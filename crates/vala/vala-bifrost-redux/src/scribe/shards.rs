@@ -1,6 +1,6 @@
 //! Fixed pod-local Scribe shard mailboxes and tenant round-robin scheduling.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -94,6 +94,16 @@ struct ReplayChunkOwner {
     >,
 }
 
+/// Stable reconstruction output prepared before replay ownership is adopted.
+struct PreparedReplayChunk {
+    /// Reconstructed generations awaiting serialized persistence.
+    generations: VecDeque<ReplayChunkGeneration>,
+    /// Already-published generations eligible for WAL retirement.
+    retirements: Vec<ReplayRetirement>,
+    /// Exact Arrow bytes represented by `generations`.
+    total_arrow_bytes: usize,
+}
+
 type PendingGenerationsByKey =
     HashMap<crate::scribe::seal_key::SealKey, VecDeque<PendingGeneration>>;
 
@@ -133,13 +143,246 @@ fn retain_replayed_batches(
         .retain(|commit| !suppressed.contains(&commit.batch_id));
 }
 
+/// Durable artifact-range projection used to suppress already-published replay input.
+#[derive(Debug, sqlx::FromRow)]
+struct PublishedReplayRange {
+    /// Inclusive first WAL slice represented by the atomic artifact set.
+    wal_lsn_min: i64,
+    /// Inclusive final WAL slice represented by the atomic artifact set.
+    wal_lsn_max: i64,
+    /// Number of artifact rows committed by the set transaction.
+    artifact_count: i64,
+    /// Smallest committed artifact ordinal.
+    first_ordinal: Option<i16>,
+    /// Largest committed artifact ordinal.
+    last_ordinal: Option<i16>,
+}
+
+/// Selects only replay batches covered by one exact, contiguous atomic artifact set.
+///
+/// A range is evidence only when its stored ordinals are complete and its endpoints match the
+/// first and last recovered append it covers. Ambiguous overlapping ranges suppress nothing.
+///
+/// # Errors
+///
+/// Returns [`ScribeError`] when a recovered WAL coordinate cannot fit `PostgreSQL` `bigint`.
+fn exact_published_replay_batches(
+    metas: &[crate::scribe::replay::ReplayedAppendMeta],
+    published_ranges: &[PublishedReplayRange],
+) -> Result<HashSet<[u8; 16]>, ScribeError> {
+    let mut candidates = HashMap::<[u8; 16], usize>::new();
+    for (range_index, published) in published_ranges.iter().enumerate() {
+        let complete_ordinals = published.first_ordinal == Some(0)
+            && published
+                .last_ordinal
+                .map(i64::from)
+                .and_then(|ordinal| ordinal.checked_add(1))
+                == Some(published.artifact_count);
+        if !complete_ordinals || published.wal_lsn_min > published.wal_lsn_max {
+            continue;
+        }
+        let overlaps_another_range =
+            published_ranges
+                .iter()
+                .enumerate()
+                .any(|(other_index, other)| {
+                    other_index != range_index
+                        && published.wal_lsn_min <= other.wal_lsn_max
+                        && other.wal_lsn_min <= published.wal_lsn_max
+                });
+        if overlaps_another_range {
+            continue;
+        }
+        let mut covered = Vec::new();
+        for meta in metas {
+            let lsn = i64::try_from(meta.wal_lsn.as_u64()).map_err(|_| ScribeError::Internal {
+                detail: "replay file-list WAL coordinate exceeds bigint".to_owned(),
+            })?;
+            if published.wal_lsn_min <= lsn && lsn <= published.wal_lsn_max {
+                covered.push((meta.batch_id, lsn));
+            }
+        }
+        if covered.first().map(|(_, lsn)| *lsn) != Some(published.wal_lsn_min)
+            || covered.last().map(|(_, lsn)| *lsn) != Some(published.wal_lsn_max)
+        {
+            continue;
+        }
+        for (batch_id, _) in covered {
+            *candidates.entry(batch_id).or_default() += 1;
+        }
+    }
+    Ok(candidates
+        .into_iter()
+        .filter_map(|(batch_id, evidence_count)| (evidence_count == 1).then_some(batch_id))
+        .collect())
+}
+
 #[derive(Debug, Clone)]
 struct RetainedGeneration {
     arrow_bytes: usize,
+    /// Whether governed Arrow and memtable ownership has already been released.
+    memory_released: bool,
     wal_segments: Vec<crate::scribe::wal::WalSegmentRef>,
     wal: crate::scribe::wal::WalHandle,
     /// Replay identity retained when committed retirement cannot finish.
     replay_identity: Arc<Mutex<Option<crate::scribe::memory::ReplayIdentityOwnership>>>,
+}
+
+/// Sole retirement authority for one automatically rotated shard generation.
+///
+/// Members remain independent persistence units. They reference the same
+/// closed segment set, but only this cohort may retire it after every member
+/// reaches a terminal committed or already-identical outcome.
+#[derive(Debug)]
+struct ShardRotationCohort {
+    /// Fixed shard whose active WAL and memtable were swapped together.
+    shard_id: usize,
+    /// Closed segments retained exactly once for the complete cohort.
+    wal_segments: Vec<crate::scribe::wal::WalSegmentRef>,
+    /// Stable seal identifiers that have not reached a terminal outcome.
+    pending_member_seal_ids: BTreeSet<u64>,
+}
+
+/// Deterministic replay result used to install the sole segment owner.
+#[derive(Debug, PartialEq, Eq)]
+struct ReplayCohortPlan {
+    /// Union of every segment still required after SQL/file-list suppression.
+    wal_segments: Vec<crate::scribe::wal::WalSegmentRef>,
+    /// Reconstructed members that must settle before that union can retire.
+    pending_member_seal_ids: BTreeSet<u64>,
+}
+
+/// Plans one replay cohort from post-suppression members and retirements.
+///
+/// Suppressed or already-reconciled members contribute segment identity but no
+/// pending seal ID. Surviving generations contribute both. This keeps replay's
+/// sole retirement authority independent from member-local references.
+fn plan_replay_cohort<'a>(
+    pending: impl IntoIterator<Item = (u64, &'a [crate::scribe::wal::WalSegmentRef])>,
+    suppressed: impl IntoIterator<Item = &'a [crate::scribe::wal::WalSegmentRef]>,
+) -> ReplayCohortPlan {
+    let mut wal_segments = Vec::new();
+    let mut pending_member_seal_ids = BTreeSet::new();
+    for (seal_id, segments) in pending {
+        pending_member_seal_ids.insert(seal_id);
+        wal_segments.extend_from_slice(segments);
+    }
+    for segments in suppressed {
+        wal_segments.extend_from_slice(segments);
+    }
+    wal_segments.sort_by(|left, right| left.path.cmp(&right.path));
+    wal_segments.dedup_by(|left, right| left.path == right.path);
+    ReplayCohortPlan {
+        wal_segments,
+        pending_member_seal_ids,
+    }
+}
+
+/// Transfers replay segment authority into either pending cohort members or final retirement.
+fn assign_replay_segment_authority(
+    prepared: &VecDeque<ReplayChunkGeneration>,
+    retirements: &mut [ReplayRetirement],
+) -> ReplayCohortPlan {
+    let cohort = plan_replay_cohort(
+        prepared.iter().map(|pending| {
+            (
+                pending.generation.generation_id.0,
+                pending.generation.wal_segments.as_slice(),
+            )
+        }),
+        retirements
+            .iter()
+            .map(|retirement| retirement.segments.as_slice()),
+    );
+    for retirement in retirements.iter_mut() {
+        retirement.segments.clear();
+    }
+    if cohort.pending_member_seal_ids.is_empty()
+        && let Some(final_retirement) = retirements.last_mut()
+    {
+        final_retirement.segments.clone_from(&cohort.wal_segments);
+    }
+    cohort
+}
+
+/// Absorbs every existing cohort connected by physical-segment overlap.
+///
+/// The repeated scan computes the transitive closure, so chunks that expose
+/// `[A]`, then `[A, B]`, then `[B, C]` retain one owner for `[A, B, C]`.
+/// Returned paths are the only paths not already retained by an absorbed
+/// cohort and therefore the only paths that require a new WAL reference. The
+/// returned indices identify cohorts the caller removes only after that retain
+/// succeeds, preserving the original owners on refusal.
+fn merge_replay_cohort(
+    cohorts: &VecDeque<ShardRotationCohort>,
+    mut plan: ReplayCohortPlan,
+) -> (
+    ReplayCohortPlan,
+    Vec<crate::scribe::wal::WalSegmentRef>,
+    Vec<usize>,
+) {
+    let newly_discovered = plan.wal_segments.clone();
+    let mut absorbed_paths = BTreeSet::new();
+    let mut absorbed_indices = BTreeSet::new();
+    while let Some((index, absorbed)) = cohorts.iter().enumerate().find(|(index, cohort)| {
+        !absorbed_indices.contains(index)
+            && cohort.wal_segments.iter().any(|existing| {
+                plan.wal_segments
+                    .iter()
+                    .any(|candidate| candidate.path == existing.path)
+            })
+    }) {
+        absorbed_indices.insert(index);
+        for segment in &absorbed.wal_segments {
+            absorbed_paths.insert(segment.path.clone());
+        }
+        plan.wal_segments.extend(absorbed.wal_segments.clone());
+        plan.pending_member_seal_ids
+            .extend(absorbed.pending_member_seal_ids.iter().copied());
+        plan.wal_segments
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        plan.wal_segments
+            .dedup_by(|left, right| left.path == right.path);
+    }
+    let retain = newly_discovered
+        .into_iter()
+        .filter(|segment| !absorbed_paths.contains(&segment.path))
+        .collect();
+    (plan, retain, absorbed_indices.into_iter().collect())
+}
+
+/// Complete projected facts for one pre-append shard rotation decision.
+#[derive(Debug, Clone, Copy)]
+struct ShardRotationProjection {
+    /// Existing plus incoming encoded WAL bytes.
+    wal_encoded: u64,
+    /// Existing plus incoming uncompressed WAL payload bytes.
+    wal_uncompressed: u64,
+    /// Existing plus incoming JSON-equivalent memtable bytes.
+    memtable_json: usize,
+    /// Existing plus incoming Arrow memtable bytes.
+    memtable_arrow: usize,
+    /// Whether the complete shard generation reached its age bound.
+    age_expired: bool,
+}
+
+impl ShardRotationProjection {
+redacted
+    #[must_use]
+    fn should_rotate(self, wal_target: u64, memtable_target: usize) -> bool {
+        self.wal_encoded > wal_target
+            || self.wal_uncompressed > wal_target
+            || self.memtable_json > memtable_target
+            || self.memtable_arrow > memtable_target
+            || self.age_expired
+    }
+}
+
+impl ShardRotationCohort {
+    /// Marks one member terminal and reports whether the sole WAL owner may retire.
+    fn complete_member(&mut self, seal_id: u64) -> bool {
+        self.pending_member_seal_ids.remove(&seal_id) && self.pending_member_seal_ids.is_empty()
+    }
 }
 
 /// WAL ownership deferred until the directory replay worker has stopped reading.
@@ -162,9 +405,6 @@ pub const SHARD_COMMAND_CAPACITY: usize = 256;
 
 /// Maximum requests in one tenant scheduling group.
 pub const MAX_GROUP_ITEMS: usize = 64;
-
-/// Maximum bytes in one tenant scheduling group.
-pub const MAX_GROUP_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PressureSignal {
@@ -304,23 +544,18 @@ impl<T: ShardItem> TenantRoundRobin<T> {
     /// cannot fill an entire fsync group while another tenant waits behind it.
     pub fn pop_group(&mut self) -> Vec<T> {
         let mut result = Vec::new();
-        let mut bytes = 0_usize;
         while result.len() < MAX_GROUP_ITEMS {
             let Some(tenant) = self.active_tenants.pop_front() else {
                 break;
             };
-            let Some(next_bytes) = self
+            if self
                 .pending_by_tenant
                 .get(&tenant)
                 .and_then(|queue| queue.front())
-                .map(ShardItem::bytes)
-            else {
+                .is_none()
+            {
                 self.pending_by_tenant.remove(&tenant);
                 continue;
-            };
-            if !result.is_empty() && bytes.saturating_add(next_bytes) > MAX_GROUP_BYTES {
-                self.active_tenants.push_front(tenant);
-                break;
             }
             let item = self
                 .pending_by_tenant
@@ -329,7 +564,6 @@ impl<T: ShardItem> TenantRoundRobin<T> {
             let Some(item) = item else {
                 continue;
             };
-            bytes = bytes.saturating_add(item.bytes());
             result.push(item);
             if self
                 .pending_by_tenant
@@ -467,6 +701,18 @@ struct ShardOwner {
     synced_not_inserted: HashMap<AppendSliceId, WalSliceState>,
     /// Per-key immutable generations waiting for ordered persistence.
     pending_generations: PendingGenerationsByKey,
+    /// Whole-shard automatic rotations that solely own closed WAL retirement.
+    rotation_cohorts: VecDeque<ShardRotationCohort>,
+    /// Encoded and uncompressed WAL target for this writer.
+    wal_rotation_bytes: u64,
+    /// Aggregate JSON-equivalent and Arrow memtable target for this writer.
+    memtable_rotation_bytes: usize,
+    /// Monotonic start of the complete active shard generation.
+    generation_started_at: std::time::Instant,
+    /// JSON-equivalent bytes inserted into the current active generation.
+    active_json_bytes: usize,
+    /// Maximum lifetime of the complete active shard generation.
+    generation_max_age: std::time::Duration,
     /// At most one synchronous replay chunk advanced one generation at a time.
     replay_chunk: Option<ReplayChunkOwner>,
     /// Seal keys whose `flush_keys` attempt failed after the freeze but before
@@ -557,6 +803,9 @@ pub(crate) struct ScribeShardRuntime {
     /// Owner acknowledgements received through the graceful flush path.
     #[cfg(any(test, feature = "test-support"))]
     shutdown_flush_completions: AtomicUsize,
+    /// Boot-selected WAL and memtable rotation targets shared by all owners.
+    #[cfg(test)]
+    rotation_thresholds: (u64, usize),
 }
 
 /// Configuration supplied to [`ScribeShardRuntime::start`].
@@ -567,13 +816,15 @@ pub(crate) struct ScribeShardRuntime {
 pub(crate) struct ScribeShardStartConfig {
     /// Admission controller shared by all shard owners.
     pub(crate) admission: AdmissionController,
-    /// Writable-byte threshold that triggers active-bucket rotation.
-    pub(crate) rotation_bytes: usize,
+    /// Encoded and uncompressed WAL threshold for whole-shard rotation.
+    pub(crate) wal_rotation_bytes: u64,
+    /// Aggregate JSON-equivalent and Arrow threshold for whole-shard rotation.
+    pub(crate) memtable_rotation_bytes: usize,
     /// Active-generation max age consulted by the age seal predicate.
     ///
     /// Threaded from [`crate::scribe::ScribePressureConfig::seal_max_age`] into
-    /// each owner's memtable the same way `rotation_bytes` is, so the age
-    /// trigger uses the configured seconds-scale value (D83 default 30 s).
+    /// each owner's memtable the same way `memtable_rotation_bytes` is, so the age
+    /// trigger uses the configured seconds-scale value (D83 default 600 s).
     pub(crate) seal_max_age: std::time::Duration,
     /// Shared WAL writer used to create shard handles.
     pub(crate) wal: Arc<WalWriter>,
@@ -681,7 +932,8 @@ impl ScribeShardRuntime {
     pub(crate) fn start(config: ScribeShardStartConfig, runtime: &Handle) -> Arc<Self> {
         let ScribeShardStartConfig {
             admission,
-            rotation_bytes,
+            wal_rotation_bytes,
+            memtable_rotation_bytes,
             seal_max_age,
             wal,
             persistence_cpu,
@@ -723,12 +975,18 @@ impl ScribeShardRuntime {
                 wal_segments: WalSegmentsByKey::new(),
                 synced_not_inserted: HashMap::new(),
                 pending_generations: PendingGenerationsByKey::new(),
+                rotation_cohorts: VecDeque::new(),
+                wal_rotation_bytes,
+                memtable_rotation_bytes,
+                generation_started_at: std::time::Instant::now(),
+                active_json_bytes: 0,
+                generation_max_age: seal_max_age,
                 replay_chunk: None,
                 seal_retry: HashSet::new(),
                 retained_generations: HashMap::new(),
                 retained_commit_ambiguity: None,
                 admission: admission.clone(),
-                memtable: Memtable::new_with_config(rotation_bytes, seal_max_age),
+                memtable: Memtable::new_with_config(memtable_rotation_bytes, seal_max_age),
                 persistence_cpu: persistence_cpu.clone(),
                 wal_io: wal_io.clone(),
                 persistence: persistence.clone(),
@@ -762,7 +1020,15 @@ impl ScribeShardRuntime {
             closed: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-support"))]
             shutdown_flush_completions: AtomicUsize::new(0),
+            #[cfg(test)]
+            rotation_thresholds: (wal_rotation_bytes, memtable_rotation_bytes),
         })
+    }
+
+    /// Returns the exact boot-selected owner thresholds for constructor tests.
+    #[cfg(test)]
+    pub(crate) const fn rotation_thresholds_for_test(&self) -> (u64, usize) {
+        self.rotation_thresholds
     }
 
     /// Enqueue a prepared request onto its deterministic shard.
@@ -1197,6 +1463,11 @@ impl ScribeShardRuntime {
 impl ShardOwner {
     /// Publishes this owner's read-only inspection projection.
     fn publish_snapshot(&self) {
+        debug_assert!(self.rotation_cohorts.iter().all(|cohort| {
+            cohort.shard_id == self.id
+                && !cohort.pending_member_seal_ids.is_empty()
+                && !cohort.wal_segments.is_empty()
+        }));
         let snapshot = ShardMemtableSnapshot {
             stats: self.memtable.stats().unwrap_or_default(),
             bucket_memory: self.memtable.bucket_memory().unwrap_or_default(),
@@ -1380,23 +1651,23 @@ impl ShardOwner {
     ///
     /// Returns [`ScribeError`] when the requested range or projection cannot be read.
     fn snapshot_at(&self, request: &FetchLiveTailRequest) -> Result<Vec<HotBatch>, ScribeError> {
-        let readable = self.memtable.readable_batches_for_range(
+        let readable = self.memtable.readable_batches_for_provider_cut(
             request.binding.tenant,
             &request.binding.table_ref,
-            request.start_day,
-            request.end_day,
-            &request.required_columns,
-            ReadableBatchLimits {
-                max_batches: request.max_batches,
-                max_retained_bytes: request.max_retained_bytes,
+            &crate::scribe::memtable::ProviderCut {
+                start_day: request.start_day,
+                end_day: request.end_day,
+                required_columns: &request.required_columns,
+                persisted_cursor: request.after_lsn,
+                persisted_ranges: &request.persisted_lsn_ranges,
+                limits: ReadableBatchLimits {
+                    max_batches: request.max_batches,
+                    max_retained_bytes: request.max_retained_bytes,
+                },
             },
         )?;
         Ok(readable
             .into_iter()
-            .filter(|batch| {
-                request.after_lsn == crate::scribe::wal::WalLsn::ZERO
-                    || batch.meta.wal_lsn_max > request.after_lsn
-            })
             .map(|batch| HotBatch {
                 partition_day: batch.partition_day,
                 wal_lsn: batch.meta.wal_lsn_max,
@@ -1404,6 +1675,81 @@ impl ShardOwner {
                 rows: batch.batch,
             })
             .collect())
+    }
+
+    /// Resolves and reconstructs every replay state in stable seal-key order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when durable suppression, Arrow reconstruction, accounting, or
+    /// immutable retention fails. Any already-prepared generation is discarded before return.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation ends the owning shard task; WAL remains authoritative and startup replay
+    /// reconstructs any state that had not reached fenced publication.
+    async fn prepare_replay_chunk(
+        &mut self,
+        states: HashMap<String, crate::scribe::replay::ReplayedSealKey>,
+    ) -> Result<PreparedReplayChunk, ScribeError> {
+        let mut ordered = states.into_iter().collect::<Vec<_>>();
+        ordered.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut generations = VecDeque::new();
+        let mut retirements = Vec::new();
+        let mut total_arrow_bytes = 0_usize;
+        for (_, replayed) in ordered {
+            match self.prepare_replay_state(replayed).await {
+                Ok(PreparedReplayState::Retired(retirement)) => retirements.push(retirement),
+                Ok(PreparedReplayState::Generation {
+                    prepared,
+                    arrow_bytes,
+                }) => {
+                    let Some(total) = total_arrow_bytes.checked_add(arrow_bytes) else {
+                        self.discard_prepared_replay(&mut generations);
+                        return Err(ScribeError::Internal {
+                            detail: "replay chunk Arrow ownership overflowed".to_owned(),
+                        });
+                    };
+                    total_arrow_bytes = total;
+                    generations.push_back(prepared);
+                }
+                Err(error) => {
+                    self.discard_prepared_replay(&mut generations);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(PreparedReplayChunk {
+            generations,
+            retirements,
+            total_arrow_bytes,
+        })
+    }
+
+    /// Installs one replay cohort after retaining only newly discovered paths.
+    ///
+    /// Existing cohorts connected by physical-segment overlap are removed only
+    /// after the new reference acquisition succeeds, so refusal preserves the
+    /// previous sole owners unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns the WAL retention failure without mutating existing cohorts.
+    fn retain_replay_cohort(&mut self, cohort: ReplayCohortPlan) -> Result<(), ScribeError> {
+        let (cohort, segments_to_retain, absorbed_indices) =
+            merge_replay_cohort(&self.rotation_cohorts, cohort);
+        self.wal_handle.retain_segments(&segments_to_retain)?;
+        for index in absorbed_indices.into_iter().rev() {
+            self.rotation_cohorts
+                .remove(index)
+                .expect("absorbed replay cohort index came from this deque");
+        }
+        self.rotation_cohorts.push_back(ShardRotationCohort {
+            shard_id: self.id,
+            wal_segments: cohort.wal_segments,
+            pending_member_seal_ids: cohort.pending_member_seal_ids,
+        });
+        Ok(())
     }
 
     /// Reconstructs one WAL-restored generation and queues it for persistence.
@@ -1431,37 +1777,18 @@ impl ShardOwner {
             }));
             return;
         }
-        let mut ordered = states.into_iter().collect::<Vec<_>>();
-        ordered.sort_by(|left, right| left.0.cmp(&right.0));
-        let mut prepared = VecDeque::new();
-        let mut retirements = Vec::new();
-        let mut total_arrow_bytes = 0_usize;
-        for (_, replayed) in ordered {
-            match self.prepare_replay_state(replayed).await {
-                Ok(PreparedReplayState::Retired(retirement)) => {
-                    retirements.push(retirement);
-                }
-                Ok(PreparedReplayState::Generation {
-                    prepared: generation,
-                    arrow_bytes,
-                }) => {
-                    let Some(total) = total_arrow_bytes.checked_add(arrow_bytes) else {
-                        self.discard_prepared_replay(&mut prepared);
-                        let _ = response.send(Err(ScribeError::Internal {
-                            detail: "replay chunk Arrow ownership overflowed".to_owned(),
-                        }));
-                        return;
-                    };
-                    total_arrow_bytes = total;
-                    prepared.push_back(generation);
-                }
-                Err(error) => {
-                    self.discard_prepared_replay(&mut prepared);
-                    let _ = response.send(Err(error));
-                    return;
-                }
+        let PreparedReplayChunk {
+            generations: mut prepared,
+            mut retirements,
+            total_arrow_bytes,
+        } = match self.prepare_replay_chunk(states).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let _ = response.send(Err(error));
+                return;
             }
-        }
+        };
+        let cohort = assign_replay_segment_authority(&prepared, &mut retirements);
         let adoption = match memory {
             Some(memory) => self
                 .memory_ownership
@@ -1502,6 +1829,20 @@ impl ShardOwner {
                     identity_memory,
                 }
             }));
+            return;
+        }
+        if !cohort.pending_member_seal_ids.is_empty()
+            && let Err(error) = self.retain_replay_cohort(cohort)
+        {
+            self.rollback_prepared_replay(&mut prepared);
+            let identity_memory = identity
+                .map(crate::scribe::memory::ReplayIdentityOwnership::return_to_decode)
+                .transpose();
+            let result = match identity_memory {
+                Ok(_) => Err(error),
+                Err(identity_error) => Err(identity_error),
+            };
+            let _ = response.send(result);
             return;
         }
         self.replay_chunk = Some(ReplayChunkOwner {
@@ -1648,15 +1989,6 @@ impl ShardOwner {
         } else {
             None
         };
-        if let Err(error) = self
-            .wal_handle
-            .retain_segments(&next.generation.wal_segments)
-        {
-            drop(identity_slot);
-            owner.remaining.push_front(next);
-            self.replay_chunk = Some(owner);
-            return Err(error);
-        }
         if let (Some(identity), Some(slot)) = (owner.identity.take(), identity_slot.as_mut()) {
             slot.replace(identity);
         }
@@ -1727,6 +2059,7 @@ impl ShardOwner {
                 suppressed.insert(commit.batch_id);
             }
         }
+        suppressed.extend(self.resolve_published_replay_batches(replayed).await?);
         if suppressed.is_empty() {
             return Ok(None);
         }
@@ -1748,6 +2081,51 @@ impl ShardOwner {
             seal_key: replayed.seal_key.clone(),
             sealed_lsn,
         }))
+    }
+
+    /// Finds canonical WAL batches already represented by one atomic file-list publication.
+    ///
+    /// The durable batch fence deliberately restores the canonical WAL location because an
+    /// acknowledged batch can still be hot-only. Once a tenant-qualified file-list transaction
+    /// covers that batch's exact slice range, replay must suppress it before rebuilding Arrow or
+    /// attempting a second physical artifact set. This is the Wyrd replacement for removing the
+redacted
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when WAL coordinates exceed `PostgreSQL` integer bounds, the
+    /// tenant-scoped read fails, or its read transaction cannot commit.
+    async fn resolve_published_replay_batches(
+        &self,
+        replayed: &crate::scribe::replay::ReplayedSealKey,
+    ) -> Result<HashSet<[u8; 16]>, ScribeError> {
+        let postgres = self
+            .control_postgres
+            .as_ref()
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "production WAL replay lacks control Postgres".to_owned(),
+            })?;
+        let mut conn = postgres.tenant_conn(replayed.seal_key.tenant).await?;
+        let published_ranges: Vec<PublishedReplayRange> = sqlx::query_as(
+            "SELECT wal_lsn_min, wal_lsn_max, COUNT(*)::bigint AS artifact_count, \
+                    MIN(file_ordinal)::smallint AS first_ordinal, \
+                    MAX(file_ordinal)::smallint AS last_ordinal \
+             FROM vala.file_list \
+             WHERE data_tenant_id=wyrd.current_tenant() AND namespace=$1 AND table_name=$2 \
+               AND partition_day=$3 AND node_id=$4 AND writer_epoch=$5 \
+             GROUP BY wal_lsn_min, wal_lsn_max",
+        )
+        .bind(replayed.seal_key.table.namespace.as_str())
+        .bind(&replayed.seal_key.table.name)
+        .bind(replayed.seal_key.day.as_naive_date())
+        .bind(replayed.stream.node_id.as_uuid())
+        .bind(replayed.stream.writer_epoch.as_i64())
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .map_err(vala_sql::SqlError::from)?;
+        conn.commit().await?;
+
+        exact_published_replay_batches(&replayed.append_metas, &published_ranges)
     }
 
     /// Resolves one reconstructed batch against its tenant-scoped SQL fence.
@@ -2030,8 +2408,8 @@ impl ShardOwner {
     /// before the accounting move, then queues it through the infallible tail.
     ///
     /// This is the transactional pivot of the seal path. Table-binding
-    /// resolution and WAL segment retention — the two fallible prep steps —
-    /// execute BEFORE `move_active_to_immutable`, and the ledger move (T52
+    /// resolution and informational WAL-segment capture execute before
+    /// `move_active_to_immutable`, and the ledger move (T52
     /// net-zero, poison-only failure) is the last fallible step, run
     /// immediately before the infallible queue push. As a result a single-step
     /// failure leaves exactly one of two states: (A) prep failed, bytes remain
@@ -2039,14 +2417,14 @@ impl ShardOwner {
     /// entry is intact for an identical retry; or (B) the generation is queued,
     /// bytes are Immutable-accounted, and its segments are retained. There is
     /// no state in which bytes are Immutable-accounted with no queued
-    /// generation. The `wal_segments` entry is removed only after retention
-    /// succeeds, and `segment_refs` is derived non-destructively so a retention
-    /// failure re-derives identical references.
+    /// generation. Segment references remain discovery/replay facts only; the
+    /// open shard owner, and later its closed cohort, are the sole retirement
+    /// authorities.
     ///
     /// # Errors
     /// Returns [`ScribeError::Internal`] when the table binding cannot be
-    /// resolved, or propagates [`ScribeError`] from `retain_segments` or the
-    /// ledger move (poison only). Every such failure occurs at or before the
+    /// resolved, or propagates [`ScribeError`] from the ledger move (poison
+    /// only). Every such failure occurs at or before the
     /// accounting move, so no partial queue or Immutable accounting is left
     /// behind.
     fn prepare_and_queue_generation(
@@ -2059,9 +2437,7 @@ impl ShardOwner {
                 .map_err(|error| ScribeError::Internal {
                     detail: error.to_string(),
                 })?;
-        // Non-destructive: the segment map entry is removed only after
-        // retention succeeds (below), so a retention failure leaves identical
-        // references for a retry to re-derive.
+        // These references locate replay bytes but own no deletion authority.
         let segment_refs = self
             .wal_segments
             .get(seal_key)
@@ -2072,8 +2448,6 @@ impl ShardOwner {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        self.wal_handle.retain_segments(&segment_refs)?;
-
         // Accounting move is the last fallible step; everything below is
         // infallible, so no fallible step runs between the move and the queue
         // push (AC1).
@@ -2082,6 +2456,17 @@ impl ShardOwner {
         self.admission
             .transfer_active_to_immutable(frozen.arrow_bytes)?;
         self.wal_segments.remove(seal_key);
+        tracing::info!(
+            tenant = %seal_key.tenant,
+            table = %seal_key.table,
+            shard_id = self.id,
+            writer_epoch = self.stream.writer_epoch.as_i64(),
+            shard_generation = ?segment_refs.first().map(|segment| &segment.path),
+            cohort_id = ?segment_refs.first().map(|segment| &segment.path),
+            member_generation = frozen.seal_id,
+            terminal = false,
+            "Scribe shard rotation member queued"
+        );
         let generation = Arc::new(ImmutableGeneration::from_frozen(
             frozen,
             (seal_key.tenant, seal_key.table.clone()),
@@ -2270,28 +2655,20 @@ impl ShardOwner {
     /// the exact generation into retained state.
     fn complete_external_post_commit(
         &mut self,
-        seal_key: &crate::scribe::seal_key::SealKey,
+        _seal_key: &crate::scribe::seal_key::SealKey,
         seal_id: u64,
         arrow_bytes: usize,
         file_list_key: crate::scribe::file_list_writer::FileListCommitKey,
     ) -> Result<(), ScribeError> {
-        let segment_refs = self
-            .wal_segments
-            .get(seal_key)
-            .into_iter()
-            .flat_map(|segments| segments.values())
-            .map(|segment| segment.reference())
-            .collect::<Vec<_>>();
-        self.wal_handle.retain_segments(&segment_refs)?;
-        if let Err(error) = self.memtable.complete_post_commit(seal_id, file_list_key) {
-            let _ = self.wal_handle.retire_segments(&segment_refs);
-            return Err(error);
-        }
+        self.memtable.complete_post_commit(seal_id, file_list_key)?;
         self.retained_generations.insert(
             seal_id,
             RetainedGeneration {
                 arrow_bytes,
-                wal_segments: segment_refs,
+                memory_released: false,
+                // Selective generations borrow active-segment identity only.
+                // The later closed-segment cohort is the sole retirement owner.
+                wal_segments: Vec::new(),
                 wal: self.wal_handle.clone(),
                 replay_identity: Arc::new(Mutex::new(None)),
             },
@@ -2339,27 +2716,31 @@ impl ShardOwner {
         Ok(())
     }
 
-    /// Releases one committed generation's governed immutable and memtable ownership.
+    /// Releases one committed generation's governed immutable and memtable ownership once.
     ///
-    /// The returned WAL ownership remains retained so the caller can choose the
-    /// safe IO boundary for segment retirement. This is required during replay,
-    /// where submitting WAL work from the sole WAL worker would self-deadlock.
+    /// Replay uses this transition as soon as a published member is terminal,
+    /// while leaving the retained generation and its cohort vote in place for
+    /// the later physical-WAL retirement pass.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError`] when retirement accounting is inconsistent,
     /// poisoned, or cannot commit the exact planned generation transition.
-    fn retire_committed_generation(
+    fn release_committed_generation_memory(
         &mut self,
         generation_id: u64,
-    ) -> Result<Option<RetainedGeneration>, ScribeError> {
+    ) -> Result<bool, ScribeError> {
+        let Some(retained) = self.retained_generations.get(&generation_id) else {
+            return Ok(false);
+        };
+        if retained.memory_released {
+            return Ok(true);
+        }
+        let arrow_bytes = retained.arrow_bytes;
         let Some(token) = self.memtable.plan_committed_retirement(generation_id)? else {
-            return Ok(None);
+            return Ok(false);
         };
-        let Some(retained) = self.retained_generations.get(&generation_id).cloned() else {
-            return Ok(None);
-        };
-        if token.arrow_bytes != retained.arrow_bytes {
+        if token.arrow_bytes != arrow_bytes {
             self.memory_ownership.poison();
             return Err(ScribeError::Internal {
                 detail: format!("retirement bytes mismatch for generation {generation_id}"),
@@ -2383,8 +2764,56 @@ impl ShardOwner {
             self.memory_ownership.poison();
             return Err(error);
         }
-        self.retained_generations.remove(&generation_id);
-        record_retirement(token.arrow_bytes);
+        self.retained_generations
+            .get_mut(&generation_id)
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "retained generation disappeared during memory release".to_owned(),
+            })?
+            .memory_released = true;
+        record_retirement(arrow_bytes);
+        Ok(true)
+    }
+
+    /// Releases one committed generation's remaining cohort and WAL ownership.
+    ///
+    /// The returned WAL ownership remains retained so the caller can choose the
+    /// safe IO boundary for segment retirement. This is required during replay,
+    /// where submitting WAL work from the sole WAL worker would self-deadlock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when retirement accounting is inconsistent,
+    /// poisoned, or cannot commit the exact planned generation transition.
+    fn retire_committed_generation(
+        &mut self,
+        generation_id: u64,
+    ) -> Result<Option<RetainedGeneration>, ScribeError> {
+        if !self.release_committed_generation_memory(generation_id)? {
+            return Ok(None);
+        }
+        let Some(mut retained) = self.retained_generations.remove(&generation_id) else {
+            return Ok(None);
+        };
+        if let Some(index) = self
+            .rotation_cohorts
+            .iter_mut()
+            .position(|cohort| cohort.pending_member_seal_ids.contains(&generation_id))
+        {
+            let terminal = self.rotation_cohorts[index].complete_member(generation_id);
+            if terminal {
+                let cohort = self
+                    .rotation_cohorts
+                    .remove(index)
+                    .expect("cohort index was selected from this deque");
+                retained.wal_segments = cohort.wal_segments;
+            } else {
+                retained.wal_segments.clear();
+            }
+        } else {
+            // Selective members only carry replay/discovery references to the
+            // still-open segment. They never acquire deletion authority.
+            retained.wal_segments.clear();
+        }
         Ok(Some(retained))
     }
 
@@ -2414,56 +2843,42 @@ impl ShardOwner {
         let Some(seal_key) = seal_key else {
             return self.handle_unowned_completion(completion, waiter);
         };
+        self.trace_persistence_settlement(&seal_key, generation_id, completion.error.is_some());
         let replay_owned = self.front_is_replay_owned(&seal_key);
         if let Some(error) = completion.error.as_ref() {
             let detail = error.clone();
-            self.mark_front_retryable(&seal_key);
             tracing::warn!(error = %error, generation_id, "shard persistence failed; retaining immutable generation");
-            if replay_owned {
-                if let Some(owner) = self.replay_chunk.as_mut() {
-                    owner.identity = replay_identity.take();
-                }
-                self.fail_replay_chunk(ScribeError::Internal {
-                    detail: detail.clone(),
-                });
-            }
-            self.send_replay_error(&seal_key, &detail);
-            Self::send_waiter_error(waiter, detail.clone());
-            return Err(detail);
+            return self.fail_persistence_completion(
+                &seal_key,
+                replay_owned,
+                &mut replay_identity,
+                detail,
+                waiter,
+            );
         }
         let Some(file_list_key) = completion.file_list_key.clone() else {
             let detail = "persistence completion omitted its file-list key".to_owned();
-            self.mark_front_retryable(&seal_key);
-            if replay_owned {
-                if let Some(owner) = self.replay_chunk.as_mut() {
-                    owner.identity = replay_identity.take();
-                }
-                self.fail_replay_chunk(ScribeError::Internal {
-                    detail: detail.clone(),
-                });
-            }
-            self.send_replay_error(&seal_key, &detail);
-            Self::send_waiter_error(waiter, detail.clone());
-            return Err(detail);
+            return self.fail_persistence_completion(
+                &seal_key,
+                replay_owned,
+                &mut replay_identity,
+                detail,
+                waiter,
+            );
         };
         if let Err(error) = self
             .memtable
             .complete_post_commit(generation_id, file_list_key)
         {
             let detail = error.to_string();
-            self.mark_front_retryable(&seal_key);
-            if replay_owned {
-                if let Some(owner) = self.replay_chunk.as_mut() {
-                    owner.identity = replay_identity.take();
-                }
-                self.fail_replay_chunk(ScribeError::Internal {
-                    detail: detail.clone(),
-                });
-            }
             tracing::warn!(error = %error, generation_id, "shard persistence completion could not publish generation");
-            self.send_replay_error(&seal_key, &detail);
-            Self::send_waiter_error(waiter, detail.clone());
-            return Err(detail);
+            return self.fail_persistence_completion(
+                &seal_key,
+                replay_owned,
+                &mut replay_identity,
+                detail,
+                waiter,
+            );
         }
         let Some(queue) = self.pending_generations.get_mut(&seal_key) else {
             return Err("persistence completion queue disappeared".to_owned());
@@ -2479,6 +2894,7 @@ impl ShardOwner {
             generation_id,
             RetainedGeneration {
                 arrow_bytes: completion.arrow_bytes,
+                memory_released: false,
                 wal_segments: completion.wal_segments,
                 wal: completion.wal,
                 replay_identity: Arc::new(Mutex::new(None)),
@@ -2503,6 +2919,67 @@ impl ShardOwner {
             self.submit_front(&seal_key);
         }
         Ok(())
+    }
+
+    /// Retains one failed FIFO front and propagates its terminal replay result.
+    ///
+    /// Replay identity returns to the active chunk before failure settlement so
+    /// its sole root lease remains owned until the replay waiter observes the error.
+    ///
+    /// # Errors
+    ///
+    /// Always returns the supplied persistence failure after every owner and
+    /// waiter has observed the same terminal detail.
+    fn fail_persistence_completion(
+        &mut self,
+        seal_key: &crate::scribe::seal_key::SealKey,
+        replay_owned: bool,
+        replay_identity: &mut Option<crate::scribe::memory::ReplayIdentityOwnership>,
+        detail: String,
+        waiter: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    ) -> Result<(), String> {
+        self.mark_front_retryable(seal_key);
+        if replay_owned {
+            if let Some(owner) = self.replay_chunk.as_mut() {
+                owner.identity = replay_identity.take();
+            }
+            self.fail_replay_chunk(ScribeError::Internal {
+                detail: detail.clone(),
+            });
+        }
+        self.send_replay_error(seal_key, &detail);
+        Self::send_waiter_error(waiter, detail.clone());
+        Err(detail)
+    }
+
+    /// Emits the full shard and cohort identity for one terminal persistence result.
+    ///
+    /// The cohort path remains the stable local identity shared by the shard
+    /// generation and cohort fields while member generations settle independently.
+    fn trace_persistence_settlement(
+        &self,
+        seal_key: &crate::scribe::seal_key::SealKey,
+        generation_id: u64,
+        failed: bool,
+    ) {
+        let cohort_id = self
+            .rotation_cohorts
+            .iter()
+            .find(|cohort| cohort.pending_member_seal_ids.contains(&generation_id))
+            .and_then(|cohort| cohort.wal_segments.first())
+            .map(|segment| &segment.path);
+        tracing::info!(
+            tenant = %seal_key.tenant,
+            table = %seal_key.table,
+            shard_id = self.id,
+            writer_epoch = self.stream.writer_epoch.as_i64(),
+            shard_generation = ?cohort_id,
+            cohort_id = ?cohort_id,
+            member_generation = generation_id,
+            terminal = true,
+            outcome = if failed { "failed" } else { "committed" },
+            "Scribe shard persistence settlement received"
+        );
     }
 
     /// Reports whether one key's FIFO front belongs to the active replay chunk.
@@ -2532,17 +3009,16 @@ impl ShardOwner {
         generation_id: u64,
         replay_identity: Option<crate::scribe::memory::ReplayIdentityOwnership>,
     ) -> Result<(), ScribeError> {
-        let retained = self
-            .retire_committed_generation(generation_id)
-            .and_then(|retained| {
-                retained.ok_or_else(|| ScribeError::Internal {
+        let released = self.release_committed_generation_memory(generation_id);
+        match released {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(ScribeError::Internal {
                     detail: format!(
-                        "replay generation {generation_id} was not eligible for retirement"
+                        "replay generation {generation_id} was not eligible for memory release"
                     ),
-                })
-            });
-        let retained = match retained {
-            Ok(retained) => retained,
+                });
+            }
             Err(error) => {
                 if let Some(identity) = replay_identity {
                     self.retained_generations
@@ -2559,7 +3035,7 @@ impl ShardOwner {
                 }
                 return Err(error);
             }
-        };
+        }
         let Some(owner) = self.replay_chunk.as_mut() else {
             return Err(ScribeError::Internal {
                 detail: "replay completion lost its chunk owner".to_owned(),
@@ -2573,8 +3049,8 @@ impl ShardOwner {
         owner.current_generation = None;
         owner.identity = replay_identity;
         owner.retirements.push(ReplayRetirement {
-            wal: retained.wal,
-            segments: retained.wal_segments,
+            wal: self.wal_handle.clone(),
+            segments: Vec::new(),
             stream: front.generation.stream,
             seal_key: front.generation.seal_key.clone(),
             sealed_lsn: front.generation.wal_lsn_max,
@@ -2624,22 +3100,26 @@ impl ShardOwner {
         >,
     ) -> Result<(), String> {
         let result = self
-            .retire_committed_generation(generation_id)
-            .and_then(|retained| {
-                retained.ok_or_else(|| ScribeError::Internal {
-                    detail: format!(
-                        "replay generation {generation_id} was not eligible for retirement"
-                    ),
-                })
+            .release_committed_generation_memory(generation_id)
+            .and_then(|released| {
+                if released {
+                    Ok(())
+                } else {
+                    Err(ScribeError::Internal {
+                        detail: format!(
+                            "replay generation {generation_id} was not eligible for memory release"
+                        ),
+                    })
+                }
             })
-            .and_then(|retained| {
+            .and_then(|()| {
                 let identity_memory = replay_identity
                     .map(crate::scribe::memory::ReplayIdentityOwnership::return_to_decode)
                     .transpose()?;
                 Ok(crate::scribe::replay::ReplayChunkResponse {
                     retirements: vec![ReplayRetirement {
-                        wal: retained.wal,
-                        segments: retained.wal_segments,
+                        wal: self.wal_handle.clone(),
+                        segments: Vec::new(),
                         stream: front.generation.stream,
                         seal_key: front.generation.seal_key.clone(),
                         sealed_lsn: front.generation.wal_lsn_max,
@@ -2720,6 +3200,7 @@ impl ShardOwner {
             generation_id,
             RetainedGeneration {
                 arrow_bytes: completion.arrow_bytes,
+                memory_released: false,
                 wal_segments: completion.wal_segments,
                 wal: completion.wal,
                 replay_identity: Arc::new(Mutex::new(None)),
@@ -2746,6 +3227,12 @@ struct DurableSlice {
     active_reserved: bool,
     /// Batch identity used for retry deduplication.
     batch_id: [u8; 16],
+    /// Stable Arrow schema identity for logical retry comparison.
+    schema_fingerprint: [u8; 32],
+    /// Stable Arrow data digest for logical retry comparison.
+    data_digest: [u8; 32],
+    /// Stable Arrow data length for logical retry comparison.
+    data_len: u32,
     /// WAL sequence number assigned to the durable append.
     lsn: crate::scribe::wal::WalLsn,
     /// SHA-256 digest of this exact WAL slice payload.
@@ -2795,6 +3282,28 @@ struct GroupWalState {
     rows_by_append: HashMap<[u8; 16], u64>,
 }
 
+/// Owns one WAL/SQL-committed group until every retained batch is query-visible.
+///
+/// The owner is deliberately move-only: a failed insertion keeps the same
+/// materialized batches, active child leases, and ACK waiters together for a
+/// serial retry or coordinated replay after readiness is poisoned.
+struct PostCommitInsertOwner {
+    /// Complete committed group awaiting memtable visibility.
+    state: GroupWalState,
+}
+
+impl PostCommitInsertOwner {
+    /// Takes exclusive ownership immediately after the durable control fence.
+    fn new(state: GroupWalState) -> Self {
+        Self { state }
+    }
+
+    /// Returns the retained group for fail-stop recovery ownership.
+    fn into_state(self) -> GroupWalState {
+        self.state
+    }
+}
+
 impl ShardOwner {
     /// Writes, syncs, inserts, rotates, and ACKs one bounded tenant-fair group.
     ///
@@ -2804,6 +3313,8 @@ impl ShardOwner {
     /// prepared ACK waiters receive the same completion error and reservations
     /// are released before the error returns.
     async fn process_group(&mut self, group: Vec<PreparedAppend>) -> Result<(), ScribeError> {
+        self.retry_retained_post_commit()?;
+        self.rotate_before_append_if_needed(&group)?;
         let mut state = self.write_group(group).await?;
         if let Err(error) = self.sync_group(&state.touched).await {
             if let Err(cleanup_error) = self.release_active_reservations(&state.durable) {
@@ -2845,30 +3356,66 @@ impl ShardOwner {
                 },
             );
         }
+        let mut post_commit = PostCommitInsertOwner::new(state);
         #[cfg(any(test, feature = "test-support"))]
         if self.wal_handle.take_post_sync_failure_for_test() {
+            tracing::warn!(
+                "injected post-COMMIT insertion failure retained the owner for serial retry"
+            );
             let error = ScribeError::Internal {
                 detail: "injected post-sync WAL failure".to_owned(),
             };
-            if let Err(cleanup_error) = self.release_active_reservations(&state.durable) {
-                tracing::error!(error = %cleanup_error, "active cleanup failed after injected group error");
-            }
-            self.mark_wal_error(&error);
-            Self::notify_prepared_error(&mut state.prepared, &error);
+            debug_assert!(self.retained_commit_ambiguity.is_none());
+            self.retained_commit_ambiguity = Some(post_commit.into_state());
             return Err(error);
         }
-        let touched_keys = match self.insert_committed_group(&mut state).await {
+        let touched_keys = match self.insert_committed_group(&mut post_commit.state) {
             Ok(keys) => keys,
             Err(error) => {
-                if let Err(cleanup_error) = self.release_active_reservations(&state.durable) {
-                    tracing::error!(error = %cleanup_error, "active cleanup failed after visibility error");
-                }
-                Self::notify_prepared_error(&mut state.prepared, &error);
+                self.memory_ownership.poison();
+                debug_assert!(self.retained_commit_ambiguity.is_none());
+                self.retained_commit_ambiguity = Some(post_commit.into_state());
                 return Err(error);
             }
         };
-        if let Err(error) = self.rotate_group(touched_keys) {
-            tracing::warn!(error = %error, "durable append completed but bucket rotation was deferred");
+        let state = post_commit.into_state();
+        let _ = touched_keys;
+        for mut append in state.prepared {
+            if let Some(lifecycle) = append.lifecycle.as_mut() {
+                lifecycle.succeed();
+            }
+            if let Some(sender) = append.durable_ack {
+                let rows = state
+                    .rows_by_append
+                    .get(append.batch_id.as_bytes())
+                    .copied()
+                    .unwrap_or(0);
+                let _ = sender.send(Ok(rows));
+            }
+            drop(append.reservation);
+        }
+        Ok(())
+    }
+
+    /// Re-drives the sole WAL/SQL-committed insertion owner before new work.
+    ///
+    /// The retained material and Active children stay charged after an
+    /// ambiguous post-COMMIT response. The next serialized shard turn inserts
+    /// those exact Arrow batches first; only then may a duplicate retry observe
+    /// the memtable identity and converge without another row.
+    ///
+    /// # Errors
+    ///
+    /// Returns the insertion error after restoring the complete owner and
+    /// poisoning readiness. No new group mutates WAL while this owner remains.
+    fn retry_retained_post_commit(&mut self) -> Result<(), ScribeError> {
+        let Some(mut state) = self.retained_commit_ambiguity.take() else {
+            return Ok(());
+        };
+        if let Err(error) = self.insert_committed_group(&mut state) {
+            self.memory_ownership.poison();
+            self.retained_commit_ambiguity = Some(state);
+            return Err(error);
         }
         for mut append in state.prepared {
             if let Some(lifecycle) = append.lifecycle.as_mut() {
@@ -2883,6 +3430,302 @@ impl ShardOwner {
                 let _ = sender.send(Ok(rows));
             }
             drop(append.reservation);
+        }
+        Ok(())
+    }
+
+    /// Applies the complete-writer projected OR before any incoming WAL mutation.
+    ///
+    /// Existing non-empty state rotates when encoded or uncompressed WAL,
+    /// aggregate JSON-equivalent or Arrow ownership, or generation age reaches
+    /// its configured target. The old WAL is closed and every active key is
+    /// installed immutable before the incoming group can append to fresh state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sizing, WAL close/retention, memtable, binding, or accounting
+    /// error before the incoming group mutates WAL.
+    fn rotate_before_append_if_needed(
+        &mut self,
+        group: &[PreparedAppend],
+    ) -> Result<(), ScribeError> {
+        let stats = self.memtable.stats()?;
+        // A selectively sealed key can leave this generation with no writable
+        // bucket while its WAL still contains accepted records.  Upstream's
+        // writer predicate evaluates a non-empty WAL independently from the
+        // complete memtable, so neither a fresh append nor an empty bucket set
+        // may reset this generation's age or skip its WAL threshold.
+        let active_wal_bytes = self.wal_handle.current_segment_bytes()?;
+        let wal_has_records = self.wal_handle.has_active_records()?;
+        if stats.writable_buckets == 0 && !wal_has_records {
+            return Ok(());
+        }
+        for append in group {
+            let PreparedSliceSet::Materialized(slices) = &append.slices;
+            for slice in slices {
+                let incoming = group.iter().flat_map(|candidate_append| {
+                    let PreparedSliceSet::Materialized(candidate_slices) = &candidate_append.slices;
+                    candidate_slices
+                        .iter()
+                        .filter(|candidate| candidate.seal_key == slice.seal_key)
+                        .map(|candidate| (candidate.rows.num_rows(), candidate.memtable_bytes))
+                });
+                let candidate_peak = self
+                    .memtable
+                    .projected_candidate_peak(&slice.seal_key, incoming)?;
+                let persistence_peak = candidate_peak
+                    .checked_add(crate::scribe::memory::parquet_candidate_incremental_bytes(
+                        candidate_peak,
+                    )?)
+                    .ok_or_else(|| ScribeError::Internal {
+                        detail: "projected persistence envelope overflowed".to_owned(),
+                    })?;
+                if persistence_peak > append.maximum_scribe_envelope_bytes {
+                    return self.rotate_active_generation();
+                }
+            }
+        }
+        let mut incoming_encoded = 0_usize;
+        let mut incoming_uncompressed = 0_usize;
+        let mut incoming_arrow = 0_usize;
+        for append in group {
+            let PreparedSliceSet::Materialized(slices) = &append.slices;
+            for slice in slices {
+                incoming_encoded = incoming_encoded
+                    .checked_add(slice.wal_append.encoded_len()?)
+                    .ok_or_else(|| ScribeError::Internal {
+                        detail: "projected encoded WAL bytes overflow".to_owned(),
+                    })?;
+                incoming_uncompressed = incoming_uncompressed
+                    .checked_add(slice.wal_append.uncompressed_len()?)
+                    .ok_or_else(|| ScribeError::Internal {
+                        detail: "projected uncompressed WAL bytes overflow".to_owned(),
+                    })?;
+                incoming_arrow = incoming_arrow
+                    .checked_add(slice.memtable_bytes)
+                    .ok_or_else(|| ScribeError::Internal {
+                        detail: "projected aggregate Arrow bytes overflow".to_owned(),
+                    })?;
+            }
+        }
+        let encoded =
+            active_wal_bytes.saturating_add(u64::try_from(incoming_encoded).unwrap_or(u64::MAX));
+        let uncompressed = u64::try_from(self.active_json_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_add(u64::try_from(incoming_uncompressed).unwrap_or(u64::MAX));
+        let projected_json = self.active_json_bytes.saturating_add(incoming_uncompressed);
+        let projected_arrow = stats.writable_bytes.saturating_add(incoming_arrow);
+        let age_expired =
+            wal_has_records && self.generation_started_at.elapsed() >= self.generation_max_age;
+        let projection = ShardRotationProjection {
+            wal_encoded: encoded,
+            wal_uncompressed: uncompressed,
+            memtable_json: projected_json,
+            memtable_arrow: projected_arrow,
+            age_expired,
+        };
+        if !projection.should_rotate(self.wal_rotation_bytes, self.memtable_rotation_bytes) {
+            return Ok(());
+        }
+        let rotation_trigger = if projection.age_expired {
+            "age"
+        } else if projection.wal_encoded > self.wal_rotation_bytes {
+            "wal_encoded"
+        } else if projection.wal_uncompressed > self.wal_rotation_bytes {
+            "wal_uncompressed"
+        } else if projection.memtable_json > self.memtable_rotation_bytes {
+            "memtable_json"
+        } else {
+            "memtable_arrow"
+        };
+        let rotation_result = self.rotate_active_generation();
+        tracing::info!(
+            shard_id = self.id,
+            rotation_trigger,
+            terminal = true,
+            outcome = if rotation_result.is_ok() {
+                "rotated"
+            } else {
+                "failed"
+            },
+            "Scribe shard generation rotation settled"
+        );
+        rotation_result
+    }
+
+    /// Closes and queues one complete non-empty shard generation as a cohort.
+    ///
+    /// # Errors
+    ///
+    /// Returns when WAL retention, atomic all-key freeze, accounting transfer,
+    /// binding resolution, or queue construction fails. The incoming append has
+    /// not started when this method is called.
+    fn rotate_active_generation(&mut self) -> Result<(), ScribeError> {
+        // Resolve every member and prove the complete accounting transfer
+        // before closing the only active WAL. Nothing below this point may
+        // discover an ordinary retryable preparation failure after durable
+        // ownership has moved away from the active generation.
+        let keys = self.memtable.active_seal_keys_for_shard(self.id)?;
+        let mut active_bytes = 0_usize;
+        for key in &keys {
+            crate::catalog::TenantTableBinding::resolve((key.tenant, key.table.clone())).map_err(
+                |error| ScribeError::Internal {
+                    detail: error.to_string(),
+                },
+            )?;
+            active_bytes = active_bytes
+                .checked_add(self.memtable.writable_bytes(key)?)
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "automatic rotation active-byte preflight overflow".to_owned(),
+                })?;
+        }
+        self.admission
+            .preflight_transfer_active_to_immutable(active_bytes)?;
+        self.memory_ownership
+            .preflight_move_active_to_immutable(active_bytes)?;
+
+        let result = self.rotate_active_generation_after_preflight();
+        if result.is_err() {
+            // Once WAL close begins, retrying as a normal active generation
+            // could duplicate cohort ownership. Preserve every durable file
+            // and frozen member, fail-stop admission, and let startup replay
+            // reconstruct the sole owner from WAL v4.
+            self.memory_ownership.poison();
+        }
+        result
+    }
+
+    /// Completes an automatic rotation after all retryable preparation passed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fail-stop error for WAL close/retention, all-key freeze,
+    /// accounting transfer, or queue installation. The caller poisons
+    /// readiness and leaves WAL/staged state intact for deterministic replay.
+    fn rotate_active_generation_after_preflight(&mut self) -> Result<(), ScribeError> {
+        let mut segment_refs = self
+            .wal_segments
+            .values()
+            .flat_map(|segments| segments.values().map(|segment| segment.reference()))
+            .collect::<Vec<_>>();
+        if let Some(closed) = self.wal_handle.close_active_generation()?
+            && !segment_refs
+                .iter()
+                .any(|segment| segment.path == closed.path)
+        {
+            segment_refs.push(closed);
+        }
+        segment_refs.sort_by(|left, right| left.path.cmp(&right.path));
+        segment_refs.dedup_by(|left, right| left.path == right.path);
+        self.wal_handle.retain_segments(&segment_refs)?;
+        let mut frozen = self.memtable.freeze_all_nonempty()?;
+        for member in &mut frozen {
+            member.shard_id = self.id;
+        }
+        let frozen_bytes = frozen.iter().try_fold(0_usize, |total, member| {
+            total
+                .checked_add(member.arrow_bytes)
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "automatic rotation frozen-byte total overflow".to_owned(),
+                })
+        })?;
+        self.memory_ownership
+            .move_active_to_immutable(frozen_bytes)?;
+        self.admission.transfer_active_to_immutable(frozen_bytes)?;
+        // A selective seal can already be waiting or retained against the
+        // segment being closed.  Its segment reference is informational only:
+        // the closed cohort is the unique retirement owner and must retain it
+        // until every still-needed member completes.
+        let mut pending_member_seal_ids = frozen
+            .iter()
+            .map(|member| member.seal_id)
+            .collect::<BTreeSet<_>>();
+        for pending in self.pending_generations.values().flatten() {
+            if pending
+                .generation
+                .wal_segments
+                .iter()
+                .any(|member| segment_refs.iter().any(|closed| closed.path == member.path))
+            {
+                pending_member_seal_ids.insert(pending.generation.generation_id.0);
+            }
+        }
+        for (generation_id, retained) in &self.retained_generations {
+            if retained
+                .wal_segments
+                .iter()
+                .any(|member| segment_refs.iter().any(|closed| closed.path == member.path))
+            {
+                pending_member_seal_ids.insert(*generation_id);
+            }
+        }
+        self.rotation_cohorts.push_back(ShardRotationCohort {
+            shard_id: self.id,
+            wal_segments: segment_refs.clone(),
+            pending_member_seal_ids,
+        });
+        let cohort = self
+            .rotation_cohorts
+            .back()
+            .expect("rotation cohort was just inserted");
+        tracing::info!(
+            shard_id = self.id,
+            shard_generation = ?segment_refs.first().map(|segment| &segment.path),
+            cohort_id = ?segment_refs.first().map(|segment| &segment.path),
+            cohort_member_count = cohort.pending_member_seal_ids.len(),
+            terminal = true,
+            outcome = "rotated",
+            "Scribe shard generation rotation settled"
+        );
+        self.wal_segments.clear();
+        for member in frozen {
+            self.queue_prepared_rotated_generation(&member, &segment_refs)?;
+        }
+        self.generation_started_at = std::time::Instant::now();
+        self.active_json_bytes = 0;
+        Ok(())
+    }
+
+    /// Installs one preflighted cohort member without repeating accounting.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal error only if the preflighted binding unexpectedly
+    /// becomes invalid; the rotation owner treats that contradiction as
+    /// fail-stop and retains the WAL for replay.
+    fn queue_prepared_rotated_generation(
+        &mut self,
+        frozen: &crate::scribe::memtable::FrozenMemtable,
+        segment_refs: &[crate::scribe::wal::WalSegmentRef],
+    ) -> Result<(), ScribeError> {
+        let seal_key = &frozen.seal_key;
+        let binding =
+            crate::catalog::TenantTableBinding::resolve((seal_key.tenant, seal_key.table.clone()))
+                .map_err(|error| ScribeError::Internal {
+                    detail: error.to_string(),
+                })?;
+        let generation = Arc::new(ImmutableGeneration::from_frozen(
+            frozen,
+            (seal_key.tenant, seal_key.table.clone()),
+            self.stream,
+            segment_refs.to_vec(),
+            self.wal_handle.clone(),
+        ));
+        let queue = self
+            .pending_generations
+            .entry(seal_key.clone())
+            .or_default();
+        let should_submit = queue.is_empty();
+        queue.push_back(PendingGeneration {
+            generation,
+            binding,
+            submitted: false,
+            retry_scheduled: false,
+            replay_response: None,
+            replay_owned: false,
+        });
+        if should_submit {
+            self.submit_front(seal_key);
         }
         Ok(())
     }
@@ -3115,7 +3958,7 @@ impl ShardOwner {
     ) -> Result<GroupWalState, ScribeError> {
         let durable_capacity = prepared.iter().try_fold(0_usize, |total, append| {
             total
-                .checked_add(append.slices.exact_slice_capacity()?)
+                .checked_add(append.slices.exact_slice_capacity())
                 .ok_or_else(|| ScribeError::Internal {
                     detail: "WAL durable slice metadata capacity overflow".to_owned(),
                 })
@@ -3130,7 +3973,7 @@ impl ShardOwner {
             }
             let batch_id = *append.batch_id.as_bytes();
             loop {
-                let slice = match Self::next_prepared_slice(&self.persistence_cpu, append).await {
+                let slice = match Self::next_prepared_slice(&self.persistence_cpu, append) {
                     Ok(Some(slice)) => slice,
                     Ok(None) => break,
                     Err(error) => {
@@ -3141,10 +3984,8 @@ impl ShardOwner {
                         return Err(error);
                     }
                 };
-                match self
-                    .memtable
-                    .retained_batch_rows(&slice.seal_key, *slice.id.batch_id.as_bytes())
-                {
+                let identity = slice.wal_append.payload_identity()?;
+                match self.memtable.retained_batch_rows(&slice.seal_key, identity) {
                     Ok(Some(rows)) => {
                         let entry = rows_by_append.entry(batch_id).or_default();
                         *entry = entry.saturating_add(rows);
@@ -3223,91 +4064,26 @@ impl ShardOwner {
     ///
     /// Returns [`ScribeError`] when the producer owner is missing, the CPU lane
     /// refuses/fails, or it returns a result for a different operation.
-    async fn next_prepared_slice(
-        persistence_cpu: &crate::scribe::execution_lanes::ScribePersistenceCpuPool,
+    fn next_prepared_slice(
+        _persistence_cpu: &crate::scribe::execution_lanes::ScribePersistenceCpuPool,
         append: &mut PreparedAppend,
     ) -> Result<Option<PreparedSlice>, ScribeError> {
+        if append.exact_material.retained_live != append.prepared_bytes
+            || append.exact_material.largest_stored_batch
+                > append.exact_material.persistence_candidate_peak
+            || append.exact_material.persistence_envelope_peak
+                > append.maximum_scribe_envelope_bytes
+        {
+            return Err(ScribeError::Internal {
+                detail: "prepared exact-material facts contradict the retained owner".to_owned(),
+            });
+        }
         match &mut append.slices {
             PreparedSliceSet::Materialized(slices) => {
                 if slices.is_empty() {
                     Ok(None)
                 } else {
                     Ok(Some(slices.remove(0)))
-                }
-            }
-            PreparedSliceSet::Native(producer_slot) => {
-                let producer = producer_slot.take().ok_or_else(|| ScribeError::Internal {
-                    detail: "native prepared-slice producer owner is missing".to_owned(),
-                })?;
-                let memory = append.memory.take().ok_or_else(|| ScribeError::Internal {
-                    detail: "native root owner missing before CPU dispatch".to_owned(),
-                })?;
-                let lifecycle = append
-                    .lifecycle
-                    .take()
-                    .ok_or_else(|| ScribeError::Internal {
-                        detail: "native lifecycle owner missing before CPU dispatch".to_owned(),
-                    })?;
-                match persistence_cpu
-                    .submit(crate::scribe::execution_lanes::ScribePersistenceCpuOp::ProduceNativeSlice {
-                        producer,
-                        memory,
-                        lifecycle,
-                    })
-                    .await?
-                {
-                    crate::scribe::execution_lanes::ScribePersistenceCpuResult::NativeSliceProduced {
-                        producer: returned,
-                        slice,
-                        memory,
-                        lifecycle,
-                    } => {
-                        *producer_slot = Some(returned);
-                        append.memory = Some(memory);
-                        append.lifecycle = Some(lifecycle);
-                        Ok(slice)
-                    }
-                    _ => Err(ScribeError::Internal {
-                        detail: "persistence lane returned the wrong native slice result"
-                            .to_owned(),
-                    }),
-                }
-            }
-            PreparedSliceSet::Otlp(producer_slot) => {
-                let producer = producer_slot.take().ok_or_else(|| ScribeError::Internal {
-                    detail: "OTLP prepared-slice producer owner is missing".to_owned(),
-                })?;
-                let memory = append.memory.take().ok_or_else(|| ScribeError::Internal {
-                    detail: "OTLP root owner missing before CPU dispatch".to_owned(),
-                })?;
-                let lifecycle = append
-                    .lifecycle
-                    .take()
-                    .ok_or_else(|| ScribeError::Internal {
-                        detail: "OTLP lifecycle owner missing before CPU dispatch".to_owned(),
-                    })?;
-                match persistence_cpu
-                    .submit(crate::scribe::execution_lanes::ScribePersistenceCpuOp::ProduceOtlpSlice {
-                        producer,
-                        memory,
-                        lifecycle,
-                    })
-                    .await?
-                {
-                    crate::scribe::execution_lanes::ScribePersistenceCpuResult::OtlpSliceProduced {
-                        producer: returned,
-                        slice,
-                        memory,
-                        lifecycle,
-                    } => {
-                        *producer_slot = Some(returned);
-                        append.memory = Some(memory);
-                        append.lifecycle = Some(lifecycle);
-                        Ok(slice)
-                    }
-                    _ => Err(ScribeError::Internal {
-                        detail: "persistence lane returned the wrong OTLP slice result".to_owned(),
-                    }),
                 }
             }
         }
@@ -3324,7 +4100,7 @@ impl ShardOwner {
         append: &mut PreparedAppend,
         slice: PreparedSlice,
     ) -> Result<(DurableSlice, crate::scribe::wal::WalAppendResult), ScribeError> {
-        let retain_rows = matches!(&append.slices, PreparedSliceSet::Materialized(_));
+        let retain_rows = true;
         let PreparedSlice {
             seal_key,
             audit_event,
@@ -3335,6 +4111,9 @@ impl ShardOwner {
         } = slice;
         let slice_index = wal_append.slice_index;
         let slice_count = wal_append.slice_count;
+        let schema_fingerprint = wal_append.schema_fingerprint;
+        let data_digest = wal_append.logical_data_digest;
+        let data_len = wal_append.logical_data_len;
         let materialized_bytes = memtable_bytes
             .saturating_add(wal_append.audit.len())
             .saturating_add(wal_append.data.len());
@@ -3396,6 +4175,9 @@ impl ShardOwner {
                 memtable_bytes,
                 active_reserved: retain_rows,
                 batch_id: *append.batch_id.as_bytes(),
+                schema_fingerprint,
+                data_digest,
+                data_len,
                 lsn: result.lsn,
                 payload_digest: result.payload_digest,
                 payload_len: result.payload_len,
@@ -3421,7 +4203,7 @@ impl ShardOwner {
         slice: PreparedSlice,
         previous: &WalSliceState,
     ) -> Result<(DurableSlice, crate::scribe::wal::WalAppendResult), ScribeError> {
-        let retain_rows = matches!(&append.slices, PreparedSliceSet::Materialized(_));
+        let retain_rows = true;
         let PreparedSlice {
             seal_key,
             audit_event,
@@ -3451,6 +4233,9 @@ impl ShardOwner {
                 memtable_bytes,
                 active_reserved: retain_rows,
                 batch_id: *append.batch_id.as_bytes(),
+                schema_fingerprint: wal_append.schema_fingerprint,
+                data_digest: wal_append.logical_data_digest,
+                data_len: wal_append.logical_data_len,
                 lsn: previous.lsn,
                 payload_digest: previous.payload_digest,
                 payload_len: previous.payload_len,
@@ -3497,97 +4282,16 @@ impl ShardOwner {
         }
     }
 
-    /// Regenerates native rows one slice at a time after every durable fence.
-    ///
-    /// Native WAL payload rows are deliberately dropped after each SLICE write.
-    /// Once COMMIT fsync and the SQL control/audit transaction succeed, this
-    /// method rewinds the retained source under the same root, regenerates one
-    /// deterministic slice, inserts it, and drops it before advancing. Projected
-    /// slices use their existing retained rows.
+    /// Inserts once-materialized rows after the durable fence.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError`] when regeneration diverges from durable slice
-    /// identity, the CPU lane fails, or memtable insertion/rotation fails.
-    async fn insert_committed_group(
+    /// Returns [`ScribeError`] when memtable insertion or rotation fails.
+    fn insert_committed_group(
         &mut self,
         state: &mut GroupWalState,
     ) -> Result<HashSet<crate::scribe::seal_key::SealKey>, ScribeError> {
         let mut touched_keys = HashSet::new();
-        for append in &mut state.prepared {
-            let is_lazy = match &mut append.slices {
-                PreparedSliceSet::Native(Some(producer)) => {
-                    producer.restart()?;
-                    true
-                }
-                PreparedSliceSet::Native(None) => {
-                    return Err(ScribeError::Internal {
-                        detail: "native producer owner missing before visibility".to_owned(),
-                    });
-                }
-                PreparedSliceSet::Otlp(Some(producer)) => {
-                    producer.restart();
-                    true
-                }
-                PreparedSliceSet::Otlp(None) => {
-                    return Err(ScribeError::Internal {
-                        detail: "OTLP producer owner missing before visibility".to_owned(),
-                    });
-                }
-                PreparedSliceSet::Materialized(_) => false,
-            };
-            if !is_lazy {
-                continue;
-            }
-            while let Some(produced) =
-                Self::next_prepared_slice(&self.persistence_cpu, append).await?
-            {
-                let materialized_bytes = produced
-                    .memtable_bytes
-                    .saturating_add(produced.wal_append.audit.len())
-                    .saturating_add(produced.wal_append.data.len());
-                let position = state.durable.iter().position(|durable| {
-                    durable.batch_id == *append.batch_id.as_bytes()
-                        && durable.slice_index == produced.wal_append.slice_index
-                });
-                let Some(position) = position else {
-                    append
-                        .lifecycle
-                        .as_mut()
-                        .ok_or_else(|| ScribeError::Internal {
-                            detail: "prepared append lost lifecycle while dropping unmatched regenerated slice"
-                                .to_owned(),
-                        })?
-                        .released_materialization(materialized_bytes);
-                    continue;
-                };
-                let mut durable = state.durable.remove(position);
-                let (payload_digest, payload_len) = produced.wal_append.payload_identity()?;
-                if durable.seal_key != produced.seal_key
-                    || durable.slice_index != produced.wal_append.slice_index
-                    || durable.slice_count != produced.wal_append.slice_count
-                    || durable.payload_digest != payload_digest
-                    || durable.payload_len != payload_len
-                {
-                    return Err(ScribeError::Internal {
-                        detail: "regenerated lazy slice identity diverged after COMMIT".to_owned(),
-                    });
-                }
-                durable.rows = Some(produced.rows);
-                durable.audit_event = produced.audit_event;
-                self.reserve_slice_active(append, &durable.seal_key, durable.memtable_bytes)?;
-                durable.active_reserved = true;
-                self.insert_committed_slice(durable, &mut state.rows_by_append, &mut touched_keys)?;
-                append
-                    .lifecycle
-                    .as_mut()
-                    .ok_or_else(|| ScribeError::Internal {
-                        detail: "prepared append lost lifecycle after visibility transfer"
-                            .to_owned(),
-                    })?
-                    .released_materialization(materialized_bytes);
-            }
-        }
         while !state.durable.is_empty() {
             let slice = state.durable.remove(0);
             self.insert_committed_slice(slice, &mut state.rows_by_append, &mut touched_keys)?;
@@ -3609,30 +4313,26 @@ impl ShardOwner {
         touched_keys: &mut HashSet<crate::scribe::seal_key::SealKey>,
     ) -> Result<(), ScribeError> {
         let rows = slice.rows.take().ok_or_else(|| ScribeError::Internal {
-            detail: "durable slice rows were not regenerated before visibility".to_owned(),
+            detail: "durable slice rows were lost before visibility".to_owned(),
         })?;
         let row_count = rows.num_rows();
-        let pre_insert = self.memtable.would_cross_rotation(&slice.seal_key, &rows);
-        let pre_insert = match pre_insert {
-            Ok(true) => {
-                self.flush_keys(vec![slice.seal_key.clone()], Some(SealTriggerReason::Size))
-            }
-            Ok(false) => Ok(()),
-            Err(error) => Err(error),
-        };
-        if let Err(error) = pre_insert {
-            return Err(self.preserve_primary_after_active_cleanup(
-                error,
-                slice.memtable_bytes,
-                true,
-            ));
-        }
+        let payload_len =
+            usize::try_from(slice.payload_len).map_err(|_| ScribeError::Internal {
+                detail: "WAL payload length does not fit shard accounting".to_owned(),
+            })?;
         self.memtable
             .insert(
                 &slice.seal_key,
                 slice.audit_event,
                 crate::scribe::wal::ScribeAppendMeta {
                     batch_id: slice.batch_id,
+                    schema_fingerprint: slice.schema_fingerprint,
+                    data_digest: slice.data_digest,
+                    data_len: slice.data_len,
+                    payload_digest: slice.payload_digest,
+                    payload_len: slice.payload_len,
+                    slice_index: slice.slice_index,
+                    slice_count: slice.slice_count,
                     rows_accepted: row_count,
                     wal_lsn_min: slice.lsn,
                     wal_lsn_max: slice.lsn,
@@ -3643,6 +4343,7 @@ impl ShardOwner {
             .map_err(|error| {
                 self.preserve_primary_after_active_cleanup(error, slice.memtable_bytes, true)
             })?;
+        self.active_json_bytes = self.active_json_bytes.saturating_add(payload_len);
         touched_keys.insert(slice.seal_key.clone());
         self.synced_not_inserted.remove(&AppendSliceId {
             batch_id: uuid::Uuid::from_bytes(slice.batch_id),
@@ -3834,34 +4535,6 @@ impl ShardOwner {
             self.admission.trip_wal_disk_full();
         }
     }
-
-    /// Selects buckets crossing the rotation threshold and freezes them.
-    ///
-    /// Each touched key is classified by [`Memtable::should_seal_reason`] so its
-    /// executed seal is counted under the true trigger — a size-crossing bucket
-    /// as `size`, an age-crossing bucket as `age` (D84). The two groups are
-    /// flushed separately purely so the seal counter is labelled correctly; the
-    /// freeze work and its ordering are unchanged from the single-group flush.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError`] when rotation selection or generation preparation fails.
-    fn rotate_group(
-        &mut self,
-        touched_keys: HashSet<crate::scribe::seal_key::SealKey>,
-    ) -> Result<(), ScribeError> {
-        let mut size_keys = Vec::new();
-        let mut age_keys = Vec::new();
-        for seal_key in touched_keys {
-            match self.memtable.should_seal_reason(&seal_key)? {
-                Some(SealTriggerReason::Age) => age_keys.push(seal_key),
-                Some(_) => size_keys.push(seal_key),
-                None => {}
-            }
-        }
-        self.flush_keys(size_keys, Some(SealTriggerReason::Size))?;
-        self.flush_keys(age_keys, Some(SealTriggerReason::Age))
-    }
 }
 
 /// Classifies the one expected shard-group capacity boundary.
@@ -3926,6 +4599,635 @@ mod tests {
     use std::sync::Arc;
     use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
     use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
+
+    /// Every projected writer threshold independently triggers the same atomic
+    /// whole-shard rotation decision, while a projection below all bounds does not.
+    #[test]
+    fn automatic_rotation_ors_all_projected_writer_thresholds() {
+        let wal_target = 100;
+        let memtable_target = 200;
+        let below = ShardRotationProjection {
+            wal_encoded: 100,
+            wal_uncompressed: 100,
+            memtable_json: 200,
+            memtable_arrow: 200,
+            age_expired: false,
+        };
+        assert!(!below.should_rotate(wal_target, memtable_target));
+        for projection in [
+            ShardRotationProjection {
+                wal_encoded: 101,
+                ..below
+            },
+            ShardRotationProjection {
+                wal_uncompressed: 101,
+                ..below
+            },
+            ShardRotationProjection {
+                memtable_json: 201,
+                ..below
+            },
+            ShardRotationProjection {
+                memtable_arrow: 201,
+                ..below
+            },
+            ShardRotationProjection {
+                age_expired: true,
+                ..below
+            },
+        ] {
+            assert!(projection.should_rotate(wal_target, memtable_target));
+        }
+    }
+
+    /// Distinct WAL and memtable thresholds independently rotate the real shard owner.
+    ///
+    /// Each case keeps the other threshold deliberately unreachable, proving
+    /// configuration propagation cannot accidentally collapse the two values.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the isolated WAL, memtable, root ownership, or owner rotation
+    /// cannot be constructed and settled for either threshold case.
+    #[test]
+    fn distinct_wal_and_memtable_thresholds_drive_owner_rotation() {
+        for (wal_target, memtable_target) in [(1, usize::MAX), (u64::MAX, 1)] {
+            let key = owner_key();
+            let memtable = Memtable::new();
+            memtable
+                .insert(&key, owner_event(), owner_meta(&key), owner_batch())
+                .expect("seed threshold member");
+            let active_bytes = memtable.stats().expect("active statistics").writable_bytes;
+            let wal_root = tempfile::tempdir().expect("WAL directory");
+            let node = crate::scribe::stream_identity::NodeId::generate();
+            let stream =
+                StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+            let wal = Arc::new(
+                WalWriter::new(
+                    wal_root.path(),
+                    *node.as_bytes(),
+                    1,
+                    crate::scribe::wal::WalConfig::default(),
+                )
+                .expect("WAL writer"),
+            );
+            let batch_id = batch_id_for_owner(&key, 0);
+            wal.append_and_commit_for_replay_test(&key, *batch_id.as_bytes(), b"audit", b"data")
+                .expect("owner WAL append");
+            let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+            let (mut owner, _budget) =
+                owner_for_completion_test_with_budget(memtable, &wal, wal_handle, stream);
+            owner.wal_rotation_bytes = wal_target;
+            owner.memtable_rotation_bytes = memtable_target;
+            owner
+                .memory_ownership
+                .reserve_active(active_bytes)
+                .expect("active memory ownership");
+            owner
+                .admission
+                .try_reserve_active("distinct-threshold", active_bytes)
+                .expect("active admission ownership");
+
+            owner
+                .rotate_before_append_if_needed(&[])
+                .expect("threshold rotates owner");
+
+            assert_eq!(owner.rotation_cohorts.len(), 1);
+            assert_eq!(
+                owner
+                    .memtable
+                    .stats()
+                    .expect("rotated statistics")
+                    .writable_buckets,
+                0
+            );
+        }
+    }
+
+    /// Routing retains all sixteen deterministic lanes while distinct keys can
+    /// share one complete shard owner.
+    ///
+    /// # Panics
+    ///
+    /// Panics if deterministic routing cannot reach every fixed lane or two
+    /// tenant-qualified keys cannot be colocated under one owner.
+    #[test]
+    fn routing_preserves_sixteen_shards_and_multi_key_owner() {
+        let tenant = DataTenantId::new_v7();
+        let first = TableRef::new(BifrostNamespace::Bifrost, "routing-first");
+        let second = TableRef::new(BifrostNamespace::Bifrost, "routing-second");
+        let mut reached = BTreeSet::new();
+        let mut colocated = None;
+        for value in 1_u128..100_000 {
+            let batch_id = uuid::Uuid::from_u128(value);
+            let first_lane = shard_for(tenant, &first, batch_id);
+            reached.insert(first_lane);
+            assert_eq!(first_lane, shard_for(tenant, &first, batch_id));
+            if colocated.is_none() {
+                let second_id = uuid::Uuid::from_u128(value.saturating_add(100_000));
+                if shard_for(tenant, &second, second_id) == first_lane {
+                    colocated = Some((first_lane, batch_id, second_id));
+                }
+            }
+            if reached.len() == SCRIBE_SHARD_COUNT && colocated.is_some() {
+                break;
+            }
+        }
+        assert_eq!(reached.len(), SCRIBE_SHARD_COUNT);
+        let (owner, first_id, second_id) = colocated.expect("two keys share one owner");
+        assert_eq!(shard_for(tenant, &first, first_id), owner);
+        assert_eq!(shard_for(tenant, &second, second_id), owner);
+    }
+
+    /// Root refusal and automatic owner rotation remain independent actions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if root occupation changes the owner rotation predicate or an
+    /// owner threshold crossing prevents an otherwise valid root reservation.
+    #[test]
+    fn root_admission_is_distinct_from_shard_rotation() {
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let (mut owner, budget) =
+            owner_for_completion_test_with_budget(Memtable::new(), &wal, wal_handle, stream);
+        owner.wal_rotation_bytes = 100;
+        owner.memtable_rotation_bytes = 200;
+        let root_ceiling = budget.ingress_limit_bytes();
+        let occupied = budget
+            .try_reserve_maintenance(MemoryCategory::Raw, root_ceiling)
+            .expect("occupy root admission");
+        assert!(
+            !ShardRotationProjection {
+                wal_encoded: 0,
+                wal_uncompressed: 0,
+                memtable_json: 0,
+                memtable_arrow: 0,
+                age_expired: false,
+            }
+            .should_rotate(owner.wal_rotation_bytes, owner.memtable_rotation_bytes)
+        );
+        assert!(matches!(
+            budget.try_reserve_maintenance(MemoryCategory::Raw, 1),
+            Err(ScribeError::IngestBusy { .. })
+        ));
+        drop(occupied);
+        assert!(
+            ShardRotationProjection {
+                wal_encoded: 101,
+                wal_uncompressed: 0,
+                memtable_json: 0,
+                memtable_arrow: 0,
+                age_expired: false,
+            }
+            .should_rotate(owner.wal_rotation_bytes, owner.memtable_rotation_bytes)
+        );
+        drop(
+            budget
+                .try_reserve_maintenance(MemoryCategory::Raw, 1)
+                .expect("root remains independently available"),
+        );
+    }
+
+    /// Executes the real owner-level rotation swap for a multi-key generation.
+    ///
+    /// # Panics
+    ///
+    /// Panics when isolated owners cannot be built or the all-key rotation does
+    /// not preserve one complete cohort before admitting a fresh generation.
+    #[test]
+    fn shard_owner_rotation_swaps_complete_generation_before_fresh_append() {
+        let first = owner_key();
+        let second = SealKey::new(
+            first.tenant,
+            TableRef::new(BifrostNamespace::Bifrost, "owner-test-second"),
+            first.day,
+        );
+        let memtable = Memtable::new();
+        for key in [&first, &second] {
+            memtable
+                .insert(key, owner_event(), owner_meta(key), owner_batch())
+                .expect("seed active cohort member");
+        }
+        let active_bytes = memtable.stats().expect("active statistics").writable_bytes;
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("shard WAL handle");
+        let (mut owner, _budget) =
+            owner_for_completion_test_with_budget(memtable, &wal, wal_handle, stream);
+        owner
+            .memory_ownership
+            .reserve_active(active_bytes)
+            .expect("active memory ownership");
+        owner
+            .admission
+            .try_reserve_active("rotation-test", active_bytes)
+            .expect("active admission ownership");
+
+        owner
+            .rotate_active_generation()
+            .expect("automatic all-key rotation");
+
+        let stats = owner.memtable.stats().expect("rotated statistics");
+        assert_eq!(stats.writable_buckets, 0);
+        assert_eq!(stats.immutable_generations, 2);
+        assert_eq!(owner.rotation_cohorts.len(), 1);
+        assert_eq!(
+            owner
+                .rotation_cohorts
+                .front()
+                .expect("rotation cohort")
+                .pending_member_seal_ids
+                .len(),
+            2
+        );
+        assert_eq!(owner.pending_generations.len(), 2);
+        owner
+            .memtable
+            .insert(&first, owner_event(), owner_meta(&first), owner_batch())
+            .expect("incoming unit enters fresh generation");
+        assert_eq!(owner.memtable.row_count(&first).expect("fresh rows"), 1);
+        assert_eq!(owner.memtable.row_count(&second).expect("frozen rows"), 0);
+    }
+
+    /// Chooses a stable batch identity that routes one key to the requested owner.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the fixed routing function cannot reach the requested lane.
+    fn batch_id_for_owner(key: &SealKey, owner: usize) -> uuid::Uuid {
+        (1_u128..100_000)
+            .map(uuid::Uuid::from_u128)
+            .find(|batch_id| shard_for(key.tenant, &key.table, *batch_id) == owner)
+            .expect("fixed routing reaches requested owner")
+    }
+
+    /// Automatic age expiry closes the real owner WAL and swaps every key into
+    /// one cohort before the next unit enters a fresh generation.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the isolated owner cannot append its WAL records, transfer
+    /// active ownership, rotate all keys, reset its clock, or admit fresh state.
+    #[test]
+    fn automatic_age_rotation_is_whole_shard_below_high_water() {
+        let first = owner_key();
+        let second = SealKey::new(
+            first.tenant,
+            TableRef::new(BifrostNamespace::Bifrost, "age-owner-peer"),
+            first.day,
+        );
+        let memtable = Memtable::new();
+        for key in [&first, &second] {
+            memtable
+                .insert(key, owner_event(), owner_meta(key), owner_batch())
+                .expect("seed owner member");
+        }
+        let active_bytes = memtable.stats().expect("active stats").writable_bytes;
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        for key in [&first, &second] {
+            let batch_id = batch_id_for_owner(key, 0);
+            wal.append_and_commit_for_replay_test(key, *batch_id.as_bytes(), b"audit", b"data")
+                .expect("owner WAL append");
+        }
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let (mut owner, _budget) =
+            owner_for_completion_test_with_budget(memtable, &wal, wal_handle, stream);
+        owner
+            .memory_ownership
+            .reserve_active(active_bytes)
+            .expect("active memory ownership");
+        owner
+            .admission
+            .try_reserve_active("age-owner", active_bytes)
+            .expect("active admission ownership");
+        owner.generation_started_at = std::time::Instant::now()
+            .checked_sub(owner.generation_max_age)
+            .expect("clock supports expired generation");
+        let expired_at = owner.generation_started_at;
+
+        owner
+            .rotate_before_append_if_needed(&[])
+            .expect("automatic age owner rotation");
+
+        assert_eq!(owner.rotation_cohorts.len(), 1);
+        assert_eq!(
+            owner
+                .rotation_cohorts
+                .front()
+                .expect("age cohort")
+                .pending_member_seal_ids
+                .len(),
+            2
+        );
+        assert_eq!(
+            owner
+                .memtable
+                .stats()
+                .expect("rotated stats")
+                .writable_buckets,
+            0
+        );
+        assert!(
+            !owner
+                .wal_handle
+                .has_active_records()
+                .expect("fresh WAL state")
+        );
+        assert!(owner.generation_started_at > expired_at);
+        owner
+            .memtable
+            .insert(&first, owner_event(), owner_meta(&first), owner_batch())
+            .expect("incoming unit enters fresh owner generation");
+        assert_eq!(owner.memtable.row_count(&first).expect("fresh row"), 1);
+        assert_eq!(owner.memtable.row_count(&second).expect("frozen peer"), 0);
+    }
+
+    /// Selective pressure freezes only its chosen key while preserving the
+    /// automatic owner clock and open WAL generation identity.
+    ///
+    /// # Panics
+    ///
+    /// Panics when selective pressure cannot transfer the chosen key or when it
+    /// resets the owner generation, closes the WAL, or freezes the younger peer.
+    #[test]
+    fn selective_pressure_can_seal_younger_key_without_resetting_shard_generation() {
+        let first = owner_key();
+        let second = SealKey::new(
+            first.tenant,
+            TableRef::new(BifrostNamespace::Bifrost, "pressure-owner-peer"),
+            first.day,
+        );
+        let memtable = Memtable::new();
+        for key in [&first, &second] {
+            memtable
+                .insert(key, owner_event(), owner_meta(key), owner_batch())
+                .expect("seed owner member");
+        }
+        let active_bytes = memtable.stats().expect("active stats").writable_bytes;
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        for key in [&first, &second] {
+            let batch_id = batch_id_for_owner(key, 0);
+            wal.append_and_commit_for_replay_test(key, *batch_id.as_bytes(), b"audit", b"data")
+                .expect("owner WAL append");
+        }
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let (mut owner, _budget) =
+            owner_for_completion_test_with_budget(memtable, &wal, wal_handle, stream);
+        owner
+            .memory_ownership
+            .reserve_active(active_bytes)
+            .expect("active memory ownership");
+        owner
+            .admission
+            .try_reserve_active("pressure-owner", active_bytes)
+            .expect("active admission ownership");
+        let opened_at = owner.generation_started_at;
+        let wal_bytes = owner
+            .wal_handle
+            .current_segment_bytes()
+            .expect("open WAL bytes");
+
+        owner.handle_pressure_signal(PressureSignal {
+            keys: vec![first.clone()],
+            wal_key: None,
+        });
+
+        assert_eq!(owner.generation_started_at, opened_at);
+        assert_eq!(
+            owner
+                .wal_handle
+                .current_segment_bytes()
+                .expect("same WAL bytes"),
+            wal_bytes
+        );
+        assert!(
+            owner
+                .wal_handle
+                .has_active_records()
+                .expect("open WAL generation")
+        );
+        assert!(owner.rotation_cohorts.is_empty());
+        assert_eq!(owner.memtable.row_count(&first).expect("sealed key"), 0);
+        assert_eq!(owner.memtable.row_count(&second).expect("younger peer"), 1);
+        assert_eq!(
+            owner
+                .memtable
+                .stats()
+                .expect("selective immutable owner")
+                .immutable_generations,
+            1
+        );
+    }
+
+    /// Post-suppression replay installs one segment union owned only by the
+    /// surviving member set.
+    #[test]
+    fn replay_cohort_plan_makes_suppressed_refs_non_authoritative() {
+        let first = crate::scribe::wal::WalSegmentRef {
+            path: std::path::PathBuf::from("segment-1.wal"),
+        };
+        let second = crate::scribe::wal::WalSegmentRef {
+            path: std::path::PathBuf::from("segment-2.wal"),
+        };
+        let pending_a = vec![first.clone()];
+        let pending_b = vec![first.clone(), second.clone()];
+        let suppressed = vec![second.clone()];
+        let plan = plan_replay_cohort(
+            [(41, pending_a.as_slice()), (43, pending_b.as_slice())],
+            [suppressed.as_slice()],
+        );
+        assert_eq!(plan.wal_segments, vec![first, second]);
+        assert_eq!(
+            plan.pending_member_seal_ids,
+            BTreeSet::from([41_u64, 43_u64]),
+            "suppressed members contribute no retirement vote"
+        );
+    }
+
+    /// Same-segment replay chunks reuse one retained path and yield it only
+    /// after the final logical member retires.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the merge requests a duplicate retain, loses either member,
+    /// or makes the physical segment terminal before the final member.
+    #[test]
+    fn replay_same_segment_cohort_retains_once_and_yields_once() {
+        let segment = crate::scribe::wal::WalSegmentRef {
+            path: std::path::PathBuf::from("segment-shared.wal"),
+        };
+        let cohorts = VecDeque::from([ShardRotationCohort {
+            shard_id: 0,
+            wal_segments: vec![segment.clone()],
+            pending_member_seal_ids: BTreeSet::from([11]),
+        }]);
+        let (plan, retain, absorbed) = merge_replay_cohort(
+            &cohorts,
+            ReplayCohortPlan {
+                wal_segments: vec![segment.clone()],
+                pending_member_seal_ids: BTreeSet::from([12]),
+            },
+        );
+        assert!(retain.is_empty(), "the shared path already has one owner");
+        assert_eq!(absorbed, vec![0]);
+        let mut merged = ShardRotationCohort {
+            shard_id: 0,
+            wal_segments: plan.wal_segments,
+            pending_member_seal_ids: plan.pending_member_seal_ids,
+        };
+        assert!(!merged.complete_member(11));
+        assert!(merged.complete_member(12));
+        assert_eq!(merged.wal_segments, vec![segment]);
+    }
+
+    /// Physical overlap closes transitively across independently handed-off
+    /// replay chunks without introducing a shard-wide cohort.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `[A] -> [A, B] -> [B, C]` does not form one exact segment and
+    /// member union or if an already-owned path is retained again.
+    #[test]
+    fn replay_cohort_merge_follows_transitive_segment_overlap() {
+        let segment = |name: &str| crate::scribe::wal::WalSegmentRef {
+            path: std::path::PathBuf::from(name),
+        };
+        let a = segment("segment-a.wal");
+        let b = segment("segment-b.wal");
+        let c = segment("segment-c.wal");
+        let cohorts = VecDeque::from([
+            ShardRotationCohort {
+                shard_id: 0,
+                wal_segments: vec![a.clone(), b.clone()],
+                pending_member_seal_ids: BTreeSet::from([21]),
+            },
+            ShardRotationCohort {
+                shard_id: 0,
+                wal_segments: vec![b.clone(), c.clone()],
+                pending_member_seal_ids: BTreeSet::from([22]),
+            },
+        ]);
+        let (plan, retain, absorbed) = merge_replay_cohort(
+            &cohorts,
+            ReplayCohortPlan {
+                wal_segments: vec![a.clone()],
+                pending_member_seal_ids: BTreeSet::from([23]),
+            },
+        );
+        assert!(retain.is_empty());
+        assert_eq!(absorbed, vec![0, 1]);
+        assert_eq!(plan.wal_segments, vec![a, b, c]);
+        assert_eq!(plan.pending_member_seal_ids, BTreeSet::from([21, 22, 23]));
+    }
+
+    /// The cohort alone releases its closed WAL set after its last independently
+    /// completed member; repeated or unknown completions cannot retire early.
+    #[test]
+    fn cohort_wal_retires_only_after_every_member_terminal() {
+        let mut cohort = ShardRotationCohort {
+            shard_id: 7,
+            wal_segments: Vec::new(),
+            pending_member_seal_ids: [11_u64, 12_u64].into_iter().collect(),
+        };
+        assert_eq!(cohort.shard_id, 7);
+        assert!(cohort.wal_segments.is_empty());
+        assert!(!cohort.complete_member(11));
+        assert!(!cohort.complete_member(11));
+        assert!(cohort.complete_member(12));
+    }
+
+    /// Shutdown closes new producer work while accepted incremental ownership
+    /// and the final cohort member both drain to terminal release.
+    ///
+    /// # Panics
+    ///
+    /// Panics if closing admission cancels an accepted producer, releases a
+    /// cohort early, or leaves a waiter or lease after both owners settle.
+    #[tokio::test]
+    async fn shutdown_drains_cohorts_and_incremental_producers() {
+        const MIB: usize = 1024 * 1024;
+        let roles = crate::resources::BifrostRuntimeResources::composed_for_test(
+            768 * MIB,
+            512 * MIB as u64,
+            [crate::resources::BifrostRole::Scribe],
+        );
+        let resources = roles.scribe().expect("Scribe resources");
+        let baseline = resources.memory_snapshot();
+        let admission = crate::scribe::persistence::ProducerAdmission::new(resources.clone());
+        let blocker = admission.acquire(500 * MIB).await.expect("active producer");
+        let accepted = tokio::spawn({
+            let admission = admission.clone();
+            async move { admission.acquire_accepted(32 * MIB).await }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(admission.queue_len(), 1);
+
+        admission.close();
+        assert!(admission.acquire(1).await.is_err());
+        let mut cohort = ShardRotationCohort {
+            shard_id: 0,
+            wal_segments: Vec::new(),
+            pending_member_seal_ids: BTreeSet::from([71_u64, 72_u64]),
+        };
+        assert!(!cohort.complete_member(71));
+        drop(blocker);
+        let incremental = tokio::time::timeout(std::time::Duration::from_secs(1), accepted)
+            .await
+            .expect("accepted producer drains")
+            .expect("producer task")
+            .expect("incremental lease");
+        assert!(cohort.complete_member(72));
+        drop(incremental);
+        assert_eq!(admission.queue_len(), 0);
+        assert_eq!(
+            resources.memory_snapshot().total_bytes(),
+            baseline.total_bytes()
+        );
+    }
 
     /// Failed replay binding or adoption restores memtable and memory baselines.
     ///
@@ -4261,6 +5563,7 @@ mod tests {
         let wal_handle = wal.handle_for_shard(0).expect("advance-failure WAL handle");
         let current = owner_generation(&current_key, &current_frozen, stream, wal_handle.clone());
         let next = owner_generation(&next_key, &next_frozen, stream, wal_handle.clone());
+        let next_for_poison = Arc::clone(&next);
         let (mut owner, budget) =
             owner_for_completion_test_with_budget(memtable, &wal, wal_handle, stream);
         let baseline = budget.snapshot().expect("advance-failure baseline");
@@ -4303,7 +5606,20 @@ mod tests {
             identity: None,
             response: Some(response),
         });
-        crate::scribe::wal::arm_retain_failure_for_test();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = next_for_poison
+                .replay_identity
+                .lock()
+                .expect("next identity lock");
+            panic!("poison next replay identity lock");
+        }));
+        let advance_lease = budget
+            .try_reserve_maintenance(MemoryCategory::Decode, 64)
+            .expect("advance-failure identity lease");
+        let advance_identity = owner
+            .memory_ownership
+            .adopt_replay_identity(advance_lease, 64)
+            .expect("advance-failure identity adoption");
         let completion_result = owner.handle_persistence_completion(
             PersistenceCompletion {
                 generation_id: current.generation_id,
@@ -4311,7 +5627,7 @@ mod tests {
                 wal_segments: Vec::new(),
                 wal: current.wal.clone(),
                 arrow_bytes: current.arrow_bytes,
-                replay_identity: None,
+                replay_identity: Some(advance_identity),
                 error: None,
             },
             None,
@@ -4324,7 +5640,7 @@ mod tests {
         assert!(
             response_error
                 .to_string()
-                .contains("forced WAL retention failure"),
+                .contains("replay identity owner lock poisoned"),
             "unexpected response: {response_error}; completion: {completion_result:?}"
         );
         assert!(completion_result.is_err());
@@ -4756,6 +6072,9 @@ mod tests {
         };
         let meta = |batch_id, lsn| crate::scribe::replay::ReplayedAppendMeta {
             batch_id,
+            payload_digest: [0; 32],
+            payload_len: 0,
+            slice_count: 1,
             wal_lsn: WalLsn::new(lsn),
             rows_accepted: 1,
             append_slice_id: crate::scribe::preprocess::AppendSliceId {
@@ -4787,6 +6106,66 @@ mod tests {
         assert_eq!(replayed.data_records, vec![vec![1]]);
         assert_eq!(replayed.commits.len(), 1);
         assert_eq!(replayed.commits[0].batch_id, canonical);
+    }
+
+    /// Proves file-list suppression requires one complete, exact, unambiguous artifact range.
+    #[test]
+    fn replay_file_list_suppression_requires_complete_exact_generation_identity() {
+        let key = owner_key();
+        let meta = |marker, lsn| crate::scribe::replay::ReplayedAppendMeta {
+            batch_id: [marker; 16],
+            payload_digest: [0; 32],
+            payload_len: 0,
+            slice_count: 1,
+            wal_lsn: WalLsn::new(lsn),
+            rows_accepted: 1,
+            append_slice_id: crate::scribe::preprocess::AppendSliceId {
+                batch_id: uuid::Uuid::from_bytes([marker; 16]),
+                seal_key: key.clone(),
+                slice_index: 0,
+            },
+            schema_fingerprint: [marker; 32],
+        };
+        let metas = vec![meta(1, 4), meta(2, 6), meta(3, 8)];
+        let range = |wal_lsn_min, wal_lsn_max, artifact_count, first_ordinal, last_ordinal| {
+            PublishedReplayRange {
+                wal_lsn_min,
+                wal_lsn_max,
+                artifact_count,
+                first_ordinal,
+                last_ordinal,
+            }
+        };
+
+        let committed = exact_published_replay_batches(&metas, &[range(4, 8, 2, Some(0), Some(1))])
+            .expect("complete artifact set");
+        assert_eq!(committed, HashSet::from([[1; 16], [2; 16], [3; 16]]));
+        assert!(
+            exact_published_replay_batches(&metas, &[])
+                .expect("ACK-only state")
+                .is_empty()
+        );
+        assert!(
+            exact_published_replay_batches(&metas, &[range(4, 8, 1, Some(1), Some(1))])
+                .expect("partial ordinal state")
+                .is_empty()
+        );
+        assert!(
+            exact_published_replay_batches(&metas, &[range(5, 8, 1, Some(0), Some(0))])
+                .expect("non-boundary range")
+                .is_empty()
+        );
+        assert!(
+            exact_published_replay_batches(
+                &metas,
+                &[
+                    range(4, 8, 1, Some(0), Some(0)),
+                    range(6, 8, 1, Some(0), Some(0)),
+                ],
+            )
+            .expect("overlapping durable ranges")
+            .is_empty()
+        );
     }
 
     fn owner_batch() -> RecordBatch {
@@ -4828,6 +6207,13 @@ mod tests {
     fn owner_meta(key: &SealKey) -> ScribeAppendMeta {
         ScribeAppendMeta {
             batch_id: *uuid::Uuid::now_v7().as_bytes(),
+            schema_fingerprint: [0; 32],
+            data_digest: [0; 32],
+            data_len: 0,
+            payload_digest: [0; 32],
+            payload_len: 0,
+            slice_index: 0,
+            slice_count: 1,
             rows_accepted: 1,
             wal_lsn_min: WalLsn::new(1),
             wal_lsn_max: WalLsn::new(1),
@@ -4864,9 +6250,27 @@ mod tests {
         wal_handle: WalHandle,
         stream: StreamIdentity,
     ) -> (ShardOwner, crate::resources::ScribeResources) {
-        let (_command_tx, receiver) = mpsc::channel(1);
-        let (_pressure_tx, pressure_receiver) = watch::channel(None);
-        let (completion_tx, _completion_rx) = mpsc::channel(1);
+        let (owner, budget, _command_tx, _completion_tx, _pressure_tx) =
+            owner_for_completion_test_with_channels(memtable, wal, wal_handle, stream);
+        (owner, budget)
+    }
+
+    /// Builds an isolated owner and returns its command/completion mailbox sender.
+    fn owner_for_completion_test_with_channels(
+        memtable: Memtable,
+        wal: &Arc<WalWriter>,
+        wal_handle: WalHandle,
+        stream: StreamIdentity,
+    ) -> (
+        ShardOwner,
+        crate::resources::ScribeResources,
+        mpsc::Sender<ShardCommand>,
+        mpsc::Sender<ShardCommand>,
+        watch::Sender<Option<PressureSignal>>,
+    ) {
+        let (command_tx, receiver) = mpsc::channel(1);
+        let completion_tx = command_tx.clone();
+        let (pressure_tx, pressure_receiver) = watch::channel(None);
         let budget =
             crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
         let _ = wal;
@@ -4879,6 +6283,12 @@ mod tests {
             wal_segments: WalSegmentsByKey::new(),
             synced_not_inserted: HashMap::new(),
             pending_generations: PendingGenerationsByKey::new(),
+            rotation_cohorts: VecDeque::new(),
+            wal_rotation_bytes: crate::scribe::wal::WalConfig::default().segment_bytes,
+            memtable_rotation_bytes: crate::scribe::memtable::MEMTABLE_ROTATION_BYTES,
+            generation_started_at: std::time::Instant::now(),
+            active_json_bytes: 0,
+            generation_max_age: crate::scribe::memtable::ACTIVE_GENERATION_MAX_AGE,
             replay_chunk: None,
             seal_retry: HashSet::new(),
             retained_generations: HashMap::new(),
@@ -4892,7 +6302,7 @@ mod tests {
             wal_io: ScribeWalIoPool::new(1),
             persistence: None,
             control_postgres: None,
-            completion_tx,
+            completion_tx: completion_tx.clone(),
             stream,
             wal_handle,
             memory_ownership: ScribeOwnership::new(&budget).expect("memory ownership"),
@@ -4901,7 +6311,7 @@ mod tests {
             drained: Arc::new(Notify::new()),
             fail_next_retirement_release: false,
         };
-        (owner, budget)
+        (owner, budget, command_tx, completion_tx, pressure_tx)
     }
 
     /// Proves shard insertion seals a full bucket before a crossing append lands.
@@ -4952,6 +6362,9 @@ mod tests {
                     memtable_bytes: rotation_bytes,
                     active_reserved: true,
                     batch_id: next_id,
+                    schema_fingerprint: [0; 32],
+                    data_digest: [0; 32],
+                    data_len: 0,
                     lsn: WalLsn::new(2),
                     payload_digest: [0; 32],
                     payload_len: 0,
@@ -4968,12 +6381,11 @@ mod tests {
             .expect("seal second generation");
 
         let immutable = owner.memtable.immutable.lock().expect("immutable lock");
-        let generations = immutable.get(&key).expect("two generations");
-        assert_eq!(generations.len(), 2);
+        let generations = immutable.get(&key).expect("whole generation");
+        assert_eq!(generations.len(), 1);
         assert!(
-            generations
-                .iter()
-                .all(|entry| entry.frozen.arrow_bytes <= rotation_bytes)
+            generations[0].frozen.arrow_bytes >= rotation_bytes,
+            "an oversized first whole batch remains intact"
         );
     }
 
@@ -5086,6 +6498,7 @@ mod tests {
             frozen.seal_id,
             RetainedGeneration {
                 arrow_bytes: frozen.arrow_bytes,
+                memory_released: false,
                 wal_segments: Vec::new(),
                 wal: wal_handle,
                 replay_identity: Arc::new(Mutex::new(None)),
@@ -5122,6 +6535,7 @@ mod tests {
             measured_wire_bytes: initial_bytes,
             admitted_bytes: initial_bytes,
             wal_workspace_bytes: crate::gate::limits::BIFROST_WAL_WORKSPACE_LIMIT_BYTES,
+            maximum_scribe_envelope_bytes: budget.ingress_limit_bytes(),
             reservation,
             memory,
             tenant: key.tenant,
@@ -5250,81 +6664,27 @@ mod tests {
         );
     }
 
-    /// A forced WAL retention failure strands the seal in state A with the
-    /// segment map intact; a subsequent age tick whose own selection does not
-    /// name the key re-drives it through the production entry drain to state B
-    /// with exact net-zero accounting and exactly one seal count.
-    ///
-    /// Proves AC2 (state A/B accounting + admission + segment-map + retry),
-    /// AC3 (recovery through a production re-drive site that does not name the
-    /// key), and AC4 (`wal_segments` removed only after retention succeeds).
+    /// Selective seal does not acquire shared-segment retirement authority.
     #[test]
-    fn retention_failure_recovers_to_state_b_through_age_tick() {
+    fn selective_seal_leaves_retention_fault_for_the_cohort_owner() {
         let key = owner_key();
         let seed = 1_usize << 20;
         let (mut owner, _wal, _root) = owner_for_seal_atomicity_test(&key, seed);
-
-        let recorder = wyrd_bench::BenchmarkRecorder::default();
-        metrics::with_local_recorder(&recorder, || {
-            crate::scribe::wal::arm_retain_failure_for_test();
-            let error = owner
-                .flush_keys(vec![key.clone()], Some(SealTriggerReason::Size))
-                .expect_err("armed retention failure must fail the seal");
-            assert!(matches!(error, ScribeError::Internal { .. }));
-
-            // State A: no move, admission unchanged, segment map intact (AC4),
-            // key retry-reachable.
-            assert_eq!(owner.memory_ownership.active_bytes(), seed);
-            assert_eq!(owner.memory_ownership.immutable_bytes(), 0);
-            let admission = owner.admission.snapshot();
-            assert_eq!(admission.active_bytes, seed);
-            assert_eq!(admission.immutable_bytes, 0);
-            assert!(
-                owner.wal_segments.contains_key(&key),
-                "retention failure must not drop the segment map entry (AC4)"
-            );
-            assert!(!owner.pending_generations.contains_key(&key));
-            assert!(owner.seal_retry.contains(&key));
-
-            // Age tick: expired selection is empty (bucket already frozen), so
-            // the key is re-driven only by the entry drain (AC3). Retention now
-            // succeeds (the fault self-consumed).
-            owner
-                .flush_expired(std::time::Instant::now())
-                .expect("age-tick re-drive completes the seal");
-
-            // State B: net-zero move landed, admission moved, segment map entry
-            // removed after success (AC4), generation queued, mark cleared.
-            let active = owner.memory_ownership.active_bytes();
-            let immutable = owner.memory_ownership.immutable_bytes();
-            assert!(immutable > 0, "bytes moved to Immutable accounting");
-            assert_eq!(active + immutable, seed, "net-zero category move");
-            let admission = owner.admission.snapshot();
-            assert!(admission.immutable_bytes > 0);
-            assert_eq!(admission.active_bytes + admission.immutable_bytes, seed);
-            assert!(
-                !owner.wal_segments.contains_key(&key),
-                "segment map entry removed only after retention succeeds (AC4)"
-            );
-            assert!(owner.pending_generations.contains_key(&key));
-            assert!(!owner.seal_retry.contains(&key));
-        });
-
-        let snapshot = recorder.snapshot();
-        assert_eq!(
-            snapshot
-                .counters
-                .get("bifrost_scribe_seal_total{trigger=\"size\"}")
-                .copied(),
-            Some(1),
-            "the bucket seals exactly once across failure and retry"
-        );
-        assert!(
-            !snapshot
-                .counters
-                .contains_key("bifrost_scribe_seal_total{trigger=\"age\"}"),
-            "the age-tick re-drive returns the pending entry and counts no seal"
-        );
+        crate::scribe::wal::arm_retain_failure_for_test();
+        owner
+            .flush_keys(vec![key.clone()], Some(SealTriggerReason::Size))
+            .expect("member-local seal has no segment-retention mutation");
+        owner
+            .wal_handle
+            .retain_segments(&[])
+            .expect_err("cohort retention fault remains armed");
+        let active = owner.memory_ownership.active_bytes();
+        let immutable = owner.memory_ownership.immutable_bytes();
+        assert!(immutable > 0);
+        assert_eq!(active + immutable, seed);
+        assert!(!owner.wal_segments.contains_key(&key));
+        assert!(owner.pending_generations.contains_key(&key));
+        assert!(!owner.seal_retry.contains(&key));
     }
 
     /// A stale retry mark — one whose key is already queued, and one whose key
@@ -5402,7 +6762,7 @@ mod tests {
 
     /// The real shard command returns visibility success only after publishing and advancing FIFO ownership.
     #[tokio::test]
-    async fn persistence_command_acknowledges_only_completed_visibility_transition() {
+    async fn accepted_batches_are_serialized_then_inserted_without_regeneration() {
         let key = owner_key();
         let memtable = Memtable::new();
         memtable
@@ -5471,6 +6831,136 @@ mod tests {
         );
     }
 
+    /// An injected failure after WAL/SQL durability retains the same material
+    /// owner, retries on the serial shard, and acknowledges only after the
+    /// original Arrow buffers are visible from the memtable snapshot.
+    #[tokio::test]
+    async fn post_commit_insertion_failure_retries_without_black_hole_or_early_ack() {
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let (mut owner, budget) =
+            owner_for_completion_test_with_budget(Memtable::new(), &wal, wal_handle, stream);
+        let mut append = prepared_append_for_group_test(&owner, &budget);
+        let PreparedSliceSet::Materialized(slices) = &append.slices;
+        let original_buffer = slices[0].rows.column(0).to_data().buffers()[0].as_ptr();
+        let expected_rows = slices
+            .iter()
+            .map(|slice| slice.rows.num_rows())
+            .sum::<usize>();
+        let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel();
+        append.durable_ack = Some(ack_tx);
+        wal.trip_post_sync_failure_for_test();
+        assert!(matches!(
+            ack_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        owner
+            .process_group(vec![append])
+            .await
+            .expect_err("injected post-COMMIT response must not acknowledge");
+        assert!(matches!(
+            ack_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        owner
+            .retry_retained_post_commit()
+            .expect("same-owner retry");
+        assert_eq!(
+            ack_rx
+                .await
+                .expect("visible success response")
+                .expect("visible insertion succeeds"),
+            u64::try_from(expected_rows).expect("test row count fits u64")
+        );
+        let visible = owner.memtable.stats().expect("query-visible rows");
+        assert_eq!(
+            visible.writable_rows + visible.immutable_rows,
+            expected_rows
+        );
+        assert_ne!(original_buffer, std::ptr::null());
+        assert!(!owner.memory_ownership.is_poisoned());
+    }
+
+    /// Proves accepted mailbox material remains charged until query visibility permits ACK.
+    ///
+    /// The injected post-COMMIT insertion fault retains both the caller channel
+    /// and its exact Active owner. The serial retry makes those same rows visible
+    /// before completing the ACK and leaves the material charged to the memtable.
+    #[tokio::test]
+    async fn accepted_mailbox_material_remains_owned_until_visible_ack() {
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
+        let (mut owner, budget) =
+            owner_for_completion_test_with_budget(Memtable::new(), &wal, wal_handle, stream);
+        let mut append = prepared_append_for_group_test(&owner, &budget);
+        let PreparedSliceSet::Materialized(slices) = &append.slices;
+        let expected_rows = slices
+            .iter()
+            .map(|slice| slice.rows.num_rows())
+            .sum::<usize>();
+        let (ack_tx, mut ack_rx) = tokio::sync::oneshot::channel();
+        append.durable_ack = Some(ack_tx);
+
+        wal.trip_post_sync_failure_for_test();
+        owner
+            .process_group(vec![append])
+            .await
+            .expect_err("post-COMMIT insertion fault");
+        assert!(matches!(
+            ack_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(owner.retained_commit_ambiguity.is_some());
+        assert!(owner.memory_ownership.active_bytes() > 0);
+        assert_eq!(
+            owner
+                .memtable
+                .stats()
+                .expect("pre-visible stats")
+                .writable_rows,
+            0
+        );
+
+        owner
+            .retry_retained_post_commit()
+            .expect("visible owner-local retry");
+        assert_eq!(
+            ack_rx
+                .await
+                .expect("post-visible ACK")
+                .expect("visible insertion succeeds"),
+            u64::try_from(expected_rows).expect("test row count fits u64")
+        );
+        assert_eq!(
+            owner.memtable.stats().expect("visible stats").writable_rows,
+            expected_rows
+        );
+        assert!(owner.retained_commit_ambiguity.is_none());
+        assert!(owner.memory_ownership.active_bytes() > 0);
+    }
+
     /// A shard publication failure returns the identical error to visibility and caller acknowledgments.
     #[tokio::test]
     async fn persistence_command_preserves_publication_failure_for_both_waiters() {
@@ -5519,22 +7009,136 @@ mod tests {
         assert!(visibility_error.contains("generation"));
     }
 
-    #[test]
-    fn shard_owner_exclusively_mutates_generation_state() {
+    /// Proves one real shard owner drives WAL, age, memtable, and both mailbox
+    /// transitions for one generation from age expiry through visible rows.
+    #[tokio::test]
+    async fn shard_owner_owns_one_wal_memtable_age_and_mailbox() {
         let key = owner_key();
-        let owner = Memtable::new();
-        let other_owner = Memtable::new();
-        owner
+        let memtable = Memtable::new();
+        memtable
             .insert(&key, owner_event(), owner_meta(&key), owner_batch())
             .expect("owner insert");
-        assert_eq!(owner.stats().expect("owner stats").writable_buckets, 1);
-        assert_eq!(
-            other_owner
-                .stats()
-                .expect("other owner stats")
-                .writable_buckets,
-            0
+        let active_bytes = memtable.stats().expect("owner stats").writable_bytes;
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("WAL writer"),
         );
+        let batch_id = batch_id_for_owner(&key, 0);
+        wal.append_and_commit_for_replay_test(&key, *batch_id.as_bytes(), b"audit", b"data")
+            .expect("owner WAL append");
+        let wal_handle = wal.handle_for_shard(0).expect("owner WAL handle");
+        let (mut owner, budget, command_tx, completion_tx, _pressure_tx) =
+            owner_for_completion_test_with_channels(memtable, &wal, wal_handle, stream);
+        owner
+            .memory_ownership
+            .reserve_active(active_bytes)
+            .expect("active memory ownership");
+        owner
+            .admission
+            .try_reserve_active("owner-proof", active_bytes)
+            .expect("active admission ownership");
+        let (persistence, mut persistence_rx) = PersistenceRuntime::bounded_for_test();
+        owner.persistence = Some(Arc::new(persistence.clone()));
+        owner.generation_started_at = std::time::Instant::now()
+            .checked_sub(owner.generation_max_age)
+            .expect("expired owner generation");
+        assert!(owner.wal_handle.has_active_records().expect("active WAL"));
+        assert!(owner.generation_started_at.elapsed() >= owner.generation_max_age);
+        let append = prepared_append_for_group_test(&owner, &budget);
+        owner.pending.fetch_add(1, Ordering::AcqRel);
+
+        let task = tokio::spawn(owner.run());
+        command_tx
+            .send(ShardCommand::Append(Box::new(append)))
+            .await
+            .expect("append command mailbox");
+        let job = tokio::time::timeout(std::time::Duration::from_secs(1), persistence_rx.recv())
+            .await
+            .expect("age rotation queued persistence job")
+            .expect("owner persistence job");
+        assert!(!job.generation.rows.is_empty());
+
+        let generation = Arc::clone(&job.generation);
+        let (visibility_result, visibility_rx) = tokio::sync::oneshot::channel();
+        completion_tx
+            .send(ShardCommand::PersistenceComplete {
+                completion: Box::new(PersistenceCompletion {
+                    generation_id: generation.generation_id,
+                    file_list_key: Some(owner_file_list_key(&key)),
+                    wal_segments: generation.wal_segments.clone(),
+                    wal: generation.wal.clone(),
+                    arrow_bytes: generation.arrow_bytes,
+                    replay_identity: None,
+                    error: None,
+                }),
+                waiter: None,
+                visibility_result,
+            })
+            .await
+            .expect("completion mailbox");
+        visibility_rx
+            .await
+            .expect("completion response")
+            .expect("generation publication");
+        persistence.complete_for_test(generation.arrow_bytes);
+        drop(job);
+
+        assert!(
+            wal.handle_for_shard(0)
+                .expect("owner WAL handle")
+                .has_active_records()
+                .expect("fresh WAL generation")
+        );
+        let binding = crate::catalog::TenantTableBinding::resolve((key.tenant, key.table.clone()))
+            .expect("owner binding");
+        let (snapshot_response, snapshot_rx) = tokio::sync::oneshot::channel();
+        command_tx
+            .send(ShardCommand::Snapshot {
+                request: FetchLiveTailRequest {
+                    binding,
+                    target_stream: stream,
+                    start_day: key.day,
+                    end_day: key.day,
+                    after_lsn: crate::scribe::wal::WalLsn::ZERO,
+                    persisted_lsn_ranges: Vec::new(),
+                    required_columns: vec!["value".to_owned()],
+                    max_batches: 4,
+                    max_retained_bytes: 1 << 20,
+                },
+                response: snapshot_response,
+            })
+            .await
+            .expect("visible snapshot command mailbox");
+        let visible = snapshot_rx
+            .await
+            .expect("snapshot response")
+            .expect("visible owner rows");
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].rows.num_rows(), 1);
+        let (retire_response, retire_result) = tokio::sync::oneshot::channel();
+        command_tx
+            .send(ShardCommand::RetireCommittedForTest {
+                response: retire_response,
+            })
+            .await
+            .expect("retirement command mailbox");
+        retire_result
+            .await
+            .expect("retirement response")
+            .expect("committed generation retirement");
+        command_tx
+            .send(ShardCommand::Shutdown)
+            .await
+            .expect("owner shutdown mailbox");
+        task.await.expect("owner task");
     }
 
     #[test]
@@ -6122,6 +7726,7 @@ mod tests {
             frozen.seal_id,
             RetainedGeneration {
                 arrow_bytes: frozen.arrow_bytes,
+                memory_released: false,
                 wal_segments: Vec::new(),
                 wal: wal_handle,
                 replay_identity: Arc::new(Mutex::new(None)),
@@ -6296,9 +7901,10 @@ mod tests {
         assert!(owner.memory_ownership.is_poisoned());
     }
 
-    /// Group cleanup reports the primary failure while the shared cleanup path poisons corruption.
+    /// The legacy post-sync fault is now an owner-local retry point and cannot
+    /// enter cleanup or consume a separately armed cleanup-accounting fault.
     #[tokio::test]
-    async fn cleanup_release_failure_preserves_primary_error_and_poisons() {
+    async fn post_sync_retry_does_not_enter_precommit_cleanup() {
         let memtable = Memtable::new();
         let wal_root = tempfile::tempdir().expect("WAL directory");
         let node = crate::scribe::stream_identity::NodeId::generate();
@@ -6317,21 +7923,25 @@ mod tests {
             owner_for_completion_test_with_budget(memtable, &wal, wal_handle, stream);
         let prepared = prepared_append_for_group_test(&owner, &budget);
         wal.trip_post_sync_failure_for_test();
-        budget.arm_post_preflight_release_fault();
-        let error = owner
+        let PreparedSliceSet::Materialized(expected_slices) = &prepared.slices;
+        let expected_rows = expected_slices
+            .iter()
+            .map(|slice| slice.rows.num_rows())
+            .sum::<usize>();
+        owner
             .process_group(vec![prepared])
             .await
-            .expect_err("post-sync WAL fault");
-        assert!(
-            matches!(error, ScribeError::Internal { detail } if detail == "injected post-sync WAL failure")
-        );
-        assert!(owner.memory_ownership.is_poisoned());
-        assert_eq!(owner.synced_not_inserted.len(), 1);
+            .expect_err("post-sync response failure");
+        owner
+            .retry_retained_post_commit()
+            .expect("post-sync owner-local retry");
+        assert!(!owner.memory_ownership.is_poisoned());
+        assert_eq!(owner.synced_not_inserted.len(), 0);
         let memtable = owner.memtable.stats().expect("memtable stats");
-        assert_eq!(memtable.writable_rows, 0);
+        assert_eq!(memtable.writable_rows, expected_rows);
         assert_eq!(memtable.immutable_rows, 0);
-        assert_eq!(owner.admission.snapshot().active_bytes, 0);
+        assert!(owner.admission.snapshot().active_bytes > 0);
         assert!(owner.memory_ownership.active_bytes() > 0);
-        assert!(budget.try_reserve(MemoryCategory::Raw, 1).is_err());
+        assert!(budget.try_reserve(MemoryCategory::Raw, 1).is_ok());
     }
 }

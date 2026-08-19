@@ -62,6 +62,11 @@ fn audit() -> Vec<u8> {
 /// # Panics
 /// Panics when static date or Arrow fixture construction fails.
 fn batch() -> RecordBatch {
+    batch_with_value(7)
+}
+
+/// Build the fixed one-row batch with a caller-selected payload value.
+fn batch_with_value(value: i64) -> RecordBatch {
     RecordBatch::try_new(
         Arc::new(Schema::new(vec![
             Field::new(
@@ -83,7 +88,7 @@ fn batch() -> RecordBatch {
                 ])
                 .with_timezone("UTC"),
             ),
-            Arc::new(Int64Array::from(vec![7_i64])),
+            Arc::new(Int64Array::from(vec![value])),
         ],
     )
     .expect("batch")
@@ -133,7 +138,40 @@ async fn append(
     table: &str,
     batch_id: Uuid,
 ) -> Result<(), ScribeError> {
+    append_as(scribe, principal(tenant), table, batch_id).await
+}
+
+/// Append one fixed batch as a retained authenticated principal.
+async fn append_as(
+    scribe: &crate::scribe::ScribeImpl,
+    principal: Principal,
+    table: &str,
+    batch_id: Uuid,
+) -> Result<(), ScribeError> {
     let rows = batch();
+    scribe
+        .append_durable(ScribeAppend {
+            principal,
+            table: TableRef::new(BifrostNamespace::Bifrost, table),
+            schema_fingerprint: SchemaFingerprint::from_arrow_schema(rows.schema().as_ref()),
+            request_id: RequestId::now_v7(),
+            batch_id,
+            measured_wire_bytes: 0,
+            rows,
+        })
+        .await
+        .map(|_| ())
+}
+
+/// Append a payload variant through the production durable seam.
+async fn append_value(
+    scribe: &crate::scribe::ScribeImpl,
+    tenant: DataTenantId,
+    table: &str,
+    batch_id: Uuid,
+    value: i64,
+) -> Result<(), ScribeError> {
+    let rows = batch_with_value(value);
     scribe
         .append_durable(ScribeAppend {
             principal: principal(tenant),
@@ -314,7 +352,7 @@ async fn scribe_invalid_rejection_emits_exact_owner_reason() {
         DataTenantId::new_v7(),
         "invalid",
         Uuid::now_v7(),
-        crate::scribe::admission::MAX_REQUEST_BYTES + 1,
+        crate::gate::limits::BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES + 1,
     )
     .await
     .expect_err("oversized request rejects append");
@@ -466,18 +504,32 @@ async fn failure_after_fsync_before_ack_reuses_stable_batch_once() {
     let (wal, scribe) = scribe(&wal_root, node);
     let tenant = DataTenantId::new_v7();
     let batch_id = Uuid::now_v7();
+    let retry_principal = principal(tenant);
     wal.trip_post_sync_failure_for_test();
 
-    let error = append(&scribe, tenant, "post_sync_failure", batch_id)
-        .await
-        .expect_err("post-sync failure must not acknowledge");
-    assert!(error.to_string().contains("post-sync"));
+    let first = append_as(
+        &scribe,
+        retry_principal.clone(),
+        "post_sync_failure",
+        batch_id,
+    );
+    tokio::pin!(first);
+    tokio::select! {
+        result = &mut first => panic!("post-COMMIT owner acknowledged before visibility: {result:?}"),
+        () = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+    }
     assert_eq!(scribe.memtable_stats().expect("stats").writable_rows, 0);
-    assert_ingress_owners_settled(&scribe);
+    let retained = scribe
+        .inspection_snapshot()
+        .expect("retained post-COMMIT owner")
+        .ingress_lifecycle;
+    assert_eq!(retained.active_attempts, 1);
+    assert!(retained.active_reserved_bytes > 0);
 
-    append(&scribe, tenant, "post_sync_failure", batch_id)
-        .await
-        .expect("stable batch retry");
+    let retry = append_as(&scribe, retry_principal, "post_sync_failure", batch_id);
+    let (first_result, retry_result) = tokio::join!(first, retry);
+    first_result.expect("original ACK follows visible insertion");
+    retry_result.expect("stable batch retry");
     assert_eq!(scribe.memtable_stats().expect("stats").writable_rows, 1);
     assert_ingress_owners_settled(&scribe);
     scribe
@@ -500,6 +552,40 @@ async fn failure_after_fsync_before_ack_reuses_stable_batch_once() {
     assert_eq!(replayed_identity.seal_key.tenant, tenant);
     assert_eq!(replayed_identity.seal_key.table.name, "post_sync_failure");
     assert_eq!(replayed_identity.slice_index, 0);
+}
+
+#[tokio::test]
+/// A reused batch ID with different payload identity fails before WAL mutation.
+async fn contradictory_batch_retry_is_rejected_before_second_wal_append() {
+    let wal_root = tempfile::tempdir().expect("WAL directory");
+    let node = NodeId::new(Uuid::now_v7());
+    let (wal, scribe) = scribe(&wal_root, node);
+    let tenant = DataTenantId::new_v7();
+    let batch_id = Uuid::now_v7();
+
+    append_value(&scribe, tenant, "contradictory_retry", batch_id, 7)
+        .await
+        .expect("first append");
+    let wal_bytes_before = wal.bytes_on_disk();
+    let error = append_value(&scribe, tenant, "contradictory_retry", batch_id, 8)
+        .await
+        .expect_err("contradictory retry must not acknowledge");
+    assert!(error.to_string().contains("contradictory payload identity"));
+    assert_eq!(wal.bytes_on_disk(), wal_bytes_before);
+    assert_eq!(scribe.memtable_stats().expect("stats").writable_rows, 1);
+    assert_ingress_owners_settled(&scribe);
+
+    scribe
+        .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
+        .await;
+    let replayed = replay_wal_directory(wal_root.path()).expect("replay");
+    let state = replayed
+        .values()
+        .find(|state| state.seal_key.table.name == "contradictory_retry")
+        .expect("first append remains durable");
+    assert_eq!(state.data_records.len(), 1);
+    assert_eq!(state.append_metas.len(), 1);
+    assert_eq!(state.commits.len(), 1);
 }
 
 #[test]

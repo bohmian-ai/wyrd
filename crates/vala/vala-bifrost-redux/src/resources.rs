@@ -12,8 +12,6 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::LazyLock;
-#[cfg(test)]
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -306,7 +304,7 @@ impl BifrostVolumeGovernor {
                 detail: "WAL volume root was not registered".to_owned(),
             }
         })?;
-        let retained = retained_path_bytes(&wal.path)?;
+        let retained = retained_wal_root_bytes(&wal.path)?;
         devices
             .get_mut(&wal.device)
             .ok_or_else(accounting_overflow)?
@@ -928,24 +926,43 @@ impl Drop for VolumeLease {
     }
 }
 
-/// Recursively measures retained durable bytes without following symlinks.
+/// Measures WAL segments and the flat, authorized Scribe staging namespace.
 ///
 /// # Errors
 ///
 /// Returns unavailable when a registered path cannot be read or measured.
-fn retained_path_bytes(path: &Path) -> Result<u64, BifrostResourceError> {
+fn retained_wal_root_bytes(root: &Path) -> Result<u64, BifrostResourceError> {
+    retained_path_bytes(root, &root.join("staged"))
+}
+
+/// Recursively measures retained WAL bytes without following symlinks.
+///
+/// Regular WAL files are counted outside the staged namespace. Inside the
+/// staged namespace only Scribe's flat, closed filename set participates, so
+/// an unrelated operator file cannot consume or release WAL capacity.
+///
+/// # Errors
+///
+/// Returns unavailable when a registered path cannot be read or measured.
+fn retained_path_bytes(path: &Path, staged_root: &Path) -> Result<u64, BifrostResourceError> {
     let metadata =
         fs::symlink_metadata(path).map_err(|error| BifrostResourceError::Unavailable {
             detail: format!("cannot inspect retained WAL path: {error}"),
         })?;
     if metadata.is_file() {
-        return Ok(
-            if path.extension().and_then(|value| value.to_str()) == Some("wal") {
-                metadata.len()
-            } else {
-                0
-            },
-        );
+        let retained = if path.starts_with(staged_root) {
+            path.parent() == Some(staged_root)
+                && path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(is_authorized_staged_name)
+        } else {
+            path.extension().and_then(|value| value.to_str()) == Some("wal")
+        };
+        return Ok(if retained { metadata.len() } else { 0 });
+    }
+    if !metadata.is_dir() || (path.starts_with(staged_root) && path != staged_root) {
+        return Ok(0);
     }
     let mut total = 0_u64;
     for entry in fs::read_dir(path).map_err(|error| BifrostResourceError::Unavailable {
@@ -955,10 +972,20 @@ fn retained_path_bytes(path: &Path) -> Result<u64, BifrostResourceError> {
             detail: format!("cannot inspect retained WAL entry: {error}"),
         })?;
         total = total
-            .checked_add(retained_path_bytes(&entry.path())?)
+            .checked_add(retained_path_bytes(&entry.path(), staged_root)?)
             .ok_or_else(accounting_overflow)?;
     }
     Ok(total)
+}
+
+/// Identifies one durable filename owned by the flat Scribe stage lifecycle.
+fn is_authorized_staged_name(name: &str) -> bool {
+    name.ends_with(".par.tmp")
+        || name.ends_with(".parquet")
+        || name.ends_with(".attempt.json")
+        || name.ends_with(".winner")
+        || name.ends_with(".publication.tmp")
+        || name.ends_with(".publication.json")
 }
 
 /// Samples current filesystem-available bytes for one registered root.
@@ -1285,8 +1312,28 @@ impl BifrostRuntimeResources {
     /// Returns [`BifrostResourceError`] when detection or checked root-policy
     /// validation fails.
     pub fn detect(policy: BifrostResourcePolicy) -> Result<Self, BifrostResourceError> {
+        Self::detect_with_transport_message_limit(
+            policy,
+            crate::gate::limits::BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES,
+        )
+    }
+
+    /// Detects resources while freezing an operator-selected transport message maximum.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostResourceError`] when detection, root-policy validation,
+    /// or the selected message-to-aggregate relationship is invalid.
+    pub fn detect_with_transport_message_limit(
+        policy: BifrostResourcePolicy,
+        transport_message_limit_bytes: usize,
+    ) -> Result<Self, BifrostResourceError> {
         let snapshot = detect_snapshot(&policy.scratch_root, policy.memory_limit_bytes)?;
-        Self::from_snapshot(snapshot, policy)
+        Self::from_snapshot_with_transport_message_limit(
+            snapshot,
+            policy,
+            transport_message_limit_bytes,
+        )
     }
 
     /// Constructs the shared role graph from a complete resource observation.
@@ -1303,6 +1350,24 @@ impl BifrostRuntimeResources {
         snapshot: SystemResourceSnapshot,
         policy: BifrostResourcePolicy,
     ) -> Result<Self, BifrostResourceError> {
+        Self::from_snapshot_with_transport_message_limit(
+            snapshot,
+            policy,
+            crate::gate::limits::BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES,
+        )
+    }
+
+    /// Constructs the shared graph with an operator-selected message maximum.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostResourceError`] when the observation, root policy, or
+    /// selected message-to-aggregate relationship is invalid.
+    pub fn from_snapshot_with_transport_message_limit(
+        snapshot: SystemResourceSnapshot,
+        policy: BifrostResourcePolicy,
+        transport_message_limit_bytes: usize,
+    ) -> Result<Self, BifrostResourceError> {
         let roots = policy.volume_roots.clone();
         let configured_limit = policy
             .scratch_limit_bytes
@@ -1313,9 +1378,13 @@ impl BifrostRuntimeResources {
                 BifrostVolumeGovernor::register(roots, configured_limit, root.inner.health.clone())
             })
             .transpose()?;
+        let transport = crate::gate::limits::BifrostTransportAdmission::new(
+            root.plan().unmanaged_reserve_bytes,
+            transport_message_limit_bytes,
+        )?;
         Ok(Self {
+            transport,
             governor: root,
-            transport: crate::gate::limits::BifrostTransportAdmission::default(),
             volumes,
         })
     }
@@ -1601,15 +1670,6 @@ impl ScribeResources {
         }
     }
 
-    /// Injects the fail-stop state used by post-preflight owner tests.
-    #[cfg(test)]
-    pub(crate) fn arm_post_preflight_release_fault(&self) {
-        self.governor
-            .inner
-            .post_preflight_release_fault
-            .store(true, AtomicOrdering::Release);
-    }
-
     /// Exercises ordinary ingress refusal after test-owned poison.
     #[cfg(test)]
     pub(crate) fn try_reserve(
@@ -1655,9 +1715,8 @@ impl ScribeResources {
 
     /// Returns the full checked Scribe role ceiling for ingress ownership.
     ///
-    /// Immutable generation bytes transfer into the fixed Parquet producer
-    /// owner, whose incremental reservation charges only the remaining delta.
-    /// Reserving that target here would therefore double-count the producer.
+    /// This maximum envelope is distinct from per-bucket rotation targets and
+    /// bounds a whole accepted request under the shared process-root governor.
     ///
     /// # Panics
     ///
@@ -1671,10 +1730,14 @@ impl ScribeResources {
             .expect("validated Scribe role ceiling must fit usize")
     }
 
-    /// Returns the bounded active-bucket target derived from root Scribe capacity.
+    /// Returns the maximum intrinsic Scribe envelope available at server boot.
+    ///
+    /// This public projection exposes capacity only, never mutable accounting,
+    /// so the server can reject an unreplayable configured request shape before
+    /// it starts a Scribe role. Runtime admission remains owned by this capability.
     #[must_use]
-    pub(crate) fn active_bucket_target_bytes(&self) -> usize {
-        (self.limit_bytes() / 4).clamp(64 * MIB, 512 * MIB)
+    pub fn maximum_ingress_envelope_bytes(&self) -> usize {
+        self.ingress_limit_bytes()
     }
 
     /// Acquires ingress ownership directly from the root capability.
@@ -1967,9 +2030,6 @@ struct ResourceGovernorInner {
     cgroup_current: Mutex<Option<(Instant, Option<usize>)>>,
     /// Lock-free first-poison signal observed by application supervision.
     health: BifrostResourceHealth,
-    /// One-shot post-preflight release failure used by owner fault tests.
-    #[cfg(test)]
-    post_preflight_release_fault: AtomicBool,
 }
 
 /// Derives every enabled role floor and their checked aggregate.
@@ -2096,8 +2156,6 @@ impl BifrostResourceGovernor {
                 cgroup_limit_bytes: crate::scribe::memory::read_cgroup_limit(),
                 cgroup_current: Mutex::new(None),
                 health: BifrostResourceHealth::default(),
-                #[cfg(test)]
-                post_preflight_release_fault: AtomicBool::new(false),
             }),
         };
         root.record_plan_metrics();
@@ -2139,11 +2197,7 @@ impl BifrostResourceGovernor {
             "role" => "transport",
             "resource" => "memory"
         )
-        .set(
-            crate::gate::limits::BIFROST_TRANSPORT_LIMIT_BYTES
-                .to_f64()
-                .unwrap_or(f64::MAX),
-        );
+        .set(plan.unmanaged_reserve_bytes.to_f64().unwrap_or(f64::MAX));
     }
 
     /// Returns the immutable boot resource calculation.
@@ -2901,19 +2955,6 @@ impl ScribeMemoryLease {
         bytes: usize,
         limit_bytes: Option<usize>,
     ) -> Result<(), BifrostResourceError> {
-        #[cfg(test)]
-        if self
-            .root
-            .inner
-            .post_preflight_release_fault
-            .swap(false, AtomicOrdering::AcqRel)
-        {
-            self.root
-                .poison("injected post-preflight Scribe release failure");
-            return Err(BifrostResourceError::Poisoned {
-                detail: "injected post-preflight Scribe release failure".to_owned(),
-            });
-        }
         if bytes == self.bytes {
             return Ok(());
         }
@@ -4237,6 +4278,43 @@ mod tests {
         }
     }
 
+    /// Boot composition preserves the selected message bound and rejects a clamp.
+    ///
+    /// # Panics
+    ///
+    /// Panics when valid composition loses the selected bound or an invalid
+    /// message-to-aggregate relationship is silently accepted.
+    #[test]
+    fn transport_message_limit_is_frozen_separately_from_aggregate_capacity() {
+        let selected = 201 * MIB;
+        let resources = BifrostRuntimeResources::from_snapshot_with_transport_message_limit(
+            snapshot(2 * 1024 * MIB),
+            policy(&[BifrostRole::Scribe]),
+            selected,
+        )
+        .expect("selected maximum fits derived aggregate capacity");
+        let admission = resources
+            .compose_roles()
+            .expect("role composition")
+            .transport_admission();
+        assert_eq!(admission.message_limit_bytes(), selected);
+        assert_eq!(
+            admission.limit_bytes(),
+            resources.plan().unmanaged_reserve_bytes
+        );
+
+        let aggregate = resources.plan().unmanaged_reserve_bytes;
+        assert!(
+            BifrostRuntimeResources::from_snapshot_with_transport_message_limit(
+                snapshot(2 * 1024 * MIB),
+                policy(&[BifrostRole::Scribe]),
+                aggregate + 1,
+            )
+            .is_err(),
+            "boot must reject rather than clamp a selected maximum above aggregate capacity"
+        );
+    }
+
     /// Builds one exact interactive query quantum for root-ledger tests.
     fn interactive_query(local_ratio: f64) -> OracleResourceRequest {
         OracleResourceRequest {
@@ -4367,14 +4445,17 @@ mod tests {
         generation
             .transfer_category(ScribeMemoryCategory::Immutable)
             .expect("generation ownership must transfer to immutable");
-        let producer_delta = crate::scribe::memory::parquet_producer_delta(generation_bytes)
-            .expect("representative generation must fit the producer owner");
+        let producer_delta = crate::scribe::memory::parquet_candidate_incremental_bytes(72 * MIB)
+            .expect("candidate workspace projection");
         let producer = scribe
             .try_reserve_maintenance(ScribeMemoryCategory::Persistence, producer_delta)
             .expect("producer delta must complete the exact Scribe floor");
 
         let occupied = scribe.snapshot().expect("occupied Scribe snapshot");
-        assert_eq!(occupied.scribe_memory_used_bytes, 256 * MIB);
+        assert_eq!(
+            occupied.scribe_memory_used_bytes,
+            generation_bytes + producer_delta
+        );
         assert_eq!(occupied.elastic_memory_used_bytes, 0);
         let attribution = scribe
             .governor
@@ -5285,7 +5366,7 @@ mod tests {
 
     /// Scribe ownership transformations preserve one root and exact attribution.
     #[test]
-    fn scribe_root_lease_transforms_reconcile_exactly() {
+    fn material_upper_bound_owns_single_materialization_and_exact_shrink_is_atomic() {
         let roles = BifrostRuntimeResources::composed_for_test(
             768 * MIB,
             512 * MIB as u64,
@@ -5316,7 +5397,14 @@ mod tests {
         );
         assert_eq!(attribution.shard_bytes.get(&3), Some(&(128 * MIB)));
         assert_eq!(attribution.omitted_generation_count, 1);
-        owner.resize(64 * MIB).expect("checked shrink");
+        let before_shrink = scribe.snapshot().expect("pre-shrink snapshot");
+        owner.shrink_to(64 * MIB).expect("atomic exact shrink");
+        let after_shrink = scribe.snapshot().expect("post-shrink snapshot");
+        assert_eq!(
+            before_shrink.scribe_memory_used_bytes - after_shrink.scribe_memory_used_bytes,
+            64 * MIB
+        );
+        assert_eq!(owner.bytes(), 64 * MIB);
         drop(owner);
         assert_eq!(
             scribe
@@ -5330,7 +5418,7 @@ mod tests {
 
     /// Epoch waiting observes a release that occurs before waiter registration.
     #[tokio::test]
-    async fn scribe_memory_epoch_prevents_release_lost_wakeup() {
+    async fn accepted_replay_capacity_wait_is_bounded_and_cancellation_safe() {
         let roles = BifrostRuntimeResources::composed_for_test(
             768 * MIB,
             512 * MIB as u64,
@@ -5346,6 +5434,15 @@ mod tests {
             })
             .expect("root admission");
         let observed = scribe.memory_epoch();
+        let cancelled = {
+            let scribe = scribe.clone();
+            tokio::spawn(async move { scribe.wait_for_memory_change(observed).await })
+        };
+        cancelled.abort();
+        assert!(
+            cancelled.await.is_err(),
+            "cancelled replay waiter owns no lease"
+        );
         drop(owner);
         let advanced = scribe
             .wait_for_memory_change(observed)

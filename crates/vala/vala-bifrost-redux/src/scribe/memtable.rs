@@ -2,8 +2,9 @@
 //!
 //! The memtable holds Arrow buffers + paired `AuditEvent` lists per
 //! `SealKey = (DataTenantId, TableRef, EventDay)`. Rotation is driven by
-//! retained Arrow size, active-generation age, and global pressure. WAL
-//! segment rollover is deliberately independent from bucket rotation.
+//! retained Arrow size, active-generation age, and global pressure. Automatic
+//! writer rotation swaps every non-empty bucket as one shard cohort; selective
+//! pressure and explicit seals continue to freeze individual keys.
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -27,7 +28,7 @@ pub const MEMTABLE_ROTATION_BYTES: usize = 512 * 1024 * 1024;
 /// [`Memtable::new_with_rotation`] when no runtime value is supplied.
 ///
 /// Production wiring threads the D83 seconds-scale
-/// [`crate::scribe::ScribePressureConfig::seal_max_age`] (30 s) through the
+/// [`crate::scribe::ScribePressureConfig::seal_max_age`] (600 s) through the
 /// shard runtime instead of reading this constant, so trickle workloads get
 /// bounded visibility latency. This value is retained only so bare-`Memtable`
 /// unit tests keep compiling.
@@ -138,6 +139,30 @@ pub(crate) struct PressureCandidate {
     pub oldest_wal_lsn: Option<crate::scribe::wal::WalLsn>,
 }
 
+/// Resolves one retained batch ID only when stable logical slice facts match.
+///
+/// # Errors
+///
+/// Returns an invariant error when a caller reuses a retained batch ID for a
+/// different schema/data, length, slice ordinal, or complete slice count.
+fn retained_identity_rows(
+    meta: &ScribeAppendMeta,
+    identity: crate::scribe::wal::ScribeAppendPayloadIdentity,
+) -> Result<Option<u64>, ScribeError> {
+    if meta.schema_fingerprint != identity.schema_fingerprint
+        || meta.data_digest != identity.data_digest
+        || meta.data_len != identity.data_len
+        || meta.slice_index != identity.slice_index
+        || meta.slice_count != identity.slice_count
+    {
+        return Err(ScribeError::Internal {
+            detail: "retained Scribe batch ID was reused with contradictory payload identity"
+                .to_owned(),
+        });
+    }
+    Ok(Some(u64::try_from(meta.rows_accepted).unwrap_or(u64::MAX)))
+}
+
 impl Memtable {
     /// Construct a new empty memtable with the default active-bucket rotation threshold.
     ///
@@ -169,7 +194,7 @@ impl Memtable {
     ///
     /// This is the constructor production wiring uses: the shard runtime threads
     /// `rotation_bytes` (the active-bucket target) and the configured
-    /// `seal_max_age` (D83 default 30 s) so the size and age seal predicates read
+    /// `seal_max_age` (D83 default 600 s) so the size and age seal predicates read
     /// runtime values rather than module constants.
     ///
     /// # Errors
@@ -210,16 +235,47 @@ impl Memtable {
         Ok(())
     }
 
+    /// Computes the encoder candidate peak after appending whole incoming batches.
+    ///
+    /// The calculation borrows the active bucket and does not concatenate or
+    /// clone Arrow arrays. Its grouping rule is shared with the Parquet writer,
+    /// allowing the shard owner to rotate before WAL mutation when appending to
+    /// an existing candidate would make the generation unreplayable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the writable lock is poisoned or
+    /// candidate arithmetic overflows.
+    pub(crate) fn projected_candidate_peak(
+        &self,
+        seal_key: &SealKey,
+        incoming: impl IntoIterator<Item = (usize, usize)>,
+    ) -> Result<usize, ScribeError> {
+        let writable = self
+            .writable
+            .lock()
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("memtable writable lock poisoned: {error}"),
+            })?;
+        let retained = writable.get(seal_key).into_iter().flat_map(|bucket| {
+            bucket
+                .batches
+                .iter()
+                .map(|batch| (batch.num_rows(), estimate_batch_bytes(batch)))
+        });
+        crate::scribe::parquet_writer::largest_candidate_bytes_from_facts(retained.chain(incoming))
+    }
+
     /// Return the row count for a batch that is still retained in the active
     /// or immutable grace state for this exact seal key.
     ///
     /// The lookup is the runtime idempotency index. It is intentionally
     /// derived from the bounded buckets instead of maintaining a process-wide
     /// append-ID set whose memory would grow with the lifetime of a shard.
-    pub fn retained_batch_rows(
+    pub(crate) fn retained_batch_rows(
         &self,
         seal_key: &SealKey,
-        batch_id: [u8; 16],
+        identity: crate::scribe::wal::ScribeAppendPayloadIdentity,
     ) -> Result<Option<u64>, ScribeError> {
         let writable = self
             .writable
@@ -228,9 +284,20 @@ impl Memtable {
                 detail: format!("memtable writable lock poisoned: {error}"),
             })?;
         if let Some(bucket) = writable.get(seal_key)
-            && let Some(meta) = bucket.metas.iter().find(|meta| meta.batch_id == batch_id)
+            && let Some(meta) = bucket
+                .metas
+                .iter()
+                .find(|meta| {
+                    meta.batch_id == identity.batch_id && meta.slice_index == identity.slice_index
+                })
+                .or_else(|| {
+                    bucket
+                        .metas
+                        .iter()
+                        .find(|meta| meta.batch_id == identity.batch_id)
+                })
         {
-            return Ok(Some(u64::try_from(meta.rows_accepted).unwrap_or(u64::MAX)));
+            return retained_identity_rows(meta, identity);
         }
         drop(writable);
 
@@ -240,16 +307,28 @@ impl Memtable {
             .map_err(|error| ScribeError::Internal {
                 detail: format!("memtable immutable lock poisoned: {error}"),
             })?;
-        Ok(immutable.get(seal_key).and_then(|entries| {
+        if let Some(meta) = immutable.get(seal_key).and_then(|entries| {
             entries.iter().find_map(|entry| {
                 entry
                     .frozen
                     .metas
                     .iter()
-                    .find(|meta| meta.batch_id == batch_id)
-                    .map(|meta| u64::try_from(meta.rows_accepted).unwrap_or(u64::MAX))
+                    .find(|meta| {
+                        meta.batch_id == identity.batch_id
+                            && meta.slice_index == identity.slice_index
+                    })
+                    .or_else(|| {
+                        entry
+                            .frozen
+                            .metas
+                            .iter()
+                            .find(|meta| meta.batch_id == identity.batch_id)
+                    })
             })
-        }))
+        }) {
+            return retained_identity_rows(meta, identity);
+        }
+        Ok(None)
     }
 
     /// Restore one unretired WAL range as a pending immutable generation.
@@ -321,9 +400,17 @@ impl Memtable {
                 }
             })?;
             let rows_accepted = batch.num_rows();
+            let (data_digest, data_len) = crate::scribe::preprocess::logical_data_identity(&batch)?;
             batches.push(batch);
             metas.push(ScribeAppendMeta {
                 batch_id: replayed_meta.batch_id,
+                schema_fingerprint: replayed_meta.schema_fingerprint,
+                data_digest,
+                data_len,
+                payload_digest: replayed_meta.payload_digest,
+                payload_len: replayed_meta.payload_len,
+                slice_index: replayed_meta.append_slice_id.slice_index,
+                slice_count: replayed_meta.slice_count,
                 rows_accepted,
                 wal_lsn_min: replayed_meta.wal_lsn,
                 wal_lsn_max: replayed_meta.wal_lsn,
@@ -479,6 +566,46 @@ impl Memtable {
             .entry(seal_key.clone())
             .or_default()
             .push(ImmutableEntry::pending(frozen.clone()));
+        Ok(frozen)
+    }
+
+    /// Atomically freezes every non-empty writable key in stable identity order.
+    ///
+    /// The writable and immutable locks are held across the complete swap, so
+    /// readers observe either the old active generation or every new immutable
+    /// member. No Arrow batch or lease is duplicated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when either memtable lock is poisoned.
+    pub(crate) fn freeze_all_nonempty(&self) -> Result<Vec<FrozenMemtable>, ScribeError> {
+        let mut writable = self
+            .writable
+            .lock()
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("memtable writable lock poisoned: {error}"),
+            })?;
+        let mut immutable = self
+            .immutable
+            .lock()
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("memtable immutable lock poisoned: {error}"),
+            })?;
+        let mut buckets: Vec<_> = writable
+            .drain()
+            .filter(|(_, bucket)| bucket.row_count != 0)
+            .collect();
+        buckets.sort_by_key(|(key, _)| key.to_string());
+        let mut frozen = Vec::with_capacity(buckets.len());
+        for (key, bucket) in buckets {
+            let seal_id = self.next_seal_id.fetch_add(1, Ordering::Relaxed);
+            let member = bucket.freeze(seal_id);
+            immutable
+                .entry(key)
+                .or_default()
+                .push(ImmutableEntry::pending(member.clone()));
+            frozen.push(member);
+        }
         Ok(frozen)
     }
 
@@ -746,6 +873,47 @@ impl Memtable {
             }
         }
         Ok(batches.finish())
+    }
+
+    /// Captures one atomic active-plus-immutable provider cut at a persisted cursor.
+    ///
+    /// Both owner maps remain locked while the cut is selected. A publication
+    /// that has not advanced the caller's pinned manifest cursor therefore
+    /// remains represented by its immutable Arrow member, while batches at or
+    /// below the cursor are excluded because the persisted provider owns them.
+    /// This provider interlock is consumed by Oracle execution; it performs no
+    /// remote query and introduces no local-Parquet tier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the requested range, owner locks, capacity
+    /// bounds, checked arithmetic, or Arrow projection is invalid.
+    pub(crate) fn readable_batches_for_provider_cut(
+        &self,
+        tenant: DataTenantId,
+        table: &crate::catalog::TableRef,
+        cut: &ProviderCut<'_>,
+    ) -> Result<Vec<ReadableBatch>, ScribeError> {
+        let batches = self.readable_batches_for_range(
+            tenant,
+            table,
+            cut.start_day,
+            cut.end_day,
+            cut.required_columns,
+            cut.limits,
+        )?;
+        Ok(batches
+            .into_iter()
+            .filter(|batch| {
+                let lsn = batch.meta.wal_lsn_max;
+                (cut.persisted_cursor == crate::scribe::wal::WalLsn::ZERO
+                    || lsn > cut.persisted_cursor)
+                    && !cut
+                        .persisted_ranges
+                        .iter()
+                        .any(|(min, max)| *min <= lsn && lsn <= *max)
+            })
+            .collect())
     }
 
     /// Return all readable batches for a table, preserving the old unit-test
@@ -1314,6 +1482,22 @@ pub(crate) struct ReadableBatchLimits {
     pub(crate) max_retained_bytes: usize,
 }
 
+/// Manifest-pinned bounds defining one atomic hot-provider query cut.
+pub(crate) struct ProviderCut<'a> {
+    /// First included event day.
+    pub(crate) start_day: crate::scribe::seal_key::EventDay,
+    /// Last included event day.
+    pub(crate) end_day: crate::scribe::seal_key::EventDay,
+    /// Requested projection in caller order.
+    pub(crate) required_columns: &'a [String],
+    /// Inclusive persisted prefix owned by the pinned manifest.
+    pub(crate) persisted_cursor: crate::scribe::wal::WalLsn,
+    /// Independently published non-prefix ranges owned by that manifest.
+    pub(crate) persisted_ranges: &'a [(crate::scribe::wal::WalLsn, crate::scribe::wal::WalLsn)],
+    /// Count and retained-byte bounds for the shallow snapshot.
+    pub(crate) limits: ReadableBatchLimits,
+}
+
 /// Inclusive WAL range eligible for retirement after a committed sweep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalRange {
@@ -1571,6 +1755,13 @@ mod tests {
     fn make_test_meta(lsn: u64) -> ScribeAppendMeta {
         ScribeAppendMeta {
             batch_id: [0u8; 16],
+            schema_fingerprint: [0; 32],
+            data_digest: [0; 32],
+            data_len: 0,
+            payload_digest: [0; 32],
+            payload_len: 0,
+            slice_index: 0,
+            slice_count: 1,
             rows_accepted: 100,
             wal_lsn_min: WalLsn::new(lsn),
             wal_lsn_max: WalLsn::new(lsn),
@@ -1584,6 +1775,189 @@ mod tests {
             TableRef::new(BifrostNamespace::Bifrost, "events"),
             EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date")),
         )
+    }
+
+    /// Automatic rotation snapshots every non-empty key in stable order and
+    /// leaves the active generation empty for the incoming unit.
+    #[test]
+    fn automatic_rotation_swaps_all_keys_before_incoming_unit() {
+        let memtable = Memtable::new();
+        let first = make_test_seal_key();
+        let second = SealKey::new(
+            first.tenant,
+            TableRef::new(BifrostNamespace::Bifrost, "spans"),
+            first.day,
+        );
+        memtable
+            .insert(
+                &first,
+                make_test_event(),
+                make_test_meta(1),
+                make_test_batch(1),
+            )
+            .expect("first active member");
+        memtable
+            .insert(
+                &second,
+                make_test_event(),
+                make_test_meta(2),
+                make_test_batch(1),
+            )
+            .expect("second active member");
+
+        let frozen = memtable
+            .freeze_all_nonempty()
+            .expect("atomic all-key freeze");
+        assert_eq!(frozen.len(), 2);
+        assert!(
+            frozen
+                .windows(2)
+                .all(|pair| pair[0].seal_key.to_string() < pair[1].seal_key.to_string())
+        );
+        assert_eq!(memtable.stats().expect("cohort stats").writable_buckets, 0);
+        assert_eq!(
+            memtable
+                .stats()
+                .expect("cohort stats")
+                .immutable_generations,
+            2
+        );
+        memtable
+            .insert(
+                &first,
+                make_test_event(),
+                make_test_meta(3),
+                make_test_batch(1),
+            )
+            .expect("incoming unit enters fresh generation");
+        assert_eq!(memtable.row_count(&first).expect("fresh active rows"), 1);
+        assert_eq!(
+            memtable.row_count(&second).expect("old key stays frozen"),
+            0
+        );
+    }
+
+    /// Proves a rotation cohort snapshots every non-empty active key exactly once.
+    ///
+    /// Empty buckets are excluded, while every populated key is returned in the
+    /// stable cohort and removed from the active generation before new ingress.
+    #[test]
+    fn cohort_snapshot_contains_every_nonempty_seal_key() {
+        let memtable = Memtable::new();
+        let first = make_test_seal_key();
+        let second = SealKey::new(
+            first.tenant,
+            TableRef::new(BifrostNamespace::Bifrost, "metrics"),
+            first.day,
+        );
+        let empty = SealKey::new(
+            first.tenant,
+            TableRef::new(BifrostNamespace::Bifrost, "empty"),
+            first.day,
+        );
+        for (key, lsn) in [(&first, 1), (&second, 2)] {
+            memtable
+                .insert(
+                    key,
+                    make_test_event(),
+                    make_test_meta(lsn),
+                    make_test_batch(1),
+                )
+                .expect("populate cohort member");
+        }
+        memtable.writable.lock().expect("writable lock").insert(
+            empty.clone(),
+            MemtableBucket::new(empty, make_test_batch(1).schema()),
+        );
+
+        let cohort = memtable.freeze_all_nonempty().expect("cohort snapshot");
+        let mut actual = cohort
+            .iter()
+            .map(|member| member.seal_key.to_string())
+            .collect::<Vec<_>>();
+        actual.sort();
+        let mut expected = [first.to_string(), second.to_string()];
+        expected.sort();
+        assert_eq!(actual, expected);
+        assert_eq!(cohort.len(), 2, "each populated key appears once");
+        assert_eq!(
+            memtable.stats().expect("post-snapshot stats").writable_rows,
+            0
+        );
+    }
+
+    /// A pinned provider cut includes every not-yet-persisted immutable member
+    /// plus active rows and excludes exactly the cursor-covered prefix.
+    #[test]
+    fn provider_cut_filters_cursor_and_nonprefix_ranges() {
+        let memtable = Memtable::new();
+        let key = make_test_seal_key();
+        for lsn in [1_u64, 2] {
+            memtable
+                .insert(
+                    &key,
+                    make_test_event(),
+                    make_test_meta(lsn),
+                    make_test_batch(1),
+                )
+                .expect("cohort source insert");
+        }
+        memtable.freeze(&key).expect("immutable cohort member");
+        memtable
+            .insert(
+                &key,
+                make_test_event(),
+                make_test_meta(3),
+                make_test_batch(1),
+            )
+            .expect("fresh active insert");
+        let limits = ReadableBatchLimits {
+            max_batches: 3,
+            max_retained_bytes: usize::MAX,
+        };
+        let before_publication = memtable
+            .readable_batches_for_provider_cut(
+                key.tenant,
+                &key.table,
+                &ProviderCut {
+                    start_day: key.day,
+                    end_day: key.day,
+                    required_columns: &[],
+                    persisted_cursor: WalLsn::ZERO,
+                    persisted_ranges: &[],
+                    limits,
+                },
+            )
+            .expect("pre-publication cut");
+        assert_eq!(
+            before_publication
+                .iter()
+                .map(|batch| batch.meta.wal_lsn_max.as_u64())
+                .collect::<std::collections::BTreeSet<_>>(),
+            [1_u64, 2, 3].into_iter().collect()
+        );
+        let after_partial_publication = memtable
+            .readable_batches_for_provider_cut(
+                key.tenant,
+                &key.table,
+                &ProviderCut {
+                    start_day: key.day,
+                    end_day: key.day,
+                    required_columns: &[],
+                    persisted_cursor: WalLsn::ZERO,
+                    persisted_ranges: &[(WalLsn::new(2), WalLsn::new(2))],
+                    limits,
+                },
+            )
+            .expect("post-publication cut");
+        assert_eq!(after_partial_publication.len(), 2);
+        assert_eq!(
+            after_partial_publication
+                .iter()
+                .map(|batch| batch.meta.wal_lsn_max.as_u64())
+                .collect::<std::collections::BTreeSet<_>>(),
+            [1_u64, 3].into_iter().collect()
+        );
     }
 
     fn make_file_list_key(min: u64, max: u64) -> FileListCommitKey {
@@ -1612,6 +1986,7 @@ mod tests {
         let mut writer = StreamWriter::try_new(&mut bytes, &schema).expect("IPC writer");
         writer.write(&batch).expect("IPC batch");
         writer.finish().expect("IPC finish");
+        let payload_len = u32::try_from(bytes.len()).expect("test payload length");
         let seal_key = make_test_seal_key();
         let batch_id = uuid::Uuid::now_v7();
         ReplayedSealKey {
@@ -1625,6 +2000,9 @@ mod tests {
             data_records: vec![bytes],
             append_metas: vec![ReplayedAppendMeta {
                 batch_id: *batch_id.as_bytes(),
+                payload_digest: [0; 32],
+                payload_len,
+                slice_count: 1,
                 wal_lsn: WalLsn::new(1),
                 rows_accepted,
                 append_slice_id: AppendSliceId {
@@ -1700,25 +2078,43 @@ mod tests {
         let batch_id = [7u8; 16];
         let mut meta = make_test_meta(10);
         meta.batch_id = batch_id;
+        let identity = crate::scribe::wal::ScribeAppendPayloadIdentity {
+            batch_id,
+            schema_fingerprint: meta.schema_fingerprint,
+            data_digest: meta.data_digest,
+            data_len: meta.data_len,
+            slice_index: meta.slice_index,
+            slice_count: meta.slice_count,
+        };
         memtable
             .insert(&seal_key, make_test_event(), meta, make_test_batch(2))
             .expect("insert");
         assert_eq!(
             memtable
-                .retained_batch_rows(&seal_key, batch_id)
+                .retained_batch_rows(&seal_key, identity,)
                 .expect("active lookup"),
             Some(100)
         );
         memtable.freeze(&seal_key).expect("freeze");
         assert_eq!(
             memtable
-                .retained_batch_rows(&seal_key, batch_id)
+                .retained_batch_rows(&seal_key, identity,)
                 .expect("immutable lookup"),
             Some(100)
         );
         assert_eq!(
             memtable
-                .retained_batch_rows(&seal_key, [8u8; 16])
+                .retained_batch_rows(
+                    &seal_key,
+                    crate::scribe::wal::ScribeAppendPayloadIdentity {
+                        batch_id: [8u8; 16],
+                        schema_fingerprint: [0; 32],
+                        data_digest: [0; 32],
+                        data_len: 0,
+                        slice_index: 0,
+                        slice_count: 1,
+                    },
+                )
                 .expect("missing lookup"),
             None
         );
@@ -1949,8 +2345,14 @@ mod tests {
         );
     }
 
+    /// Expired bucket discovery feeds the complete non-empty memtable freeze primitive.
+    ///
+    /// # Panics
+    ///
+    /// Panics if age discovery misses the expired key or the complete freeze
+    /// omits a younger peer. Owner WAL and clock behavior is proved in `shards`.
     #[test]
-    fn active_generation_age_is_the_only_time_predicate() {
+    fn expired_bucket_discovery_feeds_complete_nonempty_freeze() {
         let memtable = Memtable::new();
         let seal_key = make_test_seal_key();
 
@@ -1968,6 +2370,27 @@ mod tests {
         assert!(
             memtable.should_seal(&seal_key).expect("should_seal"),
             "600s active age triggers rotation"
+        );
+        let second = SealKey::new(
+            seal_key.tenant,
+            TableRef::new(BifrostNamespace::Bifrost, "age_peer"),
+            seal_key.day,
+        );
+        memtable
+            .insert(
+                &second,
+                make_test_event(),
+                make_test_meta(1),
+                make_test_batch(1),
+            )
+            .expect("younger peer");
+        let frozen = memtable
+            .freeze_all_nonempty()
+            .expect("whole-shard age swap");
+        assert_eq!(frozen.len(), 2, "age rotation includes the younger peer");
+        assert_eq!(
+            memtable.stats().expect("post-age stats").writable_buckets,
+            0
         );
     }
 
@@ -2195,8 +2618,14 @@ mod tests {
         );
     }
 
+    /// Pressure victim selection accumulates keys until the low-water target is met.
+    ///
+    /// # Panics
+    ///
+    /// Panics if deterministic victim ordering cannot select enough writable
+    /// bytes. Owner clock and WAL preservation is proved in `shards`.
     #[test]
-    fn global_pressure_flushes_from_seventy_five_to_sixty_five_percent() {
+    fn pressure_victim_selection_reaches_low_water_target() {
         let first = make_test_seal_key();
         let second = SealKey::new(
             first.tenant,

@@ -167,6 +167,7 @@ mod pg_tests {
                     persistence: None,
                     resources: resources.scribe().expect("Scribe test capability"),
                     staging_file_publisher: None,
+                    rotation_for_test: None,
                 },
             ),
         );

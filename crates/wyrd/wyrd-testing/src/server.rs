@@ -400,6 +400,11 @@ pub struct WyrdTestServerBuilder {
     scribe_admission: Option<AdmissionConfig>,
     /// One immutable lowerable limits snapshot shared by the test server's ingest owners.
     scribe_ingest_limits: IngestLimits,
+    /// Optional projection of production Scribe rotation limits for real-server journeys.
+    scribe_rotation_for_test: Option<vala_bifrost_redux::scribe::ScribeRotationTestConfig>,
+    /// Optional faults installed in the real Scribe persistence graph for journeys.
+    scribe_persistence_faults_for_test:
+        Option<vala_bifrost_redux::scribe::persistence::PersistenceFaults>,
     /// Optional accelerated role cadence for heartbeat-specific journeys.
     role_timing: Option<RoleTiming>,
     /// Stable node identity retained when a cluster restarts this builder.
@@ -466,6 +471,8 @@ impl Default for WyrdTestServerBuilder {
             wal_sync_delay: Duration::ZERO,
             scribe_admission: None,
             scribe_ingest_limits: IngestLimits::default(),
+            scribe_rotation_for_test: None,
+            scribe_persistence_faults_for_test: None,
             role_timing: None,
             node_id: None,
             bifrost_roles: [
@@ -2547,6 +2554,33 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Select low existing Scribe rotation thresholds for a real-server journey.
+    ///
+    /// This test-only projection does not introduce a second lifecycle policy:
+    /// it supplies the same WAL bytes, memtable bytes, and age inputs that
+    /// production boot reads from `ScribeRuntimeConfig`.
+    #[must_use]
+    pub fn with_scribe_rotation_for_test(
+        mut self,
+        rotation: vala_bifrost_redux::scribe::ScribeRotationTestConfig,
+    ) -> Self {
+        self.scribe_rotation_for_test = Some(rotation);
+        self
+    }
+
+    /// Installs deterministic controls in the real Scribe persistence graph.
+    ///
+    /// The controls are consumed only by the `test-support` build and preserve
+    /// the production persistence, SQL publication, and retirement sequence.
+    #[must_use]
+    pub fn with_scribe_persistence_faults_for_test(
+        mut self,
+        faults: vala_bifrost_redux::scribe::persistence::PersistenceFaults,
+    ) -> Self {
+        self.scribe_persistence_faults_for_test = Some(faults);
+        self
+    }
+
     /// Retain one stable physical identity and role set across cluster restarts.
     #[must_use]
     pub(crate) fn with_bifrost_node(
@@ -2848,19 +2882,21 @@ impl WyrdTestServerBuilder {
             memory_source: ResourceSource::Injected,
             cpu_source: ResourceSource::Injected,
         });
-        let runtime_resources = BifrostRuntimeResources::from_snapshot(
-            snapshot,
-            BifrostResourcePolicy {
-                roles: resource_roles,
-                memory_limit_bytes: None,
-                unmanaged_reserve_bytes: None,
-                scratch_limit_bytes: None,
-                effective_cpu: None,
-                scratch_root,
-                volume_roots,
-            },
-        )
-        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        let runtime_resources =
+            BifrostRuntimeResources::from_snapshot_with_transport_message_limit(
+                snapshot,
+                BifrostResourcePolicy {
+                    roles: resource_roles,
+                    memory_limit_bytes: None,
+                    unmanaged_reserve_bytes: None,
+                    scratch_limit_bytes: None,
+                    effective_cpu: None,
+                    scratch_root,
+                    volume_roots,
+                },
+                self.scribe_ingest_limits.max_frame_bytes,
+            )
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         let bifrost_resources = runtime_resources
             .compose_roles()
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
@@ -2937,12 +2973,16 @@ impl WyrdTestServerBuilder {
             i64::try_from(registered.fencing_token).expect("Scribe fence fits WAL epoch")
         });
         let scribe = if let Some(wal_root) = &scribe_wal_root {
+            let rotation = self.scribe_rotation_for_test;
             let wal = Arc::new(
                 WalWriter::new(
                     wal_root.path(),
                     *node_id.as_uuid().as_bytes(),
                     writer_epoch,
-                    WalConfig::default(),
+                    rotation.map_or_else(WalConfig::default, |rotation| {
+                        WalConfig::new(rotation.wal_rotation_bytes)
+                            .expect("test rotation bytes must be nonzero")
+                    }),
                 )
                 .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
             );
@@ -2980,6 +3020,11 @@ impl WyrdTestServerBuilder {
                                                 .to_owned(),
                                         )
                                     })?,
+                            )
+                            .with_test_faults(
+                                self.scribe_persistence_faults_for_test
+                                    .clone()
+                                    .unwrap_or_default(),
                             ),
                         ),
                         resources: bifrost_resources.scribe().ok_or_else(|| {
@@ -2988,6 +3033,7 @@ impl WyrdTestServerBuilder {
                             )
                         })?,
                         staging_file_publisher: Some(forge_publisher.clone()),
+                        rotation_for_test: rotation,
                     },
                 )
             } else {
@@ -3024,6 +3070,11 @@ impl WyrdTestServerBuilder {
                                                 .to_owned(),
                                         )
                                     })?,
+                            )
+                            .with_test_faults(
+                                self.scribe_persistence_faults_for_test
+                                    .clone()
+                                    .unwrap_or_default(),
                             ),
                         ),
                         resources: bifrost_resources.scribe().ok_or_else(|| {
@@ -3032,6 +3083,7 @@ impl WyrdTestServerBuilder {
                             )
                         })?,
                         staging_file_publisher: Some(forge_publisher.clone()),
+                        rotation_for_test: rotation,
                     },
                 )
                 .map_err(WyrdTestServerError::Start)?

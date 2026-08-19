@@ -7,6 +7,8 @@ use parquet::schema::types::ColumnPath;
 
 /// Complete version marker for the Bifrost physical Parquet writer recipe.
 pub(crate) const BIFROST_WRITER_RECIPE_VERSION: &str = "bifrost-writer-v2";
+/// Number of rows handed to parquet-rs for one internal column write batch.
+pub(crate) const PARQUET_WRITE_BATCH_ROWS: usize = 8_192;
 
 use super::memory::MAX_ROW_GROUP_ROWS;
 const BLOOM_FPP: f64 = 0.01;
@@ -62,6 +64,7 @@ pub fn bifrost_writer_properties_with_metadata(
         .set_compression(Compression::ZSTD(
             ZstdLevel::try_new(3).expect("zstd level 3 is valid"),
         ))
+        .set_write_batch_size(PARQUET_WRITE_BATCH_ROWS)
         .set_max_row_group_row_count(Some(MAX_ROW_GROUP_ROWS))
         .set_dictionary_enabled(false)
         .set_column_encoding(
@@ -103,6 +106,7 @@ mod tests {
             properties.max_row_group_row_count(),
             Some(MAX_ROW_GROUP_ROWS)
         );
+        assert_eq!(properties.write_batch_size(), PARQUET_WRITE_BATCH_ROWS);
         assert!(!properties.dictionary_enabled(&timestamp));
         assert_eq!(
             properties.encoding(&timestamp),

@@ -19,6 +19,10 @@ mod pg_tests {
     use chrono::Duration;
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use tower::ServiceExt;
+    use vala_bifrost_redux::resources::{
+        BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, ResourceSource,
+        SystemResourceSnapshot,
+    };
     use vala_bifrost_redux::scribe::{
         ScribeImpl,
         wal::{WalConfig, WalWriter},
@@ -29,7 +33,7 @@ mod pg_tests {
     };
     use wyrd_runtime::PrincipalId;
     use wyrd_server::components::auth::ServerAuth;
-    use wyrd_server::config::WyrdServerConfig;
+    use wyrd_server::config::{ScribeRuntimeConfig, WyrdServerConfig};
     use wyrd_server::postgres::ServerPostgres;
     use wyrd_server::state::{BifrostIngestRuntime, LimitsConfig};
     use wyrd_server::{AppState, WyrdServer};
@@ -38,6 +42,14 @@ mod pg_tests {
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
     async fn test_state() -> AppState {
+        test_state_with_ingest_limits(vala_bifrost_redux::gate::limits::IngestLimits::default())
+            .await
+    }
+
+    /// Builds the route fixture with one shared Gate-and-Scribe limit snapshot.
+    async fn test_state_with_ingest_limits(
+        ingest_limits: vala_bifrost_redux::gate::limits::IngestLimits,
+    ) -> AppState {
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
         let postgres = Arc::new(ServerPostgres::from_parts(
             wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None),
@@ -80,21 +92,48 @@ mod pg_tests {
             )
             .expect("wal initializes"),
         );
-        let scribe = Arc::new(ScribeImpl::new_for_embedded_with_deps_and_catalog(
-            Arc::new(storage.operator().clone()),
-            wal,
-            &uuid::Uuid::now_v7().to_string(),
-            1,
-            Arc::clone(&catalog),
-        ));
+        let scribe = Arc::new(
+            ScribeImpl::new_for_embedded_with_deps_and_catalog(
+                Arc::new(storage.operator().clone()),
+                wal,
+                &uuid::Uuid::now_v7().to_string(),
+                1,
+                Arc::clone(&catalog),
+            )
+            .with_ingest_limits_for_test(ingest_limits),
+        );
         let ingest = Arc::new(BifrostIngestRuntime::new(
             scribe,
             Arc::clone(&verifier),
-            vala_bifrost_redux::gate::limits::IngestLimits::default(),
+            ingest_limits,
             None,
         ));
         let gate = ingest.gate();
+        let resources = BifrostRuntimeResources::from_snapshot_with_transport_message_limit(
+            SystemResourceSnapshot {
+                memory_limit_bytes: 2 * 1024 * 1024 * 1024,
+                effective_cpu: 2,
+                scratch_capacity_bytes: 1024 * 1024 * 1024,
+                scratch_available_bytes: 1024 * 1024 * 1024,
+                memory_source: ResourceSource::Injected,
+                cpu_source: ResourceSource::Injected,
+            },
+            BifrostResourcePolicy {
+                roles: [BifrostRole::Scribe].into_iter().collect(),
+                memory_limit_bytes: None,
+                unmanaged_reserve_bytes: None,
+                scratch_limit_bytes: Some(512 * 1024 * 1024),
+                effective_cpu: None,
+                scratch_root: std::env::temp_dir(),
+                volume_roots: None,
+            },
+            ingest_limits.max_frame_bytes,
+        )
+        .expect("route-test resources")
+        .compose_roles()
+        .expect("route-test Scribe role");
         AppState::new(postgres, storage, catalog)
+            .with_bifrost_resources(resources)
             .with_bifrost_ingest(ingest)
             .with_bifrost_gate(gate)
             .with_auth(ServerAuth {
@@ -200,19 +239,59 @@ mod pg_tests {
         );
     }
 
+    /// Proves Scribe routes use their frozen ingest cap only while the role is active.
     #[tokio::test]
-    async fn extension_oversized_body_rejected() {
-        let state = test_state().await.with_limits(LimitsConfig {
-            body_bytes: 1024,
-            ..LimitsConfig::default()
-        });
-        let router = build_protected_server(state)
+    async fn pg_scribe_body_limit_is_route_and_role_local() {
+        let request_bytes = 201 * 1024 * 1024;
+        let scribe_config = ScribeRuntimeConfig {
+            ingest_request_bytes: request_bytes,
+            ..ScribeRuntimeConfig::default()
+        };
+        scribe_config
+            .validate()
+            .expect("supported request above the default validates");
+        let state = test_state_with_ingest_limits(scribe_config.ingest_limits())
+            .await
+            .with_limits(LimitsConfig {
+                body_bytes: 1024,
+                ..LimitsConfig::default()
+            });
+        let transport = state
+            .bifrost_resources
+            .as_ref()
+            .expect("Scribe role resources")
+            .transport_admission();
+        assert_eq!(
+            transport.message_limit_bytes(),
+            request_bytes,
+            "resource composition freezes the selected Scribe request maximum"
+        );
+        let tenant = DataTenantId::new_v7();
+        let principal = TokenPrincipalRef {
+            id: PrincipalId::new(uuid::Uuid::now_v7()),
+            kind: PrincipalKindTag::User,
+            tenant_id: tenant,
+            card_ref: None,
+            card_ref_scope: Default::default(),
+        };
+        let token = state
+            .auth
+            .issuing_key
+            .as_ref()
+            .expect("route fixture issuing key")
+            .issue_user_access_token(principal, vec![], Duration::minutes(5))
+            .expect("route fixture token");
+        let mut without_scribe = state.clone();
+        without_scribe.bifrost_gate = None;
+        without_scribe.bifrost_resources = None;
+        let router = build_protected_server(state.clone())
             .await
             .merge_http_protected(probe_router())
             .into_http_router();
 
         // Use the Content-Length fast path: no need to stream 1025 bytes.
         let response = router
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -229,6 +308,53 @@ mod pg_tests {
             StatusCode::PAYLOAD_TOO_LARGE,
             "body exceeding the limit must return 413"
         );
+        let above_default = 200 * 1024 * 1024 + 512 * 1024;
+        let scribe_response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/traces")
+                    .header("content-length", above_default.to_string())
+                    .header("content-type", "application/json")
+                    .header("x-wyrd-access-token", format!("Bearer {token}"))
+                    .body(Body::from("{invalid-json"))
+                    .expect("Scribe request builds"),
+            )
+            .await
+            .expect("Scribe router responds");
+        assert_eq!(
+            scribe_response.status(),
+            StatusCode::BAD_REQUEST,
+            "enabled Scribe route must reach the downstream OTLP decoder"
+        );
+        let scribe_body = to_bytes(scribe_response.into_body(), usize::MAX)
+            .await
+            .expect("Scribe decoder response collects");
+        let scribe_problem: serde_json::Value =
+            serde_json::from_slice(&scribe_body).expect("Scribe decoder response is JSON");
+        assert_eq!(
+            scribe_problem["code"], "WYRD_VALA_400_OTLP_REQUEST_MALFORMED",
+            "selected transport admission must yield the exact downstream decoder contract"
+        );
+        assert_eq!(
+            transport.used_bytes(),
+            0,
+            "downstream decoder completion releases the selected transport charge"
+        );
+        let absent_response = build_protected_server(without_scribe)
+            .await
+            .into_http_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/traces")
+                    .header("content-length", above_default.to_string())
+                    .body(Body::empty())
+                    .expect("role-absent request builds"),
+            )
+            .await
+            .expect("role-absent router responds");
+        assert_eq!(absent_response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         let body = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("body collects");

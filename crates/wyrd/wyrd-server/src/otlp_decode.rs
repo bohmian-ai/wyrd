@@ -89,7 +89,7 @@ impl TraceWireFacts {
     /// Returns the stable malformed-request error on overflow or when the
     /// immutable material ceiling would be exceeded.
     fn add_decode_bytes(&mut self, amount: usize) -> Result<(), IngestError> {
-        Self::add_count(&mut self.decode_bytes, amount, self.limits.material_bytes)
+        Self::add_count(&mut self.decode_bytes, amount, usize::MAX)
     }
 
     /// Records one repeated attribute element before visiting its payload.

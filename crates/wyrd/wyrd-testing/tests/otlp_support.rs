@@ -181,13 +181,13 @@ pub(crate) fn assert_otlp_owner_settled(srv: &WyrdTestServer) {
     assert_eq!(lifecycle.shard_transferred_bytes, lifecycle.reserved_bytes);
     assert_eq!(lifecycle.reserved_bytes, lifecycle.released_bytes);
     assert!(
-        lifecycle.transfers > 0 && lifecycle.transfers <= lifecycle.materializations,
-        "WAL transfers are a nonempty subset of materializations; post-COMMIT regeneration may materialize again: {lifecycle:?}"
+        lifecycle.transfers > 0 && lifecycle.transfers == lifecycle.materializations,
+        "WAL transfer count must match one materialization per accepted unit: {lifecycle:?}"
     );
     assert!(
         lifecycle.transferred_bytes > 0
-            && lifecycle.transferred_bytes <= lifecycle.materialized_bytes,
-        "WAL-owned bytes are a nonempty subset of materialized bytes; deterministic regeneration remains root-owned: {lifecycle:?}"
+            && lifecycle.transferred_bytes == lifecycle.materialized_bytes,
+        "WAL and memtable must consume the same materialized buffer bytes: {lifecycle:?}"
     );
     assert_eq!(
         lifecycle.succeeded

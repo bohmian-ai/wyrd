@@ -11,9 +11,6 @@ use std::sync::{Arc, Mutex};
 use crate::contracts::ScribeError;
 use crate::resources::ScribeResources;
 
-/// Maximum request size accepted by the Scribe seam.
-pub const MAX_REQUEST_BYTES: usize = 33_554_432;
-
 /// Fixed request overhead charged to every accepted append.
 pub const REQUEST_OVERHEAD_BYTES: usize = 4 * 1024;
 /// Fixed pod-global in-flight item ceiling from the Scribe contract.

@@ -129,6 +129,11 @@ pub struct BifrostNodeSpec {
 pub struct BifrostClusterSpec {
     /// Ordered node descriptors with unique stable identities.
     pub nodes: Vec<BifrostNodeSpec>,
+    /// Optional projection of the production Scribe rotation inputs for journeys.
+    scribe_rotation_for_test: Option<vala_bifrost_redux::scribe::ScribeRotationTestConfig>,
+    /// Optional deterministic controls for the real Scribe publisher.
+    scribe_persistence_faults_for_test:
+        Option<vala_bifrost_redux::scribe::persistence::PersistenceFaults>,
 }
 
 impl BifrostClusterSpec {
@@ -136,6 +141,30 @@ impl BifrostClusterSpec {
     #[must_use]
     pub fn one_mixed() -> Self {
         Self::mixed(1)
+    }
+
+    /// Apply small existing Scribe rotation thresholds to every Scribe node.
+    ///
+    /// The cluster forwards these inputs unchanged to the server-owned Scribe
+    /// graph, so a journey drives ordinary whole-shard rotation rather than a
+    /// Memtable-only substitute.
+    #[must_use]
+    pub fn with_scribe_rotation_for_test(
+        mut self,
+        rotation: vala_bifrost_redux::scribe::ScribeRotationTestConfig,
+    ) -> Self {
+        self.scribe_rotation_for_test = Some(rotation);
+        self
+    }
+
+    /// Installs deterministic controls in each real Scribe persistence graph.
+    #[must_use]
+    pub fn with_scribe_persistence_faults_for_test(
+        mut self,
+        faults: vala_bifrost_redux::scribe::persistence::PersistenceFaults,
+    ) -> Self {
+        self.scribe_persistence_faults_for_test = Some(faults);
+        self
     }
 
     /// Applies one raw process observation to every Oracle node.
@@ -196,7 +225,11 @@ impl BifrostClusterSpec {
             ],
         )];
         nodes.extend((2..=4).map(|id| Self::node(id, [BifrostRuntimeRole::Forge])));
-        Self { nodes }
+        Self {
+            nodes,
+            scribe_rotation_for_test: None,
+            scribe_persistence_faults_for_test: None,
+        }
     }
 
     /// Construct the deterministic three-Server/three-ForgeWorker matrix.
@@ -220,7 +253,11 @@ impl BifrostClusterSpec {
             })
             .collect::<Vec<_>>();
         nodes.extend((4..=6).map(|id| Self::node(id, [BifrostRuntimeRole::Forge])));
-        Self { nodes }
+        Self {
+            nodes,
+            scribe_rotation_for_test: None,
+            scribe_persistence_faults_for_test: None,
+        }
     }
 
     /// Build `count` mixed nodes with deterministic identities.
@@ -238,6 +275,8 @@ impl BifrostClusterSpec {
                     )
                 })
                 .collect(),
+            scribe_rotation_for_test: None,
+            scribe_persistence_faults_for_test: None,
         }
     }
 
@@ -711,6 +750,11 @@ pub struct WyrdTestCluster {
     scribe_admission: Option<AdmissionConfig>,
     /// Optional node receiving the deterministic admission override.
     scribe_admission_node: Option<NodeId>,
+    /// Optional test-only production rotation projection retained across restarts.
+    scribe_rotation_for_test: Option<vala_bifrost_redux::scribe::ScribeRotationTestConfig>,
+    /// Optional test-only persistence controls retained across restarts.
+    scribe_persistence_faults_for_test:
+        Option<vala_bifrost_redux::scribe::persistence::PersistenceFaults>,
     /// Scoped transport fault state.
     faults: OracleFaultController,
     /// Read-only process telemetry handle.
@@ -1562,6 +1606,8 @@ impl WyrdTestCluster {
     ) -> Result<Self, ClusterError> {
         let (options, resource_source) = harness;
         spec.validate()?;
+        let scribe_rotation_for_test = spec.scribe_rotation_for_test;
+        let scribe_persistence_faults_for_test = spec.scribe_persistence_faults_for_test.clone();
         let process = process_telemetry()?;
         // `explicit_root` is the storage root to reuse (a shared or a
         // caller-declared dedicated root); `None` selects a temporary root.
@@ -1734,6 +1780,8 @@ impl WyrdTestCluster {
             wal_sync_delay,
             scribe_admission,
             scribe_admission_node,
+            scribe_rotation_for_test,
+            scribe_persistence_faults_for_test,
             faults: OracleFaultController::default(),
             telemetry: process.forge_capture.clone(),
             oracle_peer_credentials,
@@ -1799,6 +1847,12 @@ impl WyrdTestCluster {
             && (self.scribe_admission_node.is_none() || self.scribe_admission_node == Some(node_id))
         {
             builder = builder.with_scribe_admission_for_test(admission);
+        }
+        if let Some(rotation) = self.scribe_rotation_for_test {
+            builder = builder.with_scribe_rotation_for_test(rotation);
+        }
+        if let Some(faults) = &self.scribe_persistence_faults_for_test {
+            builder = builder.with_scribe_persistence_faults_for_test(faults.clone());
         }
         if let Some((_, tls)) = &self.oracle_peer_tls {
             builder = builder.with_oracle_peer_tls(tls.clone());

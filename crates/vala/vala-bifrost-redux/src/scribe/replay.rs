@@ -30,19 +30,6 @@ use crate::scribe::wal::{
 };
 
 const REPLAY_RECORD_OVERHEAD_BYTES: usize = 1024;
-/// Maximum accounted decode memory held by one streamed replay batch.
-///
-/// One accepted native request can produce at most one slice for each
-/// canonical source/day pair. Replay simultaneously retains the validated WAL
-/// payload and its decoded audit/IPC fields until the terminal COMMIT arrives,
-/// so the envelope is twice the admitted projection ceiling plus one fixed
-/// metadata allowance for every possible source/day slice.
-pub const REPLAY_BATCH_MEMORY_BYTES: usize = crate::gate::limits::OTLP_WIRE_LIMITS.material_bytes
-    * 2
-    + REPLAY_RECORD_OVERHEAD_BYTES
-        * crate::gate::limits::BIFROST_NATIVE_SOURCE_LIMIT
-        * crate::gate::limits::OTLP_WIRE_LIMITS.event_days;
-
 /// Replayed state for one seal-key.
 ///
 /// The `shard_id` field carries the pod-local shard lane recorded in the WAL
@@ -116,8 +103,6 @@ pub struct ReplayChunk {
 /// Synchronous settlement returned before the replay scanner advances.
 #[derive(Debug)]
 pub(crate) struct ReplayChunkSettlement {
-    /// Whether every state in the chunk reached durable retirement.
-    pub(crate) retired: bool,
     /// The same committed-identity lease restored to Decode ownership.
     pub(crate) identity_memory: Option<ScribeMemoryLease>,
 }
@@ -136,6 +121,12 @@ pub(crate) struct ReplayChunkResponse {
 pub struct ReplayedAppendMeta {
     /// Batch ID for dedup.
     pub batch_id: [u8; 16],
+    /// SHA-256 digest of the exact WAL-v4 slice payload.
+    pub payload_digest: [u8; 32],
+    /// Exact WAL-v4 slice payload length.
+    pub payload_len: u32,
+    /// Complete committed batch slice count.
+    pub slice_count: u32,
     /// LSN for this append.
     pub wal_lsn: WalLsn,
     /// Number of rows in this append, when the Arrow IPC payload decoded.
@@ -193,7 +184,6 @@ pub fn replay_wal_directory_stream(
     let mut emit = emit;
     replay_wal_directory_stream_accounted(wal_dir, None, None, None, None, |chunk| {
         emit(chunk).map(|()| ReplayChunkSettlement {
-            retired: false,
             identity_memory: None,
         })
     })
@@ -251,36 +241,59 @@ pub(crate) fn replay_wal_directory_stream_accounted(
                 governor,
             )?);
         }
-        accumulators
-            .get_mut(&key)
-            .ok_or_else(|| ScribeError::Internal {
-                detail: "replay accumulator disappeared after insertion".to_owned(),
-            })?
-            .append(segment_path, &record, payload_memory)?;
-        // A WAL record is the indivisible replay unit. Hand it off immediately
-        // so partial accumulators from other shard streams cannot retain decode
-        // reservations while publication owns immutable and encoding workspace.
-        // The existing synchronous callback supplies the required backpressure.
-        let identity_owner_bytes = replay_identity_owner_bytes(&accumulators)?;
-        let accumulator = accumulators
-            .get_mut(&key)
-            .ok_or_else(|| ScribeError::Internal {
-                detail: "replay accumulator disappeared before handoff".to_owned(),
-            })?;
-        if let Some(mut chunk) = accumulator.take_chunk()? {
-            chunk.identity_owner_bytes = identity_owner_bytes;
-            let settlement = emit(chunk)?;
-            accumulator.identity_memory = settlement.identity_memory;
-            if !settlement.retired {
-                accumulator.mark_current_segment_unsettled();
-            }
-            if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
-                return Err(ScribeError::Internal {
-                    detail: "WAL replay cancelled".to_owned(),
-                });
+        let segment_changed = accumulators
+            .get(&key)
+            .and_then(|accumulator| accumulator.current_segment_path.as_ref())
+            .is_some_and(|current| current != &segment_path);
+        if segment_changed {
+            let accumulator = accumulators
+                .get_mut(&key)
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "replay accumulator disappeared at segment boundary".to_owned(),
+                })?;
+            // WAL v4 may roll between a SLICE and its terminal COMMIT. Keep
+            // that incomplete batch and its segment refs together, then emit
+            // at the first later boundary where no batch crosses the cut.
+            if accumulator.pending_batches.is_empty() {
+                let identity_owner_bytes = replay_identity_owner_bytes(&accumulators)?;
+                let accumulator =
+                    accumulators
+                        .get_mut(&key)
+                        .ok_or_else(|| ScribeError::Internal {
+                            detail: "replay accumulator disappeared before boundary handoff"
+                                .to_owned(),
+                        })?;
+                if let Some(mut chunk) = accumulator.take_chunk()? {
+                    chunk.identity_owner_bytes = identity_owner_bytes;
+                    let settlement = emit(chunk)?;
+                    accumulator.identity_memory = settlement.identity_memory;
+                }
             }
         }
-        Ok(accumulator.segment_retirement_safe())
+        let completed_unit = accumulators
+            .get_mut(&key)
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "replay accumulator disappeared before append".to_owned(),
+            })?
+            .append(segment_path, &record, payload_memory)?;
+        if completed_unit {
+            let identity_owner_bytes = replay_identity_owner_bytes(&accumulators)?;
+            let accumulator = accumulators
+                .get_mut(&key)
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "replay accumulator disappeared before unit handoff".to_owned(),
+                })?;
+            if let Some(mut chunk) = accumulator.take_chunk()? {
+                chunk.identity_owner_bytes = identity_owner_bytes;
+                let settlement = emit(chunk)?;
+                accumulator.identity_memory = settlement.identity_memory;
+            }
+        }
+        // A completely cursor-suppressed segment has no cohort member and can
+        // retire at EOF. Any pending/visible state remains pinned for handoff.
+        Ok(accumulators
+            .get(&key)
+            .is_some_and(ReplayAccumulator::segment_retirement_safe))
     })?;
 
     let accumulator_keys = accumulators.keys().copied().collect::<Vec<_>>();
@@ -372,22 +385,24 @@ struct ReplayAccumulator<'a> {
     sealed_lsn_map: HashMap<String, WalLsn>,
     /// Incomplete v4 batches retained until their terminal COMMIT is read.
     pending_batches: HashMap<[u8; 16], PendingBatch>,
+    /// Decode ownership retained exclusively by incomplete slice sets.
+    pending_memory: Option<ScribeMemoryLease>,
     /// Accounted canonical identities of completed slice sets already emitted.
     committed_batches: Vec<CommittedBatchEntry>,
     /// In-flight replay state keyed by seal-key path.
     states: HashMap<String, ReplayedSealKey>,
     /// Optional memory governor supplied by the production WAL lane.
     governor: Option<&'a ScribeResources>,
-    /// Current memory reservation for the in-flight batch.
+    /// Decode ownership for commit-authorized state awaiting handoff.
     memory: Option<ScribeMemoryLease>,
     /// Fixed replay-history reservation retained until this stream scan ends.
     identity_memory: Option<ScribeMemoryLease>,
-    /// Accounted bytes for the in-flight batch.
+    /// Accounted bytes for commit-authorized state awaiting handoff.
     memory_bytes: usize,
+    /// Accounted bytes retained by incomplete slice sets.
+    pending_memory_bytes: usize,
     /// Segment currently contributing records to this shard accumulator.
     current_segment_path: Option<std::path::PathBuf>,
-    /// Whether a group from the current segment failed to reach retirement settlement.
-    current_segment_unsettled: bool,
 }
 
 impl<'a> ReplayAccumulator<'a> {
@@ -411,23 +426,32 @@ impl<'a> ReplayAccumulator<'a> {
         let identity_memory = governor
             .map(|governor| governor.try_reserve_maintenance(MemoryCategory::Decode, 0))
             .transpose()?;
+        let pending_memory = governor
+            .map(|governor| governor.try_reserve_maintenance(MemoryCategory::Decode, 0))
+            .transpose()?;
         Ok(Self {
             stream,
             shard_id,
             sealed_lsn_map,
             pending_batches: HashMap::new(),
+            pending_memory,
             committed_batches: Vec::new(),
             states: HashMap::new(),
             governor,
             memory,
             identity_memory,
             memory_bytes: 0,
+            pending_memory_bytes: 0,
             current_segment_path: None,
-            current_segment_unsettled: false,
         })
     }
 
     /// Decodes one WAL record and releases slices only after their COMMIT.
+    ///
+    /// Returns `true` when this record completed a validated unit that can move
+    /// immediately into the governed immutable owner. Incomplete slice sets
+    /// retain distinct decode ownership, so writer-ordered slice groups cannot
+    /// retain completed groups before their later sibling COMMITs arrive.
     ///
     /// # Errors
     ///
@@ -438,57 +462,64 @@ impl<'a> ReplayAccumulator<'a> {
         segment_path: std::path::PathBuf,
         record: &crate::scribe::wal::WalRecord,
         payload_memory: Option<ScribeMemoryLease>,
-    ) -> Result<(), ScribeError> {
+    ) -> Result<bool, ScribeError> {
         if self.current_segment_path.as_ref() != Some(&segment_path) {
             self.current_segment_path = Some(segment_path.clone());
-            self.current_segment_unsettled = false;
-        }
-        // The WAL reader retains one validated payload while replay owns at
-        // most one exact record clone plus decoded variable fields whose total
-        // cannot exceed that payload. The fixed metadata ceiling covers the
-        // owned seal-key/path and descriptor layouts.
-        let record_memory_bytes = record
-            .payload
-            .len()
-            .checked_add(record.payload.len())
-            .and_then(|bytes| bytes.checked_add(REPLAY_RECORD_OVERHEAD_BYTES))
-            .ok_or_else(|| ScribeError::Internal {
-                detail: "replay record ownership plan overflow".to_owned(),
-            })?;
-        let previous_memory = self.memory_bytes;
-        let next_memory = previous_memory
-            .checked_add(record_memory_bytes)
-            .ok_or_else(|| ScribeError::Internal {
-                detail: "replay batch ownership plan overflow".to_owned(),
-            })?;
-        if next_memory > REPLAY_BATCH_MEMORY_BYTES {
-            return Err(ScribeError::IngestBusy {
-                table: "WAL replay batch".to_owned(),
-            });
-        }
-        if let Some(payload_memory) = payload_memory {
-            let memory = self.memory.as_mut().ok_or_else(|| ScribeError::Internal {
-                detail: "accounted WAL payload lacks a replay decode owner".to_owned(),
-            })?;
-            memory
-                .merge(payload_memory)
-                .map_err(|error| ScribeError::Internal {
-                    detail: error.to_string(),
-                })?;
-        }
-        if let Some(memory) = self.memory.as_mut() {
-            memory.resize_ingress(next_memory)?;
         }
         if record.is_commit() {
             self.commit(&segment_path, record)?;
-            self.resize_memory(self.memory_bytes)?;
-            return Ok(());
+            return Ok(!self.states.is_empty());
         }
         if !record.is_slice() {
             return Err(ScribeError::Internal {
                 detail: "WAL v4 contains an unknown record flag".to_owned(),
             });
         }
+        if self.validate_pending_slice_header(record)? {
+            return Ok(false);
+        }
+        // The WAL reader retains one validated payload while replay owns one
+        // exact slice clone plus decoded fields. Pending slices retain that
+        // ownership independently from commit-authorized handoff state.
+        let record_memory_bytes = replay_record_memory_bytes(record)?;
+        let batch_memory_bytes = self
+            .pending_batches
+            .get(&record.batch_id)
+            .map(PendingBatch::memory_bytes)
+            .transpose()?
+            .unwrap_or_default()
+            .checked_add(record_memory_bytes)
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "replay pending-batch ownership plan overflow".to_owned(),
+            })?;
+        if self
+            .governor
+            .is_some_and(|governor| batch_memory_bytes > governor.maximum_ingress_envelope_bytes())
+        {
+            return Err(ScribeError::IngestBusy {
+                table: "WAL replay batch".to_owned(),
+            });
+        }
+        let previous_memory = self.pending_memory_bytes;
+        let next_memory = previous_memory
+            .checked_add(record_memory_bytes)
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "replay pending ownership plan overflow".to_owned(),
+            })?;
+        if let Some(payload_memory) = payload_memory {
+            let memory = self
+                .pending_memory
+                .as_mut()
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "accounted WAL payload lacks a pending replay decode owner".to_owned(),
+                })?;
+            memory
+                .merge(payload_memory)
+                .map_err(|error| ScribeError::Internal {
+                    detail: error.to_string(),
+                })?;
+        }
+        self.resize_pending_memory(next_memory)?;
         let decoded = decode_slice_payload(&record.payload)?;
         let seal_key = decoded.seal_key.clone();
         let append_slice_id = AppendSliceId {
@@ -512,15 +543,6 @@ impl<'a> ReplayAccumulator<'a> {
                 detail: "WAL v4 batch has contradictory slice-set identity".to_owned(),
             });
         }
-        if let Some(existing) = pending.slices.get(&record.slice_index) {
-            if !same_slice_retry_facts(&existing.record, record) {
-                return Err(ScribeError::Internal {
-                    detail: "WAL v4 batch has a contradictory duplicate slice".to_owned(),
-                });
-            }
-            self.resize_memory(previous_memory)?;
-            return Ok(());
-        }
         pending.slices.insert(
             record.slice_index,
             PendingSlice {
@@ -531,8 +553,36 @@ impl<'a> ReplayAccumulator<'a> {
                 seal_key_path,
             },
         );
-        self.memory_bytes = next_memory;
-        Ok(())
+        self.pending_memory_bytes = next_memory;
+        Ok(false)
+    }
+
+    /// Validates slice-set headers before any additional replay ownership is charged.
+    ///
+    /// Returns `true` for an exact duplicate slice that requires no decode or
+    /// allocation and `false` for a new ordinal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] for contradictory batch or duplicate identity.
+    fn validate_pending_slice_header(&self, record: &WalRecord) -> Result<bool, ScribeError> {
+        let Some(pending) = self.pending_batches.get(&record.batch_id) else {
+            return Ok(false);
+        };
+        if pending.tenant_id != record.tenant_id || pending.slice_count != record.slice_count {
+            return Err(ScribeError::Internal {
+                detail: "WAL v4 batch has contradictory slice-set identity".to_owned(),
+            });
+        }
+        let Some(existing) = pending.slices.get(&record.slice_index) else {
+            return Ok(false);
+        };
+        if !same_slice_retry_facts(&existing.record, record) {
+            return Err(ScribeError::Internal {
+                detail: "WAL v4 batch has a contradictory duplicate slice".to_owned(),
+            });
+        }
+        Ok(true)
     }
 
     /// Validates one terminal COMMIT and moves its complete slice set into replay state.
@@ -555,12 +605,14 @@ impl<'a> ReplayAccumulator<'a> {
             }
             if let Some(pending) = self.pending_batches.remove(&record.batch_id) {
                 validate_pending_batch(&pending, record)?;
-                self.memory_bytes = self
-                    .memory_bytes
-                    .checked_sub(pending.memory_bytes()?)
+                let bytes = pending.memory_bytes()?;
+                self.pending_memory_bytes = self
+                    .pending_memory_bytes
+                    .checked_sub(bytes)
                     .ok_or_else(|| ScribeError::Internal {
                         detail: "replay duplicate settlement underflow".to_owned(),
                     })?;
+                self.resize_pending_memory(self.pending_memory_bytes)?;
             }
             return Ok(());
         }
@@ -571,6 +623,8 @@ impl<'a> ReplayAccumulator<'a> {
                 detail: "WAL v4 COMMIT has no preceding complete slice set".to_owned(),
             })?;
         validate_pending_batch(&pending, record)?;
+        let pending_bytes = pending.memory_bytes()?;
+        self.transfer_pending_to_completed(pending_bytes)?;
         let commit = replayed_commit_identity(segment_path, &pending, record)?;
         for slice in pending.slices.into_values() {
             if self
@@ -586,6 +640,38 @@ impl<'a> ReplayAccumulator<'a> {
             batch_id: record.batch_id,
             identity: CommittedBatchIdentity::from_commit(record),
         });
+        Ok(())
+    }
+
+    /// Moves one validated slice set from pending decode ownership to the
+    /// commit-authorized handoff owner without reacquiring root capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] if the paired replay owners cannot
+    /// reconcile the exact validated slice-set bytes.
+    fn transfer_pending_to_completed(&mut self, bytes: usize) -> Result<(), ScribeError> {
+        match (self.pending_memory.as_mut(), self.memory.as_mut()) {
+            (Some(pending), Some(completed)) => pending.transfer_bytes_to(completed, bytes)?,
+            (None, None) => {}
+            _ => {
+                return Err(ScribeError::Internal {
+                    detail: "replay decode ownership is only partially initialized".to_owned(),
+                });
+            }
+        }
+        self.pending_memory_bytes =
+            self.pending_memory_bytes
+                .checked_sub(bytes)
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "replay pending settlement underflow".to_owned(),
+                })?;
+        self.memory_bytes =
+            self.memory_bytes
+                .checked_add(bytes)
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "replay completed ownership overflow".to_owned(),
+                })?;
         Ok(())
     }
 
@@ -669,6 +755,13 @@ impl<'a> ReplayAccumulator<'a> {
         state.data_records.push(slice.decoded.data);
         state.append_metas.push(ReplayedAppendMeta {
             batch_id: slice.record.batch_id,
+            payload_digest: Sha256::digest(&slice.record.payload).into(),
+            payload_len: u32::try_from(slice.record.payload.len()).map_err(|_| {
+                ScribeError::Internal {
+                    detail: "replayed WAL payload exceeds its u32 record bound".to_owned(),
+                }
+            })?,
+            slice_count: slice.record.slice_count,
             wal_lsn: slice.record.lsn,
             rows_accepted,
             append_slice_id: slice.append_slice_id,
@@ -677,7 +770,7 @@ impl<'a> ReplayAccumulator<'a> {
         Ok(())
     }
 
-    /// Move the current batch into a handoff and start a fresh reservation.
+    /// Move commit-authorized state into a handoff and retain pending slices.
     ///
     /// # Errors
     ///
@@ -685,7 +778,7 @@ impl<'a> ReplayAccumulator<'a> {
     /// occupied, or [`ScribeError::Internal`] for accounting, poison, or other
     /// resource-owner failures.
     fn take_chunk(&mut self) -> Result<Option<ReplayChunk>, ScribeError> {
-        if self.states.is_empty() || !self.pending_batches.is_empty() {
+        if self.states.is_empty() {
             return Ok(None);
         }
         let next_memory = self
@@ -703,34 +796,41 @@ impl<'a> ReplayAccumulator<'a> {
         Ok(Some(chunk))
     }
 
-    /// Resize the current batch after a record is rejected by deduplication or
-    /// the manifest watermark.
+    /// Resize ownership for incomplete slice sets after replay validation.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::IngestBusy`] when the replay reservation cannot
-    /// resize because its envelope is occupied, or [`ScribeError::Internal`]
-    /// for accounting, poison, or other resource-owner failures.
-    fn resize_memory(&mut self, bytes: usize) -> Result<(), ScribeError> {
-        if let Some(memory) = self.memory.as_mut() {
+    /// Returns [`ScribeError::Internal`] when pending state has no decode
+    /// owner, or propagates the root-governed resize refusal.
+    fn resize_pending_memory(&mut self, bytes: usize) -> Result<(), ScribeError> {
+        if let Some(memory) = self.pending_memory.as_mut() {
             memory.resize_ingress(bytes)?;
         }
         Ok(())
     }
 
-    /// Returns whether the current record left no unpublished replay group.
-    ///
-    /// The WAL reader uses this only for its completed-segment pin: a false
-    /// value preserves the source file even after clean EOF.
+    /// Returns whether the current segment produced no unpublished state.
     #[must_use]
     fn segment_retirement_safe(&self) -> bool {
-        self.pending_batches.is_empty() && self.states.is_empty() && !self.current_segment_unsettled
+        self.pending_batches.is_empty() && self.states.is_empty()
     }
+}
 
-    /// Marks the current segment non-retirable after a handoff remains unpublished.
-    fn mark_current_segment_unsettled(&mut self) {
-        self.current_segment_unsettled = true;
-    }
+/// Returns the exact decode reservation retained for one pending WAL slice.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::Internal`] when the fixed replay ownership plan
+/// overflows `usize`.
+fn replay_record_memory_bytes(record: &WalRecord) -> Result<usize, ScribeError> {
+    record
+        .payload
+        .len()
+        .checked_add(record.payload.len())
+        .and_then(|bytes| bytes.checked_add(REPLAY_RECORD_OVERHEAD_BYTES))
+        .ok_or_else(|| ScribeError::Internal {
+            detail: "replay record ownership plan overflow".to_owned(),
+        })
 }
 
 /// A v4 slice set held until its terminal WAL COMMIT proves it complete.
@@ -1123,13 +1223,14 @@ mod tests {
         let identity_bytes = replay_identity_owner_bytes(&accumulators)
             .expect("aggregate replay identity ownership");
         assert_eq!(identity_bytes, 3 * MIB);
-        let generation_bytes = 96 * MIB;
+        // Identity and immutable ownership remain charged while the one
+        // incremental producer workspace is handed off under the root fence.
+        let generation_bytes = 61 * MIB;
         let generation = resources
             .try_reserve_maintenance(MemoryCategory::Immutable, generation_bytes)
             .expect("replay generation ownership");
-        let producer_delta =
-            crate::scribe::memory::parquet_producer_delta(generation_bytes + identity_bytes)
-                .expect("aggregate producer delta");
+        let producer_delta = crate::scribe::memory::parquet_candidate_incremental_bytes(24 * MIB)
+            .expect("candidate incremental workspace");
         let producer = resources
             .try_reserve_maintenance(MemoryCategory::Persistence, producer_delta)
             .expect("aggregate identity projection preserves exact-floor admission");
@@ -1138,7 +1239,7 @@ mod tests {
                 .snapshot()
                 .expect("full producer tuple")
                 .scribe_memory_used_bytes,
-            256 * MIB
+            generation_bytes + identity_bytes + producer_delta
         );
         drop(producer);
         drop(generation);
@@ -1267,6 +1368,94 @@ mod tests {
         //
     }
 
+    /// Existing v4 headers, slice/commit identities, and the manifest cursor
+    /// reconstruct one stable remaining cohort without a new WAL marker.
+    #[test]
+    fn replay_reconstructs_cohort_from_v4_segment_without_new_format() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let node_id = NodeId::generate();
+        let tenant = crate::test_support::tenant();
+        let writer = WalWriter::new(
+            temp_dir.path(),
+            *node_id.as_bytes(),
+            9,
+            WalConfig::default(),
+        )
+        .expect("writer");
+        let keys = [14_u32, 15, 16].map(|day| {
+            SealKey::new(
+                tenant,
+                TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "events"),
+                EventDay::new(NaiveDate::from_ymd_opt(2026, 7, day).expect("cohort event day")),
+            )
+        });
+        let event = AuditEvent {
+            request_id: RequestId::now_v7(),
+            trace_id: None,
+            operation: "append".to_owned(),
+            resource: "bifrost.events".to_owned(),
+            card_ref: None,
+            principal_id: PrincipalId::new(uuid::Uuid::new_v4()),
+            principal_kind: PrincipalKindTag::User,
+            auth_method: AuthMethod::Jwt,
+            permission: "test".to_owned(),
+            decision: AuditDecision::Allow,
+            result: AuditResult::Success,
+            payload_summary: "1 rows".to_owned(),
+            detail: None,
+        };
+        let audit = crate::scribe::audit_envelope::encode_audit_event(&event).expect("audit");
+        let mut batch_ids = Vec::new();
+        let target_shard = crate::scribe::routing::shard_for(
+            tenant,
+            &keys[0].table,
+            uuid::Uuid::from_bytes([0; 16]),
+        );
+        for candidate in 0_u128..10_000 {
+            let id = uuid::Uuid::from_u128(candidate);
+            if crate::scribe::routing::shard_for(tenant, &keys[0].table, id) == target_shard {
+                batch_ids.push(*id.as_bytes());
+                if batch_ids.len() == keys.len() {
+                    break;
+                }
+            }
+        }
+        assert_eq!(batch_ids.len(), keys.len());
+        let first_lsn = writer
+            .append_and_commit_for_replay_test(&keys[0], batch_ids[0], &audit, b"committed-a")
+            .expect("committed A");
+        writer
+            .append_and_commit_for_replay_test(&keys[1], batch_ids[1], &audit, b"pending-b")
+            .expect("pending B");
+        writer
+            .append_and_commit_for_replay_test(&keys[2], batch_ids[2], &audit, b"active-c")
+            .expect("active C");
+        let stream = crate::scribe::stream_identity::StreamIdentity::new(
+            node_id,
+            crate::scribe::stream_identity::WriterEpoch::new(9),
+        );
+        let mut manifest = crate::scribe::manifest::Manifest::new(stream);
+        manifest.update_sealed_lsn(&keys[0], first_lsn);
+        crate::scribe::manifest::write_atomic(
+            stream_directory(temp_dir.path(), stream).join("manifest"),
+            &manifest,
+        )
+        .expect("committed A cursor");
+
+        let replayed = replay_wal_directory(temp_dir.path()).expect("mixed cohort replay");
+        assert!(!replayed.contains_key(&keys[0].as_path_components()));
+        let pending = &replayed[&keys[1].as_path_components()];
+        let active = &replayed[&keys[2].as_path_components()];
+        assert_eq!(pending.append_metas[0].batch_id, batch_ids[1]);
+        assert_eq!(active.append_metas[0].batch_id, batch_ids[2]);
+        assert_eq!(pending.wal_segments, active.wal_segments);
+        assert_eq!(
+            pending.wal_segments.len(),
+            1,
+            "one closed-segment owner set"
+        );
+    }
+
     /// Recovery selects every lower epoch for the stable node and excludes a
     /// foreign node even when it has an otherwise valid WAL stream.
     #[test]
@@ -1317,7 +1506,6 @@ mod tests {
             |mut chunk| {
                 recovered.extend(chunk.states.into_values().map(|state| state.stream));
                 Ok(ReplayChunkSettlement {
-                    retired: false,
                     identity_memory: chunk.identity_memory.take(),
                 })
             },
@@ -1492,10 +1680,7 @@ mod tests {
             |mut chunk| {
                 let identity_memory = chunk.identity_memory.take();
                 chunks.push(chunk);
-                Ok(ReplayChunkSettlement {
-                    retired: false,
-                    identity_memory,
-                })
+                Ok(ReplayChunkSettlement { identity_memory })
             },
         )
         .expect("streamed replay");
@@ -1577,10 +1762,7 @@ mod tests {
                         .map(|state| state.append_metas.len())
                         .sum::<usize>(),
                 );
-                Ok(ReplayChunkSettlement {
-                    retired: false,
-                    identity_memory,
-                })
+                Ok(ReplayChunkSettlement { identity_memory })
             },
         )
         .expect("replay");
@@ -1620,7 +1802,6 @@ mod tests {
             None,
             |mut chunk| {
                 Ok(ReplayChunkSettlement {
-                    retired: false,
                     identity_memory: chunk.identity_memory.take(),
                 })
             },
@@ -1675,7 +1856,6 @@ mod tests {
                 settled = settled.saturating_add(chunk.states.len());
                 cancelled.store(true, Ordering::Release);
                 Ok(ReplayChunkSettlement {
-                    retired: false,
                     identity_memory: chunk.identity_memory.take(),
                 })
             },
@@ -1921,6 +2101,139 @@ mod tests {
         assert_eq!(state.append_metas.len(), 2);
         assert_eq!(state.append_metas[0].append_slice_id.slice_index, 0);
         assert_eq!(state.append_metas[1].append_slice_id.slice_index, 1);
+    }
+
+    /// Proves production writer ordering emits each committed batch while an
+    /// unrelated cross-segment slice set remains pending under a near-full
+    /// replay root reservation.
+    #[test]
+    fn replay_handoffs_commit_units_before_later_group_commits() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let node_id = NodeId::generate();
+        let tenant = crate::test_support::tenant();
+        let wal = WalWriter::new(
+            temp_dir.path(),
+            *node_id.as_bytes(),
+            1,
+            WalConfig::new(16 * 1024).expect("small rotating WAL config"),
+        )
+        .expect("writer");
+        let seal_key = replay_key(tenant);
+        let audit = crate::scribe::audit_envelope::encode_audit_event(&AuditEvent {
+            request_id: RequestId::now_v7(),
+            trace_id: None,
+            operation: "writer-ordered-group".to_owned(),
+            resource: "bifrost.events".to_owned(),
+            card_ref: None,
+            principal_id: PrincipalId::new(uuid::Uuid::new_v4()),
+            principal_kind: PrincipalKindTag::User,
+            auth_method: AuthMethod::Jwt,
+            permission: "test".to_owned(),
+            decision: AuditDecision::Allow,
+            result: AuditResult::Success,
+            payload_summary: "writer group".to_owned(),
+            detail: None,
+        })
+        .expect("audit");
+        let shard_id = u8::try_from(crate::scribe::routing::shard_for(
+            tenant,
+            &seal_key.table,
+            uuid::Uuid::nil(),
+        ))
+        .expect("fixed shard count fits u8");
+        let complete_batches = [[1_u8; 16], [2_u8; 16], [3_u8; 16]];
+        let pending_batch = [4_u8; 16];
+        let payload = vec![9_u8; 6 * 1024];
+        let mut digests = Vec::new();
+        let mut touched = Vec::new();
+
+        for batch_id in complete_batches {
+            let mut append = PreparedWalAppend::new(
+                WalLsn::ZERO,
+                batch_id,
+                Bytes::copy_from_slice(&audit),
+                Bytes::copy_from_slice(&payload),
+            )
+            .for_slice(seal_key.clone(), [3; 32]);
+            append.shard_id = Some(shard_id);
+            let result = wal.append_prepared(append).expect("writer slice");
+            let mut digest = Sha256::new();
+            digest.update(0_u32.to_le_bytes());
+            digest.update(result.payload_len.to_le_bytes());
+            digest.update(result.payload_digest);
+            digests.push(digest.finalize().into());
+            touched.extend(result.touched_segments);
+        }
+
+        for slice_index in 0_u32..2 {
+            let mut append = PreparedWalAppend::new(
+                WalLsn::ZERO,
+                pending_batch,
+                Bytes::copy_from_slice(&audit),
+                Bytes::copy_from_slice(&payload),
+            )
+            .for_slice(seal_key.clone(), [3; 32]);
+            append.assign_slice_ordinal(slice_index, 2);
+            append.shard_id = Some(shard_id);
+            touched.extend(
+                wal.append_prepared(append)
+                    .expect("cross-segment pending slice")
+                    .touched_segments,
+            );
+        }
+
+        for (batch_id, digest) in complete_batches.into_iter().zip(digests) {
+            let mut commit =
+                PreparedWalAppend::commit(batch_id, *tenant.as_uuid().as_bytes(), 1, digest);
+            commit.shard_id = Some(shard_id);
+            touched.extend(
+                wal.append_prepared(commit)
+                    .expect("writer group commit")
+                    .touched_segments,
+            );
+        }
+        WalWriter::sync_segments(&touched).expect("sync writer group");
+
+        let resources =
+            crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
+        let baseline = resources.snapshot().expect("baseline");
+        let near_full = resources
+            .try_reserve_maintenance(
+                MemoryCategory::Decode,
+                resources.ingress_limit_bytes().saturating_sub(128 * 1024),
+            )
+            .expect("near-full replay root reservation");
+        let mut chunks = Vec::new();
+        replay_wal_directory_stream_accounted(
+            temp_dir.path(),
+            None,
+            Some(&resources),
+            None,
+            None,
+            |mut chunk| {
+                let identity_memory = chunk.identity_memory.take();
+                chunks.push(chunk);
+                Ok(ReplayChunkSettlement { identity_memory })
+            },
+        )
+        .expect("replay writer-ordered group");
+
+        assert_eq!(chunks.len(), complete_batches.len());
+        assert!(chunks.iter().all(|chunk| {
+            chunk
+                .states
+                .values()
+                .all(|state| state.append_metas.len() == 1 && state.commits.len() == 1)
+        }));
+        drop(chunks);
+        drop(near_full);
+        assert_eq!(
+            resources
+                .snapshot()
+                .expect("settled replay root")
+                .scribe_memory_used_bytes,
+            baseline.scribe_memory_used_bytes
+        );
     }
 
     /// Proves an exact repeated slice set and COMMIT remain idempotent.

@@ -321,6 +321,7 @@ async fn query_scribe_rows(
                     start_day: day,
                     end_day: day,
                     after_lsn: WalLsn::ZERO,
+                    persisted_lsn_ranges: Vec::new(),
                     required_columns: vec!["value".to_owned()],
                     max_batches: 4_096,
                     max_retained_bytes: 512 * 1024 * 1024,

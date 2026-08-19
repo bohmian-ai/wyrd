@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use wyrd_spec::vala::api::{
     ClusterCapabilities, ClusterRole, ClusterRoleLease, NodeId, QueryClass, QueryId,
@@ -185,6 +186,122 @@ impl OracleQueryAttemptCut {
         self.deadline
     }
 
+    /// Returns a stable digest of every execution-relevant immutable cut fact.
+    ///
+    /// # Panics
+    ///
+    /// Panics only when an in-process participant or capability collection
+    /// exceeds the fixed-width canonical digest encoding.
+    #[must_use]
+    pub fn fingerprint(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"wyrd.oracle.participant-cut.v1\0");
+        digest.update(self.attempt_id.as_uuid().as_bytes());
+        Self::hash_timestamp(&mut digest, self.observed_at);
+        Self::hash_timestamp(&mut digest, self.deadline);
+        digest.update(b"leader\0");
+        Self::hash_participant(&mut digest, &self.leader);
+        digest.update(b"oracles\0");
+        Self::hash_len(&mut digest, self.oracles.len());
+        for participant in &self.oracles {
+            Self::hash_participant(&mut digest, participant);
+        }
+        digest.update(b"scribes\0");
+        Self::hash_len(&mut digest, self.scribes.len());
+        for participant in &self.scribes {
+            Self::hash_participant(&mut digest, participant);
+        }
+        format!("sha256:{:x}", digest.finalize())
+    }
+
+    /// Adds one full-resolution UTC timestamp to the cut digest.
+    fn hash_timestamp(digest: &mut Sha256, timestamp: DateTime<Utc>) {
+        digest.update(timestamp.timestamp().to_be_bytes());
+        digest.update(timestamp.timestamp_subsec_nanos().to_be_bytes());
+    }
+
+    /// Adds one exact participant and its validated capability document.
+    ///
+    /// # Panics
+    ///
+    /// Panics only when a validated capability advertises more query classes
+    /// than the canonical u32 collection length can represent.
+    fn hash_participant(digest: &mut Sha256, participant: &OracleQueryParticipant) {
+        digest.update(participant.node_id.as_uuid().as_bytes());
+        Self::hash_bytes(digest, participant.endpoint.as_bytes());
+        digest.update(match participant.role {
+            ClusterRole::Scribe => [0],
+            ClusterRole::Oracle => [1],
+        });
+        digest.update(participant.fencing_token.to_be_bytes());
+        match &participant.capabilities {
+            ClusterCapabilities::ScribeV1(value) => {
+                digest.update([0]);
+                digest.update(value.tail_protocol_version.to_be_bytes());
+            }
+            ClusterCapabilities::OracleV1(value) => {
+                digest.update([1]);
+                digest.update(value.peer_protocol_version.to_be_bytes());
+                digest.update(value.storage_protocol_version.to_be_bytes());
+                digest.update(value.cpu_cores.to_bits().to_be_bytes());
+                digest.update(value.memory_budget_bytes.to_be_bytes());
+                digest.update(value.cpu_cores_per_slot.to_bits().to_be_bytes());
+                digest.update(value.memory_bytes_per_slot.to_be_bytes());
+                digest.update(value.raw_slots.to_be_bytes());
+                digest.update(value.usable_slots.to_be_bytes());
+                digest.update(
+                    u32::try_from(value.supported_classes.len())
+                        .expect("invariant: capability class count fits in u32")
+                        .to_be_bytes(),
+                );
+                for class in &value.supported_classes {
+                    digest.update(match class {
+                        QueryClass::Interactive => [0],
+                        QueryClass::Analytical => [1],
+                    });
+                }
+                digest.update(value.max_workers_per_query.to_be_bytes());
+            }
+        }
+    }
+
+    /// Adds length-delimited bytes to the cut digest.
+    ///
+    /// # Panics
+    ///
+    /// Panics only when the byte slice length cannot fit the canonical u64
+    /// collection length.
+    fn hash_bytes(digest: &mut Sha256, value: &[u8]) {
+        Self::hash_len(digest, value.len());
+        digest.update(value);
+    }
+
+    /// Adds one collection length to the canonical cut digest.
+    ///
+    /// # Panics
+    ///
+    /// Panics only when the collection length cannot fit the canonical u64
+    /// collection length.
+    fn hash_len(digest: &mut Sha256, value: usize) {
+        digest.update(
+            u64::try_from(value)
+                .expect("invariant: participant collection length fits in u64")
+                .to_be_bytes(),
+        );
+    }
+
+    /// Returns the exact number of participants frozen into this cut.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if a process constructs a participant slice larger than the
+    /// public `u32` protocol counter can represent.
+    #[must_use]
+    pub fn participant_count(&self) -> u32 {
+        u32::try_from(self.oracles.len() + self.scribes.len())
+            .expect("invariant: participant cut length fits in u32")
+    }
+
     /// Looks up an exact Oracle role incarnation without refreshing membership.
     #[must_use]
     pub fn oracle(&self, node_id: NodeId, fencing_token: u64) -> Option<&OracleQueryParticipant> {
@@ -194,8 +311,9 @@ impl OracleQueryAttemptCut {
     }
 }
 
+/// Focused invariants for immutable participant selection and fingerprinting.
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use wyrd_spec::vala::api::{ClusterNodeKey, OracleCapabilitiesV1, ScribeCapabilitiesV1};
 
@@ -305,5 +423,173 @@ mod tests {
             result,
             Err(OracleQueryAttemptCutError::DuplicateRole)
         ));
+    }
+
+    /// Every stored execution fact changes the participant-cut fingerprint.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the valid fixture cannot be built or any immutable fact is
+    /// omitted from the digest.
+    #[test]
+    pub(in crate::oracle) fn fingerprint_binds_every_immutable_participant_cut_fact() {
+        let now = Utc::now();
+        let snapshot = ClusterSnapshot::observed(
+            vec![
+                lease(1, ClusterRole::Oracle, 7),
+                lease(2, ClusterRole::Oracle, 8),
+                lease(3, ClusterRole::Scribe, 9),
+            ],
+            now,
+        );
+        let cut = OracleQueryAttemptCut::try_from_snapshot(
+            &snapshot,
+            QueryId::new(uuid::Uuid::from_u128(11)),
+            NodeId::new(uuid::Uuid::from_u128(1)),
+            QueryClass::Interactive,
+            now + chrono::Duration::seconds(5),
+            now,
+            Duration::from_secs(15),
+        )
+        .expect("fresh compatible cut");
+        assert_cut_mutation(&cut, "attempt_id", |changed| {
+            changed.attempt_id = QueryId::new(uuid::Uuid::from_u128(12));
+        });
+        assert_cut_mutation(&cut, "observed_at", |changed| {
+            changed.observed_at += chrono::Duration::nanoseconds(1);
+        });
+        assert_cut_mutation(&cut, "deadline", |changed| {
+            changed.deadline += chrono::Duration::nanoseconds(1);
+        });
+        assert_oracle_participant_fields(&cut, "leader", |changed| &mut changed.leader);
+        assert_oracle_participant_fields(&cut, "oracle", |changed| &mut changed.oracles[1]);
+        assert_scribe_participant_fields(&cut, "scribe", |changed| &mut changed.scribes[0]);
+        assert_cut_mutation(&cut, "oracle_membership", |changed| {
+            changed.oracles.pop();
+        });
+        assert_cut_mutation(&cut, "scribe_membership", |changed| {
+            changed.scribes.pop();
+        });
+        assert_cut_mutation(&cut, "oracle_order", |changed| {
+            changed.oracles.swap(0, 1);
+        });
+    }
+
+    /// Asserts that one isolated cut mutation changes its canonical fingerprint.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the named mutation does not change the fingerprint.
+    fn assert_cut_mutation(
+        cut: &OracleQueryAttemptCut,
+        field: &str,
+        mutate: impl FnOnce(&mut OracleQueryAttemptCut),
+    ) {
+        let expected = cut.fingerprint();
+        let mut changed = cut.clone();
+        mutate(&mut changed);
+        assert_ne!(changed.fingerprint(), expected, "{field}");
+    }
+
+    /// Proves every field of one Oracle participant is independently fingerprinted.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an Oracle field is omitted from the fingerprint or the
+    /// fixture no longer carries Oracle capabilities.
+    fn assert_oracle_participant_fields(
+        cut: &OracleQueryAttemptCut,
+        prefix: &str,
+        select: fn(&mut OracleQueryAttemptCut) -> &mut OracleQueryParticipant,
+    ) {
+        assert_cut_mutation(cut, &format!("{prefix}.node_id"), |changed| {
+            select(changed).node_id = NodeId::new(uuid::Uuid::from_u128(40));
+        });
+        assert_cut_mutation(cut, &format!("{prefix}.endpoint"), |changed| {
+            select(changed).endpoint.push_str("/changed");
+        });
+        assert_cut_mutation(cut, &format!("{prefix}.role"), |changed| {
+            select(changed).role = ClusterRole::Scribe;
+        });
+        assert_cut_mutation(cut, &format!("{prefix}.fencing_token"), |changed| {
+            select(changed).fencing_token += 1;
+        });
+        for field in 0..11 {
+            assert_cut_mutation(cut, &format!("{prefix}.capabilities.{field}"), |changed| {
+                let participant = select(changed);
+                if field == 10 {
+                    participant.capabilities =
+                        ClusterCapabilities::ScribeV1(ScribeCapabilitiesV1 {
+                            tail_protocol_version: 1,
+                        });
+                    return;
+                }
+                let ClusterCapabilities::OracleV1(value) = &mut participant.capabilities else {
+                    panic!("invariant: Oracle fingerprint fixture has Oracle capabilities");
+                };
+                match field {
+                    0 => value.peer_protocol_version += 1,
+                    1 => value.storage_protocol_version += 1,
+                    2 => value.cpu_cores += 1.0,
+                    3 => value.memory_budget_bytes += 1,
+                    4 => value.cpu_cores_per_slot += 1.0,
+                    5 => value.memory_bytes_per_slot += 1,
+                    6 => value.raw_slots += 1,
+                    7 => value.usable_slots += 1,
+                    8 => value.supported_classes.push(QueryClass::Analytical),
+                    9 => value.max_workers_per_query += 1,
+                    _ => unreachable!("bounded Oracle capability fixture"),
+                }
+            });
+        }
+    }
+
+    /// Proves every field of one Scribe participant is independently fingerprinted.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a Scribe field is omitted from the fingerprint or the
+    /// fixture no longer carries Scribe capabilities.
+    fn assert_scribe_participant_fields(
+        cut: &OracleQueryAttemptCut,
+        prefix: &str,
+        select: fn(&mut OracleQueryAttemptCut) -> &mut OracleQueryParticipant,
+    ) {
+        assert_cut_mutation(cut, &format!("{prefix}.node_id"), |changed| {
+            select(changed).node_id = NodeId::new(uuid::Uuid::from_u128(41));
+        });
+        assert_cut_mutation(cut, &format!("{prefix}.endpoint"), |changed| {
+            select(changed).endpoint.push_str("/changed");
+        });
+        assert_cut_mutation(cut, &format!("{prefix}.role"), |changed| {
+            select(changed).role = ClusterRole::Oracle;
+        });
+        assert_cut_mutation(cut, &format!("{prefix}.fencing_token"), |changed| {
+            select(changed).fencing_token += 1;
+        });
+        assert_cut_mutation(cut, &format!("{prefix}.capabilities.variant"), |changed| {
+            select(changed).capabilities = ClusterCapabilities::OracleV1(OracleCapabilitiesV1 {
+                peer_protocol_version: 1,
+                storage_protocol_version: 1,
+                cpu_cores: 1.0,
+                memory_budget_bytes: 1024,
+                cpu_cores_per_slot: 1.0,
+                memory_bytes_per_slot: 1024,
+                raw_slots: 1,
+                usable_slots: 1,
+                supported_classes: vec![QueryClass::Interactive],
+                max_workers_per_query: 1,
+            });
+        });
+        assert_cut_mutation(
+            cut,
+            &format!("{prefix}.capabilities.tail_protocol_version"),
+            |changed| {
+                let ClusterCapabilities::ScribeV1(value) = &mut select(changed).capabilities else {
+                    panic!("invariant: Scribe fingerprint fixture has Scribe capabilities");
+                };
+                value.tail_protocol_version += 1;
+            },
+        );
     }
 }

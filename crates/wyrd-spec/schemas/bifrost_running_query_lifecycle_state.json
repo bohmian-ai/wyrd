@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RunningQueryLifecycleState",
+  "description": "The current non-terminal lifecycle state of an admitted Oracle query.\n\nThe state is projected by live controls only; completed queries are removed from the in-memory registry and are not durable query jobs.",
+  "oneOf": [
+    {
+      "description": "Admission completed and execution has not emitted progress yet.",
+      "type": "string",
+      "enum": [
+        "admitted"
+      ]
+    },
+    {
+      "description": "The selected participant cut is executing.",
+      "type": "string",
+      "enum": [
+        "running"
+      ]
+    },
+    {
+      "description": "A caller requested cancellation and owners are draining the cut.",
+      "type": "string",
+      "enum": [
+        "cancelling"
+      ]
+    }
+  ]
+}

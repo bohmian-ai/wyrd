@@ -1,5 +1,6 @@
 //! Validated conversions between protobuf and pure Bifrost query contracts.
 
+use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api as domain;
 
 use crate::wyrd::v1 as proto;
@@ -31,6 +32,189 @@ pub enum QueryConversionError {
     /// Pure contract validation failed.
     #[error("invalid query contract: {0}")]
     Contract(#[from] domain::QueryContractError),
+    /// A public request identity did not satisfy the UUIDv7 contract.
+    #[error("running query request identity is invalid")]
+    RequestId,
+    /// A required nested lifecycle message was absent.
+    #[error("running query field `{0}` is missing")]
+    Missing(&'static str),
+    /// A lifecycle timestamp was outside Chrono's supported range.
+    #[error("running query timestamp `{0}` is invalid")]
+    Timestamp(&'static str),
+}
+
+impl TryFrom<proto::RunningQuerySummary> for domain::RunningQuerySummary {
+    type Error = QueryConversionError;
+
+    /// Decodes a SQL-free public running-query summary.
+    ///
+    /// # Errors
+    /// Returns [`QueryConversionError`] for malformed request identities,
+    /// unknown enums, missing progress, or invalid timestamps.
+    fn try_from(value: proto::RunningQuerySummary) -> Result<Self, Self::Error> {
+        Ok(Self {
+            request_id: RequestId::parse(&value.request_id)
+                .map_err(|_| QueryConversionError::RequestId)?,
+            query_class: query_class(value.query_class)?,
+            started_at: timestamp(value.started_at_unix_ms, "started_at_unix_ms")?,
+            deadline: timestamp(value.deadline_unix_ms, "deadline_unix_ms")?,
+            state: running_query_state(value.state)?,
+            progress: value
+                .progress
+                .ok_or(QueryConversionError::Missing("progress"))?
+                .into(),
+            cancellation_requested: value.cancellation_requested,
+        })
+    }
+}
+
+impl From<domain::RunningQuerySummary> for proto::RunningQuerySummary {
+    /// Encodes a SQL-free public running-query summary.
+    fn from(value: domain::RunningQuerySummary) -> Self {
+        Self {
+            request_id: value.request_id.to_string(),
+            query_class: match value.query_class {
+                domain::QueryClass::Interactive => proto::QueryClass::Interactive as i32,
+                domain::QueryClass::Analytical => proto::QueryClass::Analytical as i32,
+            },
+            started_at_unix_ms: unix_millis(value.started_at),
+            deadline_unix_ms: unix_millis(value.deadline),
+            state: match value.state {
+                domain::RunningQueryLifecycleState::Admitted => {
+                    proto::RunningQueryLifecycleState::Admitted as i32
+                }
+                domain::RunningQueryLifecycleState::Running => {
+                    proto::RunningQueryLifecycleState::Running as i32
+                }
+                domain::RunningQueryLifecycleState::Cancelling => {
+                    proto::RunningQueryLifecycleState::Cancelling as i32
+                }
+            },
+            progress: Some(value.progress.into()),
+            cancellation_requested: value.cancellation_requested,
+        }
+    }
+}
+
+impl From<domain::RunningQueryProgress> for proto::RunningQueryProgress {
+    /// Encodes aggregate progress from the immutable participant cut.
+    fn from(value: domain::RunningQueryProgress) -> Self {
+        Self {
+            completed_participants: value.completed_participants,
+            total_participants: value.total_participants,
+        }
+    }
+}
+
+impl From<proto::RunningQueryProgress> for domain::RunningQueryProgress {
+    /// Decodes aggregate progress from the immutable participant cut.
+    fn from(value: proto::RunningQueryProgress) -> Self {
+        Self {
+            completed_participants: value.completed_participants,
+            total_participants: value.total_participants,
+        }
+    }
+}
+
+impl TryFrom<proto::ListRunningQueriesResponse> for domain::ListRunningQueriesResponse {
+    type Error = QueryConversionError;
+
+    /// Decodes all tenant-visible running-query summaries.
+    ///
+    /// # Errors
+    /// Returns [`QueryConversionError`] when any contained summary is invalid.
+    fn try_from(value: proto::ListRunningQueriesResponse) -> Result<Self, Self::Error> {
+        Ok(Self {
+            queries: value
+                .queries
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+        })
+    }
+}
+
+impl From<domain::ListRunningQueriesResponse> for proto::ListRunningQueriesResponse {
+    /// Encodes all tenant-visible running-query summaries.
+    fn from(value: domain::ListRunningQueriesResponse) -> Self {
+        Self {
+            queries: value.queries.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl TryFrom<proto::GetRunningQueryRequest> for domain::GetRunningQueryRequest {
+    type Error = QueryConversionError;
+
+    /// Decodes the sole public identifier accepted by a status control.
+    ///
+    /// # Errors
+    /// Returns [`QueryConversionError::RequestId`] for non-UUIDv7 values.
+    fn try_from(value: proto::GetRunningQueryRequest) -> Result<Self, Self::Error> {
+        Ok(Self {
+            request_id: RequestId::parse(&value.request_id)
+                .map_err(|_| QueryConversionError::RequestId)?,
+        })
+    }
+}
+
+impl From<domain::GetRunningQueryRequest> for proto::GetRunningQueryRequest {
+    /// Encodes the sole public identifier accepted by a status control.
+    fn from(value: domain::GetRunningQueryRequest) -> Self {
+        Self {
+            request_id: value.request_id.to_string(),
+        }
+    }
+}
+
+impl TryFrom<proto::CancelRunningQueryRequest> for domain::CancelRunningQueryRequest {
+    type Error = QueryConversionError;
+
+    /// Decodes the sole public identifier accepted by a cancellation control.
+    ///
+    /// # Errors
+    /// Returns [`QueryConversionError::RequestId`] for non-UUIDv7 values.
+    fn try_from(value: proto::CancelRunningQueryRequest) -> Result<Self, Self::Error> {
+        Ok(Self {
+            request_id: RequestId::parse(&value.request_id)
+                .map_err(|_| QueryConversionError::RequestId)?,
+        })
+    }
+}
+
+impl From<domain::CancelRunningQueryRequest> for proto::CancelRunningQueryRequest {
+    /// Encodes the sole public identifier accepted by a cancellation control.
+    fn from(value: domain::CancelRunningQueryRequest) -> Self {
+        Self {
+            request_id: value.request_id.to_string(),
+        }
+    }
+}
+
+impl TryFrom<proto::CancelRunningQueryResponse> for domain::CancelRunningQueryResponse {
+    type Error = QueryConversionError;
+
+    /// Decodes an idempotent cancellation response.
+    ///
+    /// # Errors
+    /// Returns [`QueryConversionError::RequestId`] for non-UUIDv7 values.
+    fn try_from(value: proto::CancelRunningQueryResponse) -> Result<Self, Self::Error> {
+        Ok(Self {
+            request_id: RequestId::parse(&value.request_id)
+                .map_err(|_| QueryConversionError::RequestId)?,
+            cancellation_started: value.cancellation_started,
+        })
+    }
+}
+
+impl From<domain::CancelRunningQueryResponse> for proto::CancelRunningQueryResponse {
+    /// Encodes an idempotent cancellation response.
+    fn from(value: domain::CancelRunningQueryResponse) -> Self {
+        Self {
+            request_id: value.request_id.to_string(),
+            cancellation_started: value.cancellation_started,
+        }
+    }
 }
 
 impl TryFrom<proto::BifrostQueryRequest> for domain::BifrostQueryRequest {
@@ -196,6 +380,69 @@ impl QueryStreamConverter {
             }
         }
     }
+}
+
+/// Decodes a server-derived query class without accepting protobuf's zero value.
+///
+/// # Errors
+/// Returns [`QueryConversionError::RequiredEnum`] for unknown or unspecified classes.
+fn query_class(value: i32) -> Result<domain::QueryClass, QueryConversionError> {
+    match proto::QueryClass::try_from(value)
+        .map_err(|_| QueryConversionError::RequiredEnum("query_class"))?
+    {
+        proto::QueryClass::Interactive => Ok(domain::QueryClass::Interactive),
+        proto::QueryClass::Analytical => Ok(domain::QueryClass::Analytical),
+        proto::QueryClass::Unspecified => Err(QueryConversionError::RequiredEnum("query_class")),
+    }
+}
+
+/// Decodes a public live lifecycle state without accepting protobuf's zero value.
+///
+/// # Errors
+/// Returns [`QueryConversionError::RequiredEnum`] for unknown or unspecified states.
+fn running_query_state(
+    value: i32,
+) -> Result<domain::RunningQueryLifecycleState, QueryConversionError> {
+    match proto::RunningQueryLifecycleState::try_from(value)
+        .map_err(|_| QueryConversionError::RequiredEnum("state"))?
+    {
+        proto::RunningQueryLifecycleState::Admitted => {
+            Ok(domain::RunningQueryLifecycleState::Admitted)
+        }
+        proto::RunningQueryLifecycleState::Running => {
+            Ok(domain::RunningQueryLifecycleState::Running)
+        }
+        proto::RunningQueryLifecycleState::Cancelling => {
+            Ok(domain::RunningQueryLifecycleState::Cancelling)
+        }
+        proto::RunningQueryLifecycleState::Unspecified => {
+            Err(QueryConversionError::RequiredEnum("state"))
+        }
+    }
+}
+
+/// Converts a non-negative Unix-millisecond timestamp into UTC.
+///
+/// # Errors
+/// Returns [`QueryConversionError::Timestamp`] when the protobuf value does not
+/// fit Chrono's supported timestamp range.
+fn timestamp(
+    value: u64,
+    field: &'static str,
+) -> Result<chrono::DateTime<chrono::Utc>, QueryConversionError> {
+    let value = i64::try_from(value).map_err(|_| QueryConversionError::Timestamp(field))?;
+    chrono::DateTime::from_timestamp_millis(value).ok_or(QueryConversionError::Timestamp(field))
+}
+
+/// Converts a UTC timestamp into the non-negative Unix-millisecond wire form.
+///
+/// # Panics
+///
+/// Panics when a server-generated public lifecycle timestamp predates the Unix
+/// epoch, which is outside this protobuf contract's representable range.
+fn unix_millis(value: chrono::DateTime<chrono::Utc>) -> u64 {
+    u64::try_from(value.timestamp_millis())
+        .expect("invariant: public lifecycle timestamps are after the Unix epoch")
 }
 
 /// Rejects row metadata supplied for a non-batch frame.
@@ -673,5 +920,137 @@ mod tests {
             converter.convert(batch(), Some(1)),
             Err(QueryConversionError::FrameAfterTerminal)
         ));
+    }
+
+    /// Public lifecycle summaries and cancellation controls preserve one request ID.
+    #[test]
+    fn running_query_contract_round_trips() {
+        let request_id = RequestId::now_v7();
+        let started_at = chrono::DateTime::from_timestamp_millis(1_725_000_000_123)
+            .expect("fixed running-query timestamp is valid");
+        let expected = domain::RunningQuerySummary {
+            request_id: request_id.clone(),
+            query_class: domain::QueryClass::Interactive,
+            started_at,
+            deadline: started_at + chrono::Duration::seconds(30),
+            state: domain::RunningQueryLifecycleState::Running,
+            progress: domain::RunningQueryProgress {
+                completed_participants: 1,
+                total_participants: 2,
+            },
+            cancellation_requested: false,
+        };
+        let actual = domain::RunningQuerySummary::try_from(proto::RunningQuerySummary::from(
+            expected.clone(),
+        ))
+        .expect("valid running-query summary round-trips");
+        assert_eq!(actual, expected);
+        let list = domain::ListRunningQueriesResponse {
+            queries: vec![expected],
+        };
+        let actual = domain::ListRunningQueriesResponse::try_from(
+            proto::ListRunningQueriesResponse::from(list.clone()),
+        )
+        .expect("valid running-query list round-trips");
+        assert_eq!(actual, list);
+        let status = domain::GetRunningQueryRequest {
+            request_id: request_id.clone(),
+        };
+        let actual = domain::GetRunningQueryRequest::try_from(proto::GetRunningQueryRequest::from(
+            status.clone(),
+        ))
+        .expect("valid status request round-trips");
+        assert_eq!(actual, status);
+        let cancellation_request = domain::CancelRunningQueryRequest {
+            request_id: request_id.clone(),
+        };
+        let actual = domain::CancelRunningQueryRequest::try_from(
+            proto::CancelRunningQueryRequest::from(cancellation_request.clone()),
+        )
+        .expect("valid cancellation request round-trips");
+        assert_eq!(actual, cancellation_request);
+        let cancellation = domain::CancelRunningQueryResponse {
+            request_id: request_id.clone(),
+            cancellation_started: true,
+        };
+        let actual = domain::CancelRunningQueryResponse::try_from(
+            proto::CancelRunningQueryResponse::from(cancellation.clone()),
+        )
+        .expect("valid cancellation response round-trips");
+        assert_eq!(actual, cancellation);
+
+        let tenant_id = wyrd_spec::DataTenantId::new_v7();
+        let query_id = domain::QueryId::new(uuid::Uuid::from_u128(11));
+        let leader = domain::OracleRoleFence {
+            node_id: domain::NodeId::new(uuid::Uuid::from_u128(12)),
+            role: domain::ClusterRole::Oracle,
+            fencing_token: 13,
+        };
+        let admission = domain::AdmitOracleLifecycleRequest {
+            tenant_id,
+            request_id: request_id.clone(),
+            query_id,
+            query_class: domain::QueryClass::Interactive,
+            deadline: started_at + chrono::Duration::seconds(30),
+            cut_fingerprint: "sha256:cut".to_owned(),
+            leader: leader.clone(),
+            participants: vec![leader.clone()],
+        };
+        let actual = domain::AdmitOracleLifecycleRequest::try_from(
+            proto::AdmitOracleLifecycleRequest::from(admission.clone()),
+        )
+        .expect("private admission round-trips");
+        assert_eq!(actual, admission);
+        let admission_response = domain::AdmitOracleLifecycleResponse { accepted: true };
+        assert_eq!(
+            domain::AdmitOracleLifecycleResponse::from(proto::AdmitOracleLifecycleResponse::from(
+                admission_response
+            )),
+            admission_response
+        );
+
+        let follower = domain::ReportOracleFollowerLifecycleRequest {
+            tenant_id,
+            request_id: request_id.clone(),
+            query_id,
+            cut_fingerprint: "sha256:cut".to_owned(),
+            follower: leader,
+            outcome: domain::QueryTerminalOutcome::Success,
+        };
+        let actual = domain::ReportOracleFollowerLifecycleRequest::try_from(
+            proto::ReportOracleFollowerLifecycleRequest::from(follower.clone()),
+        )
+        .expect("private follower report round-trips");
+        assert_eq!(actual, follower);
+        let follower_response = domain::ReportOracleFollowerLifecycleResponse {
+            completed_participants: 1,
+        };
+        assert_eq!(
+            domain::ReportOracleFollowerLifecycleResponse::from(
+                proto::ReportOracleFollowerLifecycleResponse::from(follower_response)
+            ),
+            follower_response
+        );
+
+        let private_cancel = domain::CancelOracleLifecycleRequest {
+            tenant_id,
+            request_id,
+            query_id,
+            cut_fingerprint: "sha256:cut".to_owned(),
+        };
+        let actual = domain::CancelOracleLifecycleRequest::try_from(
+            proto::CancelOracleLifecycleRequest::from(private_cancel.clone()),
+        )
+        .expect("private cancellation round-trips");
+        assert_eq!(actual, private_cancel);
+        let private_cancel_response = domain::CancelOracleLifecycleResponse {
+            cancellation_started: true,
+        };
+        assert_eq!(
+            domain::CancelOracleLifecycleResponse::from(
+                proto::CancelOracleLifecycleResponse::from(private_cancel_response)
+            ),
+            private_cancel_response
+        );
     }
 }

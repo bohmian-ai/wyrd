@@ -391,6 +391,78 @@ impl DelegatedOracleAdmission {
             .map_err(|_| DelegatedOracleAdmissionError::StateUnavailable)
     }
 
+    /// Projects coalesced waiting demand for one cadence-bounded retry pass.
+    ///
+    /// Waiter order defines retry order, identical keys remain coalesced, and
+    /// cancelled demands without a replacement waiter are omitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DelegatedOracleAdmissionError::StateUnavailable`] when local
+    /// admission state cannot be inspected.
+    fn retryable_demands(
+        &self,
+    ) -> Result<Vec<OracleAdmissionDemand>, DelegatedOracleAdmissionError> {
+        self.state
+            .lock()
+            .map(|state| {
+                let mut projected = HashSet::new();
+                state
+                    .waiters
+                    .iter()
+                    .filter_map(|waiter| {
+                        let key = (
+                            waiter.request.tenant_id,
+                            waiter.request.principal_id,
+                            waiter.request.query_class,
+                        );
+                        (state.outstanding.contains(&key) && projected.insert(key)).then_some(
+                            OracleAdmissionDemand {
+                                tenant_id: waiter.request.tenant_id,
+                                principal_id: waiter.request.principal_id,
+                                query_class: waiter.request.query_class,
+                                requested_units: self.config.allocation_units,
+                                holder_node_id: self.node_id,
+                                holder_fencing_token: self.fencing_token,
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .map_err(|_| DelegatedOracleAdmissionError::StateUnavailable)
+    }
+
+    /// Settles an empty allocation attempt without starving a live waiter.
+    ///
+    /// A matching waiter retains the coalescing key for the next background
+    /// cadence. When every waiter was cancelled after notification delivery,
+    /// the consumed notification is forgotten so a future request can notify.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DelegatedOracleAdmissionError::StateUnavailable`] when local
+    /// admission state cannot be updated.
+    fn settle_empty_allocation(
+        &self,
+        demand: OracleAdmissionDemand,
+    ) -> Result<(), DelegatedOracleAdmissionError> {
+        let key = (demand.tenant_id, demand.principal_id, demand.query_class);
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DelegatedOracleAdmissionError::StateUnavailable)?;
+        if !state.waiters.iter().any(|waiter| {
+            (
+                waiter.request.tenant_id,
+                waiter.request.principal_id,
+                waiter.request.query_class,
+            ) == key
+        }) {
+            state.outstanding.remove(&key);
+        }
+        Ok(())
+    }
+
     /// Applies authoritative database-time renewal evidence to one cached block.
     ///
     /// The local expiry advances under the same state lock used by acquisition,
@@ -550,7 +622,7 @@ impl DelegatedOracleAdmissionWorker {
                     Some(demand) => self.allocate(demand).await,
                     None => Err(DelegatedOracleAdmissionError::ContinuityLost),
                 },
-                _ = renewal.tick() => self.renew().await,
+                _ = renewal.tick() => self.maintain().await,
             };
             if let Err(error) = result {
                 tracing::warn!(%error, "delegated Oracle admission continuity closed");
@@ -588,10 +660,27 @@ impl DelegatedOracleAdmissionWorker {
             .map_err(|_| DelegatedOracleAdmissionError::ContinuityLost)?;
         if rows.is_empty() {
             tracing::debug!("delegated Oracle admission capacity unavailable or fragmented");
-            return Ok(());
+            return self.admission.settle_empty_allocation(demand);
         }
         let block = DelegatedAdmissionBlock::try_from_rows(&rows)?;
         self.admission.install_block(block, Utc::now())
+    }
+
+    /// Renews live blocks and retries coalesced demand once per owner cadence.
+    ///
+    /// Empty allocations remain eligible for a later cadence without feeding
+    /// the worker channel or creating a busy loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns a continuity error when renewal, retry allocation, or local
+    /// state inspection fails.
+    async fn maintain(&self) -> Result<(), DelegatedOracleAdmissionError> {
+        self.renew().await?;
+        for demand in self.admission.retryable_demands()? {
+            self.allocate(demand).await?;
+        }
+        Ok(())
     }
 
     /// Renews every cached allocation while continuity remains uninterrupted.
@@ -778,6 +867,58 @@ mod tests {
         assert!(demand_rx.try_recv().is_err());
         first.abort();
         second.abort();
+    }
+
+    /// Empty allocation stays coalesced until a cadence retry returns capacity.
+    ///
+    /// # Panics
+    ///
+    /// Panics when empty settlement loses or duplicates demand, or later
+    /// capacity cannot complete the original waiting request.
+    #[tokio::test]
+    async fn empty_allocation_retries_on_cadence_and_later_grants() {
+        let (owner, mut demand_rx, _) = owner();
+        let request = DelegatedAdmissionRequest {
+            tenant_id: DataTenantId::new_v7(),
+            principal_id: PrincipalId::new(uuid::Uuid::now_v7()),
+            query_class: QueryClass::Interactive,
+        };
+        let waiting_owner = Arc::clone(&owner);
+        let waiting = tokio::spawn(async move { waiting_owner.acquire(request).await });
+        tokio::task::yield_now().await;
+        let demand = demand_rx.try_recv().expect("initial demand");
+        owner
+            .settle_empty_allocation(demand)
+            .expect("empty allocation stays retryable");
+        assert_eq!(owner.retryable_demands().expect("cadence demand"), [demand]);
+        assert!(demand_rx.try_recv().is_err(), "retry does not use channel");
+
+        let now = Utc::now();
+        owner
+            .install_block(
+                DelegatedAdmissionBlock {
+                    allocation_id: uuid::Uuid::now_v7(),
+                    tenant_id: request.tenant_id,
+                    principal_id: request.principal_id,
+                    query_class: request.query_class,
+                    holder_node_id: demand.holder_node_id,
+                    holder_fencing_token: demand.holder_fencing_token,
+                    valid_from: now,
+                    expires_at: now + chrono::Duration::seconds(10),
+                    units: demand.requested_units,
+                    used: 0,
+                },
+                now,
+            )
+            .expect("later retry capacity installs");
+        let grant = waiting.await.expect("waiter joins").expect("waiter grants");
+        assert!(
+            owner
+                .retryable_demands()
+                .expect("settled demand")
+                .is_empty()
+        );
+        drop(grant);
     }
 
     /// Cancellation reclaims queue capacity without duplicating queued demand.

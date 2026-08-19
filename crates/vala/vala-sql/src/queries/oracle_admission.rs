@@ -3,6 +3,7 @@
 use chrono::Duration;
 use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
+use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{OracleAdmissionDemand, QueryClass};
 
 use crate::row_types::oracle_admission::OracleAdmissionBlockRow;
@@ -17,9 +18,18 @@ pub struct OracleAdmissionRenewal {
     pub database_now: chrono::DateTime<chrono::Utc>,
 }
 
-/// Internal projection that carries the shared database clock beside each row.
+/// Authoritative database-time evidence for one complete fenced allocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OracleAdmissionAllocation {
+    /// The three allocated global, tenant, and principal rows, or none when full.
+    pub rows: Vec<OracleAdmissionBlockRow>,
+    /// Database statement time used to establish the rows' validity interval.
+    pub database_now: chrono::DateTime<chrono::Utc>,
+}
+
+/// Internal projection that carries a shared database clock beside each row.
 #[derive(sqlx::FromRow)]
-struct OracleAdmissionRenewalRow {
+struct OracleAdmissionTimedBlockRow {
     /// Unique row identity.
     block_id: Uuid,
     /// Identity shared by the three accounting rows.
@@ -44,11 +54,11 @@ struct OracleAdmissionRenewalRow {
     expires_at: chrono::DateTime<chrono::Utc>,
     /// Database-time closure marker after continuity loss.
     closed_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// Shared statement timestamp used by the fenced renewal.
+    /// Shared statement timestamp used by the fenced mutation.
     database_now: chrono::DateTime<chrono::Utc>,
 }
 
-impl OracleAdmissionRenewalRow {
+impl OracleAdmissionTimedBlockRow {
     /// Splits one internal database projection into its durable row and clock.
     fn into_parts(self) -> (OracleAdmissionBlockRow, chrono::DateTime<chrono::Utc>) {
         (
@@ -183,12 +193,13 @@ impl<'a> OracleAdmissionBlocks<'a> {
     /// # Errors
     ///
     /// Returns [`SqlError`] for invalid demand, missing/conflicting policy, or
-    /// any PostgreSQL failure. Zero available capacity returns an empty vector.
+    /// any PostgreSQL failure. Zero available capacity returns authoritative
+    /// statement-time evidence with no rows.
     pub async fn allocate(
         &self,
         demand: OracleAdmissionDemand,
         validity: Duration,
-    ) -> Result<Vec<OracleAdmissionBlockRow>, SqlError> {
+    ) -> Result<OracleAdmissionAllocation, SqlError> {
         if demand.requested_units == 0
             || demand.holder_fencing_token == 0
             || validity <= Duration::zero()
@@ -205,7 +216,7 @@ impl<'a> OracleAdmissionBlocks<'a> {
              AND node_id=$2 AND role='oracle' AND fencing_token=$3 AND ready=true \
              AND heartbeat_at>=statement_timestamp()-interval '15 seconds')",
         )
-        .bind(Uuid::from(demand.tenant_id))
+        .bind(DataTenantId::SYSTEM_OWNER.as_uuid())
         .bind(demand.holder_node_id.as_uuid())
         .bind(holder_fence)
         .fetch_one(&mut *tx)
@@ -230,24 +241,34 @@ impl<'a> OracleAdmissionBlocks<'a> {
             .min(tenant - tenant_used)
             .max(0);
         if units == 0 {
+            let database_now = sqlx::query_scalar("SELECT statement_timestamp()")
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(SqlError::from)?;
             tx.commit().await.map_err(SqlError::from)?;
-            return Ok(Vec::new());
+            return Ok(OracleAdmissionAllocation {
+                rows: Vec::new(),
+                database_now,
+            });
         }
         let allocation_id = Uuid::now_v7();
-        let rows = sqlx::query_as::<_, OracleAdmissionBlockRow>(
+        let rows = sqlx::query_as::<_, OracleAdmissionTimedBlockRow>(
             r#"WITH clock AS MATERIALIZED (SELECT statement_timestamp() AS now),
             scopes(scope_kind, principal_id) AS (
               VALUES ('global'::text, NULL::uuid), ('tenant', NULL), ('principal', $2::uuid)
-            )
-            INSERT INTO vala.oracle_admission_blocks
+            ), inserted AS (
+              INSERT INTO vala.oracle_admission_blocks
               (block_id, allocation_id, scope_kind, data_tenant_id, principal_id, query_class,
                units, holder_node_id, holder_fencing_token, valid_from, expires_at)
-            SELECT gen_random_uuid(), $1, scope_kind, $3, principal_id, $4, $5, $6, $7,
-                   clock.now, clock.now + ($8 * interval '1 millisecond')
-            FROM scopes CROSS JOIN clock
-            RETURNING block_id, allocation_id, scope_kind, data_tenant_id, principal_id,
-                      query_class, units, holder_node_id, holder_fencing_token,
-                      valid_from, expires_at, closed_at"#,
+              SELECT gen_random_uuid(), $1, scope_kind, $3, principal_id, $4, $5, $6, $7,
+                     clock.now, clock.now + ($8 * interval '1 millisecond')
+              FROM scopes CROSS JOIN clock
+              RETURNING block_id, allocation_id, scope_kind, data_tenant_id, principal_id,
+                        query_class, units, holder_node_id, holder_fencing_token,
+                        valid_from, expires_at, closed_at
+            )
+            SELECT inserted.*, clock.now AS database_now
+            FROM inserted CROSS JOIN clock"#,
         )
         .bind(allocation_id)
         .bind(demand.principal_id.as_uuid())
@@ -261,7 +282,7 @@ impl<'a> OracleAdmissionBlocks<'a> {
         .await
         .map_err(SqlError::from)?;
         tx.commit().await.map_err(SqlError::from)?;
-        Ok(rows)
+        timed_allocation(rows)
     }
 
     /// Renews every row of a live allocation without permitting a late revival.
@@ -283,7 +304,7 @@ impl<'a> OracleAdmissionBlocks<'a> {
                 "Oracle admission renewal validity must be positive",
             ));
         }
-        let rows = sqlx::query_as::<_, OracleAdmissionRenewalRow>(
+        let rows = sqlx::query_as::<_, OracleAdmissionTimedBlockRow>(
             r#"WITH clock AS MATERIALIZED (SELECT statement_timestamp() AS now),
             renewed AS (
               UPDATE vala.oracle_admission_blocks AS blocks
@@ -440,7 +461,7 @@ async fn live_units(
          AND blocks.data_tenant_id IS NOT DISTINCT FROM COALESCE($2,blocks.data_tenant_id) \
          AND blocks.query_class=$3 AND (blocks.expires_at>statement_timestamp() OR EXISTS ( \
            SELECT 1 FROM vala.cluster_nodes roles \
-           WHERE roles.data_tenant_id=blocks.data_tenant_id \
+           WHERE roles.data_tenant_id=$4 \
            AND roles.node_id=blocks.holder_node_id AND roles.role='oracle' \
            AND roles.fencing_token=blocks.holder_fencing_token AND roles.ready=true \
            AND roles.heartbeat_at>=statement_timestamp()-interval '15 seconds'))",
@@ -448,9 +469,38 @@ async fn live_units(
     .bind(scope)
     .bind(tenant_id)
     .bind(class_name(query_class))
+    .bind(DataTenantId::SYSTEM_OWNER.as_uuid())
     .fetch_one(&mut **tx)
     .await
     .map_err(SqlError::from)
+}
+
+/// Splits timed allocation rows while proving one authoritative statement clock.
+///
+/// # Errors
+///
+/// Returns [`SqlError`] when the three rows do not carry one identical clock.
+fn timed_allocation(
+    rows: Vec<OracleAdmissionTimedBlockRow>,
+) -> Result<OracleAdmissionAllocation, SqlError> {
+    let mut database_now = None;
+    let rows = rows
+        .into_iter()
+        .map(|row| {
+            let (row, observed_now) = row.into_parts();
+            if database_now
+                .replace(observed_now)
+                .is_some_and(|now| now != observed_now)
+            {
+                return Err(invariant("Oracle admission allocation clock diverged"));
+            }
+            Ok(row)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(OracleAdmissionAllocation {
+        rows,
+        database_now: database_now.ok_or_else(|| invariant("allocation clock is absent"))?,
+    })
 }
 
 /// Returns the durable discriminator for a closed query class.

@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use thiserror::Error;
@@ -199,10 +199,18 @@ enum AdmissionDemandPhase {
     Retryable,
 }
 
+/// One durable allocation paired with its conservative local monotonic bound.
+struct CachedDelegatedAdmissionBlock {
+    /// Database-issued accounting and absolute validity evidence.
+    block: DelegatedAdmissionBlock,
+    /// Local deadline derived without trusting the pod wall clock.
+    valid_until: Instant,
+}
+
 /// Mutable cached blocks, fairness queue, and lifecycle latches.
 struct DelegatedState {
     /// Cached allocations issued to this exact role incarnation.
-    blocks: Vec<DelegatedAdmissionBlock>,
+    blocks: Vec<CachedDelegatedAdmissionBlock>,
     /// Stable FIFO across tenant and principal request identities.
     waiters: VecDeque<DelegatedWaiter>,
     /// Coalesced background demand and its exact scheduling phase.
@@ -275,6 +283,7 @@ impl DelegatedOracleAdmission {
         &self,
         block: DelegatedAdmissionBlock,
         database_now: DateTime<Utc>,
+        observed_before: Instant,
     ) -> Result<(), DelegatedOracleAdmissionError> {
         if block.holder_node_id != self.node_id
             || block.holder_fencing_token != self.fencing_token
@@ -284,6 +293,11 @@ impl DelegatedOracleAdmission {
         {
             return Err(DelegatedOracleAdmissionError::ContinuityLost);
         }
+        let valid_until =
+            conservative_local_deadline(database_now, block.expires_at, observed_before)?;
+        if valid_until <= Instant::now() {
+            return Err(DelegatedOracleAdmissionError::ContinuityLost);
+        }
         let mut state = self
             .state
             .lock()
@@ -291,7 +305,9 @@ impl DelegatedOracleAdmission {
         state
             .demands
             .remove(&(block.tenant_id, block.principal_id, block.query_class));
-        state.blocks.push(block);
+        state
+            .blocks
+            .push(CachedDelegatedAdmissionBlock { block, valid_until });
         Self::grant_waiters(&self.state, &mut state);
         self.queue_waiting_demands(&mut state)
     }
@@ -317,8 +333,8 @@ impl DelegatedOracleAdmission {
             if !state.available {
                 return Err(DelegatedOracleAdmissionError::ContinuityLost);
             }
-            if let Some(index) = available_block(&state.blocks, request, Utc::now()) {
-                state.blocks[index].used += 1;
+            if let Some(index) = available_block(&state.blocks, request, Instant::now()) {
+                state.blocks[index].block.used += 1;
                 return Ok(DelegatedOracleAdmissionGrant::new(self, index));
             }
             if state.waiters.len() >= self.config.queue_capacity {
@@ -460,7 +476,7 @@ impl DelegatedOracleAdmission {
                 state
                     .blocks
                     .iter()
-                    .map(|block| block.allocation_id)
+                    .map(|cached| cached.block.allocation_id)
                     .collect()
             })
             .map_err(|_| DelegatedOracleAdmissionError::StateUnavailable)
@@ -588,12 +604,18 @@ impl DelegatedOracleAdmission {
     fn apply_renewal(
         &self,
         renewal: &vala_sql::queries::oracle_admission::OracleAdmissionRenewal,
+        observed_before: Instant,
     ) -> Result<(), DelegatedOracleAdmissionError> {
         let renewed = DelegatedAdmissionBlock::try_from_rows(&renewal.rows)?;
         if renewed.holder_node_id != self.node_id
             || renewed.holder_fencing_token != self.fencing_token
             || renewed.expires_at <= renewal.database_now
         {
+            return Err(DelegatedOracleAdmissionError::ContinuityLost);
+        }
+        let valid_until =
+            conservative_local_deadline(renewal.database_now, renewed.expires_at, observed_before)?;
+        if valid_until <= Instant::now() {
             return Err(DelegatedOracleAdmissionError::ContinuityLost);
         }
         let mut state = self
@@ -603,23 +625,25 @@ impl DelegatedOracleAdmission {
         let mut matching = state
             .blocks
             .iter_mut()
-            .filter(|block| block.allocation_id == renewed.allocation_id);
+            .filter(|cached| cached.block.allocation_id == renewed.allocation_id);
         let current = matching
             .next()
             .ok_or(DelegatedOracleAdmissionError::ContinuityLost)?;
         if matching.next().is_some()
-            || current.tenant_id != renewed.tenant_id
-            || current.principal_id != renewed.principal_id
-            || current.query_class != renewed.query_class
-            || current.holder_node_id != renewed.holder_node_id
-            || current.holder_fencing_token != renewed.holder_fencing_token
-            || current.valid_from != renewed.valid_from
-            || current.units != renewed.units
-            || renewed.expires_at <= current.expires_at
+            || current.block.tenant_id != renewed.tenant_id
+            || current.block.principal_id != renewed.principal_id
+            || current.block.query_class != renewed.query_class
+            || current.block.holder_node_id != renewed.holder_node_id
+            || current.block.holder_fencing_token != renewed.holder_fencing_token
+            || current.block.valid_from != renewed.valid_from
+            || current.block.units != renewed.units
+            || renewed.expires_at <= current.block.expires_at
+            || valid_until <= current.valid_until
         {
             return Err(DelegatedOracleAdmissionError::ContinuityLost);
         }
-        current.expires_at = renewed.expires_at;
+        current.block.expires_at = renewed.expires_at;
+        current.valid_until = valid_until;
         Ok(())
     }
 
@@ -627,15 +651,16 @@ impl DelegatedOracleAdmission {
     fn grant_waiters(owner: &Arc<Mutex<DelegatedState>>, state: &mut DelegatedState) {
         let mut retained = VecDeque::new();
         while let Some(waiter) = state.waiters.pop_front() {
-            if let Some(index) = available_block(&state.blocks, waiter.request, Utc::now()) {
-                state.blocks[index].used += 1;
+            if let Some(index) = available_block(&state.blocks, waiter.request, Instant::now()) {
+                state.blocks[index].block.used += 1;
                 let grant = DelegatedOracleAdmissionGrant {
                     owner: Arc::clone(owner),
                     block_index: index,
                     released: false,
                 };
                 if waiter.sender.send(grant).is_err() {
-                    state.blocks[index].used = state.blocks[index].used.saturating_sub(1);
+                    state.blocks[index].block.used =
+                        state.blocks[index].block.used.saturating_sub(1);
                 }
             } else {
                 retained.push_back(waiter);
@@ -798,7 +823,8 @@ impl DelegatedOracleAdmissionWorker {
         demand: OracleAdmissionDemand,
     ) -> Result<(), DelegatedOracleAdmissionError> {
         let blocks = vala_sql::queries::oracle_admission::OracleAdmissionBlocks::new(&self.pool);
-        let rows = blocks
+        let observed_before = Instant::now();
+        let allocation = blocks
             .allocate(
                 demand,
                 chrono::Duration::from_std(self.admission.config.validity)
@@ -806,12 +832,13 @@ impl DelegatedOracleAdmissionWorker {
             )
             .await
             .map_err(|_| DelegatedOracleAdmissionError::ContinuityLost)?;
-        if rows.is_empty() {
+        if allocation.rows.is_empty() {
             tracing::debug!("delegated Oracle admission capacity unavailable or fragmented");
             return self.admission.settle_empty_allocation(demand);
         }
-        let block = DelegatedAdmissionBlock::try_from_rows(&rows)?;
-        self.admission.install_block(block, Utc::now())
+        let block = DelegatedAdmissionBlock::try_from_rows(&allocation.rows)?;
+        self.admission
+            .install_block(block, allocation.database_now, observed_before)
     }
 
     /// Renews live blocks and retries coalesced demand once per owner cadence.
@@ -841,6 +868,7 @@ impl DelegatedOracleAdmissionWorker {
         let validity = chrono::Duration::from_std(self.admission.config.validity)
             .map_err(|_| DelegatedOracleAdmissionError::InvalidConfig)?;
         for allocation_id in self.admission.allocation_ids()? {
+            let observed_before = Instant::now();
             let renewal = blocks
                 .renew(
                     allocation_id,
@@ -851,7 +879,7 @@ impl DelegatedOracleAdmissionWorker {
                 .await
                 .map_err(|_| DelegatedOracleAdmissionError::ContinuityLost)?;
             let renewal = renewal.ok_or(DelegatedOracleAdmissionError::ContinuityLost)?;
-            self.admission.apply_renewal(&renewal)?;
+            self.admission.apply_renewal(&renewal, observed_before)?;
         }
         Ok(())
     }
@@ -859,17 +887,39 @@ impl DelegatedOracleAdmissionWorker {
 
 /// Finds one valid complete allocation for a request.
 fn available_block(
-    blocks: &[DelegatedAdmissionBlock],
+    blocks: &[CachedDelegatedAdmissionBlock],
     request: DelegatedAdmissionRequest,
-    now: DateTime<Utc>,
+    now: Instant,
 ) -> Option<usize> {
-    blocks.iter().position(|block| {
-        block.tenant_id == request.tenant_id
-            && block.principal_id == request.principal_id
-            && block.query_class == request.query_class
-            && block.expires_at > now
-            && block.used < block.units
+    blocks.iter().position(|cached| {
+        cached.block.tenant_id == request.tenant_id
+            && cached.block.principal_id == request.principal_id
+            && cached.block.query_class == request.query_class
+            && cached.valid_until > now
+            && cached.block.used < cached.block.units
     })
+}
+
+/// Maps a database-issued validity interval onto a conservative local deadline.
+///
+/// The local anchor is captured before the SQL request. Network and scheduling
+/// delay therefore shorten usable capacity rather than extending database time.
+///
+/// # Errors
+///
+/// Returns [`DelegatedOracleAdmissionError::ContinuityLost`] when the database
+/// interval is empty, cannot convert to monotonic duration, or overflows.
+fn conservative_local_deadline(
+    database_now: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    observed_before: Instant,
+) -> Result<Instant, DelegatedOracleAdmissionError> {
+    let remaining = (expires_at - database_now)
+        .to_std()
+        .map_err(|_| DelegatedOracleAdmissionError::ContinuityLost)?;
+    observed_before
+        .checked_add(remaining)
+        .ok_or(DelegatedOracleAdmissionError::ContinuityLost)
 }
 
 /// RAII ownership of one locally consumed global/tenant/principal unit.
@@ -899,9 +949,9 @@ impl DelegatedOracleAdmissionGrant {
         }
         self.released = true;
         if let Ok(mut state) = self.owner.lock()
-            && let Some(block) = state.blocks.get_mut(self.block_index)
+            && let Some(cached) = state.blocks.get_mut(self.block_index)
         {
-            block.used = block.used.saturating_sub(1);
+            cached.block.used = cached.block.used.saturating_sub(1);
             DelegatedOracleAdmission::grant_waiters(&self.owner, &mut state);
         }
     }
@@ -1038,6 +1088,7 @@ mod tests {
                     used: 0,
                 },
                 now,
+                Instant::now(),
             )
             .expect("test allocation installs");
     }
@@ -1377,12 +1428,69 @@ mod tests {
                     used: 0,
                 },
                 now,
+                Instant::now(),
             )
             .expect("matching block");
         let grant = owner.acquire(request).await.expect("cached grant");
-        assert_eq!(owner.state.lock().expect("state").blocks[0].used, 1);
+        assert_eq!(owner.state.lock().expect("state").blocks[0].block.used, 1);
         drop(grant);
-        assert_eq!(owner.state.lock().expect("state").blocks[0].used, 0);
+        assert_eq!(owner.state.lock().expect("state").blocks[0].block.used, 0);
+    }
+
+    /// Database wall-clock skew cannot extend or prematurely reject local use.
+    ///
+    /// # Panics
+    ///
+    /// Panics when local validity follows the pod wall clock instead of the
+    /// authoritative database interval mapped onto monotonic time.
+    #[test]
+    fn database_time_skew_uses_conservative_monotonic_validity() {
+        for database_now in [
+            DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
+                .expect("past database time")
+                .to_utc(),
+            DateTime::parse_from_rfc3339("2100-01-01T00:00:00Z")
+                .expect("future database time")
+                .to_utc(),
+        ] {
+            let (owner, _, _) = owner();
+            let request = DelegatedAdmissionRequest {
+                tenant_id: DataTenantId::new_v7(),
+                principal_id: PrincipalId::new(uuid::Uuid::now_v7()),
+                query_class: QueryClass::Interactive,
+            };
+            let observed_before = Instant::now();
+            owner
+                .install_block(
+                    DelegatedAdmissionBlock {
+                        allocation_id: uuid::Uuid::now_v7(),
+                        tenant_id: request.tenant_id,
+                        principal_id: request.principal_id,
+                        query_class: request.query_class,
+                        holder_node_id: NodeId::new(uuid::Uuid::from_u128(1)),
+                        holder_fencing_token: 3,
+                        valid_from: database_now,
+                        expires_at: database_now + chrono::Duration::milliseconds(40),
+                        units: 1,
+                        used: 0,
+                    },
+                    database_now,
+                    observed_before,
+                )
+                .expect("skewed database interval installs");
+            let state = owner.state.lock().expect("skewed state");
+            assert_eq!(
+                available_block(&state.blocks, request, observed_before),
+                Some(0)
+            );
+            drop(state);
+            std::thread::sleep(Duration::from_millis(50));
+            let state = owner.state.lock().expect("expired skewed state");
+            assert_eq!(
+                available_block(&state.blocks, request, Instant::now()),
+                None
+            );
+        }
     }
 
     /// Authoritative renewal advances cached expiry without resetting usage.
@@ -1407,7 +1515,7 @@ mod tests {
             used: 0,
         };
         owner
-            .install_block(block.clone(), now)
+            .install_block(block.clone(), now, Instant::now())
             .expect("initial block installs");
         let request = DelegatedAdmissionRequest {
             tenant_id: block.tenant_id,
@@ -1420,10 +1528,12 @@ mod tests {
             rows: renewal_rows(&block, renewed_expiry),
             database_now: now + chrono::Duration::seconds(1),
         };
-        owner.apply_renewal(&renewal).expect("renewal applies");
+        owner
+            .apply_renewal(&renewal, Instant::now())
+            .expect("renewal applies");
         let state = owner.state.lock().expect("renewed state");
-        assert_eq!(state.blocks[0].expires_at, renewed_expiry);
-        assert_eq!(state.blocks[0].used, 1);
+        assert_eq!(state.blocks[0].block.expires_at, renewed_expiry);
+        assert_eq!(state.blocks[0].block.used, 1);
         drop(state);
         drop(grant);
     }
@@ -1450,7 +1560,7 @@ mod tests {
             used: 0,
         };
         owner
-            .install_block(block.clone(), now)
+            .install_block(block.clone(), now, Instant::now())
             .expect("initial block installs");
         let mut rows = renewal_rows(&block, now + chrono::Duration::seconds(10));
         rows[0].holder_fencing_token = 4;
@@ -1458,7 +1568,7 @@ mod tests {
             rows,
             database_now: now + chrono::Duration::seconds(1),
         };
-        assert!(owner.apply_renewal(&renewal).is_err());
+        assert!(owner.apply_renewal(&renewal, Instant::now()).is_err());
         owner.close_continuity();
         owner.close_continuity();
         assert_eq!(

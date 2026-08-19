@@ -17,7 +17,7 @@ use wyrd_spec::vala::api::{NodeId, OracleAdmissionDemand, QueryClass};
 /// # Panics
 ///
 /// Panics when the fixture cannot register or activate the role.
-async fn register_oracle(fixture: &PgFixture, tenant: DataTenantId, node_id: NodeId) {
+async fn register_oracle(fixture: &PgFixture, node_id: NodeId) -> u64 {
     let nodes = ClusterNodes::new(fixture.vala_postgres().clone());
     let capabilities = ClusterCapabilities::OracleV1(OracleCapabilitiesV1 {
         peer_protocol_version: 1,
@@ -37,7 +37,7 @@ async fn register_oracle(fixture: &PgFixture, tenant: DataTenantId, node_id: Nod
     };
     let mut conn = fixture
         .vala_postgres()
-        .tenant_conn(tenant)
+        .tenant_conn(DataTenantId::SYSTEM_OWNER)
         .await
         .expect("tenant conn");
     let registered = nodes
@@ -63,6 +63,7 @@ async fn register_oracle(fixture: &PgFixture, tenant: DataTenantId, node_id: Nod
         .await
         .expect("role activates");
     conn.commit().await.expect("role commits");
+    registered.lease.fencing_token
 }
 
 /// Canonical insertion is idempotent and conflicting pod configuration fails.
@@ -173,27 +174,111 @@ async fn allocations_bind_three_scopes_and_respect_ceiling() {
         .ensure_policy(Some(tenant.into()), QueryClass::Interactive, 2)
         .await
         .expect("tenant policy");
-    let node_id = NodeId::new(uuid::Uuid::from_u128(1));
-    register_oracle(&fixture, tenant, node_id).await;
+    assert_ne!(tenant, DataTenantId::SYSTEM_OWNER);
+    let first_node = NodeId::new(uuid::Uuid::from_u128(1));
+    let second_node = NodeId::new(uuid::Uuid::from_u128(2));
+    let first_fence = register_oracle(&fixture, first_node).await;
+    let second_fence = register_oracle(&fixture, second_node).await;
     let demand = |node| OracleAdmissionDemand {
         tenant_id: tenant,
         principal_id: PrincipalId::new(uuid::Uuid::now_v7()),
         query_class: QueryClass::Interactive,
         requested_units: 2,
-        holder_node_id: NodeId::new(uuid::Uuid::from_u128(node)),
-        holder_fencing_token: 1,
+        holder_node_id: node,
+        holder_fencing_token: if node == first_node {
+            first_fence
+        } else {
+            second_fence
+        },
     };
-    let first = blocks
-        .allocate(demand(1), Duration::seconds(15))
+    let (first, second) = tokio::join!(
+        blocks.allocate(demand(first_node), Duration::seconds(15)),
+        blocks.allocate(demand(second_node), Duration::seconds(15))
+    );
+    let first = first.expect("first concurrent allocation");
+    let second = second.expect("second concurrent allocation");
+    assert_eq!(first.rows.len() + second.rows.len(), 3);
+    assert!(
+        first
+            .rows
+            .iter()
+            .chain(&second.rows)
+            .all(|row| row.units == 2)
+    );
+    assert!(first.rows.is_empty() || second.rows.is_empty());
+}
+
+/// Expired capacity remains fenced while its system role is live, then reuses.
+///
+/// # Panics
+///
+/// Panics when data-tenant accounting is confused with system membership or
+/// predecessor capacity is reused before the successor fence replaces it.
+#[tokio::test]
+async fn reuse_requires_expiry_and_non_live_system_owner_incarnation() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture
+        .seed_additional_tenant("admission-reuse")
         .await
-        .expect("first allocation");
-    assert_eq!(first.len(), 3);
-    assert!(first.iter().all(|row| row.units == 2));
-    let second = blocks
-        .allocate(demand(1), Duration::seconds(15))
+        .expect("data tenant seeds");
+    assert_ne!(tenant, DataTenantId::SYSTEM_OWNER);
+    let blocks = OracleAdmissionBlocks::new(fixture.operator_pool());
+    blocks
+        .ensure_policy(None, QueryClass::Interactive, 1)
         .await
-        .expect("bounded second allocation");
-    assert!(second.is_empty());
+        .expect("global policy");
+    blocks
+        .ensure_policy(Some(tenant.into()), QueryClass::Interactive, 1)
+        .await
+        .expect("tenant policy");
+    let predecessor = NodeId::new(uuid::Uuid::from_u128(11));
+    let contender = NodeId::new(uuid::Uuid::from_u128(12));
+    let predecessor_fence = register_oracle(&fixture, predecessor).await;
+    let contender_fence = register_oracle(&fixture, contender).await;
+    let demand = |node_id, fence| OracleAdmissionDemand {
+        tenant_id: tenant,
+        principal_id: PrincipalId::new(uuid::Uuid::now_v7()),
+        query_class: QueryClass::Interactive,
+        requested_units: 1,
+        holder_node_id: node_id,
+        holder_fencing_token: fence,
+    };
+    let predecessor_allocation = blocks
+        .allocate(
+            demand(predecessor, predecessor_fence),
+            Duration::seconds(10),
+        )
+        .await
+        .expect("predecessor allocation");
+    assert_eq!(predecessor_allocation.rows.len(), 3);
+    sqlx::query(
+        "UPDATE vala.oracle_admission_blocks \
+         SET expires_at=statement_timestamp()-interval '1 millisecond' \
+         WHERE allocation_id=$1",
+    )
+    .bind(predecessor_allocation.rows[0].allocation_id)
+    .execute(fixture.operator_pool().pool())
+    .await
+    .expect("predecessor block expires");
+    let refused = blocks
+        .allocate(demand(contender, contender_fence), Duration::seconds(10))
+        .await
+        .expect("live-predecessor refusal query");
+    assert!(refused.rows.is_empty());
+
+    let successor_fence = register_oracle(&fixture, predecessor).await;
+    assert!(successor_fence > predecessor_fence);
+    let successor = blocks
+        .allocate(demand(predecessor, successor_fence), Duration::seconds(10))
+        .await
+        .expect("successor allocation");
+    assert_eq!(successor.rows.len(), 3);
+    assert!(
+        successor
+            .rows
+            .iter()
+            .all(|row| row.holder_fencing_token == i64::try_from(successor_fence).expect("fence"))
+    );
 }
 
 /// Fenced renewal returns one complete authoritative database-time expiry.
@@ -215,22 +300,31 @@ async fn renewal_advances_authoritative_expiry_and_refuses_late_rows() {
         .await
         .expect("tenant policy");
     let node_id = NodeId::new(uuid::Uuid::from_u128(7));
-    register_oracle(&fixture, tenant, node_id).await;
+    assert_ne!(tenant, DataTenantId::SYSTEM_OWNER);
+    let fence = register_oracle(&fixture, node_id).await;
     let demand = OracleAdmissionDemand {
         tenant_id: tenant,
         principal_id: PrincipalId::new(uuid::Uuid::now_v7()),
         query_class: QueryClass::Interactive,
         requested_units: 1,
         holder_node_id: node_id,
-        holder_fencing_token: 1,
+        holder_fencing_token: fence,
     };
     let allocated = blocks
         .allocate(demand, Duration::seconds(2))
         .await
         .expect("allocation");
-    let allocation_id = allocated[0].allocation_id;
+    assert!(allocated.rows.iter().all(|row| {
+        row.valid_from == allocated.database_now && row.expires_at > allocated.database_now
+    }));
+    let allocation_id = allocated.rows[0].allocation_id;
     let first = blocks
-        .renew(allocation_id, node_id.as_uuid(), 1, Duration::seconds(10))
+        .renew(
+            allocation_id,
+            node_id.as_uuid(),
+            fence,
+            Duration::seconds(10),
+        )
         .await
         .expect("first renewal")
         .expect("live allocation renews");
@@ -242,7 +336,12 @@ async fn renewal_advances_authoritative_expiry_and_refuses_late_rows() {
             .all(|row| row.expires_at > first.database_now)
     );
     let second = blocks
-        .renew(allocation_id, node_id.as_uuid(), 1, Duration::seconds(10))
+        .renew(
+            allocation_id,
+            node_id.as_uuid(),
+            fence,
+            Duration::seconds(10),
+        )
         .await
         .expect("second renewal")
         .expect("continuous allocation renews again");
@@ -258,7 +357,12 @@ async fn renewal_advances_authoritative_expiry_and_refuses_late_rows() {
     .expect("allocation expires");
     assert!(
         blocks
-            .renew(allocation_id, node_id.as_uuid(), 1, Duration::seconds(10))
+            .renew(
+                allocation_id,
+                node_id.as_uuid(),
+                fence,
+                Duration::seconds(10),
+            )
             .await
             .expect("late renewal query")
             .is_none()

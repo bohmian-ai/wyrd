@@ -5540,9 +5540,9 @@ mod tests {
             oracle
                 .try_acquire_query(OracleResourceRequest {
                     query_class: QueryClass::Analytical,
-                    memory_bytes: ORACLE_PARTITION_MEMORY_BYTES,
-                    scratch_bytes: ORACLE_PARTITION_MEMORY_BYTES as u64,
-                    slot_units: 1,
+                    memory_bytes: 2 * ORACLE_PARTITION_MEMORY_BYTES,
+                    scratch_bytes: (2 * ORACLE_PARTITION_MEMORY_BYTES) as u64,
+                    slot_units: 2,
                     local_ratio: 0.0,
                 })
                 .is_err()

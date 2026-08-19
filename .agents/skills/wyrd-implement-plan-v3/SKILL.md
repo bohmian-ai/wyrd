@@ -19,7 +19,12 @@ tasks. Confirm that each task has bounded scope, concrete acceptance criteria,
 focused verification, and only necessary dependencies. Resolve the current
 integration SHA and preserve a small execution record outside source
 worktrees: task ID, base SHA, candidate SHA, verification result, review
-verdict, and integrated SHA.
+verdict, and integrated SHA. A repository that supplies the plan is a planning
+source only: never place source worktrees, Cargo targets, virtual environments,
+or execution records inside that repository. Put execution records under the
+target repository's ignored `.dev/executions/<plan-id>/` tree (or another
+caller-declared external evidence root), and put source worktrees under a
+dedicated sibling such as `<target-repository>-worktrees/<plan-id>/`.
 
 The plan is an allowlist of outcomes and ownership, not a demand that every
 local implementation consequence be anticipated in a packet. Reject
@@ -77,5 +82,11 @@ were completed. Required terminal-review remediation returns to
 `$wyrd-plan-v3` as new or revised task packets.
 
 Report integrated commits, focused verification, review verdicts, unresolved
-material decisions, and any checks intentionally not run. Preserve worktrees
-and the minimal execution record unless the user authorizes cleanup.
+material decisions, and any checks intentionally not run. Preserve the minimal
+execution record. After a candidate is reviewed and integrated, reclaim its
+clean implementation and verification worktrees and their task-specific Cargo
+targets, virtual environments, and caches. Never delete a dirty worktree:
+archive it under the dedicated sibling worktree root and report why it was
+retained. Keep only the current integration worktree and worktrees needed by
+active or dependent tasks; reclaim those during final closeout. If the user
+explicitly requests preserved worktrees, retain the requested set instead.

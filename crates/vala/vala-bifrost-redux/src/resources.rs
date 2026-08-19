@@ -5522,7 +5522,7 @@ mod tests {
     #[test]
     fn analytical_capacity_preserves_one_interactive_quantum() {
         let roles = BifrostRuntimeResources::composed_for_test(
-            1024 * MIB,
+            1280 * MIB,
             1024 * MIB as u64,
             [BifrostRole::Oracle],
         );
@@ -5536,17 +5536,41 @@ mod tests {
                 local_ratio: 0.0,
             })
             .expect("analytical query below protected reserve");
-        assert!(
-            oracle
-                .try_acquire_query(OracleResourceRequest {
-                    query_class: QueryClass::Analytical,
-                    memory_bytes: 2 * ORACLE_PARTITION_MEMORY_BYTES,
-                    scratch_bytes: (2 * ORACLE_PARTITION_MEMORY_BYTES) as u64,
-                    slot_units: 2,
-                    local_ratio: 0.0,
-                })
-                .is_err()
+        let occupied = oracle.snapshot().expect("one analytical owner");
+        let ordinary_memory_remaining = occupied
+            .plan
+            .oracle_floor_bytes
+            .checked_add(occupied.plan.elastic_memory_bytes)
+            .and_then(|total| total.checked_sub(occupied.oracle_memory_used_bytes))
+            .expect("ordinary Oracle memory remainder");
+        let scratch_remaining = occupied
+            .plan
+            .scratch_limit_bytes
+            .checked_sub(occupied.scratch_used_bytes)
+            .expect("Oracle scratch remainder");
+        let slots_remaining = oracle_worker_slots(occupied.plan)
+            .expect("Oracle slot ceiling")
+            .checked_sub(occupied.oracle_query_slot_units as usize)
+            .expect("Oracle slot remainder");
+        assert_eq!(ordinary_memory_remaining, 2 * ORACLE_PARTITION_MEMORY_BYTES);
+        assert_eq!(
+            scratch_remaining,
+            (2 * ORACLE_PARTITION_MEMORY_BYTES) as u64
         );
+        assert_eq!(slots_remaining, 2);
+
+        let refused = oracle.try_acquire_query(OracleResourceRequest {
+            query_class: QueryClass::Analytical,
+            memory_bytes: 2 * ORACLE_PARTITION_MEMORY_BYTES,
+            scratch_bytes: (2 * ORACLE_PARTITION_MEMORY_BYTES) as u64,
+            slot_units: 2,
+            local_ratio: 0.0,
+        });
+        assert!(matches!(
+            refused,
+            Err(BifrostResourceError::Occupied { .. })
+        ));
+        assert_eq!(oracle.snapshot().expect("reserve refusal"), occupied);
         let interactive = oracle
             .try_acquire_query(interactive_query(0.0))
             .expect("protected interactive quantum remains available");

@@ -347,7 +347,7 @@ impl DelegatedOracleAdmission {
             }
             (
                 receiver,
-                DelegatedWaiterCleanup::new(&self.state, waiter_id, request),
+                DelegatedWaiterCleanup::new(&self.state, waiter_id),
             )
         };
         let result = receiver
@@ -461,29 +461,22 @@ impl DelegatedOracleAdmission {
     }
 }
 
-/// Cancellation guard that removes one queued waiter and its orphaned demand.
+/// Cancellation guard that removes one queued waiter without duplicating demand.
 struct DelegatedWaiterCleanup {
     /// Shared local state containing the queued waiter.
     owner: Arc<Mutex<DelegatedState>>,
     /// Exact waiter identity to remove without disturbing FIFO peers.
     waiter_id: u64,
-    /// Coalescing key whose demand is reclaimed after its final waiter leaves.
-    request: DelegatedAdmissionRequest,
     /// Whether successful completion already removed the waiter.
     armed: bool,
 }
 
 impl DelegatedWaiterCleanup {
     /// Arms cancellation cleanup for one newly queued waiter.
-    fn new(
-        owner: &Arc<Mutex<DelegatedState>>,
-        waiter_id: u64,
-        request: DelegatedAdmissionRequest,
-    ) -> Self {
+    fn new(owner: &Arc<Mutex<DelegatedState>>, waiter_id: u64) -> Self {
         Self {
             owner: Arc::clone(owner),
             waiter_id,
-            request,
             armed: true,
         }
     }
@@ -495,7 +488,11 @@ impl DelegatedWaiterCleanup {
 }
 
 impl Drop for DelegatedWaiterCleanup {
-    /// Reclaims cancelled queue and coalescing state without waiting for capacity.
+    /// Reclaims queue capacity while retaining the already-enqueued demand.
+    ///
+    /// The worker channel cannot retract a sent notification. Keeping its
+    /// coalescing key prevents a replacement waiter from enqueueing a duplicate
+    /// allocation before the worker receives the original notification.
     fn drop(&mut self) {
         if !self.armed {
             return;
@@ -504,20 +501,6 @@ impl Drop for DelegatedWaiterCleanup {
             state
                 .waiters
                 .retain(|waiter| waiter.waiter_id != self.waiter_id);
-            let demand_key = (
-                self.request.tenant_id,
-                self.request.principal_id,
-                self.request.query_class,
-            );
-            if !state.waiters.iter().any(|waiter| {
-                (
-                    waiter.request.tenant_id,
-                    waiter.request.principal_id,
-                    waiter.request.query_class,
-                ) == demand_key
-            }) {
-                state.outstanding.remove(&demand_key);
-            }
         }
     }
 }
@@ -709,12 +692,30 @@ mod tests {
         mpsc::Receiver<OracleAdmissionDemand>,
         mpsc::Receiver<OracleAdmissionContinuityLost>,
     ) {
+        owner_with_queue_capacity(DelegatedOracleAdmissionConfig::default().queue_capacity)
+    }
+
+    /// Constructs a local owner with one exact test queue capacity.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the requested queue capacity violates lifecycle invariants.
+    fn owner_with_queue_capacity(
+        queue_capacity: usize,
+    ) -> (
+        Arc<DelegatedOracleAdmission>,
+        mpsc::Receiver<OracleAdmissionDemand>,
+        mpsc::Receiver<OracleAdmissionContinuityLost>,
+    ) {
         let (demand_tx, demand_rx) = mpsc::channel(8);
         let (loss_tx, loss_rx) = mpsc::channel(8);
         let owner = DelegatedOracleAdmission::new(
             NodeId::new(uuid::Uuid::from_u128(1)),
             3,
-            DelegatedOracleAdmissionConfig::default(),
+            DelegatedOracleAdmissionConfig {
+                queue_capacity,
+                ..DelegatedOracleAdmissionConfig::default()
+            },
             demand_tx,
             loss_tx,
         )
@@ -779,15 +780,15 @@ mod tests {
         second.abort();
     }
 
-    /// Cancelling a waiter immediately reclaims queue and coalesced demand state.
+    /// Cancellation reclaims queue capacity without duplicating queued demand.
     ///
     /// # Panics
     ///
-    /// Panics when cancellation leaves state behind or the reclaimed queue cannot
-    /// accept and complete a replacement request.
+    /// Panics when cancellation leaves its waiter behind, forgets the original
+    /// notification, duplicates demand, or changes replacement FIFO order.
     #[tokio::test]
-    async fn cancelled_waiter_reclaims_demand_and_queue_for_reuse() {
-        let (owner, mut demand_rx, _) = owner();
+    async fn cancelled_waiter_preserves_enqueued_demand_and_fifo_queue_reuse() {
+        let (owner, mut demand_rx, _) = owner_with_queue_capacity(2);
         let request = DelegatedAdmissionRequest {
             tenant_id: DataTenantId::new_v7(),
             principal_id: PrincipalId::new(uuid::Uuid::now_v7()),
@@ -796,26 +797,45 @@ mod tests {
         let cancelled_owner = Arc::clone(&owner);
         let cancelled = tokio::spawn(async move { cancelled_owner.acquire(request).await });
         tokio::task::yield_now().await;
-        let first_demand = demand_rx.try_recv().expect("first demand");
+        assert_eq!(demand_rx.len(), 1, "worker has not received first demand");
         cancelled.abort();
         let cancelled_result = cancelled.await;
         assert!(matches!(cancelled_result, Err(error) if error.is_cancelled()));
         {
             let state = owner.state.lock().expect("state after cancellation");
             assert!(state.waiters.is_empty());
-            assert!(state.outstanding.is_empty());
-        }
-
-        let replacement_owner = Arc::clone(&owner);
-        let replacement = tokio::spawn(async move { replacement_owner.acquire(request).await });
-        tokio::task::yield_now().await;
-        let replacement_demand = demand_rx.try_recv().expect("replacement demand");
-        assert_eq!(replacement_demand.tenant_id, first_demand.tenant_id);
-        {
-            let state = owner.state.lock().expect("replacement state");
-            assert_eq!(state.waiters.len(), 1);
             assert_eq!(state.outstanding.len(), 1);
         }
+
+        let first_owner = Arc::clone(&owner);
+        let first = tokio::spawn(async move { first_owner.acquire(request).await });
+        tokio::task::yield_now().await;
+        let second_owner = Arc::clone(&owner);
+        let second = tokio::spawn(async move { second_owner.acquire(request).await });
+        tokio::task::yield_now().await;
+        {
+            let state = owner.state.lock().expect("replacement state");
+            assert_eq!(
+                state
+                    .waiters
+                    .iter()
+                    .map(|waiter| waiter.waiter_id)
+                    .collect::<Vec<_>>(),
+                vec![2, 3]
+            );
+            assert_eq!(state.outstanding.len(), 1);
+        }
+        assert_eq!(demand_rx.len(), 1, "replacement must reuse original demand");
+        let original_demand = demand_rx.try_recv().expect("original demand remains");
+        assert_eq!(original_demand.tenant_id, request.tenant_id);
+        assert!(
+            demand_rx.try_recv().is_err(),
+            "no duplicate demand is queued"
+        );
+        assert!(matches!(
+            owner.acquire(request).await,
+            Err(DelegatedOracleAdmissionError::QueueFull)
+        ));
         let now = Utc::now();
         owner
             .install_block(
@@ -834,15 +854,36 @@ mod tests {
                 now,
             )
             .expect("replacement block installs");
-        let grant = replacement
+        let first_grant = first
             .await
-            .expect("replacement joins")
-            .expect("grant");
+            .expect("first replacement joins")
+            .expect("first grant");
+        tokio::task::yield_now().await;
+        assert!(
+            !second.is_finished(),
+            "second replacement remains FIFO queued"
+        );
+        assert_eq!(
+            owner
+                .state
+                .lock()
+                .expect("state after first grant")
+                .waiters
+                .front()
+                .expect("second waiter remains")
+                .waiter_id,
+            3
+        );
+        drop(first_grant);
+        let second_grant = second
+            .await
+            .expect("second replacement joins")
+            .expect("second grant");
         let state = owner.state.lock().expect("completed replacement state");
         assert!(state.waiters.is_empty());
         assert!(state.outstanding.is_empty());
         drop(state);
-        drop(grant);
+        drop(second_grant);
     }
 
     /// Cached grants consume and restore complete local units without SQL.

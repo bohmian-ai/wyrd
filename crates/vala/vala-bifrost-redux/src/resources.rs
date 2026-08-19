@@ -29,6 +29,7 @@ use datafusion::execution::memory_pool::{
 use num_traits::ToPrimitive;
 use rustix::fs::statvfs;
 use tokio::sync::Notify;
+use wyrd_spec::vala::api::QueryClass;
 
 /// One mebibyte in bytes.
 const MIB: usize = 1024 * 1024;
@@ -1144,7 +1145,19 @@ pub struct ResourceSnapshot {
     pub scratch_used_bytes: u64,
     /// Concurrent Forge input-reader permits held by active rewrites.
     pub forge_reader_permits_used: usize,
-    /// Whether the sole Oracle query owner is active.
+    /// Aggregate number of live Oracle query owners.
+    pub oracle_active_queries: u32,
+    /// Live interactive Oracle query owners.
+    pub oracle_interactive_queries: u32,
+    /// Live analytical Oracle query owners.
+    pub oracle_analytical_queries: u32,
+    /// Aggregate slot units retained by Oracle query owners.
+    pub oracle_query_slot_units: u32,
+    /// Aggregate memory retained specifically by Oracle query owners.
+    pub oracle_query_memory_used_bytes: usize,
+    /// Aggregate scratch retained specifically by Oracle query owners.
+    pub oracle_query_scratch_used_bytes: u64,
+    /// Whether at least one Oracle query owner is active.
     pub oracle_query_active: bool,
 }
 
@@ -1179,6 +1192,14 @@ pub struct ResourceAttributionSnapshot {
 /// One complete Oracle query request.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OracleResourceRequest {
+    /// Scheduling class whose protected-capacity rules apply to the query.
+    pub query_class: QueryClass,
+    /// Exact positive root memory demand.
+    pub memory_bytes: usize,
+    /// Exact positive root scratch demand.
+    pub scratch_bytes: u64,
+    /// Exact positive Oracle slot-unit demand.
+    pub slot_units: u32,
     /// Fraction of pinned input bytes expected to be local, in `[0, 1]`.
     pub local_ratio: f64,
 }
@@ -1210,7 +1231,12 @@ struct ResourceState {
     elastic_memory_used_bytes: usize,
     scratch_used_bytes: u64,
     forge_reader_permits_used: usize,
-    oracle_query_active: bool,
+    oracle_active_queries: u32,
+    oracle_interactive_queries: u32,
+    oracle_analytical_queries: u32,
+    oracle_query_slot_units: u32,
+    oracle_query_memory_used_bytes: usize,
+    oracle_query_scratch_used_bytes: u64,
     scribe_category_bytes: [usize; crate::scribe::memory::MEMORY_CATEGORY_COUNT],
     scribe_shard_bytes: BTreeMap<usize, usize>,
     scribe_generation_bytes: usize,
@@ -1772,12 +1798,19 @@ impl OracleResources {
         OracleQueryMemoryReservation::try_new(pool, self.governor.clone(), consumer, bytes)
     }
 
-    /// Acquires one remote-worker quantum from the Oracle floor and elastic pool.
+    /// Acquires one exact remote-worker quantum alongside other Oracle owners.
+    ///
+    /// The worker spends the shared Oracle floor first and borrows only the
+    /// incremental elastic bytes required by its closed class quantum. Query,
+    /// metadata, and sibling worker owners remain independently attributable in
+    /// the same root ledger.
     ///
     /// # Errors
     ///
-    /// Returns a typed refusal when an exclusive query is active or the shared
-    /// Oracle role cannot cover one advertised worker quantum.
+    /// Returns [`BifrostResourceError::Occupied`] when the Oracle floor plus
+    /// currently free elastic memory cannot cover the class quantum, or a
+    /// poison/invalid-plan error when root accounting or role configuration is
+    /// not trustworthy. Refusal changes no counters.
     pub fn try_acquire_worker(
         &self,
         class: OracleWorkerClass,
@@ -1796,14 +1829,21 @@ impl OracleResources {
         }
     }
 
-    /// Atomically acquires the complete currently-free Oracle query envelope.
+    /// Atomically acquires one exact query envelope alongside compatible owners.
+    ///
+    /// Memory is charged floor-first, scratch and slot units are additive, and
+    /// analytical admission preserves one interactive quantum. The returned
+    /// query owns a bounded `DataFusion` pool and nested scratch ceiling equal
+    /// to this request rather than the role's remaining capacity.
     ///
     /// # Errors
     ///
-    /// Returns [`BifrostResourceError::Occupied`] when another query owns the
-    /// envelope or the exact memory/scratch minimum cannot be owned, and
-    /// [`BifrostResourceError::InvalidPlan`] for invalid partition inputs. No
-    /// counter changes on refusal.
+    /// Returns [`BifrostResourceError::Occupied`] when aggregate memory,
+    /// scratch, slot units, physical scratch, or the protected interactive
+    /// reserve cannot cover the exact request. Returns
+    /// [`BifrostResourceError::InvalidPlan`] for zero, overflowing, inactive,
+    /// or invalid partition demand, and a poison error for divergent root
+    /// accounting. No root counter changes on root-admission refusal.
     pub fn try_acquire_query(
         &self,
         request: OracleResourceRequest,
@@ -2152,7 +2192,13 @@ impl BifrostResourceGovernor {
             elastic_memory_used_bytes: state.elastic_memory_used_bytes,
             scratch_used_bytes: state.scratch_used_bytes,
             forge_reader_permits_used: state.forge_reader_permits_used,
-            oracle_query_active: state.oracle_query_active,
+            oracle_active_queries: state.oracle_active_queries,
+            oracle_interactive_queries: state.oracle_interactive_queries,
+            oracle_analytical_queries: state.oracle_analytical_queries,
+            oracle_query_slot_units: state.oracle_query_slot_units,
+            oracle_query_memory_used_bytes: state.oracle_query_memory_used_bytes,
+            oracle_query_scratch_used_bytes: state.oracle_query_scratch_used_bytes,
+            oracle_query_active: state.oracle_active_queries > 0,
         })
     }
 
@@ -2400,13 +2446,14 @@ impl BifrostResourceGovernor {
         }
     }
 
-    /// Atomically acquires the complete currently-free Oracle query envelope.
+    /// Atomically acquires one exact Oracle query envelope.
     ///
     /// # Errors
     ///
-    /// Returns [`BifrostResourceError::Occupied`] when another Oracle query is
-    /// active or the exact memory/scratch minimum cannot be owned. No counter is
-    /// changed on refusal.
+    /// Returns [`BifrostResourceError::Occupied`] when aggregate memory,
+    /// scratch, slot, or protected interactive capacity cannot cover the exact
+    /// request. Invalid or overflowing demand returns
+    /// [`BifrostResourceError::InvalidPlan`]. No counter changes on refusal.
     pub(crate) fn try_acquire_oracle(
         &self,
         request: OracleResourceRequest,
@@ -2418,53 +2465,101 @@ impl BifrostResourceGovernor {
                 detail: "Oracle resources requested while the role is inactive".to_owned(),
             });
         }
-        if state.oracle_query_active || state.oracle_memory_used_bytes != 0 {
-            record_memory_transition("oracle", "refused", state.oracle_memory_used_bytes);
-            return Err(BifrostResourceError::Occupied {
-                detail: "another Oracle query owns the pod resource envelope".to_owned(),
+        if request.memory_bytes == 0 || request.scratch_bytes == 0 || request.slot_units == 0 {
+            return Err(BifrostResourceError::InvalidPlan {
+                detail: "Oracle query demands must be positive".to_owned(),
             });
         }
-        let free_elastic = plan
-            .elastic_memory_bytes
-            .checked_sub(state.elastic_memory_used_bytes)
-            .ok_or_else(|| self.poison_locked(&mut state, "elastic memory underflow"))?;
-        let memory_bytes = plan
-            .oracle_floor_bytes
-            .checked_add(free_elastic)
+        let next_memory = state
+            .oracle_memory_used_bytes
+            .checked_add(request.memory_bytes)
             .ok_or_else(accounting_overflow)?;
-        let scratch_bytes = plan
-            .scratch_limit_bytes
-            .checked_sub(state.scratch_used_bytes)
-            .ok_or_else(|| self.poison_locked(&mut state, "scratch underflow"))?;
-        if memory_bytes < ROLE_MEMORY_FLOOR_BYTES || scratch_bytes == 0 {
-            record_memory_transition("oracle", "refused", state.oracle_memory_used_bytes);
-            return Err(BifrostResourceError::Occupied {
-                detail: format!(
-                    "Oracle requires at least {ROLE_MEMORY_FLOOR_BYTES} memory bytes and positive scratch"
-                ),
-            });
-        }
-        let target_partitions =
-            oracle_target_partitions(plan.effective_cpu, request.local_ratio, memory_bytes)?;
-        state.elastic_memory_used_bytes = state
+        let prior_borrow = state
+            .oracle_memory_used_bytes
+            .saturating_sub(plan.oracle_floor_bytes);
+        let next_borrow = next_memory.saturating_sub(plan.oracle_floor_bytes);
+        let added_elastic = next_borrow
+            .checked_sub(prior_borrow)
+            .ok_or_else(accounting_overflow)?;
+        let next_elastic = state
             .elastic_memory_used_bytes
-            .checked_add(free_elastic)
+            .checked_add(added_elastic)
             .ok_or_else(accounting_overflow)?;
-        state.oracle_memory_used_bytes = memory_bytes;
-        state.scratch_used_bytes = state
+        let next_scratch = state
             .scratch_used_bytes
-            .checked_add(scratch_bytes)
+            .checked_add(request.scratch_bytes)
             .ok_or_else(accounting_overflow)?;
-        state.oracle_query_active = true;
-        record_memory_transition("oracle", "acquired", memory_bytes);
-        let memory_pool = bounded_memory_pool(memory_bytes);
+        let next_slots = state
+            .oracle_query_slot_units
+            .checked_add(request.slot_units)
+            .ok_or_else(accounting_overflow)?;
+        let slot_limit =
+            u32::try_from(oracle_worker_slots(plan)?).map_err(|_| accounting_overflow())?;
+        let role_ceiling = plan
+            .oracle_floor_bytes
+            .checked_add(
+                plan.elastic_memory_bytes
+                    .checked_sub(state.elastic_memory_used_bytes)
+                    .ok_or_else(|| self.poison_locked(&mut state, "elastic memory underflow"))?,
+            )
+            .and_then(|free| free.checked_add(prior_borrow))
+            .ok_or_else(accounting_overflow)?;
+        let analytical_ceiling = role_ceiling.saturating_sub(ORACLE_PARTITION_MEMORY_BYTES);
+        if next_elastic > plan.elastic_memory_bytes
+            || next_scratch > plan.scratch_limit_bytes
+            || next_slots > slot_limit
+            || (request.query_class == QueryClass::Analytical && next_memory > analytical_ceiling)
+        {
+            record_memory_transition("oracle", "refused", state.oracle_memory_used_bytes);
+            return Err(BifrostResourceError::Occupied {
+                detail: "Oracle query exceeds aggregate memory, scratch, slot, or protected interactive capacity".to_owned(),
+            });
+        }
+        let target_partitions = oracle_target_partitions(
+            plan.effective_cpu,
+            request.local_ratio,
+            request.memory_bytes,
+        )?;
+        let next_active = state
+            .oracle_active_queries
+            .checked_add(1)
+            .ok_or_else(accounting_overflow)?;
+        let next_interactive = state
+            .oracle_interactive_queries
+            .checked_add(u32::from(request.query_class == QueryClass::Interactive))
+            .ok_or_else(accounting_overflow)?;
+        let next_analytical = state
+            .oracle_analytical_queries
+            .checked_add(u32::from(request.query_class == QueryClass::Analytical))
+            .ok_or_else(accounting_overflow)?;
+        let next_query_memory = state
+            .oracle_query_memory_used_bytes
+            .checked_add(request.memory_bytes)
+            .ok_or_else(accounting_overflow)?;
+        let next_query_scratch = state
+            .oracle_query_scratch_used_bytes
+            .checked_add(request.scratch_bytes)
+            .ok_or_else(accounting_overflow)?;
+        state.elastic_memory_used_bytes = next_elastic;
+        state.oracle_memory_used_bytes = next_memory;
+        state.scratch_used_bytes = next_scratch;
+        state.oracle_query_slot_units = next_slots;
+        state.oracle_active_queries = next_active;
+        state.oracle_interactive_queries = next_interactive;
+        state.oracle_analytical_queries = next_analytical;
+        state.oracle_query_memory_used_bytes = next_query_memory;
+        state.oracle_query_scratch_used_bytes = next_query_scratch;
+        record_memory_transition("oracle", "acquired", next_memory);
+        let memory_pool = bounded_memory_pool(request.memory_bytes);
         Ok(OracleQueryResources {
-            memory_bytes,
-            scratch_bytes,
+            query_class: request.query_class,
+            memory_bytes: request.memory_bytes,
+            scratch_bytes: request.scratch_bytes,
+            slot_units: request.slot_units,
             target_partitions,
             memory_pool,
             nested_scratch_used_bytes: Arc::new(Mutex::new(0)),
-            elastic_bytes: free_elastic,
+            elastic_bytes: added_elastic,
             governor: self.clone(),
             released: false,
             volume_scratch: None,
@@ -2481,12 +2576,6 @@ impl BifrostResourceGovernor {
         if plan.oracle_floor_bytes == 0 {
             return Err(BifrostResourceError::InvalidPlan {
                 detail: "Oracle resources requested while the role is inactive".to_owned(),
-            });
-        }
-        if state.oracle_query_active {
-            record_memory_transition("oracle", "refused", state.oracle_memory_used_bytes);
-            return Err(BifrostResourceError::Occupied {
-                detail: "an Oracle query owns the pod resource envelope".to_owned(),
             });
         }
         let next = state
@@ -3262,12 +3351,13 @@ pub struct OracleMetadataResources {
 }
 
 impl OracleMetadataResources {
-    /// Acquires the exact 40 MiB footer slot before any trailer or footer I/O.
+    /// Acquires the exact 40 MiB footer slot alongside other Oracle owners.
     ///
     /// # Errors
     ///
-    /// Returns a typed refusal when the Oracle floor plus free elastic memory
-    /// cannot cover the fixed slot or an exclusive query is active.
+    /// Returns [`BifrostResourceError::Occupied`] when the Oracle floor plus
+    /// free elastic memory cannot cover the fixed slot, or a poison/invalid-plan
+    /// error when root accounting or role configuration is not trustworthy.
     pub fn try_acquire_footer_slot(
         &self,
     ) -> Result<OracleFooterSlotResources, BifrostResourceError> {
@@ -3348,10 +3438,14 @@ impl Drop for OracleMemoryLease {
 /// Query-lifetime Oracle memory, scratch, and adaptive parallelism owner.
 #[derive(Debug)]
 pub struct OracleQueryResources {
+    /// Scheduling class charged by this query owner.
+    query_class: QueryClass,
     /// Exact bounded memory available to all query consumers.
     pub memory_bytes: usize,
     /// Exact bounded disposable scratch capacity.
     pub scratch_bytes: u64,
+    /// Exact slot units retained by this query owner.
+    slot_units: u32,
     /// Query-local `DataFusion` target partition count.
     pub target_partitions: usize,
     /// One shared pool used by `DataFusion` and every query-owned Wyrd consumer.
@@ -3448,7 +3542,15 @@ impl OracleQueryResources {
         }
         drop(nested_scratch);
         let mut state = self.governor.lock_state()?;
-        if !state.oracle_query_active
+        let class_count = match self.query_class {
+            QueryClass::Interactive => state.oracle_interactive_queries,
+            QueryClass::Analytical => state.oracle_analytical_queries,
+        };
+        if state.oracle_active_queries == 0
+            || class_count == 0
+            || state.oracle_query_slot_units < self.slot_units
+            || state.oracle_query_memory_used_bytes < self.memory_bytes
+            || state.oracle_query_scratch_used_bytes < self.scratch_bytes
             || state.oracle_memory_used_bytes < self.memory_bytes
             || state.elastic_memory_used_bytes < self.elastic_bytes
             || state.scratch_used_bytes < self.scratch_bytes
@@ -3460,7 +3562,14 @@ impl OracleQueryResources {
         state.elastic_memory_used_bytes -= self.elastic_bytes;
         state.oracle_memory_used_bytes -= self.memory_bytes;
         state.scratch_used_bytes -= self.scratch_bytes;
-        state.oracle_query_active = false;
+        state.oracle_active_queries -= 1;
+        match self.query_class {
+            QueryClass::Interactive => state.oracle_interactive_queries -= 1,
+            QueryClass::Analytical => state.oracle_analytical_queries -= 1,
+        }
+        state.oracle_query_slot_units -= self.slot_units;
+        state.oracle_query_memory_used_bytes -= self.memory_bytes;
+        state.oracle_query_scratch_used_bytes -= self.scratch_bytes;
         state.memory_epoch = state.memory_epoch.wrapping_add(1);
         record_memory_transition("oracle", "released", state.oracle_memory_used_bytes);
         self.volume_scratch.take();
@@ -4089,6 +4198,17 @@ mod tests {
             scratch_available_bytes: 2 * 1024 * 1024 * 1024,
             memory_source: ResourceSource::Injected,
             cpu_source: ResourceSource::Injected,
+        }
+    }
+
+    /// Builds one exact interactive query quantum for root-ledger tests.
+    fn interactive_query(local_ratio: f64) -> OracleResourceRequest {
+        OracleResourceRequest {
+            query_class: QueryClass::Interactive,
+            memory_bytes: ORACLE_PARTITION_MEMORY_BYTES,
+            scratch_bytes: ORACLE_PARTITION_MEMORY_BYTES as u64,
+            slot_units: 1,
+            local_ratio,
         }
     }
 
@@ -4849,13 +4969,9 @@ mod tests {
         );
         let oracle = roles.oracle().expect("Oracle capability");
         let first = oracle
-            .try_acquire_query(OracleResourceRequest { local_ratio: 0.0 })
-            .expect("first query owns the complete grant");
-        assert!(
-            oracle
-                .try_acquire_query(OracleResourceRequest { local_ratio: 1.0 })
-                .is_err()
-        );
+            .try_acquire_query(interactive_query(0.0))
+            .expect("first query owns one exact grant");
+        assert!(oracle.try_acquire_query(interactive_query(1.0)).is_err());
         let occupied = oracle.snapshot().expect("snapshot");
         assert!(occupied.oracle_query_active);
         drop(first);
@@ -4869,6 +4985,12 @@ mod tests {
                 elastic_memory_used_bytes: 0,
                 scratch_used_bytes: 0,
                 forge_reader_permits_used: 0,
+                oracle_active_queries: 0,
+                oracle_interactive_queries: 0,
+                oracle_analytical_queries: 0,
+                oracle_query_slot_units: 0,
+                oracle_query_memory_used_bytes: 0,
+                oracle_query_scratch_used_bytes: 0,
                 oracle_query_active: false,
             }
         );
@@ -4972,7 +5094,7 @@ mod tests {
         assert!(matches!(error, BifrostResourceError::InvalidPlan { .. }));
     }
 
-    /// A complete Oracle grant owns one finite greedy pool and releases exactly.
+    /// One exact Oracle grant owns one finite greedy pool and releases exactly.
     #[test]
     fn oracle_runtime_pool_is_issued_by_query_lease() {
         let roles = BifrostRuntimeResources::from_snapshot(
@@ -4984,9 +5106,9 @@ mod tests {
         .expect("combined role composition");
         let oracle = roles.oracle().expect("Oracle capability");
         let query = oracle
-            .try_acquire_query(OracleResourceRequest { local_ratio: 0.0 })
+            .try_acquire_query(interactive_query(0.0))
             .expect("complete query grant");
-        assert_eq!(query.memory_bytes, 512 * MIB);
+        assert_eq!(query.memory_bytes, ORACLE_PARTITION_MEMORY_BYTES);
         let pool = query.memory_pool();
         let reservation = MemoryConsumer::new("oracle-test").register(&pool);
         reservation
@@ -5265,7 +5387,7 @@ mod tests {
         );
         let oracle = roles.oracle().expect("Oracle capability");
         let query = oracle
-            .try_acquire_query(OracleResourceRequest { local_ratio: 0.0 })
+            .try_acquire_query(interactive_query(0.0))
             .expect("query owner");
         let root_snapshot = oracle.snapshot().expect("root snapshot");
         let memory = query
@@ -5283,6 +5405,224 @@ mod tests {
         assert!(!oracle.snapshot().expect("released").oracle_query_active);
     }
 
+    /// Exact interactive queries overlap until one aggregate dimension is full.
+    #[test]
+    fn oracle_exact_queries_overlap_until_memory_or_scratch_exhaustion() {
+        let roles = BifrostRuntimeResources::composed_for_test(
+            1024 * MIB,
+            512 * MIB as u64,
+            [BifrostRole::Oracle],
+        );
+        let oracle = roles.oracle().expect("Oracle capability");
+        let first = oracle
+            .try_acquire_query(interactive_query(0.0))
+            .expect("first exact query");
+        let second = oracle
+            .try_acquire_query(interactive_query(1.0))
+            .expect("second exact query");
+        let occupied = oracle.snapshot().expect("aggregate snapshot");
+        assert_eq!(occupied.oracle_active_queries, 2);
+        assert_eq!(occupied.oracle_query_memory_used_bytes, 512 * MIB);
+        assert_eq!(occupied.oracle_query_scratch_used_bytes, 512 * MIB as u64);
+        assert!(oracle.try_acquire_query(interactive_query(0.5)).is_err());
+        assert_eq!(oracle.snapshot().expect("atomic refusal"), occupied);
+        drop(first);
+        let replacement = oracle
+            .try_acquire_query(interactive_query(0.5))
+            .expect("release restores exact eligibility");
+        drop((second, replacement));
+        let released = oracle.snapshot().expect("released aggregate snapshot");
+        assert_eq!(released.oracle_active_queries, 0);
+        assert_eq!(released.oracle_memory_used_bytes, 0);
+        assert_eq!(released.scratch_used_bytes, 0);
+    }
+
+    /// Analytical admission preserves one complete interactive query quantum.
+    #[test]
+    fn analytical_capacity_preserves_one_interactive_quantum() {
+        let roles = BifrostRuntimeResources::composed_for_test(
+            1024 * MIB,
+            1024 * MIB as u64,
+            [BifrostRole::Oracle],
+        );
+        let oracle = roles.oracle().expect("Oracle capability");
+        let analytical = oracle
+            .try_acquire_query(OracleResourceRequest {
+                query_class: QueryClass::Analytical,
+                memory_bytes: 2 * ORACLE_PARTITION_MEMORY_BYTES,
+                scratch_bytes: (2 * ORACLE_PARTITION_MEMORY_BYTES) as u64,
+                slot_units: 2,
+                local_ratio: 0.0,
+            })
+            .expect("analytical query below protected reserve");
+        assert!(
+            oracle
+                .try_acquire_query(OracleResourceRequest {
+                    query_class: QueryClass::Analytical,
+                    memory_bytes: ORACLE_PARTITION_MEMORY_BYTES,
+                    scratch_bytes: ORACLE_PARTITION_MEMORY_BYTES as u64,
+                    slot_units: 1,
+                    local_ratio: 0.0,
+                })
+                .is_err()
+        );
+        let interactive = oracle
+            .try_acquire_query(interactive_query(0.0))
+            .expect("protected interactive quantum remains available");
+        let snapshot = oracle.snapshot().expect("mixed-class snapshot");
+        assert_eq!(snapshot.oracle_interactive_queries, 1);
+        assert_eq!(snapshot.oracle_analytical_queries, 1);
+        assert_eq!(snapshot.oracle_query_slot_units, 3);
+        drop((analytical, interactive));
+    }
+
+    /// Every role retains multiple exact owners in the same checked root ledger.
+    #[test]
+    fn role_leases_share_one_root_without_crossing_floors_or_elastic() {
+        let roles = BifrostRuntimeResources::composed_for_test(
+            1536 * MIB,
+            1024 * MIB as u64,
+            [BifrostRole::Scribe, BifrostRole::Oracle, BifrostRole::Forge],
+        );
+        let oracle = roles.oracle().expect("Oracle capability");
+        let scribe = roles.scribe().expect("Scribe capability");
+        let forge = roles.forge().expect("Forge capability");
+        let queries = [
+            oracle
+                .try_acquire_query(interactive_query(0.0))
+                .expect("query one"),
+            oracle
+                .try_acquire_query(interactive_query(1.0))
+                .expect("query two"),
+        ];
+        let scribe_leases = [
+            scribe
+                .try_acquire_memory(ScribeMemoryRequest {
+                    bytes: 64 * MIB,
+                    category: ScribeMemoryCategory::Raw,
+                    shard: Some(0),
+                    generation: None,
+                })
+                .expect("Scribe lease one"),
+            scribe
+                .try_acquire_memory(ScribeMemoryRequest {
+                    bytes: 64 * MIB,
+                    category: ScribeMemoryCategory::Queued,
+                    shard: Some(1),
+                    generation: None,
+                })
+                .expect("Scribe lease two"),
+        ];
+        let forge_leases = [
+            forge
+                .try_acquire_rewrite(ForgeRewriteRequest {
+                    envelope: envelope(),
+                    memory_bytes: 32 * MIB,
+                    scratch_bytes: 32 * MIB as u64,
+                    reader_permits: 1,
+                })
+                .expect("Forge lease one"),
+            forge
+                .try_acquire_rewrite(ForgeRewriteRequest {
+                    envelope: envelope(),
+                    memory_bytes: 32 * MIB,
+                    scratch_bytes: 32 * MIB as u64,
+                    reader_permits: 1,
+                })
+                .expect("Forge lease two"),
+        ];
+        let snapshot = roles.snapshot().expect("shared-root snapshot");
+        assert!(
+            snapshot.scribe_memory_used_bytes
+                + snapshot.oracle_memory_used_bytes
+                + snapshot.forge_memory_used_bytes
+                <= snapshot.plan.managed_memory_bytes
+        );
+        assert_eq!(
+            snapshot.elastic_memory_used_bytes,
+            ORACLE_PARTITION_MEMORY_BYTES
+        );
+        drop((queries, scribe_leases, forge_leases));
+        let released = roles.snapshot().expect("shared-root release");
+        assert_eq!(released.scribe_memory_used_bytes, 0);
+        assert_eq!(released.oracle_memory_used_bytes, 0);
+        assert_eq!(released.forge_memory_used_bytes, 0);
+        assert_eq!(released.scratch_used_bytes, 0);
+    }
+
+    /// Query release is exact, idempotent, and fail-closed on surviving children.
+    #[test]
+    fn oracle_release_paths_are_exact_and_idempotent() {
+        let roles = BifrostRuntimeResources::composed_for_test(
+            1024 * MIB,
+            512 * MIB as u64,
+            [BifrostRole::Oracle],
+        );
+        let oracle = roles.oracle().expect("Oracle capability");
+        let mut explicit = oracle
+            .try_acquire_query(interactive_query(0.0))
+            .expect("explicit owner");
+        let scratch = explicit.try_split_scratch(1).expect("scratch child");
+        drop(scratch);
+        explicit.release().expect("explicit release");
+        explicit.release().expect("idempotent release");
+        drop(explicit);
+        let dropped = oracle
+            .try_acquire_query(interactive_query(0.0))
+            .expect("drop owner");
+        drop(dropped);
+        assert_eq!(
+            oracle
+                .snapshot()
+                .expect("ordinary release")
+                .oracle_active_queries,
+            0
+        );
+
+        let poisoned_roles = BifrostRuntimeResources::composed_for_test(
+            1024 * MIB,
+            512 * MIB as u64,
+            [BifrostRole::Oracle],
+        );
+        let poisoned_oracle = poisoned_roles.oracle().expect("poison test capability");
+        let owner = poisoned_oracle
+            .try_acquire_query(interactive_query(0.0))
+            .expect("poison owner");
+        let child = owner.try_split_scratch(1).expect("surviving child");
+        drop(owner);
+        assert_eq!(
+            poisoned_roles.health().reason(),
+            Some(BifrostResourcePoisonReason::Accounting)
+        );
+        drop(child);
+
+        let underflow_roles = BifrostRuntimeResources::composed_for_test(
+            1024 * MIB,
+            512 * MIB as u64,
+            [BifrostRole::Oracle],
+        );
+        let underflow_oracle = underflow_roles.oracle().expect("underflow test capability");
+        let mut underflow_owner = underflow_oracle
+            .try_acquire_query(interactive_query(0.0))
+            .expect("underflow owner");
+        underflow_oracle
+            .governor
+            .inner
+            .state
+            .lock()
+            .expect("underflow state lock")
+            .oracle_query_slot_units = 0;
+        assert!(matches!(
+            underflow_owner.release(),
+            Err(BifrostResourceError::Poisoned { .. })
+        ));
+        assert_eq!(
+            underflow_roles.health().reason(),
+            Some(BifrostResourcePoisonReason::Accounting)
+        );
+        drop(underflow_owner);
+    }
+
     /// A refused Oracle query mutates no counter and leaves the root usable.
     #[test]
     fn oracle_capability_refusal_is_atomic() {
@@ -5293,14 +5633,10 @@ mod tests {
         );
         let oracle = roles.oracle().expect("Oracle capability");
         let held = oracle
-            .try_acquire_query(OracleResourceRequest { local_ratio: 0.0 })
-            .expect("sole query owns the complete grant");
+            .try_acquire_query(interactive_query(0.0))
+            .expect("first query owns one exact grant");
         let occupied = oracle.snapshot().expect("occupied snapshot");
-        assert!(
-            oracle
-                .try_acquire_query(OracleResourceRequest { local_ratio: 0.0 })
-                .is_err()
-        );
+        assert!(oracle.try_acquire_query(interactive_query(0.0)).is_err());
         assert_eq!(
             oracle.snapshot().expect("post-refusal snapshot"),
             occupied,
@@ -5312,9 +5648,7 @@ mod tests {
         assert_eq!(released.scratch_used_bytes, 0);
         assert!(!released.oracle_query_active);
         assert!(
-            oracle
-                .try_acquire_query(OracleResourceRequest { local_ratio: 0.0 })
-                .is_ok(),
+            oracle.try_acquire_query(interactive_query(0.0)).is_ok(),
             "the root remains usable after a refusal"
         );
     }
@@ -5423,7 +5757,7 @@ mod tests {
         let oracle = roles.oracle().expect("Oracle capability");
         let baseline = oracle.snapshot().expect("baseline");
         let query = oracle
-            .try_acquire_query(OracleResourceRequest { local_ratio: 0.0 })
+            .try_acquire_query(interactive_query(0.0))
             .expect("query lease");
         let pool = query.memory_pool();
         assert!(
@@ -5507,24 +5841,19 @@ mod tests {
         assert_eq!(with_scribe.scribe_memory_used_bytes, 300 * MIB);
         assert_eq!(with_scribe.elastic_memory_used_bytes, 44 * MIB);
         let query = oracle
-            .try_acquire_query(OracleResourceRequest { local_ratio: 0.0 })
+            .try_acquire_query(interactive_query(0.0))
             .expect("Oracle owns only its floor and shared elastic memory");
-        assert_eq!(
-            query.memory_bytes,
-            plan.oracle_floor_bytes + plan.elastic_memory_bytes
-                - with_scribe.elastic_memory_used_bytes
-        );
-        assert!(
-            forge
-                .try_acquire_rewrite(ForgeRewriteRequest {
-                    envelope: envelope(),
-                    memory_bytes: 1,
-                    scratch_bytes: 1,
-                    reader_permits: 1,
-                })
-                .is_err()
-        );
+        assert_eq!(query.memory_bytes, ORACLE_PARTITION_MEMORY_BYTES);
+        let concurrent_forge = forge
+            .try_acquire_rewrite(ForgeRewriteRequest {
+                envelope: envelope(),
+                memory_bytes: 1,
+                scratch_bytes: 1,
+                reader_permits: 1,
+            })
+            .expect("Forge retains its floor while Oracle owns an exact query");
         assert_eq!(roles.plan().scribe_floor_bytes, ROLE_MEMORY_FLOOR_BYTES);
+        drop(concurrent_forge);
         drop(query);
         drop(scribe_owner);
         let forge_owner = forge

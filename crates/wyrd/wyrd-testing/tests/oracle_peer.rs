@@ -557,7 +557,13 @@ fn context(leader: NodeId) -> TestDispatchContext {
     let query = roles
         .oracle()
         .expect("Oracle peer fixture capability")
-        .try_acquire_query(OracleResourceRequest { local_ratio: 0.0 })
+        .try_acquire_query(OracleResourceRequest {
+            query_class: QueryClass::Interactive,
+            memory_bytes: vala_bifrost_redux::resources::ORACLE_PARTITION_MEMORY_BYTES,
+            scratch_bytes: vala_bifrost_redux::resources::ORACLE_PARTITION_MEMORY_BYTES as u64,
+            slot_units: 1,
+            local_ratio: 0.0,
+        })
         .expect("Oracle peer fixture query owner");
     let query_memory_pool = query.memory_pool();
     TestDispatchContext {

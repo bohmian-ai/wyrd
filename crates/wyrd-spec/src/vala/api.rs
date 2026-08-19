@@ -1016,6 +1016,179 @@ pub enum QueryClass {
     Analytical,
 }
 
+/// The current non-terminal lifecycle state of an admitted Oracle query.
+///
+/// The state is projected by live controls only; completed queries are removed
+/// from the in-memory registry and are not durable query jobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum RunningQueryLifecycleState {
+    /// Admission completed and execution has not emitted progress yet.
+    Admitted,
+    /// The selected participant cut is executing.
+    Running,
+    /// A caller requested cancellation and owners are draining the cut.
+    Cancelling,
+}
+
+/// Aggregate progress for one request-ID-keyed Oracle query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct RunningQueryProgress {
+    /// Number of selected participants that have reported completion.
+    pub completed_participants: u32,
+    /// Exact number of participants frozen into the immutable cut.
+    pub total_participants: u32,
+}
+
+/// Public summary for one active Oracle query.
+///
+/// This contract deliberately excludes SQL text, parameters, Arrow batches,
+/// and result rows. A summary is tenant-scoped by the serving boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct RunningQuerySummary {
+    /// Stable request identity used by live controls.
+    pub request_id: RequestId,
+    /// Server-derived admission class.
+    pub query_class: QueryClass,
+    /// Wall-clock admission time.
+    pub started_at: DateTime<Utc>,
+    /// Absolute query deadline.
+    pub deadline: DateTime<Utc>,
+    /// Current non-terminal lifecycle state.
+    pub state: RunningQueryLifecycleState,
+    /// Aggregate progress over the immutable participant cut.
+    pub progress: RunningQueryProgress,
+    /// Whether cancellation has been requested for this request identity.
+    pub cancellation_requested: bool,
+}
+
+/// Response containing every active Oracle query visible to one tenant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ListRunningQueriesResponse {
+    /// Active request summaries in deterministic request-ID order.
+    pub queries: Vec<RunningQuerySummary>,
+}
+
+/// Request to read one active Oracle query by its public request identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct GetRunningQueryRequest {
+    /// Request identity selected by the caller.
+    pub request_id: RequestId,
+}
+
+/// Request to cancel one active Oracle query by its public request identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct CancelRunningQueryRequest {
+    /// Request identity selected by the caller.
+    pub request_id: RequestId,
+}
+
+/// Idempotent cancellation result for one active Oracle query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct CancelRunningQueryResponse {
+    /// Request identity selected by the caller.
+    pub request_id: RequestId,
+    /// Whether this call changed the registry from active to cancelling.
+    pub cancellation_started: bool,
+}
+
+/// Exact private role identity accepted for one immutable Oracle participant cut.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct OracleRoleFence {
+    /// Physical node identity.
+    pub node_id: NodeId,
+    /// Exact role represented by this participant.
+    pub role: ClusterRole,
+    /// Exact role-incarnation fence.
+    pub fencing_token: FencingToken,
+}
+
+/// Private admission facts for one request-ID-keyed Oracle lifecycle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct AdmitOracleLifecycleRequest {
+    /// Authenticated tenant that owns the request.
+    pub tenant_id: DataTenantId,
+    /// Public request identity used for all lifecycle controls.
+    pub request_id: RequestId,
+    /// Internal attempt identity bound to the immutable cut.
+    pub query_id: QueryId,
+    /// Server-derived execution class.
+    pub query_class: QueryClass,
+    /// Absolute execution deadline.
+    pub deadline: DateTime<Utc>,
+    /// SHA-256 fingerprint of the exact immutable participant cut.
+    pub cut_fingerprint: String,
+    /// Request-local leader's exact role fence.
+    pub leader: OracleRoleFence,
+    /// Every role fence frozen into the participant cut.
+    pub participants: Vec<OracleRoleFence>,
+}
+
+/// Private response to lifecycle admission before distributed execution begins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct AdmitOracleLifecycleResponse {
+    /// Whether the private owner accepted the exact participant cut.
+    pub accepted: bool,
+}
+
+/// Private follower report tied to an admitted lifecycle's cut and role fence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ReportOracleFollowerLifecycleRequest {
+    /// Authenticated tenant that owns the request.
+    pub tenant_id: DataTenantId,
+    /// Public request identity used for all lifecycle controls.
+    pub request_id: RequestId,
+    /// Internal attempt identity bound to the immutable cut.
+    pub query_id: QueryId,
+    /// SHA-256 fingerprint of the immutable participant cut.
+    pub cut_fingerprint: String,
+    /// Exact follower role fence making the report.
+    pub follower: OracleRoleFence,
+    /// Follower's terminal execution classification.
+    pub outcome: QueryTerminalOutcome,
+}
+
+/// Private acknowledgement of one follower lifecycle report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ReportOracleFollowerLifecycleResponse {
+    /// Number of participant reports accepted for the immutable cut.
+    pub completed_participants: u32,
+}
+
+/// Private cancellation signal tied to one tenant-qualified request identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct CancelOracleLifecycleRequest {
+    /// Authenticated tenant that owns the request.
+    pub tenant_id: DataTenantId,
+    /// Public request identity selected for cancellation.
+    pub request_id: RequestId,
+    /// Internal attempt identity bound to the immutable cut.
+    pub query_id: QueryId,
+    /// SHA-256 fingerprint of the immutable participant cut.
+    pub cut_fingerprint: String,
+}
+
+/// Private acknowledgement of a lifecycle cancellation signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct CancelOracleLifecycleResponse {
+    /// Whether cancellation was newly requested by this message.
+    pub cancellation_started: bool,
+}
+
 /// One durable accounting level used by delegated Oracle query admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
@@ -2454,6 +2627,108 @@ mod tests {
         let _ = schemars::schema_for!(QueryAgentTracesRequest);
         let _ = schemars::schema_for!(GetTraceRequest);
         let _ = schemars::schema_for!(TraceWaterfall);
+    }
+
+    /// Running-query controls retain one request identity and SQL-free state.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a lifecycle contract cannot serialize or deserialize, or
+    /// when its JSON round-trip changes the value.
+    #[test]
+    fn running_query_contract_round_trips() {
+        let request_id = RequestId::now_v7();
+        let started_at = DateTime::from_timestamp_millis(1_725_000_000_123)
+            .expect("fixed running-query timestamp is valid");
+        let summary = RunningQuerySummary {
+            request_id: request_id.clone(),
+            query_class: QueryClass::Interactive,
+            started_at,
+            deadline: started_at + chrono::Duration::seconds(30),
+            state: RunningQueryLifecycleState::Running,
+            progress: RunningQueryProgress {
+                completed_participants: 1,
+                total_participants: 2,
+            },
+            cancellation_requested: false,
+        };
+        assert_json_round_trip(&summary);
+        assert_json_round_trip(&ListRunningQueriesResponse {
+            queries: vec![summary],
+        });
+        assert_json_round_trip(&GetRunningQueryRequest {
+            request_id: request_id.clone(),
+        });
+        assert_json_round_trip(&CancelRunningQueryRequest {
+            request_id: request_id.clone(),
+        });
+        assert_json_round_trip(&CancelRunningQueryResponse {
+            request_id: request_id.clone(),
+            cancellation_started: true,
+        });
+
+        let tenant_id = DataTenantId::new_v7();
+        let query_id = QueryId::new(uuid::Uuid::from_u128(11));
+        let leader = OracleRoleFence {
+            node_id: NodeId::new(uuid::Uuid::from_u128(12)),
+            role: ClusterRole::Oracle,
+            fencing_token: 13,
+        };
+        assert_json_round_trip(&AdmitOracleLifecycleRequest {
+            tenant_id,
+            request_id: request_id.clone(),
+            query_id,
+            query_class: QueryClass::Interactive,
+            deadline: started_at + chrono::Duration::seconds(30),
+            cut_fingerprint: "sha256:cut".to_owned(),
+            leader: leader.clone(),
+            participants: vec![leader.clone()],
+        });
+        assert_json_round_trip(&AdmitOracleLifecycleResponse { accepted: true });
+        assert_json_round_trip(&ReportOracleFollowerLifecycleRequest {
+            tenant_id,
+            request_id: request_id.clone(),
+            query_id,
+            cut_fingerprint: "sha256:cut".to_owned(),
+            follower: leader,
+            outcome: QueryTerminalOutcome::Success,
+        });
+        assert_json_round_trip(&ReportOracleFollowerLifecycleResponse {
+            completed_participants: 1,
+        });
+        assert_json_round_trip(&CancelOracleLifecycleRequest {
+            tenant_id,
+            request_id,
+            query_id,
+            cut_fingerprint: "sha256:cut".to_owned(),
+        });
+        assert_json_round_trip(&CancelOracleLifecycleResponse {
+            cancellation_started: true,
+        });
+
+        let _ = schemars::schema_for!(RunningQuerySummary);
+        let _ = schemars::schema_for!(ListRunningQueriesResponse);
+        let _ = schemars::schema_for!(GetRunningQueryRequest);
+        let _ = schemars::schema_for!(CancelRunningQueryRequest);
+        let _ = schemars::schema_for!(CancelRunningQueryResponse);
+        let _ = schemars::schema_for!(AdmitOracleLifecycleRequest);
+        let _ = schemars::schema_for!(ReportOracleFollowerLifecycleRequest);
+        let _ = schemars::schema_for!(CancelOracleLifecycleRequest);
+    }
+
+    /// Proves one pure contract survives a complete JSON encode/decode cycle.
+    ///
+    /// # Panics
+    ///
+    /// Panics when serialization or deserialization fails, or when the decoded
+    /// contract differs from its source value.
+    fn assert_json_round_trip<T>(expected: &T)
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + std::fmt::Debug + PartialEq,
+    {
+        let value = serde_json::to_value(expected).expect("lifecycle contract serializes");
+        let actual: T = serde_json::from_value(value).expect("lifecycle contract deserializes");
+        assert_eq!(&actual, expected);
     }
 }
 

@@ -55,9 +55,11 @@ use wyrd_spec::storage::{
 use wyrd_spec::vala::api::{
     AuditDecision, AuditEvent, AuditResult, AuthMethod, BifrostErrorDescriptor,
     BifrostPermissionDescriptor, BifrostQueryRequest, BifrostTableDescription, BifrostTableEntry,
-    DataTypeSpec, FieldSpec as BifrostFieldSpec, PartitionColumnSpec, PartitionTransformWire,
-    QueryParam, RegisterOutcome, RegisterTableRequest, RegisterTableResponse, SyncQueryRequest,
-    TableStatus, TimeUnit,
+    CancelRunningQueryRequest, CancelRunningQueryResponse, DataTypeSpec,
+    FieldSpec as BifrostFieldSpec, GetRunningQueryRequest, ListRunningQueriesResponse,
+    PartitionColumnSpec, PartitionTransformWire, QueryParam, RegisterOutcome, RegisterTableRequest,
+    RegisterTableResponse, RunningQueryLifecycleState, RunningQueryProgress, RunningQuerySummary,
+    SyncQueryRequest, TableStatus, TimeUnit,
 };
 use wyrd_spec::vala::eval::{
     AgentTurnSubmission, ComparisonOperator, ConversationTurn, DagError, EvalCondition,
@@ -198,6 +200,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<RegisterTableResponse>(out, golden, "bifrost_register_table_response")?;
     write::<QueryParam>(out, golden, "bifrost_query_param")?;
     write::<BifrostQueryRequest>(out, golden, "bifrost_query_request")?;
+    write::<RunningQueryLifecycleState>(out, golden, "bifrost_running_query_lifecycle_state")?;
+    write::<RunningQueryProgress>(out, golden, "bifrost_running_query_progress")?;
+    write::<RunningQuerySummary>(out, golden, "bifrost_running_query_summary")?;
+    write::<ListRunningQueriesResponse>(out, golden, "bifrost_list_running_queries_response")?;
+    write::<GetRunningQueryRequest>(out, golden, "bifrost_get_running_query_request")?;
+    write::<CancelRunningQueryRequest>(out, golden, "bifrost_cancel_running_query_request")?;
+    write::<CancelRunningQueryResponse>(out, golden, "bifrost_cancel_running_query_response")?;
     write::<SyncQueryRequest>(out, golden, "bifrost_sync_query_request")?;
     write::<AuditEvent>(out, golden, "bifrost_audit_event")?;
     write::<AuthMethod>(out, golden, "bifrost_audit_auth_method")?;

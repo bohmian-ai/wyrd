@@ -2,7 +2,9 @@
 
 use std::str::FromStr;
 
+use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api as domain;
+use wyrd_spec::DataTenantId;
 
 use crate::wyrd::v1 as proto;
 
@@ -358,6 +360,245 @@ impl From<domain::ReleaseTailFenceRequest> for proto::ReleaseTailFenceRequest {
     }
 }
 
+impl TryFrom<proto::OracleRoleFence> for domain::OracleRoleFence {
+    type Error = PrivateConversionError;
+
+    /// Decodes one exact private participant role fence.
+    ///
+    /// # Errors
+    /// Returns [`PrivateConversionError`] for malformed node identities, an
+    /// unspecified role, or a zero fencing token.
+    fn try_from(value: proto::OracleRoleFence) -> Result<Self, Self::Error> {
+        if value.fencing_token == 0 {
+            return Err(PrivateConversionError::Invalid {
+                field: "fencing_token",
+            });
+        }
+        Ok(Self {
+            node_id: domain::NodeId::new(uuid_string(&value.node_id, "node_id")?),
+            role: cluster_role(value.role)?,
+            fencing_token: value.fencing_token,
+        })
+    }
+}
+
+impl From<domain::OracleRoleFence> for proto::OracleRoleFence {
+    /// Encodes one exact private participant role fence.
+    fn from(value: domain::OracleRoleFence) -> Self {
+        Self {
+            node_id: value.node_id.as_uuid().to_string(),
+            role: match value.role {
+                domain::ClusterRole::Scribe => proto::ClusterRole::Scribe as i32,
+                domain::ClusterRole::Oracle => proto::ClusterRole::Oracle as i32,
+            },
+            fencing_token: value.fencing_token,
+        }
+    }
+}
+
+impl TryFrom<proto::AdmitOracleLifecycleRequest> for domain::AdmitOracleLifecycleRequest {
+    type Error = PrivateConversionError;
+
+    /// Decodes private admission facts bound to one exact participant cut.
+    ///
+    /// # Errors
+    /// Returns [`PrivateConversionError`] for malformed identities, absent
+    /// leader details, unknown classes, invalid deadlines, or an empty cut hash.
+    fn try_from(value: proto::AdmitOracleLifecycleRequest) -> Result<Self, Self::Error> {
+        nonempty(&value.cut_fingerprint, "cut_fingerprint")?;
+        Ok(Self {
+            tenant_id: DataTenantId::from_str(&value.tenant_id)
+                .map_err(|_| PrivateConversionError::InvalidUuid("tenant_id"))?,
+            request_id: RequestId::parse(&value.request_id).map_err(|_| {
+                PrivateConversionError::Invalid {
+                    field: "request_id",
+                }
+            })?,
+            query_id: domain::QueryId::new(uuid_bytes(&value.query_id, "query_id")?),
+            query_class: query_class(value.query_class)?,
+            deadline: datetime(value.deadline_unix_ms, "deadline_unix_ms")?,
+            cut_fingerprint: value.cut_fingerprint,
+            leader: value
+                .leader
+                .ok_or(PrivateConversionError::Missing("leader"))?
+                .try_into()?,
+            participants: value
+                .participants
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+        })
+    }
+}
+
+impl From<domain::AdmitOracleLifecycleRequest> for proto::AdmitOracleLifecycleRequest {
+    /// Encodes private admission facts without projecting execution payloads.
+    fn from(value: domain::AdmitOracleLifecycleRequest) -> Self {
+        Self {
+            tenant_id: value.tenant_id.to_string(),
+            request_id: value.request_id.to_string(),
+            query_id: value.query_id.as_uuid().as_bytes().to_vec(),
+            query_class: match value.query_class {
+                domain::QueryClass::Interactive => proto::QueryClass::Interactive as i32,
+                domain::QueryClass::Analytical => proto::QueryClass::Analytical as i32,
+            },
+            deadline_unix_ms: unix_millis(value.deadline),
+            cut_fingerprint: value.cut_fingerprint,
+            leader: Some(value.leader.into()),
+            participants: value.participants.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<domain::AdmitOracleLifecycleResponse> for proto::AdmitOracleLifecycleResponse {
+    /// Encodes the closed lifecycle-admission acknowledgement.
+    fn from(value: domain::AdmitOracleLifecycleResponse) -> Self {
+        Self {
+            accepted: value.accepted,
+        }
+    }
+}
+
+impl From<proto::AdmitOracleLifecycleResponse> for domain::AdmitOracleLifecycleResponse {
+    /// Decodes the closed lifecycle-admission acknowledgement.
+    fn from(value: proto::AdmitOracleLifecycleResponse) -> Self {
+        Self {
+            accepted: value.accepted,
+        }
+    }
+}
+
+impl TryFrom<proto::ReportOracleFollowerLifecycleRequest>
+    for domain::ReportOracleFollowerLifecycleRequest
+{
+    type Error = PrivateConversionError;
+
+    /// Decodes one follower completion report bound to its immutable cut.
+    ///
+    /// # Errors
+    /// Returns [`PrivateConversionError`] for malformed identities, an absent
+    /// follower fence, an empty cut hash, or an unspecified terminal outcome.
+    fn try_from(value: proto::ReportOracleFollowerLifecycleRequest) -> Result<Self, Self::Error> {
+        nonempty(&value.cut_fingerprint, "cut_fingerprint")?;
+        Ok(Self {
+            tenant_id: DataTenantId::from_str(&value.tenant_id)
+                .map_err(|_| PrivateConversionError::InvalidUuid("tenant_id"))?,
+            request_id: RequestId::parse(&value.request_id).map_err(|_| {
+                PrivateConversionError::Invalid {
+                    field: "request_id",
+                }
+            })?,
+            query_id: domain::QueryId::new(uuid_bytes(&value.query_id, "query_id")?),
+            cut_fingerprint: value.cut_fingerprint,
+            follower: value
+                .follower
+                .ok_or(PrivateConversionError::Missing("follower"))?
+                .try_into()?,
+            outcome: query_terminal_outcome(value.outcome)?,
+        })
+    }
+}
+
+impl From<domain::ReportOracleFollowerLifecycleRequest>
+    for proto::ReportOracleFollowerLifecycleRequest
+{
+    /// Encodes one follower completion report bound to its immutable cut.
+    fn from(value: domain::ReportOracleFollowerLifecycleRequest) -> Self {
+        Self {
+            tenant_id: value.tenant_id.to_string(),
+            request_id: value.request_id.to_string(),
+            query_id: value.query_id.as_uuid().as_bytes().to_vec(),
+            cut_fingerprint: value.cut_fingerprint,
+            follower: Some(value.follower.into()),
+            outcome: match value.outcome {
+                domain::QueryTerminalOutcome::Success => {
+                    proto::QueryTerminalOutcome::Success as i32
+                }
+                domain::QueryTerminalOutcome::Degraded => {
+                    proto::QueryTerminalOutcome::Degraded as i32
+                }
+                domain::QueryTerminalOutcome::Failed => proto::QueryTerminalOutcome::Failed as i32,
+            },
+        }
+    }
+}
+
+impl From<domain::ReportOracleFollowerLifecycleResponse>
+    for proto::ReportOracleFollowerLifecycleResponse
+{
+    /// Encodes the aggregate accepted follower-report count.
+    fn from(value: domain::ReportOracleFollowerLifecycleResponse) -> Self {
+        Self {
+            completed_participants: value.completed_participants,
+        }
+    }
+}
+
+impl From<proto::ReportOracleFollowerLifecycleResponse>
+    for domain::ReportOracleFollowerLifecycleResponse
+{
+    /// Decodes the aggregate accepted follower-report count.
+    fn from(value: proto::ReportOracleFollowerLifecycleResponse) -> Self {
+        Self {
+            completed_participants: value.completed_participants,
+        }
+    }
+}
+
+impl TryFrom<proto::CancelOracleLifecycleRequest> for domain::CancelOracleLifecycleRequest {
+    type Error = PrivateConversionError;
+
+    /// Decodes a private cancellation signal tied to one immutable cut.
+    ///
+    /// # Errors
+    /// Returns [`PrivateConversionError`] for malformed identities or an empty
+    /// participant-cut fingerprint.
+    fn try_from(value: proto::CancelOracleLifecycleRequest) -> Result<Self, Self::Error> {
+        nonempty(&value.cut_fingerprint, "cut_fingerprint")?;
+        Ok(Self {
+            tenant_id: DataTenantId::from_str(&value.tenant_id)
+                .map_err(|_| PrivateConversionError::InvalidUuid("tenant_id"))?,
+            request_id: RequestId::parse(&value.request_id).map_err(|_| {
+                PrivateConversionError::Invalid {
+                    field: "request_id",
+                }
+            })?,
+            query_id: domain::QueryId::new(uuid_bytes(&value.query_id, "query_id")?),
+            cut_fingerprint: value.cut_fingerprint,
+        })
+    }
+}
+
+impl From<domain::CancelOracleLifecycleRequest> for proto::CancelOracleLifecycleRequest {
+    /// Encodes a private cancellation signal tied to one immutable cut.
+    fn from(value: domain::CancelOracleLifecycleRequest) -> Self {
+        Self {
+            tenant_id: value.tenant_id.to_string(),
+            request_id: value.request_id.to_string(),
+            query_id: value.query_id.as_uuid().as_bytes().to_vec(),
+            cut_fingerprint: value.cut_fingerprint,
+        }
+    }
+}
+
+impl From<domain::CancelOracleLifecycleResponse> for proto::CancelOracleLifecycleResponse {
+    /// Encodes the idempotent cancellation acknowledgement.
+    fn from(value: domain::CancelOracleLifecycleResponse) -> Self {
+        Self {
+            cancellation_started: value.cancellation_started,
+        }
+    }
+}
+
+impl From<proto::CancelOracleLifecycleResponse> for domain::CancelOracleLifecycleResponse {
+    /// Decodes the idempotent cancellation acknowledgement.
+    fn from(value: proto::CancelOracleLifecycleResponse) -> Self {
+        Self {
+            cancellation_started: value.cancellation_started,
+        }
+    }
+}
+
 impl TryFrom<proto::ReserveNodeSlotsRequest> for domain::ReserveNodeSlotsRequest {
     type Error = PrivateConversionError;
 
@@ -640,6 +881,39 @@ fn query_class(value: i32) -> Result<domain::QueryClass, PrivateConversionError>
         proto::QueryClass::Interactive => Ok(domain::QueryClass::Interactive),
         proto::QueryClass::Analytical => Ok(domain::QueryClass::Analytical),
         proto::QueryClass::Unspecified => Err(PrivateConversionError::RequiredEnum("query_class")),
+    }
+}
+
+/// Decodes a private runtime role without accepting protobuf's zero value.
+///
+/// # Errors
+/// Returns [`PrivateConversionError::RequiredEnum`] for unknown or unspecified roles.
+fn cluster_role(value: i32) -> Result<domain::ClusterRole, PrivateConversionError> {
+    match proto::ClusterRole::try_from(value)
+        .map_err(|_| PrivateConversionError::RequiredEnum("role"))?
+    {
+        proto::ClusterRole::Scribe => Ok(domain::ClusterRole::Scribe),
+        proto::ClusterRole::Oracle => Ok(domain::ClusterRole::Oracle),
+        proto::ClusterRole::Unspecified => Err(PrivateConversionError::RequiredEnum("role")),
+    }
+}
+
+/// Decodes a private follower terminal classification without accepting zero.
+///
+/// # Errors
+/// Returns [`PrivateConversionError::RequiredEnum`] for unknown or unspecified outcomes.
+fn query_terminal_outcome(
+    value: i32,
+) -> Result<domain::QueryTerminalOutcome, PrivateConversionError> {
+    match proto::QueryTerminalOutcome::try_from(value)
+        .map_err(|_| PrivateConversionError::RequiredEnum("outcome"))?
+    {
+        proto::QueryTerminalOutcome::Success => Ok(domain::QueryTerminalOutcome::Success),
+        proto::QueryTerminalOutcome::Degraded => Ok(domain::QueryTerminalOutcome::Degraded),
+        proto::QueryTerminalOutcome::Failed => Ok(domain::QueryTerminalOutcome::Failed),
+        proto::QueryTerminalOutcome::Unspecified => {
+            Err(PrivateConversionError::RequiredEnum("outcome"))
+        }
     }
 }
 

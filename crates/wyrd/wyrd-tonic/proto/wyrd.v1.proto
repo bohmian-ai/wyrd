@@ -15,6 +15,7 @@ service BifrostQueryService {
 enum VisibilityMode { VISIBILITY_MODE_UNSPECIFIED = 0; VISIBILITY_MODE_PUBLISHED_ONLY = 1; VISIBILITY_MODE_FUSED = 2; }
 enum FreshnessPolicy { FRESHNESS_POLICY_UNSPECIFIED = 0; FRESHNESS_POLICY_STRICT = 1; FRESHNESS_POLICY_ALLOW_DEGRADED = 2; }
 enum QueryTerminalOutcome { QUERY_TERMINAL_OUTCOME_UNSPECIFIED = 0; QUERY_TERMINAL_OUTCOME_SUCCESS = 1; QUERY_TERMINAL_OUTCOME_DEGRADED = 2; QUERY_TERMINAL_OUTCOME_FAILED = 3; }
+enum RunningQueryLifecycleState { RUNNING_QUERY_LIFECYCLE_STATE_UNSPECIFIED = 0; RUNNING_QUERY_LIFECYCLE_STATE_ADMITTED = 1; RUNNING_QUERY_LIFECYCLE_STATE_RUNNING = 2; RUNNING_QUERY_LIFECYCLE_STATE_CANCELLING = 3; }
 enum QueryFreshness { QUERY_FRESHNESS_UNSPECIFIED = 0; QUERY_FRESHNESS_COMPLETE = 1; QUERY_FRESHNESS_DEGRADED = 2; }
 enum QuerySource { QUERY_SOURCE_UNSPECIFIED = 0; QUERY_SOURCE_ICEBERG = 1; QUERY_SOURCE_HOT_SEALED = 2; QUERY_SOURCE_LIVE_TAIL = 3; }
 enum SourceCompletionOutcome { SOURCE_COMPLETION_OUTCOME_UNSPECIFIED = 0; SOURCE_COMPLETION_OUTCOME_COMPLETE = 1; SOURCE_COMPLETION_OUTCOME_UNAVAILABLE = 2; }
@@ -44,6 +45,16 @@ message QueryTerminalFrame {
 message QueryStreamFrame {
   oneof frame { QuerySchemaFrame schema = 1; QueryBatchFrame batch = 2; QueryTerminalFrame terminal = 3; }
 }
+message RunningQueryProgress { uint32 completed_participants = 1; uint32 total_participants = 2; }
+message RunningQuerySummary {
+  string request_id = 1; QueryClass query_class = 2; uint64 started_at_unix_ms = 3;
+  uint64 deadline_unix_ms = 4; RunningQueryLifecycleState state = 5;
+  RunningQueryProgress progress = 6; bool cancellation_requested = 7;
+}
+message ListRunningQueriesResponse { repeated RunningQuerySummary queries = 1; }
+message GetRunningQueryRequest { string request_id = 1; }
+message CancelRunningQueryRequest { string request_id = 1; }
+message CancelRunningQueryResponse { string request_id = 1; bool cancellation_started = 2; }
 
 service ScribeTailService {
   rpc ListActiveStreams(ListActiveStreamsRequest) returns (ListActiveStreamsResponse);
@@ -55,6 +66,11 @@ service OraclePeerService {
   rpc ReserveSlots(ReserveNodeSlotsRequest) returns (ReserveNodeSlotsResponse);
   rpc ReleaseSlots(ReleaseNodeSlotsRequest) returns (ReleaseNodeSlotsResponse);
   rpc ExecuteFragment(ExecuteFragmentRequest) returns (stream WorkerAttemptFrame);
+}
+service OracleLifecycleService {
+  rpc AdmitLifecycle(AdmitOracleLifecycleRequest) returns (AdmitOracleLifecycleResponse);
+  rpc ReportFollowerLifecycle(ReportOracleFollowerLifecycleRequest) returns (ReportOracleFollowerLifecycleResponse);
+  rpc CancelLifecycle(CancelOracleLifecycleRequest) returns (CancelOracleLifecycleResponse);
 }
 message TenantTableBinding { string tenant_id = 1; string namespace = 2; string table = 3; }
 message TailCursor { uint64 writer_epoch = 1; uint64 wal_lsn = 2; bytes batch_id = 3; uint32 row_ordinal = 4; }
@@ -80,6 +96,21 @@ message ListActiveStreamsRequest { bytes tail_ticket = 1; TenantTableBinding bin
 message ActiveTailStream { string event_day = 1; TailStreamIdentity stream = 2; }
 message ListActiveStreamsResponse { repeated ActiveTailStream streams = 1; }
 enum QueryClass { QUERY_CLASS_UNSPECIFIED = 0; QUERY_CLASS_INTERACTIVE = 1; QUERY_CLASS_ANALYTICAL = 2; }
+enum ClusterRole { CLUSTER_ROLE_UNSPECIFIED = 0; CLUSTER_ROLE_SCRIBE = 1; CLUSTER_ROLE_ORACLE = 2; }
+message OracleRoleFence { string node_id = 1; ClusterRole role = 2; uint64 fencing_token = 3; }
+message AdmitOracleLifecycleRequest {
+  string tenant_id = 1; string request_id = 2; bytes query_id = 3; QueryClass query_class = 4;
+  uint64 deadline_unix_ms = 5; string cut_fingerprint = 6; OracleRoleFence leader = 7;
+  repeated OracleRoleFence participants = 8;
+}
+message AdmitOracleLifecycleResponse { bool accepted = 1; }
+message ReportOracleFollowerLifecycleRequest {
+  string tenant_id = 1; string request_id = 2; bytes query_id = 3; string cut_fingerprint = 4;
+  OracleRoleFence follower = 5; QueryTerminalOutcome outcome = 6;
+}
+message ReportOracleFollowerLifecycleResponse { uint32 completed_participants = 1; }
+message CancelOracleLifecycleRequest { string tenant_id = 1; string request_id = 2; bytes query_id = 3; string cut_fingerprint = 4; }
+message CancelOracleLifecycleResponse { bool cancellation_started = 1; }
 message ReserveNodeSlotsRequest {
   bytes query_id = 1; string leader_node_id = 2; uint64 leader_fencing_token = 3;
   QueryClass query_class = 4; uint32 slot_units = 5; uint64 expires_at_unix_ms = 6;

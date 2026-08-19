@@ -61,6 +61,7 @@ mod participant_cut;
 pub mod peer;
 mod planner;
 mod query_stream;
+mod running;
 mod spill;
 pub use spill::OracleSpillRuntime;
 
@@ -96,6 +97,7 @@ pub use planner::OraclePlanner;
 pub use query_stream::OracleQueryStream;
 pub(crate) use query_stream::QueryStreamLifecycle;
 use query_stream::{QueryStreamInput, encode_schema_frame};
+pub use running::{RunningQueryEntry, RunningQueryRegistry, RunningQuerySettlement};
 
 /// Builds one test stream through the production telemetry terminal owner.
 #[cfg(test)]

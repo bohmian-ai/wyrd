@@ -509,7 +509,6 @@ fn rr9_label_contract_table_is_complete() {
         "bifrost_gate_query_stream_duration_seconds",
         "bifrost_scribe_ingress_active",
         "oracle_admission_total",
-        "bifrost_oracle_source_operation_seconds",
     ]
     .into_iter()
     .collect();

@@ -37,10 +37,10 @@ use vala_bifrost_redux::oracle::peer::{
     VerifiedClaimsBytes,
 };
 use vala_bifrost_redux::oracle::{
-    AuthorizedQueryContext, BifrostQueryReadDecision, BifrostSecurityViolation, Oracle,
-    OracleAudit, OracleBuildConfig, OracleConfig, OracleMemoryResources, OracleSlotManager,
-    QueryOptions, QueryResourceSnapshot, TailTransportDirectory, TestPostgresOracleAudit,
-    VerifiedSecurityContext,
+    AuthorizedQueryContext, BifrostQueryReadDecision, BifrostSecurityViolation,
+    DelegatedOracleAdmissionConfig, Oracle, OracleAudit, OracleBuildConfig, OracleConfig,
+    OracleMemoryResources, OracleSlotManager, QueryOptions, QueryResourceSnapshot,
+    TailTransportDirectory, TestPostgresOracleAudit, VerifiedSecurityContext,
 };
 use vala_bifrost_redux::schema::with_managed_columns;
 use vala_bifrost_redux::scribe::file_list_writer::{FileListInsert, insert_and_audit};
@@ -639,6 +639,7 @@ impl OracleFixture {
         Oracle::new(OracleBuildConfig {
             catalog: Arc::clone(&self.catalog),
             vala: self.pg.vala_postgres().clone(),
+            operator_pool: self.pg.operator_pool().clone(),
             cluster: Arc::clone(&self.cluster),
             local_role: self.role.clone(),
             local_slots: Arc::new(OracleSlotManager::new(16, 16)),
@@ -666,6 +667,7 @@ impl OracleFixture {
             tail_ticket_minter: None,
             tail_discovery: None,
             peer_transports,
+            delegated_admission_config: DelegatedOracleAdmissionConfig::default(),
             config,
         })
         .expect("Oracle")

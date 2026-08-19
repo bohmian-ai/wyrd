@@ -1224,6 +1224,11 @@ impl<'a> OracleRoleBuilder<'a> {
         let calibrated =
             crate::config::load_oracle_admission_translation(&config.bifrost.oracle, raw_slots)
                 .map_err(ServerBootError::OraclePeer)?;
+        let delegated_admission_config = config
+            .bifrost
+            .oracle
+            .delegated_admission_config()
+            .map_err(ServerBootError::OraclePeer)?;
         let capabilities = OracleCapabilitiesV1 {
             peer_protocol_version: u16::try_from(PEER_PROTOCOL_VERSION)
                 .map_err(|_| ServerBootError::OraclePeer("peer protocol exceeds u16".to_owned()))?,
@@ -1397,6 +1402,11 @@ impl<'a> OracleRoleBuilder<'a> {
         let oracle = match Oracle::new(OracleBuildConfig {
             catalog: Arc::clone(catalog),
             vala: state.postgres.vala().clone(),
+            operator_pool: state.postgres.operator_pool().ok_or_else(|| {
+                ServerBootError::OraclePeer(
+                    "Oracle delegated admission requires the operator pool".to_owned(),
+                )
+            })?,
             cluster: Arc::clone(&cluster),
             local_role: role.clone(),
             local_slots: slots,
@@ -1411,6 +1421,7 @@ impl<'a> OracleRoleBuilder<'a> {
             tail_ticket_minter: Some(tail_authority),
             tail_discovery: Some(tail_discovery),
             peer_transports: Some(peer_transports),
+            delegated_admission_config,
             config: OracleConfig {
                 planning_permits: config.bifrost.oracle.planning_permits,
                 max_workers_per_query: config.bifrost.oracle.max_workers_per_query,

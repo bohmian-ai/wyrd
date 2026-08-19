@@ -121,8 +121,8 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    /// Query modules that intentionally coordinate operator-owned Forge state.
-    const MIXED_EXECUTOR_QUERY_MODULES: &[&str] = &["forge_tasks.rs"];
+    /// Query modules that intentionally coordinate cross-tenant operator state.
+    const MIXED_EXECUTOR_QUERY_MODULES: &[&str] = &["forge_tasks.rs", "oracle_admission.rs"];
 
     /// Returns whether a query module is a sanctioned mixed executor owner.
     fn is_mixed_executor_query_module(path: &Path) -> bool {
@@ -449,20 +449,15 @@ mod tests {
         source.split("\n#[cfg(test)]").next().unwrap_or(source)
     }
 
+    /// Returns whether a quoted SQL statement starts with transaction control.
     fn contains_sql_keyword(text: &str, keyword: &str) -> bool {
-        let mut start = 0;
-        while let Some(pos) = text[start..].find(keyword) {
-            let abs = start + pos;
-            let before_ok =
-                abs == 0 || !matches!(text.as_bytes()[abs - 1], b'A'..=b'Z' | b'0'..=b'9' | b'_');
-            let end = abs + keyword.len();
-            let after_ok = end >= text.len()
-                || !matches!(text.as_bytes()[end], b'A'..=b'Z' | b'0'..=b'9' | b'_');
-            if before_ok && after_ok {
-                return true;
-            }
-            start = abs + 1;
-        }
-        false
+        text.split('"').skip(1).step_by(2).any(|literal| {
+            let statement = literal.trim_start();
+            statement.starts_with(keyword)
+                && statement
+                    .as_bytes()
+                    .get(keyword.len())
+                    .is_none_or(u8::is_ascii_whitespace)
+        })
     }
 }

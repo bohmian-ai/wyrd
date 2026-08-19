@@ -857,36 +857,7 @@ fn grant_waiters(
                     made_progress = true;
                     continue;
                 }
-                let Ok(resources) =
-                    shared
-                        .resources
-                        .try_acquire_query(crate::resources::OracleResourceRequest {
-                            query_class: match kind {
-                                AdmissionClass::Interactive => QueryClass::Interactive,
-                                AdmissionClass::Analytical => QueryClass::Analytical,
-                            },
-                            memory_bytes: match kind {
-                                AdmissionClass::Interactive => {
-                                    crate::resources::ORACLE_PARTITION_MEMORY_BYTES
-                                }
-                                AdmissionClass::Analytical => {
-                                    2 * crate::resources::ORACLE_PARTITION_MEMORY_BYTES
-                                }
-                            },
-                            scratch_bytes: match kind {
-                                AdmissionClass::Interactive => {
-                                    crate::resources::ORACLE_PARTITION_MEMORY_BYTES as u64
-                                }
-                                AdmissionClass::Analytical => {
-                                    (2 * crate::resources::ORACLE_PARTITION_MEMORY_BYTES) as u64
-                                }
-                            },
-                            slot_units: match kind {
-                                AdmissionClass::Interactive => 1,
-                                AdmissionClass::Analytical => 2,
-                            },
-                            local_ratio: waiter.local_ratio,
-                        })
+                let Ok(resources) = acquire_waiter_resources(shared, kind, waiter.local_ratio)
                 else {
                     class.tenants[index].1.waiters.push_front(waiter);
                     continue;
@@ -915,6 +886,40 @@ fn grant_waiters(
         }
     }
     notifications
+}
+
+/// Acquires the exact root resource quantum for one queued admission class.
+///
+/// # Errors
+///
+/// Returns [`crate::resources::BifrostResourceError`] when the root governor
+/// cannot cover the class quantum without violating Task 01 accounting.
+fn acquire_waiter_resources(
+    shared: &AdmissionShared,
+    kind: AdmissionClass,
+    local_ratio: f64,
+) -> Result<crate::resources::OracleQueryResources, crate::resources::BifrostResourceError> {
+    let (query_class, memory_bytes, slot_units) = match kind {
+        AdmissionClass::Interactive => (
+            QueryClass::Interactive,
+            crate::resources::ORACLE_PARTITION_MEMORY_BYTES,
+            1,
+        ),
+        AdmissionClass::Analytical => (
+            QueryClass::Analytical,
+            2 * crate::resources::ORACLE_PARTITION_MEMORY_BYTES,
+            2,
+        ),
+    };
+    shared
+        .resources
+        .try_acquire_query(crate::resources::OracleResourceRequest {
+            query_class,
+            memory_bytes,
+            scratch_bytes: memory_bytes as u64,
+            slot_units,
+            local_ratio,
+        })
 }
 
 /// Notifies winners after releasing the admission mutex and repairs canceled sends.

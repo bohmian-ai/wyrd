@@ -2446,20 +2446,16 @@ impl BifrostResourceGovernor {
         }
     }
 
-    /// Atomically acquires one exact Oracle query envelope.
+    /// Validates one query request against the active Oracle class contract.
     ///
     /// # Errors
     ///
-    /// Returns [`BifrostResourceError::Occupied`] when aggregate memory,
-    /// scratch, slot, or protected interactive capacity cannot cover the exact
-    /// request. Invalid or overflowing demand returns
-    /// [`BifrostResourceError::InvalidPlan`]. No counter changes on refusal.
-    pub(crate) fn try_acquire_oracle(
-        &self,
+    /// Returns [`BifrostResourceError::InvalidPlan`] when Oracle is inactive,
+    /// any demand is zero, or the request differs from its exact class quantum.
+    fn validate_oracle_request(
+        plan: ResourcePlan,
         request: OracleResourceRequest,
-    ) -> Result<OracleQueryResources, BifrostResourceError> {
-        let mut state = self.lock_state()?;
-        let plan = self.plan();
+    ) -> Result<(), BifrostResourceError> {
         if plan.oracle_floor_bytes == 0 {
             return Err(BifrostResourceError::InvalidPlan {
                 detail: "Oracle resources requested while the role is inactive".to_owned(),
@@ -2492,6 +2488,24 @@ impl BifrostResourceGovernor {
                 detail: "Oracle query demand must match its class quantum".to_owned(),
             });
         }
+        Ok(())
+    }
+
+    /// Atomically acquires one exact Oracle query envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostResourceError::Occupied`] when aggregate memory,
+    /// scratch, slot, or protected interactive capacity cannot cover the exact
+    /// request. Invalid or overflowing demand returns
+    /// [`BifrostResourceError::InvalidPlan`]. No counter changes on refusal.
+    pub(crate) fn try_acquire_oracle(
+        &self,
+        request: OracleResourceRequest,
+    ) -> Result<OracleQueryResources, BifrostResourceError> {
+        let mut state = self.lock_state()?;
+        let plan = self.plan();
+        Self::validate_oracle_request(plan, request)?;
         let next_memory = state
             .oracle_memory_used_bytes
             .checked_add(request.memory_bytes)

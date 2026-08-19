@@ -913,6 +913,8 @@ pub struct ForgeObjectStoreControl {
     output_put_release: tokio::sync::Notify,
     /// Counts every successful output PUT notification, armed or unarmed.
     output_put_calls: AtomicUsize,
+    /// Counts every wrapped object-store call made after fixture construction.
+    object_io_calls: AtomicUsize,
     /// Retains the exact path observed by the most recent armed notification.
     last_output_path: Mutex<Option<String>>,
     /// One-shot arm flag for the next delegated object listing.
@@ -960,6 +962,7 @@ impl ForgeObjectStoreControl {
             output_put_ready: tokio::sync::Notify::new(),
             output_put_release: tokio::sync::Notify::new(),
             output_put_calls: AtomicUsize::new(0),
+            object_io_calls: AtomicUsize::new(0),
             last_output_path: Mutex::new(None),
             pause_next_list: AtomicBool::new(false),
             list_returned: AtomicBool::new(false),
@@ -1006,6 +1009,12 @@ impl ForgeObjectStoreControl {
     #[must_use]
     pub fn output_put_calls(&self) -> usize {
         self.output_put_calls.load(Ordering::Acquire)
+    }
+
+    /// Return the number of wrapped object-store operations observed.
+    #[must_use]
+    pub fn object_io_calls(&self) -> usize {
+        self.object_io_calls.load(Ordering::Acquire)
     }
 
     /// Return the exact path captured by the most recent armed notification.
@@ -1138,14 +1147,17 @@ impl ForgeObjectStore for ForgeObjectStoreControl {
     /// Returns the OpenDAL error when the reader cannot open or fetch the
     /// requested range.
     async fn read_range(&self, path: &str, range: std::ops::Range<u64>) -> opendal::Result<Buffer> {
+        self.object_io_calls.fetch_add(1, Ordering::AcqRel);
         self.inner.reader(path).await?.read(range).await
     }
 
     async fn read(&self, path: &str) -> opendal::Result<Buffer> {
+        self.object_io_calls.fetch_add(1, Ordering::AcqRel);
         self.inner.read(path).await
     }
 
     async fn list(&self, prefix: &str) -> opendal::Result<Vec<Entry>> {
+        self.object_io_calls.fetch_add(1, Ordering::AcqRel);
         let entries = self.inner.list_with(prefix).recursive(true).await?;
         if self.pause_next_list.swap(false, Ordering::AcqRel) {
             self.list_returned.store(true, Ordering::Release);
@@ -1156,10 +1168,12 @@ impl ForgeObjectStore for ForgeObjectStoreControl {
     }
 
     async fn stat(&self, path: &str) -> opendal::Result<Metadata> {
+        self.object_io_calls.fetch_add(1, Ordering::AcqRel);
         self.inner.stat(path).await
     }
 
     async fn delete(&self, path: &str) -> opendal::Result<()> {
+        self.object_io_calls.fetch_add(1, Ordering::AcqRel);
         let call = self.delete_count.fetch_add(1, Ordering::AcqRel) + 1;
         self.delete_paths
             .lock()
@@ -2139,6 +2153,8 @@ mod worker_lifecycle_tests {
                 reader_permits: 1,
             })
             .expect("the test owner occupies all Forge capacity");
+        let blocked = resources.snapshot().expect("blocked snapshot");
+        let object_io_before = object_store.object_io_calls();
         let worker = ForgeWorker::new(
             Arc::clone(&forge),
             ForgeWorkerConfig::default(),
@@ -2162,21 +2178,32 @@ mod worker_lifecycle_tests {
             0,
             "a refused attempt must not write any rewrite output"
         );
-        let state: Option<String> = sqlx::query_scalar(
-            "SELECT state FROM vala.forge_tasks WHERE data_tenant_id = $1 ORDER BY created_at DESC LIMIT 1",
+        assert_eq!(
+            object_store.object_io_calls(),
+            object_io_before,
+            "capacity refusal must occur before object IO"
+        );
+        let state: (String, bool, bool, bool, Option<String>, i32) = sqlx::query_as(
+            "SELECT state,attempt_id IS NULL,claimed_by IS NULL,claim_expires_at IS NULL,\
+             failure_class,attempt_count FROM vala.forge_tasks WHERE data_tenant_id = $1 \
+             ORDER BY created_at DESC LIMIT 1",
         )
         .bind(fixture.tenant.as_uuid())
-        .fetch_optional(fixture.operator_pool.pool())
+        .fetch_one(fixture.operator_pool.pool())
         .await
         .expect("durable task state");
-        assert_eq!(
-            state.as_deref(),
-            Some("claimed"),
-            "a refused claim keeps its existing bounded-reclaim recovery state"
-        );
+        assert_eq!(state.0, "retryable");
+        assert!(state.1, "capacity refusal clears the attempt identity");
+        assert!(state.2, "capacity refusal clears the claim owner");
+        assert!(state.3, "capacity refusal clears the claim fence");
+        assert_eq!(state.4.as_deref(), Some("capacity_refused"));
+        assert_eq!(state.5, 0, "capacity refusal consumes no attempt budget");
         let refused = resources.snapshot().expect("post-refusal snapshot");
-        assert_eq!(refused.elastic_memory_used_bytes, plan.elastic_memory_bytes);
-        assert_eq!(refused.scratch_used_bytes, plan.scratch_limit_bytes);
+        assert_eq!(
+            refused.elastic_memory_used_bytes,
+            blocked.elastic_memory_used_bytes
+        );
+        assert_eq!(refused.scratch_used_bytes, blocked.scratch_used_bytes);
         drop(blocker);
         let released = resources.snapshot().expect("released snapshot");
         assert_eq!(released.elastic_memory_used_bytes, 0);

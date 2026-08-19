@@ -56,6 +56,8 @@ pub mod dispatcher;
 mod exec;
 pub mod executor;
 pub mod fragment;
+mod ownership;
+mod participant_cut;
 pub mod peer;
 mod planner;
 mod query_stream;
@@ -81,6 +83,14 @@ pub use admission::OracleAdmission;
 pub use admission::{QueryResourceProbe, QueryResourceSnapshot};
 pub use exec::TenantTripwireExec;
 use exec::{HotFileSource, OracleQueryScanStats, OracleTableInputs, OracleTableProvider};
+pub use ownership::{
+    DelegatedAdmissionBlock, DelegatedAdmissionRequest, DelegatedOracleAdmission,
+    DelegatedOracleAdmissionConfig, DelegatedOracleAdmissionError, DelegatedOracleAdmissionGrant,
+    DelegatedOracleAdmissionWorker,
+};
+pub use participant_cut::{
+    OracleQueryAttemptCut, OracleQueryAttemptCutError, OracleQueryParticipant,
+};
 use planner::OracleClassification;
 pub use planner::OraclePlanner;
 pub use query_stream::OracleQueryStream;
@@ -1177,6 +1187,8 @@ pub struct OracleBuildConfig {
     pub catalog: Arc<BifrostCatalog>,
     /// Tenant-scoped SQL owner.
     pub vala: ValaPostgres,
+    /// Cross-tenant operator pool used only by delegated admission background work.
+    pub operator_pool: vala_sql::OperatorPool,
     /// Immutable membership registry.
     pub cluster: Arc<ClusterRegistry>,
     /// Fenced local Oracle role.
@@ -1201,6 +1213,8 @@ pub struct OracleBuildConfig {
     pub peer_transports: Option<dispatcher::OraclePeerTransportDirectory>,
     /// Engine limits and lifecycle values.
     pub config: OracleConfig,
+    /// Validated delegated policy-capacity lifecycle settings.
+    pub delegated_admission_config: DelegatedOracleAdmissionConfig,
 }
 
 /// Local Oracle limits and bounded lifecycle settings.
@@ -1408,6 +1422,12 @@ pub struct Oracle {
     planner: OraclePlanner,
     /// Admission state and local guards.
     admission: Arc<OracleAdmission>,
+    /// Cached-only policy admission owner bound to the exact local role fence.
+    delegated_admission: Arc<DelegatedOracleAdmission>,
+    /// Typed continuity-loss handoff retained for the distributed query consumer.
+    delegated_loss: Mutex<
+        Option<tokio::sync::mpsc::Receiver<wyrd_spec::vala::api::OracleAdmissionContinuityLost>>,
+    >,
     /// Immutable membership registry retained for planning and worker selection.
     cluster: Arc<ClusterRegistry>,
     /// Tenant-qualified catalog and SQL owners retained for query execution.
@@ -1441,6 +1461,8 @@ pub struct Oracle {
     startup_result: Mutex<Option<StartupResultReceiver>>,
     /// Cancellation-bound local admission lifecycle task.
     maintenance: Mutex<Option<JoinHandle<()>>>,
+    /// Background-only `PostgreSQL` allocator and renewal task.
+    delegated_maintenance: Mutex<Option<JoinHandle<()>>>,
     /// Test-tier one-shot pause after immutable worker selection.
     #[cfg(feature = "test-support")]
     topology_probe: Mutex<Option<Arc<OracleTopologyProbe>>>,
@@ -1514,6 +1536,39 @@ impl std::fmt::Debug for Oracle {
     }
 }
 
+/// Validates the synchronous Oracle construction limits before owners start.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::Internal`] when fragment, SQL, planning, or tenant
+/// limits cannot safely admit work.
+fn validate_oracle_config(config: OracleConfig) -> Result<(), BifrostError> {
+    if config.max_workers_per_query > 63
+        || config.fragment_max_files == 0
+        || config.attempt_max_bytes == 0
+        || config.attempt_memory_bytes == 0
+        || config.attempt_memory_bytes > config.attempt_max_bytes
+    {
+        return Err(BifrostError::Internal {
+            detail: "Oracle fragment configuration is invalid".to_owned(),
+        });
+    }
+    if config.max_sql_bytes == 0 {
+        return Err(BifrostError::Internal {
+            detail: "Oracle SQL byte limit must be positive".to_owned(),
+        });
+    }
+    if config.planning_permits == 0
+        || config.tenant_interactive_slots == 0
+        || config.tenant_analytical_slots == 0
+    {
+        return Err(BifrostError::Internal {
+            detail: "Oracle planning and tenant limits must be positive".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 impl Oracle {
     /// Borrow the serving composition's live-tail transport directory.
     ///
@@ -1557,29 +1612,7 @@ impl Oracle {
     /// # Errors
     /// Returns [`BifrostError::Internal`] when the configured SQL floor is zero.
     pub fn new(config: OracleBuildConfig) -> Result<Self, BifrostError> {
-        if config.config.max_workers_per_query > 63
-            || config.config.fragment_max_files == 0
-            || config.config.attempt_max_bytes == 0
-            || config.config.attempt_memory_bytes == 0
-            || config.config.attempt_memory_bytes > config.config.attempt_max_bytes
-        {
-            return Err(BifrostError::Internal {
-                detail: "Oracle fragment configuration is invalid".to_owned(),
-            });
-        }
-        if config.config.max_sql_bytes == 0 {
-            return Err(BifrostError::Internal {
-                detail: "Oracle SQL byte limit must be positive".to_owned(),
-            });
-        }
-        if config.config.planning_permits == 0
-            || config.config.tenant_interactive_slots == 0
-            || config.config.tenant_analytical_slots == 0
-        {
-            return Err(BifrostError::Internal {
-                detail: "Oracle planning and tenant limits must be positive".to_owned(),
-            });
-        }
+        validate_oracle_config(config.config)?;
         let planner = OraclePlanner::new(config.config);
         let telemetry = Arc::new(OracleTelemetry::new(Arc::clone(&config.local_slots)));
         let cluster = Arc::clone(&config.cluster);
@@ -1601,6 +1634,34 @@ impl Oracle {
         let initial_snapshot = cluster.snapshot();
         admission.refresh(&initial_snapshot);
         let shutdown = CancellationToken::new();
+        let (demand_tx, demand_rx) =
+            tokio::sync::mpsc::channel(config.config.queue_capacity.max(1) as usize);
+        let (loss_tx, loss_rx) = tokio::sync::mpsc::channel(1);
+        let delegated_admission = Arc::new(
+            DelegatedOracleAdmission::new(
+                admission.local_role.key.node_id,
+                admission.local_role.fencing_token,
+                config.delegated_admission_config,
+                demand_tx,
+                loss_tx,
+            )
+            .map_err(|error| BifrostError::Internal {
+                detail: error.to_string(),
+            })?,
+        );
+        let delegated_maintenance = tokio::runtime::Handle::try_current()
+            .map_err(|_| BifrostError::Internal {
+                detail: "Oracle construction requires an active Tokio runtime".to_owned(),
+            })?
+            .spawn(
+                DelegatedOracleAdmissionWorker::new(
+                    config.operator_pool,
+                    Arc::clone(&delegated_admission),
+                    demand_rx,
+                    shutdown.clone(),
+                )
+                .run(),
+            );
         let ready = Arc::new(AtomicBool::new(false));
         let (maintenance, startup_result) =
             OracleAdmission::start_maintenance(shutdown.clone(), Arc::clone(&ready))?;
@@ -1610,6 +1671,8 @@ impl Oracle {
         Ok(Self {
             planner,
             admission,
+            delegated_admission,
+            delegated_loss: Mutex::new(Some(loss_rx)),
             cluster,
             catalog: config.catalog,
             vala: config.vala,
@@ -1627,6 +1690,7 @@ impl Oracle {
             ready,
             startup_result: Mutex::new(Some(startup_result)),
             maintenance: Mutex::new(Some(maintenance)),
+            delegated_maintenance: Mutex::new(Some(delegated_maintenance)),
             #[cfg(feature = "test-support")]
             topology_probe: Mutex::new(None),
         })
@@ -2315,6 +2379,35 @@ impl Oracle {
         &self.vala
     }
 
+    /// Returns the exact-role local delegated policy admission owner.
+    #[must_use]
+    pub fn delegated_admission(&self) -> &Arc<DelegatedOracleAdmission> {
+        &self.delegated_admission
+    }
+
+    /// Transfers the typed continuity-loss receiver to the distributed query owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal error when the receiver was already transferred or
+    /// its ownership lock is poisoned.
+    pub fn take_delegated_continuity_loss(
+        &self,
+    ) -> Result<
+        tokio::sync::mpsc::Receiver<wyrd_spec::vala::api::OracleAdmissionContinuityLost>,
+        BifrostError,
+    > {
+        self.delegated_loss
+            .lock()
+            .map_err(|_| BifrostError::Internal {
+                detail: "delegated continuity receiver lock is poisoned".to_owned(),
+            })?
+            .take()
+            .ok_or_else(|| BifrostError::Internal {
+                detail: "delegated continuity receiver was already transferred".to_owned(),
+            })
+    }
+
     /// Cancels lifecycle maintenance and drains owned cleanup until `deadline`.
     ///
     /// The lifecycle task is aborted at expiry. Dropping this future can leave
@@ -2352,6 +2445,22 @@ impl Oracle {
                 .is_err()
             {
                 maintenance.abort();
+            }
+        }
+        let delegated = self
+            .delegated_maintenance
+            .lock()
+            .ok()
+            .and_then(|mut handle| handle.take());
+        if let Some(mut delegated) = delegated {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or(Duration::ZERO);
+            if tokio::time::timeout(remaining, &mut delegated)
+                .await
+                .is_err()
+            {
+                delegated.abort();
             }
         }
         let _ = deadline;

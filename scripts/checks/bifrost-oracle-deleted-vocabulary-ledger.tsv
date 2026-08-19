@@ -1,5 +1,10 @@
 # RR7 deletion ledger; source baseline: 4cf66014b
 # token	classification	evidence or allowlist
+OracleAdmissionOwner	deleted	Removed tenant rendezvous admission-owner lifecycle; checker-enforced.
+OracleAdmissionTicketClaims	deleted	Removed admission-owner ticket contract; checker-enforced.
+admission_owner_fencing_token	deleted	Removed owner-specific reservation fence; checker-enforced.
+oracle_admission_owner	deleted	Removed maintenance-lease admission-owner namespace; checker-enforced.
+OracleOwnerRouteCache	deleted	Removed tenant owner route cache and takeover path; checker-enforced.
 bifrost_oracle_lease_renewals_total	deleted	Removed Oracle lease lifecycle family; checker-enforced.
 bifrost_oracle_lease_release_queue_total	deleted	Removed Oracle lease lifecycle family; checker-enforced.
 bifrost_oracle_admission_reconcile_total	deleted	Removed admission reconciliation family; checker-enforced.

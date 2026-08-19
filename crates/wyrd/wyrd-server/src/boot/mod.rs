@@ -1229,6 +1229,42 @@ impl<'a> OracleRoleBuilder<'a> {
             .oracle
             .delegated_admission_config()
             .map_err(ServerBootError::OraclePeer)?;
+        let oracle_config = OracleConfig {
+            planning_permits: config.bifrost.oracle.planning_permits,
+            max_workers_per_query: config.bifrost.oracle.max_workers_per_query,
+            attempt_memory_bytes: config.bifrost.oracle.max_frame_bytes.min(8 * 1024 * 1024),
+            interactive_slots: calibrated
+                .as_ref()
+                .map_or((raw_slots / 2).max(1), |value| value.interactive_slots),
+            analytical_slots: calibrated
+                .as_ref()
+                .map_or((raw_slots.saturating_sub(raw_slots / 2)).max(1), |value| {
+                    value.analytical_slots
+                }),
+            single_tenant_ceiling: calibrated
+                .as_ref()
+                .map_or(raw_slots.max(1), |value| value.single_tenant_ceiling),
+            multi_tenant_ceiling: calibrated
+                .as_ref()
+                .map_or((raw_slots / 2).max(1), |value| value.multi_tenant_ceiling),
+            queue_capacity: calibrated.as_ref().map_or(
+                u32::try_from(config.bifrost.oracle.admission_waiters).map_err(|_| {
+                    ServerBootError::OraclePeer("Oracle queue capacity exceeds u32".to_owned())
+                })?,
+                |value| value.queue_capacity,
+            ),
+            max_queue_wait: calibrated.as_ref().map_or(
+                std::time::Duration::from_millis(config.bifrost.oracle.max_queue_wait_ms),
+                |value| value.max_queue_wait,
+            ),
+            ..OracleConfig::default()
+        };
+        let operator_pool = state.postgres.operator_pool().ok_or_else(|| {
+            ServerBootError::OraclePeer(
+                "Oracle delegated admission requires the operator pool".to_owned(),
+            )
+        })?;
+        ensure_oracle_admission_policies(&operator_pool, oracle_config).await?;
         let capabilities = OracleCapabilitiesV1 {
             peer_protocol_version: u16::try_from(PEER_PROTOCOL_VERSION)
                 .map_err(|_| ServerBootError::OraclePeer("peer protocol exceeds u16".to_owned()))?,
@@ -1402,11 +1438,7 @@ impl<'a> OracleRoleBuilder<'a> {
         let oracle = match Oracle::new(OracleBuildConfig {
             catalog: Arc::clone(catalog),
             vala: state.postgres.vala().clone(),
-            operator_pool: state.postgres.operator_pool().ok_or_else(|| {
-                ServerBootError::OraclePeer(
-                    "Oracle delegated admission requires the operator pool".to_owned(),
-                )
-            })?,
+            operator_pool,
             cluster: Arc::clone(&cluster),
             local_role: role.clone(),
             local_slots: slots,
@@ -1422,36 +1454,7 @@ impl<'a> OracleRoleBuilder<'a> {
             tail_discovery: Some(tail_discovery),
             peer_transports: Some(peer_transports),
             delegated_admission_config,
-            config: OracleConfig {
-                planning_permits: config.bifrost.oracle.planning_permits,
-                max_workers_per_query: config.bifrost.oracle.max_workers_per_query,
-                attempt_memory_bytes: config.bifrost.oracle.max_frame_bytes.min(8 * 1024 * 1024),
-                interactive_slots: calibrated
-                    .as_ref()
-                    .map_or((raw_slots / 2).max(1), |value| value.interactive_slots),
-                analytical_slots: calibrated
-                    .as_ref()
-                    .map_or((raw_slots.saturating_sub(raw_slots / 2)).max(1), |value| {
-                        value.analytical_slots
-                    }),
-                single_tenant_ceiling: calibrated
-                    .as_ref()
-                    .map_or(raw_slots.max(1), |value| value.single_tenant_ceiling),
-                multi_tenant_ceiling: calibrated
-                    .as_ref()
-                    .map_or((raw_slots / 2).max(1), |value| value.multi_tenant_ceiling),
-                queue_capacity: calibrated.as_ref().map_or(
-                    u32::try_from(config.bifrost.oracle.admission_waiters).map_err(|_| {
-                        ServerBootError::OraclePeer("Oracle queue capacity exceeds u32".to_owned())
-                    })?,
-                    |value| value.queue_capacity,
-                ),
-                max_queue_wait: calibrated.as_ref().map_or(
-                    std::time::Duration::from_millis(config.bifrost.oracle.max_queue_wait_ms),
-                    |value| value.max_queue_wait,
-                ),
-                ..OracleConfig::default()
-            },
+            config: oracle_config,
         }) {
             Ok(oracle) => Arc::new(oracle),
             Err(error) => {
@@ -1468,6 +1471,31 @@ impl<'a> OracleRoleBuilder<'a> {
             audit,
         })
     }
+}
+
+/// Initializes every canonical Oracle admission ceiling before role readiness.
+///
+/// Repeated pods with equal locked ceilings are idempotent. A conflicting pod
+/// fails before reserving or advertising an Oracle role, so no worker can grant
+/// against an ambiguous durable policy.
+///
+/// # Errors
+///
+/// Returns [`ServerBootError::OraclePeer`] when active tenants cannot be read,
+/// a durable policy conflicts, or PostgreSQL cannot commit initialization.
+async fn ensure_oracle_admission_policies(
+    operator_pool: &vala_sql::OperatorPool,
+    config: OracleConfig,
+) -> Result<(), ServerBootError> {
+    vala_sql::queries::oracle_admission::OracleAdmissionBlocks::new(operator_pool)
+        .ensure_startup_policies(
+            config.interactive_slots,
+            config.analytical_slots,
+            config.tenant_interactive_slots,
+            config.tenant_analytical_slots,
+        )
+        .await
+        .map_err(|error| ServerBootError::OraclePeer(error.to_string()))
 }
 
 /// Rejects plaintext live remote Oracle membership before runtime publication.
@@ -2639,6 +2667,55 @@ pub(crate) mod pg_tests {
                 .expect("local Oracle role is ready");
             assert!(role.ready);
             assert_eq!(role.address, "127.0.0.1:9443");
+            let policy_count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM vala.oracle_admission_policies \
+                 WHERE scope_kind='global' OR data_tenant_id=$1",
+            )
+            .bind(DataTenantId::SYSTEM_OWNER.as_uuid())
+            .fetch_one(
+                state
+                    .postgres
+                    .operator_pool()
+                    .expect("boot retains operator pool")
+                    .pool(),
+            )
+            .await
+            .expect("startup policies are inspectable");
+            assert_eq!(policy_count, 4);
+        });
+    }
+
+    /// Repeated production policy composition is idempotent and conflicts fail.
+    ///
+    /// # Panics
+    ///
+    /// Panics when equal startup configuration diverges or conflicting global
+    /// capacity does not fail the readiness prerequisite.
+    #[test]
+    fn oracle_policy_composition_is_idempotent_and_conflict_fails() {
+        wyrd_runtime::runtime().block_on(async {
+            let operator_pool = crate::test_support::test_operator_pool().await;
+            let canonical = OracleConfig {
+                interactive_slots: 1,
+                analytical_slots: 1,
+                ..OracleConfig::default()
+            };
+            ensure_oracle_admission_policies(&operator_pool, canonical)
+                .await
+                .expect("first composition");
+            ensure_oracle_admission_policies(&operator_pool, canonical)
+                .await
+                .expect("idempotent composition");
+            let conflicting = OracleConfig {
+                interactive_slots: 2,
+                ..canonical
+            };
+            assert!(
+                ensure_oracle_admission_policies(&operator_pool, conflicting)
+                    .await
+                    .is_err(),
+                "conflicting policy must prevent readiness composition"
+            );
         });
     }
 

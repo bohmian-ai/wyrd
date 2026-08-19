@@ -177,6 +177,8 @@ pub enum DelegatedOracleAdmissionError {
 
 /// One queued principal request retained in deterministic FIFO order.
 struct DelegatedWaiter {
+    /// Monotonic local identity used for cancellation cleanup.
+    waiter_id: u64,
     /// Request whose three scopes must become available together.
     request: DelegatedAdmissionRequest,
     /// Completion notification.
@@ -191,6 +193,8 @@ struct DelegatedState {
     waiters: VecDeque<DelegatedWaiter>,
     /// Coalesced outstanding background demands.
     outstanding: HashSet<(DataTenantId, PrincipalId, QueryClass)>,
+    /// Next monotonic waiter identity, never reused within this owner.
+    next_waiter_id: u64,
     /// Whether new local grants remain valid.
     available: bool,
     /// Exactly-once continuity-loss notification latch.
@@ -238,6 +242,7 @@ impl DelegatedOracleAdmission {
                 blocks: Vec::new(),
                 waiters: VecDeque::new(),
                 outstanding: HashSet::new(),
+                next_waiter_id: 1,
                 available: true,
                 loss_notified: false,
             })),
@@ -290,7 +295,7 @@ impl DelegatedOracleAdmission {
         self: &Arc<Self>,
         request: DelegatedAdmissionRequest,
     ) -> Result<DelegatedOracleAdmissionGrant, DelegatedOracleAdmissionError> {
-        let receiver = {
+        let (receiver, cleanup) = {
             let mut state = self
                 .state
                 .lock()
@@ -306,7 +311,16 @@ impl DelegatedOracleAdmission {
                 return Err(DelegatedOracleAdmissionError::QueueFull);
             }
             let (sender, receiver) = oneshot::channel();
-            state.waiters.push_back(DelegatedWaiter { request, sender });
+            let waiter_id = state.next_waiter_id;
+            state.next_waiter_id = state
+                .next_waiter_id
+                .checked_add(1)
+                .ok_or(DelegatedOracleAdmissionError::StateUnavailable)?;
+            state.waiters.push_back(DelegatedWaiter {
+                waiter_id,
+                request,
+                sender,
+            });
             if state.outstanding.insert((
                 request.tenant_id,
                 request.principal_id,
@@ -331,11 +345,16 @@ impl DelegatedOracleAdmission {
                 state.waiters.pop_back();
                 return Err(DelegatedOracleAdmissionError::ContinuityLost);
             }
-            receiver
+            (
+                receiver,
+                DelegatedWaiterCleanup::new(&self.state, waiter_id, request),
+            )
         };
-        receiver
+        let result = receiver
             .await
-            .map_err(|_| DelegatedOracleAdmissionError::ContinuityLost)
+            .map_err(|_| DelegatedOracleAdmissionError::ContinuityLost);
+        cleanup.disarm();
+        result
     }
 
     /// Closes new grants and emits exactly one typed continuity-loss notification.
@@ -372,6 +391,54 @@ impl DelegatedOracleAdmission {
             .map_err(|_| DelegatedOracleAdmissionError::StateUnavailable)
     }
 
+    /// Applies authoritative database-time renewal evidence to one cached block.
+    ///
+    /// The local expiry advances under the same state lock used by acquisition,
+    /// while the consumed-unit count remains unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DelegatedOracleAdmissionError::ContinuityLost`] when the
+    /// renewed rows do not exactly match one cached allocation, holder fence,
+    /// immutable accounting identity, or strictly later live expiry.
+    fn apply_renewal(
+        &self,
+        renewal: &vala_sql::queries::oracle_admission::OracleAdmissionRenewal,
+    ) -> Result<(), DelegatedOracleAdmissionError> {
+        let renewed = DelegatedAdmissionBlock::try_from_rows(&renewal.rows)?;
+        if renewed.holder_node_id != self.node_id
+            || renewed.holder_fencing_token != self.fencing_token
+            || renewed.expires_at <= renewal.database_now
+        {
+            return Err(DelegatedOracleAdmissionError::ContinuityLost);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DelegatedOracleAdmissionError::StateUnavailable)?;
+        let mut matching = state
+            .blocks
+            .iter_mut()
+            .filter(|block| block.allocation_id == renewed.allocation_id);
+        let current = matching
+            .next()
+            .ok_or(DelegatedOracleAdmissionError::ContinuityLost)?;
+        if matching.next().is_some()
+            || current.tenant_id != renewed.tenant_id
+            || current.principal_id != renewed.principal_id
+            || current.query_class != renewed.query_class
+            || current.holder_node_id != renewed.holder_node_id
+            || current.holder_fencing_token != renewed.holder_fencing_token
+            || current.valid_from != renewed.valid_from
+            || current.units != renewed.units
+            || renewed.expires_at <= current.expires_at
+        {
+            return Err(DelegatedOracleAdmissionError::ContinuityLost);
+        }
+        current.expires_at = renewed.expires_at;
+        Ok(())
+    }
+
     /// Grants queued requests in stable arrival order while complete units exist.
     fn grant_waiters(owner: &Arc<Mutex<DelegatedState>>, state: &mut DelegatedState) {
         let mut retained = VecDeque::new();
@@ -391,6 +458,67 @@ impl DelegatedOracleAdmission {
             }
         }
         state.waiters = retained;
+    }
+}
+
+/// Cancellation guard that removes one queued waiter and its orphaned demand.
+struct DelegatedWaiterCleanup {
+    /// Shared local state containing the queued waiter.
+    owner: Arc<Mutex<DelegatedState>>,
+    /// Exact waiter identity to remove without disturbing FIFO peers.
+    waiter_id: u64,
+    /// Coalescing key whose demand is reclaimed after its final waiter leaves.
+    request: DelegatedAdmissionRequest,
+    /// Whether successful completion already removed the waiter.
+    armed: bool,
+}
+
+impl DelegatedWaiterCleanup {
+    /// Arms cancellation cleanup for one newly queued waiter.
+    fn new(
+        owner: &Arc<Mutex<DelegatedState>>,
+        waiter_id: u64,
+        request: DelegatedAdmissionRequest,
+    ) -> Self {
+        Self {
+            owner: Arc::clone(owner),
+            waiter_id,
+            request,
+            armed: true,
+        }
+    }
+
+    /// Disarms cleanup after the waiter completes normally.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DelegatedWaiterCleanup {
+    /// Reclaims cancelled queue and coalescing state without waiting for capacity.
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(mut state) = self.owner.lock() {
+            state
+                .waiters
+                .retain(|waiter| waiter.waiter_id != self.waiter_id);
+            let demand_key = (
+                self.request.tenant_id,
+                self.request.principal_id,
+                self.request.query_class,
+            );
+            if !state.waiters.iter().any(|waiter| {
+                (
+                    waiter.request.tenant_id,
+                    waiter.request.principal_id,
+                    waiter.request.query_class,
+                ) == demand_key
+            }) {
+                state.outstanding.remove(&demand_key);
+            }
+        }
     }
 }
 
@@ -493,7 +621,7 @@ impl DelegatedOracleAdmissionWorker {
         let validity = chrono::Duration::from_std(self.admission.config.validity)
             .map_err(|_| DelegatedOracleAdmissionError::InvalidConfig)?;
         for allocation_id in self.admission.allocation_ids()? {
-            let renewed = blocks
+            let renewal = blocks
                 .renew(
                     allocation_id,
                     self.admission.node_id.as_uuid(),
@@ -502,9 +630,8 @@ impl DelegatedOracleAdmissionWorker {
                 )
                 .await
                 .map_err(|_| DelegatedOracleAdmissionError::ContinuityLost)?;
-            if !renewed {
-                return Err(DelegatedOracleAdmissionError::ContinuityLost);
-            }
+            let renewal = renewal.ok_or(DelegatedOracleAdmissionError::ContinuityLost)?;
+            self.admission.apply_renewal(&renewal)?;
         }
         Ok(())
     }
@@ -570,6 +697,7 @@ impl Drop for DelegatedOracleAdmissionGrant {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vala_sql::row_types::oracle_admission::OracleAdmissionBlockRow;
 
     /// Constructs a valid local owner and its observable background channels.
     ///
@@ -594,6 +722,39 @@ mod tests {
         (Arc::new(owner), demand_rx, loss_rx)
     }
 
+    /// Projects one complete cached allocation into its three durable rows.
+    ///
+    /// # Panics
+    ///
+    /// Panics when test-only unit or fence values exceed their SQL projections.
+    fn renewal_rows(
+        block: &DelegatedAdmissionBlock,
+        expires_at: DateTime<Utc>,
+    ) -> Vec<OracleAdmissionBlockRow> {
+        ["global", "tenant", "principal"]
+            .into_iter()
+            .map(|scope_kind| OracleAdmissionBlockRow {
+                block_id: uuid::Uuid::now_v7(),
+                allocation_id: block.allocation_id,
+                scope_kind: scope_kind.to_owned(),
+                data_tenant_id: block.tenant_id.into(),
+                principal_id: (scope_kind == "principal").then_some(block.principal_id.as_uuid()),
+                query_class: match block.query_class {
+                    QueryClass::Interactive => "interactive",
+                    QueryClass::Analytical => "analytical",
+                }
+                .to_owned(),
+                units: i32::from(u16::try_from(block.units).expect("test block units fit u16")),
+                holder_node_id: block.holder_node_id.as_uuid(),
+                holder_fencing_token: i64::try_from(block.holder_fencing_token)
+                    .expect("test holder fence fits i64"),
+                valid_from: block.valid_from,
+                expires_at,
+                closed_at: None,
+            })
+            .collect()
+    }
+
     /// Missing capacity coalesces identical background demand notifications.
     ///
     /// # Panics
@@ -616,6 +777,72 @@ mod tests {
         assert!(demand_rx.try_recv().is_err());
         first.abort();
         second.abort();
+    }
+
+    /// Cancelling a waiter immediately reclaims queue and coalesced demand state.
+    ///
+    /// # Panics
+    ///
+    /// Panics when cancellation leaves state behind or the reclaimed queue cannot
+    /// accept and complete a replacement request.
+    #[tokio::test]
+    async fn cancelled_waiter_reclaims_demand_and_queue_for_reuse() {
+        let (owner, mut demand_rx, _) = owner();
+        let request = DelegatedAdmissionRequest {
+            tenant_id: DataTenantId::new_v7(),
+            principal_id: PrincipalId::new(uuid::Uuid::now_v7()),
+            query_class: QueryClass::Interactive,
+        };
+        let cancelled_owner = Arc::clone(&owner);
+        let cancelled = tokio::spawn(async move { cancelled_owner.acquire(request).await });
+        tokio::task::yield_now().await;
+        let first_demand = demand_rx.try_recv().expect("first demand");
+        cancelled.abort();
+        let cancelled_result = cancelled.await;
+        assert!(matches!(cancelled_result, Err(error) if error.is_cancelled()));
+        {
+            let state = owner.state.lock().expect("state after cancellation");
+            assert!(state.waiters.is_empty());
+            assert!(state.outstanding.is_empty());
+        }
+
+        let replacement_owner = Arc::clone(&owner);
+        let replacement = tokio::spawn(async move { replacement_owner.acquire(request).await });
+        tokio::task::yield_now().await;
+        let replacement_demand = demand_rx.try_recv().expect("replacement demand");
+        assert_eq!(replacement_demand.tenant_id, first_demand.tenant_id);
+        {
+            let state = owner.state.lock().expect("replacement state");
+            assert_eq!(state.waiters.len(), 1);
+            assert_eq!(state.outstanding.len(), 1);
+        }
+        let now = Utc::now();
+        owner
+            .install_block(
+                DelegatedAdmissionBlock {
+                    allocation_id: uuid::Uuid::now_v7(),
+                    tenant_id: request.tenant_id,
+                    principal_id: request.principal_id,
+                    query_class: request.query_class,
+                    holder_node_id: NodeId::new(uuid::Uuid::from_u128(1)),
+                    holder_fencing_token: 3,
+                    valid_from: now,
+                    expires_at: now + chrono::Duration::seconds(10),
+                    units: 1,
+                    used: 0,
+                },
+                now,
+            )
+            .expect("replacement block installs");
+        let grant = replacement
+            .await
+            .expect("replacement joins")
+            .expect("grant");
+        let state = owner.state.lock().expect("completed replacement state");
+        assert!(state.waiters.is_empty());
+        assert!(state.outstanding.is_empty());
+        drop(state);
+        drop(grant);
     }
 
     /// Cached grants consume and restore complete local units without SQL.
@@ -653,6 +880,89 @@ mod tests {
         assert_eq!(owner.state.lock().expect("state").blocks[0].used, 1);
         drop(grant);
         assert_eq!(owner.state.lock().expect("state").blocks[0].used, 0);
+    }
+
+    /// Authoritative renewal advances cached expiry without resetting usage.
+    ///
+    /// # Panics
+    ///
+    /// Panics when renewal evidence fails or changes local consumption.
+    #[tokio::test]
+    async fn renewal_advances_cached_expiry_and_preserves_usage() {
+        let (owner, _, _) = owner();
+        let now = Utc::now();
+        let block = DelegatedAdmissionBlock {
+            allocation_id: uuid::Uuid::now_v7(),
+            tenant_id: DataTenantId::new_v7(),
+            principal_id: PrincipalId::new(uuid::Uuid::now_v7()),
+            query_class: QueryClass::Interactive,
+            holder_node_id: NodeId::new(uuid::Uuid::from_u128(1)),
+            holder_fencing_token: 3,
+            valid_from: now,
+            expires_at: now + chrono::Duration::seconds(2),
+            units: 1,
+            used: 0,
+        };
+        owner
+            .install_block(block.clone(), now)
+            .expect("initial block installs");
+        let request = DelegatedAdmissionRequest {
+            tenant_id: block.tenant_id,
+            principal_id: block.principal_id,
+            query_class: block.query_class,
+        };
+        let grant = owner.acquire(request).await.expect("initial grant");
+        let renewed_expiry = now + chrono::Duration::seconds(10);
+        let renewal = vala_sql::queries::oracle_admission::OracleAdmissionRenewal {
+            rows: renewal_rows(&block, renewed_expiry),
+            database_now: now + chrono::Duration::seconds(1),
+        };
+        owner.apply_renewal(&renewal).expect("renewal applies");
+        let state = owner.state.lock().expect("renewed state");
+        assert_eq!(state.blocks[0].expires_at, renewed_expiry);
+        assert_eq!(state.blocks[0].used, 1);
+        drop(state);
+        drop(grant);
+    }
+
+    /// Mismatched renewal evidence fails closed and notifies exactly once.
+    ///
+    /// # Panics
+    ///
+    /// Panics when mismatched evidence applies or continuity notification duplicates.
+    #[test]
+    fn mismatched_renewal_closes_continuity_once() {
+        let (owner, _, mut loss_rx) = owner();
+        let now = Utc::now();
+        let block = DelegatedAdmissionBlock {
+            allocation_id: uuid::Uuid::now_v7(),
+            tenant_id: DataTenantId::new_v7(),
+            principal_id: PrincipalId::new(uuid::Uuid::now_v7()),
+            query_class: QueryClass::Interactive,
+            holder_node_id: NodeId::new(uuid::Uuid::from_u128(1)),
+            holder_fencing_token: 3,
+            valid_from: now,
+            expires_at: now + chrono::Duration::seconds(2),
+            units: 1,
+            used: 0,
+        };
+        owner
+            .install_block(block.clone(), now)
+            .expect("initial block installs");
+        let mut rows = renewal_rows(&block, now + chrono::Duration::seconds(10));
+        rows[0].holder_fencing_token = 4;
+        let renewal = vala_sql::queries::oracle_admission::OracleAdmissionRenewal {
+            rows,
+            database_now: now + chrono::Duration::seconds(1),
+        };
+        assert!(owner.apply_renewal(&renewal).is_err());
+        owner.close_continuity();
+        owner.close_continuity();
+        assert_eq!(
+            loss_rx.try_recv().expect("one loss").holder_fencing_token,
+            3
+        );
+        assert!(loss_rx.try_recv().is_err());
     }
 
     /// Repeated continuity loss emits exactly one typed notification.

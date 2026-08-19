@@ -8,6 +8,69 @@ use wyrd_spec::vala::api::{OracleAdmissionDemand, QueryClass};
 use crate::row_types::oracle_admission::OracleAdmissionBlockRow;
 use crate::{OperatorPool, SqlError};
 
+/// Authoritative database-time evidence for one complete fenced renewal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OracleAdmissionRenewal {
+    /// The three renewed global, tenant, and principal rows.
+    pub rows: Vec<OracleAdmissionBlockRow>,
+    /// Database statement time used to validate and advance their expiry.
+    pub database_now: chrono::DateTime<chrono::Utc>,
+}
+
+/// Internal projection that carries the shared database clock beside each row.
+#[derive(sqlx::FromRow)]
+struct OracleAdmissionRenewalRow {
+    /// Unique row identity.
+    block_id: Uuid,
+    /// Identity shared by the three accounting rows.
+    allocation_id: Uuid,
+    /// Durable accounting-level discriminator.
+    scope_kind: String,
+    /// Tenant charged by the allocation.
+    data_tenant_id: Uuid,
+    /// Principal charged only by the principal row.
+    principal_id: Option<Uuid>,
+    /// Durable query-class discriminator.
+    query_class: String,
+    /// Units delegated at every accounting level.
+    units: i32,
+    /// Physical holder node.
+    holder_node_id: Uuid,
+    /// Exact Oracle role-incarnation fence.
+    holder_fencing_token: i64,
+    /// Database-time beginning of uninterrupted validity.
+    valid_from: chrono::DateTime<chrono::Utc>,
+    /// Renewed absolute database-time validity bound.
+    expires_at: chrono::DateTime<chrono::Utc>,
+    /// Database-time closure marker after continuity loss.
+    closed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Shared statement timestamp used by the fenced renewal.
+    database_now: chrono::DateTime<chrono::Utc>,
+}
+
+impl OracleAdmissionRenewalRow {
+    /// Splits one internal database projection into its durable row and clock.
+    fn into_parts(self) -> (OracleAdmissionBlockRow, chrono::DateTime<chrono::Utc>) {
+        (
+            OracleAdmissionBlockRow {
+                block_id: self.block_id,
+                allocation_id: self.allocation_id,
+                scope_kind: self.scope_kind,
+                data_tenant_id: self.data_tenant_id,
+                principal_id: self.principal_id,
+                query_class: self.query_class,
+                units: self.units,
+                holder_node_id: self.holder_node_id,
+                holder_fencing_token: self.holder_fencing_token,
+                valid_from: self.valid_from,
+                expires_at: self.expires_at,
+                closed_at: self.closed_at,
+            },
+            self.database_now,
+        )
+    }
+}
+
 /// Durable allocator for canonical policy ceilings and delegated capacity.
 pub struct OracleAdmissionBlocks<'a> {
     /// Cross-tenant operator connection used only by background work.
@@ -60,6 +123,55 @@ impl<'a> OracleAdmissionBlocks<'a> {
             ));
         }
         Ok(())
+    }
+
+    /// Initializes and validates every startup policy in one transaction.
+    ///
+    /// Global class ceilings are installed once, while tenant class ceilings
+    /// are installed for every active tenant visible at the readiness boundary.
+    /// Existing equal rows make repeated pod startup idempotent; any conflict
+    /// rolls back the complete startup set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError`] when a capacity is invalid, an existing canonical
+    /// row conflicts, active tenants cannot be enumerated, or the transaction
+    /// cannot commit.
+    pub async fn ensure_startup_policies(
+        &self,
+        global_interactive: u32,
+        global_analytical: u32,
+        tenant_interactive: u32,
+        tenant_analytical: u32,
+    ) -> Result<(), SqlError> {
+        let capacities = [
+            (QueryClass::Interactive, global_interactive),
+            (QueryClass::Analytical, global_analytical),
+        ];
+        let tenant_capacities = [
+            (QueryClass::Interactive, tenant_interactive),
+            (QueryClass::Analytical, tenant_analytical),
+        ];
+        for (_, capacity) in capacities.into_iter().chain(tenant_capacities) {
+            validate_capacity(capacity)?;
+        }
+        let mut tx = self.pool.pool().begin().await.map_err(SqlError::from)?;
+        let tenants: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT data_tenant_id FROM platform.tenants \
+             WHERE status='active' AND deleted_at IS NULL ORDER BY data_tenant_id",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(SqlError::from)?;
+        for (query_class, capacity) in capacities {
+            ensure_policy_in(&mut tx, None, query_class, capacity).await?;
+        }
+        for tenant_id in tenants {
+            for (query_class, capacity) in tenant_capacities {
+                ensure_policy_in(&mut tx, Some(tenant_id), query_class, capacity).await?;
+            }
+        }
+        tx.commit().await.map_err(SqlError::from)
     }
 
     /// Allocates one co-located three-scope block using database time.
@@ -163,22 +275,59 @@ impl<'a> OracleAdmissionBlocks<'a> {
         holder_node_id: Uuid,
         holder_fencing_token: u64,
         validity: Duration,
-    ) -> Result<bool, SqlError> {
+    ) -> Result<Option<OracleAdmissionRenewal>, SqlError> {
         let fence = i64::try_from(holder_fencing_token)
             .map_err(|_| invariant("holder fence exceeds i64"))?;
-        let result = sqlx::query(
-            "UPDATE vala.oracle_admission_blocks SET expires_at=statement_timestamp()+($4*interval '1 millisecond') \
-             WHERE allocation_id=$1 AND holder_node_id=$2 AND holder_fencing_token=$3 \
-             AND closed_at IS NULL AND expires_at>statement_timestamp()",
+        if validity <= Duration::zero() {
+            return Err(invariant(
+                "Oracle admission renewal validity must be positive",
+            ));
+        }
+        let rows = sqlx::query_as::<_, OracleAdmissionRenewalRow>(
+            r#"WITH clock AS MATERIALIZED (SELECT statement_timestamp() AS now),
+            renewed AS (
+              UPDATE vala.oracle_admission_blocks AS blocks
+              SET expires_at=clock.now+($4*interval '1 millisecond')
+              FROM clock
+              WHERE blocks.allocation_id=$1 AND blocks.holder_node_id=$2
+                AND blocks.holder_fencing_token=$3 AND blocks.closed_at IS NULL
+                AND blocks.expires_at>clock.now
+              RETURNING blocks.block_id, blocks.allocation_id, blocks.scope_kind,
+                        blocks.data_tenant_id, blocks.principal_id, blocks.query_class,
+                        blocks.units, blocks.holder_node_id, blocks.holder_fencing_token,
+                        blocks.valid_from, blocks.expires_at, blocks.closed_at
+            )
+            SELECT renewed.*, clock.now AS database_now
+            FROM renewed CROSS JOIN clock"#,
         )
         .bind(allocation_id)
         .bind(holder_node_id)
         .bind(fence)
         .bind(validity.num_milliseconds())
-        .execute(self.pool.pool())
+        .fetch_all(self.pool.pool())
         .await
         .map_err(SqlError::from)?;
-        Ok(result.rows_affected() == 3)
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        let mut database_now = None;
+        let rows = rows
+            .into_iter()
+            .map(|row| {
+                let (row, observed_now) = row.into_parts();
+                if database_now
+                    .replace(observed_now)
+                    .is_some_and(|now| now != observed_now)
+                {
+                    return Err(invariant("Oracle admission renewal clock diverged"));
+                }
+                Ok(row)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(OracleAdmissionRenewal {
+            rows,
+            database_now: database_now.ok_or_else(|| invariant("renewal clock is absent"))?,
+        }))
     }
 
     /// Closes all blocks for one exact holder incarnation at database time.
@@ -199,6 +348,56 @@ impl<'a> OracleAdmissionBlocks<'a> {
         .map_err(SqlError::from)?;
         Ok(result.rows_affected())
     }
+}
+
+/// Validates one canonical positive capacity before opening policy mutation.
+///
+/// # Errors
+///
+/// Returns [`SqlError`] when the capacity is zero or exceeds PostgreSQL `integer`.
+fn validate_capacity(capacity: u32) -> Result<i32, SqlError> {
+    let capacity = i32::try_from(capacity).map_err(|_| invariant("capacity exceeds i32"))?;
+    if capacity == 0 {
+        return Err(invariant("Oracle admission capacity must be positive"));
+    }
+    Ok(capacity)
+}
+
+/// Inserts or validates one policy row inside a caller-owned startup transaction.
+///
+/// # Errors
+///
+/// Returns [`SqlError`] when the row conflicts or PostgreSQL rejects the mutation.
+async fn ensure_policy_in(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant_id: Option<Uuid>,
+    query_class: QueryClass,
+    capacity: u32,
+) -> Result<(), SqlError> {
+    let capacity = validate_capacity(capacity)?;
+    let scope = if tenant_id.is_some() {
+        "tenant"
+    } else {
+        "global"
+    };
+    let row: i32 = sqlx::query_scalar(
+        "INSERT INTO vala.oracle_admission_policies(scope_kind,data_tenant_id,query_class,capacity) \
+         VALUES($1,$2,$3,$4) ON CONFLICT (scope_kind,data_tenant_id,query_class) \
+         DO UPDATE SET capacity=vala.oracle_admission_policies.capacity RETURNING capacity",
+    )
+    .bind(scope)
+    .bind(tenant_id)
+    .bind(class_name(query_class))
+    .bind(capacity)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(SqlError::from)?;
+    if row != capacity {
+        return Err(invariant(
+            "Oracle admission policy conflicts with durable ceiling",
+        ));
+    }
+    Ok(())
 }
 
 /// Locks and returns one canonical policy row in deterministic caller order.

@@ -102,6 +102,55 @@ async fn canonical_policy_is_idempotent_and_conflict_fails() {
     );
 }
 
+/// Production startup initializes every active tenant atomically and idempotently.
+///
+/// # Panics
+///
+/// Panics when startup policy initialization, inspection, or conflict rollback fails.
+#[tokio::test]
+async fn startup_policies_cover_active_tenants_and_reject_conflict() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let second = fixture
+        .seed_additional_tenant("startup-second")
+        .await
+        .expect("second tenant seeds");
+    let blocks = OracleAdmissionBlocks::new(fixture.operator_pool());
+    blocks
+        .ensure_startup_policies(4, 2, 3, 1)
+        .await
+        .expect("first startup initializes policies");
+    blocks
+        .ensure_startup_policies(4, 2, 3, 1)
+        .await
+        .expect("repeated startup is idempotent");
+    let active_tenants: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM platform.tenants WHERE status='active' AND deleted_at IS NULL",
+    )
+    .fetch_one(fixture.operator_pool().pool())
+    .await
+    .expect("active tenants count");
+    let tenant_policies: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.oracle_admission_policies WHERE scope_kind='tenant'",
+    )
+    .fetch_one(fixture.operator_pool().pool())
+    .await
+    .expect("tenant policy count");
+    assert_eq!(tenant_policies, active_tenants * 2);
+    assert!(
+        blocks.ensure_startup_policies(5, 2, 3, 1).await.is_err(),
+        "conflicting startup must fail readiness initialization"
+    );
+    let retained: i32 = sqlx::query_scalar(
+        "SELECT capacity FROM vala.oracle_admission_policies \
+         WHERE scope_kind='tenant' AND data_tenant_id=$1 AND query_class='interactive'",
+    )
+    .bind(second.as_uuid())
+    .fetch_one(fixture.operator_pool().pool())
+    .await
+    .expect("second tenant policy remains canonical");
+    assert_eq!(retained, 3);
+}
+
 /// Concurrent holders cannot exceed global or tenant canonical ceilings.
 ///
 /// # Panics
@@ -145,4 +194,73 @@ async fn allocations_bind_three_scopes_and_respect_ceiling() {
         .await
         .expect("bounded second allocation");
     assert!(second.is_empty());
+}
+
+/// Fenced renewal returns one complete authoritative database-time expiry.
+///
+/// # Panics
+///
+/// Panics when allocation, repeated renewal, or late-renewal refusal diverges.
+#[tokio::test]
+async fn renewal_advances_authoritative_expiry_and_refuses_late_rows() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let blocks = OracleAdmissionBlocks::new(fixture.operator_pool());
+    blocks
+        .ensure_policy(None, QueryClass::Interactive, 1)
+        .await
+        .expect("global policy");
+    blocks
+        .ensure_policy(Some(tenant.into()), QueryClass::Interactive, 1)
+        .await
+        .expect("tenant policy");
+    let node_id = NodeId::new(uuid::Uuid::from_u128(7));
+    register_oracle(&fixture, tenant, node_id).await;
+    let demand = OracleAdmissionDemand {
+        tenant_id: tenant,
+        principal_id: PrincipalId::new(uuid::Uuid::now_v7()),
+        query_class: QueryClass::Interactive,
+        requested_units: 1,
+        holder_node_id: node_id,
+        holder_fencing_token: 1,
+    };
+    let allocated = blocks
+        .allocate(demand, Duration::seconds(2))
+        .await
+        .expect("allocation");
+    let allocation_id = allocated[0].allocation_id;
+    let first = blocks
+        .renew(allocation_id, node_id.as_uuid(), 1, Duration::seconds(10))
+        .await
+        .expect("first renewal")
+        .expect("live allocation renews");
+    assert_eq!(first.rows.len(), 3);
+    assert!(
+        first
+            .rows
+            .iter()
+            .all(|row| row.expires_at > first.database_now)
+    );
+    let second = blocks
+        .renew(allocation_id, node_id.as_uuid(), 1, Duration::seconds(10))
+        .await
+        .expect("second renewal")
+        .expect("continuous allocation renews again");
+    assert!(second.rows[0].expires_at > first.rows[0].expires_at);
+    sqlx::query(
+        "UPDATE vala.oracle_admission_blocks \
+         SET expires_at=statement_timestamp()-interval '1 millisecond' \
+         WHERE allocation_id=$1",
+    )
+    .bind(allocation_id)
+    .execute(fixture.operator_pool().pool())
+    .await
+    .expect("allocation expires");
+    assert!(
+        blocks
+            .renew(allocation_id, node_id.as_uuid(), 1, Duration::seconds(10))
+            .await
+            .expect("late renewal query")
+            .is_none()
+    );
 }

@@ -2470,6 +2470,28 @@ impl BifrostResourceGovernor {
                 detail: "Oracle query demands must be positive".to_owned(),
             });
         }
+        let exact_class_quantum = match request.query_class {
+            QueryClass::Interactive => (
+                ORACLE_PARTITION_MEMORY_BYTES,
+                ORACLE_PARTITION_MEMORY_BYTES as u64,
+                1,
+            ),
+            QueryClass::Analytical => (
+                2 * ORACLE_PARTITION_MEMORY_BYTES,
+                (2 * ORACLE_PARTITION_MEMORY_BYTES) as u64,
+                2,
+            ),
+        };
+        if (
+            request.memory_bytes,
+            request.scratch_bytes,
+            request.slot_units,
+        ) != exact_class_quantum
+        {
+            return Err(BifrostResourceError::InvalidPlan {
+                detail: "Oracle query demand must match its class quantum".to_owned(),
+            });
+        }
         let next_memory = state
             .oracle_memory_used_bytes
             .checked_add(request.memory_bytes)
@@ -5435,6 +5457,65 @@ mod tests {
         assert_eq!(released.oracle_active_queries, 0);
         assert_eq!(released.oracle_memory_used_bytes, 0);
         assert_eq!(released.scratch_used_bytes, 0);
+    }
+
+    /// Query classes reject every noncanonical demand tuple without mutation.
+    #[test]
+    fn oracle_query_classes_require_their_exact_locked_quantum() {
+        let roles = BifrostRuntimeResources::composed_for_test(
+            1024 * MIB,
+            1024 * MIB as u64,
+            [BifrostRole::Oracle],
+        );
+        let oracle = roles.oracle().expect("Oracle capability");
+        let baseline = oracle.snapshot().expect("empty governor snapshot");
+        let malformed = [
+            OracleResourceRequest {
+                memory_bytes: 2 * ORACLE_PARTITION_MEMORY_BYTES,
+                ..interactive_query(0.0)
+            },
+            OracleResourceRequest {
+                scratch_bytes: (2 * ORACLE_PARTITION_MEMORY_BYTES) as u64,
+                ..interactive_query(0.0)
+            },
+            OracleResourceRequest {
+                slot_units: 2,
+                ..interactive_query(0.0)
+            },
+            OracleResourceRequest {
+                query_class: QueryClass::Analytical,
+                memory_bytes: ORACLE_PARTITION_MEMORY_BYTES,
+                scratch_bytes: (2 * ORACLE_PARTITION_MEMORY_BYTES) as u64,
+                slot_units: 2,
+                local_ratio: 0.0,
+            },
+            OracleResourceRequest {
+                query_class: QueryClass::Analytical,
+                memory_bytes: 2 * ORACLE_PARTITION_MEMORY_BYTES,
+                scratch_bytes: ORACLE_PARTITION_MEMORY_BYTES as u64,
+                slot_units: 2,
+                local_ratio: 0.0,
+            },
+            OracleResourceRequest {
+                query_class: QueryClass::Analytical,
+                memory_bytes: 2 * ORACLE_PARTITION_MEMORY_BYTES,
+                scratch_bytes: (2 * ORACLE_PARTITION_MEMORY_BYTES) as u64,
+                slot_units: 1,
+                local_ratio: 0.0,
+            },
+        ];
+
+        for request in malformed {
+            assert!(matches!(
+                oracle.try_acquire_query(request),
+                Err(BifrostResourceError::InvalidPlan { .. })
+            ));
+            assert_eq!(
+                oracle.snapshot().expect("refusal snapshot"),
+                baseline,
+                "malformed {request:?} mutated root counters"
+            );
+        }
     }
 
     /// Analytical admission preserves one complete interactive query quantum.

@@ -491,13 +491,18 @@ task packets, or documentation.
   `wyrd-review` skill, then owns integrated verification.
 - A plan may opt into the self-contained repo-local v3 pilot only when its
   `Execution handoff` explicitly names `wyrd-implement-plan-v3`. An opted-in
-  plan uses the complete v3 family for planning, cold rehearsal, isolated task
-  implementation, immutable-candidate review, remediation planning, bounded
-  concurrent control, and terminal review. Every v3 root and delegated role
-  runs `gpt-5.6-sol` at low reasoning effort. V3 plans require a validated
-  dependency DAG, disjoint source and shared-artifact locks, digest-bound
-  focused proof, and serial root integration. Existing plans never inherit v3
-  behavior implicitly, and UI work is excluded from the initial v3 pilot.
+  plan uses concise task packets, isolated task implementation,
+  immutable-candidate review, focused verification, and serial root
+  integration. The controller executes tasks serially by default and may run
+  explicitly independent, disjoint tasks in parallel. Every v3 root and
+  delegated role runs `gpt-5.6-sol` at low reasoning effort, except the
+  read-only `gpt-5.6-luna` medium evidence scouts expressly permitted by
+  `wyrd-plan-v3`; scouts retrieve bounded evidence only and do not plan,
+  decide, edit, or execute. V3 plans require bounded task scope, declared
+  dependencies, focused proof, and serial root integration; they do not require
+  an external readiness workflow.
+  Existing plans never inherit v3 behavior implicitly, and UI work is excluded
+  from the initial v3 pilot.
 - The complete integration review runs the global `review-and-plan` skill; its
   repo-specific review binding is the `wyrd-review` skill.
   For an explicitly opted-in v3 plan, `wyrd-review-and-plan-v3` replaces that

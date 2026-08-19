@@ -42,11 +42,12 @@ verification:
   command: <exact focused mise command>
 ```
 
-Return `BLOCKED` before editing if the request is incomplete, packet digest
-differs, its contract is missing or ambiguous, the worktree is not clean and
-checked out at `parent_sha`, a path overlaps a prohibition, or `parent_sha` is
-not a commit. Do not require a task status, revision, manifest, or controller
-proof record: controller dispatch is the authority to begin work.
+Return `BLOCKED` before editing only if the request is incomplete, packet
+digest differs, its contract cannot be understood after inspecting its stated
+outcome and repository context, the worktree is not clean and checked out at
+`parent_sha`, a necessary path overlaps a prohibition, or `parent_sha` is not
+a commit. Do not require a task status, revision, manifest, or controller proof
+record: controller dispatch is the authority to begin work.
 
 ## Establish the execution boundary
 
@@ -55,8 +56,12 @@ the architecture/design/doctrine references relevant to its changed behavior.
 Inspect the named paths, consumers, tests, manifests, and `mise` command.
 Use CodeGraph first when indexed.
 
-Treat the packet's `write_set` as the behavioral ownership allowlist;
-`prohibited_writes` always wins. Refuse unrelated dirty state. Never amend,
+Use the packet's `write_set` as the expected ownership boundary and
+`prohibited_writes` as a hard boundary. Before calling something ambiguous or
+blocked, use the acceptance criteria, surrounding code, consumers, tests, and
+diagnostics to determine the smallest coherent way to achieve the stated
+outcome. A packet need not enumerate every supporting file, implementation
+detail, or local consequence. Refuse unrelated dirty state. Never amend,
 rebase, merge, cherry-pick, integrate, push, or modify the packet/plan.
 
 ## Implement and verify
@@ -67,23 +72,27 @@ struct-centered Rust, rustdoc, async, PyO3, contract, and journey-test rules.
 Do not reopen a material task decision or implement later work.
 
 Compiler, formatter, lint, test, fixture, codegen, and repository-managed
-setup failures are ordinary development feedback. Apply the smallest
-candidate-caused mechanical repair needed to pass a required check even when
-its adjacent path is outside `write_set`: imports, call-site type adjustments,
-generated output, fixtures, rustdoc, and lint cleanup are allowed. Record each
-such path and exact diagnostic. This repair closure never permits new behavior,
-owners, dependencies, public or durable contracts, acceptance scope, unrelated
-cleanup, broad formatting, or a prohibited path.
+setup failures are ordinary development feedback. Use judgment to make the
+smallest task-local completion change needed to deliver the packet's stated
+outcome, even when a necessary supporting path is outside `write_set`:
+imports, call-site type adjustments, declarations, generated output, fixtures,
+rustdoc, and lint cleanup are examples, not a closed list. Record every such
+path and the repository evidence or diagnostic that makes it necessary. This
+completion closure never permits a materially new behavior, owner, dependency,
+public or durable contract, acceptance outcome, unrelated cleanup, broad
+formatting, or a prohibited path.
 
 Run `verification.command` diagnostically when it is repeatable and safe. If
 it is destructive, non-repeatable, cross-task, or a terminal qualification
 gate, report why it was not run; the controller will run it once in its
 authoritative lane. Never weaken, replace, skip, or mask the command.
 
-Return `BLOCKED` only for a material decision, unavailable authority,
-ambiguous acceptance outcome, prohibited write, or mandatory proof that cannot
-be safely run. A first failing check or ordinary mechanical repair is not a
-blocker.
+Return `BLOCKED` only after reasonable task-local investigation and recovery
+for a material decision, unavailable authority, genuinely indeterminate
+acceptance outcome, prohibited necessary write, or mandatory proof that cannot
+be safely run. Do not elevate an omitted file, an unspecified implementation
+detail, a first failing check, or an ordinary repair into a blocker when the
+packet's intended outcome and repository evidence make the next action clear.
 
 ## Seal the candidate
 

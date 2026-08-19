@@ -25,6 +25,23 @@ security, tenancy, migration, or acceptance outcome. Do not turn ordinary
 implementation details, test setup, or adjacent mechanical repairs into
 planning blockers.
 
+## Use bounded evidence scouts when breadth earns them
+
+For an unfamiliar or multi-owner evidence gap that direct tracing cannot
+efficiently close, the planner may dispatch one through three read-only
+`gpt-5.6-luna` scouts at medium reasoning effort. Give each scout one bounded
+question and explicit repository or source scope. Require an evidence-only
+report containing verified facts with paths, symbols, or primary links,
+relevant tests or commands, counterevidence, and unresolved uncertainty.
+
+Use scouts to inventory owners and projections, find repository-native
+precedents, or map consumers, configuration, and verification conventions. Do
+not dispatch them for a single named symbol, a local change with an obvious
+precedent, or a judgment-heavy design choice. Scouts do not edit, recommend,
+decide, assign tasks, or create plan artifacts. The parent planner verifies
+facts that affect contracts, ownership, security, tenancy, dependencies, or
+acceptance criteria, and remains solely responsible for the plan and packets.
+
 ## Write the plan
 
 Create one plan directory with:

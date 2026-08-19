@@ -21,16 +21,22 @@ integration SHA and preserve a small execution record outside source
 worktrees: task ID, base SHA, candidate SHA, verification result, review
 verdict, and integrated SHA.
 
-The plan is an allowlist of outcomes and ownership. Reject speculative work or
-material contract changes outside a task. Treat compiler, formatter, lint,
-rustdoc, codegen, fixture, and focused-test failures as normal implementation
-feedback. The implementor may make the task-local mechanical repairs permitted
-by its implementation skill; do not replan for those repairs.
+The plan is an allowlist of outcomes and ownership, not a demand that every
+local implementation consequence be anticipated in a packet. Reject
+speculative work or material contract changes outside a task. Before freezing a
+task, use the packet's intended outcome, repository context, diagnostics, and
+the implementor's evidence to distinguish a real authority gap from routine
+implementation judgment. Treat compiler, formatter, lint, rustdoc, codegen,
+fixture, and focused-test failures as normal development feedback. The
+implementor may make the task-local completion changes permitted by its
+implementation skill; do not replan for those changes.
 
-Stop for user or plan-authority direction only when evidence exposes an
-undecided product, public or durable contract, ownership, dependency, security,
-tenancy, migration, or acceptance decision. Record the exact conflict and
-freeze only the affected task and its dependent tasks.
+Stop for user or plan-authority direction only when evidence, after reasonable
+task-local investigation, exposes an undecided product, public or durable
+contract, ownership, dependency, security, tenancy, migration, or acceptance
+decision. An omitted path, unspecified local implementation detail, or routine
+repair is not itself such evidence. Record the exact conflict and freeze only
+the affected task and its dependent tasks.
 
 ## Execute tasks
 

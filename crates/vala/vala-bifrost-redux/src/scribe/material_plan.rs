@@ -32,9 +32,6 @@ pub(crate) const MAX_SOURCE_PLANS: usize = 64;
 pub(crate) const MAX_NATIVE_FIELDS: usize = 256;
 /// Maximum distinct event days in one request.
 pub(crate) const MAX_EVENT_DAYS: usize = crate::gate::limits::OTLP_WIRE_LIMITS.event_days;
-/// Maximum projected Arrow and IPC bytes in one request.
-pub(crate) const MAX_PROJECTED_BYTES: usize = crate::gate::limits::OTLP_WIRE_LIMITS.material_bytes;
-
 /// Metadata-only facts for one current source.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct SourceMaterialPlan {
@@ -98,15 +95,106 @@ pub(crate) struct IngestMaterialPlan {
     pub(crate) current_material_bytes: usize,
     /// Aggregate native rows transferred into active memtable ownership.
     pub(crate) active_output_bytes: usize,
+    /// Conservative Arrow bytes that can form one later file candidate.
+    pub(crate) persistence_candidate_bytes: usize,
     /// Authorized fixed backing ceiling for WAL-durable slice descriptors.
     pub(crate) durable_metadata_bytes: usize,
     /// Fixed WAL framing/digest workspace.
     pub(crate) wal_workspace_bytes: usize,
+    /// Conservative immutable-plus-serial-workspace replayability peak.
+    pub(crate) persistence_replay_bytes: usize,
     /// Complete simultaneous-live-set charge.
     pub(crate) root_bytes: usize,
 }
 
+/// Canonical two-phase materialization plan used by every Scribe producer.
+///
+/// The alias keeps the existing field-level planner representation while
+/// making the preflight owner explicit at ingress and recovery call sites.
+pub(crate) type MaterialPlan = IngestMaterialPlan;
+
+/// Derives the largest configured preflight or persistence envelope.
+///
+/// Native buffers cannot exceed the configured frame, while typed OTLP may
+/// retain its encoded request, bounded value material, and managed Wyrd columns
+/// together. The result includes the durable slice layout, WAL workspace, and
+/// the same candidate-local persistence projection used after materialization.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::DecodedPayloadTooLarge`] when configured bound
+/// arithmetic cannot be represented on this platform.
+pub(crate) fn configured_maximum_envelope_bytes(
+    limits: crate::gate::limits::IngestLimits,
+) -> Result<usize, ScribeError> {
+    let overflow = || ScribeError::DecodedPayloadTooLarge {
+        bytes: usize::MAX,
+        limit: usize::MAX,
+    };
+    let managed = managed_projection_bytes(limits.rows, 36)?;
+    let native_candidate = limits
+        .max_frame_bytes
+        .checked_add(managed)
+        .ok_or_else(overflow)?;
+    let otlp_candidate = limits
+        .otlp
+        .request_bytes
+        .checked_add(limits.otlp.value_bytes)
+        .and_then(|bytes| bytes.checked_add(managed))
+        .ok_or_else(overflow)?;
+    let candidate = native_candidate.max(otlp_candidate);
+    let durable_metadata = limits
+        .native_sources
+        .max(1)
+        .checked_mul(limits.otlp.event_days.max(1))
+        .and_then(|count| count.checked_mul(crate::scribe::shards::DURABLE_SLICE_LAYOUT_BYTES))
+        .ok_or_else(overflow)?;
+    let preflight = limits
+        .max_frame_bytes
+        .checked_add(candidate)
+        .and_then(|bytes| bytes.checked_add(durable_metadata))
+        .and_then(|bytes| bytes.checked_add(limits.wal_workspace_bytes))
+        .ok_or_else(overflow)?;
+    let persistence = candidate
+        .checked_add(crate::scribe::memory::parquet_candidate_incremental_bytes(
+            candidate,
+        )?)
+        .ok_or_else(overflow)?;
+    Ok(preflight.max(persistence))
+}
+
+/// Pre-mutation decision for one plan against the node's replayable envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MaximumEnvelopeDecision {
+    /// The complete planned live set can be accepted and replayed.
+    Fits,
+    /// The request can never fit this node even when all temporary occupancy drains.
+    IntrinsicRefusal {
+        /// Request-specific upper-bound demand computed before materialization.
+        demand_bytes: usize,
+        /// Maximum root envelope available to Scribe on this node.
+        limit_bytes: usize,
+    },
+}
+
 impl IngestMaterialPlan {
+    /// Classifies intrinsic envelope compatibility without observing temporary occupancy.
+    #[must_use]
+    pub(crate) fn maximum_envelope_decision(
+        &self,
+        maximum_scribe_envelope_bytes: usize,
+    ) -> MaximumEnvelopeDecision {
+        let demand_bytes = self.root_bytes.max(self.persistence_replay_bytes);
+        if demand_bytes <= maximum_scribe_envelope_bytes {
+            MaximumEnvelopeDecision::Fits
+        } else {
+            MaximumEnvelopeDecision::IntrinsicRefusal {
+                demand_bytes,
+                limit_bytes: maximum_scribe_envelope_bytes,
+            }
+        }
+    }
+
     /// Completes checked simultaneous-live-set arithmetic.
     ///
     /// # Errors
@@ -131,6 +219,15 @@ impl IngestMaterialPlan {
             bytes: usize::MAX,
             limit: usize::MAX,
         })?;
+        let candidate_upper_bound = self.persistence_candidate_bytes;
+        self.persistence_replay_bytes = candidate_upper_bound
+            .checked_add(crate::scribe::memory::parquet_candidate_incremental_bytes(
+                candidate_upper_bound,
+            )?)
+            .ok_or(ScribeError::DecodedPayloadTooLarge {
+                bytes: usize::MAX,
+                limit: usize::MAX,
+            })?;
         Ok(self)
     }
 }
@@ -347,7 +444,7 @@ impl NativeScan {
                 })
                 .ok_or(ScribeError::DecodedPayloadTooLarge {
                     bytes: usize::MAX,
-                    limit: self.limits.otlp.material_bytes,
+                    limit: self.limits.max_frame_bytes,
                 })?;
         }
         self.schema_seen = true;
@@ -426,7 +523,7 @@ impl NativeScan {
             })
             .ok_or(ScribeError::DecodedPayloadTooLarge {
                 bytes: usize::MAX,
-                limit: self.limits.otlp.material_bytes,
+                limit: self.limits.max_frame_bytes,
             })?;
         self.sources[self.source_count] = SourceMaterialPlan {
             rows: batch_rows,
@@ -451,10 +548,10 @@ impl NativeScan {
         let current_material_bytes = self
             .schema_material_bytes
             .checked_add(self.max_metadata_bytes)
-            .and_then(|value| value.checked_add(self.limits.otlp.material_bytes))
+            .and_then(|value| value.checked_add(self.active_output_bytes))
             .ok_or(ScribeError::DecodedPayloadTooLarge {
                 bytes: usize::MAX,
-                limit: self.limits.otlp.material_bytes,
+                limit: self.limits.max_frame_bytes,
             })?;
         IngestMaterialPlan {
             path: IngestPath::Native,
@@ -482,6 +579,7 @@ impl NativeScan {
             event_day_count: 0,
             current_material_bytes,
             active_output_bytes: self.active_output_bytes,
+            persistence_candidate_bytes: self.active_output_bytes,
             durable_metadata_bytes: self
                 .source_count
                 .checked_mul(self.limits.otlp.event_days)
@@ -490,9 +588,10 @@ impl NativeScan {
                 })
                 .ok_or(ScribeError::DecodedPayloadTooLarge {
                     bytes: usize::MAX,
-                    limit: self.limits.otlp.material_bytes,
+                    limit: self.limits.max_frame_bytes,
                 })?,
             wal_workspace_bytes: self.limits.wal_workspace_bytes,
+            persistence_replay_bytes: 0,
             root_bytes: 0,
         }
         .finish()
@@ -530,19 +629,13 @@ impl ScribeIngressPlanner {
                 .checked_add(batch.get_array_memory_size())
                 .ok_or(ScribeError::DecodedPayloadTooLarge {
                     bytes: usize::MAX,
-                    limit: self.limits.otlp.material_bytes,
+                    limit: self.limits.max_frame_bytes,
                 })?;
         }
         if rows > self.limits.rows {
             return Err(ScribeError::TooManyRows {
                 rows: u64::try_from(rows).unwrap_or(u64::MAX),
                 limit: self.limits.rows as u64,
-            });
-        }
-        if total_bytes > self.limits.otlp.material_bytes {
-            return Err(ScribeError::DecodedPayloadTooLarge {
-                bytes: total_bytes,
-                limit: self.limits.otlp.material_bytes,
             });
         }
         let mut sources = [SourceMaterialPlan::default(); MAX_SOURCE_PLANS];
@@ -563,27 +656,21 @@ impl ScribeIngressPlanner {
                 .checked_add(managed_bytes)
                 .ok_or(ScribeError::DecodedPayloadTooLarge {
                     bytes: usize::MAX,
-                    limit: self.limits.otlp.material_bytes,
+                    limit: self.limits.max_frame_bytes,
                 })?;
         let encoded_bytes = max_ipc_bytes
             .checked_add(managed_bytes)
             .and_then(|value| value.checked_add(self.limits.wal_workspace_bytes))
             .ok_or(ScribeError::DecodedPayloadTooLarge {
                 bytes: usize::MAX,
-                limit: self.limits.otlp.material_bytes,
+                limit: self.limits.max_frame_bytes,
             })?;
         let current_material_bytes = decoded_bytes.checked_add(encoded_bytes).ok_or(
             ScribeError::DecodedPayloadTooLarge {
                 bytes: usize::MAX,
-                limit: self.limits.otlp.material_bytes,
+                limit: self.limits.max_frame_bytes,
             },
         )?;
-        if current_material_bytes > self.limits.otlp.material_bytes {
-            return Err(ScribeError::DecodedPayloadTooLarge {
-                bytes: current_material_bytes,
-                limit: self.limits.otlp.material_bytes,
-            });
-        }
         IngestMaterialPlan {
             path: IngestPath::Otlp,
             request_bytes,
@@ -601,14 +688,16 @@ impl ScribeIngressPlanner {
             event_day_count: 0,
             current_material_bytes,
             active_output_bytes: 0,
+            persistence_candidate_bytes: decoded_bytes,
             durable_metadata_bytes: batches
                 .len()
                 .checked_mul(crate::scribe::shards::DURABLE_SLICE_LAYOUT_BYTES)
                 .ok_or(ScribeError::DecodedPayloadTooLarge {
                     bytes: usize::MAX,
-                    limit: self.limits.otlp.material_bytes,
+                    limit: self.limits.max_frame_bytes,
                 })?,
             wal_workspace_bytes: self.limits.wal_workspace_bytes,
+            persistence_replay_bytes: 0,
             root_bytes: 0,
         }
         .finish()
@@ -1161,7 +1250,7 @@ fn validate_offsets(
 fn managed_projection_bytes(rows: usize, request_id_bytes: usize) -> Result<usize, ScribeError> {
     let overflow = || ScribeError::DecodedPayloadTooLarge {
         bytes: usize::MAX,
-        limit: MAX_PROJECTED_BYTES,
+        limit: usize::MAX,
     };
     let offsets = rows
         .checked_add(1)
@@ -1312,11 +1401,16 @@ impl OtlpCounts {
                 bytes: request_bytes,
             });
         }
-        let current_material_bytes = usize::from(self.records != 0)
-            .checked_mul(self.limits.otlp.material_bytes)
+        let current_material_bytes = request_bytes
+            .checked_add(self.value_bytes)
+            .and_then(|value| {
+                managed_projection_bytes(self.records, 36)
+                    .ok()
+                    .and_then(|managed| value.checked_add(managed))
+            })
             .ok_or(ScribeError::DecodedPayloadTooLarge {
                 bytes: usize::MAX,
-                limit: self.limits.otlp.material_bytes,
+                limit: usize::MAX,
             })?;
         let mut sources = [SourceMaterialPlan::default(); MAX_SOURCE_PLANS];
         if self.records != 0 {
@@ -1349,13 +1443,15 @@ impl OtlpCounts {
             event_day_count: usize::from(self.records != 0),
             current_material_bytes,
             active_output_bytes: 0,
+            persistence_candidate_bytes: 0,
             durable_metadata_bytes: usize::from(self.records != 0)
                 .checked_mul(crate::scribe::shards::DURABLE_SLICE_LAYOUT_BYTES)
                 .ok_or(ScribeError::DecodedPayloadTooLarge {
                     bytes: usize::MAX,
-                    limit: self.limits.otlp.material_bytes,
+                    limit: self.limits.max_frame_bytes,
                 })?,
             wal_workspace_bytes: self.limits.wal_workspace_bytes,
+            persistence_replay_bytes: 0,
             root_bytes: 0,
         }
         .finish()

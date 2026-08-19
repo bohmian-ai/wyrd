@@ -2,9 +2,8 @@
 
 use super::ScribeImpl;
 use crate::contracts::{FrameAdmission, IngressPayload, ScribeError, ScribeIngressFrame};
-use crate::scribe::admission::MAX_REQUEST_BYTES;
 use crate::scribe::execution_lanes::{ScribePersistenceCpuOp, ScribePersistenceCpuResult};
-use crate::scribe::material_plan::{IngestMaterialPlan, ScribeIngressPlanner};
+use crate::scribe::material_plan::{MaterialPlan, MaximumEnvelopeDecision, ScribeIngressPlanner};
 use crate::scribe::memory::MemoryCategory;
 use crate::scribe::preprocess::{
     AdmittedAppend, AdmittedRows, NativeAdmittedRows, OtlpAdmittedRows, OtlpTypedRows,
@@ -47,13 +46,16 @@ fn validate_decoded_request_size(
 ///
 /// Returns [`ScribeError::InvalidFrame`] for tenant mismatch or a nil tenant,
 /// and [`ScribeError::PayloadTooLarge`] above the fixed request ceiling.
-fn validate_logical_transport_frame(frame: &ScribeIngressFrame) -> Result<(), ScribeError> {
+fn validate_logical_transport_frame(
+    frame: &ScribeIngressFrame,
+    request_limit_bytes: usize,
+) -> Result<(), ScribeError> {
     if frame.authenticated_tenant != frame.principal.tenant_id
         || frame.authenticated_tenant.as_uuid().is_nil()
     {
         return Err(ScribeError::InvalidFrame);
     }
-    if frame.measured_wire_bytes > MAX_REQUEST_BYTES {
+    if frame.measured_wire_bytes > request_limit_bytes {
         return Err(ScribeError::PayloadTooLarge {
             bytes: frame.measured_wire_bytes,
         });
@@ -130,7 +132,7 @@ struct RootAdmission {
     /// One authoritative receipt time shared by planning and projection.
     receipt_micros: i64,
     /// Complete immutable source-derived material plan.
-    material_plan: IngestMaterialPlan,
+    material_plan: MaterialPlan,
     /// Sole root lease retained through detached persistence work.
     memory: crate::resources::ScribeMemoryLease,
     /// Tenant-qualified physical binding constructed after root admission.
@@ -190,7 +192,7 @@ impl ScribeImpl {
         frame: &ScribeIngressFrame,
         receipt_micros: i64,
         physical_binding_peak_bytes: usize,
-    ) -> Result<IngestMaterialPlan, ScribeError> {
+    ) -> Result<MaterialPlan, ScribeError> {
         let planner = ScribeIngressPlanner::new(self.ingest_limits);
         let plan = match &frame.payload {
             IngressPayload::ArrowIpc(bytes) => {
@@ -368,7 +370,7 @@ impl ScribeImpl {
         frame: &mut ScribeIngressFrame,
         lifecycle: &mut crate::scribe::telemetry::ScribeIngressLifecycleOwner,
     ) -> Result<RootAdmission, ScribeError> {
-        validate_logical_transport_frame(frame)?;
+        validate_logical_transport_frame(frame, self.ingest_limits.otlp.request_bytes)?;
         let decode_owner = take_transport_decode_owner(&mut frame.payload)?;
         let expected_schema_fingerprint = self.resolve_logical_frame(frame).await?;
         let receipt_micros = crate::scribe::execution_lanes::current_receipt_micros()?;
@@ -377,6 +379,16 @@ impl ScribeImpl {
                 .map_err(|_| ScribeError::InvalidFrame)?;
         let material_plan =
             self.plan_transport_payload(frame, receipt_micros, binding_facts.peak_bytes)?;
+        if let MaximumEnvelopeDecision::IntrinsicRefusal {
+            demand_bytes,
+            limit_bytes,
+        } = material_plan.maximum_envelope_decision(self.memory.ingress_limit_bytes())
+        {
+            return Err(ScribeError::DecodedPayloadTooLarge {
+                bytes: demand_bytes,
+                limit: limit_bytes,
+            });
+        }
         lifecycle.planned(&material_plan);
         let mut memory = match decode_owner {
             Some(owner) => owner.complete(material_plan.root_bytes)?,
@@ -524,6 +536,7 @@ impl ScribeImpl {
             measured_wire_bytes: frame.measured_wire_bytes,
             admitted_bytes: material_plan.root_bytes,
             wal_workspace_bytes: material_plan.wal_workspace_bytes,
+            maximum_scribe_envelope_bytes: self.memory.ingress_limit_bytes(),
             reservation,
             memory,
             tenant,
@@ -539,9 +552,7 @@ impl ScribeImpl {
             .await?
         {
             ScribePersistenceCpuResult::Prepared(value) => value,
-            ScribePersistenceCpuResult::NativeSliceProduced { .. }
-            | ScribePersistenceCpuResult::OtlpSliceProduced { .. }
-            | ScribePersistenceCpuResult::ParquetEncoded(_)
+            ScribePersistenceCpuResult::ParquetEncoded(_)
             | ScribePersistenceCpuResult::ReplayRestored(_) => {
                 return Err(ScribeError::Internal {
                     detail: "persistence lane returned the wrong preparation result".to_owned(),
@@ -577,7 +588,7 @@ impl ScribeImpl {
                 return override_bytes;
             }
         }
-        self.memory.active_bucket_target_bytes()
+        self.memory.ingress_limit_bytes()
     }
 
     /// Overrides the decoded-request ceiling for one bounded test owner.
@@ -765,7 +776,7 @@ mod tests {
     /// same admission path admits instead of rejecting — proving the rejection
     /// is conditional on genuine backlog rather than unconditional.
     #[tokio::test]
-    async fn admission_rejects_only_when_seal_cannot_free() {
+    async fn live_ingress_pressure_seals_retries_once_then_returns_ingest_busy() {
         let scribe = ScribeImpl::new();
         let ceiling = scribe.memory.ingress_limit_bytes();
 

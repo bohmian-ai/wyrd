@@ -463,6 +463,31 @@ fn prepare_oracle_spill_root(
     Ok(root)
 }
 
+/// Rejects a Scribe configuration whose largest admitted unit cannot replay on this root.
+///
+/// The comparison uses only the immutable configured shape and detected maximum
+/// Scribe envelope. Temporary occupancy remains governed by the existing
+/// capacity-epoch wait during replay.
+///
+/// # Errors
+///
+/// Returns [`ServerBootError::Scribe`] when envelope arithmetic overflows or
+/// the intrinsic requirement exceeds the detected root capability.
+fn validate_scribe_replay_envelope(
+    config: crate::config::ScribeRuntimeConfig,
+    maximum_envelope_bytes: usize,
+) -> Result<(), ServerBootError> {
+    let required =
+        vala_bifrost_redux::scribe::configured_maximum_envelope_bytes(config.ingest_limits())
+            .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
+    if required > maximum_envelope_bytes {
+        return Err(ServerBootError::Scribe(format!(
+            "scribe configured replay envelope requires {required} bytes but the detected root provides {maximum_envelope_bytes} bytes"
+        )));
+    }
+    Ok(())
+}
+
 /// Builds state plus unmounted Scribe dependencies for the authenticated boot path.
 ///
 /// # Errors
@@ -536,26 +561,40 @@ async fn build_bifrost_parts_from_boot(
             BifrostRuntimeRole::Oracle => BifrostRole::Oracle,
         })
         .collect();
-    let runtime_resources = BifrostRuntimeResources::detect(BifrostResourcePolicy {
-        roles: resource_roles,
-        memory_limit_bytes: bifrost_config.resources.memory_limit_bytes,
-        unmanaged_reserve_bytes: bifrost_config.resources.unmanaged_reserve_bytes,
-        scratch_limit_bytes: bifrost_config.resources.scratch_limit_bytes,
-        effective_cpu: bifrost_config.resources.effective_cpu,
-        scratch_root: oracle_spill_root.clone(),
-        volume_roots: Some(vala_bifrost_redux::resources::BifrostVolumeRoots {
-            wal: wal_dir.clone(),
-            scribe_output_scratch,
-            forge_scratch,
-            oracle_scratch: oracle_spill_root.clone(),
-        }),
-    })
+    let runtime_resources = BifrostRuntimeResources::detect_with_transport_message_limit(
+        BifrostResourcePolicy {
+            roles: resource_roles,
+            memory_limit_bytes: bifrost_config.resources.memory_limit_bytes,
+            unmanaged_reserve_bytes: bifrost_config.resources.unmanaged_reserve_bytes,
+            scratch_limit_bytes: bifrost_config.resources.scratch_limit_bytes,
+            effective_cpu: bifrost_config.resources.effective_cpu,
+            scratch_root: oracle_spill_root.clone(),
+            volume_roots: Some(vala_bifrost_redux::resources::BifrostVolumeRoots {
+                wal: wal_dir.clone(),
+                scribe_output_scratch,
+                forge_scratch,
+                oracle_scratch: oracle_spill_root.clone(),
+            }),
+        },
+        scribe_config.ingest_request_bytes,
+    )
     .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
     let bifrost_resources = runtime_resources
         .compose_roles()
         .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
     let resource_plan = bifrost_resources.plan();
     let pod_memory_limit = resource_plan.managed_memory_bytes;
+    if roles.contains(&BifrostRuntimeRole::Scribe) {
+        let scribe_resources = bifrost_resources.scribe().ok_or_else(|| {
+            ServerBootError::Scribe(
+                "Scribe role selected without a composed Scribe capability".to_owned(),
+            )
+        })?;
+        validate_scribe_replay_envelope(
+            scribe_config,
+            scribe_resources.maximum_ingress_envelope_bytes(),
+        )?;
+    }
     let (staging_file_publisher, staging_file_inbox) = staging_file_channel(DEFAULT_HINT_CAPACITY)
         .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
     let scribe = if roles.contains(&BifrostRuntimeRole::Scribe) {
@@ -591,7 +630,8 @@ async fn build_bifrost_parts_from_boot(
                 &wal_dir,
                 *stream.node_id.as_bytes(),
                 stream.writer_epoch.as_i64(),
-                WalConfig::default()
+                WalConfig::new(scribe_config.wal_rotation_bytes)
+                    .map_err(|error| ServerBootError::Scribe(error.to_string()))?
                     .with_disk_limit(scribe_config.wal_disk_limit_bytes)
                     .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
                 wal_volume,
@@ -671,6 +711,9 @@ async fn build_bifrost_parts_from_boot(
                 )
             })?,
             ingest_limits: scribe_config.ingest_limits(),
+            wal_rotation_bytes: scribe_config.wal_rotation_bytes,
+            memtable_rotation_bytes: scribe_config.memtable_rotation_bytes,
+            memtable_max_age: std::time::Duration::from_secs(scribe_config.memtable_max_age_secs),
             staging_file_publisher: Some(staging_file_publisher),
         }));
         if let Err(error) = scribe.replay_wal_async().await {
@@ -2073,6 +2116,25 @@ pub fn spawn_maintenance_scheduler(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// Boot rejects an intrinsic replay envelope while accepting its exact boundary.
+    ///
+    /// # Panics
+    ///
+    /// Panics if configured maximum-envelope derivation overflows, a root one
+    /// byte too small is accepted, or the exact detected capability is refused.
+    #[test]
+    fn scribe_boot_rejects_intrinsically_unreplayable_config() {
+        let config = crate::config::ScribeRuntimeConfig::default();
+        let required =
+            vala_bifrost_redux::scribe::configured_maximum_envelope_bytes(config.ingest_limits())
+                .expect("configured replay envelope");
+        let error = validate_scribe_replay_envelope(config, required - 1)
+            .expect_err("intrinsically unreplayable root must fail boot");
+        assert!(error.to_string().contains("configured replay envelope"));
+        validate_scribe_replay_envelope(config, required)
+            .expect("exact replay envelope must remain bootable");
+    }
 
     /// Server composition appends one disposable component before detection.
     #[test]

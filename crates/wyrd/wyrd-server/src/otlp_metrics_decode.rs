@@ -91,7 +91,7 @@ impl MetricsWireFacts {
     ///
     /// Returns a malformed-request error on overflow or material limit excess.
     fn add_decode_bytes(&mut self, amount: usize) -> Result<(), IngestError> {
-        Self::add_count(&mut self.decode_bytes, amount, self.limits.material_bytes)
+        Self::add_count(&mut self.decode_bytes, amount, usize::MAX)
     }
 
     /// Charges one retained attribute and its `KeyValue` layout.

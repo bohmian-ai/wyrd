@@ -235,7 +235,7 @@ impl IngestError {
             crate::contracts::ScribeError::IngestBusy { table } => Self::IngestBusy { table },
             crate::contracts::ScribeError::PayloadTooLarge { bytes } => Self::PayloadTooLarge {
                 bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
-                limit: u64::try_from(crate::scribe::admission::MAX_REQUEST_BYTES)
+                limit: u64::try_from(crate::gate::limits::BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES)
                     .unwrap_or(u64::MAX),
             },
             crate::contracts::ScribeError::DecodedPayloadTooLarge { bytes, limit } => {

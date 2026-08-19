@@ -2225,6 +2225,7 @@ async fn public_grpc_without_oracle_is_unavailable() {
             oracle: None,
             role_timing: None,
         }],
+        ..BifrostClusterSpec::one_mixed()
     };
     assert!(WyrdTestCluster::start_spec(spec).await.is_err());
 }

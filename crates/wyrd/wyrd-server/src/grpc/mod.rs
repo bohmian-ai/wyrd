@@ -120,7 +120,8 @@ where
 /// Build the application gRPC router: health (unauthenticated) plus the C1
 /// ingest service with auth completed in the handler.
 ///
-/// Fallible: ingest is never mounted unauthenticated, so a `None`
+/// A role-absent topology returns the health-only router and does not mount
+/// Scribe ingest, OTLP, query, or tail services. Fallible: ingest is never mounted unauthenticated, so a `None`
 /// `AppState.token_verifier` is a hard [`GrpcError::MissingTokenVerifier`]. The
 /// verifier is the same `TokenVerifier` the HTTP `AuthenticatedPrincipal`
 /// extractor uses; `build_grpc_router` stays unchanged (health only,
@@ -128,7 +129,9 @@ where
 ///
 /// # Errors
 /// Returns [`GrpcError::MissingTokenVerifier`] when no token verifier is
-/// configured, or a router-assembly error from [`build_grpc_router`].
+/// configured, [`GrpcError::MissingScribe`] when only one of the paired Scribe
+/// gate/resource capabilities is present, or a router-assembly error from
+/// [`build_grpc_router`].
 pub fn build_app_grpc<H>(
     state: &AppState,
     health_service: HealthServer<H>,
@@ -139,6 +142,10 @@ where
 {
     if state.auth.token_verifier.is_none() {
         return Err(GrpcError::MissingTokenVerifier);
+    }
+    let router = build_grpc_router(health_service, NoopInterceptor, cfg)?;
+    if state.bifrost_gate.is_none() && state.bifrost_resources.is_none() {
+        return Ok(router);
     }
     let ingest = state
         .bifrost_gate
@@ -154,7 +161,6 @@ where
         .as_ref()
         .map(vala_bifrost_redux::resources::BifrostRoleResources::transport_admission)
         .ok_or(GrpcError::MissingScribe)?;
-    let router = build_grpc_router(health_service, NoopInterceptor, cfg)?;
     let router = router
         .add_service(GrpcTransportAdmissionService::new(
             (**ingest).clone().into_server(),

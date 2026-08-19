@@ -2561,6 +2561,13 @@ fn live_only_tail_directory(fixture: &OracleFixture) -> Arc<TailTransportDirecto
             audit_event("oracle.fixture.live"),
             ScribeAppendMeta {
                 batch_id: [7; 16],
+                schema_fingerprint: [0; 32],
+                data_digest: [0; 32],
+                data_len: 0,
+                payload_digest: [0; 32],
+                payload_len: 0,
+                slice_index: 0,
+                slice_count: 1,
                 rows_accepted: 1,
                 wal_lsn_min: WalLsn::new(1),
                 wal_lsn_max: WalLsn::new(1),

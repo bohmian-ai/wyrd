@@ -29,34 +29,34 @@ pub(crate) fn arm_replay_identity_return_failure_for_test() {
 /// constructing this ledger. A combined process therefore needs exactly two
 /// 256 MiB role floors beneath this 512 MiB managed minimum.
 pub const MIN_MEMORY_BYTES: usize = 256 * 1024 * 1024;
-/// Minimum byte budget for each static child (Scribe or Oracle).
-/// Complete conservative owner shared by both T4 Parquet producer paths.
-pub(crate) const PARQUET_PRODUCER_OWNER_BYTES: usize = 256 * 1024 * 1024;
 /// Exact encoded-footer child held from before writer creation through inspection.
 pub(crate) const PARQUET_FOOTER_CHILD_BYTES: usize = 8 * 1024 * 1024;
+/// Bounded transfer buffer held while `OpenDAL` owns one payload copy.
+pub(crate) const PARQUET_TRANSFER_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 /// Number of bounded lifecycle memory categories.
 pub const MEMORY_CATEGORY_COUNT: usize = 8;
 
-/// Returns the checked delta needed beside an admitted generation.
+/// Returns the checked incremental workspace for one whole-batch candidate.
 ///
-/// The immutable charge is transferred conceptually into the complete 256 MiB
-/// producer owner and is never charged a second time.
-///
-/// Only the current generation's checked immutable ownership contributes to
-/// the complete producer owner. A single generation larger than that owner is
-/// refused before encoder construction because it cannot fit the fixed floor.
+/// The immutable Arrow input remains charged to its existing owner. The
+/// producer root lease covers one merge/sort copy, one codec-output copy, the
+/// retained footer child, and both caller/OpenDAL transfer buffers.
 ///
 /// # Errors
 ///
-/// Returns [`ScribeError::IngestBusy`] when `generation_bytes` exceeds the
-/// complete conservative producer owner.
-pub(crate) fn parquet_producer_delta(generation_bytes: usize) -> Result<usize, ScribeError> {
-    if generation_bytes > PARQUET_PRODUCER_OWNER_BYTES {
-        return Err(ScribeError::IngestBusy {
-            table: "memory".to_owned(),
-        });
-    }
-    Ok(PARQUET_PRODUCER_OWNER_BYTES.saturating_sub(generation_bytes))
+/// Returns [`ScribeError::Internal`] when the exact incremental projection
+/// cannot be represented by the current platform.
+pub(crate) fn parquet_candidate_incremental_bytes(
+    candidate_bytes: usize,
+) -> Result<usize, ScribeError> {
+    candidate_bytes
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(PARQUET_FOOTER_CHILD_BYTES))
+        .and_then(|bytes| bytes.checked_add(PARQUET_TRANSFER_BUFFER_BYTES))
+        .and_then(|bytes| bytes.checked_add(PARQUET_TRANSFER_BUFFER_BYTES))
+        .ok_or_else(|| ScribeError::Internal {
+            detail: "Parquet candidate incremental workspace overflowed".to_owned(),
+        })
 }
 
 /// Move-only encoded-footer child split from the complete producer owner.

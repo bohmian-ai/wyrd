@@ -14,7 +14,9 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use secrecy::ExposeSecret;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
-use vala_bifrost_redux::catalog::{BifrostCatalog, CreateTableRequest, TableRef};
+use vala_bifrost_redux::catalog::{
+    BifrostCatalog, CreateTableRequest, TableRef, TenantTableBinding,
+};
 use vala_bifrost_redux::contracts::{ScribeAppend, ScribeError};
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
@@ -24,10 +26,13 @@ use vala_bifrost_redux::resources::{
 };
 use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
 use vala_bifrost_redux::scribe::audit_envelope::encode_audit_event;
+use vala_bifrost_redux::scribe::file_list_writer::PublicationFenceBarrier;
 use vala_bifrost_redux::scribe::memory::MemoryCategory;
 use vala_bifrost_redux::scribe::persistence::PersistenceFaults;
+use vala_bifrost_redux::scribe::seal_key::EventDay;
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
-use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
+use vala_bifrost_redux::scribe::tail_rpc::FetchLiveTailRequest;
+use vala_bifrost_redux::scribe::wal::{WalConfig, WalLsn, WalWriter};
 use vala_bifrost_redux::scribe::{
     NativeIngressTestFrame, ScribeBuildConfig, ScribeExecutionPools, ScribeImpl,
     ScribeIngressCpuPool, ScribeLaneConfig, ScribePersistenceConfig, ScribePersistenceCpuPool,
@@ -98,6 +103,8 @@ struct PersistenceFixture {
     scratch_root: TempDir,
     _warehouse: Option<TempDir>,
     tenant: DataTenantId,
+    /// Stable source node reused across replacement epochs.
+    node_id: uuid::Uuid,
     /// Aggregate decoded Arrow ownership represented by the seeded replay WAL.
     replay_decoded_bytes: usize,
 }
@@ -140,6 +147,9 @@ fn restarted_scribe(config: RestartedScribeConfig) -> Arc<ScribeImpl> {
         persistence: Some(config.persistence),
         resources: config.resources,
         ingest_limits: vala_bifrost_redux::gate::limits::IngestLimits::default(),
+        wal_rotation_bytes: 512 * 1024 * 1024,
+        memtable_rotation_bytes: 512 * 1024 * 1024,
+        memtable_max_age: Duration::from_secs(600),
         staging_file_publisher: Some(config.publisher),
     }))
 }
@@ -267,6 +277,9 @@ impl PersistenceFixture {
             persistence: Some(persistence),
             resources: scribe_resources,
             ingest_limits: vala_bifrost_redux::gate::limits::IngestLimits::default(),
+            wal_rotation_bytes: 512 * 1024 * 1024,
+            memtable_rotation_bytes: 512 * 1024 * 1024,
+            memtable_max_age: Duration::from_secs(600),
             staging_file_publisher: Some(staging_file_publisher),
         }));
         scribe.replay_wal_async().await.expect("empty WAL replay");
@@ -281,6 +294,7 @@ impl PersistenceFixture {
             scratch_root,
             _warehouse: None,
             tenant,
+            node_id,
             replay_decoded_bytes: 0,
         }
     }
@@ -305,6 +319,7 @@ impl PersistenceFixture {
             persistence_test_roles(9 * 1024 * 1024 * 1024),
             2,
             50_000,
+            None,
         )
         .await
         .expect("replay")
@@ -324,6 +339,7 @@ impl PersistenceFixture {
         memory: BifrostRoleResources,
         wal_io_threads: usize,
         rows_per_generation: usize,
+        wal_segment_bytes: Option<u64>,
     ) -> Result<Self, ScribeError> {
         let database = PgFixture::start().await.expect("Postgres fixture");
         let tenant = database.data_tenant_id();
@@ -358,7 +374,10 @@ impl PersistenceFixture {
                 wal_root.path(),
                 *node_id.as_bytes(),
                 1,
-                WalConfig::default(),
+                wal_segment_bytes
+                    .map(WalConfig::new)
+                    .transpose()?
+                    .unwrap_or_default(),
             )
             .expect("WAL writer"),
         );
@@ -421,6 +440,7 @@ impl PersistenceFixture {
             scratch_root,
             _warehouse: Some(warehouse),
             tenant,
+            node_id,
             replay_decoded_bytes,
         })
     }
@@ -485,6 +505,9 @@ fn first_replay_scribe(
         persistence: None,
         resources: memory.scribe().expect("composed Scribe capability"),
         ingest_limits: vala_bifrost_redux::gate::limits::IngestLimits::default(),
+        wal_rotation_bytes: 512 * 1024 * 1024,
+        memtable_rotation_bytes: 512 * 1024 * 1024,
+        memtable_max_age: Duration::from_secs(600),
         staging_file_publisher: None,
     }))
 }
@@ -763,6 +786,146 @@ fn colocated_distinct_batch_id(
         .expect("a co-locating distinct batch id exists within the bounded search")
 }
 
+/// Chooses a distinct batch identity routing a second tenant-qualified key to one shard.
+fn batch_id_for_shard(
+    tenant: DataTenantId,
+    table: &TableRef,
+    target_shard: usize,
+    excluded: uuid::Uuid,
+) -> uuid::Uuid {
+    (0_u128..1_000_000)
+        .map(uuid::Uuid::from_u128)
+        .find(|candidate| {
+            *candidate != excluded
+                && vala_bifrost_redux::scribe::routing::shard_for(tenant, table, *candidate)
+                    == target_shard
+        })
+        .expect("a second tenant-qualified key maps to the selected shard")
+}
+
+/// Reads one table through the production shard snapshot and returns `(LSN, value)` rows.
+///
+/// # Panics
+///
+/// Panics when the production tail service cannot bind, snapshot, or project
+/// the requested table, or when the fixture's `value` column is not `Int64`.
+async fn hot_values_for_cut(
+    fixture: &PersistenceFixture,
+    table_name: &str,
+    persisted_ranges: Vec<(WalLsn, WalLsn)>,
+) -> Vec<(u64, i64)> {
+    let service = fixture
+        .scribe
+        .tail_service()
+        .expect("production tail service");
+    let today = EventDay::new(chrono::Utc::now().date_naive());
+    service
+        .fetch_hot_batches(FetchLiveTailRequest {
+            binding: TenantTableBinding::resolve((fixture.tenant, table(table_name)))
+                .expect("tenant table binding"),
+            target_stream: service.stream(),
+            start_day: today,
+            end_day: today,
+            after_lsn: WalLsn::ZERO,
+            persisted_lsn_ranges: persisted_ranges,
+            required_columns: vec!["value".to_owned()],
+            max_batches: 16,
+            max_retained_bytes: 16 * 1024 * 1024,
+        })
+        .await
+        .expect("production provider cut")
+        .into_iter()
+        .flat_map(|batch| {
+            let lsn = batch.wal_lsn.as_u64();
+            batch
+                .rows
+                .column_by_name("value")
+                .expect("value projection")
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("value remains Int64")
+                .values()
+                .iter()
+                .map(move |value| (lsn, *value))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Reads exact `value` rows from one published Parquet object.
+///
+/// # Panics
+///
+/// Panics when the object is absent, malformed Parquet, or carries a non-Int64
+/// `value` column.
+async fn persisted_values(fixture: &PersistenceFixture, path: &str) -> Vec<i64> {
+    let bytes = fixture
+        .operator
+        .read(path)
+        .await
+        .expect("published object reads");
+    ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes.to_vec()))
+        .expect("published object is parquet")
+        .build()
+        .expect("published parquet reader")
+        .flat_map(|batch| {
+            let batch = batch.expect("published parquet batch");
+            batch
+                .column_by_name("value")
+                .expect("persisted value column")
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("persisted value remains Int64")
+                .values()
+                .to_vec()
+        })
+        .collect()
+}
+
+/// Asserts the exact persisted-plus-hot union for one actual provider cut.
+///
+/// Independently published cohort members contribute fenced WAL ranges while
+/// every absent or unretired member remains available from the production hot
+/// provider. The combined values must contain every expected row once.
+async fn assert_provider_union(fixture: &PersistenceFixture, tables: &[&str], expected: &[i64]) {
+    let mut published = Vec::new();
+    for table_name in tables {
+        published.extend(rows_for_table(fixture, table_name).await);
+    }
+    let ranges = published
+        .iter()
+        .map(|row| {
+            (
+                WalLsn::new(u64::try_from(row.0).expect("positive minimum LSN")),
+                WalLsn::new(u64::try_from(row.1).expect("positive maximum LSN")),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut union = Vec::new();
+    for table_name in tables {
+        union.extend(
+            hot_values_for_cut(fixture, table_name, ranges.clone())
+                .await
+                .into_iter()
+                .map(|(_, value)| value),
+        );
+    }
+    for row in &published {
+        union.extend(persisted_values(fixture, &row.2).await);
+    }
+    union.sort_unstable();
+    assert_eq!(union, expected);
+    assert_eq!(
+        union
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        union.len(),
+        "persisted-plus-hot provider cut contains no duplicate row"
+    );
+}
+
 async fn wait_for_state(fixture: &PersistenceFixture, pending: usize) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -1006,6 +1169,9 @@ async fn different_seal_keys_persist_concurrently() {
     let fixture = PersistenceFixture::start().await;
     fixture
         .faults
+        .set_encode_delay_for_test(Duration::from_millis(100));
+    fixture
+        .faults
         .set_object_write_delay_for_test(Duration::from_millis(100));
     append_one(&fixture, "concurrent_events_a", 1).await;
     append_one(&fixture, "concurrent_events_b", 2).await;
@@ -1020,50 +1186,190 @@ async fn different_seal_keys_persist_concurrently() {
         fixture.faults.max_concurrent_object_writes_for_test() >= 2,
         "different SealKey generations must overlap across persistence workers"
     );
+    assert!(
+        fixture.faults.max_concurrent_encodes_for_test() >= 2,
+        "different SealKey generations must overlap inside actual Parquet encode intervals"
+    );
+    fixture.stop().await;
+}
+
+/// Proves the persisted-plus-hot provider union on both sides of real publication.
+///
+/// Two distinct tenant-qualified keys are placed on one production shard. The
+/// later-LSN member is deliberately published first, proving that the provider
+/// cut excludes an independently visible non-prefix range while retaining the
+/// earlier immutable member. Both deterministic pauses execute inside the
+/// actual staged mover and writer-v2 file-list reconciler.
+#[tokio::test]
+async fn query_cut_is_atomic_across_active_cohort_and_manifest() {
+    let fixture = PersistenceFixture::start().await;
+    let prefix_table = "z_cut_prefix_events";
+    let non_prefix_table = "a_cut_non_prefix_events";
+    let prefix_batch_id = uuid::Uuid::now_v7();
+    let target_shard = vala_bifrost_redux::scribe::routing::shard_for(
+        fixture.tenant,
+        &table(prefix_table),
+        prefix_batch_id,
+    );
+    let non_prefix_batch_id = batch_id_for_shard(
+        fixture.tenant,
+        &table(non_prefix_table),
+        target_shard,
+        prefix_batch_id,
+    );
+    assert_eq!(
+        vala_bifrost_redux::scribe::routing::shard_for(
+            fixture.tenant,
+            &table(non_prefix_table),
+            non_prefix_batch_id,
+        ),
+        target_shard,
+        "both tenant-qualified keys must enter one production shard cohort"
+    );
+
+    append_with_batch_id(&fixture, prefix_table, 11, prefix_batch_id).await;
+    append_with_batch_id(&fixture, non_prefix_table, 22, non_prefix_batch_id).await;
+    let barrier = PublicationFenceBarrier::for_table(non_prefix_table);
+    fixture.faults.pause_next_publication(barrier.clone());
+    let flushing_scribe = Arc::clone(&fixture.scribe);
+    let flush = tokio::spawn(async move { flushing_scribe.flush_writable_for_test().await });
+
+    tokio::time::timeout(Duration::from_secs(10), barrier.wait_before_publication())
+        .await
+        .expect("pre-publication barrier timeout");
+    assert!(
+        rows_for_table(&fixture, non_prefix_table).await.is_empty(),
+        "selected local manifest is pinned before its file-list publication"
+    );
+    assert_provider_union(&fixture, &[prefix_table, non_prefix_table], &[11, 22]).await;
+    assert_eq!(
+        fixture
+            .scribe
+            .memtable_stats()
+            .expect("pre-publication immutable state")
+            .immutable_rows,
+        2
+    );
+
+    barrier.release_before_publication();
+    tokio::time::timeout(Duration::from_secs(10), barrier.wait_after_publication())
+        .await
+        .expect("post-publication barrier timeout");
+    let published = rows_for_table(&fixture, non_prefix_table).await;
+    assert_eq!(published.len(), 1, "selected member publishes exactly once");
+    assert_provider_union(&fixture, &[prefix_table, non_prefix_table], &[11, 22]).await;
+    assert_eq!(
+        fixture
+            .scribe
+            .memtable_stats()
+            .expect("post-publication immutable state")
+            .immutable_rows,
+        2,
+        "SQL visibility precedes local immutable retirement"
+    );
+
+    barrier.release_after_publication();
+    flush
+        .await
+        .expect("flush task joins")
+        .expect("production cohort flush");
+    wait_for_state(&fixture, 0).await;
+    assert_eq!(rows(&fixture).await.len(), 2);
+    fixture
+        .scribe
+        .retire_committed_for_test()
+        .await
+        .expect("cohort retirement");
     fixture.stop().await;
 }
 
 #[tokio::test]
-async fn failed_front_generation_blocks_later_same_key_generation() {
+async fn pg_later_candidate_failure_and_cancellation_leave_no_partial_generation() {
     let fixture = PersistenceFixture::start().await;
-    fixture.faults.fail_next_object_write();
-    // The failed front can only block its successor when BOTH generations occupy
-    // the same shard FIFO. `shard_for(tenant, table, batch_id)` keys on the
-    // `batch_id`, so `append_one`'s per-call `now_v7` ids would otherwise spread
-    // these two generations across lanes and let the successor publish
-    // independently. Pin both to one lane by choosing a second, distinct
-    // `batch_id` that routes to the same shard as the first. Distinct ids keep
-    // this a genuine FIFO-ordering scenario, not a `(batch_id, seal_key)` replay.
+    let baseline = fixture.memory.snapshot().expect("baseline root snapshot");
+    fixture.faults.fail_object_write_attempt_for_test(2);
+    let table_name = "failed_later_candidate_events";
     let front_batch_id = uuid::Uuid::from_u128(0x00FA_11ED);
-    let successor_batch_id = colocated_distinct_batch_id(
-        fixture.tenant,
-        &table("failed_front_events"),
-        front_batch_id,
-    );
-    append_with_batch_id(&fixture, "failed_front_events", 1, front_batch_id).await;
+    let successor_batch_id =
+        colocated_distinct_batch_id(fixture.tenant, &table(table_name), front_batch_id);
+    for (value, batch_id) in [(1_i64, front_batch_id), (2_i64, successor_batch_id)] {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "wyrd_event_time",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let rows = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![
+                        chrono::Utc::now().timestamp_micros();
+                        51_201
+                    ])
+                    .with_timezone("UTC"),
+                ),
+                Arc::new(Int64Array::from(vec![value; 51_201])),
+            ],
+        )
+        .expect("whole candidate batch");
+        fixture
+            .scribe
+            .append(ScribeAppend {
+                principal: principal(fixture.tenant),
+                table: table(table_name),
+                schema_fingerprint: SchemaFingerprint::from_arrow_schema(rows.schema().as_ref()),
+                request_id: RequestId::now_v7(),
+                batch_id,
+                measured_wire_bytes: 0,
+                rows,
+            })
+            .await
+            .expect("candidate append");
+    }
     fixture
         .scribe
         .flush_writable_for_test()
         .await
-        .expect("failed front flush");
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    append_with_batch_id(&fixture, "failed_front_events", 2, successor_batch_id).await;
-    fixture
-        .scribe
-        .flush_writable_for_test()
-        .await
-        .expect("blocked successor flush");
-    wait_for_state(&fixture, 2).await;
+        .expect("failed later-candidate flush");
+    wait_for_state(&fixture, 1).await;
     assert!(
         rows(&fixture).await.is_empty(),
-        "failed front must publish nothing"
+        "one failed candidate must publish none of its generation"
+    );
+    assert_eq!(
+        object_paths(&fixture).await.len(),
+        1,
+        "the first candidate remains durable for deterministic retry"
+    );
+    assert_eq!(
+        fixture.scribe.memory_snapshot().categories[MemoryCategory::Persistence as usize],
+        0,
+        "the failed later candidate releases all incremental producer workspace"
     );
 
     retry_and_wait(&fixture).await;
     assert_eq!(
         rows(&fixture).await.len(),
         2,
-        "retry releases the FIFO successor"
+        "retry publishes the complete two-candidate generation"
+    );
+    assert_eq!(object_paths(&fixture).await.len(), 2);
+    fixture
+        .scribe
+        .retire_committed_for_test()
+        .await
+        .expect("published generation retirement");
+    let settled = fixture.memory.snapshot().expect("settled root snapshot");
+    assert_eq!(
+        settled.scribe_memory_used_bytes,
+        baseline.scribe_memory_used_bytes
+    );
+    assert_eq!(
+        settled.elastic_memory_used_bytes,
+        baseline.elastic_memory_used_bytes
     );
     fixture.stop().await;
 }
@@ -1085,12 +1391,30 @@ async fn failed_generation_reuses_deterministic_object_id() {
         "SQL failure must roll back rows"
     );
     assert_eq!(fixture.scribe.wal_bytes_on_disk(), wal_before);
-    assert_eq!(object_paths(&fixture).await.len(), 0);
+    let retained_paths = object_paths(&fixture).await;
+    assert_eq!(retained_paths.len(), 1);
+    let retained_bytes = fixture
+        .operator
+        .read(&retained_paths[0])
+        .await
+        .expect("retained remote bytes")
+        .to_bytes();
 
     retry_and_wait(&fixture).await;
     let paths = object_paths(&fixture).await;
     assert_eq!(rows(&fixture).await.len(), 1);
     assert_eq!(paths.len(), 1, "retry reuses the exact generation identity");
+    assert_eq!(paths, retained_paths);
+    assert_eq!(
+        fixture
+            .operator
+            .read(&paths[0])
+            .await
+            .expect("reconciled remote bytes")
+            .to_bytes(),
+        retained_bytes
+    );
+    assert_eq!(audit_counts(&fixture).await, (1, 1));
     fixture.stop().await;
 }
 
@@ -1111,6 +1435,119 @@ async fn sql_failure_keeps_wal_and_file_list_unchanged() {
     assert_eq!(fixture.scribe.wal_bytes_on_disk(), wal_before);
     assert!(rows(&fixture).await.is_empty());
     assert_eq!(audit_counts(&fixture).await, (1, 0));
+    fixture.stop().await;
+}
+
+/// Proves the durable stage survives competing creators, catalog failure, and restart.
+#[tokio::test]
+async fn pg_staged_publication_race_preserves_published_remote_bytes() {
+    let mut fixture = PersistenceFixture::start().await;
+    let table = "staged_publication_race_events";
+    append_one(&fixture, table, 1).await;
+    fixture.faults.fail_next_sql_commit();
+    fixture
+        .scribe
+        .flush_writable_for_test()
+        .await
+        .expect("first creator flush");
+    wait_for_state(&fixture, 1).await;
+
+    let first_paths = object_paths(&fixture).await;
+    assert_eq!(
+        first_paths.len(),
+        1,
+        "ambiguous upload retains one remote key"
+    );
+    let remote_key = first_paths[0].clone();
+    let remote_before = fixture
+        .operator
+        .read(&remote_key)
+        .await
+        .expect("remote bytes after catalog failure")
+        .to_vec();
+    assert!(!remote_before.is_empty());
+    assert!(rows_for_table(&fixture, table).await.is_empty());
+    assert_eq!(audit_counts(&fixture).await, (1, 0));
+
+    fixture.faults.fail_next_sql_commit();
+    fixture.scribe.check_age(Instant::now());
+    wait_for_state(&fixture, 1).await;
+    assert_eq!(
+        fixture
+            .operator
+            .read(&remote_key)
+            .await
+            .expect("remote bytes after competing creator")
+            .to_vec(),
+        remote_before,
+        "losing creator and catalog failure never delete remote bytes"
+    );
+
+    fixture.scribe.shutdown(Instant::now()).await;
+    let node_id = fixture.node_id;
+    PersistenceFixture::register_scribe_fence(&fixture.database, node_id, 2).await;
+    let wal = Arc::new(
+        WalWriter::new(
+            fixture.wal_root.path(),
+            *node_id.as_bytes(),
+            2,
+            WalConfig::default(),
+        )
+        .expect("replacement WAL writer"),
+    );
+    let scribe_resources = fixture
+        .memory
+        .scribe()
+        .expect("replacement Scribe resources");
+    let (_, output_scratch) = scribe_resources
+        .volume_capabilities()
+        .expect("replacement output scratch");
+    let replacement_faults = PersistenceFaults::default();
+    let (publisher, hint_inbox) = staging_file_channel(16).expect("replacement hints");
+    let persistence =
+        ScribePersistenceConfig::new(Arc::new(fixture.database.vala_postgres().clone()), 16, 2)
+            .with_operator_pool(fixture.database.operator_pool().clone())
+            .with_output_scratch(output_scratch)
+            .with_test_faults(replacement_faults.clone());
+    fixture.scribe = restarted_scribe(RestartedScribeConfig {
+        operator: Arc::clone(&fixture.operator),
+        wal,
+        node_id,
+        admission: vala_bifrost_redux::scribe::admission::AdmissionConfig::default(),
+        persistence,
+        resources: scribe_resources,
+        publisher,
+        wal_io_threads: 2,
+    });
+    fixture.faults = replacement_faults;
+    fixture.hint_inbox = hint_inbox;
+    fixture
+        .scribe
+        .replay_wal_async()
+        .await
+        .expect("replacement staged publication recovery");
+
+    let published = rows_for_table(&fixture, table).await;
+    assert_eq!(published.len(), 1, "restart publishes one file-list row");
+    assert_eq!(audit_counts(&fixture).await, (1, 1));
+    assert_eq!(object_paths(&fixture).await, vec![remote_key.clone()]);
+    assert_eq!(
+        fixture
+            .operator
+            .read(&remote_key)
+            .await
+            .expect("committed remote bytes")
+            .to_vec(),
+        remote_before
+    );
+    let staged_root = fixture.wal_root.path().join("staged");
+    let remaining = std::fs::read_dir(staged_root)
+        .map(|entries| entries.count())
+        .unwrap_or_default();
+    assert_eq!(
+        remaining, 0,
+        "only committed publication permits local cleanup"
+    );
     fixture.stop().await;
 }
 
@@ -1138,7 +1575,7 @@ async fn confirmed_commit_publishes_hint() {
 /// runtime reconciler and completes without duplicate rows, audit operations,
 /// or objects.
 #[tokio::test]
-async fn automatic_commit_ambiguity_reconciles_exactly_once() {
+async fn pg_multi_candidate_unknown_commit_reconciles_one_generation() {
     let mut fixture = PersistenceFixture::start().await;
     fixture.faults.fail_next_post_commit_response();
     append_one(&fixture, "automatic_ambiguous_commit_events", 1).await;
@@ -1179,6 +1616,84 @@ async fn automatic_commit_ambiguity_reconciles_exactly_once() {
         hint_outcome(&mut fixture),
         Err(tokio::sync::mpsc::error::TryRecvError::Empty)
     ));
+    fixture.stop().await;
+}
+
+/// Two whole stored batches that cross the 100K candidate target publish as
+/// one fenced generation with consecutive physical ordinals.
+#[tokio::test]
+async fn multi_candidate_generation_publishes_one_fenced_set_with_deterministic_ordinals() {
+    let fixture = PersistenceFixture::start().await;
+    let table_name = "multi_candidate_fenced_events";
+    let first_id = uuid::Uuid::now_v7();
+    let second_id = colocated_distinct_batch_id(fixture.tenant, &table(table_name), first_id);
+    for (value, batch_id) in [(1_i64, first_id), (2_i64, second_id)] {
+        let request_id = RequestId::now_v7();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "wyrd_event_time",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let rows = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![
+                        chrono::Utc::now().timestamp_micros();
+                        51_201
+                    ])
+                    .with_timezone("UTC"),
+                ),
+                Arc::new(Int64Array::from(vec![value; 51_201])),
+            ],
+        )
+        .expect("whole candidate batch");
+        fixture
+            .scribe
+            .append(ScribeAppend {
+                principal: principal(fixture.tenant),
+                table: table(table_name),
+                schema_fingerprint: SchemaFingerprint::from_arrow_schema(rows.schema().as_ref()),
+                request_id,
+                batch_id,
+                measured_wire_bytes: 0,
+                rows,
+            })
+            .await
+            .expect("candidate append");
+    }
+    fixture
+        .scribe
+        .flush_writable_for_test()
+        .await
+        .expect("one generation flush");
+    wait_for_state(&fixture, 0).await;
+    let artifacts = artifact_rows_for_table(&fixture, table_name).await;
+    assert_eq!(
+        artifacts.len(),
+        2,
+        "both candidates become one complete set"
+    );
+    let mut conn = fixture
+        .database
+        .tenant_conn_for(fixture.tenant)
+        .await
+        .expect("ordinal tenant connection");
+    let ordinals: Vec<i16> = sqlx::query_scalar(
+        "SELECT file_ordinal FROM vala.file_list WHERE data_tenant_id=$1 AND table_name=$2 ORDER BY file_ordinal",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(table_name)
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .expect("candidate ordinals");
+    assert_eq!(ordinals, vec![0, 1]);
+    drop(conn);
+    assert_eq!(rows_for_table(&fixture, table_name).await.len(), 2);
+    assert_eq!(audit_counts(&fixture).await, (2, 1));
     fixture.stop().await;
 }
 
@@ -1516,6 +2031,7 @@ async fn replayed_generation_failure_keeps_replacement_unready() {
         persistence_test_roles(9 * 1024 * 1024 * 1024),
         2,
         25_000,
+        None,
     )
     .await
     {
@@ -1539,7 +2055,7 @@ async fn replayed_generation_failure_keeps_replacement_unready() {
 /// Panics if mixed-role exact-floor recovery fails, publishes a duplicate,
 /// remains unready, or leaves any root-owned Scribe bytes after settlement.
 #[tokio::test]
-async fn replay_exact_floor_restart_duplicate_and_settlement() {
+async fn pg_writer_produced_large_record_replays_and_publishes_exactly_once() {
     let memory = persistence_test_roles(768 * 1024 * 1024);
     let baseline = memory.snapshot().expect("baseline root snapshot");
     assert_eq!(baseline.plan.scribe_floor_bytes, 256 * 1024 * 1024);
@@ -1552,6 +2068,7 @@ async fn replay_exact_floor_restart_duplicate_and_settlement() {
         memory,
         1,
         10_000,
+        None,
     )
     .await
     .expect("exact-floor replay");
@@ -1613,6 +2130,7 @@ async fn replay_total_above_ceiling_is_bounded_by_persistence_retirement() {
         memory,
         1,
         rows_per_generation,
+        Some(16 * 1024 * 1024),
     )
     .await
     .expect("bounded replay completes with one WAL worker");
@@ -1661,6 +2179,7 @@ async fn replay_indivisible_generation_over_ceiling_stays_unready() {
         memory.clone(),
         1,
         oversized_rows,
+        None,
     )
     .await
     {
@@ -1703,6 +2222,14 @@ async fn replay_indivisible_generation_over_ceiling_stays_unready() {
     );
 }
 
+/// Replays distinct keys in deterministic order and retires the retained WAL
+/// only after every reconstructed generation has reached publication terminality.
+///
+/// # Panics
+///
+/// Panics when the real PostgreSQL/object-store fixture cannot reconstruct or
+/// publish the keys, or when retirement releases the WAL before all rows are
+/// visible exactly once.
 #[tokio::test]
 async fn replayed_distinct_keys_publish_in_replay_order_and_fifo() {
     let fixture = PersistenceFixture::start_after_wal_restart_with_keys(
@@ -1713,6 +2240,7 @@ async fn replayed_distinct_keys_publish_in_replay_order_and_fifo() {
         persistence_test_roles(9 * 1024 * 1024 * 1024),
         2,
         50_000,
+        None,
     )
     .await
     .expect("replay");
@@ -1743,6 +2271,20 @@ async fn replayed_distinct_keys_publish_in_replay_order_and_fifo() {
     }
     assert_eq!(audit_counts(&fixture).await, (0, 4));
     assert_eq!(object_paths(&fixture).await.len(), 4);
+    assert!(
+        fixture.scribe.wal_bytes_on_disk() > 0,
+        "the shared recovered WAL remains the sole replay source until every key publishes"
+    );
+    fixture
+        .scribe
+        .retire_committed_for_test()
+        .await
+        .expect("final cohort retirement");
+    assert_eq!(
+        fixture.scribe.wal_bytes_on_disk(),
+        0,
+        "only the final multi-key retirement may release the recovered WAL"
+    );
     fixture.stop().await;
 }
 
@@ -1798,7 +2340,7 @@ fn native_event_time_frame(
 /// Persistence workspace admission remains available while a governed Oracle
 /// range overlaps, and both role counters return to their exact baseline.
 #[tokio::test]
-async fn persistence_headroom_survives_oracle_range_overlap() {
+async fn near_full_root_immutable_owner_still_allows_incremental_candidate_progress() {
     let memory = persistence_test_roles(1024 * 1024 * 1024);
     let fixture = PersistenceFixture::start_with_memory(memory).await;
     let baseline = fixture.memory.snapshot().expect("baseline root snapshot");
@@ -1831,7 +2373,8 @@ async fn persistence_headroom_survives_oracle_range_overlap() {
     )
     .expect("near-target persistence batch");
     let request_id = RequestId::now_v7();
-    let measured_wire_bytes = vala_bifrost_redux::scribe::admission::MAX_REQUEST_BYTES;
+    let measured_wire_bytes =
+        vala_bifrost_redux::gate::limits::BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES;
     fixture
         .scribe
         .append(ScribeAppend {

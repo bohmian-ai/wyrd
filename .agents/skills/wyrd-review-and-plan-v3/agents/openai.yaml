@@ -1,4 +1,4 @@
 interface:
   display_name: "Wyrd Review and Plan v3"
   short_description: "Run terminal Wyrd review gates"
-  default_prompt: "Use $wyrd-review-and-plan-v3 to run the terminal committed-branch review and route confirmed remediation through $wyrd-plan-v3."
+  default_prompt: "Use $wyrd-review-and-plan-v3 to run terminal committed-branch review, return reversible findings to autonomous remediation, and route only material decisions through $wyrd-plan-v3."

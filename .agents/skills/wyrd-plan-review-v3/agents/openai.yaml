@@ -1,0 +1,4 @@
+interface:
+  display_name: "Wyrd Plan Review v3"
+  short_description: "Review Wyrd plans and task packets"
+  default_prompt: "Use $wyrd-plan-review-v3 to reject both unnecessary serialization and over-decomposition, optimizing this Wyrd v3 plan for wall-clock time to accepted integrated code."

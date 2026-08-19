@@ -1,17 +1,18 @@
 ---
 name: wyrd-implement-v3
-description: Implement one decision-complete Wyrd task packet in an isolated worktree, stay within its declared scope, run its focused diagnostic verification, and return one immutable candidate commit or a material BLOCKED result. Use only when an orchestrator supplies the packet, parent SHA, and dedicated worktree; never use for planning, integration, review, or task-status mutation.
+description: Implement one decision-complete Wyrd task packet or bounded terminal remediation in an isolated worktree, run focused diagnostic verification, and return one immutable candidate commit or a material BLOCKED result. Use only when an orchestrator supplies the packet, parent SHA, and dedicated worktree; never use for planning, integration, review, or task-status mutation.
 ---
 
 # Wyrd Implement v3
 
-Produce one reviewable commit from one immutable task packet. The packet is the
-single source of task scope, acceptance, dependencies, and focused
-verification. The controller alone dispatches, verifies authoritatively,
-reviews, integrates, supersedes, and records execution state.
+Produce one reviewable commit from one immutable task packet, optionally
+augmented by a bounded terminal-remediation contract. Together they are the
+source of task scope, acceptance, dependencies, and focused verification. The
+controller alone dispatches, verifies authoritatively, risk-routes review,
+integrates, supersedes, and records execution state.
 
-Never invoke another workflow or spawn children. When delegated, run as
-`gpt-5.6-sol` at low reasoning effort.
+Never invoke another workflow or spawn children. Use the packet's
+`execution_tier` through `.agents/model-routing.md`.
 
 ## Required input
 
@@ -26,6 +27,17 @@ task_packet:
   sha256: <lowercase 64-hex digest of its exact bytes>
 parent_sha: <immutable commit checked out in the worktree>
 worktree_path: <absolute dedicated clean worktree path>
+remediation: null
+# For a replacement generation:
+# remediation:
+#   supersedes_candidate_sha: <rejected immutable candidate>
+#   findings: [<exact proof diagnostics or review findings>]
+terminal_remediation: null
+# Or after terminal review:
+# terminal_remediation:
+#   review: {path: <terminal review artifact>, sha256: <digest>}
+#   reviewed_target_sha: <current integrated parent>
+#   finding_ids: [<REV IDs assigned to this worker>]
 ```
 
 The task packet begins with a `Task contract` YAML block:
@@ -35,11 +47,13 @@ id: <stable task ID>
 depends_on: [<task IDs>]
 write_set: [<repository-relative paths>]
 prohibited_writes: [<repository-relative paths>]
+execution_tier: <fast|general>
 acceptance_criteria:
   - id: AC1
     text: <verbatim observable criterion>
 verification:
-  command: <exact focused mise command>
+  worker: <optional fastest safe diagnostic mise command, or null>
+  candidate: <exact focused authoritative mise command>
 ```
 
 Return `BLOCKED` before editing only if the request is incomplete, packet
@@ -49,15 +63,24 @@ outcome and repository context, the worktree is not clean and checked out at
 a commit. Do not require a task status, revision, manifest, or controller proof
 record: controller dispatch is the authority to begin work.
 
+Exactly one of `remediation` or `terminal_remediation` may be non-null. For
+terminal remediation, verify the review artifact digest, target SHA, selected
+finding IDs, owners, required outcomes, acceptance assertions, and verification
+commands. Treat those selected findings as an additive bounded work contract;
+they may authorize their named owners/paths even when the primary task packet
+did not forecast them. They never authorize a new material decision.
+
 ## Establish the execution boundary
 
 Read `AGENTS.md`, `architecture/agent-rules.md`, the complete task packet, and
 the architecture/design/doctrine references relevant to its changed behavior.
 Inspect the named paths, consumers, tests, manifests, and `mise` command.
-Use CodeGraph first when indexed.
+Use CodeGraph only when its indexed revision matches `parent_sha`; otherwise
+inspect the dedicated worktree directly.
 
-Use the packet's `write_set` as the expected ownership boundary and
-`prohibited_writes` as a hard boundary. Before calling something ambiguous or
+Use `write_set` as a coordination forecast and `prohibited_writes` as the only
+path-level hard boundary. Autonomously inspect and change additional task-local
+paths when source, consumers, or diagnostics show they are required. Before calling something ambiguous or
 blocked, use the acceptance criteria, surrounding code, consumers, tests, and
 diagnostics to determine the smallest coherent way to achieve the stated
 outcome. A packet need not enumerate every supporting file, implementation
@@ -82,10 +105,29 @@ completion closure never permits a materially new behavior, owner, dependency,
 public or durable contract, acceptance outcome, unrelated cleanup, broad
 formatting, or a prohibited path.
 
-Run `verification.command` diagnostically when it is repeatable and safe. If
-it is destructive, non-repeatable, cross-task, or a terminal qualification
-gate, report why it was not run; the controller will run it once in its
-authoritative lane. Never weaken, replace, skip, or mask the command.
+For a remediation generation, start again from the original `parent_sha`, read
+the rejected candidate diff and exact findings, and produce one complete
+replacement candidate. Do not create a repair-only descendant. The controller
+supersedes the rejected candidate and integrates only the replacement.
+
+For terminal remediation, require `parent_sha == reviewed_target_sha` and
+produce one normal candidate atop that current integrated parent. Implement
+only the assigned reversible findings. When findings have disjoint owners, the
+controller may dispatch several terminal-remediation workers concurrently;
+overlapping findings remain serial.
+
+Finish one coherent implementation before checking it. Do not run compiler,
+test, lint, or format commands after small edits or use tests as a stepwise
+search mechanism. Run `verification.worker` after the coherent change when it
+is present, repeatable, and safe; request the controller's heavy-resource lane
+for a filtered Cargo diagnostic rather than omitting useful compiler feedback.
+Batch all directly indicated mechanical
+repairs before rerunning it, and never rerun without a relevant source or test
+change. Continue while failures remain explained and task-local; escalate only
+an unexplained diagnostic after focused investigation or a material decision.
+The controller runs `verification.candidate` once per immutable candidate in
+its authoritative resource lane. Never weaken, replace, skip, or mask either
+command.
 
 Return `BLOCKED` only after reasonable task-local investigation and recovery
 for a material decision, unavailable authority, genuinely indeterminate
@@ -103,6 +145,11 @@ matches repository policy. Create exactly one normal commit with
 `parent_sha` as its sole parent, calculate the binary diff SHA-256, and leave
 the worktree clean. Never alter the commit after reporting it.
 
+This implementor audit is a self-check, not a review stage. Do not request,
+dispatch, or perform a mutable-working-tree, pre-commit, or "pre-seal" code
+review. The controller risk-routes at most one substantive independent review
+after this immutable candidate commit exists.
+
 ## Output contract
 
 Return exactly one YAML document.
@@ -117,18 +164,29 @@ task_packet: {path: <input path>, sha256: <input digest>}
 task_id: <packet contract ID>
 candidate_sha: <immutable commit>
 parent_sha: <input parent SHA>
+supersedes_candidate_sha: <input remediation SHA or null>
+terminal_finding_ids: [<input terminal finding IDs, or empty>]
+terminal_binding: null
+# Or exactly when terminal remediation is present:
+# terminal_binding:
+#   review: {path: <input path>, sha256: <input digest>}
+#   reviewed_target_sha: <input target>
+#   finding_ids: [<input IDs>]
+#   assertion_ids: [<all selected assertion IDs>]
+#   reviewed_integrated_tasks: [<terminal artifact's exact task identities>]
+#   reviewed_proof_artifacts: [<terminal artifact's exact proof identities>]
 diff_sha256: <lowercase 64-hex digest>
 changed_paths: [<sorted repository-relative paths>]
-incidental_repair_paths:
+forecast_expansion_paths:
   - path: <path outside write_set>
-    diagnostic: <exact diagnostic>
+    evidence: <source, consumer, or diagnostic requiring it>
 acceptance_trace:
-  - ac_id: <every packet AC exactly once>
+  - assertion_id: <every packet AC, or every assigned terminal assertion, exactly once>
     implementation: [<path:symbol or path:line evidence>]
     tests: [<test or source evidence>]
 diagnostic_verification:
-  command: <packet verification command>
-  result: <PASS|NOT_RUN>
+  command: <packet worker diagnostic, or assigned terminal verification command, or null>
+  result: <PASS|NOT_RUN|FAIL>
   evidence: <concise result or safety limitation>
 ```
 
@@ -146,10 +204,13 @@ partial_commit: null
 ```
 
 Never return a partial candidate. Preserve working-tree evidence on `BLOCKED`
-unless reverting only this run's known changes is explicitly requested.
+until the controller captures its binary diff, status, necessary untracked
+evidence, report, and task binding. The controller may then reclaim it under
+the plan-execution cleanup contract.
 
 ## Invalidation
 
 A candidate is valid only for its task-packet digest, parent SHA, candidate
 SHA, and diff digest. A changed packet, parent, amended/rebased commit, or
-successor candidate requires fresh diagnostic verification and review.
+successor candidate requires fresh diagnostic verification and, when routed by
+the controller's risk rule, fresh review.

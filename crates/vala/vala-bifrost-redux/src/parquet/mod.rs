@@ -2,6 +2,7 @@
 
 pub(crate) mod footer_preflight;
 pub mod memory;
+pub mod object_uploader;
 pub mod writer_properties;
 
 pub use memory::{

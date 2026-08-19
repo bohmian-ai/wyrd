@@ -1308,14 +1308,21 @@ cross-shard state is introduced.
 **Scribe ingress pressure sealing (D83).** Admission is gated by ingress
 *occupancy*, not effective child pressure: occupancy is
 `scribe_total_bytes / ingress_limit_bytes`, where the ingress ceiling excludes
-the persistence headroom (D75). A single hysteresis band drives every seal
-decision — configured by `ScribePressureConfig` with D83 defaults of a 75%
-high-water mark, a 50% low-water target, and a 30-second active-generation
-`seal_max_age` (a `low < high` invariant is enforced at construction). Both the
-admission path and the periodic age scanner call one shared helper: at or above
-the high-water mark it seals the largest writable buckets aggregated across all
-sixteen lanes (shard-count-invariant) toward the low-water target and returns;
-below low-water it no-ops. Sealing is flush-first and drain-before-reject — a
+the persistence headroom (D75). `ScribePressureConfig` defines one 600-second
+shard-generation age and a hysteresis band with a 75% high-water mark and 50%
+low-water target (`low < high` is enforced at construction). Before appending
+an incoming whole unit, automatic rotation ORs projected non-empty WAL
+compressed bytes, WAL uncompressed bytes, aggregate shard JSON-equivalent
+bytes, aggregate shard Arrow bytes, and shard-generation age. Any automatic
+size or age trigger closes the shard WAL and atomically freezes every non-empty
+`SealKey` into one cohort before the incoming unit enters a fresh generation;
+age rotation does this even below high water. Separately, at or above the
+high-water mark pressure sealing may selectively freeze younger largest
+writable buckets across all sixteen lanes toward the low-water target without
+closing the shard WAL or resetting shard-generation age. Forced and
+tenant-scoped sealing are also selective paths and never masquerade as the
+automatic whole-shard rotation contract.
+Sealing is flush-first and drain-before-reject — a
 memory-ceiling rejection returns `IngestBusy` only after a pressure seal is
 requested and a single reservation retry still fails, deferring to D71 client
 backoff for eventual admission. Freezing only recategorizes bytes; persistence

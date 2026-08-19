@@ -914,7 +914,6 @@ mod tests {
             value_bytes: 1 << 20,
             value_depth: 8,
             event_days: 32,
-            material_bytes: 1 << 24,
         }
     }
 }

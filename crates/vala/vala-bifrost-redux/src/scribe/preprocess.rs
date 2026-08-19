@@ -1,8 +1,10 @@
 //! Blocking preprocessing for admitted appends.
 
+use arrow::array::{Array, ArrayData};
 use arrow::buffer::Buffer;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
+use sha2::{Digest, Sha256};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio::sync::oneshot;
@@ -10,6 +12,7 @@ use uuid::Uuid;
 use wyrd_runtime::Principal;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::AuditEvent;
+use wyrd_spec::vala::managed_columns::{WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_REQUEST_ID};
 
 use crate::catalog::TableRef;
 use crate::contracts::ScribeError;
@@ -34,6 +37,8 @@ pub(crate) struct AdmittedAppend {
     pub admitted_bytes: usize,
     /// Admitted exact-capacity ceiling for one current audit JSON payload.
     pub wal_workspace_bytes: usize,
+    /// Maximum root envelope that must later replay this accepted unit.
+    pub maximum_scribe_envelope_bytes: usize,
     pub reservation: InflightFrameReservation,
     pub memory: ScribeMemoryLease,
     pub tenant: DataTenantId,
@@ -69,7 +74,7 @@ pub(crate) enum OtlpTypedRows {
 /// Retained typed OTLP request and deterministic managed-column context.
 #[derive(Debug)]
 pub(crate) struct OtlpAdmittedRows {
-    /// Move-only typed request retained through post-COMMIT regeneration.
+    /// Move-only typed request consumed by the sole pre-WAL projection pass.
     pub(crate) request: OtlpTypedRows,
     /// Authenticated principal stamped into the current projected slice.
     pub(crate) principal: Principal,
@@ -102,7 +107,7 @@ pub(crate) struct NativeAdmittedRows {
     pub(crate) batch_id: Uuid,
     /// Immutable event-time acceptance window.
     pub(crate) event_time_window: EventTimeWindow,
-    /// One receipt instant reused by WAL and post-COMMIT regeneration.
+    /// One receipt instant reused by planning, projection, and WAL identity.
     pub(crate) receipt_micros: i64,
     /// Start of the preflighted schema frame in retained transport bytes.
     pub(crate) schema_start: usize,
@@ -125,6 +130,10 @@ pub(crate) struct PreparedAppend {
     pub slices: PreparedSliceSet,
     pub reservation: InflightFrameReservation,
     pub memory: Option<ScribeMemoryLease>,
+    /// Exact retained and persistence facts from the sole materialization.
+    pub exact_material: ExactMaterialFacts,
+    /// Maximum root envelope checked again with exact grouped-candidate facts.
+    pub maximum_scribe_envelope_bytes: usize,
     pub durable_ack: Option<oneshot::Sender<Result<u64, ScribeError>>>,
     /// Move-only lifecycle observation retained beside the admitted root.
     pub lifecycle: Option<crate::scribe::telemetry::ScribeIngressLifecycleOwner>,
@@ -133,12 +142,21 @@ pub(crate) struct PreparedAppend {
 /// Closed prepared-slice source used by the shard owner.
 #[derive(Debug)]
 pub(crate) enum PreparedSliceSet {
-    /// Existing projected/test path with already materialized slices.
+    /// The complete once-materialized slice set retained through visibility.
     Materialized(Vec<PreparedSlice>),
-    /// Native path producing exactly one current slice per CPU-lane turn.
-    Native(Option<Box<NativeSliceProducer>>),
-    /// OTLP path producing one receipt-day slice on demand.
-    Otlp(Option<Box<OtlpSliceProducer>>),
+}
+
+/// Exact byte facts measured after the accepted unit is materialized once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExactMaterialFacts {
+    /// Complete retained live-set charged after atomic shrink.
+    pub(crate) retained_live: usize,
+    /// Largest whole stored Arrow batch in this unit.
+    pub(crate) largest_stored_batch: usize,
+    /// Largest candidate persistence must later admit without splitting input.
+    pub(crate) persistence_candidate_peak: usize,
+    /// Immutable candidate plus its serial incremental Parquet workspace.
+    pub(crate) persistence_envelope_peak: usize,
 }
 
 /// One-shot typed OTLP current-slice producer.
@@ -266,11 +284,6 @@ impl OtlpSliceProducer {
         slice.id.slice_index = 0;
         Ok(Some(slice))
     }
-
-    /// Rewinds deterministic projection for post-COMMIT identity regeneration.
-    pub(crate) fn restart(&mut self) {
-        self.produced = false;
-    }
 }
 
 /// Stateful current-only native slice producer.
@@ -310,12 +323,6 @@ struct NativeCurrentSource {
 }
 
 impl NativeSliceProducer {
-    /// Returns the immutable complete slice count established before production.
-    #[must_use]
-    pub(crate) const fn slice_count(&self) -> u32 {
-        self.slice_count
-    }
-
     /// Builds a producer after a non-retaining pass fixes the total slice count.
     ///
     /// # Errors
@@ -329,7 +336,6 @@ impl NativeSliceProducer {
         table: TableRef,
         wal_workspace_bytes: usize,
     ) -> Result<Self, ScribeError> {
-        let slice_count = count_native_slices(&source)?;
         let mut decoder = arrow::ipc::reader::StreamDecoder::new().with_require_alignment(true);
         feed_native_schema(&mut decoder, &source)?;
         Ok(Self {
@@ -338,7 +344,7 @@ impl NativeSliceProducer {
             source_index: 0,
             current: None,
             slice_index: 0,
-            slice_count,
+            slice_count: 0,
             audit_event,
             tenant,
             table,
@@ -388,11 +394,6 @@ impl NativeSliceProducer {
             let Some(rows) =
                 decode_planned_native_source(&mut self.decoder, &self.source, self.source_index)?
             else {
-                if self.slice_index != self.slice_count {
-                    return Err(ScribeError::Internal {
-                        detail: "native slice production diverged from count pass".to_owned(),
-                    });
-                }
                 return Ok(None);
             };
             self.source_index += 1;
@@ -405,48 +406,14 @@ impl NativeSliceProducer {
             });
         }
     }
-
-    /// Rewinds the retained source for deterministic post-COMMIT regeneration.
-    ///
-    /// The same root continues to own the aliased bytes; this operation only
-    /// replaces fixed decoder state and resets ordinals.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError::InvalidFrame`] when the retained native schema
-    /// cannot be fed back into the alignment-enforcing decoder.
-    pub(crate) fn restart(&mut self) -> Result<(), ScribeError> {
-        self.decoder = arrow::ipc::reader::StreamDecoder::new().with_require_alignment(true);
-        feed_native_schema(&mut self.decoder, &self.source)?;
-        self.source_index = 0;
-        self.current = None;
-        self.slice_index = 0;
-        Ok(())
-    }
 }
 
 impl PreparedSliceSet {
     /// Returns the exact remaining closed-set size without advancing the source.
     ///
-    /// # Errors
-    ///
-    /// Returns an internal error when the native producer owner is absent or
-    /// its fixed count cannot be represented by the current platform.
-    pub(crate) fn exact_slice_capacity(&self) -> Result<usize, ScribeError> {
+    pub(crate) fn exact_slice_capacity(&self) -> usize {
         match self {
-            Self::Materialized(slices) => Ok(slices.len()),
-            Self::Native(Some(producer)) => {
-                usize::try_from(producer.slice_count()).map_err(|_| ScribeError::Internal {
-                    detail: "native slice count exceeds platform capacity".to_owned(),
-                })
-            }
-            Self::Native(None) => Err(ScribeError::Internal {
-                detail: "native producer owner missing during capacity planning".to_owned(),
-            }),
-            Self::Otlp(Some(_)) => Ok(1),
-            Self::Otlp(None) => Err(ScribeError::Internal {
-                detail: "OTLP producer owner missing during capacity planning".to_owned(),
-            }),
+            Self::Materialized(slices) => slices.len(),
         }
     }
 }
@@ -457,26 +424,6 @@ impl PreparedSliceSet {
 ///
 /// Returns [`ScribeError`] when decoding, stamping, day planning, or checked
 /// slice-count conversion fails.
-fn count_native_slices(source: &NativeAdmittedRows) -> Result<u32, ScribeError> {
-    let mut decoder = arrow::ipc::reader::StreamDecoder::new().with_require_alignment(true);
-    feed_native_schema(&mut decoder, source)?;
-    let mut slices = 0_usize;
-    for source_index in 0..source.source_count {
-        let rows = decode_planned_native_source(&mut decoder, source, source_index)?
-            .ok_or(ScribeError::InvalidFrame)?;
-        let rows = stamp_native_source(&rows, source)?;
-        slices = slices
-            .checked_add(plan_event_days(&rows)?.len())
-            .ok_or_else(|| ScribeError::Internal {
-                detail: "native slice count overflow".to_owned(),
-            })?;
-    }
-    decoder.finish().map_err(|_| ScribeError::InvalidFrame)?;
-    u32::try_from(slices).map_err(|_| ScribeError::Internal {
-        detail: "native slice count exceeds WAL v4 range".to_owned(),
-    })
-}
-
 /// Decodes the next record batch from a preflighted native source.
 ///
 /// # Errors
@@ -594,6 +541,62 @@ pub(crate) struct PreparedSlice {
     pub memtable_bytes: usize,
 }
 
+/// Computes the stable logical Arrow identity used only for retained retries.
+///
+/// Server-generated request and time columns change across a legitimate client
+/// retry, so they are excluded. Schema identity remains an independent retained
+/// fact, while every other Arrow buffer participates byte-for-byte.
+///
+/// # Errors
+///
+/// Returns an internal error when the stable buffer length exceeds its WAL-v4
+/// metadata representation.
+pub(crate) fn logical_data_identity(rows: &RecordBatch) -> Result<([u8; 32], u32), ScribeError> {
+    fn update(data: &ArrayData, digest: &mut Sha256, bytes: &mut usize) -> Result<(), ScribeError> {
+        digest.update(data.len().to_le_bytes());
+        digest.update(data.offset().to_le_bytes());
+        if let Some(nulls) = data.nulls() {
+            let buffer = nulls.buffer().as_slice();
+            digest.update(buffer);
+            *bytes = bytes
+                .checked_add(buffer.len())
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "logical Arrow identity length overflow".to_owned(),
+                })?;
+        }
+        for buffer in data.buffers() {
+            let buffer = buffer.as_slice();
+            digest.update(buffer);
+            *bytes = bytes
+                .checked_add(buffer.len())
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "logical Arrow identity length overflow".to_owned(),
+                })?;
+        }
+        for child in data.child_data() {
+            update(child, digest, bytes)?;
+        }
+        Ok(())
+    }
+
+    let mut digest = Sha256::new();
+    let mut bytes = 0_usize;
+    for (field, column) in rows.schema().fields().iter().zip(rows.columns()) {
+        if matches!(
+            field.name().as_str(),
+            WYRD_REQUEST_ID | WYRD_EVENT_TIME | WYRD_INGESTED_AT
+        ) {
+            continue;
+        }
+        digest.update(field.name().as_bytes());
+        update(&column.to_data(), &mut digest, &mut bytes)?;
+    }
+    let bytes = u32::try_from(bytes).map_err(|_| ScribeError::Internal {
+        detail: "logical Arrow identity exceeds its u32 bound".to_owned(),
+    })?;
+    Ok((digest.finalize().into(), bytes))
+}
+
 /// Idempotency identity for one logical slice within a routed batch.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AppendSliceId {
@@ -670,27 +673,44 @@ fn prepare_rows(
             let prepared_bytes = prepared_slice_bytes(&slices, memory_bytes)?;
             Ok((PreparedSliceSet::Materialized(slices), prepared_bytes))
         }
-        AdmittedRows::Native(native) => Ok((
-            PreparedSliceSet::Native(Some(Box::new(NativeSliceProducer::new(
-                *native,
-                audit_event,
-                tenant,
-                table,
-                wal_workspace_bytes,
-            )?))),
-            memory_bytes,
-        )),
-        AdmittedRows::Otlp(otlp) => Ok((
-            PreparedSliceSet::Otlp(Some(Box::new(OtlpSliceProducer::new(
-                *otlp,
-                audit_event,
-                tenant,
-                table,
-                wal_workspace_bytes,
-            )))),
-            memory_bytes,
-        )),
+        AdmittedRows::Native(native) => {
+            let mut producer =
+                NativeSliceProducer::new(*native, audit_event, tenant, table, wal_workspace_bytes)?;
+            let mut slices = Vec::new();
+            while let Some(slice) = producer.next_slice()? {
+                slices.push(slice);
+            }
+            assign_slice_ordinals(&mut slices)?;
+            let prepared_bytes = prepared_slice_bytes(&slices, memory_bytes)?;
+            Ok((PreparedSliceSet::Materialized(slices), prepared_bytes))
+        }
+        AdmittedRows::Otlp(otlp) => {
+            let mut producer =
+                OtlpSliceProducer::new(*otlp, audit_event, tenant, table, wal_workspace_bytes);
+            let slices = producer.next_slice()?.into_iter().collect::<Vec<_>>();
+            let prepared_bytes = prepared_slice_bytes(&slices, memory_bytes)?;
+            Ok((PreparedSliceSet::Materialized(slices), prepared_bytes))
+        }
     }
+}
+
+/// Assigns final WAL ordinals after the single materialization traversal.
+///
+/// # Errors
+///
+/// Returns an internal error when the slice set exceeds WAL v4 integer bounds.
+fn assign_slice_ordinals(slices: &mut [PreparedSlice]) -> Result<(), ScribeError> {
+    let count = u32::try_from(slices.len()).map_err(|_| ScribeError::Internal {
+        detail: "Scribe batch exceeds the v4 WAL slice-count bound".to_owned(),
+    })?;
+    for (index, slice) in slices.iter_mut().enumerate() {
+        let index = u32::try_from(index).map_err(|_| ScribeError::Internal {
+            detail: "Scribe batch slice index exceeds the v4 WAL bound".to_owned(),
+        })?;
+        slice.wal_append.assign_slice_ordinal(index, count);
+        slice.id.slice_index = index;
+    }
+    Ok(())
 }
 
 /// Split and serialize an admitted append on the bounded pre-ACK CPU lane.
@@ -707,6 +727,7 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
         measured_wire_bytes: _measured_wire_bytes,
         admitted_bytes: _admitted_bytes,
         wal_workspace_bytes,
+        maximum_scribe_envelope_bytes,
         reservation,
         mut memory,
         tenant,
@@ -738,14 +759,13 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
             return Err(error);
         }
     };
-    if let PreparedSliceSet::Materialized(materialized) = &slices {
-        for slice in materialized {
-            let bytes = slice
-                .memtable_bytes
-                .saturating_add(slice.wal_append.audit.len())
-                .saturating_add(slice.wal_append.data.len());
-            lifecycle.materialized(bytes);
-        }
+    let PreparedSliceSet::Materialized(materialized) = &slices;
+    for slice in materialized {
+        let bytes = slice
+            .memtable_bytes
+            .saturating_add(slice.wal_append.audit.len())
+            .saturating_add(slice.wal_append.data.len());
+        lifecycle.materialized(bytes);
     }
     if prepared_bytes > memory.bytes() {
         let error = ScribeError::DecodedPayloadTooLarge {
@@ -756,7 +776,10 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
         notify_completion(&mut durable_ack, &error);
         return Err(error);
     }
-    if let Err(error) = memory.resize_ingress(prepared_bytes) {
+    if let Err(error) = memory.shrink_to(prepared_bytes) {
+        let error = ScribeError::Internal {
+            detail: format!("exact material shrink violated the admitted upper bound: {error}"),
+        };
         lifecycle.refuse();
         notify_completion(&mut durable_ack, &error);
         return Err(error);
@@ -767,6 +790,16 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
         return Err(error);
     }
 
+    let exact_material = exact_material_facts(&slices, prepared_bytes)?;
+    if exact_material.persistence_envelope_peak > maximum_scribe_envelope_bytes {
+        let error = ScribeError::DecodedPayloadTooLarge {
+            bytes: exact_material.persistence_envelope_peak,
+            limit: maximum_scribe_envelope_bytes,
+        };
+        lifecycle.refuse();
+        notify_completion(&mut durable_ack, &error);
+        return Err(error);
+    }
     Ok(PreparedAppend {
         batch_id,
         tenant,
@@ -775,8 +808,52 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
         slices,
         reservation,
         memory: Some(memory),
+        exact_material,
+        maximum_scribe_envelope_bytes,
         durable_ack,
         lifecycle: Some(lifecycle),
+    })
+}
+
+/// Measures exact retained and whole-batch persistence facts.
+fn exact_material_facts(
+    slices: &PreparedSliceSet,
+    retained_live_bytes: usize,
+) -> Result<ExactMaterialFacts, ScribeError> {
+    let largest_stored_batch_bytes = match slices {
+        PreparedSliceSet::Materialized(slices) => slices
+            .iter()
+            .map(|slice| slice.memtable_bytes)
+            .max()
+            .unwrap_or(0),
+    };
+    let persistence_candidate_peak = match slices {
+        PreparedSliceSet::Materialized(slices) => {
+            let mut by_key = std::collections::HashMap::<SealKey, Vec<(usize, usize)>>::new();
+            for slice in slices {
+                by_key
+                    .entry(slice.seal_key.clone())
+                    .or_default()
+                    .push((slice.rows.num_rows(), slice.memtable_bytes));
+            }
+            by_key.into_values().try_fold(0_usize, |largest, facts| {
+                crate::scribe::parquet_writer::largest_candidate_bytes_from_facts(facts)
+                    .map(|candidate| largest.max(candidate))
+            })?
+        }
+    };
+    let persistence_envelope_peak = persistence_candidate_peak
+        .checked_add(crate::scribe::memory::parquet_candidate_incremental_bytes(
+            persistence_candidate_peak,
+        )?)
+        .ok_or_else(|| ScribeError::Internal {
+            detail: "persistence replayability envelope overflowed".to_owned(),
+        })?;
+    Ok(ExactMaterialFacts {
+        retained_live: retained_live_bytes,
+        largest_stored_batch: largest_stored_batch_bytes,
+        persistence_candidate_peak,
+        persistence_envelope_peak,
     })
 }
 
@@ -863,6 +940,7 @@ fn prepare_slice(
     day_audit.payload_summary = format!("{} rows", rows.num_rows());
     let audit_payload = encode_audit_event_bounded(&day_audit, context.wal_workspace_bytes)?;
     let data_payload = encode_ipc_fixed(&rows, ipc_plan)?;
+    let (logical_data_digest, logical_data_len) = logical_data_identity(&rows)?;
     let wal_append = PreparedWalAppend::new(
         crate::scribe::wal::WalLsn::ZERO,
         *context.batch_id.as_bytes(),
@@ -872,7 +950,8 @@ fn prepare_slice(
     .for_slice(
         seal_key.clone(),
         SchemaFingerprint::from_arrow_schema(&rows.schema()).0,
-    );
+    )
+    .with_logical_data_identity(logical_data_digest, logical_data_len);
     let memtable_bytes = rows.get_array_memory_size();
     Ok(PreparedSlice {
         id: AppendSliceId {
@@ -928,7 +1007,7 @@ fn notify_completion(
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::Int64Array;
+    use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::ipc::writer::StreamWriter;
     use arrow::record_batch::RecordBatch;
@@ -937,9 +1016,11 @@ mod tests {
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::ids::DataTenantId;
     use wyrd_spec::request_id::RequestId;
+    use wyrd_spec::vala::managed_columns::{WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_REQUEST_ID};
 
     use super::{
         EventTimeWindow, NativeAdmittedRows, decode_planned_native_source, feed_native_schema,
+        logical_data_identity,
     };
     use crate::schema::SchemaFingerprint;
     use crate::scribe::material_plan::ScribeIngressPlanner;
@@ -1023,5 +1104,34 @@ mod tests {
                 .expect("batch");
             assert_eq!(batch.num_rows(), 2);
         }
+    }
+
+    /// Volatile server columns do not alter retained logical payload identity.
+    #[test]
+    fn logical_identity_ignores_server_receipt_columns_only() {
+        fn rows(value: i64, request: &str, receipt: i64) -> RecordBatch {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("value", DataType::Int64, false),
+                Field::new(WYRD_REQUEST_ID, DataType::Utf8, false),
+                Field::new(WYRD_EVENT_TIME, DataType::Int64, false),
+                Field::new(WYRD_INGESTED_AT, DataType::Int64, false),
+            ]));
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int64Array::from(vec![value])),
+                    Arc::new(StringArray::from(vec![request])),
+                    Arc::new(Int64Array::from(vec![receipt])),
+                    Arc::new(Int64Array::from(vec![receipt])),
+                ],
+            )
+            .expect("identity batch")
+        }
+
+        let first = logical_data_identity(&rows(7, "request-a", 10)).expect("first identity");
+        let fresh = logical_data_identity(&rows(7, "request-b", 20)).expect("fresh identity");
+        let changed = logical_data_identity(&rows(8, "request-c", 30)).expect("changed identity");
+        assert_eq!(first, fresh);
+        assert_ne!(first, changed);
     }
 }

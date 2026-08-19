@@ -7,7 +7,13 @@ set -euo pipefail
 root_dir="${BIFROST_DELETED_VOCABULARY_ROOT:-$(git rev-parse --show-toplevel)}"
 checker_path="scripts/checks/bifrost-oracle-deleted-vocabulary.sh"
 ledger_path="scripts/checks/bifrost-oracle-deleted-vocabulary-ledger.tsv"
+fixture_path="scripts/checks/test-bifrost-oracle-deleted-vocabulary.sh"
 patterns=(
+  'OracleAdmissionOwner'
+  'OracleAdmissionTicketClaims'
+  'admission_owner_fencing_token'
+  'oracle_admission_owner'
+  'OracleOwnerRouteCache'
   'bifrost_oracle_lease_renewals_total'
   'bifrost_oracle_lease_release_queue_total'
   'bifrost_oracle_admission_reconcile_total'
@@ -100,6 +106,7 @@ violations="$(git -C "$root_dir" grep -n -I -F "${grep_args[@]}" -- \
   ':(exclude).dev/plan/**' \
   ":(exclude)$checker_path" \
   ":(exclude)$ledger_path" \
+  ":(exclude)$fixture_path" \
   'crates/**' 'scripts/**' 'benchmarks/**' 'benches/**' 'mise.toml' \
   '*.toml' '*.yaml' '*.yml' '*.json' '*.py' '*.sh' '*.rs' '*.ts' '*.tsx' '*.mjs' \
   2>/dev/null || true)"

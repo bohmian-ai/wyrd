@@ -16,21 +16,18 @@ use crate::scribe::execution_lanes::{
 };
 use crate::scribe::file_list_writer;
 use crate::scribe::file_list_writer::FileListCommitKey;
-use crate::scribe::memory::{MemoryCategory, parquet_producer_delta};
+use crate::scribe::memory::{MemoryCategory, parquet_candidate_incremental_bytes};
 use crate::scribe::memtable::{FrozenMemtable, Memtable};
 use crate::scribe::parquet_writer::BoundedParquetArtifactSet;
 use crate::scribe::parquet_writer::ParquetEncoded;
 use crate::scribe::seal_key::{ScribeArtifactIdentity, SealKey};
 use crate::scribe::wal::WalLsn;
 
-/// Cancellation-safe owner for objects uploaded before the caller's COMMIT boundary.
+/// Cancellation-safe identity owner for objects uploaded before COMMIT.
 ///
-/// Until disarmed, dropping the owner schedules deletion of every exact path
-/// already uploaded. This covers cancellation between members and while the
-/// caller-owned SQL transaction is still known not committed.
+/// Remote bytes are retained for deterministic retry and reconciliation; this
+/// owner deliberately has no object-store deletion authority.
 struct PreCommitUploads {
-    /// Object store containing the deterministic generation members.
-    operator: Arc<Operator>,
     /// Exact successfully uploaded identities in ordinal order.
     paths: Vec<String>,
     /// False only after ownership transfers into [`ScribeCommitAttempt`].
@@ -39,9 +36,8 @@ struct PreCommitUploads {
 
 impl PreCommitUploads {
     /// Creates an armed owner before the first object mutation.
-    fn new(operator: Arc<Operator>, capacity: usize) -> Self {
+    fn new(capacity: usize) -> Self {
         Self {
-            operator,
             paths: Vec::with_capacity(capacity),
             armed: true,
         }
@@ -52,13 +48,9 @@ impl PreCommitUploads {
         self.paths.push(path);
     }
 
-    /// Deletes every completed member after a positively pre-COMMIT failure.
-    async fn cleanup(&mut self) {
-        for path in self.paths.drain(..) {
-            if let Err(error) = self.operator.delete(&path).await {
-                tracing::error!(path, %error, "failed to clean known-uncommitted Scribe object");
-            }
-        }
+    /// Releases process-local attempt identities while retaining remote retry evidence.
+    fn cleanup(&mut self) {
+        self.paths.clear();
         self.armed = false;
     }
 
@@ -69,22 +61,9 @@ impl PreCommitUploads {
 }
 
 impl Drop for PreCommitUploads {
-    /// Schedules exact cleanup when cancellation interrupts a known-uncommitted stage.
+    /// Retains remote evidence when cancellation interrupts a known-uncommitted stage.
     fn drop(&mut self) {
-        if !self.armed || self.paths.is_empty() {
-            return;
-        }
-        let operator = Arc::clone(&self.operator);
-        let paths = std::mem::take(&mut self.paths);
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                for path in paths {
-                    if let Err(error) = operator.delete(&path).await {
-                        tracing::error!(path, %error, "failed to clean cancelled Scribe upload");
-                    }
-                }
-            });
-        }
+        self.paths.clear();
     }
 }
 
@@ -198,9 +177,9 @@ mod tests {
 
     use crate::test_support::{SpanCaptureSubscriber, has_span_outcome};
 
-    /// Cancellation cleanup deletes only completed pre-COMMIT member identities.
+    /// Cancellation retains remote evidence and releases only local attempt identities.
     #[tokio::test]
-    async fn partial_upload_owner_cleans_exact_completed_members_on_drop() {
+    async fn partial_upload_owner_retains_remote_evidence_on_drop() {
         let operator = Arc::new(
             opendal::Operator::new(opendal::services::Memory::default())
                 .expect("memory operator")
@@ -221,19 +200,12 @@ mod tests {
             .write(unrelated, bytes::Bytes::from_static(b"unrelated"))
             .await
             .expect("unrelated upload");
-        let mut uploads = super::PreCommitUploads::new(Arc::clone(&operator), 2);
+        let mut uploads = super::PreCommitUploads::new(2);
         uploads.record(first.to_owned());
         uploads.record(second.to_owned());
         drop(uploads);
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while operator.exists(first).await.expect("first existence")
-                || operator.exists(second).await.expect("second existence")
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("cancellation cleanup");
+        assert!(operator.exists(first).await.expect("first existence"));
+        assert!(operator.exists(second).await.expect("second existence"));
         assert!(
             operator
                 .exists(unrelated)
@@ -422,7 +394,7 @@ pub struct ScribeCommitAttempt {
     pub(crate) artifacts: Option<BoundedParquetArtifactSet>,
     /// Shared Scribe owner poisoned if the attempt is abandoned unsettled.
     pub(crate) memory: Option<ScribeResources>,
-    /// Checked delta completing the immutable charge into one 256 MiB owner.
+    /// Checked delta completing the immutable charge into one governed immutable owner.
     pub(crate) parquet_owner: Option<ScribeMemoryLease>,
     /// Production owner that completes immutable retirement after reconciliation.
     pub(crate) completion: Option<ScribeCommitCompletion>,
@@ -625,7 +597,9 @@ impl SealDriver {
         })?;
         let mut parquet_owner = memory.try_reserve_maintenance(
             MemoryCategory::Persistence,
-            parquet_producer_delta(frozen.arrow_bytes)?,
+            parquet_candidate_incremental_bytes(
+                crate::scribe::parquet_writer::largest_candidate_bytes(&frozen.batches)?,
+            )?,
         )?;
         info!("seal stage: WriteParquet");
         let parquet_started = std::time::Instant::now();
@@ -635,6 +609,10 @@ impl SealDriver {
             .ok_or_else(|| ScribeError::Internal {
                 detail: "Scribe output scratch is unavailable before seal encoding".to_owned(),
             })?;
+        let scratch_bytes =
+            u64::try_from(parquet_owner.bytes()).map_err(|_| ScribeError::Internal {
+                detail: "Scribe seal scratch ownership exceeds u64".to_owned(),
+            })?;
         let node_uuid = Uuid::parse_str(node_id).map_err(|error| ScribeError::Internal {
             detail: format!("node_id is not a valid UUID: {error}"),
         })?;
@@ -642,7 +620,7 @@ impl SealDriver {
             .create_scribe_generation(
                 &node_uuid.simple().to_string(),
                 frozen.seal_id,
-                256 * 1024 * 1024,
+                scratch_bytes,
             )
             .map_err(|error| ScribeError::Internal {
                 detail: format!("Scribe seal scratch admission failed: {error}"),
@@ -802,10 +780,9 @@ impl SealDriver {
         // 3. PutObject
         info!("seal stage: PutObject");
         let put_started = std::time::Instant::now();
-        let mut uploads =
-            PreCommitUploads::new(Arc::clone(&self.operator), encoded.artifacts.len());
+        let mut uploads = PreCommitUploads::new(encoded.artifacts.len());
         if let Err(error) = self.put_artifacts(&encoded, &mut uploads).await {
-            uploads.cleanup().await;
+            uploads.cleanup();
             return Err(error);
         }
         Self::record(
@@ -834,7 +811,7 @@ impl SealDriver {
         {
             Ok(outcome) => outcome,
             Err(error) => {
-                uploads.cleanup().await;
+                uploads.cleanup();
                 return Err(ScribeError::from(error));
             }
         };
@@ -899,6 +876,8 @@ impl SealDriver {
                     frozen: Box::new(frozen.clone()),
                     binding: binding.clone(),
                     tenant,
+                    candidate: None,
+                    first_ordinal: 0,
                     scratch_dir: scratch_dir.to_path_buf(),
                     object_base: object_base.to_owned(),
                     footer_reservation,
@@ -909,12 +888,6 @@ impl SealDriver {
             ScribePersistenceCpuResult::ParquetEncoded(encoded) => Ok(encoded),
             ScribePersistenceCpuResult::Prepared(_) => Err(ScribeError::Internal {
                 detail: "persistence lane returned the wrong seal result".to_owned(),
-            }),
-            ScribePersistenceCpuResult::NativeSliceProduced { .. } => Err(ScribeError::Internal {
-                detail: "persistence lane returned native slice during seal".to_owned(),
-            }),
-            ScribePersistenceCpuResult::OtlpSliceProduced { .. } => Err(ScribeError::Internal {
-                detail: "persistence lane returned OTLP slice during seal".to_owned(),
             }),
             ScribePersistenceCpuResult::ReplayRestored(_) => Err(ScribeError::Internal {
                 detail: "persistence lane returned replay output during seal".to_owned(),

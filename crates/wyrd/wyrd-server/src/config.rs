@@ -324,6 +324,15 @@ pub struct ScribeRuntimeConfig {
     /// Maximum encoded bytes accepted for one native or OTLP request.
     #[serde(default = "default_ingest_request_bytes")]
     pub ingest_request_bytes: usize,
+    /// Target bytes for one non-empty Scribe WAL segment before rotation.
+    #[serde(default = "default_scribe_wal_rotation_bytes")]
+    pub wal_rotation_bytes: u64,
+    /// Target bytes for one non-empty Scribe memtable before rotation.
+    #[serde(default = "default_scribe_memtable_rotation_bytes")]
+    pub memtable_rotation_bytes: usize,
+    /// Maximum active memtable age before rotation.
+    #[serde(default = "default_scribe_memtable_max_age_secs")]
+    pub memtable_max_age_secs: u64,
     /// Maximum field count in one canonical native IPC schema.
     #[serde(default = "default_ingest_native_fields")]
     pub ingest_native_fields: usize,
@@ -354,9 +363,6 @@ pub struct ScribeRuntimeConfig {
     /// Maximum distinct event-day partitions in one request.
     #[serde(default = "default_ingest_event_days")]
     pub ingest_event_days: usize,
-    /// Maximum simultaneous projected Arrow and IPC material bytes.
-    #[serde(default = "default_ingest_projected_bytes")]
-    pub ingest_projected_bytes: usize,
     /// Fixed WAL header and digest workspace bytes retained by an ingress root.
     #[serde(default = "default_ingest_wal_workspace_bytes")]
     pub ingest_wal_workspace_bytes: usize,
@@ -400,6 +406,15 @@ pub struct OracleRuntimeConfig {
     /// Maximum absolute time a query may wait in the local admission queues.
     #[serde(default = "default_oracle_max_queue_wait_ms")]
     pub max_queue_wait_ms: u64,
+    /// Exact delegated units requested after a complete local miss.
+    #[serde(default = "default_oracle_delegated_allocation_units")]
+    pub delegated_allocation_units: u32,
+    /// Background delegated-block renewal cadence in milliseconds.
+    #[serde(default = "default_oracle_delegated_renewal_ms")]
+    pub delegated_renewal_ms: u64,
+    /// Maximum delegated-block validity in milliseconds.
+    #[serde(default = "default_oracle_delegated_validity_ms")]
+    pub delegated_validity_ms: u64,
     /// Maximum remote workers, excluding the leader.
     #[serde(default = "default_oracle_max_workers_per_query")]
     pub max_workers_per_query: usize,
@@ -459,6 +474,20 @@ fn default_oracle_admission_waiters() -> usize {
 fn default_oracle_max_queue_wait_ms() -> u64 {
     250
 }
+/// Default exact demand amount; allocation is still bounded by durable availability.
+fn default_oracle_delegated_allocation_units() -> u32 {
+    1
+}
+/// Default renewal cadence inherited from role heartbeat membership.
+fn default_oracle_delegated_renewal_ms() -> u64 {
+    u64::try_from(vala_bifrost_redux::cluster::ROLE_HEARTBEAT_INTERVAL.as_millis())
+        .expect("role heartbeat interval fits u64 milliseconds")
+}
+/// Default maximum validity inherited from role liveness membership.
+fn default_oracle_delegated_validity_ms() -> u64 {
+    u64::try_from(vala_bifrost_redux::cluster::ROLE_LIVENESS_CUTOFF.as_millis())
+        .expect("role liveness cutoff fits u64 milliseconds")
+}
 fn default_oracle_max_workers_per_query() -> usize {
     2
 }
@@ -508,6 +537,9 @@ impl Default for OracleRuntimeConfig {
             planning_permits: default_oracle_planning_permits(),
             admission_waiters: default_oracle_admission_waiters(),
             max_queue_wait_ms: default_oracle_max_queue_wait_ms(),
+            delegated_allocation_units: default_oracle_delegated_allocation_units(),
+            delegated_renewal_ms: default_oracle_delegated_renewal_ms(),
+            delegated_validity_ms: default_oracle_delegated_validity_ms(),
             max_workers_per_query: default_oracle_max_workers_per_query(),
             max_frame_bytes: default_oracle_max_frame_bytes(),
             calibration_profile: PathBuf::new(),
@@ -522,6 +554,27 @@ impl Default for OracleRuntimeConfig {
             audit_relay_backoff_max_ms: default_audit_relay_backoff_max_ms(),
             audit_relay_shutdown_timeout_ms: default_audit_relay_shutdown_timeout_ms(),
         }
+    }
+}
+
+impl OracleRuntimeConfig {
+    /// Translates and validates the delegated-capacity lifecycle configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when allocation is zero, renewal is not shorter than
+    /// validity, or validity exceeds the Oracle role-liveness cutoff.
+    pub(crate) fn delegated_admission_config(
+        &self,
+    ) -> Result<vala_bifrost_redux::oracle::DelegatedOracleAdmissionConfig, String> {
+        vala_bifrost_redux::oracle::DelegatedOracleAdmissionConfig {
+            allocation_units: self.delegated_allocation_units,
+            renewal_interval: Duration::from_millis(self.delegated_renewal_ms),
+            validity: Duration::from_millis(self.delegated_validity_ms),
+            queue_capacity: self.admission_waiters,
+        }
+        .validate()
+        .map_err(|error| error.to_string())
     }
 }
 
@@ -1078,9 +1131,24 @@ fn default_scribe_wal_io_threads() -> usize {
     4
 }
 
-/// Returns the immutable V1 transport-request hard maximum.
+/// Returns the operator-configurable transport-request default.
 fn default_ingest_request_bytes() -> usize {
     vala_bifrost_redux::gate::limits::BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES
+}
+
+redacted
+fn default_scribe_wal_rotation_bytes() -> u64 {
+    512 * 1024 * 1024
+}
+
+redacted
+fn default_scribe_memtable_rotation_bytes() -> usize {
+    512 * 1024 * 1024
+}
+
+redacted
+fn default_scribe_memtable_max_age_secs() -> u64 {
+    600
 }
 
 /// Returns the immutable V1 native field hard maximum.
@@ -1133,11 +1201,6 @@ fn default_ingest_event_days() -> usize {
     vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS.event_days
 }
 
-/// Returns the immutable V1 projected-material hard maximum.
-fn default_ingest_projected_bytes() -> usize {
-    vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS.material_bytes
-}
-
 /// Returns the immutable V1 WAL-workspace hard maximum.
 fn default_ingest_wal_workspace_bytes() -> usize {
     vala_bifrost_redux::gate::limits::BIFROST_WAL_WORKSPACE_LIMIT_BYTES
@@ -1154,6 +1217,9 @@ impl Default for ScribeRuntimeConfig {
             event_time_past_window_secs: None,
             event_time_future_window_secs: None,
             ingest_request_bytes: default_ingest_request_bytes(),
+            wal_rotation_bytes: default_scribe_wal_rotation_bytes(),
+            memtable_rotation_bytes: default_scribe_memtable_rotation_bytes(),
+            memtable_max_age_secs: default_scribe_memtable_max_age_secs(),
             ingest_native_fields: default_ingest_native_fields(),
             ingest_native_sources: default_ingest_native_sources(),
             ingest_rows: default_ingest_rows(),
@@ -1164,7 +1230,6 @@ impl Default for ScribeRuntimeConfig {
             ingest_otlp_value_bytes: default_ingest_otlp_value_bytes(),
             ingest_otlp_value_depth: default_ingest_otlp_value_depth(),
             ingest_event_days: default_ingest_event_days(),
-            ingest_projected_bytes: default_ingest_projected_bytes(),
             ingest_wal_workspace_bytes: default_ingest_wal_workspace_bytes(),
         }
     }
@@ -1176,8 +1241,9 @@ impl ScribeRuntimeConfig {
     /// # Errors
     ///
     /// Returns a field-specific boot error when a thread or ingest bound is
-    /// zero, an ingest bound exceeds its immutable V1 maximum, or a configured
-    /// WAL disk budget is zero.
+    /// zero, a frozen cardinality bound exceeds its immutable V1 maximum, the
+    /// configured request cannot be represented by tonic/WAL v4 framing, or a
+    /// configured WAL disk budget is zero.
     pub fn validate(&self) -> Result<(), String> {
         let thread_values = [
             ("coordination_threads", self.coordination_threads),
@@ -1193,12 +1259,29 @@ impl ScribeRuntimeConfig {
         {
             return Err("scribe.wal_disk_limit_bytes must be at least 1".to_owned());
         }
+        if self.wal_rotation_bytes == 0 {
+            return Err("scribe.wal_rotation_bytes must be at least 1".to_owned());
+        }
+        if self.memtable_rotation_bytes == 0 {
+            return Err("scribe.memtable_rotation_bytes must be at least 1".to_owned());
+        }
+        if self.memtable_max_age_secs == 0 {
+            return Err("scribe.memtable_max_age_secs must be at least 1".to_owned());
+        }
+        if self.ingest_request_bytes == 0 {
+            return Err("scribe.ingest_request_bytes must be at least 1".to_owned());
+        }
+        if self.ingest_request_bytes.checked_add(64 * 1024).is_none() {
+            return Err(
+                "scribe.ingest_request_bytes plus tonic framing allowance exceeds usize".to_owned(),
+            );
+        }
+        if u32::try_from(self.ingest_request_bytes).is_err() {
+            return Err(
+                "scribe.ingest_request_bytes exceeds WAL v4 payload representability".to_owned(),
+            );
+        }
         let ingest_values = [
-            (
-                "ingest_request_bytes",
-                self.ingest_request_bytes,
-                default_ingest_request_bytes(),
-            ),
             (
                 "ingest_native_fields",
                 self.ingest_native_fields,
@@ -1246,11 +1329,6 @@ impl ScribeRuntimeConfig {
                 default_ingest_event_days(),
             ),
             (
-                "ingest_projected_bytes",
-                self.ingest_projected_bytes,
-                default_ingest_projected_bytes(),
-            ),
-            (
                 "ingest_wal_workspace_bytes",
                 self.ingest_wal_workspace_bytes,
                 default_ingest_wal_workspace_bytes(),
@@ -1293,7 +1371,6 @@ impl ScribeRuntimeConfig {
                 value_bytes: self.ingest_otlp_value_bytes,
                 value_depth: self.ingest_otlp_value_depth,
                 event_days: self.ingest_event_days,
-                material_bytes: self.ingest_projected_bytes,
             },
             native_fields: self.ingest_native_fields,
             native_sources: self.ingest_native_sources,
@@ -3014,10 +3091,14 @@ minimum_slots = 2
     }
 
     #[test]
-    fn scribe_runtime_defaults_match_bounded_contract() {
+    fn scribe_runtime_defaults_match_configured_ingest_contract() {
         let cfg = ScribeRuntimeConfig::default();
         assert_eq!(cfg.coordination_threads, 2);
         assert_eq!(cfg.wal_disk_limit_bytes, None);
+        assert_eq!(cfg.ingest_request_bytes, 200 * 1024 * 1024);
+        assert_eq!(cfg.wal_rotation_bytes, 512 * 1024 * 1024);
+        assert_eq!(cfg.memtable_rotation_bytes, 512 * 1024 * 1024);
+        assert_eq!(cfg.memtable_max_age_secs, 600);
         assert_eq!(
             cfg.ingest_limits(),
             vala_bifrost_redux::gate::limits::IngestLimits::default()
@@ -3025,28 +3106,89 @@ minimum_slots = 2
         cfg.validate().expect("resolved defaults must validate");
     }
 
+    /// Rejects every independently configurable Scribe bound before boot.
+    ///
+    /// # Panics
+    ///
+    /// Panics when validation accepts an invalid value or fails to identify its
+    /// owning configuration field.
     #[test]
-    fn scribe_runtime_rejects_zero_and_small_bounds() {
-        let cfg = ScribeRuntimeConfig {
-            persistence_cpu_threads: 0,
+    fn scribe_runtime_rejects_every_invalid_configured_bound() {
+        macro_rules! assert_rejected {
+            ($field:ident, $value:expr) => {{
+                let mut config = ScribeRuntimeConfig::default();
+                config.$field = $value;
+                let error = config
+                    .validate()
+                    .expect_err(concat!(stringify!($field), " must be rejected"));
+                assert!(error.contains(stringify!($field)), "{error}");
+            }};
+        }
+        assert_rejected!(coordination_threads, 0);
+        assert_rejected!(ingress_cpu_threads, 0);
+        assert_rejected!(persistence_cpu_threads, 0);
+        assert_rejected!(wal_io_threads, 0);
+        assert_rejected!(wal_disk_limit_bytes, Some(0));
+        assert_rejected!(wal_rotation_bytes, 0);
+        assert_rejected!(memtable_rotation_bytes, 0);
+        assert_rejected!(memtable_max_age_secs, 0);
+        assert_rejected!(ingest_request_bytes, 0);
+        assert_rejected!(ingest_native_fields, 0);
+        assert_rejected!(ingest_native_sources, 0);
+        assert_rejected!(ingest_rows, 0);
+        assert_rejected!(ingest_otlp_resources, 0);
+        assert_rejected!(ingest_otlp_scopes, 0);
+        assert_rejected!(ingest_otlp_records, 0);
+        assert_rejected!(ingest_otlp_attributes, 0);
+        assert_rejected!(ingest_otlp_value_bytes, 0);
+        assert_rejected!(ingest_otlp_value_depth, 0);
+        assert_rejected!(ingest_event_days, 0);
+        assert_rejected!(ingest_wal_workspace_bytes, 0);
+        assert_rejected!(ingest_native_fields, default_ingest_native_fields() + 1);
+        assert_rejected!(ingest_native_sources, default_ingest_native_sources() + 1);
+        assert_rejected!(ingest_rows, default_ingest_rows() + 1);
+        assert_rejected!(ingest_otlp_resources, default_ingest_otlp_resources() + 1);
+        assert_rejected!(ingest_otlp_scopes, default_ingest_otlp_scopes() + 1);
+        assert_rejected!(ingest_otlp_records, default_ingest_otlp_records() + 1);
+        assert_rejected!(ingest_otlp_attributes, default_ingest_otlp_attributes() + 1);
+        assert_rejected!(
+            ingest_otlp_value_bytes,
+            default_ingest_otlp_value_bytes() + 1
+        );
+        assert_rejected!(
+            ingest_otlp_value_depth,
+            default_ingest_otlp_value_depth() + 1
+        );
+        assert_rejected!(ingest_event_days, default_ingest_event_days() + 1);
+        assert_rejected!(
+            ingest_wal_workspace_bytes,
+            default_ingest_wal_workspace_bytes() + 1
+        );
+        assert_rejected!(ingest_request_bytes, usize::MAX);
+        #[cfg(target_pointer_width = "64")]
+        assert_rejected!(ingest_request_bytes, u32::MAX as usize + 1);
+    }
+
+    /// Proves the 200 MiB request value is a default rather than a hard cap.
+    #[test]
+    fn scribe_runtime_propagates_supported_request_above_default() {
+        let request_bytes = default_ingest_request_bytes() + 1024 * 1024;
+        let config = ScribeRuntimeConfig {
+            ingest_request_bytes: request_bytes,
             ..ScribeRuntimeConfig::default()
         };
-        assert!(cfg.validate().is_err());
+        config
+            .validate()
+            .expect("supported request above the default must validate");
 
-        let mut cfg = ScribeRuntimeConfig::default();
-        cfg.wal_disk_limit_bytes = Some(0);
-        assert!(cfg.validate().is_err());
-
-        let mut cfg = ScribeRuntimeConfig::default();
-        cfg.ingest_otlp_resources = 0;
-        assert!(cfg.validate().is_err());
-
-        let mut cfg = ScribeRuntimeConfig::default();
-        cfg.ingest_native_fields = vala_bifrost_redux::gate::limits::BIFROST_NATIVE_FIELD_LIMIT + 1;
-        assert!(cfg.validate().is_err());
+        let limits = config.ingest_limits();
+        assert_eq!(limits.max_frame_bytes, request_bytes);
+        assert_eq!(limits.max_decoding_message_size, request_bytes + 64 * 1024);
+        assert_eq!(limits.otlp.request_bytes, request_bytes);
     }
 
     /// Proves one lower operator limit is frozen into the shared Gate/Scribe snapshot.
+    /// Proves configured lower ingest bounds remain identical across Gate and Scribe.
     #[test]
     fn scribe_runtime_freezes_lower_ingest_limits() {
         let config = ScribeRuntimeConfig {
@@ -3061,7 +3203,6 @@ minimum_slots = 2
             ingest_otlp_value_bytes: 512,
             ingest_otlp_value_depth: 3,
             ingest_event_days: 2,
-            ingest_projected_bytes: 4096,
             ingest_wal_workspace_bytes: 256,
             ..ScribeRuntimeConfig::default()
         };
@@ -3079,7 +3220,6 @@ minimum_slots = 2
         assert_eq!(frozen.otlp.value_bytes, 512);
         assert_eq!(frozen.otlp.value_depth, 3);
         assert_eq!(frozen.otlp.event_days, 2);
-        assert_eq!(frozen.otlp.material_bytes, 4096);
         assert_eq!(frozen.wal_workspace_bytes, 256);
     }
 
@@ -3880,5 +4020,44 @@ minimum_slots = 2
                 .expect_err("class allocations exceeding usable slots must fail closed")
                 .contains("exceeds usable slots")
         );
+    }
+
+    /// Delegated admission defaults remain tied to role membership timing.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the production defaults violate their locked relationship.
+    #[test]
+    fn delegated_admission_defaults_follow_role_liveness() {
+        let runtime = OracleRuntimeConfig::default();
+        let delegated = runtime
+            .delegated_admission_config()
+            .expect("default delegated admission is valid");
+        assert_eq!(
+            delegated.renewal_interval,
+            vala_bifrost_redux::cluster::ROLE_HEARTBEAT_INTERVAL
+        );
+        assert_eq!(
+            delegated.validity,
+            vala_bifrost_redux::cluster::ROLE_LIVENESS_CUTOFF
+        );
+    }
+
+    /// Zero, inverted, and over-liveness timing configurations fail closed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any invalid configuration is accepted.
+    #[test]
+    fn delegated_admission_rejects_invalid_timing() {
+        let mut runtime = OracleRuntimeConfig::default();
+        runtime.delegated_allocation_units = 0;
+        assert!(runtime.delegated_admission_config().is_err());
+        runtime.delegated_allocation_units = 1;
+        runtime.delegated_renewal_ms = runtime.delegated_validity_ms;
+        assert!(runtime.delegated_admission_config().is_err());
+        runtime.delegated_renewal_ms = 1;
+        runtime.delegated_validity_ms = default_oracle_delegated_validity_ms() + 1;
+        assert!(runtime.delegated_admission_config().is_err());
     }
 }

@@ -98,6 +98,9 @@ wyrd-telemetry = { workspace = true }
 wyrd-utils = { workspace = true, features = ["python"], optional = true }
 wyrd-tls = { workspace = true }
 
+[dev-dependencies]
+metrics = { workspace = true }
+
 [[bench]]
 name = "bench_bifrost_scribe"
 harness = false

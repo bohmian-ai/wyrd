@@ -1855,6 +1855,7 @@ impl ScribeTailReader {
                 start_day: event_day,
                 end_day: event_day,
                 after_lsn: WalLsn::ZERO,
+                persisted_lsn_ranges: Vec::new(),
                 required_columns: Vec::new(),
                 max_batches: self.config.max_page_rows as usize,
                 max_retained_bytes: pending.payload_limit,
@@ -2325,6 +2326,11 @@ pub struct FetchLiveTailRequest {
     pub end_day: EventDay,
     /// Emit only records with `LSN > after_lsn`.
     pub after_lsn: WalLsn,
+    /// Manifest-pinned inclusive WAL ranges already owned by persisted files.
+    ///
+    /// Each range suppresses only its cohort member, so an independently
+    /// published later member cannot hide an earlier hot member.
+    pub persisted_lsn_ranges: Vec<(WalLsn, WalLsn)>,
     /// Columns required by Oracle filters, ordering, tripwire, and projection.
     pub required_columns: Vec<String>,
     /// Maximum shallow Arrow batches materialized by the snapshot.

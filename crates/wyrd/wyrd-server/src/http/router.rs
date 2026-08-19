@@ -108,6 +108,10 @@ where
         .layer(crate::http::middleware::body_limit::wyrd_body_limit(
             state.limits.body_bytes,
             state
+                .bifrost_gate
+                .as_ref()
+                .map(|gate| gate.otlp_decoding_message_size()),
+            state
                 .bifrost_resources
                 .as_ref()
                 .map(vala_bifrost_redux::resources::BifrostRoleResources::transport_admission),

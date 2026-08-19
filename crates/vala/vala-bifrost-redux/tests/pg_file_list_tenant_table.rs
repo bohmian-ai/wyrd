@@ -853,7 +853,7 @@ mod pg_tests {
             ClusterNodeId::new(actor_node.as_uuid()),
         );
         let replacement = async {
-            barrier.wait_until_acquired().await;
+            barrier.wait_before_publication().await;
             replacement_signal.notify_one();
             replacement_registry
                 .reserve_scribe(
@@ -870,7 +870,7 @@ mod pg_tests {
         let controller = async {
             replacement_started.notified().await;
             tokio::task::yield_now().await;
-            barrier.release();
+            barrier.release_before_publication();
         };
         let audit_events = [audit_event()];
         let publication = insert_and_audit_fenced_with_barrier(

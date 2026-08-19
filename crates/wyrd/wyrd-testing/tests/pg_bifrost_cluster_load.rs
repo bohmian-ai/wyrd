@@ -34,7 +34,7 @@ fn bifrost_cluster_task_contract_is_exact() {
         assert_eq!(
             *command,
             format!(
-                "cargo test --locked -p wyrd-testing --test integration -- {filter} --ignored --test-threads=1"
+                "cargo test --locked -p wyrd-testing --test cluster -- {filter} --ignored --test-threads=1"
             )
         );
     }

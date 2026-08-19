@@ -213,6 +213,11 @@ impl BifrostHarness {
                 ),
                 resources: scribe_resources,
                 ingest_limits: vala_bifrost_redux::gate::limits::IngestLimits::default(),
+                wal_rotation_bytes: WalConfig::default().segment_bytes,
+                memtable_rotation_bytes:
+                    vala_bifrost_redux::scribe::memtable::MEMTABLE_ROTATION_BYTES,
+                memtable_max_age: vala_bifrost_redux::scribe::ScribePressureConfig::default()
+                    .seal_max_age,
                 staging_file_publisher: None,
             });
             scribes.push(Arc::new(scribe));

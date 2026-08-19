@@ -45,7 +45,8 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
     AuditDecision, AuditEvent, AuditResult, AuthMethod, BifrostQueryRequest, EventDay,
-    FreshnessPolicy, QueryTerminalErrorCode, QueryTerminalOutcome, QueryWarning, VisibilityMode,
+    FreshnessPolicy, QueryClass, QueryTerminalErrorCode, QueryTerminalOutcome, QueryWarning,
+    VisibilityMode,
 };
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_testing::bifrost::{
@@ -947,6 +948,10 @@ async fn pg_bifrost_oracle_capacity_contract_journey() {
     let oracle = governor.oracle().expect("Oracle resource capability");
     let retained = oracle
         .try_acquire_query(vala_bifrost_redux::resources::OracleResourceRequest {
+            query_class: QueryClass::Interactive,
+            memory_bytes: vala_bifrost_redux::resources::ORACLE_PARTITION_MEMORY_BYTES,
+            scratch_bytes: vala_bifrost_redux::resources::ORACLE_PARTITION_MEMORY_BYTES as u64,
+            slot_units: 1,
             local_ratio: 1.0,
         })
         .expect("retain the complete Oracle child budget");
@@ -1668,6 +1673,10 @@ async fn oracle_heartbeat_survives_capacity_refusals() {
     let oracle = governor.oracle().expect("Oracle resource capability");
     let retained = oracle
         .try_acquire_query(vala_bifrost_redux::resources::OracleResourceRequest {
+            query_class: QueryClass::Interactive,
+            memory_bytes: vala_bifrost_redux::resources::ORACLE_PARTITION_MEMORY_BYTES,
+            scratch_bytes: vala_bifrost_redux::resources::ORACLE_PARTITION_MEMORY_BYTES as u64,
+            slot_units: 1,
             local_ratio: 1.0,
         })
         .expect("retain Oracle capacity during heartbeat proof");
@@ -2216,6 +2225,7 @@ async fn public_grpc_without_oracle_is_unavailable() {
             oracle: None,
             role_timing: None,
         }],
+        ..BifrostClusterSpec::one_mixed()
     };
     assert!(WyrdTestCluster::start_spec(spec).await.is_err());
 }

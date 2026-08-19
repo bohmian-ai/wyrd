@@ -86,6 +86,10 @@ pub struct RegisteredRole {
 /// Immutable projection of ready, live cluster role leases.
 #[derive(Debug, Clone, Default)]
 pub struct ClusterSnapshot {
+    /// Database-observation time represented by this immutable membership cut.
+    observed_at: chrono::DateTime<Utc>,
+    /// Whether construction received the same role identity more than once.
+    duplicate_roles: bool,
     /// Ready, fresh leases keyed by their composite node and closed role values.
     roles: HashMap<SnapshotKey, ClusterRoleLease>,
 }
@@ -129,12 +133,38 @@ impl ClusterSnapshot {
     /// Builds an immutable snapshot from already validated live leases.
     #[must_use]
     pub fn new(roles: Vec<ClusterRoleLease>) -> Self {
+        Self::observed(roles, Utc::now())
+    }
+
+    /// Builds an immutable snapshot with its authoritative observation time.
+    #[must_use]
+    pub fn observed(roles: Vec<ClusterRoleLease>, observed_at: chrono::DateTime<Utc>) -> Self {
+        let duplicate_roles = roles.len()
+            != roles
+                .iter()
+                .map(|lease| SnapshotKey::from(lease.key))
+                .collect::<std::collections::HashSet<_>>()
+                .len();
         Self {
+            observed_at,
+            duplicate_roles,
             roles: roles
                 .into_iter()
                 .map(|lease| (SnapshotKey::from(lease.key), lease))
                 .collect(),
         }
+    }
+
+    /// Returns when this immutable membership projection was observed.
+    #[must_use]
+    pub const fn observed_at(&self) -> chrono::DateTime<Utc> {
+        self.observed_at
+    }
+
+    /// Reports whether the source projection contained a duplicate role identity.
+    #[must_use]
+    pub const fn has_duplicate_roles(&self) -> bool {
+        self.duplicate_roles
     }
 
     /// Returns the live Scribe projection without relying on a positional role order.

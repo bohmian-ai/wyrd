@@ -167,12 +167,6 @@ const RECORD_FLAG_COMMIT: u32 = 2;
 const WAL_RECOVERY_FILE_LIMIT: usize = 4_096;
 /// Maximum UTF-8 path length accepted for one eligible recovery file.
 const WAL_RECOVERY_PATH_LIMIT: usize = 4_096;
-redacted
-const WAL_RECOVERY_FILE_BYTES_LIMIT: u64 = 128 * 1024 * 1024;
-/// Maximum single record payload admitted by V1 recovery.
-const WAL_RECOVERY_RECORD_BYTES_LIMIT: usize = 128 * 1024 * 1024;
-/// Maximum aggregate eligible WAL bytes admitted during one startup recovery.
-const WAL_RECOVERY_TOTAL_BYTES_LIMIT: u64 = 64 * 1024 * 1024 * 1024;
 
 impl SegmentHeader {
     /// Construct a new segment header.
@@ -386,7 +380,7 @@ impl WalConfig {
 impl Default for WalConfig {
     fn default() -> Self {
         Self {
-            segment_bytes: 64 * 1024 * 1024,
+            segment_bytes: 512 * 1024 * 1024,
             disk_limit_bytes: None,
         }
     }
@@ -401,6 +395,10 @@ pub(crate) struct PreparedWalAppend {
     pub(crate) data: Bytes,
     pub(crate) seal_key: Option<SealKey>,
     pub(crate) schema_fingerprint: [u8; 32],
+    /// Stable logical Arrow digest excluding volatile managed correlation columns.
+    pub(crate) logical_data_digest: [u8; 32],
+    /// Stable logical Arrow buffer length covered by `logical_data_digest`.
+    pub(crate) logical_data_len: u32,
     pub(crate) shard_id: Option<u8>,
     /// Ordered ordinal assigned by the preprocessor before WAL allocation.
     pub(crate) slice_index: u32,
@@ -434,6 +432,8 @@ impl PreparedWalAppend {
             data,
             seal_key: None,
             schema_fingerprint: [0; 32],
+            logical_data_digest: [0; 32],
+            logical_data_len: 0,
             shard_id: None,
             slice_index: 0,
             slice_count: 1,
@@ -456,6 +456,8 @@ impl PreparedWalAppend {
             data: Bytes::new(),
             seal_key: None,
             schema_fingerprint: [0; 32],
+            logical_data_digest: [0; 32],
+            logical_data_len: 0,
             shard_id: None,
             slice_index: slice_count,
             slice_count,
@@ -470,10 +472,45 @@ impl PreparedWalAppend {
         self
     }
 
+    /// Attaches the stable logical Arrow identity computed before WAL append.
+    pub(crate) fn with_logical_data_identity(mut self, digest: [u8; 32], len: u32) -> Self {
+        self.logical_data_digest = digest;
+        self.logical_data_len = len;
+        self
+    }
+
     /// Updates the ordinal after batch splitting fixes the complete slice count.
     pub(crate) fn assign_slice_ordinal(&mut self, slice_index: u32, slice_count: u32) {
         self.slice_index = slice_index;
         self.slice_count = slice_count;
+    }
+
+    /// Computes the exact retained retry identity without allocating a WAL payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal invariant error when the prepared slice lacks its
+    /// self-describing key or a fixed-width WAL-v4 field cannot represent it.
+    pub(crate) fn payload_identity(&self) -> Result<ScribeAppendPayloadIdentity, ScribeError> {
+        if self.commit_digest.is_some() {
+            return Err(ScribeError::Internal {
+                detail: "terminal WAL COMMIT has no retained slice identity".to_owned(),
+            });
+        }
+        let _seal_key = self
+            .seal_key
+            .as_ref()
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "prepared WAL append is missing its self-describing seal key".to_owned(),
+            })?;
+        Ok(ScribeAppendPayloadIdentity {
+            batch_id: self.batch_id,
+            schema_fingerprint: self.schema_fingerprint,
+            data_digest: self.logical_data_digest,
+            data_len: self.logical_data_len,
+            slice_index: self.slice_index,
+            slice_count: self.slice_count,
+        })
     }
 
     fn assign_lsn(&mut self, lsn: WalLsn) {
@@ -536,6 +573,21 @@ impl PreparedWalAppend {
             })
     }
 
+    /// Returns the exact uncompressed v4 packet payload length.
+    ///
+    /// This includes the self-describing seal-key, schema, audit, and Arrow
+    /// fields that are part of the durable packet. Rotation must use this
+    /// value rather than a JSON or audit-plus-Arrow proxy so live projection
+    /// and replay apply identical packet semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when a self-describing field exceeds
+    /// its v4 width or checked packet-length arithmetic overflows.
+    pub(crate) fn uncompressed_len(&self) -> Result<usize, ScribeError> {
+        self.payload_len()
+    }
+
     /// Returns the exact payload length without materializing the payload.
     ///
     /// # Errors
@@ -581,82 +633,6 @@ impl PreparedWalAppend {
             .saturating_add(usize::try_from(audit_len).expect("invariant: u32 fits usize"))
             .saturating_add(usize::try_from(data_len).expect("invariant: u32 fits usize"));
         Ok(payload_len)
-    }
-
-    /// Computes the exact v4 payload identity without materializing a payload copy.
-    ///
-    /// This is used to bind post-COMMIT native regeneration to the bytes that
-    /// were durably accepted. The digest covers the same ordered fields as the
-    /// production borrowed writer while the returned length is the checked
-    /// self-describing payload length.
-    ///
-    /// # Errors
-    ///
-    /// Returns an internal invariant error when required slice metadata is
-    /// absent, a fixed-width field overflows, or checked payload sizing fails.
-    pub(crate) fn payload_identity(&self) -> Result<([u8; 32], u32), ScribeError> {
-        let payload_len =
-            u32::try_from(self.payload_len()?).map_err(|_| ScribeError::Internal {
-                detail: "WAL v4 payload exceeds its u32 record bound".to_owned(),
-            })?;
-        let mut digest = Sha256::new();
-        if let Some(commit_digest) = self.commit_digest.as_ref() {
-            digest.update(commit_digest);
-            return Ok((digest.finalize().into(), payload_len));
-        }
-        let seal_key = self
-            .seal_key
-            .as_ref()
-            .ok_or_else(|| ScribeError::Internal {
-                detail: "prepared WAL append is missing its self-describing seal key".to_owned(),
-            })?;
-        let namespace = seal_key.table.namespace.as_str().as_bytes();
-        let name = seal_key.table.name.as_bytes();
-        let tenant_id = *seal_key.tenant.as_uuid().as_bytes();
-        let table_len = u16::try_from(namespace.len() + 1 + name.len())
-            .map_err(|_| ScribeError::Internal {
-                detail: "WAL table FQN exceeds v3 payload limits".to_owned(),
-            })?
-            .to_le_bytes();
-        let mut day = FixedText::<16>::new();
-        write!(day, "{}", seal_key.day.as_date().format("%Y-%m-%d")).map_err(|_| {
-            ScribeError::Internal {
-                detail: "WAL partition day exceeds v3 payload limits".to_owned(),
-            }
-        })?;
-        let day_len = [
-            u8::try_from(day.as_bytes().len()).map_err(|_| ScribeError::Internal {
-                detail: "WAL partition day exceeds v3 payload limits".to_owned(),
-            })?,
-        ];
-        let audit_len = u32::try_from(self.audit.len())
-            .map_err(|_| ScribeError::Internal {
-                detail: "WAL audit payload exceeds v3 payload limits".to_owned(),
-            })?
-            .to_le_bytes();
-        let data_len = u32::try_from(self.data.len())
-            .map_err(|_| ScribeError::Internal {
-                detail: "WAL Arrow payload exceeds v3 payload limits".to_owned(),
-            })?
-            .to_le_bytes();
-        for part in [
-            SLICE_PAYLOAD_MAGIC.as_slice(),
-            tenant_id.as_slice(),
-            table_len.as_slice(),
-            namespace,
-            b".".as_slice(),
-            name,
-            day_len.as_slice(),
-            day.as_bytes(),
-            self.schema_fingerprint.as_slice(),
-            audit_len.as_slice(),
-            self.audit.as_ref(),
-            data_len.as_slice(),
-            self.data.as_ref(),
-        ] {
-            digest.update(part);
-        }
-        Ok((digest.finalize().into(), payload_len))
     }
 }
 
@@ -2129,6 +2105,68 @@ impl WalHandle {
         self.writer.append_prepared(append)
     }
 
+    /// Returns this shard generation's current encoded WAL occupancy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the fixed shard state is poisoned.
+    pub(crate) fn current_segment_bytes(&self) -> Result<u64, ScribeError> {
+        let state = self.writer.states[usize::from(self.shard_id)]
+            .lock()
+            .map_err(|_| ScribeError::Internal {
+                detail: "WAL state lock poisoned (current segment bytes)".to_owned(),
+            })?;
+        Ok(state.current_segment_size)
+    }
+
+    /// Reports whether the current shard generation contains accepted WAL records.
+    ///
+    /// This is intentionally separate from byte occupancy: a segment header is
+    /// created before the first record, while rotation age applies only after a
+    /// non-empty generation exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the fixed shard state is poisoned.
+    pub(crate) fn has_active_records(&self) -> Result<bool, ScribeError> {
+        let state = self.writer.states[usize::from(self.shard_id)]
+            .lock()
+            .map_err(|_| ScribeError::Internal {
+                detail: "WAL state lock poisoned (active record check)".to_owned(),
+            })?;
+        Ok(state.current_segment_records > 0)
+    }
+
+    /// Fsyncs and closes this shard's non-empty active WAL generation.
+    ///
+    /// The returned segment is detached from the append stream but remains on
+    /// disk until the shard rotation cohort releases its sole retirement ref.
+    /// Empty streams return `None` and create no retirement owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns the fixed-shard state-lock or segment-fsync error. The stream is
+    /// left open when fsync fails.
+    pub(crate) fn close_active_generation(&self) -> Result<Option<WalSegmentRef>, ScribeError> {
+        let mut state = self.writer.states[usize::from(self.shard_id)]
+            .lock()
+            .map_err(|_| ScribeError::Internal {
+                detail: "WAL state lock poisoned (close active generation)".to_owned(),
+            })?;
+        let Some(segment) = state.current_segment.as_ref() else {
+            return Ok(None);
+        };
+        if state.current_segment_records == 0 {
+            return Ok(None);
+        }
+        segment.sync_data()?;
+        let reference = segment.reference();
+        state.current_segment = None;
+        state.current_segment_size = 0;
+        state.current_segment_records = 0;
+        Ok(Some(reference))
+    }
+
     pub(crate) fn sync_segments(&self, segments: &[Arc<WalSegment>]) -> Result<(), ScribeError> {
         match self.writer.sync_segments_with_fault(segments) {
             Ok(()) => Ok(()),
@@ -2357,6 +2395,44 @@ impl WalWriter {
     #[must_use]
     pub fn base_dir(&self) -> &Path {
         &self.base_dir
+    }
+
+    /// Reserves exact durable growth for a Scribe staged artifact lifecycle.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed internal refusal when the registered WAL volume cannot
+    /// admit the exact staged bytes.
+    pub(crate) fn reserve_staged_growth(
+        &self,
+        bytes: u64,
+    ) -> Result<Option<crate::resources::WalVolumeGrowth>, ScribeError> {
+        self.volume
+            .as_ref()
+            .map(|volume| {
+                volume
+                    .try_reserve_growth(bytes)
+                    .map_err(|error| ScribeError::Internal {
+                        detail: format!("reserve Scribe staged WAL-volume growth: {error}"),
+                    })
+            })
+            .transpose()
+    }
+
+    /// Releases exact staged occupancy after local removal and directory fsync.
+    ///
+    /// # Errors
+    ///
+    /// Returns poison when registered durable ownership cannot cover the bytes.
+    pub(crate) fn retire_staged_bytes(&self, bytes: u64) -> Result<(), ScribeError> {
+        if let Some(volume) = &self.volume {
+            volume
+                .retire(bytes)
+                .map_err(|error| ScribeError::Internal {
+                    detail: format!("retire Scribe staged WAL-volume bytes: {error}"),
+                })?;
+        }
+        Ok(())
     }
 
     /// Trip the concrete WAL disk breaker for deterministic failure-path
@@ -3169,9 +3245,11 @@ impl ShardRecordCursor {
         let Some(header) = self.header.take() else {
             return Ok(None);
         };
-        if header.payload_bytes() > WAL_RECOVERY_RECORD_BYTES_LIMIT {
+        if governor.is_some_and(|governor| {
+            header.payload_bytes() > governor.maximum_ingress_envelope_bytes()
+        }) {
             return Err(ScribeError::IngestBusy {
-                table: "WAL recovery record".to_owned(),
+                table: "WAL recovery segment".to_owned(),
             });
         }
         // The fixed header is validated before this reservation. Holding the
@@ -3381,7 +3459,6 @@ impl WalReader {
             });
         }
         let mut paths = Vec::new();
-        let mut aggregate_bytes = 0_u64;
         for entry in std::fs::read_dir(&node_dir).map_err(|error| ScribeError::Internal {
             detail: format!("failed to read WAL node directory: {error}"),
         })? {
@@ -3401,7 +3478,7 @@ impl WalReader {
             if epoch >= current.writer_epoch.as_i64() {
                 continue;
             }
-            collect_bounded_segment_paths(&entry.path(), &mut paths, &mut aggregate_bytes)?;
+            collect_bounded_segment_paths(&entry.path(), &mut paths)?;
         }
         Self::open_paths(paths, Some(*current.node_id.as_uuid().as_bytes()))
     }
@@ -3633,17 +3710,13 @@ fn collect_segment_paths(dir: &Path, paths: &mut Vec<PathBuf>) -> Result<(), Scr
     Ok(())
 }
 
-/// Collects eligible WAL paths within fixed V1 recovery limits.
+/// Collects eligible WAL paths within structural V1 recovery limits.
 ///
 /// # Errors
 ///
 /// Returns [`ScribeError`] for filesystem failures or when file count, path,
-/// individual size, or aggregate recovery-byte bounds are exceeded.
-fn collect_bounded_segment_paths(
-    dir: &Path,
-    paths: &mut Vec<PathBuf>,
-    aggregate_bytes: &mut u64,
-) -> Result<(), ScribeError> {
+/// or path bounds are exceeded.
+fn collect_bounded_segment_paths(dir: &Path, paths: &mut Vec<PathBuf>) -> Result<(), ScribeError> {
     for entry in std::fs::read_dir(dir).map_err(|error| ScribeError::Internal {
         detail: format!("failed to read eligible WAL directory: {error}"),
     })? {
@@ -3652,7 +3725,7 @@ fn collect_bounded_segment_paths(
         })?;
         let path = entry.path();
         if path.is_dir() {
-            collect_bounded_segment_paths(&path, paths, aggregate_bytes)?;
+            collect_bounded_segment_paths(&path, paths)?;
             continue;
         }
         if path.extension().and_then(|extension| extension.to_str()) != Some("wal") {
@@ -3668,28 +3741,6 @@ fn collect_bounded_segment_paths(
                 table: "WAL recovery file inventory".to_owned(),
             });
         }
-        let file_bytes = entry
-            .metadata()
-            .map_err(|error| ScribeError::Internal {
-                detail: format!("failed to inspect eligible WAL file: {error}"),
-            })?
-            .len();
-        if file_bytes > WAL_RECOVERY_FILE_BYTES_LIMIT {
-            return Err(ScribeError::IngestBusy {
-                table: "WAL recovery segment".to_owned(),
-            });
-        }
-        *aggregate_bytes =
-            aggregate_bytes
-                .checked_add(file_bytes)
-                .ok_or_else(|| ScribeError::Internal {
-                    detail: "WAL recovery byte inventory overflow".to_owned(),
-                })?;
-        if *aggregate_bytes > WAL_RECOVERY_TOTAL_BYTES_LIMIT {
-            return Err(ScribeError::IngestBusy {
-                table: "WAL recovery bytes".to_owned(),
-            });
-        }
         paths.push(path);
     }
     Ok(())
@@ -3703,6 +3754,20 @@ fn collect_bounded_segment_paths(
 pub struct ScribeAppendMeta {
     /// Opaque batch ID for dedup.
     pub batch_id: [u8; 16],
+    /// Stable Arrow schema identity for logical retry comparison.
+    pub schema_fingerprint: [u8; 32],
+    /// SHA-256 digest of canonical Arrow data, excluding volatile audit bytes.
+    pub data_digest: [u8; 32],
+    /// Canonical Arrow data length, excluding volatile audit bytes.
+    pub data_len: u32,
+    /// SHA-256 digest of the exact WAL-v4 slice payload.
+    pub payload_digest: [u8; 32],
+    /// Exact WAL-v4 slice payload length.
+    pub payload_len: u32,
+    /// Zero-based ordinal in the committed batch slice set.
+    pub slice_index: u32,
+    /// Complete committed batch slice count.
+    pub slice_count: u32,
     /// Number of rows accepted in this append.
     pub rows_accepted: usize,
     /// Minimum LSN for this append's WAL records.
@@ -3711,6 +3776,23 @@ pub struct ScribeAppendMeta {
     pub wal_lsn_max: WalLsn,
     /// Canonical seal-key path components for this append.
     pub seal_key: String,
+}
+
+/// Exact retry identity retained with one active or immutable append slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScribeAppendPayloadIdentity {
+    /// Stable caller batch identity.
+    pub(crate) batch_id: [u8; 16],
+    /// Stable Arrow schema identity.
+    pub(crate) schema_fingerprint: [u8; 32],
+    /// SHA-256 digest of canonical Arrow data.
+    pub(crate) data_digest: [u8; 32],
+    /// Canonical Arrow data length.
+    pub(crate) data_len: u32,
+    /// Zero-based ordinal in the committed batch slice set.
+    pub(crate) slice_index: u32,
+    /// Complete committed batch slice count.
+    pub(crate) slice_count: u32,
 }
 
 /// Compute CRC32C hash of the given bytes.

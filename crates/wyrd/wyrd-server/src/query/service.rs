@@ -418,7 +418,7 @@ mod tests {
             .split("#[cfg(test)]")
             .next()
             .expect("query service has a production section");
-        for (path, source) in [
+        for (path, complete_source) in [
             ("query/service.rs", own_source),
             ("query/routes.rs", include_str!("routes.rs")),
             (
@@ -431,6 +431,10 @@ mod tests {
             ),
             ("vala_query/grpc.rs", include_str!("../vala_query/grpc.rs")),
         ] {
+            let source = complete_source
+                .split("#[cfg(test)]")
+                .next()
+                .expect("query adapter has a production section");
             for forbidden in [
                 "run_plan_query",
                 "provider_with_hot_batches",

@@ -35,6 +35,122 @@ use crate::scribe::memtable::FrozenMemtable;
 use crate::scribe::seal_key::EventDay;
 use crate::scribe::wal::ScribeAppendMeta;
 
+redacted
+const FILE_CANDIDATE_TARGET_ROWS: usize = 100 * 1024;
+
+/// One serial, seal-key-local candidate expressed as a stored-batch range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileCandidate {
+    /// First stored batch included in the candidate.
+    start: usize,
+    /// Exclusive stored-batch end.
+    end: usize,
+    /// Exact rows in the complete stored batches.
+    rows: usize,
+}
+
+/// Closes candidates before an exceeding whole batch without splitting it.
+pub(crate) fn file_candidates(batches: &[RecordBatch]) -> Vec<FileCandidate> {
+    let mut candidates = Vec::new();
+    let mut start = 0;
+    let mut rows = 0_usize;
+    for (index, batch) in batches.iter().enumerate() {
+        if rows != 0 && rows.saturating_add(batch.num_rows()) > FILE_CANDIDATE_TARGET_ROWS {
+            candidates.push(FileCandidate {
+                start,
+                end: index,
+                rows,
+            });
+            start = index;
+            rows = 0;
+        }
+        rows = rows.saturating_add(batch.num_rows());
+    }
+    if start < batches.len() {
+        candidates.push(FileCandidate {
+            start,
+            end: batches.len(),
+            rows,
+        });
+    }
+    candidates
+}
+
+impl FileCandidate {
+    /// Returns the exact Arrow memory represented by this whole-batch candidate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the candidate byte sum overflows.
+    pub(crate) fn arrow_bytes(self, batches: &[RecordBatch]) -> Result<usize, ScribeError> {
+        batches[self.start..self.end]
+            .iter()
+            .try_fold(0_usize, |sum, batch| {
+                sum.checked_add(batch.get_array_memory_size())
+                    .ok_or_else(|| ScribeError::Internal {
+                        detail: "Parquet candidate Arrow footprint overflowed".to_owned(),
+                    })
+            })
+    }
+}
+
+/// Returns the largest exact Arrow footprint among whole-batch candidates.
+///
+/// Admission shares the encoder's candidate grouping, ensuring several small
+/// batches that merge into one candidate reserve their complete peak.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::Internal`] when a candidate byte sum overflows.
+pub(crate) fn largest_candidate_bytes(batches: &[RecordBatch]) -> Result<usize, ScribeError> {
+    largest_candidate_bytes_from_facts(
+        batches
+            .iter()
+            .map(|batch| (batch.num_rows(), batch.get_array_memory_size())),
+    )
+}
+
+/// Returns the largest whole-batch candidate from row and Arrow-byte facts.
+///
+/// This is the allocation-free form of [`largest_candidate_bytes`]. Ingress
+/// and the shard owner use it before WAL mutation so their replayability check
+redacted
+///
+/// # Errors
+///
+/// Returns [`ScribeError::Internal`] when candidate row or byte arithmetic
+/// overflows.
+pub(crate) fn largest_candidate_bytes_from_facts(
+    facts: impl IntoIterator<Item = (usize, usize)>,
+) -> Result<usize, ScribeError> {
+    let mut candidate_rows = 0_usize;
+    let mut candidate_bytes = 0_usize;
+    let mut largest = 0_usize;
+    for (rows, bytes) in facts {
+        if candidate_rows != 0
+            && candidate_rows
+                .checked_add(rows)
+                .is_none_or(|projected| projected > FILE_CANDIDATE_TARGET_ROWS)
+        {
+            largest = largest.max(candidate_bytes);
+            candidate_rows = 0;
+            candidate_bytes = 0;
+        }
+        candidate_rows = candidate_rows
+            .checked_add(rows)
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "Parquet candidate row count overflowed".to_owned(),
+            })?;
+        candidate_bytes =
+            candidate_bytes
+                .checked_add(bytes)
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "Parquet candidate Arrow footprint overflowed".to_owned(),
+                })?;
+    }
+    Ok(largest.max(candidate_bytes))
+}
+
 /// Result of encoding a frozen memtable to Parquet.
 #[derive(Debug)]
 pub struct ParquetEncoded {
@@ -66,11 +182,11 @@ impl BoundedParquetArtifactSet {
     /// Returns an internal error when the encoder produced no artifacts or
     /// noncontiguous ordinals.
     pub(crate) fn encoded(artifacts: Vec<BoundedParquetArtifact>) -> Result<Self, ScribeError> {
+        let first_ordinal = artifacts.first().map_or(0, |artifact| artifact.ordinal);
         if artifacts.is_empty()
-            || artifacts
-                .iter()
-                .enumerate()
-                .any(|(ordinal, artifact)| usize::from(artifact.ordinal) != ordinal)
+            || artifacts.iter().enumerate().any(|(offset, artifact)| {
+                usize::from(artifact.ordinal) != usize::from(first_ordinal) + offset
+            })
         {
             return Err(ScribeError::Internal {
                 detail: "writer-v2 artifact set must be nonempty and contiguous".to_owned(),
@@ -247,11 +363,58 @@ pub(crate) fn encode_batch(
         frozen,
         binding,
         seal_tenant,
+        candidates: file_candidates(&frozen.batches),
+        first_ordinal: 0,
         scratch_dir,
         object_base,
         footer_reservation,
     }
     .encode()
+}
+
+/// Encodes exactly one whole-batch candidate with generation-global ordinals.
+///
+/// The caller serially owns candidate workspace and scratch, so this operation
+/// never retains encoded bytes from an earlier candidate.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::Internal`] for invalid identity, candidate bounds,
+/// Arrow materialization, scratch IO, or an invalid encoded artifact.
+pub(crate) fn encode_candidate(
+    request: CandidateEncodeRequest<'_>,
+    footer_reservation: crate::scribe::memory::EncodedFooterReservation,
+) -> Result<ParquetEncoded, ScribeError> {
+    ParquetBatchEncoder {
+        frozen: request.frozen,
+        binding: request.binding,
+        seal_tenant: request.seal_tenant,
+        candidates: vec![request.candidate],
+        first_ordinal: request.first_ordinal,
+        scratch_dir: request.scratch_dir,
+        object_base: request.object_base,
+        footer_reservation,
+    }
+    .encode()
+}
+
+/// Borrowed inputs for one candidate-local Parquet encoding operation.
+#[derive(Clone, Copy)]
+pub(crate) struct CandidateEncodeRequest<'a> {
+    /// Immutable generation containing the candidate's stored batches.
+    pub(crate) frozen: &'a FrozenMemtable,
+    /// Tenant-qualified physical table binding.
+    pub(crate) binding: &'a TenantTableBinding,
+    /// Authenticated tenant stamped into physical output.
+    pub(crate) seal_tenant: DataTenantId,
+    /// Exact whole-batch candidate encoded by this operation.
+    pub(crate) candidate: FileCandidate,
+    /// First generation-global artifact ordinal.
+    pub(crate) first_ordinal: usize,
+    /// Candidate-owned scratch directory.
+    pub(crate) scratch_dir: &'a Path,
+    /// Deterministic generation object prefix.
+    pub(crate) object_base: &'a str,
 }
 
 /// Owns one bounded Parquet encoding workflow and its footer reservation.
@@ -262,6 +425,10 @@ struct ParquetBatchEncoder<'a> {
     binding: &'a TenantTableBinding,
     /// Authenticated tenant stamped into the physical batch.
     seal_tenant: DataTenantId,
+    /// Ordered whole-batch candidates owned by this operation.
+    candidates: Vec<FileCandidate>,
+    /// First generation-global artifact ordinal assigned to this candidate.
+    first_ordinal: usize,
     /// Generation-owned scratch directory for encoded artifacts.
     scratch_dir: &'a Path,
     /// Deterministic object identity prefix for artifact ordinals.
@@ -295,8 +462,17 @@ impl ParquetBatchEncoder<'_> {
             self.footer_reservation.bytes(),
             crate::scribe::memory::PARQUET_FOOTER_CHILD_BYTES
         );
-        let sorted_batch = self.prepare_sorted_batch()?;
-        let (artifacts, row_group_stats) = self.encode_artifacts(&sorted_batch)?;
+        let mut artifacts = Vec::new();
+        let mut row_group_stats = Vec::new();
+        for candidate in &self.candidates {
+            let sorted_batch = self.prepare_sorted_candidate(*candidate)?;
+            let (mut candidate_artifacts, mut candidate_stats) = self.encode_artifacts(
+                &sorted_batch,
+                self.first_ordinal.saturating_add(artifacts.len()),
+            )?;
+            artifacts.append(&mut candidate_artifacts);
+            row_group_stats.append(&mut candidate_stats);
+        }
         Ok(ParquetEncoded {
             artifacts: BoundedParquetArtifactSet::encoded(artifacts)?,
             row_group_stats,
@@ -312,7 +488,10 @@ impl ParquetBatchEncoder<'_> {
     ///
     /// Returns [`ScribeError::Internal`] when identity, concatenation, tenant
     /// stamping, or sort-key validation fails.
-    fn prepare_sorted_batch(&self) -> Result<RecordBatch, ScribeError> {
+    fn prepare_sorted_candidate(
+        &self,
+        candidate: FileCandidate,
+    ) -> Result<RecordBatch, ScribeError> {
         if self.binding.tenant != self.seal_tenant
             || self.binding.tenant != self.frozen.seal_key.tenant
         {
@@ -331,12 +510,14 @@ impl ParquetBatchEncoder<'_> {
                 ),
             });
         }
-        let encoder_batch =
-            concat_batches(&self.frozen.schema, &self.frozen.batches).map_err(|error| {
-                ScribeError::Internal {
-                    detail: format!("failed to materialize frozen memtable for encoding: {error}"),
-                }
-            })?;
+        let encoder_batch = concat_batches(
+            &self.frozen.schema,
+            &self.frozen.batches[candidate.start..candidate.end],
+        )
+        .map_err(|error| ScribeError::Internal {
+            detail: format!("failed to materialize frozen memtable for encoding: {error}"),
+        })?;
+        debug_assert_eq!(encoder_batch.num_rows(), candidate.rows);
         let stamped_batch = stamp_tenant(&encoder_batch, self.seal_tenant)?;
         sort_batch(&stamped_batch)
     }
@@ -350,6 +531,7 @@ impl ParquetBatchEncoder<'_> {
     fn encode_artifacts(
         &self,
         sorted_batch: &RecordBatch,
+        first_ordinal: usize,
     ) -> Result<(Vec<BoundedParquetArtifact>, Vec<RowGroupStats>), ScribeError> {
         let slices = BifrostArrowLogicalSizer::slice(sorted_batch).map_err(|detail| {
             ScribeError::Internal {
@@ -365,9 +547,12 @@ impl ParquetBatchEncoder<'_> {
         let mut artifacts = Vec::with_capacity(pending.len());
         let mut row_group_stats = Vec::with_capacity(pending.len());
         while let Some(slice) = pending.pop_front() {
-            let ordinal = u16::try_from(artifacts.len()).map_err(|_| ScribeError::Internal {
-                detail: "writer-v2 artifact ordinal exceeds u16".to_owned(),
-            })?;
+            let ordinal =
+                u16::try_from(first_ordinal.saturating_add(artifacts.len())).map_err(|_| {
+                    ScribeError::Internal {
+                        detail: "writer-v2 artifact ordinal exceeds u16".to_owned(),
+                    }
+                })?;
             match self.encode_artifact(sorted_batch, slice, ordinal)? {
                 ArtifactEncodingOutcome::Accepted(artifact) => {
                     row_group_stats.extend(artifact.row_group_stats.iter().cloned());
@@ -758,7 +943,7 @@ fn extract_row_group_time_range(rg: &RowGroupMetaData) -> Result<RowGroupStats, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{RecordBatch, StringArray, TimestampMicrosecondArray};
+    use arrow::array::{NullArray, RecordBatch, StringArray, TimestampMicrosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use chrono::NaiveDate;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -769,6 +954,131 @@ mod tests {
     use crate::catalog::TableRef;
     use crate::namespaces::BifrostNamespace;
     use crate::scribe::seal_key::{EventDay, SealKey};
+
+    /// Builds one metadata-light stored batch with the requested row count.
+    fn candidate_batch(rows: usize) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("value", DataType::Null, true)])),
+            vec![Arc::new(NullArray::new(rows))],
+        )
+        .expect("candidate fixture")
+    }
+
+    /// Whole stored batches close before exceeding the row target independently
+    /// for each seal key, while an oversized first batch remains whole.
+    #[test]
+    fn whole_batch_file_candidates_preserve_writer_bounds() {
+        let first = (
+            SealKey::new(
+                DataTenantId::new_v7(),
+                TableRef::new(BifrostNamespace::Bifrost, "candidate-first"),
+                EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("first day")),
+            ),
+            vec![
+                candidate_batch(60 * 1024),
+                candidate_batch(40 * 1024),
+                candidate_batch(1),
+                candidate_batch(120 * 1024),
+                candidate_batch(2),
+            ],
+        );
+        let second = (
+            SealKey::new(
+                DataTenantId::new_v7(),
+                TableRef::new(BifrostNamespace::Bifrost, "candidate-second"),
+                EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 15).expect("second day")),
+            ),
+            vec![
+                candidate_batch(100 * 1024 - 1),
+                candidate_batch(1),
+                candidate_batch(120 * 1024),
+            ],
+        );
+        assert_ne!(first.0, second.0);
+
+        let first_candidates = file_candidates(&first.1);
+        assert_eq!(
+            first_candidates,
+            vec![
+                FileCandidate {
+                    start: 0,
+                    end: 2,
+                    rows: 100 * 1024,
+                },
+                FileCandidate {
+                    start: 2,
+                    end: 3,
+                    rows: 1,
+                },
+                FileCandidate {
+                    start: 3,
+                    end: 4,
+                    rows: 120 * 1024,
+                },
+                FileCandidate {
+                    start: 4,
+                    end: 5,
+                    rows: 2,
+                },
+            ]
+        );
+        let second_candidates = file_candidates(&second.1);
+        assert_eq!(
+            second_candidates,
+            vec![
+                FileCandidate {
+                    start: 0,
+                    end: 2,
+                    rows: 100 * 1024,
+                },
+                FileCandidate {
+                    start: 2,
+                    end: 3,
+                    rows: 120 * 1024,
+                },
+            ]
+        );
+        assert_eq!(first_candidates[0].start, 0);
+        assert_eq!(second_candidates[0].start, 0);
+        assert_eq!(first_candidates[2].rows, 120 * 1024);
+        assert_eq!(second_candidates[1].rows, 120 * 1024);
+        for (batches, candidates) in [
+            (&first.1, &first_candidates),
+            (&second.1, &second_candidates),
+        ] {
+            for candidate in candidates {
+                assert!(candidate.start < candidate.end);
+                assert_eq!(
+                    candidate.rows,
+                    batches[candidate.start..candidate.end]
+                        .iter()
+                        .map(RecordBatch::num_rows)
+                        .sum::<usize>()
+                );
+                assert!(
+                    candidate.rows <= FILE_CANDIDATE_TARGET_ROWS
+                        || candidate.end - candidate.start == 1
+                );
+            }
+        }
+        assert_eq!(
+            crate::parquet::writer_properties::PARQUET_WRITE_BATCH_ROWS,
+            8_192
+        );
+        assert_eq!(crate::parquet::memory::MAX_ROW_GROUP_ROWS, 128 * 1024);
+        assert_eq!(
+            largest_candidate_bytes_from_facts([
+                (60 * 1024, 60),
+                (40 * 1024, 40),
+                (1, 7),
+                (120 * 1024, 120),
+                (2, 9),
+            ])
+            .expect("candidate peak"),
+            120,
+            "admission reserves the complete largest grouped candidate"
+        );
+    }
 
     fn build_test_frozen(
         seal_day: NaiveDate,
@@ -804,7 +1114,7 @@ mod tests {
             seal_id: 0,
             seal_key,
             shard_id: 0,
-            schema,
+            schema: Arc::clone(&schema),
             batches: vec![batch],
             events: vec![],
             metas: vec![],
@@ -831,6 +1141,205 @@ mod tests {
         )
         .expect("writer-v2 encode");
         (scratch, encoded)
+    }
+
+    /// Builds one whole stored batch retained as one candidate input boundary.
+    fn whole_member_batch(tenant: &str, first_timestamp: i64, rows: usize) -> RecordBatch {
+        let row_count = i64::try_from(rows).expect("test row count fits i64");
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("data_tenant_id", DataType::Utf8, false),
+                Field::new(
+                    "wyrd_event_time",
+                    DataType::Timestamp(TimeUnit::Microsecond, None),
+                    false,
+                ),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec![tenant; rows])),
+                Arc::new(TimestampMicrosecondArray::from_iter_values(
+                    first_timestamp..first_timestamp + row_count,
+                )),
+            ],
+        )
+        .expect("whole member batch")
+    }
+
+    /// Proves forced selective seal publishes multiple candidates as one
+    /// contiguous deterministic artifact set.
+    #[test]
+    fn forced_seal_multi_candidate_member_has_one_deterministic_artifact_set() {
+        let tenant = DataTenantId::new_v7();
+        let tenant_string = tenant.to_string();
+        let day = NaiveDate::from_ymd_opt(2026, 7, 14).expect("test day");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("data_tenant_id", DataType::Utf8, false),
+            Field::new(
+                "wyrd_event_time",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+        ]));
+        let frozen = FrozenMemtable {
+            seal_id: 41,
+            seal_key: SealKey::new(
+                tenant,
+                TableRef::new(BifrostNamespace::Bifrost, "forced_member"),
+                EventDay::new(day),
+            ),
+            shard_id: 3,
+            schema,
+            batches: vec![
+                whole_member_batch(&tenant_string, 0, 60 * 1024),
+                whole_member_batch(&tenant_string, 60 * 1024, 50 * 1024),
+            ],
+            events: vec![],
+            metas: vec![],
+            opened_at: std::time::Instant::now(),
+            closed_at: std::time::Instant::now(),
+            arrow_bytes: 0,
+        };
+        let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
+            .expect("tenant binding");
+        let (_scratch, encoded) = encode_for_test(&frozen, &binding, tenant);
+        let facts = encoded
+            .artifacts
+            .iter()
+            .map(|artifact| (artifact.ordinal, artifact.row_count))
+            .collect::<Vec<_>>();
+        assert_eq!(facts, vec![(0, 60 * 1024), (1, 50 * 1024)]);
+    }
+
+    /// Runs one production candidate encode while retaining its scratch owner.
+    fn encode_serial_candidate_for_test(
+        frozen: &FrozenMemtable,
+        binding: &TenantTableBinding,
+        tenant: DataTenantId,
+        batch_index: usize,
+        first_ordinal: usize,
+    ) -> (tempfile::TempDir, Result<ParquetEncoded, ScribeError>) {
+        let scratch = tempfile::tempdir().expect("candidate scratch");
+        let encoded = encode_candidate(
+            CandidateEncodeRequest {
+                frozen,
+                binding,
+                seal_tenant: tenant,
+                candidate: FileCandidate {
+                    start: batch_index,
+                    end: batch_index + 1,
+                    rows: frozen.batches[batch_index].num_rows(),
+                },
+                first_ordinal,
+                scratch_dir: scratch.path(),
+                object_base: "tenant/table/member",
+            },
+            crate::scribe::memory::EncodedFooterReservation::for_test(),
+        );
+        (scratch, encoded)
+    }
+
+    /// Reads one encoded candidate and proves its tenant and timestamp order.
+    fn assert_serial_candidate(encoded: &ParquetEncoded, tenant: &str, expected_times: &[i64]) {
+        let file =
+            std::fs::File::open(&encoded.artifacts[0].scratch_path).expect("candidate artifact");
+        let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .expect("candidate parquet")
+            .build()
+            .expect("candidate reader");
+        let batch = reader
+            .next()
+            .expect("candidate row group")
+            .expect("candidate batch");
+        let times = batch
+            .column_by_name("wyrd_event_time")
+            .expect("event time")
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("timestamp column")
+            .values();
+        let tenants = batch
+            .column_by_name(DATA_TENANT_ID)
+            .expect("tenant column")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string tenant");
+        assert_eq!(times, expected_times);
+        assert!((0..tenants.len()).all(|index| tenants.value(index) == tenant));
+    }
+
+    /// Candidate-local production encoding sorts every iteration, stamps the
+    /// authenticated tenant, preserves generation-global ordinals, and refuses
+    /// a mismatched tenant before materialization.
+    #[test]
+    fn serial_candidate_encoding_preserves_sort_tenant_and_global_identity() {
+        let tenant = DataTenantId::new_v7();
+        let tenant_string = tenant.to_string();
+        let day = NaiveDate::from_ymd_opt(2026, 7, 14).expect("test day");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("data_tenant_id", DataType::Utf8, false),
+            Field::new(
+                "wyrd_event_time",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+        ]));
+        let stored_batch = |timestamps: Vec<i64>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(vec![
+                        tenant_string.as_str();
+                        timestamps.len()
+                    ])),
+                    Arc::new(TimestampMicrosecondArray::from(timestamps)),
+                ],
+            )
+            .expect("candidate batch")
+        };
+        let frozen = FrozenMemtable {
+            seal_id: 42,
+            seal_key: SealKey::new(
+                tenant,
+                TableRef::new(BifrostNamespace::Bifrost, "serial_candidates"),
+                EventDay::new(day),
+            ),
+            shard_id: 4,
+            schema: Arc::clone(&schema),
+            batches: vec![stored_batch(vec![40, 10]), stored_batch(vec![30, 20])],
+            events: vec![],
+            metas: vec![],
+            opened_at: std::time::Instant::now(),
+            closed_at: std::time::Instant::now(),
+            arrow_bytes: 0,
+        };
+        let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
+            .expect("tenant binding");
+        let (_first_scratch, first) =
+            encode_serial_candidate_for_test(&frozen, &binding, tenant, 0, 0);
+        let first = first.expect("first candidate");
+        let (_second_scratch, second) =
+            encode_serial_candidate_for_test(&frozen, &binding, tenant, 1, first.artifacts.len());
+        let second = second.expect("second candidate");
+        assert_eq!(first.artifacts[0].ordinal, 0);
+        assert_eq!(second.artifacts[0].ordinal, 1);
+        assert!(
+            first.artifacts[0]
+                .object_identity
+                .ends_with("-00000.parquet")
+        );
+        assert!(
+            second.artifacts[0]
+                .object_identity
+                .ends_with("-00001.parquet")
+        );
+        assert_serial_candidate(&first, &tenant_string, &[10, 40]);
+        assert_serial_candidate(&second, &tenant_string, &[20, 30]);
+        let (_mismatch_scratch, mismatch) =
+            encode_serial_candidate_for_test(&frozen, &binding, DataTenantId::new_v7(), 0, 0);
+        let error = mismatch.expect_err("mismatched tenant must fail closed");
+        assert!(
+            matches!(error, ScribeError::Internal { detail } if detail.contains("tenant-table binding mismatch"))
+        );
     }
 
     #[test]
@@ -987,6 +1496,13 @@ mod tests {
 
         let meta = crate::scribe::wal::ScribeAppendMeta {
             batch_id: [0u8; 16],
+            schema_fingerprint: [0; 32],
+            data_digest: [0; 32],
+            data_len: 0,
+            payload_digest: [0; 32],
+            payload_len: 0,
+            slice_index: 0,
+            slice_count: 1,
             rows_accepted: 1,
             wal_lsn_min: crate::scribe::wal::WalLsn::new(0),
             wal_lsn_max: crate::scribe::wal::WalLsn::new(0),

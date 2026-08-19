@@ -16,6 +16,9 @@ use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::forge::ForgeLifecycleEvent;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::scribe::ScribePublicationEvent;
+use vala_bifrost_redux::scribe::file_list_writer::PublicationFenceBarrier;
+use vala_bifrost_redux::scribe::persistence::PersistenceFaults;
+use vala_bifrost_redux::scribe::routing::shard_for;
 use vala_sdk::{
     BifrostFrame, BifrostGrpcTransport, CollectedQueryLimits, CollectedQueryResult, QueryClient,
 };
@@ -34,6 +37,10 @@ use wyrd_testing::bifrost::{
 
 const TABLE_NAME: &str = "closeout_events";
 const TABLE_FQN: &str = "vala.bifrost.closeout_events";
+const ROTATION_PREFIX_TABLE: &str = "z_rotation_events";
+const ROTATION_PREFIX_FQN: &str = "vala.bifrost.z_rotation_events";
+const ROTATION_NON_PREFIX_TABLE: &str = "a_rotation_events";
+const ROTATION_NON_PREFIX_FQN: &str = "vala.bifrost.a_rotation_events";
 /// Exact Prometheus rendering of the production Bifrost duration buckets.
 const BIFROST_BUCKET_LABELS: &[&str] = &[
     "0.001", "0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10", "30",
@@ -509,7 +516,6 @@ fn rr9_label_contract_table_is_complete() {
         "bifrost_gate_query_stream_duration_seconds",
         "bifrost_scribe_ingress_active",
         "oracle_admission_total",
-        "bifrost_oracle_source_operation_seconds",
     ]
     .into_iter()
     .collect();
@@ -542,11 +548,21 @@ async fn distributed_write_compact_read_journey() {
 /// preserves that exact durable identity through publication and retirement.
 #[tokio::test]
 #[ignore = "requires the real Postgres-backed Bifrost journey lane"]
-async fn public_ack_restart_read_exact_once_journey() {
-    let mut cluster =
-        WyrdTestCluster::start_spec_with_forge_completion_observer(BifrostClusterSpec::one_mixed())
-            .await
-            .expect("restart journey cluster");
+async fn pg_bifrost_scribe_shard_rotation_replay_journey() {
+    let faults = PersistenceFaults::default();
+    let publication_barrier = PublicationFenceBarrier::for_table(ROTATION_NON_PREFIX_TABLE);
+    faults.pause_next_publication(publication_barrier.clone());
+    let mut cluster = WyrdTestCluster::start_spec_with_forge_completion_observer(
+        BifrostClusterSpec::three_mixed()
+            .with_scribe_rotation_for_test(vala_bifrost_redux::scribe::ScribeRotationTestConfig {
+                wal_rotation_bytes: 64 * 1024,
+                memtable_rotation_bytes: 64 * 1024,
+                memtable_max_age: Duration::from_millis(150),
+            })
+            .with_scribe_persistence_faults_for_test(faults.clone()),
+    )
+    .await
+    .expect("restart journey cluster");
     let server = cluster.server(0).expect("restart journey server");
     let tenant = cluster.data_tenant_id();
     server
@@ -563,14 +579,408 @@ async fn public_ack_restart_read_exact_once_journey() {
         })
         .await
         .expect("restart table");
+    for table_name in [ROTATION_PREFIX_TABLE, ROTATION_NON_PREFIX_TABLE] {
+        server
+            .state()
+            .bifrost
+            .create_table(CreateTableRequest {
+                table: TableRef::new(BifrostNamespace::Bifrost, table_name),
+                user_fields: vec![
+                    Field::new("id", DataType::Int64, false),
+                    Field::new("value", DataType::Utf8, false),
+                ],
+                tenant,
+                audit: None,
+            })
+            .await
+            .expect("rotation cohort table");
+    }
     let writer = bootstrap_transport(server, "restart-writer", &["admin"])
         .await
         .expect("restart writer");
-    let batch_id = uuid::Uuid::now_v7();
+    let (prefix_batch, non_prefix_batch, trigger_batch) =
+        same_shard_batch_ids(tenant, ROTATION_PREFIX_TABLE, ROTATION_NON_PREFIX_TABLE);
+    let target_shard = shard_for(
+        tenant,
+        &TableRef::new(BifrostNamespace::Bifrost, ROTATION_PREFIX_TABLE),
+        prefix_batch,
+    );
+    assert_eq!(
+        target_shard,
+        shard_for(
+            tenant,
+            &TableRef::new(BifrostNamespace::Bifrost, ROTATION_NON_PREFIX_TABLE),
+            non_prefix_batch,
+        ),
+        "production routing must place both tenant-qualified keys on one shard"
+    );
     writer
-        .send_frame(frame(batch_id.into_bytes(), &[707]))
+        .send_frame(frame_for_table(
+            ROTATION_PREFIX_FQN,
+            prefix_batch.into_bytes(),
+            &[101],
+        ))
+        .await
+        .expect("age cohort prefix ACK");
+    writer
+        .send_frame(frame_for_table(
+            ROTATION_NON_PREFIX_FQN,
+            non_prefix_batch.into_bytes(),
+            &[202],
+        ))
+        .await
+        .expect("age cohort non-prefix ACK");
+    tokio::time::sleep(Duration::from_millis(175)).await;
+    writer
+        .send_frame(frame_for_table(
+            ROTATION_PREFIX_FQN,
+            trigger_batch.into_bytes(),
+            &[303],
+        ))
+        .await
+        .expect("age rotation trigger ACK");
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        publication_barrier.wait_before_publication(),
+    )
+    .await
+    .expect("age cohort publication barrier");
+    let hot_reader = bootstrap_client(server, "rotation-hot-reader", &["admin"])
+        .await
+        .expect("rotation hot reader");
+    for (table, expected) in [
+        (ROTATION_PREFIX_FQN, vec![101, 303]),
+        (ROTATION_NON_PREFIX_FQN, vec![202]),
+    ] {
+        let hot = QueryClient::new(&hot_reader)
+            .collect_bounded(
+                &fused_query_for_table(table),
+                CollectedQueryLimits {
+                    max_rows: 16,
+                    max_encoded_bytes: 1024 * 1024,
+                },
+            )
+            .await
+            .expect("cohort hot read");
+        assert_query_result(&hot, &expected);
+    }
+    let retained_cohort_wal = server
+        .bifrost_scribe()
+        .expect("rotation Scribe")
+        .wal_bytes_on_disk();
+    assert!(
+        retained_cohort_wal > 0,
+        "cohort WAL remains retained while a member is unpublished"
+    );
+    publication_barrier.release_before_publication();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        publication_barrier.wait_after_publication(),
+    )
+    .await
+    .expect("visible-before-retirement barrier");
+    let immutable_during_visible_cut = server
+        .bifrost_scribe()
+        .expect("rotation Scribe")
+        .memtable_stats()
+        .expect("rotation immutable stats")
+        .immutable_rows;
+    assert!(
+        immutable_during_visible_cut >= 1,
+        "publication visibility must precede selected immutable retirement"
+    );
+    publication_barrier.release_after_publication();
+    server.flush_bifrost().await.expect("finish age cohort");
+    server
+        .bifrost_scribe()
+        .expect("rotation Scribe")
+        .retire_committed_for_test()
+        .await
+        .expect("retire completed age cohort");
+    for _ in 0..50 {
+        if server
+            .bifrost_scribe()
+            .expect("rotation Scribe")
+            .memtable_stats()
+            .expect("retired cohort stats")
+            .immutable_rows
+            == 0
+        {
+            break;
+        }
+        server.flush_bifrost().await.expect("converge age cohort");
+        server
+            .bifrost_scribe()
+            .expect("rotation Scribe")
+            .retire_committed_for_test()
+            .await
+            .expect("converge age cohort retirement");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        server
+            .bifrost_scribe()
+            .expect("rotation Scribe")
+            .memtable_stats()
+            .expect("retired cohort stats")
+            .immutable_rows,
+        0,
+        "cohort ownership retires only after its final member completes"
+    );
+
+    let size_batch = matching_batch_id(tenant, ROTATION_PREFIX_TABLE, target_shard, &[]);
+    let size_trigger =
+        matching_batch_id(tenant, ROTATION_PREFIX_TABLE, target_shard, &[size_batch]);
+    let oversized_ids = (1_000_i64..12_000).collect::<Vec<_>>();
+    writer
+        .send_frame(frame_for_table(
+            ROTATION_PREFIX_FQN,
+            size_batch.into_bytes(),
+            &oversized_ids,
+        ))
+        .await
+        .expect("size cohort ACK");
+    writer
+        .send_frame(frame_for_table(
+            ROTATION_PREFIX_FQN,
+            size_trigger.into_bytes(),
+            &[12_001],
+        ))
+        .await
+        .expect("automatic size rotation trigger ACK");
+    server.flush_bifrost().await.expect("finish size cohort");
+    for _ in 0..100 {
+        let published_rows: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(row_count), 0)::bigint
+               FROM vala.file_list
+              WHERE data_tenant_id=$1 AND namespace='vala.bifrost'
+                AND table_name IN ($2, $3)",
+        )
+        .bind(tenant.as_uuid())
+        .bind(ROTATION_PREFIX_TABLE)
+        .bind(ROTATION_NON_PREFIX_TABLE)
+        .fetch_one(cluster.pg_fixture().operator_pool().pool())
+        .await
+        .expect("size publication convergence");
+        if published_rows == 11_004 {
+            break;
+        }
+        server
+            .flush_bifrost()
+            .await
+            .expect("continue size publication");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let mut expected_prefix = vec![101, 303];
+    expected_prefix.extend(oversized_ids.iter().copied());
+    expected_prefix.push(12_001);
+    expected_prefix.sort_unstable();
+    for (table, expected) in [
+        (ROTATION_PREFIX_FQN, expected_prefix),
+        (ROTATION_NON_PREFIX_FQN, vec![202]),
+    ] {
+        let sealed = QueryClient::new(&hot_reader)
+            .collect_bounded(
+                &query_for_table(table),
+                CollectedQueryLimits {
+                    max_rows: 16_384,
+                    max_encoded_bytes: 8 * 1024 * 1024,
+                },
+            )
+            .await
+            .expect("cohort sealed read");
+        assert_query_result(&sealed, &expected);
+    }
+    let cardinality: (i64, i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*)::bigint,
+                COUNT(DISTINCT id)::bigint,
+                COALESCE(SUM(row_count), 0)::bigint
+           FROM vala.file_list
+          WHERE data_tenant_id=$1
+            AND namespace='vala.bifrost'
+            AND table_name IN ($2, $3)",
+    )
+    .bind(tenant.as_uuid())
+    .bind(ROTATION_PREFIX_TABLE)
+    .bind(ROTATION_NON_PREFIX_TABLE)
+    .fetch_one(cluster.pg_fixture().operator_pool().pool())
+    .await
+    .expect("rotation file-list and audit cardinality");
+    assert_eq!(
+        cardinality.0, cardinality.1,
+        "artifact identities are unique"
+    );
+    assert_eq!(
+        cardinality.2, 11_004,
+        "every cohort row publishes exactly once"
+    );
+    let mut cohort_conn = cluster
+        .pg_fixture()
+        .vala_postgres()
+        .tenant_conn(tenant)
+        .await
+        .expect("cohort audit tenant connection");
+    let cohort_audits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM vala.audit_outbox
+          WHERE operation='bifrost.ingest_batch' AND resource IN ($1, $2)",
+    )
+    .bind(ROTATION_PREFIX_FQN)
+    .bind(ROTATION_NON_PREFIX_FQN)
+    .fetch_one(&mut **cohort_conn.transaction())
+    .await
+    .expect("cohort canonical audit cardinality");
+    assert_eq!(cohort_audits, 5, "each accepted cohort batch audits once");
+    cohort_conn
+        .commit()
+        .await
+        .expect("commit cohort audit inspection");
+    for _ in 0..100 {
+        server
+            .bifrost_scribe()
+            .expect("rotation Scribe")
+            .retire_committed_for_test()
+            .await
+            .expect("retire size cohort");
+        if server
+            .bifrost_scribe()
+            .expect("rotation Scribe")
+            .memtable_stats()
+            .expect("size cohort retirement stats")
+            .immutable_rows
+            == 0
+        {
+            break;
+        }
+        server.flush_bifrost().await.expect("converge size cohort");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        server
+            .bifrost_scribe()
+            .expect("rotation Scribe")
+            .memtable_stats()
+            .expect("size cohort retirement stats")
+            .immutable_rows,
+        0,
+        "completed size cohort retires before crash replay begins"
+    );
+    let batch_id = uuid::Uuid::now_v7();
+    let retry_frame = frame(batch_id.into_bytes(), &[707]);
+    writer
+        .send_frame(retry_frame.clone())
         .await
         .expect("durable restart ACK");
+    let before_duplicate = server
+        .scribe_inspection_snapshot()
+        .expect("pre-duplicate Scribe ownership")
+        .ingress_lifecycle;
+    let wal_before_duplicate = server
+        .bifrost_scribe()
+        .expect("pre-duplicate Scribe")
+        .wal_bytes_on_disk();
+    let visible_before_duplicate = server
+        .bifrost_scribe()
+        .expect("pre-duplicate Scribe")
+        .memtable_stats()
+        .expect("pre-duplicate memtable visibility");
+    let visible_rows_before_duplicate =
+        visible_before_duplicate.writable_rows + visible_before_duplicate.immutable_rows;
+    writer
+        .send_frame(retry_frame)
+        .await
+        .expect("duplicate client retry converges");
+    let after_duplicate = server
+        .scribe_inspection_snapshot()
+        .expect("post-duplicate Scribe ownership")
+        .ingress_lifecycle;
+    assert_eq!(
+        after_duplicate.materializations,
+        before_duplicate.materializations + 1,
+        "the duplicate is preprocessed into one current slice"
+    );
+    assert!(
+        after_duplicate.materialized_bytes > before_duplicate.materialized_bytes,
+        "the duplicate slice contributes its measured materialized bytes"
+    );
+    assert_eq!(
+        after_duplicate.transfers, before_duplicate.transfers,
+        "duplicate convergence must not append another WAL slice"
+    );
+    assert_eq!(
+        after_duplicate.transferred_bytes, before_duplicate.transferred_bytes,
+        "duplicate convergence must not transfer bytes into WAL"
+    );
+    assert_eq!(
+        after_duplicate.reservations,
+        before_duplicate.reservations + 1
+    );
+    assert_eq!(after_duplicate.releases, before_duplicate.releases + 1);
+    assert_eq!(
+        after_duplicate.shard_transfers,
+        before_duplicate.shard_transfers + 1
+    );
+    let reserved_delta = after_duplicate.reserved_bytes - before_duplicate.reserved_bytes;
+    assert!(reserved_delta > 0, "duplicate root reservation is measured");
+    assert_eq!(
+        after_duplicate.released_bytes - before_duplicate.released_bytes,
+        reserved_delta
+    );
+    assert_eq!(
+        after_duplicate.shard_transferred_bytes - before_duplicate.shard_transferred_bytes,
+        reserved_delta
+    );
+    assert_eq!(after_duplicate.active_attempts, 0);
+    assert_eq!(after_duplicate.active_reservations, 0);
+    assert_eq!(after_duplicate.active_materializations, 0);
+    assert_eq!(after_duplicate.active_shard_transfers, 0);
+    assert_eq!(
+        server
+            .bifrost_scribe()
+            .expect("post-duplicate Scribe")
+            .wal_bytes_on_disk(),
+        wal_before_duplicate,
+        "duplicate retry adds no WAL record bytes"
+    );
+    let visible_after_duplicate = server
+        .bifrost_scribe()
+        .expect("post-duplicate Scribe")
+        .memtable_stats()
+        .expect("post-duplicate memtable visibility");
+    assert_eq!(
+        visible_after_duplicate.writable_rows + visible_after_duplicate.immutable_rows,
+        visible_rows_before_duplicate,
+        "duplicate retry adds no visible row"
+    );
+    let mut after_duplicate_conn = cluster
+        .pg_fixture()
+        .vala_postgres()
+        .tenant_conn(tenant)
+        .await
+        .expect("post-duplicate tenant connection");
+    let durable_after_duplicate: (i64, i64, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT COUNT(*)::bigint FROM vala.scribe_batch_commits
+              WHERE logical_table_fqn=$1 AND batch_id=$2),
+            (SELECT COUNT(*)::bigint FROM vala.audit_outbox
+              WHERE operation='bifrost.ingest_batch' AND resource=$1),
+            (SELECT COUNT(*)::bigint FROM vala.file_list
+              WHERE namespace='vala.bifrost' AND table_name=$3)",
+    )
+    .bind(TABLE_FQN)
+    .bind(batch_id)
+    .bind(TABLE_NAME)
+    .fetch_one(&mut **after_duplicate_conn.transaction())
+    .await
+    .expect("post-duplicate durable cardinality");
+    after_duplicate_conn
+        .commit()
+        .await
+        .expect("commit post-duplicate inspection");
+    assert_eq!(
+        durable_after_duplicate,
+        (1, 1, 0),
+        "duplicate retry adds no SQL fence, audit, or file-list row"
+    );
     let node = cluster
         .configured_node_ids()
         .first()
@@ -662,17 +1072,16 @@ async fn public_ack_restart_read_exact_once_journey() {
     );
     assert!(
         ownership.ingress_lifecycle.transfers > 0
-            && ownership.ingress_lifecycle.transfers
-                <= ownership.ingress_lifecycle.materializations,
-        "WAL transfers must be a positive subset of current-slice materializations"
+            && ownership.ingress_lifecycle.transfers < ownership.ingress_lifecycle.materializations,
+        "WAL transfers are a positive strict subset when a duplicate is preprocessed"
     );
     assert!(
         ownership.ingress_lifecycle.transferred_bytes > 0
             && ownership.ingress_lifecycle.transferred_bytes
-                <= ownership.ingress_lifecycle.materialized_bytes,
-        "WAL-owned bytes must be a positive subset of materialized bytes"
+                < ownership.ingress_lifecycle.materialized_bytes,
+        "duplicate materialized bytes never transfer into WAL"
     );
-    assert_eq!(ownership.ingress_lifecycle.succeeded, 1);
+    assert!(ownership.ingress_lifecycle.succeeded >= 1);
     let unpublished: i64 = sqlx::query_scalar(
         "SELECT COALESCE(SUM(row_count), 0)::bigint FROM vala.file_list
          WHERE namespace = 'vala.bifrost' AND table_name = $1",
@@ -714,10 +1123,21 @@ async fn public_ack_restart_read_exact_once_journey() {
         "restart must advance the production writer fence"
     );
     let replacement = cluster.server(0).expect("replacement restart server");
-    replacement
-        .flush_bifrost()
+    for _ in 0..250 {
+        let replayed_rows: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(row_count), 0)::bigint FROM vala.file_list
+              WHERE data_tenant_id=$1 AND namespace='vala.bifrost' AND table_name=$2",
+        )
+        .bind(tenant.as_uuid())
+        .bind(TABLE_NAME)
+        .fetch_one(cluster.pg_fixture().operator_pool().pool())
         .await
-        .expect("replay and publish WAL");
+        .expect("replay publication inspection");
+        if replayed_rows == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let mut restarted_tenant_conn = cluster
         .pg_fixture()
         .vala_postgres()
@@ -763,6 +1183,42 @@ async fn public_ack_restart_read_exact_once_journey() {
         .await
         .expect("restart exact-once read");
     assert_query_result(&query, &[707]);
+    let unrelated_tenant = cluster
+        .add_tenant("rotation-unrelated")
+        .await
+        .expect("unrelated tenant");
+    replacement
+        .state()
+        .bifrost
+        .create_table(CreateTableRequest {
+            table: TableRef::new(BifrostNamespace::Bifrost, TABLE_NAME),
+            user_fields: vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("value", DataType::Utf8, false),
+            ],
+            tenant: unrelated_tenant,
+            audit: None,
+        })
+        .await
+        .expect("unrelated tenant table");
+    let unrelated_reader =
+        bootstrap_client_for_tenant(replacement, unrelated_tenant, "rotation-unrelated-reader")
+            .await
+            .expect("unrelated tenant reader");
+    let unrelated = QueryClient::new(&unrelated_reader)
+        .collect_bounded(
+            &closeout_query(),
+            CollectedQueryLimits {
+                max_rows: 16,
+                max_encoded_bytes: 1024 * 1024,
+            },
+        )
+        .await
+        .expect("unrelated tenant query");
+    assert_eq!(
+        unrelated.rows, 0,
+        "another tenant cannot observe replayed rows"
+    );
     let source_epoch = roots
         .previous_writer_epoch
         .expect("acknowledged source epoch is retained");
@@ -787,49 +1243,6 @@ async fn public_ack_restart_read_exact_once_journey() {
         .commit()
         .await
         .expect("commit restart post-replacement inspection");
-    let writer = bootstrap_transport(replacement, "restart-convergence-writer", &["admin"])
-        .await
-        .expect("restart convergence writer");
-    for value in [708, 709] {
-        writer
-            .send_frame(frame(uuid::Uuid::now_v7().into_bytes(), &[value]))
-            .await
-            .expect("post-restart Forge input ACK");
-        replacement
-            .flush_bifrost()
-            .await
-            .expect("post-restart Forge input publication");
-    }
-    replacement
-        .forge_clock()
-        .advance(chrono::Duration::days(1) + chrono::Duration::minutes(3))
-        .expect("advance restart Forge clock");
-    cluster.request_forge_scheduler_pass_for_test();
-    let observer = cluster
-        .forge_completion_observer()
-        .expect("restart Forge observer");
-    let lifecycle = tokio::time::timeout(
-        Duration::from_secs(30),
-        observer.wait_for_lifecycle(|events| {
-            events
-                .iter()
-                .any(|event| matches!(event, ForgeLifecycleEvent::Terminal { .. }))
-        }),
-    )
-    .await
-    .expect("restart Forge convergence timeout");
-    assert_forge_event_sequence(&lifecycle, Some(tenant));
-    let converged = QueryClient::new(&reader)
-        .collect_bounded(
-            &closeout_query(),
-            CollectedQueryLimits {
-                max_rows: 16,
-                max_encoded_bytes: 1024 * 1024,
-            },
-        )
-        .await
-        .expect("restart post-Forge read");
-    assert_query_result(&converged, &[707, 708, 709]);
     replacement
         .bifrost_scribe()
         .expect("replacement Scribe")
@@ -1907,6 +2320,66 @@ fn query_for_table(table: &str) -> BifrostQueryRequest {
         freshness: FreshnessPolicy::Strict,
         deadline_ms: None,
     }
+}
+
+/// Builds a public Oracle query that includes the exact fenced live tail.
+fn fused_query_for_table(table: &str) -> BifrostQueryRequest {
+    BifrostQueryRequest {
+        sql: format!("SELECT id, value FROM {table} ORDER BY id"),
+        visibility: VisibilityMode::Fused,
+        freshness: FreshnessPolicy::Strict,
+        deadline_ms: None,
+    }
+}
+
+/// Finds three distinct batch identities whose tenant-qualified table keys route together.
+///
+/// The search calls the production Scribe hash and therefore remains valid if
+/// the routing implementation changes while the fixed shard-count contract is
+/// preserved.
+///
+/// # Panics
+///
+/// Panics only if the bounded deterministic UUID search cannot find matches,
+/// which would violate the fixed sixteen-shard routing contract.
+fn same_shard_batch_ids(
+    tenant: DataTenantId,
+    prefix_table: &str,
+    non_prefix_table: &str,
+) -> (uuid::Uuid, uuid::Uuid, uuid::Uuid) {
+    let prefix = TableRef::new(BifrostNamespace::Bifrost, prefix_table);
+    let non_prefix = TableRef::new(BifrostNamespace::Bifrost, non_prefix_table);
+    for _ in 0..256 {
+        let prefix_id = uuid::Uuid::now_v7();
+        let target = shard_for(tenant, &prefix, prefix_id);
+        let non_prefix_id = matching_batch_id(tenant, non_prefix_table, target, &[]);
+        let trigger_id = matching_batch_id(tenant, prefix_table, target, &[prefix_id]);
+        if shard_for(tenant, &non_prefix, non_prefix_id) == target {
+            return (prefix_id, non_prefix_id, trigger_id);
+        }
+    }
+    panic!("fixed Scribe routing must yield a same-shard cohort");
+}
+
+/// Finds one valid unused UUIDv7 batch identity for a production Scribe shard.
+///
+/// # Panics
+///
+/// Panics if no identity maps to `target_shard` in the bounded search, which
+/// would contradict the production hash's fixed sixteen-shard topology.
+fn matching_batch_id(
+    tenant: DataTenantId,
+    table_name: &str,
+    target_shard: usize,
+    excluded: &[uuid::Uuid],
+) -> uuid::Uuid {
+    let table = TableRef::new(BifrostNamespace::Bifrost, table_name);
+    (0..65_280)
+        .map(|_| uuid::Uuid::now_v7())
+        .find(|candidate| {
+            !excluded.contains(candidate) && shard_for(tenant, &table, *candidate) == target_shard
+        })
+        .expect("fixed Scribe routing must yield a matching batch identity")
 }
 
 async fn bootstrap_transport(

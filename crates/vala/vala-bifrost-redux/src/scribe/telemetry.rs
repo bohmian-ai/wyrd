@@ -1,11 +1,249 @@
 //! Optional stage measurements for real Scribe workload runs.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::scribe::admission::AdmissionSnapshot;
 use crate::scribe::material_plan::IngestMaterialPlan;
 use crate::scribe::memory::MEMORY_CATEGORY_COUNT;
 use crate::scribe::seal_key::SealKey;
+
+/// Closed resource and state facts for one producer lifecycle transition.
+#[derive(Clone, Copy)]
+pub(crate) struct ProducerLifecycleEvent {
+    /// Exact producer workspace charged by the transition.
+    pub(crate) workspace_bytes: usize,
+    /// Arrival position observed when the producer entered its queue.
+    pub(crate) queue_position: usize,
+    /// Queue population observed when the transition was emitted.
+    pub(crate) queue_count: usize,
+    /// Resource epoch associated with the admission decision.
+    pub(crate) resource_epoch: u64,
+    /// Producer operation that owns the transition.
+    pub(crate) operation: &'static str,
+    /// Lifecycle stage reached by the operation.
+    pub(crate) stage: &'static str,
+    /// Stable outcome of the transition.
+    pub(crate) outcome: &'static str,
+    /// Stable reason that explains the outcome.
+    pub(crate) reason: &'static str,
+}
+
+/// Bounded generation identity attached to each producer lifecycle event.
+///
+/// This is trace-only correlation context. It must not become a metric label:
+/// the tenant, table, closed WAL cohort, and member generation are all
+/// workload-cardinality values.
+#[derive(Clone)]
+pub(crate) struct ProducerLifecycleIdentity {
+    /// Tenant/table/day member that owns the producer.
+    pub(crate) seal_key: SealKey,
+    /// Pod-local shard lane that detached the member.
+    pub(crate) shard_id: usize,
+    /// Fenced WAL writer epoch for the detached member.
+    pub(crate) writer_epoch: i64,
+    /// Generation-local WAL position that identifies the shard generation.
+    pub(crate) shard_generation: u64,
+    /// Closed WAL cohort retained until every member settles, when available.
+    pub(crate) cohort_id: Option<PathBuf>,
+    /// Detached member generation within the shard cohort.
+    pub(crate) member_generation: u64,
+}
+
+/// Emits one production producer admission or persistence lifecycle event.
+///
+/// When supplied, `identity` is emitted as tracing fields on every admission,
+/// cancellation, release, and terminal event for one immutable producer.
+pub(crate) fn record_producer_lifecycle(
+    event: ProducerLifecycleEvent,
+    identity: Option<&ProducerLifecycleIdentity>,
+) {
+    let ProducerLifecycleEvent {
+        workspace_bytes,
+        queue_position,
+        queue_count,
+        resource_epoch,
+        operation,
+        stage,
+        outcome,
+        reason,
+    } = event;
+    if let Some(identity) = identity {
+        tracing::info!(
+            tenant = %identity.seal_key.tenant,
+            table = %identity.seal_key.table,
+            shard_id = identity.shard_id,
+            writer_epoch = identity.writer_epoch,
+            shard_generation = identity.shard_generation,
+            cohort_id = ?identity.cohort_id,
+            member_generation = identity.member_generation,
+            workspace_bytes,
+            queue_position,
+            queue_count,
+            resource_epoch,
+            operation,
+            stage,
+            outcome,
+            reason,
+            "Scribe producer lifecycle"
+        );
+    } else {
+        tracing::info!(
+            workspace_bytes,
+            queue_position,
+            queue_count,
+            resource_epoch,
+            operation,
+            stage,
+            outcome,
+            reason,
+            "Scribe producer lifecycle"
+        );
+    }
+}
+
+#[cfg(test)]
+/// Event-capture fixtures shared by focused producer lifecycle owner tests.
+pub(crate) mod producer_lifecycle_tests {
+    use super::*;
+
+    use crate::catalog::TableRef;
+    use crate::namespaces::BifrostNamespace;
+
+    /// Captures structured tracing event fields for producer lifecycle tests.
+    #[derive(Default)]
+    pub(crate) struct EventCaptureSubscriber {
+        /// Event fields in the order each lifecycle event was emitted.
+        pub(crate) events: Arc<Mutex<Vec<Vec<(String, String)>>>>,
+    }
+
+    /// Collects the fields from one tracing event.
+    struct EventFieldVisitor<'a> {
+        /// Destination for the current event's fields.
+        fields: &'a mut Vec<(String, String)>,
+    }
+
+    impl tracing::field::Visit for EventFieldVisitor<'_> {
+        /// Retains string fields without debug quoting.
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.fields
+                .push((field.name().to_owned(), value.to_owned()));
+        }
+
+        /// Retains numeric and debug fields in tracing's canonical format.
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.fields
+                .push((field.name().to_owned(), format!("{value:?}")));
+        }
+    }
+
+    impl tracing::Subscriber for EventCaptureSubscriber {
+        /// Enables every event emitted under the scoped test subscriber.
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        /// Returns a placeholder span ID because this capture observes events only.
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        /// Ignores span field updates because this capture observes events only.
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        /// Ignores causal links because producer identity is asserted on each event.
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        /// Captures every structured field on a producer lifecycle event.
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = Vec::new();
+            event.record(&mut EventFieldVisitor {
+                fields: &mut fields,
+            });
+            self.events.lock().expect("event capture").push(fields);
+        }
+
+        /// Ignores span entry because this capture observes events only.
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        /// Ignores span exit because this capture observes events only.
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// Returns one named event field from a captured lifecycle event.
+    pub(crate) fn field(event: &[(String, String)], name: &str) -> String {
+        event
+            .iter()
+            .find(|(field, _)| field == name)
+            .map(|(_, value)| value.clone())
+            .unwrap_or_else(|| panic!("missing event field {name}"))
+    }
+
+    /// Emits the same bounded generation identity for every producer transition.
+    #[test]
+    fn producer_lifecycle_events_share_generation_identity() {
+        let identity = ProducerLifecycleIdentity {
+            seal_key: SealKey::new(
+                crate::test_support::tenant(),
+                TableRef::new(BifrostNamespace::Bifrost, "producer_lifecycle"),
+                crate::scribe::seal_key::EventDay::new(
+                    chrono::NaiveDate::from_ymd_opt(2026, 8, 19).expect("valid event day"),
+                ),
+            ),
+            shard_id: 3,
+            writer_epoch: 41,
+            shard_generation: 9001,
+            cohort_id: Some(PathBuf::from("wal/shard-3/segment-9001")),
+            member_generation: 77,
+        };
+        let subscriber = EventCaptureSubscriber::default();
+        let events = Arc::clone(&subscriber.events);
+        tracing::subscriber::with_default(subscriber, || {
+            for (stage, outcome) in [
+                ("wait", "pending"),
+                ("grant", "granted"),
+                ("refusal", "refused"),
+                ("cancel", "cancelled"),
+                ("terminal", "committed"),
+                ("release", "released"),
+            ] {
+                record_producer_lifecycle(
+                    ProducerLifecycleEvent {
+                        workspace_bytes: 1024,
+                        queue_position: 2,
+                        queue_count: 1,
+                        resource_epoch: 19,
+                        operation: "persistence",
+                        stage,
+                        outcome,
+                        reason: "test",
+                    },
+                    Some(&identity),
+                );
+            }
+        });
+        let events = events.lock().expect("event capture");
+        assert_eq!(events.len(), 6);
+        for name in [
+            "tenant",
+            "table",
+            "shard_id",
+            "writer_epoch",
+            "shard_generation",
+            "cohort_id",
+            "member_generation",
+        ] {
+            let values = events
+                .iter()
+                .map(|event| field(event, name))
+                .collect::<Vec<_>>();
+            assert!(
+                values.windows(2).all(|pair| pair[0] == pair[1]),
+                "{name} changed across lifecycle events: {values:?}"
+            );
+        }
+    }
+}
 
 /// Bounded cumulative and live ownership facts for Scribe ingress roots.
 ///
@@ -457,8 +695,10 @@ mod tests {
             event_day_count: 1,
             current_material_bytes: 32,
             active_output_bytes: 24,
+            persistence_candidate_bytes: 24,
             durable_metadata_bytes: 8,
             wal_workspace_bytes: 8,
+            persistence_replay_bytes: root_bytes,
             root_bytes,
         }
     }

@@ -2639,7 +2639,7 @@ mod tests {
         assert!(slots.try_running(1).is_ok());
     }
 
-    /// Leader-admitted execution reaches a frame while the exclusive query owns the root.
+    /// Leader-admitted execution reaches a frame while its exact query lease is active.
     #[tokio::test]
     async fn oracle_peer_leader_admitted_executes_under_active_query_owner() {
         let roles = crate::resources::BifrostRuntimeResources::composed_for_test(
@@ -2649,8 +2649,14 @@ mod tests {
         );
         let oracle = roles.oracle().expect("Oracle capability");
         let query_owner = oracle
-            .try_acquire_query(crate::resources::OracleResourceRequest { local_ratio: 1.0 })
-            .expect("exclusive query owner");
+            .try_acquire_query(crate::resources::OracleResourceRequest {
+                query_class: QueryClass::Interactive,
+                memory_bytes: crate::resources::ORACLE_PARTITION_MEMORY_BYTES,
+                scratch_bytes: crate::resources::ORACLE_PARTITION_MEMORY_BYTES as u64,
+                slot_units: 1,
+                local_ratio: 1.0,
+            })
+            .expect("exact query owner");
         let node = NodeId::new(uuid::Uuid::now_v7());
         let query_id = QueryId::new(uuid::Uuid::now_v7());
         let tenant = DataTenantId::new_v7();

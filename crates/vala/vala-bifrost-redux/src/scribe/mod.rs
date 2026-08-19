@@ -24,6 +24,7 @@ pub mod routing;
 pub mod seal;
 pub mod seal_key;
 pub mod shards;
+pub(crate) mod staging;
 pub mod stream_identity;
 pub mod tail_rpc;
 pub mod telemetry;
@@ -64,6 +65,21 @@ pub use crate::scribe::tail_rpc::{
     LocalTailReadTransport, ScribeTailReader, TailFenceConfig, TailReadTransport,
     TonicTailReadTransport,
 };
+
+/// Derives the largest replayable Scribe envelope admitted by configured limits.
+///
+/// Server boot compares this intrinsic requirement with the detected root
+/// capability before accepting traffic or starting WAL replay.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::DecodedPayloadTooLarge`] when configured bound
+/// arithmetic cannot be represented on this platform.
+pub fn configured_maximum_envelope_bytes(
+    limits: crate::gate::limits::IngestLimits,
+) -> Result<usize, ScribeError> {
+    material_plan::configured_maximum_envelope_bytes(limits)
+}
 use crate::scribe::telemetry::{
     ScribeBucketMemorySnapshot, ScribeIngressLifecycle, ScribeInspectionSnapshot,
     ScribeRuntimeSnapshot,
@@ -461,7 +477,7 @@ pub struct ScribePressureConfig {
     /// pressure sealing drains toward. Default 50. Must be < high-water.
     pub ingress_low_water_percent: usize,
     /// Maximum age of an active generation before age-based sealing.
-    /// Default 30 s (was 10 min).
+    /// Default 600 s.
     pub seal_max_age: Duration,
 }
 
@@ -493,9 +509,9 @@ impl ScribePressureConfig {
 }
 
 impl Default for ScribePressureConfig {
-    /// The locked D83 defaults: 75% high-water, 50% low-water, 30 s max age.
+redacted
     fn default() -> Self {
-        Self::new(75, 50, Duration::from_secs(30))
+        Self::new(75, 50, Duration::from_mins(10))
     }
 }
 
@@ -525,6 +541,12 @@ pub struct ScribeBuildConfig {
     pub resources: crate::resources::ScribeResources,
     /// Immutable boot-selected ingest ceilings shared with Gate.
     pub ingest_limits: crate::gate::limits::IngestLimits,
+    /// Encoded and uncompressed WAL target for whole-shard rotation.
+    pub wal_rotation_bytes: u64,
+    /// Target bytes for one non-empty memtable before rotation.
+    pub memtable_rotation_bytes: usize,
+    /// Maximum age of one active memtable before rotation.
+    pub memtable_max_age: Duration,
     /// Optional bounded local wake-up publisher for committed staging files.
     pub staging_file_publisher: Option<StagingFilePublisher>,
 }
@@ -567,6 +589,55 @@ pub struct ScribeEmbeddedConfig {
     pub resources: crate::resources::ScribeResources,
     /// Optional bounded publisher for post-commit Forge wake-ups.
     pub staging_file_publisher: Option<StagingFilePublisher>,
+    /// Test-tier override for the existing writer-wide size rotation target.
+    ///
+    /// Production boot constructs [`ScribeBuildConfig`] directly from
+    /// `ScribeRuntimeConfig`; this embedded projection exists only so real
+    /// server journeys can make the already-configurable production boundary
+    /// small without adding a second rotation policy.
+    #[cfg(any(test, feature = "test-support"))]
+    pub rotation_for_test: Option<ScribeRotationTestConfig>,
+}
+
+impl ScribeEmbeddedConfig {
+    /// Selects the writer's configured WAL target unless test support overrides it.
+    fn wal_rotation_bytes(&self, wal: &wal::WalWriter) -> u64 {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(rotation) = self.rotation_for_test {
+            return rotation.wal_rotation_bytes;
+        }
+        wal.segment_bytes()
+    }
+
+    /// Selects the production memtable target unless test support overrides it.
+    fn memtable_rotation_bytes(&self) -> usize {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(rotation) = self.rotation_for_test {
+            return rotation.memtable_rotation_bytes;
+        }
+        memtable::MEMTABLE_ROTATION_BYTES
+    }
+
+    /// Selects the production age target unless test support overrides it.
+    fn memtable_max_age(&self) -> Duration {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(rotation) = self.rotation_for_test {
+            return rotation.memtable_max_age;
+        }
+        ScribePressureConfig::default().seal_max_age
+    }
+}
+
+/// Test-only projection of the existing production rotation thresholds.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Clone, Copy)]
+pub struct ScribeRotationTestConfig {
+    /// Target bytes for a non-empty WAL generation before whole-shard rotation.
+    pub wal_rotation_bytes: u64,
+    /// Target bytes for one active shard memtable before whole-shard rotation.
+    pub memtable_rotation_bytes: usize,
+    /// Maximum active shard-generation age before whole-shard rotation.
+    pub memtable_max_age: Duration,
 }
 
 /// Composes the embedded Scribe capability through the production root path.
@@ -721,6 +792,8 @@ impl ScribeImpl {
                 persistence: None,
                 resources,
                 staging_file_publisher: None,
+                #[cfg(any(test, feature = "test-support"))]
+                rotation_for_test: None,
             },
         )
     }
@@ -782,6 +855,8 @@ impl ScribeImpl {
                 persistence: None,
                 resources,
                 staging_file_publisher: None,
+                #[cfg(any(test, feature = "test-support"))]
+                rotation_for_test: None,
             },
         )
     }
@@ -801,6 +876,9 @@ impl ScribeImpl {
         sync_delay: std::time::Duration,
         config: ScribeEmbeddedConfig,
     ) -> Result<Self, String> {
+        let wal_rotation_bytes = config.wal_rotation_bytes(&wal);
+        let memtable_rotation_bytes = config.memtable_rotation_bytes();
+        let memtable_max_age = config.memtable_max_age();
         let execution_pools = ScribeExecutionPools::new(
             ScribeIngressCpuPool::try_new_with_capacity(
                 config.lane_config.ingress_cpu_threads,
@@ -836,6 +914,9 @@ impl ScribeImpl {
             persistence: config.persistence,
             resources: config.resources,
             ingest_limits: crate::gate::limits::IngestLimits::default(),
+            wal_rotation_bytes,
+            memtable_rotation_bytes,
+            memtable_max_age,
             staging_file_publisher: None,
         }))
     }
@@ -920,6 +1001,8 @@ impl ScribeImpl {
                 persistence: None,
                 resources,
                 staging_file_publisher: None,
+                #[cfg(any(test, feature = "test-support"))]
+                rotation_for_test: None,
             },
         )
     }
@@ -938,6 +1021,9 @@ impl ScribeImpl {
         writer_epoch: i64,
         config: ScribeEmbeddedConfig,
     ) -> Self {
+        let wal_rotation_bytes = config.wal_rotation_bytes(&wal);
+        let memtable_rotation_bytes = config.memtable_rotation_bytes();
+        let memtable_max_age = config.memtable_max_age();
         let stream = stream_identity::StreamIdentity::new(
             stream_identity::NodeId::new(
                 uuid::Uuid::parse_str(node_id).expect("embedded Scribe node_id must be a UUID"),
@@ -965,6 +1051,9 @@ impl ScribeImpl {
             persistence: config.persistence,
             resources: config.resources,
             ingest_limits: crate::gate::limits::IngestLimits::default(),
+            wal_rotation_bytes,
+            memtable_rotation_bytes,
+            memtable_max_age,
             staging_file_publisher: config.staging_file_publisher,
         })
     }
@@ -1017,10 +1106,12 @@ impl ScribeImpl {
             admission: _,
             resources: _,
             ingest_limits,
+            wal_rotation_bytes,
+            memtable_rotation_bytes,
+            memtable_max_age,
             staging_file_publisher,
         } = config;
-        let node_id = stream.node_id.to_string();
-        let writer_epoch = stream.writer_epoch.as_i64();
+        let (node_id, writer_epoch) = (stream.node_id.to_string(), stream.writer_epoch.as_i64());
         let ScribeExecutionPools {
             ingress_cpu,
             persistence_cpu,
@@ -1048,12 +1139,12 @@ impl ScribeImpl {
                 &coordination_runtime,
             )
         });
-        let pressure_config = ScribePressureConfig::default();
         let shards = shards::ScribeShardRuntime::start(
             shards::ScribeShardStartConfig {
                 admission: admission.clone(),
-                rotation_bytes: memory.active_bucket_target_bytes(),
-                seal_max_age: pressure_config.seal_max_age,
+                wal_rotation_bytes,
+                memtable_rotation_bytes,
+                seal_max_age: memtable_max_age,
                 wal: Arc::clone(&wal),
                 persistence_cpu: persistence_cpu.clone(),
                 wal_io: wal_io.clone(),
@@ -1064,6 +1155,7 @@ impl ScribeImpl {
             },
             &coordination_runtime,
         );
+        let pressure_config = ScribePressureConfig::new(75, 50, memtable_max_age);
         Self::install_boot_metrics(wal.bytes_on_disk());
         Self {
             catalog,
@@ -1160,6 +1252,7 @@ impl ScribeImpl {
         std::mem::forget(temp_dir);
 
         let resources = embedded_scribe_resources(&admission_config);
+        let wal_rotation_bytes = wal.segment_bytes();
         Self::build(ScribeBuildConfig {
             catalog: None,
             operator,
@@ -1181,6 +1274,9 @@ impl ScribeImpl {
             persistence: None,
             resources,
             ingest_limits: crate::gate::limits::IngestLimits::default(),
+            wal_rotation_bytes,
+            memtable_rotation_bytes: memtable::MEMTABLE_ROTATION_BYTES,
+            memtable_max_age: ScribePressureConfig::default().seal_max_age,
             staging_file_publisher: None,
         })
     }
@@ -1882,13 +1978,13 @@ mod pressure_config_tests {
     use super::ScribePressureConfig;
     use std::time::Duration;
 
-    /// The D83 defaults are the locked 75/50/30 s triple that T40 reads.
+    /// The D83 defaults are the locked 75/50/600 s triple that T40 reads.
     #[test]
     fn default_is_the_locked_d83_triple() {
         let config = ScribePressureConfig::default();
         assert_eq!(config.ingress_high_water_percent, 75);
         assert_eq!(config.ingress_low_water_percent, 50);
-        assert_eq!(config.seal_max_age, Duration::from_secs(30));
+        assert_eq!(config.seal_max_age, Duration::from_mins(10));
     }
 
     /// A low-water at or above high-water is clamped strictly below it, so the
@@ -1902,6 +1998,115 @@ mod pressure_config_tests {
 
         let equal = ScribePressureConfig::new(75, 75, Duration::from_secs(5));
         assert_eq!(equal.ingress_low_water_percent, 74);
+    }
+}
+
+#[cfg(test)]
+mod constructor_rotation_tests {
+    use super::*;
+
+    /// Embedded construction preserves production-selected WAL, memtable, and
+    /// age thresholds when no test-only override is supplied.
+    #[tokio::test]
+    async fn embedded_constructor_preserves_selected_wal_rotation_target() {
+        let segment_bytes = 37 * 1024 * 1024;
+        let wal_root = tempfile::tempdir().expect("WAL root");
+        let wal = Arc::new(
+            wal::WalWriter::new(
+                wal_root.path(),
+                *uuid::Uuid::now_v7().as_bytes(),
+                1,
+                wal::WalConfig::new(segment_bytes).expect("nondefault WAL config"),
+            )
+            .expect("nondefault WAL writer"),
+        );
+        let operator = Arc::new(
+            opendal::Operator::new(opendal::services::Memory::default())
+                .expect("memory backend")
+                .finish(),
+        );
+        let scribe = ScribeImpl::try_new_for_embedded_with_wal_sync_delay_and_admission(
+            operator,
+            Arc::clone(&wal),
+            &uuid::Uuid::now_v7().to_string(),
+            1,
+            Duration::ZERO,
+            AdmissionConfig::default(),
+        )
+        .expect("embedded Scribe");
+        assert_eq!(wal.segment_bytes(), segment_bytes);
+        assert_eq!(
+            scribe.shards.rotation_thresholds_for_test(),
+            (segment_bytes, memtable::MEMTABLE_ROTATION_BYTES)
+        );
+        assert_eq!(
+            scribe.pressure_config.seal_max_age,
+            ScribePressureConfig::default().seal_max_age
+        );
+        scribe
+            .shutdown(std::time::Instant::now() + Duration::from_secs(1))
+            .await;
+    }
+
+    /// Embedded construction applies every explicitly selected test-tier
+    /// threshold to the same shard-owner graph used by production boot.
+    #[tokio::test]
+    async fn embedded_constructor_applies_rotation_for_test_override() {
+        let segment_bytes = 41 * 1024 * 1024;
+        let memtable_bytes = 23 * 1024 * 1024;
+        let max_age = Duration::from_secs(7);
+        let wal_root = tempfile::tempdir().expect("WAL root");
+        let wal = Arc::new(
+            wal::WalWriter::new(
+                wal_root.path(),
+                *uuid::Uuid::now_v7().as_bytes(),
+                1,
+                wal::WalConfig::new(segment_bytes).expect("nondefault WAL config"),
+            )
+            .expect("nondefault WAL writer"),
+        );
+        let operator = Arc::new(
+            opendal::Operator::new(opendal::services::Memory::default())
+                .expect("memory backend")
+                .finish(),
+        );
+        let admission = AdmissionConfig::default();
+        let configured_request_bytes = 201 * 1024 * 1024;
+        let mut ingest_limits = crate::gate::limits::IngestLimits::default();
+        ingest_limits.max_frame_bytes = configured_request_bytes;
+        ingest_limits.max_decoding_message_size = configured_request_bytes + 64 * 1024;
+        ingest_limits.otlp.request_bytes = configured_request_bytes;
+        let scribe = ScribeImpl::new_for_embedded_with_runtime_config_and_admission_and_memory(
+            operator,
+            wal,
+            &uuid::Uuid::now_v7().to_string(),
+            1,
+            ScribeEmbeddedConfig {
+                catalog: None,
+                lane_config: ScribeLaneConfig::default(),
+                admission,
+                coordination_runtime: Handle::current(),
+                persistence: None,
+                resources: embedded_scribe_resources(&admission),
+                staging_file_publisher: None,
+                rotation_for_test: Some(ScribeRotationTestConfig {
+                    wal_rotation_bytes: segment_bytes,
+                    memtable_rotation_bytes: memtable_bytes,
+                    memtable_max_age: max_age,
+                }),
+            },
+        )
+        .with_ingest_limits_for_test(ingest_limits);
+
+        assert_eq!(
+            scribe.shards.rotation_thresholds_for_test(),
+            (segment_bytes, memtable_bytes)
+        );
+        assert_eq!(scribe.pressure_config.seal_max_age, max_age);
+        assert_eq!(scribe.ingest_limits, ingest_limits);
+        scribe
+            .shutdown(std::time::Instant::now() + Duration::from_secs(1))
+            .await;
     }
 }
 
@@ -2400,12 +2605,11 @@ impl ScribeImpl {
 
     /// Aborts attempts whose caller-owned transaction is known not committed.
     ///
-    /// Exact uploaded identities are deleted before scratch and immutable
-    /// ownership return to the active tier.
+    /// Remote bytes remain retained for deterministic retry before scratch and
+    /// immutable ownership return to the active tier.
     ///
     /// # Errors
-    /// Returns a Scribe error when exact object deletion, scratch cleanup, or
-    /// immutable rollback fails. No prefix listing or broad cleanup is used.
+    /// Returns a Scribe error when scratch cleanup or immutable rollback fails.
     ///
     /// # Panics
     ///
@@ -2418,22 +2622,6 @@ impl ScribeImpl {
         let mut tokens = Vec::with_capacity(attempts.len());
         let mut parquet_owners = Vec::with_capacity(attempts.len());
         for attempt in attempts {
-            for artifact in attempt
-                .artifacts
-                .as_ref()
-                .expect("unsettled attempt owns artifacts")
-                .as_slice()
-            {
-                self.operator
-                    .delete(&artifact.object_identity)
-                    .await
-                    .map_err(|error| ScribeError::Internal {
-                        detail: format!(
-                            "delete known-uncommitted writer-v2 object `{}`: {error}",
-                            artifact.object_identity
-                        ),
-                    })?;
-            }
             let (token, artifacts, parquet_owner) = attempt.take_terminal();
             artifacts.cleanup()?;
             tokens.push(token);
@@ -2656,6 +2844,14 @@ impl ScribeImpl {
             return Err(ScribeError::Internal {
                 detail: "WAL replay cancelled".to_owned(),
             });
+        }
+        if let Some(persistence) = &self.persistence {
+            let recovered = persistence.recover_staged_publications().await?;
+            tracing::info!(
+                recovered,
+                stream = %self.stream,
+                "Scribe staged publications reconciled before WAL replay"
+            );
         }
         let result = self
             .wal_io

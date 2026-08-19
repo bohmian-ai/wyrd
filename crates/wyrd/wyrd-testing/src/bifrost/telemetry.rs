@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+#[cfg(test)]
+use metrics_exporter_prometheus::PrometheusBuilder;
 use metrics_exporter_prometheus::PrometheusHandle;
 use wyrd_telemetry::{CapturedSpan, TestTraceCapture};
 
@@ -140,6 +142,7 @@ const ORACLE_ADMISSION_LABELS: &[TelemetryLabelValues] = &[
             "memory",
             "spill",
             "audit_unavailable",
+            "membership",
             "shutdown",
         ],
     },
@@ -4867,14 +4870,12 @@ fn validate_role_topology(
 mod tests {
     use std::path::PathBuf;
 
+    use super::*;
     use vala_bifrost_redux::resources::{
         BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, ForgeRewriteRequest,
         MIN_SCRATCH_FREE_BYTES, ResourceSource, SystemResourceSnapshot,
     };
     use vala_sql::row_types::forge_tasks::{FORGE_ENVELOPE_VERSION, ForgeTaskEnvelope};
-    use wyrd_server::app::metrics::install_recorder;
-
-    use super::*;
 
     /// Construct one normalized production sample for mapper contract tests.
     fn sample(family: &str, labels: &[(&str, &str)], value: f64) -> BifrostMetricSample {
@@ -5905,6 +5906,7 @@ mod tests {
                             "memory",
                             "spill",
                             "audit_unavailable",
+                            "membership",
                             "shutdown",
                         ],
                     ),
@@ -6125,6 +6127,33 @@ mod tests {
                 aggregation: Delta,
                 requirement: Role("oracle"),
                 destination: "oracle spill bytes",
+            },
+            EmitterContractFixture {
+                id: "oracle.spill_files",
+                selectors: &[],
+                family: "oracle_query_spill_files_total",
+                kind: Counter,
+                keys: &["class"],
+                domains: &[("class", &["interactive", "analytical"])],
+                unit: Count,
+                aggregation: Delta,
+                requirement: Role("oracle"),
+                destination: "oracle spill files",
+            },
+            EmitterContractFixture {
+                id: "oracle.spill_queries",
+                selectors: &[],
+                family: "oracle_query_spill_queries_total",
+                kind: Counter,
+                keys: &["class", "outcome"],
+                domains: &[
+                    ("class", &["interactive", "analytical"]),
+                    ("outcome", &["success", "error", "cancelled"]),
+                ],
+                unit: Count,
+                aggregation: Delta,
+                requirement: Role("oracle"),
+                destination: "oracle spill queries",
             },
             EmitterContractFixture {
                 id: "postgres.acquire",
@@ -6712,69 +6741,72 @@ mod tests {
     /// acquisition, metric capture, or maintenance-report projection fails.
     #[test]
     fn forge_only_report_uses_event_driven_root_metrics() {
-        let recorder = install_recorder().expect("production Prometheus recorder");
-        let scratch_limit = 512 * 1024 * 1024_u64;
-        let runtime = BifrostRuntimeResources::from_snapshot(
-            SystemResourceSnapshot {
-                memory_limit_bytes: 1024 * 1024 * 1024,
-                effective_cpu: 4,
-                scratch_capacity_bytes: scratch_limit + MIN_SCRATCH_FREE_BYTES,
-                scratch_available_bytes: scratch_limit + MIN_SCRATCH_FREE_BYTES,
-                memory_source: ResourceSource::Injected,
-                cpu_source: ResourceSource::Injected,
-            },
-            BifrostResourcePolicy {
-                roles: [BifrostRole::Forge].into_iter().collect(),
-                memory_limit_bytes: None,
-                unmanaged_reserve_bytes: None,
-                scratch_limit_bytes: Some(scratch_limit),
-                effective_cpu: None,
-                scratch_root: PathBuf::new(),
-                volume_roots: None,
-            },
-        )
-        .expect("Forge-only runtime resources");
-        let forge = runtime
-            .compose_roles()
-            .expect("Forge-only role composition")
-            .forge()
-            .expect("Forge capability");
-        let owner = forge
-            .try_acquire_rewrite(ForgeRewriteRequest {
-                envelope: ForgeTaskEnvelope {
-                    version: FORGE_ENVELOPE_VERSION,
-                    reader_permits: 1,
-                    decoded_batch_bytes: 1,
-                    decoded_input_bytes: 1,
-                    sort_working_bytes: 1,
-                    sort_merge_reservation_bytes: 1,
-                    encoder_buffer_bytes: 1,
-                    upload_chunk_bytes: 1,
-                    footer_encoded_bytes: 1,
-                    footer_decode_workspace_bytes: 1,
-                    sort_spill_bytes: 1,
-                    output_scratch_bytes: 1,
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let (peak, final_value) = metrics::with_local_recorder(&recorder, || {
+            let scratch_limit = 512 * 1024 * 1024_u64;
+            let runtime = BifrostRuntimeResources::from_snapshot(
+                SystemResourceSnapshot {
+                    memory_limit_bytes: 1024 * 1024 * 1024,
+                    effective_cpu: 4,
+                    scratch_capacity_bytes: scratch_limit + MIN_SCRATCH_FREE_BYTES,
+                    scratch_available_bytes: scratch_limit + MIN_SCRATCH_FREE_BYTES,
+                    memory_source: ResourceSource::Injected,
+                    cpu_source: ResourceSource::Injected,
                 },
-                memory_bytes: 5,
-                scratch_bytes: 2,
-                reader_permits: 1,
-            })
-            .expect("real Forge rewrite acquisition");
-        let current = || {
-            rendered_values(&recorder.render())
-                .expect("production Forge metrics parse")
-                .into_iter()
-                .find(|(name, _)| {
-                    name.starts_with("bifrost_resource_current_bytes{")
-                        && name.contains("role=\"forge\"")
-                        && name.contains("resource=\"memory\"")
+                BifrostResourcePolicy {
+                    roles: [BifrostRole::Forge].into_iter().collect(),
+                    memory_limit_bytes: None,
+                    unmanaged_reserve_bytes: None,
+                    scratch_limit_bytes: Some(scratch_limit),
+                    effective_cpu: None,
+                    scratch_root: PathBuf::new(),
+                    volume_roots: None,
+                },
+            )
+            .expect("Forge-only runtime resources");
+            let forge = runtime
+                .compose_roles()
+                .expect("Forge-only role composition")
+                .forge()
+                .expect("Forge capability");
+            let owner = forge
+                .try_acquire_rewrite(ForgeRewriteRequest {
+                    envelope: ForgeTaskEnvelope {
+                        version: FORGE_ENVELOPE_VERSION,
+                        reader_permits: 1,
+                        decoded_batch_bytes: 1,
+                        decoded_input_bytes: 1,
+                        sort_working_bytes: 1,
+                        sort_merge_reservation_bytes: 1,
+                        encoder_buffer_bytes: 1,
+                        upload_chunk_bytes: 1,
+                        footer_encoded_bytes: 1,
+                        footer_decode_workspace_bytes: 1,
+                        sort_spill_bytes: 1,
+                        output_scratch_bytes: 1,
+                    },
+                    memory_bytes: 5,
+                    scratch_bytes: 2,
+                    reader_permits: 1,
                 })
-                .map(|(_, value)| value)
-                .expect("event-driven Forge root gauge")
-        };
-        let peak = current();
-        drop(owner);
-        let final_value = current();
+                .expect("real Forge rewrite acquisition");
+            let current = || {
+                rendered_values(&handle.render())
+                    .expect("production Forge metrics parse")
+                    .into_iter()
+                    .find(|(name, _)| {
+                        name.starts_with("bifrost_resource_current_bytes{")
+                            && name.contains("role=\"forge\"")
+                            && name.contains("resource=\"memory\"")
+                    })
+                    .map(|(_, value)| value)
+                    .expect("event-driven Forge root gauge")
+            };
+            let peak = current();
+            drop(owner);
+            (peak, current())
+        });
         assert!(peak > 0.0);
         assert_eq!(final_value, 0.0);
 

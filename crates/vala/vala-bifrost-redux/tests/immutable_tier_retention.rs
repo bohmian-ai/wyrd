@@ -53,6 +53,13 @@ fn pending_is_readable_and_only_committed_generation_retires() {
             event(),
             ScribeAppendMeta {
                 batch_id: [1; 16],
+                schema_fingerprint: [0; 32],
+                data_digest: [0; 32],
+                data_len: 0,
+                payload_digest: [0; 32],
+                payload_len: 0,
+                slice_index: 0,
+                slice_count: 1,
                 rows_accepted: 1,
                 wal_lsn_min: WalLsn::new(11),
                 wal_lsn_max: WalLsn::new(11),

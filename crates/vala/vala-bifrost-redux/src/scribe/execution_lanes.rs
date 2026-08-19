@@ -21,11 +21,10 @@ use crate::resources::ScribeResources;
 use crate::schema::fingerprint::SchemaFingerprint;
 use crate::scribe::admission::EventTimeWindow;
 use crate::scribe::memtable::FrozenMemtable;
-use crate::scribe::parquet_writer::{ParquetEncoded, encode_batch};
-use crate::scribe::preprocess::{
-    AdmittedAppend, NativeSliceProducer, OtlpSliceProducer, PreparedAppend, PreparedSlice,
-    prepare_append,
+use crate::scribe::parquet_writer::{
+    CandidateEncodeRequest, FileCandidate, ParquetEncoded, encode_batch, encode_candidate,
 };
+use crate::scribe::preprocess::{AdmittedAppend, PreparedAppend, prepare_append};
 use crate::scribe::replay::ReplayedSealKey;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::stream_identity::StreamIdentity;
@@ -525,7 +524,7 @@ fn source_schema_fingerprint(schema: &Schema) -> SchemaFingerprint {
     SchemaFingerprint::from_arrow_schema(&Schema::new(fields))
 }
 
-/// Captures one deterministic receipt timestamp for planning and regeneration.
+/// Captures one deterministic receipt timestamp for planning and projection.
 ///
 /// # Errors
 ///
@@ -1000,24 +999,6 @@ fn append_managed_columns(
 #[derive(Debug)]
 pub(crate) enum ScribePersistenceCpuOp {
     Preprocess(Box<AdmittedAppend>),
-    /// Advance one root-owned native producer by at most one slice.
-    ProduceNativeSlice {
-        /// Current-only producer state moved into the detached Rayon job.
-        producer: Box<NativeSliceProducer>,
-        /// Root-backed owner that must outlive every allocation in the job.
-        memory: crate::resources::ScribeMemoryLease,
-        /// Lifecycle owner moved with the root through detached execution.
-        lifecycle: crate::scribe::telemetry::ScribeIngressLifecycleOwner,
-    },
-    /// Advance the root-owned one-shot OTLP producer.
-    ProduceOtlpSlice {
-        /// Current-only producer state moved into the detached Rayon job.
-        producer: Box<OtlpSliceProducer>,
-        /// Root-backed owner that must outlive every allocation in the job.
-        memory: crate::resources::ScribeMemoryLease,
-        /// Lifecycle owner moved with the root through detached execution.
-        lifecycle: crate::scribe::telemetry::ScribeIngressLifecycleOwner,
-    },
     EncodeParquet(Box<EncodeParquetOp>),
     RestoreReplay {
         replayed: Box<ReplayedSealKey>,
@@ -1045,6 +1026,10 @@ pub(crate) struct EncodeParquetOp {
     pub(crate) binding: TenantTableBinding,
     /// Authenticated tenant checked again by the encoder.
     pub(crate) tenant: wyrd_spec::ids::DataTenantId,
+    /// Exact whole-batch candidate encoded by this serial operation.
+    pub(crate) candidate: Option<FileCandidate>,
+    /// First generation-global artifact ordinal assigned to this candidate.
+    pub(crate) first_ordinal: usize,
     /// Generation-owned output scratch directory.
     pub(crate) scratch_dir: std::path::PathBuf,
     /// Deterministic artifact basename.
@@ -1057,28 +1042,6 @@ pub(crate) struct EncodeParquetOp {
 #[derive(Debug)]
 pub(crate) enum ScribePersistenceCpuResult {
     Prepared(PreparedAppend),
-    /// Native producer state returned with its optional current slice.
-    NativeSliceProduced {
-        /// Producer to retain for the next bounded turn.
-        producer: Box<NativeSliceProducer>,
-        /// Current slice, or `None` after exact exhaustion.
-        slice: Option<PreparedSlice>,
-        /// Root-backed owner returned only after the detached job completes.
-        memory: crate::resources::ScribeMemoryLease,
-        /// Lifecycle owner returned only after detached execution completes.
-        lifecycle: crate::scribe::telemetry::ScribeIngressLifecycleOwner,
-    },
-    /// OTLP producer state returned with its optional current slice.
-    OtlpSliceProduced {
-        /// Producer retained for post-COMMIT deterministic regeneration.
-        producer: Box<OtlpSliceProducer>,
-        /// Sole current slice, or `None` for an empty/exhausted request.
-        slice: Option<PreparedSlice>,
-        /// Root-backed owner returned only after the detached job completes.
-        memory: crate::resources::ScribeMemoryLease,
-        /// Lifecycle owner returned only after detached execution completes.
-        lifecycle: crate::scribe::telemetry::ScribeIngressLifecycleOwner,
-    },
     ParquetEncoded(ParquetEncoded),
     ReplayRestored(Box<FrozenMemtable>),
 }
@@ -1104,65 +1067,39 @@ fn execute_persistence_operation(
             }
             prepare_append(*append).map(ScribePersistenceCpuResult::Prepared)
         }
-        ScribePersistenceCpuOp::ProduceNativeSlice {
-            mut producer,
-            memory,
-            mut lifecycle,
-        } => {
-            let slice = producer.next_slice().inspect_err(|_| lifecycle.refuse())?;
-            if let Some(materialized) = &slice {
-                lifecycle.materialized(
-                    materialized
-                        .memtable_bytes
-                        .saturating_add(materialized.wal_append.audit.len())
-                        .saturating_add(materialized.wal_append.data.len()),
-                );
-            }
-            Ok(ScribePersistenceCpuResult::NativeSliceProduced {
-                producer,
-                slice,
-                memory,
-                lifecycle,
-            })
-        }
-        ScribePersistenceCpuOp::ProduceOtlpSlice {
-            mut producer,
-            memory,
-            mut lifecycle,
-        } => {
-            let slice = producer.next_slice().inspect_err(|_| lifecycle.refuse())?;
-            if let Some(materialized) = &slice {
-                lifecycle.materialized(
-                    materialized
-                        .memtable_bytes
-                        .saturating_add(materialized.wal_append.audit.len())
-                        .saturating_add(materialized.wal_append.data.len()),
-                );
-            }
-            Ok(ScribePersistenceCpuResult::OtlpSliceProduced {
-                producer,
-                slice,
-                memory,
-                lifecycle,
-            })
-        }
         ScribePersistenceCpuOp::EncodeParquet(operation) => {
             let EncodeParquetOp {
                 frozen,
                 binding,
                 tenant,
+                candidate,
+                first_ordinal,
                 scratch_dir,
                 object_base,
                 footer_reservation,
             } = *operation;
-            encode_batch(
-                &frozen,
-                &binding,
-                tenant,
-                &scratch_dir,
-                &object_base,
-                footer_reservation,
-            )
+            match candidate {
+                Some(candidate) => encode_candidate(
+                    CandidateEncodeRequest {
+                        frozen: &frozen,
+                        binding: &binding,
+                        seal_tenant: tenant,
+                        candidate,
+                        first_ordinal,
+                        scratch_dir: &scratch_dir,
+                        object_base: &object_base,
+                    },
+                    footer_reservation,
+                ),
+                None => encode_batch(
+                    &frozen,
+                    &binding,
+                    tenant,
+                    &scratch_dir,
+                    &object_base,
+                    footer_reservation,
+                ),
+            }
             .map(ScribePersistenceCpuResult::ParquetEncoded)
         }
         ScribePersistenceCpuOp::RestoreReplay { replayed } => {
@@ -1420,7 +1357,7 @@ pub(crate) enum ScribeWalIoOp {
     },
     #[expect(
         dead_code,
-        reason = "task 14 persistence submits manifest replacements through this closed operation"
+        reason = "manifest replacement persistence submits through this closed operation"
     )]
     ReplaceManifest { path: PathBuf, contents: Bytes },
     AdvanceManifest {
@@ -1826,7 +1763,6 @@ fn execute_replay_directory_stream(
             }
             restored = restored.saturating_add(state_count);
             Ok(crate::scribe::replay::ReplayChunkSettlement {
-                retired: outcome.retirements.len() == state_count,
                 identity_memory: outcome.identity_memory,
             })
         },

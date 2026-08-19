@@ -21,7 +21,11 @@ use crate::http::error::WyrdErrorResponse;
 /// Tower layer that wraps a service with the Wyrd-owned body size limiter.
 #[derive(Clone)]
 pub struct WyrdBodyLimitLayer {
+    /// Default maximum body bytes for non-Scribe HTTP routes.
     max_bytes: usize,
+    /// Optional route-local maximum for enabled Scribe OTLP HTTP endpoints.
+    scribe_max_bytes: Option<usize>,
+    /// Process-root transport reservation owner used only by Scribe routes.
     admission: Option<vala_bifrost_redux::gate::limits::BifrostTransportAdmission>,
 }
 
@@ -30,10 +34,12 @@ impl WyrdBodyLimitLayer {
     #[must_use]
     pub fn new(
         max_bytes: usize,
+        scribe_max_bytes: Option<usize>,
         admission: Option<vala_bifrost_redux::gate::limits::BifrostTransportAdmission>,
     ) -> Self {
         Self {
             max_bytes,
+            scribe_max_bytes,
             admission,
         }
     }
@@ -46,6 +52,7 @@ impl<S> Layer<S> for WyrdBodyLimitLayer {
         WyrdBodyLimitService {
             inner,
             max_bytes: self.max_bytes,
+            scribe_max_bytes: self.scribe_max_bytes,
             admission: self.admission.clone(),
         }
     }
@@ -54,8 +61,13 @@ impl<S> Layer<S> for WyrdBodyLimitLayer {
 /// Tower service that enforces the body size limit.
 #[derive(Clone)]
 pub struct WyrdBodyLimitService<S> {
+    /// Wrapped route service invoked after bounded admission succeeds.
     inner: S,
+    /// Default maximum body bytes for non-Scribe HTTP routes.
     max_bytes: usize,
+    /// Optional route-local maximum for enabled Scribe OTLP HTTP endpoints.
+    scribe_max_bytes: Option<usize>,
+    /// Process-root transport reservation owner used only by Scribe routes.
     admission: Option<vala_bifrost_redux::gate::limits::BifrostTransportAdmission>,
 }
 
@@ -76,8 +88,16 @@ where
     }
 
     fn call(&mut self, request: Request<Body>) -> Self::Future {
-        let max_bytes = self.max_bytes;
-        let admission = self.admission.clone();
+        let scribe_route = matches!(
+            request.uri().path(),
+            "/v1/traces" | "/v1/metrics" | "/v1/logs"
+        );
+        let max_bytes = if scribe_route {
+            self.scribe_max_bytes.unwrap_or(self.max_bytes)
+        } else {
+            self.max_bytes
+        };
+        let admission = scribe_route.then(|| self.admission.clone()).flatten();
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
@@ -169,9 +189,10 @@ where
 /// Convenience constructor for use in `Router::layer` composition.
 pub fn wyrd_body_limit(
     max_bytes: usize,
+    scribe_max_bytes: Option<usize>,
     admission: Option<vala_bifrost_redux::gate::limits::BifrostTransportAdmission>,
 ) -> WyrdBodyLimitLayer {
-    WyrdBodyLimitLayer::new(max_bytes, admission)
+    WyrdBodyLimitLayer::new(max_bytes, scribe_max_bytes, admission)
 }
 
 #[cfg(test)]
@@ -193,7 +214,11 @@ mod tests {
     #[test]
     fn bifrost_transport_admission_is_process_wide_at_server_edge() {
         let admission = BifrostTransportAdmission::default();
-        let layer = wyrd_body_limit(1024, Some(admission.clone()));
+        let layer = wyrd_body_limit(
+            1024,
+            Some(BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES),
+            Some(admission.clone()),
+        );
         assert_eq!(layer.max_bytes, 1024);
         let first = admission
             .try_acquire(BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES)
@@ -223,13 +248,18 @@ mod tests {
         let invoked = Arc::new(AtomicBool::new(false));
         let observed = Arc::clone(&invoked);
         let service = ServiceBuilder::new()
-            .layer(wyrd_body_limit(1024, Some(admission.clone())))
+            .layer(wyrd_body_limit(
+                1024,
+                Some(BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES),
+                Some(admission.clone()),
+            ))
             .service(service_fn(move |_request: Request<Body>| {
                 observed.store(true, Ordering::Release);
                 async { Ok::<_, Infallible>(Response::new(Body::empty())) }
             }));
         let request = Request::builder()
             .version(axum::http::Version::HTTP_2)
+            .uri("/v1/traces")
             .body(Body::from("unknown-length"))
             .expect("HTTP/2 request");
         let response = service.oneshot(request).await.expect("infallible service");
@@ -243,5 +273,48 @@ mod tests {
             2 * BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES
         );
         drop((first, second));
+    }
+
+    /// Only the three mounted Scribe HTTP routes receive the selected encoded
+    /// request limit; unrelated protected routes retain the general 413 floor.
+    #[tokio::test]
+    async fn scribe_body_limit_is_route_local() {
+        let admission = BifrostTransportAdmission::default();
+        let invoked = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&invoked);
+        let service = ServiceBuilder::new()
+            .layer(wyrd_body_limit(
+                16,
+                Some(BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES),
+                Some(admission),
+            ))
+            .service(service_fn(move |_request: Request<Body>| {
+                observed.store(true, Ordering::Release);
+                async { Ok::<_, Infallible>(Response::new(Body::empty())) }
+            }));
+        let scribe = Request::builder()
+            .uri("/v1/traces")
+            .header(axum::http::header::CONTENT_LENGTH, "17")
+            .body(Body::from(vec![0_u8; 17]))
+            .expect("Scribe request");
+        assert_eq!(
+            service
+                .clone()
+                .oneshot(scribe)
+                .await
+                .expect("response")
+                .status(),
+            axum::http::StatusCode::OK
+        );
+        let protected = Request::builder()
+            .uri("/v1/cards")
+            .header(axum::http::header::CONTENT_LENGTH, "17")
+            .body(Body::empty())
+            .expect("protected request");
+        assert_eq!(
+            service.oneshot(protected).await.expect("response").status(),
+            axum::http::StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert!(invoked.load(Ordering::Acquire));
     }
 }

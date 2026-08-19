@@ -237,12 +237,16 @@ pub fn build_artifact_inserts(
         detail: format!("invalid writer-v2 node identity: {error}"),
     })?;
     let (wal_lsn_min, wal_lsn_max) = extract_lsn_range(encoded)?;
+    let first_ordinal = encoded
+        .artifacts
+        .first()
+        .map_or(0_usize, |artifact| usize::from(artifact.ordinal));
     encoded
         .artifacts
         .iter()
         .enumerate()
-        .map(|(expected, artifact)| {
-            if usize::from(artifact.ordinal) != expected
+        .map(|(offset, artifact)| {
+            if usize::from(artifact.ordinal) != first_ordinal.saturating_add(offset)
                 || artifact.checksum.len() != 64
                 || !artifact
                     .checksum
@@ -269,7 +273,7 @@ pub fn build_artifact_inserts(
                 .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_micros)
                 .unwrap_or(epoch);
             Ok(FileListArtifactInsert {
-                id: Uuid::now_v7(),
+                id: artifact_row_id(&artifact.object_identity),
                 data_tenant_id: binding.tenant,
                 namespace: binding.logical_namespace.clone(),
                 table_name: binding.table_name.clone(),
@@ -300,6 +304,23 @@ pub fn build_artifact_inserts(
             })
         })
         .collect()
+}
+
+/// Derives the stable catalog row identity owned by one deterministic artifact.
+///
+/// Publication retries rebuild compact SQL rows from the retained immutable
+/// generation. The row identifier must therefore remain identical to the
+/// elected local publication manifest instead of introducing attempt identity.
+fn artifact_row_id(object_identity: &str) -> Uuid {
+    let mut hasher = Sha256::new();
+    hasher.update(b"wyrd.scribe.file-list-row.v1\0");
+    hasher.update(object_identity.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
 }
 
 /// File-list INSERT row matching the `vala.file_list` columns.
@@ -662,41 +683,89 @@ pub async fn insert_artifact_set_and_audit_fenced(
     artifact_set_outcome(first, rows, inserted)
 }
 
-/// Deterministic test barrier reached while the publication transaction owns its fence lock.
+/// Deterministic test barrier spanning the two sides of durable publication.
+///
+/// The first phase pauses after Scribe has persisted its local publication
+/// manifest but before the fenced file-list transaction starts. The second
+/// phase pauses after that transaction is visible but before the persistence
+/// worker may advance its WAL manifest, clean local stages, or notify the shard
+/// owner to retire immutable state.
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone)]
 pub struct PublicationFenceBarrier {
-    /// Signals that publication has acquired and validated the membership lock.
-    acquired: std::sync::Arc<tokio::sync::Notify>,
-    /// Releases publication to perform its atomic file-list and audit mutation.
-    release: std::sync::Arc<tokio::sync::Notify>,
+    /// Optional logical table selecting which concurrent cohort member pauses.
+    target_table: Option<String>,
+    /// Signals that the durable local publication manifest is query-pinnable.
+    before_publication: std::sync::Arc<tokio::sync::Notify>,
+    /// Releases the reconciler to enter the fenced SQL transaction.
+    release_before_publication: std::sync::Arc<tokio::sync::Notify>,
+    /// Signals that file-list and audit publication are durably visible.
+    after_publication: std::sync::Arc<tokio::sync::Notify>,
+    /// Releases post-publication manifest advancement and local cleanup.
+    release_after_publication: std::sync::Arc<tokio::sync::Notify>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
 impl PublicationFenceBarrier {
-    /// Create one single-use publication fence barrier.
+    /// Creates one single-use two-phase publication fence barrier.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            acquired: std::sync::Arc::new(tokio::sync::Notify::new()),
-            release: std::sync::Arc::new(tokio::sync::Notify::new()),
+            target_table: None,
+            before_publication: std::sync::Arc::new(tokio::sync::Notify::new()),
+            release_before_publication: std::sync::Arc::new(tokio::sync::Notify::new()),
+            after_publication: std::sync::Arc::new(tokio::sync::Notify::new()),
+            release_after_publication: std::sync::Arc::new(tokio::sync::Notify::new()),
         }
     }
 
-    /// Wait until production publication owns the membership row lock.
-    pub async fn wait_until_acquired(&self) {
-        self.acquired.notified().await;
+    /// Creates a barrier selecting the next publication for one logical table.
+    #[must_use]
+    pub fn for_table(table_name: impl Into<String>) -> Self {
+        Self {
+            target_table: Some(table_name.into()),
+            ..Self::new()
+        }
     }
 
-    /// Allow the paused production publication transaction to continue.
-    pub fn release(&self) {
-        self.release.notify_one();
+    /// Reports whether one writer-v2 artifact set is the selected publication.
+    pub(crate) fn matches(&self, rows: &[FileListArtifactInsert]) -> bool {
+        self.target_table.as_ref().is_none_or(|table_name| {
+            rows.first()
+                .is_some_and(|row| row.table_name == *table_name)
+        })
     }
 
-    /// Pause the production transaction after fence validation and before mutation.
-    async fn pause(&self) {
-        self.acquired.notify_one();
-        self.release.notified().await;
+    /// Waits until the local publication manifest is durable but SQL is absent.
+    pub async fn wait_before_publication(&self) {
+        self.before_publication.notified().await;
+    }
+
+    /// Releases the reconciler to perform fenced file-list publication.
+    pub fn release_before_publication(&self) {
+        self.release_before_publication.notify_one();
+    }
+
+    /// Waits until SQL publication is visible but local immutable state remains.
+    pub async fn wait_after_publication(&self) {
+        self.after_publication.notified().await;
+    }
+
+    /// Releases manifest advancement, local cleanup, and shard completion.
+    pub fn release_after_publication(&self) {
+        self.release_after_publication.notify_one();
+    }
+
+    /// Pauses the production reconciler before it starts fenced SQL publication.
+    pub(crate) async fn pause_before_publication(&self) {
+        self.before_publication.notify_one();
+        self.release_before_publication.notified().await;
+    }
+
+    /// Pauses the production reconciler after SQL commit and before local cleanup.
+    pub(crate) async fn pause_after_publication(&self) {
+        self.after_publication.notify_one();
+        self.release_after_publication.notified().await;
     }
 }
 
@@ -708,7 +777,7 @@ impl Default for PublicationFenceBarrier {
     }
 }
 
-/// Publish through the production fenced transaction with a deterministic lock barrier.
+/// Publishes through the legacy single-row transaction with a pre-mutation barrier.
 ///
 /// # Errors
 /// Returns the same fence, replay, audit, SQL, or commit errors as
@@ -754,7 +823,7 @@ async fn insert_and_audit_fenced_inner(
     }
     #[cfg(any(test, feature = "test-support"))]
     if let Some(barrier) = barrier {
-        barrier.pause().await;
+        barrier.pause_before_publication().await;
     }
 
     let result = insert_file(&mut transaction, row).await?;
@@ -1035,4 +1104,20 @@ fn valid_artifact_identity(row: &FileListArtifactInsert) -> bool {
             .file_checksum
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::artifact_row_id;
+
+    /// Proves retries reuse one row identity while distinct artifacts remain distinct.
+    #[test]
+    fn deterministic_artifact_rows_are_retry_stable_and_artifact_local() {
+        let artifact = "tenant/table/day/member-0.parquet";
+        assert_eq!(artifact_row_id(artifact), artifact_row_id(artifact));
+        assert_ne!(
+            artifact_row_id(artifact),
+            artifact_row_id("tenant/table/day/member-1.parquet")
+        );
+    }
 }

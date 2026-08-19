@@ -113,6 +113,7 @@ mod pg_tests {
                 persistence: None,
                 resources: scribe_resources,
                 staging_file_publisher: None,
+                rotation_for_test: None,
             },
         )
         .expect("embedded Scribe");

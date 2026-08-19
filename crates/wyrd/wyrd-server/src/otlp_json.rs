@@ -351,12 +351,7 @@ impl JsonFacts {
     /// Returns [`JsonDecodeError`] when the material-byte total overflows or
     /// exceeds the configured material ceiling.
     fn add_decode(&mut self, amount: usize) -> Result<(), JsonDecodeError> {
-        Self::add_bounded(
-            &mut self.decode_bytes,
-            amount,
-            self.limits.material_bytes,
-            "material",
-        )
+        Self::add_bounded(&mut self.decode_bytes, amount, usize::MAX, "material")
     }
 
     /// Charges retained variable-width bytes and their backing allocation.

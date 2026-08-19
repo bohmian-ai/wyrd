@@ -85,6 +85,11 @@ assert_rejected() {
 }
 
 deleted_tokens=(
+  'OracleAdmission''Owner'
+  'OracleAdmissionTicket''Claims'
+  'admission_owner_fencing''_token'
+  'oracle_admission''_owner'
+  'OracleOwnerRoute''Cache'
   'bifrost_oracle''_lease_renewals_total'
   'bifrost_oracle''_lease_release_queue_total'
   'bifrost_oracle''_admission_reconcile_total'

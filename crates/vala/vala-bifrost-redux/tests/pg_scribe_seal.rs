@@ -177,6 +177,7 @@ mod pg_tests {
                 ),
                 resources: scribe_resources,
                 staging_file_publisher: None,
+                rotation_for_test: None,
             },
         );
 

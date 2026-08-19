@@ -857,12 +857,7 @@ fn grant_waiters(
                     made_progress = true;
                     continue;
                 }
-                let Ok(resources) =
-                    shared
-                        .resources
-                        .try_acquire_query(crate::resources::OracleResourceRequest {
-                            local_ratio: waiter.local_ratio,
-                        })
+                let Ok(resources) = acquire_waiter_resources(shared, kind, waiter.local_ratio)
                 else {
                     class.tenants[index].1.waiters.push_front(waiter);
                     continue;
@@ -891,6 +886,40 @@ fn grant_waiters(
         }
     }
     notifications
+}
+
+/// Acquires the exact root resource quantum for one queued admission class.
+///
+/// # Errors
+///
+/// Returns [`crate::resources::BifrostResourceError`] when the root governor
+/// cannot cover the class quantum without violating Task 01 accounting.
+fn acquire_waiter_resources(
+    shared: &AdmissionShared,
+    kind: AdmissionClass,
+    local_ratio: f64,
+) -> Result<crate::resources::OracleQueryResources, crate::resources::BifrostResourceError> {
+    let (query_class, memory_bytes, slot_units) = match kind {
+        AdmissionClass::Interactive => (
+            QueryClass::Interactive,
+            crate::resources::ORACLE_PARTITION_MEMORY_BYTES,
+            1,
+        ),
+        AdmissionClass::Analytical => (
+            QueryClass::Analytical,
+            2 * crate::resources::ORACLE_PARTITION_MEMORY_BYTES,
+            2,
+        ),
+    };
+    shared
+        .resources
+        .try_acquire_query(crate::resources::OracleResourceRequest {
+            query_class,
+            memory_bytes,
+            scratch_bytes: memory_bytes as u64,
+            slot_units,
+            local_ratio,
+        })
 }
 
 /// Notifies winners after releasing the admission mutex and repairs canceled sends.
@@ -1456,7 +1485,7 @@ mod tests {
             state.queued += 1;
         }
         let notifications = grant_waiters(&shared, &mut state);
-        assert_eq!(state.interactive.used, 1);
+        assert_eq!(state.interactive.used, 2);
         assert!(
             state
                 .interactive
@@ -1471,7 +1500,7 @@ mod tests {
                 .into_iter()
                 .map(|mut rx| usize::from(rx.try_recv().is_ok()))
                 .sum::<usize>(),
-            1
+            2
         );
     }
 
@@ -1501,7 +1530,7 @@ mod tests {
         drop(future);
     }
 
-    /// Weighted rounds grant one waiter per tenant before an idle tenant is borrowed.
+    /// Weighted rounds grant each tenant before borrowing the remaining idle capacity.
     #[test]
     fn local_admission_weighted_round_robin_and_borrowing() {
         let shared = shared(OracleAdmissionConfig {
@@ -1543,9 +1572,9 @@ mod tests {
             });
         state.queued += 1;
         let notifications = grant_waiters(&shared, &mut state);
-        assert_eq!(state.interactive.used, 1);
-        assert_eq!(state.interactive.tenants[0].1.active, 1);
-        assert_eq!(state.interactive.tenants[1].1.active, 0);
+        assert_eq!(state.interactive.used, 3);
+        assert_eq!(state.interactive.tenants[0].1.active, 2);
+        assert_eq!(state.interactive.tenants[1].1.active, 1);
         drop(state);
         notify_grants(&shared, notifications);
         assert_eq!(
@@ -1553,7 +1582,7 @@ mod tests {
                 .into_iter()
                 .map(|mut rx| usize::from(rx.try_recv().is_ok()))
                 .sum::<usize>(),
-            1
+            3
         );
     }
 
@@ -1656,7 +1685,7 @@ mod tests {
         drop(first);
     }
 
-    /// Releasing the sole owner cancels only its child and wakes the next query.
+    /// Releasing one concurrent owner cancels only that query's child.
     #[tokio::test]
     async fn production_admission_two_query_cancellation_isolated() {
         let owner = owner(OracleAdmissionConfig {
@@ -1689,13 +1718,13 @@ mod tests {
                 .await
         });
         tokio::task::yield_now().await;
-        assert!(!second_task.is_finished());
+        assert!(second_task.is_finished());
         first.release();
         assert!(first_child.is_cancelled());
         let second = second_task
             .await
-            .expect("queued task")
-            .expect("second admission after release");
+            .expect("concurrent task")
+            .expect("second concurrent admission");
         let second_child = second.cancellation.clone();
         assert!(!second_child.is_cancelled());
         assert!(!caller_one.is_cancelled());

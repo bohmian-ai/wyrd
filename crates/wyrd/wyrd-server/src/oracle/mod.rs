@@ -4,11 +4,12 @@ use std::sync::Arc;
 use vala_bifrost_redux::cluster::ClusterRegistry;
 use vala_bifrost_redux::cluster::RegisteredRole;
 use vala_bifrost_redux::oracle::dispatcher::OraclePeerWorker;
-use vala_bifrost_redux::scribe::tail_rpc::ScribeTailReader;
+use vala_bifrost_redux::scribe::tail_rpc::{FetchLiveTailService, ScribeTailReader};
 
 mod audit_wal;
 /// Private owner-local lifecycle transport over the canonical query runtime.
 pub(crate) mod lifecycle_service;
+mod lifecycle_transport;
 mod peer_audit;
 mod peer_authority;
 mod peer_credentials;
@@ -19,6 +20,9 @@ mod tail_authority;
 mod tail_discovery;
 
 pub use lifecycle_service::OracleLifecycleGrpc;
+pub use lifecycle_transport::{
+    OracleLifecycleNodeOutcome, OracleLifecycleOutcome, OracleLifecycleTransport,
+};
 pub use peer_audit::PostgresPeerSecurityAudit;
 pub use peer_authority::OraclePeerAuthority;
 pub use peer_credentials::ServerOraclePeerCredentials;
@@ -48,12 +52,16 @@ pub struct OraclePeerCapability {
     security_audit: Arc<PostgresPeerSecurityAudit>,
     /// Membership owner used to validate the exact Oracle incarnation.
     cluster: Arc<ClusterRegistry>,
+    /// Canonical authenticated client retained for lifecycle control fanout.
+    lifecycle_transport: Arc<OracleLifecycleTransport>,
 }
 
 /// Closed Scribe capability retained by the unified private follower owner.
 pub struct ScribePeerCapability {
     /// Existing unchanged Scribe tail reader.
     tail_reader: Arc<ScribeTailReader>,
+    /// Exact role-local source used to construct the retained reader.
+    tail_service: Arc<FetchLiveTailService>,
     /// Optional production ticket authority for the tail surface.
     tail_authority: Option<Arc<ScribeTailAuthority>>,
     /// Exact production Scribe role fence retained by the serving runtime.
@@ -67,11 +75,13 @@ impl OraclePeerRuntime {
         worker: Arc<OraclePeerWorker>,
         security_audit: Arc<PostgresPeerSecurityAudit>,
         cluster: Arc<ClusterRegistry>,
+        lifecycle_transport: Arc<OracleLifecycleTransport>,
     ) -> OraclePeerCapability {
         OraclePeerCapability {
             worker,
             security_audit,
             cluster,
+            lifecycle_transport,
         }
     }
 
@@ -79,11 +89,13 @@ impl OraclePeerRuntime {
     #[must_use]
     pub fn scribe_capability(
         tail_reader: Arc<ScribeTailReader>,
+        tail_service: Arc<FetchLiveTailService>,
         tail_authority: Option<Arc<ScribeTailAuthority>>,
         registered_role: RegisteredRole,
     ) -> ScribePeerCapability {
         ScribePeerCapability {
             tail_reader,
+            tail_service,
             tail_authority,
             registered_role,
         }
@@ -132,6 +144,12 @@ impl OraclePeerCapability {
     pub fn security_audit(&self) -> Arc<PostgresPeerSecurityAudit> {
         Arc::clone(&self.security_audit)
     }
+
+    /// Returns the one authenticated lifecycle transport built at boot.
+    #[must_use]
+    pub fn lifecycle_transport(&self) -> Arc<OracleLifecycleTransport> {
+        Arc::clone(&self.lifecycle_transport)
+    }
 }
 
 impl ScribePeerCapability {
@@ -139,6 +157,12 @@ impl ScribePeerCapability {
     #[must_use]
     pub fn tail_reader(&self) -> Arc<ScribeTailReader> {
         Arc::clone(&self.tail_reader)
+    }
+
+    /// Returns the exact role-local source retained beside the tail reader.
+    #[must_use]
+    pub fn tail_service(&self) -> Arc<FetchLiveTailService> {
+        Arc::clone(&self.tail_service)
     }
 
     /// Returns the private tail authority when production boot installed it.
@@ -158,9 +182,12 @@ impl ScribePeerCapability {
 #[cfg(test)]
 pub(crate) mod pg_tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use async_trait::async_trait;
     use tempfile::tempdir;
     use vala_bifrost_redux::cluster::ClusterRegistry;
+    use vala_bifrost_redux::oracle::dispatcher::{DispatchError, OraclePeerCredentials};
     use vala_bifrost_redux::scribe::ScribeImpl;
     use vala_bifrost_redux::scribe::tail_rpc::{
         TailTicketAudience, TailTicketClaims, TailTicketMinter,
@@ -170,7 +197,11 @@ pub(crate) mod pg_tests {
     use wyrd_auth_verify::TokenPrincipalRef;
     use wyrd_runtime::{PrincipalId, RoleRef};
     use wyrd_spec::auth::PrincipalKindTag;
-    use wyrd_spec::vala::api::{NodeId as ClusterNodeId, ScribeCapabilitiesV1};
+    use wyrd_spec::request_id::RequestId;
+    use wyrd_spec::vala::api::{
+        CancelOracleLifecycleRequest, NodeId as ClusterNodeId, OracleCapabilitiesV1,
+        OracleLifecycleLookupRequest, QueryClass, ScribeCapabilitiesV1,
+    };
     use wyrd_tonic::tonic::transport::{Channel, Endpoint};
     use wyrd_tonic::tonic_health::server::health_reporter;
     use wyrd_tonic::wyrd::v1;
@@ -179,8 +210,38 @@ pub(crate) mod pg_tests {
     use wyrd_tonic::wyrd::v1::oracle_peer_service_client::OraclePeerServiceClient;
     use wyrd_tonic::wyrd::v1::scribe_tail_service_client::ScribeTailServiceClient;
 
-    use super::OraclePeerRuntime;
+    use super::{OracleLifecycleOutcome, OraclePeerRuntime};
     use crate::state::{AppState, BifrostIngestRuntime};
+
+    /// Credential fixture that records acquisition and rejects one normal call.
+    struct CredentialProbe {
+        /// Production-signed credential owner installed by the boot fixture.
+        inner: Arc<dyn OraclePeerCredentials>,
+        /// Number of non-refresh acquisitions observed across boot and calls.
+        normal_calls: AtomicUsize,
+        /// Number of forced refresh acquisitions observed after rejection.
+        forced_refreshes: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl OraclePeerCredentials for CredentialProbe {
+        /// Returns real signed credentials except for the first transport call.
+        ///
+        /// # Errors
+        ///
+        /// Propagates an error from the production-shaped credential fixture.
+        async fn bearer(&self, force_refresh: bool) -> Result<String, DispatchError> {
+            if force_refresh {
+                self.forced_refreshes.fetch_add(1, Ordering::SeqCst);
+                return self.inner.bearer(true).await;
+            }
+            let call = self.normal_calls.fetch_add(1, Ordering::SeqCst);
+            if call == 2 {
+                return Ok("rejected-test-bearer".to_owned());
+            }
+            self.inner.bearer(false).await
+        }
+    }
 
     /// Builds one immutable production-shaped role state and its peer bearer.
     ///
@@ -191,6 +252,36 @@ pub(crate) mod pg_tests {
     pub(crate) async fn real_api_serving_state(
         role: crate::config::ForgeProcessRole,
     ) -> (AppState, String) {
+        let (state, bearer, _) = real_api_serving_state_inner(role, false).await;
+        (state, bearer)
+    }
+
+    /// Builds production composition with an observable credential refresh probe.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the production-shaped fixture cannot install the probe.
+    async fn real_api_serving_state_with_probe(
+        role: crate::config::ForgeProcessRole,
+    ) -> (AppState, String, Arc<CredentialProbe>) {
+        let (state, bearer, probe) = real_api_serving_state_inner(role, true).await;
+        (
+            state,
+            bearer,
+            probe.expect("credential probe requested by fixture"),
+        )
+    }
+
+    /// Builds the shared production-shaped state with optional credential observation.
+    ///
+    /// # Panics
+    ///
+    /// Panics when shared Postgres, authentication, Scribe, or Oracle fixtures
+    /// cannot establish the requested topology.
+    async fn real_api_serving_state_inner(
+        role: crate::config::ForgeProcessRole,
+        observe_credentials: bool,
+    ) -> (AppState, String, Option<Arc<CredentialProbe>>) {
         let state = AppState::new(
             crate::test_support::test_server_postgres().await,
             crate::test_support::test_storage().await,
@@ -211,9 +302,20 @@ pub(crate) mod pg_tests {
         );
         let signing_key = IssuingKey::generate_ephemeral_pem().expect("test signing key");
         config.auth.signing_key = Some(signing_key.clone());
-        let (state, credentials) =
+        let (state, base_credentials) =
             crate::boot::pg_tests::with_test_oracle_peer_credentials(state, &config, &signing_key)
                 .await;
+        let probe = observe_credentials.then(|| {
+            Arc::new(CredentialProbe {
+                inner: Arc::clone(&base_credentials),
+                normal_calls: AtomicUsize::new(0),
+                forced_refreshes: AtomicUsize::new(0),
+            })
+        });
+        let credentials: Arc<dyn OraclePeerCredentials> = probe.as_ref().map_or_else(
+            || Arc::clone(&base_credentials),
+            |probe| Arc::clone(probe) as Arc<dyn OraclePeerCredentials>,
+        );
         let peer_bearer = credentials
             .bearer(false)
             .await
@@ -288,7 +390,7 @@ pub(crate) mod pg_tests {
         )
         .await
         .expect("production-shaped combined runtime attaches");
-        (state, peer_bearer)
+        (state, peer_bearer, probe)
     }
 
     /// Captures the real Scribe reader retained by the ingest runtime.
@@ -303,6 +405,11 @@ pub(crate) mod pg_tests {
                 .as_ref()
                 .expect("Scribe runtime")
                 .tail_reader(),
+            state
+                .bifrost_ingest
+                .as_ref()
+                .expect("Scribe runtime")
+                .tail_service(),
             state
                 .bifrost_ingest
                 .as_ref()
@@ -524,6 +631,125 @@ pub(crate) mod pg_tests {
                 .bifrost_query
                 .take()
                 .expect("combined runtime")
+                .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(2))
+                .await;
+        });
+    }
+
+    /// Production composition invokes one registry through refreshing credentials.
+    ///
+    /// # Panics
+    ///
+    /// Panics when production composition, membership, authentication, refresh,
+    /// owner-local registry identity, or lifecycle semantics diverge.
+    #[test]
+    fn authenticated_lifecycle_transport_reuses_canonical_credentials_and_registry() {
+        wyrd_runtime::runtime().block_on(async {
+            let (mut state, _, credentials) =
+                real_api_serving_state_with_probe(crate::config::ForgeProcessRole::Server).await;
+            let query = state.bifrost_query().expect("query runtime");
+            let peer = state.oracle_peer.as_ref().expect("combined peer");
+            assert!(Arc::ptr_eq(
+                query.lifecycle_transport(),
+                &peer.oracle().lifecycle_transport(),
+            ));
+
+            let tenant = wyrd_spec::DataTenantId::new_v7();
+            let request_id = RequestId::now_v7();
+            assert!(query.running_queries().insert(
+                crate::oracle::lifecycle_service::pg_tests::running_entry(
+                    tenant,
+                    request_id.clone(),
+                ),
+            ));
+            let (_, health) = health_reporter();
+            let router = crate::grpc::build_app_grpc(
+                &state,
+                health,
+                crate::grpc::GrpcRouterConfig {
+                    reflection_enabled: false,
+                    tls_identity: None,
+                },
+            )
+            .expect("lifecycle service mounts");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("loopback listener binds");
+            let address = listener.local_addr().expect("listener has address");
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let server_shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                router
+                    .serve_with_incoming_shutdown(
+                        tokio_stream::wrappers::TcpListenerStream::new(listener),
+                        server_shutdown.cancelled_owned(),
+                    )
+                    .await
+                    .expect("lifecycle server runs");
+            });
+
+            let remote_node = ClusterNodeId::new(uuid::Uuid::now_v7());
+            let remote_cluster = ClusterRegistry::new(state.postgres.vala().clone(), remote_node);
+            remote_cluster
+                .register_oracle(
+                    &format!("http://{address}"),
+                    OracleCapabilitiesV1 {
+                        peer_protocol_version: 1,
+                        storage_protocol_version: 1,
+                        cpu_cores: 1.0,
+                        memory_budget_bytes: 1_024,
+                        cpu_cores_per_slot: 1.0,
+                        memory_bytes_per_slot: 1_024,
+                        raw_slots: 1,
+                        usable_slots: 1,
+                        supported_classes: vec![QueryClass::Interactive],
+                        max_workers_per_query: 1,
+                    },
+                )
+                .await
+                .expect("remote Oracle registers");
+            peer.oracle()
+                .cluster()
+                .refresh_snapshot()
+                .await
+                .expect("canonical cluster observes remote Oracle");
+
+            let lookup = OracleLifecycleLookupRequest {
+                tenant_id: tenant,
+                request_id: request_id.clone(),
+            };
+            let listed = query.lifecycle_transport().list(lookup.clone()).await;
+            assert_eq!(listed.len(), 1);
+            assert!(matches!(
+                &listed[0].outcome,
+                OracleLifecycleOutcome::Found(queries)
+                    if queries.len() == 1 && queries[0].request_id == request_id
+            ));
+            let got = query.lifecycle_transport().get(lookup).await;
+            assert!(matches!(
+                &got[0].outcome,
+                OracleLifecycleOutcome::Found(summary) if summary.request_id == request_id
+            ));
+            let cancelled = query
+                .lifecycle_transport()
+                .cancel(CancelOracleLifecycleRequest {
+                    tenant_id: tenant,
+                    request_id: request_id.clone(),
+                })
+                .await;
+            assert!(matches!(
+                &cancelled[0].outcome,
+                OracleLifecycleOutcome::Found(response)
+                    if response.request_id == request_id && response.cancellation_started
+            ));
+            assert_eq!(credentials.normal_calls.load(Ordering::SeqCst), 5);
+            assert_eq!(credentials.forced_refreshes.load(Ordering::SeqCst), 1);
+            assert!(query.running_queries().get(tenant, &request_id).is_some());
+            shutdown.cancel();
+            state
+                .bifrost_query
+                .take()
+                .expect("query runtime")
                 .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(2))
                 .await;
         });

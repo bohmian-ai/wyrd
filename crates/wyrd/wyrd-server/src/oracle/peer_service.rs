@@ -7,6 +7,7 @@ use futures_util::{Stream, StreamExt};
 use vala_bifrost_redux::cluster::ClusterRegistry;
 use vala_bifrost_redux::oracle::dispatcher::{DispatchError, OraclePeerWorker, WorkerExecution};
 use vala_bifrost_redux::oracle::peer::PeerSecurityAudit;
+use vala_bifrost_redux::scribe::tail_rpc::FetchLiveTailService;
 use wyrd_runtime::{Permission, Principal, PrincipalKind};
 use wyrd_spec::vala::api::BifrostSecurityViolationKind;
 use wyrd_tonic::private_conversion::PrivateConversionError;
@@ -30,6 +31,8 @@ pub struct OraclePeerGrpc {
     cluster: Arc<ClusterRegistry>,
     /// Scrubbed durable audit used for rejected peer authority.
     security_audit: Arc<dyn PeerSecurityAudit>,
+    /// Exact role-local follower source retained for authenticated execution.
+    tail_service: Arc<FetchLiveTailService>,
 }
 
 impl OraclePeerGrpc {
@@ -40,13 +43,21 @@ impl OraclePeerGrpc {
         worker: Arc<OraclePeerWorker>,
         cluster: Arc<ClusterRegistry>,
         security_audit: Arc<dyn PeerSecurityAudit>,
+        tail_service: Arc<FetchLiveTailService>,
     ) -> Self {
         Self {
             state,
             worker,
             cluster,
             security_audit,
+            tail_service,
         }
+    }
+
+    /// Borrows the exact role-local follower source installed by composition.
+    #[must_use]
+    pub fn tail_service(&self) -> &Arc<FetchLiveTailService> {
+        &self.tail_service
     }
 
     /// Returns the generated tonic server wrapper.

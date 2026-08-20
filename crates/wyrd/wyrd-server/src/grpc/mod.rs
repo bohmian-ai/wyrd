@@ -209,6 +209,7 @@ where
                 oracle.worker(),
                 oracle.cluster(),
                 oracle.security_audit(),
+                peer.scribe().tail_service(),
             )
             .into_server(),
             transport.clone(),
@@ -240,6 +241,34 @@ mod tests {
     use vala_bifrost_redux::gate::limits::{
         BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES, BifrostTransportAdmission,
     };
+
+    /// Mounted peer construction receives the exact retained follower source.
+    #[tokio::test]
+    async fn mounted_peer_receives_retained_follower_tail_source() {
+        let (mut state, _) = crate::oracle::pg_tests::real_api_serving_state(
+            crate::config::ForgeProcessRole::Server,
+        )
+        .await;
+        let peer = state.oracle_peer.as_ref().expect("combined peer");
+        let oracle = peer.oracle();
+        let mounted = crate::oracle::OraclePeerGrpc::new(
+            state.clone(),
+            oracle.worker(),
+            oracle.cluster(),
+            oracle.security_audit(),
+            peer.scribe().tail_service(),
+        );
+        assert!(Arc::ptr_eq(
+            mounted.tail_service(),
+            &peer.scribe().tail_service(),
+        ));
+        state
+            .bifrost_query
+            .take()
+            .expect("query runtime")
+            .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(2))
+            .await;
+    }
 
     /// Minimal tonic-shaped service recording admission state before body decode.
     #[derive(Clone)]

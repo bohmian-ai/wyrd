@@ -21,7 +21,9 @@ use vala_bifrost_redux::oracle::Oracle;
 use vala_bifrost_redux::oracle::RunningQueryRegistry;
 use vala_bifrost_redux::resources::BifrostRoleResources;
 use vala_bifrost_redux::scribe::ScribeImpl;
-use vala_bifrost_redux::scribe::tail_rpc::ScribeTailReader;
+use vala_bifrost_redux::scribe::tail_rpc::{
+    FetchLiveTailService, ScribeTailReader, TailFenceConfig,
+};
 use wyrd_auth_verify::TokenVerifier;
 use wyrd_storage::StorageHandle;
 use wyrd_telemetry::TelemetryGuard;
@@ -114,6 +116,8 @@ pub struct BifrostIngestRuntime {
     scribe: Arc<ScribeImpl>,
     /// One fence registry shared by every local and authenticated tonic tail read.
     tail_reader: Arc<ScribeTailReader>,
+    /// Exact role-local source used to construct [`Self::tail_reader`].
+    tail_service: Arc<FetchLiveTailService>,
     /// Optional domain-separated authority for private tail RPCs.
     tail_authority: Option<Arc<crate::oracle::ScribeTailAuthority>>,
     /// Protocol and policy boundary built around [`Self::scribe`].
@@ -178,6 +182,8 @@ pub struct BifrostQueryRuntime {
     audit: Arc<crate::oracle::OracleAuditPublisher>,
     /// Process-wide owner-local active-query registry.
     running_queries: RunningQueryOwner,
+    /// Canonical authenticated transport for owner-local lifecycle fanout.
+    lifecycle_transport: Arc<crate::oracle::OracleLifecycleTransport>,
 }
 
 /// Process-wide owner of the single local active-query registry allocation.
@@ -224,6 +230,7 @@ impl BifrostQueryRuntime {
         registry: Arc<ClusterRegistry>,
         coordination_runtime: Option<Arc<tokio::runtime::Runtime>>,
         audit: Arc<crate::oracle::OracleAuditPublisher>,
+        lifecycle_transport: Arc<crate::oracle::OracleLifecycleTransport>,
     ) -> Self {
         let role_shutdown = CancellationToken::new();
         let advertise_ready = Arc::new(AtomicBool::new(true));
@@ -250,6 +257,7 @@ impl BifrostQueryRuntime {
             coordination_runtime,
             audit,
             running_queries: RunningQueryOwner::new(),
+            lifecycle_transport,
         }
     }
 
@@ -263,6 +271,12 @@ impl BifrostQueryRuntime {
     #[must_use]
     pub fn running_queries(&self) -> &Arc<RunningQueryRegistry> {
         self.running_queries.registry()
+    }
+
+    /// Borrows the one boot-constructed authenticated lifecycle transport.
+    #[must_use]
+    pub fn lifecycle_transport(&self) -> &Arc<crate::oracle::OracleLifecycleTransport> {
+        &self.lifecycle_transport
     }
 
     /// Returns the private peer service owner mounted for this Oracle fence.
@@ -419,11 +433,15 @@ impl BifrostIngestRuntime {
         limits: IngestLimits,
         coordination_runtime: Option<Arc<tokio::runtime::Runtime>>,
     ) -> Self {
-        let tail_reader = Arc::new(
+        let tail_service = Arc::new(
             scribe
-                .tail_reader()
+                .tail_service()
                 .expect("constructed Scribe must retain a valid UUID stream identity"),
         );
+        let tail_reader = Arc::new(ScribeTailReader::new(
+            Arc::clone(&tail_service),
+            TailFenceConfig::default(),
+        ));
         let gate = Arc::new(ServerGate::with_scribe(
             scribe.clone(),
             ingest_auth_interceptor(verifier),
@@ -432,6 +450,7 @@ impl BifrostIngestRuntime {
         Self {
             scribe,
             tail_reader,
+            tail_service,
             tail_authority: None,
             gate,
             coordination_runtime,
@@ -525,6 +544,12 @@ impl BifrostIngestRuntime {
     #[must_use]
     pub fn tail_reader(&self) -> Arc<ScribeTailReader> {
         Arc::clone(&self.tail_reader)
+    }
+
+    /// Returns the exact role-local source used by the retained tail reader.
+    #[must_use]
+    pub(crate) fn tail_service(&self) -> Arc<FetchLiveTailService> {
+        Arc::clone(&self.tail_service)
     }
 
     /// Reports whether the ingest writer has completed recovery and can accept work.

@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use wyrd_runtime::{Permission, Principal, PrincipalKind};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
     CancelOracleLifecycleRequest, CancelOracleLifecycleResponse, GetOracleLifecycleResponse,
@@ -62,10 +63,10 @@ impl OracleLifecycleGrpc {
     ///
     /// Panics only if construction violated the invariant that the production
     /// adapter retains its application state.
-    async fn authenticated_tenant(
+    async fn authenticated_principal(
         &self,
         metadata: &wyrd_tonic::tonic::metadata::MetadataMap,
-    ) -> Result<DataTenantId, Status> {
+    ) -> Result<Principal, Status> {
         let verifier = self
             .state
             .as_ref()
@@ -76,7 +77,7 @@ impl OracleLifecycleGrpc {
             .ok_or_else(|| Status::unavailable("auth backend not configured"))?;
         vala_bifrost_redux::gate::auth::authenticate(verifier.as_ref(), metadata)
             .await
-            .map(|auth| auth.principal.tenant_id)
+            .map(|auth| auth.principal)
             .map_err(|error| Status::unauthenticated(error.to_string()))
     }
 
@@ -85,8 +86,15 @@ impl OracleLifecycleGrpc {
     /// # Errors
     ///
     /// Returns opaque `NOT_FOUND` when the authenticated and requested tenants differ.
-    fn require_owner(authenticated: DataTenantId, requested: DataTenantId) -> Result<(), Status> {
-        (authenticated == requested)
+    fn require_owner(authenticated: &Principal, requested: DataTenantId) -> Result<(), Status> {
+        let tenant_self = authenticated.tenant_id == requested
+            && !matches!(authenticated.kind, PrincipalKind::Service { .. });
+        let platform_peer = authenticated.tenant_id == DataTenantId::SYSTEM_OWNER
+            && matches!(authenticated.kind, PrincipalKind::Service { .. })
+            && authenticated
+                .effective_permissions
+                .contains(&Permission::bifrost_oracle_peer_invoke());
+        (tenant_self || platform_peer)
             .then_some(())
             .ok_or_else(|| Status::not_found("Oracle lifecycle is not owned locally"))
     }
@@ -114,10 +122,10 @@ impl OracleLifecycleService for OracleLifecycleGrpc {
         &self,
         request: Request<proto::ListOracleLifecyclesRequest>,
     ) -> Result<Response<proto::ListOracleLifecyclesResponse>, Status> {
-        let tenant = self.authenticated_tenant(request.metadata()).await?;
+        let principal = self.authenticated_principal(request.metadata()).await?;
         let lookup = OracleLifecycleLookupRequest::try_from(request.into_inner())
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        Self::require_owner(tenant, lookup.tenant_id)?;
+        Self::require_owner(&principal, lookup.tenant_id)?;
         let queries = self.local_summary(&lookup).into_iter().collect();
         Ok(Response::new(
             ListOracleLifecyclesResponse { queries }.into(),
@@ -134,10 +142,10 @@ impl OracleLifecycleService for OracleLifecycleGrpc {
         &self,
         request: Request<proto::GetOracleLifecycleRequest>,
     ) -> Result<Response<proto::GetOracleLifecycleResponse>, Status> {
-        let tenant = self.authenticated_tenant(request.metadata()).await?;
+        let principal = self.authenticated_principal(request.metadata()).await?;
         let lookup = OracleLifecycleLookupRequest::try_from(request.into_inner())
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        Self::require_owner(tenant, lookup.tenant_id)?;
+        Self::require_owner(&principal, lookup.tenant_id)?;
         let query = self
             .local_summary(&lookup)
             .ok_or_else(|| Status::not_found("Oracle lifecycle is not owned locally"))?;
@@ -154,10 +162,10 @@ impl OracleLifecycleService for OracleLifecycleGrpc {
         &self,
         request: Request<proto::CancelOracleLifecycleRequest>,
     ) -> Result<Response<proto::CancelOracleLifecycleResponse>, Status> {
-        let tenant = self.authenticated_tenant(request.metadata()).await?;
+        let principal = self.authenticated_principal(request.metadata()).await?;
         let request = CancelOracleLifecycleRequest::try_from(request.into_inner())
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        Self::require_owner(tenant, request.tenant_id)?;
+        Self::require_owner(&principal, request.tenant_id)?;
         let cancelled = self
             .registry
             .cancel(request.tenant_id, &request.request_id)
@@ -190,13 +198,18 @@ pub(crate) mod pg_tests {
     use wyrd_auth_verify::{
         Kid, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem,
     };
-    use wyrd_runtime::{PrincipalId, RoleRef};
+    use wyrd_runtime::permission::PermissionSet;
+    use wyrd_runtime::{Permission, Principal, PrincipalId, PrincipalKind, RoleRef};
+    use wyrd_semver::VersionBlock;
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::PrincipalKindTag;
+    use wyrd_spec::auth::{PrincipalId as AuthPrincipalId, PrincipalKindTag};
+    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::ids::{CardName, SpaceName};
+    use wyrd_spec::reference::{CardRef, CardRefScope};
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{
-        ClusterCapabilities, ClusterNodeKey, ClusterRole, ClusterRoleLease, NodeId,
-        OracleCapabilitiesV1, QueryClass,
+        CancelOracleLifecycleRequest, ClusterCapabilities, ClusterNodeKey, ClusterRole,
+        ClusterRoleLease, NodeId, OracleCapabilitiesV1, QueryClass,
     };
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
     use wyrd_tonic::wyrd::v1::oracle_lifecycle_service_server::OracleLifecycleService;
@@ -290,6 +303,37 @@ pub(crate) mod pg_tests {
         request
     }
 
+    /// Builds a signed Service request for the private adapter authority boundary.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot sign or encode the Service bearer.
+    fn service_request<T>(
+        body: T,
+        issuer: &IssuingKey,
+        tenant: DataTenantId,
+        card_ref: CardRef,
+    ) -> wyrd_tonic::tonic::Request<T> {
+        let token = issuer
+            .issue_service_access_token(
+                PrincipalId::new(uuid::Uuid::now_v7()),
+                tenant,
+                card_ref.clone(),
+                CardRefScope::own(&card_ref),
+                Vec::<RoleRef>::new(),
+                chrono::Duration::minutes(5),
+            )
+            .expect("test Service token signs");
+        let mut request = wyrd_tonic::tonic::Request::new(body);
+        request.metadata_mut().insert(
+            "x-wyrd-access-token",
+            format!("Bearer {token}")
+                .parse()
+                .expect("Service bearer metadata parses"),
+        );
+        request
+    }
+
     /// Builds one ready Oracle lease for an immutable owner-local cut.
     fn oracle_lease(now: chrono::DateTime<Utc>) -> ClusterRoleLease {
         ClusterRoleLease {
@@ -346,7 +390,7 @@ pub(crate) mod pg_tests {
     /// Panics when production JWT verification or the owner/nonowner lifecycle
     /// contract diverges from its tenant-safe behavior.
     #[tokio::test]
-    async fn private_lifecycle_service_is_local_tenant_scoped_and_cut_opaque() {
+    async fn tenant_self_authority_remains_compatible() {
         let owner = DataTenantId::new_v7();
         let other = DataTenantId::new_v7();
         let owner_request_id = RequestId::now_v7();
@@ -422,5 +466,77 @@ pub(crate) mod pg_tests {
             .expect("repeated owner cancel succeeds")
             .into_inner();
         assert!(!second.cancellation_started);
+    }
+
+    /// Platform peer authority requires the exact platform Service permission tuple.
+    #[tokio::test]
+    async fn platform_peer_authority_is_tenant_scoped_and_non_disclosing() {
+        let tenant = DataTenantId::new_v7();
+        let card_ref = CardRef {
+            kind: CardKind::Service,
+            name: CardName::new("oracle-peer").expect("name"),
+            version: VersionBlock::parse("1.0.0").expect("version"),
+            space: SpaceName::new("system").expect("space"),
+            uid: None,
+        };
+        let service_kind = PrincipalKind::Service {
+            card_ref: card_ref.clone(),
+            card_ref_scope: CardRefScope::own(&card_ref),
+        };
+        let principal = |kind, tenant_id, permissions| Principal {
+            id: AuthPrincipalId::new(uuid::Uuid::now_v7()),
+            kind,
+            tenant_id,
+            roles: Vec::new(),
+            effective_permissions: permissions,
+        };
+        let allowed = principal(
+            service_kind.clone(),
+            DataTenantId::SYSTEM_OWNER,
+            PermissionSet::from_iter([Permission::bifrost_oracle_peer_invoke()]),
+        );
+        assert!(OracleLifecycleGrpc::require_owner(&allowed, tenant).is_ok());
+        for denied in [
+            principal(
+                PrincipalKind::User,
+                DataTenantId::SYSTEM_OWNER,
+                PermissionSet::from_iter([Permission::bifrost_oracle_peer_invoke()]),
+            ),
+            principal(
+                service_kind.clone(),
+                tenant,
+                PermissionSet::from_iter([Permission::bifrost_oracle_peer_invoke()]),
+            ),
+            principal(
+                service_kind,
+                DataTenantId::SYSTEM_OWNER,
+                PermissionSet::new(),
+            ),
+        ] {
+            let error = OracleLifecycleGrpc::require_owner(&denied, tenant)
+                .expect_err("noncanonical peer is denied");
+            assert_eq!(error.code(), wyrd_tonic::tonic::Code::NotFound);
+        }
+
+        let request_id = RequestId::now_v7();
+        let registry = Arc::new(RunningQueryRegistry::new());
+        assert!(registry.insert(running_entry(tenant, request_id.clone())));
+        let (state, issuer) = authenticated_state().await;
+        let service = OracleLifecycleGrpc::new_for_test(state, Arc::clone(&registry));
+        let denied_cancel = CancelOracleLifecycleRequest {
+            tenant_id: tenant,
+            request_id: request_id.clone(),
+        };
+        let error = service
+            .cancel_lifecycle(service_request(
+                denied_cancel.into(),
+                &issuer,
+                tenant,
+                card_ref,
+            ))
+            .await
+            .expect_err("tenant Service cannot enter tenant-self authority");
+        assert_eq!(error.code(), wyrd_tonic::tonic::Code::NotFound);
+        assert!(registry.get(tenant, &request_id).is_some());
     }
 }

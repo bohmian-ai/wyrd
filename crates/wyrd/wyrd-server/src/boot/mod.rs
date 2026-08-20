@@ -979,6 +979,7 @@ pub async fn build_state(
                 );
             let capability = OraclePeerRuntime::scribe_capability(
                 ingest.tail_reader(),
+                ingest.tail_service(),
                 ingest.tail_authority(),
                 ingest
                     .scribe_registered_role()
@@ -1424,6 +1425,20 @@ impl<'a> OracleRoleBuilder<'a> {
                 Arc::clone(&peer_credentials),
             ))
         };
+        let lifecycle_transport = Arc::new(if let Some(tls) = tail_tls.clone() {
+            crate::oracle::OracleLifecycleTransport::with_tls(
+                Arc::clone(&cluster),
+                Arc::clone(&peer_credentials),
+                node_id,
+                tls,
+            )
+        } else {
+            crate::oracle::OracleLifecycleTransport::new(
+                Arc::clone(&cluster),
+                Arc::clone(&peer_credentials),
+                node_id,
+            )
+        });
         let reconciliation_limit_bytes = memory_budget
             .checked_div(4)
             .filter(|limit| *limit > 0)
@@ -1486,6 +1501,7 @@ impl<'a> OracleRoleBuilder<'a> {
                 Arc::clone(&worker),
                 Arc::clone(&security_audit),
                 Arc::clone(&cluster),
+                lifecycle_transport,
             ),
             scribe_capability,
         ));
@@ -1560,6 +1576,7 @@ fn scribe_capability_from_state(
     })?;
     Ok(OraclePeerRuntime::scribe_capability(
         ingest.tail_reader(),
+        ingest.tail_service(),
         ingest.tail_authority(),
         registered_role,
     ))
@@ -1675,8 +1692,15 @@ impl BuiltOracleRole {
                 "Oracle role did not become ready after activation".to_owned(),
             ));
         }
+        let lifecycle_transport = peer.oracle().lifecycle_transport();
         let query_runtime = Arc::new(BifrostQueryRuntime::new(
-            oracle, role, peer, cluster, None, audit,
+            oracle,
+            role,
+            peer,
+            cluster,
+            None,
+            audit,
+            lifecycle_transport,
         ));
         Ok(state.with_bifrost_query(query_runtime))
     }
@@ -2447,6 +2471,34 @@ pub(crate) mod pg_tests {
         QueryTerminalOutcome, VisibilityMode,
     };
 
+    /// Combined production composition retains the exact lifecycle and tail owners.
+    #[test]
+    fn combined_peer_retains_one_lifecycle_transport_and_follower_tail_source() {
+        wyrd_runtime::runtime().block_on(async {
+            let (mut state, _) = crate::oracle::pg_tests::real_api_serving_state(
+                crate::config::ForgeProcessRole::Server,
+            )
+            .await;
+            let peer = state.oracle_peer.as_ref().expect("combined peer");
+            let query = state.bifrost_query().expect("query runtime");
+            let ingest = state.bifrost_ingest.as_ref().expect("ingest runtime");
+            assert!(Arc::ptr_eq(
+                query.lifecycle_transport(),
+                &peer.oracle().lifecycle_transport(),
+            ));
+            assert!(Arc::ptr_eq(
+                &ingest.tail_service(),
+                &peer.scribe().tail_service(),
+            ));
+            state
+                .bifrost_query
+                .take()
+                .expect("query runtime")
+                .shutdown(std::time::Instant::now() + Duration::from_secs(2))
+                .await;
+        });
+    }
+
     /// Composes production-equivalent Oracle and Scribe capabilities from an injected snapshot.
     pub(crate) fn oracle_scribe_test_resources()
     -> vala_bifrost_redux::resources::BifrostRoleResources {
@@ -2870,6 +2922,7 @@ pub(crate) mod pg_tests {
             );
             let scribe_capability = OraclePeerRuntime::scribe_capability(
                 ingest.tail_reader(),
+                ingest.tail_service(),
                 ingest.tail_authority(),
                 ingest
                     .scribe_registered_role()
@@ -3031,6 +3084,7 @@ pub(crate) mod pg_tests {
             );
             let scribe_capability = OraclePeerRuntime::scribe_capability(
                 ingest.tail_reader(),
+                ingest.tail_service(),
                 ingest.tail_authority(),
                 ingest
                     .scribe_registered_role()

@@ -183,34 +183,42 @@ where
             bifrost_query.into_server(),
             transport.clone(),
         ));
-    let router = if let Some(ingest_runtime) = &state.bifrost_ingest {
+    let router = if let Some(peer) = state.oracle_peer.as_ref() {
+        let scribe = peer.scribe();
         router.add_service(GrpcTransportAdmissionService::new(
-            match ingest_runtime.tail_authority() {
+            match scribe.tail_authority() {
                 Some(authority) => scribe_tail::ScribeTailGrpc::new_with_authority(
                     state.clone(),
-                    ingest_runtime.tail_reader(),
+                    scribe.tail_reader(),
                     authority,
                 )
                 .into_server(),
-                None => {
-                    scribe_tail::ScribeTailGrpc::new(state.clone(), ingest_runtime.tail_reader())
-                        .into_server()
-                }
+                None => scribe_tail::ScribeTailGrpc::new(state.clone(), scribe.tail_reader())
+                    .into_server(),
             },
             transport.clone(),
         ))
     } else {
         router
     };
-    let router = if let Some(peer) = &state.oracle_peer {
+    let router = if let Some(peer) = state.oracle_peer.as_ref() {
+        let oracle = peer.oracle();
         router.add_service(GrpcTransportAdmissionService::new(
             crate::oracle::OraclePeerGrpc::new(
                 state.clone(),
-                peer.worker(),
-                peer.cluster(),
-                peer.security_audit(),
+                oracle.worker(),
+                oracle.cluster(),
+                oracle.security_audit(),
             )
             .into_server(),
+            transport.clone(),
+        ))
+    } else {
+        router
+    };
+    let router = if let Some(query) = state.bifrost_query() {
+        router.add_service(GrpcTransportAdmissionService::new(
+            crate::oracle::OracleLifecycleGrpc::new(state.clone(), Arc::clone(query)).into_server(),
             transport,
         ))
     } else {

@@ -13,6 +13,7 @@ mod wire;
 pub(crate) use bifrost_catalog::schema_shape_matches;
 pub use bifrost_catalog::{
     BifrostCatalog, CreateTableRequest, PinnedIcebergFile, PinnedSealedTable, TableUid,
+    project_persisted_wal_ranges,
 };
 pub use error::BifrostCatalogError;
 pub(crate) use logical_table_identity::{

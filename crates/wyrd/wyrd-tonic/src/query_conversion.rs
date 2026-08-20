@@ -923,6 +923,11 @@ mod tests {
     }
 
     /// Public lifecycle summaries and cancellation controls preserve one request ID.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the fixed timestamp is invalid, a valid lifecycle value fails its
+    /// wire round-trip, or any reconstructed value differs from its source.
     #[test]
     fn running_query_contract_round_trips() {
         let request_id = RequestId::now_v7();
@@ -980,63 +985,9 @@ mod tests {
         assert_eq!(actual, cancellation);
 
         let tenant_id = wyrd_spec::DataTenantId::new_v7();
-        let query_id = domain::QueryId::new(uuid::Uuid::from_u128(11));
-        let leader = domain::OracleRoleFence {
-            node_id: domain::NodeId::new(uuid::Uuid::from_u128(12)),
-            role: domain::ClusterRole::Oracle,
-            fencing_token: 13,
-        };
-        let admission = domain::AdmitOracleLifecycleRequest {
-            tenant_id,
-            request_id: request_id.clone(),
-            query_id,
-            query_class: domain::QueryClass::Interactive,
-            deadline: started_at + chrono::Duration::seconds(30),
-            cut_fingerprint: "sha256:cut".to_owned(),
-            leader: leader.clone(),
-            participants: vec![leader.clone()],
-        };
-        let actual = domain::AdmitOracleLifecycleRequest::try_from(
-            proto::AdmitOracleLifecycleRequest::from(admission.clone()),
-        )
-        .expect("private admission round-trips");
-        assert_eq!(actual, admission);
-        let admission_response = domain::AdmitOracleLifecycleResponse { accepted: true };
-        assert_eq!(
-            domain::AdmitOracleLifecycleResponse::from(proto::AdmitOracleLifecycleResponse::from(
-                admission_response
-            )),
-            admission_response
-        );
-
-        let follower = domain::ReportOracleFollowerLifecycleRequest {
-            tenant_id,
-            request_id: request_id.clone(),
-            query_id,
-            cut_fingerprint: "sha256:cut".to_owned(),
-            follower: leader,
-            outcome: domain::QueryTerminalOutcome::Success,
-        };
-        let actual = domain::ReportOracleFollowerLifecycleRequest::try_from(
-            proto::ReportOracleFollowerLifecycleRequest::from(follower.clone()),
-        )
-        .expect("private follower report round-trips");
-        assert_eq!(actual, follower);
-        let follower_response = domain::ReportOracleFollowerLifecycleResponse {
-            completed_participants: 1,
-        };
-        assert_eq!(
-            domain::ReportOracleFollowerLifecycleResponse::from(
-                proto::ReportOracleFollowerLifecycleResponse::from(follower_response)
-            ),
-            follower_response
-        );
-
         let private_cancel = domain::CancelOracleLifecycleRequest {
             tenant_id,
-            request_id,
-            query_id,
-            cut_fingerprint: "sha256:cut".to_owned(),
+            request_id: request_id.clone(),
         };
         let actual = domain::CancelOracleLifecycleRequest::try_from(
             proto::CancelOracleLifecycleRequest::from(private_cancel.clone()),
@@ -1044,12 +995,14 @@ mod tests {
         .expect("private cancellation round-trips");
         assert_eq!(actual, private_cancel);
         let private_cancel_response = domain::CancelOracleLifecycleResponse {
+            request_id,
             cancellation_started: true,
         };
         assert_eq!(
-            domain::CancelOracleLifecycleResponse::from(
-                proto::CancelOracleLifecycleResponse::from(private_cancel_response)
-            ),
+            domain::CancelOracleLifecycleResponse::try_from(
+                proto::CancelOracleLifecycleResponse::from(private_cancel_response.clone())
+            )
+            .expect("private cancellation response round-trips"),
             private_cancel_response
         );
     }

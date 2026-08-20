@@ -396,151 +396,108 @@ impl From<domain::OracleRoleFence> for proto::OracleRoleFence {
     }
 }
 
-impl TryFrom<proto::AdmitOracleLifecycleRequest> for domain::AdmitOracleLifecycleRequest {
+impl TryFrom<proto::ListOracleLifecyclesRequest> for domain::OracleLifecycleLookupRequest {
     type Error = PrivateConversionError;
 
-    /// Decodes private admission facts bound to one exact participant cut.
+    /// Decodes an owner-local lifecycle list lookup.
     ///
     /// # Errors
-    /// Returns [`PrivateConversionError`] for malformed identities, absent
-    /// leader details, unknown classes, invalid deadlines, or an empty cut hash.
-    fn try_from(value: proto::AdmitOracleLifecycleRequest) -> Result<Self, Self::Error> {
-        nonempty(&value.cut_fingerprint, "cut_fingerprint")?;
+    /// Returns a conversion error for malformed tenant or request identities.
+    fn try_from(value: proto::ListOracleLifecyclesRequest) -> Result<Self, Self::Error> {
+        decode_lifecycle_lookup(&value.tenant_id, &value.request_id)
+    }
+}
+
+impl From<domain::OracleLifecycleLookupRequest> for proto::ListOracleLifecyclesRequest {
+    /// Encodes an owner-local lifecycle list lookup.
+    fn from(value: domain::OracleLifecycleLookupRequest) -> Self {
+        Self {
+            tenant_id: value.tenant_id.to_string(),
+            request_id: value.request_id.to_string(),
+        }
+    }
+}
+
+impl TryFrom<proto::GetOracleLifecycleRequest> for domain::OracleLifecycleLookupRequest {
+    type Error = PrivateConversionError;
+
+    /// Decodes an owner-local lifecycle get lookup.
+    ///
+    /// # Errors
+    /// Returns a conversion error for malformed tenant or request identities.
+    fn try_from(value: proto::GetOracleLifecycleRequest) -> Result<Self, Self::Error> {
+        decode_lifecycle_lookup(&value.tenant_id, &value.request_id)
+    }
+}
+
+impl From<domain::OracleLifecycleLookupRequest> for proto::GetOracleLifecycleRequest {
+    /// Encodes an owner-local lifecycle get lookup.
+    fn from(value: domain::OracleLifecycleLookupRequest) -> Self {
+        Self {
+            tenant_id: value.tenant_id.to_string(),
+            request_id: value.request_id.to_string(),
+        }
+    }
+}
+
+impl TryFrom<proto::ListOracleLifecyclesResponse> for domain::ListOracleLifecyclesResponse {
+    type Error = PrivateConversionError;
+
+    /// Decodes every owner-local lifecycle summary in stable response order.
+    ///
+    /// # Errors
+    /// Returns a conversion error when any nested running-query summary is malformed.
+    fn try_from(value: proto::ListOracleLifecyclesResponse) -> Result<Self, Self::Error> {
+        let queries = value
+            .queries
+            .into_iter()
+            .map(|query| {
+                domain::RunningQuerySummary::try_from(query).map_err(|_| {
+                    PrivateConversionError::Invalid {
+                        field: "running_query_summary",
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { queries })
+    }
+}
+
+impl From<domain::ListOracleLifecyclesResponse> for proto::ListOracleLifecyclesResponse {
+    /// Encodes owner-local lifecycle summaries without changing their order.
+    fn from(value: domain::ListOracleLifecyclesResponse) -> Self {
+        Self {
+            queries: value.queries.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl TryFrom<proto::GetOracleLifecycleResponse> for domain::GetOracleLifecycleResponse {
+    type Error = PrivateConversionError;
+
+    /// Decodes the required owner-local lifecycle summary.
+    ///
+    /// # Errors
+    /// Returns a conversion error when the summary is absent or malformed.
+    fn try_from(value: proto::GetOracleLifecycleResponse) -> Result<Self, Self::Error> {
+        let query = value
+            .query
+            .ok_or(PrivateConversionError::Missing("query"))?;
         Ok(Self {
-            tenant_id: DataTenantId::from_str(&value.tenant_id)
-                .map_err(|_| PrivateConversionError::InvalidUuid("tenant_id"))?,
-            request_id: RequestId::parse(&value.request_id).map_err(|_| {
+            query: domain::RunningQuerySummary::try_from(query).map_err(|_| {
                 PrivateConversionError::Invalid {
-                    field: "request_id",
+                    field: "running_query_summary",
                 }
             })?,
-            query_id: domain::QueryId::new(uuid_bytes(&value.query_id, "query_id")?),
-            query_class: query_class(value.query_class)?,
-            deadline: datetime(value.deadline_unix_ms, "deadline_unix_ms")?,
-            cut_fingerprint: value.cut_fingerprint,
-            leader: value
-                .leader
-                .ok_or(PrivateConversionError::Missing("leader"))?
-                .try_into()?,
-            participants: value
-                .participants
-                .into_iter()
-                .map(TryInto::try_into)
-                .collect::<Result<_, _>>()?,
         })
     }
 }
 
-impl From<domain::AdmitOracleLifecycleRequest> for proto::AdmitOracleLifecycleRequest {
-    /// Encodes private admission facts without projecting execution payloads.
-    fn from(value: domain::AdmitOracleLifecycleRequest) -> Self {
+impl From<domain::GetOracleLifecycleResponse> for proto::GetOracleLifecycleResponse {
+    /// Encodes the required owner-local lifecycle summary.
+    fn from(value: domain::GetOracleLifecycleResponse) -> Self {
         Self {
-            tenant_id: value.tenant_id.to_string(),
-            request_id: value.request_id.to_string(),
-            query_id: value.query_id.as_uuid().as_bytes().to_vec(),
-            query_class: match value.query_class {
-                domain::QueryClass::Interactive => proto::QueryClass::Interactive as i32,
-                domain::QueryClass::Analytical => proto::QueryClass::Analytical as i32,
-            },
-            deadline_unix_ms: unix_millis(value.deadline),
-            cut_fingerprint: value.cut_fingerprint,
-            leader: Some(value.leader.into()),
-            participants: value.participants.into_iter().map(Into::into).collect(),
-        }
-    }
-}
-
-impl From<domain::AdmitOracleLifecycleResponse> for proto::AdmitOracleLifecycleResponse {
-    /// Encodes the closed lifecycle-admission acknowledgement.
-    fn from(value: domain::AdmitOracleLifecycleResponse) -> Self {
-        Self {
-            accepted: value.accepted,
-        }
-    }
-}
-
-impl From<proto::AdmitOracleLifecycleResponse> for domain::AdmitOracleLifecycleResponse {
-    /// Decodes the closed lifecycle-admission acknowledgement.
-    fn from(value: proto::AdmitOracleLifecycleResponse) -> Self {
-        Self {
-            accepted: value.accepted,
-        }
-    }
-}
-
-impl TryFrom<proto::ReportOracleFollowerLifecycleRequest>
-    for domain::ReportOracleFollowerLifecycleRequest
-{
-    type Error = PrivateConversionError;
-
-    /// Decodes one follower completion report bound to its immutable cut.
-    ///
-    /// # Errors
-    /// Returns [`PrivateConversionError`] for malformed identities, an absent
-    /// follower fence, an empty cut hash, or an unspecified terminal outcome.
-    fn try_from(value: proto::ReportOracleFollowerLifecycleRequest) -> Result<Self, Self::Error> {
-        nonempty(&value.cut_fingerprint, "cut_fingerprint")?;
-        Ok(Self {
-            tenant_id: DataTenantId::from_str(&value.tenant_id)
-                .map_err(|_| PrivateConversionError::InvalidUuid("tenant_id"))?,
-            request_id: RequestId::parse(&value.request_id).map_err(|_| {
-                PrivateConversionError::Invalid {
-                    field: "request_id",
-                }
-            })?,
-            query_id: domain::QueryId::new(uuid_bytes(&value.query_id, "query_id")?),
-            cut_fingerprint: value.cut_fingerprint,
-            follower: value
-                .follower
-                .ok_or(PrivateConversionError::Missing("follower"))?
-                .try_into()?,
-            outcome: query_terminal_outcome(value.outcome)?,
-        })
-    }
-}
-
-impl From<domain::ReportOracleFollowerLifecycleRequest>
-    for proto::ReportOracleFollowerLifecycleRequest
-{
-    /// Encodes one follower completion report bound to its immutable cut.
-    fn from(value: domain::ReportOracleFollowerLifecycleRequest) -> Self {
-        Self {
-            tenant_id: value.tenant_id.to_string(),
-            request_id: value.request_id.to_string(),
-            query_id: value.query_id.as_uuid().as_bytes().to_vec(),
-            cut_fingerprint: value.cut_fingerprint,
-            follower: Some(value.follower.into()),
-            outcome: match value.outcome {
-                domain::QueryTerminalOutcome::Success => {
-                    proto::QueryTerminalOutcome::Success as i32
-                }
-                domain::QueryTerminalOutcome::Degraded => {
-                    proto::QueryTerminalOutcome::Degraded as i32
-                }
-                domain::QueryTerminalOutcome::Failed => proto::QueryTerminalOutcome::Failed as i32,
-            },
-        }
-    }
-}
-
-impl From<domain::ReportOracleFollowerLifecycleResponse>
-    for proto::ReportOracleFollowerLifecycleResponse
-{
-    /// Encodes the aggregate accepted follower-report count.
-    fn from(value: domain::ReportOracleFollowerLifecycleResponse) -> Self {
-        Self {
-            completed_participants: value.completed_participants,
-        }
-    }
-}
-
-impl From<proto::ReportOracleFollowerLifecycleResponse>
-    for domain::ReportOracleFollowerLifecycleResponse
-{
-    /// Decodes the aggregate accepted follower-report count.
-    fn from(value: proto::ReportOracleFollowerLifecycleResponse) -> Self {
-        Self {
-            completed_participants: value.completed_participants,
+            query: Some(value.query.into()),
         }
     }
 }
@@ -548,13 +505,11 @@ impl From<proto::ReportOracleFollowerLifecycleResponse>
 impl TryFrom<proto::CancelOracleLifecycleRequest> for domain::CancelOracleLifecycleRequest {
     type Error = PrivateConversionError;
 
-    /// Decodes a private cancellation signal tied to one immutable cut.
+    /// Decodes a tenant-qualified owner-local cancellation request.
     ///
     /// # Errors
-    /// Returns [`PrivateConversionError`] for malformed identities or an empty
-    /// participant-cut fingerprint.
+    /// Returns a conversion error for malformed tenant or request identities.
     fn try_from(value: proto::CancelOracleLifecycleRequest) -> Result<Self, Self::Error> {
-        nonempty(&value.cut_fingerprint, "cut_fingerprint")?;
         Ok(Self {
             tenant_id: DataTenantId::from_str(&value.tenant_id)
                 .map_err(|_| PrivateConversionError::InvalidUuid("tenant_id"))?,
@@ -563,39 +518,46 @@ impl TryFrom<proto::CancelOracleLifecycleRequest> for domain::CancelOracleLifecy
                     field: "request_id",
                 }
             })?,
-            query_id: domain::QueryId::new(uuid_bytes(&value.query_id, "query_id")?),
-            cut_fingerprint: value.cut_fingerprint,
         })
     }
 }
 
 impl From<domain::CancelOracleLifecycleRequest> for proto::CancelOracleLifecycleRequest {
-    /// Encodes a private cancellation signal tied to one immutable cut.
+    /// Encodes a tenant-qualified owner-local cancellation request.
     fn from(value: domain::CancelOracleLifecycleRequest) -> Self {
         Self {
             tenant_id: value.tenant_id.to_string(),
             request_id: value.request_id.to_string(),
-            query_id: value.query_id.as_uuid().as_bytes().to_vec(),
-            cut_fingerprint: value.cut_fingerprint,
         }
     }
 }
 
 impl From<domain::CancelOracleLifecycleResponse> for proto::CancelOracleLifecycleResponse {
-    /// Encodes the idempotent cancellation acknowledgement.
+    /// Encodes the idempotent owner-local cancellation acknowledgement.
     fn from(value: domain::CancelOracleLifecycleResponse) -> Self {
         Self {
+            request_id: value.request_id.to_string(),
             cancellation_started: value.cancellation_started,
         }
     }
 }
 
-impl From<proto::CancelOracleLifecycleResponse> for domain::CancelOracleLifecycleResponse {
-    /// Decodes the idempotent cancellation acknowledgement.
-    fn from(value: proto::CancelOracleLifecycleResponse) -> Self {
-        Self {
+impl TryFrom<proto::CancelOracleLifecycleResponse> for domain::CancelOracleLifecycleResponse {
+    type Error = PrivateConversionError;
+
+    /// Decodes the idempotent owner-local cancellation acknowledgement.
+    ///
+    /// # Errors
+    /// Returns a conversion error for a malformed request identity.
+    fn try_from(value: proto::CancelOracleLifecycleResponse) -> Result<Self, Self::Error> {
+        Ok(Self {
+            request_id: RequestId::parse(&value.request_id).map_err(|_| {
+                PrivateConversionError::Invalid {
+                    field: "request_id",
+                }
+            })?,
             cancellation_started: value.cancellation_started,
-        }
+        })
     }
 }
 
@@ -770,6 +732,117 @@ impl From<domain::SignedPeerTicket> for proto::SignedPeerTicket {
     }
 }
 
+impl TryFrom<proto::FollowerScanAssignment> for domain::FollowerScanAssignment {
+    type Error = PrivateConversionError;
+
+    /// Decodes one role-local scan assignment and preserves wrapper presence.
+    ///
+    /// # Errors
+    /// Returns [`PrivateConversionError`] when identity, binding, persisted
+    /// assignment, or schema fingerprint is absent.
+    fn try_from(value: proto::FollowerScanAssignment) -> Result<Self, Self::Error> {
+        nonempty(&value.scan_id, "scan_id")?;
+        nonempty(&value.schema_fingerprint, "schema_fingerprint")?;
+        let persisted = value
+            .persisted
+            .ok_or(PrivateConversionError::Missing("persisted"))?;
+        Ok(Self {
+            scan_id: value.scan_id,
+            binding: value
+                .binding
+                .ok_or(PrivateConversionError::Missing("binding"))?
+                .try_into()?,
+            persisted: domain::PersistedFileAssignment {
+                files: persisted.files,
+            },
+            scribe_provider_cut: value
+                .scribe_provider_cut
+                .map(TryInto::try_into)
+                .transpose()?,
+            schema_fingerprint: value.schema_fingerprint,
+        })
+    }
+}
+
+impl From<domain::FollowerScanAssignment> for proto::FollowerScanAssignment {
+    /// Encodes one validated role-local scan assignment.
+    fn from(value: domain::FollowerScanAssignment) -> Self {
+        Self {
+            scan_id: value.scan_id,
+            binding: Some(value.binding.into()),
+            persisted: Some(proto::PersistedFileAssignment {
+                files: value.persisted.files,
+            }),
+            scribe_provider_cut: value.scribe_provider_cut.map(Into::into),
+            schema_fingerprint: value.schema_fingerprint,
+        }
+    }
+}
+
+impl TryFrom<proto::ScribeProviderCut> for domain::ScribeProviderCut {
+    type Error = PrivateConversionError;
+
+    /// Decodes the bounded Scribe provider projection without erasing endpoint presence.
+    ///
+    /// # Errors
+    /// Returns a conversion error when either WAL endpoint is absent or the
+    /// complete cut violates its canonical ordering, cursor, or signed bounds.
+    fn try_from(value: proto::ScribeProviderCut) -> Result<Self, Self::Error> {
+        let cut = Self {
+            writer_epoch: value.writer_epoch,
+            start_event_day: value.start_event_day,
+            end_event_day: value.end_event_day,
+            required_columns: value.required_columns,
+            persisted_cursor: value.persisted_cursor,
+            persisted_ranges: value
+                .persisted_ranges
+                .into_iter()
+                .map(|range| {
+                    Ok(domain::PersistedWalRange {
+                        start_lsn: range
+                            .start_lsn
+                            .ok_or(PrivateConversionError::Missing("start_lsn"))?,
+                        end_lsn: range
+                            .end_lsn
+                            .ok_or(PrivateConversionError::Missing("end_lsn"))?,
+                    })
+                })
+                .collect::<Result<_, PrivateConversionError>>()?,
+            maximum_batch_count: value.maximum_batch_count,
+            maximum_retained_bytes: value.maximum_retained_bytes,
+        };
+        if !cut.is_valid() {
+            return Err(PrivateConversionError::Invalid {
+                field: "scribe_provider_cut",
+            });
+        }
+        Ok(cut)
+    }
+}
+
+impl From<domain::ScribeProviderCut> for proto::ScribeProviderCut {
+    /// Encodes the bounded Scribe provider projection.
+    fn from(value: domain::ScribeProviderCut) -> Self {
+        Self {
+            writer_epoch: value.writer_epoch,
+            start_event_day: value.start_event_day,
+            end_event_day: value.end_event_day,
+            required_columns: value.required_columns,
+            persisted_cursor: value.persisted_cursor,
+            persisted_ranges: value
+                .persisted_ranges
+                .into_iter()
+                .map(|range| proto::PersistedWalRange {
+                    start_lsn: Some(range.start_lsn),
+                    end_lsn: Some(range.end_lsn),
+                })
+                .collect(),
+            maximum_batch_count: value.maximum_batch_count,
+            maximum_retained_bytes: value.maximum_retained_bytes,
+        }
+    }
+}
+
 impl TryFrom<proto::ExecuteFragmentRequest> for domain::ExecuteFragmentRequest {
     type Error = PrivateConversionError;
 
@@ -898,23 +971,21 @@ fn cluster_role(value: i32) -> Result<domain::ClusterRole, PrivateConversionErro
     }
 }
 
-/// Decodes a private follower terminal classification without accepting zero.
+/// Decodes the shared authenticated owner-local lifecycle lookup fields.
 ///
 /// # Errors
-/// Returns [`PrivateConversionError::RequiredEnum`] for unknown or unspecified outcomes.
-fn query_terminal_outcome(
-    value: i32,
-) -> Result<domain::QueryTerminalOutcome, PrivateConversionError> {
-    match proto::QueryTerminalOutcome::try_from(value)
-        .map_err(|_| PrivateConversionError::RequiredEnum("outcome"))?
-    {
-        proto::QueryTerminalOutcome::Success => Ok(domain::QueryTerminalOutcome::Success),
-        proto::QueryTerminalOutcome::Degraded => Ok(domain::QueryTerminalOutcome::Degraded),
-        proto::QueryTerminalOutcome::Failed => Ok(domain::QueryTerminalOutcome::Failed),
-        proto::QueryTerminalOutcome::Unspecified => {
-            Err(PrivateConversionError::RequiredEnum("outcome"))
-        }
-    }
+/// Returns a conversion error for malformed tenant or request identities.
+fn decode_lifecycle_lookup(
+    tenant_id: &str,
+    request_id: &str,
+) -> Result<domain::OracleLifecycleLookupRequest, PrivateConversionError> {
+    Ok(domain::OracleLifecycleLookupRequest {
+        tenant_id: DataTenantId::from_str(tenant_id)
+            .map_err(|_| PrivateConversionError::InvalidUuid("tenant_id"))?,
+        request_id: RequestId::parse(request_id).map_err(|_| PrivateConversionError::Invalid {
+            field: "request_id",
+        })?,
+    })
 }
 
 /// Decodes an exact 16-byte UUID field.
@@ -1266,6 +1337,88 @@ mod tests {
             .expect("execute request round-trips"),
             execute
         );
+    }
+
+    /// The private lifecycle surface contains only owner-local list/get/cancel operations.
+    #[test]
+    /// # Panics
+    /// Panics if an owner-local lifecycle message does not round-trip exactly.
+    fn oracle_private_lifecycle_uses_owner_local_list_get_cancel() {
+        let tenant_id = wyrd_spec::DataTenantId::new_v7();
+        let request_id = RequestId::now_v7();
+        let request = domain::CancelOracleLifecycleRequest {
+            tenant_id,
+            request_id: request_id.clone(),
+        };
+        let decoded = domain::CancelOracleLifecycleRequest::try_from(
+            proto::CancelOracleLifecycleRequest::from(request),
+        )
+        .expect("owner-local cancellation round-trips");
+        assert_eq!(decoded.tenant_id, tenant_id);
+        assert_eq!(decoded.request_id, request_id);
+        let lookup = domain::OracleLifecycleLookupRequest {
+            tenant_id,
+            request_id: request_id.clone(),
+        };
+        let listed = domain::OracleLifecycleLookupRequest::try_from(
+            proto::ListOracleLifecyclesRequest::from(lookup.clone()),
+        )
+        .expect("owner-local list lookup round-trips");
+        let fetched = domain::OracleLifecycleLookupRequest::try_from(
+            proto::GetOracleLifecycleRequest::from(lookup.clone()),
+        )
+        .expect("owner-local get lookup round-trips");
+        assert_eq!(listed, lookup);
+        assert_eq!(fetched, lookup);
+
+        let summary = domain::RunningQuerySummary {
+            request_id: request_id.clone(),
+            query_class: domain::QueryClass::Interactive,
+            started_at: chrono::DateTime::from_timestamp(1, 0).expect("valid timestamp"),
+            deadline: chrono::DateTime::from_timestamp(2, 0).expect("valid timestamp"),
+            state: domain::RunningQueryLifecycleState::Running,
+            progress: domain::RunningQueryProgress {
+                completed_participants: 1,
+                total_participants: 2,
+            },
+            cancellation_requested: false,
+        };
+        let list = domain::ListOracleLifecyclesResponse {
+            queries: vec![summary.clone()],
+        };
+        assert_eq!(
+            domain::ListOracleLifecyclesResponse::try_from(
+                proto::ListOracleLifecyclesResponse::from(list.clone())
+            )
+            .expect("owner-local list response round-trips"),
+            list
+        );
+        let get = domain::GetOracleLifecycleResponse { query: summary };
+        assert_eq!(
+            domain::GetOracleLifecycleResponse::try_from(proto::GetOracleLifecycleResponse::from(
+                get.clone()
+            ))
+            .expect("owner-local get response round-trips"),
+            get
+        );
+    }
+
+    /// Optional protobuf WAL endpoints distinguish explicit zero from absence.
+    #[test]
+    /// # Panics
+    /// Panics if optional persisted-WAL endpoints lose their wire presence.
+    fn oracle_execute_fragment_preserves_optional_wal_endpoint_presence() {
+        let present = proto::PersistedWalRange {
+            start_lsn: Some(0),
+            end_lsn: Some(0),
+        };
+        assert_eq!(present.start_lsn, Some(0));
+        assert_eq!(present.end_lsn, Some(0));
+        let missing = proto::PersistedWalRange {
+            start_lsn: None,
+            end_lsn: Some(0),
+        };
+        assert!(missing.start_lsn.is_none());
     }
 
     /// A completed worker footer round-trips as the terminal frame.

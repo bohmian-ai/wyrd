@@ -52,9 +52,11 @@ use crate::scribe::tail_rpc::{TAIL_PROTOCOL_VERSION, TailReadTransport};
 mod admission;
 pub mod assignment;
 pub mod attempt;
+pub mod codec;
 pub mod dispatcher;
 mod exec;
 pub mod executor;
+pub mod follower;
 pub mod fragment;
 mod ownership;
 mod participant_cut;
@@ -4284,5 +4286,66 @@ mod tests {
             output.is_empty(),
             "decode failure cannot expose partial batches"
         );
+    }
+
+    /// Canonical persisted-WAL validation rejects reversals and cursor straddling.
+    #[test]
+    /// # Panics
+    /// Panics if invalid, overlapping, or cursor-contradictory ranges are accepted.
+    fn persisted_wal_range_validation_rejects_invalid_or_cursor_contradictory_input() {
+        use wyrd_spec::vala::api::{PersistedWalRange, ScribeProviderCut};
+
+        let mut cut = ScribeProviderCut {
+            writer_epoch: 1,
+            start_event_day: "2026-08-19".to_owned(),
+            end_event_day: "2026-08-19".to_owned(),
+            required_columns: vec!["wyrd_event_time".to_owned()],
+            persisted_cursor: 7,
+            persisted_ranges: vec![PersistedWalRange {
+                start_lsn: 9,
+                end_lsn: 8,
+            }],
+            maximum_batch_count: 1,
+            maximum_retained_bytes: 1,
+        };
+        assert!(!cut.is_valid());
+        cut.persisted_ranges = vec![PersistedWalRange {
+            start_lsn: 1,
+            end_lsn: 7,
+        }];
+        assert!(
+            cut.is_valid(),
+            "a wholly pre-cursor inclusive range is valid"
+        );
+        cut.persisted_ranges = vec![PersistedWalRange {
+            start_lsn: 8,
+            end_lsn: 9,
+        }];
+        assert!(cut.is_valid(), "a wholly post-cursor range is valid");
+        cut.persisted_ranges = vec![PersistedWalRange {
+            start_lsn: 7,
+            end_lsn: 8,
+        }];
+        assert!(!cut.is_valid());
+        cut.persisted_ranges = vec![
+            PersistedWalRange {
+                start_lsn: 8,
+                end_lsn: 10,
+            },
+            PersistedWalRange {
+                start_lsn: 10,
+                end_lsn: 12,
+            },
+        ];
+        assert!(!cut.is_valid());
+        cut.persisted_ranges.clear();
+        cut.persisted_cursor = i64::MAX as u64 + 1;
+        assert!(!cut.is_valid());
+        cut.persisted_cursor = 0;
+        cut.persisted_ranges = vec![PersistedWalRange {
+            start_lsn: i64::MAX as u64 + 1,
+            end_lsn: i64::MAX as u64 + 1,
+        }];
+        assert!(!cut.is_valid());
     }
 }

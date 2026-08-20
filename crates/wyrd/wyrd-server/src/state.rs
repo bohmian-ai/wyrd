@@ -18,6 +18,7 @@ use vala_bifrost_redux::forge::Forge;
 use vala_bifrost_redux::gate::auth::ingest_auth_interceptor;
 use vala_bifrost_redux::gate::limits::IngestLimits;
 use vala_bifrost_redux::oracle::Oracle;
+use vala_bifrost_redux::oracle::RunningQueryRegistry;
 use vala_bifrost_redux::resources::BifrostRoleResources;
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::tail_rpc::ScribeTailReader;
@@ -175,6 +176,29 @@ pub struct BifrostQueryRuntime {
     coordination_runtime: Option<Arc<tokio::runtime::Runtime>>,
     /// Local WAL publisher retained for the complete Oracle lifecycle.
     audit: Arc<crate::oracle::OracleAuditPublisher>,
+    /// Process-wide owner-local active-query registry.
+    running_queries: RunningQueryOwner,
+}
+
+/// Process-wide owner of the single local active-query registry allocation.
+#[derive(Clone)]
+struct RunningQueryOwner {
+    /// Registry retained for the complete Oracle role lifecycle.
+    registry: Arc<RunningQueryRegistry>,
+}
+
+impl RunningQueryOwner {
+    /// Allocates the one registry published through [`BifrostQueryRuntime`].
+    fn new() -> Self {
+        Self {
+            registry: Arc::new(RunningQueryRegistry::new()),
+        }
+    }
+
+    /// Borrows the owned registry without allocating a replacement.
+    fn registry(&self) -> &Arc<RunningQueryRegistry> {
+        &self.registry
+    }
 }
 
 impl BifrostQueryRuntime {
@@ -225,6 +249,7 @@ impl BifrostQueryRuntime {
             advertise_ready,
             coordination_runtime,
             audit,
+            running_queries: RunningQueryOwner::new(),
         }
     }
 
@@ -232,6 +257,12 @@ impl BifrostQueryRuntime {
     #[must_use]
     pub fn oracle(&self) -> &Arc<Oracle> {
         &self.oracle
+    }
+
+    /// Borrows the one process-wide owner-local active-query registry.
+    #[must_use]
+    pub fn running_queries(&self) -> &Arc<RunningQueryRegistry> {
+        self.running_queries.registry()
     }
 
     /// Returns the private peer service owner mounted for this Oracle fence.
@@ -422,6 +453,12 @@ impl BifrostIngestRuntime {
     #[must_use]
     pub fn tail_authority(&self) -> Option<Arc<crate::oracle::ScribeTailAuthority>> {
         self.tail_authority.clone()
+    }
+
+    /// Borrows the exact Scribe role fence retained by this runtime.
+    #[must_use]
+    pub fn scribe_registered_role(&self) -> Option<&RegisteredRole> {
+        self.scribe_role.as_ref().map(|role| &role.registered)
     }
 
     /// Starts the independently fenced Scribe role lifecycle on the active server runtime.
@@ -1168,9 +1205,87 @@ impl AppState {
     }
 }
 
+/// PostgreSQL-backed application-state ownership proofs.
 #[cfg(test)]
 mod pg_tests {
     use std::sync::Arc;
+
+    use wyrd_tonic::wyrd::v1::oracle_lifecycle_service_client::OracleLifecycleServiceClient;
+
+    use super::{AppState, LimitsConfig, ProductionValidationError};
+
+    /// The runtime accessor and mounted lifecycle adapter share one allocation.
+    ///
+    /// # Panics
+    ///
+    /// Panics when production-shaped Oracle composition, TCP serving, JWT
+    /// authentication, registry observation, cancellation, or shutdown fails.
+    #[test]
+    fn bifrost_query_runtime_owns_one_running_registry() {
+        wyrd_runtime::runtime().block_on(async {
+            let (state, _) = crate::oracle::pg_tests::real_api_serving_state(
+                crate::config::ForgeProcessRole::Server,
+            )
+            .await;
+            let runtime = state.bifrost_query().expect("query runtime is published");
+            let first = runtime.running_queries();
+            let second = runtime.running_queries();
+            assert!(Arc::ptr_eq(first, second));
+            assert!(Arc::ptr_eq(
+                state.oracle_peer.as_ref().expect("published peer"),
+                &runtime.peer()
+            ));
+            let tenant = wyrd_spec::DataTenantId::new_v7();
+            let lifecycle_bearer = crate::oracle::pg_tests::tenant_bearer(&state, tenant);
+            let request_id = wyrd_spec::request_id::RequestId::now_v7();
+            assert!(runtime.running_queries().insert(
+                crate::oracle::lifecycle_service::pg_tests::running_entry(
+                    tenant,
+                    request_id.clone(),
+                )
+            ));
+            let (channel, shutdown) = crate::oracle::pg_tests::serve(&state).await;
+            let lookup = wyrd_tonic::wyrd::v1::ListOracleLifecyclesRequest {
+                tenant_id: tenant.as_uuid().to_string(),
+                request_id: request_id.to_string(),
+            };
+            let listed = OracleLifecycleServiceClient::new(channel.clone())
+                .list_lifecycles(crate::oracle::pg_tests::peer_request(
+                    lookup,
+                    &lifecycle_bearer,
+                ))
+                .await
+                .expect("mounted lifecycle adapter observes runtime registry")
+                .into_inner();
+            assert_eq!(listed.queries.len(), 1);
+            assert_eq!(listed.queries[0].request_id, request_id.to_string());
+            let cancel = wyrd_tonic::wyrd::v1::CancelOracleLifecycleRequest {
+                tenant_id: tenant.as_uuid().to_string(),
+                request_id: request_id.to_string(),
+            };
+            let cancelled = OracleLifecycleServiceClient::new(channel)
+                .cancel_lifecycle(crate::oracle::pg_tests::peer_request(
+                    cancel,
+                    &lifecycle_bearer,
+                ))
+                .await
+                .expect("mounted lifecycle adapter mutates runtime registry")
+                .into_inner();
+            assert!(cancelled.cancellation_started);
+            assert!(
+                runtime
+                    .running_queries()
+                    .get(tenant, &request_id)
+                    .expect("runtime entry remains observable")
+                    .cancellation_token()
+                    .is_cancelled()
+            );
+            shutdown.cancel();
+            runtime
+                .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(2))
+                .await;
+        });
+    }
 
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use wyrd_auth_check::AuthzCheckContext;
@@ -1188,8 +1303,6 @@ mod pg_tests {
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
     use crate::postgres::ServerPostgres;
-
-    use super::{AppState, LimitsConfig, ProductionValidationError};
 
     #[tokio::test]
     async fn defaults_for_test_safe() {

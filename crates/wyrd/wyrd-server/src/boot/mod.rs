@@ -935,26 +935,6 @@ pub async fn build_state(
             return Err(error);
         }
     };
-    let state = match (OracleRoleBuilder {
-        state,
-        config,
-        signing_key: &signing_key,
-        cluster: Arc::clone(&bifrost_parts.cluster_registry),
-        node_id: bifrost_parts.node_id,
-        advertise_addr: &config.bifrost.oracle.advertise_addr,
-        spill_root: None,
-        #[cfg(feature = "test-support")]
-        peer_credentials: None,
-    }
-    .build()
-    .await)
-    {
-        Ok(state) => state,
-        Err(error) => {
-            bifrost_parts.rollback().await;
-            return Err(error);
-        }
-    };
     let verifier = match state
         .auth
         .token_verifier
@@ -968,38 +948,67 @@ pub async fn build_state(
         }
     };
     let limits = config.bifrost.scribe.ingest_limits();
-    let state = if roles.contains(&BifrostRuntimeRole::Scribe) {
-        let scribe_parts = bifrost_parts.scribe.ok_or_else(|| {
-            ServerBootError::Scribe("selected Scribe role was not constructed".to_owned())
-        })?;
-        let tail_audit = Arc::new(
-            crate::oracle::PostgresTailSecurityAudit::try_new(&state.postgres)
-                .await
-                .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
-        );
-        let ingest = Arc::new(
-            BifrostIngestRuntime::new(
-                scribe_parts.scribe,
-                Arc::clone(&verifier),
-                limits,
-                Some(
-                    scribe_parts
-                        .coordination_runtime
-                        .expect("Scribe coordination runtime remains during state composition"),
-                ),
-            )
-            .with_tail_authority(Arc::new(
-                crate::oracle::ScribeTailAuthority::from_pem(&signing_key, tail_audit)
+    let (state, scribe_capability) =
+        if roles.contains(&BifrostRuntimeRole::Scribe) {
+            let scribe_parts = bifrost_parts.scribe.as_ref().ok_or_else(|| {
+                ServerBootError::Scribe("selected Scribe role was not constructed".to_owned())
+            })?;
+            let tail_audit = Arc::new(
+                crate::oracle::PostgresTailSecurityAudit::try_new(&state.postgres)
+                    .await
                     .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
-            ))
-            .with_scribe_role(
-                Arc::clone(&bifrost_parts.cluster_registry),
-                scribe_parts.scribe_role,
-            ),
-        );
-        state.with_bifrost_ingest(ingest)
-    } else {
-        state
+            );
+            let ingest =
+                Arc::new(
+                    BifrostIngestRuntime::new(
+                        Arc::clone(&scribe_parts.scribe),
+                        Arc::clone(&verifier),
+                        limits,
+                        Some(scribe_parts.coordination_runtime.clone().expect(
+                            "Scribe coordination runtime remains during state composition",
+                        )),
+                    )
+                    .with_tail_authority(Arc::new(
+                        crate::oracle::ScribeTailAuthority::from_pem(&signing_key, tail_audit)
+                            .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
+                    ))
+                    .with_scribe_role(
+                        Arc::clone(&bifrost_parts.cluster_registry),
+                        scribe_parts.scribe_role.clone(),
+                    ),
+                );
+            let capability = OraclePeerRuntime::scribe_capability(
+                ingest.tail_reader(),
+                ingest.tail_authority(),
+                ingest
+                    .scribe_registered_role()
+                    .expect("Scribe role was installed immediately above")
+                    .clone(),
+            );
+            (state.with_bifrost_ingest(ingest), Some(capability))
+        } else {
+            (state, None)
+        };
+    let state = match (OracleRoleBuilder {
+        state,
+        config,
+        signing_key: &signing_key,
+        cluster: Arc::clone(&bifrost_parts.cluster_registry),
+        node_id: bifrost_parts.node_id,
+        advertise_addr: &config.bifrost.oracle.advertise_addr,
+        spill_root: None,
+        #[cfg(feature = "test-support")]
+        peer_credentials: None,
+        scribe_capability,
+    }
+    .build()
+    .await)
+    {
+        Ok(state) => state,
+        Err(error) => {
+            bifrost_parts.rollback().await;
+            return Err(error);
+        }
     };
     let mut gate = match &state.bifrost_ingest {
         Some(ingest) => vala_bifrost_redux::gate::Gate::with_scribe(
@@ -1193,10 +1202,17 @@ struct OracleRoleBuilder<'a> {
     /// Optional test-harness credential owner replacing environment discovery.
     #[cfg(feature = "test-support")]
     peer_credentials: Option<Arc<dyn OraclePeerCredentials>>,
+    /// Optional Scribe follower staged before final peer publication.
+    scribe_capability: Option<crate::oracle::ScribePeerCapability>,
 }
 
 impl<'a> OracleRoleBuilder<'a> {
-    /// Constructs one fenced Oracle role without starting or publishing it.
+    /// Constructs the combined fenced API-serving follower without publishing a partial peer.
+    ///
+    /// # Errors
+    ///
+    /// Returns a server boot error when the configured closed role set cannot
+    /// be constructed, fenced, reconciled, activated, and published.
     async fn build(self) -> Result<AppState, ServerBootError> {
         if !self
             .config
@@ -1225,7 +1241,11 @@ impl<'a> OracleRoleBuilder<'a> {
             spill_root,
             #[cfg(feature = "test-support")]
                 peer_credentials: injected_peer_credentials,
+            scribe_capability,
         } = self;
+        let scribe_capability = scribe_capability
+            .map(Ok)
+            .unwrap_or_else(|| scribe_capability_from_state(&state))?;
         let security_audit = Arc::new(
             PostgresPeerSecurityAudit::try_new(&state.postgres)
                 .await
@@ -1462,9 +1482,12 @@ impl<'a> OracleRoleBuilder<'a> {
             oracle_resources,
         ));
         let peer = Arc::new(OraclePeerRuntime::new(
-            Arc::clone(&worker),
-            Arc::clone(&security_audit),
-            Arc::clone(&cluster),
+            OraclePeerRuntime::oracle_capability(
+                Arc::clone(&worker),
+                Arc::clone(&security_audit),
+                Arc::clone(&cluster),
+            ),
+            scribe_capability,
         ));
         let local_transport = Arc::new(LocalOraclePeerTransport::new(worker));
         let peer_transports =
@@ -1514,6 +1537,32 @@ impl<'a> OracleRoleBuilder<'a> {
             audit,
         })
     }
+}
+
+/// Derives the closed Scribe follower capability already owned by application state.
+///
+/// # Errors
+///
+/// Returns [`ServerBootError::OraclePeer`] when the application has no Scribe
+/// runtime or its production role fence has not been installed.
+fn scribe_capability_from_state(
+    state: &AppState,
+) -> Result<crate::oracle::ScribePeerCapability, ServerBootError> {
+    let ingest = state.bifrost_ingest.as_ref().ok_or_else(|| {
+        ServerBootError::OraclePeer(
+            "combined API-serving peer requires the Scribe runtime".to_owned(),
+        )
+    })?;
+    let registered_role = ingest.scribe_registered_role().cloned().ok_or_else(|| {
+        ServerBootError::OraclePeer(
+            "combined API-serving peer requires the Scribe role fence".to_owned(),
+        )
+    })?;
+    Ok(OraclePeerRuntime::scribe_capability(
+        ingest.tail_reader(),
+        ingest.tail_authority(),
+        registered_role,
+    ))
 }
 
 /// Initializes every canonical Oracle admission ceiling before role readiness.
@@ -1706,6 +1755,7 @@ pub async fn attach_test_oracle_runtime_for_node_at(
         advertise_addr: &advertise_addr,
         spill_root: None,
         peer_credentials: None,
+        scribe_capability: None,
     }
     .build()
     .await
@@ -1760,6 +1810,65 @@ pub async fn attach_test_oracle_runtime_for_node_at_with_credentials_and_root(
     peer_credentials: Arc<dyn OraclePeerCredentials>,
     attachment: TestOracleAttachment,
 ) -> Result<AppState, ServerBootError> {
+    attach_test_oracle_runtime_for_node_at_with_credentials_root_and_scribe(
+        state,
+        node_id,
+        signing_key,
+        advertise_addr,
+        peer_credentials,
+        attachment,
+        None,
+    )
+    .await
+}
+
+/// Composes one actual API-serving public target through the production role owner.
+///
+/// # Errors
+///
+/// Returns the same construction, fencing, reconciliation, and publication
+/// failures as [`OracleRoleBuilder::build`].
+#[cfg(test)]
+pub(crate) async fn compose_test_api_serving_target(
+    state: AppState,
+    config: &crate::config::WyrdServerConfig,
+    signing_key: &secrecy::SecretString,
+    node_id: ClusterNodeId,
+    cluster: Arc<ClusterRegistry>,
+    peer_credentials: Arc<dyn OraclePeerCredentials>,
+    scribe_capability: crate::oracle::ScribePeerCapability,
+) -> Result<AppState, ServerBootError> {
+    OracleRoleBuilder {
+        state,
+        config,
+        signing_key,
+        cluster,
+        node_id,
+        advertise_addr: "http://127.0.0.1:0",
+        spill_root: None,
+        peer_credentials: Some(peer_credentials),
+        scribe_capability: Some(scribe_capability),
+    }
+    .build()
+    .await
+}
+
+/// Performs the shared test Oracle composition with closed follower capabilities.
+///
+/// # Errors
+///
+/// Returns the same resource, credential, registration, admission, fencing,
+/// reconciliation, and publication failures as [`OracleRoleBuilder::build`].
+#[cfg(feature = "test-support")]
+async fn attach_test_oracle_runtime_for_node_at_with_credentials_root_and_scribe(
+    state: AppState,
+    node_id: wyrd_spec::vala::api::NodeId,
+    signing_key: secrecy::SecretString,
+    advertise_addr: String,
+    peer_credentials: Arc<dyn OraclePeerCredentials>,
+    attachment: TestOracleAttachment,
+    scribe_capability: Option<crate::oracle::ScribePeerCapability>,
+) -> Result<AppState, ServerBootError> {
     let TestOracleAttachment {
         audit_wal_root,
         spill_root,
@@ -1791,6 +1900,7 @@ pub async fn attach_test_oracle_runtime_for_node_at_with_credentials_and_root(
         advertise_addr: &advertise_addr,
         spill_root,
         peer_credentials: Some(peer_credentials),
+        scribe_capability,
     }
     .build()
     .await
@@ -1884,6 +1994,7 @@ pub async fn attach_test_oracle_runtime_for_node_at_with_credentials_and_tls_and
         advertise_addr: &advertise_addr,
         spill_root: tls.spill_root,
         peer_credentials: Some(peer_credentials),
+        scribe_capability: None,
     }
     .build()
     .await
@@ -2337,7 +2448,8 @@ pub(crate) mod pg_tests {
     };
 
     /// Composes production-equivalent Oracle and Scribe capabilities from an injected snapshot.
-    fn oracle_scribe_test_resources() -> vala_bifrost_redux::resources::BifrostRoleResources {
+    pub(crate) fn oracle_scribe_test_resources()
+    -> vala_bifrost_redux::resources::BifrostRoleResources {
         vala_bifrost_redux::resources::BifrostRuntimeResources::from_snapshot(
             vala_bifrost_redux::resources::SystemResourceSnapshot {
                 memory_limit_bytes: 2 * 1024 * 1024 * 1024,
@@ -2446,7 +2558,9 @@ pub(crate) mod pg_tests {
         AppState,
         vala_bifrost_redux::maintenance::StagingFilePublisher,
     ) {
-        let state = make_test_state().await;
+        let state = make_test_state()
+            .await
+            .with_bifrost_node_id(ClusterNodeId::new(uuid::Uuid::now_v7()));
         let storage = crate::test_support::test_storage().await;
         let redux = Arc::clone(&state.bifrost);
         let vala = crate::test_support::test_vala_postgres().await;
@@ -2690,7 +2804,7 @@ pub(crate) mod pg_tests {
             let postgres = crate::test_support::test_server_postgres().await;
             let storage = crate::test_support::test_storage().await;
             let redux = crate::test_support::test_catalog().await;
-            let state = AppState::new(postgres, storage, redux)
+            let state = AppState::new(postgres, Arc::clone(&storage), Arc::clone(&redux))
                 .with_bifrost_resources(oracle_scribe_test_resources());
             let node_id = ClusterNodeId::new(uuid::Uuid::now_v7());
             let cluster = Arc::new(ClusterRegistry::new(state.postgres.vala().clone(), node_id));
@@ -2706,8 +2820,64 @@ pub(crate) mod pg_tests {
                 .expect("test config retains signing key");
             let (state, peer_credentials) =
                 with_test_oracle_peer_credentials(state, &config, signing_key).await;
+            let scribe_role = cluster
+                .register_scribe(
+                    "127.0.0.1:9444",
+                    ScribeCapabilitiesV1 {
+                        tail_protocol_version: 1,
+                    },
+                )
+                .await
+                .expect("Scribe role");
+            let wal_root = tempdir().expect("WAL root");
+            let writer_epoch =
+                i64::try_from(scribe_role.fencing_token).expect("Scribe fence fits writer epoch");
+            let wal = Arc::new(
+                WalWriter::new(
+                    wal_root.path(),
+                    *node_id.as_uuid().as_bytes(),
+                    writer_epoch,
+                    WalConfig::default(),
+                )
+                .expect("WAL"),
+            );
+            let scribe = Arc::new(ScribeImpl::new_for_embedded_with_deps_and_catalog(
+                Arc::new(storage.operator().clone()),
+                wal,
+                &node_id.as_uuid().to_string(),
+                writer_epoch,
+                Arc::clone(&redux),
+            ));
+            let verifier = state.auth.token_verifier.clone().expect("test verifier");
+            let tail_audit = Arc::new(
+                crate::oracle::PostgresTailSecurityAudit::try_new(&state.postgres)
+                    .await
+                    .expect("tail audit"),
+            );
+            let tail_authority = Arc::new(
+                crate::oracle::ScribeTailAuthority::from_pem(signing_key, tail_audit)
+                    .expect("tail authority"),
+            );
+            let ingest = Arc::new(
+                BifrostIngestRuntime::new(
+                    scribe,
+                    verifier,
+                    vala_bifrost_redux::gate::limits::IngestLimits::default(),
+                    None,
+                )
+                .with_tail_authority(tail_authority)
+                .with_scribe_role(Arc::clone(&cluster), scribe_role),
+            );
+            let scribe_capability = OraclePeerRuntime::scribe_capability(
+                ingest.tail_reader(),
+                ingest.tail_authority(),
+                ingest
+                    .scribe_registered_role()
+                    .expect("Scribe role was installed immediately above")
+                    .clone(),
+            );
             let state = OracleRoleBuilder {
-                state,
+                state: state.with_bifrost_ingest(ingest),
                 config: &config,
                 signing_key,
                 cluster: Arc::clone(&cluster),
@@ -2715,6 +2885,7 @@ pub(crate) mod pg_tests {
                 advertise_addr: "127.0.0.1:9443",
                 spill_root: None,
                 peer_credentials: Some(peer_credentials),
+                scribe_capability: Some(scribe_capability),
             }
             .build()
             .await
@@ -2810,33 +2981,6 @@ pub(crate) mod pg_tests {
                 .expect("test config retains signing key");
             let (state, peer_credentials) =
                 with_test_oracle_peer_credentials(state, &config, signing_key).await;
-            let state = OracleRoleBuilder {
-                state,
-                config: &config,
-                signing_key,
-                cluster: Arc::clone(&cluster),
-                node_id,
-                advertise_addr: "127.0.0.1:9443",
-                spill_root: None,
-                peer_credentials: Some(peer_credentials),
-            }
-            .build()
-            .await
-            .expect("Oracle role");
-            let query = Arc::clone(state.bifrost_query().expect("query runtime"));
-            let oracle_lease = cluster
-                .snapshot()
-                .live_oracles()
-                .into_iter()
-                .find(|lease| lease.key.node_id == node_id)
-                .expect("ready Oracle")
-                .clone();
-            let oracle_role = RegisteredRole {
-                key: oracle_lease.key,
-                fencing_token: oracle_lease.fencing_token,
-                capabilities: oracle_lease.capabilities,
-            };
-
             let scribe_role = cluster
                 .register_scribe(
                     "127.0.0.1:9444",
@@ -2846,18 +2990,6 @@ pub(crate) mod pg_tests {
                 )
                 .await
                 .expect("Scribe role");
-            cluster.refresh_snapshot().await.expect("mixed snapshot");
-            assert_eq!(cluster.snapshot().live_oracles().len(), 1);
-            assert_eq!(cluster.snapshot().live_scribes().len(), 1);
-            assert_ne!(
-                oracle_role.fencing_token, 0,
-                "Oracle retains a concrete fence"
-            );
-            assert_ne!(
-                scribe_role.fencing_token, 0,
-                "Scribe retains a concrete fence"
-            );
-
             let wal_root = tempdir().expect("WAL root");
             let writer_epoch =
                 i64::try_from(scribe_role.fencing_token).expect("Scribe fence fits writer epoch");
@@ -2878,6 +3010,15 @@ pub(crate) mod pg_tests {
                 Arc::clone(&redux),
             ));
             let verifier = state.auth.token_verifier.clone().expect("test verifier");
+            let tail_audit = Arc::new(
+                crate::oracle::PostgresTailSecurityAudit::try_new(&state.postgres)
+                    .await
+                    .expect("tail audit"),
+            );
+            let tail_authority = Arc::new(
+                crate::oracle::ScribeTailAuthority::from_pem(signing_key, tail_audit)
+                    .expect("tail authority"),
+            );
             let ingest = Arc::new(
                 BifrostIngestRuntime::new(
                     scribe,
@@ -2885,7 +3026,55 @@ pub(crate) mod pg_tests {
                     vala_bifrost_redux::gate::limits::IngestLimits::default(),
                     None,
                 )
+                .with_tail_authority(tail_authority)
                 .with_scribe_role(Arc::clone(&cluster), scribe_role.clone()),
+            );
+            let scribe_capability = OraclePeerRuntime::scribe_capability(
+                ingest.tail_reader(),
+                ingest.tail_authority(),
+                ingest
+                    .scribe_registered_role()
+                    .expect("Scribe role was installed immediately above")
+                    .clone(),
+            );
+            let state = OracleRoleBuilder {
+                state: state.with_bifrost_ingest(Arc::clone(&ingest)),
+                config: &config,
+                signing_key,
+                cluster: Arc::clone(&cluster),
+                node_id,
+                advertise_addr: "127.0.0.1:9443",
+                spill_root: None,
+                peer_credentials: Some(peer_credentials),
+                scribe_capability: Some(scribe_capability),
+            }
+            .build()
+            .await
+            .expect("Oracle role");
+            let query = Arc::clone(state.bifrost_query().expect("query runtime"));
+            let oracle_lease = cluster
+                .snapshot()
+                .live_oracles()
+                .into_iter()
+                .find(|lease| lease.key.node_id == node_id)
+                .expect("ready Oracle")
+                .clone();
+            let oracle_role = RegisteredRole {
+                key: oracle_lease.key,
+                fencing_token: oracle_lease.fencing_token,
+                capabilities: oracle_lease.capabilities,
+            };
+
+            cluster.refresh_snapshot().await.expect("mixed snapshot");
+            assert_eq!(cluster.snapshot().live_oracles().len(), 1);
+            assert_eq!(cluster.snapshot().live_scribes().len(), 1);
+            assert_ne!(
+                oracle_role.fencing_token, 0,
+                "Oracle retains a concrete fence"
+            );
+            assert_ne!(
+                scribe_role.fencing_token, 0,
+                "Scribe retains a concrete fence"
             );
 
             let tenant = crate::test_support::test_tenant().await;

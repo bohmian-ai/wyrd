@@ -283,6 +283,12 @@ mod pg_tests {
             if std::net::TcpStream::connect(metrics_addr).is_ok() {
                 break;
             }
+            if runner.is_finished() {
+                let result = runner
+                    .await
+                    .expect("dedicated runner task reports its early exit");
+                panic!("dedicated runner exited before metrics listener startup: {result:?}");
+            }
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "dedicated metrics listener did not start"

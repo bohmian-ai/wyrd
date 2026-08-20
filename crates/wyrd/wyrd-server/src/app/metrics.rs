@@ -15,7 +15,7 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use wyrd_telemetry::{TelemetryConfig, TelemetryGuard};
 
-use crate::config::ForgeProcessRole;
+use crate::config::BifrostTarget;
 
 /// Histogram buckets (seconds) for request-duration metrics.
 const REQUEST_DURATION_BUCKETS: &[f64] = &[
@@ -221,11 +221,13 @@ pub struct TestForgeRoleTelemetryGuard {
 impl ForgeRoleTelemetryGuard {
     /// Record that one configured Forge role completed process composition.
     #[must_use]
-    pub(crate) fn started(role: ForgeProcessRole, node_id: uuid::Uuid) -> Self {
+    pub(crate) fn started(role: BifrostTarget, node_id: uuid::Uuid) -> Self {
         let role = match role {
-            ForgeProcessRole::All => "all",
-            ForgeProcessRole::Server => "server",
-            ForgeProcessRole::ForgeWorker => "forge_worker",
+            BifrostTarget::All => "all",
+            BifrostTarget::Server => "server",
+            BifrostTarget::Oracle => "oracle",
+            BifrostTarget::Scribe => "scribe",
+            BifrostTarget::ForgeWorker => "forge_worker",
         };
         let active = metrics::gauge!("bifrost_forge_role_processes", "role" => role);
         active.increment(1.0);
@@ -248,7 +250,7 @@ impl ForgeRoleTelemetryGuard {
 #[cfg(feature = "test-support")]
 #[must_use]
 pub fn start_capture_forge_role(
-    role: ForgeProcessRole,
+    role: BifrostTarget,
     node_id: uuid::Uuid,
 ) -> TestForgeRoleTelemetryGuard {
     TestForgeRoleTelemetryGuard {

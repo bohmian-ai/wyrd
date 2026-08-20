@@ -1121,7 +1121,15 @@ pub struct OracleLifecycleLookupRequest {
     pub request_id: RequestId,
 }
 
-/// Private owner-local listing for one tenant/request lookup.
+/// Private owner-local lifecycle list scoped only by authenticated tenant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ListOracleLifecyclesRequest {
+    /// Authenticated tenant whose complete node-local registry is enumerated.
+    pub tenant_id: DataTenantId,
+}
+
+/// Private owner-local listing for one tenant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct ListOracleLifecyclesResponse {

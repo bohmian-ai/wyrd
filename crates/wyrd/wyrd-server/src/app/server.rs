@@ -23,7 +23,7 @@ use crate::app::supervise::{
 };
 use crate::boot::{ServerBootError, spawn_maintenance_scheduler, spawn_storage_sweeper};
 use crate::components::health::readiness_loop;
-use crate::config::{ForgeProcessRole, ServeMode, WyrdServerConfig};
+use crate::config::{BifrostTarget, ServeMode, WyrdServerConfig};
 use crate::grpc::{
     GrpcRouterConfig, build_app_grpc, drive_health_status, publish_initial_health,
     serve_grpc_with_listener,
@@ -458,8 +458,7 @@ impl BoundServer {
     pub async fn run(mut self) -> Result<(), BootExit> {
         let shutdown = self.state.shutdown_token.clone();
         let mut set: JoinSet<TaskExit> = JoinSet::new();
-        if let Some(resources) = self.state.bifrost_resources.as_ref() {
-            let health = resources.health();
+        if let Some(health) = self.state.bifrost.resource_health() {
             set.spawn(fallible_task(
                 TaskId::Worker("bifrost_resource_health"),
                 async move { health.wait_for_poison().await },
@@ -489,8 +488,7 @@ impl BoundServer {
         ));
         if let Some(scribe) = self
             .state
-            .bifrost_ingest
-            .as_ref()
+            .bifrost_ingest()
             .map(|runtime| Arc::clone(runtime.scribe()))
         {
             let shutdown = shutdown.clone();
@@ -532,7 +530,7 @@ impl BoundServer {
         // `Server` intentionally schedules maintenance without executing it.
         // The dedicated `ForgeWorker` process is composed by
         // `run_forge_worker_process` and never reaches this serving owner.
-        if self.config.role == ForgeProcessRole::All {
+        if self.config.role == BifrostTarget::All {
             let worker = crate::boot::spawn_forge_worker(
                 &self.state,
                 shutdown.clone(),
@@ -583,53 +581,43 @@ impl BoundServer {
         ));
 
         let drain = Duration::from_millis(self.config.shutdown.drain_ms);
-        let query = self.state.bifrost_query();
-        let ingest = self.state.bifrost_ingest.clone();
+        let bifrost = Arc::clone(&self.state.bifrost);
         #[cfg(feature = "test-support")]
         let shutdown_probe = self.shutdown_probe.clone();
         let terminal = classify_first_exit_with_shutdown(&mut set, &shutdown).await;
         let deadline = tokio::time::Instant::now() + drain;
-        drain_with_shutdown_hooks(set, shutdown, deadline, || {
-            let ingest = ingest.clone();
-            #[cfg(feature = "test-support")]
-            let shutdown_probe = shutdown_probe.clone();
-            async move {
+        drain_with_shutdown_hooks(
+            set,
+            shutdown,
+            deadline,
+            || {
+                let bifrost = Arc::clone(&bifrost);
                 #[cfg(feature = "test-support")]
-                if let Some(probe) = shutdown_probe {
-                    probe.enter(ShutdownTestPhase::Readiness, deadline).await;
+                let shutdown_probe = shutdown_probe.clone();
+                async move {
+                    #[cfg(feature = "test-support")]
+                    if let Some(probe) = shutdown_probe {
+                        probe.enter(ShutdownTestPhase::Readiness, deadline).await;
+                    }
+                    bifrost.begin_shutdown();
                 }
-                if let Some(runtime) = query
-                    && let Err(error) = runtime.begin_shutdown().await
-                {
-                    tracing::warn!(%error, "failed to remove Oracle readiness before transport drain");
-                }
-                if let Some(runtime) = ingest
-                    && let Err(error) = runtime.begin_shutdown().await
-                {
-                    tracing::warn!(%error, "failed to remove Scribe readiness before transport drain");
-                }
-            }
-        }, || {
-            #[cfg(feature = "test-support")]
-            let shutdown_probe = shutdown_probe.clone();
-            async move {
+            },
+            || {
                 #[cfg(feature = "test-support")]
-                if let Some(probe) = shutdown_probe {
-                    probe.enter(ShutdownTestPhase::Transport, deadline).await;
-                    return true;
+                let shutdown_probe = shutdown_probe.clone();
+                async move {
+                    #[cfg(feature = "test-support")]
+                    if let Some(probe) = shutdown_probe {
+                        probe.enter(ShutdownTestPhase::Transport, deadline).await;
+                        return true;
+                    }
+                    false
                 }
-                false
-            }
-        }).await;
+            },
+        )
+        .await;
 
         let deadline = deadline.into_std();
-        if shutdown_deadline_active(deadline)
-            && let Some(runtime) = self.state.bifrost_query()
-        {
-            runtime.shutdown_owner(deadline).await;
-        } else if let Some(runtime) = self.state.bifrost_query() {
-            runtime.abort_shutdown();
-        }
         #[cfg(feature = "test-support")]
         if shutdown_deadline_active(deadline)
             && let Some(probe) = &self.shutdown_probe
@@ -642,11 +630,6 @@ impl BoundServer {
                 ),
             )
             .await;
-        }
-        if shutdown_deadline_active(deadline)
-            && let Some(runtime) = self.state.bifrost_query()
-        {
-            runtime.shutdown_registry(deadline).await;
         }
         #[cfg(feature = "test-support")]
         if shutdown_deadline_active(deadline)
@@ -661,13 +644,6 @@ impl BoundServer {
             )
             .await;
         }
-        if shutdown_deadline_active(deadline)
-            && let Some(runtime) = &self.state.bifrost_ingest
-        {
-            runtime.shutdown_owner(deadline).await;
-        } else if let Some(runtime) = &self.state.bifrost_ingest {
-            runtime.abort_shutdown();
-        }
         #[cfg(feature = "test-support")]
         if shutdown_deadline_active(deadline)
             && let Some(probe) = &self.shutdown_probe
@@ -681,10 +657,13 @@ impl BoundServer {
             )
             .await;
         }
-        if shutdown_deadline_active(deadline)
-            && let Some(runtime) = &self.state.bifrost_ingest
-        {
-            runtime.shutdown_registry(deadline).await;
+        if shutdown_deadline_active(deadline) {
+            if let Err(error) = bifrost.shutdown(deadline).await {
+                tracing::warn!(%error, "Bifrost shutdown did not complete cleanly");
+                bifrost.abort();
+            }
+        } else {
+            bifrost.abort();
         }
 
         tracing::info!("wyrd-server shutdown complete");
@@ -720,7 +699,7 @@ mod pg_tests {
     use crate::components::auth::ServerAuth;
     use crate::config::WyrdServerConfig;
     use crate::postgres::ServerPostgres;
-    use crate::state::BifrostIngestRuntime;
+    use crate::state::Scribe;
 
     /// Private gRPC key material is absent from diagnostic formatting.
     #[test]
@@ -782,16 +761,13 @@ mod pg_tests {
             1,
             Arc::clone(&redux_catalog),
         ));
-        let ingest = Arc::new(BifrostIngestRuntime::new(
-            scribe,
-            Arc::clone(&verifier),
-            vala_bifrost_redux::gate::limits::IngestLimits::default(),
-            None,
-        ));
-        let gate = ingest.gate();
+        let ingest = Arc::new(Scribe::new(scribe, None));
         AppState::new(postgres, storage, redux_catalog)
             .with_bifrost_ingest(ingest)
-            .with_bifrost_gate(gate)
+            .compose_bifrost_gate(
+                Arc::clone(&verifier),
+                vala_bifrost_redux::gate::limits::IngestLimits::default(),
+            )
             .with_auth(ServerAuth {
                 issuing_key: Some(issuing_key),
                 token_verifier: Some(verifier),
@@ -818,13 +794,15 @@ mod pg_tests {
             .expect("test Scribe role registers");
         let ingest = Arc::new(
             state
-                .bifrost_ingest
-                .as_ref()
+                .bifrost_ingest()
                 .expect("test state owns Scribe")
                 .clone_with_scribe_role_for_test(cluster, scribe_role),
         );
-        let gate = ingest.gate();
-        state = state.with_bifrost_ingest(ingest).with_bifrost_gate(gate);
+        let verifier = state.auth.token_verifier.clone().expect("test verifier");
+        state = state.with_bifrost_ingest(ingest).compose_bifrost_gate(
+            verifier,
+            vala_bifrost_redux::gate::limits::IngestLimits::default(),
+        );
         let mut oracle_config = crate::config::WyrdServerConfig::default();
         let oracle_signing_key =
             IssuingKey::generate_ephemeral_pem().expect("test Oracle signing key");
@@ -858,16 +836,10 @@ mod pg_tests {
         config.shutdown.drain_ms = 1_000;
         let state = test_state_with_role_tasks().await;
         let query = Arc::clone(state.bifrost_query().expect("test state owns Oracle"));
-        let ingest = Arc::clone(
-            state
-                .bifrost_ingest
-                .as_ref()
-                .expect("test state owns Scribe role"),
-        );
+        let ingest = Arc::clone(state.bifrost_ingest().expect("test state owns Scribe role"));
         let scribe = Arc::clone(
             state
-                .bifrost_ingest
-                .as_ref()
+                .bifrost_ingest()
                 .expect("test state owns Scribe")
                 .scribe(),
         );

@@ -29,6 +29,36 @@ pub enum BifrostError {
     )]
     OracleRoleUnavailable,
 
+    /// No running query is visible for the authenticated tenant and request.
+    #[error("running query not found")]
+    #[wyrd_error(
+        code = "WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND",
+        status = 404,
+        title = "Running query not found",
+        remediation = "Verify the request identity or list currently running queries for the authenticated tenant."
+    )]
+    RunningQueryNotFound,
+
+    /// Current Oracle owners reported contradictory lifecycle authority.
+    #[error("running query ownership conflict")]
+    #[wyrd_error(
+        code = "WYRD_VALA_409_RUNNING_QUERY_CONFLICT",
+        status = 409,
+        title = "Running query ownership conflict",
+        remediation = "Do not retry cancellation automatically; investigate the contradictory Oracle owners."
+    )]
+    RunningQueryConflict,
+
+    /// At least one current-ready Oracle could not answer lifecycle control.
+    #[error("running query control unavailable")]
+    #[wyrd_error(
+        code = "WYRD_VALA_503_RUNNING_QUERY_CONTROL_UNAVAILABLE",
+        status = 503,
+        title = "Running query control unavailable",
+        remediation = "Restore every current-ready Oracle lifecycle endpoint before retrying the logical operation."
+    )]
+    RunningQueryControlUnavailable,
+
     /// This server has no WAL-ready local Scribe role.
     #[error("Scribe role unavailable")]
     #[wyrd_error(

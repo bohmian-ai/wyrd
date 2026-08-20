@@ -44,6 +44,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use serde::Serialize;
+use std::sync::Arc;
 use vala_bifrost_redux::contracts::DecodedOtlp;
 use vala_bifrost_redux::gate::{AuthContext, IngestError};
 use wyrd_spec::error::WyrdError;
@@ -204,21 +205,12 @@ async fn export_traces(
     tracing::Span::current().record("encoding", tracing::field::debug(encoding));
     let auth = caller_auth_context(&caller);
 
-    let gate = state
-        .bifrost_ingest
-        .as_ref()
-        .map(|runtime| runtime.gate())
-        .ok_or_else(|| {
-            WyrdErrorResponse::from(WyrdError::ServiceUnavailable {
-                message: "Bifrost Gate is not available".to_owned(),
-                details: serde_json::Value::Null,
-            })
-        })?;
+    let bifrost = Arc::clone(&state.bifrost);
     let (owner, request) = match encoding {
         OtlpEncoding::Protobuf => {
-            let plan = preflight_trace_protobuf(&body, gate.otlp_wire_limits())
+            let plan = preflight_trace_protobuf(&body, bifrost.gate().otlp_wire_limits())
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
-            let owner = gate
+            let owner = bifrost
                 .reserve_otlp_decode(plan.decode_bytes)
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
             let request = decode_trace_protobuf(&body)
@@ -226,7 +218,7 @@ async fn export_traces(
             (owner, request)
         }
         OtlpEncoding::Json => {
-            let plan = preflight_trace_json(&body, gate.otlp_wire_limits())
+            let plan = preflight_trace_json(&body, bifrost.gate().otlp_wire_limits())
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
             let total = plan
                 .decode_bytes
@@ -237,7 +229,7 @@ async fn export_traces(
                         OtlpSignal::Traces,
                     )
                 })?;
-            let mut owner = gate
+            let mut owner = bifrost
                 .reserve_otlp_decode(total)
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
             let scratch = owner
@@ -250,7 +242,7 @@ async fn export_traces(
             (owner, request)
         }
     };
-    let outcome = gate
+    let outcome = bifrost
         .ingest_decoded_resource_spans(&auth, DecodedOtlp::new(request, body.len(), owner))
         .await
         .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
@@ -292,21 +284,12 @@ async fn export_metrics(
     tracing::Span::current().record("encoding", tracing::field::debug(encoding));
     let auth = caller_auth_context(&caller);
 
-    let gate = state
-        .bifrost_ingest
-        .as_ref()
-        .map(|runtime| runtime.gate())
-        .ok_or_else(|| {
-            WyrdErrorResponse::from(WyrdError::ServiceUnavailable {
-                message: "Bifrost Gate is not available".to_owned(),
-                details: serde_json::Value::Null,
-            })
-        })?;
+    let bifrost = Arc::clone(&state.bifrost);
     let (owner, request) = match encoding {
         OtlpEncoding::Protobuf => {
-            let plan = preflight_metrics_protobuf(&body, gate.otlp_wire_limits())
+            let plan = preflight_metrics_protobuf(&body, bifrost.gate().otlp_wire_limits())
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
-            let owner = gate
+            let owner = bifrost
                 .reserve_otlp_decode(plan.decode_bytes)
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
             let request = decode_metrics_protobuf(&body, plan)
@@ -314,7 +297,7 @@ async fn export_metrics(
             (owner, request)
         }
         OtlpEncoding::Json => {
-            let plan = preflight_metrics_json(&body, gate.otlp_wire_limits())
+            let plan = preflight_metrics_json(&body, bifrost.gate().otlp_wire_limits())
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
             let total = plan
                 .decode_bytes
@@ -325,7 +308,7 @@ async fn export_metrics(
                         OtlpSignal::Metrics,
                     )
                 })?;
-            let mut owner = gate
+            let mut owner = bifrost
                 .reserve_otlp_decode(total)
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
             let scratch = owner
@@ -339,7 +322,7 @@ async fn export_metrics(
             (owner, request)
         }
     };
-    let outcome = gate
+    let outcome = bifrost
         .ingest_decoded_resource_metrics(&auth, DecodedOtlp::new(request, body.len(), owner))
         .await
         .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
@@ -381,21 +364,12 @@ async fn export_logs(
     tracing::Span::current().record("encoding", tracing::field::debug(encoding));
     let auth = caller_auth_context(&caller);
 
-    let gate = state
-        .bifrost_ingest
-        .as_ref()
-        .map(|runtime| runtime.gate())
-        .ok_or_else(|| {
-            WyrdErrorResponse::from(WyrdError::ServiceUnavailable {
-                message: "Bifrost Gate is not available".to_owned(),
-                details: serde_json::Value::Null,
-            })
-        })?;
+    let bifrost = Arc::clone(&state.bifrost);
     let (owner, request) = match encoding {
         OtlpEncoding::Protobuf => {
-            let plan = preflight_logs_protobuf(&body, gate.otlp_wire_limits())
+            let plan = preflight_logs_protobuf(&body, bifrost.gate().otlp_wire_limits())
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
-            let owner = gate
+            let owner = bifrost
                 .reserve_otlp_decode(plan.decode_bytes)
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
             let request = decode_logs_protobuf(&body)
@@ -403,7 +377,7 @@ async fn export_logs(
             (owner, request)
         }
         OtlpEncoding::Json => {
-            let plan = preflight_logs_json(&body, gate.otlp_wire_limits())
+            let plan = preflight_logs_json(&body, bifrost.gate().otlp_wire_limits())
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
             let total = plan
                 .decode_bytes
@@ -414,7 +388,7 @@ async fn export_logs(
                         OtlpSignal::Logs,
                     )
                 })?;
-            let mut owner = gate
+            let mut owner = bifrost
                 .reserve_otlp_decode(total)
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
             let scratch = owner
@@ -427,7 +401,7 @@ async fn export_logs(
             (owner, request)
         }
     };
-    let outcome = gate
+    let outcome = bifrost
         .ingest_decoded_resource_logs(&auth, DecodedOtlp::new(request, body.len(), owner))
         .await
         .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;

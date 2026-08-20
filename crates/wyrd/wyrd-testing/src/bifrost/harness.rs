@@ -159,7 +159,7 @@ impl BifrostHarness {
             );
             let scribe_resources = cluster
                 .server(index)
-                .and_then(|server| server.state().bifrost_resources.as_ref())
+                .and_then(|server| server.state().bifrost_resources())
                 .and_then(vala_bifrost_redux::resources::BifrostRoleResources::scribe)
                 .ok_or_else(|| {
                     HarnessError::Configuration(
@@ -170,7 +170,7 @@ impl BifrostHarness {
                 HarnessError::Configuration("missing Bifrost test server".to_owned())
             })?;
             let scribe = ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
-                catalog: Some(Arc::clone(&server.state().bifrost)),
+                catalog: Some(Arc::clone(server.state().bifrost_catalog())),
                 operator: Arc::clone(&operator),
                 wal,
                 stream: StreamIdentity::new(NodeId::new(node_id), WriterEpoch::new(writer_epoch)),
@@ -198,8 +198,7 @@ impl BifrostHarness {
                     .with_output_scratch(
                         server
                             .state()
-                            .bifrost_resources
-                            .as_ref()
+                            .bifrost_resources()
                             .and_then(|resources| resources.scribe())
                             .and_then(|resources| resources.volume_capabilities())
                             .map(|(_, scratch)| scratch)

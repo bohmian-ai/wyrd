@@ -4,13 +4,18 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use futures_util::{Stream, StreamExt};
-use vala_bifrost_redux::cluster::ClusterRegistry;
-use vala_bifrost_redux::oracle::dispatcher::{DispatchError, OraclePeerWorker, WorkerExecution};
-use vala_bifrost_redux::oracle::peer::PeerSecurityAudit;
-use vala_bifrost_redux::scribe::tail_rpc::FetchLiveTailService;
+use vala_bifrost_redux::oracle::dispatcher::PEER_PROTOCOL_VERSION;
+use vala_bifrost_redux::oracle::dispatcher::{DispatchError, WorkerExecution};
+use vala_bifrost_redux::oracle::executor::AttemptEncoder;
+use vala_bifrost_redux::oracle::follower::{
+    AuthenticatedFollowerContext, PhysicalPlanFollowerError, authenticated_preflight,
+};
+use vala_bifrost_redux::oracle::peer::{PeerSecurityAudit, PeerTicketClaims, PeerTicketVerifier};
 use wyrd_runtime::{Permission, Principal, PrincipalKind};
 use wyrd_spec::vala::api::BifrostSecurityViolationKind;
+use wyrd_spec::vala::api::{ClusterRole, PhysicalExecuteFragmentRequest};
 use wyrd_tonic::private_conversion::PrivateConversionError;
+use wyrd_tonic::prost::Message;
 use wyrd_tonic::tonic::{Request, Response, Status};
 use wyrd_tonic::wyrd::v1::oracle_peer_service_server::{
     OraclePeerService, OraclePeerServiceServer,
@@ -19,45 +24,19 @@ use wyrd_tonic::wyrd::v1::{
     self as proto, ExecuteFragmentRequest, ReleaseNodeSlotsRequest, ReserveNodeSlotsRequest,
 };
 
-use crate::AppState;
+use crate::state::Bifrost;
 
 /// Private tonic service retaining one fenced worker runtime.
 pub struct OraclePeerGrpc {
-    /// Server auth state used to authenticate workload peers.
-    state: AppState,
-    /// Redux worker owner shared with the local transport.
-    worker: Arc<OraclePeerWorker>,
-    /// Authoritative membership owner used before reservation mutation.
-    cluster: Arc<ClusterRegistry>,
-    /// Scrubbed durable audit used for rejected peer authority.
-    security_audit: Arc<dyn PeerSecurityAudit>,
-    /// Exact role-local follower source retained for authenticated execution.
-    tail_service: Arc<FetchLiveTailService>,
+    /// One published Bifrost facade owning every selectable peer capability.
+    bifrost: Arc<Bifrost>,
 }
 
 impl OraclePeerGrpc {
     /// Creates the adapter around the retained worker runtime.
     #[must_use]
-    pub fn new(
-        state: AppState,
-        worker: Arc<OraclePeerWorker>,
-        cluster: Arc<ClusterRegistry>,
-        security_audit: Arc<dyn PeerSecurityAudit>,
-        tail_service: Arc<FetchLiveTailService>,
-    ) -> Self {
-        Self {
-            state,
-            worker,
-            cluster,
-            security_audit,
-            tail_service,
-        }
-    }
-
-    /// Borrows the exact role-local follower source installed by composition.
-    #[must_use]
-    pub fn tail_service(&self) -> &Arc<FetchLiveTailService> {
-        &self.tail_service
+    pub const fn new(bifrost: Arc<Bifrost>) -> Self {
+        Self { bifrost }
     }
 
     /// Returns the generated tonic server wrapper.
@@ -74,21 +53,14 @@ impl OraclePeerGrpc {
         &self,
         metadata: &wyrd_tonic::tonic::metadata::MetadataMap,
     ) -> Result<Principal, Status> {
-        let verifier = self
-            .state
-            .auth
-            .token_verifier
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("auth backend not configured"))?;
-        let auth =
-            match vala_bifrost_redux::gate::auth::authenticate(verifier.as_ref(), metadata).await {
-                Ok(auth) => auth,
-                Err(error) => {
-                    self.audit_denial(BifrostSecurityViolationKind::PeerAudience)
-                        .await?;
-                    return Err(Status::unauthenticated(error.to_string()));
-                }
-            };
+        let auth = match self.bifrost.gate().authenticate_peer(metadata).await {
+            Ok(auth) => auth,
+            Err(error) => {
+                self.audit_denial(BifrostSecurityViolationKind::PeerAudience)
+                    .await?;
+                return Err(Status::unauthenticated(error.to_string()));
+            }
+        };
         if let Some(violation) = peer_authority_violation(&auth.principal) {
             self.audit_denial(violation).await?;
             return Err(Status::permission_denied("Oracle peer authority denied"));
@@ -98,10 +70,132 @@ impl OraclePeerGrpc {
 
     /// Appends one scrubbed denial and fails closed if audit storage is unavailable.
     async fn audit_denial(&self, violation: BifrostSecurityViolationKind) -> Result<(), Status> {
-        self.security_audit
+        self.security_audit()?
             .append_unverified_ticket_rejection(violation)
             .await
             .map_err(|_| Status::unavailable("Oracle peer security audit unavailable"))
+    }
+
+    /// Selects the exact role-owned peer security audit without constructing an aggregate.
+    fn security_audit(&self) -> Result<Arc<dyn PeerSecurityAudit>, Status> {
+        if let Some(oracle) = self.bifrost.oracle() {
+            return Ok(oracle.peer().security_audit());
+        }
+        self.bifrost
+            .scribe()
+            .map(|scribe| scribe.fragment_security_audit())
+            .ok_or_else(|| Status::unavailable("Bifrost peer capability is not configured"))
+    }
+
+    /// Executes one Scribe-targeted physical fragment under Scribe's own fence and resources.
+    async fn execute_scribe_fragment(
+        &self,
+        request: PhysicalExecuteFragmentRequest,
+    ) -> Result<WorkerExecution, DispatchError> {
+        let scribe = self.bifrost.scribe().ok_or(DispatchError::Terminal)?;
+        let local_role = scribe.scribe_registered_role();
+        if request.target_fence.role != ClusterRole::Scribe
+            || request.target_fence.node_id != local_role.key.node_id
+            || request.target_fence.fencing_token != local_role.fencing_token
+            || request.reservation_id.as_uuid() != uuid::Uuid::nil()
+            || scribe
+                .cluster()
+                .snapshot()
+                .live_scribe_at_fence(local_role.key.node_id, local_role.fencing_token)
+                .is_none()
+        {
+            return Err(DispatchError::Terminal);
+        }
+        let verifier: Arc<dyn PeerTicketVerifier> = scribe.fragment_verifier();
+        let verified = verifier
+            .verify_peer_ticket(
+                &request.ticket,
+                local_role.key.node_id,
+                local_role.fencing_token,
+                chrono::Utc::now(),
+            )
+            .await
+            .map_err(|_| DispatchError::Terminal)?;
+        let claims =
+            PeerTicketClaims::decode(verified.0.as_slice()).map_err(|_| DispatchError::Terminal)?;
+        let tenant_id = uuid::Uuid::from_slice(&claims.tenant_id)
+            .ok()
+            .and_then(|tenant| wyrd_spec::DataTenantId::new(tenant).ok())
+            .ok_or(DispatchError::Terminal)?;
+        let query_id =
+            uuid::Uuid::from_slice(&claims.query_id).map_err(|_| DispatchError::Terminal)?;
+        if claims.protocol_version != PEER_PROTOCOL_VERSION
+            || claims.leader_node_id.as_slice() != request.leader_fence.node_id.as_uuid().as_bytes()
+            || claims.leader_fence != request.leader_fence.fencing_token
+            || claims.worker_fence != local_role.fencing_token
+            || claims.fragment_digest != request.plan_fingerprint
+            || claims.manifest_digest != request.plan_fingerprint
+            || claims.permission_digest.is_empty()
+            || request.assignments.is_empty()
+            || request.assignments.iter().any(|assignment| {
+                assignment.binding.tenant_id != tenant_id
+                    || format!(
+                        "{}.{}",
+                        assignment.binding.namespace, assignment.binding.table
+                    ) != claims.binding
+                    || !assignment.persisted.files.is_empty()
+                    || assignment.scribe_provider_cut.is_none()
+            })
+        {
+            return Err(DispatchError::Terminal);
+        }
+        let binding = request
+            .assignments
+            .first()
+            .map(|assignment| assignment.binding.clone())
+            .ok_or(DispatchError::Terminal)?;
+        let authenticated = AuthenticatedFollowerContext {
+            tenant_id,
+            table_binding: &binding,
+            reservation_id: &request.reservation_id,
+            leader_fence: request.leader_fence.clone(),
+            local_fence: request.target_fence.clone(),
+        };
+        authenticated_preflight(&request, authenticated.clone())
+            .map_err(|_| DispatchError::Terminal)?;
+        let request_id = wyrd_spec::request_id::RequestId::parse(&query_id.to_string())
+            .map_err(|_| DispatchError::Terminal)?;
+        let lease = scribe
+            .resources()
+            .try_acquire_follower(
+                &request_id,
+                vala_bifrost_redux::resources::ORACLE_PARTITION_MEMORY_BYTES,
+            )
+            .map_err(|_| DispatchError::Capacity)?;
+        let mut batches = scribe
+            .fragment_follower()
+            .execute(&request, authenticated, lease.memory_pool())
+            .await
+            .map_err(|error| match error {
+                PhysicalPlanFollowerError::Preflight(_)
+                | PhysicalPlanFollowerError::PostResolutionDecode(_) => DispatchError::Terminal,
+                PhysicalPlanFollowerError::Resolution(_)
+                | PhysicalPlanFollowerError::Execution(_) => DispatchError::Retryable,
+            })?;
+        let plan_fingerprint = request.plan_fingerprint;
+        let output = async_stream::stream! {
+            let _lease = lease;
+            let mut encoder = AttemptEncoder::default();
+            while let Some(batch) = batches.next().await {
+                let batch = batch.map_err(|_| DispatchError::Retryable)?;
+                let (schema, batch) = encoder.encode(&batch).map_err(|_| DispatchError::Terminal)?;
+                if let Some(schema) = schema {
+                    yield Ok(schema);
+                }
+                yield Ok(batch);
+            }
+            yield encoder
+                .finish_physical(&plan_fingerprint)
+                .map_err(|_| DispatchError::Terminal);
+        };
+        Ok(WorkerExecution {
+            stream: Box::pin(output),
+        })
     }
 }
 
@@ -137,7 +231,10 @@ impl OraclePeerService for OraclePeerGrpc {
         let request = wyrd_spec::vala::api::ReserveNodeSlotsRequest::try_from(request.into_inner())
             .map_err(conversion_status)?;
         if self
-            .cluster
+            .bifrost
+            .oracle()
+            .ok_or_else(|| Status::failed_precondition("Oracle role is not configured"))?
+            .cluster()
             .validate_live_oracle(request.leader_node_id, request.leader_fencing_token)
             .await
             .is_err()
@@ -146,7 +243,12 @@ impl OraclePeerService for OraclePeerGrpc {
                 .await?;
             return Err(Status::permission_denied("Oracle peer fence is not live"));
         }
-        Ok(Response::new(self.worker.reserve(&request).into()))
+        let worker = self
+            .bifrost
+            .oracle_peer_service()
+            .ok_or_else(|| Status::failed_precondition("Oracle role is not configured"))?
+            .worker();
+        Ok(Response::new(worker.reserve(&request).into()))
     }
 
     /// Releases one matching reservation idempotently after workload authentication.
@@ -160,7 +262,11 @@ impl OraclePeerService for OraclePeerGrpc {
         self.authenticate(request.metadata()).await?;
         let request = wyrd_spec::vala::api::ReleaseNodeSlotsRequest::try_from(request.into_inner())
             .map_err(conversion_status)?;
-        self.worker.release(&request);
+        self.bifrost
+            .oracle_peer_service()
+            .ok_or_else(|| Status::failed_precondition("Oracle role is not configured"))?
+            .worker()
+            .release(&request);
         Ok(Response::new(proto::ReleaseNodeSlotsResponse {}))
     }
 
@@ -173,13 +279,17 @@ impl OraclePeerService for OraclePeerGrpc {
         request: Request<ExecuteFragmentRequest>,
     ) -> Result<Response<Self::ExecuteFragmentStream>, Status> {
         self.authenticate(request.metadata()).await?;
-        let request = wyrd_spec::vala::api::ExecuteFragmentRequest::try_from(request.into_inner())
-            .map_err(conversion_status)?;
-        let WorkerExecution { mut stream } = self
-            .worker
-            .execute(request)
-            .await
-            .map_err(dispatch_status)?;
+        let request =
+            wyrd_spec::vala::api::PhysicalExecuteFragmentRequest::try_from(request.into_inner())
+                .map_err(conversion_status)?;
+        let WorkerExecution { mut stream } = match request.target_fence.role {
+            ClusterRole::Oracle => match self.bifrost.oracle_peer_service() {
+                Some(peer) => peer.worker().execute(request).await,
+                None => Err(DispatchError::Terminal),
+            },
+            ClusterRole::Scribe => self.execute_scribe_fragment(request).await,
+        }
+        .map_err(dispatch_status)?;
         let output = async_stream::stream! {
             while let Some(frame) = stream.next().await {
                 yield frame.map(Into::into).map_err(dispatch_status);

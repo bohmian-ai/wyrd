@@ -737,7 +737,7 @@ async fn provision_tables(
     let server = cluster
         .server(0)
         .ok_or_else(|| ClusterLoadError::Cluster("cluster has no Server".to_owned()))?;
-    let catalog = &server.state().bifrost;
+    let catalog = server.state().bifrost_catalog();
     let fields = vec![
         Field::new("id", DataType::Int64, false),
         Field::new("tenant", DataType::Utf8, false),

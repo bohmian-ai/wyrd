@@ -24,7 +24,7 @@ use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_runtime::{Permission, PermissionSet};
 use wyrd_server::app::metrics::install_recorder;
 use wyrd_server::config::BifrostRuntimeRole;
-use wyrd_server::config::ForgeProcessRole;
+use wyrd_server::config::BifrostTarget;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{NodeId, TenantTableBinding};
 use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
@@ -194,17 +194,18 @@ impl BifrostClusterSpec {
         Self::mixed(3)
     }
 
-    /// Construct three full Server processes for the role-separated lane.
+    /// Construct one Oracle leader, one Oracle follower, and one Scribe follower.
     #[must_use]
     pub fn role_separated() -> Self {
-        let mut spec = Self::mixed(3);
-        // Retain an explicit Oracle resource marker so legacy lane reporting
-        // can distinguish this named topology from the ordinary three-pod
-        // capacity lane without reintroducing component-partial roles.
-        for node in &mut spec.nodes {
-            node.oracle = Some(TestOracleResources::default());
+        Self {
+            nodes: vec![
+                Self::node(1, [BifrostRuntimeRole::Oracle]),
+                Self::node(2, [BifrostRuntimeRole::Oracle]),
+                Self::node(3, [BifrostRuntimeRole::Scribe]),
+            ],
+            scribe_rotation_for_test: None,
+            scribe_persistence_faults_for_test: None,
         }
-        spec
     }
 
     /// Construct six mixed capacity nodes.
@@ -220,11 +221,12 @@ impl BifrostClusterSpec {
             1,
             [
                 BifrostRuntimeRole::Scribe,
-                BifrostRuntimeRole::Forge,
+                BifrostRuntimeRole::ForgeCoordinator,
+                BifrostRuntimeRole::ForgeWorker,
                 BifrostRuntimeRole::Oracle,
             ],
         )];
-        nodes.extend((2..=4).map(|id| Self::node(id, [BifrostRuntimeRole::Forge])));
+        nodes.extend((2..=4).map(|id| Self::node(id, [BifrostRuntimeRole::ForgeWorker])));
         Self {
             nodes,
             scribe_rotation_for_test: None,
@@ -246,13 +248,13 @@ impl BifrostClusterSpec {
                     id,
                     [
                         BifrostRuntimeRole::Scribe,
-                        BifrostRuntimeRole::Forge,
+                        BifrostRuntimeRole::ForgeCoordinator,
                         BifrostRuntimeRole::Oracle,
                     ],
                 )
             })
             .collect::<Vec<_>>();
-        nodes.extend((4..=6).map(|id| Self::node(id, [BifrostRuntimeRole::Forge])));
+        nodes.extend((4..=6).map(|id| Self::node(id, [BifrostRuntimeRole::ForgeWorker])));
         Self {
             nodes,
             scribe_rotation_for_test: None,
@@ -269,7 +271,8 @@ impl BifrostClusterSpec {
                         u128::try_from(index).expect("node index fits u128"),
                         [
                             BifrostRuntimeRole::Scribe,
-                            BifrostRuntimeRole::Forge,
+                            BifrostRuntimeRole::ForgeCoordinator,
+                            BifrostRuntimeRole::ForgeWorker,
                             BifrostRuntimeRole::Oracle,
                         ],
                     )
@@ -313,14 +316,6 @@ impl BifrostClusterSpec {
             if !ids.insert(node.node_id) {
                 return Err(ClusterError::Resource(format!(
                     "duplicate node identity {}",
-                    node.node_id.as_uuid()
-                )));
-            }
-            let forge_worker =
-                node.roles.len() == 1 && node.roles.contains(&BifrostRuntimeRole::Forge);
-            if !forge_worker && !has_full_server_roles(&node.roles) {
-                return Err(ClusterError::Resource(format!(
-                    "node {} must declare all Server roles or Forge only",
                     node.node_id.as_uuid()
                 )));
             }
@@ -643,7 +638,7 @@ struct NodeResources {
     /// Fixed private/public gRPC bind retained across a restart.
     grpc_addr: std::net::SocketAddr,
     /// Closed production process role derived from the component set.
-    process_role: ForgeProcessRole,
+    process_role: BifrostTarget,
 }
 
 /// Optional Forge supervision controls shared by every node in one cluster.
@@ -1150,10 +1145,10 @@ impl WyrdTestCluster {
         let server = self
             .server(leader_index)
             .ok_or_else(|| ClusterError::Resource("Oracle leader is absent".to_owned()))?;
-        let peer =
-            server.state().oracle_peer.as_ref().ok_or_else(|| {
-                ClusterError::Resource("Oracle leader runtime is absent".to_owned())
-            })?;
+        let peer = server
+            .state()
+            .oracle_peer()
+            .ok_or_else(|| ClusterError::Resource("Oracle leader runtime is absent".to_owned()))?;
         let ca = std::fs::read(&tls.ca_path)
             .map_err(|error| ClusterError::Resource(error.to_string()))?;
         Ok(TonicOraclePeerTransport::with_credentials_and_tls(
@@ -1169,7 +1164,7 @@ impl WyrdTestCluster {
     /// Returns a resource error when any registry refresh fails.
     pub async fn refresh_oracle_snapshots(&self) -> Result<(), ClusterError> {
         for server in self.servers.values().flatten() {
-            if let Some(peer) = &server.state().oracle_peer {
+            if let Some(peer) = server.state().oracle_peer() {
                 peer.cluster()
                     .refresh_snapshot()
                     .await
@@ -1712,7 +1707,6 @@ impl WyrdTestCluster {
         let topology = classify_topology(&spec);
         let scribe_admission_node =
             scribe_admission_node.and_then(|index| spec.nodes.get(index).map(|node| node.node_id));
-        let node_count = spec.nodes.len();
         let mut nodes = BTreeMap::new();
         for node in spec.nodes {
             let wal_root = if node.roles.contains(&BifrostRuntimeRole::Scribe) {
@@ -1723,7 +1717,8 @@ impl WyrdTestCluster {
                 None
             };
             let spill_root = if node.roles.contains(&BifrostRuntimeRole::Oracle)
-                || node.roles.contains(&BifrostRuntimeRole::Forge)
+                || node.roles.contains(&BifrostRuntimeRole::ForgeCoordinator)
+                || node.roles.contains(&BifrostRuntimeRole::ForgeWorker)
             {
                 Some(Arc::new(create_spill_root(node.oracle.as_ref())?))
             } else {
@@ -1736,21 +1731,12 @@ impl WyrdTestCluster {
             } else {
                 None
             };
-            let process_role =
-                if node.roles.len() == 1 && node.roles.contains(&BifrostRuntimeRole::Forge) {
-                    ForgeProcessRole::ForgeWorker
-                } else if has_full_server_roles(&node.roles) {
-                    if node_count == 1 {
-                        ForgeProcessRole::All
-                    } else {
-                        ForgeProcessRole::Server
-                    }
-                } else {
-                    return Err(ClusterError::Resource(format!(
-                        "node {} must declare all Server roles or Forge only",
-                        node.node_id.as_uuid()
-                    )));
-                };
+            let process_role = process_target_for_roles(&node.roles).ok_or_else(|| {
+                ClusterError::Resource(format!(
+                    "node {} has no exact public process target",
+                    node.node_id.as_uuid()
+                ))
+            })?;
             nodes.insert(
                 node.node_id,
                 NodeResources {
@@ -2571,12 +2557,23 @@ fn is_exact_reclaimed_panic_row(row: &(String, i32, Option<String>, bool, bool))
     row == &("retryable".to_owned(), 1, None, true, true)
 }
 
-/// Return whether a node carries the complete public Server component roster.
-fn has_full_server_roles(roles: &BTreeSet<BifrostRuntimeRole>) -> bool {
-    roles.len() == 3
-        && roles.contains(&BifrostRuntimeRole::Scribe)
-        && roles.contains(&BifrostRuntimeRole::Forge)
-        && roles.contains(&BifrostRuntimeRole::Oracle)
+/// Maps one exact concrete role set to its public process target.
+fn process_target_for_roles(roles: &BTreeSet<BifrostRuntimeRole>) -> Option<BifrostTarget> {
+    [
+        BifrostTarget::All,
+        BifrostTarget::Server,
+        BifrostTarget::Oracle,
+        BifrostTarget::Scribe,
+        BifrostTarget::ForgeWorker,
+    ]
+    .into_iter()
+    .find(|target| {
+        wyrd_server::config::BifrostRoles::for_target(*target)
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            == *roles
+    })
 }
 
 /// Classify a validated concrete descriptor for legacy lane reporting.
@@ -2584,21 +2581,24 @@ fn classify_topology(spec: &BifrostClusterSpec) -> BifrostTopology {
     match spec.nodes.len() {
         1 => BifrostTopology::OnePod,
         2 => BifrostTopology::TwoPod,
-        6 if spec.nodes[..3]
-            .iter()
-            .all(|node| has_full_server_roles(&node.roles))
-            && spec.nodes[3..].iter().all(|node| {
-                node.roles.len() == 1 && node.roles.contains(&BifrostRuntimeRole::Forge)
-            }) =>
+        6 if spec.nodes[..3].iter().all(|node| {
+            node.roles.contains(&BifrostRuntimeRole::Scribe)
+                && node.roles.contains(&BifrostRuntimeRole::ForgeCoordinator)
+                && node.roles.contains(&BifrostRuntimeRole::ForgeWorker)
+                && node.roles.contains(&BifrostRuntimeRole::Oracle)
+        }) && spec.nodes[3..].iter().all(|node| {
+            node.roles.len() == 1 && node.roles.contains(&BifrostRuntimeRole::ForgeWorker)
+        }) =>
         {
             BifrostTopology::ThreeServersThreeForgeWorkers
         }
         4 if spec.nodes.first().is_some_and(|node| {
             node.roles.contains(&BifrostRuntimeRole::Scribe)
-                && node.roles.contains(&BifrostRuntimeRole::Forge)
+                && node.roles.contains(&BifrostRuntimeRole::ForgeCoordinator)
+                && node.roles.contains(&BifrostRuntimeRole::ForgeWorker)
                 && node.roles.contains(&BifrostRuntimeRole::Oracle)
         }) && spec.nodes[1..].iter().all(|node| {
-            node.roles.len() == 1 && node.roles.contains(&BifrostRuntimeRole::Forge)
+            node.roles.len() == 1 && node.roles.contains(&BifrostRuntimeRole::ForgeWorker)
         }) =>
         {
             BifrostTopology::DedicatedForgeWorkers
@@ -2716,7 +2716,7 @@ mod tests {
             .find("pub async fn shutdown_and_inspect(mut self)")
             .expect("cluster shutdown owner exists");
         let end = source[start..]
-            .find("fn has_full_server_roles")
+            .find("fn process_target_for_roles")
             .map(|offset| start + offset)
             .expect("shutdown owner ends before topology helper");
         let function = &source[start..end];
@@ -2746,12 +2746,12 @@ mod tests {
         assert!(
             spec.nodes[..3]
                 .iter()
-                .all(|node| has_full_server_roles(&node.roles))
+                .all(|node| process_target_for_roles(&node.roles) == Some(BifrostTarget::Server))
         );
         assert!(
             spec.nodes[3..]
                 .iter()
-                .all(|node| node.roles == BTreeSet::from([BifrostRuntimeRole::Forge]))
+                .all(|node| node.roles == BTreeSet::from([BifrostRuntimeRole::ForgeWorker]))
         );
         assert_eq!(
             classify_topology(&spec),
@@ -2780,8 +2780,7 @@ mod tests {
         let original_identity = original.postgres_pool_identity();
         let original_resources = original
             .state()
-            .bifrost_resources
-            .as_ref()
+            .bifrost_resources()
             .expect("original global resources")
             .snapshot()
             .expect("original resource snapshot");
@@ -2794,8 +2793,7 @@ mod tests {
         assert_eq!(cluster.wal_dirs().next(), Some(wal_root.as_path()));
         let restarted_resources = server
             .state()
-            .bifrost_resources
-            .as_ref()
+            .bifrost_resources()
             .expect("restarted global resources")
             .snapshot()
             .expect("restarted resource snapshot");

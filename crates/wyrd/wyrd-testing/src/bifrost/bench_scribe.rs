@@ -426,7 +426,7 @@ async fn run_fault_profile(
             let roles = harness
                 .cluster()
                 .server(0)
-                .and_then(|server| server.state().bifrost_resources.clone())
+                .and_then(|server| server.state().bifrost_resources().cloned())
                 .ok_or("missing shared Bifrost resource composition")?;
             let pressure = roles
                 .oracle()
@@ -473,7 +473,7 @@ async fn run_fault_profile(
             let roles = harness
                 .cluster()
                 .server(0)
-                .and_then(|server| server.state().bifrost_resources.clone())
+                .and_then(|server| server.state().bifrost_resources().cloned())
                 .ok_or("missing shared Bifrost resource composition")?;
             let oracle = roles
                 .oracle()
@@ -989,7 +989,7 @@ async fn measure_public_components(
         .ok_or("missing benchmark server")?;
     let table_name = "bifrost_component_events";
     let table = TableRef::new(BifrostNamespace::Bifrost, table_name);
-    let catalog = server.state().bifrost;
+    let catalog = server.state().bifrost_catalog();
     catalog
         .create_table(vala_bifrost_redux::catalog::CreateTableRequest {
             table,

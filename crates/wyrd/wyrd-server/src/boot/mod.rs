@@ -16,8 +16,8 @@ use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::cluster::RoleTiming;
 use vala_bifrost_redux::cluster::{ClusterRegistry, RegisteredRole};
 use vala_bifrost_redux::forge::{
-    Forge, ForgeBuildConfig, ForgeClock, ForgeConfig, ForgeObjectPages, ForgeObjectStore,
-    ForgeTelemetry, ForgeWorker, ForgeWorkerConfig,
+    Forge as ForgeCoordinator, ForgeBuildConfig, ForgeClock, ForgeConfig, ForgeObjectPages,
+    ForgeObjectStore, ForgeTelemetry, ForgeWorker, ForgeWorkerConfig,
 };
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::oracle::dispatcher::{
@@ -26,10 +26,12 @@ use vala_bifrost_redux::oracle::dispatcher::{
 };
 use vala_bifrost_redux::oracle::executor::SealedFragmentExecutor;
 use vala_bifrost_redux::oracle::{
-    Oracle, OracleBuildConfig, OracleConfig, OracleMemoryResources, OracleSlotManager,
-    OracleSpillRuntime, TailTransportDirectory,
+    Oracle as OracleEngine, OracleBuildConfig, OracleConfig, OracleMemoryResources,
+    OracleSlotManager, OracleSpillRuntime, TailTransportDirectory,
 };
-use vala_bifrost_redux::resources::{BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources};
+use vala_bifrost_redux::resources::{
+    BifrostResourcePolicy, BifrostRole, BifrostRoleResources, BifrostRuntimeResources,
+};
 use vala_bifrost_redux::scribe::admission::{AdmissionConfig, EventTimeWindow};
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
@@ -58,13 +60,11 @@ use crate::components::auth::{ServerAuth, ServerAuthz};
 use crate::components::eval::EvalAuditWriter;
 use crate::config::{BifrostRuntimeRole, WorkloadBindingEntry};
 use crate::oracle::{
-    OracleAuditPublisher, OraclePeerAuthority, OraclePeerRuntime, PostgresPeerSecurityAudit,
+    OracleAuditPublisher, OraclePeerAuthority, PostgresPeerSecurityAudit,
     ServerOraclePeerCredentials,
 };
 use crate::postgres::ServerPostgres;
-use crate::state::{
-    AppState, BifrostIngestRuntime, BifrostQueryRuntime, ProductionValidationError,
-};
+use crate::state::{AppState, Forge, Oracle, ProductionValidationError, Scribe};
 
 const DEFAULT_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 const DEFAULT_HINT_CAPACITY: usize = 1_024;
@@ -183,16 +183,24 @@ pub struct StateOverrides {
     pub fail_after_scribe_activation: bool,
 }
 
-/// Holds shared and role-specific Bifrost dependencies during server boot.
-struct BifrostBootParts {
-    /// State without mounted Gate role adapters.
-    state: AppState,
-    /// Optional recovered Scribe resources selected by runtime role config.
-    scribe: Option<ScribeBootParts>,
-    /// Cluster registry shared by independently fenced local roles.
-    cluster_registry: Arc<ClusterRegistry>,
-    /// Physical node identity shared by independently fenced local roles.
+/// External process dependencies prepared before the one Bifrost composition call.
+struct BifrostExternalDependencies {
+    /// Shared production PostgreSQL handles.
+    postgres: Arc<ServerPostgres>,
+    /// Shared object-storage handle.
+    storage: Arc<StorageHandle>,
+    /// Shared Bifrost catalog.
+    catalog: Arc<BifrostCatalog>,
+    /// One root-derived role resource graph.
+    resources: BifrostRoleResources,
+    /// One shared current-ready cluster registry.
+    cluster: Arc<ClusterRegistry>,
+    /// Stable physical node identity.
     node_id: ClusterNodeId,
+    /// Private endpoint advertised by selected roles.
+    advertise_addr: String,
+    /// Durable Scribe WAL root.
+    wal_dir: std::path::PathBuf,
 }
 
 /// Owns resources created only when the Scribe role is selected.
@@ -203,36 +211,6 @@ struct ScribeBootParts {
     coordination_runtime: Option<Arc<tokio::runtime::Runtime>>,
     /// Independently fenced Scribe role registered during this boot.
     scribe_role: RegisteredRole,
-}
-
-impl BifrostBootParts {
-    /// Roll back resources that were activated before the enclosing server
-    /// state became usable.
-    ///
-    /// Scribe recovery and role registration happen before auth/Oracle
-    /// composition. Any later boot error must close the writer and release its
-    /// exact fence; this method is intentionally idempotent and never starts a
-    /// second shutdown budget.
-    async fn rollback(&mut self) {
-        if let Some(scribe) = &mut self.scribe {
-            scribe.scribe.shutdown(std::time::Instant::now()).await;
-            if let Err(error) = self
-                .cluster_registry
-                .shutdown_role(scribe.scribe_role.clone())
-                .await
-            {
-                tracing::warn!(%error, "failed to release Scribe role during boot rollback");
-            }
-            if let Some(runtime) = scribe.coordination_runtime.take()
-                && let Ok(runtime) = Arc::try_unwrap(runtime)
-            {
-                let _ = tokio::task::spawn_blocking(move || {
-                    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
-                })
-                .await;
-            }
-        }
-    }
 }
 
 /// Errors raised while assembling server state.
@@ -326,61 +304,6 @@ pub enum ServerBootError {
     /// Oracle peer authority, audit, role, or worker construction failed.
     #[error("Oracle peer runtime construction failed: {0}")]
     OraclePeer(String),
-}
-
-/// Resolve database configuration and assemble a Scribe/Forge test fixture.
-///
-/// Production boot uses the role-aware authenticated builder. This convenience
-/// surface remains available only to crate tests and the `test-support` feature
-/// so its intentionally absent Oracle/auth composition cannot become a server
-/// activation path.
-///
-/// # Errors
-/// Returns [`ServerBootError`] when database boot, migration, or runtime pool
-/// construction fails.
-#[cfg(any(test, feature = "test-support"))]
-pub async fn build_app_state() -> Result<AppState, ServerBootError> {
-    let boot = PostgresBoot::from_env().await?;
-    build_app_state_from_boot_with_config(&boot, crate::config::ScribeRuntimeConfig::default())
-        .await
-}
-
-/// Assemble a Scribe/Forge test fixture from a resolved Postgres boot mode.
-///
-/// # Errors
-/// Returns [`ServerBootError`] when DSN resolution, migrations, or runtime
-/// pool construction fails.
-#[cfg(any(test, feature = "test-support"))]
-pub async fn build_app_state_from_boot(boot: &PostgresBoot) -> Result<AppState, ServerBootError> {
-    build_app_state_from_boot_with_config(boot, crate::config::ScribeRuntimeConfig::default()).await
-}
-
-/// Assemble a Scribe/Forge test fixture with an explicit Scribe configuration.
-///
-/// # Errors
-///
-/// Returns [`ServerBootError`] when database, storage, catalog, Scribe, or Forge
-/// fixture construction fails.
-#[cfg(any(test, feature = "test-support"))]
-pub async fn build_app_state_from_boot_with_config(
-    boot: &PostgresBoot,
-    scribe_config: crate::config::ScribeRuntimeConfig,
-) -> Result<AppState, ServerBootError> {
-    let bifrost_config = crate::config::BifrostRuntimeConfig {
-        scribe: scribe_config,
-        ..crate::config::BifrostRuntimeConfig::default()
-    };
-    let roles = [BifrostRuntimeRole::Scribe, BifrostRuntimeRole::Forge]
-        .into_iter()
-        .collect();
-    Ok(build_bifrost_parts_from_boot(
-        boot,
-        &bifrost_config,
-        &crate::config::ForgeRuntimeConfig::default(),
-        &roles,
-    )
-    .await?
-    .state)
 }
 
 /// Resolve the operator `forge` config section into a `ForgeConfig` plus the
@@ -488,37 +411,21 @@ fn validate_scribe_replay_envelope(
     Ok(())
 }
 
-/// Builds state plus unmounted Scribe dependencies for the authenticated boot path.
+/// Constructs the external dependency graph injected into Bifrost composition.
 ///
 /// # Errors
-///
-/// Returns [`ServerBootError`] when database, storage, catalog, WAL, execution
-/// pool, recovery, or Forge setup fails.
-async fn build_bifrost_parts_from_boot(
+/// Returns a boot error when Postgres, storage, catalog, resource detection, or
+/// volume-root preparation fails.
+async fn build_bifrost_external_dependencies(
     boot: &PostgresBoot,
-    bifrost_config: &crate::config::BifrostRuntimeConfig,
-    forge_runtime: &crate::config::ForgeRuntimeConfig,
-    roles: &std::collections::BTreeSet<BifrostRuntimeRole>,
-) -> Result<BifrostBootParts, ServerBootError> {
-    if roles.contains(&BifrostRuntimeRole::Scribe) {
-        bifrost_config
-            .scribe
-            .validate()
-            .map_err(ServerBootError::Scribe)?;
-    }
+    config: &crate::config::BifrostRuntimeConfig,
+    target: crate::config::BifrostTarget,
+) -> Result<BifrostExternalDependencies, ServerBootError> {
     let dsns = boot.dsns()?;
     let postgres = Arc::new(ServerPostgres::connect_from_boot(boot).await?);
     let storage_settings = load_storage_settings()?;
-    tracing::info!(
-        backend = %storage_settings.backend.kind(),
-        require_encryption = storage_settings.require_encryption,
-        presign_ttl_secs = storage_settings.presign_ttl.as_secs(),
-        part_size_bytes = storage_settings.part_size_bytes,
-        "storage settings loaded"
-    );
     let storage = StorageHandle::from_settings(storage_settings).await?;
-    tracing::info!(backend = %storage.backend(), "storage handle ready");
-    let bifrost = Arc::new(
+    let catalog = Arc::new(
         BifrostCatalog::new(
             dsns.catalog_app.expose_secret(),
             storage.backend_config(),
@@ -527,24 +434,108 @@ async fn build_bifrost_parts_from_boot(
         .await
         .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
     );
+    let node_id = NodeId::generate();
+    let advertise_addr =
+        std::env::var("WYRD_SERVER_ADVERTISE_ADDR").unwrap_or_else(|_| "127.0.0.1:0".to_owned());
+    let cluster = Arc::new(ClusterRegistry::new(
+        postgres.vala().clone(),
+        ClusterNodeId::new(node_id.as_uuid()),
+    ));
+    let wal_dir = std::env::var_os("WYRD_SCRIBE_WAL_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(".wyrd/scribe-wal"));
+    let oracle_scratch = prepare_oracle_spill_root(Some(wal_dir.clone()))?;
+    let scribe_output_scratch = wal_dir.join("scribe-output-scratch");
+    let forge_scratch = wal_dir.join("forge-spill");
+    let roles = crate::config::BifrostRoles::for_target(target);
+    let resource_roles = roles
+        .iter()
+        .map(|role| match role {
+            BifrostRuntimeRole::Scribe => BifrostRole::Scribe,
+            BifrostRuntimeRole::ForgeCoordinator | BifrostRuntimeRole::ForgeWorker => {
+                BifrostRole::Forge
+            }
+            BifrostRuntimeRole::Oracle => BifrostRole::Oracle,
+        })
+        .collect();
+    let runtime_resources = BifrostRuntimeResources::detect_with_transport_message_limit(
+        BifrostResourcePolicy {
+            roles: resource_roles,
+            memory_limit_bytes: config.resources.memory_limit_bytes,
+            unmanaged_reserve_bytes: config.resources.unmanaged_reserve_bytes,
+            scratch_limit_bytes: config.resources.scratch_limit_bytes,
+            effective_cpu: config.resources.effective_cpu,
+            scratch_root: oracle_scratch.clone(),
+            volume_roots: Some(vala_bifrost_redux::resources::BifrostVolumeRoots {
+                wal: wal_dir.clone(),
+                scribe_output_scratch,
+                forge_scratch,
+                oracle_scratch,
+            }),
+        },
+        config.scribe.ingest_request_bytes,
+    )
+    .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
+    let resources = runtime_resources
+        .compose_roles()
+        .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
+    Ok(BifrostExternalDependencies {
+        postgres,
+        storage,
+        catalog,
+        resources,
+        cluster,
+        node_id: ClusterNodeId::new(node_id.as_uuid()),
+        advertise_addr,
+        wal_dir,
+    })
+}
 
+/// Composes the complete immutable Bifrost subsystem graph from injected dependencies.
+///
+/// # Errors
+///
+/// Returns [`ServerBootError`] when Scribe, Forge, Oracle, role fencing, or
+/// request-boundary construction fails before publication.
+pub async fn compose_bifrost(
+    inputs: crate::state::BifrostBuildInputs,
+) -> Result<Arc<crate::state::Bifrost>, ServerBootError> {
+    let crate::state::BifrostBuildInputs {
+        target,
+        deployment_profile,
+        postgres,
+        storage,
+        catalog: bifrost,
+        resources: bifrost_resources,
+        cluster: cluster_registry,
+        token_verifier,
+        peer_credentials,
+        peer_tls,
+        signing_key,
+        config: bifrost_config,
+        forge_config: forge_runtime,
+        node_id,
+        advertise_addr,
+        wal_dir,
+        shutdown,
+        #[cfg(feature = "test-support")]
+        test_controls,
+    } = inputs;
+    let roles = crate::config::BifrostRoles::for_target(target);
+    if roles.contains(&BifrostRuntimeRole::Scribe) {
+        bifrost_config
+            .scribe
+            .validate()
+            .map_err(ServerBootError::Scribe)?;
+    }
+    let postgres = Arc::new(postgres);
     let operator_pool =
         postgres
             .operator_pool()
             .ok_or_else(|| ServerBootError::ForgeSchedulerRequired {
                 detail: "platform-admin operator pool is unavailable".to_owned(),
             })?;
-    let node_id = NodeId::generate();
-    let advertise_addr =
-        std::env::var("WYRD_SERVER_ADVERTISE_ADDR").unwrap_or_else(|_| "127.0.0.1:0".to_owned());
-    let cluster_registry = Arc::new(ClusterRegistry::new(
-        postgres.vala().clone(),
-        ClusterNodeId::new(node_id.as_uuid()),
-    ));
     let scribe_config = bifrost_config.scribe;
-    let wal_dir = std::env::var_os("WYRD_SCRIBE_WAL_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(".wyrd/scribe-wal"));
     let oracle_spill_root = prepare_oracle_spill_root(Some(wal_dir.clone()))?;
     let scribe_output_scratch = wal_dir.join("scribe-output-scratch");
     let forge_scratch = wal_dir.join("forge-spill");
@@ -553,35 +544,6 @@ async fn build_bifrost_parts_from_boot(
             ServerBootError::Scribe(format!("Bifrost volume root creation failed: {error}"))
         })?;
     }
-    let resource_roles = roles
-        .iter()
-        .map(|role| match role {
-            BifrostRuntimeRole::Scribe => BifrostRole::Scribe,
-            BifrostRuntimeRole::Forge => BifrostRole::Forge,
-            BifrostRuntimeRole::Oracle => BifrostRole::Oracle,
-        })
-        .collect();
-    let runtime_resources = BifrostRuntimeResources::detect_with_transport_message_limit(
-        BifrostResourcePolicy {
-            roles: resource_roles,
-            memory_limit_bytes: bifrost_config.resources.memory_limit_bytes,
-            unmanaged_reserve_bytes: bifrost_config.resources.unmanaged_reserve_bytes,
-            scratch_limit_bytes: bifrost_config.resources.scratch_limit_bytes,
-            effective_cpu: bifrost_config.resources.effective_cpu,
-            scratch_root: oracle_spill_root.clone(),
-            volume_roots: Some(vala_bifrost_redux::resources::BifrostVolumeRoots {
-                wal: wal_dir.clone(),
-                scribe_output_scratch,
-                forge_scratch,
-                oracle_scratch: oracle_spill_root.clone(),
-            }),
-        },
-        scribe_config.ingest_request_bytes,
-    )
-    .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
-    let bifrost_resources = runtime_resources
-        .compose_roles()
-        .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
     let resource_plan = bifrost_resources.plan();
     let pod_memory_limit = resource_plan.managed_memory_bytes;
     if roles.contains(&BifrostRuntimeRole::Scribe) {
@@ -609,7 +571,7 @@ async fn build_bifrost_parts_from_boot(
             .await
             .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
         let stream = StreamIdentity::new(
-            node_id,
+            NodeId::new(node_id.as_uuid()),
             WriterEpoch::new(i64::try_from(scribe_role.fencing_token).map_err(|_| {
                 ServerBootError::Scribe("Scribe role fence exceeds the WAL epoch range".to_owned())
             })?),
@@ -625,12 +587,21 @@ async fn build_bifrost_parts_from_boot(
                     "live Scribe role requires registered WAL volume capabilities".to_owned(),
                 )
             })?;
+        #[cfg(feature = "test-support")]
+        let wal_rotation_bytes = test_controls
+            .as_ref()
+            .and_then(|controls| controls.scribe_rotation)
+            .map_or(scribe_config.wal_rotation_bytes, |rotation| {
+                rotation.wal_rotation_bytes
+            });
+        #[cfg(not(feature = "test-support"))]
+        let wal_rotation_bytes = scribe_config.wal_rotation_bytes;
         let wal = Arc::new(
             WalWriter::new_with_volume(
                 &wal_dir,
                 *stream.node_id.as_bytes(),
                 stream.writer_epoch.as_i64(),
-                WalConfig::new(scribe_config.wal_rotation_bytes)
+                WalConfig::new(wal_rotation_bytes)
                     .map_err(|error| ServerBootError::Scribe(error.to_string()))?
                     .with_disk_limit(scribe_config.wal_disk_limit_bytes)
                     .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
@@ -655,6 +626,12 @@ async fn build_bifrost_parts_from_boot(
                     ServerBootError::Scribe(format!("coordination runtime failed: {error}"))
                 })?,
         );
+        #[cfg(feature = "test-support")]
+        let wal_sync_delay = test_controls
+            .as_ref()
+            .map_or(std::time::Duration::ZERO, |controls| {
+                controls.scribe_wal_sync_delay
+            });
         let execution_pools = ScribeExecutionPools::new(
             ScribeIngressCpuPool::try_new_with_capacity(scribe_config.ingress_cpu_threads, 256)
                 .map_err(|error| {
@@ -667,15 +644,23 @@ async fn build_bifrost_parts_from_boot(
             .map_err(|error| {
                 ServerBootError::Scribe(format!("persistence CPU pool failed: {error}"))
             })?,
-            ScribeWalIoPool::try_new_with_capacity(scribe_config.wal_io_threads, 256)
-                .map_err(|error| ServerBootError::Scribe(format!("WAL IO pool failed: {error}")))?,
+            ScribeWalIoPool::try_new_with_capacity_and_delay(scribe_config.wal_io_threads, 256, {
+                #[cfg(feature = "test-support")]
+                {
+                    wal_sync_delay
+                }
+                #[cfg(not(feature = "test-support"))]
+                {
+                    std::time::Duration::ZERO
+                }
+            })
+            .map_err(|error| ServerBootError::Scribe(format!("WAL IO pool failed: {error}")))?,
         );
-        let scribe = Arc::new(ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
-            catalog: Some(Arc::clone(&bifrost)),
-            operator: Arc::new(storage.operator().clone()),
-            wal,
-            stream,
-            admission: AdmissionConfig {
+        #[cfg(feature = "test-support")]
+        let admission = test_controls
+            .as_ref()
+            .and_then(|controls| controls.scribe_admission)
+            .unwrap_or(AdmissionConfig {
                 memory_limit_bytes: pod_memory_limit,
                 scribe_memory_limit_bytes: (resource_plan.scribe_floor_bytes > 0)
                     .then_some(resource_plan.scribe_floor_bytes),
@@ -689,31 +674,76 @@ async fn build_bifrost_parts_from_boot(
                         .map(std::time::Duration::from_secs)
                         .unwrap_or_else(|| std::time::Duration::from_secs(24 * 60 * 60)),
                 },
+            });
+        #[cfg(not(feature = "test-support"))]
+        let admission = AdmissionConfig {
+            memory_limit_bytes: pod_memory_limit,
+            scribe_memory_limit_bytes: (resource_plan.scribe_floor_bytes > 0)
+                .then_some(resource_plan.scribe_floor_bytes),
+            event_time_window: EventTimeWindow {
+                past: scribe_config
+                    .event_time_past_window_secs
+                    .map(std::time::Duration::from_secs)
+                    .unwrap_or_else(|| std::time::Duration::from_secs(30 * 24 * 60 * 60)),
+                future: scribe_config
+                    .event_time_future_window_secs
+                    .map(std::time::Duration::from_secs)
+                    .unwrap_or_else(|| std::time::Duration::from_secs(24 * 60 * 60)),
             },
+        };
+        let persistence = ScribePersistenceConfig::new(
+            Arc::new(postgres.vala().clone()),
+            64,
+            scribe_config.wal_io_threads,
+        )
+        .with_operator_pool(postgres.operator_pool().ok_or_else(|| {
+            ServerBootError::Scribe(
+                "Scribe publication requires the platform operator pool".to_owned(),
+            )
+        })?)
+        .with_output_scratch(scribe_output_volume);
+        #[cfg(feature = "test-support")]
+        let persistence = persistence.with_test_faults(
+            test_controls
+                .as_ref()
+                .map_or_else(Default::default, |controls| {
+                    controls.scribe_persistence_faults.clone()
+                }),
+        );
+        #[cfg(feature = "test-support")]
+        let (memtable_rotation_bytes, memtable_max_age) = test_controls
+            .as_ref()
+            .and_then(|controls| controls.scribe_rotation)
+            .map_or(
+                (
+                    scribe_config.memtable_rotation_bytes,
+                    std::time::Duration::from_secs(scribe_config.memtable_max_age_secs),
+                ),
+                |rotation| (rotation.memtable_rotation_bytes, rotation.memtable_max_age),
+            );
+        #[cfg(not(feature = "test-support"))]
+        let (memtable_rotation_bytes, memtable_max_age) = (
+            scribe_config.memtable_rotation_bytes,
+            std::time::Duration::from_secs(scribe_config.memtable_max_age_secs),
+        );
+        let scribe = Arc::new(ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
+            catalog: Some(Arc::clone(&bifrost)),
+            operator: Arc::new(storage.operator().clone()),
+            wal,
+            stream,
+            admission,
             coordination_runtime: coordination_runtime.handle().clone(),
             execution_pools,
-            persistence: Some(
-                ScribePersistenceConfig::new(
-                    Arc::new(postgres.vala().clone()),
-                    64,
-                    scribe_config.wal_io_threads,
-                )
-                .with_operator_pool(postgres.operator_pool().ok_or_else(|| {
-                    ServerBootError::Scribe(
-                        "Scribe publication requires the platform operator pool".to_owned(),
-                    )
-                })?)
-                .with_output_scratch(scribe_output_volume),
-            ),
+            persistence: Some(persistence),
             resources: bifrost_resources.scribe().ok_or_else(|| {
                 ServerBootError::Scribe(
                     "Scribe role selected without a composed Scribe capability".to_owned(),
                 )
             })?,
             ingest_limits: scribe_config.ingest_limits(),
-            wal_rotation_bytes: scribe_config.wal_rotation_bytes,
-            memtable_rotation_bytes: scribe_config.memtable_rotation_bytes,
-            memtable_max_age: std::time::Duration::from_secs(scribe_config.memtable_max_age_secs),
+            wal_rotation_bytes,
+            memtable_rotation_bytes,
+            memtable_max_age,
             staging_file_publisher: Some(staging_file_publisher),
         }));
         if let Err(error) = scribe.replay_wal_async().await {
@@ -753,48 +783,188 @@ async fn build_bifrost_parts_from_boot(
         None
     };
 
-    let forge = if roles.contains(&BifrostRuntimeRole::Forge) {
-        let (forge_config, maintenance_interval) = resolve_forge_config(forge_runtime);
+    let forge = if roles.contains(&BifrostRuntimeRole::ForgeCoordinator)
+        || roles.contains(&BifrostRuntimeRole::ForgeWorker)
+    {
+        let (mut forge_config, maintenance_interval) = resolve_forge_config(&forge_runtime);
+        #[cfg(feature = "test-support")]
+        if let Some(config) = test_controls
+            .as_ref()
+            .and_then(|controls| controls.forge_config.clone())
+        {
+            forge_config = config;
+        }
         let rewrite_spill_root = wal_dir.join("forge-spill");
         let staging = Arc::new(storage.operator().clone());
+        #[cfg(feature = "test-support")]
+        let object_store: Arc<dyn ForgeObjectStore> = test_controls
+            .as_ref()
+            .and_then(|controls| controls.forge_object_store.clone())
+            .unwrap_or_else(|| Arc::new(OpenDalForgeObjectStore::new(Arc::clone(&staging))));
+        #[cfg(not(feature = "test-support"))]
         let object_store: Arc<dyn ForgeObjectStore> =
             Arc::new(OpenDalForgeObjectStore::new(Arc::clone(&staging)));
-        Some(Arc::new(Forge::new(ForgeBuildConfig {
-            resources: bifrost_resources.forge().ok_or_else(|| {
-                ServerBootError::Scribe(
-                    "Forge role selected without a composed Forge capability".to_owned(),
-                )
-            })?,
+        let forge_resources = bifrost_resources.forge().ok_or_else(|| {
+            ServerBootError::Scribe(
+                "Forge role selected without a composed Forge capability".to_owned(),
+            )
+        })?;
+        let coordinator = Arc::new(ForgeCoordinator::new(ForgeBuildConfig {
+            resources: forge_resources.clone(),
             vala: postgres.vala().clone(),
             operator_pool: operator_pool.clone(),
-            catalog: bifrost.iceberg_catalog(),
+            catalog: {
+                #[cfg(feature = "test-support")]
+                {
+                    test_controls
+                        .as_ref()
+                        .and_then(|controls| controls.forge_catalog.clone())
+                        .unwrap_or_else(|| bifrost.iceberg_catalog())
+                }
+                #[cfg(not(feature = "test-support"))]
+                {
+                    bifrost.iceberg_catalog()
+                }
+            },
             staging,
             object_store,
             rewrite_spill_root,
             hints: staging_file_inbox,
             config: forge_config,
             maintenance_interval,
-            clock: ForgeClock::system(),
-            completion_observer: None,
-            scheduler_trigger: None,
+            clock: {
+                #[cfg(feature = "test-support")]
+                {
+                    test_controls
+                        .as_ref()
+                        .map_or_else(ForgeClock::system, |controls| controls.forge_clock.clone())
+                }
+                #[cfg(not(feature = "test-support"))]
+                {
+                    ForgeClock::system()
+                }
+            },
+            completion_observer: {
+                #[cfg(feature = "test-support")]
+                {
+                    test_controls
+                        .as_ref()
+                        .and_then(|controls| controls.forge_completion_observer.clone())
+                }
+                #[cfg(not(feature = "test-support"))]
+                {
+                    None
+                }
+            },
+            scheduler_trigger: {
+                #[cfg(feature = "test-support")]
+                {
+                    test_controls
+                        .as_ref()
+                        .map(|controls| controls.forge_scheduler_trigger.clone())
+                }
+                #[cfg(not(feature = "test-support"))]
+                {
+                    None
+                }
+            },
             telemetry: Arc::new(ForgeTelemetry::new()),
-        })?))
+        })?);
+        let worker = roles
+            .contains(&BifrostRuntimeRole::ForgeWorker)
+            .then(|| {
+                ForgeWorker::new(
+                    Arc::clone(&coordinator),
+                    ForgeWorkerConfig {
+                        worker_concurrency: forge_runtime.worker_concurrency,
+                        per_tenant_active_cap: forge_runtime.resolved_per_tenant_active_cap(),
+                    },
+                    node_id.as_uuid(),
+                )
+                .map(Arc::new)
+            })
+            .transpose()
+            .map_err(ServerBootError::Forge)?;
+        Some(Arc::new(Forge::new(
+            roles
+                .contains(&BifrostRuntimeRole::ForgeCoordinator)
+                .then_some(coordinator),
+            worker,
+            forge_resources,
+            shutdown.clone(),
+            node_id,
+        )))
     } else {
         None
     };
 
-    let mut state = AppState::new(postgres, storage, Arc::clone(&bifrost))
-        .with_bifrost_node_id(ClusterNodeId::new(node_id.as_uuid()))
-        .with_bifrost_resources(bifrost_resources);
-    if let Some(forge) = forge {
-        state = state.with_forge(forge);
+    let scribe = if let Some(parts) = scribe {
+        let tail_audit = Arc::new(
+            crate::oracle::PostgresTailSecurityAudit::try_new(&postgres)
+                .await
+                .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
+        );
+        let fragment_security_audit = Arc::new(
+            crate::oracle::PostgresPeerSecurityAudit::try_new(&postgres)
+                .await
+                .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
+        );
+        let fragment_authority = Arc::new(
+            crate::oracle::OraclePeerAuthority::from_pem(
+                &signing_key,
+                fragment_security_audit.clone(),
+            )
+            .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
+        );
+        Some(Arc::new(
+            Scribe::new(
+                parts.scribe,
+                Arc::clone(&bifrost),
+                bifrost_resources.scribe().ok_or_else(|| {
+                    ServerBootError::Scribe(
+                        "selected Scribe role has no root-derived resource capability".to_owned(),
+                    )
+                })?,
+                Arc::clone(&cluster_registry),
+                parts.scribe_role,
+                fragment_authority,
+                fragment_security_audit,
+                parts.coordination_runtime,
+            )
+            .with_tail_authority(Arc::new(
+                crate::oracle::ScribeTailAuthority::from_pem(&signing_key, tail_audit)
+                    .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
+            )),
+        ))
+    } else {
+        None
+    };
+    let oracle = OracleRoleBuilder {
+        postgres: Arc::clone(&postgres),
+        catalog: Arc::clone(&bifrost),
+        resources: bifrost_resources.clone(),
+        token_verifier: Arc::clone(&token_verifier),
+        config: &bifrost_config,
+        target,
+        deployment_profile,
+        signing_key: &signing_key,
+        cluster: cluster_registry,
+        node_id,
+        advertise_addr: &advertise_addr,
+        spill_root: Some(wal_dir),
+        peer_credentials,
+        peer_tls,
     }
-    Ok(BifrostBootParts {
-        state,
-        scribe,
-        cluster_registry,
-        node_id: ClusterNodeId::new(node_id.as_uuid()),
-    })
+    .build()
+    .await?;
+    let gate = crate::state::Gate::new(
+        token_verifier,
+        scribe_config.ingest_limits(),
+        bifrost_resources.transport_admission(),
+    );
+    Ok(crate::state::Bifrost::assembled(
+        gate, scribe, forge, oracle,
+    ))
 }
 
 /// Build the bounded Forge worker future shared by embedded and worker roles.
@@ -811,37 +981,23 @@ async fn build_bifrost_parts_from_boot(
 pub fn spawn_forge_worker(
     state: &AppState,
     shutdown: CancellationToken,
-    worker_concurrency: usize,
-    per_tenant_active_cap: usize,
+    _worker_concurrency: usize,
+    _per_tenant_active_cap: usize,
 ) -> Result<
     impl std::future::Future<Output = Result<(), vala_bifrost_redux::forge::ForgeError>>
     + Send
     + 'static,
     ServerBootError,
 > {
-    let forge =
-        state
-            .forge_handle()
-            .cloned()
-            .ok_or_else(|| ServerBootError::ForgeSchedulerRequired {
-                detail: "AppState has no shared Forge for worker execution".to_owned(),
-            })?;
-    let node_id =
-        state
-            .bifrost_node_id()
-            .ok_or_else(|| ServerBootError::ForgeSchedulerRequired {
-                detail: "AppState has no configured physical Bifrost node identity".to_owned(),
-            })?;
-    let worker = ForgeWorker::new(
-        forge,
-        ForgeWorkerConfig {
-            worker_concurrency,
-            per_tenant_active_cap,
-        },
-        node_id.as_uuid(),
-    )
-    .map_err(ServerBootError::Forge)?;
-    Ok(async move { worker.run(shutdown).await })
+    let worker = state
+        .bifrost
+        .forge()
+        .and_then(Forge::worker)
+        .cloned()
+        .ok_or_else(|| ServerBootError::ForgeSchedulerRequired {
+            detail: "Bifrost target has no retained Forge worker".to_owned(),
+        })?;
+    Ok(async move { worker.as_ref().clone().run(shutdown).await })
 }
 
 /// Emit pre-telemetry warnings for relaxed config that is still safe to run.
@@ -880,152 +1036,80 @@ pub async fn build_state(
     overrides: StateOverrides,
 ) -> Result<AppState, ServerBootError> {
     let shutdown = CancellationToken::new();
-
     let boot = PostgresBoot::from_env().await?;
-    let roles = config.bifrost_roles();
-    let mut bifrost_parts =
-        build_bifrost_parts_from_boot(&boot, &config.bifrost, &config.forge, &roles).await?;
+    let external = build_bifrost_external_dependencies(&boot, &config.bifrost, config.role).await?;
+    let sealing_key = build_sealing_key(config)?;
+    let signing_key = resolve_signing_key(config)?;
+    let auth = install_auth(
+        external.postgres.as_ref(),
+        config,
+        &signing_key,
+        sealing_key.clone(),
+    )
+    .await?;
+    let verifier = auth
+        .token_verifier
+        .clone()
+        .ok_or_else(|| ServerBootError::Scribe("Gate requires a token verifier".to_owned()))?;
+    let peer_credentials: Arc<dyn OraclePeerCredentials> =
+        Arc::new(ServerOraclePeerCredentials::from_env().map_err(ServerBootError::OraclePeer)?);
+    let peer_tls = match (
+        &config.bifrost.oracle.peer_ca_certificate_path,
+        &config.bifrost.oracle.peer_server_name,
+    ) {
+        (Some(path), Some(server_name)) => OraclePeerTls::new(
+            std::fs::read(path).map_err(|error| {
+                ServerBootError::OraclePeer(format!(
+                    "failed to read Oracle peer CA certificate {}: {error}",
+                    path.display()
+                ))
+            })?,
+            server_name.clone(),
+        ),
+        _ if config.role.serves_api() => {
+            return Err(ServerBootError::OraclePeer(
+                "API-serving Bifrost targets require Oracle peer TLS CA and server name".to_owned(),
+            ));
+        }
+        _ => OraclePeerTls::new(Vec::new(), "unused.invalid".to_owned()),
+    };
+    let bifrost = compose_bifrost(crate::state::BifrostBuildInputs {
+        target: config.role,
+        deployment_profile: config.deployment_profile,
+        postgres: external.postgres.as_ref().clone(),
+        storage: Arc::clone(&external.storage),
+        catalog: Arc::clone(&external.catalog),
+        resources: external.resources,
+        cluster: Arc::clone(&external.cluster),
+        token_verifier: verifier,
+        peer_credentials,
+        peer_tls,
+        signing_key,
+        config: config.bifrost.clone(),
+        forge_config: config.forge.clone(),
+        node_id: external.node_id,
+        advertise_addr: external.advertise_addr,
+        wal_dir: external.wal_dir,
+        shutdown: shutdown.clone(),
+        #[cfg(feature = "test-support")]
+        test_controls: None,
+    })
+    .await?;
     #[cfg(feature = "test-support")]
     if overrides.fail_after_scribe_activation {
-        bifrost_parts.rollback().await;
+        bifrost.abort();
         return Err(ServerBootError::Scribe(
             "test-injected failure after Scribe activation".to_owned(),
         ));
     }
-    let state = bifrost_parts.state.clone();
-    // A dedicated Forge worker is intentionally a narrow process graph. It
-    // reuses the durable Forge/catalog dependencies assembled above, but does
-    // not construct auth, Gate, Scribe WAL ownership, Oracle membership, or
-    // Oracle TLS/calibration state. This branch must remain before any
-    // server-only side effect such as signing-key resolution or federation
-    // seeding.
-    if matches!(config.role, crate::config::ForgeProcessRole::ForgeWorker) {
-        let state = attach_config_fields(state, config, shutdown, telemetry)?;
-        state
-            .production_validate()
-            .map_err(ServerBootError::ProductionValidation)?;
-        return Ok(state);
-    }
-    let sealing_key = match build_sealing_key(config) {
-        Ok(key) => key,
-        Err(error) => {
-            bifrost_parts.rollback().await;
-            return Err(error);
-        }
-    };
-    let signing_key = match resolve_signing_key(config) {
-        Ok(key) => key,
-        Err(error) => {
-            bifrost_parts.rollback().await;
-            return Err(error);
-        }
-    };
-
-    let state = match attach_config_fields(state, config, shutdown, telemetry) {
-        Ok(state) => state,
-        Err(error) => {
-            bifrost_parts.rollback().await;
-            return Err(error);
-        }
-    };
-    let state = match install_auth(state, config, &signing_key, sealing_key.clone()).await {
-        Ok(state) => state,
-        Err(error) => {
-            bifrost_parts.rollback().await;
-            return Err(error);
-        }
-    };
-    let verifier = match state
-        .auth
-        .token_verifier
-        .clone()
-        .ok_or_else(|| ServerBootError::Scribe("Gate requires a token verifier".to_owned()))
-    {
-        Ok(verifier) => verifier,
-        Err(error) => {
-            bifrost_parts.rollback().await;
-            return Err(error);
-        }
-    };
-    let limits = config.bifrost.scribe.ingest_limits();
-    let (state, scribe_capability) =
-        if roles.contains(&BifrostRuntimeRole::Scribe) {
-            let scribe_parts = bifrost_parts.scribe.as_ref().ok_or_else(|| {
-                ServerBootError::Scribe("selected Scribe role was not constructed".to_owned())
-            })?;
-            let tail_audit = Arc::new(
-                crate::oracle::PostgresTailSecurityAudit::try_new(&state.postgres)
-                    .await
-                    .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
-            );
-            let ingest =
-                Arc::new(
-                    BifrostIngestRuntime::new(
-                        Arc::clone(&scribe_parts.scribe),
-                        Arc::clone(&verifier),
-                        limits,
-                        Some(scribe_parts.coordination_runtime.clone().expect(
-                            "Scribe coordination runtime remains during state composition",
-                        )),
-                    )
-                    .with_tail_authority(Arc::new(
-                        crate::oracle::ScribeTailAuthority::from_pem(&signing_key, tail_audit)
-                            .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
-                    ))
-                    .with_scribe_role(
-                        Arc::clone(&bifrost_parts.cluster_registry),
-                        scribe_parts.scribe_role.clone(),
-                    ),
-                );
-            let capability = OraclePeerRuntime::scribe_capability(
-                ingest.tail_reader(),
-                ingest.tail_service(),
-                ingest.tail_authority(),
-                ingest
-                    .scribe_registered_role()
-                    .expect("Scribe role was installed immediately above")
-                    .clone(),
-            );
-            (state.with_bifrost_ingest(ingest), Some(capability))
-        } else {
-            (state, None)
-        };
-    let state = match (OracleRoleBuilder {
-        state,
-        config,
-        signing_key: &signing_key,
-        cluster: Arc::clone(&bifrost_parts.cluster_registry),
-        node_id: bifrost_parts.node_id,
-        advertise_addr: &config.bifrost.oracle.advertise_addr,
-        spill_root: None,
-        #[cfg(feature = "test-support")]
-        peer_credentials: None,
-        scribe_capability,
-    }
-    .build()
-    .await)
-    {
-        Ok(state) => state,
-        Err(error) => {
-            bifrost_parts.rollback().await;
-            return Err(error);
-        }
-    };
-    let mut gate = match &state.bifrost_ingest {
-        Some(ingest) => vala_bifrost_redux::gate::Gate::with_scribe(
-            ingest.scribe().clone(),
-            vala_bifrost_redux::gate::auth::ingest_auth_interceptor(verifier),
-            limits,
-        ),
-        None => vala_bifrost_redux::gate::Gate::without_scribe(
-            vala_bifrost_redux::gate::auth::ingest_auth_interceptor(verifier),
-            limits,
-        ),
-    };
-    if let Some(query) = state.bifrost_query() {
-        gate = gate.with_oracle(Arc::clone(query.oracle()));
-    }
-    let state = state.with_bifrost_gate(Arc::new(gate));
+    let state = AppState::new(
+        external.postgres,
+        external.storage,
+        bifrost,
+        shutdown.clone(),
+    )
+    .with_auth(auth);
+    let state = attach_config_fields(state, config, telemetry)?;
     if let Err(error) = seed_federation(&state, config, sealing_key.as_deref()).await {
         rollback_state_roles(&state).await;
         return Err(error);
@@ -1054,15 +1138,9 @@ pub async fn build_state(
 /// abort happen without granting a second cleanup budget.
 async fn rollback_state_roles(state: &AppState) {
     let deadline = std::time::Instant::now();
-    if let Some(query) = state.bifrost_query() {
-        query.abort_shutdown();
-        query.shutdown_owner(deadline).await;
-        query.shutdown_registry(deadline).await;
-    }
-    if let Some(ingest) = &state.bifrost_ingest {
-        ingest.abort_shutdown();
-        ingest.shutdown_owner(deadline).await;
-        ingest.shutdown_registry(deadline).await;
+    state.bifrost.begin_shutdown();
+    if state.bifrost.shutdown(deadline).await.is_err() {
+        state.bifrost.abort();
     }
 }
 
@@ -1116,13 +1194,10 @@ fn apply_overrides(state: AppState, overrides: StateOverrides) -> AppState {
 fn attach_config_fields(
     state: AppState,
     config: &crate::config::WyrdServerConfig,
-    shutdown: CancellationToken,
     telemetry: Arc<wyrd_telemetry::TelemetryGuard>,
 ) -> Result<AppState, ServerBootError> {
     Ok(state
         .with_deployment_profile(config.deployment_profile)
-        .with_bifrost_roles(config.bifrost_roles())
-        .with_shutdown_token(shutdown)
         .with_telemetry(telemetry)
         .with_limits(config.limits.into_state()))
 }
@@ -1135,31 +1210,31 @@ fn attach_config_fields(
 /// Returns [`ServerBootError::SigningKey`] when production profile lacks a
 /// signing key, or when key material is invalid.
 async fn install_auth(
-    state: AppState,
+    postgres: &ServerPostgres,
     config: &crate::config::WyrdServerConfig,
     signing_key: &SecretString,
     sealing_key: Option<Arc<SecretKey>>,
-) -> Result<AppState, ServerBootError> {
+) -> Result<ServerAuth, ServerBootError> {
     // Postgres is the single source of issuer/binding resolution. Both resolvers
     // are always attached; an empty config simply means the tenant federates no
     // issuers and binds no workloads, which they resolve as empty results. The
     // issuer resolver also feeds the token verifier's external (foreign-OIDC)
     // path so federated tokens can be exchanged per-request.
     let issuer_resolver = Arc::new(PgIssuerResolver::new(
-        Arc::new(state.postgres.app_pool().clone()),
+        Arc::new(postgres.app_pool().clone()),
         sealing_key.clone(),
     ));
     let binding_resolver = Arc::new(PgWorkloadBindingResolver::new(Arc::new(
-        state.postgres.app_pool().clone(),
+        postgres.app_pool().clone(),
     )));
 
     let (issuing_key, verifier) = crate::boot::auth::build_auth_handles(
         signing_key,
-        state.postgres.app_pool(),
+        postgres.app_pool(),
         Arc::clone(&issuer_resolver),
     )?;
 
-    Ok(state.with_auth(ServerAuth {
+    Ok(ServerAuth {
         allow_preview: config.auth.allow_preview,
         issuing_key: Some(issuing_key),
         token_verifier: Some(verifier),
@@ -1167,7 +1242,7 @@ async fn install_auth(
         workload_binding_resolver: Some(binding_resolver),
         sealing_key: sealing_key.clone(),
         token_exchange_settings: crate::auth::exchange_api_key::TokenExchangeSettings::default(),
-    }))
+    })
 }
 
 /// Builds and registers the local Oracle role after security dependencies verify.
@@ -1186,10 +1261,20 @@ async fn install_auth(
 /// All dependencies are retained by this owner until activation succeeds, so
 /// every partial failure follows the same fenced-role cleanup path.
 struct OracleRoleBuilder<'a> {
-    /// Server state containing SQL, auth, storage, and memory owners.
-    state: AppState,
-    /// Validated server configuration borrowed for this activation.
-    config: &'a crate::config::WyrdServerConfig,
+    /// Shared production PostgreSQL handles.
+    postgres: Arc<ServerPostgres>,
+    /// Shared Bifrost catalog used by persisted providers.
+    catalog: Arc<BifrostCatalog>,
+    /// Root-derived selected-role resource graph.
+    resources: BifrostRoleResources,
+    /// Exact boot-constructed token verifier used for peer preflight.
+    token_verifier: Arc<crate::state::WyrdTokenVerifier>,
+    /// Validated Bifrost configuration borrowed for this activation.
+    config: &'a crate::config::BifrostRuntimeConfig,
+    /// Closed process target controlling Oracle selection.
+    target: crate::config::BifrostTarget,
+    /// Deployment posture used for remote TLS validation.
+    deployment_profile: crate::config::DeploymentProfile,
     /// Server signing authority used by peer tickets.
     signing_key: &'a SecretString,
     /// Cluster registry owning the role fence and readiness publication.
@@ -1200,11 +1285,10 @@ struct OracleRoleBuilder<'a> {
     advertise_addr: &'a str,
     /// Optional harness-owned Bifrost root replacing environment discovery.
     spill_root: Option<std::path::PathBuf>,
-    /// Optional test-harness credential owner replacing environment discovery.
-    #[cfg(feature = "test-support")]
-    peer_credentials: Option<Arc<dyn OraclePeerCredentials>>,
-    /// Optional Scribe follower staged before final peer publication.
-    scribe_capability: Option<crate::oracle::ScribePeerCapability>,
+    /// Shared outbound peer bearer owner.
+    peer_credentials: Arc<dyn OraclePeerCredentials>,
+    /// Immutable peer TLS trust policy.
+    peer_tls: OraclePeerTls,
 }
 
 impl<'a> OracleRoleBuilder<'a> {
@@ -1214,16 +1298,14 @@ impl<'a> OracleRoleBuilder<'a> {
     ///
     /// Returns a server boot error when the configured closed role set cannot
     /// be constructed, fenced, reconciled, activated, and published.
-    async fn build(self) -> Result<AppState, ServerBootError> {
-        if !self
-            .config
-            .bifrost_roles()
+    async fn build(self) -> Result<Option<Arc<Oracle>>, ServerBootError> {
+        if !crate::config::BifrostRoles::for_target(self.target)
             .contains(&BifrostRuntimeRole::Oracle)
         {
-            return Ok(self.state);
+            return Ok(None);
         }
         let built = self.construct().await?;
-        built.start_reconcile_activate_publish().await
+        built.start_reconcile_activate_publish().await.map(Some)
     }
 
     /// Constructs one Oracle role and retains its reserved fence.
@@ -1233,22 +1315,23 @@ impl<'a> OracleRoleBuilder<'a> {
     /// durable-role construction fails.
     async fn construct(self) -> Result<BuiltOracleRole, ServerBootError> {
         let Self {
-            state,
+            postgres,
+            catalog,
+            resources: roles,
+            token_verifier,
             config,
+            target: _,
+            deployment_profile,
             signing_key,
             cluster,
             node_id,
             advertise_addr,
             spill_root,
-            #[cfg(feature = "test-support")]
-                peer_credentials: injected_peer_credentials,
-            scribe_capability,
+            peer_credentials,
+            peer_tls: tail_tls,
         } = self;
-        let scribe_capability = scribe_capability
-            .map(Ok)
-            .unwrap_or_else(|| scribe_capability_from_state(&state))?;
         let security_audit = Arc::new(
-            PostgresPeerSecurityAudit::try_new(&state.postgres)
+            PostgresPeerSecurityAudit::try_new(&postgres)
                 .await
                 .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
         );
@@ -1256,16 +1339,12 @@ impl<'a> OracleRoleBuilder<'a> {
             OraclePeerAuthority::from_pem(signing_key, security_audit.clone())
                 .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
         );
-        let roles = state.bifrost_resources.clone().ok_or_else(|| {
-            ServerBootError::OraclePeer("shared Bifrost role composition is absent".to_owned())
-        })?;
         let resource_plan = roles.plan();
         let resources = roles.oracle().ok_or_else(|| {
             ServerBootError::OraclePeer(
                 "Oracle role selected without a composed Oracle capability".to_owned(),
             )
         })?;
-        let catalog = &state.bifrost;
         let configured_cpu = resource_plan.effective_cpu as f64;
         let memory_bytes_per_slot = u64::try_from(
             vala_bifrost_redux::resources::ORACLE_PARTITION_MEMORY_BYTES,
@@ -1286,17 +1365,16 @@ impl<'a> OracleRoleBuilder<'a> {
         )
         .map_err(|_| ServerBootError::OraclePeer("Oracle slot count exceeds u32".to_owned()))?;
         let calibrated =
-            crate::config::load_oracle_admission_translation(&config.bifrost.oracle, raw_slots)
+            crate::config::load_oracle_admission_translation(&config.oracle, raw_slots)
                 .map_err(ServerBootError::OraclePeer)?;
         let delegated_admission_config = config
-            .bifrost
             .oracle
             .delegated_admission_config()
             .map_err(ServerBootError::OraclePeer)?;
         let oracle_config = OracleConfig {
-            planning_permits: config.bifrost.oracle.planning_permits,
-            max_workers_per_query: config.bifrost.oracle.max_workers_per_query,
-            attempt_memory_bytes: config.bifrost.oracle.max_frame_bytes.min(8 * 1024 * 1024),
+            planning_permits: config.oracle.planning_permits,
+            max_workers_per_query: config.oracle.max_workers_per_query,
+            attempt_memory_bytes: config.oracle.max_frame_bytes.min(8 * 1024 * 1024),
             interactive_slots: calibrated
                 .as_ref()
                 .map_or((raw_slots / 2).max(1), |value| value.interactive_slots),
@@ -1312,18 +1390,18 @@ impl<'a> OracleRoleBuilder<'a> {
                 .as_ref()
                 .map_or((raw_slots / 2).max(1), |value| value.multi_tenant_ceiling),
             queue_capacity: calibrated.as_ref().map_or(
-                u32::try_from(config.bifrost.oracle.admission_waiters).map_err(|_| {
+                u32::try_from(config.oracle.admission_waiters).map_err(|_| {
                     ServerBootError::OraclePeer("Oracle queue capacity exceeds u32".to_owned())
                 })?,
                 |value| value.queue_capacity,
             ),
             max_queue_wait: calibrated.as_ref().map_or(
-                std::time::Duration::from_millis(config.bifrost.oracle.max_queue_wait_ms),
+                std::time::Duration::from_millis(config.oracle.max_queue_wait_ms),
                 |value| value.max_queue_wait,
             ),
             ..OracleConfig::default()
         };
-        let operator_pool = state.postgres.operator_pool().ok_or_else(|| {
+        let operator_pool = postgres.operator_pool().ok_or_else(|| {
             ServerBootError::OraclePeer(
                 "Oracle delegated admission requires the operator pool".to_owned(),
             )
@@ -1340,50 +1418,36 @@ impl<'a> OracleRoleBuilder<'a> {
             raw_slots,
             usable_slots: raw_slots,
             supported_classes: vec![QueryClass::Interactive, QueryClass::Analytical],
-            max_workers_per_query: u32::try_from(config.bifrost.oracle.max_workers_per_query)
+            max_workers_per_query: u32::try_from(config.oracle.max_workers_per_query)
                 .map_err(|_| ServerBootError::OraclePeer("worker fanout exceeds u32".to_owned()))?,
         };
         let running_slots = usize::try_from(raw_slots).map_err(|_| {
             ServerBootError::OraclePeer("Oracle slot count exceeds usize".to_owned())
         })?;
         let slots = Arc::new(OracleSlotManager::new(
-            config.bifrost.oracle.admission_waiters,
+            config.oracle.admission_waiters,
             running_slots,
         ));
         let reservations = Arc::new(ReservationRegistry::new(Arc::clone(&slots), 1_024));
         let snapshot = cluster.snapshot();
         validate_remote_oracle_addresses(
-            config.deployment_profile,
+            deployment_profile,
             snapshot
                 .live_oracles()
                 .into_iter()
                 .filter(|lease| lease.key.node_id != node_id)
                 .map(|lease| lease.address.as_str()),
         )?;
-        #[cfg(feature = "test-support")]
-        let peer_credentials: Arc<dyn OraclePeerCredentials> = match injected_peer_credentials {
-            Some(credentials) => credentials,
-            None => Arc::new(
-                ServerOraclePeerCredentials::from_env().map_err(ServerBootError::OraclePeer)?,
-            ),
-        };
-        #[cfg(not(feature = "test-support"))]
-        let peer_credentials: Arc<dyn OraclePeerCredentials> =
-            Arc::new(ServerOraclePeerCredentials::from_env().map_err(ServerBootError::OraclePeer)?);
         let initial_bearer = peer_credentials.bearer(false).await.map_err(|_| {
             ServerBootError::OraclePeer("Oracle peer credential exchange failed".to_owned())
         })?;
-        let verifier =
-            state.auth.token_verifier.as_ref().ok_or_else(|| {
-                ServerBootError::OraclePeer("auth backend not configured".to_owned())
-            })?;
         let mut metadata = wyrd_tonic::tonic::metadata::MetadataMap::new();
         let bearer = format!("Bearer {initial_bearer}").parse().map_err(|_| {
             ServerBootError::OraclePeer("Oracle peer access token is invalid".to_owned())
         })?;
         metadata.insert("x-wyrd-access-token", bearer);
         let authenticated =
-            vala_bifrost_redux::gate::auth::authenticate(verifier.as_ref(), &metadata)
+            vala_bifrost_redux::gate::auth::authenticate(token_verifier.as_ref(), &metadata)
                 .await
                 .map_err(|_| {
                     ServerBootError::OraclePeer("Oracle peer access token was rejected".to_owned())
@@ -1399,61 +1463,29 @@ impl<'a> OracleRoleBuilder<'a> {
                 "Oracle peer credential lacks platform service authority".to_owned(),
             ));
         }
-        let tail_tls = if let (Some(ca_path), Some(server_name)) = (
-            &config.bifrost.oracle.peer_ca_certificate_path,
-            &config.bifrost.oracle.peer_server_name,
-        ) {
-            let ca_certificate_pem = std::fs::read(ca_path).map_err(|_| {
-                ServerBootError::OraclePeer(format!(
-                    "failed to read Oracle peer CA certificate {}",
-                    ca_path.display()
-                ))
-            })?;
-            Some(OraclePeerTls::new(ca_certificate_pem, server_name.clone()))
-        } else {
-            None
-        };
-        let remote_transport = if let Some(tls) = tail_tls.clone() {
-            Arc::new(TonicOraclePeerTransport::with_credentials_and_tls(
-                Arc::clone(&cluster),
-                Arc::clone(&peer_credentials),
-                tls,
-            ))
-        } else {
-            Arc::new(TonicOraclePeerTransport::with_credentials(
-                Arc::clone(&cluster),
-                Arc::clone(&peer_credentials),
-            ))
-        };
-        let lifecycle_transport = Arc::new(if let Some(tls) = tail_tls.clone() {
-            crate::oracle::OracleLifecycleTransport::with_tls(
-                Arc::clone(&cluster),
-                Arc::clone(&peer_credentials),
-                node_id,
-                tls,
-            )
-        } else {
-            crate::oracle::OracleLifecycleTransport::new(
-                Arc::clone(&cluster),
-                Arc::clone(&peer_credentials),
-                node_id,
-            )
-        });
+        let remote_transport = Arc::new(TonicOraclePeerTransport::with_credentials_and_tls(
+            Arc::clone(&cluster),
+            Arc::clone(&peer_credentials),
+            tail_tls.clone(),
+        ));
+        let lifecycle_transport = Arc::new(crate::oracle::OracleLifecycleTransport::with_tls(
+            Arc::clone(&cluster),
+            Arc::clone(&peer_credentials),
+            node_id,
+            tail_tls.clone(),
+        ));
         let reconciliation_limit_bytes = memory_budget
             .checked_div(4)
             .filter(|limit| *limit > 0)
             .ok_or_else(|| {
                 ServerBootError::OraclePeer("Oracle reconciliation budget is zero".to_owned())
             })?;
-        let audit = OracleAuditPublisher::new(
-            state.postgres.vala().clone(),
-            (&config.bifrost.oracle).into(),
-        )
-        .map_err(|error| {
-            ServerBootError::OraclePeer(format!("Oracle audit WAL recovery failed: {error:?}"))
-        })?;
+        let audit = OracleAuditPublisher::new(postgres.vala().clone(), (&config.oracle).into())
+            .map_err(|error| {
+                ServerBootError::OraclePeer(format!("Oracle audit WAL recovery failed: {error:?}"))
+            })?;
         let tail_audit = Arc::new(
-            crate::oracle::PostgresTailSecurityAudit::try_new(&state.postgres)
+            crate::oracle::PostgresTailSecurityAudit::try_new(&postgres)
                 .await
                 .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
         );
@@ -1464,7 +1496,7 @@ impl<'a> OracleRoleBuilder<'a> {
         let tail_discovery = Arc::new(crate::oracle::RegistryTailStreamDiscovery::new(
             Arc::clone(&cluster),
             Arc::clone(&peer_credentials),
-            tail_tls,
+            Some(tail_tls),
             Arc::clone(&tail_authority)
                 as Arc<dyn vala_bifrost_redux::scribe::tail_rpc::TailTicketMinter>,
             node_id,
@@ -1478,32 +1510,29 @@ impl<'a> OracleRoleBuilder<'a> {
             .reserve_oracle(advertise_addr, capabilities)
             .await
             .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?;
-        let oracle_resources = state
-            .bifrost_resources
-            .as_ref()
-            .and_then(vala_bifrost_redux::resources::BifrostRoleResources::oracle)
-            .ok_or_else(|| {
-                ServerBootError::OraclePeer(
-                    "Oracle peer role requires root resource capability".to_owned(),
-                )
-            })?;
-        let worker = Arc::new(OraclePeerWorker::new_with_resources(
+        let oracle_resources = roles.oracle().ok_or_else(|| {
+            ServerBootError::OraclePeer(
+                "Oracle peer role requires root resource capability".to_owned(),
+            )
+        })?;
+        let follower_resolver = Arc::new(
+            vala_bifrost_redux::oracle::follower::OracleCatalogResolver::new(Arc::clone(&catalog)),
+        );
+        let worker = Arc::new(OraclePeerWorker::new_physical_with_resources(
             node_id,
             role.fencing_token,
             verifier,
             security_audit.clone(),
             reservations,
-            SealedFragmentExecutor::with_resources(catalog.file_io(), oracle_resources.clone()),
-            oracle_resources,
+            oracle_resources.clone(),
+            follower_resolver,
+            audit.clone(),
+            running_slots,
         ));
-        let peer = Arc::new(OraclePeerRuntime::new(
-            OraclePeerRuntime::oracle_capability(
-                Arc::clone(&worker),
-                Arc::clone(&security_audit),
-                Arc::clone(&cluster),
-                lifecycle_transport,
-            ),
-            scribe_capability,
+        let peer = Arc::new(crate::oracle::OraclePeerRuntime::new(
+            Arc::clone(&worker),
+            Arc::clone(&security_audit),
+            lifecycle_transport,
         ));
         let local_transport = Arc::new(LocalOraclePeerTransport::new(worker));
         let peer_transports =
@@ -1517,9 +1546,9 @@ impl<'a> OracleRoleBuilder<'a> {
                     return Err(ServerBootError::OraclePeer(error.to_string()));
                 }
             };
-        let oracle = match Oracle::new(OracleBuildConfig {
-            catalog: Arc::clone(catalog),
-            vala: state.postgres.vala().clone(),
+        let oracle = match OracleEngine::new(OracleBuildConfig {
+            catalog: Arc::clone(&catalog),
+            vala: postgres.vala().clone(),
             operator_pool,
             cluster: Arc::clone(&cluster),
             local_role: role.clone(),
@@ -1545,12 +1574,13 @@ impl<'a> OracleRoleBuilder<'a> {
             }
         };
         Ok(BuiltOracleRole {
-            state,
+            catalog,
             oracle,
             role,
             peer,
             cluster,
             audit,
+            resources: oracle_resources,
         })
     }
 }
@@ -1559,29 +1589,6 @@ impl<'a> OracleRoleBuilder<'a> {
 ///
 /// # Errors
 ///
-/// Returns [`ServerBootError::OraclePeer`] when the application has no Scribe
-/// runtime or its production role fence has not been installed.
-fn scribe_capability_from_state(
-    state: &AppState,
-) -> Result<crate::oracle::ScribePeerCapability, ServerBootError> {
-    let ingest = state.bifrost_ingest.as_ref().ok_or_else(|| {
-        ServerBootError::OraclePeer(
-            "combined API-serving peer requires the Scribe runtime".to_owned(),
-        )
-    })?;
-    let registered_role = ingest.scribe_registered_role().cloned().ok_or_else(|| {
-        ServerBootError::OraclePeer(
-            "combined API-serving peer requires the Scribe role fence".to_owned(),
-        )
-    })?;
-    Ok(OraclePeerRuntime::scribe_capability(
-        ingest.tail_reader(),
-        ingest.tail_service(),
-        ingest.tail_authority(),
-        registered_role,
-    ))
-}
-
 /// Initializes every canonical Oracle admission ceiling before role readiness.
 ///
 /// Repeated pods with equal locked ceilings are idempotent. A conflicting pod
@@ -1630,18 +1637,20 @@ fn validate_remote_oracle_addresses<'a>(
 
 /// Fully constructed Oracle role waiting for lifecycle publication.
 struct BuiltOracleRole {
-    /// Server state retained until the query runtime is published.
-    state: AppState,
+    /// Shared catalog retained by the selected Oracle owner.
+    catalog: Arc<BifrostCatalog>,
     /// Oracle engine awaiting startup reconciliation.
-    oracle: Arc<Oracle>,
+    oracle: Arc<OracleEngine>,
     /// Reserved cluster role fence.
     role: RegisteredRole,
-    /// Peer runtime attached after role activation.
-    peer: Arc<OraclePeerRuntime>,
+    /// Oracle-owned private peer service attached after role activation.
+    peer: Arc<crate::oracle::OraclePeerRuntime>,
     /// Cluster owner used for activation and snapshot publication.
     cluster: Arc<ClusterRegistry>,
     /// Local audit publisher recovered before role activation.
     audit: Arc<OracleAuditPublisher>,
+    /// Root-derived Oracle resource capability.
+    resources: vala_bifrost_redux::resources::OracleResources,
 }
 
 impl BuiltOracleRole {
@@ -1650,14 +1659,15 @@ impl BuiltOracleRole {
     /// # Errors
     /// Returns [`ServerBootError::OraclePeer`] when startup reconciliation,
     /// activation, snapshot refresh, or readiness publication fails.
-    async fn start_reconcile_activate_publish(self) -> Result<AppState, ServerBootError> {
+    async fn start_reconcile_activate_publish(self) -> Result<Arc<Oracle>, ServerBootError> {
         let Self {
-            state,
+            catalog,
             oracle,
             role,
             peer,
             cluster,
             audit,
+            resources,
         } = self;
         match tokio::time::timeout(ORACLE_STARTUP_TIMEOUT, oracle.await_startup()).await {
             Ok(Ok(())) => {}
@@ -1692,17 +1702,19 @@ impl BuiltOracleRole {
                 "Oracle role did not become ready after activation".to_owned(),
             ));
         }
-        let lifecycle_transport = peer.oracle().lifecycle_transport();
-        let query_runtime = Arc::new(BifrostQueryRuntime::new(
+        let lifecycle_transport = peer.lifecycle_transport();
+        let query_runtime = Arc::new(Oracle::new(
             oracle,
+            catalog,
             role,
-            peer,
             cluster,
             None,
             audit,
             lifecycle_transport,
+            resources,
+            peer,
         ));
-        Ok(state.with_bifrost_query(query_runtime))
+        Ok(query_runtime)
     }
 }
 
@@ -1718,7 +1730,7 @@ impl BuiltOracleRole {
 /// Returns [`ServerBootError::SigningKey`] if an ephemeral peer key cannot be
 /// generated, or the same [`ServerBootError::OraclePeer`] failures as the
 /// production Oracle constructor.
-#[cfg(feature = "test-support")]
+#[cfg(test)]
 pub async fn attach_test_oracle_runtime(state: AppState) -> Result<AppState, ServerBootError> {
     let node_id = wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7());
     let signing_key = wyrd_auth_issue::IssuingKey::generate_ephemeral_pem()
@@ -1737,7 +1749,7 @@ pub async fn attach_test_oracle_runtime(state: AppState) -> Result<AppState, Ser
 ///
 /// Returns the same signing, sentinel, registration, admission, and readiness
 /// failures as [`attach_test_oracle_runtime`].
-#[cfg(feature = "test-support")]
+#[cfg(test)]
 pub async fn attach_test_oracle_runtime_for_node(
     state: AppState,
     node_id: wyrd_spec::vala::api::NodeId,
@@ -1758,7 +1770,7 @@ pub async fn attach_test_oracle_runtime_for_node(
 ///
 /// Returns the same signing, sentinel, registration, admission, and readiness
 /// failures as [`attach_test_oracle_runtime_for_node`].
-#[cfg(feature = "test-support")]
+#[cfg(test)]
 pub async fn attach_test_oracle_runtime_for_node_at(
     state: AppState,
     node_id: wyrd_spec::vala::api::NodeId,
@@ -1779,7 +1791,6 @@ pub async fn attach_test_oracle_runtime_for_node_at(
         advertise_addr: &advertise_addr,
         spill_root: None,
         peer_credentials: None,
-        scribe_capability: None,
     }
     .build()
     .await
@@ -1791,7 +1802,7 @@ pub async fn attach_test_oracle_runtime_for_node_at(
 ///
 /// Returns the same signing, credential, registration, admission, and readiness
 /// failures as [`attach_test_oracle_runtime_for_node_at`].
-#[cfg(feature = "test-support")]
+#[cfg(test)]
 pub async fn attach_test_oracle_runtime_for_node_at_with_credentials(
     state: AppState,
     node_id: wyrd_spec::vala::api::NodeId,
@@ -1811,9 +1822,11 @@ pub async fn attach_test_oracle_runtime_for_node_at_with_credentials(
 }
 
 /// Harness-owned storage and timing inputs for one attached Oracle role.
-#[cfg(feature = "test-support")]
-#[derive(Debug, Default)]
+#[cfg(test)]
+#[derive(Default)]
 pub struct TestOracleAttachment {
+    /// Exact process registry already used by a colocated Scribe role.
+    pub cluster: Option<Arc<ClusterRegistry>>,
     /// Optional durable audit WAL root.
     pub audit_wal_root: Option<std::path::PathBuf>,
     /// Optional disposable spill storage base.
@@ -1825,7 +1838,7 @@ pub struct TestOracleAttachment {
 }
 
 /// Attach a test Oracle role while retaining an explicit harness-owned WAL root.
-#[cfg(feature = "test-support")]
+#[cfg(test)]
 pub async fn attach_test_oracle_runtime_for_node_at_with_credentials_and_root(
     state: AppState,
     node_id: wyrd_spec::vala::api::NodeId,
@@ -1841,7 +1854,6 @@ pub async fn attach_test_oracle_runtime_for_node_at_with_credentials_and_root(
         advertise_addr,
         peer_credentials,
         attachment,
-        None,
     )
     .await
 }
@@ -1860,7 +1872,6 @@ pub(crate) async fn compose_test_api_serving_target(
     node_id: ClusterNodeId,
     cluster: Arc<ClusterRegistry>,
     peer_credentials: Arc<dyn OraclePeerCredentials>,
-    scribe_capability: crate::oracle::ScribePeerCapability,
 ) -> Result<AppState, ServerBootError> {
     OracleRoleBuilder {
         state,
@@ -1871,7 +1882,6 @@ pub(crate) async fn compose_test_api_serving_target(
         advertise_addr: "http://127.0.0.1:0",
         spill_root: None,
         peer_credentials: Some(peer_credentials),
-        scribe_capability: Some(scribe_capability),
     }
     .build()
     .await
@@ -1883,7 +1893,7 @@ pub(crate) async fn compose_test_api_serving_target(
 ///
 /// Returns the same resource, credential, registration, admission, fencing,
 /// reconciliation, and publication failures as [`OracleRoleBuilder::build`].
-#[cfg(feature = "test-support")]
+#[cfg(test)]
 async fn attach_test_oracle_runtime_for_node_at_with_credentials_root_and_scribe(
     state: AppState,
     node_id: wyrd_spec::vala::api::NodeId,
@@ -1891,25 +1901,27 @@ async fn attach_test_oracle_runtime_for_node_at_with_credentials_root_and_scribe
     advertise_addr: String,
     peer_credentials: Arc<dyn OraclePeerCredentials>,
     attachment: TestOracleAttachment,
-    scribe_capability: Option<crate::oracle::ScribePeerCapability>,
 ) -> Result<AppState, ServerBootError> {
     let TestOracleAttachment {
+        cluster,
         audit_wal_root,
         spill_root,
         spill_limit_bytes,
         role_timing,
     } = attachment;
     let node_id = ClusterNodeId::new(node_id.as_uuid());
-    let cluster = Arc::new(if let Some(timing) = role_timing {
-        ClusterRegistry::new_with_role_timing(state.postgres.vala().clone(), node_id, timing)
-    } else {
-        ClusterRegistry::new(state.postgres.vala().clone(), node_id)
+    let cluster = cluster.unwrap_or_else(|| {
+        Arc::new(if let Some(timing) = role_timing {
+            ClusterRegistry::new_with_role_timing(state.postgres.vala().clone(), node_id, timing)
+        } else {
+            ClusterRegistry::new(state.postgres.vala().clone(), node_id)
+        })
     });
     let mut config = crate::config::WyrdServerConfig::default();
     config.auth.signing_key = Some(signing_key.clone());
     config.bifrost.oracle.audit_wal_root =
         Some(audit_wal_root.unwrap_or_else(|| test_oracle_audit_root(node_id.as_uuid())));
-    if state.bifrost_resources.is_none() {
+    if state.bifrost_resources().is_none() {
         return Err(ServerBootError::OraclePeer(
             "test Oracle attachment requires injected Bifrost runtime resources".to_owned(),
         ));
@@ -1924,7 +1936,6 @@ async fn attach_test_oracle_runtime_for_node_at_with_credentials_root_and_scribe
         advertise_addr: &advertise_addr,
         spill_root,
         peer_credentials: Some(peer_credentials),
-        scribe_capability,
     }
     .build()
     .await
@@ -1935,7 +1946,7 @@ async fn attach_test_oracle_runtime_for_node_at_with_credentials_root_and_scribe
 /// # Errors
 /// Returns the same boot, credential, membership, and TLS configuration failures
 /// as production Oracle attachment.
-#[cfg(feature = "test-support")]
+#[cfg(test)]
 pub async fn attach_test_oracle_runtime_for_node_at_with_credentials_and_tls(
     state: AppState,
     node_id: wyrd_spec::vala::api::NodeId,
@@ -1952,6 +1963,7 @@ pub async fn attach_test_oracle_runtime_for_node_at_with_credentials_and_tls(
         advertise_addr,
         peer_credentials,
         TestOracleTlsAttachment {
+            cluster: None,
             ca_path,
             server_name,
             audit_wal_root: None,
@@ -1964,8 +1976,10 @@ pub async fn attach_test_oracle_runtime_for_node_at_with_credentials_and_tls(
 }
 
 /// TLS and durable-root inputs for a test Oracle attachment.
-#[cfg(feature = "test-support")]
+#[cfg(test)]
 pub struct TestOracleTlsAttachment {
+    /// Exact process registry already used by a colocated Scribe role.
+    pub cluster: Option<Arc<ClusterRegistry>>,
     /// Peer CA certificate path.
     pub ca_path: std::path::PathBuf,
     /// Expected peer DNS name.
@@ -1979,7 +1993,7 @@ pub struct TestOracleTlsAttachment {
 }
 
 /// Attach a TLS test Oracle role with an explicit harness-owned WAL root.
-#[cfg(feature = "test-support")]
+#[cfg(test)]
 pub async fn attach_test_oracle_runtime_for_node_at_with_credentials_and_tls_and_root(
     state: AppState,
     node_id: wyrd_spec::vala::api::NodeId,
@@ -1990,10 +2004,12 @@ pub async fn attach_test_oracle_runtime_for_node_at_with_credentials_and_tls_and
     role_timing: Option<RoleTiming>,
 ) -> Result<AppState, ServerBootError> {
     let node_id = ClusterNodeId::new(node_id.as_uuid());
-    let cluster = Arc::new(if let Some(timing) = role_timing {
-        ClusterRegistry::new_with_role_timing(state.postgres.vala().clone(), node_id, timing)
-    } else {
-        ClusterRegistry::new(state.postgres.vala().clone(), node_id)
+    let cluster = tls.cluster.clone().unwrap_or_else(|| {
+        Arc::new(if let Some(timing) = role_timing {
+            ClusterRegistry::new_with_role_timing(state.postgres.vala().clone(), node_id, timing)
+        } else {
+            ClusterRegistry::new(state.postgres.vala().clone(), node_id)
+        })
     });
     let mut config = crate::config::WyrdServerConfig::default();
     config.auth.signing_key = Some(signing_key.clone());
@@ -2003,7 +2019,7 @@ pub async fn attach_test_oracle_runtime_for_node_at_with_credentials_and_tls_and
     );
     config.bifrost.oracle.peer_ca_certificate_path = Some(tls.ca_path);
     config.bifrost.oracle.peer_server_name = Some(tls.server_name);
-    if state.bifrost_resources.is_none() {
+    if state.bifrost_resources().is_none() {
         return Err(ServerBootError::OraclePeer(
             "TLS test Oracle attachment requires injected Bifrost runtime resources".to_owned(),
         ));
@@ -2018,7 +2034,6 @@ pub async fn attach_test_oracle_runtime_for_node_at_with_credentials_and_tls_and
         advertise_addr: &advertise_addr,
         spill_root: tls.spill_root,
         peer_credentials: Some(peer_credentials),
-        scribe_capability: None,
     }
     .build()
     .await
@@ -2476,24 +2491,56 @@ pub(crate) mod pg_tests {
     fn combined_peer_retains_one_lifecycle_transport_and_follower_tail_source() {
         wyrd_runtime::runtime().block_on(async {
             let (mut state, _) = crate::oracle::pg_tests::real_api_serving_state(
-                crate::config::ForgeProcessRole::Server,
+                crate::config::BifrostTarget::Server,
             )
             .await;
-            let peer = state.oracle_peer.as_ref().expect("combined peer");
             let query = state.bifrost_query().expect("query runtime");
-            let ingest = state.bifrost_ingest.as_ref().expect("ingest runtime");
+            let ingest = state.bifrost_ingest().expect("ingest runtime");
             assert!(Arc::ptr_eq(
                 query.lifecycle_transport(),
-                &peer.oracle().lifecycle_transport(),
+                &query.peer().lifecycle_transport(),
             ));
             assert!(Arc::ptr_eq(
                 &ingest.tail_service(),
-                &peer.scribe().tail_service(),
+                &state.bifrost.scribe_tail_service().expect("Scribe tail"),
             ));
             state
-                .bifrost_query
-                .take()
+                .bifrost_query()
+                .cloned()
                 .expect("query runtime")
+                .shutdown(std::time::Instant::now() + Duration::from_secs(2))
+                .await;
+        });
+    }
+
+    /// Production and test serving paths publish the same one-composite ownership shape.
+    ///
+    /// # Panics
+    /// Panics when the shared boot helper duplicates Gate, catalog, peer, or tail owners.
+    #[test]
+    fn production_and_test_server_share_bifrost_composition() {
+        wyrd_runtime::runtime().block_on(async {
+            let (state, _) = crate::oracle::pg_tests::real_api_serving_state(
+                crate::config::BifrostTarget::Server,
+            )
+            .await;
+            let composite = Arc::clone(&state.bifrost);
+            let query = composite.oracle().expect("Oracle composition");
+            let ingest = composite.scribe().expect("Scribe composition");
+            assert!(Arc::ptr_eq(composite.catalog(), state.bifrost_catalog()));
+            assert!(Arc::ptr_eq(
+                composite.gate(),
+                state.bifrost_gate().expect("mounted Gate").as_ref(),
+            ));
+            assert!(Arc::ptr_eq(
+                query.lifecycle_transport(),
+                &query.peer().lifecycle_transport(),
+            ));
+            assert!(Arc::ptr_eq(
+                &ingest.tail_service(),
+                &composite.scribe_tail_service().expect("Scribe tail"),
+            ));
+            composite
                 .shutdown(std::time::Instant::now() + Duration::from_secs(2))
                 .await;
         });
@@ -2537,7 +2584,7 @@ pub(crate) mod pg_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn production_boot_failure_after_scribe_activation_rolls_back_roles() {
         let mut config = crate::config::WyrdServerConfig::default();
-        config.role = crate::config::ForgeProcessRole::Server;
+        config.role = crate::config::BifrostTarget::Server;
         config.bifrost.oracle.allow_unapproved_profile = true;
         let telemetry = Arc::new(wyrd_telemetry::init_test_only_no_global(
             wyrd_telemetry::TelemetryConfig::default(),
@@ -2614,7 +2661,7 @@ pub(crate) mod pg_tests {
             .await
             .with_bifrost_node_id(ClusterNodeId::new(uuid::Uuid::now_v7()));
         let storage = crate::test_support::test_storage().await;
-        let redux = Arc::clone(&state.bifrost);
+        let redux = Arc::clone(state.bifrost_catalog());
         let vala = crate::test_support::test_vala_postgres().await;
         let operator_pool: OperatorPool = crate::test_support::test_operator_pool().await;
         let (publisher, inbox) = staging_file_channel(16).expect("hint channel");
@@ -2651,7 +2698,7 @@ pub(crate) mod pg_tests {
         let object_store: Arc<dyn ForgeObjectStore> =
             Arc::new(OpenDalForgeObjectStore::new(Arc::clone(&staging)));
         let forge = Arc::new(
-            Forge::new(ForgeBuildConfig {
+            ForgeCoordinator::new(ForgeBuildConfig {
                 resources: roles.forge().expect("composed Forge capability"),
                 vala,
                 operator_pool,
@@ -2911,23 +2958,9 @@ pub(crate) mod pg_tests {
                     .expect("tail authority"),
             );
             let ingest = Arc::new(
-                BifrostIngestRuntime::new(
-                    scribe,
-                    verifier,
-                    vala_bifrost_redux::gate::limits::IngestLimits::default(),
-                    None,
-                )
-                .with_tail_authority(tail_authority)
-                .with_scribe_role(Arc::clone(&cluster), scribe_role),
-            );
-            let scribe_capability = OraclePeerRuntime::scribe_capability(
-                ingest.tail_reader(),
-                ingest.tail_service(),
-                ingest.tail_authority(),
-                ingest
-                    .scribe_registered_role()
-                    .expect("Scribe role was installed immediately above")
-                    .clone(),
+                Scribe::new(scribe, None)
+                    .with_tail_authority(tail_authority)
+                    .with_scribe_role(Arc::clone(&cluster), scribe_role),
             );
             let state = OracleRoleBuilder {
                 state: state.with_bifrost_ingest(ingest),
@@ -2938,13 +2971,12 @@ pub(crate) mod pg_tests {
                 advertise_addr: "127.0.0.1:9443",
                 spill_root: None,
                 peer_credentials: Some(peer_credentials),
-                scribe_capability: Some(scribe_capability),
             }
             .build()
             .await
             .expect("verified Oracle peer boot");
 
-            assert!(state.oracle_peer.is_some());
+            assert!(state.bifrost.oracle_peer_service().is_some());
             let snapshot = cluster.snapshot();
             let role = snapshot
                 .live_oracles()
@@ -3073,23 +3105,9 @@ pub(crate) mod pg_tests {
                     .expect("tail authority"),
             );
             let ingest = Arc::new(
-                BifrostIngestRuntime::new(
-                    scribe,
-                    verifier,
-                    vala_bifrost_redux::gate::limits::IngestLimits::default(),
-                    None,
-                )
-                .with_tail_authority(tail_authority)
-                .with_scribe_role(Arc::clone(&cluster), scribe_role.clone()),
-            );
-            let scribe_capability = OraclePeerRuntime::scribe_capability(
-                ingest.tail_reader(),
-                ingest.tail_service(),
-                ingest.tail_authority(),
-                ingest
-                    .scribe_registered_role()
-                    .expect("Scribe role was installed immediately above")
-                    .clone(),
+                Scribe::new(scribe, None)
+                    .with_tail_authority(tail_authority)
+                    .with_scribe_role(Arc::clone(&cluster), scribe_role.clone()),
             );
             let state = OracleRoleBuilder {
                 state: state.with_bifrost_ingest(Arc::clone(&ingest)),
@@ -3100,7 +3118,6 @@ pub(crate) mod pg_tests {
                 advertise_addr: "127.0.0.1:9443",
                 spill_root: None,
                 peer_credentials: Some(peer_credentials),
-                scribe_capability: Some(scribe_capability),
             }
             .build()
             .await

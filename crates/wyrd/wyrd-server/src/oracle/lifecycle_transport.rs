@@ -3,12 +3,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use vala_bifrost_redux::cluster::ClusterRegistry;
 use vala_bifrost_redux::oracle::dispatcher::{OraclePeerCredentials, OraclePeerTls};
 use wyrd_spec::vala::api::NodeId;
 use wyrd_spec::vala::api::{
-    CancelOracleLifecycleRequest, CancelOracleLifecycleResponse, OracleLifecycleLookupRequest,
-    RunningQuerySummary,
+    CancelOracleLifecycleRequest, CancelOracleLifecycleResponse, ListOracleLifecyclesRequest,
+    OracleLifecycleLookupRequest, RunningQuerySummary,
 };
 use wyrd_tonic::tonic::metadata::MetadataValue;
 use wyrd_tonic::tonic::{Code, Request};
@@ -86,7 +88,7 @@ impl OracleLifecycleTransport {
         }
     }
 
-    /// Lists the exact tenant/request pair on every current ready remote Oracle.
+    /// Lists the complete tenant-local registry on every current ready remote Oracle.
     ///
     /// # Errors
     ///
@@ -95,13 +97,20 @@ impl OracleLifecycleTransport {
     /// unfinished calls while retaining no durable partial progress.
     pub async fn list(
         &self,
-        request: OracleLifecycleLookupRequest,
+        request: ListOracleLifecyclesRequest,
     ) -> Vec<OracleLifecycleNodeOutcome<Vec<RunningQuerySummary>>> {
         let nodes = self.ready_remote_nodes();
-        let mut outcomes = Vec::with_capacity(nodes.len());
+        let mut calls = FuturesUnordered::new();
         for (node_id, address) in nodes {
-            let outcome = self.list_one(&address, request.clone()).await;
-            outcomes.push(OracleLifecycleNodeOutcome { node_id, outcome });
+            let request = request.clone();
+            calls.push(async move {
+                let outcome = self.list_one(&address, request).await;
+                OracleLifecycleNodeOutcome { node_id, outcome }
+            });
+        }
+        let mut outcomes = Vec::new();
+        while let Some(outcome) = calls.next().await {
+            outcomes.push(outcome);
         }
         outcomes
     }
@@ -117,10 +126,17 @@ impl OracleLifecycleTransport {
         request: OracleLifecycleLookupRequest,
     ) -> Vec<OracleLifecycleNodeOutcome<RunningQuerySummary>> {
         let nodes = self.ready_remote_nodes();
-        let mut outcomes = Vec::with_capacity(nodes.len());
+        let mut calls = FuturesUnordered::new();
         for (node_id, address) in nodes {
-            let outcome = self.get_one(&address, request.clone()).await;
-            outcomes.push(OracleLifecycleNodeOutcome { node_id, outcome });
+            let request = request.clone();
+            calls.push(async move {
+                let outcome = self.get_one(&address, request).await;
+                OracleLifecycleNodeOutcome { node_id, outcome }
+            });
+        }
+        let mut outcomes = Vec::new();
+        while let Some(outcome) = calls.next().await {
+            outcomes.push(outcome);
         }
         outcomes
     }
@@ -137,10 +153,17 @@ impl OracleLifecycleTransport {
         request: CancelOracleLifecycleRequest,
     ) -> Vec<OracleLifecycleNodeOutcome<CancelOracleLifecycleResponse>> {
         let nodes = self.ready_remote_nodes();
-        let mut outcomes = Vec::with_capacity(nodes.len());
+        let mut calls = FuturesUnordered::new();
         for (node_id, address) in nodes {
-            let outcome = self.cancel_one(&address, request.clone()).await;
-            outcomes.push(OracleLifecycleNodeOutcome { node_id, outcome });
+            let request = request.clone();
+            calls.push(async move {
+                let outcome = self.cancel_one(&address, request).await;
+                OracleLifecycleNodeOutcome { node_id, outcome }
+            });
+        }
+        let mut outcomes = Vec::new();
+        while let Some(outcome) = calls.next().await {
+            outcomes.push(outcome);
         }
         outcomes
     }
@@ -206,7 +229,7 @@ impl OracleLifecycleTransport {
     async fn list_one(
         &self,
         address: &str,
-        request: OracleLifecycleLookupRequest,
+        request: ListOracleLifecyclesRequest,
     ) -> OracleLifecycleOutcome<Vec<RunningQuerySummary>> {
         let call = async {
             let mut client = self.client(address.to_owned()).await?;

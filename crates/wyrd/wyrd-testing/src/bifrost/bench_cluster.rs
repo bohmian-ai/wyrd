@@ -987,7 +987,7 @@ pub(crate) async fn provision_named_tables(
     tables: &[String],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let server = cluster.server(0).ok_or("reference cluster has no Server")?;
-    let catalog = server.state().bifrost;
+    let catalog = server.state().bifrost_catalog();
     let fields = vec![Field::new("row_id", DataType::Int64, false)];
     for tenant in tenants {
         for table in tables {

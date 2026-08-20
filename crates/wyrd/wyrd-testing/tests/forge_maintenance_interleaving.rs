@@ -14,7 +14,7 @@ use vala_bifrost_redux::forge::{
 use vala_sql::row_types::forge_operations::{
     ForgeOperationFamily, ForgeOperationPhase, ForgeOperationStateRow,
 };
-use wyrd_server::ForgeProcessRole;
+use wyrd_server::BifrostTarget;
 use wyrd_spec::vala::api::{
     AuditDetail, ForgeCompactionPhase, ForgeOrphanGcPhase, ForgeSnapshotExpirePhase, StoragePath,
 };
@@ -32,7 +32,7 @@ const MAINTENANCE_SCHEDULER_OWNER: u128 = 0x0198_39f4_2b51_7000_8000_0000_0000_0
 async fn start_maintenance_server() -> WyrdTestServer {
     WyrdTestServer::builder()
         .with_forge_interval(Duration::from_secs(3600))
-        .with_forge_process_role_for_test(ForgeProcessRole::Server)
+        .with_forge_process_role_for_test(BifrostTarget::Server)
         .start_in_process()
         .await
         .expect("in-process Forge maintenance server")

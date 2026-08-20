@@ -33,7 +33,7 @@ use crate::namespaces::BifrostNamespace;
 use crate::oracle::{
     AuthorizedQueryContext, Oracle, OracleQueryStream, QueryOptions, QueryStreamLifecycle,
 };
-pub(crate) use crate::otlp_contract::{IngestOutcome, LogsOutcome, MetricsOutcome};
+pub use crate::otlp_contract::{IngestOutcome, LogsOutcome, MetricsOutcome};
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::error::BifrostError;
 
@@ -711,7 +711,11 @@ fn authorize_record_write(auth: &AuthContext) -> Result<(), IngestError> {
         .map_err(IngestError::from_rbac)
 }
 
-fn resolve_fqn(fqn: &str) -> Result<(BifrostNamespace, String), IngestError> {
+/// Resolves one validated public table name into its closed namespace and local name.
+///
+/// # Errors
+/// Returns a stable request-validation error for an unknown namespace.
+pub fn resolve_fqn(fqn: &str) -> Result<(BifrostNamespace, String), IngestError> {
     BifrostNamespace::split_fqn(fqn)
         .ok_or_else(|| IngestError::RequestValidation(format!("unrecognized table fqn: {fqn}")))
 }
@@ -817,7 +821,14 @@ fn ingest_request_outcome(result: &Result<Response<InsertBatchResponse>, Status>
     }
 }
 
-fn validate_batch(frame: &InsertBatchRequest, limits: &IngestLimits) -> Result<(), IngestError> {
+/// Validates one native Arrow ingress envelope before provider or Scribe IO.
+///
+/// # Errors
+/// Returns a stable request-validation or payload-limit error.
+pub fn validate_batch(
+    frame: &InsertBatchRequest,
+    limits: &IngestLimits,
+) -> Result<(), IngestError> {
     if frame.table.is_empty() || frame.wyrd_batch_id.len() != 16 {
         return Err(IngestError::RequestValidation(
             "table and exactly 16-byte wyrd_batch_id are required on every frame".to_owned(),

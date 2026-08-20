@@ -4,14 +4,19 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[cfg(test)]
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfig, FileScanConfigBuilder};
 use datafusion::datasource::source::DataSourceExec;
-use datafusion::execution::{TaskContext, context::SessionState};
-use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
+use datafusion::execution::TaskContext;
+use datafusion::execution::context::SessionConfig;
+use datafusion::execution::memory_pool::MemoryPool;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
+use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream, execute_stream};
 use datafusion_proto::bytes::physical_plan_from_bytes_with_extension_codec;
 use datafusion_proto::protobuf::{PhysicalPlanNode, physical_plan_node::PhysicalPlanType};
 use prost::Message;
@@ -22,7 +27,7 @@ use wyrd_spec::vala::api::{
     ReservationId, TenantTableBinding,
 };
 
-use super::codec::{OraclePhysicalExtensionCodec, physical_plan_fingerprint};
+use super::codec::{OraclePhysicalExtensionCodec, PreflightExtension, physical_plan_fingerprint};
 use crate::catalog::{BifrostCatalog, TableRef};
 use crate::scribe::seal_key::EventDay;
 use crate::scribe::stream_identity::StreamIdentity;
@@ -63,7 +68,80 @@ pub trait FollowerSourceResolver: Send + Sync {
         &self,
         target_role: ClusterRole,
         assignment: &FollowerScanAssignment,
+        session: &SessionState,
     ) -> Result<Arc<dyn ExecutionPlan>, String>;
+}
+
+#[async_trait]
+impl<T> FollowerSourceResolver for Arc<T>
+where
+    T: FollowerSourceResolver + ?Sized,
+{
+    /// Delegates to the one injected process resolver allocation.
+    async fn resolve(
+        &self,
+        target_role: ClusterRole,
+        assignment: &FollowerScanAssignment,
+        session: &SessionState,
+    ) -> Result<Arc<dyn ExecutionPlan>, String> {
+        self.as_ref()
+            .resolve(target_role, assignment, session)
+            .await
+    }
+}
+
+/// Process-injected policy used to create one governed follower context per request.
+#[derive(Clone)]
+pub struct FollowerSessionFactory {
+    /// Maximum number of physical partitions admitted by the receiving worker.
+    target_partitions: usize,
+}
+
+impl std::fmt::Debug for FollowerSessionFactory {
+    /// Formats only the non-sensitive execution bound.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FollowerSessionFactory")
+            .field("target_partitions", &self.target_partitions)
+            .finish()
+    }
+}
+
+impl FollowerSessionFactory {
+    /// Creates the process policy retained by the physical follower owner.
+    #[must_use]
+    pub fn new(target_partitions: usize) -> Self {
+        Self {
+            target_partitions: target_partitions.max(1),
+        }
+    }
+
+    /// Creates one request-local runtime, session state, and task context.
+    ///
+    /// # Errors
+    /// Returns a redacted error when `DataFusion` cannot construct the bounded runtime.
+    fn create(
+        &self,
+        memory_pool: Arc<dyn MemoryPool>,
+    ) -> Result<(SessionState, Arc<TaskContext>), String> {
+        let runtime = Arc::new(
+            RuntimeEnvBuilder::new()
+                .with_memory_pool(memory_pool)
+                .build()
+                .map_err(|_| "governed follower runtime construction failed".to_owned())?,
+        );
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(
+                SessionConfig::new()
+                    .with_target_partitions(self.target_partitions)
+                    .with_batch_size(1_024),
+            )
+            .with_runtime_env(runtime)
+            .build();
+        let task = Arc::new(TaskContext::from(&state));
+        Ok((state, task))
+    }
 }
 
 /// Validated IO-free request projection passed into provider resolution.
@@ -92,8 +170,6 @@ pub struct AuthenticatedFollowerContext<'a> {
 pub struct OracleCatalogResolver {
     /// Tenant-qualified catalog owner.
     catalog: Arc<BifrostCatalog>,
-    /// Session state used only to build the physical scan provider.
-    session: SessionState,
 }
 
 impl std::fmt::Debug for OracleCatalogResolver {
@@ -105,7 +181,6 @@ impl std::fmt::Debug for OracleCatalogResolver {
         formatter
             .debug_struct("OracleCatalogResolver")
             .field("catalog", &"authenticated")
-            .field("session", &"configured")
             .finish()
     }
 }
@@ -113,8 +188,8 @@ impl std::fmt::Debug for OracleCatalogResolver {
 impl OracleCatalogResolver {
     /// Creates an Oracle resolver from already-authenticated process capabilities.
     #[must_use]
-    pub fn new(catalog: Arc<BifrostCatalog>, session: SessionState) -> Self {
-        Self { catalog, session }
+    pub fn new(catalog: Arc<BifrostCatalog>) -> Self {
+        Self { catalog }
     }
 }
 
@@ -131,6 +206,7 @@ impl FollowerSourceResolver for OracleCatalogResolver {
         &self,
         target_role: ClusterRole,
         assignment: &FollowerScanAssignment,
+        session: &SessionState,
     ) -> Result<Arc<dyn ExecutionPlan>, String> {
         if target_role != ClusterRole::Oracle || assignment.scribe_provider_cut.is_some() {
             return Err("Oracle resolver received a non-Oracle assignment".to_owned());
@@ -142,7 +218,7 @@ impl FollowerSourceResolver for OracleCatalogResolver {
             .await
             .map_err(|_| "authenticated Oracle catalog provider failed".to_owned())?;
         let plan = provider
-            .scan(&self.session, None, &[], None)
+            .scan(session, None, &[], None)
             .await
             .map_err(|_| "authenticated Oracle physical scan failed".to_owned())?;
         restrict_plan_to_assigned_files(plan, &assignment.persisted.files)
@@ -185,19 +261,48 @@ impl LiveTailSource for FetchLiveTailService {
 }
 
 /// Role-local resolver that snapshots the authenticated Scribe stream exactly once.
-#[derive(Debug)]
 pub struct ScribeTailResolver<T = FetchLiveTailService> {
     /// Existing Scribe snapshot service; this owner calls it once per assignment.
     tail: Arc<T>,
-    /// Authenticated schema expected for the projected Arrow cohort.
-    schema: SchemaRef,
+    /// Closed source for the authenticated role-local table schema.
+    schema_source: ScribeSchemaSource,
+}
+
+/// Closed Scribe schema source separating production catalog IO from unit fixtures.
+enum ScribeSchemaSource {
+    /// Shared tenant-qualified production catalog.
+    Catalog(Arc<BifrostCatalog>),
+    /// Focused unit-test schema with no external catalog.
+    #[cfg(test)]
+    Fixed(arrow::datatypes::SchemaRef),
+}
+
+impl<T> std::fmt::Debug for ScribeTailResolver<T> {
+    /// Redacts the injected tail and catalog dependencies.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("ScribeTailResolver").finish()
+    }
 }
 
 impl ScribeTailResolver<FetchLiveTailService> {
-    /// Creates a Scribe resolver from the local tail capability and authenticated schema.
+    /// Creates a Scribe resolver from the local tail capability and shared catalog.
     #[must_use]
-    pub fn new(tail: Arc<FetchLiveTailService>, schema: SchemaRef) -> Self {
-        Self { tail, schema }
+    pub fn new(tail: Arc<FetchLiveTailService>, catalog: Arc<BifrostCatalog>) -> Self {
+        Self {
+            tail,
+            schema_source: ScribeSchemaSource::Catalog(catalog),
+        }
+    }
+}
+
+#[cfg(test)]
+impl<T> ScribeTailResolver<T> {
+    /// Creates one IO-free resolver for focused role-local provider tests.
+    fn with_schema(tail: Arc<T>, schema: arrow::datatypes::SchemaRef) -> Self {
+        Self {
+            tail,
+            schema_source: ScribeSchemaSource::Fixed(schema),
+        }
     }
 }
 
@@ -218,6 +323,7 @@ where
         &self,
         target_role: ClusterRole,
         assignment: &FollowerScanAssignment,
+        _session: &SessionState,
     ) -> Result<Arc<dyn ExecutionPlan>, String> {
         if target_role != ClusterRole::Scribe || !assignment.persisted.files.is_empty() {
             return Err("Scribe resolver received a non-Scribe assignment".to_owned());
@@ -245,6 +351,18 @@ where
             assignment_table(&assignment.binding)?,
         ))
         .map_err(|_| "Scribe tenant/table binding is invalid".to_owned())?;
+        let schema = match &self.schema_source {
+            ScribeSchemaSource::Catalog(catalog) => catalog
+                .provider(
+                    &assignment_table(&assignment.binding)?,
+                    assignment.binding.tenant_id,
+                )
+                .await
+                .map_err(|_| "authenticated Scribe schema resolution failed".to_owned())?
+                .schema(),
+            #[cfg(test)]
+            ScribeSchemaSource::Fixed(schema) => Arc::clone(schema),
+        };
         let start_day = parse_event_day(&cut.start_event_day)?;
         let end_day = parse_event_day(&cut.end_event_day)?;
         let max_batches = usize::try_from(cut.maximum_batch_count)
@@ -269,7 +387,7 @@ where
             .into_iter()
             .map(|batch| batch.rows)
             .collect::<Vec<_>>();
-        super::exec::OracleTableProvider::validated_memory_source(&rows, Arc::clone(&self.schema))
+        super::exec::OracleTableProvider::validated_memory_source(&rows, schema)
             .map_err(|_| "Scribe Arrow provider construction failed".to_owned())
     }
 }
@@ -375,14 +493,34 @@ fn parse_event_day(value: &str) -> Result<EventDay, String> {
 }
 
 /// Concrete owner of preflight, provider resolution, and `DataFusion` decode.
-#[derive(Debug)]
 pub struct PhysicalPlanFollower<R> {
     /// Authenticated role-local provider constructor.
     resolver: R,
+    /// Process-injected request-local execution policy.
+    sessions: FollowerSessionFactory,
+    /// Exact process-owned audit capability reconstructed into tenant tripwires.
+    audit: Option<Arc<dyn super::OracleAudit>>,
     /// Maximum accepted protobuf size.
     maximum_plan_bytes: usize,
     /// Observable lifecycle-boundary effects used to prove fail-closed ordering.
     effects: FollowerEffects,
+}
+
+impl<R> std::fmt::Debug for PhysicalPlanFollower<R>
+where
+    R: std::fmt::Debug,
+{
+    /// Redacts the injected audit capability while retaining follower policy.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PhysicalPlanFollower")
+            .field("resolver", &self.resolver)
+            .field("sessions", &self.sessions)
+            .field("audit", &self.audit.is_some())
+            .field("maximum_plan_bytes", &self.maximum_plan_bytes)
+            .field("effects", &self.effects)
+            .finish()
+    }
 }
 
 /// Observable counts for the follower's effect-bearing lifecycle boundaries.
@@ -404,9 +542,11 @@ where
 {
     /// Creates a follower with the production private plan bound.
     #[must_use]
-    pub const fn new(resolver: R) -> Self {
+    pub fn new(resolver: R) -> Self {
         Self {
             resolver,
+            sessions: FollowerSessionFactory::new(1),
+            audit: None,
             maximum_plan_bytes: DEFAULT_MAX_PHYSICAL_PLAN_BYTES,
             effects: FollowerEffects {
                 resolver: AtomicUsize::new(0),
@@ -415,6 +555,20 @@ where
                 output: AtomicUsize::new(0),
             },
         }
+    }
+
+    /// Installs the process-owned request-local session policy.
+    #[must_use]
+    pub fn with_session_factory(mut self, sessions: FollowerSessionFactory) -> Self {
+        self.sessions = sessions;
+        self
+    }
+
+    /// Installs the process-owned audit capability required by tenant tripwires.
+    #[must_use]
+    pub fn with_audit(mut self, audit: Arc<dyn super::OracleAudit>) -> Self {
+        self.audit = Some(audit);
+        self
     }
 
     /// Preflights, resolves, then synchronously decodes one authenticated plan.
@@ -432,6 +586,7 @@ where
         &self,
         request: &PhysicalExecuteFragmentRequest,
         authenticated: AuthenticatedFollowerContext<'_>,
+        session: &SessionState,
         context: &TaskContext,
     ) -> Result<Arc<dyn ExecutionPlan>, PhysicalPlanFollowerError> {
         let preflight = self.preflight(request, &authenticated)?;
@@ -440,7 +595,7 @@ where
             self.effects.resolver.fetch_add(1, Ordering::SeqCst);
             let provider = self
                 .resolver
-                .resolve(request.target_fence.role, &assignment)
+                .resolve(request.target_fence.role, &assignment, session)
                 .await
                 .map_err(PhysicalPlanFollowerError::Resolution)?;
             let actual = super::sealed_fragment_schema_fingerprint(provider.schema().as_ref());
@@ -451,7 +606,11 @@ where
             }
             providers.insert(scan_id, provider);
         }
-        let codec = OraclePhysicalExtensionCodec::decoder(providers);
+        let codec = if let Some(audit) = &self.audit {
+            OraclePhysicalExtensionCodec::decoder_with_audit(providers, Arc::clone(audit))
+        } else {
+            OraclePhysicalExtensionCodec::decoder(providers)
+        };
         self.effects.decode.fetch_add(1, Ordering::SeqCst);
         let plan = physical_plan_from_bytes_with_extension_codec(
             &request.physical_plan_bytes,
@@ -477,12 +636,17 @@ where
         &self,
         request: &PhysicalExecuteFragmentRequest,
         authenticated: AuthenticatedFollowerContext<'_>,
-        context: Arc<TaskContext>,
+        memory_pool: Arc<dyn MemoryPool>,
     ) -> Result<SendableRecordBatchStream, PhysicalPlanFollowerError> {
-        let plan = self.decode(request, authenticated, &context).await?;
+        let (session, context) = self
+            .sessions
+            .create(memory_pool)
+            .map_err(PhysicalPlanFollowerError::Execution)?;
+        let plan = self
+            .decode(request, authenticated, &session, &context)
+            .await?;
         self.effects.execution.fetch_add(1, Ordering::SeqCst);
-        let stream = plan
-            .execute(0, context)
+        let stream = execute_stream(plan, context)
             .map_err(|error| PhysicalPlanFollowerError::Execution(error.to_string()))?;
         self.effects.output.fetch_add(1, Ordering::SeqCst);
         Ok(stream)
@@ -527,7 +691,7 @@ where
         let root = PhysicalPlanNode::decode(request.physical_plan_bytes.as_slice())
             .map_err(|error| PhysicalPlanFollowerError::Preflight(error.to_string()))?;
         let mut encoded = HashMap::new();
-        Self::collect_extensions(&root, &mut encoded)?;
+        Self::collect_extensions(&root, authenticated.tenant_id, &mut encoded)?;
         let mut assignments = HashMap::with_capacity(request.assignments.len());
         for assignment in &request.assignments {
             if assignment.scan_id.is_empty()
@@ -608,28 +772,40 @@ where
     /// malformed extensions, or duplicate scan identities.
     fn collect_extensions(
         node: &PhysicalPlanNode,
+        tenant_id: DataTenantId,
         encoded: &mut HashMap<String, String>,
     ) -> Result<(), PhysicalPlanFollowerError> {
         let children: Vec<&PhysicalPlanNode> = match node.physical_plan_type.as_ref() {
             Some(PhysicalPlanType::Extension(extension)) => {
-                if !extension.inputs.is_empty() {
-                    return Err(PhysicalPlanFollowerError::Preflight(
-                        "remote scan extension has inputs".to_owned(),
-                    ));
-                }
-                let payload = OraclePhysicalExtensionCodec::decode_payload(&extension.node)
-                    .map_err(|error| PhysicalPlanFollowerError::Preflight(error.to_string()))?;
-                if payload.scan_id.is_empty()
-                    || payload.schema_fingerprint.is_empty()
-                    || encoded
-                        .insert(payload.scan_id, payload.schema_fingerprint)
-                        .is_some()
+                match OraclePhysicalExtensionCodec::preflight_extension(&extension.node)
+                    .map_err(|error| PhysicalPlanFollowerError::Preflight(error.to_string()))?
                 {
-                    return Err(PhysicalPlanFollowerError::Preflight(
-                        "invalid or duplicate encoded scan".to_owned(),
-                    ));
+                    PreflightExtension::RemoteScan(payload) => {
+                        if !extension.inputs.is_empty()
+                            || payload.scan_id.is_empty()
+                            || payload.schema_fingerprint.is_empty()
+                            || encoded
+                                .insert(payload.scan_id, payload.schema_fingerprint)
+                                .is_some()
+                        {
+                            return Err(PhysicalPlanFollowerError::Preflight(
+                                "invalid or duplicate encoded scan".to_owned(),
+                            ));
+                        }
+                        return Ok(());
+                    }
+                    PreflightExtension::TenantTripwire { context, table } => {
+                        if extension.inputs.len() != 1
+                            || context.data_tenant_id != tenant_id
+                            || table.trim().is_empty()
+                        {
+                            return Err(PhysicalPlanFollowerError::Preflight(
+                                "tenant tripwire differs from authenticated binding".to_owned(),
+                            ));
+                        }
+                        extension.inputs.iter().collect()
+                    }
                 }
-                return Ok(());
             }
             Some(PhysicalPlanType::Projection(value)) => {
                 value.input.iter().map(AsRef::as_ref).collect()
@@ -658,30 +834,13 @@ where
                 value.input.iter().map(AsRef::as_ref).collect()
             }
             Some(PhysicalPlanType::Union(value)) => value.inputs.iter().collect(),
-            Some(PhysicalPlanType::HashJoin(value)) => match (&value.left, &value.right) {
-                (Some(left), Some(right)) => vec![left.as_ref(), right.as_ref()],
-                _ => {
-                    return Err(PhysicalPlanFollowerError::Preflight(
-                        "binary join is missing a required input".to_owned(),
-                    ));
-                }
-            },
-            Some(PhysicalPlanType::NestedLoopJoin(value)) => match (&value.left, &value.right) {
-                (Some(left), Some(right)) => vec![left.as_ref(), right.as_ref()],
-                _ => {
-                    return Err(PhysicalPlanFollowerError::Preflight(
-                        "binary join is missing a required input".to_owned(),
-                    ));
-                }
-            },
-            Some(PhysicalPlanType::CrossJoin(value)) => match (&value.left, &value.right) {
-                (Some(left), Some(right)) => vec![left.as_ref(), right.as_ref()],
-                _ => {
-                    return Err(PhysicalPlanFollowerError::Preflight(
-                        "binary join is missing a required input".to_owned(),
-                    ));
-                }
-            },
+            Some(PhysicalPlanType::HashJoin(_))
+            | Some(PhysicalPlanType::NestedLoopJoin(_))
+            | Some(PhysicalPlanType::CrossJoin(_)) => {
+                return Err(PhysicalPlanFollowerError::Preflight(
+                    "joins are not supported by the distributed Oracle follower".to_owned(),
+                ));
+            }
             _ => {
                 return Err(PhysicalPlanFollowerError::Preflight(
                     "unsupported follower physical operator".to_owned(),
@@ -694,7 +853,7 @@ where
             ));
         }
         for child in children {
-            Self::collect_extensions(child, encoded)?;
+            Self::collect_extensions(child, tenant_id, encoded)?;
         }
         Ok(())
     }
@@ -723,6 +882,7 @@ pub fn authenticated_preflight(
             &self,
             _target_role: ClusterRole,
             _assignment: &FollowerScanAssignment,
+            _session: &SessionState,
         ) -> Result<Arc<dyn ExecutionPlan>, String> {
             Err("preflight resolver must not run".to_owned())
         }
@@ -746,6 +906,7 @@ pub(crate) mod tests {
     use arrow::record_batch::RecordBatch;
     use datafusion::datasource::listing::PartitionedFile;
     use datafusion::datasource::physical_plan::ParquetSource;
+    use datafusion::execution::context::SessionContext;
     use datafusion::execution::object_store::ObjectStoreUrl;
     use datafusion::physical_plan::collect;
     use datafusion_proto::bytes::physical_plan_to_bytes_with_extension_codec;
@@ -901,6 +1062,7 @@ pub(crate) mod tests {
             &self,
             _target_role: ClusterRole,
             _assignment: &FollowerScanAssignment,
+            _session: &SessionState,
         ) -> Result<Arc<dyn ExecutionPlan>, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
@@ -1004,10 +1166,7 @@ pub(crate) mod tests {
             DataType::Utf8,
             true,
         )]));
-        let resolver = ScribeTailResolver {
-            tail,
-            schema: Arc::clone(&schema),
-        };
+        let resolver = ScribeTailResolver::with_schema(tail, Arc::clone(&schema));
         let ranges = vec![
             PersistedWalRange {
                 start_lsn: 8,
@@ -1018,6 +1177,7 @@ pub(crate) mod tests {
                 end_lsn: 13,
             },
         ];
+        let session = SessionContext::new().state();
         resolver
             .resolve(
                 ClusterRole::Scribe,
@@ -1034,6 +1194,7 @@ pub(crate) mod tests {
                         schema.as_ref(),
                     ),
                 },
+                &session,
             )
             .await
             .expect("Scribe provider resolves");
@@ -1075,12 +1236,26 @@ pub(crate) mod tests {
             .execute(
                 &request,
                 authenticated(&request, &binding),
-                Arc::new(TaskContext::default()),
+                Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
+                    1024 * 1024,
+                )),
             )
             .await
             .expect("validated provider decodes and executes");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(stream.schema().fields().len(), 1);
+    }
+
+    /// Proves every Oracle follower request rebuilds its governed DataFusion context.
+    ///
+    /// # Panics
+    /// Panics if either independent request fails provider resolution, native
+    /// decode, unsupported-operator preflight, or stream construction.
+    #[tokio::test]
+    async fn oracle_resolver_builds_fresh_request_local_context() {
+        role_local_providers_are_isolated_and_consumed_once();
+        role_local_providers_are_isolated_and_consumed_once();
+        assert_complete_preflight_matrix().await;
     }
 
     /// The Scribe resolver projects the complete active-plus-unretired snapshot cohort.
@@ -1165,10 +1340,8 @@ pub(crate) mod tests {
             memtable,
             role_resources.scribe().expect("Scribe capability"),
         ));
-        let resolver = ScribeTailResolver {
-            tail: service,
-            schema: Arc::clone(&schema),
-        };
+        let resolver = ScribeTailResolver::with_schema(service, Arc::clone(&schema));
+        let session = SessionContext::new().state();
         let provider = resolver
             .resolve(
                 ClusterRole::Scribe,
@@ -1185,6 +1358,7 @@ pub(crate) mod tests {
                         schema.as_ref(),
                     ),
                 },
+                &session,
             )
             .await
             .expect("snapshot cohort resolves");
@@ -1307,11 +1481,13 @@ pub(crate) mod tests {
         case.plan_fingerprint = physical_plan_fingerprint(&case.physical_plan_bytes);
         malformed.push(case);
         for case in malformed {
+            let state = SessionStateBuilder::new().with_default_features().build();
             assert!(
                 follower
                     .decode(
                         &case,
                         authenticated(&request, &binding),
+                        &state,
                         &TaskContext::default()
                     )
                     .await

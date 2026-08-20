@@ -515,6 +515,19 @@ pub(crate) struct OracleTableProvider {
     telemetry: Arc<OracleTelemetry>,
     /// Immutable admission class charged by this table execution.
     query_class: QueryClass,
+    /// Optional persisted-source placeholders used by native follower planning.
+    remote_sources: RemotePersistedSources,
+}
+
+/// Request-local scan identities replacing persisted source leaves before physical planning.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RemotePersistedSources {
+    /// Pinned Iceberg source identity, when the cut contains published files.
+    pub(crate) iceberg_scan_id: Option<String>,
+    /// Pinned hot-Parquet source identity, when the cut contains staged files.
+    pub(crate) hot_scan_id: Option<String>,
+    /// Disjoint Scribe live-tail identities selected for this table.
+    pub(crate) scribe_scan_ids: Vec<String>,
 }
 
 impl fmt::Debug for OracleTableProvider {
@@ -612,7 +625,21 @@ impl OracleTableProvider {
             query_pool,
             telemetry,
             query_class,
+            remote_sources: RemotePersistedSources::default(),
         })
+    }
+
+    /// Builds a provider whose persisted leaves are native remote-scan placeholders.
+    ///
+    /// # Errors
+    /// Returns the same schema and pinned-provider errors as [`Self::try_new`].
+    pub(crate) async fn try_new_distributed(
+        inputs: OracleTableInputs,
+        remote_sources: RemotePersistedSources,
+    ) -> DataFusionResult<Self> {
+        let mut provider = Self::try_new(inputs).await?;
+        provider.remote_sources = remote_sources;
+        Ok(provider)
     }
 }
 
@@ -663,7 +690,13 @@ impl TableProvider for OracleTableProvider {
         _limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
-        if let Some(batches) = &self.distributed_iceberg_batches {
+        if let Some(scan_id) = &self.remote_sources.iceberg_scan_id {
+            inputs.push(Arc::new(super::codec::RemoteScanExec::new(
+                scan_id.clone(),
+                super::sealed_fragment_schema_fingerprint(self.physical_schema.as_ref()),
+                Arc::clone(&self.physical_schema),
+            )));
+        } else if let Some(batches) = &self.distributed_iceberg_batches {
             let published =
                 Self::validated_memory_source(batches, Arc::clone(&self.physical_schema))?;
             inputs.push(published);
@@ -672,7 +705,13 @@ impl TableProvider for OracleTableProvider {
             let published = Arc::new(OracleIcebergScanExec::from_plan(published.as_ref())?);
             inputs.push(published);
         }
-        if !self.hot_files.is_empty() {
+        if let Some(scan_id) = &self.remote_sources.hot_scan_id {
+            inputs.push(Arc::new(super::codec::RemoteScanExec::new(
+                scan_id.clone(),
+                super::sealed_fragment_schema_fingerprint(self.physical_schema.as_ref()),
+                Arc::clone(&self.physical_schema),
+            )));
+        } else if !self.hot_files.is_empty() {
             let hot = Arc::new(HotParquetExec::new(
                 self.hot_files.clone(),
                 self.file_io.clone(),
@@ -693,6 +732,13 @@ impl TableProvider for OracleTableProvider {
                 Arc::clone(&self.physical_schema),
             )?;
             inputs.push(hot);
+        }
+        for scan_id in &self.remote_sources.scribe_scan_ids {
+            inputs.push(Arc::new(super::codec::RemoteScanExec::new(
+                scan_id.clone(),
+                super::sealed_fragment_schema_fingerprint(self.physical_schema.as_ref()),
+                Arc::clone(&self.physical_schema),
+            )));
         }
         if !self.live_batches.is_empty() {
             let live = Self::validated_memory_source(
@@ -757,6 +803,16 @@ impl TenantTripwireExec {
             audit,
             properties: plan_properties_with_partitions(schema, partition_count),
         })
+    }
+
+    /// Borrows the authenticated context encoded into a follower subtree.
+    pub(crate) const fn context(&self) -> &AuthorizedQueryContext {
+        &self.context
+    }
+
+    /// Borrows the canonical table label encoded into a follower subtree.
+    pub(crate) fn table(&self) -> &str {
+        &self.table
     }
 }
 

@@ -65,10 +65,10 @@ use wyrd_server::boot::build_workload_bindings;
 use wyrd_server::boot::issuer::{seed_trusted_issuers, seed_workload_bindings};
 use wyrd_server::components::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAuditWriter};
 use wyrd_server::config::{
-    BifrostRuntimeRole, ForgeProcessRole, IssuerEntry, ServeMode, WorkloadBindingEntry,
+    BifrostRuntimeRole, BifrostTarget, IssuerEntry, ServeMode, WorkloadBindingEntry,
 };
 use wyrd_server::postgres::ServerPostgres;
-use wyrd_server::state::BifrostIngestRuntime;
+use wyrd_server::state::Scribe;
 use wyrd_server::state::{QueryStreamFault, QueryStreamFaultController};
 use wyrd_server::{AppState, WyrdServer, WyrdServerConfig, build_router};
 use wyrd_spec::DataTenantId;
@@ -219,7 +219,7 @@ struct WyrdTestServerInner {
     /// Trigger that wakes the real supervised Forge scheduler.
     forge_scheduler_trigger: ForgeSchedulerTrigger,
     /// Process composition selected for this test server.
-    forge_process_role: ForgeProcessRole,
+    forge_process_role: BifrostTarget,
     /// Stable identity assigned to this server process.
     node_id: NodeId,
     /// Optional lifecycle telemetry owner retained until shutdown.
@@ -428,7 +428,7 @@ pub struct WyrdTestServerBuilder {
     /// Optional production-shaped Oracle server identity and peer trust paths.
     oracle_peer_tls: Option<TestOraclePeerTls>,
     /// Production Forge process role used by bound test servers.
-    forge_process_role: ForgeProcessRole,
+    forge_process_role: BifrostTarget,
     /// Optional observer of successful supervised worker completions.
     forge_completion_observer: Option<ForgeWorkerCompletionObserver>,
     /// Optional test-only Forge catalog wrapper.
@@ -477,7 +477,8 @@ impl Default for WyrdTestServerBuilder {
             node_id: None,
             bifrost_roles: [
                 BifrostRuntimeRole::Scribe,
-                BifrostRuntimeRole::Forge,
+                BifrostRuntimeRole::ForgeCoordinator,
+                BifrostRuntimeRole::ForgeWorker,
                 BifrostRuntimeRole::Oracle,
             ]
             .into_iter()
@@ -490,7 +491,7 @@ impl Default for WyrdTestServerBuilder {
             bind_addrs: None,
             oracle_peer_credentials: None,
             oracle_peer_tls: None,
-            forge_process_role: ForgeProcessRole::All,
+            forge_process_role: BifrostTarget::All,
             forge_completion_observer: None,
             forge_catalog: None,
             forge_config: None,
@@ -1310,7 +1311,7 @@ impl WyrdTestServer {
 
     /// Return the production Forge process role selected for this server.
     #[must_use]
-    pub const fn forge_process_role(&self) -> ForgeProcessRole {
+    pub const fn forge_process_role(&self) -> BifrostTarget {
         self.inner.forge_process_role
     }
 
@@ -2231,16 +2232,12 @@ impl WyrdTestServer {
 
     /// Bind an already-constructed server to OS-assigned HTTP and gRPC ports.
     pub(crate) async fn bind(mut self) -> Result<WyrdTestServer, WyrdTestServerError> {
-        // Inject a known shutdown token so the harness can stop the real server;
-        // `BoundServer::run` observes `state.shutdown_token`.
-        let shutdown_token = CancellationToken::new();
-        let state = self
-            .inner
-            .state
-            .clone()
-            .with_shutdown_token(shutdown_token.clone());
+        // Reuse the production composition's shutdown token so the harness
+        // drives the exact same immutable Bifrost owner as mounted routes.
+        let state = self.inner.state.clone();
+        let shutdown_token = state.shutdown_token.clone();
 
-        if self.forge_process_role() == ForgeProcessRole::ForgeWorker {
+        if self.forge_process_role() == BifrostTarget::ForgeWorker {
             let worker =
                 wyrd_server::boot::spawn_forge_worker(&state, shutdown_token.clone(), 1, 1)
                     .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
@@ -2371,7 +2368,7 @@ impl WyrdTestServerBuilder {
 
     /// Select the production Forge process role for this fixture.
     #[must_use]
-    pub fn with_forge_process_role_for_test(mut self, role: ForgeProcessRole) -> Self {
+    pub fn with_forge_process_role_for_test(mut self, role: BifrostTarget) -> Self {
         self.forge_process_role = role;
         self
     }
@@ -2827,7 +2824,9 @@ impl WyrdTestServerBuilder {
             .iter()
             .map(|role| match role {
                 BifrostRuntimeRole::Scribe => BifrostRole::Scribe,
-                BifrostRuntimeRole::Forge => BifrostRole::Forge,
+                BifrostRuntimeRole::ForgeCoordinator | BifrostRuntimeRole::ForgeWorker => {
+                    BifrostRole::Forge
+                }
                 BifrostRuntimeRole::Oracle => BifrostRole::Oracle,
             })
             .collect();
@@ -2909,7 +2908,13 @@ impl WyrdTestServerBuilder {
         let forge_scheduler_trigger = ForgeSchedulerTrigger::new();
         let (forge_publisher, forge_inbox) = staging_file_channel(forge_config.max_hints_per_wake)
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        let forge = if self.bifrost_roles.contains(&BifrostRuntimeRole::Forge) {
+        let forge = if self
+            .bifrost_roles
+            .contains(&BifrostRuntimeRole::ForgeCoordinator)
+            || self
+                .bifrost_roles
+                .contains(&BifrostRuntimeRole::ForgeWorker)
+        {
             let root = spill_root.as_ref().ok_or_else(|| {
                 WyrdTestServerError::Start("Forge spill root is unavailable".to_owned())
             })?;
@@ -2945,17 +2950,17 @@ impl WyrdTestServerBuilder {
             None
         };
         let node_id = self.node_id.unwrap_or_else(|| NodeId::new(Uuid::now_v7()));
+        let cluster_registry = Arc::new(if let Some(timing) = self.role_timing {
+            ClusterRegistry::new_with_role_timing(postgres.vala().clone(), node_id, timing)
+        } else {
+            ClusterRegistry::new(postgres.vala().clone(), node_id)
+        });
         let scribe_registration = if scribe_wal_root.is_some() {
-            let registry = Arc::new(if let Some(timing) = self.role_timing {
-                ClusterRegistry::new_with_role_timing(postgres.vala().clone(), node_id, timing)
-            } else {
-                ClusterRegistry::new(postgres.vala().clone(), node_id)
-            });
             let advertise_addr = self.bind_addrs.map_or_else(
                 || "http://127.0.0.1:0".to_owned(),
                 |(_, grpc)| format!("http://{grpc}"),
             );
-            let registered = registry
+            let registered = cluster_registry
                 .reserve_scribe(
                     &advertise_addr,
                     ScribeCapabilitiesV1 {
@@ -2965,7 +2970,7 @@ impl WyrdTestServerBuilder {
                 )
                 .await
                 .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-            Some((registry, registered))
+            Some((Arc::clone(&cluster_registry), registered))
         } else {
             None
         };
@@ -3115,12 +3120,7 @@ impl WyrdTestServerBuilder {
             None
         };
         let mut ingest = scribe.as_ref().map(|scribe| {
-            let runtime = BifrostIngestRuntime::new(
-                Arc::clone(scribe),
-                Arc::clone(&verifier),
-                self.scribe_ingest_limits,
-                None,
-            );
+            let runtime = Scribe::new(Arc::clone(scribe), None);
             match &tail_authority {
                 Some(authority) => Arc::new(runtime.with_tail_authority(Arc::clone(authority))),
                 None => Arc::new(runtime),
@@ -3194,6 +3194,7 @@ impl WyrdTestServerBuilder {
                     advertise_addr,
                     credentials,
                     wyrd_server::boot::TestOracleTlsAttachment {
+                        cluster: Some(Arc::clone(&cluster_registry)),
                         ca_path: tls.ca_path.clone(),
                         server_name: tls.server_name.clone(),
                         audit_wal_root: self
@@ -3217,6 +3218,7 @@ impl WyrdTestServerBuilder {
                     advertise_addr,
                     credentials,
                     wyrd_server::boot::TestOracleAttachment {
+                        cluster: Some(Arc::clone(&cluster_registry)),
                         audit_wal_root: self
                             .oracle_audit_wal_root
                             .as_ref()
@@ -3233,23 +3235,7 @@ impl WyrdTestServerBuilder {
             }
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         }
-        let limits = self.scribe_ingest_limits;
-        let mut gate = if let Some(ingest) = &ingest {
-            vala_bifrost_redux::gate::Gate::with_scribe(
-                ingest.scribe().clone(),
-                vala_bifrost_redux::gate::auth::ingest_auth_interceptor(Arc::clone(&verifier)),
-                limits,
-            )
-        } else {
-            vala_bifrost_redux::gate::Gate::without_scribe(
-                vala_bifrost_redux::gate::auth::ingest_auth_interceptor(Arc::clone(&verifier)),
-                limits,
-            )
-        };
-        if let Some(query) = state.bifrost_query() {
-            gate = gate.with_oracle(Arc::clone(query.oracle()));
-        }
-        state = state.with_bifrost_gate(Arc::new(gate));
+        state = state.compose_bifrost_gate(Arc::clone(&verifier), self.scribe_ingest_limits);
         state.authz.permission_check = Arc::new(RbacCheck);
         state.authz.audit_writer = self
             .audit_writer
@@ -3763,8 +3749,8 @@ mod production_composition_tests {
             .expect("test server boots on production composition");
         let composed = server
             .state()
-            .bifrost_resources
-            .clone()
+            .bifrost_resources()
+            .cloned()
             .expect("the booted server retains its composed Bifrost roles");
 
         let expected = BifrostRuntimeResources::from_snapshot(

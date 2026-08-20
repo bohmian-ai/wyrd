@@ -176,6 +176,21 @@ impl ClusterSnapshot {
             .collect()
     }
 
+    /// Returns one ready Scribe lease only when its live snapshot fence is exact.
+    #[must_use]
+    pub fn live_scribe_at_fence(
+        &self,
+        node_id: NodeId,
+        fencing_token: u64,
+    ) -> Option<&ClusterRoleLease> {
+        self.roles
+            .get(&SnapshotKey {
+                node_id,
+                role: SnapshotRole::Scribe,
+            })
+            .filter(|lease| lease.fencing_token == fencing_token)
+    }
+
     /// Returns the live Oracle projection without relying on a positional role order.
     #[must_use]
     pub fn live_oracles(&self) -> Vec<&ClusterRoleLease> {

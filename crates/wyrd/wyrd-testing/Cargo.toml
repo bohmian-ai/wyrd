@@ -26,6 +26,10 @@ name = "oracle"
 path = "tests/oracle.rs"
 
 [[test]]
+name = "oracle_edge_journeys"
+path = "tests/oracle_edge_journeys.rs"
+
+[[test]]
 name = "otlp"
 path = "tests/otlp.rs"
 

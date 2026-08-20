@@ -21,7 +21,7 @@ use vala_bifrost_redux::maintenance::{
     StagingFileCommitted, StagingFilePublisher, StagingPublishOutcome,
 };
 use vala_sql::queries::forge_tasks::ForgeTasks;
-use wyrd_server::ForgeProcessRole;
+use wyrd_server::BifrostTarget;
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::{
     CommitUncertaintyCatalog, ForgeObjectStoreControl, seed_forge_group,
@@ -43,7 +43,7 @@ const INTERLEAVING_SCHEDULER_OWNER: u128 = 0x0198_39f4_2b51_7000_8000_0000_0000_
 async fn start_engine_fixture_server() -> WyrdTestServer {
     let server = WyrdTestServer::builder()
         .with_forge_interval(Duration::from_secs(3600))
-        .with_forge_process_role_for_test(ForgeProcessRole::Server)
+        .with_forge_process_role_for_test(BifrostTarget::Server)
         .start_in_process()
         .await
         .expect("in-process Forge dependency server");

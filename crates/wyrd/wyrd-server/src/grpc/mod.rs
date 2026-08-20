@@ -30,8 +30,13 @@ use wyrd_tonic::tonic::codegen::http::{Request, Response};
 use wyrd_tonic::tonic::server::NamedService;
 use wyrd_tonic::tonic::transport::server::Router as TonicRouter;
 use wyrd_tonic::tonic_health::pb::health_server::{Health, HealthServer};
+use wyrd_tonic::wyrd::v1::bifrost_ingest_service_server::{
+    BifrostIngestService, BifrostIngestServiceServer,
+};
+use wyrd_tonic::wyrd::v1::{InsertBatchRequest, InsertBatchResponse};
 
 use crate::AppState;
+use crate::state::Bifrost;
 
 /// Encoded bytes occupied by the gRPC compression flag and big-endian length.
 const GRPC_FRAME_HEADER_BYTES: usize = 5;
@@ -117,6 +122,54 @@ where
     }
 }
 
+/// Native Arrow transport adapter for the one Bifrost server facade.
+#[derive(Clone)]
+struct BifrostIngestGrpc {
+    /// Complete process composition used for Gate admission and Scribe dispatch.
+    bifrost: Arc<Bifrost>,
+}
+
+impl BifrostIngestGrpc {
+    /// Creates the native adapter without constructing another Gate or Scribe owner.
+    fn new(bifrost: Arc<Bifrost>) -> Self {
+        Self { bifrost }
+    }
+
+    /// Wraps the adapter in the generated service using Gate's immutable message limit.
+    fn into_server(self) -> BifrostIngestServiceServer<Self> {
+        let size = self.bifrost.gate().otlp_decoding_message_size();
+        BifrostIngestServiceServer::new(self).max_decoding_message_size(size)
+    }
+}
+
+#[wyrd_tonic::tonic::async_trait]
+impl BifrostIngestService for BifrostIngestGrpc {
+    async fn insert_batch(
+        &self,
+        request: wyrd_tonic::tonic::Request<InsertBatchRequest>,
+    ) -> Result<wyrd_tonic::tonic::Response<InsertBatchResponse>, Status> {
+        let auth = self
+            .bifrost
+            .gate()
+            .authenticate_ingest(request.metadata())
+            .await
+            .map_err(Status::from)?;
+        let frame = request.into_inner();
+        let batch_id = frame.wyrd_batch_id.clone();
+        self.bifrost
+            .ingest_native_frame(&auth, frame)
+            .await
+            .map_err(Status::from)?;
+        let mut response = wyrd_tonic::tonic::Response::new(InsertBatchResponse {
+            wyrd_batch_id: batch_id,
+        });
+        if let Ok(value) = auth.request_id.as_str().parse() {
+            response.metadata_mut().insert("x-wyrd-request-id", value);
+        }
+        Ok(response)
+    }
+}
+
 /// Build the application gRPC router: health (unauthenticated) plus the C1
 /// ingest service with auth completed in the handler.
 ///
@@ -144,26 +197,19 @@ where
         return Err(GrpcError::MissingTokenVerifier);
     }
     let router = build_grpc_router(health_service, NoopInterceptor, cfg)?;
-    if state.bifrost_gate.is_none() && state.bifrost_resources.is_none() {
+    if !state.bifrost.serves_api() {
         return Ok(router);
     }
-    let ingest = state
-        .bifrost_gate
-        .as_ref()
-        .ok_or(GrpcError::MissingScribe)?;
-    let traces = otlp::TraceOtlpGrpcService::new(Arc::clone(ingest));
-    let metrics = otlp::MetricsOtlpGrpcService::new(Arc::clone(ingest));
-    let logs = otlp::LogsOtlpGrpcService::new(Arc::clone(ingest));
+    let bifrost = Arc::clone(&state.bifrost);
+    let traces = otlp::TraceOtlpGrpcService::new(Arc::clone(&bifrost));
+    let metrics = otlp::MetricsOtlpGrpcService::new(Arc::clone(&bifrost));
+    let logs = otlp::LogsOtlpGrpcService::new(Arc::clone(&bifrost));
     let query = crate::vala_query::grpc::ValaQueryGrpc::new(state.clone());
     let bifrost_query = query::BifrostQueryGrpc::new(state.clone());
-    let transport = state
-        .bifrost_resources
-        .as_ref()
-        .map(vala_bifrost_redux::resources::BifrostRoleResources::transport_admission)
-        .ok_or(GrpcError::MissingScribe)?;
+    let transport = state.bifrost.transport_admission();
     let router = router
         .add_service(GrpcTransportAdmissionService::new(
-            (**ingest).clone().into_server(),
+            BifrostIngestGrpc::new(Arc::clone(&bifrost)).into_server(),
             transport.clone(),
         ))
         .add_service(GrpcTransportAdmissionService::new(
@@ -183,8 +229,7 @@ where
             bifrost_query.into_server(),
             transport.clone(),
         ));
-    let router = if let Some(peer) = state.oracle_peer.as_ref() {
-        let scribe = peer.scribe();
+    let router = if let Some(scribe) = state.bifrost_ingest() {
         router.add_service(GrpcTransportAdmissionService::new(
             match scribe.tail_authority() {
                 Some(authority) => scribe_tail::ScribeTailGrpc::new_with_authority(
@@ -201,17 +246,9 @@ where
     } else {
         router
     };
-    let router = if let Some(peer) = state.oracle_peer.as_ref() {
-        let oracle = peer.oracle();
+    let router = if state.bifrost_query().is_some() || state.bifrost_ingest().is_some() {
         router.add_service(GrpcTransportAdmissionService::new(
-            crate::oracle::OraclePeerGrpc::new(
-                state.clone(),
-                oracle.worker(),
-                oracle.cluster(),
-                oracle.security_audit(),
-                peer.scribe().tail_service(),
-            )
-            .into_server(),
+            crate::oracle::OraclePeerGrpc::new(Arc::clone(&state.bifrost)).into_server(),
             transport.clone(),
         ))
     } else {
@@ -219,7 +256,15 @@ where
     };
     let router = if let Some(query) = state.bifrost_query() {
         router.add_service(GrpcTransportAdmissionService::new(
-            crate::oracle::OracleLifecycleGrpc::new(state.clone(), Arc::clone(query)).into_server(),
+            crate::oracle::OracleLifecycleGrpc::new(
+                state
+                    .auth
+                    .token_verifier
+                    .clone()
+                    .ok_or(GrpcError::MissingTokenVerifier)?,
+                Arc::clone(query),
+            )
+            .into_server(),
             transport,
         ))
     } else {
@@ -242,29 +287,21 @@ mod tests {
         BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES, BifrostTransportAdmission,
     };
 
-    /// Mounted peer construction receives the exact retained follower source.
+    /// Mounted Scribe tail source is borrowed directly from the Scribe runtime.
     #[tokio::test]
     async fn mounted_peer_receives_retained_follower_tail_source() {
-        let (mut state, _) = crate::oracle::pg_tests::real_api_serving_state(
-            crate::config::ForgeProcessRole::Server,
-        )
-        .await;
-        let peer = state.oracle_peer.as_ref().expect("combined peer");
-        let oracle = peer.oracle();
-        let mounted = crate::oracle::OraclePeerGrpc::new(
-            state.clone(),
-            oracle.worker(),
-            oracle.cluster(),
-            oracle.security_audit(),
-            peer.scribe().tail_service(),
-        );
+        let (mut state, _) =
+            crate::oracle::pg_tests::real_api_serving_state(crate::config::BifrostTarget::Server)
+                .await;
+        let scribe = state.bifrost_ingest().expect("Scribe runtime");
+        let retained = scribe.tail_reader();
         assert!(Arc::ptr_eq(
-            mounted.tail_service(),
-            &peer.scribe().tail_service(),
+            &retained,
+            &state.bifrost_tail_reader_for_test().expect("tail reader"),
         ));
         state
-            .bifrost_query
-            .take()
+            .bifrost_query()
+            .cloned()
             .expect("query runtime")
             .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(2))
             .await;

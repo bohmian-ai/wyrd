@@ -65,7 +65,7 @@ pub async fn run(mode: Option<ServeMode>) -> Result<(), BootExit> {
     let result = if !config.role.serves_api() {
         run_forge_worker_process(&config, state, metrics_handle).await
     } else {
-        let node_id = state.bifrost_node_id().ok_or_else(|| {
+        let node_id = state.bifrost.node_id().ok_or_else(|| {
             BootExit::Other("configured Bifrost node identity is unavailable".into())
         })?;
         let _role_telemetry =
@@ -97,7 +97,8 @@ async fn run_forge_worker_process(
     metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
 ) -> Result<(), BootExit> {
     let node_id = state
-        .bifrost_node_id()
+        .bifrost
+        .node_id()
         .ok_or_else(|| BootExit::Other("configured Bifrost node identity is unavailable".into()))?;
     let _role_telemetry = metrics::ForgeRoleTelemetryGuard::started(config.role, node_id.as_uuid());
     let shutdown = state.shutdown_token.clone();
@@ -110,8 +111,7 @@ async fn run_forge_worker_process(
     )
     .map_err(|error| BootExit::Other(Box::new(error)))?;
     set.spawn(fallible_task(TaskId::Worker("forge_worker"), worker));
-    if let Some(resources) = state.bifrost_resources.as_ref() {
-        let health = resources.health();
+    if let Some(health) = state.bifrost.resource_health() {
         set.spawn(fallible_task(
             TaskId::Worker("bifrost_resource_health"),
             async move { health.wait_for_poison().await },
@@ -209,11 +209,11 @@ mod tests {
             .next()
             .expect("server module has production source before tests");
         assert!(
-            !production_server.contains("ForgeProcessRole::ForgeWorker"),
+            !production_server.contains("BifrostTarget::ForgeWorker"),
             "WyrdServer bind/run must not own a dedicated worker branch"
         );
         assert!(
-            server.contains("self.config.role == ForgeProcessRole::All"),
+            server.contains("self.config.role == BifrostTarget::All"),
             "the embedded worker must be composed only for the All role"
         );
         assert_eq!(
@@ -236,7 +236,7 @@ mod pg_tests {
     use std::process::Command;
 
     use super::*;
-    use crate::config::ForgeProcessRole;
+    use crate::config::BifrostTarget;
 
     /// Reserves an ephemeral loopback address long enough to learn a distinct
     /// port for one dedicated-runner listener assertion.
@@ -257,7 +257,7 @@ mod pg_tests {
         let grpc_addr = available_loopback_addr();
         let metrics_addr = available_loopback_addr();
         let config = WyrdServerConfig {
-            role: ForgeProcessRole::ForgeWorker,
+            role: BifrostTarget::ForgeWorker,
             http: crate::config::HttpConfig { bind: http_addr },
             grpc: crate::config::GrpcConfig {
                 bind: grpc_addr,

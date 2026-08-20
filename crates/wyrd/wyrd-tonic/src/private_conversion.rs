@@ -396,24 +396,26 @@ impl From<domain::OracleRoleFence> for proto::OracleRoleFence {
     }
 }
 
-impl TryFrom<proto::ListOracleLifecyclesRequest> for domain::OracleLifecycleLookupRequest {
+impl TryFrom<proto::ListOracleLifecyclesRequest> for domain::ListOracleLifecyclesRequest {
     type Error = PrivateConversionError;
 
-    /// Decodes an owner-local lifecycle list lookup.
+    /// Decodes an owner-local tenant lifecycle listing.
     ///
     /// # Errors
-    /// Returns a conversion error for malformed tenant or request identities.
+    /// Returns a conversion error for a malformed tenant identity.
     fn try_from(value: proto::ListOracleLifecyclesRequest) -> Result<Self, Self::Error> {
-        decode_lifecycle_lookup(&value.tenant_id, &value.request_id)
+        Ok(Self {
+            tenant_id: DataTenantId::from_str(&value.tenant_id)
+                .map_err(|_| PrivateConversionError::InvalidUuid("tenant_id"))?,
+        })
     }
 }
 
-impl From<domain::OracleLifecycleLookupRequest> for proto::ListOracleLifecyclesRequest {
-    /// Encodes an owner-local lifecycle list lookup.
-    fn from(value: domain::OracleLifecycleLookupRequest) -> Self {
+impl From<domain::ListOracleLifecyclesRequest> for proto::ListOracleLifecyclesRequest {
+    /// Encodes an owner-local tenant lifecycle listing.
+    fn from(value: domain::ListOracleLifecyclesRequest) -> Self {
         Self {
             tenant_id: value.tenant_id.to_string(),
-            request_id: value.request_id.to_string(),
         }
     }
 }
@@ -843,7 +845,7 @@ impl From<domain::ScribeProviderCut> for proto::ScribeProviderCut {
     }
 }
 
-impl TryFrom<proto::ExecuteFragmentRequest> for domain::ExecuteFragmentRequest {
+impl TryFrom<proto::ExecuteFragmentRequest> for domain::PhysicalExecuteFragmentRequest {
     type Error = PrivateConversionError;
 
     /// Decodes one authenticated worker-fragment execution request.
@@ -852,32 +854,51 @@ impl TryFrom<proto::ExecuteFragmentRequest> for domain::ExecuteFragmentRequest {
     /// Returns [`PrivateConversionError`] for a missing or invalid ticket, an
     /// empty fragment payload, or a malformed reservation identifier.
     fn try_from(value: proto::ExecuteFragmentRequest) -> Result<Self, Self::Error> {
-        if value.fragment_bytes.is_empty() {
+        if value.physical_plan_bytes.is_empty() {
             return Err(PrivateConversionError::Invalid {
-                field: "fragment_bytes",
+                field: "physical_plan_bytes",
             });
         }
+        nonempty(&value.plan_fingerprint, "plan_fingerprint")?;
         Ok(Self {
             ticket: value
                 .ticket
                 .ok_or(PrivateConversionError::Missing("ticket"))?
                 .try_into()?,
-            fragment_bytes: value.fragment_bytes,
+            physical_plan_bytes: value.physical_plan_bytes,
             reservation_id: domain::ReservationId::new(uuid_bytes(
                 &value.reservation_id,
                 "reservation_id",
             )?),
+            leader_fence: value
+                .leader_fence
+                .ok_or(PrivateConversionError::Missing("leader_fence"))?
+                .try_into()?,
+            target_fence: value
+                .target_fence
+                .ok_or(PrivateConversionError::Missing("target_fence"))?
+                .try_into()?,
+            assignments: value
+                .assignments
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+            plan_fingerprint: value.plan_fingerprint,
         })
     }
 }
 
-impl From<domain::ExecuteFragmentRequest> for proto::ExecuteFragmentRequest {
+impl From<domain::PhysicalExecuteFragmentRequest> for proto::ExecuteFragmentRequest {
     /// Encodes an authenticated worker-fragment execution request.
-    fn from(value: domain::ExecuteFragmentRequest) -> Self {
+    fn from(value: domain::PhysicalExecuteFragmentRequest) -> Self {
         Self {
             ticket: Some(value.ticket.into()),
-            fragment_bytes: value.fragment_bytes,
+            physical_plan_bytes: value.physical_plan_bytes,
             reservation_id: value.reservation_id.as_uuid().as_bytes().to_vec(),
+            leader_fence: Some(value.leader_fence.into()),
+            target_fence: Some(value.target_fence.into()),
+            assignments: value.assignments.into_iter().map(Into::into).collect(),
+            plan_fingerprint: value.plan_fingerprint,
         }
     }
 }
@@ -1360,15 +1381,16 @@ mod tests {
             tenant_id,
             request_id: request_id.clone(),
         };
-        let listed = domain::OracleLifecycleLookupRequest::try_from(
-            proto::ListOracleLifecyclesRequest::from(lookup.clone()),
+        let listing = domain::ListOracleLifecyclesRequest { tenant_id };
+        let listed = domain::ListOracleLifecyclesRequest::try_from(
+            proto::ListOracleLifecyclesRequest::from(listing.clone()),
         )
-        .expect("owner-local list lookup round-trips");
+        .expect("owner-local tenant list round-trips");
         let fetched = domain::OracleLifecycleLookupRequest::try_from(
             proto::GetOracleLifecycleRequest::from(lookup.clone()),
         )
         .expect("owner-local get lookup round-trips");
-        assert_eq!(listed, lookup);
+        assert_eq!(listed, listing);
         assert_eq!(fetched, lookup);
 
         let summary = domain::RunningQuerySummary {

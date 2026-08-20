@@ -6,7 +6,7 @@ use wyrd_runtime::{Permission, Principal, PrincipalKind};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
     CancelOracleLifecycleRequest, CancelOracleLifecycleResponse, GetOracleLifecycleResponse,
-    ListOracleLifecyclesResponse, OracleLifecycleLookupRequest,
+    ListOracleLifecyclesRequest, ListOracleLifecyclesResponse, OracleLifecycleLookupRequest,
 };
 use wyrd_tonic::tonic::{Request, Response, Status};
 use wyrd_tonic::wyrd::v1 as proto;
@@ -14,12 +14,10 @@ use wyrd_tonic::wyrd::v1::oracle_lifecycle_service_server::{
     OracleLifecycleService, OracleLifecycleServiceServer,
 };
 
-use crate::AppState;
-
 /// Private generated adapter over the process-wide running-query registry.
 pub struct OracleLifecycleGrpc {
-    /// Server authentication state used at the private transport boundary.
-    state: Option<AppState>,
+    /// Exact verifier used at the private transport boundary.
+    verifier: Arc<crate::state::WyrdTokenVerifier>,
     /// Canonical process-wide owner-local active-query registry.
     registry: Arc<vala_bifrost_redux::oracle::RunningQueryRegistry>,
 }
@@ -27,9 +25,12 @@ pub struct OracleLifecycleGrpc {
 impl OracleLifecycleGrpc {
     /// Creates the owner-local adapter around the canonical registry.
     #[must_use]
-    pub fn new(state: AppState, runtime: Arc<crate::state::BifrostQueryRuntime>) -> Self {
+    pub fn new(
+        verifier: Arc<crate::state::WyrdTokenVerifier>,
+        runtime: Arc<crate::state::Oracle>,
+    ) -> Self {
         Self {
-            state: Some(state),
+            verifier,
             registry: Arc::clone(runtime.running_queries()),
         }
     }
@@ -37,11 +38,15 @@ impl OracleLifecycleGrpc {
     /// Creates a test adapter over a populated registry while retaining production auth.
     #[cfg(test)]
     fn new_for_test(
-        state: AppState,
+        state: crate::AppState,
         registry: Arc<vala_bifrost_redux::oracle::RunningQueryRegistry>,
     ) -> Self {
         Self {
-            state: Some(state),
+            verifier: state
+                .auth
+                .token_verifier
+                .clone()
+                .expect("test lifecycle adapter requires a verifier"),
             registry,
         }
     }
@@ -56,26 +61,12 @@ impl OracleLifecycleGrpc {
     ///
     /// # Errors
     ///
-    /// Returns `UNAVAILABLE` when auth is not configured and `UNAUTHENTICATED`
-    /// when the production verifier rejects the request metadata.
-    ///
-    /// # Panics
-    ///
-    /// Panics only if construction violated the invariant that the production
-    /// adapter retains its application state.
+    /// Returns `UNAUTHENTICATED` when the production verifier rejects the request metadata.
     async fn authenticated_principal(
         &self,
         metadata: &wyrd_tonic::tonic::metadata::MetadataMap,
     ) -> Result<Principal, Status> {
-        let verifier = self
-            .state
-            .as_ref()
-            .expect("invariant: production lifecycle adapter retains AppState")
-            .auth
-            .token_verifier
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("auth backend not configured"))?;
-        vala_bifrost_redux::gate::auth::authenticate(verifier.as_ref(), metadata)
+        vala_bifrost_redux::gate::auth::authenticate(self.verifier.as_ref(), metadata)
             .await
             .map(|auth| auth.principal)
             .map_err(|error| Status::unauthenticated(error.to_string()))
@@ -113,7 +104,7 @@ impl OracleLifecycleGrpc {
 
 #[wyrd_tonic::tonic::async_trait]
 impl OracleLifecycleService for OracleLifecycleGrpc {
-    /// Lists only the exact owner-local tenant/request entry.
+    /// Lists every owner-local entry for the authenticated tenant.
     ///
     /// # Errors
     ///
@@ -123,10 +114,10 @@ impl OracleLifecycleService for OracleLifecycleGrpc {
         request: Request<proto::ListOracleLifecyclesRequest>,
     ) -> Result<Response<proto::ListOracleLifecyclesResponse>, Status> {
         let principal = self.authenticated_principal(request.metadata()).await?;
-        let lookup = OracleLifecycleLookupRequest::try_from(request.into_inner())
+        let listing = ListOracleLifecyclesRequest::try_from(request.into_inner())
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        Self::require_owner(&principal, lookup.tenant_id)?;
-        let queries = self.local_summary(&lookup).into_iter().collect();
+        Self::require_owner(&principal, listing.tenant_id)?;
+        let queries = self.registry.list(listing.tenant_id);
         Ok(Response::new(
             ListOracleLifecyclesResponse { queries }.into(),
         ))
@@ -538,5 +529,15 @@ pub(crate) mod pg_tests {
             .expect_err("tenant Service cannot enter tenant-self authority");
         assert_eq!(error.code(), wyrd_tonic::tonic::Code::NotFound);
         assert!(registry.get(tenant, &request_id).is_some());
+    }
+
+    /// Tenant-scoped list/get/cancel fanout reaches every current-ready owner.
+    ///
+    /// # Panics
+    /// Panics when the production transport, authenticated peer, exact registry,
+    /// or cancellation semantics diverge.
+    #[test]
+    fn tenant_scoped_fanout_lists_gets_and_cancels_current_ready_owners() {
+        crate::oracle::pg_tests::authenticated_lifecycle_transport_reuses_canonical_credentials_and_registry();
     }
 }

@@ -1830,7 +1830,7 @@ pub async fn seed_forge_group_for_tenant_with_schema_and_days(
             .postgres
             .operator_pool()
             .expect("operator pool"),
-        bifrost_catalog: Arc::clone(&server.state().bifrost),
+        bifrost_catalog: Arc::clone(server.state().bifrost_catalog()),
         staging: Arc::new(server.state().storage.operator().clone()),
         object_store: ForgeObjectStoreControl::new(Arc::new(
             server.state().storage.operator().clone(),
@@ -1838,8 +1838,8 @@ pub async fn seed_forge_group_for_tenant_with_schema_and_days(
         spill_root: Arc::new(tempfile::tempdir().expect("Forge spill root")),
         memory: server
             .state()
-            .bifrost_resources
-            .clone()
+            .bifrost_resources()
+            .cloned()
             .expect("Bifrost memory governor"),
         config: ForgeConfig::default(),
     };

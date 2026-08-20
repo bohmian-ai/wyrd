@@ -120,8 +120,7 @@ fn forge_convergence_system_resources() -> SystemResourceSnapshot {
 fn assert_spill_resource_plan(server: &wyrd_testing::WyrdTestServer, scratch_bytes: u64) {
     let resources = server
         .state()
-        .bifrost_resources
-        .as_ref()
+        .bifrost_resources()
         .expect("server owns global Bifrost resources");
     let plan = resources.plan();
     assert_eq!(plan.memory_limit_bytes, 832 << 20);
@@ -146,8 +145,7 @@ fn assert_spill_resource_plan(server: &wyrd_testing::WyrdTestServer, scratch_byt
 fn assert_active_spill_query_resources(server: &wyrd_testing::WyrdTestServer, scratch_bytes: u64) {
     let resources = server
         .state()
-        .bifrost_resources
-        .as_ref()
+        .bifrost_resources()
         .expect("server owns global Bifrost resources");
     let snapshot = resources.snapshot().expect("active resource snapshot");
     assert!(snapshot.oracle_query_active);
@@ -729,8 +727,7 @@ async fn sample_paired_peaks(
 ) -> Result<PairedPeaks, JourneyError> {
     let governor = server
         .state()
-        .bifrost_resources
-        .as_ref()
+        .bifrost_resources()
         .ok_or("paired server lacks the shared governor")?;
     let mut peaks = PairedPeaks::default();
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(10));
@@ -942,8 +939,7 @@ async fn pg_bifrost_oracle_capacity_contract_journey() {
         .expect("reader client");
     let governor = server
         .state()
-        .bifrost_resources
-        .as_ref()
+        .bifrost_resources()
         .expect("shared production memory governor");
     let oracle = governor.oracle().expect("Oracle resource capability");
     let retained = oracle
@@ -1009,8 +1005,7 @@ async fn pg_bifrost_oracle_spill_success_is_bounded_and_exact() {
         .expect("spill success baseline");
     let memory = server
         .state()
-        .bifrost_resources
-        .as_ref()
+        .bifrost_resources()
         .expect("spill success governor")
         .snapshot()
         .expect("spill success resource snapshot");
@@ -1361,8 +1356,7 @@ async fn pg_bifrost_oracle_spill_disk_ceiling_is_typed_and_recovers() {
         .expect("spill ceiling baseline");
     let memory = server
         .state()
-        .bifrost_resources
-        .as_ref()
+        .bifrost_resources()
         .expect("spill ceiling governor")
         .snapshot()
         .expect("spill ceiling resource snapshot");
@@ -1422,8 +1416,7 @@ async fn pg_bifrost_oracle_spill_cancellation_cleans_query_scratch() {
         .expect("spill cancellation baseline");
     let memory = server
         .state()
-        .bifrost_resources
-        .as_ref()
+        .bifrost_resources()
         .expect("spill cancellation governor")
         .snapshot()
         .expect("spill cancellation resource snapshot");
@@ -1608,8 +1601,7 @@ async fn pg_bifrost_oracle_spill_pod_loss_isolated_and_restart_cleans() {
     assert_eq!(residual.peer_running, 0);
     let memory = restarted
         .state()
-        .bifrost_resources
-        .as_ref()
+        .bifrost_resources()
         .expect("restarted Oracle governor")
         .snapshot()
         .expect("restarted Oracle resource snapshot");
@@ -1667,8 +1659,7 @@ async fn oracle_heartbeat_survives_capacity_refusals() {
             .expect("initial Oracle heartbeat");
     let governor = server
         .state()
-        .bifrost_resources
-        .as_ref()
+        .bifrost_resources()
         .expect("heartbeat shared governor");
     let oracle = governor.oracle().expect("Oracle resource capability");
     let retained = oracle
@@ -2166,6 +2157,253 @@ async fn pg_bifrost_oracle_distributed_journey() {
     .expect("J4 distributed journey");
 }
 
+/// Proves the native physical-plan cut executes persisted and live subtrees on
+/// distinct remote role owners before the leader applies the final operators.
+redacted
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::three_mixed())
+        .await
+        .expect("distributed physical cluster");
+    let leader = cluster.server(0).expect("query leader");
+    let writer = cluster.server(2).expect("remote Scribe writer");
+    let leader_id = cluster.configured_node_ids()[0];
+redacted
+    register_table(writer, cluster.data_tenant_id(), &table)
+        .await
+        .expect("distributed table");
+redacted
+        .await
+        .expect("writer client");
+    ingest(&writer_client, &format!("vala.bifrost.{table}"), &[1, 2, 3])
+        .await
+        .expect("persisted rows");
+    writer.flush_bifrost().await.expect("persisted flush");
+    ingest(&writer_client, &format!("vala.bifrost.{table}"), &[4, 5])
+        .await
+        .expect("live rows");
+    let day = EventDay::new(chrono::Utc::now().format("%Y-%m-%d").to_string()).expect("event day");
+    cluster
+        .observe_live_tail(&format!("vala.bifrost.{table}"), day)
+        .await
+        .expect("live-tail discovery");
+    cluster
+        .refresh_oracle_snapshots()
+        .await
+        .expect("immutable membership input");
+
+    let before = cluster
+        .servers()
+        .map(|server| {
+            let inspection = server
+                .state()
+                .oracle_peer()
+                .expect("mixed node peer")
+                .oracle()
+                .worker()
+                .physical_inspection();
+            (inspection.node_id, inspection)
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    let probe = Arc::new(vala_bifrost_redux::oracle::OracleTopologyProbe::default());
+    leader
+        .state()
+        .bifrost_query()
+        .expect("leader query runtime")
+        .oracle()
+        .bind_topology_probe_for_test(Arc::clone(&probe));
+redacted
+        .await
+        .expect("reader client");
+    let sql = format!(
+        "SELECT value, COUNT(*) AS total FROM vala.bifrost.{table} GROUP BY value ORDER BY total DESC LIMIT 1"
+    );
+    let mut query = tokio::spawn(async move {
+        let mut stream = QueryClient::new(&reader)
+            .query(&BifrostQueryRequest {
+                sql,
+                visibility: VisibilityMode::Fused,
+                freshness: FreshnessPolicy::Strict,
+                deadline_ms: Some(20_000),
+            })
+            .await?;
+        let mut total = None;
+        while let Some(batch) = stream.next_batch().await? {
+            if batch.num_rows() > 0 {
+                total = Some(
+                    batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .ok_or("aggregate column is not Int64")?
+                        .value(0),
+                );
+            }
+        }
+        Ok::<_, JourneyError>((total, stream.terminal().cloned()))
+    });
+    tokio::select! {
+        () = probe.wait_selected() => {}
+        result = &mut query => panic!("query ended before registry-before-dispatch seam: {result:?}"),
+    }
+    let registry = leader
+        .state()
+        .bifrost_query()
+        .expect("leader query runtime")
+        .running_queries();
+    let summaries = registry.list(cluster.data_tenant_id());
+    assert_eq!(
+        summaries.len(),
+        1,
+        "registry insertion must precede dispatch"
+    );
+    let entry = registry
+        .get(cluster.data_tenant_id(), &summaries[0].request_id)
+        .expect("immutable running entry");
+    assert!(entry.participant_cut().oracles().len() >= 2);
+    assert!(entry.participant_cut().scribes().len() >= 2);
+    let cut_fingerprint = entry.participant_cut().fingerprint();
+    assert!(!cut_fingerprint.is_empty());
+    probe.resume();
+    let (total, terminal) = query
+        .await
+        .expect("distributed query joins")
+        .expect("distributed query succeeds");
+    assert_eq!(total, Some(5), "leader final aggregate/order/limit");
+    assert_eq!(
+        terminal.expect("distributed terminal").outcome,
+        QueryTerminalOutcome::Success
+    );
+
+    let after = cluster
+        .servers()
+        .map(|server| {
+            let inspection = server
+                .state()
+                .oracle_peer()
+                .expect("mixed node peer")
+                .oracle()
+                .worker()
+                .physical_inspection();
+            (inspection.node_id, inspection)
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    let oracle_nodes = after
+        .iter()
+        .filter_map(|(node, current)| {
+            (current.oracle_executions > before[node].oracle_executions).then_some(*node)
+        })
+        .collect::<Vec<_>>();
+    let scribe_nodes = after
+        .iter()
+        .filter_map(|(node, current)| {
+            (current.scribe_executions > before[node].scribe_executions).then_some(*node)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(oracle_nodes.len(), 1, "one Oracle subtree owner");
+    assert_eq!(scribe_nodes.len(), 1, "one Scribe subtree owner");
+    assert_ne!(
+        oracle_nodes[0], leader_id,
+        "persisted subtree must be remote"
+    );
+    assert_ne!(scribe_nodes[0], leader_id, "live subtree must be remote");
+    assert_ne!(
+        oracle_nodes[0], scribe_nodes[0],
+        "heterogeneous role targets"
+    );
+    let footer_delta = after
+        .iter()
+        .map(|(node, current)| current.footers_emitted - before[node].footers_emitted)
+        .sum::<u64>();
+    assert_eq!(footer_delta, 2, "each remote subtree emits one footer");
+    assert!(registry.list(cluster.data_tenant_id()).is_empty());
+    let inspection = cluster.oracle_inspection().await.expect("clean settlement");
+    assert_eq!(inspection.active_queries, 0);
+    assert_eq!(inspection.queued_queries, 0);
+    assert_eq!(inspection.reserved_memory_bytes, 0);
+    assert_eq!(inspection.reserved_spill_bytes, 0);
+    assert_eq!(inspection.peer_pending, 0);
+    assert_eq!(inspection.peer_running, 0);
+    cluster
+        .shutdown()
+        .await
+        .expect("distributed cluster shutdown");
+}
+
+/// Proves cancellation at the registry-before-dispatch seam settles every
+/// admitted owner without replaying the immutable physical assignment.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn pg_bifrost_oracle_distributed_recovery_and_settlement_journey() {
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::three_mixed())
+        .await
+        .expect("distributed cancellation cluster");
+    let leader = cluster.server(0).expect("query leader");
+    let writer = cluster.server(2).expect("remote writer");
+    let table = unique_table("oracle_distributed_cancel");
+    register_table(writer, cluster.data_tenant_id(), &table)
+        .await
+        .expect("cancellation table");
+    let writer_client = client(writer, "distributed-cancel-writer")
+        .await
+        .expect("writer client");
+    ingest(&writer_client, &format!("vala.bifrost.{table}"), &[1, 2, 3])
+        .await
+        .expect("cancellation rows");
+    writer.flush_bifrost().await.expect("cancellation flush");
+    cluster
+        .refresh_oracle_snapshots()
+        .await
+        .expect("cancellation membership");
+    let probe = Arc::new(vala_bifrost_redux::oracle::OracleTopologyProbe::default());
+    let runtime = leader
+        .state()
+        .bifrost_query()
+        .expect("leader query runtime");
+    runtime
+        .oracle()
+        .bind_topology_probe_for_test(Arc::clone(&probe));
+    let registry = Arc::clone(runtime.running_queries());
+    let reader = client(leader, "distributed-cancel-reader")
+        .await
+        .expect("reader client");
+    let query = tokio::spawn(async move {
+        QueryClient::new(&reader)
+            .query(&BifrostQueryRequest {
+                sql: format!("SELECT COUNT(*) FROM vala.bifrost.{table}"),
+                visibility: VisibilityMode::PublishedOnly,
+                freshness: FreshnessPolicy::Strict,
+                deadline_ms: Some(20_000),
+            })
+            .await
+    });
+    probe.wait_selected().await;
+    let summaries = registry.list(cluster.data_tenant_id());
+    assert_eq!(summaries.len(), 1, "cancel sees exact admitted owner");
+    let cancellation = registry
+        .cancel(cluster.data_tenant_id(), &summaries[0].request_id)
+        .expect("registry cancellation");
+    assert!(cancellation.cancellation_started);
+    probe.resume();
+    let _ = query.await.expect("cancelled query joins");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !registry.list(cluster.data_tenant_id()).is_empty()
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::task::yield_now().await;
+    }
+    assert!(registry.list(cluster.data_tenant_id()).is_empty());
+    let inspection = cluster.oracle_inspection().await.expect("cancel cleanup");
+    assert_eq!(inspection.active_queries, 0);
+    assert_eq!(inspection.queued_queries, 0);
+    assert_eq!(inspection.reserved_memory_bytes, 0);
+    assert_eq!(inspection.reserved_spill_bytes, 0);
+    assert_eq!(inspection.peer_pending, 0);
+    assert_eq!(inspection.peer_running, 0);
+    cluster
+        .shutdown()
+        .await
+        .expect("cancellation cluster shutdown");
+}
+
 /// Proves public gRPC query frames match the HTTP stream for one seeded table.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
@@ -2216,17 +2454,18 @@ async fn public_grpc_matches_http_frames() {
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn public_grpc_without_oracle_is_unavailable() {
-    let spec = BifrostClusterSpec {
-        nodes: vec![wyrd_testing::bifrost::BifrostNodeSpec {
-            node_id: wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7()),
-            roles: [BifrostRuntimeRole::Scribe, BifrostRuntimeRole::Forge]
-                .into_iter()
-                .collect(),
-            oracle: None,
-            role_timing: None,
-        }],
-        ..BifrostClusterSpec::one_mixed()
-    };
+    let mut spec = BifrostClusterSpec::one_mixed();
+    spec.nodes = vec![wyrd_testing::bifrost::BifrostNodeSpec {
+        node_id: wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7()),
+        roles: [
+            BifrostRuntimeRole::Scribe,
+            BifrostRuntimeRole::ForgeCoordinator,
+        ]
+        .into_iter()
+        .collect(),
+        oracle: None,
+        role_timing: None,
+    }];
     assert!(WyrdTestCluster::start_spec(spec).await.is_err());
 }
 
@@ -2684,13 +2923,6 @@ async fn pg_bifrost_oracle_audit_relay_journey() {
     cluster.shutdown().await.expect("J6 shutdown");
 }
 
-/// J6 proves real-tonic ticket, payload, permission, replay, footer, and cleanup invariants.
-#[tokio::test]
-#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
-async fn pg_bifrost_oracle_peer_security_journey() {
-    crate::oracle_peer::prove_oracle_peer_security_journey().await;
-}
-
 /// J7 proves stale replan, audit refusal, stale fence, SDK terminal rejection, and recovery.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
@@ -2750,8 +2982,6 @@ async fn pg_bifrost_oracle_recovery_terminal_journey() {
         .await
         .expect("remove missing manifest row");
 
-    crate::oracle_peer::prove_oracle_peer_restart_rejects_old_fence_and_releases_reservation()
-        .await;
     prove_sdk_missing_terminal_rejected().await;
     ingest(&client, &format!("vala.bifrost.{table}"), &[7])
         .await
@@ -2850,7 +3080,7 @@ async fn pg_bifrost_oracle_live_topology_replans_through_boot_directory() {
     let selected = probe.selected_worker().expect("remote selected worker");
     let old_peer = cluster
         .server_by_node(selected)
-        .and_then(|server| server.state().oracle_peer.as_ref())
+        .and_then(|server| server.state().oracle_peer())
         .expect("selected peer")
         .clone();
     cluster
@@ -2873,7 +3103,7 @@ async fn pg_bifrost_oracle_live_topology_replans_through_boot_directory() {
     assert_eq!(rows, 64);
     assert_eq!(terminal.outcome, QueryTerminalOutcome::Success);
     assert!(terminal.warnings.contains(&QueryWarning::StaleCutReplanned));
-    assert_eq!(old_peer.worker().pending_reservations(), 0);
+    assert_eq!(old_peer.oracle().worker().pending_reservations(), 0);
     cluster.shutdown().await.expect("topology replan shutdown");
 }
 
@@ -2975,9 +3205,8 @@ async fn pg_bifrost_analytical_query_admits_fragment_on_non_leader_peer() {
         .filter_map(|server| {
             server
                 .state()
-                .oracle_peer
-                .as_ref()
-                .map(|peer| peer.worker().admitted_running_total())
+                .oracle_peer()
+                .map(|peer| peer.oracle().worker().admitted_running_total())
         })
         .sum();
     assert!(
@@ -3648,8 +3877,7 @@ async fn prepare_spill_table(
     let transport = BifrostGrpcTransport::connect(&writer).await?;
     let scribe_baseline = server
         .state()
-        .bifrost_resources
-        .as_ref()
+        .bifrost_resources()
         .ok_or("spill fixture lacks memory governor")?
         .snapshot()?
         .scribe_memory_used_bytes;
@@ -3693,8 +3921,7 @@ fn assert_scribe_fixture_peaks_bounded(
 ) -> Result<(), JourneyError> {
     let governor = server
         .state()
-        .bifrost_resources
-        .as_ref()
+        .bifrost_resources()
         .ok_or("spill fixture lacks memory governor")?;
     let snapshot = governor.snapshot()?;
     let scribe_used = snapshot.scribe_memory_used_bytes;
@@ -3725,8 +3952,7 @@ async fn wait_scribe_memory_restored(
     loop {
         let current = server
             .state()
-            .bifrost_resources
-            .as_ref()
+            .bifrost_resources()
             .ok_or("spill fixture lacks memory governor")?
             .snapshot()?
             .scribe_memory_used_bytes;
@@ -3773,8 +3999,7 @@ fn assert_oracle_runtime_restored(
     }
     let memory = server
         .state()
-        .bifrost_resources
-        .as_ref()
+        .bifrost_resources()
         .ok_or("Oracle server lacks the shared memory governor")?
         .snapshot()?;
     if (managed_memory_used(memory), memory.oracle_memory_used_bytes) != memory_baseline {
@@ -3867,7 +4092,7 @@ async fn register_table(
 ) -> Result<(), JourneyError> {
     server
         .state()
-        .bifrost
+        .bifrost_catalog()
         .create_table(CreateTableRequest {
             table: TableRef::new(BifrostNamespace::Bifrost, table),
             user_fields: vec![
@@ -3889,7 +4114,7 @@ async fn register_paired_table(
 ) -> Result<(), JourneyError> {
     server
         .state()
-        .bifrost
+        .bifrost_catalog()
         .create_table(CreateTableRequest {
             table: TableRef::new(BifrostNamespace::Bifrost, table),
             user_fields: vec![Field::new("row_id", DataType::Int64, false)],

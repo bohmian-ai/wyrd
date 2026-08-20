@@ -34,7 +34,7 @@ pub use app::run_forge_worker_process_for_test;
 pub use app::{BootExit, BoundServer, WyrdServer, run, serve};
 pub use boot::{ServerBootError, StateOverrides, build_state, spawn_storage_sweeper};
 #[cfg(feature = "test-support")]
-pub use config::ForgeProcessRole;
+pub use config::BifrostTarget;
 pub use config::{ServeMode, WyrdServerConfig};
 pub use http::build_router;
 pub use postgres::{ServerPostgres, ServerPostgresError};

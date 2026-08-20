@@ -510,8 +510,7 @@ async fn prepare_oracle_query_fixture(
         .map_err(harness_error)?;
     let ingest = srv
         .state()
-        .bifrost_ingest
-        .as_ref()
+        .bifrost_ingest()
         .ok_or_else(|| harness_error("Scribe runtime is unavailable"))?;
     let stream = ingest
         .scribe()

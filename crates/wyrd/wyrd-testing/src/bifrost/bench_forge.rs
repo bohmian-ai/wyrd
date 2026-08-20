@@ -12,7 +12,7 @@ use vala_bifrost_redux::forge::{
     ForgeWorkerConfig,
 };
 use wyrd_bench::{BifrostLane, BifrostScenario, SloGate};
-use wyrd_server::{ForgeProcessRole, install_capture_runtime, start_capture_forge_role};
+use wyrd_server::{BifrostTarget, install_capture_runtime, start_capture_forge_role};
 use wyrd_telemetry::TelemetryConfig;
 
 use crate::bifrost::{
@@ -202,7 +202,7 @@ impl StandaloneForgeRoles {
             (
                 BTreeMap::from([("all".to_owned(), 1)]),
                 Some(start_capture_forge_role(
-                    ForgeProcessRole::All,
+                    BifrostTarget::All,
                     identities.coordinator,
                 )),
                 None,
@@ -215,7 +215,7 @@ impl StandaloneForgeRoles {
                 ]),
                 None,
                 Some(start_capture_forge_role(
-                    ForgeProcessRole::Server,
+                    BifrostTarget::Server,
                     identities.coordinator,
                 )),
             )
@@ -225,7 +225,7 @@ impl StandaloneForgeRoles {
             .into_iter()
             .map(|node_id| {
                 let guard = (worker_count > 1)
-                    .then(|| start_capture_forge_role(ForgeProcessRole::ForgeWorker, node_id));
+                    .then(|| start_capture_forge_role(BifrostTarget::ForgeWorker, node_id));
                 StandaloneForgeWorkerRole::start(Arc::clone(&forge), node_id, guard)
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -299,7 +299,7 @@ impl StandaloneForgeRoles {
             Arc::clone(&self.forge),
             node_id,
             Some(start_capture_forge_role(
-                ForgeProcessRole::ForgeWorker,
+                BifrostTarget::ForgeWorker,
                 node_id,
             )),
         )?);

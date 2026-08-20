@@ -27,6 +27,8 @@ use datafusion::execution::memory_pool::{
 use num_traits::ToPrimitive;
 use rustix::fs::statvfs;
 use tokio::sync::Notify;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::QueryClass;
 
 /// One mebibyte in bytes.
@@ -1452,6 +1454,7 @@ impl BifrostRuntimeResources {
             Some(ScribeResources {
                 governor: self.governor.clone(),
                 volumes: self.volumes.clone(),
+                follower_permits: Arc::new(Semaphore::new(plan.effective_cpu.max(1))),
             })
         } else {
             None
@@ -1583,9 +1586,59 @@ pub struct ScribeResources {
     governor: BifrostResourceGovernor,
     /// Physical WAL/output-scratch authority registered during live boot.
     volumes: Option<BifrostVolumeGovernor>,
+    /// Existing-role bounded concurrency for request-local live-tail followers.
+    follower_permits: Arc<Semaphore>,
 }
 
 impl ScribeResources {
+    /// Returns the shared process resource-health lifecycle signal.
+    #[must_use]
+    pub fn health(&self) -> BifrostResourceHealth {
+        self.governor.inner.health.clone()
+    }
+    /// Acquires one exact root-accounted quantum for a Scribe-role physical follower.
+    ///
+    /// The returned move-only owner holds both one existing Scribe concurrency
+    /// permit and a charge against the existing Scribe floor and shared elastic
+    /// pool until the follower stream terminates. This adds no governor or root.
+    ///
+    /// # Errors
+    ///
+    /// Returns the existing root refusal when the requested positive quantum
+    /// cannot be admitted without exceeding Scribe plus elastic capacity.
+    pub fn try_acquire_follower(
+        &self,
+        request_id: &RequestId,
+        estimated_bytes: usize,
+    ) -> Result<ScribeFollowerLease, BifrostResourceError> {
+        if estimated_bytes == 0 {
+            return Err(BifrostResourceError::InvalidPlan {
+                detail: "Scribe follower memory must be positive".to_owned(),
+            });
+        }
+        let permit = Arc::clone(&self.follower_permits)
+            .try_acquire_owned()
+            .map_err(|_| BifrostResourceError::Occupied {
+                detail: "Scribe follower concurrency is saturated".to_owned(),
+            })?;
+        let lease = self.governor.try_acquire_scribe_memory(
+            ScribeMemoryRequest {
+                bytes: estimated_bytes,
+                category: crate::scribe::memory::MemoryCategory::Decode,
+                shard: None,
+                generation: None,
+            },
+            None,
+        )?;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(estimated_bytes));
+        Ok(ScribeFollowerLease {
+            request_id: request_id.clone(),
+            _permit: permit,
+            lease,
+            pool,
+        })
+    }
+
     /// Captures the Scribe-compatible projection of authoritative root state.
     pub(crate) fn memory_snapshot(&self) -> crate::scribe::memory::MemorySnapshot {
         let state = self
@@ -1846,6 +1899,11 @@ pub struct OracleResources {
 }
 
 impl OracleResources {
+    /// Returns the shared process resource-health lifecycle signal.
+    #[must_use]
+    pub fn health(&self) -> BifrostResourceHealth {
+        self.governor.inner.health.clone()
+    }
     /// Splits one named child from an already-admitted Oracle query pool.
     ///
     /// # Errors
@@ -1881,7 +1939,8 @@ impl OracleResources {
         let lease = self
             .governor
             .try_acquire_oracle_memory(class.memory_bytes())?;
-        Ok(OracleWorkerResources { lease })
+        let memory_pool = bounded_memory_pool(lease.bytes);
+        Ok(OracleWorkerResources { lease, memory_pool })
     }
 
     /// Returns the fixed-purpose Oracle metadata admission capability.
@@ -1972,6 +2031,11 @@ pub struct ForgeResources {
 }
 
 impl ForgeResources {
+    /// Returns the shared process resource-health lifecycle signal.
+    #[must_use]
+    pub fn health(&self) -> BifrostResourceHealth {
+        self.governor.inner.health.clone()
+    }
     /// Atomically acquires the exact requested rewrite memory and scratch.
     ///
     /// # Errors
@@ -3410,6 +3474,41 @@ impl Drop for ScribeMemoryLease {
 pub struct OracleWorkerResources {
     /// Exact floor-first root-memory ownership for this remote execution.
     lease: OracleMemoryLease,
+    /// Exact bounded DataFusion pool nested under the retained root lease.
+    memory_pool: Arc<dyn MemoryPool>,
+}
+
+/// Move-only root-backed owner for one Scribe physical follower quantum.
+#[derive(Debug)]
+pub struct ScribeFollowerLease {
+    /// Typed request identity binding concurrency and memory ownership.
+    request_id: RequestId,
+    /// Existing Scribe-role bounded concurrency permit.
+    _permit: OwnedSemaphorePermit,
+    /// Existing Scribe memory lease retained until follower stream termination.
+    lease: ScribeMemoryLease,
+    /// Exact bounded DataFusion pool used by the request-local session.
+    pool: Arc<dyn MemoryPool>,
+}
+
+impl ScribeFollowerLease {
+    /// Returns the exact root-accounted bytes available to the request-local pool.
+    #[must_use]
+    pub fn memory_bytes(&self) -> usize {
+        self.lease.bytes
+    }
+
+    /// Returns the typed request identity owning this follower lease.
+    #[must_use]
+    pub fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    /// Returns the exact bounded pool retained by this lease.
+    #[must_use]
+    pub fn memory_pool(&self) -> Arc<dyn MemoryPool> {
+        Arc::clone(&self.pool)
+    }
 }
 
 impl OracleWorkerResources {
@@ -3417,6 +3516,12 @@ impl OracleWorkerResources {
     #[must_use]
     pub fn memory_bytes(&self) -> usize {
         self.lease.bytes
+    }
+
+    /// Returns the exact bounded pool retained by this worker lease.
+    #[must_use]
+    pub fn memory_pool(&self) -> Arc<dyn MemoryPool> {
+        Arc::clone(&self.memory_pool)
     }
 }
 

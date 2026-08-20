@@ -175,6 +175,54 @@ pub(super) struct QueryStreamInput {
     pub(super) scan_stats: OracleQueryScanStats,
     /// Optional Gate lifecycle retained through frame consumption.
     pub(super) gate_lifecycle: Option<Arc<QueryStreamLifecycle>>,
+    /// Exactly-once owner-local registry settlement retained through terminal output.
+    pub(super) running_query: Option<RunningQueryTerminalOwner>,
+}
+
+/// Exactly-once terminal owner for one inserted running-query entry.
+pub(super) struct RunningQueryTerminalOwner {
+    /// Exact process-local registry used by lifecycle controls.
+    registry: Arc<RunningQueryRegistry>,
+    /// Authenticated tenant key.
+    tenant_id: wyrd_spec::DataTenantId,
+    /// Public request identity.
+    request_id: wyrd_spec::request_id::RequestId,
+    /// Whether terminal settlement already removed the entry.
+    settled: bool,
+}
+
+impl RunningQueryTerminalOwner {
+    /// Retains the identity of one entry already inserted before dispatch.
+    #[must_use]
+    pub(super) fn new(
+        registry: Arc<RunningQueryRegistry>,
+        tenant_id: wyrd_spec::DataTenantId,
+        request_id: wyrd_spec::request_id::RequestId,
+    ) -> Self {
+        Self {
+            registry,
+            tenant_id,
+            request_id,
+            settled: false,
+        }
+    }
+
+    /// Removes the active entry with the truthful terminal classification once.
+    fn finish(&mut self, outcome: QueryTerminalOutcome) {
+        if !self.settled {
+            let _ = self
+                .registry
+                .settle_terminal(self.tenant_id, &self.request_id, outcome);
+            self.settled = true;
+        }
+    }
+}
+
+impl Drop for RunningQueryTerminalOwner {
+    /// Settles an abandoned execution as failed without blocking or spawning cleanup.
+    fn drop(&mut self) {
+        self.finish(QueryTerminalOutcome::Failed);
+    }
 }
 
 /// One cancellation-, timeout-, or batch-aware stream step.
@@ -213,6 +261,8 @@ struct FrameBuildInput {
     request_cancellation: CancellationToken,
     /// Cancellation marker shared with telemetry.
     stream_telemetry_cancelled: Arc<std::sync::atomic::AtomicBool>,
+    /// Exactly-once active-registry terminal owner.
+    running_query: Option<RunningQueryTerminalOwner>,
 }
 
 /// Builds the lazy frame stream that owns terminal cleanup state.
@@ -231,6 +281,7 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
         stream_cancellation,
         request_cancellation,
         stream_telemetry_cancelled,
+        mut running_query,
     } = input;
     let frames = async_stream::stream! {
         let mut admitted = Some(admitted);
@@ -297,6 +348,9 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
             visibility,
             row_count,
         );
+        if let Some(owner) = &mut running_query {
+            owner.finish(terminal.outcome);
+        }
         yield Ok(QueryStreamFrame::Terminal(terminal));
     };
     Box::pin(frames)
@@ -556,6 +610,7 @@ impl OracleQueryStream {
                 .start_query(VisibilityMode::PublishedOnly, QueryClass::Interactive),
             scan_stats,
             gate_lifecycle: None,
+            running_query: None,
         })
     }
 
@@ -579,6 +634,7 @@ impl OracleQueryStream {
             mut query_telemetry,
             scan_stats,
             gate_lifecycle,
+            running_query,
         } = input;
         #[cfg(feature = "test-support")]
         let mut admitted = admitted;
@@ -606,6 +662,7 @@ impl OracleQueryStream {
             stream_cancellation,
             request_cancellation,
             stream_telemetry_cancelled,
+            running_query,
         });
         let stream = Self::assemble(
             schema_fingerprint,
@@ -764,6 +821,7 @@ mod tests {
             query_telemetry: telemetry,
             scan_stats: OracleQueryScanStats::default(),
             gate_lifecycle: None,
+            running_query: None,
         });
         let mut terminal_seen = false;
         while let Some(Ok(frame)) = stream.frames.next().await {
@@ -801,6 +859,7 @@ mod tests {
                 .start_query(VisibilityMode::PublishedOnly, QueryClass::Interactive),
             scan_stats: OracleQueryScanStats::default(),
             gate_lifecycle: None,
+            running_query: None,
         });
         assert!(matches!(
             stream.frames.next().await,

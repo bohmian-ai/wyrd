@@ -101,6 +101,26 @@ impl RunningQueryEntry {
         }
     }
 
+    /// Constructs lifecycle facts using the admitted query's exact cancellation token.
+    #[must_use]
+    pub fn with_cancellation(
+        tenant_id: DataTenantId,
+        request_id: RequestId,
+        query_class: QueryClass,
+        started_at: DateTime<Utc>,
+        participant_cut: OracleQueryAttemptCut,
+        cancellation: CancellationToken,
+    ) -> Self {
+        Self {
+            tenant_id,
+            request_id,
+            query_class,
+            started_at,
+            participant_cut: Arc::new(participant_cut),
+            cancellation,
+        }
+    }
+
     /// Returns the tenant that owns this entry.
     #[must_use]
     pub const fn tenant_id(&self) -> DataTenantId {

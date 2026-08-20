@@ -105,12 +105,11 @@ pub async fn stream_query(
     )
     .await?;
     let context = oracle_context(&caller)?;
-    let gate = state
-        .bifrost_gate
-        .as_ref()
-        .cloned()
-        .ok_or(wyrd_spec::vala::error::BifrostError::OracleRoleUnavailable)?;
-    gate.query_sql(context, request).await.map_err(Into::into)
+    state
+        .bifrost
+        .query_sql(context, request)
+        .await
+        .map_err(Into::into)
 }
 
 /// Executes one already-lowered typed plan through retained Oracle and collects
@@ -127,14 +126,11 @@ pub async fn run_typed_query(
     limit: u32,
 ) -> Result<(Vec<RecordBatch>, bool), WyrdError> {
     let context = oracle_context(caller)?;
-    let gate = state
-        .bifrost_gate
-        .as_ref()
-        .ok_or(wyrd_spec::vala::error::BifrostError::OracleRoleUnavailable)?;
     let deadline = Instant::now()
         .checked_add(floor::SYNC_QUERY_TIMEOUT)
         .ok_or(wyrd_spec::vala::error::BifrostError::QueryTimeout)?;
-    let stream = gate
+    let stream = state
+        .bifrost
         .query_plan(
             context,
             plan,

@@ -148,21 +148,25 @@ impl ServeMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 #[clap(rename_all = "kebab-case")]
-pub enum ForgeProcessRole {
+pub enum BifrostTarget {
     /// Serve APIs, schedule Forge work, and run the embedded worker.
     #[default]
     All,
     /// Serve APIs and schedule Forge work without executing tasks.
     Server,
+    /// Serve only Oracle query, lifecycle, and persisted follower capabilities.
+    Oracle,
+    /// Serve only Scribe ingest, tail, and live follower capabilities.
+    Scribe,
     /// Run Forge workers without opening public API listeners.
     ForgeWorker,
 }
 
-impl ForgeProcessRole {
+impl BifrostTarget {
     /// Returns whether this role owns public API listeners.
     #[must_use]
     pub(crate) fn serves_api(self) -> bool {
-        matches!(self, Self::All | Self::Server)
+        matches!(self, Self::All | Self::Server | Self::Oracle | Self::Scribe)
     }
 }
 
@@ -375,10 +379,91 @@ pub struct ScribeRuntimeConfig {
 pub enum BifrostRuntimeRole {
     /// WAL-backed ingest and tail service.
     Scribe,
-    /// Maintenance and sealed-file lifecycle service.
-    Forge,
+    /// Maintenance scheduling and sealed-file coordination service.
+    ForgeCoordinator,
+    /// Bounded maintenance task execution service.
+    ForgeWorker,
     /// Retained query execution and peer service.
     Oracle,
+}
+
+/// Immutable validated Bifrost role set derived from one public process target.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BifrostRoles {
+    /// Closed selected role set.
+    selected: BTreeSet<BifrostRuntimeRole>,
+}
+
+impl BifrostRoles {
+    /// Constructs a validated internal role set for shared composition tests.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub(crate) fn from_selected(selected: impl IntoIterator<Item = BifrostRuntimeRole>) -> Self {
+        Self {
+            selected: selected.into_iter().collect(),
+        }
+    }
+
+    /// Constructs the exact effective roles for one public process target.
+    #[must_use]
+    pub fn for_target(target: BifrostTarget) -> Self {
+        let selected = match target {
+            BifrostTarget::All => [
+                BifrostRuntimeRole::Scribe,
+                BifrostRuntimeRole::ForgeCoordinator,
+                BifrostRuntimeRole::ForgeWorker,
+                BifrostRuntimeRole::Oracle,
+            ]
+            .into_iter()
+            .collect(),
+            BifrostTarget::Server => [
+                BifrostRuntimeRole::Scribe,
+                BifrostRuntimeRole::ForgeCoordinator,
+                BifrostRuntimeRole::Oracle,
+            ]
+            .into_iter()
+            .collect(),
+            BifrostTarget::Oracle => [BifrostRuntimeRole::Oracle].into_iter().collect(),
+            BifrostTarget::Scribe => [BifrostRuntimeRole::Scribe].into_iter().collect(),
+            BifrostTarget::ForgeWorker => [BifrostRuntimeRole::ForgeWorker].into_iter().collect(),
+        };
+        Self { selected }
+    }
+
+    /// Reports whether the exact role is selected.
+    #[must_use]
+    pub fn contains(&self, role: &BifrostRuntimeRole) -> bool {
+        self.selected.contains(role)
+    }
+
+    /// Reports whether this selected graph owns the public Bifrost listener.
+    #[must_use]
+    pub fn serves_api(&self) -> bool {
+        self.contains(&BifrostRuntimeRole::Scribe) || self.contains(&BifrostRuntimeRole::Oracle)
+    }
+
+    /// Returns selected roles in stable order.
+    pub fn iter(&self) -> impl Iterator<Item = &BifrostRuntimeRole> {
+        self.selected.iter()
+    }
+
+    /// Returns the number of selected concrete roles.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.selected.len()
+    }
+
+    /// Reports whether no Bifrost role is selected.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.selected.is_empty()
+    }
+
+    /// Reports whether this target owns the shared public Gate.
+    #[must_use]
+    pub fn serves_gate(&self) -> bool {
+        self.contains(&BifrostRuntimeRole::Scribe) || self.contains(&BifrostRuntimeRole::Oracle)
+    }
 }
 
 /// Oracle execution bounds owned by the server boot configuration.
@@ -1447,9 +1532,9 @@ pub struct WyrdServerConfig {
     /// Active deployment profile.
     #[serde(default)]
     pub deployment_profile: DeploymentProfile,
-    /// Forge maintenance process role derived from `WYRD_ROLES`.
+    /// Closed process target derived from `WYRD_TARGET`.
     #[serde(default)]
-    pub role: ForgeProcessRole,
+    pub role: BifrostTarget,
     /// HTTP server bind configuration.
     #[serde(default)]
     pub http: HttpConfig,
@@ -1497,21 +1582,13 @@ pub struct WyrdServerConfig {
 impl WyrdServerConfig {
     /// Derive internal Bifrost component ownership from the closed public role.
     ///
-    /// `All` and `Server` own Gate, Scribe, Forge scheduling, and Oracle;
+    /// `All` owns every Bifrost role; `Server` owns Scribe, Forge coordination,
+    /// and Oracle; `Oracle` and `Scribe` select only their named role; and
     /// `ForgeWorker` owns only Forge execution. No independent environment or
     /// config field may alter this topology.
     #[must_use]
-    pub fn bifrost_roles(&self) -> BTreeSet<BifrostRuntimeRole> {
-        match self.role {
-            ForgeProcessRole::All | ForgeProcessRole::Server => [
-                BifrostRuntimeRole::Scribe,
-                BifrostRuntimeRole::Forge,
-                BifrostRuntimeRole::Oracle,
-            ]
-            .into_iter()
-            .collect(),
-            ForgeProcessRole::ForgeWorker => [BifrostRuntimeRole::Forge].into_iter().collect(),
-        }
+    pub fn bifrost_roles(&self) -> BifrostRoles {
+        BifrostRoles::for_target(self.role)
     }
 }
 
@@ -1932,16 +2009,24 @@ impl WyrdServerConfig {
                     .to_owned(),
             });
         }
-        if let Some(value) = env_opt("WYRD_ROLES")? {
+        if env_opt("WYRD_ROLES")?.is_some() {
+            return Err(ConfigError::BadEnvVar {
+                key: "WYRD_ROLES".to_owned(),
+                message: "use the single closed WYRD_TARGET process target".to_owned(),
+            });
+        }
+        if let Some(value) = env_opt("WYRD_TARGET")? {
             self.role = match value.as_str() {
-                "all" => ForgeProcessRole::All,
-                "server" => ForgeProcessRole::Server,
-                "forge-worker" => ForgeProcessRole::ForgeWorker,
+                "all" => BifrostTarget::All,
+                "server" => BifrostTarget::Server,
+                "oracle" => BifrostTarget::Oracle,
+                "scribe" => BifrostTarget::Scribe,
+                "forge-worker" => BifrostTarget::ForgeWorker,
                 _ => {
                     return Err(ConfigError::BadEnvVar {
-                        key: "WYRD_ROLES".to_owned(),
+                        key: "WYRD_TARGET".to_owned(),
                         message: format!(
-                            "expected 'all', 'server', or 'forge-worker', got {value:?}"
+                            "expected 'all', 'server', 'oracle', 'scribe', or 'forge-worker', got {value:?}"
                         ),
                     });
                 }
@@ -2761,8 +2846,8 @@ mod tests {
     #[test]
     fn default_config_validates() {
         let mut cfg = WyrdServerConfig::default();
-        assert_eq!(cfg.role, ForgeProcessRole::All);
-        assert_eq!(cfg.bifrost_roles().len(), 3);
+        assert_eq!(cfg.role, BifrostTarget::All);
+        assert_eq!(cfg.bifrost_roles().len(), 4);
         cfg.bifrost.oracle.allow_unapproved_profile = true;
         cfg.validate().expect("default config must be valid");
     }
@@ -2770,16 +2855,18 @@ mod tests {
     /// Proves the closed public role derives the internal Bifrost topology.
     #[test]
     fn public_roles_derive_internal_bifrost_roles() {
-        let mut config = WyrdServerConfig {
-            role: ForgeProcessRole::Server,
-            ..Default::default()
-        };
-        assert_eq!(config.bifrost_roles().len(), 3);
-        config.role = ForgeProcessRole::ForgeWorker;
-        assert_eq!(
-            config.bifrost_roles(),
-            [BifrostRuntimeRole::Forge].into_iter().collect()
-        );
+        let cases = [
+            (BifrostTarget::All, 4, true),
+            (BifrostTarget::Server, 3, true),
+            (BifrostTarget::Oracle, 1, true),
+            (BifrostTarget::Scribe, 1, true),
+            (BifrostTarget::ForgeWorker, 1, false),
+        ];
+        for (target, count, serves_gate) in cases {
+            let roles = BifrostRoles::for_target(target);
+            assert_eq!(roles.len(), count, "{target:?}");
+            assert_eq!(roles.serves_gate(), serves_gate, "{target:?}");
+        }
     }
 
     /// Proves a dedicated Forge worker ignores malformed settings for services
@@ -2788,7 +2875,7 @@ mod tests {
     fn forge_worker_validation_ignores_api_only_settings() {
         let mut config = WyrdServerConfig {
             deployment_profile: DeploymentProfile::Production,
-            role: ForgeProcessRole::ForgeWorker,
+            role: BifrostTarget::ForgeWorker,
             ..WyrdServerConfig::default()
         };
         config.bifrost.scribe.coordination_threads = 0;
@@ -2813,7 +2900,7 @@ mod tests {
     /// Proves API-owning roles reject the same malformed service settings.
     #[test]
     fn api_roles_reject_forge_worker_only_validation_bypass() {
-        for role in [ForgeProcessRole::All, ForgeProcessRole::Server] {
+        for role in [BifrostTarget::All, BifrostTarget::Server] {
             let mut config = WyrdServerConfig {
                 deployment_profile: DeploymentProfile::Production,
                 role,

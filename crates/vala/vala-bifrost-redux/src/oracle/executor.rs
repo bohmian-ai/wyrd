@@ -905,7 +905,7 @@ fn prepare_batch(
 
 /// Stateful footer encoder for one incremental worker attempt.
 #[derive(Debug, Default)]
-struct AttemptEncoder {
+pub struct AttemptEncoder {
     /// Schema emitted exactly once before the first batch.
     schema: Option<SchemaRef>,
     /// Incremental hash over encoded batch payloads in stream order.
@@ -923,7 +923,7 @@ impl AttemptEncoder {
     ///
     /// Returns [`ExecutorError::Decode`] when Arrow IPC encoding or checked
     /// counters fail, and [`ExecutorError::Schema`] if later batches change schema.
-    fn encode(
+    pub fn encode(
         &mut self,
         batch: &RecordBatch,
     ) -> Result<(Option<WorkerAttemptFrame>, WorkerAttemptFrame), ExecutorError> {
@@ -977,6 +977,31 @@ impl AttemptEncoder {
         Ok(WorkerAttemptFrame::Footer(WorkerFooter {
             fragment_id: fragment.fragment_id.clone(),
             manifest_digest,
+            row_count: self.row_count,
+            encoded_bytes: u64::try_from(self.encoded_bytes).map_err(|_| ExecutorError::Decode)?,
+            payload_digest,
+            completed: true,
+        }))
+    }
+
+    /// Finalizes a native physical-plan attempt under its immutable fingerprint.
+    ///
+    /// # Errors
+    /// Returns a closed empty, digest, or checked byte-conversion failure.
+    pub fn finish_physical(
+        self,
+        plan_fingerprint: &str,
+    ) -> Result<WorkerAttemptFrame, ExecutorError> {
+        if self.schema.is_none() {
+            return Err(ExecutorError::Empty);
+        }
+        let digest = QueryAuditDigest::new(plan_fingerprint.to_owned())
+            .map_err(|_| ExecutorError::Digest)?;
+        let payload_digest = QueryAuditDigest::new(hex::encode(self.payload_hash.finalize()))
+            .map_err(|_| ExecutorError::Digest)?;
+        Ok(WorkerAttemptFrame::Footer(WorkerFooter {
+            fragment_id: plan_fingerprint.to_owned(),
+            manifest_digest: digest,
             row_count: self.row_count,
             encoded_bytes: u64::try_from(self.encoded_bytes).map_err(|_| ExecutorError::Decode)?,
             payload_digest,

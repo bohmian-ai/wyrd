@@ -157,8 +157,20 @@ pub(super) struct DrainedTails {
     pub(super) batches: HashMap<String, Vec<RecordBatch>>,
     /// Reservations retained until the final query stream drops.
     pub(super) reservations: Vec<AccountedMemoryReservation>,
+    /// Exact Scribe follower sources replacing leader-local tail materialization.
+    pub(super) follower_sources: Vec<ScribeFollowerSource>,
     /// Whether one requested live source was unavailable.
     pub(super) degraded: bool,
+}
+
+/// One authenticated Scribe source selected from the immutable live-tail cut.
+pub(super) struct ScribeFollowerSource {
+    /// Canonical table receiving this disjoint live source.
+    pub(super) table: String,
+    /// Exact Scribe participant selected by the acquired stream fence.
+    pub(super) node_id: wyrd_spec::vala::api::NodeId,
+    /// Follower assignment consumed by the existing `FetchLiveTailService`.
+    pub(super) assignment: wyrd_spec::vala::api::FollowerScanAssignment,
 }
 
 /// One live-tail interval drained and charged under the parent governor.

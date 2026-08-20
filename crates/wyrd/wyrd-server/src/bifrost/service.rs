@@ -110,7 +110,11 @@ pub async fn register_table(
 
     let fqn = format!("{}.{}", ns.as_str(), body.name);
     let table = TableRef::new(ns, body.name.clone());
-    let catalog = state.bifrost.as_ref();
+    let catalog = state
+        .bifrost
+        .catalog()
+        .ok_or(wyrd_spec::vala::BifrostError::ScribeRoleUnavailable)?
+        .as_ref();
 
     match catalog.describe_table(&table, caller.data_tenant_id).await {
         Ok(existing) => {
@@ -158,6 +162,8 @@ pub async fn list_tables(
     authorize(state, &caller, &Permission::bifrost_table_read())?;
     state
         .bifrost
+        .catalog()
+        .ok_or(wyrd_spec::vala::BifrostError::ScribeRoleUnavailable)?
         .list_tables(caller.data_tenant_id)
         .await
         .map_err(map_engine_error)
@@ -175,6 +181,8 @@ pub async fn describe_table(
     let table = TableRef::new(ns, name);
     state
         .bifrost
+        .catalog()
+        .ok_or(wyrd_spec::vala::BifrostError::ScribeRoleUnavailable)?
         .describe_table(&table, caller.data_tenant_id)
         .await
         .map_err(map_engine_error)

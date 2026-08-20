@@ -50,26 +50,26 @@ pub(crate) fn projected_source_schema_fingerprint(
 
 /// One logical batch crossing the Gate-to-Scribe boundary.
 #[derive(Debug)]
-pub(crate) struct ScribeIngressFrame {
+pub struct ScribeIngressFrame {
     /// The server-verified principal that owns the write.
-    pub(crate) principal: Principal,
+    pub principal: Principal,
     /// Authenticated tenant selected by the transport boundary.
-    pub(crate) authenticated_tenant: wyrd_spec::DataTenantId,
+    pub authenticated_tenant: wyrd_spec::DataTenantId,
     /// Requested logical table, unchanged by physical resolution.
-    pub(crate) table: TableRef,
+    pub table: TableRef,
     /// Engine-only expected fingerprint for already projected fixture rows.
-    pub(crate) expected_schema_fingerprint: Option<SchemaFingerprint>,
+    pub expected_schema_fingerprint: Option<SchemaFingerprint>,
     /// The request correlation identifier.
-    pub(crate) request_id: RequestId,
+    pub request_id: RequestId,
     /// The client idempotency identifier for this batch.
-    pub(crate) batch_id: uuid::Uuid,
+    pub batch_id: uuid::Uuid,
     /// The server-created audit event for this batch.
-    pub(crate) audit_event: AuditEvent,
+    pub audit_event: AuditEvent,
     /// Server-measured bytes after transport decompression.
-    pub(crate) measured_wire_bytes: usize,
+    pub measured_wire_bytes: usize,
     /// Native Arrow IPC, engine-only projected Arrow, or a fixed-capacity
     /// typed OTLP request paired with its move-only transport-decode owner.
-    pub(crate) payload: IngressPayload,
+    pub payload: IngressPayload,
 }
 
 /// In-process projected-frame adapter retained for engine-only tests and
@@ -98,7 +98,7 @@ pub struct ScribeAppend {
 /// Public OTLP adapters transfer typed, fixed-capacity requests and their
 /// decode owners through Gate; they do not project Arrow before Scribe.
 #[derive(Debug)]
-pub(crate) enum IngressPayload {
+pub enum IngressPayload {
     /// One self-contained Arrow IPC stream from the native transport.
     ArrowIpc(Bytes),
     /// Engine-internal preprojected Arrow batches used outside public OTLP
@@ -208,12 +208,12 @@ pub struct FrameAdmission {
     /// Number of rows durably admitted into the active ingest pipeline.
     pub rows_accepted: u64,
     /// OTLP projection result returned to its transport adapter.
-    pub(crate) otlp_outcome: Option<ScribeOtlpOutcome>,
+    pub otlp_outcome: Option<ScribeOtlpOutcome>,
 }
 
 /// Closed OTLP projection outcome returned through the private Scribe seam.
 #[derive(Debug, Clone)]
-pub(crate) enum ScribeOtlpOutcome {
+pub enum ScribeOtlpOutcome {
     /// Trace export counts and partial-success detail.
     Traces(crate::otlp_contract::IngestOutcome),
     /// Metrics export counts and partial-success detail.
@@ -367,15 +367,15 @@ impl From<vala_sql::SqlError> for ScribeError {
     }
 }
 
-/// Crate-private Scribe trait — the durable Gate write boundary.
+/// Durable transport-neutral Scribe write boundary.
 ///
 /// `FrameAdmission` is the durable Scribe acknowledgment. It is returned only
 /// after WAL append, grouped `sync_data`, and active memtable insertion. Its
-/// private visibility keeps the owned logical frame inside Redux. Decode
-/// reservation and readiness are synchronous; ingest performs asynchronous
-/// durability work.
+/// Decode reservation and readiness are synchronous; ingest performs
+/// asynchronous durability work. The server composition facade is the only
+/// external producer of owned logical frames.
 #[async_trait]
-pub(crate) trait Scribe: Send + Sync {
+pub trait Scribe: Send + Sync {
     /// Acquires exact root-backed capacity before an OTLP adapter decodes.
     ///
     /// # Errors

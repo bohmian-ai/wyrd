@@ -28,7 +28,7 @@ use wyrd_tonic::tonic::{Request, Response, Status};
 use crate::otlp_decode::{decode_trace_protobuf, preflight_trace_protobuf};
 use crate::otlp_logs_decode::{decode_logs_protobuf, preflight_logs_protobuf};
 use crate::otlp_metrics_decode::{decode_metrics_protobuf, preflight_metrics_protobuf};
-use crate::state::ServerGate;
+use crate::state::Bifrost;
 
 /// Canonical OTLP trace export route retained from the generated service.
 const TRACE_EXPORT_PATH: &str = "/opentelemetry.proto.collector.trace.v1.TraceService/Export";
@@ -63,9 +63,9 @@ struct ScribeOtlpDecodingLimit {
 
 impl ScribeOtlpDecodingLimit {
     /// Captures the immutable Gate allowance during service construction.
-    fn from_gate(gate: &ServerGate) -> Self {
+    fn from_gate(gate: &Bifrost) -> Self {
         Self {
-            bytes: gate.otlp_decoding_message_size(),
+            bytes: gate.gate().otlp_decoding_message_size(),
         }
     }
 
@@ -130,14 +130,14 @@ fn record_codec_activity(stage: &str) {
 #[derive(Clone)]
 pub(super) struct TraceOtlpGrpcService {
     /// Gate retains authentication and routing authority after adapter decode.
-    gate: Arc<ServerGate>,
+    gate: Arc<Bifrost>,
     /// Boot-frozen decode allowance owned only by Scribe OTLP services.
     decoding_limit: ScribeOtlpDecodingLimit,
 }
 
 impl TraceOtlpGrpcService {
     /// Couples the trace adapter to the process Gate selected during boot.
-    pub(super) fn new(gate: Arc<ServerGate>) -> Self {
+    pub(super) fn new(gate: Arc<Bifrost>) -> Self {
         let decoding_limit = ScribeOtlpDecodingLimit::from_gate(&gate);
         Self {
             gate,
@@ -179,7 +179,7 @@ where
         let maximum_message_size = self.decoding_limit.for_service(ScribeOtlpService::Traces);
         Box::pin(async move {
             let metadata = MetadataMap::from_headers(request.headers().clone());
-            let auth = match gate.authenticate_otlp_metadata(&metadata).await {
+            let auth = match gate.gate().authenticate_ingest(&metadata).await {
                 Ok(auth) => auth,
                 Err(error) => return Ok(Status::from(error).into_http()),
             };
@@ -200,7 +200,7 @@ where
 /// Unary trace handler that preserves Gate authentication and response semantics.
 struct TraceExportUnary {
     /// Gate selected during server boot.
-    gate: Arc<ServerGate>,
+    gate: Arc<Bifrost>,
     /// Call-scoped authentication consumed exactly once before routing.
     auth: Option<vala_bifrost_redux::gate::AuthContext>,
 }
@@ -230,7 +230,7 @@ impl UnaryService<DecodedOtlp<ExportTraceServiceRequest>> for TraceExportUnary {
 /// Tonic codec whose decoder owns trace preflight and root-backed decode reservation.
 struct TraceOtlpCodec {
     /// Gate used only to acquire the Scribe transport-decode child.
-    gate: Arc<ServerGate>,
+    gate: Arc<Bifrost>,
 }
 
 impl Codec for TraceOtlpCodec {
@@ -288,7 +288,7 @@ where
 /// Trace protobuf decoder that acquires capacity after wire preflight.
 struct TraceRequestDecoder {
     /// Gate used to acquire exactly the preflighted decode capacity.
-    gate: Arc<ServerGate>,
+    gate: Arc<Bifrost>,
 }
 
 impl Decoder for TraceRequestDecoder {
@@ -314,8 +314,8 @@ impl Decoder for TraceRequestDecoder {
             ));
         }
         record_codec_activity("preflight");
-        let plan =
-            preflight_trace_protobuf(bytes, self.gate.otlp_wire_limits()).map_err(Status::from)?;
+        let plan = preflight_trace_protobuf(bytes, self.gate.gate().otlp_wire_limits())
+            .map_err(Status::from)?;
         record_codec_activity("reserve");
         let owner = self
             .gate
@@ -332,14 +332,14 @@ impl Decoder for TraceRequestDecoder {
 #[derive(Clone)]
 pub(super) struct MetricsOtlpGrpcService {
     /// Gate retains authentication and routing authority after adapter decode.
-    gate: Arc<ServerGate>,
+    gate: Arc<Bifrost>,
     /// Boot-frozen decode allowance owned only by Scribe OTLP services.
     decoding_limit: ScribeOtlpDecodingLimit,
 }
 
 impl MetricsOtlpGrpcService {
     /// Couples the metrics adapter to the process Gate selected during boot.
-    pub(super) fn new(gate: Arc<ServerGate>) -> Self {
+    pub(super) fn new(gate: Arc<Bifrost>) -> Self {
         let decoding_limit = ScribeOtlpDecodingLimit::from_gate(&gate);
         Self {
             gate,
@@ -381,7 +381,7 @@ where
         let maximum_message_size = self.decoding_limit.for_service(ScribeOtlpService::Metrics);
         Box::pin(async move {
             let metadata = MetadataMap::from_headers(request.headers().clone());
-            let auth = match gate.authenticate_otlp_metadata(&metadata).await {
+            let auth = match gate.gate().authenticate_ingest(&metadata).await {
                 Ok(auth) => auth,
                 Err(error) => return Ok(Status::from(error).into_http()),
             };
@@ -405,7 +405,7 @@ where
 /// Unary metrics handler preserving authentication and partial-success behavior.
 struct MetricsExportUnary {
     /// Gate selected during server boot.
-    gate: Arc<ServerGate>,
+    gate: Arc<Bifrost>,
     /// Call-scoped authentication consumed exactly once before routing.
     auth: Option<vala_bifrost_redux::gate::AuthContext>,
 }
@@ -435,7 +435,7 @@ impl UnaryService<DecodedOtlp<ExportMetricsServiceRequest>> for MetricsExportUna
 /// Metrics codec coupling the bounded request decoder to the standard response encoder.
 struct MetricsOtlpCodec {
     /// Gate used to acquire the Scribe transport-decode child.
-    gate: Arc<ServerGate>,
+    gate: Arc<Bifrost>,
 }
 
 impl Codec for MetricsOtlpCodec {
@@ -460,7 +460,7 @@ impl Codec for MetricsOtlpCodec {
 /// Metrics protobuf decoder that preflights before acquiring typed capacity.
 struct MetricsRequestDecoder {
     /// Gate used solely for limits and transport-decode ownership.
-    gate: Arc<ServerGate>,
+    gate: Arc<Bifrost>,
 }
 
 impl Decoder for MetricsRequestDecoder {
@@ -483,7 +483,7 @@ impl Decoder for MetricsRequestDecoder {
             ));
         }
         record_codec_activity("preflight");
-        let plan = preflight_metrics_protobuf(bytes, self.gate.otlp_wire_limits())
+        let plan = preflight_metrics_protobuf(bytes, self.gate.gate().otlp_wire_limits())
             .map_err(Status::from)?;
         record_codec_activity("reserve");
         let owner = self
@@ -501,14 +501,14 @@ impl Decoder for MetricsRequestDecoder {
 #[derive(Clone)]
 pub(super) struct LogsOtlpGrpcService {
     /// Gate retains authentication and routing authority after adapter decode.
-    gate: Arc<ServerGate>,
+    gate: Arc<Bifrost>,
     /// Boot-frozen decode allowance owned only by Scribe OTLP services.
     decoding_limit: ScribeOtlpDecodingLimit,
 }
 
 impl LogsOtlpGrpcService {
     /// Couples the logs adapter to the process Gate selected during boot.
-    pub(super) fn new(gate: Arc<ServerGate>) -> Self {
+    pub(super) fn new(gate: Arc<Bifrost>) -> Self {
         let decoding_limit = ScribeOtlpDecodingLimit::from_gate(&gate);
         Self {
             gate,
@@ -550,7 +550,7 @@ where
         let maximum_message_size = self.decoding_limit.for_service(ScribeOtlpService::Logs);
         Box::pin(async move {
             let metadata = MetadataMap::from_headers(request.headers().clone());
-            let auth = match gate.authenticate_otlp_metadata(&metadata).await {
+            let auth = match gate.gate().authenticate_ingest(&metadata).await {
                 Ok(auth) => auth,
                 Err(error) => return Ok(Status::from(error).into_http()),
             };
@@ -574,7 +574,7 @@ where
 /// Unary logs handler preserving authentication and partial-success behavior.
 struct LogsExportUnary {
     /// Gate selected during server boot.
-    gate: Arc<ServerGate>,
+    gate: Arc<Bifrost>,
     /// Call-scoped authentication consumed exactly once before routing.
     auth: Option<vala_bifrost_redux::gate::AuthContext>,
 }
@@ -604,7 +604,7 @@ impl UnaryService<DecodedOtlp<ExportLogsServiceRequest>> for LogsExportUnary {
 /// Logs codec coupling the bounded request decoder to the standard response encoder.
 struct LogsOtlpCodec {
     /// Gate used to acquire the Scribe transport-decode child.
-    gate: Arc<ServerGate>,
+    gate: Arc<Bifrost>,
 }
 
 impl Codec for LogsOtlpCodec {
@@ -629,7 +629,7 @@ impl Codec for LogsOtlpCodec {
 /// Logs protobuf decoder that preflights before acquiring typed capacity.
 struct LogsRequestDecoder {
     /// Gate used solely for limits and transport-decode ownership.
-    gate: Arc<ServerGate>,
+    gate: Arc<Bifrost>,
 }
 
 impl Decoder for LogsRequestDecoder {
@@ -652,8 +652,8 @@ impl Decoder for LogsRequestDecoder {
             ));
         }
         record_codec_activity("preflight");
-        let plan =
-            preflight_logs_protobuf(bytes, self.gate.otlp_wire_limits()).map_err(Status::from)?;
+        let plan = preflight_logs_protobuf(bytes, self.gate.gate().otlp_wire_limits())
+            .map_err(Status::from)?;
         record_codec_activity("reserve");
         let owner = self
             .gate

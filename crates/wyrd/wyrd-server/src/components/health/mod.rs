@@ -143,9 +143,7 @@ async fn compute_snapshot(state: &AppState, probe_timeout: Duration) -> Readines
 
 /// Reads retained Oracle readiness without executing a query or touching storage.
 fn probe_oracle(state: &AppState) -> ProbeOutcome {
-    let selected = state
-        .bifrost_roles
-        .contains(&crate::config::BifrostRuntimeRole::Oracle);
+    let selected = state.bifrost.oracle().is_some();
     let outcome = match state.bifrost_query() {
         Some(runtime) if runtime.is_ready() => ProbeOutcome {
             ok: true,
@@ -178,10 +176,8 @@ fn probe_oracle(state: &AppState) -> ProbeOutcome {
 
 /// Read the Scribe recovery bit without touching its queues or storage.
 fn probe_scribe(state: &AppState) -> ProbeOutcome {
-    let selected = state
-        .bifrost_roles
-        .contains(&crate::config::BifrostRuntimeRole::Scribe);
-    let outcome = match &state.bifrost_ingest {
+    let selected = state.bifrost.scribe().is_some();
+    let outcome = match state.bifrost_ingest() {
         Some(runtime) if runtime.is_ready() => ProbeOutcome {
             ok: true,
             reason: ProbeReason::Ok,

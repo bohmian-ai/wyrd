@@ -11,7 +11,10 @@ use sha2::{Digest as _, Sha256};
 use vala_sql::ValaPostgres;
 use vala_sql::queries::file_list::HotFileCatalog;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::{AuditEvent, BifrostTableDescription, BifrostTableEntry};
+use wyrd_spec::vala::api::{
+    AuditEvent, BifrostTableDescription, BifrostTableEntry, PersistedWalRange,
+    persisted_wal_ranges_are_valid,
+};
 use wyrd_storage::settings::BackendConfig;
 
 use crate::catalog::error::BifrostCatalogError;
@@ -131,6 +134,85 @@ pub struct PinnedSealedTable {
     pub hot_manifest_digest: String,
     /// Bounded sealed-byte estimate used by Oracle classification.
     pub estimated_bytes: u64,
+}
+
+impl PinnedSealedTable {
+    /// Projects complete writer-v2 generations into canonical persisted WAL ranges.
+    ///
+    /// # Errors
+    ///
+    /// Returns a metadata mismatch when a generation has missing ordinals,
+    /// incompatible bounds, overlapping WAL ownership, or straddles the cursor.
+    pub fn persisted_wal_ranges(
+        &self,
+        persisted_cursor: u64,
+    ) -> Result<Vec<PersistedWalRange>, BifrostCatalogError> {
+        project_persisted_wal_ranges(&self.sealed_manifest, persisted_cursor)
+    }
+}
+
+/// Projects a sealed manifest into one inclusive WAL range per complete generation.
+///
+/// # Errors
+///
+/// Returns a metadata mismatch for invalid bounds, incomplete ordinals,
+/// overlapping generations, or cursor straddling.
+pub fn project_persisted_wal_ranges(
+    rows: &[vala_sql::row_types::file_list::HotFileRow],
+    persisted_cursor: u64,
+) -> Result<Vec<PersistedWalRange>, BifrostCatalogError> {
+    let mut generations: BTreeMap<(uuid::Uuid, i64, i64, i64), BTreeSet<i16>> = BTreeMap::new();
+    for row in rows {
+        if row.writer_epoch < 0
+            || row.wal_lsn_min < 0
+            || row.wal_lsn_max < row.wal_lsn_min
+            || row.file_ordinal < 0
+        {
+            return Err(BifrostCatalogError::MetadataMismatch(
+                "writer-v2 generation contains invalid bounds or ordinal".to_owned(),
+            ));
+        }
+        let ordinals = generations
+            .entry((
+                row.node_id,
+                row.writer_epoch,
+                row.wal_lsn_min,
+                row.wal_lsn_max,
+            ))
+            .or_default();
+        if !ordinals.insert(row.file_ordinal) {
+            return Err(BifrostCatalogError::MetadataMismatch(
+                "writer-v2 generation contains a duplicate ordinal".to_owned(),
+            ));
+        }
+    }
+    let mut ranges = Vec::with_capacity(generations.len());
+    for ((_, _, start, end), ordinals) in generations {
+        if ordinals
+            .iter()
+            .copied()
+            .enumerate()
+            .any(|(expected, actual)| usize::try_from(actual) != Ok(expected))
+        {
+            return Err(BifrostCatalogError::MetadataMismatch(
+                "writer-v2 generation ordinals are not contiguous".to_owned(),
+            ));
+        }
+        let start_lsn = u64::try_from(start).map_err(|_| {
+            BifrostCatalogError::MetadataMismatch("persisted WAL lower bound is invalid".to_owned())
+        })?;
+        let end_lsn = u64::try_from(end).map_err(|_| {
+            BifrostCatalogError::MetadataMismatch("persisted WAL upper bound is invalid".to_owned())
+        })?;
+        ranges.push(PersistedWalRange { start_lsn, end_lsn });
+    }
+    ranges.sort_unstable_by_key(|range| (range.start_lsn, range.end_lsn));
+    if !persisted_wal_ranges_are_valid(persisted_cursor, &ranges) {
+        return Err(BifrostCatalogError::MetadataMismatch(
+            "persisted WAL ranges violate cursor, order, overlap, or signed bounds".to_owned(),
+        ));
+    }
+    Ok(ranges)
 }
 
 /// Immutable file metadata retained from one pinned Iceberg manifest entry.

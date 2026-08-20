@@ -68,8 +68,8 @@ service OraclePeerService {
   rpc ExecuteFragment(ExecuteFragmentRequest) returns (stream WorkerAttemptFrame);
 }
 service OracleLifecycleService {
-  rpc AdmitLifecycle(AdmitOracleLifecycleRequest) returns (AdmitOracleLifecycleResponse);
-  rpc ReportFollowerLifecycle(ReportOracleFollowerLifecycleRequest) returns (ReportOracleFollowerLifecycleResponse);
+  rpc ListLifecycles(ListOracleLifecyclesRequest) returns (ListOracleLifecyclesResponse);
+  rpc GetLifecycle(GetOracleLifecycleRequest) returns (GetOracleLifecycleResponse);
   rpc CancelLifecycle(CancelOracleLifecycleRequest) returns (CancelOracleLifecycleResponse);
 }
 message TenantTableBinding { string tenant_id = 1; string namespace = 2; string table = 3; }
@@ -98,19 +98,12 @@ message ListActiveStreamsResponse { repeated ActiveTailStream streams = 1; }
 enum QueryClass { QUERY_CLASS_UNSPECIFIED = 0; QUERY_CLASS_INTERACTIVE = 1; QUERY_CLASS_ANALYTICAL = 2; }
 enum ClusterRole { CLUSTER_ROLE_UNSPECIFIED = 0; CLUSTER_ROLE_SCRIBE = 1; CLUSTER_ROLE_ORACLE = 2; }
 message OracleRoleFence { string node_id = 1; ClusterRole role = 2; uint64 fencing_token = 3; }
-message AdmitOracleLifecycleRequest {
-  string tenant_id = 1; string request_id = 2; bytes query_id = 3; QueryClass query_class = 4;
-  uint64 deadline_unix_ms = 5; string cut_fingerprint = 6; OracleRoleFence leader = 7;
-  repeated OracleRoleFence participants = 8;
-}
-message AdmitOracleLifecycleResponse { bool accepted = 1; }
-message ReportOracleFollowerLifecycleRequest {
-  string tenant_id = 1; string request_id = 2; bytes query_id = 3; string cut_fingerprint = 4;
-  OracleRoleFence follower = 5; QueryTerminalOutcome outcome = 6;
-}
-message ReportOracleFollowerLifecycleResponse { uint32 completed_participants = 1; }
-message CancelOracleLifecycleRequest { string tenant_id = 1; string request_id = 2; bytes query_id = 3; string cut_fingerprint = 4; }
-message CancelOracleLifecycleResponse { bool cancellation_started = 1; }
+message ListOracleLifecyclesRequest { string tenant_id = 1; string request_id = 2; }
+message ListOracleLifecyclesResponse { repeated RunningQuerySummary queries = 1; }
+message GetOracleLifecycleRequest { string tenant_id = 1; string request_id = 2; }
+message GetOracleLifecycleResponse { RunningQuerySummary query = 1; }
+message CancelOracleLifecycleRequest { string tenant_id = 1; string request_id = 2; }
+message CancelOracleLifecycleResponse { string request_id = 1; bool cancellation_started = 2; }
 message ReserveNodeSlotsRequest {
   bytes query_id = 1; string leader_node_id = 2; uint64 leader_fencing_token = 3;
   QueryClass query_class = 4; uint32 slot_units = 5; uint64 expires_at_unix_ms = 6;
@@ -121,6 +114,19 @@ message ReservationRejected { uint32 retry_after_ms = 1; }
 message ReleaseNodeSlotsRequest { bytes reservation_id = 1; bytes query_id = 2; string leader_node_id = 3; uint64 leader_fencing_token = 4; }
 message ReleaseNodeSlotsResponse {}
 message SignedPeerTicket { string key_id = 1; bytes claims_bytes = 2; bytes signature = 3; }
+message PersistedFileAssignment { repeated string files = 1; }
+message PersistedWalRange { optional uint64 start_lsn = 1; optional uint64 end_lsn = 2; }
+message ScribeProviderCut {
+  uint64 writer_epoch = 1; string start_event_day = 2; string end_event_day = 3;
+  repeated string required_columns = 4; uint64 persisted_cursor = 5;
+  repeated PersistedWalRange persisted_ranges = 6; uint32 maximum_batch_count = 7;
+  uint64 maximum_retained_bytes = 8;
+}
+message FollowerScanAssignment {
+  string scan_id = 1; TenantTableBinding binding = 2;
+  PersistedFileAssignment persisted = 3; ScribeProviderCut scribe_provider_cut = 4;
+  string schema_fingerprint = 5;
+}
 message ExecuteFragmentRequest { SignedPeerTicket ticket = 1; bytes fragment_bytes = 2; bytes reservation_id = 3; }
 message WorkerAttemptFrame { oneof frame { bytes arrow_ipc_schema = 1; bytes arrow_ipc_batch = 2; WorkerFooter footer = 3; } }
 message WorkerFooter {

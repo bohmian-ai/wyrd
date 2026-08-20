@@ -1111,60 +1111,30 @@ pub struct OracleRoleFence {
     pub fencing_token: FencingToken,
 }
 
-/// Private admission facts for one request-ID-keyed Oracle lifecycle.
+/// Private owner-local lifecycle lookup scoped by authenticated tenant and request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct AdmitOracleLifecycleRequest {
+pub struct OracleLifecycleLookupRequest {
     /// Authenticated tenant that owns the request.
     pub tenant_id: DataTenantId,
     /// Public request identity used for all lifecycle controls.
     pub request_id: RequestId,
-    /// Internal attempt identity bound to the immutable cut.
-    pub query_id: QueryId,
-    /// Server-derived execution class.
-    pub query_class: QueryClass,
-    /// Absolute execution deadline.
-    pub deadline: DateTime<Utc>,
-    /// SHA-256 fingerprint of the exact immutable participant cut.
-    pub cut_fingerprint: String,
-    /// Request-local leader's exact role fence.
-    pub leader: OracleRoleFence,
-    /// Every role fence frozen into the participant cut.
-    pub participants: Vec<OracleRoleFence>,
 }
 
-/// Private response to lifecycle admission before distributed execution begins.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct AdmitOracleLifecycleResponse {
-    /// Whether the private owner accepted the exact participant cut.
-    pub accepted: bool,
-}
-
-/// Private follower report tied to an admitted lifecycle's cut and role fence.
+/// Private owner-local listing for one tenant/request lookup.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct ReportOracleFollowerLifecycleRequest {
-    /// Authenticated tenant that owns the request.
-    pub tenant_id: DataTenantId,
-    /// Public request identity used for all lifecycle controls.
-    pub request_id: RequestId,
-    /// Internal attempt identity bound to the immutable cut.
-    pub query_id: QueryId,
-    /// SHA-256 fingerprint of the immutable participant cut.
-    pub cut_fingerprint: String,
-    /// Exact follower role fence making the report.
-    pub follower: OracleRoleFence,
-    /// Follower's terminal execution classification.
-    pub outcome: QueryTerminalOutcome,
+pub struct ListOracleLifecyclesResponse {
+    /// Matching owner-local query summaries.
+    pub queries: Vec<RunningQuerySummary>,
 }
 
-/// Private acknowledgement of one follower lifecycle report.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+/// Private owner-local get result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct ReportOracleFollowerLifecycleResponse {
-    /// Number of participant reports accepted for the immutable cut.
-    pub completed_participants: u32,
+pub struct GetOracleLifecycleResponse {
+    /// Matching owner-local query summary.
+    pub query: RunningQuerySummary,
 }
 
 /// Private cancellation signal tied to one tenant-qualified request identity.
@@ -1175,16 +1145,14 @@ pub struct CancelOracleLifecycleRequest {
     pub tenant_id: DataTenantId,
     /// Public request identity selected for cancellation.
     pub request_id: RequestId,
-    /// Internal attempt identity bound to the immutable cut.
-    pub query_id: QueryId,
-    /// SHA-256 fingerprint of the immutable participant cut.
-    pub cut_fingerprint: String,
 }
 
 /// Private acknowledgement of a lifecycle cancellation signal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct CancelOracleLifecycleResponse {
+    /// Public request identity selected for cancellation.
+    pub request_id: RequestId,
     /// Whether cancellation was newly requested by this message.
     pub cancellation_started: bool,
 }
@@ -2289,6 +2257,96 @@ pub struct SignedPeerTicket {
     pub signature: Vec<u8>,
 }
 
+/// Explicit persisted-file assignment for one physical-plan scan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct PersistedFileAssignment {
+    /// Catalog-pinned object locations assigned to this follower.
+    pub files: Vec<String>,
+}
+
+/// Inclusive persisted WAL interval excluded from a Scribe memory provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct PersistedWalRange {
+    /// First persisted Redux WAL LSN in the interval.
+    pub start_lsn: u64,
+    /// Last persisted Redux WAL LSN in the interval.
+    pub end_lsn: u64,
+}
+
+/// Immutable Scribe memory-provider cut carried by the private follower wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ScribeProviderCut {
+    /// Exact writer epoch selected from the signed participant incarnation.
+    pub writer_epoch: u64,
+    /// Inclusive first event day in the provider projection.
+    pub start_event_day: String,
+    /// Inclusive final event day in the provider projection.
+    pub end_event_day: String,
+    /// Required columns in stable projection order.
+    pub required_columns: Vec<String>,
+    /// Highest persisted stream cursor visible to this cut.
+    pub persisted_cursor: u64,
+    /// Ordered, disjoint persisted WAL intervals excluded from memory.
+    pub persisted_ranges: Vec<PersistedWalRange>,
+    /// Maximum Arrow batches retained by the provider.
+    pub maximum_batch_count: u32,
+    /// Maximum bytes retained by the provider.
+    pub maximum_retained_bytes: u64,
+}
+
+impl ScribeProviderCut {
+    /// Validates the canonical ordered inclusive persisted-WAL cut.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.writer_epoch > 0
+            && !self.start_event_day.is_empty()
+            && self.start_event_day <= self.end_event_day
+            && !self.required_columns.is_empty()
+            && self.maximum_batch_count > 0
+            && self.maximum_retained_bytes > 0
+            && persisted_wal_ranges_are_valid(self.persisted_cursor, &self.persisted_ranges)
+    }
+}
+
+/// Validates one canonical persisted cursor and its ordered inclusive WAL ranges.
+///
+/// Endpoints must fit the durable signed domain, every range must be forward,
+/// and consecutive ranges must be strictly disjoint. A range may lie wholly on
+/// either side of the cursor, but may not contain values on both sides; a range
+/// ending exactly at the cursor is therefore valid.
+#[must_use]
+pub fn persisted_wal_ranges_are_valid(persisted_cursor: u64, ranges: &[PersistedWalRange]) -> bool {
+    persisted_cursor <= i64::MAX as u64
+        && ranges.iter().all(|range| {
+            range.start_lsn <= i64::MAX as u64
+                && range.end_lsn <= i64::MAX as u64
+                && range.start_lsn <= range.end_lsn
+                && !(range.start_lsn <= persisted_cursor && persisted_cursor < range.end_lsn)
+        })
+        && ranges
+            .windows(2)
+            .all(|pair| pair[0].end_lsn < pair[1].start_lsn)
+}
+
+/// One scan-keyed role-local follower assignment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct FollowerScanAssignment {
+    /// Stable identifier encoded in the physical extension node.
+    pub scan_id: String,
+    /// Authenticated tenant/table binding for this scan.
+    pub binding: TenantTableBinding,
+    /// Required wrapper preserving explicit-empty persisted semantics.
+    pub persisted: PersistedFileAssignment,
+    /// Scribe memory-provider cut, present only for a Scribe target.
+    pub scribe_provider_cut: Option<ScribeProviderCut>,
+    /// Schema fingerprint bound to the encoded placeholder.
+    pub schema_fingerprint: String,
+}
+
 /// Ticket-bound worker fragment execution request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
@@ -2299,6 +2357,26 @@ pub struct ExecuteFragmentRequest {
     pub fragment_bytes: Vec<u8>,
     /// Pending reservation identity.
     pub reservation_id: ReservationId,
+}
+
+/// Independent physical-plan request foundation for a later atomic wire cutover.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct PhysicalExecuteFragmentRequest {
+    /// Opaque signed ticket.
+    pub ticket: SignedPeerTicket,
+    /// Runtime-bounded physical-plan bytes.
+    pub physical_plan_bytes: Vec<u8>,
+    /// Pending reservation identity.
+    pub reservation_id: ReservationId,
+    /// Signed request-local leader incarnation.
+    pub leader_fence: OracleRoleFence,
+    /// Signed target follower incarnation.
+    pub target_fence: OracleRoleFence,
+    /// Complete scan-keyed role-local assignment set.
+    pub assignments: Vec<FollowerScanAssignment>,
+    /// Fingerprint shared by every follower in this attempt.
+    pub plan_fingerprint: String,
 }
 
 /// Verified worker footer for one completed attempt.

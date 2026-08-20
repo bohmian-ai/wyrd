@@ -6,16 +6,21 @@ mod pg_tests {
     use secrecy::ExposeSecret;
     use sqlx::types::Uuid;
     use std::sync::Arc;
+    use vala_bifrost_redux::catalog::project_persisted_wal_ranges;
     use vala_bifrost_redux::catalog::tenant_table::TenantTableBindingError;
     use vala_bifrost_redux::catalog::{BifrostCatalog, BifrostCatalogError, CreateTableRequest};
     use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
+    #[cfg(feature = "test-support")]
     use vala_bifrost_redux::cluster::ClusterRegistry;
     use vala_bifrost_redux::namespaces::BifrostNamespace;
     use vala_bifrost_redux::scribe::ScribeImpl;
     use vala_bifrost_redux::scribe::file_list_writer::{
-        FileListArtifactInsert, FileListInsert, FileListInsertOutcome, PublicationFenceBarrier,
-        insert_and_audit, insert_and_audit_fenced, insert_and_audit_fenced_with_barrier,
-        insert_artifact_set_and_audit,
+        FileListArtifactInsert, FileListInsert, FileListInsertOutcome, insert_and_audit,
+        insert_and_audit_fenced, insert_artifact_set_and_audit,
+    };
+    #[cfg(feature = "test-support")]
+    use vala_bifrost_redux::scribe::file_list_writer::{
+        PublicationFenceBarrier, insert_and_audit_fenced_with_barrier,
     };
     use vala_bifrost_redux::scribe::seal_key::{EventDay, SealKey};
     use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
@@ -26,6 +31,7 @@ mod pg_tests {
     use wyrd_spec::auth::PrincipalKindTag;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
+    #[cfg(feature = "test-support")]
     use wyrd_spec::vala::api::{NodeId as ClusterNodeId, ScribeCapabilitiesV1};
     use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
 
@@ -837,7 +843,14 @@ mod pg_tests {
     }
 
     /// Fence advancement serializes behind an in-flight atomic publication lock.
+    ///
+    /// # Panics
+    ///
+    /// Panics if fixture setup, binding, registration, publication, fence
+    /// replacement, or durable-state inspection fails, or if the resulting file,
+    /// audit, and fencing state is not atomic.
     #[tokio::test]
+    #[cfg(feature = "test-support")]
     async fn concurrent_fence_advance_never_splits_file_list_and_audit() {
         let (fixture, tenant, _) = setup().await;
         let binding = TenantTableBinding::resolve((tenant, logical_table())).expect("binding");
@@ -955,6 +968,56 @@ mod pg_tests {
                 .is_err(),
             "publication must reject a missing ordinal zero before mutation"
         );
+    }
+
+    /// A complete multi-artifact writer generation projects to one range regardless of row order.
+    #[tokio::test]
+    /// # Panics
+    /// Panics if fixture setup, writer-v2 persistence, or range projection fails.
+    async fn writer_v2_multi_artifact_generation_projects_one_order_independent_range() {
+        let (fixture, tenant, _) = setup().await;
+        let binding = TenantTableBinding::resolve((tenant, logical_table())).expect("binding");
+        let rows = vec![
+            artifact_row(&binding, Uuid::now_v7(), 0),
+            artifact_row(&binding, Uuid::now_v7(), 1),
+        ];
+        let node_id = rows[0].node_id;
+        let rows = rows
+            .into_iter()
+            .map(|mut row| {
+                row.node_id = node_id;
+                row
+            })
+            .collect::<Vec<_>>();
+        let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("tenant connection");
+        insert_artifact_set_and_audit(&mut conn, &rows, &[])
+            .await
+            .expect("complete artifact set");
+        conn.commit().await.expect("artifact commit");
+
+        let mut cut = read_hot_cut(
+            &fixture,
+            tenant,
+            &HotFileCatalog::new(&binding.logical_namespace, &binding.table_name),
+            &std::collections::BTreeSet::new(),
+            None,
+        )
+        .await;
+        cut.sealed_manifest.reverse();
+        let ranges =
+            project_persisted_wal_ranges(&cut.sealed_manifest, 0).expect("valid projection");
+        assert_eq!(
+            ranges,
+            vec![wyrd_spec::vala::api::PersistedWalRange {
+                start_lsn: 10,
+                end_lsn: 20,
+            }]
+        );
+        assert!(project_persisted_wal_ranges(&cut.sealed_manifest, 20).is_ok());
+        assert!(project_persisted_wal_ranges(&cut.sealed_manifest, 9).is_ok());
+        assert!(project_persisted_wal_ranges(&cut.sealed_manifest, 15).is_err());
     }
 
     #[test]

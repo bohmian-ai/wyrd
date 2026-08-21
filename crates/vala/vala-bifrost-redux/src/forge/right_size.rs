@@ -74,7 +74,7 @@ pub(crate) fn validate_supported_layout(
 pub struct ForgeRightSizePolicy {
     /// Target read from `write.target-file-size-bytes`.
     target_file_size_bytes: u64,
-    /// Inclusive lower healthy bound.
+    /// Independent inclusive threshold below which files are compaction candidates.
     minimum_file_size_bytes: u64,
     /// Inclusive upper healthy bound.
     maximum_file_size_bytes: u64,
@@ -87,24 +87,47 @@ pub struct ForgeRightSizePolicy {
 }
 
 impl ForgeRightSizePolicy {
-    /// Build one policy from the metadata captured for a rewrite operation.
+    /// Build one compact unit-test policy with the historical proportional threshold.
     ///
     /// # Errors
     ///
     /// Returns [`ForgeError::InvalidConfig`] when the target cannot produce
     /// non-zero checked tolerance bounds.
-    pub fn new(
+    #[cfg(test)]
+    pub(crate) fn new(
         target_file_size_bytes: u64,
         schema_id: i32,
         partition_spec_id: i32,
         sort_order_id: i64,
     ) -> Result<Self, ForgeError> {
-        let minimum_file_size_bytes = target_file_size_bytes
+        let small_file_threshold_bytes = target_file_size_bytes
             .checked_mul(75)
             .map(|value| value / 100)
             .ok_or_else(|| ForgeError::InvalidConfig {
                 detail: "write.target-file-size-bytes overflows Forge tolerance bounds".to_owned(),
             })?;
+        Self::from_table_threshold(
+            target_file_size_bytes,
+            small_file_threshold_bytes,
+            schema_id,
+            partition_spec_id,
+            sort_order_id,
+        )
+    }
+
+    /// Build one production policy from independent upstream-compatible thresholds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::InvalidConfig`] when either threshold is zero or
+    /// the output target cannot produce its checked oversized-file ceiling.
+    pub(crate) fn from_table_threshold(
+        target_file_size_bytes: u64,
+        small_file_threshold_bytes: u64,
+        schema_id: i32,
+        partition_spec_id: i32,
+        sort_order_id: i64,
+    ) -> Result<Self, ForgeError> {
         let maximum_file_size_bytes = target_file_size_bytes
             .checked_mul(180)
             .map(|value| value / 100)
@@ -112,17 +135,16 @@ impl ForgeRightSizePolicy {
                 detail: "write.target-file-size-bytes overflows Forge tolerance bounds".to_owned(),
             })?;
         if target_file_size_bytes == 0
-            || minimum_file_size_bytes == 0
+            || small_file_threshold_bytes == 0
             || maximum_file_size_bytes == 0
         {
             return Err(ForgeError::InvalidConfig {
-                detail: "write.target-file-size-bytes must produce non-zero Forge tolerance bounds"
-                    .to_owned(),
+                detail: "Forge small-file threshold and output target must be positive".to_owned(),
             });
         }
         Ok(Self {
             target_file_size_bytes,
-            minimum_file_size_bytes,
+            minimum_file_size_bytes: small_file_threshold_bytes,
             maximum_file_size_bytes,
             schema_id,
             partition_spec_id,

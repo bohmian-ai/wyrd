@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use iceberg::spec::TableMetadata;
 use iceberg::table::Table;
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -55,7 +56,7 @@ const ATTEMPT_BOUND: u32 = 5;
 
 /// Returns whether the next classified failure must terminalize at the worker boundary.
 #[must_use]
-const fn failure_is_terminal(class: ForgeFailureClass, completed_attempts: u32) -> bool {
+pub(super) const fn failure_is_terminal(class: ForgeFailureClass, completed_attempts: u32) -> bool {
     matches!(
         class,
         ForgeFailureClass::DataRefusal
@@ -85,6 +86,64 @@ struct ForgeDispatchRequest<'a> {
     stop: &'a CancellationToken,
     /// Attempt-local pipeline bound to the retained operation lease.
     rewrite: &'a ForgeRewritePipeline,
+}
+
+/// Validated maintenance effects encoded by one durable task plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ForgeMaintenanceIntent {
+    /// Whether the task owns one bounded manifest rewrite pass.
+    manifest_rewrite_due: bool,
+    /// Whether the task owns one snapshot-retention pass.
+    snapshot_expiry_due: bool,
+}
+
+impl ForgeMaintenanceIntent {
+    /// Decodes the canonical maintenance plan or a pre-upgrade snapshot-expiry row.
+    ///
+    /// Canonical rows carry all three due flags. A two-field `SnapshotExpiry`
+    /// row predates those flags and can only mean snapshot expiry; accepting it
+    /// preserves ready/retryable work across a rolling upgrade without allowing
+    /// a legacy row to acquire manifest-rewrite authority.
+    fn parse(strategy: &ForgeClaimStrategy, parameters: &Map<String, Value>) -> Option<Self> {
+        if parameters.get("kind").and_then(Value::as_str) != Some("maintenance")
+            || parameters
+                .get("trigger_commit_count")
+                .and_then(Value::as_u64)
+                .is_none()
+        {
+            return None;
+        }
+        if parameters.len() == 2
+            && matches!(
+                strategy,
+                ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry)
+            )
+        {
+            return Some(Self {
+                manifest_rewrite_due: false,
+                snapshot_expiry_due: true,
+            });
+        }
+        if parameters.len() != 5 {
+            return None;
+        }
+        let manifest_rewrite_due = parameters.get("manifest_rewrite_due")?.as_bool()?;
+        let snapshot_expiry_due = parameters.get("snapshot_expiry_due")?.as_bool()?;
+        let reconciliation_due = parameters.get("reconciliation_due")?.as_bool()?;
+        let strategy_matches = match strategy {
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::ManifestRewrite) => {
+                manifest_rewrite_due && !snapshot_expiry_due && !reconciliation_due
+            }
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry) => {
+                snapshot_expiry_due || reconciliation_due
+            }
+            ForgeClaimStrategy::Known(_) | ForgeClaimStrategy::Unknown(_) => false,
+        };
+        strategy_matches.then_some(Self {
+            manifest_rewrite_due,
+            snapshot_expiry_due,
+        })
+    }
 }
 
 enum ForgeDispatchResult {
@@ -829,9 +888,6 @@ pub struct ForgeWorker {
     completion_observer: Option<ForgeWorkerCompletionObserver>,
     /// Complete capacity declaration passed to atomic `PostgreSQL` admission.
     capacity: ForgeCapacity,
-    /// One-shot crash boundary after task evidence commits and before expiry closes.
-    #[cfg(feature = "test-support")]
-    fail_after_maintenance_prepared: Arc<AtomicBool>,
 }
 
 impl ForgeWorker {
@@ -856,15 +912,15 @@ impl ForgeWorker {
             owner,
             config,
             capacity,
-            #[cfg(feature = "test-support")]
-            fail_after_maintenance_prepared: Arc::new(AtomicBool::new(false)),
         })
     }
 
     /// Arms one failure after maintenance task Prepared commits but before expiry terminal audit.
     #[cfg(feature = "test-support")]
     pub fn fail_after_maintenance_prepared_for_test(&self) {
-        self.fail_after_maintenance_prepared
+        self.forge
+            .core
+            .fail_after_maintenance_prepared
             .store(true, Ordering::Release);
     }
 
@@ -1821,12 +1877,14 @@ impl ForgeWorker {
             ForgeClaimStrategy::Known(ForgeTaskStrategy::SmallFiles) => {
                 ("live_rewrite", ForgeMetricStage::IcebergRewrite)
             }
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::ManifestRewrite) => {
+                ("maintenance", ForgeMetricStage::ManifestRewrite)
+            }
             ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry) => {
                 ("maintenance", ForgeMetricStage::SnapshotExpiry)
             }
             ForgeClaimStrategy::Known(
                 ForgeTaskStrategy::FullIdentity
-                | ForgeTaskStrategy::ManifestRewrite
                 | ForgeTaskStrategy::ExpiredCleanup
                 | ForgeTaskStrategy::OrphanCleanup,
             )
@@ -1843,18 +1901,15 @@ impl ForgeWorker {
             .ok_or_else(|| ForgeError::Invariant {
                 detail: "Forge task parameters must be an object".to_owned(),
             })?;
-        let valid_parameters = parameters.get("kind").and_then(serde_json::Value::as_str)
-            == Some(expected_kind)
-            && match task.strategy {
-                ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry) => {
-                    parameters.len() == 2
-                        && parameters
-                            .get("trigger_commit_count")
-                            .and_then(serde_json::Value::as_u64)
-                            .is_some()
-                }
-                _ => parameters.len() == 1,
-            };
+        let valid_parameters = match task.strategy {
+            ForgeClaimStrategy::Known(
+                ForgeTaskStrategy::ManifestRewrite | ForgeTaskStrategy::SnapshotExpiry,
+            ) => ForgeMaintenanceIntent::parse(&task.strategy, parameters).is_some(),
+            _ => {
+                parameters.get("kind").and_then(Value::as_str) == Some(expected_kind)
+                    && parameters.len() == 1
+            }
+        };
         if !valid_parameters {
             return Err(ForgeError::Invariant {
                 detail: "Forge task parameters do not match the strategy contract".to_owned(),
@@ -1944,7 +1999,9 @@ impl ForgeWorker {
         };
         let maintenance_recovery = matches!(
             claim.strategy,
-            ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry)
+            ForgeClaimStrategy::Known(
+                ForgeTaskStrategy::ManifestRewrite | ForgeTaskStrategy::SnapshotExpiry
+            )
         );
         if !base_matches && committed_recovery.is_none() && !maintenance_recovery {
             self.forge
@@ -2164,7 +2221,9 @@ impl ForgeWorker {
         }
         if matches!(
             claim.strategy,
-            ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry)
+            ForgeClaimStrategy::Known(
+                ForgeTaskStrategy::ManifestRewrite | ForgeTaskStrategy::SnapshotExpiry
+            )
         ) && let Some(current) = table.metadata().current_snapshot()
         {
             return Ok(SnapshotWatermark {
@@ -2228,7 +2287,9 @@ impl ForgeWorker {
         if !Self::base_snapshot_matches(&table, claim.base_snapshot_id)
             && !matches!(
                 claim.strategy,
-                ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry)
+                ForgeClaimStrategy::Known(
+                    ForgeTaskStrategy::ManifestRewrite | ForgeTaskStrategy::SnapshotExpiry
+                )
             )
         {
             return Err(ForgeError::Reconciliation {
@@ -2261,7 +2322,24 @@ impl ForgeWorker {
                 })
                 .await
             }
-            ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry) => {
+            ForgeClaimStrategy::Known(
+                ForgeTaskStrategy::ManifestRewrite | ForgeTaskStrategy::SnapshotExpiry,
+            ) => {
+                let intent = ForgeMaintenanceIntent::parse(
+                    &claim.strategy,
+                    claim
+                        .plan
+                        .parameters
+                        .as_object()
+                        .ok_or_else(|| ForgeError::Invariant {
+                            detail:
+                                "validated Forge maintenance parameters lost their object shape"
+                                    .to_owned(),
+                        })?,
+                )
+                .ok_or_else(|| ForgeError::Invariant {
+                    detail: "validated Forge maintenance intent could not be decoded".to_owned(),
+                })?;
                 let key = super::compact::ForgeTableKey {
                     tenant: claim.data_tenant_id,
                     table_ref: binding.table_ref.clone(),
@@ -2276,7 +2354,16 @@ impl ForgeWorker {
                     )
                     .await?;
                 ForgeMaintenance::new(Arc::clone(&self.forge))
-                    .execute(lease, &key, binding, table, &claim.plan.inputs, stop)
+                    .execute(
+                        lease,
+                        &key,
+                        binding,
+                        table,
+                        &claim.plan.inputs,
+                        intent.manifest_rewrite_due,
+                        intent.snapshot_expiry_due,
+                        stop,
+                    )
                     .await
                     .map(Box::new)
                     .map(ForgeDispatchResult::Maintenance)
@@ -2495,6 +2582,8 @@ impl ForgeWorker {
         prepared.commit().await.map_err(ForgeError::Sql)?;
         #[cfg(feature = "test-support")]
         if self
+            .forge
+            .core
             .fail_after_maintenance_prepared
             .swap(false, Ordering::AcqRel)
         {
@@ -3454,6 +3543,16 @@ impl ForgeWorker {
     }
 }
 
+#[cfg(feature = "test-support")]
+impl Forge {
+    /// Arms one supervised failure after maintenance reaches durable Prepared state.
+    pub fn fail_after_maintenance_prepared_for_test(&self) {
+        self.core
+            .fail_after_maintenance_prepared
+            .store(true, Ordering::Release);
+    }
+}
+
 /// Return the maximum memory assigned to Forge by the current resource plan.
 ///
 /// Forge owns its protected floor and may borrow the elastic remainder. The
@@ -3696,6 +3795,51 @@ mod tests {
         let defaults = ForgeWorkerConfig::default();
         assert_eq!(defaults.worker_concurrency, 1);
         assert_eq!(defaults.per_tenant_active_cap, 1);
+    }
+
+    /// Maintenance intent preserves exact strategy routing and legacy expiry meaning.
+    #[test]
+    fn maintenance_intent_routes_manifest_and_legacy_expiry_exactly() {
+        let manifest = serde_json::json!({
+            "kind": "maintenance",
+            "trigger_commit_count": 0,
+            "manifest_rewrite_due": true,
+            "snapshot_expiry_due": false,
+            "reconciliation_due": false,
+        });
+        assert_eq!(
+            ForgeMaintenanceIntent::parse(
+                &ForgeClaimStrategy::Known(ForgeTaskStrategy::ManifestRewrite),
+                manifest.as_object().expect("manifest parameters"),
+            ),
+            Some(ForgeMaintenanceIntent {
+                manifest_rewrite_due: true,
+                snapshot_expiry_due: false,
+            })
+        );
+
+        let legacy = serde_json::json!({
+            "kind": "maintenance",
+            "trigger_commit_count": 7,
+        });
+        assert_eq!(
+            ForgeMaintenanceIntent::parse(
+                &ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry),
+                legacy.as_object().expect("legacy expiry parameters"),
+            ),
+            Some(ForgeMaintenanceIntent {
+                manifest_rewrite_due: false,
+                snapshot_expiry_due: true,
+            })
+        );
+        assert!(
+            ForgeMaintenanceIntent::parse(
+                &ForgeClaimStrategy::Known(ForgeTaskStrategy::ManifestRewrite),
+                legacy.as_object().expect("legacy manifest parameters"),
+            )
+            .is_none(),
+            "legacy expiry rows cannot acquire manifest-rewrite authority"
+        );
     }
 
     /// The per-tenant cap is stored and read independently of executor count.

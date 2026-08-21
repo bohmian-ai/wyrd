@@ -163,7 +163,7 @@ enum LiveDisposition {
     Recovered(i64),
     /// Operation remains inside the uncertainty bound.
     Pending,
-    /// Stable abandoned outputs may be deleted and reset.
+    /// Stable abandoned outputs may be terminally reset for delayed orphan GC.
     Reset,
     /// Canonical evidence cannot prove either terminal state.
     Unresolved,
@@ -174,16 +174,17 @@ impl Forge {
     ///
     /// The method performs one bounded SQL read followed by two fresh retained
     /// manifest observations. Recovered and reset transitions are fenced and
-    /// transactional; reset outputs are rechecked against a third fresh
-    /// observation before each deletion. Cancellation or fence loss returns an
-    /// error without claiming a classification, and retries remain idempotent.
+    /// transactional. A reset only records the logical terminal and leaves its
+    /// output generation for delayed, independently protected orphan GC.
+    /// Cancellation or fence loss returns an error without claiming a
+    /// classification, and retries remain idempotent.
     ///
     /// # Errors
     ///
-    /// Returns SQL, catalog, storage, cancellation, fence, malformed-evidence,
-    /// or terminal-transition errors. Deletion may have partial progress before
-    /// a terminal append failure; the Prepared row keeps subsequent retries
-    /// fail-closed.
+    /// Returns SQL, catalog, cancellation, fence, malformed-evidence, or
+    /// terminal-transition errors. This reconciliation path performs no remote
+    /// deletion, so a failed terminal append leaves the `Prepared` row and its
+    /// outputs protected for a later retry.
     pub(super) async fn reconcile_live_replacements(
         &self,
         lease: &mut ForgeLease,
@@ -529,53 +530,25 @@ impl Forge {
         Ok(())
     }
 
-    /// Recheck, delete, and terminally reset one proven abandoned operation.
+    /// Terminally reset one proven abandoned operation for delayed orphan GC.
+    ///
+    /// This method is the logical-enqueue side of the deletion boundary adapted
+redacted
+    /// never touches object storage. `orphan_gc` alone owns the TTL, refreshed
+    /// protection checks, physical deletion, and terminal deletion audit.
     ///
     /// # Errors
     ///
-    /// Returns cancellation, fence, catalog, storage, or terminal-write errors.
-    /// A newly referenced output converts the operation to Unresolved without
-    /// further deletion or terminal append.
+    /// Returns cancellation, fence, or terminal-write errors. A failed append
+    /// leaves the original `Prepared` operation authoritative and retryable.
     async fn apply_live_reset(
         &self,
         context: LiveClassificationContext<'_>,
         row: &ForgeOperationStateRow,
         group_key: &ForgeGroupKey,
-        outputs: Vec<String>,
+        _outputs: Vec<String>,
         outcome: &mut IcebergReconciliationOutcome,
     ) -> Result<(), ForgeError> {
-        for output in &outputs {
-            Self::require_running(context.stop)?;
-            context
-                .lease
-                .require_fence(&self.core.operator_pool)
-                .await?;
-            if !context
-                .lease
-                .commit_window_fits(self.core.config.commit_window())
-            {
-                return Err(ForgeError::FenceLost {
-                    lease_key: context.lease.lease_key.clone(),
-                });
-            }
-            let observation_c = self
-                .observe_retained_manifests(context.binding, context.stop)
-                .await?;
-            if observation_c
-                .snapshots
-                .values()
-                .any(|snapshot| snapshot.live_data_paths.contains(output))
-            {
-                protect(outcome, outputs);
-                outcome.unresolved = outcome.unresolved.saturating_add(1);
-                return Ok(());
-            }
-            if let Err(error) = self.core.object_store.delete(output).await
-                && error.kind() != opendal::ErrorKind::NotFound
-            {
-                return Err(ForgeError::ObjectDelete(error));
-            }
-        }
         Self::require_running(context.stop)?;
         context
             .lease

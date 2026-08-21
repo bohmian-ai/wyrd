@@ -10,6 +10,7 @@ use opendal::raw::Timestamp;
 use opendal::{EntryMode, ErrorKind};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+#[cfg(feature = "test-support")]
 use vala_sql::TenantConn;
 use vala_sql::queries::file_list::list_nonterminal_file_paths;
 use vala_sql::queries::forge_operations::ForgeOperations;
@@ -115,8 +116,6 @@ pub(crate) struct MaintenanceProtection {
     pub(crate) live_set: ProtectedLiveSet,
     /// Fail-closed permission derived from every open operation family.
     pub(crate) destructive_maintenance: DestructiveMaintenance,
-    /// Exact output paths whose operation durably Reset without publication.
-    never_published: BTreeSet<String>,
     /// The table lease's single captured maintenance time.
     pub(crate) now: DateTime<Utc>,
     /// Inclusive last-modified cutoff derived once from `now`.
@@ -154,7 +153,6 @@ impl MaintenanceProtection {
     fn new(
         live_set: ProtectedLiveSet,
         blocked: bool,
-        never_published: BTreeSet<String>,
         now: DateTime<Utc>,
         object_age_cutoff: Timestamp,
     ) -> Self {
@@ -165,13 +163,18 @@ impl MaintenanceProtection {
             } else {
                 DestructiveMaintenance::Allowed
             },
-            never_published,
             now,
             object_age_cutoff,
         }
     }
 
     /// Applies the single closed eligibility truth used before prepare and delete.
+    ///
+    /// The exact table lease excludes a concurrent producer while refreshed
+    /// catalog, SQL, and operation evidence protects every reachable object.
+    /// Once the configured TTL floor has elapsed, an unreferenced deterministic
+    /// attempt generation needs no terminal operation row: this admits outputs
+    /// whose rewrite failed before its `Prepared` transition could persist.
     #[must_use]
     pub(crate) fn gc_eligibility(
         &self,
@@ -182,15 +185,12 @@ impl MaintenanceProtection {
         let Some(normalized) = binding.validate_object_path(path) else {
             return GcEligibility::InvalidPath;
         };
-        if !is_never_published_forge_generation(&normalized) {
+        if !is_forge_attempt_generation(&normalized) {
             return GcEligibility::InvalidPath;
         }
         if self.destructive_maintenance == DestructiveMaintenance::Blocked
             || self.live_set.contains(&normalized)
         {
-            return GcEligibility::Protected;
-        }
-        if !self.never_published.contains(&normalized) {
             return GcEligibility::Protected;
         }
         let ObjectEvidence::Present(metadata) = evidence else {
@@ -213,7 +213,7 @@ impl MaintenanceProtection {
 ///
 /// Scribe pod/ULID names and generic Iceberg metadata paths deliberately fail
 /// this predicate and can be reclaimed only from committed expiry evidence.
-fn is_never_published_forge_generation(path: &str) -> bool {
+fn is_forge_attempt_generation(path: &str) -> bool {
     let marker = format!(
         "/data/forge/{}/",
         crate::parquet::writer_properties::BIFROST_WRITER_RECIPE_VERSION
@@ -765,10 +765,6 @@ impl Forge {
         let resource = table_resource_for_key(key);
         let cap = self.core.config.max_open_operations_per_table;
         let mut blocked = false;
-        let (never_published, reset_overflowed) = self
-            .load_never_published_generations(&mut conn, &resource, &table_location, binding, cap)
-            .await?;
-        blocked |= reset_overflowed;
         for family in [
             ForgeOperationFamily::IcebergRewrite,
             ForgeOperationFamily::SnapshotExpire,
@@ -824,18 +820,19 @@ impl Forge {
         Ok(MaintenanceProtection::new(
             live,
             blocked,
-            never_published,
             table_context.now,
             object_age_cutoff,
         ))
     }
 
-    /// Loads bounded terminal Reset outputs as exact no-resurrection evidence.
+    /// Loads bounded terminal Reset outputs for test inspection of durable lineage.
     ///
     /// # Errors
     ///
-    /// Returns SQL, operation-state, or table-binding failures. Overflow is
-    /// returned explicitly so the caller blocks all destructive maintenance.
+    /// Returns SQL, operation-state, or table-binding failures. Overflow remains
+    /// explicit so integration fixtures cannot mistake a truncated projection
+    /// for the complete Reset history.
+    #[cfg(feature = "test-support")]
     async fn load_never_published_generations(
         &self,
         conn: &mut TenantConn<'_>,
@@ -1424,7 +1421,7 @@ impl Forge {
     #[cfg(feature = "test-support")]
     #[must_use]
     pub fn known_iceberg_object_for_test(path: &str) -> bool {
-        is_never_published_forge_generation(path)
+        is_forge_attempt_generation(path)
     }
 
     /// Load the exact terminal Reset generation set used by production GC.
@@ -1561,7 +1558,6 @@ mod tests {
         let protection = MaintenanceProtection {
             live_set: live,
             destructive_maintenance: DestructiveMaintenance::Allowed,
-            never_published: BTreeSet::from([old_path.clone(), young_path.clone()]),
             now: DateTime::<Utc>::from_timestamp_millis(48 * 60 * 60 * 1_000).expect("time"),
             object_age_cutoff: cutoff,
         };
@@ -1579,8 +1575,8 @@ mod tests {
                 &unproven_path,
                 ObjectEvidence::Present(&old_metadata)
             ),
-            GcEligibility::Protected,
-            "UUIDv7 name and age do not substitute for terminal Reset evidence"
+            GcEligibility::Eligible,
+            "an aged deterministic pre-Prepared generation is reclaimable after refreshed protection"
         );
         assert_eq!(
             protection.gc_eligibility(
@@ -1589,6 +1585,21 @@ mod tests {
                 ObjectEvidence::Present(&old_metadata)
             ),
             GcEligibility::Protected
+        );
+        let blocked = MaintenanceProtection {
+            live_set: ProtectedLiveSet::default(),
+            destructive_maintenance: DestructiveMaintenance::Blocked,
+            now: protection.now,
+            object_age_cutoff: cutoff,
+        };
+        assert_eq!(
+            blocked.gc_eligibility(
+                &binding,
+                &unproven_path,
+                ObjectEvidence::Present(&old_metadata)
+            ),
+            GcEligibility::Protected,
+            "a nonterminal operation blocks an otherwise eligible pre-Prepared generation"
         );
         assert_eq!(
             protection.gc_eligibility(
@@ -1621,14 +1632,14 @@ mod tests {
     #[test]
     fn generic_gc_accepts_only_forge_attempt_generations() {
         let generation = Uuid::now_v7();
-        assert!(is_never_published_forge_generation(&format!(
+        assert!(is_forge_attempt_generation(&format!(
             "tenant/table/data/forge/{}/{generation}-00000.parquet",
             crate::parquet::writer_properties::BIFROST_WRITER_RECIPE_VERSION
         )));
-        assert!(!is_never_published_forge_generation(
+        assert!(!is_forge_attempt_generation(
             "tenant/table/data/pod-a-01JABC.parquet"
         ));
-        assert!(!is_never_published_forge_generation(
+        assert!(!is_forge_attempt_generation(
             "tenant/table/metadata/v1.metadata.json"
         ));
     }

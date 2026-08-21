@@ -145,6 +145,9 @@ pub(crate) struct ForgeCore {
     /// Deterministic maintenance boundaries used only by integration tests.
     #[cfg(feature = "test-support")]
     maintenance_controls: maintenance::MaintenanceTestControls,
+    /// Owner-bound one-shot failure after maintenance evidence becomes Prepared.
+    #[cfg(feature = "test-support")]
+    fail_after_maintenance_prepared: AtomicBool,
 }
 
 impl Forge {
@@ -164,7 +167,6 @@ impl Forge {
         ForgeRewriteRuntime::prepare_root(&build.rewrite_spill_root)?;
         let rewrite = ForgeRewritePipeline::new(
             Arc::clone(&build.staging),
-            Arc::clone(&build.catalog),
             Arc::clone(&build.object_store),
             build.config.max_concurrent_reads,
         )?;
@@ -185,6 +187,8 @@ impl Forge {
             telemetry: build.telemetry,
             #[cfg(feature = "test-support")]
             maintenance_controls: maintenance::MaintenanceTestControls::default(),
+            #[cfg(feature = "test-support")]
+            fail_after_maintenance_prepared: AtomicBool::new(false),
         };
         debug_assert!(core.rewrite.uses_staging(&core.staging));
         Ok(Self {

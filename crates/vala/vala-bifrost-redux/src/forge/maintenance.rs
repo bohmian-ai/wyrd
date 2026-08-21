@@ -1,5 +1,6 @@
 //! Ordered Iceberg metadata maintenance for one claimed Forge task.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -17,6 +18,137 @@ use super::expire::PendingExpiryTerminal;
 use super::lease::ForgeLease;
 use super::metrics::ForgeMetricStage;
 use crate::catalog::TenantTableBinding;
+
+/// One already-filtered data manifest considered by the shared rewrite planner.
+///
+redacted
+/// inputs so scheduling and execution cannot drift in their completed-bin
+/// predicate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ManifestRewriteCandidate {
+    /// Immutable manifest object identity.
+    pub(super) path: String,
+    /// Manifest object size in bytes.
+    pub(super) size_bytes: u64,
+    /// Partition-spec boundary for independent bins.
+    pub(super) partition_spec_id: i32,
+    /// Manifest-list order used to prefer oldest work.
+    pub(super) sequence_number: i64,
+}
+
+/// Selects at most one worthwhile oldest-first manifest bin per partition spec.
+///
+redacted
+/// `gc.rs::plan_manifest_rewrite`: a completed bin and a final bin both must
+/// reduce at least two manifests to one. A final bin is useful only when it
+/// reaches the target bytes or the configured minimum count.
+#[must_use]
+pub(super) fn select_manifest_rewrite_paths(
+    candidates: &[ManifestRewriteCandidate],
+    target_size_bytes: u64,
+    min_count_to_merge: usize,
+) -> Vec<String> {
+    debug_assert!(target_size_bytes > 0, "manifest target must be positive");
+    debug_assert!(
+        min_count_to_merge > 0,
+        "manifest minimum count must be positive"
+    );
+
+    let mut by_spec = BTreeMap::<i32, Vec<&ManifestRewriteCandidate>>::new();
+    for candidate in candidates {
+        if candidate.size_bytes < target_size_bytes {
+            by_spec
+                .entry(candidate.partition_spec_id)
+                .or_default()
+                .push(candidate);
+        }
+    }
+
+    let mut selected = Vec::new();
+    for candidates in by_spec.values_mut() {
+        candidates.sort_by_key(|candidate| candidate.sequence_number);
+        let mut current_bin = Vec::new();
+        let mut current_bytes = 0_u64;
+        let mut completed_bin = None;
+        for candidate in candidates {
+            let next_bytes = current_bytes.saturating_add(candidate.size_bytes);
+            if !current_bin.is_empty() && next_bytes > target_size_bytes {
+                if current_bin.len() >= 2 {
+                    completed_bin = Some(std::mem::take(&mut current_bin));
+                    break;
+                }
+                current_bin.clear();
+                current_bytes = 0;
+            }
+            current_bin.push(*candidate);
+            current_bytes = current_bytes.saturating_add(candidate.size_bytes);
+        }
+        let chosen = if let Some(completed) = completed_bin {
+            completed
+        } else if current_bin.len() >= 2
+            && (current_bytes >= target_size_bytes || current_bin.len() >= min_count_to_merge)
+        {
+            current_bin
+        } else {
+            continue;
+        };
+        selected.extend(chosen.into_iter().map(|candidate| candidate.path.clone()));
+    }
+    selected.sort_unstable();
+    selected
+}
+
+/// Selects one complete worthwhile bin that fits the task's file and byte bounds.
+///
+/// Preserving the bin as the unit of admission prevents an interleaved manifest
+/// list from truncating two valid per-spec bins into two non-rewritable
+/// singletons. When no whole bin fits, the scheduler must leave demand pending.
+#[must_use]
+pub(super) fn select_bounded_manifest_rewrite_paths(
+    candidates: &[ManifestRewriteCandidate],
+    target_size_bytes: u64,
+    min_count_to_merge: usize,
+    max_files: usize,
+    max_bytes: u64,
+) -> Vec<String> {
+    let selected = select_manifest_rewrite_paths(candidates, target_size_bytes, min_count_to_merge);
+    let selected = selected
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut by_spec = BTreeMap::<i32, Vec<&ManifestRewriteCandidate>>::new();
+    for candidate in candidates {
+        if selected.contains(&candidate.path) {
+            by_spec
+                .entry(candidate.partition_spec_id)
+                .or_default()
+                .push(candidate);
+        }
+    }
+    for bin in by_spec.values_mut() {
+        bin.sort_by_key(|candidate| candidate.sequence_number);
+        let bytes = bin.iter().try_fold(0_u64, |sum, candidate| {
+            sum.checked_add(candidate.size_bytes)
+        });
+        if bin.len() <= max_files && bytes.is_some_and(|bytes| bytes <= max_bytes) {
+            return bin.iter().map(|candidate| candidate.path.clone()).collect();
+        }
+    }
+    Vec::new()
+}
+
+/// Returns whether one manifest-rewrite pass has publishable work.
+///
+/// The scheduler uses this before considering snapshot expiry, so the
+/// maintenance trigger follows the same selection rules as the eventual
+/// catalog rewrite instead of borrowing expiry's retained-snapshot predicate.
+#[must_use]
+pub(super) fn manifest_rewrite_is_due(
+    candidates: &[ManifestRewriteCandidate],
+    target_size_bytes: u64,
+    min_count_to_merge: usize,
+) -> bool {
+    !select_manifest_rewrite_paths(candidates, target_size_bytes, min_count_to_merge).is_empty()
+}
 
 /// Deterministic one-shot catalog boundaries for Forge integration tests.
 #[cfg(feature = "test-support")]
@@ -203,6 +335,8 @@ impl ForgeMaintenance {
         binding: &TenantTableBinding,
         table: Table,
         manifest_paths: &[String],
+        manifest_rewrite_due: bool,
+        snapshot_expiry_due: bool,
         stop: &CancellationToken,
     ) -> Result<ForgeMaintenanceResult, ForgeError> {
         require_running(stop)?;
@@ -226,65 +360,118 @@ impl ForgeMaintenance {
                         .to_owned(),
             });
         }
-        let rewrite = rewrite_manifests(
-            self.forge.core.catalog.as_ref(),
-            &table,
-            ManifestRewriteSelection {
-                manifest_paths: manifest_paths.to_vec(),
-            },
-            ManifestRewriteLimits {
-                max_manifests: self.forge.core.config.max_files_per_tick,
-                max_entries: self.forge.core.config.max_files_per_tick,
-                max_bytes: self.forge.core.config.max_bytes_per_tick,
-            },
-        );
-        #[cfg(feature = "test-support")]
-        if self
-            .forge
-            .core
-            .maintenance_controls
-            .manifest
-            .pause(stop)
-            .await
-        {
-            return Err(ForgeError::Reconciliation {
-                detail: "Iceberg manifest rewrite was cancelled at submission with unknown acceptance; reload metadata before retry".to_owned(),
-            });
-        }
-        tokio::pin!(rewrite);
-        let rewritten = tokio::select! {
-            response = tokio::time::timeout(
-                self.forge.core.config.iceberg_total_retry_timeout,
-                &mut rewrite,
-            ) => match response {
-                Ok(Ok(rewritten)) => rewritten,
-                Ok(Err(error)) => return Err(ForgeError::Catalog(error)),
-                Err(_) => return Err(ForgeError::Reconciliation {
-                    detail: "Iceberg manifest rewrite timed out with unknown acceptance; reload metadata before retry"
+        let rewrite_paths =
+            if manifest_rewrite_due && self.forge.core.config.manifest_rewrite_enabled {
+                if let Some(snapshot) = table.metadata().current_snapshot() {
+                    let manifests = table
+                        .manifest_list_reader(snapshot)
+                        .load()
+                        .await
+                        .map_err(ForgeError::Catalog)?;
+                    let candidates = manifests
+                        .entries()
+                        .iter()
+                        .filter(|manifest| {
+                            manifest.content == iceberg::spec::ManifestContentType::Data
+                                && manifest_paths.contains(&manifest.manifest_path)
+                                && manifest.manifest_length >= 0
+                        })
+                        .map(|manifest| ManifestRewriteCandidate {
+                            path: manifest.manifest_path.clone(),
+                            size_bytes: u64::try_from(manifest.manifest_length)
+                                .expect("nonnegative manifest length fits u64"),
+                            partition_spec_id: manifest.partition_spec_id,
+                            sequence_number: manifest.sequence_number,
+                        })
+                        .collect::<Vec<_>>();
+                    select_bounded_manifest_rewrite_paths(
+                        &candidates,
+                        self.forge.core.config.manifest_rewrite_target_size_bytes,
+                        self.forge.core.config.manifest_rewrite_min_count,
+                        self.forge.core.config.max_files_per_tick,
+                        self.forge.core.config.max_bytes_per_tick,
+                    )
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+        if !rewrite_paths.is_empty() {
+            let rewrite = rewrite_manifests(
+                self.forge.core.catalog.as_ref(),
+                &table,
+                ManifestRewriteSelection {
+                    manifest_paths: rewrite_paths,
+                },
+                ManifestRewriteLimits {
+                    max_manifests: self.forge.core.config.max_files_per_tick,
+                    max_entries: self.forge.core.config.max_files_per_tick,
+                    max_bytes: self.forge.core.config.manifest_rewrite_target_size_bytes,
+                },
+            );
+            #[cfg(feature = "test-support")]
+            if self
+                .forge
+                .core
+                .maintenance_controls
+                .manifest
+                .pause(stop)
+                .await
+            {
+                return Err(ForgeError::Reconciliation {
+                    detail: "Iceberg manifest rewrite was cancelled at submission with unknown acceptance; reload metadata before retry".to_owned(),
+                });
+            }
+            tokio::pin!(rewrite);
+            let rewritten = tokio::select! {
+                response = tokio::time::timeout(
+                    self.forge.core.config.iceberg_total_retry_timeout,
+                    &mut rewrite,
+                ) => match response {
+                    Ok(Ok(rewritten)) => rewritten,
+                    Ok(Err(error)) => return Err(ForgeError::Catalog(error)),
+                    Err(_) => return Err(ForgeError::Reconciliation {
+                        detail: "Iceberg manifest rewrite timed out with unknown acceptance; reload metadata before retry"
+                            .to_owned(),
+                    }),
+                },
+                () = stop.cancelled() => return Err(ForgeError::Reconciliation {
+                    detail: "Iceberg manifest rewrite was cancelled with unknown acceptance; reload metadata before retry"
                         .to_owned(),
                 }),
-            },
-            () = stop.cancelled() => return Err(ForgeError::Reconciliation {
-                detail: "Iceberg manifest rewrite was cancelled with unknown acceptance; reload metadata before retry"
-                    .to_owned(),
-            }),
-        };
-        if rewritten.outcome == ManifestRewriteOutcome::Stale {
-            tracing::debug!("manifest rewrite selection became stale; reconciling expiry state");
+            };
+            if rewritten.outcome == ManifestRewriteOutcome::Stale {
+                tracing::debug!(
+                    "manifest rewrite selection became stale; reconciling expiry state"
+                );
+            }
         }
         lease.require_fence(&self.forge.core.operator_pool).await?;
         require_running(stop)?;
-        let expiry = self
-            .forge
-            .run_snapshot_expiry_for_table(lease, key, binding, self.forge.core.clock.now()?, stop)
-            .await?;
+        let (expired_files, expiry_terminals) =
+            if snapshot_expiry_due && self.forge.core.config.snapshot_expiry_enabled {
+                let expiry = self
+                    .forge
+                    .run_snapshot_expiry_for_table(
+                        lease,
+                        key,
+                        binding,
+                        self.forge.core.clock.now()?,
+                        stop,
+                    )
+                    .await?;
+                (expiry.expired_files, expiry.terminals)
+            } else {
+                (ExpiredFileSet::default(), Vec::new())
+            };
         require_running(stop)?;
         lease.require_fence(&self.forge.core.operator_pool).await?;
         let table = self.forge.load_table(&binding.table_ident()).await?;
         Ok(ForgeMaintenanceResult {
             table,
-            expired_files: expiry.expired_files,
-            expiry_terminals: expiry.terminals,
+            expired_files,
+            expiry_terminals,
         })
     }
 
@@ -332,6 +519,111 @@ impl ForgeMaintenance {
             .telemetry
             .record_orphan_gc(&outcome, elapsed);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ManifestRewriteCandidate, manifest_rewrite_is_due, select_bounded_manifest_rewrite_paths,
+        select_manifest_rewrite_paths,
+    };
+
+    fn candidate(
+        path: &str,
+        size_bytes: u64,
+        spec: i32,
+        sequence: i64,
+    ) -> ManifestRewriteCandidate {
+        ManifestRewriteCandidate {
+            path: path.to_owned(),
+            size_bytes,
+            partition_spec_id: spec,
+            sequence_number: sequence,
+        }
+    }
+
+redacted
+    #[test]
+    fn manifest_selector_requires_two_manifests_and_selects_completed_bins() {
+        assert!(select_manifest_rewrite_paths(&[candidate("only", 99, 0, 0)], 100, 1).is_empty());
+        assert!(
+            select_manifest_rewrite_paths(
+                &[candidate("a", 99, 0, 0), candidate("b", 99, 0, 1)],
+                100,
+                100,
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            select_manifest_rewrite_paths(
+                &[candidate("a", 50, 0, 0), candidate("b", 50, 0, 1)],
+                100,
+                100,
+            ),
+            ["a", "b"]
+        );
+        assert_eq!(
+            select_manifest_rewrite_paths(
+                &[
+                    candidate("old-a", 40, 0, 1),
+                    candidate("old-b", 40, 0, 2),
+                    candidate("overflow", 40, 0, 3),
+                ],
+                100,
+                100,
+            ),
+            ["old-a", "old-b"]
+        );
+    }
+
+    /// Each partition spec independently retains one oldest worthwhile bin.
+    #[test]
+    fn manifest_selector_groups_specs_and_observes_minimum_count() {
+        assert_eq!(
+            select_manifest_rewrite_paths(
+                &[
+                    candidate("a", 40, 0, 2),
+                    candidate("b", 40, 0, 1),
+                    candidate("other-a", 40, 1, 1),
+                    candidate("other-b", 40, 1, 2),
+                ],
+                100,
+                2,
+            ),
+            ["a", "b", "other-a", "other-b"]
+        );
+        assert!(
+            select_manifest_rewrite_paths(&[candidate("underfilled", 40, 0, 1)], 100, 2,)
+                .is_empty()
+        );
+    }
+
+    /// Interleaved specs retain one whole bin across task file and byte bounds.
+    #[test]
+    fn bounded_manifest_selector_never_splits_interleaved_specs() {
+        let candidates = [
+            candidate("spec-zero-old", 40, 0, 1),
+            candidate("spec-one-old", 40, 1, 1),
+            candidate("spec-zero-new", 40, 0, 2),
+            candidate("spec-one-new", 40, 1, 2),
+        ];
+        assert_eq!(
+            select_bounded_manifest_rewrite_paths(&candidates, 100, 2, 2, 100),
+            ["spec-zero-old", "spec-zero-new"]
+        );
+        assert!(
+            select_bounded_manifest_rewrite_paths(&candidates, 100, 2, 1, 100).is_empty(),
+            "demand remains unacknowledged when no complete bin fits"
+        );
+    }
+
+    /// Manifest eligibility is independent of retained-snapshot expiry state.
+    #[test]
+    fn manifest_rewrite_due_uses_its_own_completed_bin_predicate() {
+        let candidates = [candidate("old-a", 50, 0, 1), candidate("old-b", 50, 0, 2)];
+        assert!(manifest_rewrite_is_due(&candidates, 100, 2));
+        assert!(!manifest_rewrite_is_due(&candidates[..1], 100, 2));
     }
 }
 

@@ -54,6 +54,12 @@ const DEFAULT_MAX_CONCURRENT_READS: usize = 4;
 const DEFAULT_SPILL_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const DEFAULT_MAX_OPEN_OPERATIONS_PER_TABLE: usize = 256;
 const DEFAULT_MAX_RETAINED_SNAPSHOTS_PER_TABLE: usize = 256;
+redacted
+pub(crate) const DEFAULT_SMALL_FILE_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
+redacted
+pub(crate) const DEFAULT_MANIFEST_REWRITE_TARGET_SIZE_BYTES: u64 = 8 * 1024 * 1024;
+redacted
+pub(crate) const DEFAULT_MANIFEST_REWRITE_MIN_COUNT: usize = 100;
 /// Default commit count past `retain_last` that makes snapshot expiry due on
 /// its own. Chosen well above ordinary per-tick compaction commit counts so a
 /// table under steady ingest still accrues history before maintenance fires,
@@ -116,6 +122,16 @@ pub struct ForgeConfig {
     pub snapshot_retention: Duration,
     /// Number of snapshots retained along each current/ref ancestry.
     pub retain_last: usize,
+    /// Whether periodic snapshot expiry is enabled for this Forge owner.
+    pub snapshot_expiry_enabled: bool,
+    /// Whether periodic fragmented-manifest rewrite is enabled.
+    pub manifest_rewrite_enabled: bool,
+    /// Independent small-file candidacy threshold used by live planning.
+    pub small_file_threshold_bytes: u64,
+    /// Maximum bytes packed into one selected manifest rewrite bin.
+    pub manifest_rewrite_target_size_bytes: u64,
+    /// Minimum count required for the newest under-filled manifest bin.
+    pub manifest_rewrite_min_count: usize,
     /// Age after which an unreferenced object may be deleted.
     pub orphan_gc_ttl: Duration,
     /// Maximum orphan candidates considered in one GC batch.
@@ -171,8 +187,13 @@ impl Default for ForgeConfig {
             uncertainty_margin: Duration::from_secs(30),
             uncertainty_bound: Duration::from_mins(2),
             audit_page_size: 256,
-            snapshot_retention: Duration::from_hours(120),
+            snapshot_retention: Duration::from_hours(24),
             retain_last: 1,
+            snapshot_expiry_enabled: true,
+            manifest_rewrite_enabled: false,
+            small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
+            manifest_rewrite_target_size_bytes: DEFAULT_MANIFEST_REWRITE_TARGET_SIZE_BYTES,
+            manifest_rewrite_min_count: DEFAULT_MANIFEST_REWRITE_MIN_COUNT,
             orphan_gc_ttl: Duration::from_hours(24),
             max_gc_candidates_per_batch: 256,
             max_concurrent_reads: DEFAULT_MAX_CONCURRENT_READS,
@@ -214,6 +235,9 @@ impl ForgeConfig {
             || self.audit_page_size <= 0
             || self.snapshot_retention.is_zero()
             || self.retain_last == 0
+            || self.small_file_threshold_bytes == 0
+            || self.manifest_rewrite_target_size_bytes == 0
+            || self.manifest_rewrite_min_count == 0
             || self.orphan_gc_ttl.is_zero()
             || self.max_gc_candidates_per_batch == 0
             || self.max_concurrent_reads == 0
@@ -810,8 +834,9 @@ impl Forge {
             table.metadata().default_partition_spec(),
             table.metadata().default_sort_order(),
         )?;
-        ForgeRightSizePolicy::new(
+        ForgeRightSizePolicy::from_table_threshold(
             target,
+            self.core.config.small_file_threshold_bytes,
             table.metadata().current_schema_id(),
             table.metadata().default_partition_spec_id(),
             table.metadata().default_sort_order_id(),

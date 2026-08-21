@@ -322,6 +322,32 @@ impl<'a> OracleAdmissionBlocks<'a> {
         .map_err(SqlError::from)?;
         Ok(result.rows_affected())
     }
+
+    /// Closes one exact allocation owned by one exact holder incarnation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError`] when PostgreSQL cannot persist the fenced closure.
+    pub async fn close_allocation(
+        &self,
+        allocation_id: Uuid,
+        node_id: Uuid,
+        fence: u64,
+    ) -> Result<u64, SqlError> {
+        let fence = i64::try_from(fence).map_err(|_| invariant("holder fence exceeds i64"))?;
+        let result = sqlx::query(
+            "UPDATE vala.oracle_admission_blocks SET closed_at=statement_timestamp() \
+             WHERE allocation_id=$1 AND holder_node_id=$2 AND holder_fencing_token=$3 \
+             AND closed_at IS NULL",
+        )
+        .bind(allocation_id)
+        .bind(node_id)
+        .bind(fence)
+        .execute(self.pool.pool())
+        .await
+        .map_err(SqlError::from)?;
+        Ok(result.rows_affected())
+    }
 }
 
 /// Validates one canonical positive capacity before opening policy mutation.
@@ -448,7 +474,8 @@ async fn live_units(
         "SELECT COALESCE(sum(blocks.units),0)::integer FROM vala.oracle_admission_blocks blocks \
          WHERE blocks.scope_kind=$1 \
          AND blocks.data_tenant_id IS NOT DISTINCT FROM COALESCE($2,blocks.data_tenant_id) \
-         AND blocks.query_class=$3 AND (blocks.expires_at>statement_timestamp() OR EXISTS ( \
+         AND blocks.query_class=$3 AND blocks.closed_at IS NULL \
+         AND (blocks.expires_at>statement_timestamp() OR EXISTS ( \
            SELECT 1 FROM vala.cluster_nodes roles \
            WHERE roles.data_tenant_id=$4 \
            AND roles.node_id=blocks.holder_node_id AND roles.role='oracle' \

@@ -1,6 +1,6 @@
 //! Durable demand scheduling without rewrite or Iceberg commit execution.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 #[cfg(feature = "test-support")]
 use std::sync::Arc;
 #[cfg(feature = "test-support")]
@@ -27,6 +27,9 @@ use super::Forge;
 use super::binpack::ForgeGroupKey;
 use super::error::ForgeError;
 use super::identity::task_table_binding;
+use super::maintenance::{
+    ManifestRewriteCandidate, manifest_rewrite_is_due, select_bounded_manifest_rewrite_paths,
+};
 use super::metrics::{ForgeDemandTransitionResult, ForgeTaskMetricStrategy};
 use super::planner::{
     ForgeCapacity, ForgePlanCandidate, ForgePlanCapacity, ForgePlanner, ForgeTableSnapshot,
@@ -77,6 +80,19 @@ struct DemandPlanningResult {
     compaction_debt_files: u64,
     /// Candidate input bytes represented by this exact demand generation.
     compaction_debt_bytes: u64,
+}
+
+impl DemandPlanningResult {
+    /// Retains a demand whose independently due manifest rewrite cannot fit.
+    #[must_use]
+    fn deferred(compaction_debt_files: u64, compaction_debt_bytes: u64) -> Self {
+        Self {
+            acknowledged: false,
+            compaction_debt_files,
+            compaction_debt_bytes,
+            ..Self::default()
+        }
+    }
 }
 
 /// Concrete owner of fenced durable Forge planning and demand convergence.
@@ -563,8 +579,14 @@ impl<'forge> ForgeScheduler<'forge> {
         demand: &ForgePlanningDemand,
         fence: i64,
     ) -> Result<DemandPlanningResult, ForgeError> {
-        let (snapshot, compaction_debt_files, compaction_debt_bytes) =
+        let (snapshot, compaction_debt_files, compaction_debt_bytes, demand_deferred) =
             self.discover_snapshot(demand).await?;
+        if demand_deferred {
+            return Ok(DemandPlanningResult::deferred(
+                compaction_debt_files,
+                compaction_debt_bytes,
+            ));
+        }
         for candidate in &snapshot.candidates {
             self.forge.core.telemetry.record_discovered_candidate(
                 ForgeTaskMetricStrategy::try_from(candidate.strategy).map_err(|strategy| {
@@ -694,7 +716,7 @@ impl<'forge> ForgeScheduler<'forge> {
     async fn discover_snapshot(
         &self,
         demand: &ForgePlanningDemand,
-    ) -> Result<(ForgeTableSnapshot, u64, u64), ForgeError> {
+    ) -> Result<(ForgeTableSnapshot, u64, u64, bool), ForgeError> {
         let binding = task_table_binding(
             demand.data_tenant_id,
             demand.data_tenant_id,
@@ -742,16 +764,33 @@ impl<'forge> ForgeScheduler<'forge> {
                 })
                 .collect::<Result<Vec<_>, ForgeError>>()?;
         }
-        // Independent per-table maintenance trigger. Evaluated every tick from
-        // the current metadata, not from the presence of compaction work, so
-        // snapshot expiry can never be starved by sustained compaction load.
-        // When maintenance is due it leads the candidate list, taking this
-        // tick's single planned slot ahead of compaction. Retention eligibility
-        // is part of the due predicate so a successful no-op expiry cannot
-        // create an endless successor-demand loop ahead of compaction.
-        let maintenance_due = self.maintenance_due(&table, demand)?
-            || self.open_rewrite_requires_reconciliation(&binding).await?;
-        if maintenance_due && let Some(candidate) = self.maintenance_candidate(&table).await? {
+redacted
+        // then executes rewrite first when both have work.  Keep that split:
+        // a fragmented manifest list must not wait for snapshot retention to
+        // become eligible, while expiry retains its acknowledgement/no-work
+        // guard.  The single candidate preserves the existing fenced ordered
+        // maintenance execution path.
+        let snapshot_expiry_due = self.snapshot_expiry_due(&table, demand)?;
+        let manifest_rewrite_due = self.manifest_rewrite_due(&table).await?;
+        let reconciliation_due = self.open_rewrite_requires_reconciliation(&binding).await?;
+        let maintenance_candidate =
+            if snapshot_expiry_due || manifest_rewrite_due || reconciliation_due {
+                self.maintenance_candidate(
+                    &table,
+                    manifest_rewrite_due,
+                    snapshot_expiry_due,
+                    reconciliation_due,
+                )
+                .await?
+            } else {
+                None
+            };
+        let demand_deferred = manifest_demand_must_remain(
+            manifest_rewrite_due,
+            maintenance_candidate.is_some(),
+            snapshot_expiry_due,
+        );
+        if let Some(candidate) = maintenance_candidate {
             candidates.insert(0, candidate);
         }
         Ok((
@@ -761,6 +800,7 @@ impl<'forge> ForgeScheduler<'forge> {
             },
             compaction_debt_files,
             compaction_debt_bytes,
+            demand_deferred,
         ))
     }
 
@@ -779,11 +819,14 @@ impl<'forge> ForgeScheduler<'forge> {
     /// # Errors
     ///
     /// Returns a clock error when the current time cannot be read.
-    fn maintenance_due(
+    fn snapshot_expiry_due(
         &self,
         table: &iceberg::table::Table,
         demand: &ForgePlanningDemand,
     ) -> Result<bool, ForgeError> {
+        if !self.forge.core.config.snapshot_expiry_enabled {
+            return Ok(false);
+        }
         let retained = table.metadata().snapshots().count();
         let commits = retained.saturating_sub(self.forge.core.config.retain_last);
         if commits == 0 {
@@ -811,6 +854,50 @@ impl<'forge> ForgeScheduler<'forge> {
             self.forge.core.config.maintenance_trigger_snapshot_count,
             self.forge.core.config.maintenance_trigger_interval,
             self.forge.core.config.snapshot_retention,
+        ))
+    }
+
+    /// Returns whether current metadata contains a worthwhile manifest rewrite.
+    ///
+    /// This is intentionally independent of retained snapshots: manifest
+    /// maintenance is an upstream-scheduled activity, not an expiry side
+    /// effect. The later candidate builder reloads metadata at the normal
+    /// planning boundary, so a concurrent catalog change can only yield a
+    /// harmless no-work pass rather than stale publication.
+    async fn manifest_rewrite_due(
+        &self,
+        table: &iceberg::table::Table,
+    ) -> Result<bool, ForgeError> {
+        if !self.forge.core.config.manifest_rewrite_enabled {
+            return Ok(false);
+        }
+        let Some(snapshot) = table.metadata().current_snapshot() else {
+            return Ok(false);
+        };
+        let manifests = table
+            .manifest_list_reader(snapshot)
+            .load()
+            .await
+            .map_err(ForgeError::Catalog)?;
+        let candidates = manifests
+            .entries()
+            .iter()
+            .filter(|manifest| {
+                manifest.content == iceberg::spec::ManifestContentType::Data
+                    && manifest.manifest_length >= 0
+            })
+            .map(|manifest| ManifestRewriteCandidate {
+                path: manifest.manifest_path.clone(),
+                size_bytes: u64::try_from(manifest.manifest_length)
+                    .expect("nonnegative manifest length fits u64"),
+                partition_spec_id: manifest.partition_spec_id,
+                sequence_number: manifest.sequence_number,
+            })
+            .collect::<Vec<_>>();
+        Ok(manifest_rewrite_is_due(
+            &candidates,
+            self.forge.core.config.manifest_rewrite_target_size_bytes,
+            self.forge.core.config.manifest_rewrite_min_count,
         ))
     }
 
@@ -866,6 +953,9 @@ impl<'forge> ForgeScheduler<'forge> {
     async fn maintenance_candidate(
         &self,
         table: &iceberg::table::Table,
+        manifest_rewrite_due: bool,
+        snapshot_expiry_due: bool,
+        reconciliation_due: bool,
     ) -> Result<Option<ForgePlanCandidate>, ForgeError> {
         let Some(snapshot) = table.metadata().current_snapshot() else {
             return Ok(None);
@@ -875,12 +965,50 @@ impl<'forge> ForgeScheduler<'forge> {
             .load()
             .await
             .map_err(ForgeError::Catalog)?;
+        let selected_paths = if self.forge.core.config.manifest_rewrite_enabled {
+            let candidates = manifests
+                .entries()
+                .iter()
+                .filter(|manifest| {
+                    manifest.content == iceberg::spec::ManifestContentType::Data
+                        && manifest.manifest_length >= 0
+                })
+                .map(|manifest| ManifestRewriteCandidate {
+                    path: manifest.manifest_path.clone(),
+                    size_bytes: u64::try_from(manifest.manifest_length)
+                        .expect("nonnegative manifest length fits u64"),
+                    partition_spec_id: manifest.partition_spec_id,
+                    sequence_number: manifest.sequence_number,
+                })
+                .collect::<Vec<_>>();
+            select_bounded_manifest_rewrite_paths(
+                &candidates,
+                self.forge.core.config.manifest_rewrite_target_size_bytes,
+                self.forge.core.config.manifest_rewrite_min_count,
+                self.forge.core.config.max_files_per_tick,
+                self.forge.core.config.max_bytes_per_tick,
+            )
+        } else {
+            Vec::new()
+        };
+        if selected_paths.is_empty() && !snapshot_expiry_due && !reconciliation_due {
+            return Ok(None);
+        }
+        let selected = selected_paths.into_iter().collect::<HashSet<_>>();
+        let maintenance_inputs = if selected.is_empty() && snapshot_expiry_due {
+            manifests.entries().iter().collect::<Vec<_>>()
+        } else {
+            manifests
+                .entries()
+                .iter()
+                .filter(|manifest| selected.contains(&manifest.manifest_path))
+                .collect::<Vec<_>>()
+        };
         let mut inputs = Vec::new();
         let mut input_bytes = Vec::new();
         let mut bytes = 0_u64;
-        for manifest in manifests
-            .entries()
-            .iter()
+        for manifest in maintenance_inputs
+            .into_iter()
             .take(self.forge.core.config.max_files_per_tick)
         {
             let size =
@@ -902,8 +1030,12 @@ impl<'forge> ForgeScheduler<'forge> {
         let mut input_terms = inputs.into_iter().zip(input_bytes).collect::<Vec<_>>();
         input_terms.sort_by(|left, right| left.0.cmp(&right.0));
         input_terms.dedup_by(|left, right| left.0 == right.0);
-        let (inputs, input_bytes): (Vec<_>, Vec<_>) = input_terms.into_iter().unzip();
-        if inputs.is_empty() {
+        let (mut inputs, mut input_bytes): (Vec<_>, Vec<_>) = input_terms.into_iter().unzip();
+        if inputs.is_empty() && reconciliation_due {
+            inputs.push(format!("forge://reconcile/{}", snapshot.snapshot_id()));
+            input_bytes.push(1);
+            bytes = 1;
+        } else if inputs.is_empty() {
             return Ok(None);
         }
         let estimate = bytes.max(1);
@@ -923,8 +1055,13 @@ impl<'forge> ForgeScheduler<'forge> {
                 .min(self.forge.core.config.max_concurrent_reads),
             self.capacity,
         )?;
+        let strategy = if snapshot_expiry_due || reconciliation_due {
+            ForgeTaskStrategy::SnapshotExpiry
+        } else {
+            ForgeTaskStrategy::ManifestRewrite
+        };
         Ok(Some(ForgePlanCandidate {
-            strategy: ForgeTaskStrategy::SnapshotExpiry,
+            strategy,
             inputs,
             input_bytes,
             bytes: estimate,
@@ -943,6 +1080,9 @@ impl<'forge> ForgeScheduler<'forge> {
                 "kind":"maintenance",
                 "trigger_commit_count": table.metadata().snapshots().count()
                     .saturating_sub(self.forge.core.config.retain_last),
+                "manifest_rewrite_due": manifest_rewrite_due,
+                "snapshot_expiry_due": snapshot_expiry_due,
+                "reconciliation_due": reconciliation_due,
             }),
         }))
     }
@@ -1044,6 +1184,16 @@ fn governed_capacity(configured: ForgeCapacity, plan: &ResourcePlan) -> ForgeCap
     }
 }
 
+/// Returns whether an independently due manifest rewrite must retain demand.
+#[must_use]
+fn manifest_demand_must_remain(
+    manifest_rewrite_due: bool,
+    maintenance_candidate_fits: bool,
+    snapshot_expiry_due: bool,
+) -> bool {
+    manifest_rewrite_due && !maintenance_candidate_fits && !snapshot_expiry_due
+}
+
 /// Project governed scheduler capacity into status claimability limits.
 ///
 /// This preserves the exact planning envelope so status never marks a task
@@ -1073,7 +1223,7 @@ fn status_claim_limits(capacity: ForgeCapacity) -> ForgeClaimLimits {
 /// A table with zero accrued commits is never due. Extracted as a free function
 /// so trigger and retention outcomes are exercised without catalog or clock IO.
 #[must_use]
-fn maintenance_trigger_due(
+pub(super) fn maintenance_trigger_due(
     commits: usize,
     oldest_age: Option<Duration>,
     count_threshold: usize,
@@ -1133,8 +1283,8 @@ mod source_tests {
     use std::time::Duration;
 
     use super::{
-        ForgeScheduleOutcome, governed_capacity, maintenance_trigger_due, should_publish_gauges,
-        status_claim_limits,
+        DemandPlanningResult, ForgeScheduleOutcome, governed_capacity, maintenance_trigger_due,
+        manifest_demand_must_remain, should_publish_gauges, status_claim_limits,
     };
     use crate::forge::planner::ForgeCapacity;
     use crate::resources::ResourcePlan;
@@ -1229,6 +1379,20 @@ mod source_tests {
             Duration::from_hours(1),
             Duration::from_hours(24 * 7),
         ));
+    }
+
+    /// A due manifest rewrite that cannot fit remains unacknowledged and durable.
+    #[test]
+    fn non_fitting_manifest_rewrite_retains_demand() {
+        assert!(manifest_demand_must_remain(true, false, false));
+        assert!(!manifest_demand_must_remain(true, true, false));
+        assert!(!manifest_demand_must_remain(true, false, true));
+
+        let result = DemandPlanningResult::deferred(7, 11);
+        assert!(!result.acknowledged);
+        assert_eq!(result.tasks_enqueued, 0);
+        assert_eq!(result.compaction_debt_files, 7);
+        assert_eq!(result.compaction_debt_bytes, 11);
     }
 
     /// The supervised scheduler path contains no direct execution or commit call.

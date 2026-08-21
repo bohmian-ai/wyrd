@@ -628,13 +628,17 @@ impl WyrdTestServer {
                 )
             })?
             .map_err(|error| WyrdTestServerError::Join(error.to_string()))?;
-        match result {
+        let terminal = match result {
             Ok(()) => Err(WyrdTestServerError::Start(
                 "production supervisor exited cleanly while terminal failure was required"
                     .to_owned(),
             )),
             Err(exit) => Ok(format!("{exit:?}")),
-        }
+        };
+        tokio::task::spawn_blocking(move || drop(self))
+            .await
+            .map_err(|error| WyrdTestServerError::Join(error.to_string()))?;
+        terminal
     }
 
     /// Shut down the bound workers and return concrete owner lifecycle evidence.

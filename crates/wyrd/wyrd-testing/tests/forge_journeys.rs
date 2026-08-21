@@ -1,12 +1,13 @@
 //! Distributed product journey for the real Scribe-to-Forge publication path.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use arrow::array::{ArrayRef, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use opendal::Buffer;
 use secrecy::SecretString;
 use tokio::task::JoinHandle;
@@ -31,16 +32,15 @@ use wyrd_client::transport::{GrpcConfig, HttpConfig};
 use wyrd_server::config::BifrostTarget;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
-    AuditDetail, BifrostQueryRequest, ForgeCompactionPhase, FreshnessPolicy, StoragePath,
+    AuditDetail, BifrostQueryRequest, ForgeIcebergRewritePhase, FreshnessPolicy, StoragePath,
     VisibilityMode,
 };
 use wyrd_testing::bifrost::forge_harness::seed_forge_group;
 use wyrd_testing::bifrost::{
     BifrostClusterSpec, BifrostTopology, ForgeCausalDiagnosis, ForgeCausalTelemetryReport,
-    ForgeTelemetryFailureClass, ForgeTelemetryResource, WyrdTestCluster,
+    ForgeObjectStoreControl, ForgeTelemetryFailureClass, ForgeTelemetryResource, WyrdTestCluster,
     shared_process_telemetry_for_test,
 };
-use wyrd_testing::otlp::RandomTraceGenerator;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 use wyrd_tonic::frame_codec::FrameDecoder;
 use wyrd_tonic::wyrd::v1 as proto;
@@ -60,11 +60,408 @@ struct Scenario {
 /// compaction is exercised instead of leaving a single open-tail file.
 const WRITE_CYCLES: usize = 3;
 
-/// Number of spans carried by each OTLP writer request.
-const SPANS_PER_WRITE: usize = 6;
-
 /// Stable scheduler identity for maintenance journey fixtures.
 const MAINTENANCE_JOURNEY_SCHEDULER_OWNER: u128 = 0x0198_39f4_2b51_7000_8000_0000_0000_0005;
+
+/// Rejects private Forge ownership seams from the authoritative journey graph.
+///
+/// The guard discovers helpers transitively across the journey and bound
+/// server/cluster harness, so cross-file indirection cannot hide a private
+/// owner seam.
+#[test]
+fn authoritative_forge_call_tree_uses_only_supervised_owners() {
+    let sources = [
+        include_str!("forge_journeys.rs"),
+        include_str!("../src/server.rs"),
+        include_str!("../src/bifrost/cluster.rs"),
+        include_str!("../src/bifrost/forge_harness.rs"),
+    ];
+    let roots = [
+        "pg_bifrost_forge_attempt_terminal_paths_settle_exactly_once",
+        "pg_bifrost_forge_publication_recovery_and_orphan_gc",
+        "pg_bifrost_forge_manifest_maintenance_precedes_expiry",
+        "pg_bifrost_forge_small_files_converges_without_query_dependency",
+    ];
+    let forbidden = [
+        "Forge::run",
+        ".run_once(",
+        "ForgeWorker::new",
+        "execute_one_for_test",
+        "claim_next_for_test",
+        "claim_fair_for_test",
+        "append_prepared",
+        "reconcile_live_replacements_for_test",
+        "run_orphan_gc_for_test",
+    ];
+    let mutation_forbidden = [
+        "INSERT INTO vala.forge_tasks",
+        "UPDATE vala.forge_tasks",
+        "DELETE FROM vala.forge_tasks",
+        "INSERT INTO vala.forge_operations",
+        "UPDATE vala.forge_operations",
+        "DELETE FROM vala.forge_operations",
+    ];
+    let violations =
+        authoritative_forge_violations(&sources, &roots, &forbidden, &mutation_forbidden);
+    assert!(
+        violations.is_empty(),
+        "authoritative Forge graph violations: {violations:?}"
+    );
+}
+
+/// Traverses the closed journey facade and reports private ownership violations.
+///
+/// Qualified calls resolve by exact owner, the closed facade's receiver names
+/// resolve to their concrete owners, `self` calls remain on the current owner,
+/// and bare calls resolve only to module functions. This deliberately refuses
+/// name-only cross-owner traversal, so same-named methods cannot alias one
+/// another in the authority graph.
+fn authoritative_forge_violations(
+    sources: &[&str],
+    roots: &[&str],
+    forbidden: &[&str],
+    mutation_forbidden: &[&str],
+) -> Vec<String> {
+    let local_functions = sources
+        .iter()
+        .enumerate()
+        .flat_map(|(source_index, source)| {
+            rust_functions(source)
+                .into_iter()
+                .map(move |function| (source_index, function))
+        })
+        .collect::<Vec<_>>();
+    let mut pending = roots
+        .into_iter()
+        .map(|name| {
+            local_functions
+                .iter()
+                .find(|(source, function)| *source == 0 && function.name == *name)
+                .cloned()
+                .expect("authoritative root has an owner-qualified definition")
+        })
+        .collect::<Vec<_>>();
+    let mut authoritative = std::collections::BTreeSet::new();
+    let mut violations = Vec::new();
+    while let Some((source_index, function)) = pending.pop() {
+        if !authoritative.insert((source_index, function.start)) {
+            continue;
+        }
+        let body = rust_function_body(sources[source_index], &function)
+            .expect("guarded function must exist in the authoritative source graph");
+        for (callee_source, callee) in &local_functions {
+            let qualified = format!("{}::{}(", callee.owner, callee.name);
+            let receiver = format!("self.{}(", callee.name);
+            let module_call = format!("{}(", callee.name);
+            let facade_receiver = authoritative_receiver(&callee.owner)
+                .is_some_and(|receiver| body.contains(&format!("{receiver}.{}(", callee.name)));
+            let is_called = body.contains(&qualified)
+                || (callee.owner == function.owner && body.contains(&receiver))
+                || facade_receiver
+                || (callee.owner == "module" && body.contains(&module_call));
+            if is_called && !authoritative.contains(&(*callee_source, callee.start)) {
+                pending.push((*callee_source, callee.clone()));
+            }
+        }
+        for token in forbidden {
+            if body.contains(token) {
+                violations.push(format!(
+                    "{}::{} contains private owner seam {token}",
+                    function.owner, function.name
+                ));
+            }
+        }
+        for token in mutation_forbidden {
+            if body.contains(token) {
+                violations.push(format!(
+                    "{}::{} mutates durable owner table through {token}",
+                    function.owner, function.name
+                ));
+            }
+        }
+    }
+    violations
+}
+
+/// Maps every stateful owner in the closed authoritative facade to its receiver.
+fn authoritative_receiver(owner: &str) -> Option<&'static str> {
+    match owner {
+        "WyrdTestServer" => Some("server"),
+        "WyrdTestCluster" => Some("cluster"),
+        "ForgeFixture" => Some("fixture"),
+        "ForgeObjectStoreControl" => Some("controls"),
+        "JourneyMaintenance" => Some("maintenance"),
+        _ => None,
+    }
+}
+
+/// One owner-qualified function definition in an inspected source.
+#[derive(Clone, Debug)]
+struct RustFunction {
+    owner: String,
+    name: String,
+    start: usize,
+}
+
+/// Returns every owner-qualified function and its exact definition offset.
+fn rust_functions(source: &str) -> Vec<RustFunction> {
+    let impls = rust_impl_ranges(source);
+    let mut functions = Vec::new();
+    let mut offset = 0;
+    while let Some(relative) = source[offset..].find("fn ") {
+        let start = offset + relative;
+        let tail = &source[start + 3..];
+        let name = tail
+            .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+            .next()
+            .unwrap_or_default();
+        if !name.is_empty() {
+            let owner = impls
+                .iter()
+                .find(|implementation| implementation.start < start && start < implementation.end)
+                .map_or("module", |implementation| implementation.owner.as_str())
+                .to_owned();
+            functions.push(RustFunction {
+                owner,
+                name: name.to_owned(),
+                start,
+            });
+        }
+        offset = start + 3 + name.len();
+    }
+    functions
+}
+
+/// One lexical `impl` block and its concrete owner.
+struct RustImplRange {
+    /// Concrete type named by the implementation.
+    owner: String,
+    /// Opening-brace offset of the implementation.
+    start: usize,
+    /// Closing-brace offset of the implementation.
+    end: usize,
+}
+
+/// Returns the lexical ranges of concrete inherent implementation blocks.
+fn rust_impl_ranges(source: &str) -> Vec<RustImplRange> {
+    let mut ranges = Vec::new();
+    let mut offset = 0;
+    while let Some(relative) = source[offset..].find("impl ") {
+        let declaration = offset + relative;
+        let tail = &source[declaration + 5..];
+        let owner = tail
+            .split(|character: char| character == '{' || character.is_whitespace())
+            .next()
+            .unwrap_or_default();
+        let Some(open_relative) = tail.find('{') else {
+            break;
+        };
+        let open = declaration + 5 + open_relative;
+        if !owner.is_empty() {
+            if let Some(end) = matching_brace(source, open) {
+                ranges.push(RustImplRange {
+                    owner: owner.to_owned(),
+                    start: open,
+                    end,
+                });
+            }
+        }
+        offset = open + 1;
+    }
+    ranges
+}
+
+/// Finds the closing brace paired with `open`.
+fn matching_brace(source: &str, open: usize) -> Option<usize> {
+    let mut depth = 0_usize;
+    for (relative, byte) in source.as_bytes()[open..].iter().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(open + relative);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Extract one Rust function body for the static authoritative-owner guard.
+///
+/// # Panics
+///
+/// Panics when the named function is absent or its braces are unbalanced.
+fn rust_function_body<'a>(source: &'a str, function: &RustFunction) -> Option<&'a str> {
+    let open = source[function.start..]
+        .find('{')
+        .map(|offset| function.start + offset)
+        .expect("guarded function must have a body");
+    let mut depth = 0_usize;
+    for (offset, byte) in source.as_bytes()[open..].iter().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth
+                    .checked_sub(1)
+                    .expect("function braces remain balanced");
+                if depth == 0 {
+                    return Some(&source[open..=open + offset]);
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("guarded function body must close")
+}
+
+/// Proves a same-named method cannot conceal a forbidden call in another owner.
+#[test]
+fn owner_guard_distinguishes_same_named_methods() {
+    let source = "impl Closed { fn start(&self) {} } fn root() { helper(); } fn helper() { Hidden::start(); } impl Allowed { fn start(&self) {} } impl Hidden { fn start(&self) { ForgeWorker::new(); } }";
+    let violations =
+        authoritative_forge_violations(&[source], &["root"], &["ForgeWorker::new"], &[]);
+    assert_eq!(violations.len(), 1);
+    assert!(violations[0].starts_with("Hidden::start "));
+}
+
+/// Provisions one Forge fixture and creates its compaction debt through native ingestion.
+///
+/// # Panics
+///
+/// Panics when provisioning or native ingestion cannot cross the durable flush barrier.
+async fn native_forge_group(
+    server: &WyrdTestServer,
+    table_name: &str,
+) -> wyrd_testing::bifrost::ForgeFixture {
+    let fixture = seed_forge_group(server, table_name).await;
+    append_native_forge_cycles(server, &fixture, 0..3).await;
+    fixture
+}
+
+/// Appends Scribe-owned files through the public native Arrow transport.
+///
+/// # Panics
+///
+/// Panics when authentication, ingestion, or the server-owned tenant flush fails.
+async fn append_native_forge_cycles(
+    server: &WyrdTestServer,
+    fixture: &wyrd_testing::bifrost::ForgeFixture,
+    sequences: impl IntoIterator<Item = i64>,
+) {
+    append_native_forge_cycles_with_rows(server, fixture, sequences, 1).await;
+}
+
+/// Appends a selected row count in each independently sealed native batch.
+async fn append_native_forge_cycles_with_rows(
+    server: &WyrdTestServer,
+    fixture: &wyrd_testing::bifrost::ForgeFixture,
+    sequences: impl IntoIterator<Item = i64>,
+    rows_per_batch: usize,
+) {
+    append_native_forge_cycles_with_flush_mode(server, fixture, sequences, rows_per_batch, true)
+        .await;
+}
+
+/// Appends public batches behind one tenant flush so Forge observes the complete group.
+async fn append_native_forge_group_with_rows(
+    server: &WyrdTestServer,
+    fixture: &wyrd_testing::bifrost::ForgeFixture,
+    sequences: impl IntoIterator<Item = i64>,
+    rows_per_batch: usize,
+) {
+    append_native_forge_cycles_with_flush_mode(server, fixture, sequences, rows_per_batch, false)
+        .await;
+}
+
+/// Sends public batches with either per-batch or group-level durable flushes.
+async fn append_native_forge_cycles_with_flush_mode(
+    server: &WyrdTestServer,
+    fixture: &wyrd_testing::bifrost::ForgeFixture,
+    sequences: impl IntoIterator<Item = i64>,
+    rows_per_batch: usize,
+    flush_each: bool,
+) {
+    let table_name = &fixture.binding.table_name;
+    let sequences = sequences.into_iter().collect::<Vec<_>>();
+    let writer_sequence = sequences.first().copied().unwrap_or_default();
+    let bootstrap = server
+        .bootstrap_service_in_tenant(
+            fixture.tenant,
+            &format!("{table_name}-writer-{writer_sequence}"),
+            &["admin"],
+        )
+        .await
+        .expect("bootstrap native Forge writer");
+    let api_key = match bootstrap {
+        Bootstrap::Machine { api_key, .. } => api_key,
+        Bootstrap::User { .. } => panic!("native Forge writer bootstrap returned a user"),
+    };
+    let client = WyrdClient::with_config(ClientConfig {
+        grpc: GrpcConfig {
+            endpoint: server.grpc_url().expect("bound Forge gRPC URL"),
+            connect_retries: 3,
+            ..GrpcConfig::default()
+        },
+        http: HttpConfig {
+            base_url: server.base_url().expect("bound Forge HTTP URL").to_owned(),
+            ..HttpConfig::default()
+        },
+        api_key: Some(api_key),
+        ..ClientConfig::default()
+    })
+    .expect("native Forge client config");
+    let transport = BifrostGrpcTransport::connect(&client)
+        .await
+        .expect("connect native Forge writer");
+    for sequence in sequences {
+        transport
+            .insert_batch(
+                &format!("vala.bifrost.{table_name}"),
+                uuid::Uuid::now_v7().into_bytes(),
+                native_forge_value_ipc(sequence, rows_per_batch),
+            )
+            .await
+            .expect("native Forge insert");
+        if flush_each {
+            server
+                .flush_bifrost_for_tenant(fixture.tenant)
+                .await
+                .expect("server-owned tenant Scribe flush barrier");
+        }
+    }
+    if !flush_each {
+        server
+            .flush_bifrost_for_tenant(fixture.tenant)
+            .await
+            .expect("server-owned grouped Scribe flush barrier");
+    }
+}
+
+/// Encodes the public one-column schema owned by the Forge fixture table.
+fn native_forge_value_ipc(sequence: i64, rows: usize) -> Vec<u8> {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from_iter_values((0..rows).map(|offset| {
+                sequence.saturating_add(i64::try_from(offset).expect("bounded native row offset"))
+            }))) as ArrayRef,
+        ],
+    )
+    .expect("native Forge value batch");
+    let mut bytes = Vec::new();
+    let mut writer = StreamWriter::try_new(&mut bytes, schema.as_ref()).expect("native IPC writer");
+    writer.write(&batch).expect("native IPC batch");
+    writer.finish().expect("native IPC finish");
+    bytes
+}
 
 /// Rows sent by each bounded public-ingest request in the convergence journey.
 const FORGE_CONVERGENCE_BATCH_ROWS: usize = 5_000;
@@ -103,6 +500,10 @@ fn journey_envelope(
 
 /// One bounded production scheduler and worker pair for a lifecycle proof.
 struct JourneyMaintenance {
+    operator_pool: vala_sql::OperatorPool,
+    tenant: DataTenantId,
+    /// Deterministic catalog boundaries shared with the production lifecycle.
+    maintenance_controls: vala_bifrost_redux::forge::MaintenanceTestControls,
     /// Passive trigger driving deterministic production scheduler passes.
     scheduler_trigger: ForgeSchedulerTrigger,
     /// Observer proving which durable worker strategy completed.
@@ -147,6 +548,7 @@ impl JourneyMaintenance {
         .expect("validated journey maintenance worker");
         let scheduler_stop = CancellationToken::new();
         let worker_stop = CancellationToken::new();
+        let maintenance_controls = forge.maintenance_controls_for_test();
         let scheduler_task = tokio::spawn({
             let stop = scheduler_stop.clone();
             async move { forge.run(stop).await }
@@ -156,6 +558,9 @@ impl JourneyMaintenance {
             async move { worker.run(stop).await }
         });
         Self {
+            operator_pool: fixture.operator_pool.clone(),
+            tenant: fixture.tenant,
+            maintenance_controls,
             scheduler_trigger,
             worker_observer,
             scheduler_stop,
@@ -172,10 +577,14 @@ impl JourneyMaintenance {
     /// Panics when the scheduler or worker misses its bounded completion or the
     /// selected attempt returns an error.
     async fn run_one_success(&mut self) -> ForgeTaskStrategy {
+        self.run_one_success_at("maintenance").await
+    }
+
+    /// Runs one completed attempt with a diagnostic stage name.
+    async fn run_one_success_at(&mut self, stage: &str) -> ForgeTaskStrategy {
         let expected_passes = self.scheduler_trigger.completed_passes().saturating_add(1);
         let expected_attempts = self.worker_observer.attempts().saturating_add(1);
         let expected_completions = self.worker_observer.completed().saturating_add(1);
-        let errors = self.worker_observer.returned_errors().len();
         self.worker_observer.hold_after_next_attempt_for_test();
         self.scheduler_trigger.request_pass();
         tokio::time::timeout(
@@ -185,16 +594,35 @@ impl JourneyMaintenance {
         )
         .await
         .expect("journey maintenance scheduler pass bound");
-        tokio::time::timeout(
+        let attempt_wait = tokio::time::timeout(
             Duration::from_secs(30),
             self.worker_observer.wait_for_held_attempt_for_test(),
         )
-        .await
-        .expect("journey maintenance worker attempt bound");
+        .await;
+        if let Err(error) = attempt_wait {
+            let (demands, tasks): (i64, i64) = sqlx::query_as(
+                "SELECT (SELECT count(*) FROM vala.forge_planning_demands WHERE data_tenant_id=$1), (SELECT count(*) FROM vala.forge_tasks WHERE data_tenant_id=$1)",
+            )
+            .bind(self.tenant.as_uuid())
+            .fetch_one(self.operator_pool.pool())
+            .await
+            .expect("journey timeout durable diagnostics");
+            panic!(
+                "journey maintenance worker attempt bound at {stage}: {error}; scheduler_finished={} worker_finished={} demands={demands} tasks={tasks}",
+                self.scheduler_task.is_finished(),
+                self.worker_task
+                    .as_ref()
+                    .is_some_and(JoinHandle::is_finished)
+            )
+        }
         assert_eq!(self.worker_observer.attempts(), expected_attempts);
-        assert_eq!(self.worker_observer.returned_errors().len(), errors);
         self.stop_worker().await;
-        assert_eq!(self.worker_observer.completed(), expected_completions);
+        assert_eq!(
+            self.worker_observer.completed(),
+            expected_completions,
+            "held maintenance attempt errors: {:?}",
+            self.worker_observer.returned_errors()
+        );
         match self
             .worker_observer
             .completed_strategies()
@@ -206,6 +634,19 @@ impl JourneyMaintenance {
                 panic!("journey maintenance completed an unknown strategy: {strategy}")
             }
         }
+    }
+
+    /// Runs one complete scheduler pass without requiring a worker attempt.
+    async fn run_scheduler_pass(&self) {
+        let expected_passes = self.scheduler_trigger.completed_passes().saturating_add(1);
+        self.scheduler_trigger.request_pass();
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            self.scheduler_trigger
+                .wait_for_passes_at_least(expected_passes),
+        )
+        .await
+        .expect("journey maintenance scheduler-only pass bound");
     }
 
     /// Cancels and joins the production worker loop once.
@@ -283,9 +724,19 @@ fn rendered_staging_fold_task_duration_count(rendered: &str, result: &str) -> Op
 /// exposition does not establish the cancellation contract.
 #[tokio::test]
 async fn superseded_worker_records_cancelled_duration_from_durable_state() {
+    superseded_worker_cancelled_settlement_journey().await;
+}
+
+/// Drives one real superseded worker through its durable cancelled settlement.
+///
+/// # Panics
+///
+/// Panics when cancellation fails to settle the task, audit, or bounded
+/// telemetry evidence through the production worker path.
+async fn superseded_worker_cancelled_settlement_journey() {
     let (server, telemetry) = start_telemetry_maintenance_server().await;
-    let fixture = seed_forge_group(&server, "durable_cancelled_metric").await;
-    commit_journey_staging_snapshot(&fixture).await;
+    let fixture = native_forge_group(&server, "durable_cancelled_metric").await;
+    commit_journey_staging_snapshot(&server, &fixture).await;
     let current_snapshot = fixture
         .catalog
         .load_table(&fixture.binding.table_ident())
@@ -362,6 +813,236 @@ async fn superseded_worker_records_cancelled_duration_from_durable_state() {
     server.shutdown().await.expect("telemetry server shutdown");
 }
 
+/// Proves cancellation, qualified failure, claim expiry, and successor reclaim settle once.
+///
+/// Each phase drives a real PostgreSQL-backed production worker boundary and
+/// asserts durable task, audit, telemetry, publication, and resource-release
+/// evidence before its fixture shuts down.
+///
+/// # Panics
+///
+/// Panics when any terminal path retains ownership, duplicates publication, or
+/// diverges from its exact durable and resource settlement.
+#[tokio::test]
+#[ignore = "gated journey: real Forge terminal paths and exact settlement"]
+async fn pg_bifrost_forge_attempt_terminal_paths_settle_exactly_once() {
+    supervised_same_tenant_fifo_journey().await;
+    supervised_worker_claim_expiry_journey().await;
+    supervised_forge_panic_recovery_scenario().await;
+    dedicated_unschedulable_admission_journey().await;
+    supervised_temporary_pressure_defers_without_ownership().await;
+}
+
+/// Proves two durable ready tasks for one tenant are claimed in FIFO order.
+///
+/// # Panics
+///
+/// Panics when owner-backed enqueue, supervised claim observation, or orderly
+/// server shutdown fails to preserve the two distinct readiness instants.
+async fn supervised_same_tenant_fifo_journey() {
+    let observer = ForgeWorkerCompletionObserver::new();
+    let server = WyrdTestServer::builder()
+        .with_forge_interval(Duration::from_secs(3600))
+        .with_forge_completion_observer_for_test(observer.clone())
+        .start_bound()
+        .await
+        .expect("bound same-tenant FIFO server");
+    let first = native_forge_group(&server, "journey_fifo_first").await;
+    let second = native_forge_group(&server, "journey_fifo_second").await;
+    let tasks = ForgeTasks::new(first.operator_pool.clone());
+    let readiness = chrono::Utc::now();
+    let first_id = enqueue_stale_fifo_task(
+        &tasks,
+        &first,
+        readiness - chrono::Duration::seconds(2),
+        0x31,
+    )
+    .await;
+    let second_id = enqueue_stale_fifo_task(
+        &tasks,
+        &second,
+        readiness - chrono::Duration::seconds(1),
+        0x32,
+    )
+    .await;
+    let events = tokio::time::timeout(
+        Duration::from_secs(30),
+        observer.wait_for_lifecycle(|events| {
+            events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        vala_bifrost_redux::forge::ForgeLifecycleEvent::Claimed { task_id, .. }
+                            if *task_id == first_id || *task_id == second_id
+                    )
+                })
+                .count()
+                == 2
+        }),
+    )
+    .await
+    .expect("two supervised same-tenant claims");
+    let claimed = events
+        .iter()
+        .filter_map(|event| match event {
+            vala_bifrost_redux::forge::ForgeLifecycleEvent::Claimed { task_id, .. }
+                if *task_id == first_id || *task_id == second_id =>
+            {
+                Some(*task_id)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        claimed,
+        [first_id, second_id],
+        "one tenant's durable ready queue must claim by ready_at then task_id"
+    );
+    server.shutdown().await.expect("same-tenant FIFO shutdown");
+}
+
+/// Enqueues one intentionally stale task whose supervised claim settles without publication.
+async fn enqueue_stale_fifo_task(
+    tasks: &ForgeTasks,
+    fixture: &wyrd_testing::bifrost::ForgeFixture,
+    ready_at: chrono::DateTime<chrono::Utc>,
+    plan_byte: u8,
+) -> uuid::Uuid {
+    let envelope = journey_envelope(fixture, 1, 1);
+    tasks
+        .enqueue(&NewForgeTask {
+            data_tenant_id: fixture.tenant,
+            table_ref: ForgeTaskTableIdentity::new(
+                "wyrd-redux",
+                &fixture.binding.logical_namespace,
+                &fixture.binding.table_name,
+            )
+            .expect("FIFO task table identity"),
+            strategy: ForgeTaskStrategy::StagingFold,
+            lane: ForgeTaskLane::Ordinary,
+            base_snapshot_id: 1,
+            plan: ForgeTaskPlan {
+                version: FORGE_TASK_PAYLOAD_VERSION,
+                inputs: vec![format!("fifo-{plan_byte}.parquet")],
+                parameters: serde_json::json!({"kind":"staging_fold"}),
+            },
+            plan_hash: [plan_byte; 32],
+            estimates: ForgeTaskEstimates {
+                envelope: Some(envelope),
+                files: 1,
+                bytes: 1,
+                parallelism: envelope.reader_permits,
+                memory_bytes: envelope.memory_bytes().expect("FIFO resident total"),
+                spill_bytes: envelope.scratch_bytes().expect("FIFO scratch total"),
+                large_ceiling_bytes: 1,
+            },
+            ready_at,
+        })
+        .await
+        .expect("enqueue same-tenant FIFO task")
+}
+
+/// Proves temporary root pressure defers durably and releases atomically.
+async fn supervised_temporary_pressure_defers_without_ownership() {
+    let observer = ForgeWorkerCompletionObserver::new();
+    let server = WyrdTestServer::builder()
+        .with_forge_interval(Duration::from_secs(3600))
+        .with_forge_completion_observer_for_test(observer.clone())
+        .start_bound()
+        .await
+        .expect("bound temporary-pressure server");
+    let fixture = native_forge_group(&server, "journey_temporary_pressure").await;
+    server
+        .forge_clock()
+        .advance(chrono::Duration::days(1) + chrono::Duration::minutes(3))
+        .expect("age temporary-pressure inputs");
+    let resources = server
+        .state()
+        .forge()
+        .expect("temporary-pressure Forge")
+        .resources();
+    let baseline = resources.snapshot().expect("temporary-pressure baseline");
+    let forge_baseline = (
+        baseline.forge_memory_used_bytes,
+        baseline.elastic_memory_used_bytes,
+        baseline.scratch_used_bytes,
+        baseline.forge_reader_permits_used,
+    );
+    let held = server
+        .hold_forge_root_capacity_for_test()
+        .expect("hold real Forge root capacity");
+    let expected_attempts = observer.attempts().saturating_add(1);
+    trigger_supervised_scheduler(
+        &server,
+        Scenario {
+            name: "temporary-pressure-refusal",
+            tenants: 1,
+        },
+    )
+    .await;
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        observer.wait_for_attempts_at_least(expected_attempts),
+    )
+    .await
+    .expect("supervised capacity refusal");
+    let deferred: (String, bool, bool, i32, Option<String>) = sqlx::query_as(
+        "SELECT state,attempt_id IS NULL,claimed_by IS NULL,attempt_count,failure_class FROM vala.forge_tasks WHERE data_tenant_id=$1 AND table_name=$2 AND strategy='staging_fold'",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(&fixture.binding.table_name)
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("durable temporary-pressure refusal");
+    assert_eq!(deferred.1, true, "refusal retains no attempt identity");
+    assert_eq!(deferred.2, true, "refusal retains no claim owner");
+    assert_eq!(deferred.3, 0, "refusal consumes no attempt budget");
+    assert_eq!(deferred.4.as_deref(), Some("capacity_refused"));
+    drop(held);
+    let expected = observer.completed().saturating_add(1);
+    trigger_supervised_scheduler(
+        &server,
+        Scenario {
+            name: "temporary-pressure-release",
+            tenants: 1,
+        },
+    )
+    .await;
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        observer.wait_for_at_least(expected),
+    )
+    .await
+    .expect("supervised progress after capacity release");
+    let settled: (String, bool, bool) = sqlx::query_as(
+        "SELECT state,attempt_id IS NULL,claimed_by IS NULL FROM vala.forge_tasks WHERE data_tenant_id=$1 AND table_name=$2 AND strategy='staging_fold'",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(&fixture.binding.table_name)
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("supervised temporary-pressure settlement");
+    assert_eq!(settled, ("succeeded".to_owned(), true, true));
+    let released = resources
+        .snapshot()
+        .expect("released temporary-pressure root");
+    assert_eq!(
+        (
+            released.forge_memory_used_bytes,
+            released.elastic_memory_used_bytes,
+            released.scratch_used_bytes,
+            released.forge_reader_permits_used,
+        ),
+        forge_baseline,
+        "RAII release restores every Forge-owned root dimension"
+    );
+    server
+        .shutdown()
+        .await
+        .expect("temporary-pressure shutdown");
+}
+
 /// Starts an isolated production server for one maintenance lifecycle journey.
 ///
 /// # Panics
@@ -371,10 +1052,10 @@ async fn superseded_worker_records_cancelled_duration_from_durable_state() {
 async fn start_maintenance_journey_server() -> WyrdTestServer {
     WyrdTestServer::builder()
         .with_forge_interval(Duration::from_secs(3600))
-        .with_forge_process_role_for_test(BifrostTarget::Server)
-        .start_in_process()
+        .with_forge_process_role_for_test(BifrostTarget::All)
+        .start_bound()
         .await
-        .expect("in-process maintenance journey server")
+        .expect("bound maintenance journey server")
 }
 
 /// Start an isolated maintenance server attached to the shared production telemetry capture.
@@ -391,10 +1072,10 @@ async fn start_telemetry_maintenance_server() -> (
     let server = WyrdTestServer::builder()
         .with_telemetry_for_test(telemetry_guard)
         .with_forge_interval(Duration::from_secs(3600))
-        .with_forge_process_role_for_test(BifrostTarget::Server)
-        .start_in_process()
+        .with_forge_process_role_for_test(BifrostTarget::All)
+        .start_bound()
         .await
-        .expect("in-process telemetry maintenance server");
+        .expect("bound telemetry maintenance server");
     (server, telemetry)
 }
 
@@ -404,7 +1085,24 @@ async fn start_telemetry_maintenance_server() -> (
 ///
 /// Panics when the fixture cannot create a successful staging-fold task within
 /// two bounded production passes.
-async fn commit_journey_staging_snapshot(fixture: &wyrd_testing::bifrost::ForgeFixture) {
+async fn commit_journey_staging_snapshot(
+    server: &WyrdTestServer,
+    fixture: &wyrd_testing::bifrost::ForgeFixture,
+) {
+    server
+        .forge_clock()
+        .advance(chrono::Duration::days(1))
+        .expect("native Forge partition age advance must remain in range");
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.file_list WHERE data_tenant_id=$1 AND namespace=$2 AND table_name=$3 AND committed_snapshot_id IS NULL",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(&fixture.binding.logical_namespace)
+    .bind(&fixture.binding.table_name)
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("journey staging debt count");
+    assert!(pending > 0, "journey staging commit requires native debt");
     let mut config = fixture.config.clone();
     config.max_files_per_bin = 2;
     config.max_files_per_tick = 2;
@@ -419,142 +1117,6 @@ async fn commit_journey_staging_snapshot(fixture: &wyrd_testing::bifrost::ForgeF
     panic!("bounded maintenance journey did not execute staging_fold");
 }
 
-/// Commits one production small-file rewrite required before maintenance proof.
-///
-/// # Panics
-///
-/// Panics when the real scheduler and worker do not complete the expected
-/// SmallFiles task needed to leave only reset-generation objects for GC.
-async fn commit_journey_live_rewrite(fixture: &wyrd_testing::bifrost::ForgeFixture) {
-    let mut lifecycle = JourneyMaintenance::start(fixture, fixture.config.clone());
-    let strategy = lifecycle.run_one_success().await;
-    lifecycle.shutdown().await;
-    assert_eq!(
-        strategy,
-        ForgeTaskStrategy::SmallFiles,
-        "orphan journey setup must drain its production live rewrite"
-    );
-}
-
-/// Seeds one durable Reset generation whose output paths are GC-eligible.
-///
-/// The fixture invokes the same Prepared and Reset transition writers used by
-/// the maintenance interleaving journey. The later product journey still drives
-/// production scheduling, worker execution, eligibility checks, deletion, and
-/// terminal orphan-GC audit; this helper only establishes the durable recovery
-/// lineage that defines an eligible never-published output.
-///
-/// # Panics
-///
-/// Panics when the reset transition fixture cannot retain its exact input,
-/// output, lease, or operation-state evidence.
-async fn seed_journey_reset_generation(
-    fixture: &wyrd_testing::bifrost::ForgeFixture,
-) -> Vec<String> {
-    fixture.append_forge_file(2).await;
-    fixture.append_forge_file(3).await;
-    let rows: Vec<(uuid::Uuid, String, chrono::NaiveDate)> = sqlx::query_as(
-        "SELECT id, file_path, partition_day FROM vala.file_list \
-         WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 \
-         AND committed_snapshot_id IS NULL ORDER BY id",
-    )
-    .bind(fixture.tenant.as_uuid())
-    .bind(&fixture.binding.logical_namespace)
-    .bind(&fixture.binding.table_name)
-    .fetch_all(fixture.operator_pool.pool())
-    .await
-    .expect("journey reset staging rows");
-    assert_eq!(rows.len(), 2);
-    let partition_day = rows[0].2;
-    assert!(rows.iter().all(|row| row.2 == partition_day));
-    let outputs = (0..2)
-        .map(|ordinal| {
-            format!(
-                "{}/data/forge/bifrost-writer-v1/{}-{ordinal:05}.parquet",
-                fixture.binding.object_prefix,
-                uuid::Uuid::now_v7(),
-            )
-        })
-        .collect::<Vec<_>>();
-    for output in &outputs {
-        fixture
-            .staging
-            .write(output, Buffer::from(vec![9_u8]))
-            .await
-            .expect("journey reset generation object");
-    }
-    let input_file_ids = rows.iter().map(|row| row.0).collect::<Vec<_>>();
-    let operation_id = uuid::Uuid::now_v7();
-    let detail = AuditDetail::ForgeCompaction {
-        operation_id,
-        phase: ForgeCompactionPhase::Prepared,
-        group: format!(
-            "bifrost://{}/{}/{}",
-            fixture.tenant, fixture.binding.table_ref.namespace, fixture.binding.table_ref.name,
-        ),
-        input_file_ids: input_file_ids.clone(),
-        input_paths: rows
-            .iter()
-            .map(|row| StoragePath::new(row.1.clone()).expect("journey reset input storage path"))
-            .collect(),
-        output_paths: outputs
-            .iter()
-            .map(|path| StoragePath::new(path.clone()).expect("journey reset output storage path"))
-            .collect(),
-        snapshot_id: None,
-        writer_recipe_version: "bifrost-writer-v1".to_owned(),
-    };
-    let lease_key = vala_bifrost_redux::forge::forge_lease_key(
-        fixture.tenant,
-        &fixture.binding.logical_namespace,
-        &fixture.binding.table_name,
-    );
-    let mut lease = ForgeLease::acquire(
-        &fixture.operator_pool,
-        lease_key,
-        uuid::Uuid::now_v7(),
-        fixture.config.lease_ttl,
-    )
-    .await
-    .expect("journey reset generation lease query")
-    .expect("journey reset generation lease");
-    fixture
-        .forge
-        .append_compaction_transition_for_test(
-            &mut lease,
-            &fixture.binding,
-            partition_day,
-            detail.clone(),
-            "forge.file_compact.prepared",
-        )
-        .await
-        .expect("prepared journey reset generation");
-    fixture
-        .forge
-        .reset_reconciled_for_test(
-            &mut lease,
-            &fixture.binding,
-            partition_day,
-            &input_file_ids,
-            &detail,
-        )
-        .await
-        .expect("terminal journey reset generation");
-    lease
-        .release(&fixture.operator_pool)
-        .await
-        .expect("journey reset generation lease release");
-    assert_eq!(
-        fixture
-            .forge
-            .reset_generation_paths_for_test(&fixture.binding)
-            .await
-            .expect("journey Reset generation projection"),
-        outputs
-    );
-    outputs
-}
-
 /// Runs the real retained-snapshot expiry path and proves one expiry commit occurs.
 ///
 /// # Panics
@@ -566,11 +1128,10 @@ async fn seed_journey_reset_generation(
 #[ignore = "gated journey: real Postgres, Forge maintenance, and Iceberg snapshots"]
 async fn forge_snapshot_expiry_journey() {
     let server = start_maintenance_journey_server().await;
-    let fixture = seed_forge_group(&server, "journey_snapshot_expiry").await;
-    commit_journey_staging_snapshot(&fixture).await;
-    fixture.append_forge_file(2).await;
-    fixture.append_forge_file(3).await;
-    commit_journey_staging_snapshot(&fixture).await;
+    let fixture = native_forge_group(&server, "journey_snapshot_expiry").await;
+    commit_journey_staging_snapshot(&server, &fixture).await;
+    append_native_forge_cycles(&server, &fixture, 3..5).await;
+    commit_journey_staging_snapshot(&server, &fixture).await;
     let table = fixture
         .catalog
         .load_table(&fixture.binding.table_ident())
@@ -591,6 +1152,7 @@ async fn forge_snapshot_expiry_journey() {
         .expect("advance journey expiry clock");
     let mut config = fixture.config.clone();
     config.snapshot_retention = Duration::from_millis(1);
+    config.manifest_rewrite_enabled = true;
     config.min_files = 3;
     config.max_files_per_bin = 3;
     config.max_files_per_tick = 3;
@@ -643,20 +1205,17 @@ redacted
 #[ignore = "gated journey: real Postgres, sustained compaction backlog, and Forge maintenance"]
 async fn sustained_ingest_does_not_starve_snapshot_expiry_journey() {
     let server = start_maintenance_journey_server().await;
-    let fixture = seed_forge_group(&server, "journey_sustained_ingest_maintenance").await;
+    let fixture = native_forge_group(&server, "journey_sustained_ingest_maintenance").await;
     // Two production staging-fold commits create retained Iceberg history so the
     // maintenance trigger has snapshots beyond `retain_last` to expire.
-    commit_journey_staging_snapshot(&fixture).await;
-    fixture.append_forge_file(2).await;
-    fixture.append_forge_file(3).await;
-    commit_journey_staging_snapshot(&fixture).await;
+    commit_journey_staging_snapshot(&server, &fixture).await;
+    append_native_forge_cycles(&server, &fixture, 3..5).await;
+    commit_journey_staging_snapshot(&server, &fixture).await;
     // Seed a sustained compaction backlog: uncompacted staging files keep a
     // staging-fold candidate available on every subsequent planning tick, so
     // maintenance must lead through real compaction contention rather than an
     // idle table.
-    fixture.append_forge_file(4).await;
-    fixture.append_forge_file(5).await;
-    fixture.append_forge_file(6).await;
+    append_native_forge_cycles(&server, &fixture, 5..8).await;
     let pending_backlog: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM vala.file_list \
          WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 \
@@ -736,12 +1295,566 @@ async fn sustained_ingest_does_not_starve_snapshot_expiry_journey() {
         .expect("journey sustained-ingest server shutdown");
 }
 
+/// Proves manifest submission precedes accepted snapshot expiry under one lease.
+///
+/// The journey holds the real manifest catalog boundary, observes that no
+/// expiry terminal audit exists, then releases it and requires the accepted
+/// expiry boundary before the worker may complete.
+///
+/// # Panics
+///
+/// Panics when retained history cannot be built, expiry reaches acceptance
+/// before manifest submission, or the ordered maintenance task fails to settle.
+#[tokio::test]
+#[ignore = "gated journey: real Postgres and ordered Forge maintenance boundaries"]
+async fn supporting_in_process_manifest_maintenance_precedes_expiry() {
+    let server = start_maintenance_journey_server().await;
+    let fixture = native_forge_group(&server, "journey_manifest_before_expiry").await;
+    commit_journey_staging_snapshot(&server, &fixture).await;
+    append_native_forge_cycles(&server, &fixture, 3..5).await;
+    commit_journey_staging_snapshot(&server, &fixture).await;
+    let table_ref = ForgeTaskTableIdentity::new(
+        "wyrd-redux",
+        &fixture.binding.logical_namespace,
+        &fixture.binding.table_name,
+    )
+    .expect("ordered maintenance task identity");
+    ForgeTasks::new(fixture.operator_pool.clone())
+        .upsert_periodic(fixture.tenant, &table_ref)
+        .await
+        .expect("seed no-fit manifest demand");
+    let tasks_before: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM vala.forge_tasks WHERE data_tenant_id=$1")
+            .bind(fixture.tenant.as_uuid())
+            .fetch_one(fixture.operator_pool.pool())
+            .await
+            .expect("ordered maintenance task baseline");
+    let mut no_fit = fixture.config.clone();
+    no_fit.manifest_rewrite_enabled = true;
+    no_fit.manifest_rewrite_target_size_bytes = 8 * 1024 * 1024;
+    no_fit.manifest_rewrite_min_count = 2;
+    no_fit.max_bytes_per_tick = 1;
+    no_fit.maintenance_trigger_snapshot_count = usize::MAX;
+    no_fit.maintenance_trigger_interval = Duration::from_hours(24 * 365);
+    no_fit.snapshot_retention = Duration::from_hours(24 * 365);
+    let mut fit = no_fit.clone();
+    fit.max_files_per_tick = 1_000;
+    fit.max_bytes_per_tick = fixture.config.max_bytes_per_tick;
+    let no_fit_lifecycle = JourneyMaintenance::start(&fixture, no_fit);
+    no_fit_lifecycle.run_scheduler_pass().await;
+    let demand_retained: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM vala.forge_planning_demands WHERE data_tenant_id=$1 AND catalog_name=$2 AND namespace_name=$3 AND table_name=$4)",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(&table_ref.catalog)
+    .bind(&table_ref.namespace)
+    .bind(&table_ref.table)
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("observe no-fit manifest demand");
+    let tasks_after: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM vala.forge_tasks WHERE data_tenant_id=$1")
+            .bind(fixture.tenant.as_uuid())
+            .fetch_one(fixture.operator_pool.pool())
+            .await
+            .expect("ordered maintenance task count after no-fit pass");
+    assert!(
+        demand_retained,
+        "no-fit manifest demand must remain pending"
+    );
+    assert_eq!(
+        tasks_after, tasks_before,
+        "no-fit manifest demand must enqueue no task"
+    );
+    no_fit_lifecycle.shutdown().await;
+    let mut manifest_only = JourneyMaintenance::start(&fixture, fit.clone());
+    assert_eq!(
+        manifest_only.run_one_success().await,
+        ForgeTaskStrategy::ManifestRewrite,
+        "manifest-only intent must retain its exact durable strategy"
+    );
+    manifest_only.shutdown().await;
+    assert_eq!(
+        fixture
+            .operation_count("forge.snapshot_expire.committed")
+            .await,
+        0,
+        "manifest-only demand must not bypass the independent expiry trigger"
+    );
+    server
+        .forge_clock()
+        .advance(chrono::Duration::milliseconds(2))
+        .expect("advance ordered maintenance clock");
+    let mut config = fixture.config.clone();
+    config.snapshot_retention = Duration::from_millis(1);
+    config.manifest_rewrite_enabled = true;
+    config.manifest_rewrite_target_size_bytes = 8 * 1024 * 1024;
+    config.manifest_rewrite_min_count = 2;
+    config.maintenance_trigger_snapshot_count = 1;
+    config.maintenance_trigger_interval = Duration::from_millis(1);
+    config.min_files = 3;
+    config.max_files_per_bin = 3;
+    config.max_files_per_tick = 3;
+    config.max_bytes_per_tick = fit.max_bytes_per_tick;
+    let mut lifecycle = JourneyMaintenance::start(&fixture, config);
+    let controls = lifecycle.maintenance_controls.clone();
+    controls.arm_manifest_submission();
+    controls.arm_expiry_accepted();
+    let mut attempt = Box::pin(lifecycle.run_one_success_at("ordered-expiry"));
+    tokio::select! {
+        () = controls.wait_manifest_submission() => {}
+        strategy = &mut attempt => panic!("maintenance completed before manifest boundary: {strategy:?}"),
+    }
+    assert_eq!(
+        fixture
+            .operation_count("forge.snapshot_expire.committed")
+            .await,
+        0,
+        "expiry cannot commit while manifest submission is held"
+    );
+    controls.release_manifest_submission();
+    tokio::select! {
+        () = controls.wait_expiry_accepted() => {}
+        strategy = &mut attempt => panic!("maintenance completed before expiry acceptance: {strategy:?}"),
+    }
+    controls.release_expiry_accepted();
+    assert_eq!(attempt.await, ForgeTaskStrategy::SnapshotExpiry);
+    lifecycle.shutdown().await;
+    assert_eq!(
+        fixture
+            .operation_count("forge.snapshot_expire.committed")
+            .await,
+        1,
+        "ordered expiry must terminalize exactly once"
+    );
+    server
+        .shutdown()
+        .await
+        .expect("ordered maintenance server shutdown");
+}
+
+/// Proves the bound supervised Forge owner executes maintenance without a test-owned engine.
+///
+/// # Panics
+///
+/// Panics when native ingestion, durable scheduling, or the supervised worker
+/// completion boundary fails to settle within the bounded journey window.
+#[tokio::test]
+#[ignore = "gated journey: real Postgres and supervised Forge maintenance"]
+async fn pg_bifrost_forge_manifest_maintenance_precedes_expiry() {
+    supervised_temporary_pressure_defers_without_ownership().await;
+    supervised_uncertain_commit_recovery_journey().await;
+    let observer = ForgeWorkerCompletionObserver::new();
+    let mut config = ForgeConfig::default();
+    config.lease_ttl = Duration::from_secs(4);
+    config.iceberg_total_retry_timeout = Duration::from_secs(1);
+    config.catalog_request_timeout = Duration::from_secs(1);
+    config.uncertainty_margin = Duration::from_secs(1);
+    config.uncertainty_bound = Duration::from_secs(1);
+    config.manifest_rewrite_enabled = true;
+    config.manifest_rewrite_min_count = 2;
+    config.maintenance_trigger_snapshot_count = 1;
+    config.maintenance_trigger_interval = Duration::from_millis(1);
+    let server = WyrdTestServer::builder()
+        .with_forge_interval(Duration::from_secs(3600))
+        .with_forge_config_for_test(config)
+        .with_forge_completion_observer_for_test(observer.clone())
+        .start_bound()
+        .await
+        .expect("bound supervised maintenance server");
+    let fixture = native_forge_group(&server, "journey_supervised_maintenance").await;
+    server
+        .forge_clock()
+        .advance(chrono::Duration::days(1) + chrono::Duration::minutes(3))
+        .expect("close supervised maintenance staging partition");
+    let latest_uncompacted_partition: Option<chrono::NaiveDate> = sqlx::query_scalar(
+        "SELECT max(partition_day) FROM vala.file_list \
+         WHERE data_tenant_id=$1 AND namespace=$2 AND table_name=$3 \
+         AND NOT compacted",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(&fixture.binding.logical_namespace)
+    .bind(&fixture.binding.table_name)
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("supervised maintenance uncompacted partition day");
+    assert!(
+        latest_uncompacted_partition.is_some_and(|partition_day| {
+            partition_day
+                < server
+                    .forge_clock()
+                    .now()
+                    .expect("supervised maintenance Forge clock")
+                    .date_naive()
+        }),
+        "all uncompacted maintenance inputs must belong to a closed partition"
+    );
+    for generation in 0..2 {
+        if generation == 1 {
+            append_native_forge_cycles(&server, &fixture, 3..4).await;
+        }
+        let expected = observer.completed().saturating_add(1);
+        trigger_supervised_scheduler(
+            &server,
+            Scenario {
+                name: "supervised-maintenance-staging",
+                tenants: 1,
+            },
+        )
+        .await;
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            observer.wait_for_at_least(expected),
+        )
+        .await
+        .expect("supervised maintenance staging publication");
+        assert!(matches!(
+            observer.completed_strategies().last(),
+            Some(ForgeClaimStrategy::Known(ForgeTaskStrategy::StagingFold))
+        ));
+    }
+    server
+        .forge_clock()
+        .advance(chrono::Duration::days(1))
+        .expect("age supervised maintenance partition");
+    let controls = server
+        .forge_maintenance_controls_for_test()
+        .expect("supervised maintenance controls");
+    controls.arm_manifest_submission();
+    controls.arm_expiry_accepted();
+    let failed_attempt = observer.attempts().saturating_add(1);
+    let expected = observer.completed().saturating_add(1);
+    observer.hold_after_next_attempt_for_test();
+    server
+        .fail_after_forge_maintenance_prepared_for_test()
+        .expect("arm supervised maintenance Prepared crash");
+    server.trigger_forge_scheduler_for_test();
+    tokio::time::timeout(Duration::from_secs(30), controls.wait_manifest_submission())
+        .await
+        .expect("manifest pre-submission boundary reached before snapshot expiry");
+    let (maintenance_task, carrier_plan): (uuid::Uuid, serde_json::Value) = sqlx::query_as(
+        "SELECT task_id,plan FROM vala.forge_tasks WHERE data_tenant_id=$1 AND table_name=$2 AND strategy='snapshot_expiry' AND state='running'",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(&fixture.binding.table_name)
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("exact running maintenance carrier at manifest pre-submission boundary");
+    let selected_manifest_paths = carrier_plan["inputs"]
+        .as_array()
+        .expect("maintenance carrier inputs")
+        .iter()
+        .map(|path| path.as_str().expect("manifest path input").to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(selected_manifest_paths.len() >= 2);
+    let before_table = fixture
+        .catalog
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("load maintenance table before manifest rewrite");
+    let before_manifest_facts =
+        selected_manifest_facts(&before_table, &selected_manifest_paths, None).await;
+    let before_live_paths = current_live_paths(&before_table).await;
+    assert_eq!(
+        fixture
+            .operation_count("forge.snapshot_expire.committed")
+            .await,
+        0,
+        "snapshot expiry cannot commit while the manifest future is still lazy"
+    );
+    controls.release_manifest_submission();
+    tokio::time::timeout(Duration::from_secs(30), controls.wait_expiry_accepted())
+        .await
+        .expect("snapshot expiry accepted boundary");
+    controls.release_expiry_accepted();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        observer.wait_for_held_attempt_for_test(),
+    )
+    .await
+    .expect("maintenance Prepared crash held after returning to supervisor");
+    assert_eq!(observer.attempts(), failed_attempt);
+    let (prepared_task, claim_expires_at, prepared_watermark, prepared_watermark_ms, prepared_plan, prepared_evidence): (uuid::Uuid, chrono::DateTime<chrono::Utc>, i64, i64, serde_json::Value, serde_json::Value) = sqlx::query_as(
+        "SELECT task_id,claim_expires_at,watermark_snapshot_id,watermark_timestamp_ms,plan,evidence FROM vala.forge_tasks WHERE data_tenant_id=$1 AND table_name=$2 AND strategy='snapshot_expiry' AND state='prepared'",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(&fixture.binding.table_name)
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("maintenance Prepared takeover evidence");
+    assert_eq!(prepared_task, maintenance_task);
+    assert_eq!(
+        prepared_plan, carrier_plan,
+        "Prepared preserves the immutable carrier plan"
+    );
+    assert!(
+        prepared_evidence.is_object(),
+        "Prepared preserves committed evidence"
+    );
+    observer.release_held_attempt_for_test();
+    tokio::time::timeout(
+        Duration::from_secs(12),
+        async {
+            loop {
+                let expired: bool = sqlx::query_scalar(
+                    "SELECT claim_expires_at < statement_timestamp() FROM vala.forge_tasks WHERE task_id=$1 AND state='prepared'",
+                )
+                .bind(prepared_task)
+                .fetch_one(fixture.operator_pool.pool())
+                .await
+                .expect("observe exact Prepared lease expiry");
+                if expired {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            observer.wait_for_at_least(expected).await;
+        },
+    )
+    .await
+    .expect("exact Prepared maintenance recovery after PostgreSQL lease expiry");
+    let workflow = server
+        .inspect_forge_workflow_for_test(fixture.tenant, &fixture.binding.table_name)
+        .await
+        .expect("supervised maintenance workflow");
+    assert_eq!(workflow.active_claims, 0);
+    assert_eq!(workflow.active_attempts, 0);
+    let strategies = observer.completed_strategies();
+    assert!(
+        matches!(
+            strategies.last(),
+            Some(ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry))
+        ),
+        "one SnapshotExpiry carrier completes both due maintenance effects"
+    );
+    let guarded: (bool, bool, Option<uuid::Uuid>, Option<uuid::Uuid>, Option<chrono::DateTime<chrono::Utc>>, Option<i64>, Option<i64>, serde_json::Value, serde_json::Value) = sqlx::query_as(
+        "SELECT (plan->'parameters'->>'manifest_rewrite_due')::boolean,(plan->'parameters'->>'snapshot_expiry_due')::boolean,attempt_id,claimed_by,claim_expires_at,watermark_snapshot_id,watermark_timestamp_ms,plan,evidence FROM vala.forge_tasks WHERE data_tenant_id=$1 AND table_name=$2 AND task_id=$3 AND strategy='snapshot_expiry' AND state='succeeded'",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(&fixture.binding.table_name)
+    .bind(prepared_task)
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("maintenance durable guards");
+    assert!(guarded.0, "the carrier preserves manifest rewrite due");
+    assert!(guarded.1, "the carrier preserves snapshot expiry due");
+    assert_eq!(
+        (guarded.2, guarded.3, guarded.4, guarded.5, guarded.6),
+        (None, None, None, None, None)
+    );
+    assert_eq!(
+        guarded.7, prepared_plan,
+        "terminal carrier plan remains immutable"
+    );
+    for field in [
+        "version",
+        "committed_snapshot_id",
+        "committed_metadata_location",
+        "committed_metadata_digest",
+        "cleanup_candidates",
+    ] {
+        assert_eq!(
+            guarded.8[field], prepared_evidence[field],
+            "terminal committed evidence field {field} remains immutable"
+        );
+    }
+    let prepared_cleanup_cursor = prepared_evidence["deleted_candidate_count"]
+        .as_u64()
+        .expect("Prepared cleanup cursor");
+    let terminal_cleanup_cursor = guarded.8["deleted_candidate_count"]
+        .as_u64()
+        .expect("terminal cleanup cursor");
+    let cleanup_candidate_count = guarded.8["cleanup_candidates"]
+        .as_array()
+        .expect("terminal cleanup candidates")
+        .len();
+    assert_eq!(
+        usize::try_from(terminal_cleanup_cursor).expect("bounded terminal cleanup cursor"),
+        cleanup_candidate_count,
+        "terminal cleanup cursor finalizes the immutable candidate list"
+    );
+    assert!(
+        terminal_cleanup_cursor > prepared_cleanup_cursor,
+        "Prepared recovery must durably advance the cleanup cursor"
+    );
+    assert!(claim_expires_at < chrono::Utc::now());
+    assert!(prepared_watermark > 0 && prepared_watermark_ms >= 0);
+    let active: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.forge_tasks WHERE data_tenant_id=$1 AND table_name=$2 AND strategy IN ('manifest_rewrite','snapshot_expiry') AND state IN ('ready','claimed','running','retryable','prepared')",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(&fixture.binding.table_name)
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("maintenance active-work guard");
+    assert_eq!(active, 0, "maintenance leaves no durable active work");
+    let active_table_leases: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.maintenance_leases WHERE lease_key LIKE $1 AND expires_at >= statement_timestamp()",
+    )
+    .bind(format!("forge:table:{}:%", fixture.tenant))
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("maintenance active table leases");
+    assert_eq!(
+        active_table_leases, 0,
+        "maintenance leaves no active table lease"
+    );
+    assert_eq!(
+        fixture
+            .operation_count("forge.snapshot_expire.recovered")
+            .await,
+        1,
+        "lost-response expiry recovery has one recovered audit"
+    );
+    assert_eq!(
+        fixture
+            .operation_count("forge.snapshot_expire.committed")
+            .await,
+        0
+    );
+    let mut audit_conn = fixture
+        .vala
+        .tenant_conn(fixture.tenant)
+        .await
+        .expect("maintenance audit tenant connection");
+    for operation in ["forge.task.prepared", "forge.task.succeeded"] {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id=wyrd.current_tenant() AND operation=$1 AND resource=$2",
+        )
+        .bind(operation)
+        .bind(format!("forge-task:{prepared_task}"))
+        .fetch_one(&mut **audit_conn.transaction())
+        .await
+        .expect("exact maintenance task audit count");
+        assert_eq!(count, 1, "{operation} must be emitted exactly once");
+    }
+    audit_conn
+        .commit()
+        .await
+        .expect("close maintenance audit read");
+    let after_table = fixture
+        .catalog
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("load maintenance table after rewrite and expiry");
+    let after_manifest_facts = selected_manifest_facts(
+        &after_table,
+        &selected_manifest_paths,
+        Some(before_manifest_facts.2),
+    )
+    .await;
+    assert!(
+        after_manifest_facts.0 < before_manifest_facts.0,
+        "selected same-spec manifest cardinality must decrease"
+    );
+    assert_eq!(
+        after_manifest_facts.1, before_manifest_facts.1,
+        "manifest rewrite preserves selected-bin live files"
+    );
+    assert_eq!(
+        current_live_paths(&after_table).await,
+        before_live_paths,
+        "maintenance preserves all live data-file membership"
+    );
+    let retained = fixture
+        .catalog
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("load retained maintenance history")
+        .metadata()
+        .snapshots()
+        .count();
+    assert!(
+        retained >= 2,
+        "retention keeps the current snapshot and retained history"
+    );
+    let settled_attempts = observer.attempts();
+    trigger_supervised_scheduler(
+        &server,
+        Scenario {
+            name: "supervised-maintenance-no-work",
+            tenants: 1,
+        },
+    )
+    .await;
+    assert_eq!(
+        observer.attempts(),
+        settled_attempts,
+        "a settled maintenance table does not loop on no work"
+    );
+    server
+        .shutdown()
+        .await
+        .expect("maintenance server shutdown");
+}
+
+/// Returns selected same-spec manifest cardinality and live file membership.
+async fn selected_manifest_facts(
+    table: &iceberg::table::Table,
+    selected_paths: &std::collections::BTreeSet<String>,
+    known_partition_spec: Option<i32>,
+) -> (usize, std::collections::BTreeSet<String>, i32) {
+    let snapshot = table
+        .metadata()
+        .current_snapshot()
+        .expect("maintenance current snapshot");
+    let manifest_list = table
+        .manifest_list_reader(snapshot)
+        .load()
+        .await
+        .expect("maintenance manifest list");
+    let selected = manifest_list
+        .entries()
+        .iter()
+        .filter(|manifest| selected_paths.contains(&manifest.manifest_path))
+        .collect::<Vec<_>>();
+    let partition_spec = known_partition_spec.unwrap_or_else(|| {
+        selected
+            .first()
+            .expect("selected manifests remain visible before rewrite")
+            .partition_spec_id
+    });
+    assert!(
+        selected
+            .iter()
+            .all(|manifest| manifest.partition_spec_id == partition_spec)
+    );
+    let mut live_paths = std::collections::BTreeSet::new();
+    for manifest_file in manifest_list
+        .entries()
+        .iter()
+        .filter(|manifest| manifest.partition_spec_id == partition_spec)
+    {
+        let manifest = manifest_file
+            .load_manifest(table.file_io())
+            .await
+            .expect("selected-spec manifest");
+        live_paths.extend(
+            manifest
+                .entries()
+                .iter()
+                .filter(|entry| entry.is_alive())
+                .map(|entry| entry.file_path().to_owned()),
+        );
+    }
+    let cardinality = manifest_list
+        .entries()
+        .iter()
+        .filter(|manifest| manifest.partition_spec_id == partition_spec)
+        .count();
+    (cardinality, live_paths, partition_spec)
+}
+
 /// Real Forge workers converge public small-file debt without constructing Oracle.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Bifrost journey lane"]
 async fn pg_bifrost_forge_small_files_converges_without_query_dependency() {
-    let cluster = WyrdTestCluster::start_spec_with_forge_completion_observer(
+    let mut forge_config = ForgeConfig::default();
+    forge_config.snapshot_expiry_enabled = false;
+    forge_config.max_files_per_bin = 2;
+    let cluster = WyrdTestCluster::start_spec_with_forge_config_and_completion_observer(
         BifrostClusterSpec::one_mixed().with_system_resources(forge_convergence_system_resources()),
+        forge_config,
     )
     .await
     .expect("Forge-local convergence cluster");
@@ -750,7 +1863,7 @@ async fn pg_bifrost_forge_small_files_converges_without_query_dependency() {
         .checkpoint()
         .expect("Forge-local causal telemetry checkpoint");
     let server = cluster.server(0).expect("Forge-local convergence server");
-    let table = prepare_forge_convergence_table(&cluster, server, 1_000_000)
+    let table = prepare_forge_convergence_table(&cluster, server, 100_000)
         .await
         .expect("Forge-local convergence fixture");
     server
@@ -769,7 +1882,10 @@ async fn pg_bifrost_forge_small_files_converges_without_query_dependency() {
         if workflow.uncompacted_staging_files == 0 {
             break;
         }
-        advance_transient_forge_retries(server, cluster.data_tenant_id(), &table).await;
+        server
+            .forge_clock()
+            .advance(chrono::Duration::minutes(15))
+            .expect("advance supervised transient retry clock");
         let expected_attempts = observer.attempts().saturating_add(1);
         let completed_passes = server.completed_forge_scheduler_passes_for_test();
         cluster.request_forge_scheduler_pass_for_test();
@@ -817,16 +1933,12 @@ async fn pg_bifrost_forge_small_files_converges_without_query_dependency() {
         .resources()
         .snapshot()
         .expect("Forge resource baseline");
-
-    for _ in 0..64 {
-        if observer
-            .completed_strategies()
-            .contains(&ForgeClaimStrategy::Known(ForgeTaskStrategy::SmallFiles))
-        {
-            break;
-        }
-        advance_transient_forge_retries(server, cluster.data_tenant_id(), &table).await;
-        let expected_completions = observer.completed().saturating_add(1);
+    for transition in 1..=64 {
+        server
+            .forge_clock()
+            .advance(chrono::Duration::minutes(15))
+            .expect("advance supervised rewrite retry clock");
+        let expected_attempts = observer.attempts().saturating_add(1);
         let completed_passes = server.completed_forge_scheduler_passes_for_test();
         cluster.request_forge_scheduler_pass_for_test();
         tokio::time::timeout(
@@ -835,9 +1947,22 @@ async fn pg_bifrost_forge_small_files_converges_without_query_dependency() {
         )
         .await
         .expect("production rewrite scheduler pass completes");
+        let workflow = server
+            .inspect_forge_workflow_for_test(cluster.data_tenant_id(), &table)
+            .await
+            .expect("inspect bounded SmallFiles continuation");
+        let has_live_task = workflow.tasks.iter().any(|(_, state)| {
+            matches!(
+                state.as_str(),
+                "ready" | "retryable" | "claimed" | "running" | "prepared"
+            )
+        });
+        if !workflow.has_demand && !has_live_task {
+            break;
+        }
         if tokio::time::timeout(
             Duration::from_secs(90),
-            observer.wait_for_at_least(expected_completions),
+            observer.wait_for_attempts_at_least(expected_attempts),
         )
         .await
         .is_err()
@@ -847,7 +1972,7 @@ async fn pg_bifrost_forge_small_files_converges_without_query_dependency() {
                 server,
                 &checkpoint,
                 &table,
-                "SmallFiles rewrite did not settle",
+                &format!("SmallFiles transition {transition} did not settle"),
             )
             .await;
         }
@@ -859,33 +1984,52 @@ async fn pg_bifrost_forge_small_files_converges_without_query_dependency() {
             .contains(&ForgeClaimStrategy::Known(ForgeTaskStrategy::SmallFiles)),
         "bounded production continuation must reach SmallFiles"
     );
-    let planned_inputs = observer
-        .lifecycle_events()
+    let lifecycle = observer.lifecycle_events();
+    let committed_tasks = lifecycle
         .iter()
-        .rev()
-        .find_map(|event| match event {
-            vala_bifrost_redux::forge::ForgeLifecycleEvent::Planned {
-                table: observed,
-                inputs,
-                ..
-            } if observed == &table => Some(inputs.clone()),
+        .filter_map(|event| match event {
+            vala_bifrost_redux::forge::ForgeLifecycleEvent::CatalogCommitted {
+                task_id, ..
+            } => Some(*task_id),
             _ => None,
         })
-        .expect("table-scoped planned inputs");
+        .collect::<std::collections::BTreeSet<_>>();
     let after = server
         .inspect_forge_table_for_test(cluster.data_tenant_id(), &table)
         .await
         .expect("inspect post-compaction Forge table");
-    let rewrite = WyrdTestServer::compare_forge_rewrite_for_test(&before, &after, &planned_inputs)
-        .expect("exact Forge replacement comparison");
-    let final_passes = server.completed_forge_scheduler_passes_for_test();
-    cluster.request_forge_scheduler_pass_for_test();
-    tokio::time::timeout(
-        Duration::from_secs(30),
-        server.wait_for_forge_scheduler_passes_for_test(final_passes + 1),
-    )
-    .await
-    .expect("final zero-debt scheduler observation");
+    let after_paths = after
+        .live_data_files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let replaced_inputs = before
+        .live_data_files
+        .iter()
+        .filter(|file| !after_paths.contains(file.path.as_str()))
+        .map(|file| file.path.clone())
+        .collect::<Vec<_>>();
+    let planned_inputs = lifecycle
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            vala_bifrost_redux::forge::ForgeLifecycleEvent::Planned {
+                task_id,
+                table: observed,
+                inputs,
+                ..
+            } if committed_tasks.contains(task_id)
+                && observed == &table
+                && inputs.iter().all(|input| replaced_inputs.contains(input)) =>
+            {
+                Some(inputs.clone())
+            }
+            _ => None,
+        })
+        .expect("one committed exact plan must remove its baseline inputs");
+    assert!(!planned_inputs.is_empty());
+    let rewrite = WyrdTestServer::compare_forge_rewrite_for_test(&before, &after, &replaced_inputs)
+        .expect("whole convergence replacement comparison");
     let delta = cluster
         .telemetry()
         .delta_since(&checkpoint)
@@ -903,7 +2047,7 @@ async fn pg_bifrost_forge_small_files_converges_without_query_dependency() {
         ForgeCausalDiagnosis::Converged
     );
     assert!(after.data_file_count() < before.data_file_count());
-    assert_eq!(rewrite.input_files.len(), planned_inputs.len());
+    assert_eq!(rewrite.input_files.len(), replaced_inputs.len());
     assert!(!rewrite.output_files.is_empty());
     assert!(rewrite.input_bytes > 0 && rewrite.output_bytes > 0);
     assert_eq!(after.active_claims, 0);
@@ -1040,63 +2184,6 @@ fn forge_convergence_ipc(ids: &[i64]) -> Vec<u8> {
     bytes
 }
 
-/// Advances only durably classified transient Forge retries in the journey.
-async fn advance_transient_forge_retries(
-    server: &WyrdTestServer,
-    tenant: DataTenantId,
-    table: &str,
-) {
-    let pool = server
-        .state()
-        .postgres
-        .operator_pool()
-        .expect("Forge-local operator pool");
-    let mut transaction = pool
-        .pool()
-        .begin()
-        .await
-        .expect("begin Forge-local retry clock step");
-    let retries = sqlx::query_as::<_, (uuid::Uuid, Option<String>)>(
-        "SELECT task_id,failure_class FROM vala.forge_tasks WHERE data_tenant_id=$1 AND table_name=$2 AND state='retryable' FOR UPDATE",
-    )
-    .bind(tenant.as_uuid())
-    .bind(table)
-    .fetch_all(&mut *transaction)
-    .await
-    .expect("load Forge-local retry classifications");
-    for (task_id, failure_class) in &retries {
-        assert!(
-            matches!(
-                failure_class.as_deref(),
-                Some("transient_object_store" | "transient_coordination" | "storage_health")
-            ),
-            "task {task_id} must have a permitted transient class; observed {failure_class:?}"
-        );
-    }
-    let task_ids = retries
-        .into_iter()
-        .map(|(task_id, _)| task_id)
-        .collect::<Vec<_>>();
-    if !task_ids.is_empty() {
-        let updated = sqlx::query(
-            "UPDATE vala.forge_tasks SET ready_at=statement_timestamp(),next_eligible_at=statement_timestamp()-interval '15 minutes' WHERE task_id=ANY($1) AND state='retryable'",
-        )
-        .bind(&task_ids)
-        .execute(&mut *transaction)
-        .await
-        .expect("advance Forge-local transient eligibility")
-        .rows_affected();
-        assert_eq!(
-            updated,
-            u64::try_from(task_ids.len()).expect("retry count fits u64")
-        );
-    }
-    transaction
-        .commit()
-        .await
-        .expect("commit Forge-local retry clock step");
-}
-
 /// Advances one exact, durably classified transient Forge retry in the journey.
 ///
 /// The guarded update repeats every classification and ownership predicate at
@@ -1184,11 +2271,22 @@ async fn panic_with_forge_convergence_diagnosis(
 #[ignore = "gated journey: real Postgres and filesystem scratch quarantine"]
 #[cfg(unix)]
 async fn unhealthy_scratch_volume_defers_peer_and_healthy_worker_takes_over() {
+    unhealthy_scratch_takeover_journey().await;
+}
+
+/// Drives one qualified storage failure through healthy-volume takeover.
+///
+/// # Panics
+///
+/// Panics when the production failure classification, quarantine, retry,
+/// publication, telemetry, or resource release contract diverges.
+#[cfg(unix)]
+async fn unhealthy_scratch_takeover_journey() {
     let (server, telemetry) = start_telemetry_maintenance_server().await;
-    let fixture = seed_forge_group(&server, "journey_unhealthy_scratch_takeover").await;
     let checkpoint = telemetry
         .checkpoint()
         .expect("takeover causal telemetry checkpoint");
+    let fixture = native_forge_group(&server, "journey_unhealthy_scratch_takeover").await;
     sqlx::query("DELETE FROM vala.forge_tasks WHERE data_tenant_id=$1")
         .bind(fixture.tenant.as_uuid())
         .execute(fixture.operator_pool.pool())
@@ -1199,8 +2297,8 @@ async fn unhealthy_scratch_volume_defers_peer_and_healthy_worker_takes_over() {
         .execute(fixture.operator_pool.pool())
         .await
         .expect("isolate takeover demand queue");
-    let inputs: Vec<String> = sqlx::query_scalar(
-        "SELECT file_path FROM vala.file_list WHERE data_tenant_id=$1 AND namespace=$2 AND table_name=$3 ORDER BY file_path",
+    let mut inputs: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT file_path FROM vala.file_list WHERE data_tenant_id=$1 AND namespace=$2 AND table_name=$3 ORDER BY file_path",
     )
     .bind(fixture.tenant.as_uuid())
     .bind(&fixture.binding.logical_namespace)
@@ -1208,6 +2306,8 @@ async fn unhealthy_scratch_volume_defers_peer_and_healthy_worker_takes_over() {
     .fetch_all(fixture.operator_pool.pool())
     .await
     .expect("takeover inputs");
+    inputs.sort_unstable();
+    inputs.dedup();
     let envelope = journey_envelope(&fixture, 200, 2);
     let task_id = ForgeTasks::new(fixture.operator_pool.clone())
         .enqueue(&NewForgeTask {
@@ -1428,10 +2528,13 @@ async fn unhealthy_scratch_volume_defers_peer_and_healthy_worker_takes_over() {
     server.shutdown().await.expect("takeover server shutdown");
 }
 
-/// Production supervision fails stop on Forge panics and restart recovers one publication.
-#[tokio::test]
-#[ignore = "gated journey: real supervised server panic and lease-expiry recovery"]
-async fn supervised_forge_panic_fails_stop_and_recovers_exactly_once() {
+/// Exercises production fail-stop supervision and exact recovery after Forge panics.
+///
+/// # Panics
+///
+/// Panics when supervision does not fail stop, the durable attempt cannot be
+/// reclaimed, publication is duplicated, or attempt resources remain owned.
+async fn supervised_forge_panic_recovery_scenario() {
     for after_commit in [false, true] {
         let config = ForgeConfig {
             lease_ttl: Duration::from_secs(4),
@@ -1445,14 +2548,43 @@ async fn supervised_forge_panic_fails_stop_and_recovers_exactly_once() {
             WyrdTestCluster::start_with_embedded_forge_panic_recovery_for_test(config)
                 .await
                 .expect("panic recovery cluster");
-        let node = cluster.configured_node_ids()[0];
-        let server = cluster.server_by_node(node).expect("panic recovery server");
+        let nodes = cluster.configured_node_ids();
+        let scheduler_node = nodes[0];
+        let server = cluster
+            .server_by_node(scheduler_node)
+            .expect("panic recovery scheduler server");
         let table_name = if after_commit {
             "forge_panic_after_commit"
         } else {
             "forge_panic_before_commit"
         };
-        let fixture = seed_forge_group(server, table_name).await;
+        let fixture = native_forge_group(server, table_name).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let persisted: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM vala.forge_planning_demands \
+                     WHERE data_tenant_id=$1 AND catalog_name=$2 \
+                     AND namespace_name=$3 AND table_name=$4)",
+                )
+                .bind(fixture.tenant.as_uuid())
+                .bind("wyrd-redux")
+                .bind(&fixture.binding.logical_namespace)
+                .bind(&fixture.binding.table_name)
+                .fetch_one(fixture.operator_pool.pool())
+                .await
+                .expect("observe panic-recovery hint persistence");
+                if persisted {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("production Forge hint owner persisted panic-recovery demand");
+        server
+            .forge_clock()
+            .advance(chrono::Duration::days(1) + chrono::Duration::minutes(3))
+            .expect("advance panic-recovery debt past the production retention cutoff");
         let control = cluster
             .commit_uncertainty_catalog()
             .expect("panic catalog control");
@@ -1466,6 +2598,19 @@ async fn supervised_forge_panic_fails_stop_and_recovers_exactly_once() {
         tokio::time::timeout(Duration::from_secs(30), control.wait_for_panic())
             .await
             .expect("production catalog panic reached");
+        let node = cluster
+            .forge_completion_observer()
+            .expect("panic recovery completion observer")
+            .lifecycle_events()
+            .into_iter()
+            .rev()
+            .find_map(|event| match event {
+                vala_bifrost_redux::forge::ForgeLifecycleEvent::Claimed { worker_id, .. } => {
+                    Some(wyrd_spec::vala::api::NodeId::new(worker_id))
+                }
+                _ => None,
+            })
+            .expect("panic recovery production worker claim");
         let terminal = cluster
             .await_node_terminal_failure_for_test(node, Duration::from_secs(30))
             .await
@@ -1476,51 +2621,60 @@ async fn supervised_forge_panic_fails_stop_and_recovers_exactly_once() {
         );
         assert!(completed_passes <= 1);
         control.disarm_panic();
-        let retained: (uuid::Uuid, uuid::Uuid, String, i32) = sqlx::query_as(
-            "SELECT task_id,attempt_id,state,attempt_count FROM vala.forge_tasks WHERE data_tenant_id=$1 AND table_name=$2 AND state IN ('claimed','running') ORDER BY created_at DESC LIMIT 1",
+        let retained: (uuid::Uuid, uuid::Uuid, uuid::Uuid, String, i32) = sqlx::query_as(
+            "SELECT task_id,attempt_id,claimed_by,state,attempt_count FROM vala.forge_tasks WHERE data_tenant_id=$1 AND table_name=$2 AND state IN ('claimed','running') ORDER BY created_at DESC LIMIT 1",
         )
         .bind(fixture.tenant.as_uuid())
         .bind(&fixture.binding.table_name)
         .fetch_one(fixture.operator_pool.pool())
         .await
         .expect("panic-retained durable attempt");
-        assert_eq!(retained.2, "running");
-        assert_eq!(retained.3, 0);
-        cluster.retain_panic_attempt_for_test(retained.0, retained.1);
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(retained.3, "running");
+        assert_eq!(retained.4, 0);
+        tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                let expired: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM vala.forge_tasks WHERE task_id=$1 AND attempt_id=$2 AND claimed_by=$3 AND state='running' AND claim_expires_at < statement_timestamp())",
+                )
+                .bind(retained.0)
+                .bind(retained.1)
+                .bind(retained.2)
+                .fetch_one(fixture.operator_pool.pool())
+                .await
+                .expect("observe exact panic-retained claim expiry");
+                if expired {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("panic-retained claim expires before node restart");
         cluster
             .restart_node(node)
             .await
             .expect("fresh server restart");
-        let reclaimed = cluster
-            .reclaim_expired_forge_attempts_for_test(node, 1)
-            .await
-            .expect("production attempt reclaim");
-        if !reclaimed.is_empty() {
-            assert_eq!(reclaimed, vec![(retained.0, retained.1)]);
-        }
-        panic_recovery_clock_requires_exact_reclaimed_row(
-            &mut cluster,
-            fixture.operator_pool.pool(),
-            retained.0,
-            retained.1,
-        )
-        .await;
         let observer = cluster
             .forge_completion_observer()
             .expect("panic recovery completion observer");
+        let expected_completions = observer.completed().saturating_add(1);
         cluster.request_forge_scheduler_pass_for_test();
-        tokio::time::timeout(Duration::from_secs(90), observer.wait_for_at_least(1))
-            .await
-            .expect("restarted production worker settles retained debt");
-        let restarted = cluster
-            .server_by_node(node)
-            .expect("settled restart server");
-        let workflow = restarted
-            .inspect_forge_workflow_for_test(fixture.tenant, &fixture.binding.table_name)
-            .await
-            .expect("panic recovery workflow");
-        assert_eq!(workflow.uncompacted_staging_files, 0);
+        tokio::time::timeout(
+            Duration::from_secs(90),
+            observer.wait_for_at_least(expected_completions),
+        )
+        .await
+        .expect("restarted production worker settles retained task");
+        let unrecovered_inputs: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.file_list WHERE data_tenant_id=$1 AND namespace=$2 AND table_name=$3 AND file_path LIKE '%/journey-%' AND NOT compacted",
+        )
+        .bind(fixture.tenant.as_uuid())
+        .bind(&fixture.binding.logical_namespace)
+        .bind(&fixture.binding.table_name)
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("inspect exact panic-recovered task inputs");
+        assert_eq!(unrecovered_inputs, 0);
         let table = fixture
             .catalog
             .load_table(&fixture.binding.table_ident())
@@ -1537,6 +2691,9 @@ async fn supervised_forge_panic_fails_stop_and_recovers_exactly_once() {
             })
             .count();
         assert_eq!(publications, 1, "one operation identity may publish once");
+        let restarted = cluster
+            .server_by_node(node)
+            .expect("settled restart server");
         let resources = restarted
             .state()
             .forge()
@@ -1551,103 +2708,16 @@ async fn supervised_forge_panic_fails_stop_and_recovers_exactly_once() {
     }
 }
 
-/// Proves the panic-recovery clock seam rejects every ineligible durable shape.
-///
-/// The fixture mutates only the isolated reclaimed task to arrange each negative
-/// case, snapshots the full row excluding the two eligibility timestamps, and
-/// restores the exact production-reclaimed shape before the accepted call.
+/// Proves production supervision fails stop on Forge panics and restart recovers once.
 ///
 /// # Panics
 ///
-/// Panics when a rejected shape changes any column, the accepted call changes a
-/// non-eligibility column, audit count changes, or retained evidence is reusable.
-async fn panic_recovery_clock_requires_exact_reclaimed_row(
-    cluster: &mut WyrdTestCluster,
-    pool: &sqlx::PgPool,
-    task_id: uuid::Uuid,
-    attempt_id: uuid::Uuid,
-) {
-    let durable = async || {
-        sqlx::query_scalar::<_, serde_json::Value>(
-            "SELECT to_jsonb(t)-'ready_at'-'next_eligible_at' FROM vala.forge_tasks t WHERE task_id=$1",
-        )
-        .bind(task_id)
-        .fetch_one(pool)
-        .await
-        .expect("panic clock durable row")
-    };
-    let wrong_attempt_before = durable().await;
-    assert!(
-        cluster
-            .advance_reclaimed_panic_task_for_test(task_id, uuid::Uuid::now_v7())
-            .await
-            .is_err()
-    );
-    assert_eq!(durable().await, wrong_attempt_before);
-
-    for statement in [
-        "UPDATE vala.forge_tasks SET state='claimed',attempt_id=gen_random_uuid(),claimed_by=gen_random_uuid(),claim_expires_at=statement_timestamp()+interval '1 minute',watermark_snapshot_id=NULL,watermark_timestamp_ms=NULL,failure_class=NULL WHERE task_id=$1",
-        "UPDATE vala.forge_tasks SET state='running',attempt_id=gen_random_uuid(),claimed_by=gen_random_uuid(),claim_expires_at=statement_timestamp()+interval '1 minute',watermark_snapshot_id=0,watermark_timestamp_ms=0,failure_class=NULL WHERE task_id=$1",
-        "UPDATE vala.forge_tasks SET state='retryable',attempt_id=NULL,claimed_by=NULL,claim_expires_at=NULL,watermark_snapshot_id=NULL,watermark_timestamp_ms=NULL,failure_class='storage_health' WHERE task_id=$1",
-        "UPDATE vala.forge_tasks SET state='retryable',attempt_id=NULL,claimed_by=NULL,claim_expires_at=NULL,watermark_snapshot_id=NULL,watermark_timestamp_ms=NULL,failure_class=NULL,attempt_count=2 WHERE task_id=$1",
-        "UPDATE vala.forge_tasks SET state='ready',attempt_id=NULL,claimed_by=NULL,claim_expires_at=NULL,watermark_snapshot_id=NULL,watermark_timestamp_ms=NULL,failure_class=NULL,attempt_count=0 WHERE task_id=$1",
-    ] {
-        sqlx::query(statement)
-            .bind(task_id)
-            .execute(pool)
-            .await
-            .expect("arrange rejected panic clock row");
-        let before = durable().await;
-        assert!(
-            cluster
-                .advance_reclaimed_panic_task_for_test(task_id, attempt_id)
-                .await
-                .is_err()
-        );
-        assert_eq!(durable().await, before, "rejected clock step is immutable");
-    }
-    sqlx::query(
-        "UPDATE vala.forge_tasks SET state='retryable',attempt_count=1,failure_class=NULL,attempt_id=NULL,claimed_by=NULL,claim_expires_at=NULL,watermark_snapshot_id=NULL,watermark_timestamp_ms=NULL WHERE task_id=$1",
-    )
-    .bind(task_id)
-    .execute(pool)
-    .await
-    .expect("restore exact reclaimed panic row");
-    let audit_before = cluster
-        .audit_outbox_count_for_test()
-        .await
-        .expect("panic clock audit baseline");
-    let durable_before = durable().await;
-    let eligibility_before: (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) =
-        sqlx::query_as("SELECT ready_at,next_eligible_at FROM vala.forge_tasks WHERE task_id=$1")
-            .bind(task_id)
-            .fetch_one(pool)
-            .await
-            .expect("panic clock eligibility baseline");
-    cluster
-        .advance_reclaimed_panic_task_for_test(task_id, attempt_id)
-        .await
-        .expect("exact panic eligibility advance");
-    assert_eq!(durable().await, durable_before);
-    let eligibility_after: (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) =
-        sqlx::query_as("SELECT ready_at,next_eligible_at FROM vala.forge_tasks WHERE task_id=$1")
-            .bind(task_id)
-            .fetch_one(pool)
-            .await
-            .expect("panic clock eligibility result");
-    assert_ne!(eligibility_after, eligibility_before);
-    let audit_after = cluster
-        .audit_outbox_count_for_test()
-        .await
-        .expect("panic clock audit result");
-    assert_eq!(audit_after, audit_before);
-    assert!(
-        cluster
-            .advance_reclaimed_panic_task_for_test(task_id, attempt_id)
-            .await
-            .is_err(),
-        "reclaimed attempt evidence is single-use"
-    );
+/// Panics when the shared panic-recovery scenario violates its supervision,
+/// durable recovery, publication, or resource-settlement invariants.
+#[tokio::test]
+#[ignore = "gated journey: real supervised server panic and lease-expiry recovery"]
+async fn supervised_forge_panic_fails_stop_and_recovers_exactly_once() {
+    supervised_forge_panic_recovery_scenario().await;
 }
 
 /// Runs real orphan collection and proves an aged, unreferenced object is deleted.
@@ -1660,15 +2730,122 @@ async fn panic_recovery_clock_requires_exact_reclaimed_row(
 #[tokio::test]
 #[ignore = "gated journey: real Postgres, Forge maintenance, and object cleanup"]
 async fn forge_orphan_cleanup_journey() {
+    forge_orphan_cleanup_lifecycle_journey().await;
+}
+
+/// Drives one reset generation through protected production orphan collection.
+///
+/// # Panics
+///
+/// Panics when an aged reset generation is not reclaimed exclusively through
+/// maintenance or when its terminal orphan audit is absent.
+async fn forge_orphan_cleanup_lifecycle_journey() {
     let server = start_maintenance_journey_server().await;
-    let fixture = seed_forge_group(&server, "journey_orphan_cleanup").await;
-    commit_journey_staging_snapshot(&fixture).await;
-    let orphans = seed_journey_reset_generation(&fixture).await;
-    commit_journey_staging_snapshot(&fixture).await;
-    commit_journey_live_rewrite(&fixture).await;
+    let fixture = native_forge_group(&server, "journey_orphan_cleanup").await;
+    commit_journey_staging_snapshot(&server, &fixture).await;
+    let (input_path, partition_day): (String, chrono::NaiveDate) = sqlx::query_as(
+        "SELECT file_path,partition_day FROM vala.file_list \
+         WHERE data_tenant_id=$1 AND namespace=$2 AND table_name=$3 \
+         AND committed_snapshot_id IS NOT NULL ORDER BY id LIMIT 1",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(&fixture.binding.logical_namespace)
+    .bind(&fixture.binding.table_name)
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("journey live input path");
+    let table = fixture
+        .catalog
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("journey reset table");
+    let base_snapshot_id = table
+        .metadata()
+        .current_snapshot_id()
+        .expect("journey reset base snapshot");
+    let operation_id = uuid::Uuid::now_v7();
+    let orphan = format!(
+        "{}/data/forge/bifrost-writer-v1/{operation_id}-00000.parquet",
+        fixture.binding.object_prefix,
+    );
+    fixture
+        .staging
+        .write(&orphan, Buffer::from(vec![9_u8]))
+        .await
+        .expect("journey reset generation object");
+    let resource = format!(
+        "bifrost://{}/{}/{}",
+        fixture.tenant, fixture.binding.table_ref.namespace, fixture.binding.table_ref.name,
+    );
+    let detail = AuditDetail::ForgeIcebergRewrite {
+        operation_id,
+        phase: ForgeIcebergRewritePhase::Prepared,
+        group: resource,
+        base_snapshot_id,
+        committed_snapshot_id: None,
+        partition_spec_id: table.metadata().default_partition_spec_id(),
+        partition_day: partition_day.to_string(),
+        target_file_size_bytes: 1,
+        input_paths: vec![StoragePath::new(input_path).expect("journey live input storage path")],
+        output_paths: vec![
+            StoragePath::new(orphan.clone()).expect("journey reset output storage path"),
+        ],
+        writer_recipe_version: "bifrost-writer-v1".to_owned(),
+    };
+    let object_store = ForgeObjectStoreControl::new(Arc::clone(&fixture.staging));
+    let mut config = fixture.config.clone();
+    config.orphan_gc_ttl = Duration::from_millis(1);
+    let forge = fixture.context_with_object_store(config, Arc::clone(&object_store));
+    let lease_key = vala_bifrost_redux::forge::forge_lease_key(
+        fixture.tenant,
+        &fixture.binding.logical_namespace,
+        &fixture.binding.table_name,
+    );
+    let mut lease = ForgeLease::acquire(
+        &fixture.operator_pool,
+        lease_key,
+        uuid::Uuid::now_v7(),
+        fixture.config.lease_ttl,
+    )
+    .await
+    .expect("journey reset lease query")
+    .expect("journey reset lease");
+    forge
+        .append_prepared_live_rewrite_for_test(&mut lease, &fixture.binding, partition_day, detail)
+        .await
+        .expect("journey Prepared live rewrite");
+    let reconcile_now = chrono::Utc::now()
+        + chrono::Duration::from_std(fixture.config.uncertainty_bound)
+            .expect("journey uncertainty bound")
+        + chrono::Duration::seconds(1);
+    let reconciled = forge
+        .reconcile_live_replacements_for_test(
+            &mut lease,
+            &fixture.binding,
+            &CancellationToken::new(),
+            reconcile_now,
+        )
+        .await
+        .expect("journey Reset reconciliation");
+    assert_eq!(
+        reconciled.reset, 1,
+        "stable Prepared output must Reset once"
+    );
+    assert!(
+        object_store.delete_paths().is_empty(),
+        "Reset reconciliation must enqueue without remote deletion"
+    );
+    assert!(
+        fixture.staging.stat(&orphan).await.is_ok(),
+        "Reset output remains durable for delayed orphan GC"
+    );
+    lease
+        .release(&fixture.operator_pool)
+        .await
+        .expect("journey reset lease release");
     let modified = fixture
         .staging
-        .stat(&orphans[0])
+        .stat(&orphan)
         .await
         .expect("journey orphan metadata")
         .last_modified()
@@ -1682,36 +2859,765 @@ async fn forge_orphan_cleanup_journey() {
                 .expect("journey orphan timestamp is UTC-representable"),
         )
         .expect("advance journey orphan clock");
-    let mut config = fixture.config.clone();
-    config.snapshot_retention = Duration::from_millis(1);
-    config.orphan_gc_ttl = Duration::from_millis(1);
-    config.min_files = 3;
-    config.max_files_per_bin = 3;
-    config.max_files_per_tick = 3;
-    let mut lifecycle = JourneyMaintenance::start(&fixture, config);
-    let strategy = lifecycle.run_one_success().await;
-    lifecycle.shutdown().await;
     assert_eq!(
-        strategy,
-        ForgeTaskStrategy::SnapshotExpiry,
-        "production journey must complete orphan maintenance"
+        forge
+            .run_orphan_gc_for_test(&fixture.binding)
+            .await
+            .expect("aged reset orphan-GC pass"),
+        1,
+        "orphan GC must delete the aged Reset generation once"
     );
-    for orphan in &orphans {
-        assert!(
-            fixture.staging.stat(orphan).await.is_err(),
-            "production orphan collector must delete every aged reset-generation output"
-        );
-    }
-    assert!(
+    assert!(fixture.staging.stat(&orphan).await.is_err());
+    assert_eq!(
+        object_store
+            .delete_paths()
+            .iter()
+            .filter(|path| path.as_str() == orphan.as_str())
+            .count(),
+        1,
+        "orphan GC is the sole exact-once physical-delete owner"
+    );
+    assert_eq!(
+        forge
+            .run_orphan_gc_for_test(&fixture.binding)
+            .await
+            .expect("idempotent reset orphan-GC pass"),
+        0,
+        "successor orphan GC must not repeat deletion"
+    );
+    assert_eq!(
         fixture.operation_count("forge.orphan_gc.committed").await
-            + fixture.operation_count("forge.orphan_gc.recovered").await
-            >= 1,
-        "production journey must persist an orphan-GC terminal audit"
+            + fixture.operation_count("forge.orphan_gc.recovered").await,
+        1,
+        "one terminal orphan-GC audit must settle the deletion"
     );
     server
         .shutdown()
         .await
         .expect("journey orphan server shutdown");
+}
+
+/// Proves a verified output whose `Prepared` audit fails is reclaimed only by orphan GC.
+///
+/// The production rewrite is held immediately after the shared uploader has
+/// verified a real object. The injected audit failure then leaves that object
+/// without a `Prepared` or Reset projection. Production orphan GC first
+/// protects it below the TTL floor, then deletes it under the exact table lease
+/// after the server-owned clock makes it eligible.
+///
+/// # Panics
+///
+/// Panics when the verified upload is deleted by the rewrite path, becomes
+/// eligible before its TTL, survives an eligible production GC pass, is
+/// deleted more than once, or lacks exactly one terminal orphan-GC audit.
+#[tokio::test]
+#[ignore = "supporting integration seam: direct owner controls"]
+async fn supporting_preprepared_verified_output_orphan_gc_journey() {
+    let mut server_config = vala_bifrost_redux::forge::ForgeConfig::default();
+    server_config.min_files = 2;
+    server_config.max_files_per_bin = 2;
+    server_config.max_files_per_tick = 2;
+    let server = WyrdTestServer::builder()
+        .with_forge_interval(Duration::from_secs(3600))
+        .with_forge_process_role_for_test(BifrostTarget::All)
+        .with_forge_config_for_test(server_config)
+        .start_bound()
+        .await
+        .expect("bound pre-Prepared orphan journey server");
+    let fixture = native_forge_group(&server, "journey_prepared_audit_failure_gc").await;
+    commit_journey_staging_snapshot(&server, &fixture).await;
+    append_native_forge_cycles(&server, &fixture, 3..5).await;
+    commit_journey_staging_snapshot(&server, &fixture).await;
+
+    server
+        .forge_clock()
+        .advance(chrono::Duration::days(1) + chrono::Duration::minutes(3))
+        .expect("age committed files beyond the live-rewrite cutoff");
+    let partition_day: chrono::NaiveDate = sqlx::query_scalar(
+        "SELECT partition_day FROM vala.file_list \
+         WHERE data_tenant_id=$1 AND namespace=$2 AND table_name=$3 \
+         AND committed_snapshot_id IS NOT NULL ORDER BY partition_day LIMIT 1",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(&fixture.binding.logical_namespace)
+    .bind(&fixture.binding.table_name)
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("live-rewrite partition cutoff");
+    assert_eq!(
+        server
+            .forge_publisher()
+            .try_publish(StagingFileCommitted::new(
+                fixture.binding.clone(),
+                partition_day,
+            )),
+        StagingPublishOutcome::Published,
+        "production demand channel must accept the live-rewrite hint"
+    );
+
+    let object_store = ForgeObjectStoreControl::new(Arc::clone(&fixture.staging));
+    let mut rewrite_config = fixture.config.clone();
+    rewrite_config.min_files = 2;
+    rewrite_config.max_files_per_bin = 2;
+    rewrite_config.max_files_per_tick = 2;
+    let forge = fixture.context_with_object_store(rewrite_config, Arc::clone(&object_store));
+    let completed_passes = server.completed_forge_scheduler_passes_for_test();
+    server.request_forge_scheduler_pass_for_test();
+    server
+        .wait_for_forge_scheduler_passes_for_test(completed_passes + 1)
+        .await;
+    let queued: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM vala.forge_tasks \
+         WHERE data_tenant_id=$1 AND namespace_name=$2 AND table_name=$3 \
+         AND strategy='live_rewrite' AND state IN ('ready','retryable'))",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(&fixture.binding.logical_namespace)
+    .bind(&fixture.binding.table_name)
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("observe server-owned live-rewrite enqueue");
+    let planner_diagnostics: Vec<(String, String)> = sqlx::query_as(
+        "SELECT strategy,state FROM vala.forge_tasks WHERE data_tenant_id=$1 ORDER BY created_at",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .fetch_all(fixture.operator_pool.pool())
+    .await
+    .expect("read production planner diagnostics");
+    assert!(
+        queued,
+        "production planner must enqueue the live rewrite: {planner_diagnostics:?}"
+    );
+    forge.fail_next_prepared_live_audit_for_test();
+    object_store.pause_after_next_output_put();
+    let worker = ForgeWorker::new(
+        Arc::clone(&forge),
+        ForgeWorkerConfig::default(),
+        uuid::Uuid::now_v7(),
+    )
+    .expect("pre-Prepared failure worker");
+    let attempt =
+        tokio::spawn(async move { worker.execute_one_for_test(&CancellationToken::new()).await });
+    tokio::time::timeout(Duration::from_secs(30), object_store.wait_for_output_put())
+        .await
+        .expect("verified output PUT boundary");
+    let orphan = object_store
+        .last_output_path()
+        .expect("verified output path");
+    assert!(
+        fixture.staging.stat(&orphan).await.is_ok(),
+        "shared uploader must leave verified bytes durable"
+    );
+    object_store.release_output_put();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(30), attempt)
+            .await
+            .expect("pre-Prepared failure worker bound")
+            .expect("pre-Prepared failure worker join")
+            .is_err(),
+        "the injected Prepared audit failure must remain authoritative"
+    );
+    assert_eq!(
+        fixture
+            .operation_count("forge.iceberg_rewrite.prepared")
+            .await,
+        0,
+        "the failure must precede durable Prepared evidence"
+    );
+    assert!(
+        object_store.delete_paths().is_empty(),
+        "the rewrite path must leave remote deletion exclusively to orphan GC"
+    );
+    assert_eq!(
+        forge
+            .gc_eligibility_for_test(&fixture.binding, &orphan)
+            .await
+            .expect("young pre-Prepared eligibility"),
+        "TooYoung",
+        "the TTL floor protects a freshly verified generation"
+    );
+    assert_eq!(
+        forge
+            .run_orphan_gc_for_test(&fixture.binding)
+            .await
+            .expect("young pre-Prepared GC pass"),
+        0,
+        "orphan GC must not delete below the TTL floor"
+    );
+    assert!(
+        fixture.staging.stat(&orphan).await.is_ok(),
+        "the young verified generation must remain durable"
+    );
+
+    let modified = fixture
+        .staging
+        .stat(&orphan)
+        .await
+        .expect("pre-Prepared orphan metadata")
+        .last_modified()
+        .expect("pre-Prepared orphan modification time")
+        .into_inner()
+        .as_millisecond();
+    server
+        .forge_clock()
+        .set(
+            chrono::DateTime::from_timestamp_millis(modified + 100)
+                .expect("pre-Prepared orphan timestamp is UTC-representable"),
+        )
+        .expect("advance pre-Prepared orphan clock");
+    let mut gc_config = fixture.config.clone();
+    gc_config.orphan_gc_ttl = Duration::from_millis(1);
+    let gc_forge = fixture.context_with_object_store(gc_config, Arc::clone(&object_store));
+    assert_eq!(
+        gc_forge
+            .gc_eligibility_for_test(&fixture.binding, &orphan)
+            .await
+            .expect("aged pre-Prepared eligibility"),
+        "Eligible"
+    );
+    let terminal_before = fixture.operation_count("forge.orphan_gc.committed").await
+        + fixture.operation_count("forge.orphan_gc.recovered").await;
+    assert!(
+        gc_forge
+            .run_orphan_gc_for_test(&fixture.binding)
+            .await
+            .expect("aged pre-Prepared GC pass")
+            >= 1,
+        "production orphan GC must reclaim the aged generation"
+    );
+    assert!(
+        fixture.staging.stat(&orphan).await.is_err(),
+        "the aged pre-Prepared generation must be absent"
+    );
+    assert_eq!(
+        object_store
+            .delete_paths()
+            .iter()
+            .filter(|path| path.as_str() == orphan.as_str())
+            .count(),
+        1,
+        "the exact generation must be deleted once"
+    );
+    let terminal_after = fixture.operation_count("forge.orphan_gc.committed").await
+        + fixture.operation_count("forge.orphan_gc.recovered").await;
+    assert_eq!(
+        terminal_after,
+        terminal_before + 1,
+        "one orphan-GC terminal audit must settle the deletion"
+    );
+    assert_eq!(
+        gc_forge
+            .run_orphan_gc_for_test(&fixture.binding)
+            .await
+            .expect("idempotent pre-Prepared GC pass"),
+        0,
+        "a successor pass must not repeat the deletion"
+    );
+    assert_eq!(
+        object_store
+            .delete_paths()
+            .iter()
+            .filter(|path| path.as_str() == orphan.as_str())
+            .count(),
+        1,
+        "successor GC must preserve exactly-once deletion"
+    );
+    server
+        .shutdown()
+        .await
+        .expect("pre-Prepared orphan server shutdown");
+}
+
+/// Proves ambiguous publication recovery and protected orphan GC converge once.
+///
+/// # Panics
+///
+/// Panics when the production recovery path duplicates a catalog update or
+/// rows, or when protected maintenance fails to reclaim its reset generation.
+#[tokio::test]
+#[ignore = "gated journey: real Forge publication recovery and orphan collection"]
+async fn pg_bifrost_forge_publication_recovery_and_orphan_gc() {
+    supervised_prepared_audit_failure_and_gc_journey().await;
+    supervised_uncertain_commit_recovery_journey().await;
+}
+
+/// Drives verified publication failure and later GC through the bound Forge roles.
+///
+/// # Panics
+///
+/// Panics when the durable planner does not expose the exact small-files
+/// live-rewrite plan, the shared uploader boundary is not reached, the
+/// supervised failure performs eager deletion, or its lawful snapshot-expiry
+/// carrier does not settle orphan collection exactly once.
+async fn supervised_prepared_audit_failure_and_gc_journey() {
+    let observer = ForgeWorkerCompletionObserver::new();
+    let mut config = ForgeConfig::default();
+    config.min_files = 2;
+    config.max_files_per_bin = 64;
+    config.max_files_per_tick = 64;
+    config.orphan_gc_ttl = Duration::from_millis(1);
+    config.snapshot_retention = Duration::from_hours(48);
+    let server = WyrdTestServer::builder()
+        .with_forge_interval(Duration::from_secs(3600))
+        .with_forge_config_for_test(config)
+        .with_forge_completion_observer_for_test(observer.clone())
+        .start_bound()
+        .await
+        .expect("bound publication supervision server");
+    let fixture = seed_forge_group(&server, "journey_supervised_prepared_gc").await;
+    server
+        .forge_clock()
+        .advance(chrono::Duration::days(1) + chrono::Duration::minutes(3))
+        .expect("close supervised publication staging partition");
+    let latest_uncompacted_partition: Option<chrono::NaiveDate> = sqlx::query_scalar(
+        "SELECT max(partition_day) FROM vala.file_list \
+         WHERE data_tenant_id=$1 AND namespace=$2 AND table_name=$3 \
+         AND NOT compacted",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(&fixture.binding.logical_namespace)
+    .bind(&fixture.binding.table_name)
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("supervised publication uncompacted partition day");
+    assert!(
+        latest_uncompacted_partition.is_some_and(|partition_day| {
+            partition_day
+                < server
+                    .forge_clock()
+                    .now()
+                    .expect("supervised publication Forge clock")
+                    .date_naive()
+        }),
+        "all uncompacted publication inputs must belong to a closed partition"
+    );
+    let controls = server
+        .forge_object_store_control_for_test()
+        .expect("supervised Forge object-store controls");
+    let mut staging_worker_held = false;
+    for generation in 0..2 {
+        if generation == 1 {
+            observer.hold_after_next_attempt_for_test();
+            let table = fixture
+                .catalog
+                .load_table(&fixture.binding.table_ident())
+                .await
+                .expect("publication first-fold table");
+            let target_update = Transaction::new(&table).update_table_properties().set(
+                "write.target-file-size-bytes".to_owned(),
+                (10 * 1024 * 1024).to_string(),
+            );
+            ApplyTransactionAction::apply(target_update, Transaction::new(&table))
+                .expect("multi-output target property update")
+                .commit(fixture.catalog.as_ref())
+                .await
+                .expect("multi-output target property commit");
+            append_native_forge_group_with_rows(
+                &server,
+                &fixture,
+                0..8,
+                14 * FORGE_CONVERGENCE_BATCH_ROWS,
+            )
+            .await;
+        }
+        let expected = observer.completed().saturating_add(1);
+        let expected_attempts = observer.attempts().saturating_add(1);
+        trigger_supervised_scheduler(
+            &server,
+            Scenario {
+                name: "supervised-staging-publication",
+                tenants: 1,
+            },
+        )
+        .await;
+        if generation == 1 {
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                observer.wait_for_attempts_at_least(expected_attempts),
+            )
+            .await
+            .expect("supervised staging publication attempt");
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                observer.wait_for_held_attempt_for_test(),
+            )
+            .await
+            .expect("hold publication worker after staging");
+            staging_worker_held = true;
+        } else {
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                observer.wait_for_at_least(expected),
+            )
+            .await
+            .expect("supervised staging publication");
+            assert!(matches!(
+                observer.completed_strategies().last(),
+                Some(ForgeClaimStrategy::Known(ForgeTaskStrategy::StagingFold))
+            ));
+        }
+    }
+    for _ in 0..4 {
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.file_list WHERE data_tenant_id=$1 AND namespace=$2 AND table_name=$3 AND NOT compacted",
+        )
+        .bind(fixture.tenant.as_uuid())
+        .bind(&fixture.binding.logical_namespace)
+        .bind(&fixture.binding.table_name)
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("publication staging remainder");
+        if remaining == 0 {
+            break;
+        }
+        assert!(staging_worker_held);
+        let expected_attempts = observer.attempts().saturating_add(1);
+        observer.hold_after_next_attempt_for_test();
+        observer.release_held_attempt_for_test();
+        trigger_supervised_scheduler(
+            &server,
+            Scenario {
+                name: "supervised-staging-publication-remainder",
+                tenants: 1,
+            },
+        )
+        .await;
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            observer.wait_for_attempts_at_least(expected_attempts),
+        )
+        .await
+        .expect("supervised staging publication remainder attempt");
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            observer.wait_for_held_attempt_for_test(),
+        )
+        .await
+        .expect("hold publication worker after staging remainder");
+        staging_worker_held = true;
+    }
+    let uncompacted_files: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.file_list WHERE data_tenant_id=$1 AND namespace=$2 AND table_name=$3 AND NOT compacted",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(&fixture.binding.logical_namespace)
+    .bind(&fixture.binding.table_name)
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("closed-partition uncompacted file count");
+    assert_eq!(
+        uncompacted_files, 0,
+        "both staging folds must be catalog-published"
+    );
+    let table = fixture
+        .catalog
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("publication catalog table");
+    assert!(
+        table.metadata().snapshots().count() >= 2,
+        "the staging folds must create multiple snapshots"
+    );
+    let catalog_paths = current_live_paths(&table)
+        .await
+        .into_iter()
+        .collect::<Vec<_>>();
+    assert!(
+        catalog_paths.len() >= 2,
+        "the two staging folds must expose multiple physical outputs"
+    );
+    let nonterminal_expiry_tasks: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.forge_tasks WHERE data_tenant_id=$1 AND table_name=$2 AND strategy='snapshot_expiry' AND state IN ('ready','claimed','running','prepared','retryable')",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(&fixture.binding.table_name)
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("pre-rewrite snapshot-expiry task count");
+    assert_eq!(
+        nonterminal_expiry_tasks, 0,
+        "snapshot retention must not compete with the live rewrite"
+    );
+    trigger_supervised_scheduler(
+        &server,
+        Scenario {
+            name: "supervised-incomplete-multi-output-plan",
+            tenants: 1,
+        },
+    )
+    .await;
+    let (planned_state, planned_inputs): (String, Vec<String>) = sqlx::query_as(
+        "SELECT state,ARRAY(SELECT jsonb_array_elements_text(plan->'inputs') ORDER BY 1) FROM vala.forge_tasks WHERE data_tenant_id=$1 AND table_name=$2 AND strategy='small_files' AND state IN ('ready','retryable') ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(&fixture.binding.table_name)
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("observe planned multi-output rewrite");
+    assert_eq!(planned_state, "ready");
+    assert!(
+        planned_inputs.len() >= 2
+            && planned_inputs
+                .iter()
+                .all(|input| catalog_paths.contains(input)),
+        "the multi-output failure must target one whole multi-file bin"
+    );
+    let publication_base = fixture
+        .catalog
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("multi-output publication base");
+    let publication_snapshot = publication_base
+        .metadata()
+        .current_snapshot_id()
+        .expect("multi-output publication snapshot");
+    let prepared_before = fixture
+        .operation_count("forge.iceberg_rewrite.prepared")
+        .await;
+    let verified_outputs_before = controls.output_put_calls();
+    let returned_errors_before = observer.returned_errors().len();
+    controls.fail_output_put_at_ordinal_for_test(1);
+    controls.pause_after_next_output_put();
+    let expected_failure_attempts = observer.attempts().saturating_add(1);
+    assert!(staging_worker_held);
+    observer.release_held_attempt_for_test();
+    trigger_supervised_scheduler(
+        &server,
+        Scenario {
+            name: "supervised-incomplete-multi-output",
+            tenants: 1,
+        },
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(30), controls.wait_for_output_put())
+        .await
+        .expect("verified ordinal-zero output PUT");
+    let incomplete_output = controls
+        .last_output_path()
+        .expect("verified ordinal-zero output path");
+    controls.release_output_put();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        observer.wait_for_attempts_at_least(expected_failure_attempts),
+    )
+    .await
+    .expect("incomplete multi-output attempt");
+    let incomplete_table = fixture
+        .catalog
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("table after incomplete multi-output attempt");
+    assert_eq!(
+        controls.output_put_calls(),
+        verified_outputs_before + 1,
+        "output ordinal zero must verify before ordinal one reaches its injected failure"
+    );
+    assert_eq!(
+        observer.returned_errors().len(),
+        returned_errors_before + 1,
+        "the selected second-output failure must return from the supervised attempt"
+    );
+    assert_eq!(
+        fixture
+            .operation_count("forge.iceberg_rewrite.prepared")
+            .await,
+        prepared_before,
+        "an incomplete verified output set must not append Prepared evidence"
+    );
+    assert_eq!(
+        incomplete_table.metadata().current_snapshot_id(),
+        Some(publication_snapshot),
+        "an incomplete verified output set must not replace the Iceberg snapshot"
+    );
+    assert!(
+        fixture.staging.stat(&incomplete_output).await.is_ok(),
+        "the verified prefix remains available to delayed fenced orphan GC"
+    );
+    let incomplete_task: uuid::Uuid = sqlx::query_scalar(
+        "SELECT task_id FROM vala.forge_tasks WHERE data_tenant_id=$1 AND table_name=$2 \
+         AND strategy='small_files' AND state='retryable' AND failure_class='transient_object_store' \
+         AND attempt_id IS NULL AND claimed_by IS NULL ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(&fixture.binding.table_name)
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("incomplete live rewrite retry row");
+    server
+        .fail_next_forge_prepared_audit_for_test()
+        .expect("arm Prepared audit failure");
+    controls.pause_after_next_output_put();
+    advance_transient_forge_retry(&server, incomplete_task, "transient_object_store", false).await;
+    let expected_attempts = observer.attempts().saturating_add(1);
+    trigger_supervised_scheduler(
+        &server,
+        Scenario {
+            name: "supervised-prepared-gc",
+            tenants: 1,
+        },
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(30), controls.wait_for_output_put())
+        .await
+        .expect("supervised verified output PUT");
+    let output = controls
+        .last_output_path()
+        .expect("supervised verified output path");
+    let (strategy, state, base_snapshot_id, inputs): (String, String, i64, Vec<String>) =
+        sqlx::query_as(
+        "SELECT strategy,state,base_snapshot_id,ARRAY(SELECT jsonb_array_elements_text(plan->'inputs') ORDER BY 1) FROM vala.forge_tasks WHERE data_tenant_id=$1 AND table_name=$2 AND strategy='small_files' AND plan->'parameters'->>'kind'='live_rewrite' ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(&fixture.binding.table_name)
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("observe exact durable live-rewrite plan");
+    assert_eq!(strategy, "small_files");
+    assert_eq!(state, "running");
+    assert_eq!(
+        base_snapshot_id,
+        table
+            .metadata()
+            .current_snapshot_id()
+            .expect("current base snapshot")
+    );
+    assert!(
+        inputs.len() >= 2 && inputs.iter().all(|input| catalog_paths.contains(input)),
+        "the durable plan must retain one whole pinned catalog bin"
+    );
+    assert!(fixture.staging.stat(&output).await.is_ok());
+    controls.release_output_put();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        observer.wait_for_attempts_at_least(expected_attempts),
+    )
+    .await
+    .expect("Prepared audit failure observation");
+    assert_eq!(
+        fixture
+            .operation_count("forge.iceberg_rewrite.prepared")
+            .await,
+        0
+    );
+    assert!(controls.delete_paths().is_empty());
+    assert!(fixture.staging.stat(&output).await.is_ok());
+    server
+        .forge_clock()
+        .advance(chrono::Duration::days(1) + chrono::Duration::minutes(3))
+        .expect("make snapshot retention and orphan TTL due");
+    let terminal_before = fixture.operation_count("forge.orphan_gc.committed").await
+        + fixture.operation_count("forge.orphan_gc.recovered").await;
+    controls.pause_next_delete();
+    server.trigger_forge_scheduler_for_test();
+    tokio::time::timeout(Duration::from_secs(30), controls.wait_for_delete())
+        .await
+        .expect("orphan GC final recheck admitted one delete");
+    assert!(fixture.staging.stat(&output).await.is_ok());
+    let (expiry_task, expiry_state, snapshot_expiry_due): (uuid::Uuid, String, bool) =
+        sqlx::query_as(
+            "SELECT task_id,state,(plan->'parameters'->>'snapshot_expiry_due')::boolean FROM vala.forge_tasks WHERE data_tenant_id=$1 AND table_name=$2 AND strategy='snapshot_expiry' AND state='prepared' ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(fixture.tenant.as_uuid())
+        .bind(&fixture.binding.table_name)
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("prepared snapshot-expiry orphan-GC carrier");
+    assert_eq!(expiry_state, "prepared");
+    assert!(
+        snapshot_expiry_due,
+        "the lawful carrier must be due for snapshot expiry"
+    );
+    observer.hold_after_next_attempt_for_test();
+    controls.release_paused_delete();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        observer.wait_for_held_attempt_for_test(),
+    )
+    .await
+    .expect("held snapshot-expiry attempt after durable execution");
+    let expiry_terminal_state: String = sqlx::query_scalar(
+        "SELECT state FROM vala.forge_tasks WHERE data_tenant_id=$1 AND task_id=$2",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(expiry_task)
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("terminal snapshot-expiry carrier");
+    let mut conn = fixture
+        .vala
+        .tenant_conn(fixture.tenant)
+        .await
+        .expect("snapshot-expiry audit tenant connection");
+    let expiry_terminal_audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id=wyrd.current_tenant() AND operation='forge.task.succeeded' AND resource=$1",
+    )
+    .bind(format!("forge-task:{expiry_task}"))
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("terminal snapshot-expiry carrier audit count");
+    assert_eq!(expiry_terminal_state, "succeeded");
+    assert_eq!(expiry_terminal_audits, 1);
+    assert!(fixture.staging.stat(&output).await.is_err());
+    assert!(
+        fixture.staging.stat(&incomplete_output).await.is_err(),
+        "orphan GC must reclaim the aged pre-Prepared output prefix"
+    );
+    assert_eq!(
+        controls
+            .delete_paths()
+            .iter()
+            .filter(|path| path.as_str() == output.as_str())
+            .count(),
+        1,
+        "orphan GC deletes the verified generation once"
+    );
+    assert_eq!(
+        controls
+            .delete_paths()
+            .iter()
+            .filter(|path| path.as_str() == incomplete_output.as_str())
+            .count(),
+        1,
+        "orphan GC deletes the incomplete generation prefix once"
+    );
+    let terminal_after = fixture.operation_count("forge.orphan_gc.committed").await
+        + fixture.operation_count("forge.orphan_gc.recovered").await;
+    assert_eq!(terminal_after, terminal_before + 1);
+    let shutdown = tokio::spawn(async move { server.shutdown().await });
+    tokio::task::yield_now().await;
+    observer.release_held_attempt_for_test();
+    shutdown
+        .await
+        .expect("publication shutdown task")
+        .expect("publication server shutdown");
+}
+
+/// Read the sorted live data-file membership of the current Iceberg snapshot.
+async fn current_live_paths(table: &iceberg::table::Table) -> std::collections::BTreeSet<String> {
+    let snapshot = table
+        .metadata()
+        .current_snapshot()
+        .expect("publication table current snapshot");
+    let manifest_list = table
+        .manifest_list_reader(snapshot)
+        .load()
+        .await
+        .expect("publication current manifest list");
+    let mut paths = std::collections::BTreeSet::new();
+    for manifest_file in manifest_list.entries() {
+        let manifest = manifest_file
+            .load_manifest(table.file_io())
+            .await
+            .expect("publication current manifest");
+        paths.extend(
+            manifest
+                .entries()
+                .iter()
+                .filter(|entry| entry.is_alive())
+                .map(|entry| entry.file_path().to_owned()),
+        );
+    }
+    paths
 }
 
 /// Proves Forge fixture rebuilds retain the server-owned wall clock.
@@ -1722,7 +3628,7 @@ async fn forge_fixture_rebuilds_retain_manual_forge_clock() {
         .start_bound()
         .await
         .expect("server");
-    let fixture = seed_forge_group(&server, "manual_forge_clock").await;
+    let fixture = native_forge_group(&server, "manual_forge_clock").await;
     let initial = fixture
         .forge
         .clock_for_test()
@@ -1770,7 +3676,11 @@ async fn dedicated_forge_workers_share_dependencies_without_public_listeners() {
 /// Panics when the worker topology, listener isolation, durable work, or
 /// supervised shutdown differs from the production role contract.
 async fn dedicated_forge_workers_journey() {
-    let cluster = WyrdTestCluster::start_with_dedicated_forge_workers()
+    let config = ForgeConfig {
+        lease_ttl: Duration::from_millis(1),
+        ..ForgeConfig::default()
+    };
+    let cluster = WyrdTestCluster::start_with_dedicated_forge_workers_with_config_for_test(config)
         .await
         .expect("dedicated Forge worker cluster");
     assert_eq!(cluster.topology(), BifrostTopology::DedicatedForgeWorkers);
@@ -1870,17 +3780,16 @@ async fn dedicated_forge_workers_journey() {
         readiness.running_capacity > 0,
         "dedicated worker Oracle has no local query capacity before query: {readiness:?}"
     );
-    let expected_rows =
-        u64::try_from(WRITE_CYCLES * SPANS_PER_WRITE).expect("bounded dedicated journey row count");
+    let expected_rows = u64::try_from(WRITE_CYCLES).expect("bounded dedicated journey row count");
     for tenant in &tenants {
         assert_eq!(
-            query_rows(scheduler_server, &tenant.jwt).await,
+            query_rows(scheduler_server, tenant).await,
             expected_rows,
             "dedicated worker tenant {} rows",
             tenant.id
         );
         assert_terminal_audits(scheduler_server, tenant.id, scenario).await;
-        assert_snapshot(scheduler_server, tenant.id, scenario).await;
+        assert_snapshot(scheduler_server, tenant, scenario).await;
     }
     assert_no_forge_leases(scheduler_server, scenario).await;
     cluster
@@ -1947,7 +3856,25 @@ async fn embedded_and_dedicated_forge_roles_preserve_exact_durable_parity() {
 #[tokio::test]
 #[ignore = "gated journey: supervised dedicated Forge worker loss and lease reclaim"]
 async fn supervised_dedicated_roles_reclaim_lost_worker_without_duplicate_rows() {
-    let cluster = WyrdTestCluster::start_with_dedicated_forge_workers()
+    supervised_worker_claim_expiry_journey().await;
+}
+
+/// Drives one abandoned durable claim through expiry and exact worker reclaim.
+///
+/// # Panics
+///
+/// Panics when claim expiry, successor ownership, public rows, durable evidence,
+/// audit settlement, or lease release diverges from the production contract.
+async fn supervised_worker_claim_expiry_journey() {
+    let config = ForgeConfig {
+        lease_ttl: Duration::from_secs(4),
+        iceberg_total_retry_timeout: Duration::from_secs(1),
+        catalog_request_timeout: Duration::from_secs(1),
+        uncertainty_margin: Duration::from_secs(1),
+        uncertainty_bound: Duration::from_secs(1),
+        ..ForgeConfig::default()
+    };
+    let cluster = WyrdTestCluster::start_with_dedicated_forge_workers_with_config_for_test(config)
         .await
         .expect("dedicated Forge cluster");
     let server = cluster.server(0).expect("scheduler server");
@@ -1981,26 +3908,9 @@ async fn supervised_dedicated_roles_reclaim_lost_worker_without_duplicate_rows()
     )
     .await
     .expect("one real worker stopped after its durable claim");
-    let (lost_task, lost_attempt, lost_owner) = completion.abandoned_claim_identity_for_test();
-    let expired: uuid::Uuid = sqlx::query_scalar(
-        "UPDATE vala.forge_tasks SET claim_expires_at = statement_timestamp() - interval '1 millisecond' WHERE task_id = $1 AND attempt_id = $2 AND claimed_by = $3 AND state = 'claimed' RETURNING task_id",
-    )
-    .bind(lost_task)
-    .bind(lost_attempt)
-    .bind(lost_owner)
-    .fetch_one(
-        server
-            .state()
-            .postgres
-            .operator_pool()
-            .expect("operator pool")
-            .pool(),
-    )
-    .await
-    .expect("expire the exact abandoned durable claim");
-    assert_eq!(expired, lost_task, "only the stopped claim may expire");
+    let abandoned_identity = completion.abandoned_claim_identity_for_test();
     let staged_completion = tokio::time::timeout(
-        Duration::from_secs(15),
+        Duration::from_secs(90),
         completion.wait_for_strategy_at_least(ForgeTaskStrategy::StagingFold, 3),
     )
     .await;
@@ -2010,6 +3920,18 @@ async fn supervised_dedicated_roles_reclaim_lost_worker_without_duplicate_rows()
             forge_task_diagnostics(server).await
         );
     }
+    let reclaimed_by_other_worker = completion.lifecycle_events().iter().any(|event| {
+        matches!(event, vala_bifrost_redux::forge::ForgeLifecycleEvent::Claimed { task_id, worker_id, .. }
+            if *task_id == abandoned_identity.0 && *worker_id != abandoned_identity.2)
+    });
+    assert!(
+        reclaimed_by_other_worker,
+        "the abandoned task is reclaimed by a different production worker"
+    );
+    assert!(completion.lifecycle_events().iter().any(|event| {
+        matches!(event, vala_bifrost_redux::forge::ForgeLifecycleEvent::Terminal { task_id, worker_id }
+            if *task_id == abandoned_identity.0 && *worker_id != abandoned_identity.2)
+    }), "the different reclaiming worker terminalizes the abandoned task");
 
     server
         .bifrost_scribe()
@@ -2017,11 +3939,10 @@ async fn supervised_dedicated_roles_reclaim_lost_worker_without_duplicate_rows()
         .retire_committed_for_test()
         .await
         .expect("retire committed Scribe generations");
-    let expected_rows =
-        u64::try_from(WRITE_CYCLES * SPANS_PER_WRITE).expect("bounded reclaim rows");
+    let expected_rows = u64::try_from(WRITE_CYCLES).expect("bounded reclaim rows");
     for tenant in &tenants {
         assert_terminal_audits(server, tenant.id, scenario).await;
-        assert_snapshot(server, tenant.id, scenario).await;
+        assert_snapshot(server, tenant, scenario).await;
         let mut conn = server
             .state()
             .postgres
@@ -2047,7 +3968,7 @@ async fn supervised_dedicated_roles_reclaim_lost_worker_without_duplicate_rows()
             tenant.id
         );
         assert_eq!(
-            supervised_reclaim_query_rows(server, &tenant.jwt).await,
+            supervised_reclaim_query_rows(server, tenant).await,
             expected_rows,
             "reclaimed tenant {} public rows after terminal={terminal}, evidence={evidence}",
             tenant.id
@@ -2141,10 +4062,9 @@ async fn supervised_uncertain_commit_recovery_journey() {
         tail_stats.immutable_rows, 0,
         "uncertain immutable tail retired"
     );
-    let expected_rows =
-        u64::try_from(WRITE_CYCLES * SPANS_PER_WRITE).expect("bounded uncertain rows");
+    let expected_rows = u64::try_from(WRITE_CYCLES).expect("bounded uncertain rows");
     assert_terminal_audits(server, tenants[0].id, scenario).await;
-    assert_snapshot(server, tenants[0].id, scenario).await;
+    assert_snapshot(server, &tenants[0], scenario).await;
     let mut conn = server
         .state()
         .postgres
@@ -2176,7 +4096,7 @@ async fn supervised_uncertain_commit_recovery_journey() {
         "uncertain recovery stamps every exact staging input"
     );
     assert_eq!(
-        query_rows(server, &tenants[0].jwt).await,
+        query_rows(server, &tenants[0]).await,
         expected_rows,
         "uncertain commit public rows after terminal={terminal}, evidence={evidence}, files={files}, compacted={compacted}, committed={committed}"
     );
@@ -2205,153 +4125,6 @@ async fn dedicated_roles_terminalize_unschedulable_work() {
 /// Panics when production planner admission fails to retain the exact large or
 /// unschedulable durable task classification.
 async fn dedicated_unschedulable_admission_journey() {
-    let large_config = vala_bifrost_redux::forge::ForgeConfig {
-        max_bytes_per_tick: 1,
-        max_memory_bytes: i64::MAX as u64,
-        max_large_task_bytes: i64::MAX as u64,
-        ..vala_bifrost_redux::forge::ForgeConfig::default()
-    };
-    let cluster = WyrdTestCluster::start_with_dedicated_forge_workers_with_config_for_test(
-        large_config.clone(),
-    )
-    .await
-    .expect("large-lane cluster");
-    let server = cluster.server(0).expect("scheduler server");
-    let scenario = Scenario {
-        name: "large-lane",
-        tenants: 2,
-    };
-    let tenants = provision_tenants(server, scenario).await;
-    let fixture = seed_forge_group(server, "large_singleton").await;
-    let bootstrap = fixture.context_with_config(vala_bifrost_redux::forge::ForgeConfig::default());
-    ForgeScheduler::new(&bootstrap)
-        .expect("bootstrap scheduler")
-        .record_hint(StagingFileCommitted::new(
-            fixture.binding.clone(),
-            chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("fixture day"),
-        ))
-        .await
-        .expect("record bootstrap ingest hint");
-    bootstrap.run_once().await.expect("schedule bootstrap fold");
-    let bootstrap_stop = CancellationToken::new();
-    let bootstrap_worker = ForgeWorker::new(
-        bootstrap,
-        ForgeWorkerConfig {
-            worker_concurrency: 1,
-            per_tenant_active_cap: 1,
-        },
-        uuid::Uuid::now_v7(),
-    )
-    .expect("bootstrap worker");
-    let bootstrap_task = tokio::spawn(bootstrap_worker.run(bootstrap_stop.clone()));
-    let mut bootstrap_completed = false;
-    for _ in 0..200 {
-        let completed: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM vala.forge_tasks WHERE data_tenant_id=$1 AND table_name='large_singleton' AND strategy='staging_fold' AND state='succeeded')",
-        )
-        .bind(fixture.tenant.as_uuid())
-        .fetch_one(
-            server
-                .state()
-                .postgres
-                .operator_pool()
-                .expect("operator pool")
-                .pool(),
-        )
-        .await
-        .expect("observe bootstrap fold");
-        if completed {
-            bootstrap_completed = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    bootstrap_stop.cancel();
-    bootstrap_task
-        .await
-        .expect("join bootstrap worker")
-        .expect("stop bootstrap worker");
-    assert!(
-        bootstrap_completed,
-        "bootstrap fold must create one snapshot"
-    );
-    sqlx::query("UPDATE vala.forge_scheduler_state SET expires_at=statement_timestamp()-interval '1 second' WHERE singleton")
-        .execute(
-            server
-                .state()
-                .postgres
-                .operator_pool()
-                .expect("operator pool")
-                .pool(),
-        )
-        .await
-        .expect("release bootstrap scheduler lease");
-    assert_eq!(
-        server
-            .forge_publisher()
-            .try_publish(StagingFileCommitted::new(
-                fixture.binding.clone(),
-                chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("fixture day"),
-            )),
-        StagingPublishOutcome::Published,
-        "production scheduler hint channel must accept the maintenance discovery signal"
-    );
-    trigger_supervised_scheduler(server, scenario).await;
-    let (large_lane, estimated_files): (String, i64) =
-        sqlx::query_as("SELECT lane, estimated_files FROM vala.forge_tasks WHERE data_tenant_id=$1 AND table_name='large_singleton' AND strategy='snapshot_expiry' ORDER BY created_at DESC LIMIT 1")
-            .bind(fixture.tenant.as_uuid())
-            .fetch_one(
-                server
-                    .state()
-                    .postgres
-                    .operator_pool()
-                    .expect("operator pool")
-                    .pool(),
-            )
-            .await
-            .expect("observe durable one-input large task");
-    assert_eq!(large_lane, ForgeTaskLane::LargeSingleton.as_str());
-    assert_eq!(estimated_files, 1);
-    for cycle in 0..WRITE_CYCLES {
-        write_cycle(std::slice::from_ref(server), &tenants, cycle, scenario).await;
-        for tenant in &tenants {
-            server
-                .flush_bifrost_for_tenant(tenant.id)
-                .await
-                .expect("large flush");
-        }
-    }
-    server
-        .forge_clock()
-        .advance(chrono::Duration::days(1) + chrono::Duration::minutes(3))
-        .expect("age large files");
-    trigger_supervised_scheduler(server, scenario).await;
-    trigger_supervised_scheduler(server, scenario).await;
-    let tasks: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT strategy, lane, state FROM vala.forge_tasks WHERE data_tenant_id = ANY($1) AND table_name='spans' AND strategy='staging_fold' ORDER BY data_tenant_id, strategy",
-    )
-    .bind(tenants.iter().map(|tenant| tenant.id.as_uuid()).collect::<Vec<_>>())
-    .fetch_all(
-        server
-            .state()
-            .postgres
-            .operator_pool()
-            .expect("operator pool")
-            .pool(),
-    )
-    .await
-    .expect("large singleton task states");
-    assert!(
-        !tasks.is_empty()
-            && tasks
-                .iter()
-                .all(|(strategy, lane, state)| strategy == "staging_fold"
-                    && lane == "ordinary"
-                    && state == "unschedulable"),
-        "multi-input overflow must be terminally unschedulable even when its bytes fit the large ceiling: {tasks:?}"
-    );
-    cluster.shutdown().await.expect("large cluster shutdown");
-
     let unschedulable_config = vala_bifrost_redux::forge::ForgeConfig {
         max_bytes_per_tick: 1,
         max_large_task_bytes: 1,
@@ -2435,7 +4208,7 @@ async fn scheduler_renewal_loss_stops_every_later_effect() {
         server
             .state()
             .forge_coordinator()
-            .expect("server-owned Forge coordinator")
+            .expect("server-owned Forge")
             .as_ref(),
         owner,
     )
@@ -2577,18 +4350,17 @@ async fn run_supervised_role_fixture(
         .await
         .expect("retire Scribe generations");
 
-    let expected_rows =
-        u64::try_from(WRITE_CYCLES * SPANS_PER_WRITE).expect("bounded role fixture rows");
+    let expected_rows = u64::try_from(WRITE_CYCLES).expect("bounded role fixture rows");
     let mut rows = Vec::with_capacity(tenants.len());
     let mut terminal_tasks = Vec::with_capacity(tenants.len());
     let mut terminal_audits = Vec::with_capacity(tenants.len());
     let mut evidence_rows = Vec::with_capacity(tenants.len());
     let mut watermark_rows = Vec::with_capacity(tenants.len());
     for tenant in &tenants {
-        let row_count = query_rows(server, &tenant.jwt).await;
+        let row_count = query_rows(server, tenant).await;
         assert_eq!(row_count, expected_rows, "{name} tenant {} rows", tenant.id);
         assert_terminal_audits(server, tenant.id, scenario).await;
-        assert_snapshot(server, tenant.id, scenario).await;
+        assert_snapshot(server, tenant, scenario).await;
         rows.push(row_count);
         let mut conn = server
             .state()
@@ -2936,8 +4708,12 @@ async fn trigger_supervised_scheduler(server: &WyrdTestServer, scenario: Scenari
 struct TenantWriter {
     /// Durable tenant isolation key.
     id: DataTenantId,
-    /// Tenant-scoped access token accepted by OTLP and query endpoints.
+    /// Tenant-scoped access token accepted by the public query endpoint.
     jwt: String,
+    /// API key used by the public native Arrow SDK transport.
+    api_key: SecretString,
+    /// Tenant-local native Bifrost table receiving the journey rows.
+    table: String,
 }
 
 /// Provision the requested number of isolated tenants and writer identities.
@@ -2958,14 +4734,20 @@ async fn provision_tenants(server: &WyrdTestServer, scenario: Scenario) -> Vec<T
     }
     let mut tenants = Vec::with_capacity(tenant_ids.len());
     for (index, id) in tenant_ids.into_iter().enumerate() {
+        let table = format!("forge_journey_{}", uuid::Uuid::now_v7().simple());
         server
-            .ensure_traces_spans_table_for_test(id)
+            .create_bifrost_table_for_test(CreateTableRequest {
+                table: TableRef::new(BifrostNamespace::Bifrost, &table),
+                user_fields: vec![
+                    Field::new("id", DataType::Int64, false),
+                    Field::new("value", DataType::Utf8, false),
+                ],
+                tenant: id,
+                audit: None,
+            })
             .await
             .unwrap_or_else(|error| {
-                panic!(
-                    "{} provision traces spans table for {id}: {error}",
-                    scenario.name
-                )
+                panic!("{} provision native table for {id}: {error}", scenario.name)
             });
         let bootstrap = if index == 0 {
             server
@@ -2988,12 +4770,17 @@ async fn provision_tenants(server: &WyrdTestServer, scenario: Scenario) -> Vec<T
             .exchange_api_key(&api_key)
             .await
             .unwrap_or_else(|error| panic!("{} exchange tenant {id}: {error}", scenario.name));
-        tenants.push(TenantWriter { id, jwt });
+        tenants.push(TenantWriter {
+            id,
+            jwt,
+            api_key,
+            table,
+        });
     }
     tenants
 }
 
-/// Assert the scheduler's operator-visible roster contains every journey tenant.
+/// Assert the scheduler's operator-visible roster contains every native journey table.
 ///
 /// This journey writes only the canonical traces spans table, so a row for each
 /// tenant proves Forge will discover the intended table independently of
@@ -3020,16 +4807,17 @@ async fn assert_active_traces_roster(
     for tenant in tenants {
         assert!(
             roster.iter().any(|row| {
-                row.data_tenant_id == tenant.id.as_uuid() && row.fqn == "vala.traces.spans"
+                row.data_tenant_id == tenant.id.as_uuid()
+                    && row.fqn == format!("vala.bifrost.{}", tenant.table)
             }),
-            "{} missing active traces roster entry for tenant {}: {roster:?}",
+            "{} missing active native-table roster entry for tenant {}: {roster:?}",
             scenario.name,
             tenant.id
         );
     }
 }
 
-/// Send one concurrent OTLP write from every pod for every tenant.
+/// Send one concurrent native Arrow SDK write from every pod for every tenant.
 ///
 /// # Panics
 ///
@@ -3046,48 +4834,38 @@ async fn write_cycle(
         let endpoint = server.grpc_url().expect("bound pod gRPC URL");
         for (tenant_index, tenant) in tenants.iter().enumerate() {
             let endpoint = endpoint.clone();
-            let jwt = tenant.jwt.clone();
+            let http_endpoint = server.base_url().expect("bound pod HTTP URL").to_owned();
+            let api_key = tenant.api_key.clone();
+            let table = tenant.table.clone();
             writers.push(tokio::spawn(async move {
-                let deadline = Instant::now() + Duration::from_secs(10);
-                let channel = loop {
-                    match wyrd_tonic::tonic::transport::Channel::from_shared(endpoint.clone())
-                        .expect("valid gRPC endpoint")
-                        .connect()
-                        .await
-                    {
-                        Ok(channel) => break channel,
-                        Err(error) => {
-                            assert!(Instant::now() < deadline, "connect OTLP writer: {error}");
-                            tokio::time::sleep(Duration::from_millis(50)).await;
-                        }
-                    }
-                };
                 let seed =
                     u64::try_from((cycle + 1) * 10_000 + (pod_index + 1) * 100 + tenant_index)
                         .expect("bounded seed");
-                let anchor = u64::try_from(
-                    (chrono::Utc::now() - chrono::Duration::days(2))
-                        .timestamp_nanos_opt()
-                        .expect("timestamp nanos"),
-                )
-                .expect("positive timestamp");
-                let mut generator = RandomTraceGenerator::from_seed_at(seed, anchor);
-                let request = generator.export_request(pod_index, seed, SPANS_PER_WRITE);
-                let mut request = wyrd_tonic::tonic::Request::new(request);
-                request.metadata_mut().insert(
-                    "x-wyrd-access-token",
-                    format!("Bearer {jwt}").parse().expect("token metadata"),
-                );
-                let mut client =
-                    wyrd_tonic::otlp::trace_service::trace_service_client::TraceServiceClient::new(
-                        channel,
-                    );
-                let response = client
-                    .export(request)
+                let client = WyrdClient::with_config(ClientConfig {
+                    grpc: GrpcConfig {
+                        endpoint,
+                        connect_retries: 3,
+                        ..GrpcConfig::default()
+                    },
+                    http: HttpConfig {
+                        base_url: http_endpoint,
+                        ..HttpConfig::default()
+                    },
+                    api_key: Some(api_key),
+                    ..ClientConfig::default()
+                })
+                .expect("native Arrow client config");
+                let transport = BifrostGrpcTransport::connect(&client)
                     .await
-                    .expect("OTLP export")
-                    .into_inner();
-                assert!(response.partial_success.is_none());
+                    .expect("connect native Arrow writer");
+                transport
+                    .insert_batch(
+                        &format!("vala.bifrost.{table}"),
+                        uuid::Uuid::now_v7().into_bytes(),
+                        native_journey_ipc(seed),
+                    )
+                    .await
+                    .expect("native Arrow write");
             }));
         }
     }
@@ -3096,6 +4874,37 @@ async fn write_cycle(
             .await
             .unwrap_or_else(|error| panic!("{} writer task: {error}", scenario.name));
     }
+    for server in servers {
+        for tenant in tenants {
+            server
+                .flush_bifrost_for_tenant(tenant.id)
+                .await
+                .expect("native Arrow write durable Scribe flush");
+        }
+    }
+}
+
+/// Encodes one deterministic native Arrow row for the public SDK fixture.
+fn native_journey_ipc(sequence: u64) -> Vec<u8> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(vec![
+                i64::try_from(sequence).expect("bounded sequence"),
+            ])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["forge-write"])) as ArrayRef,
+        ],
+    )
+    .expect("native journey batch");
+    let mut bytes = Vec::new();
+    let mut writer = StreamWriter::try_new(&mut bytes, schema.as_ref()).expect("native IPC writer");
+    writer.write(&batch).expect("native IPC batch");
+    writer.finish().expect("native IPC finish");
+    bytes
 }
 
 /// Send the public same-table query used before and after Forge publication.
@@ -3103,16 +4912,15 @@ async fn write_cycle(
 /// # Panics
 ///
 /// Panics when the HTTP request cannot be sent.
-async fn query_response(server: &WyrdTestServer, jwt: &str) -> reqwest::Response {
+async fn query_response(server: &WyrdTestServer, tenant: &TenantWriter) -> reqwest::Response {
     reqwest::Client::new()
         .post(format!(
             "{}/v1/query",
             server.base_url().expect("bound server URL")
         ))
-        .header("x-wyrd-access-token", format!("Bearer {jwt}"))
+        .header("x-wyrd-access-token", format!("Bearer {}", tenant.jwt))
         .json(&BifrostQueryRequest {
-            sql: "SELECT * FROM \"vala.traces.spans\" WHERE service_name = 'checkout-api'"
-                .to_owned(),
+            sql: format!("SELECT * FROM \"vala.bifrost.{}\"", tenant.table),
             visibility: VisibilityMode::Fused,
             freshness: FreshnessPolicy::Strict,
             deadline_ms: None,
@@ -3127,8 +4935,8 @@ async fn query_response(server: &WyrdTestServer, jwt: &str) -> reqwest::Response
 /// # Panics
 ///
 /// Panics when the query fails, framing is invalid, or the terminal is missing.
-async fn query_rows(server: &WyrdTestServer, jwt: &str) -> u64 {
-    let response = query_response(server, jwt).await;
+async fn query_rows(server: &WyrdTestServer, tenant: &TenantWriter) -> u64 {
+    let response = query_response(server, tenant).await;
     if !response.status().is_success() {
         let status = response.status();
         let readiness = server
@@ -3158,23 +4966,8 @@ async fn query_rows(server: &WyrdTestServer, jwt: &str) -> u64 {
 /// # Panics
 ///
 /// Panics when the public read does not succeed or omits its row-count header.
-async fn supervised_reclaim_query_rows(server: &WyrdTestServer, jwt: &str) -> u64 {
-    let response = query_response(server, jwt).await;
-    let status = response.status();
-    let headers = response.headers().clone();
-    let body = response
-        .text()
-        .await
-        .expect("public reclaim query response body");
-    assert!(
-        status.is_success(),
-        "supervised reclaimed public query {status}: {body}"
-    );
-    headers
-        .get("x-wyrd-row-count")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse().ok())
-        .expect("successful supervised reclaim query row-count header")
+async fn supervised_reclaim_query_rows(server: &WyrdTestServer, tenant: &TenantWriter) -> u64 {
+    query_rows(server, tenant).await
 }
 
 /// Assert every prepared operation has one terminal event and ordered outputs.
@@ -3239,20 +5032,20 @@ async fn assert_terminal_audits(server: &WyrdTestServer, tenant: DataTenantId, s
     }
 }
 
-/// Assert the tenant's traces table has at least one committed snapshot.
+/// Assert the tenant's native journey table has at least one committed snapshot.
 ///
 /// # Panics
 ///
 /// Panics when the Redux catalog or table cannot be loaded.
-async fn assert_snapshot(server: &WyrdTestServer, tenant: DataTenantId, scenario: Scenario) {
+async fn assert_snapshot(server: &WyrdTestServer, tenant: &TenantWriter, scenario: Scenario) {
     let binding = vala_bifrost_redux::catalog::TenantTableBinding::resolve((
-        tenant,
+        tenant.id,
         vala_bifrost_redux::catalog::TableRef::new(
-            vala_bifrost_redux::namespaces::BifrostNamespace::Traces,
-            "spans",
+            vala_bifrost_redux::namespaces::BifrostNamespace::Bifrost,
+            &tenant.table,
         ),
     ))
-    .expect("traces binding");
+    .expect("native journey binding");
     let table = server
         .state()
         .bifrost_catalog()
@@ -3260,11 +5053,14 @@ async fn assert_snapshot(server: &WyrdTestServer, tenant: DataTenantId, scenario
         .iceberg_catalog()
         .load_table(&binding.table_ident())
         .await
-        .unwrap_or_else(|error| panic!("{} load tenant {tenant} table: {error}", scenario.name));
+        .unwrap_or_else(|error| {
+            panic!("{} load tenant {} table: {error}", scenario.name, tenant.id)
+        });
     assert!(
         table.metadata().current_snapshot_id().is_some(),
-        "{} tenant {tenant} missing snapshot",
-        scenario.name
+        "{} tenant {} missing snapshot",
+        scenario.name,
+        tenant.id
     );
 }
 

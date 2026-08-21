@@ -270,16 +270,11 @@ impl Forge {
             Err(error) => Err(error),
         };
         if let Err(error) = prepared {
-            request
-                .rewrite
-                .cleanup_unprepared_outputs(
-                    &operation.rewrite.object_paths,
-                    request.binding,
-                    request.stop,
-                    request.lease,
-                    &self.core.operator_pool,
-                )
-                .await;
+            tracing::debug!(
+                output_count = operation.rewrite.object_paths.len(),
+                error = %error,
+                "Forge left pre-Prepared uploads for protected orphan GC"
+            );
             return Err(error);
         }
         self.commit_live_rewrite(
@@ -572,8 +567,8 @@ impl Forge {
     /// Fail the next test-support `Prepared` live-replacement audit append.
     ///
     /// This is a single-use integration seam. It fails before any audit row is
-    /// durable so callers can prove that rewrite-owned outputs are reclaimed
-    /// while the original audit error remains authoritative.
+    /// durable so callers can prove that verified outputs remain retained for
+    /// the fenced orphan-GC lifecycle while the audit error stays authoritative.
     #[cfg(feature = "test-support")]
     pub fn fail_next_prepared_live_audit_for_test(&self) {
         FAIL_NEXT_PREPARED_LIVE_AUDIT.store(true, Ordering::Release);
@@ -586,6 +581,31 @@ impl Forge {
     #[cfg(feature = "test-support")]
     pub fn fail_next_terminal_live_audit_for_test(&self) {
         FAIL_NEXT_TERMINAL_LIVE_AUDIT.store(true, Ordering::Release);
+    }
+
+    /// Persists one exact `Prepared` live-rewrite operation for reconciliation journeys.
+    ///
+    /// This test-support seam uses the production transactional audit writer; it
+    /// does not bypass fencing or create a second operation-state authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns the production lease, SQL, audit, or operation-transition error.
+    #[cfg(feature = "test-support")]
+    pub async fn append_prepared_live_rewrite_for_test(
+        &self,
+        lease: &mut ForgeLease,
+        binding: &TenantTableBinding,
+        partition_day: NaiveDate,
+        detail: AuditDetail,
+    ) -> Result<(), ForgeError> {
+        let key = ForgeGroupKey {
+            tenant: binding.tenant,
+            table_ref: binding.table_ref.clone(),
+            partition_day,
+        };
+        self.append_live_audit(lease, &key, "forge.iceberg_rewrite.prepared", detail)
+            .await
     }
 
     /// Append one live-replacement audit and projection transition atomically.

@@ -94,8 +94,9 @@ impl Forge {
         .map_err(|_| ForgeError::Invariant {
             detail: "Iceberg target file size exceeds u64".to_owned(),
         })?;
-        let policy = ForgeRightSizePolicy::new(
+        let policy = ForgeRightSizePolicy::from_table_threshold(
             target,
+            self.core.config.small_file_threshold_bytes,
             schema_id,
             table.metadata().default_partition_spec_id(),
             table.metadata().default_sort_order_id(),
@@ -158,8 +159,9 @@ impl Forge {
         .map_err(|_| ForgeError::Invariant {
             detail: "Iceberg target file size exceeds u64".to_owned(),
         })?;
-        let policy = ForgeRightSizePolicy::new(
+        let policy = ForgeRightSizePolicy::from_table_threshold(
             target,
+            self.core.config.small_file_threshold_bytes,
             schema_id,
             table.metadata().default_partition_spec_id(),
             table.metadata().default_sort_order_id(),

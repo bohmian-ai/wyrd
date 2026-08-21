@@ -1309,6 +1309,36 @@ impl WyrdTestCluster {
         .await
     }
 
+    /// Start an explicit descriptor with a selected Forge configuration and observer.
+    ///
+    /// # Errors
+    /// Returns the same topology, resource, configuration, and role-supervision
+    /// errors as [`Self::start_spec_with_forge_completion_observer`].
+    pub async fn start_spec_with_forge_config_and_completion_observer(
+        spec: BifrostClusterSpec,
+        config: ForgeConfig,
+    ) -> Result<Self, ClusterError> {
+        Self::start_spec_with_all_options(
+            spec,
+            Duration::ZERO,
+            None,
+            None,
+            false,
+            false,
+            (
+                ForgeHarnessOptions {
+                    completion_observer: Some(ForgeWorkerCompletionObserver::new()),
+                    config: Some(config),
+                    ..ForgeHarnessOptions::default()
+                },
+                ClusterResourceSource::Owned {
+                    dedicated_root: None,
+                },
+            ),
+        )
+        .await
+    }
+
     /// Start an observed topology against one caller-declared filesystem root.
     ///
     /// # Errors
@@ -1484,7 +1514,7 @@ impl WyrdTestCluster {
                     completion_observer: Some(ForgeWorkerCompletionObserver::new()),
                     config: Some(config),
                     inject_uncertainty: true,
-                    interval: Duration::from_secs(60),
+                    interval: Duration::from_secs(1),
                 },
                 ClusterResourceSource::Owned {
                     dedicated_root: None,

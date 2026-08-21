@@ -33,38 +33,26 @@ use datafusion::physical_plan::{
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use futures_util::{StreamExt, TryStreamExt};
-use iceberg::Catalog;
 use iceberg::arrow::NanValueCountVisitor;
+use sha2::{Digest, Sha256};
 
-/// Attempt-local pool view enforcing persisted resident term families.
+use crate::parquet::object_uploader::{
+    BifrostParquetUploader, BifrostUploadRole, ParquetObjectIdentity,
+};
+
+/// Attempt-local aggregate pool view recording the root reservation peak.
 #[derive(Debug)]
 struct ForgeAttemptMemoryPool {
     /// Aggregate production pool issued by the root lease.
     inner: Arc<dyn MemoryPool>,
-    /// Limits and live counters for decoded, sort, and output ownership.
-    terms: [(usize, AtomicU64); 3],
     /// Largest aggregate reservation observed after successful growth.
     peak_bytes: Arc<AtomicU64>,
 }
 
 impl ForgeAttemptMemoryPool {
-    /// Wraps the aggregate lease with decoded, sort, and output ceilings.
-    fn new(
-        inner: Arc<dyn MemoryPool>,
-        decoded: usize,
-        sort: usize,
-        output: usize,
-        peak_bytes: Arc<AtomicU64>,
-    ) -> Self {
-        Self {
-            inner,
-            terms: [
-                (decoded, AtomicU64::new(0)),
-                (sort, AtomicU64::new(0)),
-                (output, AtomicU64::new(0)),
-            ],
-            peak_bytes,
-        }
+    /// Wraps the one aggregate attempt lease without creating child ledgers.
+    fn new(inner: Arc<dyn MemoryPool>, peak_bytes: Arc<AtomicU64>) -> Self {
+        Self { inner, peak_bytes }
     }
 
     /// Retains the largest aggregate reservation after successful pool growth.
@@ -73,42 +61,6 @@ impl ForgeAttemptMemoryPool {
             u64::try_from(self.inner.reserved()).unwrap_or(u64::MAX),
             Ordering::AcqRel,
         );
-    }
-
-    /// Returns the persisted term family for one known consumer.
-    fn term(&self, reservation: &MemoryReservation) -> Option<&(usize, AtomicU64)> {
-        let name = reservation.consumer().name();
-        if name.contains("forge-rewrite-decoded-batch") {
-            Some(&self.terms[0])
-        } else if name.contains("Sort") || name.contains("ExternalSorter") {
-            Some(&self.terms[1])
-        } else if name.contains("forge-rewrite-output") {
-            Some(&self.terms[2])
-        } else {
-            None
-        }
-    }
-
-    /// Claims a named term before aggregate pool growth.
-    fn claim_term(
-        &self,
-        reservation: &MemoryReservation,
-        additional: usize,
-    ) -> datafusion::error::Result<Option<&AtomicU64>> {
-        let Some((limit, counter)) = self.term(reservation) else {
-            return Ok(None);
-        };
-        let additional = u64::try_from(additional).unwrap_or(u64::MAX);
-        counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(additional)
-                    .filter(|next| *next <= u64::try_from(*limit).unwrap_or(u64::MAX))
-            })
-            .map_err(|used| datafusion::error::DataFusionError::ResourcesExhausted(format!(
-                "Forge consumer {} exceeds persisted term: used={used}, additional={additional}, limit={limit}",
-                reservation.consumer().name()
-            )))?;
-        Ok(Some(counter))
     }
 }
 
@@ -123,38 +75,24 @@ impl MemoryPool for ForgeAttemptMemoryPool {
         self.inner.unregister(consumer);
     }
 
-    /// Grows after enforcing the named term.
+    /// Grows the one aggregate reservation and records its peak.
     fn grow(&self, reservation: &MemoryReservation, additional: usize) {
-        self.claim_term(reservation, additional)
-            .expect("infallible Forge growth remains within its persisted term");
         self.inner.grow(reservation, additional);
         self.observe_peak();
     }
 
-    /// Releases aggregate and named ownership together.
+    /// Releases bytes from the one aggregate reservation.
     fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
         self.inner.shrink(reservation, shrink);
-        if let Some((_, counter)) = self.term(reservation) {
-            counter.fetch_sub(u64::try_from(shrink).unwrap_or(u64::MAX), Ordering::AcqRel);
-        }
     }
 
-    /// Refuses named growth before aggregate accounting changes.
+    /// Attempts aggregate growth without claiming a fungible child ledger.
     fn try_grow(
         &self,
         reservation: &MemoryReservation,
         additional: usize,
     ) -> datafusion::error::Result<()> {
-        let counter = self.claim_term(reservation, additional)?;
-        if let Err(error) = self.inner.try_grow(reservation, additional) {
-            if let Some(counter) = counter {
-                counter.fetch_sub(
-                    u64::try_from(additional).unwrap_or(u64::MAX),
-                    Ordering::AcqRel,
-                );
-            }
-            return Err(error);
-        }
+        self.inner.try_grow(reservation, additional)?;
         self.observe_peak();
         Ok(())
     }
@@ -265,12 +203,6 @@ impl ForgeAttemptResources {
                     detail: "decoded batch exceeds this platform".to_owned(),
                 }
             })?;
-        let sort_working_bytes =
-            usize::try_from(request.envelope.sort_working_bytes).map_err(|_| {
-                ForgeError::Capacity {
-                    detail: "sort working term exceeds this platform".to_owned(),
-                }
-            })?;
         let output_allowance = usize::try_from(
             request
                 .envelope
@@ -286,9 +218,6 @@ impl ForgeAttemptResources {
         let peak_memory_bytes = Arc::new(AtomicU64::new(0));
         let pool: Arc<dyn MemoryPool> = Arc::new(ForgeAttemptMemoryPool::new(
             lease.memory_pool(),
-            decoded_batch_bytes,
-            sort_working_bytes,
-            output_allowance,
             Arc::clone(&peak_memory_bytes),
         ));
         let sort_spill_bytes = request.envelope.sort_spill_bytes;
@@ -450,7 +379,7 @@ use super::planner::{ForgeCapacity, ForgePlanner};
 use crate::catalog::TenantTableBinding;
 use crate::parquet::memory::{
     BifrostArrowLogicalSizer, BifrostParquetMemoryEnvelope, BoundedRowSlice, MAX_FILE_BYTES,
-    MAX_FILE_ROW_GROUPS,
+    MAX_FILE_ROW_GROUPS, MAX_LOGICAL_ROW_GROUP_BYTES, MAX_ROW_GROUP_ROWS,
 };
 use crate::parquet::writer_properties::{
     BIFROST_WRITER_RECIPE_VERSION, bifrost_writer_properties_with_metadata,
@@ -467,8 +396,6 @@ pub(crate) const ROW_GROUP_FLUSH_BYTES: usize = 32 * 1024 * 1024;
 /// Target decoded batch bytes used by the envelope and footer refusal rule.
 #[cfg(test)]
 pub(crate) const DECODED_BATCH_TARGET_BYTES: usize = 16 * 1024 * 1024;
-/// Total upload openings permitted for one sealed output in one attempt.
-const OUTPUT_UPLOAD_ATTEMPTS: usize = 2;
 /// Fixed working set every rewrite plan needs regardless of input size.
 ///
 /// The rewrite executes a `DataFusion` sort/merge into one Parquet writer.
@@ -611,8 +538,8 @@ pub(crate) struct ForgeRewritePipeline {
     runtime: Option<Arc<ForgeRewriteRuntime>>,
     /// Staging operator used for deterministic rewritten-object PUTs.
     staging: Arc<opendal::Operator>,
-    /// Iceberg catalog used to re-check live references before cleanup.
-    catalog: Arc<dyn Catalog>,
+    /// Shared physical-evidence producer for deterministic rewritten objects.
+    uploader: Arc<BifrostParquetUploader>,
     /// Testable object-store seam used for source reads and failure cleanup.
     object_store: Arc<dyn ForgeObjectStore>,
     /// Upper bound for concurrently open source readers.
@@ -716,7 +643,7 @@ pub(crate) struct RewriteSourceFile {
     pub(crate) record_count: u64,
 }
 
-/// Complete multi-file result returned after rewrite-owned cleanup transfers.
+/// Complete multi-file result retaining verified paths for publication settlement.
 pub(crate) struct RewriteOutput {
     /// Iceberg metadata for every rotated output in deterministic order.
     pub(crate) files: Vec<DataFile>,
@@ -809,9 +736,15 @@ struct RewriteBatchState {
     scratch_path: Option<PathBuf>,
     /// Rows buffered in `writer` and not yet transferred to an output object.
     writer_rows: u64,
+    /// Flushed row groups retained by the active writer.
+    writer_row_groups: usize,
+    /// Logical bytes accumulated in the active row group.
+    writer_row_group_logical_bytes: u64,
+    /// Rows accumulated in the active row group.
+    writer_row_group_rows: usize,
     /// Iceberg metadata accumulated for successfully finalized outputs.
     files: Vec<DataFile>,
-    /// Object paths still owned by rewrite cleanup.
+    /// Verified object paths retained for publication settlement or orphan GC.
     output_paths: Vec<String>,
     /// Rows accepted from source batches.
     input_rows: u64,
@@ -857,6 +790,9 @@ impl RewriteBatchState {
             scratch_dir,
             scratch_path: None,
             writer_rows: 0,
+            writer_row_groups: 0,
+            writer_row_group_logical_bytes: 0,
+            writer_row_group_rows: 0,
             files: Vec::new(),
             output_paths: Vec::new(),
             input_rows: 0,
@@ -888,14 +824,41 @@ impl RewriteBatchState {
     }
 
     /// Report whether the active non-empty writer reached the output bound.
-    #[cfg(test)]
     fn should_rotate(&self, output_file_bytes: u64) -> bool {
         self.writer.as_ref().is_some_and(|writer| {
             self.writer_rows > 0
-                && u64::try_from(writer.bytes_written() + writer.in_progress_size())
-                    .unwrap_or(u64::MAX)
-                    >= output_file_bytes
+                && (self.writer_row_groups >= MAX_FILE_ROW_GROUPS
+                    || u64::try_from(writer.bytes_written() + writer.in_progress_size())
+                        .unwrap_or(u64::MAX)
+                        >= output_file_bytes)
         })
+    }
+
+    /// Report whether appending another physical group would cross the hard
+    /// writer-v2 row-group ceiling.
+    fn would_exceed_row_groups(&self, slices: &[BoundedRowSlice]) -> bool {
+        if self.writer.is_none() {
+            return false;
+        }
+        let mut groups = self.writer_row_groups;
+        let mut logical_bytes = self.writer_row_group_logical_bytes;
+        let mut rows = self.writer_row_group_rows;
+        for slice in slices {
+            let crosses_bytes = logical_bytes
+                .checked_add(slice.logical_bytes)
+                .is_none_or(|bytes| bytes > MAX_LOGICAL_ROW_GROUP_BYTES);
+            let crosses_rows = rows
+                .checked_add(slice.len)
+                .is_none_or(|rows| rows > MAX_ROW_GROUP_ROWS);
+            if logical_bytes == 0 || crosses_bytes || crosses_rows {
+                groups = groups.saturating_add(1);
+                logical_bytes = 0;
+                rows = 0;
+            }
+            logical_bytes = logical_bytes.saturating_add(slice.logical_bytes);
+            rows = rows.saturating_add(slice.len);
+        }
+        groups > MAX_FILE_ROW_GROUPS
     }
 
     /// Append one validated batch to the active bounded Parquet writer.
@@ -959,16 +922,35 @@ impl RewriteBatchState {
             detail: "Forge rewrite failed to retain its active writer".to_owned(),
         })?;
         for slice in row_groups {
+            let crosses_bytes = self
+                .writer_row_group_logical_bytes
+                .checked_add(slice.logical_bytes)
+                .is_none_or(|bytes| bytes > MAX_LOGICAL_ROW_GROUP_BYTES);
+            let crosses_rows = self
+                .writer_row_group_rows
+                .checked_add(slice.len)
+                .is_none_or(|rows| rows > MAX_ROW_GROUP_ROWS);
+            if self.writer_row_group_logical_bytes > 0 && (crosses_bytes || crosses_rows) {
+                writer.flush().map_err(|error| ForgeError::ScratchIo {
+                    kind: std::io::ErrorKind::Other,
+                    detail: format!("flush bounded Parquet row group: {error}"),
+                })?;
+                self.writer_row_group_logical_bytes = 0;
+                self.writer_row_group_rows = 0;
+            }
+            if self.writer_row_group_logical_bytes == 0 {
+                self.writer_row_groups = self.writer_row_groups.saturating_add(1);
+            }
             writer
                 .write(&batch.slice(slice.offset, slice.len))
                 .map_err(|error| ForgeError::ScratchIo {
                     kind: std::io::ErrorKind::StorageFull,
                     detail: format!("write bounded Parquet scratch output: {error}"),
                 })?;
-            writer.flush().map_err(|error| ForgeError::ScratchIo {
-                kind: std::io::ErrorKind::Other,
-                detail: format!("flush bounded Parquet row group: {error}"),
-            })?;
+            self.writer_row_group_logical_bytes = self
+                .writer_row_group_logical_bytes
+                .saturating_add(slice.logical_bytes);
+            self.writer_row_group_rows = self.writer_row_group_rows.saturating_add(slice.len);
         }
         if writer.in_progress_size() >= encoder_flush_bytes {
             writer.flush().map_err(|error| ForgeError::ScratchIo {
@@ -1027,6 +1009,9 @@ impl RewriteBatchState {
     fn record_output(&mut self, file: DataFile, path: String) {
         self.output_rows = self.output_rows.saturating_add(self.writer_rows);
         self.writer_rows = 0;
+        self.writer_row_groups = 0;
+        self.writer_row_group_logical_bytes = 0;
+        self.writer_row_group_rows = 0;
         self.output_paths.push(path);
         self.files.push(file);
         self.nan_value_counts = NanValueCountVisitor::new();
@@ -1035,6 +1020,9 @@ impl RewriteBatchState {
     /// Clears non-durable counters after an encoded row group is rejected.
     fn discard_oversized_output(&mut self) {
         self.writer_rows = 0;
+        self.writer_row_groups = 0;
+        self.writer_row_group_logical_bytes = 0;
+        self.writer_row_group_rows = 0;
         self.nan_value_counts = NanValueCountVisitor::new();
     }
 
@@ -1085,7 +1073,7 @@ struct RewriteBatchResult {
     result: Result<(), ForgeError>,
     /// Iceberg metadata accumulated before the terminal result.
     files: Vec<DataFile>,
-    /// Object paths still owned by rewrite cleanup.
+    /// Verified object paths retained for publication settlement or orphan GC.
     output_paths: Vec<String>,
     /// Rows accepted from source batches.
     input_rows: u64,
@@ -1108,17 +1096,9 @@ struct RewriteOutputContext<'a, 'b> {
 }
 
 /// Inputs needed to finalize a completed rewrite after its stream is dropped.
-struct RewriteFinalization<'a> {
+struct RewriteFinalization {
     /// Terminal batch state, including all rewrite-owned output paths.
     batch: RewriteBatchResult,
-    /// Validated target binding used for cleanup ownership checks.
-    binding: &'a TenantTableBinding,
-    /// Cancellation source checked before cleanup side effects.
-    stop: &'a CancellationToken,
-    /// Mutable lease that proves cleanup still belongs to this Forge owner.
-    lease: &'a mut ForgeLease,
-    /// Operator pool used for lease-fence validation.
-    operator_pool: &'a OperatorPool,
 }
 
 /// Blocking inputs for deriving Iceberg metadata from one completed Parquet output.
@@ -1173,46 +1153,29 @@ struct FinalizedOutput {
     scratch_path: PathBuf,
     /// Exact sealed Parquet length.
     bytes: u64,
-    /// CRC32C computed while reading the sealed file in bounded chunks.
-    checksum: u32,
+    /// SHA-256 computed while reading the sealed file in bounded chunks.
+    sha256: [u8; 32],
     /// Iceberg data-file metadata derived from those bytes.
     file: DataFile,
 }
 
-/// Verifies that bytes streamed to the backend still match the sealed file.
-///
-/// # Errors
-///
-/// Returns [`ForgeError::Invariant`] when the upload pass observed different
-/// CRC32C bytes from the blocking seal pass.
-fn verify_output_checksum(expected: u32, uploaded: u32) -> Result<(), ForgeError> {
-    if expected != uploaded {
-        return Err(ForgeError::Invariant {
-            detail: format!(
-                "Forge upload checksum mismatch: sealed={expected:#010x}, uploaded={uploaded:#010x}"
-            ),
-        });
-    }
-    Ok(())
-}
-
-/// Computes CRC32C across the complete sealed file in bounded reads.
+/// Computes SHA-256 across the complete sealed file in bounded reads.
 ///
 /// # Errors
 ///
 /// Returns [`ForgeError::ScratchIo`] when rewind or read-back fails.
-fn checksum_sealed_file(
+fn hash_sealed_file(
     source: &mut std::fs::File,
     path: &Path,
     chunk_bytes: usize,
-) -> Result<u32, ForgeError> {
+) -> Result<[u8; 32], ForgeError> {
     source.rewind().map_err(|error| ForgeError::ScratchIo {
         kind: error.kind(),
         detail: format!("rewind {} for checksum: {error}", path.display()),
     })?;
     let mut reader = BufReader::new(source);
     let mut chunk = vec![0_u8; chunk_bytes];
-    let mut checksum = 0;
+    let mut hash = Sha256::new();
     loop {
         let read = reader
             .read(&mut chunk)
@@ -1221,9 +1184,9 @@ fn checksum_sealed_file(
                 detail: format!("checksum {}: {error}", path.display()),
             })?;
         if read == 0 {
-            return Ok(checksum);
+            return Ok(hash.finalize().into());
         }
-        checksum = crc32c::crc32c_append(checksum, &chunk[..read]);
+        hash.update(&chunk[..read]);
     }
 }
 
@@ -1590,11 +1553,11 @@ fn finalize_output_metadata(request: OutputMetadataRequest) -> Result<FinalizedO
         });
     }
     let mut source_file = source_file;
-    let checksum = checksum_sealed_file(&mut source_file, &scratch_path, checksum_chunk_bytes)?;
+    let sha256 = hash_sealed_file(&mut source_file, &scratch_path, checksum_chunk_bytes)?;
     Ok(FinalizedOutput {
         scratch_path,
         bytes: output_size,
-        checksum,
+        sha256,
         file,
     })
 }
@@ -1607,7 +1570,6 @@ impl ForgeRewritePipeline {
     /// Returns [`ForgeError::InvalidConfig`] when the concurrency limit is zero.
     pub(crate) fn new(
         staging: Arc<opendal::Operator>,
-        catalog: Arc<dyn Catalog>,
         object_store: Arc<dyn ForgeObjectStore>,
         max_concurrent_reads: usize,
     ) -> Result<Self, ForgeError> {
@@ -1618,8 +1580,8 @@ impl ForgeRewritePipeline {
         }
         Ok(Self {
             runtime: None,
+            uploader: Arc::new(BifrostParquetUploader::new((*staging).clone())),
             staging,
-            catalog,
             object_store,
             max_concurrent_reads,
             blocking_permits: Arc::new(tokio::sync::Semaphore::new(max_concurrent_reads)),
@@ -1631,7 +1593,7 @@ impl ForgeRewritePipeline {
         Self {
             runtime: Some(runtime),
             staging: Arc::clone(&self.staging),
-            catalog: Arc::clone(&self.catalog),
+            uploader: Arc::clone(&self.uploader),
             object_store: Arc::clone(&self.object_store),
             max_concurrent_reads: self.max_concurrent_reads,
             blocking_permits: Arc::clone(&self.blocking_permits),
@@ -1660,9 +1622,10 @@ impl ForgeRewritePipeline {
     /// Source batches are bounded and enter a `DataFusion` `SortExec` backed by
     /// the supplied shared memory pool and owned spill directory. Cancellation
     /// is checked between batches and before every output PUT. Before this
-    /// method returns success, paths already written remain rewrite-owned and
-    /// are deleted best-effort after any error; success transfers all paths to
-    /// compaction reconciliation.
+    /// method returns success, paths already written remain rewrite-owned.
+    /// Success transfers the complete set to compaction reconciliation;
+    /// failed or pre-Prepared uploads remain remote until protected TTL orphan
+    /// GC proves them unreferenced and deletes them.
     ///
     /// # Errors
     ///
@@ -1693,14 +1656,8 @@ impl ForgeRewritePipeline {
         result.peak_spill_bytes = result.peak_spill_bytes.max(
             u64::try_from(sort_metrics.spilled_bytes().unwrap_or_default()).unwrap_or(u64::MAX),
         );
-        self.finalize_rewrite(RewriteFinalization {
-            batch: result,
-            binding: request.binding,
-            stop,
-            lease,
-            operator_pool,
-        })
-        .await
+        self.finalize_rewrite(RewriteFinalization { batch: result })
+            .await
     }
 
     /// Consume sorted batches, rotate bounded writers, and collect output metadata.
@@ -1713,7 +1670,7 @@ impl ForgeRewritePipeline {
     /// # Cancellation
     ///
     /// Cancellation stops before the next batch or output PUT. Previously
-    /// finalized paths remain in the returned state for complete-set cleanup.
+    /// finalized paths remain recorded for error settlement and protected orphan GC.
     async fn rewrite_batches(
         &self,
         stream: &mut SendableRecordBatchStream,
@@ -1796,7 +1753,7 @@ impl ForgeRewritePipeline {
     ///
     /// Returns row-count, Parquet, cancellation, lease, object-store, path, or
     /// metadata failures. A successful rotated PUT remains in `state` for
-    /// final ownership transfer or complete-set cleanup.
+    /// final ownership transfer or protected orphan GC.
     ///
     /// # Cancellation
     ///
@@ -1820,7 +1777,9 @@ impl ForgeRewritePipeline {
         let mut pending: VecDeque<_> = slices.into();
         while !pending.is_empty() {
             let group = take_physical_file_group(&mut pending, request.target_file_size_bytes);
-            if state.writer.is_some() {
+            if state.should_rotate(request.target_file_size_bytes)
+                || state.would_exceed_row_groups(&group)
+            {
                 self.rotate_output(
                     state,
                     RewriteOutputContext {
@@ -1833,9 +1792,14 @@ impl ForgeRewritePipeline {
                 .await?;
             }
             let (output_batch, output_groups) = physical_output_batch(batch, &group)?;
-            let footer_phase = tokio::select! {
-                () = stop.cancelled() => return Err(ForgeError::Shutdown),
-                phase = self.runtime().footer_phase.enter_execution() => phase?,
+            let output_rows = u64::try_from(output_batch.num_rows()).unwrap_or(u64::MAX);
+            let footer_phase = if state.writer.is_none() {
+                Some(tokio::select! {
+                    () = stop.cancelled() => return Err(ForgeError::Shutdown),
+                    phase = self.runtime().footer_phase.enter_execution() => phase?,
+                })
+            } else {
+                None
             };
             // Detach the state owning the real reservation while the bounded
             // blocking encoder writes this physical output.
@@ -1861,7 +1825,9 @@ impl ForgeRewritePipeline {
                 request.attempt_generation,
                 detached.files.len(),
             );
-            detached.footer_phase = Some(footer_phase);
+            if let Some(footer_phase) = footer_phase {
+                detached.footer_phase = Some(footer_phase);
+            }
             let join = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 let result = detached.write_batch(
@@ -1880,24 +1846,28 @@ impl ForgeRewritePipeline {
             *state = returned;
             result?;
             state.observe_spill(self.runtime().runtime.spilling_progress().current_bytes);
-            let rotation = self
-                .rotate_output(
-                    state,
-                    RewriteOutputContext {
-                        request,
-                        stop,
-                        lease: &mut *lease,
-                        operator_pool,
-                    },
-                )
-                .await;
-            match rotation {
-                Ok(()) => {}
-                Err(ForgeError::EncodedRowGroupOverflow { row_group, .. }) => {
-                    state.discard_oversized_output();
-                    requeue_bisected_file(&mut pending, batch, group, row_group)?;
+            if state.should_rotate(request.target_file_size_bytes) {
+                let rotation = self
+                    .rotate_output(
+                        state,
+                        RewriteOutputContext {
+                            request,
+                            stop,
+                            lease: &mut *lease,
+                            operator_pool,
+                        },
+                    )
+                    .await;
+                match rotation {
+                    Ok(()) => {}
+                    Err(ForgeError::EncodedRowGroupOverflow { row_group, .. })
+                        if state.writer_rows == output_rows =>
+                    {
+                        state.discard_oversized_output();
+                        requeue_bisected_file(&mut pending, batch, group, row_group)?;
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) => return Err(error),
             }
         }
         Ok(())
@@ -1937,7 +1907,7 @@ impl ForgeRewritePipeline {
     /// Cancellation is checked before the PUT and while the bounded blocking
     /// finalization task runs. On cancellation, that task is always joined so
     /// no writer, permit, or metadata buffer is detached; earlier finalized
-    /// paths remain in `state` for cleanup.
+    /// paths remain recorded for error settlement and protected orphan GC.
     async fn rotate_output(
         &self,
         state: &mut RewriteBatchState,
@@ -1967,18 +1937,12 @@ impl ForgeRewritePipeline {
     /// # Errors
     ///
     /// Returns the original rewrite error, an active-spill invariant, or a row
-    /// conservation invariant after deleting rewrite-owned outputs best-effort.
+    /// conservation invariant. Uploaded objects remain for fenced orphan GC.
     async fn finalize_rewrite(
         &self,
-        finalization: RewriteFinalization<'_>,
+        finalization: RewriteFinalization,
     ) -> Result<RewriteOutput, ForgeError> {
-        let RewriteFinalization {
-            batch,
-            binding,
-            stop,
-            lease,
-            operator_pool,
-        } = finalization;
+        let RewriteFinalization { batch, .. } = finalization;
         let RewriteBatchResult {
             result,
             files,
@@ -1988,26 +1952,18 @@ impl ForgeRewritePipeline {
             peak_spill_bytes,
         } = batch;
         if let Err(error) = self.await_spill_cleanup().await {
-            self.cleanup_paths(&output_paths, binding, stop, lease, operator_pool)
-                .await;
             return Err(error);
         }
         if let Err(error) = result {
-            self.cleanup_paths(&output_paths, binding, stop, lease, operator_pool)
-                .await;
             return Err(error);
         }
         let final_spill = self.runtime().runtime.spilling_progress();
         if final_spill.active_files_count != 0 {
-            self.cleanup_paths(&output_paths, binding, stop, lease, operator_pool)
-                .await;
             return Err(ForgeError::Invariant {
                 detail: "Forge rewrite ended with active spill files".to_owned(),
             });
         }
         if input_rows != output_rows {
-            self.cleanup_paths(&output_paths, binding, stop, lease, operator_pool)
-                .await;
             return Err(ForgeError::Invariant {
                 detail: format!(
                     "Forge rewrite row mismatch: accepted {input_rows}, encoded {output_rows}"
@@ -2147,15 +2103,17 @@ impl ForgeRewritePipeline {
     ///
     /// # Errors
     ///
-    /// Returns cancellation, lease, Parquet, object-store, path, or
-    /// metadata-builder failures. The caller remains responsible for deleting
-    /// prior outputs.
+    /// Returns cancellation, lease, Parquet, object-store, path, scratch, or
+    /// metadata-builder failures. The caller retains prior remote outputs for
+    /// the fenced orphan-GC owner rather than deleting them here.
     ///
     /// # Cancellation
     ///
     /// Cancellation is checked before fence validation and again before PUT.
-    /// After PUT succeeds, synchronous metadata construction either returns the
-    /// path or deletes that just-written path before returning an error.
+    /// Metadata construction finishes before PUT. After the shared uploader
+    /// verifies the remote object, this method removes only the local sealed
+    /// scratch file; any later remote reclamation belongs exclusively to
+    /// orphan GC.
     async fn finish_output(
         &self,
         parts: FinishOutputParts,
@@ -2234,7 +2192,7 @@ impl ForgeRewritePipeline {
         let FinalizedOutput {
             scratch_path,
             bytes,
-            checksum,
+            sha256,
             file,
         } = finalized.map_err(|error| ForgeError::Invariant {
             detail: format!("Forge output finalization task failed: {error}"),
@@ -2243,9 +2201,9 @@ impl ForgeRewritePipeline {
         if stop.is_cancelled() {
             return Err(ForgeError::Shutdown);
         }
-        self.upload_sealed_output(&scratch_path, &object_path, bytes, checksum)
+        self.upload_sealed_output(&scratch_path, &object_path, bytes, sha256)
             .await?;
-        tracing::debug!(checksum, bytes, "Forge streamed sealed output");
+        tracing::debug!(sha256 = ?sha256, bytes, "Forge verified sealed output");
         self.object_store.after_output_put(&object_path).await;
         tokio::fs::remove_file(&scratch_path)
             .await
@@ -2256,225 +2214,47 @@ impl ForgeRewritePipeline {
         Ok((file, object_path))
     }
 
-    /// Uploads one sealed output in bounded chunks with one in-attempt retry.
-    ///
-    /// A failed chunk aborts its writer before the same attempt reopens the
-    /// immutable scratch file and deterministic object path. A close failure is
-    /// returned without retry because publication may already be durable.
+    /// Delegates deterministic create and read-back verification to the shared uploader.
     ///
     /// # Errors
     ///
-    /// Returns scratch IO, object-store, or length-verification failures. After
-    /// both chunk-write attempts fail, the second object-store error is returned
-    /// and the sealed file remains attempt-owned for terminal cleanup.
+    /// Returns a typed Forge invariant when the shared uploader cannot converge
+    /// on the exact sealed SHA-256 and length. Remote objects remain retained
+    /// for fenced orphan GC after any failure or ambiguity.
     async fn upload_sealed_output(
         &self,
         scratch_path: &Path,
         object_path: &str,
         expected_bytes: u64,
-        expected_checksum: u32,
+        expected_sha256: [u8; 32],
     ) -> Result<(), ForgeError> {
-        for attempt in 0..OUTPUT_UPLOAD_ATTEMPTS {
-            let mut source = tokio::fs::File::open(scratch_path).await.map_err(|error| {
-                ForgeError::ScratchIo {
-                    kind: error.kind(),
-                    detail: format!("open {} for upload: {error}", scratch_path.display()),
-                }
+        let identity =
+            ParquetObjectIdentity::new(object_path).map_err(|error| ForgeError::Invariant {
+                detail: format!("Forge output identity is invalid: {error}"),
             })?;
-            let mut output = self
-                .object_store
-                .output_writer(
-                    &self.staging,
-                    object_path,
-                    self.runtime().upload_chunk_bytes,
-                )
-                .await
-                .map_err(ForgeError::ObjectStore)?;
-            let mut uploaded = 0_u64;
-            let mut uploaded_checksum = 0_u32;
-            let mut chunk = vec![0_u8; self.runtime().upload_chunk_bytes];
-            let write_result = async {
-                use tokio::io::AsyncReadExt;
-                loop {
-                    let read =
-                        source
-                            .read(&mut chunk)
-                            .await
-                            .map_err(|error| ForgeError::ScratchIo {
-                                kind: error.kind(),
-                                detail: format!(
-                                    "read {} for upload: {error}",
-                                    scratch_path.display()
-                                ),
-                            })?;
-                    if read == 0 {
-                        break;
-                    }
-                    self.object_store
-                        .write_output_chunk(&mut output, Bytes::copy_from_slice(&chunk[..read]))
-                        .await
-                        .map_err(ForgeError::ObjectStore)?;
-                    uploaded_checksum = crc32c::crc32c_append(uploaded_checksum, &chunk[..read]);
-                    uploaded = uploaded.saturating_add(read as u64);
-                }
-                Ok::<(), ForgeError>(())
-            }
-            .await;
-            if let Err(error) = write_result {
-                let _ = self.object_store.abort_output_writer(&mut output).await;
-                if attempt + 1 < OUTPUT_UPLOAD_ATTEMPTS {
-                    continue;
-                }
-                return Err(error);
-            }
-            let metadata = output.close().await.map_err(ForgeError::ObjectStore)?;
-            if uploaded != expected_bytes || metadata.content_length() != expected_bytes {
-                return Err(ForgeError::Invariant {
-                    detail: format!(
-                        "Forge upload length mismatch: local={expected_bytes}, streamed={uploaded}, remote={}",
-                        metadata.content_length()
-                    ),
-                });
-            }
-            verify_output_checksum(expected_checksum, uploaded_checksum)?;
-            return Ok(());
+        let mut chunk = vec![0_u8; self.runtime().upload_chunk_bytes];
+        let verified = self
+            .uploader
+            .upload_file_verified(
+                &identity,
+                scratch_path,
+                expected_sha256,
+                expected_bytes,
+                &mut chunk,
+                BifrostUploadRole::Forge,
+            )
+            .await
+            .map_err(|error| ForgeError::Invariant {
+                detail: format!("Forge verified upload failed: {error}"),
+            })?;
+        if verified.length != expected_bytes || verified.sha256 != expected_sha256 {
+            return Err(ForgeError::Invariant {
+                detail:
+                    "Forge shared uploader returned evidence that diverges from the sealed output"
+                        .to_owned(),
+            });
         }
-        Err(ForgeError::Invariant {
-            detail: "Forge upload retry loop exhausted without a terminal result".to_owned(),
-        })
-    }
-
-    /// Delete rewrite-owned paths only after binding and fence validation.
-    ///
-    /// Cleanup is deliberately best effort: the caller's primary rewrite or
-    /// metadata error remains authoritative. A cancelled operation, lost
-    /// fence, invalid binding, or uncertain ownership leaves all remaining
-    /// objects for the fenced orphan-GC pass rather than risking a successor's
-    /// committed output.
-    async fn cleanup_paths(
-        &self,
-        paths: &[String],
-        binding: &TenantTableBinding,
-        stop: &CancellationToken,
-        lease: &mut ForgeLease,
-        operator_pool: &OperatorPool,
-    ) {
-        if stop.is_cancelled() {
-            return;
-        }
-        let table = match self.catalog.load_table(&binding.table_ident()).await {
-            Ok(table) => table,
-            Err(error) => {
-                tracing::warn!(error = %error, "Forge cleanup deferred because catalog live set is uncertain");
-                return;
-            }
-        };
-        let live_set = match self.current_live_set(binding, &table).await {
-            Ok(live_set) => live_set,
-            Err(error) => {
-                tracing::warn!(error = %error, "Forge cleanup deferred because live-set loading failed");
-                return;
-            }
-        };
-        for path in paths {
-            let Some(path) = binding.validate_object_path(path) else {
-                tracing::warn!(path, "Forge cleanup refused path outside table binding");
-                continue;
-            };
-            if stop.is_cancelled() {
-                return;
-            }
-            if live_set.contains(&path) {
-                tracing::warn!(path, "Forge cleanup refused a currently referenced object");
-                continue;
-            }
-            if let Err(fence_error) = lease.require_fence(operator_pool).await {
-                tracing::warn!(
-                    path,
-                    error = %fence_error,
-                    "Forge cleanup deferred after fence loss"
-                );
-                return;
-            }
-            if stop.is_cancelled() {
-                return;
-            }
-            if let Err(cleanup_error) = self.object_store.delete(&path).await {
-                tracing::warn!(
-                    path,
-                    error = %cleanup_error,
-                    "Forge rewrite output cleanup failed"
-                );
-            }
-        }
-    }
-
-    /// Reclaim outputs written before a live replacement reaches its durable
-    /// `Prepared` audit transition.
-    ///
-    /// The caller uses this only while the output set is still rewrite-owned.
-    /// It delegates to the established live-set and fence-checked cleanup path,
-    /// so uncertain catalog state, cancellation, or lost ownership retains the
-    /// objects for orphan reconciliation instead of risking a committed file.
-    pub(crate) async fn cleanup_unprepared_outputs(
-        &self,
-        paths: &[String],
-        binding: &TenantTableBinding,
-        stop: &CancellationToken,
-        lease: &mut ForgeLease,
-        operator_pool: &OperatorPool,
-    ) {
-        self.cleanup_paths(paths, binding, stop, lease, operator_pool)
-            .await;
-    }
-
-    /// Load the current catalog and control-plane references as object keys.
-    ///
-    /// # Errors
-    ///
-    /// Returns a catalog, manifest, or binding invariant error when the live
-    /// set cannot be established exactly.
-    async fn current_live_set(
-        &self,
-        binding: &TenantTableBinding,
-        table: &iceberg::table::Table,
-    ) -> Result<std::collections::HashSet<String>, ForgeError> {
-        let mut live = std::collections::HashSet::new();
-        let mut add = |path: &str| {
-            let key = catalog_path_to_object_key(
-                table.metadata().location(),
-                binding,
-                &self.staging,
-                path,
-            )?;
-            live.insert(key);
-            Ok::<(), ForgeError>(())
-        };
-        add(table
-            .metadata_location_result()
-            .map_err(ForgeError::Catalog)?)?;
-        for entry in table.metadata().metadata_log() {
-            add(&entry.metadata_file)?;
-        }
-        for snapshot in table.metadata().snapshots() {
-            add(snapshot.manifest_list())?;
-            let manifests = table
-                .manifest_list_reader(snapshot)
-                .load()
-                .await
-                .map_err(ForgeError::Catalog)?;
-            for manifest_file in manifests.entries() {
-                add(&manifest_file.manifest_path)?;
-                let manifest = manifest_file
-                    .load_manifest(table.file_io())
-                    .await
-                    .map_err(ForgeError::Catalog)?;
-                for entry in manifest.entries() {
-                    add(entry.data_file().file_path())?;
-                }
-            }
-        }
-        Ok(live)
+        Ok(())
     }
 
     /// Validate catalog location and object-store identity before any output PUT.
@@ -3958,14 +3738,6 @@ mod tests {
         assert_eq!(runtime.runtime.spilling_progress().current_bytes, 0);
     }
 
-    /// Checksum disagreement is a typed invariant rather than silent upload.
-    #[test]
-    fn sealed_output_checksum_mismatch_is_rejected() {
-        let error = verify_output_checksum(0x1234, 0x5678).expect_err("mismatch must fail");
-        assert!(matches!(error, ForgeError::Invariant { .. }));
-        verify_output_checksum(0x1234, 0x1234).expect("matching checksum");
-    }
-
     /// A decoded slot waits for competing ownership and becomes reusable on release.
     #[tokio::test]
     async fn decoded_batch_slot_blocks_then_releases() {
@@ -3997,9 +3769,9 @@ mod tests {
         assert_eq!(pool.reserved(), 0);
     }
 
-    /// Scratch-backed encoding rotates by bytes and leaves a readable footer.
+    /// Sub-target batches share one writer until accumulated bytes reach the target.
     #[test]
-    fn scaled_footer_refusal_precedes_data_page_read() {
+    fn sub_target_batches_coalesce_before_rotation() {
         let root = tempfile::tempdir().expect("output scratch");
         let schema = Arc::new(Schema::new(vec![
             Field::new("value", DataType::Int64, false).with_metadata(HashMap::from([(
@@ -4045,7 +3817,34 @@ mod tests {
                 ROW_GROUP_FLUSH_BYTES,
             )
             .expect("scratch encode");
-        assert!(state.should_rotate(1), "encoded bytes cross byte target");
+        let first_bytes = state
+            .writer
+            .as_ref()
+            .map(|writer| writer.bytes_written() + writer.in_progress_size())
+            .expect("active first-batch writer");
+        let target = u64::try_from(first_bytes.saturating_add(1)).expect("bounded target");
+        assert!(
+            !state.should_rotate(target),
+            "one sub-target batch retains the active writer"
+        );
+        state
+            .write_batch(
+                &schema,
+                &iceberg_schema,
+                &batch,
+                &[BoundedRowSlice {
+                    offset: 0,
+                    len: batch.num_rows(),
+                    logical_bytes: 32_768,
+                }],
+                "s3://bucket/table/data/forge/bifrost-writer-v2/test-00000.parquet",
+                ROW_GROUP_FLUSH_BYTES,
+            )
+            .expect("second scratch encode");
+        assert!(
+            state.should_rotate(target),
+            "the next boundary rotates after accumulated bytes cross target"
+        );
         let (writer, path, _phase) = state.take_writer().expect("active writer");
         let mut sink = writer.into_inner().expect("close writer");
         sink.flush().expect("flush file");
@@ -4055,7 +3854,7 @@ mod tests {
         let metadata = parquet::file::metadata::ParquetMetaDataReader::new()
             .parse_and_finish(&file)
             .expect("valid Parquet footer");
-        assert_eq!(metadata.file_metadata().num_rows(), 4096);
+        assert_eq!(metadata.file_metadata().num_rows(), 8192);
 
         validate_writer_v2_structure(&metadata).expect("writer-v2 structure is bounded");
     }

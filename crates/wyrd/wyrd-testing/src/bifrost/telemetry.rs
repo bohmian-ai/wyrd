@@ -2482,6 +2482,8 @@ pub enum ForgeTelemetryStrategy {
     StagingFold,
     /// Rewrite current-snapshot small files.
     SmallFiles,
+    /// Rewrite fragmented Iceberg manifests.
+    ManifestRewrite,
     /// Expire old Iceberg snapshots.
     SnapshotExpiry,
 }
@@ -2514,6 +2516,8 @@ pub enum ForgeTelemetryStage {
     ManifestDiscovery,
     /// Rewrite an Iceberg data-file group.
     IcebergRewrite,
+    /// Rewrite a bounded same-spec manifest group.
+    ManifestRewrite,
     /// Expire retained snapshots.
     SnapshotExpiry,
     /// Remove proven orphan objects.
@@ -3302,7 +3306,12 @@ fn validate_causal_metric_contract(
                 &["strategy", "le"],
                 &[(
                     "strategy",
-                    &["staging_fold", "small_files", "snapshot_expiry"],
+                    &[
+                        "staging_fold",
+                        "small_files",
+                        "manifest_rewrite",
+                        "snapshot_expiry",
+                    ],
                 )],
             ),
             "bifrost_forge_planning_demand_total" => {
@@ -3313,7 +3322,12 @@ fn validate_causal_metric_contract(
                 &[
                     (
                         "strategy",
-                        &["staging_fold", "small_files", "snapshot_expiry"],
+                        &[
+                            "staging_fold",
+                            "small_files",
+                            "manifest_rewrite",
+                            "snapshot_expiry",
+                        ],
                     ),
                     (
                         "result",
@@ -3337,6 +3351,7 @@ fn validate_causal_metric_contract(
                         "staging_fold",
                         "manifest_discovery",
                         "iceberg_rewrite",
+                        "manifest_rewrite",
                         "snapshot_expiry",
                         "orphan_gc",
                     ],
@@ -3624,6 +3639,7 @@ fn causal_terminal_tasks(
     let strategies = [
         ("staging_fold", ForgeTelemetryStrategy::StagingFold),
         ("small_files", ForgeTelemetryStrategy::SmallFiles),
+        ("manifest_rewrite", ForgeTelemetryStrategy::ManifestRewrite),
         ("snapshot_expiry", ForgeTelemetryStrategy::SnapshotExpiry),
     ];
     let results = [
@@ -3666,6 +3682,7 @@ fn causal_discovered_candidates(
     let strategies = [
         ("staging_fold", ForgeTelemetryStrategy::StagingFold),
         ("small_files", ForgeTelemetryStrategy::SmallFiles),
+        ("manifest_rewrite", ForgeTelemetryStrategy::ManifestRewrite),
         ("snapshot_expiry", ForgeTelemetryStrategy::SnapshotExpiry),
     ];
     let mut rows = Vec::new();
@@ -3712,6 +3729,7 @@ fn causal_stage_failures(
         ("staging_fold", ForgeTelemetryStage::StagingFold),
         ("manifest_discovery", ForgeTelemetryStage::ManifestDiscovery),
         ("iceberg_rewrite", ForgeTelemetryStage::IcebergRewrite),
+        ("manifest_rewrite", ForgeTelemetryStage::ManifestRewrite),
         ("snapshot_expiry", ForgeTelemetryStage::SnapshotExpiry),
         ("orphan_gc", ForgeTelemetryStage::OrphanGc),
     ];
@@ -3841,9 +3859,14 @@ fn causal_spans(
                 span,
                 "strategy",
                 if name == ForgeCausalSpanName::CatalogCommit {
-                    &["staging_fold", "small_files"]
+                    &["staging_fold", "small_files", "manifest_rewrite"]
                 } else {
-                    &["staging_fold", "small_files", "snapshot_expiry"]
+                    &[
+                        "staging_fold",
+                        "small_files",
+                        "manifest_rewrite",
+                        "snapshot_expiry",
+                    ]
                 },
             )?;
         } else if name == ForgeCausalSpanName::Cleanup {
@@ -4010,7 +4033,12 @@ fn validate_forge_span_contract(
                 validate_closed_span_attribute(
                     span,
                     "strategy",
-                    &["staging_fold", "small_files", "snapshot_expiry"],
+                    &[
+                        "staging_fold",
+                        "small_files",
+                        "manifest_rewrite",
+                        "snapshot_expiry",
+                    ],
                 )?;
                 validate_closed_span_attribute(
                     span,
@@ -4032,7 +4060,11 @@ fn validate_forge_span_contract(
                     span,
                     &["attempt_id", "result", "role", "strategy", "task_id"],
                 )?;
-                validate_closed_span_attribute(span, "strategy", &["staging_fold", "small_files"])?;
+                validate_closed_span_attribute(
+                    span,
+                    "strategy",
+                    &["staging_fold", "small_files", "manifest_rewrite"],
+                )?;
                 validate_closed_span_attribute(
                     span,
                     "result",
@@ -4227,7 +4259,12 @@ fn validate_forge_label_contract(
                 &[
                     (
                         "strategy",
-                        &["staging_fold", "small_files", "snapshot_expiry"],
+                        &[
+                            "staging_fold",
+                            "small_files",
+                            "manifest_rewrite",
+                            "snapshot_expiry",
+                        ],
                     ),
                     (
                         "result",
@@ -4313,7 +4350,12 @@ fn validate_forge_label_contract(
                 &["strategy", "le"],
                 &[(
                     "strategy",
-                    &["staging_fold", "small_files", "snapshot_expiry"],
+                    &[
+                        "staging_fold",
+                        "small_files",
+                        "manifest_rewrite",
+                        "snapshot_expiry",
+                    ],
                 )],
             ),
             "bifrost_forge_conflicts_total" => (

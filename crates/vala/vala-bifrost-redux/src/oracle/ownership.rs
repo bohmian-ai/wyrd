@@ -205,6 +205,8 @@ struct CachedDelegatedAdmissionBlock {
     block: DelegatedAdmissionBlock,
     /// Local deadline derived without trusting the pod wall clock.
     valid_until: Instant,
+    /// Whether background maintenance owns durable retirement of this idle block.
+    retiring: bool,
 }
 
 /// Mutable cached blocks, fairness queue, and lifecycle latches.
@@ -305,9 +307,11 @@ impl DelegatedOracleAdmission {
         state
             .demands
             .remove(&(block.tenant_id, block.principal_id, block.query_class));
-        state
-            .blocks
-            .push(CachedDelegatedAdmissionBlock { block, valid_until });
+        state.blocks.push(CachedDelegatedAdmissionBlock {
+            block,
+            valid_until,
+            retiring: false,
+        });
         Self::grant_waiters(&self.state, &mut state);
         self.queue_waiting_demands(&mut state)
     }
@@ -335,7 +339,8 @@ impl DelegatedOracleAdmission {
             }
             if let Some(index) = available_block(&state.blocks, request, Instant::now()) {
                 state.blocks[index].block.used += 1;
-                return Ok(DelegatedOracleAdmissionGrant::new(self, index));
+                let allocation_id = state.blocks[index].block.allocation_id;
+                return Ok(DelegatedOracleAdmissionGrant::new(self, allocation_id));
             }
             if state.waiters.len() >= self.config.queue_capacity {
                 return Err(DelegatedOracleAdmissionError::QueueFull);
@@ -468,14 +473,52 @@ impl DelegatedOracleAdmission {
         Ok(())
     }
 
-    /// Returns allocation identities currently cached for background renewal.
-    fn allocation_ids(&self) -> Result<Vec<uuid::Uuid>, DelegatedOracleAdmissionError> {
+    /// Claims every idle allocation for fenced background retirement.
+    fn begin_idle_retirements(&self) -> Result<Vec<uuid::Uuid>, DelegatedOracleAdmissionError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DelegatedOracleAdmissionError::StateUnavailable)?;
+        let mut allocations = Vec::new();
+        for cached in &mut state.blocks {
+            if cached.block.used == 0 && !cached.retiring {
+                cached.retiring = true;
+                allocations.push(cached.block.allocation_id);
+            }
+        }
+        Ok(allocations)
+    }
+
+    /// Removes one exact allocation after its durable rows close successfully.
+    fn finish_idle_retirement(
+        &self,
+        allocation_id: uuid::Uuid,
+    ) -> Result<(), DelegatedOracleAdmissionError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| DelegatedOracleAdmissionError::StateUnavailable)?;
+        let index = state
+            .blocks
+            .iter()
+            .position(|cached| cached.block.allocation_id == allocation_id)
+            .ok_or(DelegatedOracleAdmissionError::ContinuityLost)?;
+        if !state.blocks[index].retiring || state.blocks[index].block.used != 0 {
+            return Err(DelegatedOracleAdmissionError::ContinuityLost);
+        }
+        state.blocks.remove(index);
+        Ok(())
+    }
+
+    /// Returns non-retiring allocation identities cached for background renewal.
+    fn renewal_allocation_ids(&self) -> Result<Vec<uuid::Uuid>, DelegatedOracleAdmissionError> {
         self.state
             .lock()
             .map(|state| {
                 state
                     .blocks
                     .iter()
+                    .filter(|cached| !cached.retiring)
                     .map(|cached| cached.block.allocation_id)
                     .collect()
             })
@@ -655,7 +698,7 @@ impl DelegatedOracleAdmission {
                 state.blocks[index].block.used += 1;
                 let grant = DelegatedOracleAdmissionGrant {
                     owner: Arc::clone(owner),
-                    block_index: index,
+                    allocation_id: state.blocks[index].block.allocation_id,
                     released: false,
                 };
                 if waiter.sender.send(grant).is_err() {
@@ -851,9 +894,30 @@ impl DelegatedOracleAdmissionWorker {
     /// Returns a continuity error when renewal, retry allocation, or local
     /// state inspection fails.
     async fn maintain(&self) -> Result<(), DelegatedOracleAdmissionError> {
+        self.retire_idle().await?;
         self.renew().await?;
         for demand in self.admission.begin_retryable_demands()? {
             self.allocate(demand).await?;
+        }
+        Ok(())
+    }
+
+    /// Closes and removes every locally idle allocation before renewing active work.
+    async fn retire_idle(&self) -> Result<(), DelegatedOracleAdmissionError> {
+        let blocks = vala_sql::queries::oracle_admission::OracleAdmissionBlocks::new(&self.pool);
+        for allocation_id in self.admission.begin_idle_retirements()? {
+            let closed = blocks
+                .close_allocation(
+                    allocation_id,
+                    self.admission.node_id.as_uuid(),
+                    self.admission.fencing_token,
+                )
+                .await
+                .map_err(|_| DelegatedOracleAdmissionError::ContinuityLost)?;
+            if closed != 3 {
+                return Err(DelegatedOracleAdmissionError::ContinuityLost);
+            }
+            self.admission.finish_idle_retirement(allocation_id)?;
         }
         Ok(())
     }
@@ -867,7 +931,7 @@ impl DelegatedOracleAdmissionWorker {
         let blocks = vala_sql::queries::oracle_admission::OracleAdmissionBlocks::new(&self.pool);
         let validity = chrono::Duration::from_std(self.admission.config.validity)
             .map_err(|_| DelegatedOracleAdmissionError::InvalidConfig)?;
-        for allocation_id in self.admission.allocation_ids()? {
+        for allocation_id in self.admission.renewal_allocation_ids()? {
             let observed_before = Instant::now();
             let renewal = blocks
                 .renew(
@@ -892,7 +956,8 @@ fn available_block(
     now: Instant,
 ) -> Option<usize> {
     blocks.iter().position(|cached| {
-        cached.block.tenant_id == request.tenant_id
+        !cached.retiring
+            && cached.block.tenant_id == request.tenant_id
             && cached.block.principal_id == request.principal_id
             && cached.block.query_class == request.query_class
             && cached.valid_until > now
@@ -926,18 +991,18 @@ fn conservative_local_deadline(
 pub struct DelegatedOracleAdmissionGrant {
     /// Shared local state restored by release.
     owner: Arc<Mutex<DelegatedState>>,
-    /// Cached allocation index charged atomically at grant time.
-    block_index: usize,
+    /// Stable allocation identity charged atomically at grant time.
+    allocation_id: uuid::Uuid,
     /// Exactly-once local release latch.
     released: bool,
 }
 
 impl DelegatedOracleAdmissionGrant {
     /// Builds a grant over one atomically charged cached allocation.
-    fn new(owner: &Arc<DelegatedOracleAdmission>, block_index: usize) -> Self {
+    fn new(owner: &Arc<DelegatedOracleAdmission>, allocation_id: uuid::Uuid) -> Self {
         Self {
             owner: Arc::clone(&owner.state),
-            block_index,
+            allocation_id,
             released: false,
         }
     }
@@ -949,7 +1014,10 @@ impl DelegatedOracleAdmissionGrant {
         }
         self.released = true;
         if let Ok(mut state) = self.owner.lock()
-            && let Some(cached) = state.blocks.get_mut(self.block_index)
+            && let Some(cached) = state
+                .blocks
+                .iter_mut()
+                .find(|cached| cached.block.allocation_id == self.allocation_id)
         {
             cached.block.used = cached.block.used.saturating_sub(1);
             DelegatedOracleAdmission::grant_waiters(&self.owner, &mut state);
@@ -1506,6 +1574,82 @@ mod tests {
         assert_eq!(owner.state.lock().expect("state").blocks[0].block.used, 1);
         drop(grant);
         assert_eq!(owner.state.lock().expect("state").blocks[0].block.used, 0);
+    }
+
+    /// Stable grant identity survives removal of an earlier idle allocation.
+    ///
+    /// # Panics
+    ///
+    /// Panics when vector compaction redirects release to another allocation.
+    #[tokio::test]
+    async fn grant_release_uses_allocation_identity_after_earlier_retirement() {
+        let (owner, _, _) = owner();
+        let request = |tenant_id| DelegatedAdmissionRequest {
+            tenant_id,
+            principal_id: PrincipalId::new(uuid::Uuid::now_v7()),
+            query_class: QueryClass::Interactive,
+        };
+        let first = request(DataTenantId::new_v7());
+        let second = request(DataTenantId::new_v7());
+        for current in [first, second] {
+            install_test_block(&owner, current, owner.demand_for(current), 1);
+        }
+        let grant = owner
+            .acquire(second)
+            .await
+            .expect("second allocation grant");
+        let first_id = owner.state.lock().expect("state").blocks[0]
+            .block
+            .allocation_id;
+        assert_eq!(
+            owner.begin_idle_retirements().expect("idle claims"),
+            vec![first_id]
+        );
+        owner
+            .finish_idle_retirement(first_id)
+            .expect("first allocation retires");
+        drop(grant);
+        let state = owner.state.lock().expect("compacted state");
+        assert_eq!(state.blocks.len(), 1);
+        assert_eq!(state.blocks[0].block.used, 0);
+    }
+
+    /// Retirement excludes an idle block from both local grants and renewal.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a retiring allocation remains usable or renewable.
+    #[tokio::test]
+    async fn retiring_block_cannot_grant_or_renew() {
+        let (owner, mut demand_rx, _) = owner();
+        let request = DelegatedAdmissionRequest {
+            tenant_id: DataTenantId::new_v7(),
+            principal_id: PrincipalId::new(uuid::Uuid::now_v7()),
+            query_class: QueryClass::Interactive,
+        };
+        install_test_block(&owner, request, owner.demand_for(request), 1);
+        let allocation_id = owner.state.lock().expect("state").blocks[0]
+            .block
+            .allocation_id;
+        assert_eq!(
+            owner.begin_idle_retirements().expect("idle claims"),
+            vec![allocation_id]
+        );
+        assert!(
+            owner
+                .renewal_allocation_ids()
+                .expect("renewal identities")
+                .is_empty()
+        );
+        let waiting_owner = Arc::clone(&owner);
+        let waiting = tokio::spawn(async move { waiting_owner.acquire(request).await });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        assert_eq!(
+            demand_rx.try_recv().expect("replacement demand").tenant_id,
+            request.tenant_id
+        );
+        waiting.abort();
     }
 
     /// Database wall-clock skew cannot extend or prematurely reject local use.

@@ -80,6 +80,8 @@ pub(super) enum ForgeMetricStage {
     ManifestDiscovery,
     /// Replace one current-snapshot group.
     IcebergRewrite,
+    /// Rewrite fragmented Iceberg manifests.
+    ManifestRewrite,
     /// Reconcile and expire old snapshots.
     SnapshotExpiry,
     /// Reconcile and remove proven orphan objects.
@@ -88,12 +90,13 @@ pub(super) enum ForgeMetricStage {
 
 impl ForgeMetricStage {
     /// Every stage label registered for Forge duration and failure series.
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::ReconcileStaging,
         Self::ReconcileIceberg,
         Self::StagingFold,
         Self::ManifestDiscovery,
         Self::IcebergRewrite,
+        Self::ManifestRewrite,
         Self::SnapshotExpiry,
         Self::OrphanGc,
     ];
@@ -106,6 +109,7 @@ impl ForgeMetricStage {
             Self::StagingFold => "staging_fold",
             Self::ManifestDiscovery => "manifest_discovery",
             Self::IcebergRewrite => "iceberg_rewrite",
+            Self::ManifestRewrite => "manifest_rewrite",
             Self::SnapshotExpiry => "snapshot_expiry",
             Self::OrphanGc => "orphan_gc",
         }
@@ -123,7 +127,7 @@ pub(super) enum ForgeCatalogCommitStrategy {
 
 impl ForgeCatalogCommitStrategy {
     /// Return the stable span value for this catalog commit strategy.
-    const fn as_str(self) -> &'static str {
+    pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::StagingFold => "staging_fold",
             Self::SmallFiles => "small_files",
@@ -163,7 +167,7 @@ impl ForgeOperationResult {
     ];
 
     /// Returns the only metric label value emitted for this result.
-    const fn as_str(self) -> &'static str {
+    pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::Committed => "committed",
             Self::Recovered => "recovered",
@@ -208,19 +212,27 @@ pub(super) enum ForgeTaskMetricStrategy {
     StagingFold,
     /// Compact current Iceberg small files.
     SmallFiles,
+    /// Rewrite fragmented Iceberg manifests.
+    ManifestRewrite,
     /// Expire retained Iceberg snapshots.
     SnapshotExpiry,
 }
 
 impl ForgeTaskMetricStrategy {
     /// Every strategy label eagerly registered for task-duration and spill series.
-    const ALL: [Self; 3] = [Self::StagingFold, Self::SmallFiles, Self::SnapshotExpiry];
+    const ALL: [Self; 4] = [
+        Self::StagingFold,
+        Self::SmallFiles,
+        Self::ManifestRewrite,
+        Self::SnapshotExpiry,
+    ];
 
     /// Returns the stable task metric label for this strategy.
     pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::StagingFold => "staging_fold",
             Self::SmallFiles => "small_files",
+            Self::ManifestRewrite => "manifest_rewrite",
             Self::SnapshotExpiry => "snapshot_expiry",
         }
     }
@@ -231,17 +243,17 @@ impl TryFrom<ForgeTaskStrategy> for ForgeTaskMetricStrategy {
 
     /// Converts executable durable strategies to the fixed task-metric vocabulary.
     ///
-    /// Full-identity repair, manifest rewrite, and cleanup rows deliberately have
-    /// no task-duration series: the worker rejects them before execution. The
+    /// Full-identity repair and cleanup rows deliberately have no task-duration
+    /// series: the worker rejects them before execution. The
     /// explicit error preserves that invariant instead of silently discarding an
     /// unexpected durable strategy.
     fn try_from(strategy: ForgeTaskStrategy) -> Result<Self, Self::Error> {
         match strategy {
             ForgeTaskStrategy::StagingFold => Ok(Self::StagingFold),
             ForgeTaskStrategy::SmallFiles => Ok(Self::SmallFiles),
+            ForgeTaskStrategy::ManifestRewrite => Ok(Self::ManifestRewrite),
             ForgeTaskStrategy::SnapshotExpiry => Ok(Self::SnapshotExpiry),
             ForgeTaskStrategy::FullIdentity
-            | ForgeTaskStrategy::ManifestRewrite
             | ForgeTaskStrategy::ExpiredCleanup
             | ForgeTaskStrategy::OrphanCleanup => Err(strategy),
         }
@@ -1542,12 +1554,15 @@ mod tests {
             Ok(ForgeTaskMetricStrategy::SmallFiles)
         );
         assert_eq!(
+            ForgeTaskMetricStrategy::try_from(ForgeTaskStrategy::ManifestRewrite),
+            Ok(ForgeTaskMetricStrategy::ManifestRewrite)
+        );
+        assert_eq!(
             ForgeTaskMetricStrategy::try_from(ForgeTaskStrategy::SnapshotExpiry),
             Ok(ForgeTaskMetricStrategy::SnapshotExpiry)
         );
         for strategy in [
             ForgeTaskStrategy::FullIdentity,
-            ForgeTaskStrategy::ManifestRewrite,
             ForgeTaskStrategy::ExpiredCleanup,
             ForgeTaskStrategy::OrphanCleanup,
         ] {

@@ -267,6 +267,131 @@ async fn late_tenants_use_dynamic_default_with_isolated_usage() {
     assert_eq!(tenant_policies, 0);
 }
 
+/// Exact fenced closure releases all three accounting rows immediately.
+///
+/// # Panics
+///
+/// Panics when closure is partial or closed rows continue consuming capacity.
+#[tokio::test]
+async fn exact_allocation_closure_frees_global_capacity() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let blocks = OracleAdmissionBlocks::new(fixture.operator_pool());
+    blocks
+        .ensure_canonical_policies(1, 1, 1, 1)
+        .await
+        .expect("canonical policies");
+    let first_tenant = fixture
+        .seed_additional_tenant("retire-first")
+        .await
+        .expect("first tenant seeds");
+    let second_tenant = fixture
+        .seed_additional_tenant("retire-second")
+        .await
+        .expect("second tenant seeds");
+    let node_id = NodeId::new(uuid::Uuid::from_u128(31));
+    let fence = register_oracle(&fixture, node_id).await;
+    let demand = |tenant_id| OracleAdmissionDemand {
+        tenant_id,
+        principal_id: PrincipalId::new(uuid::Uuid::now_v7()),
+        query_class: QueryClass::Interactive,
+        requested_units: 1,
+        holder_node_id: node_id,
+        holder_fencing_token: fence,
+    };
+    let first = blocks
+        .allocate(demand(first_tenant), Duration::seconds(15))
+        .await
+        .expect("first allocation");
+    let allocation_id = first.rows[0].allocation_id;
+    assert_eq!(
+        blocks
+            .close_allocation(allocation_id, node_id.as_uuid(), fence)
+            .await
+            .expect("exact allocation closes"),
+        3
+    );
+    assert_eq!(
+        blocks
+            .allocate(demand(second_tenant), Duration::seconds(15))
+            .await
+            .expect("successor allocation")
+            .rows
+            .len(),
+        3
+    );
+}
+
+/// Two released tenants let a third allocate beneath a global ceiling of two.
+///
+/// # Panics
+///
+/// Panics when idle tenant-specific allocations pin reusable global capacity.
+#[tokio::test]
+async fn sequential_tenant_retirement_reuses_global_capacity() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let blocks = OracleAdmissionBlocks::new(fixture.operator_pool());
+    blocks
+        .ensure_canonical_policies(2, 1, 1, 1)
+        .await
+        .expect("canonical policies");
+    let tenants = ["sequential-a", "sequential-b", "sequential-c"];
+    let mut tenant_ids = Vec::new();
+    for name in tenants {
+        tenant_ids.push(
+            fixture
+                .seed_additional_tenant(name)
+                .await
+                .expect("tenant seeds"),
+        );
+    }
+    let node_id = NodeId::new(uuid::Uuid::from_u128(32));
+    let fence = register_oracle(&fixture, node_id).await;
+    let demand = |tenant_id| OracleAdmissionDemand {
+        tenant_id,
+        principal_id: PrincipalId::new(uuid::Uuid::now_v7()),
+        query_class: QueryClass::Interactive,
+        requested_units: 1,
+        holder_node_id: node_id,
+        holder_fencing_token: fence,
+    };
+    let first = blocks
+        .allocate(demand(tenant_ids[0]), Duration::seconds(15))
+        .await
+        .expect("first allocation");
+    let second = blocks
+        .allocate(demand(tenant_ids[1]), Duration::seconds(15))
+        .await
+        .expect("second allocation");
+    assert_eq!(first.rows.len(), 3);
+    assert_eq!(second.rows.len(), 3);
+    assert!(
+        blocks
+            .allocate(demand(tenant_ids[2]), Duration::seconds(15))
+            .await
+            .expect("saturated allocation")
+            .rows
+            .is_empty()
+    );
+    for allocation_id in [first.rows[0].allocation_id, second.rows[0].allocation_id] {
+        assert_eq!(
+            blocks
+                .close_allocation(allocation_id, node_id.as_uuid(), fence)
+                .await
+                .expect("idle allocation closes"),
+            3
+        );
+    }
+    assert_eq!(
+        blocks
+            .allocate(demand(tenant_ids[2]), Duration::seconds(15))
+            .await
+            .expect("third allocation after retirement")
+            .rows
+            .len(),
+        3
+    );
+}
+
 /// Inactive, deleted, and unknown tenants receive no delegated allocation.
 ///
 /// # Panics

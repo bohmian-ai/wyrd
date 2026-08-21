@@ -222,7 +222,6 @@ impl BifrostClusterSpec {
             [
                 BifrostRuntimeRole::Scribe,
                 BifrostRuntimeRole::ForgeCoordinator,
-                BifrostRuntimeRole::ForgeWorker,
                 BifrostRuntimeRole::Oracle,
             ],
         )];
@@ -2583,8 +2582,8 @@ fn classify_topology(spec: &BifrostClusterSpec) -> BifrostTopology {
         6 if spec.nodes[..3].iter().all(|node| {
             node.roles.contains(&BifrostRuntimeRole::Scribe)
                 && node.roles.contains(&BifrostRuntimeRole::ForgeCoordinator)
-                && node.roles.contains(&BifrostRuntimeRole::ForgeWorker)
                 && node.roles.contains(&BifrostRuntimeRole::Oracle)
+                && node.roles.len() == 3
         }) && spec.nodes[3..].iter().all(|node| {
             node.roles.len() == 1 && node.roles.contains(&BifrostRuntimeRole::ForgeWorker)
         }) =>
@@ -2594,8 +2593,8 @@ fn classify_topology(spec: &BifrostClusterSpec) -> BifrostTopology {
         4 if spec.nodes.first().is_some_and(|node| {
             node.roles.contains(&BifrostRuntimeRole::Scribe)
                 && node.roles.contains(&BifrostRuntimeRole::ForgeCoordinator)
-                && node.roles.contains(&BifrostRuntimeRole::ForgeWorker)
                 && node.roles.contains(&BifrostRuntimeRole::Oracle)
+                && node.roles.len() == 3
         }) && spec.nodes[1..].iter().all(|node| {
             node.roles.len() == 1 && node.roles.contains(&BifrostRuntimeRole::ForgeWorker)
         }) =>
@@ -2755,6 +2754,32 @@ mod tests {
         assert_eq!(
             classify_topology(&spec),
             BifrostTopology::ThreeServersThreeForgeWorkers
+        );
+    }
+
+    /// The dedicated-worker descriptor keeps the serving coordinator out of the worker pool.
+    ///
+    /// # Panics
+    ///
+    /// Panics when validation, process-target mapping, worker isolation, or
+    /// legacy topology classification diverges from the four-node contract.
+    #[test]
+    fn dedicated_forge_workers_descriptor_is_exact() {
+        let spec = BifrostClusterSpec::dedicated_forge_workers();
+        spec.validate().expect("dedicated descriptor validates");
+        assert_eq!(spec.nodes.len(), 4);
+        assert_eq!(
+            process_target_for_roles(&spec.nodes[0].roles),
+            Some(BifrostTarget::Server)
+        );
+        assert!(
+            spec.nodes[1..]
+                .iter()
+                .all(|node| node.roles == BTreeSet::from([BifrostRuntimeRole::ForgeWorker]))
+        );
+        assert_eq!(
+            classify_topology(&spec),
+            BifrostTopology::DedicatedForgeWorkers
         );
     }
 

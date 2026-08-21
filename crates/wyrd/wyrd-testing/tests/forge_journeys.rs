@@ -28,7 +28,7 @@ use vala_sql::row_types::forge_tasks::{
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
-use wyrd_server::config::ForgeProcessRole;
+use wyrd_server::config::BifrostTarget;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
     AuditDetail, BifrostQueryRequest, ForgeCompactionPhase, FreshnessPolicy, StoragePath,
@@ -371,7 +371,7 @@ async fn superseded_worker_records_cancelled_duration_from_durable_state() {
 async fn start_maintenance_journey_server() -> WyrdTestServer {
     WyrdTestServer::builder()
         .with_forge_interval(Duration::from_secs(3600))
-        .with_forge_process_role_for_test(ForgeProcessRole::Server)
+        .with_forge_process_role_for_test(BifrostTarget::Server)
         .start_in_process()
         .await
         .expect("in-process maintenance journey server")
@@ -391,7 +391,7 @@ async fn start_telemetry_maintenance_server() -> (
     let server = WyrdTestServer::builder()
         .with_telemetry_for_test(telemetry_guard)
         .with_forge_interval(Duration::from_secs(3600))
-        .with_forge_process_role_for_test(ForgeProcessRole::Server)
+        .with_forge_process_role_for_test(BifrostTarget::Server)
         .start_in_process()
         .await
         .expect("in-process telemetry maintenance server");
@@ -814,7 +814,7 @@ async fn pg_bifrost_forge_small_files_converges_without_query_dependency() {
         .state()
         .forge()
         .expect("Forge composition")
-        .resources_for_test()
+        .resources()
         .snapshot()
         .expect("Forge resource baseline");
 
@@ -913,7 +913,7 @@ async fn pg_bifrost_forge_small_files_converges_without_query_dependency() {
             .state()
             .forge()
             .expect("Forge composition after rewrite")
-            .resources_for_test()
+            .resources()
             .snapshot()
             .expect("Forge resources after rewrite"),
         forge_baseline
@@ -968,9 +968,7 @@ async fn prepare_forge_convergence_table(
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let table = format!("forge_local_{}", uuid::Uuid::now_v7().simple());
     server
-        .state()
-        .bifrost
-        .create_table(CreateTableRequest {
+        .create_bifrost_table_for_test(CreateTableRequest {
             table: TableRef::new(BifrostNamespace::Bifrost, &table),
             user_fields: vec![
                 Field::new("id", DataType::Int64, false),
@@ -1543,7 +1541,7 @@ async fn supervised_forge_panic_fails_stop_and_recovers_exactly_once() {
             .state()
             .forge()
             .expect("restarted Forge")
-            .resources_for_test()
+            .resources()
             .snapshot()
             .expect("panic recovery resource snapshot");
         assert_eq!(resources.elastic_memory_used_bytes, 0);
@@ -1784,10 +1782,10 @@ async fn dedicated_forge_workers_journey() {
     assert_eq!(
         roles,
         vec![
-            ForgeProcessRole::Server,
-            ForgeProcessRole::ForgeWorker,
-            ForgeProcessRole::ForgeWorker,
-            ForgeProcessRole::ForgeWorker,
+            BifrostTarget::Server,
+            BifrostTarget::ForgeWorker,
+            BifrostTarget::ForgeWorker,
+            BifrostTarget::ForgeWorker,
         ]
     );
     let scheduler_server = cluster.server(0).expect("scheduler/server pod");
@@ -1908,7 +1906,7 @@ async fn embedded_and_dedicated_forge_roles_preserve_exact_durable_parity() {
             .server(0)
             .expect("embedded server")
             .forge_process_role(),
-        ForgeProcessRole::All
+        BifrostTarget::All
     );
     let embedded_evidence = run_supervised_role_fixture(&embedded, 1, "embedded-forge-role").await;
     embedded
@@ -1921,7 +1919,7 @@ async fn embedded_and_dedicated_forge_roles_preserve_exact_durable_parity() {
         .expect("dedicated Forge cluster");
     assert_eq!(dedicated.topology(), BifrostTopology::DedicatedForgeWorkers);
     assert!(dedicated.servers()[1..].iter().all(|worker| {
-        worker.forge_process_role() == ForgeProcessRole::ForgeWorker
+        worker.forge_process_role() == BifrostTarget::ForgeWorker
             && worker.base_url().is_none()
             && worker.grpc_url().is_none()
             && worker.bound_addr().is_none()
@@ -2434,7 +2432,11 @@ async fn scheduler_renewal_loss_stops_every_later_effect() {
     .expect("renewal-loss demand");
     let owner = uuid::Uuid::now_v7();
     let scheduler = ForgeScheduler::with_owner_for_test(
-        server.state().forge().expect("server-owned Forge"),
+        server
+            .state()
+            .forge_coordinator()
+            .expect("server-owned Forge coordinator")
+            .as_ref(),
         owner,
     )
     .expect("renewal-loss scheduler");
@@ -3253,7 +3255,8 @@ async fn assert_snapshot(server: &WyrdTestServer, tenant: DataTenantId, scenario
     .expect("traces binding");
     let table = server
         .state()
-        .bifrost
+        .bifrost_catalog()
+        .expect("Bifrost catalog")
         .iceberg_catalog()
         .load_table(&binding.table_ident())
         .await

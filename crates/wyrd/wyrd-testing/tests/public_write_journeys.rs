@@ -25,7 +25,7 @@ use vala_sdk::{
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
-use wyrd_server::config::ForgeProcessRole;
+use wyrd_server::config::BifrostTarget;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
     BifrostQueryRequest, FreshnessPolicy, QueryTerminalOutcome, VisibilityMode,
@@ -566,9 +566,7 @@ async fn pg_bifrost_scribe_shard_rotation_replay_journey() {
     let server = cluster.server(0).expect("restart journey server");
     let tenant = cluster.data_tenant_id();
     server
-        .state()
-        .bifrost
-        .create_table(CreateTableRequest {
+        .create_bifrost_table_for_test(CreateTableRequest {
             table: TableRef::new(BifrostNamespace::Bifrost, TABLE_NAME),
             user_fields: vec![
                 Field::new("id", DataType::Int64, false),
@@ -581,9 +579,7 @@ async fn pg_bifrost_scribe_shard_rotation_replay_journey() {
         .expect("restart table");
     for table_name in [ROTATION_PREFIX_TABLE, ROTATION_NON_PREFIX_TABLE] {
         server
-            .state()
-            .bifrost
-            .create_table(CreateTableRequest {
+            .create_bifrost_table_for_test(CreateTableRequest {
                 table: TableRef::new(BifrostNamespace::Bifrost, table_name),
                 user_fields: vec![
                     Field::new("id", DataType::Int64, false),
@@ -1188,9 +1184,7 @@ async fn pg_bifrost_scribe_shard_rotation_replay_journey() {
         .await
         .expect("unrelated tenant");
     replacement
-        .state()
-        .bifrost
-        .create_table(CreateTableRequest {
+        .create_bifrost_table_for_test(CreateTableRequest {
             table: TableRef::new(BifrostNamespace::Bifrost, TABLE_NAME),
             user_fields: vec![
                 Field::new("id", DataType::Int64, false),
@@ -1312,8 +1306,8 @@ async fn run_topology_public_journey(
             .servers()
             .map(wyrd_testing::WyrdTestServer::forge_process_role)
             .collect::<Vec<_>>();
-        assert_eq!(roles[..3], [ForgeProcessRole::Server; 3]);
-        assert_eq!(roles[3..], [ForgeProcessRole::ForgeWorker; 3]);
+        assert_eq!(roles[..3], [BifrostTarget::Server; 3]);
+        assert_eq!(roles[3..], [BifrostTarget::ForgeWorker; 3]);
         assert!(
             cluster.servers()[..3]
                 .iter()
@@ -1337,7 +1331,7 @@ async fn run_topology_public_journey(
         assert!(
             cluster.servers()[..3]
                 .iter()
-                .all(|server| { server.forge_process_role() == ForgeProcessRole::Server })
+                .all(|server| { server.forge_process_role() == BifrostTarget::Server })
         );
     }
     let scribe_observers = cluster
@@ -1437,7 +1431,7 @@ async fn run_topology_public_journey(
                 .count();
             for server in cluster
                 .servers()
-                .filter(|server| server.forge_process_role() != ForgeProcessRole::ForgeWorker)
+                .filter(|server| server.forge_process_role() != BifrostTarget::ForgeWorker)
             {
                 let expected_passes = server.completed_forge_scheduler_passes_for_test() + 1;
                 server.request_forge_scheduler_pass_for_test();
@@ -1614,9 +1608,7 @@ async fn run_multitenant_public_journey() -> Result<(), Box<dyn std::error::Erro
     for (tenant, table_name, expected) in tenant_tables {
         let table_fqn = format!("vala.bifrost.{table_name}");
         server
-            .state()
-            .bifrost
-            .create_table(CreateTableRequest {
+            .create_bifrost_table_for_test(CreateTableRequest {
                 table: TableRef::new(BifrostNamespace::Bifrost, table_name),
                 user_fields: vec![
                     Field::new("id", DataType::Int64, false),
@@ -1962,9 +1954,8 @@ async fn fresh_boot_provisions_redux_before_first_write() {
         .expect("fresh WyrdTestCluster boot");
     let server = cluster.server(0).expect("booted Bifrost server");
     let tenant = cluster.data_tenant_id();
-    let redux = &server.state().bifrost;
-    redux
-        .create_table(CreateTableRequest {
+    server
+        .create_bifrost_table_for_test(CreateTableRequest {
             table: TableRef::new(BifrostNamespace::Bifrost, TABLE_NAME),
             user_fields: vec![
                 Field::new("id", DataType::Int64, false),
@@ -2019,9 +2010,7 @@ async fn run_closeout_journey(
     let tenant = cluster.data_tenant_id();
     let first = cluster.server(0).ok_or("missing first Bifrost pod")?;
     first
-        .state()
-        .bifrost
-        .create_table(CreateTableRequest {
+        .create_bifrost_table_for_test(CreateTableRequest {
             table: TableRef::new(BifrostNamespace::Bifrost, TABLE_NAME),
             user_fields: vec![
                 Field::new("id", DataType::Int64, false),
@@ -2229,9 +2218,7 @@ async fn run_delayed_fsync_journey(
     let tenant = cluster.data_tenant_id();
     let server = cluster.server(0).ok_or("missing delayed-fsync pod")?;
     server
-        .state()
-        .bifrost
-        .create_table(CreateTableRequest {
+        .create_bifrost_table_for_test(CreateTableRequest {
             table: TableRef::new(BifrostNamespace::Bifrost, TABLE_NAME),
             user_fields: vec![
                 Field::new("id", DataType::Int64, false),

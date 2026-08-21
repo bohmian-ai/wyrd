@@ -33,7 +33,7 @@ use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::oracle::dispatcher::{DispatchError, OraclePeerCredentials};
 use vala_bifrost_redux::resources::{
     BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, BifrostVolumeRoots,
-    ResourceSource, SystemResourceSnapshot,
+    ForgeRewriteRequest, ForgeRewriteResources, ResourceSource, SystemResourceSnapshot,
 };
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
@@ -74,6 +74,8 @@ use wyrd_server::{AppState, WyrdServer, WyrdServerConfig, build_router};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::NodeId;
 use wyrd_telemetry::TelemetryGuard;
+
+use crate::bifrost::ForgeObjectStoreControl;
 
 /// Harness-owned credential that exchanges one persisted Service API key.
 struct TestOraclePeerCredentials {
@@ -174,6 +176,8 @@ struct WyrdTestServerInner {
     forge_clock: ForgeClockControl,
     /// Trigger that wakes the real supervised Forge scheduler.
     forge_scheduler_trigger: ForgeSchedulerTrigger,
+    /// Passive controls retained by the actual production-composed Forge object store.
+    forge_object_store: Option<Arc<ForgeObjectStoreControl>>,
     /// Process composition selected for this test server.
     forge_process_role: BifrostTarget,
     /// Stable identity assigned to this server process.
@@ -1308,10 +1312,146 @@ impl WyrdTestServer {
         self.inner.forge_clock.clone()
     }
 
+    /// Return passive controls for the object store used by the supervised Forge owner.
+    #[must_use]
+    pub fn forge_object_store_control_for_test(&self) -> Option<Arc<ForgeObjectStoreControl>> {
+        self.inner.forge_object_store.as_ref().map(Arc::clone)
+    }
+
+    /// Return deterministic maintenance gates from the supervised Forge owner.
+    #[must_use]
+    pub fn forge_maintenance_controls_for_test(
+        &self,
+    ) -> Option<vala_bifrost_redux::forge::MaintenanceTestControls> {
+        self.inner
+            .state
+            .forge()
+            .and_then(|forge| forge.coordinator())
+            .map(|forge| forge.maintenance_controls_for_test())
+    }
+
+    /// Hold the live process root's available Forge capacity through one RAII lease.
+    ///
+    /// The returned production lease is opaque to the harness. Dropping it
+    /// releases memory, scratch, and reader counters through the root-owned
+    /// finalizer used by real rewrites.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when Forge is absent or its live root cannot admit the
+    /// exact remaining memory and reader capacity atomically.
+    pub fn hold_forge_root_capacity_for_test(
+        &self,
+    ) -> Result<ForgeRewriteResources, WyrdTestServerError> {
+        let resources = self
+            .inner
+            .state
+            .forge()
+            .ok_or_else(|| WyrdTestServerError::Start("Forge is not composed".to_owned()))?
+            .resources();
+        let snapshot = resources
+            .snapshot()
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        let memory_bytes = snapshot
+            .plan
+            .elastic_memory_bytes
+            .checked_sub(snapshot.elastic_memory_used_bytes)
+            .ok_or_else(|| {
+                WyrdTestServerError::Start("Forge root memory accounting diverged".to_owned())
+            })?;
+        let reader_permits = u16::try_from(snapshot.plan.effective_cpu).map_err(|_| {
+            WyrdTestServerError::Start("Forge reader capacity exceeds u16".to_owned())
+        })?;
+        let envelope = vala_sql::row_types::forge_tasks::ForgeTaskEnvelope {
+            version: vala_sql::row_types::forge_tasks::FORGE_ENVELOPE_VERSION,
+            reader_permits,
+            decoded_batch_bytes: 0,
+            decoded_input_bytes: u64::try_from(memory_bytes).map_err(|_| {
+                WyrdTestServerError::Start("Forge memory capacity exceeds u64".to_owned())
+            })?,
+            sort_working_bytes: 0,
+            sort_merge_reservation_bytes: 0,
+            encoder_buffer_bytes: 0,
+            upload_chunk_bytes: 0,
+            footer_encoded_bytes: 0,
+            footer_decode_workspace_bytes: 0,
+            sort_spill_bytes: 0,
+            output_scratch_bytes: 0,
+        };
+        resources
+            .try_acquire_rewrite(ForgeRewriteRequest {
+                envelope,
+                memory_bytes,
+                scratch_bytes: 1,
+                reader_permits,
+            })
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))
+    }
+
+    /// Arm the canonical one-shot Prepared audit failure on the composed Forge owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this server has no Forge coordinator.
+    pub fn fail_next_forge_prepared_audit_for_test(&self) -> Result<(), WyrdTestServerError> {
+        let forge = self
+            .inner
+            .state
+            .forge()
+            .and_then(|forge| forge.coordinator())
+            .ok_or_else(|| {
+                WyrdTestServerError::Start("Forge coordinator is not composed".to_owned())
+            })?;
+        forge.fail_next_prepared_live_audit_for_test();
+        Ok(())
+    }
+
+    /// Arm one failure after maintenance commits Prepared task evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this server has no Forge worker.
+    pub fn fail_after_forge_maintenance_prepared_for_test(
+        &self,
+    ) -> Result<(), WyrdTestServerError> {
+        let worker = self
+            .inner
+            .state
+            .forge()
+            .and_then(|forge| forge.worker())
+            .ok_or_else(|| WyrdTestServerError::Start("Forge worker is not composed".to_owned()))?;
+        worker.fail_after_maintenance_prepared_for_test();
+        Ok(())
+    }
+
     /// Return the stable node identity assigned by the cluster harness.
     #[must_use]
     pub fn node_id(&self) -> NodeId {
         self.inner.node_id
+    }
+
+    /// Create one tenant-qualified table through the retained production catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns the catalog error when validation, creation, or durable metadata
+    /// publication fails.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation stops waiting for catalog completion. The production
+    /// catalog remains authoritative for whether the idempotent table creation
+    /// committed before cancellation.
+    pub async fn create_bifrost_table_for_test(
+        &self,
+        request: vala_bifrost_redux::catalog::CreateTableRequest,
+    ) -> Result<(), WyrdTestServerError> {
+        self.inner
+            .bifrost_catalog
+            .create_table(request)
+            .await
+            .map(|_| ())
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))
     }
 
     /// Provision the canonical traces/spans table for one test tenant.
@@ -2888,13 +3028,23 @@ impl WyrdTestServerBuilder {
         });
         let (forge_clock, forge_clock_control) = ForgeClock::manual(Utc::now());
         let forge_scheduler_trigger = ForgeSchedulerTrigger::new();
+        let forge_object_store = (self
+            .bifrost_roles
+            .contains(&BifrostRuntimeRole::ForgeCoordinator)
+            || self
+                .bifrost_roles
+                .contains(&BifrostRuntimeRole::ForgeWorker))
+        .then(|| ForgeObjectStoreControl::new(Arc::new(storage.operator().clone())));
+        let composed_forge_object_store = forge_object_store.as_ref().map(|control| {
+            Arc::clone(control) as Arc<dyn vala_bifrost_redux::forge::ForgeObjectStore>
+        });
         let test_controls = BifrostTestControls {
             forge_clock,
             forge_scheduler_trigger: forge_scheduler_trigger.clone(),
             forge_completion_observer: self.forge_completion_observer.clone(),
             forge_config: Some(forge_config),
             forge_catalog: self.forge_catalog,
-            forge_object_store: None,
+            forge_object_store: composed_forge_object_store,
             scribe_wal_sync_delay: self.wal_sync_delay,
             scribe_rotation: self.scribe_rotation_for_test,
             scribe_persistence_faults: self
@@ -2995,6 +3145,7 @@ impl WyrdTestServerBuilder {
                 bifrost_catalog: Arc::clone(&bifrost),
                 forge_clock: forge_clock_control,
                 forge_scheduler_trigger,
+                forge_object_store,
                 forge_process_role: self.forge_process_role,
                 node_id,
                 _forge_role_telemetry: forge_role_telemetry,

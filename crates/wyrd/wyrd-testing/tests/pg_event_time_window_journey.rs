@@ -137,19 +137,17 @@ mod pg_tests {
             .await
             .expect("bound Bifrost server");
         let tenant = srv.data_tenant_id();
-        srv.state()
-            .bifrost
-            .create_table(CreateTableRequest {
-                table: TableRef::new(BifrostNamespace::Bifrost, TABLE_NAME),
-                user_fields: vec![
-                    Field::new("id", DataType::Int64, false),
-                    Field::new("value", DataType::Utf8, false),
-                ],
-                tenant,
-                audit: None,
-            })
-            .await
-            .expect("event-time journey table resolves");
+        srv.create_bifrost_table_for_test(CreateTableRequest {
+            table: TableRef::new(BifrostNamespace::Bifrost, TABLE_NAME),
+            user_fields: vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("value", DataType::Utf8, false),
+            ],
+            tenant,
+            audit: None,
+        })
+        .await
+        .expect("event-time journey table resolves");
 
         let jwt = match srv
             .bootstrap_user("event-time-writer", &["admin"])

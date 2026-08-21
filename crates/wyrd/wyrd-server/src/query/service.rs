@@ -10,8 +10,8 @@ use vala_bifrost_redux::oracle::{AuthorizedQueryContext, OracleQueryStream, Quer
 use wyrd_runtime::{Permission, PermissionVerdict};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
-    AuditDecision, AuditResult, AuthMethod, BifrostQueryRequest, QueryStreamFrame,
-    QueryTerminalOutcome, VisibilityMode,
+    AuditDecision, AuditResult, AuthMethod, BifrostQueryRequest, CancelRunningQueryResponse,
+    QueryStreamFrame, QueryTerminalOutcome, RunningQuerySummary, VisibilityMode,
 };
 
 use crate::AppState;
@@ -110,6 +110,98 @@ pub async fn stream_query(
         .query_sql(context, request)
         .await
         .map_err(Into::into)
+}
+
+/// Authorizes and audits one public running-query control before accessing its owner.
+async fn authorize_control(
+    state: &AppState,
+    caller: &Caller,
+    operation: &'static str,
+) -> Result<(), WyrdError> {
+    let permission = Permission::bifrost_query_read();
+    authorize_audited(
+        state.clone(),
+        caller.clone(),
+        permission.clone(),
+        operation,
+        "vala.query.lifecycle",
+    )
+    .await?;
+    let event = audit::audit_event(
+        caller,
+        operation,
+        "vala.query.lifecycle",
+        &permission.to_string(),
+        AuditDecision::Allow,
+        AuditResult::Success,
+        "running query control authorized",
+    );
+    audit::record_audit_owned(
+        state.postgres.vala_pool().clone(),
+        caller.data_tenant_id,
+        event,
+    )
+    .await
+}
+
+/// Lists active queries visible to the authenticated tenant.
+///
+/// # Errors
+///
+/// Returns stable authorization, audit, role-availability, or owner-control errors.
+pub async fn list_running_queries(
+    state: &AppState,
+    caller: &Caller,
+) -> Result<Vec<RunningQuerySummary>, WyrdError> {
+    authorize_control(state, caller, "vala.query.running.list").await?;
+    state
+        .bifrost
+        .query_controls()
+        .ok_or(wyrd_spec::vala::error::BifrostError::OracleRoleUnavailable)?
+        .list(caller.data_tenant_id)
+        .await
+}
+
+/// Returns one active query visible to the authenticated tenant.
+///
+/// # Errors
+///
+/// Returns stable authorization, audit, role-availability, not-found, or conflict errors.
+pub async fn get_running_query(
+    state: &AppState,
+    caller: &Caller,
+    request_id: wyrd_spec::request_id::RequestId,
+) -> Result<RunningQuerySummary, WyrdError> {
+    authorize_control(state, caller, "vala.query.running.get").await?;
+    state
+        .bifrost
+        .query_controls()
+        .ok_or(wyrd_spec::vala::error::BifrostError::OracleRoleUnavailable)?
+        .get(caller.data_tenant_id, request_id)
+        .await
+}
+
+/// Requests idempotent cancellation of one active query for the authenticated tenant.
+///
+/// # Errors
+///
+/// Returns stable authorization, audit, role-availability, not-found, or conflict errors.
+pub async fn cancel_running_query(
+    state: &AppState,
+    caller: &Caller,
+    request_id: wyrd_spec::request_id::RequestId,
+) -> Result<CancelRunningQueryResponse, WyrdError> {
+    authorize_control(state, caller, "vala.query.running.cancel").await?;
+    let cancelled = state
+        .bifrost
+        .query_controls()
+        .ok_or(wyrd_spec::vala::error::BifrostError::OracleRoleUnavailable)?
+        .cancel(caller.data_tenant_id, request_id)
+        .await?;
+    Ok(CancelRunningQueryResponse {
+        request_id: cancelled.request_id,
+        cancellation_started: cancelled.cancellation_started,
+    })
 }
 
 /// Executes one already-lowered typed plan through retained Oracle and collects

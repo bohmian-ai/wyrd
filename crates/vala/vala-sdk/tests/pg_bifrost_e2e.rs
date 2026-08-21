@@ -33,7 +33,9 @@ mod pg_tests {
         BatchSink, ClientByteGuard, DurableBatchAck, MockSink, QueueConfig, SealedBatch, SinkError,
         WyrdQueueError,
     };
+    use wyrd_spec::DataTenantId;
     use wyrd_spec::reference::CardRef;
+    use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
     use wyrd_testing::server::WyrdTestServer;
 
@@ -63,6 +65,376 @@ mod pg_tests {
             api_key: Some(srv.api_key().expose_secret().to_owned().into()),
             ..ClientConfig::default()
         }
+    }
+
+    /// Counts durable lifecycle authorization audits for one tenant and operation.
+    async fn lifecycle_audit_count(
+        srv: &WyrdTestServer,
+        tenant: DataTenantId,
+        operation: &str,
+    ) -> i64 {
+        let mut conn = srv
+            .tenant_conn_for(tenant)
+            .await
+            .expect("tenant lifecycle audit connection");
+        let count = sqlx::query_scalar(
+            "SELECT count(*)::bigint FROM vala.audit_outbox WHERE operation = $1",
+        )
+        .bind(operation)
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("count lifecycle audit rows");
+        conn.commit().await.expect("commit lifecycle audit read");
+        count
+    }
+
+    /// Adds one Wyrd access token to a typed public gRPC request.
+    fn authenticated_request<T>(value: T, bearer: &str) -> wyrd_tonic::tonic::Request<T> {
+        let mut request = wyrd_tonic::tonic::Request::new(value);
+        request.metadata_mut().insert(
+            "x-wyrd-access-token",
+            format!("Bearer {bearer}").parse().expect("metadata"),
+        );
+        request
+    }
+
+    /// Starts one real server with a published queryable table and authenticated SDK client.
+    async fn lifecycle_fixture() -> (
+        WyrdTestServer,
+        WyrdClient,
+        WyrdClient,
+        WyrdClient,
+        DataTenantId,
+        String,
+    ) {
+        let srv = WyrdTestServer::start_bound()
+            .await
+            .expect("lifecycle test server start");
+        let table_name = format!("sdk_lifecycle_{}", uuid::Uuid::now_v7().simple());
+        let table_fqn = format!("vala.bifrost.{table_name}");
+        srv.state()
+            .bifrost_catalog()
+            .expect("Bifrost catalog")
+            .create_table(CreateTableRequest {
+                table: TableRef::new(BifrostNamespace::Bifrost, &table_name),
+                user_fields: vec![Field::new("value", DataType::Int64, false)],
+                tenant: srv.data_tenant_id(),
+                audit: None,
+            })
+            .await
+            .expect("register lifecycle table");
+        srv.seed_bifrost_rows(&table_fqn, &[1])
+            .await
+            .expect("publish lifecycle row");
+        let bootstrap = srv
+            .bootstrap_service("sdk-query-lifecycle", &["admin"])
+            .await
+            .expect("bootstrap lifecycle caller");
+        let config = ClientConfig {
+            grpc: GrpcConfig {
+                endpoint: srv.grpc_url().expect("gRPC URL"),
+                connect_retries: 0,
+                ..GrpcConfig::default()
+            },
+            http: HttpConfig {
+                base_url: srv.base_url().expect("HTTP URL").to_owned(),
+                ..HttpConfig::default()
+            },
+            api_key: Some(bootstrap.api_key().expect("machine API key").clone()),
+            ..ClientConfig::default()
+        };
+        let client = WyrdClient::with_config(config).expect("lifecycle SDK client");
+        let other_tenant = srv
+            .seed_tenant(&format!(
+                "sdk-lifecycle-other-{}",
+                uuid::Uuid::now_v7().simple()
+            ))
+            .await
+            .expect("seed second lifecycle tenant");
+        let other = srv
+            .bootstrap_service_in_tenant(other_tenant, "sdk-query-lifecycle-other", &["admin"])
+            .await
+            .expect("bootstrap second lifecycle caller");
+        let other_config = ClientConfig {
+            grpc: GrpcConfig {
+                endpoint: srv.grpc_url().expect("gRPC URL"),
+                connect_retries: 0,
+                ..GrpcConfig::default()
+            },
+            http: HttpConfig {
+                base_url: srv.base_url().expect("HTTP URL").to_owned(),
+                ..HttpConfig::default()
+            },
+            api_key: Some(other.api_key().expect("second machine API key").clone()),
+            ..ClientConfig::default()
+        };
+        let other_client =
+            WyrdClient::with_config(other_config).expect("second lifecycle SDK client");
+        let denied = srv
+            .bootstrap_service_in_tenant(other_tenant, "sdk-query-lifecycle-denied", &[])
+            .await
+            .expect("bootstrap under-privileged lifecycle caller");
+        let denied_config = ClientConfig {
+            grpc: GrpcConfig {
+                endpoint: srv.grpc_url().expect("gRPC URL"),
+                connect_retries: 0,
+                ..GrpcConfig::default()
+            },
+            http: HttpConfig {
+                base_url: srv.base_url().expect("HTTP URL").to_owned(),
+                ..HttpConfig::default()
+            },
+            api_key: Some(denied.api_key().expect("denied machine API key").clone()),
+            ..ClientConfig::default()
+        };
+        let denied_client =
+            WyrdClient::with_config(denied_config).expect("under-privileged lifecycle SDK client");
+        (
+            srv,
+            client,
+            other_client,
+            denied_client,
+            other_tenant,
+            table_fqn,
+        )
+    }
+
+    /// Runs one HTTP query into the deterministic schema stall and returns its owner task.
+    async fn stalled_query(
+        srv: &WyrdTestServer,
+        query: &QueryClient,
+        table_fqn: &str,
+    ) -> (RequestId, tokio::task::JoinHandle<()>) {
+        srv.stall_next_query_after_schema();
+        let stream = query
+            .query(&BifrostQueryRequest {
+                sql: format!("SELECT value FROM {table_fqn}"),
+                visibility: VisibilityMode::PublishedOnly,
+                freshness: FreshnessPolicy::Strict,
+                deadline_ms: Some(30_000),
+            })
+            .await
+            .expect("query starts");
+        let request_id = stream.request_id().clone();
+        let task = tokio::spawn(async move {
+            let mut stream = stream;
+            let _ = stream.next_batch().await;
+        });
+        let stalled = srv.wait_query_schema_stall().await.expect("query stalls");
+        assert_eq!(stalled, request_id.as_str());
+        (request_id, task)
+    }
+
+    /// Real HTTP list/status/cancel controls preserve request identity and idempotency.
+    pub(super) async fn oracle_query_status_cancel_impl() {
+        let (srv, client, other_client, denied_client, other_tenant, table_fqn) =
+            lifecycle_fixture().await;
+        let query = QueryClient::new(&client);
+        let other_query = QueryClient::new(&other_client);
+        let denied_query = QueryClient::new(&denied_client);
+        let (request_id, task) = stalled_query(&srv, &query, &table_fqn).await;
+
+        let running = query.running().await.expect("running list");
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].request_id, request_id);
+        assert_eq!(
+            query.status(&request_id).await.expect("status").request_id,
+            request_id
+        );
+        assert!(
+            other_query
+                .running()
+                .await
+                .expect("foreign running list")
+                .is_empty()
+        );
+        let unknown_id = RequestId::now_v7();
+        let foreign_status = other_query
+            .status(&request_id)
+            .await
+            .expect_err("foreign tenant cannot inspect query");
+        let absent_status = other_query
+            .status(&unknown_id)
+            .await
+            .expect_err("unknown query remains opaque");
+        assert_eq!(
+            foreign_status.code(),
+            "WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND"
+        );
+        assert_eq!(foreign_status.code(), absent_status.code());
+        assert_eq!(foreign_status.detail(), absent_status.detail());
+        let foreign_cancel = other_query
+            .cancel(&request_id)
+            .await
+            .expect_err("foreign tenant cannot cancel query");
+        let absent_cancel = other_query
+            .cancel(&unknown_id)
+            .await
+            .expect_err("unknown cancellation remains opaque");
+        assert_eq!(
+            foreign_cancel.code(),
+            "WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND"
+        );
+        assert_eq!(foreign_cancel.code(), absent_cancel.code());
+        assert_eq!(foreign_cancel.detail(), absent_cancel.detail());
+        let denied = denied_query
+            .running()
+            .await
+            .expect_err("under-privileged lifecycle list is denied");
+        assert_eq!(denied.code(), "WYRD_PERMISSION_403_DENIED_RBAC");
+        assert!(
+            query
+                .cancel(&request_id)
+                .await
+                .expect("cancel")
+                .cancellation_started
+        );
+        assert!(
+            !query
+                .cancel(&request_id)
+                .await
+                .expect("idempotent cancel")
+                .cancellation_started
+        );
+        assert_eq!(
+            lifecycle_audit_count(&srv, srv.data_tenant_id(), "vala.query.running.cancel",).await,
+            2,
+        );
+        assert_eq!(
+            lifecycle_audit_count(&srv, other_tenant, "vala.query.running.cancel",).await,
+            2,
+        );
+
+        task.abort();
+        let _ = task.await;
+        srv.shutdown().await.expect("server shutdown");
+    }
+
+    /// Public gRPC controls use the same active registry and cancellation semantics.
+    pub(super) async fn oracle_query_grpc_status_cancel_impl() {
+        use wyrd_tonic::wyrd::v1 as proto;
+        use wyrd_tonic::wyrd::v1::bifrost_query_service_client::BifrostQueryServiceClient;
+
+        let (srv, client, other_client, denied_client, other_tenant, table_fqn) =
+            lifecycle_fixture().await;
+        let query = QueryClient::new(&client);
+        let (request_id, task) = stalled_query(&srv, &query, &table_fqn).await;
+        let channel =
+            wyrd_tonic::tonic::transport::Endpoint::from_shared(srv.grpc_url().expect("gRPC URL"))
+                .expect("endpoint")
+                .connect()
+                .await
+                .expect("gRPC connect");
+        let bearer = client.auth().bearer().await.expect("bearer");
+        let other_bearer = other_client.auth().bearer().await.expect("second bearer");
+        let denied_bearer = denied_client.auth().bearer().await.expect("denied bearer");
+        let mut grpc = BifrostQueryServiceClient::new(channel);
+        let listed = grpc
+            .list_running_queries(authenticated_request(
+                proto::ListRunningQueriesRequest {},
+                bearer.expose(),
+            ))
+            .await
+            .expect("gRPC list")
+            .into_inner();
+        assert_eq!(listed.queries.len(), 1);
+        assert_eq!(listed.queries[0].request_id, request_id.as_str());
+        let got = grpc
+            .get_running_query(authenticated_request(
+                proto::GetRunningQueryRequest {
+                    request_id: request_id.to_string(),
+                },
+                bearer.expose(),
+            ))
+            .await
+            .expect("gRPC status")
+            .into_inner();
+        assert_eq!(got.request_id, request_id.as_str());
+        let foreign_status = grpc
+            .get_running_query(authenticated_request(
+                proto::GetRunningQueryRequest {
+                    request_id: request_id.to_string(),
+                },
+                other_bearer.expose(),
+            ))
+            .await
+            .expect_err("foreign tenant cannot inspect query");
+        let unknown_id = RequestId::now_v7();
+        let absent_status = grpc
+            .get_running_query(authenticated_request(
+                proto::GetRunningQueryRequest {
+                    request_id: unknown_id.to_string(),
+                },
+                other_bearer.expose(),
+            ))
+            .await
+            .expect_err("unknown query remains opaque");
+        assert_eq!(foreign_status.code(), wyrd_tonic::tonic::Code::NotFound);
+        assert_eq!(foreign_status.code(), absent_status.code());
+        assert_eq!(foreign_status.message(), absent_status.message());
+        let foreign_cancel = grpc
+            .cancel_running_query(authenticated_request(
+                proto::CancelRunningQueryRequest {
+                    request_id: request_id.to_string(),
+                },
+                other_bearer.expose(),
+            ))
+            .await
+            .expect_err("foreign tenant cannot cancel query");
+        let absent_cancel = grpc
+            .cancel_running_query(authenticated_request(
+                proto::CancelRunningQueryRequest {
+                    request_id: unknown_id.to_string(),
+                },
+                other_bearer.expose(),
+            ))
+            .await
+            .expect_err("unknown cancellation remains opaque");
+        assert_eq!(foreign_cancel.code(), wyrd_tonic::tonic::Code::NotFound);
+        assert_eq!(foreign_cancel.code(), absent_cancel.code());
+        assert_eq!(foreign_cancel.message(), absent_cancel.message());
+        let denied = grpc
+            .list_running_queries(authenticated_request(
+                proto::ListRunningQueriesRequest {},
+                denied_bearer.expose(),
+            ))
+            .await
+            .expect_err("under-privileged lifecycle list is denied");
+        assert_eq!(denied.code(), wyrd_tonic::tonic::Code::PermissionDenied);
+        let first = grpc
+            .cancel_running_query(authenticated_request(
+                proto::CancelRunningQueryRequest {
+                    request_id: request_id.to_string(),
+                },
+                bearer.expose(),
+            ))
+            .await
+            .expect("gRPC cancel")
+            .into_inner();
+        assert!(first.cancellation_started);
+        let second = grpc
+            .cancel_running_query(authenticated_request(
+                proto::CancelRunningQueryRequest {
+                    request_id: request_id.to_string(),
+                },
+                bearer.expose(),
+            ))
+            .await
+            .expect("gRPC idempotent cancel")
+            .into_inner();
+        assert!(!second.cancellation_started);
+        assert_eq!(
+            lifecycle_audit_count(&srv, srv.data_tenant_id(), "vala.query.running.cancel",).await,
+            2,
+        );
+        assert_eq!(
+            lifecycle_audit_count(&srv, other_tenant, "vala.query.running.cancel",).await,
+            2,
+        );
+
+        task.abort();
+        let _ = task.await;
+        srv.shutdown().await.expect("server shutdown");
     }
 
     /// A stall sink that parks forever once a batch arrives — used to saturate the
@@ -261,7 +633,8 @@ mod pg_tests {
         let table_name = format!("sdk_oracle_{}", uuid::Uuid::now_v7().simple());
         let table_fqn = format!("vala.bifrost.{table_name}");
         srv.state()
-            .bifrost
+            .bifrost_catalog()
+            .expect("Bifrost catalog")
             .create_table(CreateTableRequest {
                 table: TableRef::new(BifrostNamespace::Bifrost, &table_name),
                 user_fields: vec![
@@ -326,7 +699,8 @@ mod pg_tests {
             .expect("test server start");
         let table_name = format!("sdk_roundtrip_{}", uuid::Uuid::now_v7().simple());
         srv.state()
-            .bifrost
+            .bifrost_catalog()
+            .expect("Bifrost catalog")
             .create_table(CreateTableRequest {
                 table: TableRef::new(BifrostNamespace::Bifrost, &table_name),
                 user_fields: vec![
@@ -423,7 +797,8 @@ mod pg_tests {
         let table_name = format!("sdk_timeout_retry_{}", uuid::Uuid::now_v7().simple());
         let table_fqn = format!("vala.bifrost.{table_name}");
         srv.state()
-            .bifrost
+            .bifrost_catalog()
+            .expect("Bifrost catalog")
             .create_table(CreateTableRequest {
                 table: TableRef::new(BifrostNamespace::Bifrost, &table_name),
                 user_fields: vec![
@@ -792,4 +1167,18 @@ mod pg_tests {
         drop(bifrost);
         srv.shutdown().await.expect("server shutdown");
     }
+}
+
+/// Real HTTP list/status/cancel controls preserve tenant-scoped lifecycle identity.
+#[tokio::test]
+#[ignore = "requires the controlled Postgres journey harness"]
+async fn oracle_query_status_cancel_is_tenant_scoped() {
+    pg_tests::oracle_query_status_cancel_impl().await;
+}
+
+/// Public gRPC controls project the same tenant-scoped lifecycle owner.
+#[tokio::test]
+#[ignore = "requires the controlled Postgres journey harness"]
+async fn oracle_query_grpc_status_cancel_is_tenant_scoped() {
+    pg_tests::oracle_query_grpc_status_cancel_impl().await;
 }

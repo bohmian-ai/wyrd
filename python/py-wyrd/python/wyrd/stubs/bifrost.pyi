@@ -1,5 +1,5 @@
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, TypedDict
 
 import pyarrow
 
@@ -57,11 +57,38 @@ class BifrostQueryError(RuntimeError):
 class IncompleteQueryStreamError(BifrostQueryError):
     """Raised when transport EOF arrives before a validated terminal."""
 
+class RunningQueryProgress(TypedDict):
+    """Participant progress for one live Oracle query."""
+
+    completed_participants: int
+    total_participants: int
+
+class RunningQuery(TypedDict):
+    """Canonical live-query summary projected by Bifrost."""
+
+    request_id: str
+    query_class: str
+    started_at: str
+    deadline: str
+    state: str
+    progress: RunningQueryProgress
+    cancellation_requested: bool
+
+class CancelRunningQueryResult(TypedDict):
+    """Idempotent server-side cancellation acknowledgement."""
+
+    request_id: str
+    cancellation_started: bool
+
 class BifrostQueryStream(AsyncIterator[pyarrow.RecordBatch]):
     """Asynchronously yields Arrow batches from one Oracle query."""
 
     def __aiter__(self) -> BifrostQueryStream: ...
     async def __anext__(self) -> pyarrow.RecordBatch: ...
+    @property
+    def request_id(self) -> str:
+        """Return the server lifecycle request ID before completion."""
+        ...
     @property
     def terminal(self) -> dict[str, Any] | None:
         """Return terminal metadata after validated completion."""
@@ -84,11 +111,23 @@ class BifrostQueryClient:
     ) -> BifrostQueryStream:
         """Start one authenticated terminal-safe query."""
         ...
+    async def running(self) -> list[RunningQuery]:
+        """List active queries visible to the authenticated tenant."""
+        ...
+    async def status(self, request_id: str) -> RunningQuery:
+        """Return one active query by its canonical request ID."""
+        ...
+    async def cancel(self, request_id: str) -> CancelRunningQueryResult:
+        """Request server-side cancellation without closing a local stream."""
+        ...
 
 __all__ = [
     "Bifrost",
     "BifrostQueryClient",
     "BifrostQueryError",
     "BifrostQueryStream",
+    "CancelRunningQueryResult",
     "IncompleteQueryStreamError",
+    "RunningQuery",
+    "RunningQueryProgress",
 ]

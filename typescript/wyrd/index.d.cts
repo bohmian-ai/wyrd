@@ -17,6 +17,12 @@ export declare class NativeBifrostQueryClient {
    * startup result itself.
    */
   query(request: NativeQueryRequest): Promise<NativeQueryStart>
+  /** Lists active queries for the authenticated tenant. */
+  running(): Promise<NativeLifecycleResult>
+  /** Gets one active query by canonical request ID. */
+  status(requestId: string): Promise<NativeLifecycleResult>
+  /** Requests server-side cancellation without closing a local stream. */
+  cancel(requestId: string): Promise<NativeLifecycleResult>
   /**
    * Sends one Arrow IPC batch through the existing Bifrost ingest wire.
    *
@@ -35,6 +41,8 @@ export declare class NativeBifrostQueryClient {
 
 /** Native query stream that retains Rust terminal validation and emits raw IPC. */
 export declare class NativeBifrostQueryStream {
+  /** Returns the canonical server lifecycle request identity. */
+  get requestId(): string
   /**
    * Returns one Arrow IPC batch or the final validated terminal.
    *
@@ -83,6 +91,24 @@ export interface NativeInsertResult {
   /** Operator remediation when the ingest was rejected. */
   errorRemediation?: string
   /** JSON-safe structured details when the ingest was rejected. */
+  errorDetailsJson?: string
+}
+
+/** Structured native result for one live-query lifecycle control. */
+export interface NativeLifecycleResult {
+  /** Canonical JSON payload when the control succeeded. */
+  valueJson?: string
+  /** Stable SDK error code when the control failed. */
+  errorCode?: string
+  /** HTTP-equivalent status when the control failed. */
+  errorStatus?: number
+  /** Stable title when the control failed. */
+  errorTitle?: string
+  /** Scrubbed detail when the control failed. */
+  errorDetail?: string
+  /** Operator-facing remediation when the control failed. */
+  errorRemediation?: string
+  /** Serialized JSON-safe structured details when the control failed. */
   errorDetailsJson?: string
 }
 

@@ -14,6 +14,8 @@ use wyrd_client::WyrdClient;
 use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{HttpConfig, HttpTransport, ResolvedCredential};
+use wyrd_spec::error::WyrdError;
+use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
 
 /// Rust-owned stream implementation used by the native owner.
@@ -164,6 +166,55 @@ pub struct NativeInsertResult {
     pub error_remediation: Option<String>,
     /// JSON-safe structured details when the ingest was rejected.
     pub error_details_json: Option<String>,
+}
+
+/// Structured native result for one live-query lifecycle control.
+#[napi(object)]
+pub struct NativeLifecycleResult {
+    /// Canonical JSON payload when the control succeeded.
+    pub value_json: Option<String>,
+    /// Stable SDK error code when the control failed.
+    pub error_code: Option<String>,
+    /// HTTP-equivalent status when the control failed.
+    pub error_status: Option<u32>,
+    /// Stable title when the control failed.
+    pub error_title: Option<String>,
+    /// Scrubbed detail when the control failed.
+    pub error_detail: Option<String>,
+    /// Operator-facing remediation when the control failed.
+    pub error_remediation: Option<String>,
+    /// Serialized JSON-safe structured details when the control failed.
+    pub error_details_json: Option<String>,
+}
+
+impl NativeLifecycleResult {
+    /// Builds one successful JSON lifecycle projection.
+    fn success(value: serde_json::Value) -> napi::Result<Self> {
+        Ok(Self {
+            value_json: Some(serde_json::to_string(&value).map_err(napi_error)?),
+            error_code: None,
+            error_status: None,
+            error_title: None,
+            error_detail: None,
+            error_remediation: None,
+            error_details_json: None,
+        })
+    }
+
+    /// Builds one failed lifecycle projection with stable Wyrd metadata.
+    fn failure(error: &ValaSdkError) -> Self {
+        Self {
+            value_json: None,
+            error_code: Some(error.code().to_owned()),
+            error_status: Some(u32::from(error.status())),
+            error_title: Some(error.title().to_owned()),
+            error_detail: Some(error.detail()),
+            error_remediation: Some(error.remediation().to_owned()),
+            error_details_json: error
+                .safe_details()
+                .and_then(|value| serde_json::to_string(&value).ok()),
+        }
+    }
 }
 
 impl NativeInsertResult {
@@ -375,6 +426,51 @@ impl NativeBifrostQueryClient {
         })
     }
 
+    /// Lists active queries for the authenticated tenant.
+    #[napi]
+    pub async fn running(&self) -> napi::Result<NativeLifecycleResult> {
+        match self.client.running().await {
+            Ok(queries) => {
+                NativeLifecycleResult::success(serde_json::to_value(queries).map_err(napi_error)?)
+            }
+            Err(error) => Ok(NativeLifecycleResult::failure(&error)),
+        }
+    }
+
+    /// Gets one active query by canonical request ID.
+    #[napi]
+    pub async fn status(&self, request_id: String) -> napi::Result<NativeLifecycleResult> {
+        let request_id = match parse_request_id(&request_id) {
+            Ok(request_id) => request_id,
+            Err(error) => {
+                return Ok(NativeLifecycleResult::failure(&error));
+            }
+        };
+        match self.client.status(&request_id).await {
+            Ok(summary) => {
+                NativeLifecycleResult::success(serde_json::to_value(summary).map_err(napi_error)?)
+            }
+            Err(error) => Ok(NativeLifecycleResult::failure(&error)),
+        }
+    }
+
+    /// Requests server-side cancellation without closing a local stream.
+    #[napi]
+    pub async fn cancel(&self, request_id: String) -> napi::Result<NativeLifecycleResult> {
+        let request_id = match parse_request_id(&request_id) {
+            Ok(request_id) => request_id,
+            Err(error) => {
+                return Ok(NativeLifecycleResult::failure(&error));
+            }
+        };
+        match self.client.cancel(&request_id).await {
+            Ok(response) => {
+                NativeLifecycleResult::success(serde_json::to_value(response).map_err(napi_error)?)
+            }
+            Err(error) => Ok(NativeLifecycleResult::failure(&error)),
+        }
+    }
+
     /// Sends one Arrow IPC batch through the existing Bifrost ingest wire.
     ///
     /// The Rust client-tier transport owns UUID validation, authentication,
@@ -430,7 +526,9 @@ fn grpc_connection_error() -> wyrd_spec::error::WyrdError {
 impl NativeBifrostQueryStream {
     /// Wraps one Rust-owned query stream for napi iteration.
     fn new(stream: QueryResultStream) -> Self {
+        let request_id = stream.request_id().as_str().to_owned();
         Self {
+            request_id,
             stream: Arc::new(AsyncMutex::new(Some(NativeStreamOwner::Production(
                 Box::new(stream),
             )))),
@@ -442,6 +540,7 @@ impl NativeBifrostQueryStream {
     /// Wraps an injectable owner for deterministic native cleanup tests.
     fn new_for_test(owner: TestStreamOwner) -> Self {
         Self {
+            request_id: RequestId::now_v7().to_string(),
             stream: Arc::new(AsyncMutex::new(Some(NativeStreamOwner::Test(owner)))),
             terminal_json: Arc::new(Mutex::new(None)),
         }
@@ -451,6 +550,8 @@ impl NativeBifrostQueryStream {
 /// Native query stream that retains Rust terminal validation and emits raw IPC.
 #[napi]
 pub struct NativeBifrostQueryStream {
+    /// Canonical lifecycle request identity available before body polling.
+    request_id: String,
     /// Mutable Rust query stream serialized across JavaScript `next` calls.
     stream: Arc<AsyncMutex<Option<NativeStreamOwner>>>,
     /// Validated serialized terminal retained after the Rust stream is released.
@@ -459,6 +560,12 @@ pub struct NativeBifrostQueryStream {
 
 #[napi]
 impl NativeBifrostQueryStream {
+    /// Returns the canonical server lifecycle request identity.
+    #[napi(getter)]
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
     /// Returns one Arrow IPC batch or the final validated terminal.
     ///
     /// # Errors
@@ -593,6 +700,20 @@ fn parse_freshness(value: &str) -> Result<FreshnessPolicy, ValaSdkError> {
     }
 }
 
+/// Parses one canonical request ID at the Node boundary.
+///
+/// # Errors
+///
+/// Returns the stable public validation error when the value is not a UUIDv7 request ID.
+fn parse_request_id(value: &str) -> Result<RequestId, ValaSdkError> {
+    RequestId::parse(value).map_err(|error| {
+        ValaSdkError::Transport(WyrdError::Validation {
+            message: error.to_string(),
+            details: serde_json::json!({"field": "request_id"}),
+        })
+    })
+}
+
 /// Encodes one decoded Rust record batch for TypeScript Apache Arrow.
 ///
 /// # Errors
@@ -630,6 +751,14 @@ mod tests {
     use wyrd_spec::vala::error::BifrostError;
 
     use super::*;
+
+    /// Malformed lifecycle identifiers remain caller validation failures.
+    #[test]
+    fn lifecycle_request_id_validation_is_public_and_stable() {
+        let error = parse_request_id("not-a-request-id").expect_err("malformed ID must fail");
+        assert_eq!(error.code(), "WYRD_SPEC_400_VALIDATION");
+        assert_eq!(error.status(), 400);
+    }
 
     /// Verifies one SDK error is copied into independent native metadata fields.
     fn assert_start_failure(error: &ValaSdkError) {

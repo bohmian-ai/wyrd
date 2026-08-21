@@ -135,6 +135,66 @@ fn assert_config_error(err: WyrdClientError, expected_field: &str, expected_reas
     assert_eq!(reason, expected_reason);
 }
 
+/// Explicit query identity crosses the streaming request and is verified on response.
+#[tokio::test]
+async fn running_query_request_id_and_controls_round_trip() {
+    use secrecy::SecretString;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use wyrd_client::auth::AuthMiddleware;
+    use wyrd_client::config::ClientConfig;
+    use wyrd_client::transport::HttpTransport;
+    use wyrd_client::transport::credential::ResolvedCredential;
+    use wyrd_spec::request_id::RequestId;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("address");
+    let request_id = RequestId::now_v7();
+    let expected = request_id.to_string();
+    let server_expected = expected.clone();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let mut bytes = vec![0_u8; 4096];
+        let read = socket.read(&mut bytes).await.expect("read");
+        let request = String::from_utf8_lossy(&bytes[..read]);
+        assert!(request.contains(&format!("wyrd-request-id: {server_expected}")));
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/vnd.wyrd.bifrost-query-stream\r\nwyrd-request-id: {server_expected}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        );
+        socket.write_all(response.as_bytes()).await.expect("write");
+    });
+    let config = ClientConfig {
+        http: HttpConfig {
+            base_url: format!("http://{address}"),
+            ..HttpConfig::default()
+        },
+        ..ClientConfig::default()
+    };
+    let auth = AuthMiddleware::new(
+        &config,
+        ResolvedCredential::BearerToken(SecretString::from("token".to_owned())),
+    )
+    .expect("auth");
+    let transport = HttpTransport::new(&config.http, auth).expect("transport");
+    let response = transport
+        .request_json_stream_with_id(
+            reqwest::Method::POST,
+            "/v1/query",
+            &serde_json::json!({"sql": "SELECT 1"}),
+            &request_id,
+        )
+        .await
+        .expect("echoed request ID accepted");
+    assert_eq!(
+        response
+            .headers()
+            .get("wyrd-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some(expected.as_str())
+    );
+    server.await.expect("server joins");
+}
+
 // ── HttpTransport behavioral tests ────────────────────────────────────────────
 
 mod transport_behavior {

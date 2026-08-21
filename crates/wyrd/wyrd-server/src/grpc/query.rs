@@ -118,6 +118,7 @@ impl BifrostQueryService for BifrostQueryGrpc {
         request: Request<BifrostQueryRequest>,
     ) -> Result<Response<Self::QueryStream>, Status> {
         let caller = caller(self.state.clone(), request.metadata().clone()).await?;
+        let request_id = caller.request_id.clone();
         let request = wyrd_spec::vala::api::BifrostQueryRequest::try_from(request.into_inner())
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let result = Box::pin(crate::query::service::stream_query(
@@ -127,7 +128,74 @@ impl BifrostQueryService for BifrostQueryGrpc {
         ))
         .await
         .map_err(query_status)?;
-        Ok(query_stream_response(result))
+        let mut response = query_stream_response(result);
+        if let Ok(value) = request_id.as_str().parse() {
+            response.metadata_mut().insert("x-wyrd-request-id", value);
+        }
+        Ok(response)
+    }
+
+    /// Lists active queries for the authenticated tenant.
+    async fn list_running_queries(
+        &self,
+        request: Request<proto::ListRunningQueriesRequest>,
+    ) -> Result<Response<proto::ListRunningQueriesResponse>, Status> {
+        let caller = caller(self.state.clone(), request.metadata().clone()).await?;
+        let request_id = caller.request_id.clone();
+        let queries = crate::query::service::list_running_queries(&self.state, &caller)
+            .await
+            .map_err(query_status)?;
+        let mut response =
+            Response::new(wyrd_spec::vala::api::ListRunningQueriesResponse { queries }.into());
+        insert_request_id(&mut response, &request_id);
+        Ok(response)
+    }
+
+    /// Gets one active query for the authenticated tenant.
+    async fn get_running_query(
+        &self,
+        request: Request<proto::GetRunningQueryRequest>,
+    ) -> Result<Response<proto::RunningQuerySummary>, Status> {
+        let caller = caller(self.state.clone(), request.metadata().clone()).await?;
+        let request_id = caller.request_id.clone();
+        let lookup = wyrd_spec::vala::api::GetRunningQueryRequest::try_from(request.into_inner())
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let summary =
+            crate::query::service::get_running_query(&self.state, &caller, lookup.request_id)
+                .await
+                .map_err(query_status)?;
+        let mut response = Response::new(summary.into());
+        insert_request_id(&mut response, &request_id);
+        Ok(response)
+    }
+
+    /// Requests idempotent cancellation for one active authenticated-tenant query.
+    async fn cancel_running_query(
+        &self,
+        request: Request<proto::CancelRunningQueryRequest>,
+    ) -> Result<Response<proto::CancelRunningQueryResponse>, Status> {
+        let caller = caller(self.state.clone(), request.metadata().clone()).await?;
+        let request_id = caller.request_id.clone();
+        let cancellation =
+            wyrd_spec::vala::api::CancelRunningQueryRequest::try_from(request.into_inner())
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let cancelled = crate::query::service::cancel_running_query(
+            &self.state,
+            &caller,
+            cancellation.request_id,
+        )
+        .await
+        .map_err(query_status)?;
+        let mut response = Response::new(cancelled.into());
+        insert_request_id(&mut response, &request_id);
+        Ok(response)
+    }
+}
+
+/// Echoes one verified public request identity on a unary gRPC response.
+fn insert_request_id<T>(response: &mut Response<T>, request_id: &wyrd_spec::request_id::RequestId) {
+    if let Ok(value) = request_id.as_str().parse() {
+        response.metadata_mut().insert("x-wyrd-request-id", value);
     }
 }
 
@@ -188,7 +256,74 @@ mod tests {
     use wyrd_tonic::tonic::Code;
     use wyrd_tonic::tonic_types::StatusExt as _;
 
-    use super::{proto, query_status, query_stream_response};
+    use super::{
+        BifrostQueryGrpc, BifrostQueryService, insert_request_id, proto, query_status,
+        query_stream_response,
+    };
+
+    /// Public gRPC lifecycle conversion preserves tenant opacity and idempotent cancellation.
+    #[test]
+    fn running_query_controls_are_tenant_scoped() {
+        /// Requires the production adapter to implement every generated public query RPC.
+        fn assert_public_adapter<T: BifrostQueryService>() {}
+
+        assert_public_adapter::<BifrostQueryGrpc>();
+        let owner = wyrd_spec::DataTenantId::new_v7();
+        let other = wyrd_spec::DataTenantId::new_v7();
+        let request_id = wyrd_spec::request_id::RequestId::now_v7();
+        let registry = vala_bifrost_redux::oracle::RunningQueryRegistry::new();
+        assert!(
+            registry.insert(crate::oracle::lifecycle_service::pg_tests::running_entry(
+                owner,
+                request_id.clone(),
+            ),)
+        );
+        assert!(registry.list(other).is_empty());
+        assert!(registry.cancel(other, &request_id).is_none());
+        assert!(
+            registry
+                .cancel(owner, &request_id)
+                .expect("owner cancels")
+                .cancellation_started
+        );
+        assert!(
+            !registry
+                .cancel(owner, &request_id)
+                .expect("idempotent cancel")
+                .cancellation_started
+        );
+        let summary = registry.list(owner).pop().expect("summary retained");
+        let wire = proto::RunningQuerySummary::from(summary.clone());
+        let decoded = wyrd_spec::vala::api::RunningQuerySummary::try_from(wire)
+            .expect("public summary round-trips");
+        assert_eq!(decoded.request_id, summary.request_id);
+        assert_eq!(decoded.query_class, summary.query_class);
+        assert_eq!(decoded.state, summary.state);
+        assert_eq!(decoded.progress, summary.progress);
+        assert_eq!(
+            decoded.cancellation_requested,
+            summary.cancellation_requested
+        );
+        assert_eq!(
+            decoded.started_at.timestamp_millis(),
+            summary.started_at.timestamp_millis()
+        );
+        assert_eq!(
+            decoded.deadline.timestamp_millis(),
+            summary.deadline.timestamp_millis()
+        );
+        let response_id = wyrd_spec::request_id::RequestId::now_v7();
+        let mut response = wyrd_tonic::tonic::Response::new(());
+        insert_request_id(&mut response, &response_id);
+        assert_eq!(
+            response.metadata().get("x-wyrd-request-id"),
+            Some(&response_id.as_str().parse().expect("request ID metadata"))
+        );
+        let absent =
+            query_status(wyrd_spec::vala::error::BifrostError::RunningQueryNotFound.into());
+        assert_eq!(absent.code(), Code::NotFound);
+        assert!(!absent.message().contains(request_id.as_str()));
+    }
 
     /// Builds the exact complete source set for a published-only terminal.
     fn complete_sources() -> Vec<SourceCompletion> {

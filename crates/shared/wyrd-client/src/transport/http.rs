@@ -30,6 +30,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::request_id::RequestId;
 
 use crate::auth::{AuthError, AuthMiddleware};
 use crate::error::{WyrdClientError, from_problem_json};
@@ -311,6 +312,46 @@ impl HttpTransport {
     where
         S: Serialize,
     {
+        let request_id = self.auth.request_id(None);
+        self.request_json_stream_inner(method, path, body, &request_id, false)
+            .await
+    }
+
+    /// Sends a streaming JSON request with one caller-owned request identity.
+    ///
+    /// The response remains unbuffered. Success is returned only when the
+    /// server echoes the exact UUIDv7 request ID in its response headers.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable transport or protocol error, including a missing or
+    /// mismatched response request ID.
+    pub async fn request_json_stream_with_id<S>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: &S,
+        request_id: &RequestId,
+    ) -> Result<reqwest::Response, WyrdError>
+    where
+        S: Serialize,
+    {
+        self.request_json_stream_inner(method, path, body, request_id.as_str(), true)
+            .await
+    }
+
+    /// Sends one streaming request and optionally enforces the caller-owned ID echo.
+    async fn request_json_stream_inner<S>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: &S,
+        request_id: &str,
+        verify_request_id: bool,
+    ) -> Result<reqwest::Response, WyrdError>
+    where
+        S: Serialize,
+    {
         let url = self.authenticated_url(path)?;
         let bearer = self.auth.bearer().await.map_err(auth_to_wyrd)?;
         let payload = serde_json::to_vec(body).map_err(|error| WyrdError::Internal {
@@ -324,7 +365,7 @@ impl HttpTransport {
                 HEADER_WYRD_ACCESS_TOKEN,
                 format!("Bearer {}", bearer.expose()),
             )
-            .header(HEADER_REQUEST_ID, self.auth.request_id(None))
+            .header(HEADER_REQUEST_ID, request_id)
             .header("content-type", "application/json")
             .header("accept", QUERY_STREAM_CONTENT_TYPE)
             .body(payload)
@@ -342,7 +383,15 @@ impl HttpTransport {
                 .and_then(|value| value.split(';').next())
                 .map(str::trim);
             if content_type == Some(QUERY_STREAM_CONTENT_TYPE) {
-                Ok(response)
+                let echoed = header_str(&response, HEADER_REQUEST_ID);
+                if !verify_request_id || echoed == Some(request_id) {
+                    Ok(response)
+                } else {
+                    Err(WyrdError::UpstreamFailure {
+                        message: "query response request identity did not match".to_owned(),
+                        details: serde_json::json!({"reason": "request_id_mismatch"}),
+                    })
+                }
             } else {
                 Err(WyrdError::UpstreamFailure {
                     message: "query response used an unsupported content type".to_owned(),

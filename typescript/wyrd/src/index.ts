@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import type {
   NativeBifrostQueryStream,
   NativeInsertResult,
+  NativeLifecycleResult,
   NativeQueryRequest,
   NativeQueryStep,
 } from "../index.cjs";
@@ -25,6 +26,44 @@ export interface BifrostQueryRequest {
 
 export interface BifrostInsertAck {
   readonly batchId: Uint8Array;
+}
+
+export interface RunningQueryProgress {
+  readonly completedParticipants: number;
+  readonly totalParticipants: number;
+}
+
+export interface RunningQuery {
+  readonly requestId: string;
+  readonly queryClass: "interactive" | "analytical";
+  readonly startedAt: string;
+  readonly deadline: string;
+  readonly state: "admitted" | "running" | "cancelling";
+  readonly progress: RunningQueryProgress;
+  readonly cancellationRequested: boolean;
+}
+
+export interface CancelRunningQueryResult {
+  readonly requestId: string;
+  readonly cancellationStarted: boolean;
+}
+
+interface RunningQueryWire {
+  readonly request_id: string;
+  readonly query_class: "interactive" | "analytical";
+  readonly started_at: string;
+  readonly deadline: string;
+  readonly state: "admitted" | "running" | "cancelling";
+  readonly progress: {
+    readonly completed_participants: number;
+    readonly total_participants: number;
+  };
+  readonly cancellation_requested: boolean;
+}
+
+interface CancelRunningQueryWire {
+  readonly request_id: string;
+  readonly cancellation_started: boolean;
 }
 
 export interface QueryTerminal {
@@ -123,6 +162,37 @@ function projectedError(metadata: NativeErrorMetadata): WyrdError | undefined {
   );
 }
 
+function lifecycleValue<T>(result: NativeLifecycleResult): T {
+  const error = projectedError(result);
+  if (error !== undefined) {
+    throw error;
+  }
+  if (result.valueJson === null || result.valueJson === undefined) {
+    throw new WyrdError(
+      "WYRD_VALA_502_QUERY_STREAM_PROTOCOL",
+      502,
+      "Query lifecycle protocol failed",
+      "native lifecycle control returned neither a value nor structured error",
+    );
+  }
+  return JSON.parse(result.valueJson) as T;
+}
+
+function runningQuery(wire: RunningQueryWire): RunningQuery {
+  return {
+    requestId: wire.request_id,
+    queryClass: wire.query_class,
+    startedAt: wire.started_at,
+    deadline: wire.deadline,
+    state: wire.state,
+    progress: {
+      completedParticipants: wire.progress.completed_participants,
+      totalParticipants: wire.progress.total_participants,
+    },
+    cancellationRequested: wire.cancellation_requested,
+  };
+}
+
 async function closeNative(native: NativeBifrostQueryStream): Promise<void> {
   try {
     await native.close();
@@ -144,6 +214,10 @@ export class BifrostQueryStream
 
   get terminal(): QueryTerminal | undefined {
     return this.#terminal;
+  }
+
+  get requestId(): string {
+    return this.#native.requestId;
   }
 
   [Symbol.asyncIterator](): AsyncIterableIterator<RecordBatch> {
@@ -243,6 +317,28 @@ export class BifrostClient {
       );
     }
     return new BifrostQueryStream(stream);
+  }
+
+  async running(): Promise<RunningQuery[]> {
+    return lifecycleValue<RunningQueryWire[]>(await this.#native.running()).map(
+      runningQuery,
+    );
+  }
+
+  async status(requestId: string): Promise<RunningQuery> {
+    return runningQuery(
+      lifecycleValue<RunningQueryWire>(await this.#native.status(requestId)),
+    );
+  }
+
+  async cancel(requestId: string): Promise<CancelRunningQueryResult> {
+    const wire = lifecycleValue<CancelRunningQueryWire>(
+      await this.#native.cancel(requestId),
+    );
+    return {
+      requestId: wire.request_id,
+      cancellationStarted: wire.cancellation_started,
+    };
   }
 
   async insertBatch(

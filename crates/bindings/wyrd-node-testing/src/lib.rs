@@ -215,8 +215,7 @@ async fn start_test_server_async() -> napi::Result<NativeWyrdTestServer> {
     let table_name = "typescript_oracle_query";
     server
         .state()
-        .bifrost_redux
-        .as_ref()
+        .bifrost_catalog()
         .ok_or_else(|| napi::Error::from_reason("Redux catalog is unavailable".to_owned()))?
         .create_table(CreateTableRequest {
             table: TableRef::new(BifrostNamespace::Bifrost, table_name),

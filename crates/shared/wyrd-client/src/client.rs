@@ -18,6 +18,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::request_id::RequestId;
 
 use crate::auth::AuthMiddleware;
 use crate::config::ClientConfig;
@@ -197,6 +198,26 @@ impl WyrdClient {
         S: Serialize,
     {
         self.http.request_json_stream(method, path, body).await
+    }
+
+    /// Sends a streaming JSON request with a caller-owned request ID and verifies its echo.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable request, authentication, transport, response, or ID-mismatch error.
+    pub async fn request_json_stream_with_id<S>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: &S,
+        request_id: &RequestId,
+    ) -> Result<reqwest::Response, WyrdError>
+    where
+        S: Serialize,
+    {
+        self.http
+            .request_json_stream_with_id(method, path, body, request_id)
+            .await
     }
 
     /// Return the shared [`AuthMiddleware`] handle.

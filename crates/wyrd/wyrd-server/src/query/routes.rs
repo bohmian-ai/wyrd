@@ -5,15 +5,19 @@
 use std::io;
 
 use axum::body::{Body, Bytes};
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use vala_bifrost_redux::oracle::OracleQueryStream;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::vala::api::BifrostQueryRequest;
+use wyrd_spec::request_id::RequestId;
+use wyrd_spec::vala::api::{
+    BifrostQueryRequest, CancelRunningQueryResponse, ListRunningQueriesResponse,
+    RunningQuerySummary,
+};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_tonic::frame_codec::FrameEncoder;
 
@@ -74,7 +78,80 @@ fn encode_query_frame(
 
 /// Standalone query router for the `/v1` group.
 pub fn router() -> Router<AppState> {
-    Router::new().route("/query", post(sync_query))
+    Router::new()
+        .route("/query", post(sync_query))
+        .route("/query/running", get(list_running_queries))
+        .route(
+            "/query/{request_id}",
+            get(get_running_query).delete(cancel_running_query),
+        )
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/query/running",
+    responses((status = 200, body = ListRunningQueriesResponse)),
+    tag = "Bifrost"
+)]
+/// Lists active queries for the authenticated tenant.
+pub(crate) async fn list_running_queries(
+    State(state): State<AppState>,
+    caller: Caller,
+) -> Result<Json<ListRunningQueriesResponse>, WyrdErrorResponse> {
+    service::list_running_queries(&state, &caller)
+        .await
+        .map(|queries| Json(ListRunningQueriesResponse { queries }))
+        .map_err(WyrdErrorResponse::from)
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/query/{request_id}",
+    params(("request_id" = String, Path, description = "Canonical query request ID")),
+    responses((status = 200, body = RunningQuerySummary), (status = 404, description = "No visible active query")),
+    tag = "Bifrost"
+)]
+/// Returns one active query for the authenticated tenant.
+pub(crate) async fn get_running_query(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path(request_id): Path<String>,
+) -> Result<Json<RunningQuerySummary>, WyrdErrorResponse> {
+    let request_id = RequestId::parse(&request_id).map_err(|error| {
+        WyrdErrorResponse::from(WyrdError::Validation {
+            message: "request_id is invalid".to_owned(),
+            details: serde_json::json!({"field": "request_id", "reason": error.to_string()}),
+        })
+    })?;
+    service::get_running_query(&state, &caller, request_id)
+        .await
+        .map(Json)
+        .map_err(WyrdErrorResponse::from)
+}
+
+#[utoipa::path(
+    delete,
+    path = "/v1/query/{request_id}",
+    params(("request_id" = String, Path, description = "Canonical query request ID")),
+    responses((status = 200, body = CancelRunningQueryResponse), (status = 404, description = "No visible active query")),
+    tag = "Bifrost"
+)]
+/// Requests idempotent cancellation for one active query in the authenticated tenant.
+pub(crate) async fn cancel_running_query(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path(request_id): Path<String>,
+) -> Result<Json<CancelRunningQueryResponse>, WyrdErrorResponse> {
+    let request_id = RequestId::parse(&request_id).map_err(|error| {
+        WyrdErrorResponse::from(WyrdError::Validation {
+            message: "request_id is invalid".to_owned(),
+            details: serde_json::json!({"field": "request_id", "reason": error.to_string()}),
+        })
+    })?;
+    service::cancel_running_query(&state, &caller, request_id)
+        .await
+        .map(Json)
+        .map_err(WyrdErrorResponse::from)
 }
 
 #[utoipa::path(
@@ -287,6 +364,54 @@ mod tests {
     use wyrd_tonic::frame_codec::FrameDecoder;
 
     use super::*;
+
+    /// HTTP lifecycle contracts expose only the owner tenant and idempotent cancellation.
+    #[test]
+    fn running_query_controls_are_tenant_scoped() {
+        let _router = router();
+        let owner = wyrd_spec::DataTenantId::new_v7();
+        let other = wyrd_spec::DataTenantId::new_v7();
+        let request_id = RequestId::now_v7();
+        let registry = vala_bifrost_redux::oracle::RunningQueryRegistry::new();
+        assert!(
+            registry.insert(crate::oracle::lifecycle_service::pg_tests::running_entry(
+                owner,
+                request_id.clone(),
+            ),)
+        );
+        assert_eq!(registry.list(owner).len(), 1);
+        assert!(registry.list(other).is_empty());
+        assert!(registry.cancel(other, &request_id).is_none());
+        let first = registry.cancel(owner, &request_id).expect("owner cancels");
+        let second = registry
+            .cancel(owner, &request_id)
+            .expect("owner cancellation is idempotent");
+        assert!(first.cancellation_started);
+        assert!(!second.cancellation_started);
+        let summary = registry.list(owner).pop().expect("summary retained");
+        let json = serde_json::to_value(summary).expect("summary serializes");
+        assert!(json.get("sql").is_none());
+        assert!(json.get("parameters").is_none());
+        assert!(json.get("results").is_none());
+        let response =
+            query_error_response(wyrd_spec::vala::error::BifrostError::RunningQueryNotFound.into());
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = wyrd_runtime::runtime().block_on(async {
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("not-found body")
+                .to_bytes()
+        });
+        let problem: serde_json::Value =
+            serde_json::from_slice(&body).expect("not-found problem JSON");
+        assert_eq!(
+            problem.get("code").and_then(serde_json::Value::as_str),
+            Some("WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND")
+        );
+        assert!(!String::from_utf8_lossy(&body).contains(request_id.as_str()));
+    }
 
     /// Proves both route configurations share one scrubbed failure boundary.
     #[tokio::test]

@@ -19,6 +19,8 @@ use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{HttpConfig, HttpTransport, ResolvedCredential};
 use wyrd_queue::QueueConfig;
+use wyrd_spec::error::WyrdError;
+use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
 use wyrd_utils::py::json_to_pyobject;
 
@@ -241,18 +243,80 @@ impl PyBifrostQueryClient {
         let stream = py
             .detach(|| wyrd_runtime::runtime().block_on(self.client.query(&request)))
             .map_err(query_error_to_py)?;
+        let request_id = stream.request_id().as_str().to_owned();
         Ok(PyBifrostQueryStream {
+            request_id,
             consumer: Mutex::new(()),
             stream: Mutex::new(Some(NativeStreamOwner::Production(Box::new(stream)))),
             poll_abort: Mutex::new(PollAbortState::new()),
             terminal_json: Mutex::new(None),
         })
     }
+
+    /// Lists active queries for this client's authenticated tenant.
+    ///
+    /// # Errors
+    ///
+    /// Raises a typed Bifrost query error for transport or server failures.
+    fn running(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let queries = py
+            .detach(|| wyrd_runtime::runtime().block_on(self.client.running()))
+            .map_err(query_error_to_py)?;
+        let value = serde_json::to_value(queries)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        json_to_pyobject(py, &value)
+    }
+
+    /// Gets one active query by its canonical request ID.
+    ///
+    /// # Errors
+    ///
+    /// Raises a typed Bifrost query error for malformed IDs, transport, or server failures.
+    fn status(&self, py: Python<'_>, request_id: &str) -> PyResult<Py<PyAny>> {
+        let request_id = parse_query_request_id(request_id).map_err(query_error_to_py)?;
+        let summary = py
+            .detach(|| wyrd_runtime::runtime().block_on(self.client.status(&request_id)))
+            .map_err(query_error_to_py)?;
+        let value = serde_json::to_value(summary)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        json_to_pyobject(py, &value)
+    }
+
+    /// Requests server-side cancellation without closing a local stream.
+    ///
+    /// # Errors
+    ///
+    /// Raises a typed Bifrost query error for malformed IDs, transport, or server failures.
+    fn cancel(&self, py: Python<'_>, request_id: &str) -> PyResult<Py<PyAny>> {
+        let request_id = parse_query_request_id(request_id).map_err(query_error_to_py)?;
+        let response = py
+            .detach(|| wyrd_runtime::runtime().block_on(self.client.cancel(&request_id)))
+            .map_err(query_error_to_py)?;
+        let value = serde_json::to_value(response)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        json_to_pyobject(py, &value)
+    }
+}
+
+/// Parses one lifecycle request identity into the canonical structured error boundary.
+///
+/// # Errors
+///
+/// Returns the stable Wyrd validation error when `value` is not a valid request ID.
+fn parse_query_request_id(value: &str) -> Result<RequestId, ValaSdkError> {
+    RequestId::parse(value).map_err(|error| {
+        ValaSdkError::Transport(WyrdError::Validation {
+            message: "request_id is invalid".to_owned(),
+            details: serde_json::json!({"field": "request_id", "reason": error.to_string()}),
+        })
+    })
 }
 
 /// Native terminal-validating stream used by Python's async iterator facade.
 #[pyclass(module = "wyrd._wyrd.bifrost", name = "_NativeBifrostQueryStream")]
 pub struct PyBifrostQueryStream {
+    /// Canonical request identity exposed before the first body poll.
+    request_id: String,
     /// Serializes consumers without blocking cancellation signalling.
     consumer: Mutex<()>,
     /// Rust stream removed on explicit close or after terminal completion.
@@ -326,6 +390,12 @@ enum NativePollOutcome {
 
 #[pymethods]
 impl PyBifrostQueryStream {
+    /// Returns the canonical server lifecycle request identity.
+    #[getter]
+    fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
     /// Returns the next Arrow IPC batch, or `None` after validated completion.
     ///
     /// The public Python wrapper converts the returned bytes into one public

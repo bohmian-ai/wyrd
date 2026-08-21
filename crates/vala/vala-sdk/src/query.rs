@@ -10,8 +10,10 @@ use arrow::record_batch::RecordBatch;
 use futures_util::{Stream, StreamExt};
 use wyrd_client::WyrdClient;
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    BifrostQueryRequest, QueryStreamFrame, QueryTerminalFrame, QueryTerminalOutcome,
+    BifrostQueryRequest, CancelRunningQueryResponse, ListRunningQueriesResponse, QueryStreamFrame,
+    QueryTerminalFrame, QueryTerminalOutcome, RunningQuerySummary,
 };
 use wyrd_tonic::frame_codec::FrameDecoder;
 use wyrd_tonic::query_conversion::QueryStreamConverter;
@@ -194,14 +196,66 @@ impl QueryClient {
         request
             .validate()
             .map_err(|error| ValaSdkError::Protocol(error.to_string()))?;
+        let request_id = RequestId::now_v7();
         let response = self
             .client
-            .request_json_stream(reqwest::Method::POST, "/v1/query", request)
+            .request_json_stream_with_id(reqwest::Method::POST, "/v1/query", request, &request_id)
             .await?;
-        Ok(QueryResultStream::new(RawQueryStream::new(
-            response.bytes_stream(),
-            request.visibility,
-        )))
+        Ok(QueryResultStream::new(
+            RawQueryStream::new(response.bytes_stream(), request.visibility),
+            request_id,
+        ))
+    }
+
+    /// Lists active queries visible to the authenticated tenant.
+    ///
+    /// # Errors
+    ///
+    /// Returns stable authentication, authorization, audit, availability, or protocol errors.
+    pub async fn running(&self) -> Result<Vec<RunningQuerySummary>, ValaSdkError> {
+        let response: ListRunningQueriesResponse = self
+            .client
+            .request_json::<(), _>(reqwest::Method::GET, "/v1/query/running", None)
+            .await?;
+        Ok(response.queries)
+    }
+
+    /// Gets one active query visible to the authenticated tenant.
+    ///
+    /// # Errors
+    ///
+    /// Returns stable authentication, authorization, not-found, availability, or protocol errors.
+    pub async fn status(
+        &self,
+        request_id: &RequestId,
+    ) -> Result<RunningQuerySummary, ValaSdkError> {
+        self.client
+            .request_json::<(), _>(
+                reqwest::Method::GET,
+                &format!("/v1/query/{request_id}"),
+                None,
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Requests server-side cancellation without closing a local response stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns stable authentication, authorization, not-found, availability, or protocol errors.
+    pub async fn cancel(
+        &self,
+        request_id: &RequestId,
+    ) -> Result<CancelRunningQueryResponse, ValaSdkError> {
+        self.client
+            .request_json::<(), _>(
+                reqwest::Method::DELETE,
+                &format!("/v1/query/{request_id}"),
+                None,
+            )
+            .await
+            .map_err(Into::into)
     }
 
     /// Collects a query while enforcing explicit row and encoded-byte limits.
@@ -369,6 +423,8 @@ fn query_body_transport_error(error: reqwest::Error) -> ValaSdkError {
 
 /// Arrow-projecting query stream that preserves terminal metadata.
 pub struct QueryResultStream {
+    /// Canonical server-visible request identity available before body polling.
+    request_id: RequestId,
     /// Validated logical-frame stream.
     raw: RawQueryStream,
     /// Schema established by the unique initial schema frame.
@@ -383,14 +439,21 @@ pub struct QueryResultStream {
 
 impl QueryResultStream {
     /// Constructs the Arrow projection over a raw protocol stream.
-    fn new(raw: RawQueryStream) -> Self {
+    fn new(raw: RawQueryStream, request_id: RequestId) -> Self {
         Self {
+            request_id,
             raw,
             schema: None,
             terminal: None,
             emitted_rows: 0,
             encoded_bytes: 0,
         }
+    }
+
+    /// Returns the canonical request identity used by server lifecycle controls.
+    #[must_use]
+    pub const fn request_id(&self) -> &RequestId {
+        &self.request_id
     }
 
     /// Decodes and returns the next Arrow batch, or `None` after valid completion.
@@ -834,7 +897,7 @@ mod tests {
     /// Builds a result stream over arbitrary already-encoded response chunks.
     fn result_stream(chunks: Vec<Vec<u8>>, visibility: VisibilityMode) -> QueryResultStream {
         let body = stream::iter(chunks.into_iter().map(|chunk| Ok(Bytes::from(chunk))));
-        QueryResultStream::new(RawQueryStream::new(body, visibility))
+        QueryResultStream::new(RawQueryStream::new(body, visibility), RequestId::now_v7())
     }
 
     /// The converter rejects a second schema before any terminal can be accepted.
@@ -1163,5 +1226,24 @@ mod tests {
         );
         drop(raw);
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    /// The Rust client exposes one request ID and canonical typed lifecycle methods.
+    #[test]
+    fn running_query_client_projects_canonical_contract() {
+        let request_id = RequestId::now_v7();
+        let body = stream::pending::<Result<Bytes, reqwest::Error>>();
+        let result = QueryResultStream::new(
+            RawQueryStream::new(body, VisibilityMode::PublishedOnly),
+            request_id.clone(),
+        );
+        assert_eq!(result.request_id(), &request_id);
+
+        let source = include_str!("query.rs");
+        assert!(source.contains("pub async fn running(&self)"));
+        assert!(source.contains("pub async fn status("));
+        assert!(source.contains("pub async fn cancel("));
+        assert!(source.contains("/v1/query/running"));
+        assert!(source.contains("/v1/query/{request_id}"));
     }
 }

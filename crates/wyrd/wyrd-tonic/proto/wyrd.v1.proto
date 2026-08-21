@@ -10,6 +10,9 @@ service BifrostIngestService {
 
 service BifrostQueryService {
   rpc Query(BifrostQueryRequest) returns (stream QueryStreamFrame);
+  rpc ListRunningQueries(ListRunningQueriesRequest) returns (ListRunningQueriesResponse);
+  rpc GetRunningQuery(GetRunningQueryRequest) returns (RunningQuerySummary);
+  rpc CancelRunningQuery(CancelRunningQueryRequest) returns (CancelRunningQueryResponse);
 }
 
 enum VisibilityMode { VISIBILITY_MODE_UNSPECIFIED = 0; VISIBILITY_MODE_PUBLISHED_ONLY = 1; VISIBILITY_MODE_FUSED = 2; }
@@ -51,6 +54,7 @@ message RunningQuerySummary {
   uint64 deadline_unix_ms = 4; RunningQueryLifecycleState state = 5;
   RunningQueryProgress progress = 6; bool cancellation_requested = 7;
 }
+message ListRunningQueriesRequest {}
 message ListRunningQueriesResponse { repeated RunningQuerySummary queries = 1; }
 message GetRunningQueryRequest { string request_id = 1; }
 message CancelRunningQueryRequest { string request_id = 1; }

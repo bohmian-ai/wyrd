@@ -191,6 +191,18 @@ fn bifrost_error_from_code(
                 .unwrap_or(message)
                 .to_owned(),
         },
+        "WYRD_VALA_503_ORACLE_ROLE_UNAVAILABLE" => BifrostError::OracleRoleUnavailable,
+        "WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND" => BifrostError::RunningQueryNotFound,
+        "WYRD_VALA_409_RUNNING_QUERY_CONFLICT" => BifrostError::RunningQueryConflict,
+        "WYRD_VALA_503_RUNNING_QUERY_CONTROL_UNAVAILABLE" => {
+            BifrostError::RunningQueryControlUnavailable
+        }
+        "WYRD_VALA_500_AUDIT_UNAVAILABLE" => BifrostError::AuditUnavailable {
+            detail: message
+                .strip_prefix("audit outbox unavailable: ")
+                .unwrap_or(message)
+                .to_owned(),
+        },
         "WYRD_VALA_429_QUERY_ADMISSION_REJECTED" => BifrostError::QueryAdmissionRejected,
         "WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE" => BifrostError::QueryMemoryRequestTooLarge,
         "WYRD_VALA_500_QUERY_EXECUTION_FAILED" => BifrostError::QueryExecutionFailed,
@@ -274,6 +286,7 @@ mod tests {
         );
     }
 
+    /// Bifrost-specific codes retain their typed status instead of becoming upstream failures.
     #[test]
     fn bifrost_grpc_codes_keep_their_wire_status() {
         let not_found = from_problem_json(&serde_json::json!({
@@ -321,6 +334,22 @@ mod tests {
             oversized.code(),
             "WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE"
         );
+
+        for (code, status) in [
+            ("WYRD_VALA_503_ORACLE_ROLE_UNAVAILABLE", 503),
+            ("WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND", 404),
+            ("WYRD_VALA_409_RUNNING_QUERY_CONFLICT", 409),
+            ("WYRD_VALA_503_RUNNING_QUERY_CONTROL_UNAVAILABLE", 503),
+            ("WYRD_VALA_500_AUDIT_UNAVAILABLE", 500),
+        ] {
+            let error = from_problem_json(&serde_json::json!({
+                "code": code,
+                "detail": "running query lifecycle result",
+                "details": {},
+            }));
+            assert_eq!(error.code(), code);
+            assert_eq!(error.status(), status);
+        }
     }
 
     /// Proves the stable `WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE` code

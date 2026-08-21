@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, TypedDict
 
 import pyarrow
 
@@ -84,13 +84,19 @@ class BifrostQueryStream(AsyncIterator[pyarrow.RecordBatch]):
             raise
 
     @property
+    def request_id(self) -> str:
+        """Return the server lifecycle request ID before stream completion."""
+
+        return self._native.request_id
+
+    @property
     def terminal(self) -> dict[str, Any] | None:
         """Return terminal metadata only after validated completion."""
 
         return self._terminal
 
     async def aclose(self) -> None:
-        """Cancel the query by dropping its Rust-owned HTTP response stream."""
+        """Abandon this local response stream without requesting server cancellation."""
 
         self._done = True
         await asyncio.to_thread(self._native.close)
@@ -122,11 +128,55 @@ class BifrostQueryClient:
         )
         return BifrostQueryStream(native_stream)
 
+    async def running(self) -> list[RunningQuery]:
+        """List active queries visible to the authenticated tenant."""
+
+        return await asyncio.to_thread(self._native.running)
+
+    async def status(self, request_id: str) -> RunningQuery:
+        """Return one active query by its canonical request ID."""
+
+        return await asyncio.to_thread(self._native.status, request_id)
+
+    async def cancel(self, request_id: str) -> CancelRunningQueryResult:
+        """Request server-side cancellation without closing a local stream."""
+
+        return await asyncio.to_thread(self._native.cancel, request_id)
+
+
+class RunningQueryProgress(TypedDict):
+    """Participant progress for one live Oracle query."""
+
+    completed_participants: int
+    total_participants: int
+
+
+class RunningQuery(TypedDict):
+    """Canonical live-query summary projected by Bifrost."""
+
+    request_id: str
+    query_class: str
+    started_at: str
+    deadline: str
+    state: str
+    progress: RunningQueryProgress
+    cancellation_requested: bool
+
+
+class CancelRunningQueryResult(TypedDict):
+    """Idempotent server-side cancellation acknowledgement."""
+
+    request_id: str
+    cancellation_started: bool
+
 
 __all__ = [
     "Bifrost",
     "BifrostQueryClient",
     "BifrostQueryError",
     "BifrostQueryStream",
+    "CancelRunningQueryResult",
     "IncompleteQueryStreamError",
+    "RunningQuery",
+    "RunningQueryProgress",
 ]

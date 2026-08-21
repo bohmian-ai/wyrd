@@ -9,6 +9,7 @@ import pyarrow
 import pytest
 from wyrd.bifrost import (
     BifrostQueryClient,
+    BifrostQueryError,
     BifrostQueryStream,
     IncompleteQueryStreamError,
 )
@@ -27,6 +28,7 @@ class _NativeStream:
         self._payloads = payloads
         self.terminal_json = json.dumps(terminal) if terminal is not None else None
         self.closed = False
+        self.request_id = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1bff"
 
     def next_ipc(self) -> bytes | None:
         return self._payloads.pop(0) if self._payloads else None
@@ -136,6 +138,64 @@ def test_bifrost_query_aclose_drops_native_stream() -> None:
 
     asyncio.run(close())
     assert native.closed
+
+
+def test_bifrost_query_request_id_and_lifecycle_controls_are_distinct_from_close() -> None:
+    calls: list[tuple[str, str | None]] = []
+    running = {
+        "request_id": "01890f28-7c4a-7cc3-98e7-4f4a3c2d1bff",
+        "query_class": "interactive",
+        "started_at": "2026-08-21T00:00:00Z",
+        "deadline": "2026-08-21T00:01:00Z",
+        "state": "running",
+        "progress": {"completed_participants": 0, "total_participants": 1},
+        "cancellation_requested": False,
+    }
+
+    class NativeClient:
+        def running(self) -> list[dict[str, object]]:
+            calls.append(("running", None))
+            return [running]
+
+        def status(self, request_id: str) -> dict[str, object]:
+            calls.append(("status", request_id))
+            return running
+
+        def cancel(self, request_id: str) -> dict[str, object]:
+            calls.append(("cancel", request_id))
+            return {"request_id": request_id, "cancellation_started": True}
+
+    client = object.__new__(BifrostQueryClient)
+    client._native = NativeClient()
+
+    async def controls() -> None:
+        request_id = running["request_id"]
+        assert await client.running() == [running]
+        assert await client.status(request_id) == running  # type: ignore[arg-type]
+        cancelled = await client.cancel(request_id)  # type: ignore[arg-type]
+        assert cancelled["cancellation_started"] is True
+        native_stream = _NativeStream([], None)
+        stream = BifrostQueryStream(native_stream)
+        assert stream.request_id == request_id
+        await stream.aclose()
+        assert native_stream.closed
+
+    asyncio.run(controls())
+    assert [call[0] for call in calls] == ["running", "status", "cancel"]
+    assert "without requesting server cancellation" in BifrostQueryStream.aclose.__doc__
+
+
+def test_bifrost_query_malformed_lifecycle_id_has_stable_error() -> None:
+    client = BifrostQueryClient("http://127.0.0.1:1", "test-token")
+
+    async def status() -> None:
+        with pytest.raises(BifrostQueryError) as captured:
+            await client.status("not-a-request-id")
+        assert captured.value.code == "WYRD_SPEC_400_VALIDATION"
+        assert captured.value.status == 400
+        assert captured.value.details["field"] == "request_id"
+
+    asyncio.run(status())
 
 
 def test_bifrost_query_decode_failure_closes_native_without_masking_error() -> None:

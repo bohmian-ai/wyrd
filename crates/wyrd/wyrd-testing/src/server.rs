@@ -2940,44 +2940,31 @@ impl WyrdTestServerBuilder {
                 BifrostRuntimeRole::Oracle => BifrostRole::Oracle,
             })
             .collect();
-        let spill_root = if !self.bifrost_roles.is_empty() {
-            Some(
-                self.oracle_spill_root.clone().unwrap_or(Arc::new(
-                    tempfile::tempdir()
-                        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
-                )),
-            )
-        } else {
-            self.oracle_spill_root.clone()
-        };
-        let scratch_root = spill_root
-            .as_ref()
-            .map_or_else(std::path::PathBuf::new, |root| root.path().to_owned());
-        let scribe_wal_root = if self.bifrost_roles.contains(&BifrostRuntimeRole::Scribe) {
-            Some(
-                self.scribe_wal_root.clone().unwrap_or(Arc::new(
-                    tempfile::tempdir()
-                        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
-                )),
-            )
-        } else {
-            self.scribe_wal_root.clone()
-        };
+        let spill_root = self.oracle_spill_root.clone().unwrap_or(Arc::new(
+            tempfile::tempdir().map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
+        ));
+        let scratch_root = spill_root.path().to_owned();
+        let wal_root = self.scribe_wal_root.clone().unwrap_or(Arc::new(
+            tempfile::tempdir().map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
+        ));
         let volume_roots = if self.bifrost_roles.is_empty() {
             None
         } else {
-            let wal_root = scribe_wal_root
-                .as_ref()
-                .map_or_else(|| scratch_root.join("wal"), |root| root.path().to_owned());
+            let wal_volume_root = wal_root.path().to_owned();
             let scribe_output = scratch_root.join("scribe-output");
             let forge_scratch = scratch_root.join("forge");
             let oracle_scratch = scratch_root.join("oracle");
-            for root in [&wal_root, &scribe_output, &forge_scratch, &oracle_scratch] {
+            for root in [
+                &wal_volume_root,
+                &scribe_output,
+                &forge_scratch,
+                &oracle_scratch,
+            ] {
                 std::fs::create_dir_all(root)
                     .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
             }
             Some(BifrostVolumeRoots {
-                wal: wal_root,
+                wal: wal_volume_root,
                 scribe_output_scratch: scribe_output,
                 forge_scratch,
                 oracle_scratch,
@@ -3016,12 +3003,6 @@ impl WyrdTestServerBuilder {
         } else {
             ClusterRegistry::new(postgres.vala().clone(), node_id)
         });
-        let wal_root = self.scribe_wal_root.clone().unwrap_or(Arc::new(
-            tempfile::tempdir().map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
-        ));
-        let spill_root = self.oracle_spill_root.clone().unwrap_or(Arc::new(
-            tempfile::tempdir().map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
-        ));
         let forge_config = self.forge_config.unwrap_or_else(|| ForgeConfig {
             max_files_per_bin: self.forge_max_files_per_bin,
             ..ForgeConfig::default()

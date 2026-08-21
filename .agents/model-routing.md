@@ -27,8 +27,8 @@ for execution. Do not upgrade a mechanical task merely because it is large.
 | Architecture and `wyrd-plan-v3` | `gpt-5.6-sol` | high |
 | `wyrd-plan-review-v3` | `gpt-5.6-sol` | high |
 | Evidence scout | `gpt-5.6-luna` | medium |
-| Standard `wyrd-implement-v3` task | `gpt-5.6-terra` | medium |
-| Mechanical `wyrd-implement-v3` task or concrete remediation | `gpt-5.6-luna` | low |
+| Standard `wyrd-implement-v3` task | `gpt-5.6-sol` | low |
+| Mechanical `wyrd-implement-v3` task or concrete remediation | `gpt-5.6-sol` | low |
 | `wyrd-implement-plan-v3` controller and normal integration | `gpt-5.6-terra` | medium |
 | Complex debugging or reconciliation escalation | `gpt-5.6-sol` | high |
 | `wyrd-review-v3` | `gpt-5.6-sol` | medium |

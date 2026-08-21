@@ -47,6 +47,36 @@ acceptance criteria, and remains solely responsible for the plan and packets.
 
 ## Write the plan
 
+### Canonical plan location is not controller state
+
+Write every authoritative planning artifact to the caller-supplied canonical
+plan directory. That directory is the single human-visible source of truth for
+the plan and must remain portable independently of any repository clone.
+
+Never write, repair, approve, or preserve authoritative plan artifacts under
+`.git`, a Git common directory, `<git-common-dir>/wyrd-v3`, an implementation
+controller request directory, a worktree's Git metadata, or another execution-
+state/cache location. This prohibition includes:
+
+- `intent.md`, `plan.md`, and `plan-review.yaml`;
+- every task packet and supplemental task authority;
+- consensus, parity-matrix, ledger-schema, or other plan-owned supporting
+  artifacts; and
+- repaired, rebound, or generation-suffixed copies of any of the above.
+
+Controller metadata may record the canonical artifacts' absolute paths and
+SHA-256 digests. It may not become their source of truth or hold a shadow plan
+whose bytes differ from the canonical directory. Execution snapshots, proof,
+candidate, review, lease, locator, and state records remain controller-owned;
+the plan itself does not.
+
+For a repair, edit the canonical plan directory in place, retain prior identity
+through version control or the planning workspace's own history, and review the
+exact canonical bytes. Do not create `bound-plan-*` directories under `.git` as
+a fallback. If the canonical plan directory is unknown, unavailable, or not
+writable, stop and request that location instead of writing the plan into
+controller state.
+
 Create one plan directory with:
 
 ```text
@@ -224,8 +254,9 @@ Before returning the plan, verify that:
 - no task leaves a material behavior or contract decision to its implementor.
 
 Before handoff, calculate SHA-256 digests for `intent.md`, `plan.md`, and every
-packet and request one independent `$wyrd-plan-review-v3` review of those exact
-working-tree bytes against the immutable source revision. Correct bounded
+packet in the canonical plan directory and request one independent
+`$wyrd-plan-review-v3` review of those exact canonical bytes against the
+immutable source revision. Correct bounded
 findings and rerun review after any plan or packet change. Write the final reviewer YAML unchanged
 to `plan-review.yaml`; it is the controller's approval input. Return unresolved
 material choices to the user rather than guessing. Do not create an execution
@@ -245,7 +276,10 @@ Accept either bounded repair bundle:
 For source drift, update `source_revision` and only the evidenced affected
 contracts, packets, dependency text, and verification. For task repair,
 revise only the named non-material packet fields and directly affected text.
-Preserve `intent.md` and all approved material decisions. Rerun
+Apply both repair modes directly to the caller-supplied canonical plan
+directory. Never stage repaired plan bytes in `.git`, `<git-common-dir>`, or a
+controller request directory. Preserve `intent.md` and all approved material
+decisions. Rerun
 `$wyrd-plan-review-v3`, replace `plan-review.yaml`, and return the old/new
 digests plus exact invalidation set. Invalidate unintegrated changed tasks and
 their dependents. Never relabel an integrated commit with new packet bytes;

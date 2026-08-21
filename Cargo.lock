@@ -10881,6 +10881,7 @@ dependencies = [
  "futures-util",
  "hex",
  "http-body-util",
+ "iceberg",
  "insta",
  "jsonwebtoken 9.3.1",
  "metrics",

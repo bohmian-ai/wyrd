@@ -1,7 +1,15 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use wyrd_testing::WyrdTestServer;
+use arrow::datatypes::{DataType, Field};
+use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
+use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_sdk::{CollectedQueryLimits, QueryClient};
+use wyrd_client::WyrdClient;
+use wyrd_client::config::ClientConfig;
+use wyrd_client::transport::{GrpcConfig, HttpConfig};
+use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
+use wyrd_testing::{Bootstrap, WyrdTestServer};
 
 fn e2e_enabled() -> bool {
     std::env::var("WYRD_AUTH_E2E").is_ok()
@@ -38,6 +46,83 @@ async fn server_bound_real_socket_serves_healthz() {
         .expect("request sent");
     assert_eq!(resp.status(), 200);
     srv.shutdown().await.expect("shutdown");
+}
+
+/// A bound server retains the exact volume roots used by Scribe and Oracle admission.
+///
+/// The first public native write forces Scribe to sample its WAL volume. The
+/// following public query forces Oracle to admit work against its scratch
+/// volume, proving both owners still reference live harness directories after
+/// startup completes.
+///
+/// # Panics
+///
+/// Panics when server startup, table creation, authentication, native ingest,
+/// Scribe publication, Oracle admission, or shutdown fails.
+#[tokio::test]
+async fn server_retains_bifrost_volume_roots_across_public_write_and_query() {
+    if !e2e_enabled() {
+        return;
+    }
+    let server = WyrdTestServer::start_bound()
+        .await
+        .expect("bound Bifrost server");
+    let table_name = "retained_volume_roots";
+    let table_fqn = format!("vala.bifrost.{table_name}");
+    server
+        .create_bifrost_table_for_test(CreateTableRequest {
+            table: TableRef::new(BifrostNamespace::Bifrost, table_name),
+            user_fields: vec![Field::new("value", DataType::Int64, false)],
+            tenant: server.data_tenant_id(),
+            audit: None,
+        })
+        .await
+        .expect("retained-root table");
+    server
+        .seed_bifrost_rows(&table_fqn, &[7])
+        .await
+        .expect("public Scribe write samples retained WAL root");
+
+    let bootstrap = server
+        .bootstrap_service("retained-root-reader", &["admin"])
+        .await
+        .expect("query reader bootstrap");
+    let api_key = match bootstrap {
+        Bootstrap::Machine { api_key, .. } => api_key,
+        Bootstrap::User { .. } => panic!("query reader bootstrap returned a user"),
+    };
+    let client = WyrdClient::with_config(ClientConfig {
+        grpc: GrpcConfig {
+            endpoint: server.grpc_url().expect("bound gRPC URL"),
+            connect_retries: 0,
+            ..GrpcConfig::default()
+        },
+        http: HttpConfig {
+            base_url: server.base_url().expect("bound HTTP URL").to_owned(),
+            ..HttpConfig::default()
+        },
+        api_key: Some(api_key),
+        ..ClientConfig::default()
+    })
+    .expect("query client");
+    let result = QueryClient::new(&client)
+        .collect_bounded(
+            &BifrostQueryRequest {
+                sql: format!("SELECT value FROM {table_fqn}"),
+                visibility: VisibilityMode::PublishedOnly,
+                freshness: FreshnessPolicy::Strict,
+                deadline_ms: None,
+            },
+            CollectedQueryLimits {
+                max_rows: 4,
+                max_encoded_bytes: 1024 * 1024,
+            },
+        )
+        .await
+        .expect("public Oracle query samples retained scratch root");
+    assert_eq!(result.rows, 1);
+    assert_eq!(result.terminal.row_count, 1);
+    server.shutdown().await.expect("retained-root shutdown");
 }
 
 /// A readiness failure tears down the real bound task before another process starts.

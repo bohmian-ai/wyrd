@@ -913,6 +913,12 @@ pub struct ForgeObjectStoreControl {
     output_put_release: tokio::sync::Notify,
     /// Counts every successful output PUT notification, armed or unarmed.
     output_put_calls: AtomicUsize,
+    /// Zero-based output ordinal observed since the selected-output fault was armed.
+    output_put_ordinal: AtomicUsize,
+    /// Zero-based output ordinal selected for the next one-shot failure.
+    fail_output_put_ordinal: AtomicUsize,
+    /// Whether the selected-output fault remains armed.
+    fail_output_put_armed: AtomicBool,
     /// Counts every wrapped object-store call made after fixture construction.
     object_io_calls: AtomicUsize,
     /// Retains the exact path observed by the most recent armed notification.
@@ -962,6 +968,9 @@ impl ForgeObjectStoreControl {
             output_put_ready: tokio::sync::Notify::new(),
             output_put_release: tokio::sync::Notify::new(),
             output_put_calls: AtomicUsize::new(0),
+            output_put_ordinal: AtomicUsize::new(0),
+            fail_output_put_ordinal: AtomicUsize::new(0),
+            fail_output_put_armed: AtomicBool::new(false),
             object_io_calls: AtomicUsize::new(0),
             last_output_path: Mutex::new(None),
             pause_next_list: AtomicBool::new(false),
@@ -1009,6 +1018,18 @@ impl ForgeObjectStoreControl {
     #[must_use]
     pub fn output_put_calls(&self) -> usize {
         self.output_put_calls.load(Ordering::Acquire)
+    }
+
+    /// Fail one zero-based output ordinal in the next production Forge attempt.
+    ///
+    /// The fault is consumed before the selected object upload begins, so the
+    /// attempt cannot transfer an incomplete multi-output evidence set into a
+    /// Prepared operation or catalog replacement.
+    pub fn fail_output_put_at_ordinal_for_test(&self, ordinal: usize) {
+        self.output_put_ordinal.store(0, Ordering::Release);
+        self.fail_output_put_ordinal
+            .store(ordinal, Ordering::Release);
+        self.fail_output_put_armed.store(true, Ordering::Release);
     }
 
     /// Return the number of wrapped object-store operations observed.
@@ -1117,6 +1138,29 @@ impl ForgeObjectStoreControl {
 
 #[async_trait]
 impl ForgeObjectStore for ForgeObjectStoreControl {
+    /// Reject the selected output ordinal before its real upload begins.
+    ///
+    /// # Errors
+    ///
+    /// Returns one injected object-store error when the armed ordinal reaches
+    /// the production upload boundary.
+    async fn before_output_put(&self, path: &str) -> opendal::Result<()> {
+        let observed = self.output_put_ordinal.fetch_add(1, Ordering::AcqRel);
+        if observed == self.fail_output_put_ordinal.load(Ordering::Acquire)
+            && self
+                .fail_output_put_armed
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            return Err(ObjectStoreError::new(
+                ObjectStoreErrorKind::Unexpected,
+                "test-injected Forge output verification failure",
+            )
+            .with_context("path", path));
+        }
+        Ok(())
+    }
+
     /// Observe a durable output and optionally pause the one armed call.
     ///
     /// The real write has already completed through the production staging

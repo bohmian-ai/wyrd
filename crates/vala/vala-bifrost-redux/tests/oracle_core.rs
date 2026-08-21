@@ -31,7 +31,6 @@ use vala_bifrost_redux::oracle::dispatcher::{
     LocalOraclePeerTransport, OraclePeerTransportDirectory, OraclePeerWorker, ReservationRegistry,
     TonicOraclePeerTransport,
 };
-use vala_bifrost_redux::oracle::executor::SealedFragmentExecutor;
 use vala_bifrost_redux::oracle::peer::{
     NoopPeerSecurityAudit, PeerSecurityError, PeerTicketClaims, PeerTicketVerifier,
     VerifiedClaimsBytes,
@@ -61,8 +60,9 @@ use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{
     AuditDecision, AuditDetail, AuditEvent, AuditResult, AuthMethod, BifrostQueryRequest,
-    FreshnessPolicy, OracleCapabilitiesV1, QueryAuditDigest, QueryClass, QueryExecutionMode,
-    QueryStreamFrame, QueryTerminalOutcome, ScribeCapabilitiesV1, VisibilityMode,
+    FreshnessPolicy, OracleAdmissionDemand, OracleCapabilitiesV1, QueryAuditDigest, QueryClass,
+    QueryExecutionMode, QueryStreamFrame, QueryTerminalOutcome, ScribeCapabilitiesV1,
+    VisibilityMode,
 };
 use wyrd_spec::vala::api::{NodeId as OracleNodeId, SignedPeerTicket};
 
@@ -436,6 +436,10 @@ impl OracleFixture {
     async fn new(table_name: &str) -> Self {
         let pg = PgFixture::start().await.expect("managed Postgres fixture");
         let tenant = pg.data_tenant_id();
+        vala_sql::queries::oracle_admission::OracleAdmissionBlocks::new(pg.operator_pool())
+            .ensure_canonical_policies(8, 4, 8, 4)
+            .await
+            .expect("canonical Oracle admission policies");
         let warehouse = tempfile::tempdir().expect("warehouse");
         let spill_root = tempfile::tempdir().expect("Oracle spill root");
         let storage = StorageHandle::from_settings(StorageSettings {
@@ -557,27 +561,27 @@ impl OracleFixture {
         audit: Arc<dyn OracleAudit>,
         config: OracleConfig,
     ) -> Oracle {
-        let table = self
-            .catalog
-            .iceberg_catalog()
-            .load_table(&self.binding.table_ident())
-            .await
-            .expect("pinned table for peer executor");
         let reservations = Arc::new(ReservationRegistry::new(
             Arc::new(OracleSlotManager::new(16, 16)),
             16,
         ));
         let worker_resources = composed_oracle_roles();
-        let worker = Arc::new(OraclePeerWorker::new_with_resources(
+        let worker = Arc::new(OraclePeerWorker::new_physical_with_resources(
             self.role.key.node_id,
             self.role.fencing_token,
             Arc::new(DeterministicTestVerifier),
             Arc::new(NoopPeerSecurityAudit),
             reservations,
-            SealedFragmentExecutor::new(table.file_io().clone()),
             worker_resources
                 .oracle()
                 .expect("production-shaped worker Oracle capability"),
+            Arc::new(
+                vala_bifrost_redux::oracle::follower::OracleCatalogResolver::new(Arc::clone(
+                    &self.catalog,
+                )),
+            ),
+            Arc::clone(&audit),
+            16,
         ));
         let transports = OraclePeerTransportDirectory::new(
             self.role.key.node_id,
@@ -2856,6 +2860,84 @@ async fn typed_fused_acquisition_failure_precedes_audit_and_read() {
         .await
         .expect_err("typed acquisition fails");
     assert_eq!(error, BifrostError::QueryVisibilityUnavailable);
+    assert_eq!(decisions.load(Ordering::SeqCst), 0);
+    assert_eq!(page_reads.load(Ordering::SeqCst), 0);
+    shutdown_oracle(&oracle).await;
+}
+
+/// Typed execution cannot begin while delegated analytical capacity is full.
+///
+/// # Panics
+///
+/// Panics when a typed plan reaches audit or provider reads before the
+/// background delegated-capacity gate grants one complete unit.
+#[tokio::test]
+async fn typed_plan_waits_for_delegated_admission_before_execution() {
+    let fixture = OracleFixture::new("oracle_typed_delegated_gate").await;
+    let blocks =
+        vala_sql::queries::oracle_admission::OracleAdmissionBlocks::new(fixture.pg.operator_pool());
+    let allocation = blocks
+        .allocate(
+            OracleAdmissionDemand {
+                tenant_id: fixture.tenant,
+                principal_id: PrincipalId::new(uuid::Uuid::now_v7()),
+                query_class: QueryClass::Analytical,
+                requested_units: 4,
+                holder_node_id: fixture.role.key.node_id,
+                holder_fencing_token: fixture.role.fencing_token,
+            },
+            chrono::Duration::seconds(10),
+        )
+        .await
+        .expect("analytical capacity allocation");
+    assert_eq!(allocation.rows.len(), 3);
+
+    let decisions = Arc::new(AtomicUsize::new(0));
+    let page_reads = Arc::new(AtomicUsize::new(0));
+    let tails = Arc::new(TailTransportDirectory::default());
+    let node_id = wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7());
+    tails.insert_live_stream(
+        fixture.table.fqn(),
+        node_id,
+        1,
+        wyrd_spec::vala::api::EventDay::new("1970-01-01").expect("wire day"),
+        Arc::new(FenceProbeTransport {
+            node_id,
+            fail_acquire: false,
+            fail_release: false,
+            releases: Arc::new(AtomicUsize::new(0)),
+            batches: Vec::new(),
+            page_reads: Arc::clone(&page_reads),
+        }),
+    );
+    let oracle = fixture
+        .oracle(
+            Arc::new(CountingAudit {
+                decisions: Arc::clone(&decisions),
+                fail: false,
+            }),
+            tails,
+            OracleConfig::default(),
+        )
+        .await;
+    let plan = oracle
+        .typed_dataframe(fixture.tenant, &fixture.table.fqn())
+        .await
+        .expect("typed dataframe")
+        .into_optimized_plan()
+        .expect("typed plan");
+    let error = oracle
+        .query_plan(
+            fixture.context(),
+            plan,
+            QueryOptions {
+                visibility: VisibilityMode::Fused,
+                deadline: Instant::now() + Duration::from_millis(100),
+            },
+        )
+        .await
+        .expect_err("full delegated capacity blocks typed execution");
+    assert_eq!(error, BifrostError::QueryTimeout);
     assert_eq!(decisions.load(Ordering::SeqCst), 0);
     assert_eq!(page_reads.load(Ordering::SeqCst), 0);
     shutdown_oracle(&oracle).await;

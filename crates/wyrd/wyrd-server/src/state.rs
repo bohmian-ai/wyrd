@@ -3,9 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-#[cfg(feature = "test-support")]
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use secrecy::SecretString;
@@ -460,6 +458,10 @@ pub struct Oracle {
     snapshot_poller: Arc<Mutex<Option<JoinHandle<()>>>>,
     /// Synchronously aborts the snapshot poller without acquiring its async owner lock.
     snapshot_poller_abort: AbortHandle,
+    /// Retains the delegated-continuity monitor until role shutdown.
+    continuity_monitor: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Synchronously aborts the continuity monitor after a shutdown deadline.
+    continuity_monitor_abort: AbortHandle,
     /// Readiness value preserved by heartbeats during transport drain.
     advertise_ready: Arc<AtomicBool>,
     /// Optional server-owned executor retained for Oracle coordination tasks.
@@ -487,18 +489,24 @@ impl Oracle {
     /// Cancels Oracle work and explicitly aborts retained role tasks without awaiting.
     ///
     /// Used only after the process deadline is exhausted. It closes role
-    /// activity synchronously, aborts the heartbeat and snapshot poller through
-    /// handles that do not require their async owner locks, starts no registry
-    /// operation, and leaves incomplete durable cleanup to existing recovery.
+    /// activity synchronously, aborts the heartbeat, snapshot poller, and
+    /// continuity monitor through handles that do not require their async owner
+    /// locks, starts no registry operation, and leaves incomplete durable cleanup
+    /// to existing recovery.
     pub(crate) fn abort_shutdown(&self) {
         self.lifecycle.begin_stopping();
         self.role_shutdown.cancel();
         self.heartbeat_abort.abort();
         self.snapshot_poller_abort.abort();
+        self.continuity_monitor_abort.abort();
         self.engine.begin_shutdown();
     }
-    /// Creates the retained query lifecycle after role registration succeeds.
-    #[must_use]
+    /// Creates the retained query lifecycle and its exact-fence continuity monitor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`wyrd_spec::vala::error::BifrostError`] when the engine's sole
+    /// delegated-continuity receiver was already transferred or is unavailable.
     pub fn new(
         engine: Arc<OracleEngine>,
         catalog: Arc<BifrostCatalog>,
@@ -510,8 +518,10 @@ impl Oracle {
         resources: OracleResources,
         peer: Arc<crate::oracle::OraclePeerRuntime>,
         role_shutdown: CancellationToken,
-    ) -> Self {
+    ) -> Result<Self, wyrd_spec::vala::error::BifrostError> {
+        let delegated_loss = engine.take_delegated_continuity_loss()?;
         let advertise_ready = Arc::new(AtomicBool::new(true));
+        let lifecycle = RoleLifecycle::serving();
         let heartbeat = Arc::clone(&cluster).start_readiness_heartbeat(
             registered_role.clone(),
             Arc::clone(&advertise_ready),
@@ -520,6 +530,16 @@ impl Oracle {
         let snapshot_poller = Arc::clone(&cluster).start_snapshot_poller(role_shutdown.clone());
         let heartbeat_abort = heartbeat.abort_handle();
         let snapshot_poller_abort = snapshot_poller.abort_handle();
+        let continuity_monitor = tokio::spawn(run_delegated_continuity_monitor(
+            delegated_loss,
+            Arc::clone(&engine),
+            Arc::clone(&cluster),
+            registered_role.clone(),
+            lifecycle.clone(),
+            Arc::clone(&advertise_ready),
+            role_shutdown.clone(),
+        ));
+        let continuity_monitor_abort = continuity_monitor.abort_handle();
         let running_queries = Arc::clone(engine.running_queries());
         let dispatcher = engine
             .fragment_dispatcher()
@@ -529,7 +549,7 @@ impl Oracle {
             Arc::clone(&lifecycle_transport),
             Arc::clone(&cluster),
         );
-        Self {
+        Ok(Self {
             engine,
             catalog,
             registered_role,
@@ -539,7 +559,9 @@ impl Oracle {
             heartbeat_abort,
             snapshot_poller: Arc::new(Mutex::new(Some(snapshot_poller))),
             snapshot_poller_abort,
-            lifecycle: RoleLifecycle::serving(),
+            continuity_monitor: Arc::new(Mutex::new(Some(continuity_monitor))),
+            continuity_monitor_abort,
+            lifecycle,
             advertise_ready,
             coordination_runtime,
             audit,
@@ -549,7 +571,7 @@ impl Oracle {
             peer,
             dispatcher,
             resources,
-        }
+        })
     }
 
     /// Borrows the Oracle-owned private peer service.
@@ -678,6 +700,12 @@ impl Oracle {
         self.role_shutdown.cancel();
         let report = self.engine.shutdown(deadline).await;
         let audit = self.audit.shutdown(deadline).await;
+        await_role_task(
+            &self.continuity_monitor,
+            deadline,
+            "oracle continuity monitor",
+        )
+        .await?;
         await_role_task(&self.heartbeat, deadline, "oracle heartbeat").await?;
         await_role_task(&self.snapshot_poller, deadline, "oracle snapshot poller").await?;
         if report.active_queries != 0
@@ -733,15 +761,92 @@ impl Oracle {
         self.coordination_runtime.is_some()
     }
 
-    /// Returns whether both retained Oracle role tasks have reached termination.
+    /// Returns whether all three retained Oracle role tasks have reached termination.
     #[cfg(all(test, feature = "test-support"))]
     #[must_use]
-    pub(crate) fn role_tasks_finished_for_test(&self) -> (bool, bool) {
+    pub(crate) fn role_tasks_finished_for_test(&self) -> (bool, bool, bool) {
         (
             self.heartbeat_abort.is_finished(),
             self.snapshot_poller_abort.is_finished(),
+            self.continuity_monitor_abort.is_finished(),
         )
     }
+}
+
+/// Consumes the sole delegated-admission continuity signal for one Oracle fence.
+///
+/// The local readiness bit and engine cancellation close synchronously before
+/// the exact durable role row is marked unready. Refreshing the local immutable
+/// snapshot then prevents both local Gate dispatch and remote forwarding from
+/// selecting the dead owner. Query streams observe engine cancellation and
+/// retain their existing terminal-settlement guards.
+async fn run_delegated_continuity_monitor(
+    mut losses: tokio::sync::mpsc::Receiver<wyrd_spec::vala::api::OracleAdmissionContinuityLost>,
+    engine: Arc<OracleEngine>,
+    cluster: Arc<ClusterRegistry>,
+    registered_role: RegisteredRole,
+    lifecycle: RoleLifecycle,
+    advertise_ready: Arc<AtomicBool>,
+    shutdown: CancellationToken,
+) {
+    let loss = tokio::select! {
+        () = shutdown.cancelled() => return,
+        loss = losses.recv() => loss,
+    };
+    let loss = loss.unwrap_or_else(|| {
+        tracing::error!("delegated Oracle continuity channel closed unexpectedly");
+        wyrd_spec::vala::api::OracleAdmissionContinuityLost {
+            holder_node_id: registered_role.key.node_id,
+            holder_fencing_token: registered_role.fencing_token,
+        }
+    });
+    let exact_signal = crate::oracle::close_local_delegated_continuity(
+        registered_role.key.node_id,
+        registered_role.fencing_token,
+        loss,
+        advertise_ready.as_ref(),
+        &shutdown,
+    );
+    lifecycle.begin_draining();
+    metrics::gauge!("bifrost_role_ready", "role" => "oracle").set(0.0);
+    engine.begin_shutdown();
+    if !exact_signal {
+        tracing::error!(
+            expected_node = ?registered_role.key.node_id,
+            expected_fence = registered_role.fencing_token,
+            actual_node = ?loss.holder_node_id,
+            actual_fence = loss.holder_fencing_token,
+            "delegated Oracle continuity signal did not match its retained fence; deactivating the retained exact role"
+        );
+    };
+    let deactivation =
+        crate::oracle::deactivate_delegated_continuity(&cluster, &registered_role).await;
+    let report = await_delegated_continuity_settlement(
+        deactivation,
+        engine.shutdown(Instant::now() + Duration::from_secs(5)),
+    )
+    .await;
+    if report.active_queries != 0 || report.queued_queries != 0 {
+        tracing::error!(
+            active_queries = report.active_queries,
+            queued_queries = report.queued_queries,
+            "Oracle continuity shutdown retained unsettled query admission"
+        );
+    }
+}
+
+/// Reports durable routing failure without skipping local query settlement.
+async fn await_delegated_continuity_settlement<F, T>(
+    deactivation: Result<(), vala_bifrost_redux::cluster::ClusterError>,
+    settlement: F,
+) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    if let Err(error) = deactivation {
+        tracing::error!(%error, "failed to deactivate Oracle after admission continuity loss");
+    }
+    settlement.await
 }
 
 impl Scribe {
@@ -2144,6 +2249,7 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::{AppState, LimitsConfig, ProductionValidationError};
 
@@ -2163,6 +2269,22 @@ mod tests {
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
     use crate::postgres::ServerPostgres;
+
+    /// Durable registry failure cannot skip local continuity settlement.
+    #[tokio::test]
+    async fn delegated_continuity_registry_failure_still_settles_local_work() {
+        let settled = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&settled);
+        super::await_delegated_continuity_settlement(
+            Err(vala_bifrost_redux::cluster::ClusterError::StaleFence),
+            async move {
+                observed.store(true, Ordering::Release);
+            },
+        )
+        .await;
+
+        assert!(settled.load(Ordering::Acquire));
+    }
 
     #[tokio::test]
     async fn defaults_for_test_safe() {

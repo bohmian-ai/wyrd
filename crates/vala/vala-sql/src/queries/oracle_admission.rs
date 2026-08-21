@@ -94,60 +94,19 @@ impl<'a> OracleAdmissionBlocks<'a> {
         Self { pool }
     }
 
-    /// Inserts one canonical ceiling or confirms the existing value is equal.
+    /// Initializes and validates the four canonical admission ceilings.
     ///
-    /// # Errors
-    ///
-    /// Returns [`SqlError`] when the configured capacity is zero, conflicts
-    /// with durable policy, or PostgreSQL cannot complete the transaction.
-    pub async fn ensure_policy(
-        &self,
-        tenant_id: Option<Uuid>,
-        query_class: QueryClass,
-        capacity: u32,
-    ) -> Result<(), SqlError> {
-        let capacity = i32::try_from(capacity).map_err(|_| invariant("capacity exceeds i32"))?;
-        if capacity == 0 {
-            return Err(invariant("Oracle admission capacity must be positive"));
-        }
-        let scope = if tenant_id.is_some() {
-            "tenant"
-        } else {
-            "global"
-        };
-        let row: i32 = sqlx::query_scalar(
-            "INSERT INTO vala.oracle_admission_policies(scope_kind,data_tenant_id,query_class,capacity) \
-             VALUES($1,$2,$3,$4) ON CONFLICT (scope_kind,data_tenant_id,query_class) \
-             DO UPDATE SET capacity=vala.oracle_admission_policies.capacity RETURNING capacity",
-        )
-        .bind(scope)
-        .bind(tenant_id)
-        .bind(class_name(query_class))
-        .bind(capacity)
-        .fetch_one(self.pool.pool())
-        .await
-        .map_err(SqlError::from)?;
-        if row != capacity {
-            return Err(invariant(
-                "Oracle admission policy conflicts with durable ceiling",
-            ));
-        }
-        Ok(())
-    }
-
-    /// Initializes and validates every startup policy in one transaction.
-    ///
-    /// Global class ceilings are installed once, while tenant class ceilings
-    /// are installed for every active tenant visible at the readiness boundary.
+    /// Startup writes one global and one tenant-default row per query class.
+    /// It never discovers tenants or creates tenant-specific configuration.
     /// Existing equal rows make repeated pod startup idempotent; any conflict
-    /// rolls back the complete startup set.
+    /// rolls back the complete canonical set.
     ///
     /// # Errors
     ///
     /// Returns [`SqlError`] when a capacity is invalid, an existing canonical
-    /// row conflicts, active tenants cannot be enumerated, or the transaction
-    /// cannot commit.
-    pub async fn ensure_startup_policies(
+    /// row conflicts, unexpected policy state exists, or the transaction cannot
+    /// commit.
+    pub async fn ensure_canonical_policies(
         &self,
         global_interactive: u32,
         global_analytical: u32,
@@ -155,31 +114,31 @@ impl<'a> OracleAdmissionBlocks<'a> {
         tenant_analytical: u32,
     ) -> Result<(), SqlError> {
         let capacities = [
-            (QueryClass::Interactive, global_interactive),
-            (QueryClass::Analytical, global_analytical),
+            ("global", QueryClass::Interactive, global_interactive),
+            ("global", QueryClass::Analytical, global_analytical),
+            (
+                "tenant_default",
+                QueryClass::Interactive,
+                tenant_interactive,
+            ),
+            ("tenant_default", QueryClass::Analytical, tenant_analytical),
         ];
-        let tenant_capacities = [
-            (QueryClass::Interactive, tenant_interactive),
-            (QueryClass::Analytical, tenant_analytical),
-        ];
-        for (_, capacity) in capacities.into_iter().chain(tenant_capacities) {
+        for (_, _, capacity) in capacities {
             validate_capacity(capacity)?;
         }
         let mut tx = self.pool.pool().begin().await.map_err(SqlError::from)?;
-        let tenants: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT data_tenant_id FROM platform.tenants \
-             WHERE status='active' AND deleted_at IS NULL ORDER BY data_tenant_id",
-        )
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(SqlError::from)?;
-        for (query_class, capacity) in capacities {
-            ensure_policy_in(&mut tx, None, query_class, capacity).await?;
+        for (scope, query_class, capacity) in capacities {
+            ensure_policy_in(&mut tx, scope, query_class, capacity).await?;
         }
-        for tenant_id in tenants {
-            for (query_class, capacity) in tenant_capacities {
-                ensure_policy_in(&mut tx, Some(tenant_id), query_class, capacity).await?;
-            }
+        let policy_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM vala.oracle_admission_policies")
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(SqlError::from)?;
+        if policy_count != 4 {
+            return Err(invariant(
+                "Oracle admission policy set contains non-canonical rows",
+            ));
         }
         tx.commit().await.map_err(SqlError::from)
     }
@@ -225,9 +184,11 @@ impl<'a> OracleAdmissionBlocks<'a> {
         if !holder_live {
             return Err(invariant("Oracle admission holder incarnation is not live"));
         }
-        let global = lock_policy(&mut tx, None, demand.query_class).await?;
-        let tenant =
-            lock_policy(&mut tx, Some(demand.tenant_id.into()), demand.query_class).await?;
+        let global = lock_policy(&mut tx, "global", demand.query_class).await?;
+        let tenant = lock_policy(&mut tx, "tenant_default", demand.query_class).await?;
+        if !lock_active_tenant(&mut tx, demand.tenant_id).await? {
+            return empty_allocation(tx).await;
+        }
         let global_used = live_units(&mut tx, "global", None, demand.query_class).await?;
         let tenant_used = live_units(
             &mut tx,
@@ -241,15 +202,7 @@ impl<'a> OracleAdmissionBlocks<'a> {
             .min(tenant - tenant_used)
             .max(0);
         if units == 0 {
-            let database_now = sqlx::query_scalar("SELECT statement_timestamp()")
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(SqlError::from)?;
-            tx.commit().await.map_err(SqlError::from)?;
-            return Ok(OracleAdmissionAllocation {
-                rows: Vec::new(),
-                database_now,
-            });
+            return empty_allocation(tx).await;
         }
         let allocation_id = Uuid::now_v7();
         let rows = sqlx::query_as::<_, OracleAdmissionTimedBlockRow>(
@@ -391,23 +344,17 @@ fn validate_capacity(capacity: u32) -> Result<i32, SqlError> {
 /// Returns [`SqlError`] when the row conflicts or PostgreSQL rejects the mutation.
 async fn ensure_policy_in(
     tx: &mut Transaction<'_, Postgres>,
-    tenant_id: Option<Uuid>,
+    scope: &'static str,
     query_class: QueryClass,
     capacity: u32,
 ) -> Result<(), SqlError> {
     let capacity = validate_capacity(capacity)?;
-    let scope = if tenant_id.is_some() {
-        "tenant"
-    } else {
-        "global"
-    };
     let row: i32 = sqlx::query_scalar(
         "INSERT INTO vala.oracle_admission_policies(scope_kind,data_tenant_id,query_class,capacity) \
-         VALUES($1,$2,$3,$4) ON CONFLICT (scope_kind,data_tenant_id,query_class) \
+         VALUES($1,NULL,$2,$3) ON CONFLICT (scope_kind,data_tenant_id,query_class) \
          DO UPDATE SET capacity=vala.oracle_admission_policies.capacity RETURNING capacity",
     )
     .bind(scope)
-    .bind(tenant_id)
     .bind(class_name(query_class))
     .bind(capacity)
     .fetch_one(&mut **tx)
@@ -428,20 +375,62 @@ async fn ensure_policy_in(
 /// Returns [`SqlError`] when the policy is missing or PostgreSQL cannot lock it.
 async fn lock_policy(
     tx: &mut Transaction<'_, Postgres>,
-    tenant_id: Option<Uuid>,
+    scope: &'static str,
     query_class: QueryClass,
 ) -> Result<i32, SqlError> {
     sqlx::query_scalar(
         "SELECT capacity FROM vala.oracle_admission_policies \
-         WHERE scope_kind=$1 AND data_tenant_id IS NOT DISTINCT FROM $2 AND query_class=$3 FOR UPDATE",
+         WHERE scope_kind=$1 AND data_tenant_id IS NULL AND query_class=$2 FOR UPDATE",
     )
-    .bind(if tenant_id.is_some() { "tenant" } else { "global" })
-    .bind(tenant_id)
+    .bind(scope)
     .bind(class_name(query_class))
     .fetch_optional(&mut **tx)
     .await
     .map_err(SqlError::from)?
     .ok_or_else(|| invariant("Oracle admission policy is not configured"))
+}
+
+/// Locks and validates the exact tenant carried by authenticated demand.
+///
+/// The row lock serializes allocation against concurrent suspension or deletion.
+/// A missing or inactive tenant is an ordinary fail-closed refusal and does not
+/// make canonical Oracle capacity unavailable to other tenants.
+///
+/// # Errors
+///
+/// Returns [`SqlError`] when PostgreSQL cannot inspect or lock the tenant row.
+async fn lock_active_tenant(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant_id: DataTenantId,
+) -> Result<bool, SqlError> {
+    let active: Option<bool> = sqlx::query_scalar(
+        "SELECT status='active' AND deleted_at IS NULL FROM platform.tenants \
+         WHERE data_tenant_id=$1 FOR UPDATE",
+    )
+    .bind(tenant_id.as_uuid())
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(SqlError::from)?;
+    Ok(active.unwrap_or(false))
+}
+
+/// Commits one authoritative capacity refusal at the database statement clock.
+///
+/// # Errors
+///
+/// Returns [`SqlError`] when PostgreSQL cannot read its clock or commit.
+async fn empty_allocation(
+    mut tx: Transaction<'_, Postgres>,
+) -> Result<OracleAdmissionAllocation, SqlError> {
+    let database_now = sqlx::query_scalar("SELECT statement_timestamp()")
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(SqlError::from)?;
+    tx.commit().await.map_err(SqlError::from)?;
+    Ok(OracleAdmissionAllocation {
+        rows: Vec::new(),
+        database_now,
+    })
 }
 
 /// Sums capacity that database time has not yet made reusable.

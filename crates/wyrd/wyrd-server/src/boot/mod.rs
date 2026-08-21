@@ -1653,26 +1653,21 @@ impl<'a> OracleRoleBuilder<'a> {
     }
 }
 
-/// Derives the closed Scribe follower capability already owned by application state.
-///
-/// # Errors
-///
 /// Initializes every canonical Oracle admission ceiling before role readiness.
 ///
-/// Repeated pods with equal locked ceilings are idempotent. A conflicting pod
-/// fails before reserving or advertising an Oracle role, so no worker can grant
-/// against an ambiguous durable policy.
+/// Repeated pods validate the same four global and tenant-default rows. Oracle
+/// startup never enumerates tenants or materializes tenant-specific defaults.
 ///
 /// # Errors
 ///
-/// Returns [`ServerBootError::OraclePeer`] when active tenants cannot be read,
-/// a durable policy conflicts, or PostgreSQL cannot commit initialization.
+/// Returns [`ServerBootError::OraclePeer`] when a durable policy conflicts,
+/// non-canonical policy state exists, or PostgreSQL cannot commit initialization.
 async fn ensure_oracle_admission_policies(
     operator_pool: &vala_sql::OperatorPool,
     config: OracleConfig,
 ) -> Result<(), ServerBootError> {
     vala_sql::queries::oracle_admission::OracleAdmissionBlocks::new(operator_pool)
-        .ensure_startup_policies(
+        .ensure_canonical_policies(
             config.interactive_slots,
             config.analytical_slots,
             config.tenant_interactive_slots,
@@ -1774,18 +1769,25 @@ impl BuiltOracleRole {
             ));
         }
         let lifecycle_transport = peer.lifecycle_transport();
-        let query_runtime = Arc::new(Oracle::new(
-            oracle,
+        let query_runtime = match Oracle::new(
+            Arc::clone(&oracle),
             catalog,
-            role,
-            cluster,
+            role.clone(),
+            Arc::clone(&cluster),
             None,
             audit,
             lifecycle_transport,
             resources,
             peer,
             shutdown,
-        ));
+        ) {
+            Ok(runtime) => Arc::new(runtime),
+            Err(error) => {
+                oracle.shutdown(std::time::Instant::now()).await;
+                release_failed_oracle_role(&cluster, &role, "lifecycle construction").await;
+                return Err(ServerBootError::OraclePeer(error.to_string()));
+            }
+        };
         Ok(query_runtime)
     }
 }

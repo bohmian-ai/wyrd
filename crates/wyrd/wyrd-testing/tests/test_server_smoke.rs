@@ -125,6 +125,104 @@ async fn server_retains_bifrost_volume_roots_across_public_write_and_query() {
     server.shutdown().await.expect("retained-root shutdown");
 }
 
+/// Tenants created after Oracle readiness write and query without role restart.
+///
+/// The journey provisions two tenants only after the bound server is serving,
+/// then drives each through public gRPC ingest and public HTTP query. The same
+/// logical table name resolves to tenant-qualified physical state, while the
+/// durable admission configuration remains the four canonical null-tenant rows.
+///
+/// # Panics
+///
+/// Panics when late tenant provisioning, public write/flush/query, tenant
+/// isolation, canonical policy inspection, or server shutdown fails.
+#[tokio::test]
+#[ignore = "PostgreSQL-backed public dynamic-tenant admission journey"]
+async fn pg_post_boot_tenants_use_dynamic_oracle_admission() {
+    let server = WyrdTestServer::start_bound()
+        .await
+        .expect("bound server reaches Oracle readiness");
+    let tenant_a = server
+        .seed_tenant("post-boot-oracle-a")
+        .await
+        .expect("first post-boot tenant");
+    let tenant_b = server
+        .seed_tenant("post-boot-oracle-b")
+        .await
+        .expect("second post-boot tenant");
+    let table_name = "post_boot_dynamic_admission";
+    let table_fqn = format!("vala.bifrost.{table_name}");
+    for tenant in [tenant_a, tenant_b] {
+        server
+            .create_bifrost_table_for_test(CreateTableRequest {
+                table: TableRef::new(BifrostNamespace::Bifrost, table_name),
+                user_fields: vec![Field::new("value", DataType::Int64, false)],
+                tenant,
+                audit: None,
+            })
+            .await
+            .expect("tenant-qualified table");
+    }
+    server
+        .seed_bifrost_rows_for_tenant(tenant_a, &table_fqn, &[11])
+        .await
+        .expect("first tenant public write and flush");
+    server
+        .seed_bifrost_rows_for_tenant(tenant_b, &table_fqn, &[22, 23])
+        .await
+        .expect("second tenant public write and flush");
+
+    for (tenant, expected_rows) in [(tenant_a, 1), (tenant_b, 2)] {
+        let bootstrap = server
+            .bootstrap_service_in_tenant(tenant, "post-boot-query-reader", &["admin"])
+            .await
+            .expect("post-boot query reader");
+        let api_key = match bootstrap {
+            Bootstrap::Machine { api_key, .. } => api_key,
+            Bootstrap::User { .. } => panic!("query reader bootstrap returned a user"),
+        };
+        let client = WyrdClient::with_config(ClientConfig {
+            grpc: GrpcConfig {
+                endpoint: server.grpc_url().expect("bound gRPC URL"),
+                connect_retries: 0,
+                ..GrpcConfig::default()
+            },
+            http: HttpConfig {
+                base_url: server.base_url().expect("bound HTTP URL").to_owned(),
+                ..HttpConfig::default()
+            },
+            api_key: Some(api_key),
+            ..ClientConfig::default()
+        })
+        .expect("tenant query client");
+        let result = QueryClient::new(&client)
+            .collect_bounded(
+                &BifrostQueryRequest {
+                    sql: format!("SELECT value FROM {table_fqn}"),
+                    visibility: VisibilityMode::PublishedOnly,
+                    freshness: FreshnessPolicy::Strict,
+                    deadline_ms: None,
+                },
+                CollectedQueryLimits {
+                    max_rows: 4,
+                    max_encoded_bytes: 1024 * 1024,
+                },
+            )
+            .await
+            .expect("post-boot public Oracle query");
+        assert_eq!(result.rows, expected_rows);
+        assert_eq!(result.terminal.row_count, expected_rows as u64);
+    }
+    let tenant_policy_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.oracle_admission_policies WHERE data_tenant_id IS NOT NULL",
+    )
+    .fetch_one(server.pg_fixture().operator_pool().pool())
+    .await
+    .expect("tenant policy inspection");
+    assert_eq!(tenant_policy_rows, 0);
+    server.shutdown().await.expect("post-boot journey shutdown");
+}
+
 /// A readiness failure tears down the real bound task before another process starts.
 ///
 /// # Panics

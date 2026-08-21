@@ -2293,6 +2293,42 @@ impl Oracle {
         deadline: Instant,
         attempt_id: QueryId,
     ) -> Result<AdmittedQueryGuard, BifrostError> {
+        let delegated = self
+            .acquire_delegated_admission(context, query_class, deadline)
+            .await?;
+        let mut admitted = self
+            .admission
+            .admit_for_attempt(
+                admission::PreparedAdmission {
+                    tenant: context.data_tenant_id,
+                    query_class,
+                    local_ratio,
+                    deadline,
+                    cancellation: self.shutdown.child_token(),
+                },
+                attempt_id,
+            )
+            .await?;
+        admitted.retain_delegated_grant(delegated);
+        Ok(admitted)
+    }
+
+    /// Acquires one dynamic-tenant delegated unit before local query admission.
+    ///
+    /// Both generic SQL and typed analytical plans use this exact background-
+    /// backed gate, preserving admission-before-execution without giving either
+    /// request path a `PostgreSQL` capability.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable timeout, capacity rejection, or Oracle-unavailable
+    /// error when delegated admission cannot issue a complete unit.
+    async fn acquire_delegated_admission(
+        &self,
+        context: &AuthorizedQueryContext,
+        query_class: QueryClass,
+        deadline: Instant,
+    ) -> Result<DelegatedOracleAdmissionGrant, BifrostError> {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .ok_or(BifrostError::QueryTimeout)?;
@@ -2315,21 +2351,7 @@ impl Oracle {
                 BifrostError::OracleRoleUnavailable
             }
         })?;
-        let mut admitted = self
-            .admission
-            .admit_for_attempt(
-                admission::PreparedAdmission {
-                    tenant: context.data_tenant_id,
-                    query_class,
-                    local_ratio,
-                    deadline,
-                    cancellation: self.shutdown.child_token(),
-                },
-                attempt_id,
-            )
-            .await?;
-        admitted.retain_delegated_grant(delegated);
-        Ok(admitted)
+        Ok(delegated)
     }
 
     /// Delegates one SQL metadata attempt to the planner owner.
@@ -2536,7 +2558,10 @@ impl Oracle {
             query_class: class,
             predicted_scan_seconds: 0.0,
         });
-        let admitted = self
+        let delegated = self
+            .acquire_delegated_admission(&context, class, options.deadline)
+            .await?;
+        let mut admitted = self
             .admission
             .admit(admission::PreparedAdmission {
                 tenant: context.data_tenant_id,
@@ -2546,6 +2571,7 @@ impl Oracle {
                 cancellation: self.shutdown.child_token(),
             })
             .await?;
+        admitted.retain_delegated_grant(delegated);
         self.execute_typed_plan(&context, plan, options, class, query_telemetry, admitted)
             .await
     }

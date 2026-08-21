@@ -66,7 +66,7 @@ async fn register_oracle(fixture: &PgFixture, node_id: NodeId) -> u64 {
     registered.lease.fencing_token
 }
 
-/// Canonical insertion is idempotent and conflicting pod configuration fails.
+/// Canonical insertion creates four rows and conflicting pod configuration fails.
 ///
 /// # Panics
 ///
@@ -74,81 +74,88 @@ async fn register_oracle(fixture: &PgFixture, node_id: NodeId) -> u64 {
 #[tokio::test]
 async fn canonical_policy_is_idempotent_and_conflict_fails() {
     let fixture = PgFixture::start().await.expect("fixture starts");
-    let tenant = DataTenantId::new_v7();
-    fixture
-        .seed_additional_tenant_with_uuid(
-            tenant,
-            &format!("admission-{}", tenant.as_uuid().simple()),
-        )
-        .await
-        .expect("tenant seeds");
     let blocks = OracleAdmissionBlocks::new(fixture.operator_pool());
     blocks
-        .ensure_policy(None, QueryClass::Interactive, 4)
+        .ensure_canonical_policies(4, 2, 3, 1)
         .await
-        .expect("global policy");
+        .expect("canonical policies");
     blocks
-        .ensure_policy(None, QueryClass::Interactive, 4)
+        .ensure_canonical_policies(4, 2, 3, 1)
         .await
-        .expect("idempotent global policy");
-    blocks
-        .ensure_policy(Some(tenant.into()), QueryClass::Interactive, 2)
-        .await
-        .expect("tenant policy");
+        .expect("idempotent canonical policies");
+    let policies: Vec<(String, Option<uuid::Uuid>, String, i32)> = sqlx::query_as(
+        "SELECT scope_kind,data_tenant_id,query_class,capacity \
+         FROM vala.oracle_admission_policies ORDER BY scope_kind,query_class",
+    )
+    .fetch_all(fixture.operator_pool().pool())
+    .await
+    .expect("canonical policy rows");
+    assert_eq!(policies.len(), 4);
     assert!(
-        blocks
-            .ensure_policy(Some(tenant.into()), QueryClass::Interactive, 3)
-            .await
-            .is_err()
+        policies
+            .iter()
+            .all(|(_, tenant_id, _, _)| tenant_id.is_none())
     );
+    assert_eq!(
+        policies
+            .iter()
+            .filter(|(scope, _, _, _)| scope == "global")
+            .count(),
+        2
+    );
+    assert_eq!(
+        policies
+            .iter()
+            .filter(|(scope, _, _, _)| scope == "tenant_default")
+            .count(),
+        2
+    );
+    assert!(blocks.ensure_canonical_policies(5, 2, 3, 1).await.is_err());
 }
 
-/// Production startup initializes every active tenant atomically and idempotently.
+/// Production startup is independent of the current and future tenant inventory.
 ///
 /// # Panics
 ///
 /// Panics when startup policy initialization, inspection, or conflict rollback fails.
 #[tokio::test]
-async fn startup_policies_cover_active_tenants_and_reject_conflict() {
+async fn startup_policies_never_materialize_tenants() {
     let fixture = PgFixture::start().await.expect("fixture starts");
-    let second = fixture
+    fixture
         .seed_additional_tenant("startup-second")
         .await
         .expect("second tenant seeds");
     let blocks = OracleAdmissionBlocks::new(fixture.operator_pool());
     blocks
-        .ensure_startup_policies(4, 2, 3, 1)
+        .ensure_canonical_policies(4, 2, 3, 1)
         .await
         .expect("first startup initializes policies");
+    fixture
+        .seed_additional_tenant("startup-late")
+        .await
+        .expect("late tenant seeds");
     blocks
-        .ensure_startup_policies(4, 2, 3, 1)
+        .ensure_canonical_policies(4, 2, 3, 1)
         .await
         .expect("repeated startup is idempotent");
-    let active_tenants: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM platform.tenants WHERE status='active' AND deleted_at IS NULL",
-    )
-    .fetch_one(fixture.operator_pool().pool())
-    .await
-    .expect("active tenants count");
     let tenant_policies: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.oracle_admission_policies WHERE scope_kind='tenant'",
+        "SELECT count(*) FROM vala.oracle_admission_policies WHERE data_tenant_id IS NOT NULL",
     )
     .fetch_one(fixture.operator_pool().pool())
     .await
     .expect("tenant policy count");
-    assert_eq!(tenant_policies, active_tenants * 2);
+    assert_eq!(tenant_policies, 0);
     assert!(
-        blocks.ensure_startup_policies(5, 2, 3, 1).await.is_err(),
+        blocks.ensure_canonical_policies(5, 2, 3, 1).await.is_err(),
         "conflicting startup must fail readiness initialization"
     );
     let retained: i32 = sqlx::query_scalar(
         "SELECT capacity FROM vala.oracle_admission_policies \
-         WHERE scope_kind='tenant' AND data_tenant_id=$1 AND query_class='interactive'",
+         WHERE scope_kind='tenant_default' AND query_class='interactive'",
     )
-    .bind(second.as_uuid())
     .fetch_one(fixture.operator_pool().pool())
     .await
-    .expect("second tenant policy remains canonical");
+    .expect("tenant default remains canonical");
     assert_eq!(retained, 3);
 }
 
@@ -167,13 +174,9 @@ async fn allocations_bind_three_scopes_and_respect_ceiling() {
         .expect("tenant seeds");
     let blocks = OracleAdmissionBlocks::new(fixture.operator_pool());
     blocks
-        .ensure_policy(None, QueryClass::Interactive, 2)
+        .ensure_canonical_policies(2, 1, 2, 1)
         .await
-        .expect("global policy");
-    blocks
-        .ensure_policy(Some(tenant.into()), QueryClass::Interactive, 2)
-        .await
-        .expect("tenant policy");
+        .expect("canonical policies");
     assert_ne!(tenant, DataTenantId::SYSTEM_OWNER);
     let first_node = NodeId::new(uuid::Uuid::from_u128(1));
     let second_node = NodeId::new(uuid::Uuid::from_u128(2));
@@ -208,6 +211,191 @@ async fn allocations_bind_three_scopes_and_respect_ceiling() {
     assert!(first.rows.is_empty() || second.rows.is_empty());
 }
 
+/// Late tenants share the default ceiling while retaining exact usage isolation.
+///
+/// # Panics
+///
+/// Panics when a tenant created after policy initialization cannot allocate or
+/// one tenant consumes another tenant's default capacity.
+#[tokio::test]
+async fn late_tenants_use_dynamic_default_with_isolated_usage() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let blocks = OracleAdmissionBlocks::new(fixture.operator_pool());
+    blocks
+        .ensure_canonical_policies(6, 1, 2, 1)
+        .await
+        .expect("canonical policies");
+    let tenant_a = fixture
+        .seed_additional_tenant("late-admission-a")
+        .await
+        .expect("first late tenant seeds");
+    let tenant_b = fixture
+        .seed_additional_tenant("late-admission-b")
+        .await
+        .expect("second late tenant seeds");
+    let node_id = NodeId::new(uuid::Uuid::from_u128(21));
+    let fence = register_oracle(&fixture, node_id).await;
+    let demand = |tenant_id| OracleAdmissionDemand {
+        tenant_id,
+        principal_id: PrincipalId::new(uuid::Uuid::now_v7()),
+        query_class: QueryClass::Interactive,
+        requested_units: 2,
+        holder_node_id: node_id,
+        holder_fencing_token: fence,
+    };
+    let first = blocks
+        .allocate(demand(tenant_a), Duration::seconds(10))
+        .await
+        .expect("first tenant allocates");
+    let second = blocks
+        .allocate(demand(tenant_b), Duration::seconds(10))
+        .await
+        .expect("second tenant allocates");
+    let saturated = blocks
+        .allocate(demand(tenant_a), Duration::seconds(10))
+        .await
+        .expect("first tenant saturation evaluates");
+    assert_eq!(first.rows.len(), 3);
+    assert_eq!(second.rows.len(), 3);
+    assert!(saturated.rows.is_empty());
+    let tenant_policies: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.oracle_admission_policies WHERE data_tenant_id IS NOT NULL",
+    )
+    .fetch_one(fixture.operator_pool().pool())
+    .await
+    .expect("tenant policy count");
+    assert_eq!(tenant_policies, 0);
+}
+
+/// Inactive, deleted, and unknown tenants receive no delegated allocation.
+///
+/// # Panics
+///
+/// Panics when tenant validation fails open or leaves block residue.
+#[tokio::test]
+async fn inactive_deleted_and_unknown_tenants_receive_no_allocation() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let blocks = OracleAdmissionBlocks::new(fixture.operator_pool());
+    blocks
+        .ensure_canonical_policies(3, 1, 1, 1)
+        .await
+        .expect("canonical policies");
+    let suspended = fixture
+        .seed_additional_tenant("admission-suspended")
+        .await
+        .expect("suspended tenant seeds");
+    let deleted = fixture
+        .seed_additional_tenant("admission-deleted")
+        .await
+        .expect("deleted tenant seeds");
+    sqlx::query("UPDATE platform.tenants SET status='suspended' WHERE data_tenant_id=$1")
+        .bind(suspended.as_uuid())
+        .execute(fixture.operator_pool().pool())
+        .await
+        .expect("tenant suspends");
+    sqlx::query(
+        "UPDATE platform.tenants SET status='deleted',deleted_at=statement_timestamp() \
+         WHERE data_tenant_id=$1",
+    )
+    .bind(deleted.as_uuid())
+    .execute(fixture.operator_pool().pool())
+    .await
+    .expect("tenant deletes");
+    let node_id = NodeId::new(uuid::Uuid::from_u128(22));
+    let fence = register_oracle(&fixture, node_id).await;
+    for tenant_id in [suspended, deleted, DataTenantId::new_v7()] {
+        let allocation = blocks
+            .allocate(
+                OracleAdmissionDemand {
+                    tenant_id,
+                    principal_id: PrincipalId::new(uuid::Uuid::now_v7()),
+                    query_class: QueryClass::Interactive,
+                    requested_units: 1,
+                    holder_node_id: node_id,
+                    holder_fencing_token: fence,
+                },
+                Duration::seconds(10),
+            )
+            .await
+            .expect("inactive allocation evaluates");
+        assert!(allocation.rows.is_empty());
+    }
+    let blocks_count: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.oracle_admission_blocks")
+        .fetch_one(fixture.operator_pool().pool())
+        .await
+        .expect("block count");
+    assert_eq!(blocks_count, 0);
+}
+
+/// Allocation serializes with a concurrent tenant suspension and fails closed.
+///
+/// # Panics
+///
+/// Panics when allocation bypasses the tenant row lock or persists capacity
+/// after the concurrent lifecycle transition commits.
+#[tokio::test]
+async fn allocation_racing_tenant_suspension_fails_closed() {
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let blocks = OracleAdmissionBlocks::new(fixture.operator_pool());
+    blocks
+        .ensure_canonical_policies(1, 1, 1, 1)
+        .await
+        .expect("canonical policies");
+    let tenant = fixture
+        .seed_additional_tenant("admission-racing")
+        .await
+        .expect("racing tenant seeds");
+    let node_id = NodeId::new(uuid::Uuid::from_u128(23));
+    let fence = register_oracle(&fixture, node_id).await;
+    let mut lifecycle = fixture
+        .operator_pool()
+        .pool()
+        .begin()
+        .await
+        .expect("lifecycle transaction begins");
+    sqlx::query("SELECT 1 FROM platform.tenants WHERE data_tenant_id=$1 FOR UPDATE")
+        .bind(tenant.as_uuid())
+        .fetch_one(&mut *lifecycle)
+        .await
+        .expect("tenant lifecycle lock");
+    let operator_pool = fixture.operator_pool().clone();
+    let mut allocation = tokio::spawn(async move {
+        OracleAdmissionBlocks::new(&operator_pool)
+            .allocate(
+                OracleAdmissionDemand {
+                    tenant_id: tenant,
+                    principal_id: PrincipalId::new(uuid::Uuid::now_v7()),
+                    query_class: QueryClass::Interactive,
+                    requested_units: 1,
+                    holder_node_id: node_id,
+                    holder_fencing_token: fence,
+                },
+                Duration::seconds(10),
+            )
+            .await
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut allocation)
+            .await
+            .is_err(),
+        "allocation must wait for the tenant lifecycle lock"
+    );
+    sqlx::query(
+        "UPDATE platform.tenants SET status='suspended',updated_at=statement_timestamp() \
+         WHERE data_tenant_id=$1",
+    )
+    .bind(tenant.as_uuid())
+    .execute(&mut *lifecycle)
+    .await
+    .expect("tenant suspends");
+    lifecycle.commit().await.expect("suspension commits");
+    let allocation = allocation
+        .await
+        .expect("allocation task joins")
+        .expect("allocation evaluates");
+    assert!(allocation.rows.is_empty());
+}
+
 /// Expired capacity remains fenced while its system role is live, then reuses.
 ///
 /// # Panics
@@ -224,13 +412,9 @@ async fn reuse_requires_expiry_and_non_live_system_owner_incarnation() {
     assert_ne!(tenant, DataTenantId::SYSTEM_OWNER);
     let blocks = OracleAdmissionBlocks::new(fixture.operator_pool());
     blocks
-        .ensure_policy(None, QueryClass::Interactive, 1)
+        .ensure_canonical_policies(1, 1, 1, 1)
         .await
-        .expect("global policy");
-    blocks
-        .ensure_policy(Some(tenant.into()), QueryClass::Interactive, 1)
-        .await
-        .expect("tenant policy");
+        .expect("canonical policies");
     let predecessor = NodeId::new(uuid::Uuid::from_u128(11));
     let contender = NodeId::new(uuid::Uuid::from_u128(12));
     let predecessor_fence = register_oracle(&fixture, predecessor).await;
@@ -292,13 +476,9 @@ async fn renewal_advances_authoritative_expiry_and_refuses_late_rows() {
     let tenant = fixture.data_tenant_id();
     let blocks = OracleAdmissionBlocks::new(fixture.operator_pool());
     blocks
-        .ensure_policy(None, QueryClass::Interactive, 1)
+        .ensure_canonical_policies(1, 1, 1, 1)
         .await
-        .expect("global policy");
-    blocks
-        .ensure_policy(Some(tenant.into()), QueryClass::Interactive, 1)
-        .await
-        .expect("tenant policy");
+        .expect("canonical policies");
     let node_id = NodeId::new(uuid::Uuid::from_u128(7));
     assert_ne!(tenant, DataTenantId::SYSTEM_OWNER);
     let fence = register_oracle(&fixture, node_id).await;

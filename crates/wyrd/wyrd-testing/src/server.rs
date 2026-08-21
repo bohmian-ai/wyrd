@@ -731,8 +731,29 @@ impl WyrdTestServer {
         table: &str,
         rows: &[i64],
     ) -> Result<Vec<i64>, WyrdTestServerError> {
+        self.seed_bifrost_rows_for_tenant(self.data_tenant_id(), table, rows)
+            .await
+    }
+
+    /// Seed deterministic rows through public ingest for one explicit tenant.
+    ///
+    /// This helper creates the writer after the server is already ready, then
+    /// uses the normal API-key exchange, public gRPC ingest, and tenant-bound
+    /// Scribe flush paths. It is the production-shaped late-tenant write seam.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when tenant-scoped credential creation, Arrow IPC
+    /// encoding, public ingest, or the tenant-bound durable flush fails.
+    pub async fn seed_bifrost_rows_for_tenant(
+        &self,
+        tenant_id: DataTenantId,
+        table: &str,
+        rows: &[i64],
+    ) -> Result<Vec<i64>, WyrdTestServerError> {
         let bootstrap = self
-            .bootstrap_service(
+            .bootstrap_service_in_tenant(
+                tenant_id,
                 &format!("bifrost-seed-{}", Uuid::now_v7().simple()),
                 &["admin"],
             )
@@ -783,7 +804,7 @@ impl WyrdTestServer {
             .insert_batch(table, Uuid::now_v7().into_bytes(), ipc)
             .await
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        self.flush_bifrost().await?;
+        self.flush_bifrost_for_tenant(tenant_id).await?;
         Ok(rows.to_vec())
     }
 

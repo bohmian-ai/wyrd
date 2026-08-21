@@ -1117,6 +1117,77 @@ mod tests {
         second.abort();
     }
 
+    /// Dynamic tenant demand reaches only the background allocator channel.
+    ///
+    /// # Panics
+    ///
+    /// Panics when cached-only acquisition loses tenant identity, merges two
+    /// tenants, or grants capacity before background allocation installs it.
+    #[tokio::test]
+    async fn background_allocator_uses_dynamic_tenant_default_without_request_sql() {
+        let (owner, mut demand_rx, _) = owner();
+        let principal_id = PrincipalId::new(uuid::Uuid::now_v7());
+        let first_request = DelegatedAdmissionRequest {
+            tenant_id: DataTenantId::new_v7(),
+            principal_id,
+            query_class: QueryClass::Interactive,
+        };
+        let second_request = DelegatedAdmissionRequest {
+            tenant_id: DataTenantId::new_v7(),
+            principal_id,
+            query_class: QueryClass::Interactive,
+        };
+        let first_owner = Arc::clone(&owner);
+        let first = tokio::spawn(async move { first_owner.acquire(first_request).await });
+        let second_owner = Arc::clone(&owner);
+        let second = tokio::spawn(async move { second_owner.acquire(second_request).await });
+        tokio::task::yield_now().await;
+        let demands = [
+            demand_rx.try_recv().expect("first tenant demand"),
+            demand_rx.try_recv().expect("second tenant demand"),
+        ];
+        assert!(
+            demands
+                .iter()
+                .any(|demand| demand.tenant_id == first_request.tenant_id)
+        );
+        assert!(
+            demands
+                .iter()
+                .any(|demand| demand.tenant_id == second_request.tenant_id)
+        );
+        assert!(demand_rx.try_recv().is_err());
+        assert!(!first.is_finished());
+        assert!(!second.is_finished());
+        for (request, demand) in [first_request, second_request].into_iter().map(|request| {
+            let demand = demands
+                .iter()
+                .copied()
+                .find(|demand| demand.tenant_id == request.tenant_id)
+                .expect("tenant demand is present");
+            (request, demand)
+        }) {
+            assert!(
+                owner
+                    .begin_queued_allocation(demand)
+                    .expect("background worker claims demand")
+            );
+            install_test_block(&owner, request, demand, 1);
+        }
+        drop(
+            first
+                .await
+                .expect("first request joins")
+                .expect("first grant"),
+        );
+        drop(
+            second
+                .await
+                .expect("second request joins")
+                .expect("second grant"),
+        );
+    }
+
     /// Empty allocation stays coalesced until a cadence retry returns capacity.
     ///
     /// # Panics

@@ -3,12 +3,12 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-/// One canonical global or tenant query-class ceiling.
+/// One canonical global or tenant-default query-class ceiling.
 #[derive(Debug, Clone, sqlx::FromRow, PartialEq, Eq)]
 pub struct OracleAdmissionPolicyRow {
     /// Durable scope discriminator.
     pub scope_kind: String,
-    /// Tenant identity for tenant scope.
+    /// Reserved null identity shared by both canonical scopes.
     pub data_tenant_id: Option<Uuid>,
     /// Durable query-class discriminator.
     pub query_class: String,

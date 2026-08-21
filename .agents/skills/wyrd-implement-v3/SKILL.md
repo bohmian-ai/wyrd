@@ -16,7 +16,7 @@ spawn children, or mutate controller state.
 Accept `request_id`, repository root, immutable task-packet path and digest,
 `parent_sha`, dedicated clean `worktree_path`, controller generation, and an
 optional remediation binding. The packet is immutable authority for task ID,
-dependencies, forecast `write_set`, hard `prohibited_writes`, execution tier,
+dependencies, forecast `write_set`, explicit non-goals, execution tier,
 acceptance criteria, and complete verification.
 
 A remediation binding contains the prior review artifact path/digest,
@@ -28,9 +28,10 @@ authorize a new material decision.
 Read `AGENTS.md`, `architecture/agent-rules.md`, the complete packet, and
 applicable design/doctrine authorities. Inspect named paths, consumers, tests,
 manifests, and `mise` tasks. Use CodeGraph only when indexed at `parent_sha`.
-`write_set` is a forecast; `prohibited_writes` is the hard path boundary.
-Change task-local supporting files when source, consumers, or diagnostics make
-them necessary. Do not alter plans/packets, merge, rebase, cherry-pick,
+`write_set` is a coordination forecast, not an allowlist. Change supporting
+owners, consumers, generated artifacts, fixtures, and tests when implementation
+or diagnostics make them necessary, and record material forecast expansions.
+Do not alter plans/packets, merge, rebase, cherry-pick,
 integrate, push, or perform unrelated cleanup.
 
 ## Implement and fully verify
@@ -44,8 +45,7 @@ Compiler, formatter, lint, test, fixture, codegen, and setup failures are
 ordinary feedback. Fix all explained task-local failures, including necessary
 callers, declarations, generated output, fixtures, rustdoc, and lint cleanup.
 Completion closure does not permit a new material behavior, owner, dependency,
-public/durable contract, acceptance outcome, unrelated formatting, or
-prohibited write.
+public/durable contract, acceptance outcome, or unrelated formatting.
 
 Run fast diagnostics when useful, then the packet's complete required
 verification. The implementer—not the controller—owns this full edit -> verify
@@ -60,8 +60,8 @@ verification plus finding-specific checks. Every replacement receives fresh
 independent review.
 
 Return `BLOCKED` only after focused investigation for a material decision,
-unavailable authority, indeterminate acceptance outcome, necessary prohibited
-write, or mandatory proof that cannot safely run. Ordinary failures, supporting
+unavailable authority, indeterminate acceptance outcome, or mandatory proof
+that cannot safely run. Ordinary failures, supporting
 files, and implementation choices are not blockers.
 
 ## Compact proof
@@ -91,8 +91,8 @@ the worktree clean. Never alter the reported commit.
 
 Return one compact candidate manifest containing protocol/outcome, request,
 task ID and packet digest, generation, parent/candidate SHAs, binary diff
-digest, `sole_parent: true`, superseded SHA, sorted changed paths,
-`prohibited_writes: PASS`, forecast expansions with evidence refs, proof
+digest, `sole_parent: true`, superseded SHA, sorted changed paths, forecast
+expansions with evidence refs, proof
 artifact ref/digest/result, remediation binding, and:
 
 ```yaml

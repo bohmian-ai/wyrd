@@ -28,8 +28,9 @@ design/doctrine authorities. Use CodeGraph only when indexed at the candidate;
 otherwise use `git show` or a detached read-only worktree.
 
 Verify candidate existence and sole parent, diff/manifest/proof digests,
-supersession lineage, actual paths, forecast expansions, and prohibited writes.
-An allowed path outside `write_set` is not itself a defect.
+supersession lineage, actual paths, and forecast expansions. A path outside
+`write_set` is not itself a defect; judge it against task intent, ownership,
+non-goals, and acceptance criteria.
 
 Validate every required command's ID, cwd, timeout, timestamps, exit status,
 result, output ref/digest, and claimed ACs. Read only relevant log sections and
@@ -105,7 +106,7 @@ fresh independent review.
 ## Output
 
 Return one compact artifact containing reviewed task/generation and immutable
-tuple/digests, `sole_parent`, verdict, identity/prohibited-write status, proof
+tuple/digests, `sole_parent`, verdict, identity/path-reconciliation status, proof
 audit, targeted-rerun refs, static limits, companion-review refs, and each AC
 exactly once:
 
@@ -127,7 +128,7 @@ affected AC IDs, exact source location and authority, reachable scenario,
 evidence refs, observable consequence, expected behavior, owners, observable
 acceptance assertions, and required verification command IDs/assertion IDs.
 
-`APPROVE` requires valid identity, no prohibited writes, adequate passing
+`APPROVE` requires valid identity, reconciled actual paths, adequate passing
 proof, every AC satisfied, a completed code-review record with a surviving
 adversarial probe or declared static limit, and no findings. Never repeat packet AC prose,
 commands, implementation evidence, nested evidence, or logs.

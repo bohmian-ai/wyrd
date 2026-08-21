@@ -55,8 +55,8 @@ read-only worktree.
 
 Verify that every intent outcome has an owned task; material contracts have
 one producer and named consumers; and dependencies represent actual committed
-contract/behavior needs. Reconstruct the DAG from `depends_on`, write sets,
-prohibited writes, shared test/generated/migration surfaces, and cross-task
+contract/behavior needs. Reconstruct the DAG from `depends_on`, write-set
+forecasts, shared test/generated/migration surfaces, and cross-task
 contracts. Require full decomposition of outcomes, owners, producer/consumer
 obligations, actual dependencies, acceptance criteria, and proof without
 requiring one packet per repository owner. A task must have one primary outcome

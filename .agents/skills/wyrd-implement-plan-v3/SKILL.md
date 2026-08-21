@@ -58,7 +58,7 @@ evidence. Terminal review references task candidate/proof/review identities.
 
 Preserve safety-critical identity: request/task/generation; applicable packet,
 plan, and intent digests; original parent; candidate/target SHA; binary diff
-digest and sole-parent assertion; prohibited-write result; supersession;
+digest and sole-parent assertion; supersession;
 review verdict/findings; leases/process ownership; complete compact command
 metadata; and one-to-one AC/row traceability.
 
@@ -85,21 +85,22 @@ integration cost. Throttle for concrete path collision, imminent invalidation,
 review/integration backlog, or observed host/cache pressure. Do not use fixed
 waves or wait for unrelated batching.
 
-Forecast paths are coordination hints; prohibited paths are hard boundaries.
-Reconcile actual changes after implementation. Ordinary consumer closure,
-generated artifacts, conflicts, and mechanical repairs need no user approval.
+Forecast paths are coordination hints, never hard allowlists. Reconcile actual
+changes against task intent, ownership, non-goals, and acceptance criteria.
+Ordinary cross-owner consumer closure, generated artifacts, conflicts, and
+mechanical repairs need no user approval.
 
 ## Candidate lifecycle
 
 1. Give `$wyrd-implement-v3` the packet, original parent, clean worktree,
-   generation, prohibited scope, and any unchanged reviewer remediation
+   generation, scope/non-goals, and any unchanged reviewer remediation
    contract. The implementer gathers context, edits code/tests, runs every
    required command, fixes failures, and returns an immutable candidate only
    with compact `PASS` proof.
 2. The controller validates packet binding, candidate existence, sole parent,
-   diff digest, clean worktree, prohibited writes, proof artifact identity, and
-   ref anchoring. It does not rerun the full task suite or treat coordination as
-   acceptance.
+   diff digest, clean worktree, actual-path reconciliation, proof artifact
+   identity, and ref anchoring. It does not rerun the full task suite or treat
+   coordination as acceptance.
 3. Preflight each candidate packet and actual diff for high-risk review
    boundaries. For auth, tenancy, audit, scopes, public errors, SQL/storage,
    migrations, recovery, destructive writes, async lifecycle, cancellation,

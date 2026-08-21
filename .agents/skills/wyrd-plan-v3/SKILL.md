@@ -163,15 +163,16 @@ every possible touched file or incidental repair before implementation.
 Each `tasks/<NN>-<slug>.md` packet must contain these sections:
 
 1. **Task contract** — a YAML block containing `id`, `depends_on`, `write_set`,
-   `prohibited_writes`, `execution_tier`, `acceptance_criteria`, and
+   `execution_tier`, `acceptance_criteria`, and
    `verification`. This is the machine-readable coordination contract; the prose below explains
    it. Use repository-relative paths, stable `AC<N>` IDs, and the narrowest
    exact `mise` command.
 2. **Outcome** — the observable result and user/operator value.
 3. **Context** — current source behavior and the repository evidence that
    determines the change.
-4. **Scope** — expected paths/symbols, explicit non-goals, and prohibited
-   changes. `write_set` is the best coordination forecast, not an allowlist.
+4. **Scope** — expected paths/symbols and explicit non-goals. `write_set` is the
+   best coordination forecast, not an allowlist; ordinary cross-owner closure
+   is recorded and reviewed rather than blocked by path.
 5. **Design** — owned types, contracts, state/IO boundaries, error behavior,
    and the nearest repository-native precedent. Name exact paths and symbols;
    include signatures only where a new or changed cross-owner API needs one.

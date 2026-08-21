@@ -15,14 +15,33 @@ specialist discovery, explicit coverage, adversarial probes, root source
 validation, a durable candidate ledger, and one authoritative consolidated
 review. Apply Wyrd authorities and the v3 remediation lifecycle described here.
 
+Set `REVIEW_ROOT` to this skill's `references/review-core` directory. Before
+acting, read these ported full-review contracts completely and follow them:
+
+1. `${REVIEW_ROOT}/artifact-contract.md`
+2. `${REVIEW_ROOT}/orchestration-contract.md`
+3. `${REVIEW_ROOT}/packet.md`
+4. `${REVIEW_ROOT}/specialist-contract.md`
+5. `${REVIEW_ROOT}/evidence-contract.md`
+6. `${REVIEW_ROOT}/adversarial-contract.md`
+7. `${REVIEW_ROOT}/runner-contract.md`
+8. `${REVIEW_ROOT}/pipeline.md`
+
+The ported contracts are authoritative for review mechanics and artifact
+schemas. This entrypoint supplies Wyrd v3 identity, lifecycle, and remediation
+routing. If prose here appears to conflict with a ported contract, follow the
+more specific v3 rule and report the inconsistency rather than improvising.
+
 Remain read-only. Never modify production source, review a working tree, or run
 project tests, builds, formatters, linters, generators, migrations, servers, or
 repository gates. Integrated verification belongs to the v3 controller and
 task candidates. State in every report:
 `Static analysis: no runtime verification performed.`
 
-Use `.agents/model-routing.md`. Never invoke v1 or v2 implementation, review,
-or planning workflows.
+Use `.agents/model-routing.md`: the terminal root is Sol medium, every baseline
+and triggered specialist is Terra high, and the final independent adjudicator
+is Sol high. Sol high is reserved for adjudication. Never invoke v1 or v2
+implementation, review, or planning workflows.
 
 ## Required input
 
@@ -90,7 +109,8 @@ prose, or nested traces into terminal artifacts.
 
 ## Dispatch the full review roster
 
-Dispatch seven independent baseline specialists, each with a distinct reviewer
+Dispatch seven independent baseline specialists through the external Codex
+runner in `${REVIEW_ROOT}/runner-contract.md`. Each has a distinct reviewer
 identity and one primary domain:
 
 1. `correctness` — behavior, lifecycle, performance, state transitions,
@@ -110,6 +130,19 @@ identity and one primary domain:
    public contracts, async/PyO3 boundaries, deployment topology, and contract
    projection parity.
 
+Each assignment must read `${REVIEW_ROOT}/specialist-contract.md`,
+`${REVIEW_ROOT}/adversarial-contract.md`, and its exact prompt:
+
+- `correctness`: `review-bugs/review-bugs.md`
+- `security`: `review-security/review-security.md`
+- `code-quality`: `review-code-quality/review-code-quality.md`
+- `maintainability`: `review-maintainability/review-maintainability.md`
+- `tests`: `review-tests/review-tests.md`
+- `developer-experience`:
+  `review-developer-experience/review-developer-experience.md`
+- `architecture-contracts`:
+  `review-architecture-contracts/review-architecture-contracts.md`
+
 Add separate triggered specialists for every applicable domain:
 
 - persistence, SQL, storage, migrations, durability, replay, or idempotency;
@@ -119,6 +152,14 @@ Add separate triggered specialists for every applicable domain:
 - Wyrd UI or browser-visible behavior;
 - another repository specialist required by the impact graph or plan.
 
+Use the corresponding ported prompts for triggered assignments:
+
+- `review-persistence-storage/review-persistence-storage.md`
+- `review-async-reliability/review-async-reliability.md`
+- `review-pyo3-cross-language/review-pyo3-cross-language.md`
+- `review-vala-data-plane/review-vala-data-plane.md`
+- `review-wyrd-ui/review-wyrd-ui.md`
+
 Triggered assignments add coverage; they never replace a baseline assignment.
 Auth, tenancy, destructive persistence, migrations, concurrency, recovery, and
 public wire contracts require two distinct reviewers. A changed user-facing
@@ -126,12 +167,14 @@ capability must be covered by the tests/user-journey specialist.
 
 If required capability or reviewer independence is unavailable, persist the
 coverage gap and return `REVIEW_BLOCKED`. Never combine or omit a baseline role
-to fit capacity; dispatch in waves when needed.
+to fit capacity. When external sessions are unavailable, use the collaboration
+fallback and dispatch in waves.
 
 Every specialist receives the same immutable review tuple and only its scoped
-impact slice. Specialists remain read-only, write one evidence report, return
-namespaced candidate IDs, and do not assign final IDs, plan, remediate, launch
-other reviewers, or communicate with the user.
+impact slice. Specialists remain read-only and return a schema-constrained
+report to the runner, which validates identity and publishes the evidence
+atomically. Specialists do not assign final IDs, plan, remediate, launch other
+reviewers, or communicate with the user.
 
 Each specialist report records assignment identity, inspected and sampled
 coverage, applicable requirements and task criteria, at least one material
@@ -216,9 +259,15 @@ Use exactly one terminal verdict:
 files, requirements, high-risk boundaries, user-facing capabilities, and any
 gaps. `ledger.json` records every candidate and its final disposition.
 `validation.md` records the root source-validation decision for every
-candidate. Validate the artifact structure with the global full-review
-artifact and evidence validators when they are available; these are the only
-commands this static-review skill may run.
+candidate. The root may perform only immutable Git-object inspection,
+`run_specialists.py`, and the ported artifact validators. It must not run
+project tests, builds, formatters, linters, generators, migrations, servers,
+or arbitrary shell workflows. Validate the artifact structure with:
+
+```bash
+python "${REVIEW_ROOT}/scripts/validate_review.py" "${REVIEW_DIR}/review.md"
+python "${REVIEW_ROOT}/scripts/validate_evidence.py" "${REVIEW_DIR}"
+```
 
 ## V3 remediation routing
 

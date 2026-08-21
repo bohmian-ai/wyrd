@@ -24,16 +24,17 @@ for execution. Do not upgrade a mechanical task merely because it is large.
 
 | Role | Model | Reasoning |
 |---|---|---|
-| Architecture and `wyrd-plan-v3` | `gpt-5.6-sol` | high |
-| `wyrd-plan-review-v3` | `gpt-5.6-sol` | high |
-| Evidence scout | `gpt-5.6-luna` | medium |
+| Architecture and `wyrd-plan-v3` | `gpt-5.6-sol` | medium |
+| `wyrd-plan-review-v3` | `gpt-5.6-sol` | medium |
+| Evidence scout | `gpt-5.6-sol` | low |
 | Standard `wyrd-implement-v3` task | `gpt-5.6-sol` | low |
 | Mechanical `wyrd-implement-v3` task or concrete remediation | `gpt-5.6-sol` | low |
-| `wyrd-implement-plan-v3` controller and normal integration | `gpt-5.6-terra` | medium |
-| Complex debugging or reconciliation escalation | `gpt-5.6-sol` | high |
+| `wyrd-implement-plan-v3` controller and normal integration | `gpt-5.6-sol` | medium |
+| Complex debugging or reconciliation escalation | `gpt-5.6-sol` | medium |
 | `wyrd-review-v3` | `gpt-5.6-sol` | medium |
-| `wyrd-review-and-plan-v3` root and specialists | `gpt-5.6-sol` | medium |
-| Final quality-first adjudication when evidence conflicts | `gpt-5.6-sol` | high |
+| `wyrd-review-and-plan-v3` root | `gpt-5.6-sol` | medium |
+| `wyrd-review-and-plan-v3` baseline and triggered specialists | `gpt-5.6-terra` | high |
+| Final independent adjudication when evidence conflicts | `gpt-5.6-sol` | high |
 
 Classify an implementation task as `fast` only when its packet fixes the
 contract and the remaining work is mechanical, localized, and low-risk. Use
@@ -41,6 +42,12 @@ contract and the remaining work is mechanical, localized, and low-risk. Use
 closure, or any task whose implementation still requires moderate engineering
 judgment. Verification commands consume compute capacity, not model capacity;
 the controller runs them directly in resource lanes.
+
+`gpt-5.6-sol` high is reserved for final independent adjudication. Ordinary
+workers, controllers, planners, reviewers, specialists, and diagnostic paths
+must not escalate to Sol high. A specialist never changes its own model or
+reasoning effort; unresolved evidence returns to the Sol-medium root and only a
+material conflict that meets the adjudication floor may invoke Sol high.
 
 Treat this table as a measured baseline. Adjust a mapping only from repeated
 representative-task evidence showing a material quality, latency, or cost gain.

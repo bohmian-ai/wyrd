@@ -13,6 +13,7 @@ use arrow::array::Array;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
 use datafusion::common::TableReference;
 use datafusion::dataframe::DataFrame;
@@ -163,11 +164,96 @@ fn map_dispatch_error(error: &dispatcher::DispatchError) -> OracleExecutionError
         dispatcher::DispatchError::Terminal => {
             OracleExecutionError::Public(BifrostError::QueryPeerSecurity)
         }
-        dispatcher::DispatchError::Retryable | dispatcher::DispatchError::Exhausted => {
+        dispatcher::DispatchError::Unavailable => {
             OracleExecutionError::Public(BifrostError::QueryExecutionFailed)
+        }
+        dispatcher::DispatchError::EligibleSourceLoss { .. } => {
+            OracleExecutionError::Public(BifrostError::QueryVisibilityUnavailable)
         }
         dispatcher::DispatchError::Capacity => {
             OracleExecutionError::Public(BifrostError::QueryAdmissionRejected)
+        }
+    }
+}
+
+/// Classifies only parent-contract-eligible live-tail loss as degraded.
+fn follower_source_loss_degrades(
+    error: &dispatcher::DispatchError,
+    freshness: wyrd_spec::vala::api::FreshnessPolicy,
+    sources: &[QuerySource],
+) -> bool {
+    freshness == wyrd_spec::vala::api::FreshnessPolicy::AllowDegraded
+        && matches!(error, dispatcher::DispatchError::EligibleSourceLoss { .. })
+        && sources == [QuerySource::LiveTail]
+}
+
+/// Derives the exact public source tiers represented by one role-local assignment set.
+fn follower_assignment_sources(
+    role: wyrd_spec::vala::api::ClusterRole,
+    assignments: &[FollowerScanAssignment],
+) -> Vec<QuerySource> {
+    if role == wyrd_spec::vala::api::ClusterRole::Scribe {
+        return assignments
+            .iter()
+            .any(|assignment| assignment.scribe_provider_cut.is_some())
+            .then_some(QuerySource::LiveTail)
+            .into_iter()
+            .collect();
+    }
+    let mut sources = Vec::new();
+    for assignment in assignments
+        .iter()
+        .filter(|assignment| !assignment.persisted.files.is_empty())
+    {
+        if assignment.scan_id.ends_with(":iceberg") {
+            sources.push(QuerySource::Iceberg);
+        } else if assignment.scan_id.ends_with(":hot") {
+            sources.push(QuerySource::HotSealed);
+        }
+    }
+    sources.sort();
+    sources.dedup();
+    sources
+}
+
+/// One attempt's fixed stale-object replacement boundary.
+#[derive(Clone, Copy)]
+struct StaleReplacementGate {
+    /// Zero-based full-attempt ordinal.
+    retry_ordinal: u8,
+    /// Whether any public schema or record frame has been exposed.
+    output_started: bool,
+}
+
+impl StaleReplacementGate {
+    /// Creates the pre-output gate used while building one attempt stream.
+    const fn before_output(retry_ordinal: u8) -> Self {
+        Self {
+            retry_ordinal,
+            output_started: false,
+        }
+    }
+
+    /// Settles the real admitted owner before authorizing the sole typed replacement.
+    ///
+    /// A retry is returned only for the first attempt, before public output, and
+    /// after synchronous release of the complete admitted owner. Every other
+    /// combination returns the unchanged owner for terminal settlement.
+    ///
+    /// # Errors
+    ///
+    /// Returns the unchanged admitted owner when replacement is ineligible.
+    fn settle_for_typed_stale(
+        self,
+        admitted: AdmittedQueryGuard,
+        typed_stale: bool,
+    ) -> Result<(), AdmittedQueryGuard> {
+        if self.retry_ordinal == 0 && !self.output_started && typed_stale {
+            admitted.release();
+            record_stale_replan();
+            Ok(())
+        } else {
+            Err(admitted)
         }
     }
 }
@@ -1195,6 +1281,8 @@ impl OracleAudit for TestPostgresOracleAudit {
 
 /// Inputs required to retain one local Oracle owner.
 pub struct OracleBuildConfig {
+    /// One process-wide shutdown token shared by every Bifrost lifecycle owner.
+    pub shutdown: CancellationToken,
     /// Redux Iceberg/catalog owner.
     pub catalog: Arc<BifrostCatalog>,
     /// Tenant-scoped SQL owner.
@@ -1297,44 +1385,6 @@ enum OracleExecutionError {
     Public(#[from] BifrostError),
 }
 
-/// Complete inputs for one sealed-tier peer dispatch.
-struct SealedDispatchInput<'a> {
-    /// Authenticated request context.
-    context: &'a AuthorizedQueryContext,
-    /// Pinned table cut.
-    cut: &'a PinnedSealedTable,
-    /// Admitted leader resources.
-    admitted: &'a AdmittedQueryGuard,
-    /// Immutable query class.
-    query_class: QueryClass,
-    /// Absolute deadline.
-    deadline: Instant,
-    /// Persisted source tier.
-    tier: fragment::SealedSourceTier,
-    /// Pinned source digest.
-    pinned_digest: String,
-    /// Immutable file work.
-    files: Vec<fragment::SealedScanFile>,
-}
-
-/// Planned fragments, assignment, fences, and authorization for execution.
-struct PreparedSealedDispatch {
-    /// Planned immutable fragments.
-    fragments: Vec<fragment::SealedScanFragment>,
-    /// Primary assignment by node.
-    assignment: HashMap<wyrd_spec::vala::api::NodeId, Vec<fragment::SealedScanFragment>>,
-    /// Ordered retry candidates.
-    selected: Vec<wyrd_spec::vala::api::NodeId>,
-    /// Candidate role fences.
-    fences: HashMap<wyrd_spec::vala::api::NodeId, u64>,
-    /// Immutable dispatch authorization.
-    context: dispatcher::DispatchContext,
-    /// Tenant table binding.
-    binding: TenantTableBinding,
-    /// Exact follower schema.
-    schema: SchemaRef,
-}
-
 /// Complete inputs for lowering one pinned SQL visibility cut.
 struct SqlCutInput<'a> {
     /// Authenticated request context.
@@ -1349,6 +1399,8 @@ struct SqlCutInput<'a> {
     scribe_sources: Vec<ScribeFollowerSource>,
     /// Immutable admission class.
     query_class: QueryClass,
+    /// Caller-selected source-loss policy retained through follower dispatch.
+    freshness: wyrd_spec::vala::api::FreshnessPolicy,
     /// Admitted durable/local query owner used by distributed dispatch.
     admitted: &'a AdmittedQueryGuard,
     /// Query-owned `DataFusion` runtime acquired before provider and data IO.
@@ -1359,6 +1411,18 @@ struct SqlCutInput<'a> {
     logical_bytes_selected: u64,
     /// One ingress-captured, role-fenced participant cut used by every dispatch.
     participant_cut: &'a OracleQueryAttemptCut,
+}
+
+/// Table-local facts needed to derive every pinned Scribe follower assignment.
+struct ScribeAssignmentTable<'a> {
+    /// Canonical logical table identity encoded in the common scan placeholder.
+    table: String,
+    /// Authenticated tenant/table binding carried by every role-local assignment.
+    binding: TenantTableBinding,
+    /// Exact physical schema pinned by the immutable table cut.
+    physical_schema: SchemaRef,
+    /// Complete sealed manifest used to project this Scribe's persisted cursor.
+    sealed_manifest: &'a [vala_sql::row_types::file_list::HotFileRow],
 }
 
 /// Pinned tables and class selected during one retry's planning phase.
@@ -1387,6 +1451,8 @@ struct CutAuditInput<'a> {
     deadline: Instant,
     /// Admitted query owner supplying cancellation and durable query identity.
     admitted: &'a AdmittedQueryGuard,
+    /// One immutable membership cut supplying every role-fenced Scribe assignment.
+    participant_cut: &'a OracleQueryAttemptCut,
 }
 
 /// Immutable inputs shared by one complete SQL execution attempt.
@@ -1403,8 +1469,10 @@ struct SqlAttemptInput<'a> {
     retry_ordinal: u8,
     /// Optional Gate request lifecycle transferred into a returned stream.
     gate_lifecycle: Option<Arc<crate::oracle::query_stream::QueryStreamLifecycle>>,
-    /// One ingress-captured membership snapshot reused by every retry phase.
-    membership: &'a ClusterSnapshot,
+    /// One signed ingress-captured participant cut reused by every retry phase.
+    participant_cut: &'a OracleQueryAttemptCut,
+    /// Server-derived class signed into the forwarding envelope.
+    query_class: QueryClass,
 }
 
 impl<'a> SqlAttemptInput<'a> {
@@ -1418,7 +1486,8 @@ impl<'a> SqlAttemptInput<'a> {
         Instant,
         u8,
         Option<Arc<crate::oracle::query_stream::QueryStreamLifecycle>>,
-        &'a ClusterSnapshot,
+        &'a OracleQueryAttemptCut,
+        QueryClass,
     ) {
         let Self {
             context,
@@ -1427,7 +1496,8 @@ impl<'a> SqlAttemptInput<'a> {
             deadline,
             retry_ordinal,
             gate_lifecycle,
-            membership,
+            participant_cut,
+            query_class,
         } = self;
         (
             context,
@@ -1436,7 +1506,8 @@ impl<'a> SqlAttemptInput<'a> {
             deadline,
             retry_ordinal,
             gate_lifecycle,
-            membership,
+            participant_cut,
+            query_class,
         )
     }
 }
@@ -1597,6 +1668,13 @@ fn validate_oracle_config(config: OracleConfig) -> Result<(), BifrostError> {
 }
 
 impl Oracle {
+    /// Reports whether the injected process shutdown token reached the engine.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn process_shutdown_observed_for_test(&self) -> bool {
+        self.shutdown.is_cancelled()
+    }
+
     /// Borrow the serving composition's live-tail transport directory.
     ///
     /// Test and server composition roots use this handle to register transports
@@ -1661,7 +1739,7 @@ impl Oracle {
         ));
         let initial_snapshot = cluster.snapshot();
         admission.refresh(&initial_snapshot);
-        let shutdown = CancellationToken::new();
+        let shutdown = config.shutdown;
         let (demand_tx, demand_rx) =
             tokio::sync::mpsc::channel(config.config.queue_capacity.max(1) as usize);
         let (loss_tx, loss_rx) = tokio::sync::mpsc::channel(1);
@@ -1826,8 +1904,96 @@ impl Oracle {
         context: AuthorizedQueryContext,
         request: BifrostQueryRequest,
     ) -> Result<OracleQueryStream, BifrostError> {
-        self.query_sql_with_gate_lifecycle(context, request, None)
+        let (cut, query_class) = self.prepare_query_attempt(&context, &request).await?;
+        self.query_sql_with_participant_cut(context, request, cut, query_class)
             .await
+    }
+
+    /// Prepares the immutable local-leader participant cut before an attempt begins.
+    async fn prepare_query_attempt(
+        &self,
+        context: &AuthorizedQueryContext,
+        request: &BifrostQueryRequest,
+    ) -> Result<(OracleQueryAttemptCut, QueryClass), BifrostError> {
+        self.validate_query(&request)?;
+        if !self.is_ready() {
+            return Err(BifrostError::OracleRoleUnavailable);
+        }
+        let duration = request
+            .deadline_ms
+            .map_or(self.planner.config.default_deadline, Duration::from_millis);
+        let deadline = Instant::now()
+            .checked_add(duration)
+            .ok_or(BifrostError::QueryTimeout)?;
+        let snapshot = self.cluster.snapshot();
+        let query_class = self
+            .planner
+            .classify_for_forwarding(&context, &request, deadline, &self.catalog, &snapshot)
+            .await?;
+        let now = chrono::Utc::now();
+        let wall_deadline =
+            now + chrono::Duration::from_std(duration).map_err(|_| BifrostError::QueryTimeout)?;
+        let observed_age = now
+            .signed_duration_since(snapshot.observed_at())
+            .to_std()
+            .unwrap_or_default();
+        let attempt_id = QueryId::new(
+            uuid::Uuid::parse_str(context.request_id.as_str())
+                .map_err(|_| BifrostError::QueryExecutionFailed)?,
+        );
+        let cut = OracleQueryAttemptCut::try_from_snapshot(
+            &snapshot,
+            attempt_id,
+            self.admission.local_role.key.node_id,
+            query_class,
+            wall_deadline,
+            now,
+            observed_age.saturating_add(Duration::from_secs(1)),
+        )
+        .map_err(|_| BifrostError::OracleRoleUnavailable)?;
+        Ok((cut, query_class))
+    }
+
+    /// Executes one authenticated query as the exact leader named by a signed participant cut.
+    ///
+    /// Both local ingress and private forwarding use this operation. The immutable cut and its
+    /// absolute deadline survive the single allowed stale-Iceberg replan unchanged.
+    ///
+    /// # Errors
+    /// Returns a closed query, policy, role-fence, deadline, admission, audit, or execution error.
+    pub async fn query_sql_with_participant_cut(
+        &self,
+        context: AuthorizedQueryContext,
+        request: BifrostQueryRequest,
+        participant_cut: OracleQueryAttemptCut,
+        query_class: QueryClass,
+    ) -> Result<OracleQueryStream, BifrostError> {
+        self.query_sql_with_cut_and_gate_lifecycle(
+            context,
+            request,
+            participant_cut,
+            query_class,
+            None,
+        )
+        .await
+    }
+
+    /// Starts a locally selected query while retaining an optional Gate lifecycle owner.
+    pub(crate) async fn query_sql_with_gate_lifecycle(
+        &self,
+        context: AuthorizedQueryContext,
+        request: BifrostQueryRequest,
+        gate_lifecycle: Option<Arc<crate::oracle::query_stream::QueryStreamLifecycle>>,
+    ) -> Result<OracleQueryStream, BifrostError> {
+        let (cut, query_class) = self.prepare_query_attempt(&context, &request).await?;
+        self.query_sql_with_cut_and_gate_lifecycle(
+            context,
+            request,
+            cut,
+            query_class,
+            gate_lifecycle,
+        )
+        .await
     }
 
     /// Starts a SQL query while retaining an optional Gate lifecycle owner.
@@ -1850,24 +2016,33 @@ impl Oracle {
             search_role = "oracle"
         )
     )]
-    pub(crate) async fn query_sql_with_gate_lifecycle(
+    async fn query_sql_with_cut_and_gate_lifecycle(
         &self,
         context: AuthorizedQueryContext,
         request: BifrostQueryRequest,
+        participant_cut: OracleQueryAttemptCut,
+        query_class: QueryClass,
         gate_lifecycle: Option<Arc<crate::oracle::query_stream::QueryStreamLifecycle>>,
     ) -> Result<OracleQueryStream, BifrostError> {
         self.validate_query(&request)?;
         if !self.is_ready() {
             return Err(BifrostError::OracleRoleUnavailable);
         }
-        let deadline = request
-            .deadline_ms
-            .map_or(self.planner.config.default_deadline, Duration::from_millis);
+        if participant_cut.leader().node_id != self.admission.local_role.key.node_id
+            || participant_cut.leader().fencing_token != self.admission.local_role.fencing_token
+            || participant_cut.attempt_id().as_uuid().to_string() != context.request_id.as_str()
+        {
+            return Err(BifrostError::QueryPeerSecurity);
+        }
+        let remaining = participant_cut
+            .deadline()
+            .signed_duration_since(chrono::Utc::now())
+            .to_std()
+            .map_err(|_| BifrostError::QueryTimeout)?;
         let deadline = Instant::now()
-            .checked_add(deadline)
+            .checked_add(remaining)
             .ok_or(BifrostError::QueryTimeout)?;
         let tables = parse_select_tables(&request.sql)?;
-        let membership = self.cluster.snapshot();
         let mut query_telemetry = None;
         for retry_ordinal in 0_u8..=1 {
             if let Some(stream) = self
@@ -1879,7 +2054,8 @@ impl Oracle {
                         deadline,
                         retry_ordinal,
                         gate_lifecycle: gate_lifecycle.as_ref().map(Arc::clone),
-                        membership: &membership,
+                        participant_cut: &participant_cut,
+                        query_class,
                     },
                     &mut query_telemetry,
                 )
@@ -1915,24 +2091,50 @@ impl Oracle {
         input: SqlAttemptInput<'_>,
         query_telemetry: &mut Option<QueryTelemetryGuard>,
     ) -> Result<Option<OracleQueryStream>, BifrostError> {
-        let (context, request, tables, deadline, retry_ordinal, gate_lifecycle, membership) =
-            input.into_parts();
+        let (
+            context,
+            request,
+            tables,
+            deadline,
+            retry_ordinal,
+            gate_lifecycle,
+            participant_cut,
+            expected_query_class,
+        ) = input.into_parts();
+        let stale_replacement = StaleReplacementGate::before_output(retry_ordinal);
         let planned = self
-            .plan_sql_attempt(context, &request.sql, tables, deadline)
+            .plan_sql_attempt(
+                context,
+                &request.sql,
+                tables,
+                deadline,
+                participant_cut
+                    .oracles()
+                    .iter()
+                    .filter_map(|participant| match &participant.capabilities {
+                        ClusterCapabilities::OracleV1(capabilities) => Some(capabilities.cpu_cores),
+                        ClusterCapabilities::ScribeV1(_) => None,
+                    })
+                    .sum(),
+            )
             .await?;
+        if planned.query_class != expected_query_class {
+            return Err(BifrostError::QueryPeerSecurity);
+        }
         self.ensure_query_telemetry(query_telemetry, request.visibility, planned.query_class);
         let admitted = self
-            .admit_sql_query(context, planned.query_class, planned.local_ratio, deadline)
+            .admit_sql_query(
+                context,
+                planned.query_class,
+                planned.local_ratio,
+                deadline,
+                participant_cut.attempt_id(),
+            )
             .await?;
         let (session, mut admitted) = self.lease_session(deadline, admitted, "lease rejection")?;
         admitted.retain_physical_projections(&planned.cuts)?;
-        let (running_query, participant_cut) = self.register_running_query(
-            context,
-            planned.query_class,
-            deadline,
-            &admitted,
-            membership,
-        )?;
+        let running_query =
+            self.register_running_query(context, planned.query_class, &admitted, participant_cut)?;
         let mut drained = match self
             .audit_and_drain_cut(CutAuditInput {
                 context,
@@ -1942,6 +2144,7 @@ impl Oracle {
                 retry_ordinal,
                 deadline,
                 admitted: &admitted,
+                participant_cut,
             })
             .await
         {
@@ -1949,7 +2152,7 @@ impl Oracle {
             Err(error) => return release_error(deadline, admitted, error, "audit rejection"),
         };
         admitted.live_reservations = std::mem::take(&mut drained.reservations);
-        let (schema, mut batches, scan_stats) = match self
+        let (schema, mut batches, scan_stats, execution_degraded_sources) = match self
             .execute_sql_cut(SqlCutInput {
                 context,
                 sql: &request.sql,
@@ -1958,27 +2161,36 @@ impl Oracle {
                 live_batches: drained.batches,
                 scribe_sources: drained.follower_sources,
                 query_class: planned.query_class,
+                freshness: request.freshness,
                 admitted: &admitted,
                 session,
                 deadline,
-                participant_cut: &participant_cut,
+                participant_cut,
             })
             .await
         {
             Ok(execution) => execution,
-            Err(OracleExecutionError::StaleObject) if retry_ordinal == 0 => {
-                admitted.release();
-                record_stale_replan();
-                return Ok(None);
-            }
             Err(OracleExecutionError::StaleObject) => {
-                let error = BifrostError::QueryExecutionFailed;
-                return release_error(deadline, admitted, error, "final stale attempt");
+                return match stale_replacement.settle_for_typed_stale(admitted, true) {
+                    Ok(()) => Ok(None),
+                    Err(admitted) => release_error(
+                        deadline,
+                        admitted,
+                        BifrostError::QueryExecutionFailed,
+                        "final stale attempt",
+                    ),
+                };
             }
             Err(OracleExecutionError::Public(error)) => {
                 return release_error(deadline, admitted, error, "execution rejection");
             }
         };
+        let mut degraded_sources = execution_degraded_sources;
+        if drained.degraded {
+            degraded_sources.push(QuerySource::LiveTail);
+        }
+        degraded_sources.sort();
+        degraded_sources.dedup();
         let (first, admitted) = await_first_batch_or_release(
             deadline,
             batches.next(),
@@ -1993,12 +2205,19 @@ impl Oracle {
             },
         )
         .await?;
-        if first.as_ref().is_some_and(|result| {
-            retry_ordinal == 0 && result.as_ref().is_err_and(is_stale_file_error)
-        }) {
-            admitted.release();
-            record_stale_replan();
-            return Ok(None);
+        if first
+            .as_ref()
+            .is_some_and(|result| result.as_ref().is_err_and(is_stale_iceberg_object_error))
+        {
+            return match stale_replacement.settle_for_typed_stale(admitted, true) {
+                Ok(()) => Ok(None),
+                Err(admitted) => release_error(
+                    deadline,
+                    admitted,
+                    BifrostError::QueryExecutionFailed,
+                    "final stale first batch",
+                ),
+            };
         }
         if let Some(error) = map_first_batch_failure(first.as_ref()) {
             return release_error(deadline, admitted, error, "first-batch rejection");
@@ -2015,7 +2234,7 @@ impl Oracle {
             admitted,
             deadline,
             visibility: request.visibility,
-            degraded: drained.degraded,
+            degraded_sources,
             stale_replanned: retry_ordinal == 1,
             query_telemetry,
             scan_stats,
@@ -2032,49 +2251,32 @@ impl Oracle {
         &self,
         context: &AuthorizedQueryContext,
         query_class: QueryClass,
-        deadline: Instant,
         admitted: &AdmittedQueryGuard,
-        membership: &ClusterSnapshot,
-    ) -> Result<(RunningQueryTerminalOwner, OracleQueryAttemptCut), BifrostError> {
+        participant_cut: &OracleQueryAttemptCut,
+    ) -> Result<RunningQueryTerminalOwner, BifrostError> {
         let now = chrono::Utc::now();
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .ok_or(BifrostError::QueryTimeout)?;
-        let wall_deadline =
-            now + chrono::Duration::from_std(remaining).map_err(|_| BifrostError::QueryTimeout)?;
-        let observed_age = now
-            .signed_duration_since(membership.observed_at())
-            .to_std()
-            .unwrap_or_default();
-        let freshness = observed_age.saturating_add(Duration::from_secs(1));
-        let cut = OracleQueryAttemptCut::try_from_snapshot(
-            membership,
-            admitted.query_id,
-            admitted.leader.node_id,
-            query_class,
-            wall_deadline,
-            now,
-            freshness,
-        )
-        .map_err(|_| BifrostError::OracleRoleUnavailable)?;
+        if admitted.query_id != participant_cut.attempt_id()
+            || admitted.leader.node_id != participant_cut.leader().node_id
+            || admitted.leader.fencing_token != participant_cut.leader().fencing_token
+            || participant_cut.deadline() <= now
+        {
+            return Err(BifrostError::QueryPeerSecurity);
+        }
         let entry = RunningQueryEntry::with_cancellation(
             context.data_tenant_id,
             context.request_id.clone(),
             query_class,
             now,
-            cut.clone(),
+            participant_cut.clone(),
             admitted.cancellation.clone(),
         );
         if !self.running_queries.insert(entry) {
             return Err(BifrostError::RunningQueryConflict);
         }
-        Ok((
-            RunningQueryTerminalOwner::new(
-                Arc::clone(&self.running_queries),
-                context.data_tenant_id,
-                context.request_id.clone(),
-            ),
-            cut,
+        Ok(RunningQueryTerminalOwner::new(
+            Arc::clone(&self.running_queries),
+            context.data_tenant_id,
+            context.request_id.clone(),
         ))
     }
 
@@ -2089,16 +2291,45 @@ impl Oracle {
         query_class: QueryClass,
         local_ratio: f64,
         deadline: Instant,
+        attempt_id: QueryId,
     ) -> Result<AdmittedQueryGuard, BifrostError> {
-        self.admission
-            .admit(admission::PreparedAdmission {
-                tenant: context.data_tenant_id,
-                query_class,
-                local_ratio,
-                deadline,
-                cancellation: self.shutdown.child_token(),
-            })
-            .await
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(BifrostError::QueryTimeout)?;
+        let delegated = tokio::select! {
+            () = self.shutdown.cancelled() => return Err(BifrostError::QueryTimeout),
+            result = tokio::time::timeout(
+                remaining,
+                self.delegated_admission.acquire(DelegatedAdmissionRequest {
+                    tenant_id: context.data_tenant_id,
+                    principal_id: context.principal.id,
+                    query_class,
+                }),
+            ) => result.map_err(|_| BifrostError::QueryTimeout)?,
+        }
+        .map_err(|error| match error {
+            DelegatedOracleAdmissionError::QueueFull => BifrostError::QueryAdmissionRejected,
+            DelegatedOracleAdmissionError::InvalidConfig
+            | DelegatedOracleAdmissionError::ContinuityLost
+            | DelegatedOracleAdmissionError::StateUnavailable => {
+                BifrostError::OracleRoleUnavailable
+            }
+        })?;
+        let mut admitted = self
+            .admission
+            .admit_for_attempt(
+                admission::PreparedAdmission {
+                    tenant: context.data_tenant_id,
+                    query_class,
+                    local_ratio,
+                    deadline,
+                    cancellation: self.shutdown.child_token(),
+                },
+                attempt_id,
+            )
+            .await?;
+        admitted.retain_delegated_grant(delegated);
+        Ok(admitted)
     }
 
     /// Delegates one SQL metadata attempt to the planner owner.
@@ -2108,9 +2339,17 @@ impl Oracle {
         sql: &str,
         tables: &[TableRef],
         deadline: Instant,
+        live_oracle_cpu: f64,
     ) -> Result<PlannedSqlCut, BifrostError> {
         self.planner
-            .pin_and_classify(context, sql, tables, deadline, &self.catalog, &self.cluster)
+            .pin_and_classify(
+                context,
+                sql,
+                tables,
+                deadline,
+                &self.catalog,
+                live_oracle_cpu,
+            )
             .await
     }
 
@@ -2145,7 +2384,10 @@ impl Oracle {
             },
         );
         let mut degraded = false;
-        let acquired = if input.request.visibility == VisibilityMode::Fused {
+        let distributed_followers = self.fragment_dispatcher.is_some();
+        let acquired = if input.request.visibility == VisibilityMode::Fused
+            && !distributed_followers
+        {
             match drainer.acquire(input.cuts).await {
                 Ok(fences) => fences,
                 Err(error)
@@ -2202,16 +2444,15 @@ impl Oracle {
             drainer.release_acquired(acquired).await;
             return Err(public_error);
         }
-        if acquired.is_empty() {
+        if distributed_followers && input.request.visibility == VisibilityMode::Fused {
             Ok(DrainedTails {
+                follower_sources: self
+                    .scribe_follower_sources(input.cuts, input.participant_cut)?,
                 degraded,
                 ..DrainedTails::default()
             })
-        } else if self.fragment_dispatcher.is_some() {
-            let sources = self.scribe_follower_sources(input.cuts, &acquired);
-            drainer.release_acquired(acquired).await;
+        } else if acquired.is_empty() {
             Ok(DrainedTails {
-                follower_sources: sources?,
                 degraded,
                 ..DrainedTails::default()
             })
@@ -2222,83 +2463,41 @@ impl Oracle {
         }
     }
 
-    /// Converts acquired live visibility into disjoint role-fenced Scribe assignments.
+    /// Builds one explicit-empty persisted assignment for every pinned Scribe and table.
     ///
     /// # Errors
-    /// Returns visibility unavailable when a fence cannot be matched to its exact
-    /// table cut or its persisted WAL projection is contradictory.
+    /// Returns visibility unavailable when a participant epoch or its persisted
+    /// WAL projection cannot be represented by the authenticated follower cut.
     fn scribe_follower_sources(
         &self,
         cuts: &[PinnedSealedTable],
-        acquired: &[tail_fence::AcquiredTailFence],
+        participant_cut: &OracleQueryAttemptCut,
     ) -> Result<Vec<ScribeFollowerSource>, BifrostError> {
-        acquired
+        let tables = cuts
             .iter()
-            .enumerate()
-            .map(|(ordinal, acquired)| {
-                let cut = cuts
-                    .iter()
-                    .find(|cut| cut.binding.table_ref.fqn() == acquired.table)
-                    .ok_or(BifrostError::QueryVisibilityUnavailable)?;
+            .map(|cut| {
                 let physical_schema = iceberg::arrow::schema_to_arrow_schema(
                     cut.iceberg_table.metadata().current_schema(),
                 )
                 .map_err(|_| BifrostError::QueryVisibilityUnavailable)?;
-                let cursor = acquired.fence.exclusive_sealed.wal_lsn;
-                let writer_epoch = acquired.fence.stream.writer_epoch;
-                let node_id = acquired.fence.stream.node_id;
-                let stream_rows = cut
-                    .sealed_manifest
-                    .iter()
-                    .filter(|row| {
-                        row.node_id == node_id.as_uuid()
-                            && u64::try_from(row.writer_epoch).ok() == Some(writer_epoch)
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let persisted_ranges = project_persisted_wal_ranges(&stream_rows, cursor)
-                    .map_err(BifrostCatalogError::into_public)?;
-                let scan_id = format!(
-                    "scribe:{}:{}:{}:{ordinal}",
-                    acquired.table,
-                    node_id.as_uuid(),
-                    writer_epoch
-                );
-                let binding = TenantTableBinding {
-                    tenant_id: cut.binding.tenant,
-                    namespace: cut.binding.logical_namespace.clone(),
-                    table: cut.binding.table_name.clone(),
-                };
-                let day = acquired.fence.event_day.as_str().to_owned();
-                Ok(ScribeFollowerSource {
-                    table: acquired.table.clone(),
-                    node_id,
-                    assignment: FollowerScanAssignment {
-                        scan_id,
-                        binding,
-                        persisted: PersistedFileAssignment { files: Vec::new() },
-                        scribe_provider_cut: Some(ScribeProviderCut {
-                            writer_epoch,
-                            start_event_day: day.clone(),
-                            end_event_day: day,
-                            required_columns: physical_schema
-                                .fields()
-                                .iter()
-                                .map(|field| field.name().clone())
-                                .collect(),
-                            persisted_cursor: cursor,
-                            persisted_ranges,
-                            maximum_batch_count: 1_024,
-                            maximum_retained_bytes: u64::try_from(
-                                self.planner.config.attempt_max_bytes,
-                            )
-                            .map_err(|_| BifrostError::QueryVisibilityUnavailable)?,
-                        }),
-                        schema_fingerprint: sealed_fragment_schema_fingerprint(&physical_schema),
+                Ok(ScribeAssignmentTable {
+                    table: cut.binding.table_ref.fqn(),
+                    binding: TenantTableBinding {
+                        tenant_id: cut.binding.tenant,
+                        namespace: cut.binding.logical_namespace.clone(),
+                        table: cut.binding.table_name.clone(),
                     },
+                    physical_schema: Arc::new(physical_schema),
+                    sealed_manifest: &cut.sealed_manifest,
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>, BifrostError>>()?;
+        build_scribe_follower_sources(
+            &tables,
+            participant_cut.scribes(),
+            participant_cut.observed_at(),
+            self.planner.config.attempt_max_bytes,
+        )
     }
 
     /// Accepts a typed lowered plan after validating its deadline.
@@ -2456,7 +2655,11 @@ impl Oracle {
             admitted,
             deadline: options.deadline,
             visibility: options.visibility,
-            degraded: drained.degraded,
+            degraded_sources: drained
+                .degraded
+                .then_some(QuerySource::LiveTail)
+                .into_iter()
+                .collect(),
             stale_replanned: false,
             query_telemetry,
             scan_stats,
@@ -2611,7 +2814,7 @@ impl Oracle {
     /// The lifecycle task is aborted at expiry. Dropping this future can leave
     /// local cleanup to guard drop, but
     /// [`Self::begin_shutdown`] has already synchronously rejected new work.
-    pub async fn shutdown(&self, deadline: Instant) {
+    pub async fn shutdown(&self, deadline: Instant) -> admission::OracleShutdownReport {
         self.begin_shutdown();
         let report = self.admission.shutdown(deadline).await;
         if report.active_queries != 0
@@ -2662,6 +2865,7 @@ impl Oracle {
             }
         }
         let _ = deadline;
+        report
     }
 
     /// Cancels Oracle lifecycle work without awaiting cleanup progress.
@@ -2685,13 +2889,21 @@ impl Oracle {
     async fn execute_sql_cut(
         &self,
         mut input: SqlCutInput<'_>,
-    ) -> Result<(SchemaRef, SendableRecordBatchStream, OracleQueryScanStats), OracleExecutionError>
-    {
+    ) -> Result<
+        (
+            SchemaRef,
+            SendableRecordBatchStream,
+            OracleQueryScanStats,
+            Vec<QuerySource>,
+        ),
+        OracleExecutionError,
+    > {
         let session = input.session;
         let distributed = self.fragment_dispatcher.is_some();
-        let mut assignments = HashMap::new();
+        let mut oracle_assignments = HashMap::new();
+        let mut scribe_assignments =
+            HashMap::<NodeId, HashMap<String, FollowerScanAssignment>>::new();
         let mut source_groups = HashMap::new();
-        let mut scribe_targets = HashMap::new();
         let mut scribe_sources = HashMap::<String, Vec<ScribeFollowerSource>>::new();
         for source in input.scribe_sources {
             scribe_sources
@@ -2714,19 +2926,16 @@ impl Oracle {
                 table: cut.binding.table_ref.name.clone(),
             };
             let mut remote_sources = RemotePersistedSources::default();
-            if distributed && !cut.iceberg_files.is_empty() {
+            let mut common_scan_ids = Vec::new();
+            if distributed {
                 let scan_id = format!("oracle:{table_name}:iceberg");
                 let mut files = cut
                     .iceberg_files
                     .iter()
-                    .map(|file| {
-                        self.catalog
-                            .object_location(&cut.binding, &file.file_path)
-                            .map_err(BifrostCatalogError::into_public)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .map(|file| file.file_path.clone())
+                    .collect::<Vec<_>>();
                 files.sort();
-                assignments.insert(
+                oracle_assignments.insert(
                     scan_id.clone(),
                     FollowerScanAssignment {
                         scan_id: scan_id.clone(),
@@ -2736,7 +2945,8 @@ impl Oracle {
                         schema_fingerprint: schema_fingerprint.clone(),
                     },
                 );
-                source_groups.insert(scan_id.clone(), "oracle".to_owned());
+                source_groups.insert(scan_id.clone(), table_name.clone());
+                common_scan_ids.push(scan_id.clone());
                 remote_sources.iceberg_scan_id = Some(scan_id);
             }
             if distributed && !cut.hot_files.is_empty() {
@@ -2744,35 +2954,47 @@ impl Oracle {
                 let mut files = cut
                     .hot_files
                     .iter()
-                    .map(|file| {
-                        self.catalog
-                            .object_location(&cut.binding, &file.file_path)
-                            .map_err(BifrostCatalogError::into_public)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .map(|file| file.file_path.clone())
+                    .collect::<Vec<_>>();
                 files.sort();
-                assignments.insert(
+                oracle_assignments.insert(
                     scan_id.clone(),
                     FollowerScanAssignment {
                         scan_id: scan_id.clone(),
                         binding: binding.clone(),
                         persisted: PersistedFileAssignment { files },
                         scribe_provider_cut: None,
-                        schema_fingerprint,
+                        schema_fingerprint: schema_fingerprint.clone(),
                     },
                 );
-                source_groups.insert(scan_id.clone(), "oracle".to_owned());
+                source_groups.insert(scan_id.clone(), table_name.clone());
+                common_scan_ids.push(scan_id.clone());
                 remote_sources.hot_scan_id = Some(scan_id);
             }
-            for source in scribe_sources.remove(&table_name).unwrap_or_default() {
-                let scan_id = source.assignment.scan_id.clone();
-                source_groups.insert(
-                    scan_id.clone(),
-                    format!("scribe:{}", source.node_id.as_uuid()),
+            let table_scribes = scribe_sources.remove(&table_name).unwrap_or_default();
+            for template in &table_scribes {
+                let live_scan_id = template.assignment.scan_id.clone();
+                oracle_assignments.insert(
+                    live_scan_id.clone(),
+                    FollowerScanAssignment {
+                        scan_id: live_scan_id.clone(),
+                        binding: binding.clone(),
+                        persisted: PersistedFileAssignment { files: Vec::new() },
+                        scribe_provider_cut: None,
+                        schema_fingerprint: schema_fingerprint.clone(),
+                    },
                 );
-                scribe_targets.insert(scan_id.clone(), source.node_id);
-                assignments.insert(scan_id.clone(), source.assignment);
-                remote_sources.scribe_scan_ids.push(scan_id);
+                source_groups.insert(live_scan_id.clone(), table_name.clone());
+                common_scan_ids.push(live_scan_id.clone());
+                remote_sources.scribe_scan_ids.push(live_scan_id);
+            }
+            for source in table_scribes {
+                let assignments = scribe_assignments.entry(source.node_id).or_default();
+                for scan_id in &common_scan_ids {
+                    let mut assignment = source.assignment.clone();
+                    assignment.scan_id = scan_id.clone();
+                    assignments.insert(scan_id.clone(), assignment);
+                }
             }
             let local_hot_files = if distributed {
                 Vec::new()
@@ -2805,20 +3027,23 @@ impl Oracle {
                 Arc::new(provider) as Arc<dyn TableProvider>,
             )?;
         }
-        if assignments.is_empty() {
-            self.execute_session(&session, input.sql, input.logical_bytes_selected)
-                .await
+        if oracle_assignments.is_empty() && scribe_assignments.is_empty() {
+            let (schema, stream, stats) = self
+                .execute_session(&session, input.sql, input.logical_bytes_selected)
+                .await?;
+            Ok((schema, stream, stats, Vec::new()))
         } else {
             self.execute_distributed_session(
                 &session,
                 input.sql,
                 input.logical_bytes_selected,
-                assignments,
+                oracle_assignments,
                 source_groups,
-                scribe_targets,
+                scribe_assignments,
                 input.context,
                 input.admitted,
                 input.query_class,
+                input.freshness,
                 input.deadline,
                 input.participant_cut,
             )
@@ -2832,16 +3057,24 @@ impl Oracle {
         session: &SessionContext,
         sql: &str,
         logical_bytes_selected: u64,
-        assignments: HashMap<String, FollowerScanAssignment>,
+        oracle_assignments: HashMap<String, FollowerScanAssignment>,
         source_groups: HashMap<String, String>,
-        scribe_targets: HashMap<String, NodeId>,
+        scribe_assignments: HashMap<NodeId, HashMap<String, FollowerScanAssignment>>,
         context: &AuthorizedQueryContext,
         admitted: &AdmittedQueryGuard,
         query_class: QueryClass,
+        freshness: wyrd_spec::vala::api::FreshnessPolicy,
         deadline: Instant,
         participant_cut: &OracleQueryAttemptCut,
-    ) -> Result<(SchemaRef, SendableRecordBatchStream, OracleQueryScanStats), OracleExecutionError>
-    {
+    ) -> Result<
+        (
+            SchemaRef,
+            SendableRecordBatchStream,
+            OracleQueryScanStats,
+            Vec<QuerySource>,
+        ),
+        OracleExecutionError,
+    > {
         let dispatcher = self
             .fragment_dispatcher
             .as_ref()
@@ -2881,42 +3114,53 @@ impl Oracle {
         .timestamp_millis();
         let mut results = HashMap::new();
         let mut completed = 0_u32;
+        let mut degraded_sources = Vec::new();
         for follower in split.followers {
-            let subtree_assignments = follower
+            let completed_before = completed;
+            let mut follower_degraded = false;
+            let oracle_templates = follower
                 .source_scan_ids
                 .iter()
                 .map(|scan_id| {
-                    assignments
+                    oracle_assignments
                         .get(scan_id)
                         .cloned()
                         .ok_or(BifrostError::QueryExecutionFailed)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let binding = subtree_assignments
+            let binding = oracle_templates
                 .first()
                 .map(|assignment| assignment.binding.clone())
+                .or_else(|| {
+                    scribe_assignments.values().find_map(|assignments| {
+                        follower
+                            .source_scan_ids
+                            .first()
+                            .and_then(|scan_id| assignments.get(scan_id))
+                            .map(|assignment| assignment.binding.clone())
+                    })
+                })
                 .ok_or(BifrostError::QueryExecutionFailed)?;
-            if subtree_assignments
+            if oracle_templates
                 .iter()
                 .any(|assignment| assignment.binding != binding)
             {
                 return Err(BifrostError::QueryExecutionFailed.into());
             }
-            let target_role = if subtree_assignments
+            let physical_plan_bytes = physical_plan_to_bytes_with_extension_codec(
+                follower.plan,
+                &codec::OraclePhysicalExtensionCodec::encoder(),
+            )
+            .map_err(|error| map_datafusion_error(&error))?
+            .to_vec();
+            let plan_fingerprint = codec::physical_plan_fingerprint(&physical_plan_bytes);
+            let mut batches = Vec::new();
+            let persisted_count = oracle_templates
                 .iter()
-                .all(|assignment| assignment.scribe_provider_cut.is_none())
-            {
-                wyrd_spec::vala::api::ClusterRole::Oracle
-            } else if subtree_assignments
-                .iter()
-                .all(|assignment| assignment.scribe_provider_cut.is_some())
-            {
-                wyrd_spec::vala::api::ClusterRole::Scribe
-            } else {
-                return Err(BifrostError::QueryExecutionFailed.into());
-            };
-            let candidates = match target_role {
-                wyrd_spec::vala::api::ClusterRole::Oracle => participant_cut
+                .map(|assignment| assignment.persisted.files.len())
+                .sum::<usize>();
+            if persisted_count > 0 {
+                let candidates = participant_cut
                     .oracles()
                     .iter()
                     .filter(|participant| participant.node_id != admitted.leader.node_id)
@@ -2926,77 +3170,134 @@ impl Oracle {
                             .iter()
                             .filter(|participant| participant.node_id == admitted.leader.node_id),
                     )
+                    .take(
+                        self.planner
+                            .config
+                            .max_workers_per_query
+                            .max(1)
+                            .min(persisted_count),
+                    )
                     .map(|participant| dispatcher::DispatchCandidate {
                         node_id: participant.node_id,
                         role: participant.role,
                         worker_fence: participant.fencing_token,
                     })
-                    .collect::<Vec<_>>(),
-                wyrd_spec::vala::api::ClusterRole::Scribe => {
-                    let target = follower
-                        .source_scan_ids
-                        .first()
-                        .and_then(|scan_id| scribe_targets.get(scan_id))
-                        .copied()
-                        .ok_or(BifrostError::QueryExecutionFailed)?;
-                    if follower
-                        .source_scan_ids
-                        .iter()
-                        .any(|scan_id| scribe_targets.get(scan_id).copied() != Some(target))
-                    {
-                        return Err(BifrostError::QueryExecutionFailed.into());
-                    }
-                    participant_cut
-                        .scribes()
-                        .iter()
-                        .filter(|participant| participant.node_id == target)
-                        .map(|participant| dispatcher::DispatchCandidate {
-                            node_id: participant.node_id,
-                            role: participant.role,
-                            worker_fence: participant.fencing_token,
-                        })
-                        .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                if candidates.is_empty() {
+                    return Err(BifrostError::OracleRoleUnavailable.into());
                 }
-            };
-            if candidates.is_empty() {
-                return Err(BifrostError::OracleRoleUnavailable.into());
+                #[cfg(feature = "test-support")]
+                if let Some(probe) = self
+                    .topology_probe
+                    .lock()
+                    .ok()
+                    .and_then(|probe| probe.clone())
+                    && let Some(target) = candidates
+                        .first()
+                        .map(|candidate| candidate.node_id)
+                        .filter(|target| *target != admitted.leader.node_id)
+                {
+                    probe.pause_first_selection(target).await;
+                }
+                let partitions = partition_oracle_assignments(&oracle_templates, candidates.len());
+                for (candidate, assignments) in candidates.iter().zip(partitions) {
+                    let assignment_sources =
+                        follower_assignment_sources(candidate.role, &assignments);
+                    match self
+                        .dispatch_common_follower(
+                            dispatcher,
+                            &dispatch_context,
+                            candidate,
+                            physical_plan_bytes.clone(),
+                            assignments,
+                            binding.clone(),
+                            plan_fingerprint.clone(),
+                            deadline_unix_ms,
+                        )
+                        .await
+                    {
+                        Ok(remote) => {
+                            batches.extend(remote);
+                            completed = completed.saturating_add(1);
+                        }
+                        Err(error)
+                            if follower_source_loss_degrades(
+                                &error,
+                                freshness,
+                                &assignment_sources,
+                            ) =>
+                        {
+                            if assignment_sources.is_empty() {
+                                return Err(map_dispatch_error(&error));
+                            }
+                            tracing::warn!(sources = ?assignment_sources, cause = ?error, "Oracle follower source completed degraded");
+                            degraded_sources.extend(assignment_sources);
+                            follower_degraded = true;
+                        }
+                        Err(error) => return Err(map_dispatch_error(&error)),
+                    }
+                }
             }
-            #[cfg(feature = "test-support")]
-            if let Some(probe) = self
-                .topology_probe
-                .lock()
-                .ok()
-                .and_then(|probe| probe.clone())
-                && let Some(target) = candidates
-                    .first()
-                    .map(|candidate| candidate.node_id)
-                    .filter(|target| *target != admitted.leader.node_id)
-            {
-                probe.pause_first_selection(target).await;
-            }
-            let physical_plan_bytes = physical_plan_to_bytes_with_extension_codec(
-                follower.plan,
-                &codec::OraclePhysicalExtensionCodec::encoder(),
-            )
-            .map_err(|error| map_datafusion_error(&error))?
-            .to_vec();
-            let plan_fingerprint = codec::physical_plan_fingerprint(&physical_plan_bytes);
-            let attempt = dispatcher
-                .execute(
-                    &dispatch_context,
-                    dispatcher::PhysicalDispatchFragment {
-                        physical_plan_bytes,
-                        assignments: subtree_assignments,
-                        binding,
-                        target_role,
-                        plan_fingerprint,
+            for participant in participant_cut.scribes() {
+                let Some(assignments) = scribe_assignments.get(&participant.node_id) else {
+                    continue;
+                };
+                let assignments = follower
+                    .source_scan_ids
+                    .iter()
+                    .map(|scan_id| {
+                        assignments
+                            .get(scan_id)
+                            .cloned()
+                            .ok_or(BifrostError::QueryExecutionFailed)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if assignments.is_empty() {
+                    continue;
+                }
+                let candidate = dispatcher::DispatchCandidate {
+                    node_id: participant.node_id,
+                    role: participant.role,
+                    worker_fence: participant.fencing_token,
+                };
+                let assignment_sources = follower_assignment_sources(candidate.role, &assignments);
+                match self
+                    .dispatch_common_follower(
+                        dispatcher,
+                        &dispatch_context,
+                        &candidate,
+                        physical_plan_bytes.clone(),
+                        assignments,
+                        binding.clone(),
+                        plan_fingerprint.clone(),
                         deadline_unix_ms,
-                    },
-                    &candidates,
-                )
-                .await
-                .map_err(|error| map_dispatch_error(&error))?;
-            completed = completed.saturating_add(1);
+                    )
+                    .await
+                {
+                    Ok(remote) => {
+                        batches.extend(remote);
+                        completed = completed.saturating_add(1);
+                    }
+                    Err(error)
+                        if follower_source_loss_degrades(
+                            &error,
+                            freshness,
+                            &assignment_sources,
+                        ) =>
+                    {
+                        if assignment_sources.is_empty() {
+                            return Err(map_dispatch_error(&error));
+                        }
+                        tracing::warn!(sources = ?assignment_sources, cause = ?error, "Scribe follower source completed degraded");
+                        degraded_sources.extend(assignment_sources);
+                        follower_degraded = true;
+                    }
+                    Err(error) => return Err(map_dispatch_error(&error)),
+                }
+            }
+            if completed == completed_before && !follower_degraded {
+                return Err(BifrostError::QueryExecutionFailed.into());
+            }
             if !self.running_queries.update_progress(
                 context.data_tenant_id,
                 &context.request_id,
@@ -3004,8 +3305,6 @@ impl Oracle {
             ) {
                 return Err(BifrostError::QueryExecutionFailed.into());
             }
-            let mut batches = Vec::new();
-            decode_attempt_batches(attempt, &mut batches)?;
             results.insert(follower.result_scan_id, batches);
         }
         let leader = splitter::substitute_remote_results(split.leader, results)
@@ -3014,7 +3313,41 @@ impl Oracle {
         let schema = leader.schema();
         let stream = execute_stream(leader, session.task_ctx())
             .map_err(|error| map_datafusion_error(&error))?;
-        Ok((schema, stream, scan_stats))
+        degraded_sources.sort();
+        degraded_sources.dedup();
+        Ok((schema, stream, scan_stats, degraded_sources))
+    }
+
+    /// Executes one common serialized follower plan against one role-specialized assignment set.
+    async fn dispatch_common_follower(
+        &self,
+        dispatcher: &dispatcher::FragmentDispatcher,
+        context: &dispatcher::DispatchContext,
+        candidate: &dispatcher::DispatchCandidate,
+        physical_plan_bytes: Vec<u8>,
+        assignments: Vec<FollowerScanAssignment>,
+        binding: TenantTableBinding,
+        plan_fingerprint: String,
+        deadline_unix_ms: i64,
+    ) -> Result<Vec<RecordBatch>, dispatcher::DispatchError> {
+        let attempt = dispatcher
+            .execute(
+                context,
+                common_physical_fragment(
+                    &physical_plan_bytes,
+                    assignments,
+                    &binding,
+                    candidate.role,
+                    &plan_fingerprint,
+                    deadline_unix_ms,
+                ),
+                std::slice::from_ref(candidate),
+            )
+            .await?;
+        let mut batches = Vec::new();
+        decode_attempt_batches(attempt, &mut batches)
+            .map_err(|_| dispatcher::DispatchError::Terminal)?;
+        Ok(batches)
     }
 
     /// Builds one Oracle execution session over governed memory and query spill.
@@ -3159,235 +3492,6 @@ impl Oracle {
             .map_err(|error| map_datafusion_error(&error))?;
         Ok((schema, stream, scan_stats))
     }
-
-    /// Plans, assigns, executes, and decodes one footer-validated sealed source tier.
-    ///
-    /// The immutable membership snapshot is captured once. Small single-fragment
-    /// work stays leader-local; larger work selects no more configured workers
-    /// than fragments and retries only within this snapshot.
-    ///
-    /// # Errors
-    /// Returns a stable execution, timeout, metadata, or peer-security failure.
-    async fn dispatch_sealed_fragments(
-        &self,
-        input: SealedDispatchInput<'_>,
-    ) -> Result<Vec<RecordBatch>, OracleExecutionError> {
-        let dispatcher = self
-            .fragment_dispatcher
-            .as_ref()
-            .ok_or(BifrostError::QueryExecutionFailed)?;
-        let leader = input.admitted.leader.node_id;
-        let prepared = self.prepare_sealed_dispatch(input)?;
-        #[cfg(feature = "test-support")]
-        let topology_probe = self
-            .topology_probe
-            .lock()
-            .ok()
-            .and_then(|probe| probe.clone());
-        #[cfg(feature = "test-support")]
-        if let Some(probe) = topology_probe
-            && let Some(target) = prepared
-                .assignment
-                .iter()
-                .find_map(|(node, work)| (*node != leader && !work.is_empty()).then_some(*node))
-        {
-            probe.pause_first_selection(target).await;
-        }
-        let mut output = Vec::new();
-        let siblings = prepared.context.cancellation.child_token();
-        let parallelism = dispatch_parallelism(
-            prepared.selected.len(),
-            self.planner.config.max_workers_per_query,
-        );
-        let mut attempts: Vec<dispatcher::SealedFragmentFuture<'_>> = Vec::new();
-        for fragment in prepared.fragments {
-            let primary = prepared
-                .assignment
-                .iter()
-                .find_map(|(node, work)| work.contains(&fragment).then_some(*node))
-                .unwrap_or(leader);
-            let mut order = vec![primary];
-            order.extend(
-                prepared
-                    .selected
-                    .iter()
-                    .copied()
-                    .filter(|node| *node != primary),
-            );
-            let candidates = order
-                .into_iter()
-                .filter_map(|node_id| {
-                    prepared.fences.get(&node_id).copied().map(|worker_fence| {
-                        dispatcher::DispatchCandidate {
-                            node_id,
-                            role: wyrd_spec::vala::api::ClusterRole::Oracle,
-                            worker_fence,
-                        }
-                    })
-                })
-                .collect::<Vec<_>>();
-            let mut dispatch_context = prepared.context.clone();
-            dispatch_context.cancellation = siblings.clone();
-            let remote_scan: Arc<dyn datafusion::physical_plan::ExecutionPlan> =
-                Arc::new(codec::RemoteScanExec::new(
-                    fragment.fragment_id.clone(),
-                    fragment.schema_fingerprint.clone(),
-                    Arc::clone(&prepared.schema),
-                ));
-            let physical_plan_bytes = physical_plan_to_bytes_with_extension_codec(
-                remote_scan,
-                &codec::OraclePhysicalExtensionCodec::encoder(),
-            )
-            .map_err(|_| BifrostError::QueryExecutionFailed)?
-            .to_vec();
-            let plan_fingerprint = codec::physical_plan_fingerprint(&physical_plan_bytes);
-            let physical = dispatcher::PhysicalDispatchFragment {
-                physical_plan_bytes,
-                assignments: vec![FollowerScanAssignment {
-                    scan_id: fragment.fragment_id.clone(),
-                    binding: prepared.binding.clone(),
-                    persisted: PersistedFileAssignment {
-                        files: fragment
-                            .files
-                            .iter()
-                            .map(|file| file.location.clone())
-                            .collect(),
-                    },
-                    scribe_provider_cut: None,
-                    schema_fingerprint: fragment.schema_fingerprint,
-                }],
-                binding: prepared.binding.clone(),
-                target_role: wyrd_spec::vala::api::ClusterRole::Oracle,
-                plan_fingerprint,
-                deadline_unix_ms: fragment.deadline_unix_ms,
-            };
-            attempts.push(Box::pin(async move {
-                dispatcher
-                    .execute(&dispatch_context, physical, &candidates)
-                    .await
-                    .map_err(|error| map_dispatch_error(&error))
-            }));
-        }
-        dispatcher::FragmentDispatcher::dispatch_attempts(
-            attempts,
-            parallelism,
-            &siblings,
-            &mut output,
-        )
-        .await?;
-        Ok(output)
-    }
-
-    /// Plans immutable fragment work and assignment from one membership snapshot.
-    ///
-    /// # Errors
-    ///
-    /// Returns stable timeout, metadata, role, planning, or audit-digest errors.
-    fn prepare_sealed_dispatch(
-        &self,
-        input: SealedDispatchInput<'_>,
-    ) -> Result<PreparedSealedDispatch, OracleExecutionError> {
-        let remaining = input
-            .deadline
-            .checked_duration_since(Instant::now())
-            .ok_or(BifrostError::QueryTimeout)?;
-        let deadline_unix_ms = (chrono::Utc::now()
-            + chrono::Duration::from_std(remaining).map_err(|_| BifrostError::QueryTimeout)?)
-        .timestamp_millis();
-        let binding = self
-            .catalog
-            .object_location(&input.cut.binding, &input.cut.binding.object_prefix)
-            .map_err(BifrostCatalogError::into_public)?;
-        let schema = Arc::new(
-            iceberg::arrow::schema_to_arrow_schema(
-                input.cut.iceberg_table.metadata().current_schema(),
-            )
-            .map_err(|_| BifrostError::QueryExecutionFailed)?,
-        );
-        let schema_fingerprint = sealed_fragment_schema_fingerprint(schema.as_ref());
-        let fragments = fragment::FragmentPlanner
-            .plan(
-                &fragment::PreparedSealedLeaf {
-                    binding,
-                    tier: input.tier,
-                    pinned_digest: input.pinned_digest,
-                    files: input.files,
-                    projection: Vec::new(),
-                    predicates: Vec::new(),
-                    schema_fingerprint,
-                    deadline_unix_ms,
-                },
-                &fragment::FragmentConfig {
-                    max_files: self.planner.config.fragment_max_files,
-                },
-            )
-            .map_err(|_| BifrostError::QueryExecutionFailed)?;
-        let snapshot = self.cluster.snapshot();
-        let leader = input.admitted.leader.node_id;
-        let mut eligible = std::collections::BTreeMap::new();
-        let mut fences = HashMap::new();
-        for role in snapshot.live_oracles() {
-            if let ClusterCapabilities::OracleV1(capabilities) = &role.capabilities {
-                eligible.insert(
-                    role.key.node_id,
-                    assignment::OracleNode {
-                        node_id: role.key.node_id,
-                        capabilities: capabilities.clone(),
-                    },
-                );
-                fences.insert(role.key.node_id, role.fencing_token);
-            }
-        }
-        if !eligible.contains_key(&leader) {
-            return Err(BifrostError::OracleRoleUnavailable.into());
-        }
-        let assignment = assignment::PortableAssignmentV1
-            .assign(
-                &fragments,
-                &eligible,
-                leader,
-                if fragments.len() == 1 {
-                    0
-                } else {
-                    self.planner.config.max_workers_per_query
-                },
-            )
-            .map_err(|_| BifrostError::QueryExecutionFailed)?;
-        let mut selected = assignment.keys().copied().collect::<Vec<_>>();
-        selected.sort_by_key(|node| node.as_uuid());
-        let permission_digest = audit_digest(&input.context.permission)?.as_str().to_owned();
-        let dispatch_context = dispatcher::DispatchContext {
-            query_id: input.admitted.query_id,
-            leader_node_id: leader,
-            leader_fence: input.admitted.leader.fencing_token,
-            tenant_id: input.context.data_tenant_id.as_uuid(),
-            query_class: input.query_class,
-            slot_units: admission_limits(u32::MAX, input.query_class).1,
-            permission_digest,
-            attempt_bytes: self.planner.config.attempt_max_bytes,
-            attempt_memory_bytes: self.planner.config.attempt_memory_bytes,
-            query_memory_pool: input
-                .admitted
-                .memory_pool()
-                .expect("admitted Oracle query retains its root-issued memory pool"),
-            cancellation: input.admitted.cancellation.clone(),
-            deadline: input.deadline.into(),
-        };
-        let wire_binding = TenantTableBinding {
-            tenant_id: input.context.data_tenant_id,
-            namespace: input.cut.binding.logical_namespace.clone(),
-            table: input.cut.binding.table_ref.name.clone(),
-        };
-        Ok(PreparedSealedDispatch {
-            fragments,
-            assignment,
-            selected,
-            fences,
-            context: dispatch_context,
-            binding: wire_binding,
-            schema,
-        })
-    }
 }
 
 /// Awaits one stream lookahead within the query's absolute deadline.
@@ -3407,13 +3511,6 @@ async fn await_first_batch(
     tokio::time::timeout(remaining, batches.next())
         .await
         .map_err(|_| BifrostError::QueryTimeout)
-}
-
-/// Computes the exact active sealed-fragment bound from selected and admitted capacity.
-fn dispatch_parallelism(selected_peer_count: usize, admitted_query_parallelism: usize) -> usize {
-    selected_peer_count
-        .min(admitted_query_parallelism.max(1))
-        .max(1)
 }
 
 /// Computes the executor fingerprint after canonicalizing equivalent UTC timezone spellings.
@@ -3918,11 +4015,143 @@ fn validate_read_only_plan(
     Ok(())
 }
 
-/// Detects the sole storage race eligible for a whole pre-byte replan.
-fn is_stale_file_error(error: &datafusion::error::DataFusionError) -> bool {
-    let message = error.to_string().to_ascii_lowercase();
-    (message.contains("not found") || message.contains("404"))
-        && (message.contains("parquet") || message.contains("object"))
+/// Cross-products pinned tables and Scribes into explicit-empty persisted assignments.
+///
+/// # Errors
+/// Returns visibility unavailable when a persisted cursor, WAL projection, or
+/// configured retained-byte ceiling cannot be represented by the private cut.
+fn build_scribe_follower_sources(
+    tables: &[ScribeAssignmentTable<'_>],
+    scribes: &[OracleQueryParticipant],
+    observed_at: DateTime<Utc>,
+    attempt_max_bytes: usize,
+) -> Result<Vec<ScribeFollowerSource>, BifrostError> {
+    tables
+        .iter()
+        .flat_map(|table| scribes.iter().map(move |participant| (table, participant)))
+        .map(|(table, participant)| {
+            let writer_epoch = participant.fencing_token;
+            let node_id = participant.node_id;
+            let stream_rows = table
+                .sealed_manifest
+                .iter()
+                .filter(|row| {
+                    row.node_id == node_id.as_uuid()
+                        && u64::try_from(row.writer_epoch).ok() == Some(writer_epoch)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let cursor = stream_rows
+                .iter()
+                .map(|row| u64::try_from(row.wal_lsn_max))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| BifrostError::QueryVisibilityUnavailable)?
+                .into_iter()
+                .max()
+                .unwrap_or(0);
+            let persisted_ranges = project_persisted_wal_ranges(&stream_rows, cursor)
+                .map_err(BifrostCatalogError::into_public)?;
+            let mut days = stream_rows
+                .iter()
+                .map(|row| row.partition_day.format("%Y-%m-%d").to_string())
+                .collect::<Vec<_>>();
+            days.sort();
+            let fallback_day = observed_at.date_naive().format("%Y-%m-%d").to_string();
+            let start_day = days
+                .first()
+                .cloned()
+                .unwrap_or_else(|| fallback_day.clone());
+            let end_day = days.last().cloned().unwrap_or(fallback_day);
+            Ok(ScribeFollowerSource {
+                table: table.table.clone(),
+                node_id,
+                assignment: FollowerScanAssignment {
+                    scan_id: scribe_follower_scan_id(
+                        &format!("{}.{}", table.binding.namespace, table.binding.table),
+                        node_id,
+                        writer_epoch,
+                    ),
+                    binding: table.binding.clone(),
+                    persisted: PersistedFileAssignment { files: Vec::new() },
+                    scribe_provider_cut: Some(ScribeProviderCut {
+                        writer_epoch,
+                        start_event_day: start_day,
+                        end_event_day: end_day,
+                        required_columns: table
+                            .physical_schema
+                            .fields()
+                            .iter()
+                            .map(|field| field.name().clone())
+                            .collect(),
+                        persisted_cursor: cursor,
+                        persisted_ranges,
+                        maximum_batch_count: 1_024,
+                        maximum_retained_bytes: u64::try_from(attempt_max_bytes)
+                            .map_err(|_| BifrostError::QueryVisibilityUnavailable)?,
+                    }),
+                    schema_fingerprint: sealed_fragment_schema_fingerprint(&table.physical_schema),
+                },
+            })
+        })
+        .collect()
+}
+
+/// Partitions every persisted scan completely and disjointly across fixed Oracle workers.
+fn partition_oracle_assignments(
+    assignments: &[FollowerScanAssignment],
+    worker_count: usize,
+) -> Vec<Vec<FollowerScanAssignment>> {
+    if worker_count == 0 {
+        return Vec::new();
+    }
+    let mut partitions = vec![Vec::with_capacity(assignments.len()); worker_count];
+    for assignment in assignments {
+        for (worker, partition) in partitions.iter_mut().enumerate() {
+            let mut specialized = assignment.clone();
+            specialized.persisted.files = assignment
+                .persisted
+                .files
+                .iter()
+                .enumerate()
+                .filter(|(ordinal, _)| ordinal % worker_count == worker)
+                .map(|(_, file)| file.clone())
+                .collect();
+            partition.push(specialized);
+        }
+    }
+    partitions
+}
+
+/// Derives the identity-bound common-plan placeholder for one pinned Scribe stream.
+fn scribe_follower_scan_id(table: &str, node_id: NodeId, writer_epoch: u64) -> String {
+    format!(
+        "oracle:{table}:scribe:{}:{writer_epoch}:live",
+        node_id.as_uuid()
+    )
+}
+
+/// Specializes only role-local provider assignments around one common encoded plan.
+fn common_physical_fragment(
+    physical_plan_bytes: &[u8],
+    assignments: Vec<FollowerScanAssignment>,
+    binding: &TenantTableBinding,
+    target_role: wyrd_spec::vala::api::ClusterRole,
+    plan_fingerprint: &str,
+    deadline_unix_ms: i64,
+) -> dispatcher::PhysicalDispatchFragment {
+    dispatcher::PhysicalDispatchFragment {
+        physical_plan_bytes: physical_plan_bytes.to_vec(),
+        assignments,
+        binding: binding.clone(),
+        target_role,
+        plan_fingerprint: plan_fingerprint.to_owned(),
+        deadline_unix_ms,
+    }
+}
+
+/// Detects the sole typed Iceberg object-loss race eligible for a pre-byte replan.
+pub fn is_stale_iceberg_object_error(error: &datafusion::error::DataFusionError) -> bool {
+    exec::is_stale_iceberg_object_error(error)
 }
 
 /// Records consumption of the sole pre-byte stale-cut replan.
@@ -3978,8 +4207,247 @@ mod tests {
     use super::*;
     use arrow::array::{StringArray, UInt64Array};
     use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::execution::memory_pool::GreedyMemoryPool;
+    use std::collections::HashSet;
     use std::sync::atomic::AtomicUsize;
+
+    /// Creates one stable tenant/table binding for follower-assignment tests.
+    fn test_follower_binding(table: &str) -> TenantTableBinding {
+        TenantTableBinding {
+            tenant_id: DataTenantId::new_v7(),
+            namespace: "bifrost".to_owned(),
+            table: table.to_owned(),
+        }
+    }
+
+    /// Creates one persisted-only assignment with an explicit ordered file list.
+    fn test_persisted_assignment(scan_id: &str, files: &[&str]) -> FollowerScanAssignment {
+        FollowerScanAssignment {
+            scan_id: scan_id.to_owned(),
+            binding: test_follower_binding(scan_id),
+            persisted: PersistedFileAssignment {
+                files: files.iter().map(|file| (*file).to_owned()).collect(),
+            },
+            scribe_provider_cut: None,
+            schema_fingerprint: format!("schema-{scan_id}"),
+        }
+    }
+
+    /// Every pinned Scribe receives exactly one empty-persisted hot cut per pinned table.
+    #[test]
+    fn pinned_scribes_cross_product_all_tables_with_explicit_empty_hot_assignments() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "event_id",
+            DataType::Utf8,
+            false,
+        )]));
+        let empty_manifest = Vec::new();
+        let tables = ["spans", "observations"]
+            .into_iter()
+            .map(|table| ScribeAssignmentTable {
+                table: format!("vala.bifrost.{table}"),
+                binding: test_follower_binding(table),
+                physical_schema: Arc::clone(&schema),
+                sealed_manifest: &empty_manifest,
+            })
+            .collect::<Vec<_>>();
+        let scribes = [(11_u128, 101_u64), (12_u128, 102_u64), (13_u128, 103_u64)]
+            .into_iter()
+            .map(|(node, fence)| OracleQueryParticipant {
+                node_id: NodeId::new(uuid::Uuid::from_u128(node)),
+                endpoint: format!("https://scribe-{node}.internal"),
+                role: wyrd_spec::vala::api::ClusterRole::Scribe,
+                fencing_token: fence,
+                capabilities: ClusterCapabilities::ScribeV1(
+                    wyrd_spec::vala::api::ScribeCapabilitiesV1 {
+                        tail_protocol_version: 1,
+                    },
+                ),
+            })
+            .collect::<Vec<_>>();
+        let assignments = build_scribe_follower_sources(&tables, &scribes, Utc::now(), 64 * 1024)
+            .expect("valid pinned Scribes produce bounded assignments");
+
+        assert_eq!(assignments.len(), tables.len() * scribes.len());
+        let mut pairs = HashSet::new();
+        let mut scan_ids = HashSet::new();
+        for source in assignments {
+            assert!(pairs.insert((source.table.clone(), source.node_id)));
+            assert!(scan_ids.insert(source.assignment.scan_id.clone()));
+            assert!(source.assignment.persisted.files.is_empty());
+            let participant = scribes
+                .iter()
+                .find(|participant| participant.node_id == source.node_id)
+                .expect("assignment node is an exact pinned Scribe");
+            assert_eq!(
+                source.assignment.scan_id,
+                scribe_follower_scan_id(
+                    &format!(
+                        "{}.{}",
+                        source.assignment.binding.namespace, source.assignment.binding.table
+                    ),
+                    source.node_id,
+                    participant.fencing_token,
+                )
+            );
+            let provider = source
+                .assignment
+                .scribe_provider_cut
+                .expect("every pinned Scribe assignment carries the mandatory hot cut");
+            assert_eq!(provider.writer_epoch, participant.fencing_token);
+            assert_eq!(provider.persisted_cursor, 0);
+            assert_eq!(provider.required_columns, vec!["event_id".to_owned()]);
+        }
+        assert_eq!(scan_ids.len(), tables.len() * scribes.len());
+        for table in &tables {
+            for scribe in &scribes {
+                assert!(pairs.contains(&(table.table.clone(), scribe.node_id)));
+            }
+        }
+    }
+
+    /// Persisted work partitions are deterministic, complete, disjoint, and explicitly empty.
+    #[test]
+    fn oracle_partitions_preserve_exact_disjoint_persisted_union() {
+        let originals = vec![
+            test_persisted_assignment("spans", &["a", "b", "c"]),
+            test_persisted_assignment("observations", &["d"]),
+        ];
+        let partitions = partition_oracle_assignments(&originals, 4);
+        assert_eq!(partitions, partition_oracle_assignments(&originals, 4));
+        assert_eq!(partitions.len(), 4);
+        for (scan_ordinal, original) in originals.iter().enumerate() {
+            let worker_files = partitions
+                .iter()
+                .map(|partition| partition[scan_ordinal].persisted.files.clone())
+                .collect::<Vec<_>>();
+            let mut union = worker_files.iter().flatten().cloned().collect::<Vec<_>>();
+            union.sort();
+            assert_eq!(union, original.persisted.files);
+            let unique = union.iter().collect::<HashSet<_>>();
+            assert_eq!(unique.len(), union.len(), "no file is duplicated");
+            for left in 0..worker_files.len() {
+                for right in (left + 1)..worker_files.len() {
+                    assert!(
+                        worker_files[left]
+                            .iter()
+                            .all(|file| !worker_files[right].contains(file))
+                    );
+                }
+            }
+        }
+        assert!(partitions[3][0].persisted.files.is_empty());
+        assert!(partitions[1][1].persisted.files.is_empty());
+    }
+
+    /// Oracle and Scribe dispatches retain byte-identical plans and fingerprints.
+    #[test]
+    fn common_follower_plan_specializes_only_role_local_assignments() {
+        let binding = test_follower_binding("spans");
+        let oracle_assignment = test_persisted_assignment("spans", &["a"]);
+        let mut scribe_assignment = test_persisted_assignment("spans", &[]);
+        scribe_assignment.scribe_provider_cut = Some(ScribeProviderCut {
+            writer_epoch: 7,
+            start_event_day: "2026-08-20".to_owned(),
+            end_event_day: "2026-08-20".to_owned(),
+            required_columns: vec!["event_id".to_owned()],
+            persisted_cursor: 0,
+            persisted_ranges: Vec::new(),
+            maximum_batch_count: 1,
+            maximum_retained_bytes: 1024,
+        });
+        let encoded = [9_u8, 8, 7, 6];
+        let oracle = common_physical_fragment(
+            &encoded,
+            vec![oracle_assignment],
+            &binding,
+            wyrd_spec::vala::api::ClusterRole::Oracle,
+            "common-fingerprint",
+            42,
+        );
+        let scribe = common_physical_fragment(
+            &encoded,
+            vec![scribe_assignment],
+            &binding,
+            wyrd_spec::vala::api::ClusterRole::Scribe,
+            "common-fingerprint",
+            42,
+        );
+        assert_eq!(oracle.physical_plan_bytes, scribe.physical_plan_bytes);
+        assert_eq!(oracle.plan_fingerprint, scribe.plan_fingerprint);
+        assert_ne!(oracle.target_role, scribe.target_role);
+        assert_ne!(oracle.assignments, scribe.assignments);
+    }
+
+    /// Only eligible live-tail loss under explicit policy becomes degraded.
+    #[test]
+    fn eligible_source_loss_obeys_parent_terminal_matrix() {
+        use wyrd_spec::vala::api::FreshnessPolicy;
+
+        let eligible = dispatcher::DispatchError::EligibleSourceLoss {
+            cause: dispatcher::EligibleSourceLossCause::ProviderResolution,
+        };
+        assert!(follower_source_loss_degrades(
+            &eligible,
+            FreshnessPolicy::AllowDegraded,
+            &[QuerySource::LiveTail],
+        ));
+        assert!(!follower_source_loss_degrades(
+            &eligible,
+            FreshnessPolicy::Strict,
+            &[QuerySource::LiveTail],
+        ));
+        assert!(!follower_source_loss_degrades(
+            &eligible,
+            FreshnessPolicy::AllowDegraded,
+            &[QuerySource::Iceberg],
+        ));
+        assert!(!follower_source_loss_degrades(
+            &eligible,
+            FreshnessPolicy::AllowDegraded,
+            &[QuerySource::HotSealed],
+        ));
+        for error in [
+            dispatcher::DispatchError::Unavailable,
+            dispatcher::DispatchError::Capacity,
+            dispatcher::DispatchError::Terminal,
+            dispatcher::DispatchError::StaleObject,
+        ] {
+            assert!(!follower_source_loss_degrades(
+                &error,
+                FreshnessPolicy::AllowDegraded,
+                &[QuerySource::LiveTail],
+            ));
+        }
+    }
+
+    /// Assignment identity emits the exact degraded public source tier.
+    #[test]
+    fn follower_assignment_sources_preserve_oracle_and_scribe_tiers() {
+        let mut iceberg = test_persisted_assignment("oracle:spans:iceberg", &["a"]);
+        let hot = test_persisted_assignment("oracle:spans:hot", &["b"]);
+        assert_eq!(
+            follower_assignment_sources(
+                wyrd_spec::vala::api::ClusterRole::Oracle,
+                &[iceberg.clone(), hot]
+            ),
+            vec![QuerySource::Iceberg, QuerySource::HotSealed]
+        );
+        iceberg.persisted.files.clear();
+        iceberg.scribe_provider_cut = Some(ScribeProviderCut {
+            writer_epoch: 7,
+            start_event_day: "2026-08-20".to_owned(),
+            end_event_day: "2026-08-20".to_owned(),
+            required_columns: vec!["event_id".to_owned()],
+            persisted_cursor: 0,
+            persisted_ranges: Vec::new(),
+            maximum_batch_count: 1,
+            maximum_retained_bytes: 1024,
+        });
+        assert_eq!(
+            follower_assignment_sources(wyrd_spec::vala::api::ClusterRole::Scribe, &[iceberg]),
+            vec![QuerySource::LiveTail]
+        );
+    }
 
     /// Generic `DataFusion` resource exhaustion is classified structurally as capacity.
     #[test]
@@ -3995,6 +4463,74 @@ mod tests {
             map_datafusion_error(&error),
             BifrostError::QueryAdmissionRejected
         );
+    }
+
+    /// Stale replanning accepts only an exact typed storage not-found cause.
+    #[test]
+    fn stale_iceberg_replan_rejects_string_only_not_found_messages() {
+        let typed_non_iceberg = datafusion::error::DataFusionError::External(Box::new(
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+        ));
+        assert!(!is_stale_iceberg_object_error(&typed_non_iceberg));
+
+        let typed_iceberg =
+            exec::iceberg_datafusion_error(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(is_stale_iceberg_object_error(&typed_iceberg));
+
+        let text_only = datafusion::error::DataFusionError::Execution(
+            "404 parquet object not found".to_owned(),
+        );
+        assert!(!is_stale_iceberg_object_error(&text_only));
+    }
+
+    /// The sole typed pre-output replacement settles its real admission owner first.
+    #[test]
+    fn stale_replacement_gate_settles_once_and_rejects_second_or_post_output_attempts() {
+        let (admitted, shared, _request_cancellation) = admission::admitted_guard_for_test();
+        let cancellation = admitted.cancellation.clone();
+        assert_eq!(admission::active_queries_for_test(&shared), 1);
+        assert!(
+            StaleReplacementGate::before_output(0)
+                .settle_for_typed_stale(admitted, true)
+                .is_ok()
+        );
+        assert!(cancellation.is_cancelled());
+        assert_eq!(admission::active_queries_for_test(&shared), 0);
+
+        let (second, second_shared, _request_cancellation) = admission::admitted_guard_for_test();
+        let second =
+            match StaleReplacementGate::before_output(1).settle_for_typed_stale(second, true) {
+                Ok(()) => panic!("second stale attempt must not replace"),
+                Err(admitted) => admitted,
+            };
+        assert_eq!(admission::active_queries_for_test(&second_shared), 1);
+        second.release();
+        assert_eq!(admission::active_queries_for_test(&second_shared), 0);
+
+        let (post_output, post_output_shared, _request_cancellation) =
+            admission::admitted_guard_for_test();
+        let post_output = match (StaleReplacementGate {
+            retry_ordinal: 0,
+            output_started: true,
+        })
+        .settle_for_typed_stale(post_output, true)
+        {
+            Ok(()) => panic!("post-output stale failure must not replace"),
+            Err(admitted) => admitted,
+        };
+        post_output.release();
+        assert_eq!(admission::active_queries_for_test(&post_output_shared), 0);
+
+        let (string_only, string_shared, _request_cancellation) =
+            admission::admitted_guard_for_test();
+        let string_only = match StaleReplacementGate::before_output(0)
+            .settle_for_typed_stale(string_only, false)
+        {
+            Ok(()) => panic!("string-only not-found must not replace"),
+            Err(admitted) => admitted,
+        };
+        string_only.release();
+        assert_eq!(admission::active_queries_for_test(&string_shared), 0);
     }
 
     /// Synthetic first-batch owner exposing cleanup and final-drop observations.
@@ -4126,8 +4662,6 @@ mod tests {
             let declaration = ["struct ", owner_name].concat();
             assert!(owner.contains(&declaration), "missing owner: {declaration}");
         }
-        let inherent_dispatch_workflow = dispatcher::FragmentDispatcher::dispatch_attempts;
-        std::hint::black_box(inherent_dispatch_workflow);
     }
 
     /// The synchronous floor rejects empty, multi-statement, and non-SELECT SQL.
@@ -4500,264 +5034,6 @@ mod tests {
         assert_eq!(
             sealed_fragment_schema_fingerprint(&iceberg),
             sealed_fragment_schema_fingerprint(&parquet),
-        );
-    }
-
-    /// Barrier-controlled transport probe used by the real dispatcher fan-out proof.
-    struct BoundedDispatchTransport {
-        /// Synchronizes the first two execute attempts so the bound is observable.
-        barrier: Arc<tokio::sync::Barrier>,
-        /// Number of execute calls that entered the transport.
-        execute_calls: AtomicU64,
-        /// Number of execute calls still holding their attempt guard.
-        active: Arc<AtomicU64>,
-        /// Highest number of simultaneous execute calls observed.
-        maximum: Arc<AtomicU64>,
-        /// Number of tuple-bound releases received after attempt cleanup.
-        releases: Arc<AtomicU64>,
-        /// Number of in-flight attempt guards dropped during sibling draining.
-        drained: Arc<AtomicU64>,
-    }
-
-    /// Drops one in-flight transport attempt and records its cleanup.
-    struct BoundedAttemptGuard {
-        /// Shared active-attempt count.
-        active: Arc<AtomicU64>,
-        /// Shared drained-attempt count.
-        drained: Arc<AtomicU64>,
-    }
-
-    impl Drop for BoundedAttemptGuard {
-        /// Decrements in-flight work when cancellation or terminal failure drains it.
-        fn drop(&mut self) {
-            self.active.fetch_sub(1, Ordering::SeqCst);
-            self.drained.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    #[async_trait]
-    impl dispatcher::OraclePeerTransport for BoundedDispatchTransport {
-        /// Accepts every reservation so only the dispatch bound controls fan-out.
-        async fn reserve(
-            &self,
-            _worker: wyrd_spec::vala::api::NodeId,
-            request: wyrd_spec::vala::api::ReserveNodeSlotsRequest,
-        ) -> Result<wyrd_spec::vala::api::ReserveNodeSlotsResponse, dispatcher::DispatchError>
-        {
-            Ok(wyrd_spec::vala::api::ReserveNodeSlotsResponse::Pending(
-                wyrd_spec::vala::api::PendingNodeReservation {
-                    reservation_id: wyrd_spec::vala::api::ReservationId::new(uuid::Uuid::now_v7()),
-                    expires_at: request.expires_at,
-                },
-            ))
-        }
-
-        /// Records every tuple-bound cleanup issued by failed attempts.
-        async fn release(
-            &self,
-            _worker: wyrd_spec::vala::api::NodeId,
-            _request: wyrd_spec::vala::api::ReleaseNodeSlotsRequest,
-        ) -> Result<(), dispatcher::DispatchError> {
-            self.releases.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-
-        /// Blocks siblings behind a barrier, then terminates one and waits on cancellation in the other.
-        async fn execute(
-            &self,
-            _worker: wyrd_spec::vala::api::NodeId,
-            _request: wyrd_spec::vala::api::PhysicalExecuteFragmentRequest,
-            _admitted_pool: Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>>,
-        ) -> Result<dispatcher::WorkerAttemptStream, dispatcher::DispatchError> {
-            let ordinal = self.execute_calls.fetch_add(1, Ordering::SeqCst);
-            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
-            self.maximum.fetch_max(active, Ordering::SeqCst);
-            let guard = BoundedAttemptGuard {
-                active: Arc::clone(&self.active),
-                drained: Arc::clone(&self.drained),
-            };
-            self.barrier.wait().await;
-            if ordinal == 0 {
-                let stream = async_stream::stream! {
-                    let _guard = guard;
-                    yield Ok(wyrd_spec::vala::api::WorkerAttemptFrame::Schema(vec![1]));
-                    yield Err(dispatcher::DispatchError::Terminal);
-                };
-                return Ok(Box::pin(stream));
-            }
-            let _guard = guard;
-            std::future::pending::<
-                Result<dispatcher::WorkerAttemptStream, dispatcher::DispatchError>,
-            >()
-            .await
-        }
-    }
-
-    /// Actual bounded fragment orchestration overlaps real dispatcher work, cancels failure siblings, and drains.
-    #[tokio::test]
-    async fn fragment_dispatch_respects_bound() {
-        let leader = wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7());
-        let transport = Arc::new(BoundedDispatchTransport {
-            barrier: Arc::new(tokio::sync::Barrier::new(2)),
-            execute_calls: AtomicU64::new(0),
-            active: Arc::new(AtomicU64::new(0)),
-            maximum: Arc::new(AtomicU64::new(0)),
-            releases: Arc::new(AtomicU64::new(0)),
-            drained: Arc::new(AtomicU64::new(0)),
-        });
-        let dispatcher = dispatcher::FragmentDispatcher::new(
-            Arc::new(peer::DeterministicTestSigner {
-                key_id: "test".to_owned(),
-            }),
-            dispatcher::OraclePeerTransportDirectory::new_for_test(
-                leader,
-                Arc::clone(&transport) as Arc<dyn dispatcher::OraclePeerTransport>,
-                Arc::clone(&transport) as Arc<dyn dispatcher::OraclePeerTransport>,
-            ),
-        );
-        let context = dispatcher::DispatchContext {
-            query_id: QueryId::new(uuid::Uuid::now_v7()),
-            leader_node_id: leader,
-            leader_fence: 1,
-            tenant_id: uuid::Uuid::now_v7(),
-            query_class: QueryClass::Interactive,
-            slot_units: 1,
-            permission_digest: "permission".to_owned(),
-            attempt_bytes: 1_024,
-            attempt_memory_bytes: 1_024,
-            query_memory_pool: Arc::new(GreedyMemoryPool::new(2_048)),
-            cancellation: CancellationToken::new(),
-            deadline: (Instant::now() + Duration::from_secs(5)).into(),
-        };
-        let siblings = CancellationToken::new();
-        let mut attempts: Vec<dispatcher::SealedFragmentFuture<'_>> = Vec::new();
-        for ordinal in 0..3_u8 {
-            let dispatcher = &dispatcher;
-            let mut context = context.clone();
-            context.cancellation = siblings.clone();
-            let binding = TenantTableBinding {
-                tenant_id: DataTenantId::SYSTEM_OWNER,
-                namespace: "vala.bifrost".to_owned(),
-                table: "events".to_owned(),
-            };
-            let fragment = dispatcher::PhysicalDispatchFragment {
-                physical_plan_bytes: vec![ordinal],
-                assignments: vec![FollowerScanAssignment {
-                    scan_id: format!("scan-{ordinal}"),
-                    binding: binding.clone(),
-                    persisted: PersistedFileAssignment { files: Vec::new() },
-                    scribe_provider_cut: None,
-                    schema_fingerprint: "schema".to_owned(),
-                }],
-                binding,
-                target_role: wyrd_spec::vala::api::ClusterRole::Oracle,
-                plan_fingerprint: format!("fragment-{ordinal}"),
-                deadline_unix_ms: i64::MAX,
-            };
-            let candidate = dispatcher::DispatchCandidate {
-                node_id: leader,
-                role: wyrd_spec::vala::api::ClusterRole::Oracle,
-                worker_fence: 1,
-            };
-            attempts.push(Box::pin(async move {
-                dispatcher
-                    .execute(&context, fragment, &[candidate])
-                    .await
-                    .map_err(|_error| {
-                        OracleExecutionError::Public(BifrostError::QueryExecutionFailed)
-                    })
-            }));
-        }
-        let mut output = Vec::new();
-        let error =
-            dispatcher::FragmentDispatcher::dispatch_attempts(attempts, 2, &siblings, &mut output)
-                .await
-                .expect_err("terminal fragment failure");
-        assert!(matches!(
-            error,
-            OracleExecutionError::Public(BifrostError::QueryExecutionFailed)
-        ));
-        assert_eq!(transport.maximum.load(Ordering::SeqCst), 2);
-        assert_eq!(transport.active.load(Ordering::SeqCst), 0);
-        assert_eq!(transport.releases.load(Ordering::SeqCst), 2);
-        assert_eq!(transport.drained.load(Ordering::SeqCst), 2);
-        assert_eq!(transport.execute_calls.load(Ordering::SeqCst), 2);
-        assert!(
-            output.is_empty(),
-            "failed-attempt bytes must stay invisible"
-        );
-        assert!(siblings.is_cancelled());
-    }
-
-    /// Drops one sibling guard when decode failure drains the active attempt.
-    struct DecodeSiblingGuard {
-        /// Shared count of sibling cleanup completions.
-        drained: Arc<AtomicUsize>,
-    }
-
-    impl Drop for DecodeSiblingGuard {
-        /// Records that the sibling was dropped after cancellation.
-        fn drop(&mut self) {
-            self.drained.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    /// A validated attempt whose batch decode fails cancels and drains siblings.
-    #[tokio::test]
-    async fn fragment_dispatch_decode_failure_drains_sibling() {
-        let barrier = Arc::new(tokio::sync::Barrier::new(2));
-        let siblings = CancellationToken::new();
-        let drained = Arc::new(AtomicUsize::new(0));
-        let first_barrier = Arc::clone(&barrier);
-        let first = Box::pin(async move {
-            first_barrier.wait().await;
-            Ok(attempt::ValidatedAttempt {
-                schema: vec![1],
-                batches: attempt::AttemptBatchReader::Memory {
-                    batches: vec![vec![0]].into_iter(),
-                    memory_reservation: None,
-                },
-                footer: wyrd_spec::vala::api::WorkerFooter {
-                    fragment_id: "decode-failure".to_owned(),
-                    manifest_digest: QueryAuditDigest::new("manifest").expect("digest"),
-                    row_count: 0,
-                    encoded_bytes: 0,
-                    payload_digest: QueryAuditDigest::new("payload").expect("digest"),
-                    completed: true,
-                },
-            })
-        });
-        let sibling_barrier = Arc::clone(&barrier);
-        let sibling_token = siblings.clone();
-        let sibling_drained = Arc::clone(&drained);
-        let sibling = Box::pin(async move {
-            let _guard = DecodeSiblingGuard {
-                drained: sibling_drained,
-            };
-            sibling_barrier.wait().await;
-            sibling_token.cancelled().await;
-            Err(OracleExecutionError::Public(
-                BifrostError::QueryExecutionFailed,
-            ))
-        });
-        let mut output = Vec::new();
-        let error = dispatcher::FragmentDispatcher::dispatch_attempts(
-            vec![first, sibling],
-            2,
-            &siblings,
-            &mut output,
-        )
-        .await
-        .expect_err("invalid decoded batch fails the whole dispatch");
-        assert!(matches!(
-            error,
-            OracleExecutionError::Public(BifrostError::QueryExecutionFailed)
-        ));
-        assert!(siblings.is_cancelled());
-        assert_eq!(drained.load(Ordering::SeqCst), 1);
-        assert!(
-            output.is_empty(),
-            "decode failure cannot expose partial batches"
         );
     }
 

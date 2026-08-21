@@ -15,7 +15,6 @@ use axum::body::{Body, to_bytes};
 use axum::http::{HeaderValue, Request, Response, StatusCode, header};
 use chrono::{Duration as ChronoDuration, Utc};
 use ed25519_dalek::VerifyingKey;
-use opendal::{Buffer, Entry, Metadata, Operator};
 use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 use tokio::task::JoinHandle;
@@ -25,8 +24,8 @@ use uuid::Uuid;
 use vala_bifrost_redux::catalog::{BifrostCatalog, TableRef, TenantTableBinding};
 use vala_bifrost_redux::cluster::{ClusterRegistry, RoleTiming};
 use vala_bifrost_redux::forge::{
-    Forge, ForgeBuildConfig, ForgeClock, ForgeClockControl, ForgeConfig, ForgeObjectStore,
-    ForgeSchedulerTrigger, ForgeWorker, ForgeWorkerCompletionObserver, ForgeWorkerConfig,
+    ForgeClock, ForgeClockControl, ForgeConfig, ForgeSchedulerTrigger, ForgeWorker,
+    ForgeWorkerCompletionObserver, ForgeWorkerConfig,
 };
 use vala_bifrost_redux::gate::limits::IngestLimits;
 use vala_bifrost_redux::maintenance::{StagingFilePublisher, staging_file_channel};
@@ -38,7 +37,6 @@ use vala_bifrost_redux::resources::{
 };
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
-use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
 use vala_sdk::BifrostGrpcTransport;
 use wyrd_auth::exchange_api_key::{ExchangeApiKey, TokenExchangeSettings};
 use wyrd_auth::issue_api_key::WyrdApiKey;
@@ -65,21 +63,17 @@ use wyrd_server::boot::build_workload_bindings;
 use wyrd_server::boot::issuer::{seed_trusted_issuers, seed_workload_bindings};
 use wyrd_server::components::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAuditWriter};
 use wyrd_server::config::{
-    BifrostRuntimeRole, BifrostTarget, IssuerEntry, ServeMode, WorkloadBindingEntry,
+    BifrostRuntimeConfig, BifrostRuntimeRole, BifrostTarget, DeploymentProfile, ForgeRuntimeConfig,
+    IssuerEntry, ServeMode, WorkloadBindingEntry,
 };
 use wyrd_server::postgres::ServerPostgres;
-use wyrd_server::state::Scribe;
-use wyrd_server::state::{QueryStreamFault, QueryStreamFaultController};
+use wyrd_server::state::{
+    BifrostBuildInputs, BifrostTestControls, QueryStreamFault, QueryStreamFaultController,
+};
 use wyrd_server::{AppState, WyrdServer, WyrdServerConfig, build_router};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::{NodeId, ScribeCapabilitiesV1};
+use wyrd_spec::vala::api::NodeId;
 use wyrd_telemetry::TelemetryGuard;
-
-/// Production-shaped object-store seam for the embedded Forge fixture.
-#[derive(Debug)]
-struct TestForgeObjectStore {
-    operator: Arc<Operator>,
-}
 
 /// Harness-owned credential that exchanges one persisted Service API key.
 struct TestOraclePeerCredentials {
@@ -122,44 +116,6 @@ impl OraclePeerCredentials for TestOraclePeerCredentials {
     }
 }
 
-impl TestForgeObjectStore {
-    /// Retain the server-owned staging operator without changing its behavior.
-    fn new(operator: Arc<Operator>) -> Self {
-        Self { operator }
-    }
-}
-
-#[async_trait]
-impl ForgeObjectStore for TestForgeObjectStore {
-    async fn read(&self, path: &str) -> opendal::Result<Buffer> {
-        self.operator.read(path).await
-    }
-
-    /// Read exactly the requested byte range through OpenDAL's native reader.
-    ///
-    /// Forge uses bounded reads for Parquet metadata and row-group admission;
-    /// fetching the entire object here would bypass that memory guardrail.
-    ///
-    /// # Errors
-    ///
-    /// Returns the OpenDAL error when the reader cannot open or fetch the
-    /// requested range.
-    async fn read_range(&self, path: &str, range: std::ops::Range<u64>) -> opendal::Result<Buffer> {
-        self.operator.reader(path).await?.read(range).await
-    }
-
-    async fn list(&self, prefix: &str) -> opendal::Result<Vec<Entry>> {
-        self.operator.list_with(prefix).recursive(true).await
-    }
-
-    async fn stat(&self, path: &str) -> opendal::Result<Metadata> {
-        self.operator.stat(path).await
-    }
-
-    async fn delete(&self, path: &str) -> opendal::Result<()> {
-        self.operator.delete(path).await
-    }
-}
 use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::auth::{
     RequestedSubject, SecretBearer, SubjectTokenType, TokenRequest, TokenResponse,
@@ -608,6 +564,9 @@ impl WyrdTestServer {
         if let Some(handle) = self.serve_handle.take() {
             let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
         }
+        tokio::task::spawn_blocking(move || drop(self))
+            .await
+            .map_err(|error| WyrdTestServerError::Join(error.to_string()))?;
         Ok(())
     }
 
@@ -707,30 +666,21 @@ impl WyrdTestServer {
         } else {
             !matches!(self.mode, Mode::Bound { .. })
         };
-        if let Some(query) = self.inner.state.bifrost_query() {
-            // The production supervisor owns the graceful shutdown attempt. If
-            // its shared drain deadline expires, the audit writer and relay can
-            // still retain their publisher after the supervisor joins. Finish
-            // those test-owned tasks here so a restart can recover the same
-            // exclusive audit WAL root without racing a detached predecessor.
-            query.abort_audit_tasks_for_test().await;
-        }
-        if let Some(scribe) = self.inner.state.bifrost_scribe_for_test() {
-            scribe
-                .shutdown(std::time::Instant::now() + Duration::from_secs(60))
-                .await;
-        }
         let scribe = self
             .inner
             .state
             .bifrost_scribe_for_test()
             .map(|_| self.scribe_inspection_snapshot())
             .transpose()?;
-        Ok(ServerShutdownInspection {
+        let inspection = ServerShutdownInspection {
             scribe,
             listeners_stopped,
             supervised_tasks: self.supervised_task_count_for_test() as u64,
-        })
+        };
+        tokio::task::spawn_blocking(move || drop(self))
+            .await
+            .map_err(|error| WyrdTestServerError::Join(error.to_string()))?;
+        Ok(inspection)
     }
 
     /// Cancel bound server workers without dropping the server-owned fixtures.
@@ -1287,7 +1237,7 @@ impl WyrdTestServer {
         let forge = self
             .inner
             .state
-            .forge()
+            .forge_coordinator()
             .ok_or_else(|| WyrdTestServerError::Start("Forge is not composed".to_owned()))?;
         ForgeWorker::new(
             Arc::clone(forge),
@@ -1307,6 +1257,32 @@ impl WyrdTestServer {
                 .oracle()
                 .set_tail_discovery_unavailable_for_test(unavailable);
         }
+    }
+
+    /// Cancels the one composed process token and observes both selected role owners.
+    ///
+    /// # Errors
+    /// Returns a start error when the test pod does not select both Scribe and Oracle.
+    pub fn cancel_and_observe_shared_bifrost_shutdown_for_test(
+        &self,
+    ) -> Result<(bool, bool), WyrdTestServerError> {
+        let scribe = self
+            .inner
+            .state
+            .bifrost
+            .scribe()
+            .ok_or_else(|| WyrdTestServerError::Start("Scribe is not composed".to_owned()))?;
+        let oracle = self
+            .inner
+            .state
+            .bifrost
+            .oracle()
+            .ok_or_else(|| WyrdTestServerError::Start("Oracle is not composed".to_owned()))?;
+        self.inner.state.shutdown_token.cancel();
+        Ok((
+            scribe.process_shutdown_observed_for_test(),
+            oracle.process_shutdown_observed_for_test(),
+        ))
     }
 
     /// Return the production Forge process role selected for this server.
@@ -1388,7 +1364,7 @@ impl WyrdTestServer {
         let forge = self
             .inner
             .state
-            .forge()
+            .forge_coordinator()
             .ok_or_else(|| WyrdTestServerError::Start("Forge is not composed".to_owned()))?;
         let (snapshot_id, policy, candidates) = forge
             .inspect_live_files_for_test(&binding, &physical)
@@ -2813,12 +2789,6 @@ impl WyrdTestServerBuilder {
         };
 
         let postgres = Arc::new(ServerPostgres::from_parts(runtime_wyrd, runtime_vala));
-        let operator_pool = postgres.operator_pool().ok_or_else(|| {
-            WyrdTestServerError::Start(
-                "test server requires a platform-admin operator pool for Forge".to_owned(),
-            )
-        })?;
-        let scribe_admission = self.scribe_admission.unwrap_or_default();
         let resource_roles = self
             .bifrost_roles
             .iter()
@@ -2899,238 +2869,91 @@ impl WyrdTestServerBuilder {
         let bifrost_resources = runtime_resources
             .compose_roles()
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        let resource_plan = runtime_resources.plan();
-        let forge_config = self.forge_config.unwrap_or_else(|| ForgeConfig {
-            max_files_per_bin: self.forge_max_files_per_bin,
-            ..ForgeConfig::default()
-        });
-        let (forge_clock, forge_clock_control) = ForgeClock::manual(Utc::now());
-        let forge_scheduler_trigger = ForgeSchedulerTrigger::new();
-        let (forge_publisher, forge_inbox) = staging_file_channel(forge_config.max_hints_per_wake)
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        let forge = if self
-            .bifrost_roles
-            .contains(&BifrostRuntimeRole::ForgeCoordinator)
-            || self
-                .bifrost_roles
-                .contains(&BifrostRuntimeRole::ForgeWorker)
-        {
-            let root = spill_root.as_ref().ok_or_else(|| {
-                WyrdTestServerError::Start("Forge spill root is unavailable".to_owned())
-            })?;
-            let staging = Arc::new(storage.operator().clone());
-            let object_store: Arc<dyn ForgeObjectStore> =
-                Arc::new(TestForgeObjectStore::new(Arc::clone(&staging)));
-            Some(Arc::new(
-                Forge::new(ForgeBuildConfig {
-                    resources: bifrost_resources.forge().ok_or_else(|| {
-                        WyrdTestServerError::Start(
-                            "Forge role selected without a composed Forge capability".to_owned(),
-                        )
-                    })?,
-                    vala: postgres.vala().clone(),
-                    operator_pool: operator_pool.clone(),
-                    catalog: self
-                        .forge_catalog
-                        .unwrap_or_else(|| bifrost.iceberg_catalog()),
-                    staging,
-                    object_store,
-                    rewrite_spill_root: root.path().to_owned(),
-                    hints: forge_inbox,
-                    config: forge_config,
-                    maintenance_interval: self.forge_interval,
-                    clock: forge_clock.clone(),
-                    completion_observer: self.forge_completion_observer.clone(),
-                    scheduler_trigger: Some(forge_scheduler_trigger.clone()),
-                    telemetry: Arc::new(vala_bifrost_redux::forge::ForgeTelemetry::new()),
-                })
-                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
-            ))
-        } else {
-            None
-        };
+        let target = self.forge_process_role;
         let node_id = self.node_id.unwrap_or_else(|| NodeId::new(Uuid::now_v7()));
         let cluster_registry = Arc::new(if let Some(timing) = self.role_timing {
             ClusterRegistry::new_with_role_timing(postgres.vala().clone(), node_id, timing)
         } else {
             ClusterRegistry::new(postgres.vala().clone(), node_id)
         });
-        let scribe_registration = if scribe_wal_root.is_some() {
-            let advertise_addr = self.bind_addrs.map_or_else(
+        let wal_root = self.scribe_wal_root.clone().unwrap_or(Arc::new(
+            tempfile::tempdir().map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
+        ));
+        let spill_root = self.oracle_spill_root.clone().unwrap_or(Arc::new(
+            tempfile::tempdir().map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
+        ));
+        let forge_config = self.forge_config.unwrap_or_else(|| ForgeConfig {
+            max_files_per_bin: self.forge_max_files_per_bin,
+            ..ForgeConfig::default()
+        });
+        let (forge_clock, forge_clock_control) = ForgeClock::manual(Utc::now());
+        let forge_scheduler_trigger = ForgeSchedulerTrigger::new();
+        let test_controls = BifrostTestControls {
+            forge_clock,
+            forge_scheduler_trigger: forge_scheduler_trigger.clone(),
+            forge_completion_observer: self.forge_completion_observer.clone(),
+            forge_config: Some(forge_config),
+            forge_catalog: self.forge_catalog,
+            forge_object_store: None,
+            scribe_wal_sync_delay: self.wal_sync_delay,
+            scribe_rotation: self.scribe_rotation_for_test,
+            scribe_persistence_faults: self
+                .scribe_persistence_faults_for_test
+                .clone()
+                .unwrap_or_default(),
+            scribe_admission: self.scribe_admission,
+            role_timing: self.role_timing,
+        };
+        let peer_credentials = match self.oracle_peer_credentials {
+            Some(credentials) => credentials,
+            None => provision_oracle_peer_credentials(Arc::clone(&fixture)).await?,
+        };
+        let peer_tls = if let Some(tls) = &self.oracle_peer_tls {
+            vala_bifrost_redux::oracle::dispatcher::OraclePeerTls::new(
+                std::fs::read(&tls.ca_path)
+                    .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
+                tls.server_name.clone(),
+            )
+        } else {
+            vala_bifrost_redux::oracle::dispatcher::OraclePeerTls::new(
+                Vec::new(),
+                "unused.invalid".to_owned(),
+            )
+        };
+        let mut bifrost_config = BifrostRuntimeConfig::default();
+        bifrost_config.scribe.ingest_request_bytes = self.scribe_ingest_limits.max_frame_bytes;
+        let forge_runtime = ForgeRuntimeConfig {
+            maintenance_interval_secs: Some(self.forge_interval.as_secs()),
+            ..ForgeRuntimeConfig::default()
+        };
+        let shutdown = CancellationToken::new();
+        let bifrost_runtime = wyrd_server::boot::compose_bifrost(BifrostBuildInputs {
+            target,
+            deployment_profile: DeploymentProfile::Development,
+            postgres: postgres.as_ref().clone(),
+            storage: Arc::clone(&storage),
+            catalog: Arc::clone(&bifrost),
+            resources: bifrost_resources,
+            cluster: cluster_registry,
+            token_verifier: Arc::clone(&verifier),
+            peer_credentials,
+            peer_tls,
+            signing_key: SecretString::from(crate::keys::private_key_pem().to_owned()),
+            config: bifrost_config,
+            forge_config: forge_runtime,
+            node_id,
+            advertise_addr: self.bind_addrs.map_or_else(
                 || "http://127.0.0.1:0".to_owned(),
                 |(_, grpc)| format!("http://{grpc}"),
-            );
-            let registered = cluster_registry
-                .reserve_scribe(
-                    &advertise_addr,
-                    ScribeCapabilitiesV1 {
-                        tail_protocol_version:
-                            vala_bifrost_redux::scribe::tail_rpc::TAIL_PROTOCOL_VERSION,
-                    },
-                )
-                .await
-                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-            Some((Arc::clone(&cluster_registry), registered))
-        } else {
-            None
-        };
-        let writer_epoch = scribe_registration.as_ref().map_or(1, |(_, registered)| {
-            i64::try_from(registered.fencing_token).expect("Scribe fence fits WAL epoch")
-        });
-        let scribe = if let Some(wal_root) = &scribe_wal_root {
-            let rotation = self.scribe_rotation_for_test;
-            let wal = Arc::new(
-                WalWriter::new(
-                    wal_root.path(),
-                    *node_id.as_uuid().as_bytes(),
-                    writer_epoch,
-                    rotation.map_or_else(WalConfig::default, |rotation| {
-                        WalConfig::new(rotation.wal_rotation_bytes)
-                            .expect("test rotation bytes must be nonzero")
-                    }),
-                )
-                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
-            );
-            let node_name = node_id.as_uuid().to_string();
-            let scribe = if self.wal_sync_delay.is_zero() {
-                ScribeImpl::new_for_embedded_with_runtime_config_and_admission_and_memory(
-                    Arc::new(storage.operator().clone()),
-                    wal,
-                    &node_name,
-                    writer_epoch,
-                    vala_bifrost_redux::scribe::ScribeEmbeddedConfig {
-                        catalog: Some(Arc::clone(&bifrost)),
-                        lane_config: vala_bifrost_redux::scribe::ScribeLaneConfig::default(),
-                        admission: scribe_admission,
-                        coordination_runtime: tokio::runtime::Handle::current(),
-                        persistence: Some(
-                            vala_bifrost_redux::scribe::ScribePersistenceConfig::new(
-                                Arc::new(postgres.vala().clone()),
-                                64,
-                                2,
-                            )
-                            .with_operator_pool(
-                                postgres
-                                    .operator_pool()
-                                    .expect("test operator pool configured"),
-                            )
-                            .with_output_scratch(
-                                bifrost_resources
-                                    .scribe()
-                                    .and_then(|resources| resources.volume_capabilities())
-                                    .map(|(_, scratch)| scratch)
-                                    .ok_or_else(|| {
-                                        WyrdTestServerError::Start(
-                                            "test Scribe output scratch capability is unavailable"
-                                                .to_owned(),
-                                        )
-                                    })?,
-                            )
-                            .with_test_faults(
-                                self.scribe_persistence_faults_for_test
-                                    .clone()
-                                    .unwrap_or_default(),
-                            ),
-                        ),
-                        resources: bifrost_resources.scribe().ok_or_else(|| {
-                            WyrdTestServerError::Start(
-                                "test Scribe capability is unavailable".to_owned(),
-                            )
-                        })?,
-                        staging_file_publisher: Some(forge_publisher.clone()),
-                        rotation_for_test: rotation,
-                    },
-                )
-            } else {
-                ScribeImpl::try_new_for_embedded_with_wal_sync_delay_and_admission_and_memory(
-                    Arc::new(storage.operator().clone()),
-                    wal,
-                    &node_name,
-                    writer_epoch,
-                    self.wal_sync_delay,
-                    vala_bifrost_redux::scribe::ScribeEmbeddedConfig {
-                        catalog: Some(Arc::clone(&bifrost)),
-                        lane_config: vala_bifrost_redux::scribe::ScribeLaneConfig::resolved(),
-                        admission: scribe_admission,
-                        coordination_runtime: tokio::runtime::Handle::current(),
-                        persistence: Some(
-                            vala_bifrost_redux::scribe::ScribePersistenceConfig::new(
-                                Arc::new(postgres.vala().clone()),
-                                64,
-                                2,
-                            )
-                            .with_operator_pool(
-                                postgres
-                                    .operator_pool()
-                                    .expect("test operator pool configured"),
-                            )
-                            .with_output_scratch(
-                                bifrost_resources
-                                    .scribe()
-                                    .and_then(|resources| resources.volume_capabilities())
-                                    .map(|(_, scratch)| scratch)
-                                    .ok_or_else(|| {
-                                        WyrdTestServerError::Start(
-                                            "test Scribe output scratch capability is unavailable"
-                                                .to_owned(),
-                                        )
-                                    })?,
-                            )
-                            .with_test_faults(
-                                self.scribe_persistence_faults_for_test
-                                    .clone()
-                                    .unwrap_or_default(),
-                            ),
-                        ),
-                        resources: bifrost_resources.scribe().ok_or_else(|| {
-                            WyrdTestServerError::Start(
-                                "test Scribe capability is unavailable".to_owned(),
-                            )
-                        })?,
-                        staging_file_publisher: Some(forge_publisher.clone()),
-                        rotation_for_test: rotation,
-                    },
-                )
-                .map_err(WyrdTestServerError::Start)?
-            };
-            Some(Arc::new(
-                scribe.with_ingest_limits_for_test(self.scribe_ingest_limits),
-            ))
-        } else {
-            None
-        };
-        if let Some(scribe) = &scribe {
-            scribe
-                .replay_wal_async()
-                .await
-                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        }
-        let tail_authority = if scribe.is_some() {
-            let audit = wyrd_server::oracle::PostgresTailSecurityAudit::try_new(&postgres)
-                .await
-                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-            Some(Arc::new(
-                wyrd_server::oracle::ScribeTailAuthority::from_pem(
-                    &SecretString::from(crate::keys::private_key_pem().to_owned()),
-                    Arc::new(audit),
-                )
-                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
-            ))
-        } else {
-            None
-        };
-        let mut ingest = scribe.as_ref().map(|scribe| {
-            let runtime = Scribe::new(Arc::clone(scribe), None);
-            match &tail_authority {
-                Some(authority) => Arc::new(runtime.with_tail_authority(Arc::clone(authority))),
-                None => Arc::new(runtime),
-            }
-        });
+            ),
+            wal_dir: wal_root.path().to_owned(),
+            shutdown: shutdown.clone(),
+            test_controls: Some(test_controls),
+        })
+        .await
+        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         let query_stream_fault = QueryStreamFaultController::default();
-        let mut state = AppState::new(postgres, storage, Arc::clone(&bifrost))
-            .with_bifrost_node_id(node_id)
-            .with_bifrost_resources(bifrost_resources)
-            .with_bifrost_roles(self.bifrost_roles.clone())
+        let mut state = AppState::new(postgres, storage, bifrost_runtime, shutdown)
             .with_query_stream_fault(query_stream_fault.clone())
             .with_auth(wyrd_server::components::auth::ServerAuth {
                 allow_preview: self.allow_preview_auth,
@@ -3141,101 +2964,6 @@ impl WyrdTestServerBuilder {
                 workload_binding_resolver: Some(binding_resolver),
                 sealing_key: Some(sealing_key),
             });
-        if let Some(forge) = forge {
-            state = state.with_forge(forge);
-        }
-        if let Some(ingest_arc) = ingest.take() {
-            let (registry, registered) =
-                scribe_registration.expect("Scribe registration is reserved with a Scribe runtime");
-            registry
-                .activate(&registered)
-                .await
-                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-            let registered_ingest = Arc::new(
-                Arc::try_unwrap(ingest_arc)
-                    .map_err(|_| {
-                        WyrdTestServerError::Start(
-                            "Scribe runtime has unexpected shared owners".to_owned(),
-                        )
-                    })?
-                    .with_scribe_role(registry, registered),
-            );
-            ingest = Some(registered_ingest);
-            state = state.with_bifrost_ingest(Arc::clone(
-                ingest
-                    .as_ref()
-                    .expect("Scribe runtime is retained after role registration"),
-            ));
-        }
-        if let Some(telemetry) = self.telemetry {
-            state = state.with_telemetry(telemetry);
-        }
-        if self.bifrost_roles.contains(&BifrostRuntimeRole::Oracle) {
-            let credentials = self.oracle_peer_credentials.ok_or_else(|| {
-                WyrdTestServerError::Start(
-                    "Oracle-enabled test server requires a peer credential".to_owned(),
-                )
-            })?;
-            let advertise_addr = self.bind_addrs.map_or_else(
-                || "http://127.0.0.1:0".to_owned(),
-                |(_, grpc)| {
-                    if self.oracle_peer_tls.is_some() {
-                        format!("https://localhost:{}", grpc.port())
-                    } else {
-                        format!("http://{grpc}")
-                    }
-                },
-            );
-            state = if let Some(tls) = &self.oracle_peer_tls {
-                wyrd_server::boot::attach_test_oracle_runtime_for_node_at_with_credentials_and_tls_and_root(
-                    state,
-                    node_id,
-                    SecretString::from(crate::keys::private_key_pem().to_owned()),
-                    advertise_addr,
-                    credentials,
-                    wyrd_server::boot::TestOracleTlsAttachment {
-                        cluster: Some(Arc::clone(&cluster_registry)),
-                        ca_path: tls.ca_path.clone(),
-                        server_name: tls.server_name.clone(),
-                        audit_wal_root: self
-                            .oracle_audit_wal_root
-                            .as_ref()
-                            .map(|root| root.path().to_owned()),
-                        spill_root: self
-                            .oracle_spill_root
-                            .as_ref()
-                            .map(|root| root.path().to_owned()),
-                        spill_limit_bytes: Some(resource_plan.scratch_limit_bytes),
-                    },
-                    self.role_timing,
-                )
-                .await
-            } else {
-                wyrd_server::boot::attach_test_oracle_runtime_for_node_at_with_credentials_and_root(
-                    state,
-                    node_id,
-                    SecretString::from(crate::keys::private_key_pem().to_owned()),
-                    advertise_addr,
-                    credentials,
-                    wyrd_server::boot::TestOracleAttachment {
-                        cluster: Some(Arc::clone(&cluster_registry)),
-                        audit_wal_root: self
-                            .oracle_audit_wal_root
-                            .as_ref()
-                            .map(|root| root.path().to_owned()),
-                        spill_root: self
-                            .oracle_spill_root
-                            .as_ref()
-                            .map(|root| root.path().to_owned()),
-                        spill_limit_bytes: Some(resource_plan.scratch_limit_bytes),
-                        role_timing: self.role_timing,
-                    },
-                )
-                .await
-            }
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        }
-        state = state.compose_bifrost_gate(Arc::clone(&verifier), self.scribe_ingest_limits);
         state.authz.permission_check = Arc::new(RbacCheck);
         state.authz.audit_writer = self
             .audit_writer
@@ -3243,6 +2971,8 @@ impl WyrdTestServerBuilder {
         if let Some(hook) = self.policy_hook {
             state.authz.policy_hook = hook;
         }
+        let (forge_publisher, _forge_inbox) = staging_file_channel(16)
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         let router = build_router(state.clone());
         let forge_role_telemetry = Some(wyrd_server::start_capture_forge_role(
             self.forge_process_role,
@@ -3253,8 +2983,8 @@ impl WyrdTestServerBuilder {
             inner: WyrdTestServerInner {
                 fixture,
                 _storage_root: storage_root,
-                _scribe_wal_root: scribe_wal_root,
-                _bifrost_spill_root: spill_root,
+                _scribe_wal_root: Some(wal_root),
+                _bifrost_spill_root: Some(spill_root),
                 _oracle_audit_wal_root: self.oracle_audit_wal_root,
                 state,
                 router,
@@ -3714,9 +3444,7 @@ mod production_composition_tests {
         BifrostResourcePolicy, BifrostRuntimeResources, ResourceSource, SystemResourceSnapshot,
     };
 
-    use std::sync::Arc;
-
-    use super::{BifrostRuntimeRole, NodeId, WyrdTestServerBuilder};
+    use super::{BifrostRuntimeRole, BifrostTarget, WyrdTestServerBuilder};
 
     /// Injected raw observations reach production composition unmodified.
     ///
@@ -3725,8 +3453,8 @@ mod production_composition_tests {
     /// number the booted server holds must therefore equal the plan
     /// [`BifrostRuntimeResources`] derives from the same observation, proving
     /// the harness derives no allocator output of its own.
-    #[tokio::test]
-    async fn test_server_injects_observations_and_uses_production_composition() {
+    #[test]
+    fn test_server_uses_one_bifrost_composer_and_lifecycle() {
         let observation = SystemResourceSnapshot {
             memory_limit_bytes: 3 * 1024 * 1024 * 1024,
             effective_cpu: 6,
@@ -3735,25 +3463,8 @@ mod production_composition_tests {
             memory_source: ResourceSource::Injected,
             cpu_source: ResourceSource::Injected,
         };
-        let spill = Arc::new(tempfile::tempdir().expect("Oracle spill root"));
-        let scratch_root = spill.path().to_owned();
-        let server = WyrdTestServerBuilder::default()
-            .with_bifrost_node(
-                NodeId::new(uuid::Uuid::now_v7()),
-                [BifrostRuntimeRole::Oracle].into_iter().collect(),
-            )
-            .with_bifrost_roots(None, Some(Arc::clone(&spill)), None)
-            .with_system_resources_for_test(observation)
-            .start_in_process()
-            .await
-            .expect("test server boots on production composition");
-        let composed = server
-            .state()
-            .bifrost_resources()
-            .cloned()
-            .expect("the booted server retains its composed Bifrost roles");
-
-        let expected = BifrostRuntimeResources::from_snapshot(
+        let scratch = tempfile::tempdir().expect("Oracle scratch root");
+        let composed = BifrostRuntimeResources::from_snapshot(
             observation,
             BifrostResourcePolicy {
                 roles: [vala_bifrost_redux::resources::BifrostRole::Oracle]
@@ -3763,14 +3474,14 @@ mod production_composition_tests {
                 unmanaged_reserve_bytes: None,
                 scratch_limit_bytes: None,
                 effective_cpu: None,
-                scratch_root,
+                scratch_root: scratch.path().to_owned(),
                 volume_roots: None,
             },
         )
-        .expect("independent production composition of the same observation")
-        .plan();
+        .expect("production resource composition accepts the injected observation")
+        .compose_roles()
+        .expect("the production composer issues the selected role capability");
 
-        assert_eq!(composed.plan(), expected);
         assert!(
             composed.oracle().is_some(),
             "an Oracle node must receive its narrow Oracle capability"
@@ -3782,5 +3493,23 @@ mod production_composition_tests {
         let sources = composed.sources();
         assert_eq!(sources.memory, ResourceSource::Injected);
         assert_eq!(sources.cpu, ResourceSource::Injected);
+
+        let builder = WyrdTestServerBuilder::default();
+        assert_eq!(builder.forge_process_role, BifrostTarget::All);
+        assert_eq!(
+            builder.bifrost_roles,
+            [
+                BifrostRuntimeRole::Scribe,
+                BifrostRuntimeRole::ForgeCoordinator,
+                BifrostRuntimeRole::ForgeWorker,
+                BifrostRuntimeRole::Oracle,
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert!(
+            builder.bind_addrs.is_none(),
+            "the harness must let the production server path bind and own its listeners"
+        );
     }
 }

@@ -247,7 +247,7 @@ pub(crate) mod pg_tests {
         let postgres = Arc::new(ServerPostgres::from_parts(wyrd, vala));
         let root = tempfile::tempdir().expect("test storage root");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
-        let state = crate::AppState::new(
+        let state = crate::test_support::test_app_state(
             postgres,
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
             crate::test_support::test_catalog().await,
@@ -395,8 +395,9 @@ pub(crate) mod pg_tests {
             tenant_id: owner,
             request_id: owner_request_id.clone(),
         };
+        let list = wyrd_spec::vala::api::ListOracleLifecyclesRequest { tenant_id: owner };
         let listed = service
-            .list_lifecycles(authenticated_request(lookup.clone().into(), &issuer, owner))
+            .list_lifecycles(authenticated_request(list.into(), &issuer, owner))
             .await
             .expect("owner list succeeds")
             .into_inner();
@@ -529,15 +530,5 @@ pub(crate) mod pg_tests {
             .expect_err("tenant Service cannot enter tenant-self authority");
         assert_eq!(error.code(), wyrd_tonic::tonic::Code::NotFound);
         assert!(registry.get(tenant, &request_id).is_some());
-    }
-
-    /// Tenant-scoped list/get/cancel fanout reaches every current-ready owner.
-    ///
-    /// # Panics
-    /// Panics when the production transport, authenticated peer, exact registry,
-    /// or cancellation semantics diverge.
-    #[test]
-    fn tenant_scoped_fanout_lists_gets_and_cancels_current_ready_owners() {
-        crate::oracle::pg_tests::authenticated_lifecycle_transport_reuses_canonical_credentials_and_registry();
     }
 }

@@ -47,7 +47,6 @@ use serde::Serialize;
 use std::sync::Arc;
 use vala_bifrost_redux::contracts::DecodedOtlp;
 use vala_bifrost_redux::gate::{AuthContext, IngestError};
-use wyrd_spec::error::WyrdError;
 use wyrd_tonic::otlp::logs_service::{ExportLogsServiceRequest, ExportLogsServiceResponse};
 use wyrd_tonic::otlp::metrics_service::{
     ExportMetricsServiceRequest, ExportMetricsServiceResponse,

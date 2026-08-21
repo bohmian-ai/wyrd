@@ -31,9 +31,7 @@ use vala_bifrost_redux::resources::{
 };
 use vala_bifrost_redux::schema::with_managed_columns;
 use vala_bifrost_redux::scribe::file_list_writer::{FileListInsert, insert_and_audit};
-use vala_sdk::{
-    BifrostGrpcTransport, CollectedQueryLimits, IngestTransport, QueryClient, ValaSdkError,
-};
+use vala_sdk::{BifrostGrpcTransport, CollectedQueryLimits, QueryClient, ValaSdkError};
 use vala_sql::row_types::forge_tasks::{ForgeClaimStrategy, ForgeTaskStrategy};
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
@@ -1132,7 +1130,7 @@ async fn pg_bifrost_forge_small_files_converge_before_ordered_read() {
         .state()
         .forge()
         .expect("Forge composition")
-        .resources_for_test()
+        .resources()
         .snapshot()
         .expect("Forge resource baseline");
     for _ in 0..64 {
@@ -1250,7 +1248,7 @@ async fn pg_bifrost_forge_small_files_converge_before_ordered_read() {
             .state()
             .forge()
             .expect("Forge composition after rewrite")
-            .resources_for_test()
+            .resources()
             .snapshot()
             .expect("Forge resources after rewrite"),
         forge_baseline
@@ -2197,10 +2195,15 @@ redacted
                 .state()
                 .oracle_peer()
                 .expect("mixed node peer")
-                .oracle()
                 .worker()
                 .physical_inspection();
-            (inspection.node_id, inspection)
+            let scribe = server
+                .state()
+                .bifrost
+                .scribe()
+                .map(|scribe| scribe.fragment_inspection())
+                .unwrap_or_default();
+            (inspection.node_id, (inspection, scribe))
         })
         .collect::<std::collections::HashMap<_, _>>();
     let probe = Arc::new(vala_bifrost_redux::oracle::OracleTopologyProbe::default());
@@ -2260,6 +2263,12 @@ redacted
         .expect("immutable running entry");
     assert!(entry.participant_cut().oracles().len() >= 2);
     assert!(entry.participant_cut().scribes().len() >= 2);
+    let pinned_scribe_nodes = entry
+        .participant_cut()
+        .scribes()
+        .iter()
+        .map(|participant| participant.node_id)
+        .collect::<std::collections::BTreeSet<_>>();
     let cut_fingerprint = entry.participant_cut().fingerprint();
     assert!(!cut_fingerprint.is_empty());
     probe.resume();
@@ -2280,40 +2289,62 @@ redacted
                 .state()
                 .oracle_peer()
                 .expect("mixed node peer")
-                .oracle()
                 .worker()
                 .physical_inspection();
-            (inspection.node_id, inspection)
+            let scribe = server
+                .state()
+                .bifrost
+                .scribe()
+                .map(|scribe| scribe.fragment_inspection())
+                .unwrap_or_default();
+            (inspection.node_id, (inspection, scribe))
         })
         .collect::<std::collections::HashMap<_, _>>();
     let oracle_nodes = after
         .iter()
-        .filter_map(|(node, current)| {
-            (current.oracle_executions > before[node].oracle_executions).then_some(*node)
-        })
-        .collect::<Vec<_>>();
-    let scribe_nodes = after
-        .iter()
-        .filter_map(|(node, current)| {
-            (current.scribe_executions > before[node].scribe_executions).then_some(*node)
+        .filter_map(|(node, (current, _))| {
+            (current.oracle_executions > before[node].0.oracle_executions).then_some(*node)
         })
         .collect::<Vec<_>>();
     assert_eq!(oracle_nodes.len(), 1, "one Oracle subtree owner");
-    assert_eq!(scribe_nodes.len(), 1, "one Scribe subtree owner");
     assert_ne!(
         oracle_nodes[0], leader_id,
         "persisted subtree must be remote"
     );
-    assert_ne!(scribe_nodes[0], leader_id, "live subtree must be remote");
-    assert_ne!(
-        oracle_nodes[0], scribe_nodes[0],
-        "heterogeneous role targets"
+    let scribe_nodes = after
+        .iter()
+        .filter_map(|(node, (_, current))| (current.0 > before[node].1.0).then_some(*node))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        scribe_nodes
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        pinned_scribe_nodes,
+        "every pinned Scribe must execute its explicit-empty persisted hot cut"
     );
+    assert!(
+        scribe_nodes.iter().any(|node| *node != oracle_nodes[0]),
+        "persisted and live subtrees include distinct role owners"
+    );
+    let fragment_delta = after
+        .iter()
+        .map(|(node, (current, scribe))| {
+            current.oracle_executions - before[node].0.oracle_executions + scribe.0
+                - before[node].1.0
+        })
+        .sum::<u64>();
     let footer_delta = after
         .iter()
-        .map(|(node, current)| current.footers_emitted - before[node].footers_emitted)
+        .map(|(node, (current, scribe))| {
+            current.footers_emitted - before[node].0.footers_emitted + scribe.1 - before[node].1.1
+        })
         .sum::<u64>();
-    assert_eq!(footer_delta, 2, "each remote subtree emits one footer");
+    assert!(fragment_delta >= 2, "both remote role subtrees execute");
+    assert_eq!(
+        footer_delta, fragment_delta,
+        "every executed remote fragment emits one authenticated footer"
+    );
     assert!(registry.list(cluster.data_tenant_id()).is_empty());
     let inspection = cluster.oracle_inspection().await.expect("clean settlement");
     assert_eq!(inspection.active_queries, 0);
@@ -2322,6 +2353,13 @@ redacted
     assert_eq!(inspection.reserved_spill_bytes, 0);
     assert_eq!(inspection.peer_pending, 0);
     assert_eq!(inspection.peer_running, 0);
+    assert_eq!(
+        leader
+            .cancel_and_observe_shared_bifrost_shutdown_for_test()
+            .expect("mixed pod shares one Bifrost process token"),
+        (true, true),
+        "one composed process cancellation must reach both Scribe and Oracle"
+    );
     cluster
         .shutdown()
         .await
@@ -3103,7 +3141,7 @@ async fn pg_bifrost_oracle_live_topology_replans_through_boot_directory() {
     assert_eq!(rows, 64);
     assert_eq!(terminal.outcome, QueryTerminalOutcome::Success);
     assert!(terminal.warnings.contains(&QueryWarning::StaleCutReplanned));
-    assert_eq!(old_peer.oracle().worker().pending_reservations(), 0);
+    assert_eq!(old_peer.worker().pending_reservations(), 0);
     cluster.shutdown().await.expect("topology replan shutdown");
 }
 
@@ -3206,7 +3244,7 @@ async fn pg_bifrost_analytical_query_admits_fragment_on_non_leader_peer() {
             server
                 .state()
                 .oracle_peer()
-                .map(|peer| peer.oracle().worker().admitted_running_total())
+                .map(|peer| peer.worker().admitted_running_total())
         })
         .sum();
     assert!(
@@ -3775,7 +3813,7 @@ async fn oracle_production_telemetry_contract() {
     for server in role_cluster.servers() {
         assert_eq!(
             server.forge_process_role(),
-            wyrd_server::config::ForgeProcessRole::Server,
+            wyrd_server::config::BifrostTarget::Server,
             "role-separated roster must use full Server processes"
         );
         assert!(server.bifrost_scribe().is_some());
@@ -4093,6 +4131,7 @@ async fn register_table(
     server
         .state()
         .bifrost_catalog()
+        .expect("Scribe composition retains the shared catalog")
         .create_table(CreateTableRequest {
             table: TableRef::new(BifrostNamespace::Bifrost, table),
             user_fields: vec![
@@ -4115,6 +4154,7 @@ async fn register_paired_table(
     server
         .state()
         .bifrost_catalog()
+        .expect("Scribe composition retains the shared catalog")
         .create_table(CreateTableRequest {
             table: TableRef::new(BifrostNamespace::Bifrost, table),
             user_fields: vec![Field::new("row_id", DataType::Int64, false)],

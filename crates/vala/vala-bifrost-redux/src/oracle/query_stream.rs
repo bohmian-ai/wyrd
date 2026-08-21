@@ -165,8 +165,8 @@ pub(super) struct QueryStreamInput {
     pub(super) deadline: Instant,
     /// Requested visibility contract.
     pub(super) visibility: VisibilityMode,
-    /// Whether live visibility degraded.
-    pub(super) degraded: bool,
+    /// Exact source tiers completed as eligible degraded losses.
+    pub(super) degraded_sources: Vec<QuerySource>,
     /// Whether the one stale-cut replan was consumed.
     pub(super) stale_replanned: bool,
     /// Production query telemetry retained through terminal emission.
@@ -247,8 +247,8 @@ struct FrameBuildInput {
     deadline: Instant,
     /// Visibility contract for terminal mapping.
     visibility: VisibilityMode,
-    /// Whether the live read degraded.
-    degraded: bool,
+    /// Exact source tiers completed as eligible degraded losses.
+    degraded_sources: Vec<QuerySource>,
     /// Whether stale replanning was consumed.
     stale_replanned: bool,
     /// Query telemetry guard.
@@ -274,7 +274,7 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
         admitted,
         deadline,
         visibility,
-        degraded,
+        degraded_sources,
         stale_replanned,
         mut query_telemetry,
         gate_lifecycle,
@@ -324,7 +324,7 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
                 }
                 QueryStreamEvent::Batch(None) => break successful_terminal(
                     visibility,
-                    degraded,
+                    &degraded_sources,
                     stale_replanned,
                     row_count,
                 ),
@@ -406,10 +406,21 @@ fn cancellation_requested(
 /// Constructs the validated success/degraded terminal for one completed stream.
 fn successful_terminal(
     visibility: VisibilityMode,
-    degraded: bool,
+    degraded_sources: &[QuerySource],
     stale_replanned: bool,
     row_count: u64,
 ) -> QueryTerminalFrame {
+    if degraded_sources
+        .iter()
+        .any(|source| *source != QuerySource::LiveTail)
+    {
+        return failed_terminal_for_visibility(
+            QueryTerminalErrorCode::QueryVisibilityUnavailable,
+            row_count,
+            visibility,
+        );
+    }
+    let degraded = degraded_sources.contains(&QuerySource::LiveTail);
     let freshness = if degraded {
         QueryFreshness::Degraded
     } else {
@@ -421,7 +432,7 @@ fn successful_terminal(
         QueryTerminalOutcome::Success
     };
     let mut warnings = Vec::new();
-    if degraded {
+    if degraded_sources.contains(&QuerySource::LiveTail) {
         warnings.push(wyrd_spec::vala::api::QueryWarning::LiveTailUnavailable);
     }
     if stale_replanned {
@@ -440,7 +451,7 @@ fn successful_terminal(
     if visibility == VisibilityMode::Fused {
         source_completion.push(SourceCompletion {
             source: QuerySource::LiveTail,
-            outcome: if degraded {
+            outcome: if degraded_sources.contains(&QuerySource::LiveTail) {
                 SourceCompletionOutcome::Unavailable
             } else {
                 SourceCompletionOutcome::Complete
@@ -566,6 +577,24 @@ fn release_and_finish_terminal(
 }
 
 impl OracleQueryStream {
+    /// Owns a validated private-forwarding stream at the public ingress replica.
+    ///
+    /// Dropping this owner drops the underlying tonic stream, propagating cancellation to the
+    /// remote Oracle that retains admission, audit, registry, and execution ownership.
+    #[must_use]
+    pub fn from_forwarded(
+        schema_fingerprint: String,
+        frames: std::pin::Pin<Box<super::OracleFrameStream>>,
+        cancellation: CancellationToken,
+    ) -> Self {
+        Self::assemble(
+            schema_fingerprint,
+            frames,
+            cancellation,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+    }
+
     /// Builds a synthetic stream for transport and collector tests.
     ///
     /// This constructor is available only to crate tests and the repository's
@@ -604,7 +633,7 @@ impl OracleQueryStream {
             admitted,
             deadline: Instant::now() + Duration::from_secs(1),
             visibility: VisibilityMode::PublishedOnly,
-            degraded: false,
+            degraded_sources: Vec::new(),
             stale_replanned: false,
             query_telemetry: telemetry
                 .start_query(VisibilityMode::PublishedOnly, QueryClass::Interactive),
@@ -629,7 +658,7 @@ impl OracleQueryStream {
             admitted,
             deadline,
             visibility,
-            degraded,
+            degraded_sources,
             stale_replanned,
             mut query_telemetry,
             scan_stats,
@@ -655,7 +684,7 @@ impl OracleQueryStream {
             admitted,
             deadline,
             visibility,
-            degraded,
+            degraded_sources,
             stale_replanned,
             query_telemetry,
             gate_lifecycle,
@@ -742,15 +771,48 @@ mod tests {
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures_util::StreamExt;
     use tokio_util::sync::CancellationToken;
+    use wyrd_spec::vala::api::QueryWarning;
 
-    use super::{OracleQueryStream, QueryStreamInput, QueryStreamLifecycle};
+    use super::{OracleQueryStream, QueryStreamInput, QueryStreamLifecycle, successful_terminal};
     use crate::oracle::admission::{active_queries_for_test, admitted_guard_for_test};
     use crate::oracle::exec::OracleQueryScanStats;
     use crate::oracle::{
-        BifrostError, OracleSlotManager, OracleTelemetry, QueryClass, QuerySchemaFrame,
-        QueryStreamFrame, VisibilityMode,
+        BifrostError, OracleSlotManager, OracleTelemetry, QueryClass, QueryFreshness,
+        QuerySchemaFrame, QuerySource, QueryStreamFrame, QueryTerminalErrorCode,
+        QueryTerminalOutcome, VisibilityMode,
     };
     use crate::test_support::{SpanCaptureSubscriber, has_span_outcome};
+
+    /// Terminal construction emits only the parent contract's live-loss degradation.
+    #[test]
+    fn successful_terminal_obeys_parent_eligible_loss_matrix() {
+        let complete = successful_terminal(VisibilityMode::Fused, &[], false, 3);
+        assert_eq!(complete.outcome, QueryTerminalOutcome::Success);
+        complete
+            .validate(VisibilityMode::Fused)
+            .expect("complete terminal validates");
+
+        let degraded =
+            successful_terminal(VisibilityMode::Fused, &[QuerySource::LiveTail], false, 2);
+        assert_eq!(degraded.outcome, QueryTerminalOutcome::Degraded);
+        assert_eq!(degraded.freshness, QueryFreshness::Degraded);
+        assert_eq!(degraded.warnings, vec![QueryWarning::LiveTailUnavailable]);
+        degraded
+            .validate(VisibilityMode::Fused)
+            .expect("eligible live-tail degradation validates");
+
+        for source in [QuerySource::Iceberg, QuerySource::HotSealed] {
+            let failed = successful_terminal(VisibilityMode::Fused, &[source], false, 0);
+            assert_eq!(failed.outcome, QueryTerminalOutcome::Failed);
+            assert_eq!(
+                failed.error.as_ref().map(|error| error.code),
+                Some(QueryTerminalErrorCode::QueryVisibilityUnavailable)
+            );
+            failed
+                .validate(VisibilityMode::Fused)
+                .expect("ineligible persisted loss fails with parent terminal contract");
+        }
+    }
 
     /// Synthetic owner state used to exercise stream cancellation ordering.
     #[derive(Default)]
@@ -816,7 +878,7 @@ mod tests {
             admitted,
             deadline: Instant::now() + Duration::from_secs(1),
             visibility: VisibilityMode::PublishedOnly,
-            degraded: false,
+            degraded_sources: Vec::new(),
             stale_replanned: false,
             query_telemetry: telemetry,
             scan_stats: OracleQueryScanStats::default(),
@@ -831,6 +893,49 @@ mod tests {
             }
         }
         assert!(terminal_seen);
+        assert_eq!(active_queries_for_test(&shared), 0);
+    }
+
+    /// A typed stale object observed after schema output fails without replacement.
+    #[tokio::test]
+    async fn post_output_typed_stale_object_is_terminal_without_replan() {
+        let (admitted, shared, _request_cancellation) = admitted_guard_for_test();
+        let telemetry_owner =
+            Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1))));
+        let stale = crate::oracle::exec::iceberg_datafusion_error(std::io::Error::from(
+            std::io::ErrorKind::NotFound,
+        ));
+        let mut stream = OracleQueryStream::new(QueryStreamInput {
+            schema_frame: QuerySchemaFrame {
+                schema_fingerprint: "post-output-stale".to_owned(),
+                arrow_ipc_schema: Vec::new(),
+            },
+            batches: Box::pin(RecordBatchStreamAdapter::new(
+                Arc::new(Schema::empty()),
+                futures_util::stream::once(std::future::ready(Err(stale))),
+            )),
+            first: None,
+            admitted,
+            deadline: Instant::now() + Duration::from_secs(1),
+            visibility: VisibilityMode::PublishedOnly,
+            degraded_sources: Vec::new(),
+            stale_replanned: false,
+            query_telemetry: telemetry_owner
+                .start_query(VisibilityMode::PublishedOnly, QueryClass::Interactive),
+            scan_stats: OracleQueryScanStats::default(),
+            gate_lifecycle: None,
+            running_query: None,
+        });
+        assert!(matches!(
+            stream.frames.next().await,
+            Some(Ok(QueryStreamFrame::Schema(_)))
+        ));
+        let terminal = match stream.frames.next().await {
+            Some(Ok(QueryStreamFrame::Terminal(terminal))) => terminal,
+            other => panic!("expected failed terminal after stale batch, got {other:?}"),
+        };
+        assert_eq!(terminal.outcome, QueryTerminalOutcome::Failed);
+        assert!(!terminal.warnings.contains(&QueryWarning::StaleCutReplanned));
         assert_eq!(active_queries_for_test(&shared), 0);
     }
 
@@ -853,7 +958,7 @@ mod tests {
             admitted,
             deadline: Instant::now() + Duration::from_secs(1),
             visibility: VisibilityMode::PublishedOnly,
-            degraded: false,
+            degraded_sources: Vec::new(),
             stale_replanned: false,
             query_telemetry: telemetry_owner
                 .start_query(VisibilityMode::PublishedOnly, QueryClass::Interactive),

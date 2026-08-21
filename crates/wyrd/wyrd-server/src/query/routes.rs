@@ -352,7 +352,7 @@ mod tests {
     ///
     /// Panics when shared Postgres, storage, or catalog fixtures cannot start.
     async fn state_without_oracle() -> AppState {
-        AppState::new(
+        crate::test_support::test_app_state(
             crate::test_support::test_server_postgres().await,
             crate::test_support::test_storage().await,
             crate::test_support::test_catalog().await,

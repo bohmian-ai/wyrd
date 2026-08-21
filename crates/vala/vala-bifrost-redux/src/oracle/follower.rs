@@ -1,24 +1,44 @@
 //! Three-stage authenticated physical-plan follower lifecycle.
 
+use std::any::Any;
 use std::collections::HashMap;
+use std::fmt;
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use arrow::compute::cast;
 #[cfg(test)]
 use arrow::datatypes::SchemaRef;
+use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::datasource::TableProvider;
+use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfig, FileScanConfigBuilder};
 use datafusion::datasource::source::DataSourceExec;
+use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::TaskContext;
 use datafusion::execution::context::SessionConfig;
-use datafusion::execution::memory_pool::MemoryPool;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
-use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream, execute_stream};
+use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, PlanProperties};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
+    execute_stream,
+};
 use datafusion_proto::bytes::physical_plan_from_bytes_with_extension_codec;
 use datafusion_proto::protobuf::{PhysicalPlanNode, physical_plan_node::PhysicalPlanType};
+use futures_util::StreamExt;
+use iceberg::io::FileRead;
+use iceberg_datafusion::physical_plan::IcebergTableScan;
+use parquet::arrow::arrow_reader::ArrowReaderOptions;
+use parquet::arrow::async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuilder};
+use parquet::errors::ParquetError;
+use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 use prost::Message;
 use thiserror::Error;
 use wyrd_spec::DataTenantId;
@@ -28,7 +48,7 @@ use wyrd_spec::vala::api::{
 };
 
 use super::codec::{OraclePhysicalExtensionCodec, PreflightExtension, physical_plan_fingerprint};
-use crate::catalog::{BifrostCatalog, TableRef};
+use crate::catalog::{BifrostCatalog, TableRef, TenantTableBinding as CatalogTableBinding};
 use crate::scribe::seal_key::EventDay;
 use crate::scribe::stream_identity::StreamIdentity;
 use crate::scribe::tail_rpc::{FetchLiveTailRequest, FetchLiveTailService, HotBatch};
@@ -193,6 +213,275 @@ impl OracleCatalogResolver {
     }
 }
 
+/// One canonical hot object admitted to a follower's lazy ranged reader.
+#[derive(Debug, Clone)]
+struct FollowerHotFile {
+    /// Exact storage-qualified object identity derived from the tenant binding.
+    location: String,
+    /// Storage metadata size used to reject invalid ranges before IO.
+    size: u64,
+}
+
+/// Bounded lazy Parquet leaf for an authenticated Oracle hot-file assignment.
+#[derive(Debug)]
+struct FollowerHotParquetExec {
+    /// Canonical assigned objects in deterministic assignment order.
+    files: Vec<FollowerHotFile>,
+    /// Shared tenant-qualified Iceberg storage reader.
+    file_io: iceberg::io::FileIO,
+    /// Exact physical table schema expected from every assigned object.
+    schema: arrow::datatypes::SchemaRef,
+    /// Request-local pool backed by the retained Oracle worker lease.
+    memory_pool: Arc<dyn MemoryPool>,
+    /// Cached bounded single-partition leaf properties.
+    properties: Arc<PlanProperties>,
+}
+
+impl FollowerHotParquetExec {
+    /// Creates one lazy follower leaf after every object identity and size is validated.
+    fn new(
+        files: Vec<FollowerHotFile>,
+        file_io: iceberg::io::FileIO,
+        schema: arrow::datatypes::SchemaRef,
+        memory_pool: Arc<dyn MemoryPool>,
+    ) -> Self {
+        let properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(Arc::clone(&schema)),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ));
+        Self {
+            files,
+            file_io,
+            schema,
+            memory_pool,
+            properties,
+        }
+    }
+}
+
+impl DisplayAs for FollowerHotParquetExec {
+    /// Renders only the authenticated object count, never tenant storage paths.
+    fn fmt_as(
+        &self,
+        _format: DisplayFormatType,
+        formatter: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
+        write!(
+            formatter,
+            "FollowerHotParquetExec files={}",
+            self.files.len()
+        )
+    }
+}
+
+impl ExecutionPlan for FollowerHotParquetExec {
+    /// Returns the stable native follower leaf name.
+    fn name(&self) -> &'static str {
+        "FollowerHotParquetExec"
+    }
+
+    /// Exposes this concrete leaf for native plan inspection.
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    /// Returns the cached single-partition bounded properties.
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    /// This source has no child plans.
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        Vec::new()
+    }
+
+    /// Reuses this source only when no children are supplied.
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        if children.is_empty() {
+            Ok(self)
+        } else {
+            Err(DataFusionError::Plan(
+                "FollowerHotParquetExec is a leaf plan".to_owned(),
+            ))
+        }
+    }
+
+    /// Starts lazy sequential ranged reads within the request-local worker pool.
+    fn execute(
+        &self,
+        partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        if partition != 0 {
+            return Err(DataFusionError::Execution(format!(
+                "FollowerHotParquetExec has no partition {partition}"
+            )));
+        }
+        let files = self.files.clone();
+        let file_io = self.file_io.clone();
+        let schema = Arc::clone(&self.schema);
+        let output_schema = Arc::clone(&schema);
+        let memory_pool = Arc::clone(&self.memory_pool);
+        let stream = async_stream::try_stream! {
+            for file in files {
+                let input = file_io
+                    .new_input(&file.location)
+                    .map_err(|error| DataFusionError::External(Box::new(error)))?;
+                let reader = input
+                    .reader()
+                    .await
+                    .map_err(|error| DataFusionError::External(Box::new(error)))?;
+                let reader = FollowerParquetReader::new(reader, file.size, Arc::clone(&memory_pool));
+                let mut batches = ParquetRecordBatchStreamBuilder::new(reader)
+                    .await
+                    .map_err(|error| DataFusionError::External(Box::new(error)))?
+                    .with_batch_size(1_024)
+                    .build()
+                    .map_err(|error| DataFusionError::External(Box::new(error)))?;
+                while let Some(batch) = batches.next().await {
+                    let batch = batch.map_err(|error| DataFusionError::External(Box::new(error)))?;
+                    let batch = project_follower_batch(&batch, Arc::clone(&schema))?;
+                    let decoded = MemoryConsumer::new("oracle-follower-hot-decoded")
+                        .register(&memory_pool);
+                    decoded
+                        .try_grow(batch.get_array_memory_size())
+                        .map_err(|error| DataFusionError::ResourcesExhausted(error.to_string()))?;
+                    yield batch;
+                    drop(decoded);
+                }
+            }
+        };
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            output_schema,
+            stream,
+        )))
+    }
+}
+
+/// Projects one decoded hot batch to the authenticated provider schema by field name.
+///
+/// # Errors
+/// Returns a closed execution failure when a required field is absent, cannot be cast, or the
+/// projected Arrow batch is invalid.
+fn project_follower_batch(
+    batch: &RecordBatch,
+    schema: arrow::datatypes::SchemaRef,
+) -> DataFusionResult<RecordBatch> {
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let index = batch.schema().index_of(field.name()).map_err(|_| {
+                DataFusionError::Execution(
+                    "authenticated Oracle hot provider omitted a required field".to_owned(),
+                )
+            })?;
+            let column = batch.column(index);
+            if column.data_type() == field.data_type() {
+                Ok(Arc::clone(column))
+            } else {
+                cast(column, field.data_type()).map_err(DataFusionError::from)
+            }
+        })
+        .collect::<DataFusionResult<Vec<_>>>()?;
+    RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
+}
+
+/// Exact range bytes coupled to their request-local pool reservation.
+struct FollowerRangeOwner {
+    /// Immutable bytes returned by the storage range read.
+    bytes: bytes::Bytes,
+    /// Capacity retained until the final bytes clone or slice drops.
+    _reservation: MemoryReservation,
+}
+
+impl AsRef<[u8]> for FollowerRangeOwner {
+    /// Borrows the retained storage bytes without copying them.
+    fn as_ref(&self) -> &[u8] {
+        self.bytes.as_ref()
+    }
+}
+
+/// Parquet adapter that reserves every storage range before performing IO.
+struct FollowerParquetReader {
+    /// Pinned Iceberg ranged reader for one canonical object.
+    reader: Box<dyn FileRead>,
+    /// Metadata size used to reject out-of-bounds requests.
+    size: u64,
+    /// Request-local worker pool backing every range reservation.
+    memory_pool: Arc<dyn MemoryPool>,
+}
+
+impl FollowerParquetReader {
+    /// Creates one bounded reader for a metadata-validated object.
+    fn new(reader: Box<dyn FileRead>, size: u64, memory_pool: Arc<dyn MemoryPool>) -> Self {
+        Self {
+            reader,
+            size,
+            memory_pool,
+        }
+    }
+}
+
+impl AsyncFileReader for FollowerParquetReader {
+    /// Reserves an exact range before IO and retains the charge with returned bytes.
+    fn get_bytes(
+        &mut self,
+        range: Range<u64>,
+    ) -> futures_util::future::BoxFuture<'_, parquet::errors::Result<bytes::Bytes>> {
+        Box::pin(async move {
+            let requested = range.end.checked_sub(range.start).ok_or_else(|| {
+                ParquetError::General("hot Parquet range start exceeds end".to_owned())
+            })?;
+            if range.end > self.size {
+                return Err(ParquetError::General(
+                    "hot Parquet range exceeds authenticated object size".to_owned(),
+                ));
+            }
+            let requested = usize::try_from(requested)
+                .map_err(|_| ParquetError::General("hot Parquet range exceeds usize".to_owned()))?;
+            let reservation =
+                MemoryConsumer::new("oracle-follower-hot-range").register(&self.memory_pool);
+            reservation
+                .try_grow(requested)
+                .map_err(|error| ParquetError::General(error.to_string()))?;
+            let bytes = self
+                .reader
+                .read(range)
+                .await
+                .map_err(|error| ParquetError::General(error.to_string()))?;
+            if bytes.len() != requested {
+                return Err(ParquetError::General(
+                    "hot Parquet range returned a short read".to_owned(),
+                ));
+            }
+            Ok(bytes::Bytes::from_owner(FollowerRangeOwner {
+                bytes,
+                _reservation: reservation,
+            }))
+        })
+    }
+
+    /// Loads footer/page metadata through the same pre-reserved range path.
+    fn get_metadata<'a>(
+        &'a mut self,
+        _options: Option<&'a ArrowReaderOptions>,
+    ) -> futures_util::future::BoxFuture<'a, parquet::errors::Result<Arc<ParquetMetaData>>> {
+        Box::pin(async move {
+            let size = self.size;
+            ParquetMetaDataReader::new()
+                .load_and_finish(self, size)
+                .await
+                .map(Arc::new)
+        })
+    }
+}
+
 #[async_trait]
 impl FollowerSourceResolver for OracleCatalogResolver {
     /// Builds one tenant-qualified catalog/Iceberg scan and rejects Scribe assignments.
@@ -217,11 +506,61 @@ impl FollowerSourceResolver for OracleCatalogResolver {
             .provider(&table, assignment.binding.tenant_id)
             .await
             .map_err(|_| "authenticated Oracle catalog provider failed".to_owned())?;
+        if assignment.persisted.files.is_empty() {
+            let schema = provider.schema();
+            let batch = arrow::record_batch::RecordBatch::new_empty(Arc::clone(&schema));
+            return MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None)
+                .map(|plan| plan as Arc<dyn ExecutionPlan>)
+                .map_err(|_| "authenticated Oracle empty provider failed".to_owned());
+        }
         let plan = provider
             .scan(session, None, &[], None)
             .await
             .map_err(|_| "authenticated Oracle physical scan failed".to_owned())?;
-        restrict_plan_to_assigned_files(plan, &assignment.persisted.files)
+        let catalog_binding =
+            CatalogTableBinding::resolve((assignment.binding.tenant_id, table))
+                .map_err(|_| "authenticated Oracle assignment binding failed".to_owned())?;
+        let assigned_locations = assignment
+            .persisted
+            .files
+            .iter()
+            .map(|file| {
+                let table_relative = file
+                    .strip_prefix(&catalog_binding.object_prefix)
+                    .and_then(|suffix| suffix.strip_prefix('/'))
+                    .ok_or_else(|| "authenticated Oracle assignment binding failed".to_owned())?
+                    .to_owned();
+                self.catalog
+                    .object_location(&catalog_binding, file)
+                    .map(|location| (file.clone(), table_relative, location))
+                    .map_err(|_| "authenticated Oracle assignment location failed".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if assignment.scan_id.ends_with(":hot") {
+            let mut files = Vec::with_capacity(assigned_locations.len());
+            for (_, _, location) in &assigned_locations {
+                let input = self
+                    .catalog
+                    .file_io()
+                    .new_input(location)
+                    .map_err(|_| "authenticated Oracle hot provider failed".to_owned())?;
+                let metadata = input
+                    .metadata()
+                    .await
+                    .map_err(|_| "authenticated Oracle hot provider failed".to_owned())?;
+                files.push(FollowerHotFile {
+                    location: location.clone(),
+                    size: metadata.size,
+                });
+            }
+            return Ok(Arc::new(FollowerHotParquetExec::new(
+                files,
+                self.catalog.file_io().clone(),
+                provider.schema(),
+                session.runtime_env().memory_pool.clone(),
+            )));
+        }
+        restrict_plan_to_assigned_files(plan, &assigned_locations)
     }
 }
 
@@ -363,6 +702,21 @@ where
             #[cfg(test)]
             ScribeSchemaSource::Fixed(schema) => Arc::clone(schema),
         };
+        let table_name = format!(
+            "{}.{}",
+            assignment.binding.namespace, assignment.binding.table
+        );
+        let local_scan_id = super::scribe_follower_scan_id(
+            &table_name,
+            wyrd_spec::vala::api::NodeId::new(stream.node_id.as_uuid()),
+            cut.writer_epoch,
+        );
+        if assignment.scan_id != local_scan_id {
+            let batch = RecordBatch::new_empty(Arc::clone(&schema));
+            return MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None)
+                .map(|plan| plan as Arc<dyn ExecutionPlan>)
+                .map_err(|_| "authenticated Scribe empty provider failed".to_owned());
+        }
         let start_day = parse_event_day(&cut.start_event_day)?;
         let end_day = parse_event_day(&cut.end_event_day)?;
         let max_batches = usize::try_from(cut.maximum_batch_count)
@@ -412,12 +766,21 @@ fn assignment_table(binding: &TenantTableBinding) -> Result<TableRef, String> {
 /// is absent, or a non-file leaf prevents proving exact file-set equality.
 fn restrict_plan_to_assigned_files(
     plan: Arc<dyn ExecutionPlan>,
-    assigned_files: &[String],
+    assigned_files: &[(String, String, String)],
 ) -> Result<Arc<dyn ExecutionPlan>, String> {
     let assigned = assigned_files
         .iter()
-        .cloned()
+        .map(|(_, _, location)| location.clone())
         .collect::<std::collections::BTreeSet<_>>();
+    let relative_assignments = assigned_files
+        .iter()
+        .flat_map(|(canonical, table_relative, location)| {
+            [
+                (canonical.clone(), location.clone()),
+                (table_relative.clone(), location.clone()),
+            ]
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
     if assigned.len() != assigned_files.len() || assigned.iter().any(|file| file.trim().is_empty())
     {
         return Err("authenticated Oracle assignment contains duplicate or empty files".to_owned());
@@ -426,6 +789,28 @@ fn restrict_plan_to_assigned_files(
     let mut file_leaves = 0usize;
     let transformed = plan
         .transform_up(|node| {
+            if let Some(exec) = node
+                .as_any()
+                .downcast_ref::<super::exec::OracleIcebergScanExec>()
+            {
+                file_leaves = file_leaves.saturating_add(1);
+                observed.extend(assigned.iter().cloned());
+                return Ok(Transformed::yes(Arc::new(
+                    exec.clone().with_assigned_files(assigned.clone()),
+                )));
+            }
+            if node.as_any().is::<IcebergTableScan>() {
+                let restricted = super::exec::OracleIcebergScanExec::from_plan(node.as_ref())
+                    .map_err(|_| {
+                        datafusion::common::DataFusionError::Plan(
+                            "authenticated Oracle Iceberg source failed".to_owned(),
+                        )
+                    })?
+                    .with_assigned_files(assigned.clone());
+                file_leaves = file_leaves.saturating_add(1);
+                observed.extend(assigned.iter().cloned());
+                return Ok(Transformed::yes(Arc::new(restricted)));
+            }
             let Some(exec) = node.as_any().downcast_ref::<DataSourceExec>() else {
                 return Ok(Transformed::no(node));
             };
@@ -442,7 +827,16 @@ fn restrict_plan_to_assigned_files(
                     let files = group
                         .iter()
                         .filter(|file| {
-                            let location = file.object_meta.location.to_string();
+                            let object_path = file.object_meta.location.to_string();
+                            let location = relative_assignments
+                                .get(&object_path)
+                                .cloned()
+                                .unwrap_or_else(|| {
+                                    physical_file_location(
+                                        config.object_store_url.as_str(),
+                                        &object_path,
+                                    )
+                                });
                             if assigned.contains(&location) {
                                 observed.insert(location);
                                 true
@@ -468,6 +862,18 @@ fn restrict_plan_to_assigned_files(
         return Err("authenticated Oracle assignment differs from planned files".to_owned());
     }
     Ok(transformed)
+}
+
+/// Joins DataFusion's authenticated object-store authority and relative object key.
+fn physical_file_location(store: &str, path: &str) -> String {
+    if store == "file://" {
+        return format!("file:///{}", path.trim_start_matches('/'));
+    }
+    if store.ends_with('/') || path.starts_with('/') {
+        format!("{store}{path}")
+    } else {
+        format!("{store}/{path}")
+    }
 }
 
 /// Converts one validated wire endpoint into the Redux WAL owner type.
@@ -971,28 +1377,71 @@ pub(crate) mod tests {
             Arc::clone(&schema),
             &["assigned.parquet", "unassigned.parquet"],
         );
-        let restricted = restrict_plan_to_assigned_files(catalog, &["assigned.parquet".to_owned()])
-            .expect("exact assigned file remains executable");
+        let assigned = physical_file_location(
+            ObjectStoreUrl::local_filesystem().as_str(),
+            "assigned.parquet",
+        );
+        let restricted = restrict_plan_to_assigned_files(
+            catalog,
+            &[(
+                ("assigned.parquet").to_owned(),
+                "assigned.parquet".to_owned(),
+                assigned.clone(),
+            )],
+        )
+        .expect("exact assigned file remains executable");
         assert_eq!(plan_files(&restricted), vec!["assigned.parquet"]);
 
         assert!(
             restrict_plan_to_assigned_files(
                 file_plan(Arc::clone(&schema), &["assigned.parquet"]),
-                &["missing.parquet".to_owned()],
+                &[(
+                    "missing.parquet".to_owned(),
+                    "missing.parquet".to_owned(),
+                    physical_file_location(
+                        ObjectStoreUrl::local_filesystem().as_str(),
+                        "missing.parquet",
+                    ),
+                )],
             )
             .is_err()
         );
         assert!(
             restrict_plan_to_assigned_files(
                 file_plan(Arc::clone(&schema), &["assigned.parquet"]),
-                &["assigned.parquet".to_owned(), "extra.parquet".to_owned()],
+                &[
+                    (
+                        "assigned.parquet".to_owned(),
+                        "assigned.parquet".to_owned(),
+                        assigned.clone(),
+                    ),
+                    (
+                        "extra.parquet".to_owned(),
+                        "extra.parquet".to_owned(),
+                        physical_file_location(
+                            ObjectStoreUrl::local_filesystem().as_str(),
+                            "extra.parquet",
+                        ),
+                    ),
+                ],
             )
             .is_err()
         );
         assert!(
             restrict_plan_to_assigned_files(
                 file_plan(schema, &["assigned.parquet"]),
-                &["assigned.parquet".to_owned(), "assigned.parquet".to_owned()],
+                &[
+                    (
+                        "assigned.parquet".to_owned(),
+                        "assigned.parquet".to_owned(),
+                        assigned.clone(),
+                    ),
+                    (
+                        "assigned.parquet".to_owned(),
+                        "assigned.parquet".to_owned(),
+                        assigned,
+                    ),
+                ],
             )
             .is_err()
         );
@@ -1010,6 +1459,15 @@ pub(crate) mod tests {
             maximum_batch_count: 8,
             maximum_retained_bytes: 1024,
         }
+    }
+
+    /// Derives the production identity-bound scan ID for one local test stream.
+    fn local_scribe_scan_id(binding: &TenantTableBinding, stream: StreamIdentity) -> String {
+        super::super::scribe_follower_scan_id(
+            &format!("{}.{}", binding.namespace, binding.table),
+            wyrd_spec::vala::api::NodeId::new(stream.node_id.as_uuid()),
+            u64::try_from(stream.writer_epoch.as_i64()).expect("positive test writer epoch"),
+        )
     }
 
     /// Resolver whose call counter proves the complete preflight gate precedes IO.
@@ -1153,11 +1611,12 @@ pub(crate) mod tests {
     async fn scribe_provider_preserves_ordered_ranges_in_one_tail_call() {
         let tenant_id = DataTenantId::new_v7();
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stream = StreamIdentity::new(
+            crate::scribe::stream_identity::NodeId::new(uuid::Uuid::now_v7()),
+            WriterEpoch::new(2),
+        );
         let tail = Arc::new(RecordingTail {
-            stream: StreamIdentity::new(
-                crate::scribe::stream_identity::NodeId::new(uuid::Uuid::now_v7()),
-                WriterEpoch::new(2),
-            ),
+            stream,
             requests: Arc::clone(&requests),
             batches: Vec::new(),
         });
@@ -1178,16 +1637,17 @@ pub(crate) mod tests {
             },
         ];
         let session = SessionContext::new().state();
+        let binding = TenantTableBinding {
+            tenant_id,
+            namespace: "vala.logs".to_owned(),
+            table: "records".to_owned(),
+        };
         resolver
             .resolve(
                 ClusterRole::Scribe,
                 &FollowerScanAssignment {
-                    scan_id: "scan".to_owned(),
-                    binding: TenantTableBinding {
-                        tenant_id,
-                        namespace: "vala.logs".to_owned(),
-                        table: "records".to_owned(),
-                    },
+                    scan_id: local_scribe_scan_id(&binding, stream),
+                    binding,
                     persisted: PersistedFileAssignment { files: Vec::new() },
                     scribe_provider_cut: Some(cut(ranges)),
                     schema_fingerprint: super::super::sealed_fragment_schema_fingerprint(
@@ -1213,6 +1673,73 @@ pub(crate) mod tests {
         );
     }
 
+    /// The local identity fetches hot data while a sibling placeholder resolves empty.
+    #[tokio::test]
+    async fn scribe_provider_executes_only_its_identity_bound_scan() {
+        let tenant_id = DataTenantId::new_v7();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stream = StreamIdentity::new(
+            crate::scribe::stream_identity::NodeId::new(uuid::Uuid::from_u128(11)),
+            WriterEpoch::new(2),
+        );
+        let tail = Arc::new(RecordingTail {
+            stream,
+            requests: Arc::clone(&requests),
+            batches: Vec::new(),
+        });
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "wyrd_event_time",
+            DataType::Utf8,
+            true,
+        )]));
+        let resolver = ScribeTailResolver::with_schema(tail, schema);
+        let binding = TenantTableBinding {
+            tenant_id,
+            namespace: "vala.logs".to_owned(),
+            table: "records".to_owned(),
+        };
+        let assignment = |scan_id| FollowerScanAssignment {
+            scan_id,
+            binding: binding.clone(),
+            persisted: PersistedFileAssignment { files: Vec::new() },
+            scribe_provider_cut: Some(cut(Vec::new())),
+            schema_fingerprint: "schema".to_owned(),
+        };
+        let session = SessionContext::new().state();
+        resolver
+            .resolve(
+                ClusterRole::Scribe,
+                &assignment(local_scribe_scan_id(&binding, stream)),
+                &session,
+            )
+            .await
+            .expect("the exact local identity resolves its hot provider");
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1
+        );
+        let sibling = super::super::scribe_follower_scan_id(
+            "vala.logs.records",
+            wyrd_spec::vala::api::NodeId::new(uuid::Uuid::from_u128(12)),
+            3,
+        );
+        resolver
+            .resolve(ClusterRole::Scribe, &assignment(sibling), &session)
+            .await
+            .expect("a sibling placeholder resolves as an explicit empty provider");
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "the sibling placeholder must not fetch the local hot stream"
+        );
+    }
+
     /// Oracle and Scribe assignments remain a closed role-local matrix.
     ///
     /// # Panics
@@ -1220,6 +1747,11 @@ pub(crate) mod tests {
     /// cannot decode and execute.
     #[tokio::test]
     async fn role_local_providers_are_isolated_and_consumed_once() {
+        prove_role_local_providers_are_isolated_and_consumed_once().await;
+    }
+
+    /// Exercises one complete role-local provider resolution and execution.
+    async fn prove_role_local_providers_are_isolated_and_consumed_once() {
         oracle_projection_is_exactly_the_authenticated_assignment();
         let (request, binding) = oracle_request().expect("valid Oracle request");
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1253,8 +1785,21 @@ pub(crate) mod tests {
     /// decode, unsupported-operator preflight, or stream construction.
     #[tokio::test]
     async fn oracle_resolver_builds_fresh_request_local_context() {
-        role_local_providers_are_isolated_and_consumed_once();
-        role_local_providers_are_isolated_and_consumed_once();
+        let sessions = FollowerSessionFactory::new(2);
+        let (first_state, first_context) = sessions
+            .create(Arc::new(
+                datafusion::execution::memory_pool::GreedyMemoryPool::new(1024),
+            ))
+            .expect("first governed request context");
+        let (second_state, second_context) = sessions
+            .create(Arc::new(
+                datafusion::execution::memory_pool::GreedyMemoryPool::new(1024),
+            ))
+            .expect("second governed request context");
+        assert_ne!(first_state.session_id(), second_state.session_id());
+        assert!(!Arc::ptr_eq(&first_context, &second_context));
+        prove_role_local_providers_are_isolated_and_consumed_once().await;
+        prove_role_local_providers_are_isolated_and_consumed_once().await;
         assert_complete_preflight_matrix().await;
     }
 
@@ -1332,26 +1877,28 @@ pub(crate) mod tests {
             crate::resources::MIN_SCRATCH_FREE_BYTES,
             [crate::resources::BifrostRole::Scribe],
         );
+        let stream = StreamIdentity::new(
+            crate::scribe::stream_identity::NodeId::new(uuid::Uuid::now_v7()),
+            WriterEpoch::new(2),
+        );
         let service = Arc::new(FetchLiveTailService::new(
-            StreamIdentity::new(
-                crate::scribe::stream_identity::NodeId::new(uuid::Uuid::now_v7()),
-                WriterEpoch::new(2),
-            ),
+            stream,
             memtable,
             role_resources.scribe().expect("Scribe capability"),
         ));
         let resolver = ScribeTailResolver::with_schema(service, Arc::clone(&schema));
         let session = SessionContext::new().state();
+        let binding = TenantTableBinding {
+            tenant_id,
+            namespace: "vala.logs".to_owned(),
+            table: "records".to_owned(),
+        };
         let provider = resolver
             .resolve(
                 ClusterRole::Scribe,
                 &FollowerScanAssignment {
-                    scan_id: "scan".to_owned(),
-                    binding: TenantTableBinding {
-                        tenant_id,
-                        namespace: "vala.logs".to_owned(),
-                        table: "records".to_owned(),
-                    },
+                    scan_id: local_scribe_scan_id(&binding, stream),
+                    binding,
                     persisted: PersistedFileAssignment { files: Vec::new() },
                     scribe_provider_cut: Some(cut(Vec::new())),
                     schema_fingerprint: super::super::sealed_fragment_schema_fingerprint(

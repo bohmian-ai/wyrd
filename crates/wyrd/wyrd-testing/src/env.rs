@@ -10,6 +10,7 @@ use axum::http::{HeaderValue, Request, Response, StatusCode, header};
 use ed25519_dalek::VerifyingKey;
 use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::BifrostCatalog;
@@ -27,6 +28,7 @@ use wyrd_runtime::{PrincipalId, RbacCheck, RoleRef};
 use wyrd_semver::VersionBlock;
 use wyrd_server::components::auth::audit_writer::NoopAuthzAuditWriter;
 use wyrd_server::postgres::ServerPostgres;
+use wyrd_server::state::Bifrost;
 use wyrd_server::{AppState, build_router};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalKindTag;
@@ -175,7 +177,7 @@ impl WyrdTestEnv {
         })
         .await
         .map_err(|error| WyrdTestError::Start(error.to_string()))?;
-        let bifrost = test_catalog(&fixture, &storage).await?;
+        let _bifrost = test_catalog(&fixture, &storage).await?;
 
         let issuing_key = Arc::new(
             IssuingKey::from_ed_pem(
@@ -207,7 +209,9 @@ impl WyrdTestEnv {
             fixture.wyrd_postgres().clone(),
             fixture.vala_postgres().clone(),
         ));
-        let mut state = AppState::new(postgres, storage, bifrost).with_auth(
+        let shutdown = CancellationToken::new();
+        let bifrost_runtime = Bifrost::test_shell(Arc::clone(&verifier));
+        let mut state = AppState::new(postgres, storage, bifrost_runtime, shutdown).with_auth(
             wyrd_server::components::auth::ServerAuth {
                 allow_preview: true,
                 issuing_key: Some(Arc::clone(&issuing_key)),

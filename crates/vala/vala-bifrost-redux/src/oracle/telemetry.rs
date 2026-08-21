@@ -199,8 +199,6 @@ pub enum PeerErrorClass {
     Availability,
     /// Security or closed-contract validation failed.
     Security,
-    /// All bounded distinct attempts failed.
-    Exhausted,
     /// Footer identity validation failed.
     Footer,
     /// Whole-attempt buffering or footer completeness failed.
@@ -219,7 +217,6 @@ impl PeerErrorClass {
             Self::None => "none",
             Self::Availability => "availability",
             Self::Security => "security",
-            Self::Exhausted => "exhausted",
             Self::Footer => "footer",
             Self::Attempt => "attempt",
         }

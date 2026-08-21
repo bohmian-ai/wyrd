@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 #[cfg(feature = "test-support")]
 use std::time::Duration;
 use std::time::Instant;
@@ -159,6 +159,11 @@ pub struct Gate {
     ingest_admission: IngestAdmission,
     /// Existing bounded query admission policy.
     query_admission: QueryAdmission,
+    /// Canonical ready-Oracle selector and authenticated private forwarder.
+    query_forwarder: Option<Arc<crate::oracle::ReadyOracleForwarder>>,
+    /// Read-only proof handle for test-tier inspection of the production graph.
+    #[cfg(feature = "test-support")]
+    test_resources: Option<BifrostRoleResources>,
 }
 
 impl Gate {
@@ -178,7 +183,61 @@ impl Gate {
                 closed: Arc::clone(&closed),
             },
             query_admission: QueryAdmission { closed },
+            query_forwarder: None,
+            #[cfg(feature = "test-support")]
+            test_resources: None,
         }
+    }
+
+    /// Attaches the canonical query forwarder composed from the shared production graph.
+    #[must_use]
+    pub(crate) fn with_query_forwarder(
+        mut self,
+        forwarder: Arc<crate::oracle::ReadyOracleForwarder>,
+    ) -> Self {
+        self.query_forwarder = Some(forwarder);
+        self
+    }
+
+    /// Routes an authenticated query through the one ready-Oracle forwarding owner.
+    ///
+    /// # Errors
+    /// Returns a closed Gate, role, forwarding, admission, or query failure.
+    pub async fn forward_query(
+        &self,
+        context: AuthorizedQueryContext,
+        request: BifrostQueryRequest,
+    ) -> Result<OracleQueryStream, wyrd_spec::vala::error::BifrostError> {
+        self.ensure_query_open()?;
+        self.query_forwarder
+            .as_ref()
+            .ok_or(wyrd_spec::vala::error::BifrostError::OracleRoleUnavailable)?
+            .forward(context, request)
+            .await
+    }
+
+    /// Verifies and executes one private signed forwarding envelope locally.
+    ///
+    /// # Errors
+    /// Returns role-unavailable or a closed forwarding security/query failure.
+    pub(crate) async fn accept_forwarded_query(
+        &self,
+        ticket: wyrd_spec::vala::api::SignedPeerTicket,
+    ) -> Result<OracleQueryStream, wyrd_spec::vala::error::BifrostError> {
+        self.ensure_query_open()?;
+        self.query_forwarder
+            .as_ref()
+            .ok_or(wyrd_spec::vala::error::BifrostError::OracleRoleUnavailable)?
+            .accept(ticket)
+            .await
+    }
+
+    /// Attaches read-only inspection of the already-composed production resources.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub(crate) fn with_test_resources(mut self, resources: BifrostRoleResources) -> Self {
+        self.test_resources = Some(resources);
+        self
     }
 
     /// Authenticates one private peer request through the same token verifier as public Gate work.
@@ -326,6 +385,10 @@ pub struct Scribe {
     tail_service: Arc<FetchLiveTailService>,
     /// Request-local governed physical-plan follower for live Scribe assignments.
     fragment_follower: Arc<PhysicalPlanFollower<ScribeTailResolver>>,
+    /// Completed request-local Scribe fragment executions.
+    fragment_executions: Arc<AtomicU64>,
+    /// Footer frames emitted by the Scribe follower owner.
+    fragment_footers: Arc<AtomicU64>,
     /// Root-derived Scribe resource capability.
     resources: ScribeResources,
     /// Shared current-ready cluster registry.
@@ -344,6 +407,10 @@ pub struct Scribe {
     fragment_verifier: Arc<dyn PeerTicketVerifier>,
     /// Durable security audit for rejected Scribe fragment authority.
     fragment_security_audit: Arc<dyn PeerSecurityAudit>,
+    /// Process-owned query audit required by decoded tenant tripwires.
+    fragment_query_audit: Arc<crate::oracle::OracleAuditPublisher>,
+    /// Retains audit shutdown ownership only when this process has no Oracle owner.
+    owns_fragment_query_audit: bool,
     /// Optional dedicated runtime that owns Scribe coordination tasks in production.
     coordination_runtime: Option<Arc<tokio::runtime::Runtime>>,
     /// Cancels the recurring heartbeat and snapshot tasks before role removal.
@@ -404,6 +471,19 @@ pub struct Oracle {
 }
 
 impl Oracle {
+    /// Reports whether the injected process shutdown token reached Oracle lifecycle work.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn process_shutdown_observed_for_test(&self) -> bool {
+        self.role_shutdown.is_cancelled() && self.engine.process_shutdown_observed_for_test()
+    }
+
+    /// Returns the exact registered Oracle role identity and fence.
+    #[must_use]
+    pub(crate) const fn registered_role(&self) -> &RegisteredRole {
+        &self.registered_role
+    }
+
     /// Cancels Oracle work and explicitly aborts retained role tasks without awaiting.
     ///
     /// Used only after the process deadline is exhausted. It closes role
@@ -429,8 +509,8 @@ impl Oracle {
         lifecycle_transport: Arc<crate::oracle::OracleLifecycleTransport>,
         resources: OracleResources,
         peer: Arc<crate::oracle::OraclePeerRuntime>,
+        role_shutdown: CancellationToken,
     ) -> Self {
-        let role_shutdown = CancellationToken::new();
         let advertise_ready = Arc::new(AtomicBool::new(true));
         let heartbeat = Arc::clone(&cluster).start_readiness_heartbeat(
             registered_role.clone(),
@@ -581,8 +661,8 @@ impl Oracle {
     /// for durable recovery. Cleanup is best-effort and never extends the
     /// caller-owned process deadline.
     pub async fn shutdown(&self, deadline: Instant) {
-        self.shutdown_owner(deadline).await;
-        self.shutdown_registry(deadline).await;
+        let _ = self.shutdown_owner(deadline).await;
+        let _ = self.shutdown_registry(deadline).await;
     }
 
     /// Stops Oracle-owned work and retained role tasks within `deadline`.
@@ -590,20 +670,41 @@ impl Oracle {
     /// Cancellation first closes new work. Maintenance and role tasks then
     /// drain against the unchanged process deadline; partial progress is
     /// retained for recovery when the future reaches or is dropped at expiry.
-    pub(crate) async fn shutdown_owner(&self, deadline: Instant) {
+    pub(crate) async fn shutdown_owner(
+        &self,
+        deadline: Instant,
+    ) -> Result<(), wyrd_spec::vala::error::BifrostError> {
         self.lifecycle.begin_stopping();
         self.role_shutdown.cancel();
-        self.engine.shutdown(deadline).await;
-        let _ = self.audit.shutdown(deadline).await;
-        await_role_task(&self.heartbeat, deadline, "oracle heartbeat").await;
-        await_role_task(&self.snapshot_poller, deadline, "oracle snapshot poller").await;
+        let report = self.engine.shutdown(deadline).await;
+        let audit = self.audit.shutdown(deadline).await;
+        await_role_task(&self.heartbeat, deadline, "oracle heartbeat").await?;
+        await_role_task(&self.snapshot_poller, deadline, "oracle snapshot poller").await?;
+        if report.active_queries != 0
+            || report.queued_queries != 0
+            || report.peer_pending != 0
+            || report.peer_running != 0
+            || report.reserved_memory_bytes != 0
+            || report.reserved_spill_bytes != 0
+            || audit.backlog_records != 0
+            || audit.backlog_bytes != 0
+        {
+            return Err(wyrd_spec::vala::error::BifrostError::Internal {
+                detail: "Oracle shutdown retained admission, resource, peer, or audit state"
+                    .to_owned(),
+            });
+        }
+        Ok(())
     }
 
     /// Unregisters the exact Oracle fence within `deadline`.
     ///
     /// No registry await starts after expiry. Failure or timeout leaves the
     /// lifecycle unfinished and observable in logs rather than claiming cleanup.
-    pub(crate) async fn shutdown_registry(&self, deadline: Instant) {
+    pub(crate) async fn shutdown_registry(
+        &self,
+        deadline: Instant,
+    ) -> Result<(), wyrd_spec::vala::error::BifrostError> {
         if tokio::time::Instant::now() < tokio::time::Instant::from_std(deadline) {
             match timeout_at(
                 tokio::time::Instant::from_std(deadline),
@@ -611,14 +712,18 @@ impl Oracle {
             )
             .await
             {
-                Ok(Ok(())) => self.lifecycle.finish(),
-                Ok(Err(error)) => {
-                    tracing::warn!(%error, "failed to unregister the Oracle role during shutdown")
+                Ok(Ok(())) => {
+                    self.lifecycle.finish();
+                    Ok(())
                 }
-                Err(_) => tracing::warn!("Oracle role unregister exceeded shutdown deadline"),
+                Ok(Err(_)) | Err(_) => Err(wyrd_spec::vala::error::BifrostError::Internal {
+                    detail: "Oracle role registry shutdown failed".to_owned(),
+                }),
             }
         } else {
-            tracing::warn!("skipping Oracle role unregister after shutdown deadline");
+            Err(wyrd_spec::vala::error::BifrostError::Internal {
+                detail: "Oracle role registry shutdown exceeded its deadline".to_owned(),
+            })
         }
     }
 
@@ -640,6 +745,13 @@ impl Oracle {
 }
 
 impl Scribe {
+    /// Reports whether the injected process shutdown token reached Scribe lifecycle work.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn process_shutdown_observed_for_test(&self) -> bool {
+        self.role_shutdown.is_cancelled()
+    }
+
     /// Explicitly aborts all retained Scribe role work without awaiting.
     ///
     /// This deadline-expiry path signals role cancellation, explicitly aborts
@@ -665,22 +777,27 @@ impl Scribe {
         registered_role: RegisteredRole,
         fragment_verifier: Arc<dyn PeerTicketVerifier>,
         fragment_security_audit: Arc<dyn PeerSecurityAudit>,
+        fragment_query_audit: Arc<crate::oracle::OracleAuditPublisher>,
+        owns_fragment_query_audit: bool,
         coordination_runtime: Option<Arc<tokio::runtime::Runtime>>,
+        role_shutdown: CancellationToken,
     ) -> Self {
         let tail_service = Arc::new(
             ingest
                 .tail_service()
                 .expect("constructed Scribe must retain a valid UUID stream identity"),
         );
-        let fragment_follower = Arc::new(PhysicalPlanFollower::new(ScribeTailResolver::new(
-            Arc::clone(&tail_service),
-            Arc::clone(&catalog),
-        )));
+        let fragment_follower = Arc::new(
+            PhysicalPlanFollower::new(ScribeTailResolver::new(
+                Arc::clone(&tail_service),
+                Arc::clone(&catalog),
+            ))
+            .with_audit(fragment_query_audit.clone()),
+        );
         let tail_reader = Arc::new(ScribeTailReader::new(
             Arc::clone(&tail_service),
             TailFenceConfig::default(),
         ));
-        let role_shutdown = CancellationToken::new();
         let advertise_ready = Arc::new(AtomicBool::new(true));
         let heartbeat = Arc::clone(&cluster).start_readiness_heartbeat(
             registered_role.clone(),
@@ -694,6 +811,8 @@ impl Scribe {
             ingest,
             tail_service,
             fragment_follower,
+            fragment_executions: Arc::new(AtomicU64::new(0)),
+            fragment_footers: Arc::new(AtomicU64::new(0)),
             resources,
             cluster,
             registered_role,
@@ -703,6 +822,8 @@ impl Scribe {
             tail_authority: None,
             fragment_verifier,
             fragment_security_audit,
+            fragment_query_audit,
+            owns_fragment_query_audit,
             coordination_runtime,
             role_shutdown,
             heartbeat: Arc::new(Mutex::new(Some(heartbeat))),
@@ -745,6 +866,26 @@ impl Scribe {
     #[must_use]
     pub const fn fragment_follower(&self) -> &Arc<PhysicalPlanFollower<ScribeTailResolver>> {
         &self.fragment_follower
+    }
+
+    /// Records one Scribe-owned fragment execution after authenticated resolution.
+    pub(crate) fn record_fragment_execution(&self) {
+        self.fragment_executions.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Records one footer emitted by the Scribe-owned fragment stream.
+    pub(crate) fn record_fragment_footer(&self) {
+        self.fragment_footers.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Returns exact Scribe follower activity for production-shaped journeys.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn fragment_inspection(&self) -> (u64, u64) {
+        (
+            self.fragment_executions.load(Ordering::Acquire),
+            self.fragment_footers.load(Ordering::Acquire),
+        )
     }
 
     /// Borrows the root-derived Scribe resource capability.
@@ -816,8 +957,8 @@ impl Scribe {
     /// durable recovery. Cleanup is best-effort and never extends the
     /// caller-owned process deadline.
     pub async fn shutdown(&self, deadline: Instant) {
-        self.shutdown_owner(deadline).await;
-        self.shutdown_registry(deadline).await;
+        let _ = self.shutdown_owner(deadline).await;
+        let _ = self.shutdown_registry(deadline).await;
     }
 
     /// Closes and drains Scribe-owned work and retained role tasks within `deadline`.
@@ -825,15 +966,31 @@ impl Scribe {
     /// The composite closes Gate first; Scribe may flush work accepted before
     /// that transition while budget remains. Every later join shares `deadline`, and
     /// timed-out retained handles are aborted before this method returns.
-    pub(crate) async fn shutdown_owner(&self, deadline: Instant) {
+    pub(crate) async fn shutdown_owner(
+        &self,
+        deadline: Instant,
+    ) -> Result<(), wyrd_spec::vala::error::BifrostError> {
         self.lifecycle.begin_stopping();
         self.role_shutdown.cancel();
         if let Some(authority) = &self.tail_authority {
             authority.clear_replay_state();
         }
-        self.ingest.shutdown(deadline).await;
-        await_role_task(&self.heartbeat, deadline, "scribe heartbeat").await;
-        await_role_task(&self.snapshot_poller, deadline, "scribe snapshot poller").await;
+        if !self.ingest.shutdown(deadline).await {
+            return Err(wyrd_spec::vala::error::BifrostError::Internal {
+                detail: "Scribe shutdown did not flush every retained owner".to_owned(),
+            });
+        }
+        if self.owns_fragment_query_audit {
+            let audit = self.fragment_query_audit.shutdown(deadline).await;
+            if audit.backlog_records != 0 || audit.backlog_bytes != 0 {
+                return Err(wyrd_spec::vala::error::BifrostError::Internal {
+                    detail: "Scribe shutdown retained tenant-tripwire audit state".to_owned(),
+                });
+            }
+        }
+        await_role_task(&self.heartbeat, deadline, "scribe heartbeat").await?;
+        await_role_task(&self.snapshot_poller, deadline, "scribe snapshot poller").await?;
+        Ok(())
     }
 
     /// Unregisters the exact Scribe fence within `deadline`.
@@ -841,7 +998,10 @@ impl Scribe {
     /// The exact retained fence is removed only while budget remains. Timeout,
     /// cancellation, or registry failure leaves lifecycle completion unset and
     /// starts no post-deadline retry.
-    pub(crate) async fn shutdown_registry(&self, deadline: Instant) {
+    pub(crate) async fn shutdown_registry(
+        &self,
+        deadline: Instant,
+    ) -> Result<(), wyrd_spec::vala::error::BifrostError> {
         if tokio::time::Instant::now() < tokio::time::Instant::from_std(deadline) {
             match timeout_at(
                 tokio::time::Instant::from_std(deadline),
@@ -849,14 +1009,18 @@ impl Scribe {
             )
             .await
             {
-                Ok(Ok(())) => self.lifecycle.finish(),
-                Ok(Err(error)) => {
-                    tracing::warn!(%error, "failed to unregister the Scribe role during shutdown")
+                Ok(Ok(())) => {
+                    self.lifecycle.finish();
+                    Ok(())
                 }
-                Err(_) => tracing::warn!("Scribe role unregister exceeded shutdown deadline"),
+                Ok(Err(_)) | Err(_) => Err(wyrd_spec::vala::error::BifrostError::Internal {
+                    detail: "Scribe role registry shutdown failed".to_owned(),
+                }),
             }
         } else {
-            tracing::warn!("skipping Scribe role unregister after shutdown deadline");
+            Err(wyrd_spec::vala::error::BifrostError::Internal {
+                detail: "Scribe role registry shutdown exceeded its deadline".to_owned(),
+            })
         }
     }
 
@@ -882,17 +1046,19 @@ async fn await_role_task(
     task: &Mutex<Option<JoinHandle<()>>>,
     deadline: Instant,
     task_name: &'static str,
-) {
+) -> Result<(), wyrd_spec::vala::error::BifrostError> {
     let Ok(mut guard) = timeout_at(tokio::time::Instant::from_std(deadline), task.lock()).await
     else {
         tracing::warn!(
             task = task_name,
             "role task lock exceeded shutdown deadline"
         );
-        return;
+        return Err(wyrd_spec::vala::error::BifrostError::Internal {
+            detail: format!("{task_name} lock exceeded shutdown deadline"),
+        });
     };
     let Some(mut task) = guard.take() else {
-        return;
+        return Ok(());
     };
     drop(guard);
     if timeout_at(tokio::time::Instant::from_std(deadline), &mut task)
@@ -901,7 +1067,11 @@ async fn await_role_task(
     {
         tracing::warn!(task = task_name, "role task exceeded shutdown deadline");
         task.abort();
+        return Err(wyrd_spec::vala::error::BifrostError::Internal {
+            detail: format!("{task_name} exceeded shutdown deadline"),
+        });
     }
+    Ok(())
 }
 
 /// Runtime-ready limits derived from config.
@@ -1062,6 +1232,8 @@ pub struct Forge {
     shutdown: CancellationToken,
     /// Stable physical node identity retained by the selected Forge owner.
     node_id: wyrd_spec::vala::api::NodeId,
+    /// Set only after every supervised Forge task joins before the process deadline.
+    supervision_drained: Arc<AtomicBool>,
 }
 
 impl Forge {
@@ -1080,6 +1252,7 @@ impl Forge {
             resources,
             shutdown,
             node_id,
+            supervision_drained: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1104,6 +1277,16 @@ impl Forge {
     /// Signals selected Forge capabilities to stop accepting work.
     pub fn begin_shutdown(&self) {
         self.shutdown.cancel();
+    }
+
+    /// Records the production supervisor's bounded join result exactly once.
+    pub(crate) fn mark_supervision_drained(&self, drained: bool) {
+        self.supervision_drained.store(drained, Ordering::Release);
+    }
+
+    /// Returns whether every selected Forge supervisor joined without deadline abort.
+    fn supervision_drained(&self) -> bool {
+        self.supervision_drained.load(Ordering::Acquire)
     }
 }
 
@@ -1138,6 +1321,22 @@ impl Bifrost {
             scribe,
             forge,
             oracle,
+        })
+    }
+
+    /// Builds an ownerless unit-test shell for non-Bifrost route fixtures.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn test_shell(token_verifier: Arc<WyrdTokenVerifier>) -> Arc<Self> {
+        Arc::new(Self {
+            gate: Gate::new(
+                token_verifier,
+                vala_bifrost_redux::gate::limits::IngestLimits::default(),
+                vala_bifrost_redux::gate::limits::BifrostTransportAdmission::default(),
+            ),
+            scribe: None,
+            forge: None,
+            oracle: None,
         })
     }
 
@@ -1177,6 +1376,22 @@ impl Bifrost {
         self.oracle
             .as_ref()
             .map(|runtime| Arc::clone(runtime.peer()))
+    }
+
+    /// Borrows the shared catalog retained by the selected data owners.
+    #[must_use]
+    pub(crate) fn catalog(&self) -> Option<&Arc<BifrostCatalog>> {
+        self.scribe
+            .as_ref()
+            .map(|scribe| &scribe.catalog)
+            .or_else(|| self.oracle.as_ref().map(|oracle| &oracle.catalog))
+    }
+
+    /// Borrows the shared role-resource graph retained by the selected owners.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub(crate) fn resources(&self) -> Option<&BifrostRoleResources> {
+        self.gate.test_resources.as_ref()
     }
 
     /// Borrows the selected Forge runtime.
@@ -1221,14 +1436,6 @@ impl Bifrost {
             .map(|scribe| scribe.resources.health())
             .or_else(|| self.oracle.as_ref().map(|oracle| oracle.resources.health()))
             .or_else(|| self.forge.as_ref().map(|forge| forge.resources.health()))
-    }
-
-    /// Borrows the shared catalog through one selected serving subsystem.
-    pub(crate) fn catalog(&self) -> Option<&Arc<BifrostCatalog>> {
-        self.scribe
-            .as_ref()
-            .map(|scribe| &scribe.catalog)
-            .or_else(|| self.oracle.as_ref().map(|oracle| &oracle.catalog))
     }
 
     /// Reserves Scribe-owned memory for one preflighted OTLP decode.
@@ -1484,13 +1691,7 @@ impl Bifrost {
         context: AuthorizedQueryContext,
         request: BifrostQueryRequest,
     ) -> Result<OracleQueryStream, wyrd_spec::vala::error::BifrostError> {
-        self.gate().ensure_query_open()?;
-        let oracle = self
-            .oracle
-            .as_ref()
-            .filter(|oracle| oracle.is_ready())
-            .ok_or(wyrd_spec::vala::error::BifrostError::OracleRoleUnavailable)?;
-        oracle.engine.query_sql(context, request).await
+        self.gate().forward_query(context, request).await
     }
 
     /// Dispatches one authorized logical plan through Gate into the selected Oracle.
@@ -1535,25 +1736,43 @@ impl Bifrost {
         deadline: Instant,
     ) -> Result<BifrostShutdownReport, wyrd_spec::vala::error::BifrostError> {
         self.begin_shutdown();
-        if let Some(oracle) = &self.oracle {
-            oracle.begin_shutdown().await.map_err(|_| {
+        let oracle_drained = if let Some(oracle) = &self.oracle {
+            selected_owner_completion(oracle.begin_shutdown().await.map_err(|_| {
                 wyrd_spec::vala::error::BifrostError::RunningQueryControlUnavailable
-            })?;
-            oracle.shutdown_owner(deadline).await;
-            oracle.shutdown_registry(deadline).await;
-        }
-        if let Some(scribe) = &self.scribe {
-            scribe
-                .begin_shutdown()
-                .await
-                .map_err(|_| wyrd_spec::vala::error::BifrostError::ScribeRoleUnavailable)?;
-            scribe.shutdown_owner(deadline).await;
-            scribe.shutdown_registry(deadline).await;
-        }
+            }))?;
+            oracle.shutdown_owner(deadline).await?;
+            oracle.shutdown_registry(deadline).await?;
+            true
+        } else {
+            false
+        };
+        let scribe_drained = if let Some(scribe) = &self.scribe {
+            selected_owner_completion(
+                scribe
+                    .begin_shutdown()
+                    .await
+                    .map_err(|_| wyrd_spec::vala::error::BifrostError::ScribeRoleUnavailable),
+            )?;
+            scribe.shutdown_owner(deadline).await?;
+            scribe.shutdown_registry(deadline).await?;
+            true
+        } else {
+            false
+        };
+        let forge_drained = if let Some(forge) = &self.forge {
+            if !forge.supervision_drained() {
+                return Err(wyrd_spec::vala::error::BifrostError::Internal {
+                    detail: "Forge supervision did not join before shutdown".to_owned(),
+                });
+            }
+            true
+        } else {
+            false
+        };
         Ok(BifrostShutdownReport {
-            scribe_drained: self.scribe.is_some(),
-            forge_drained: self.forge.is_some(),
-            oracle_drained: self.oracle.is_some(),
+            scribe_drained,
+            forge_drained,
+            oracle_drained,
         })
     }
 
@@ -1570,6 +1789,13 @@ impl Bifrost {
             forge.begin_shutdown();
         }
     }
+}
+
+/// Preserves a selected owner's concrete lifecycle failure without translating it to success.
+fn selected_owner_completion(
+    result: Result<(), wyrd_spec::vala::error::BifrostError>,
+) -> Result<(), wyrd_spec::vala::error::BifrostError> {
+    result
 }
 
 /// Structured completion summary for the selected Bifrost subsystem graph.
@@ -1748,6 +1974,43 @@ impl AppState {
         self.bifrost.forge()
     }
 
+    /// Borrow the retained Redux Forge coordinator for test inspection.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn forge_coordinator(&self) -> Option<&Arc<ForgeCoordinator>> {
+        self.bifrost.forge().and_then(Forge::coordinator)
+    }
+
+    /// Borrow the shared Bifrost catalog for test-tier fixtures.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn bifrost_catalog(&self) -> Option<&Arc<BifrostCatalog>> {
+        self.bifrost.catalog()
+    }
+
+    /// Borrow the shared Bifrost role resources for test-tier fixtures.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn bifrost_resources(&self) -> Option<&BifrostRoleResources> {
+        self.bifrost.resources()
+    }
+
+    /// Borrow the Oracle private peer runtime for test-tier transport fixtures.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn oracle_peer(&self) -> Option<Arc<crate::oracle::OraclePeerRuntime>> {
+        self.bifrost.oracle_peer_service()
+    }
+
+    /// Borrow the Oracle owner's shared membership registry for test transport setup.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn oracle_cluster(&self) -> Option<Arc<ClusterRegistry>> {
+        self.bifrost
+            .oracle()
+            .map(|owner| Arc::clone(&owner.cluster))
+    }
+
     /// Borrow the retained Bifrost Scribe for test-tier harness inspection.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
@@ -1879,111 +2142,10 @@ impl AppState {
 
 /// PostgreSQL-backed application-state ownership proofs.
 #[cfg(test)]
-mod pg_tests {
+mod tests {
     use std::sync::Arc;
 
-    use wyrd_tonic::wyrd::v1::oracle_lifecycle_service_client::OracleLifecycleServiceClient;
-
     use super::{AppState, LimitsConfig, ProductionValidationError};
-
-    /// The runtime accessor and mounted lifecycle adapter share one allocation.
-    ///
-    /// # Panics
-    ///
-    /// Panics when production-shaped Oracle composition, TCP serving, JWT
-    /// authentication, registry observation, cancellation, or shutdown fails.
-    #[test]
-    fn bifrost_query_runtime_owns_one_running_registry() {
-        wyrd_runtime::runtime().block_on(async {
-            let (state, _) = crate::oracle::pg_tests::real_api_serving_state(
-                crate::config::BifrostTarget::Server,
-            )
-            .await;
-            let runtime = state.bifrost_query().expect("query runtime is published");
-            let first = runtime.running_queries();
-            let second = runtime.running_queries();
-            assert!(Arc::ptr_eq(first, second));
-            assert!(Arc::ptr_eq(
-                &state.bifrost.oracle_peer_service().expect("published peer"),
-                runtime.peer()
-            ));
-            let tenant = wyrd_spec::DataTenantId::new_v7();
-            let lifecycle_bearer = crate::oracle::pg_tests::tenant_bearer(&state, tenant);
-            let request_id = wyrd_spec::request_id::RequestId::now_v7();
-            assert!(runtime.running_queries().insert(
-                crate::oracle::lifecycle_service::pg_tests::running_entry(
-                    tenant,
-                    request_id.clone(),
-                )
-            ));
-            let (channel, shutdown) = crate::oracle::pg_tests::serve(&state).await;
-            let lookup = wyrd_tonic::wyrd::v1::ListOracleLifecyclesRequest {
-                tenant_id: tenant.as_uuid().to_string(),
-            };
-            let listed = OracleLifecycleServiceClient::new(channel.clone())
-                .list_lifecycles(crate::oracle::pg_tests::peer_request(
-                    lookup,
-                    &lifecycle_bearer,
-                ))
-                .await
-                .expect("mounted lifecycle adapter observes runtime registry")
-                .into_inner();
-            assert_eq!(listed.queries.len(), 1);
-            assert_eq!(listed.queries[0].request_id, request_id.to_string());
-            let cancel = wyrd_tonic::wyrd::v1::CancelOracleLifecycleRequest {
-                tenant_id: tenant.as_uuid().to_string(),
-                request_id: request_id.to_string(),
-            };
-            let cancelled = OracleLifecycleServiceClient::new(channel)
-                .cancel_lifecycle(crate::oracle::pg_tests::peer_request(
-                    cancel,
-                    &lifecycle_bearer,
-                ))
-                .await
-                .expect("mounted lifecycle adapter mutates runtime registry")
-                .into_inner();
-            assert!(cancelled.cancellation_started);
-            assert!(
-                runtime
-                    .running_queries()
-                    .get(tenant, &request_id)
-                    .expect("runtime entry remains observable")
-                    .cancellation_token()
-                    .is_cancelled()
-            );
-            shutdown.cancel();
-            runtime
-                .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(2))
-                .await;
-        });
-    }
-
-    /// The published application state retains one composite, catalog, and Gate allocation.
-    ///
-    /// # Panics
-    /// Panics when production-shaped composition duplicates a Bifrost owner.
-    #[test]
-    fn app_state_owns_one_bifrost_composite_and_gate() {
-        wyrd_runtime::runtime().block_on(async {
-            let (state, _) = crate::oracle::pg_tests::real_api_serving_state(
-                crate::config::BifrostTarget::Server,
-            )
-            .await;
-            let composite = Arc::clone(&state.bifrost);
-            assert!(Arc::ptr_eq(composite.catalog(), state.bifrost_catalog()));
-            assert!(Arc::ptr_eq(
-                composite.gate(),
-                state.bifrost_gate().expect("route Gate").as_ref(),
-            ));
-            assert!(Arc::ptr_eq(
-                composite.oracle().expect("composite Oracle"),
-                state.bifrost_query().expect("route Oracle"),
-            ));
-            composite
-                .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(2))
-                .await;
-        });
-    }
 
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use wyrd_auth_check::AuthzCheckContext;
@@ -2021,13 +2183,13 @@ mod pg_tests {
         assert!(state.shutdown_token.is_cancelled());
     }
 
-    #[tokio::test]
-    async fn with_shutdown_token_replaces_field() {
-        let state = test_state().await;
-        let token = tokio_util::sync::CancellationToken::new();
-        let state = state.with_shutdown_token(token.clone());
-        token.cancel();
-        assert!(state.shutdown_token.is_cancelled());
+    /// A selected owner's lifecycle error remains the composite shutdown result.
+    #[test]
+    fn bifrost_shutdown_propagates_selected_owner_failures() {
+        let failure = wyrd_spec::vala::error::BifrostError::ScribeRoleUnavailable;
+        let result = super::selected_owner_completion(Err(failure.clone()));
+
+        assert_eq!(result, Err(failure));
     }
 
     #[tokio::test]
@@ -2065,7 +2227,7 @@ mod pg_tests {
         let postgres = Arc::new(ServerPostgres::from_parts(wyrd, vala));
         let root = tempfile::tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
-        AppState::new(
+        crate::test_support::test_app_state(
             postgres,
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
             crate::test_support::test_catalog().await,

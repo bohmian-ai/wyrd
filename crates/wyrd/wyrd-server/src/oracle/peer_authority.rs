@@ -14,17 +14,50 @@ use vala_bifrost_redux::oracle::peer::{
     VerifiedClaimsBytes,
 };
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::{BifrostSecurityViolationKind, NodeId, SignedPeerTicket};
+use wyrd_spec::vala::api::{
+    BifrostQueryRequest, BifrostSecurityViolationKind, NodeId, QueryClass, SignedPeerTicket,
+};
 use wyrd_tonic::prost::Message;
 
 /// Domain separator preventing peer signatures from crossing protocol boundaries.
 const DOMAIN: &[u8] = b"wyrd.oracle.peer.v1\0";
+/// Domain separator for authenticated public-query forwarding envelopes.
+const FORWARD_QUERY_DOMAIN: &[u8] = b"wyrd.oracle.forward-query.v1\0";
 /// Hard cap applied before any claims bytes are decoded.
 const MAX_CLAIMS_BYTES: usize = 16 * 1024;
+/// Query envelopes include the bounded public SQL request and immutable participant cut.
+const MAX_FORWARD_QUERY_BYTES: usize = 128 * 1024;
 /// Default bound on unexpired single-use ticket identities.
 const DEFAULT_REPLAY_CAPACITY: usize = 1_024;
 /// Maximum lifetime accepted for a newly presented ticket.
 const DEFAULT_MAX_TICKET_TTL: chrono::Duration = chrono::Duration::seconds(30);
+
+/// Signed authenticated ingress state consumed exactly once by a selected ready Oracle.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ForwardQueryClaims {
+    /// Closed forwarding-envelope protocol version.
+    pub protocol_version: u32,
+    /// Exact selected Oracle audience.
+    pub audience: NodeId,
+    /// Exact selected Oracle role-incarnation fence.
+    pub worker_fence: u64,
+    /// Single-use replay identity.
+    pub nonce: Vec<u8>,
+    /// Short envelope acceptance expiry, distinct from the query deadline.
+    pub expires_at_ms: i64,
+    /// Original verified public caller context without bearer credentials.
+    pub context: vala_bifrost_redux::oracle::AuthorizedQueryContext,
+    /// Original validated public query request.
+    pub request: BifrostQueryRequest,
+    /// Server-derived class covered by the participant capability validation.
+    pub query_class: QueryClass,
+    /// Complete immutable participant cut used by every execution stage.
+    pub participant_cut: vala_bifrost_redux::oracle::OracleQueryAttemptCut,
+    /// Stable fingerprint redundantly bound for explicit receiver validation.
+    pub participant_cut_fingerprint: String,
+    /// Exact absolute query deadline, repeated for fail-closed envelope validation.
+    pub absolute_deadline_ms: i64,
+}
 
 /// Server-owned Ed25519 authority for the private peer protocol.
 pub struct OraclePeerAuthority {
@@ -54,6 +87,169 @@ impl fmt::Debug for OraclePeerAuthority {
 }
 
 impl OraclePeerAuthority {
+    /// Signs one authenticated forwarding envelope without retaining a public bearer.
+    ///
+    /// # Errors
+    /// Returns a closed encoding failure when the bounded envelope cannot be serialized.
+    pub fn mint_forward_query(
+        &self,
+        claims: &ForwardQueryClaims,
+    ) -> Result<SignedPeerTicket, PeerSecurityError> {
+        let claims_bytes = serde_json::to_vec(claims).map_err(|_| PeerSecurityError::Encoding)?;
+        if claims_bytes.is_empty() || claims_bytes.len() > MAX_FORWARD_QUERY_BYTES {
+            return Err(PeerSecurityError::Encoding);
+        }
+        let signature = self.signing.sign(&signing_input_for(
+            FORWARD_QUERY_DOMAIN,
+            &self.key_id,
+            &claims_bytes,
+        ));
+        Ok(SignedPeerTicket {
+            key_id: self.key_id.clone(),
+            claims_bytes,
+            signature: signature.to_bytes().to_vec(),
+        })
+    }
+
+    /// Verifies signature, audience, fence, expiry, replay, and tenant before decoding work.
+    ///
+    /// # Errors
+    /// Returns a durably audited closed security error for every invalid envelope.
+    pub async fn verify_forward_query(
+        &self,
+        ticket: &SignedPeerTicket,
+        expected_worker: NodeId,
+        expected_fence: u64,
+        now: DateTime<Utc>,
+    ) -> Result<ForwardQueryClaims, PeerSecurityError> {
+        if ticket.key_id != self.key_id
+            || ticket.signature.len() != 64
+            || ticket.claims_bytes.is_empty()
+            || ticket.claims_bytes.len() > MAX_FORWARD_QUERY_BYTES
+        {
+            return Err(self
+                .forwarding_rejection(
+                    None,
+                    BifrostSecurityViolationKind::PeerSignature,
+                    PeerSecurityError::InvalidSignature,
+                )
+                .await);
+        }
+        let signature = match Signature::from_slice(&ticket.signature) {
+            Ok(signature) => signature,
+            Err(_) => {
+                return Err(self
+                    .forwarding_rejection(
+                        None,
+                        BifrostSecurityViolationKind::PeerSignature,
+                        PeerSecurityError::InvalidSignature,
+                    )
+                    .await);
+            }
+        };
+        if self
+            .verifying
+            .verify(
+                &signing_input_for(FORWARD_QUERY_DOMAIN, &ticket.key_id, &ticket.claims_bytes),
+                &signature,
+            )
+            .is_err()
+        {
+            return Err(self
+                .forwarding_rejection(
+                    None,
+                    BifrostSecurityViolationKind::PeerSignature,
+                    PeerSecurityError::InvalidSignature,
+                )
+                .await);
+        }
+        let claims: ForwardQueryClaims = match serde_json::from_slice(&ticket.claims_bytes) {
+            Ok(claims) => claims,
+            Err(_) => {
+                return Err(self
+                    .forwarding_rejection(
+                        None,
+                        BifrostSecurityViolationKind::PeerSignature,
+                        PeerSecurityError::Claims,
+                    )
+                    .await);
+            }
+        };
+        let tenant = claims.context.data_tenant_id;
+        let violation = if claims.protocol_version != 1 || claims.audience != expected_worker {
+            Some((
+                BifrostSecurityViolationKind::PeerAudience,
+                PeerSecurityError::Audience,
+            ))
+        } else if claims.worker_fence != expected_fence {
+            Some((
+                BifrostSecurityViolationKind::PeerFence,
+                PeerSecurityError::Fence,
+            ))
+        } else {
+            None
+        };
+        if let Some((kind, error)) = violation {
+            return Err(self.forwarding_rejection(Some(tenant), kind, error).await);
+        }
+        let max_expiry = now
+            .checked_add_signed(self.max_ticket_ttl)
+            .ok_or(PeerSecurityError::Expired)?;
+        if claims.expires_at_ms <= now.timestamp_millis()
+            || claims.expires_at_ms > max_expiry.timestamp_millis()
+            || claims.nonce.len() < 16
+        {
+            return Err(self
+                .forwarding_rejection(
+                    Some(tenant),
+                    BifrostSecurityViolationKind::PeerReplay,
+                    PeerSecurityError::Expired,
+                )
+                .await);
+        }
+        let expires = DateTime::from_timestamp_millis(claims.expires_at_ms)
+            .ok_or(PeerSecurityError::Expired)?;
+        if let Err(error) = self
+            .replay
+            .consume(&ticket.key_id, &claims.nonce, expires, now)
+        {
+            return Err(self
+                .forwarding_rejection(
+                    Some(tenant),
+                    BifrostSecurityViolationKind::PeerReplay,
+                    error,
+                )
+                .await);
+        }
+        Ok(claims)
+    }
+
+    /// Audits one forwarding rejection and substitutes audit-unavailable on append failure.
+    async fn forwarding_rejection(
+        &self,
+        tenant: Option<DataTenantId>,
+        violation: BifrostSecurityViolationKind,
+        error: PeerSecurityError,
+    ) -> PeerSecurityError {
+        let result = match tenant {
+            Some(tenant) => {
+                self.security_audit
+                    .append_verified_ticket_violation(tenant, violation)
+                    .await
+            }
+            None => {
+                self.security_audit
+                    .append_unverified_ticket_rejection(violation)
+                    .await
+            }
+        };
+        if result.is_err() {
+            PeerSecurityError::AuditUnavailable
+        } else {
+            error
+        }
+    }
+
     /// Parses the configured Wyrd PKCS#8 key and derives the pinned key ID.
     ///
     /// # Errors
@@ -324,7 +520,12 @@ impl PeerTicketMinter for OraclePeerAuthority {
 /// The byte order is fixed as `DOMAIN || key_id || protobuf claims`; changing
 /// it invalidates every issued peer ticket and must therefore be versioned.
 fn signing_input(key_id: &str, claims: &[u8]) -> Vec<u8> {
-    [DOMAIN, key_id.as_bytes(), claims].concat()
+    signing_input_for(DOMAIN, key_id, claims)
+}
+
+/// Builds a signing preimage for one closed private protocol domain.
+fn signing_input_for(domain: &[u8], key_id: &str, claims: &[u8]) -> Vec<u8> {
+    [domain, key_id.as_bytes(), claims].concat()
 }
 
 #[cfg(test)]

@@ -223,8 +223,6 @@ mod pg_tests {
     use std::sync::Arc;
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
-    use crate::state::AppState;
-
     #[tokio::test]
     async fn login_tenant_resolution_rejects_non_tenant_host_even_with_query_fallback_context() {
         let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
@@ -238,7 +236,7 @@ mod pg_tests {
             fixture.wyrd_postgres().clone(),
             fixture.vala_postgres().clone(),
         ));
-        let state = AppState::new(
+        let state = crate::test_support::test_app_state(
             postgres,
             Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
             crate::test_support::test_catalog().await,

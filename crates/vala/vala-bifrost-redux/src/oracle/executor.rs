@@ -544,30 +544,10 @@ impl SealedFragmentExecutor {
         Ok(self.execute_validated(fragment, query_class, worker_resources))
     }
 
-    /// Opens an incremental fragment attempt beneath an already-retained capacity owner.
-    ///
-    /// Dispatcher callers use this path only after the remote worker quantum or
-    /// leader-local admitted query has been retained for the complete stream.
-    /// Validation remains identical to [`Self::execute`], but this method never
-    /// reacquires root Oracle capacity.
-    ///
-    /// # Errors
-    /// Returns a closed validation error before any IO. Storage, decode, schema,
-    /// size, and deadline errors are emitted by the returned stream.
-    pub(crate) fn execute_under_retained_owner(
-        &self,
-        fragment: &SealedScanFragment,
-        query_class: QueryClass,
-    ) -> Result<WorkerFrameStream, ExecutorError> {
-        self.validate(fragment)?;
-        Ok(self.execute_validated(fragment, query_class, None))
-    }
-
     /// Builds the lazy attempt stream after validation and capacity selection.
     ///
-    /// `worker_resources` is present only for standalone execution. Dispatcher
-    /// execution passes `None` because its surrounding worker stream owns the
-    /// applicable remote or leader-local capacity for the same lifetime.
+    /// `worker_resources` is present when the executor owns a configured root
+    /// resource capability and remains retained for the complete stream.
     fn execute_validated(
         &self,
         fragment: &SealedScanFragment,
@@ -665,7 +645,7 @@ fn classify_decode_error(error: &(dyn std::error::Error + 'static)) -> ExecutorE
 }
 
 /// Returns whether an error chain contains an exact filesystem or `OpenDAL` not-found cause.
-fn error_chain_contains_not_found(error: &(dyn std::error::Error + 'static)) -> bool {
+pub(super) fn error_chain_contains_not_found(error: &(dyn std::error::Error + 'static)) -> bool {
     let mut current = Some(error);
     while let Some(source) = current {
         if source
@@ -917,6 +897,20 @@ pub struct AttemptEncoder {
 }
 
 impl AttemptEncoder {
+    /// Starts an attempt with its immutable output schema, including empty results.
+    ///
+    /// # Errors
+    /// Returns [`ExecutorError::Decode`] when Arrow IPC schema encoding fails.
+    pub fn start(&mut self, schema: SchemaRef) -> Result<WorkerAttemptFrame, ExecutorError> {
+        let mut bytes = Vec::new();
+        StreamWriter::try_new(&mut bytes, &schema)
+            .and_then(|mut writer| writer.finish())
+            .map_err(|_| ExecutorError::Decode)?;
+        self.encoded_bytes = bytes.len();
+        self.schema = Some(schema);
+        Ok(WorkerAttemptFrame::Schema(bytes))
+    }
+
     /// Encodes one batch and returns its optional first-schema frame plus batch frame.
     ///
     /// # Errors

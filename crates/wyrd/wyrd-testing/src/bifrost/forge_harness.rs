@@ -1821,7 +1821,7 @@ pub async fn seed_forge_group_for_tenant_with_schema_and_days(
     let resources = ForgeFixtureResources {
         forge: server
             .state()
-            .forge()
+            .forge_coordinator()
             .cloned()
             .expect("production server has Forge"),
         vala: server.state().postgres.vala().clone(),
@@ -1830,7 +1830,12 @@ pub async fn seed_forge_group_for_tenant_with_schema_and_days(
             .postgres
             .operator_pool()
             .expect("operator pool"),
-        bifrost_catalog: Arc::clone(server.state().bifrost_catalog()),
+        bifrost_catalog: Arc::clone(
+            server
+                .state()
+                .bifrost_catalog()
+                .expect("production server has Bifrost catalog"),
+        ),
         staging: Arc::new(server.state().storage.operator().clone()),
         object_store: ForgeObjectStoreControl::new(Arc::new(
             server.state().storage.operator().clone(),

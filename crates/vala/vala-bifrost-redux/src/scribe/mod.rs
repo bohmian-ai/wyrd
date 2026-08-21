@@ -1287,7 +1287,7 @@ impl ScribeImpl {
     /// phase is first closed, then awaited only while the caller's process-wide
     /// shutdown budget remains. A cancellation guard synchronously aborts retained
     /// owners if the caller drops this future while it owns the draining state.
-    pub async fn shutdown(&self, deadline: std::time::Instant) {
+    pub async fn shutdown(&self, deadline: std::time::Instant) -> bool {
         if self
             .shutdown_state
             .compare_exchange(
@@ -1305,7 +1305,7 @@ impl ScribeImpl {
                 }
                 notified.await;
             }
-            return;
+            return true;
         }
         #[cfg(any(test, feature = "test-support"))]
         self.shutdown_draining_notify.notify_waiters();
@@ -1379,6 +1379,7 @@ impl ScribeImpl {
         metrics::histogram!("bifrost_scribe_shutdown_seconds")
             .record(started.elapsed().as_secs_f64());
         cancellation_finalizer.disarm();
+        graceful
     }
 
     /// Closes external admission and aborts every retained Tokio worker without waiting.

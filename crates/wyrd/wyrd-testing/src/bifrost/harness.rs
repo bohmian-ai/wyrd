@@ -170,7 +170,12 @@ impl BifrostHarness {
                 HarnessError::Configuration("missing Bifrost test server".to_owned())
             })?;
             let scribe = ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
-                catalog: Some(Arc::clone(server.state().bifrost_catalog())),
+                catalog: Some(Arc::clone(
+                    server
+                        .state()
+                        .bifrost_catalog()
+                        .expect("production server has Bifrost catalog"),
+                )),
                 operator: Arc::clone(&operator),
                 wal,
                 stream: StreamIdentity::new(NodeId::new(node_id), WriterEpoch::new(writer_epoch)),
@@ -248,7 +253,7 @@ impl BifrostHarness {
     pub fn server_forges(&self) -> Vec<Arc<Forge>> {
         self.cluster
             .servers()
-            .filter_map(|server| server.state().forge().cloned())
+            .filter_map(|server| server.state().forge_coordinator().cloned())
             .collect()
     }
 

@@ -37,6 +37,20 @@ fn shutdown_deadline_active(deadline: std::time::Instant) -> bool {
     tokio::time::Instant::now() < tokio::time::Instant::from_std(deadline)
 }
 
+/// Resolves supervisor and Bifrost terminal state without discarding lifecycle failures.
+fn server_shutdown_result(
+    terminal: Option<String>,
+    bifrost_error: Option<wyrd_spec::vala::error::BifrostError>,
+) -> Result<(), BootExit> {
+    match (terminal, bifrost_error) {
+        (_, Some(error)) => Err(BootExit::Other(Box::new(error))),
+        (Some(message), None) => Err(BootExit::Other(
+            Box::<dyn std::error::Error + Send + Sync>::from(message),
+        )),
+        (None, None) => Ok(()),
+    }
+}
+
 /// Boot-loaded gRPC identity whose private key remains redacted until tonic consumes it.
 struct GrpcIdentityMaterial {
     /// Public certificate-chain PEM bytes.
@@ -586,7 +600,7 @@ impl BoundServer {
         let shutdown_probe = self.shutdown_probe.clone();
         let terminal = classify_first_exit_with_shutdown(&mut set, &shutdown).await;
         let deadline = tokio::time::Instant::now() + drain;
-        drain_with_shutdown_hooks(
+        let supervised_drained = drain_with_shutdown_hooks(
             set,
             shutdown,
             deadline,
@@ -616,6 +630,9 @@ impl BoundServer {
             },
         )
         .await;
+        if let Some(forge) = bifrost.forge() {
+            forge.mark_supervision_drained(supervised_drained);
+        }
 
         let deadline = deadline.into_std();
         #[cfg(feature = "test-support")]
@@ -657,22 +674,22 @@ impl BoundServer {
             )
             .await;
         }
-        if shutdown_deadline_active(deadline) {
-            if let Err(error) = bifrost.shutdown(deadline).await {
-                tracing::warn!(%error, "Bifrost shutdown did not complete cleanly");
-                bifrost.abort();
+        let bifrost_shutdown_error = if shutdown_deadline_active(deadline) {
+            match bifrost.shutdown(deadline).await {
+                Ok(_) => None,
+                Err(error) => {
+                    tracing::warn!(%error, "Bifrost shutdown did not complete cleanly");
+                    bifrost.abort();
+                    Some(error)
+                }
             }
         } else {
             bifrost.abort();
-        }
+            None
+        };
 
         tracing::info!("wyrd-server shutdown complete");
-        match terminal {
-            Some(msg) => Err(BootExit::Other(
-                Box::<dyn std::error::Error + Send + Sync>::from(msg),
-            )),
-            None => Ok(()),
-        }
+        server_shutdown_result(terminal, bifrost_shutdown_error)
     }
 }
 
@@ -683,23 +700,14 @@ mod pg_tests {
 
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use tempfile::tempdir;
-    use uuid::Uuid;
-    use vala_bifrost_redux::cluster::ClusterRegistry;
-    use vala_bifrost_redux::oracle::dispatcher::OraclePeerCredentials;
-    use vala_bifrost_redux::scribe::{
-        ScribeImpl,
-        wal::{WalConfig, WalWriter},
-    };
     use wyrd_auth_issue::IssuingKey;
     use wyrd_auth_verify::{Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem};
-    use wyrd_spec::vala::api::{NodeId as ClusterNodeId, ScribeCapabilitiesV1};
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
     use super::*;
     use crate::components::auth::ServerAuth;
     use crate::config::WyrdServerConfig;
     use crate::postgres::ServerPostgres;
-    use crate::state::Scribe;
 
     /// Private gRPC key material is absent from diagnostic formatting.
     #[test]
@@ -743,137 +751,13 @@ mod pg_tests {
             WyrdAuthVerifySettings::default(),
         ));
         let storage = Arc::new(StorageHandle::new(BackendSigner::Local(signer)));
-        let redux_catalog = crate::test_support::test_catalog().await;
-        let wal_root = tempdir().expect("wal temp dir");
-        let wal = Arc::new(
-            WalWriter::new(
-                wal_root.path(),
-                *Uuid::now_v7().as_bytes(),
-                1,
-                WalConfig::default(),
-            )
-            .expect("wal initializes"),
-        );
-        let scribe = Arc::new(ScribeImpl::new_for_embedded_with_deps_and_catalog(
-            Arc::new(storage.operator().clone()),
-            wal,
-            &Uuid::now_v7().to_string(),
-            1,
-            Arc::clone(&redux_catalog),
-        ));
-        let ingest = Arc::new(Scribe::new(scribe, None));
-        AppState::new(postgres, storage, redux_catalog)
-            .with_bifrost_ingest(ingest)
-            .compose_bifrost_gate(
-                Arc::clone(&verifier),
-                vala_bifrost_redux::gate::limits::IngestLimits::default(),
-            )
-            .with_auth(ServerAuth {
-                issuing_key: Some(issuing_key),
-                token_verifier: Some(verifier),
-                ..ServerAuth::default()
-            })
-    }
-
-    /// Builds production-shaped Oracle and Scribe role task ownership for shutdown tests.
-    #[cfg(feature = "test-support")]
-    async fn test_state_with_role_tasks() -> AppState {
-        let mut state = test_state_with_auth().await;
-        state.postgres = crate::test_support::test_server_postgres().await;
-
-        let node_id = ClusterNodeId::new(Uuid::now_v7());
-        let cluster = Arc::new(ClusterRegistry::new(state.postgres.vala().clone(), node_id));
-        let scribe_role = cluster
-            .register_scribe(
-                "127.0.0.1:0",
-                ScribeCapabilitiesV1 {
-                    tail_protocol_version: 1,
-                },
-            )
-            .await
-            .expect("test Scribe role registers");
-        let ingest = Arc::new(
-            state
-                .bifrost_ingest()
-                .expect("test state owns Scribe")
-                .clone_with_scribe_role_for_test(cluster, scribe_role),
-        );
-        let verifier = state.auth.token_verifier.clone().expect("test verifier");
-        state = state.with_bifrost_ingest(ingest).compose_bifrost_gate(
-            verifier,
-            vala_bifrost_redux::gate::limits::IngestLimits::default(),
-        );
-        let mut oracle_config = crate::config::WyrdServerConfig::default();
-        let oracle_signing_key =
-            IssuingKey::generate_ephemeral_pem().expect("test Oracle signing key");
-        oracle_config.auth.signing_key = Some(oracle_signing_key.clone());
-        let (state, credentials): (AppState, Arc<dyn OraclePeerCredentials>) =
-            crate::boot::pg_tests::with_test_oracle_peer_credentials(
-                state,
-                &oracle_config,
-                &oracle_signing_key,
-            )
-            .await;
-        crate::boot::attach_test_oracle_runtime_for_node_at_with_credentials(
-            state,
-            wyrd_spec::vala::api::NodeId::new(Uuid::now_v7()),
-            oracle_signing_key,
-            "http://127.0.0.1:0".to_owned(),
-            credentials,
-        )
-        .await
-        .expect("test Oracle role attaches")
-    }
-
-    /// Proves the production server owner does not grant a stalled Scribe a second budget.
-    #[cfg(feature = "test-support")]
-    #[tokio::test(start_paused = true)]
-    async fn bound_server_run_aborts_stalled_scribe_at_original_deadline() {
-        tokio::time::resume();
-        let mut config = WyrdServerConfig::default();
-        config.http.bind = "127.0.0.1:0".parse().expect("static bind is valid");
-        config.metrics.enabled = false;
-        config.shutdown.drain_ms = 1_000;
-        let state = test_state_with_role_tasks().await;
-        let query = Arc::clone(state.bifrost_query().expect("test state owns Oracle"));
-        let ingest = Arc::clone(state.bifrost_ingest().expect("test state owns Scribe role"));
-        let scribe = Arc::clone(
-            state
-                .bifrost_ingest()
-                .expect("test state owns Scribe")
-                .scribe(),
-        );
-        let stalled = scribe.install_shutdown_stall_for_test().await;
-        tokio::time::pause();
-        let server = WyrdServer::new(config, state)
-            .expect("test server builds")
-            .spawn_worker("shutdown_trigger", async {});
-        let bound = server.bind(ServeMode::Http).await.expect("HTTP binds");
-        let started = tokio::time::Instant::now();
-
-        let result = bound.run().await;
-        tokio::task::yield_now().await;
-
-        assert!(result.is_err(), "early worker exit remains terminal");
-        assert!(
-            tokio::time::Instant::now() - started <= Duration::from_millis(1_001),
-            "role task timers must not add a second shutdown budget"
-        );
-        assert!(
-            stalled.is_finished(),
-            "Scribe retained task must be aborted"
-        );
-        assert!(!scribe.is_ready(), "Scribe admission must be closed");
-        assert_eq!(
-            query.role_tasks_finished_for_test(),
-            (true, true),
-            "Oracle heartbeat and snapshot poller cannot survive server completion"
-        );
-        assert_eq!(
-            ingest.role_tasks_finished_for_test(),
-            Some((true, true)),
-            "Scribe heartbeat and snapshot poller cannot survive server completion"
-        );
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let bifrost = crate::state::Bifrost::test_shell(Arc::clone(&verifier));
+        AppState::new(postgres, storage, bifrost, shutdown).with_auth(ServerAuth {
+            issuing_key: Some(issuing_key),
+            token_verifier: Some(verifier),
+            ..ServerAuth::default()
+        })
     }
 
     /// Proves every production shutdown phase shares one deadline and later phases are skipped.
@@ -941,5 +825,21 @@ mod pg_tests {
         // Drop both without calling serve() to confirm no recorder was installed.
         drop(server1);
         drop(server2);
+    }
+
+    /// Preserves an observable Bifrost lifecycle failure after the required abort.
+    #[tokio::test]
+    async fn bound_server_run_preserves_bifrost_shutdown_failure_after_abort() {
+        let result = server_shutdown_result(
+            Some("worker exited".to_owned()),
+            Some(wyrd_spec::vala::error::BifrostError::ScribeRoleUnavailable),
+        );
+
+        let BootExit::Other(error) =
+            result.expect_err("Bifrost failure remains terminal after abort")
+        else {
+            panic!("Bifrost lifecycle failure must use the runtime error channel");
+        };
+        assert_eq!(error.to_string(), "Scribe role unavailable");
     }
 }

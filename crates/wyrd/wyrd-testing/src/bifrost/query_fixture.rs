@@ -59,6 +59,7 @@ pub async fn seed_query_fixture(
     server
         .state()
         .bifrost_catalog()
+        .expect("production server has Bifrost catalog")
         .create_table(CreateTableRequest {
             table: TableRef::new(BifrostNamespace::Bifrost, &table_name),
             user_fields: schema

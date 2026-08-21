@@ -745,6 +745,7 @@ async fn provision_tables(
     ];
     for tenant in tenants {
         catalog
+            .expect("production server has Bifrost catalog")
             .create_table(CreateTableRequest {
                 table: TableRef::new(BifrostNamespace::Bifrost, TABLE_NAME),
                 user_fields: fields.clone(),

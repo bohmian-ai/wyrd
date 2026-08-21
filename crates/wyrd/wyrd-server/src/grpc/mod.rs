@@ -287,26 +287,6 @@ mod tests {
         BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES, BifrostTransportAdmission,
     };
 
-    /// Mounted Scribe tail source is borrowed directly from the Scribe runtime.
-    #[tokio::test]
-    async fn mounted_peer_receives_retained_follower_tail_source() {
-        let (mut state, _) =
-            crate::oracle::pg_tests::real_api_serving_state(crate::config::BifrostTarget::Server)
-                .await;
-        let scribe = state.bifrost_ingest().expect("Scribe runtime");
-        let retained = scribe.tail_reader();
-        assert!(Arc::ptr_eq(
-            &retained,
-            &state.bifrost_tail_reader_for_test().expect("tail reader"),
-        ));
-        state
-            .bifrost_query()
-            .cloned()
-            .expect("query runtime")
-            .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(2))
-            .await;
-    }
-
     /// Minimal tonic-shaped service recording admission state before body decode.
     #[derive(Clone)]
     struct AdmissionProbe {

@@ -12,7 +12,7 @@ use wyrd_spec::vala::api::{
 use crate::cluster::ClusterSnapshot;
 
 /// A participant retained by one query attempt with its exact role incarnation.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct OracleQueryParticipant {
     /// Physical node identity.
     pub node_id: NodeId,
@@ -27,7 +27,7 @@ pub struct OracleQueryParticipant {
 }
 
 /// Immutable membership and deadline used by every stage of one query attempt.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OracleQueryAttemptCut {
     /// Source snapshot observation time.
     observed_at: DateTime<Utc>,

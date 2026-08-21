@@ -263,10 +263,47 @@ pub(crate) struct OracleIcebergScanExec {
     predicates: Option<Predicate>,
     /// Original row limit applied by the Iceberg source.
     limit: Option<usize>,
+    /// Exact storage-qualified files authorized for this follower request.
+    assigned_files: Option<std::collections::BTreeSet<String>>,
     /// Cached properties copied from the pinned source plan.
     properties: Arc<PlanProperties>,
     /// Shared terminal metric owner retained by query telemetry.
     metrics: Arc<OracleScanMetricsHandle>,
+}
+
+/// Domain marker for one authenticated Iceberg object lost after cut selection.
+#[derive(Debug, thiserror::Error)]
+#[error("authenticated Iceberg object disappeared after cut selection")]
+struct OracleIcebergStaleObject {
+    /// Exact typed storage cause retained for diagnostics and downcast proof.
+    #[source]
+    source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+/// Preserves a typed Iceberg-only stale marker without classifying adjacent IO.
+pub(super) fn iceberg_datafusion_error<E>(error: E) -> DataFusionError
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    if super::executor::error_chain_contains_not_found(&error) {
+        DataFusionError::External(Box::new(OracleIcebergStaleObject {
+            source: Box::new(error),
+        }))
+    } else {
+        DataFusionError::External(Box::new(error))
+    }
+}
+
+/// Detects only the marker emitted by authenticated Iceberg object access.
+pub(crate) fn is_stale_iceberg_object_error(error: &DataFusionError) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(source) = current {
+        if source.downcast_ref::<OracleIcebergStaleObject>().is_some() {
+            return true;
+        }
+        current = source.source();
+    }
+    false
 }
 
 impl fmt::Debug for OracleIcebergScanExec {
@@ -288,7 +325,7 @@ impl OracleIcebergScanExec {
     ///
     /// Returns a planning error when the dependency plan cannot be downcast or
     /// its public projection cannot be represented by the adapter.
-    fn from_plan(plan: &dyn ExecutionPlan) -> DataFusionResult<Self> {
+    pub(crate) fn from_plan(plan: &dyn ExecutionPlan) -> DataFusionResult<Self> {
         let scan = plan
             .as_any()
             .downcast_ref::<IcebergTableScan>()
@@ -303,9 +340,19 @@ impl OracleIcebergScanExec {
             projection: scan.projection().map(ToOwned::to_owned),
             predicates: scan.predicates().cloned(),
             limit: scan.limit(),
+            assigned_files: None,
             properties: Arc::clone(plan.properties()),
             metrics: Arc::new(OracleScanMetricsHandle::default()),
         })
+    }
+
+    /// Restricts this pinned scan to one exact authenticated follower assignment.
+    pub(crate) fn with_assigned_files(
+        mut self,
+        assigned_files: std::collections::BTreeSet<String>,
+    ) -> Self {
+        self.assigned_files = Some(assigned_files);
+        self
     }
 
     /// Rebuilds the exact pinned Iceberg scan and starts its reader stream.
@@ -326,13 +373,30 @@ impl OracleIcebergScanExec {
         if let Some(predicate) = &self.predicates {
             builder = builder.with_filter(predicate.clone());
         }
-        let scan = builder
-            .build()
-            .map_err(|error| DataFusionError::External(Box::new(error)))?;
-        let tasks = scan
-            .plan_files()
+        let scan = builder.build().map_err(iceberg_datafusion_error)?;
+        let tasks = scan.plan_files().await.map_err(iceberg_datafusion_error)?;
+        let tasks = tasks
+            .try_collect::<Vec<_>>()
             .await
-            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+            .map_err(iceberg_datafusion_error)?;
+        let tasks = if let Some(assigned) = &self.assigned_files {
+            let planned = tasks
+                .iter()
+                .map(|task| task.data_file_path.clone())
+                .collect::<std::collections::BTreeSet<_>>();
+            if !assigned.is_subset(&planned) {
+                return Err(DataFusionError::Plan(
+                    "authenticated Oracle assignment differs from planned files".to_owned(),
+                ));
+            }
+            tasks
+                .into_iter()
+                .filter(|task| assigned.contains(&task.data_file_path))
+                .collect::<Vec<_>>()
+        } else {
+            tasks
+        };
+        let tasks = futures_util::stream::iter(tasks.into_iter().map(Ok));
         let metrics = self
             .table
             .reader_builder()
@@ -341,11 +405,11 @@ impl OracleIcebergScanExec {
                 let metrics = Arc::clone(&self.metrics);
                 move |task| retain_iceberg_task(task, &metrics)
             })))
-            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+            .map_err(iceberg_datafusion_error)?;
         self.metrics.set_iceberg_metrics(metrics.metrics().clone());
         let stream = metrics
             .stream()
-            .map(|result| result.map_err(|error| DataFusionError::External(Box::new(error))));
+            .map(|result| result.map_err(iceberg_datafusion_error));
         let stream: Pin<Box<dyn Stream<Item = DataFusionResult<RecordBatch>> + Send>> =
             if let Some(limit) = self.limit {
                 let mut remaining = limit;

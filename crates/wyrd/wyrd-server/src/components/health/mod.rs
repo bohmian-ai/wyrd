@@ -499,7 +499,7 @@ mod pg_tests {
         let root = tempfile::tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
         let storage = Arc::new(StorageHandle::new(BackendSigner::Local(signer)));
-        let state = crate::state::AppState::new(
+        let state = crate::test_support::test_app_state(
             postgres,
             storage,
             crate::test_support::test_catalog().await,

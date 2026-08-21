@@ -637,6 +637,7 @@ impl OracleFixture {
         peer_transports: Option<OraclePeerTransportDirectory>,
     ) -> Oracle {
         Oracle::new(OracleBuildConfig {
+            shutdown: CancellationToken::new(),
             catalog: Arc::clone(&self.catalog),
             vala: self.pg.vala_postgres().clone(),
             operator_pool: self.pg.operator_pool().clone(),

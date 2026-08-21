@@ -43,7 +43,7 @@ impl Default for OracleAdmissionConfig {
 
 /// Aggregate lifecycle report returned by bounded Oracle shutdown.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct OracleShutdownReport {
+pub struct OracleShutdownReport {
     /// Queries that still own class or tenant capacity at the deadline.
     pub active_queries: u64,
     /// Waiters that remained queued at the deadline.
@@ -556,6 +556,24 @@ impl OracleAdmission {
         self: &Arc<Self>,
         request: PreparedAdmission,
     ) -> Result<AdmittedQueryGuard, BifrostError> {
+        self.admit_with_attempt_id(request, None).await
+    }
+
+    /// Acquires admission while preserving an ingress-fixed participant-cut identity.
+    pub(super) async fn admit_for_attempt(
+        self: &Arc<Self>,
+        request: PreparedAdmission,
+        attempt_id: QueryId,
+    ) -> Result<AdmittedQueryGuard, BifrostError> {
+        self.admit_with_attempt_id(request, Some(attempt_id)).await
+    }
+
+    /// Applies the common bounded admission path with an optional fixed identity.
+    async fn admit_with_attempt_id(
+        self: &Arc<Self>,
+        request: PreparedAdmission,
+        attempt_id: Option<QueryId>,
+    ) -> Result<AdmittedQueryGuard, BifrostError> {
         let PreparedAdmission {
             tenant,
             query_class,
@@ -579,7 +597,7 @@ impl OracleAdmission {
         );
         let mut waiter_telemetry = waiter_telemetry;
         waiter_telemetry.finish("class", "acquired");
-        self.build_admitted_guard(grant, cancellation)
+        self.build_admitted_guard(grant, cancellation, attempt_id)
     }
 
     /// Enqueues one waiter and immediately grants any newly eligible requests.
@@ -724,6 +742,7 @@ impl OracleAdmission {
         &self,
         mut grant: Grant,
         cancellation: CancellationToken,
+        attempt_id: Option<QueryId>,
     ) -> Result<AdmittedQueryGuard, BifrostError> {
         let permit = LocalPermit {
             shared: Arc::clone(&self.shared),
@@ -744,7 +763,7 @@ impl OracleAdmission {
             drop(permit);
             return Err(BifrostError::OracleRoleUnavailable);
         }
-        let query_id = QueryId::new(uuid::Uuid::now_v7());
+        let query_id = attempt_id.unwrap_or_else(|| QueryId::new(uuid::Uuid::now_v7()));
         Ok(AdmittedQueryGuard {
             query_id,
             leader: AdmittedLeader {
@@ -754,6 +773,7 @@ impl OracleAdmission {
             running: None,
             physical_projections: Vec::new(),
             local_permit: Some(permit),
+            delegated_grant: None,
             live_reservations: Vec::new(),
             cancellation: self.shared.root_cancel.child_token(),
             request_cancellation: cancellation,
@@ -1002,6 +1022,8 @@ pub(super) struct AdmittedQueryGuard {
     >,
     /// Aggregate leader-local class, tenant, memory, and spill permit.
     local_permit: Option<LocalPermit>,
+    /// Delegated global, tenant, and principal policy unit retained for the attempt.
+    delegated_grant: Option<super::DelegatedOracleAdmissionGrant>,
     /// Canonical local slot-use gauge retained with the running permit.
     /// Parent reservations retaining drained live batches through stream cleanup.
     pub(super) live_reservations: Vec<AccountedMemoryReservation>,
@@ -1023,6 +1045,7 @@ impl Drop for AdmittedQueryGuard {
         if let Some(permit) = self.local_permit.take() {
             permit.release_inner();
         }
+        self.delegated_grant.take();
         self.running.take();
         #[cfg(feature = "test-support")]
         if let Some(probe) = &self.resource_probe {
@@ -1032,6 +1055,11 @@ impl Drop for AdmittedQueryGuard {
 }
 
 impl AdmittedQueryGuard {
+    /// Retains the already-acquired delegated policy unit through stream settlement.
+    pub(super) fn retain_delegated_grant(&mut self, grant: super::DelegatedOracleAdmissionGrant) {
+        self.delegated_grant = Some(grant);
+    }
+
     /// Materializes every pinned physical table under this admitted query owner.
     ///
     /// Each table's exact fixed bytes are split from the live query pool before
@@ -1159,6 +1187,7 @@ impl AdmittedQueryGuard {
         if let Some(permit) = self.local_permit.take() {
             permit.release_inner();
         }
+        self.delegated_grant.take();
         self.running.take();
         #[cfg(feature = "test-support")]
         if let Some(probe) = &self.resource_probe {
@@ -1222,6 +1251,7 @@ pub(super) fn admitted_guard_for_test()
                 resources: Mutex::new(None),
                 released: AtomicBool::new(false),
             }),
+            delegated_grant: None,
             live_reservations: Vec::new(),
             cancellation: cancellation.clone(),
             request_cancellation: request_cancellation.clone(),

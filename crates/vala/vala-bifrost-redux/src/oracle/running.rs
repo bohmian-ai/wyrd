@@ -415,6 +415,45 @@ mod tests {
         RunningQueryEntry::new(tenant_id, request_id, QueryClass::Interactive, now, cut)
     }
 
+    /// Cancellation and failed settlement retain the exact admitted cut without refresh.
+    #[test]
+    fn immutable_cut_survives_cancel_and_failed_settlement() {
+        let registry = RunningQueryRegistry::new();
+        let tenant_id = DataTenantId::new_v7();
+        let request_id = RequestId::now_v7();
+        let admitted = entry(tenant_id, request_id.clone());
+        let fingerprint = admitted.participant_cut().fingerprint();
+        let deadline = admitted.participant_cut().deadline();
+        let participants = admitted.participant_cut().participant_count();
+        assert!(registry.insert(admitted));
+
+        let cancelled = registry
+            .cancel(tenant_id, &request_id)
+            .expect("the admitted request remains cancellable");
+        assert!(cancelled.cancellation_started);
+        let cancelling = registry
+            .get(tenant_id, &request_id)
+            .expect("cancellation retains the running owner until settlement");
+        assert_eq!(cancelling.participant_cut().fingerprint(), fingerprint);
+        assert_eq!(cancelling.participant_cut().deadline(), deadline);
+        assert_eq!(
+            cancelling.participant_cut().participant_count(),
+            participants
+        );
+
+        let settled = registry
+            .settle_terminal(tenant_id, &request_id, QueryTerminalOutcome::Failed)
+            .expect("failed recovery settles the same retained owner once");
+        assert_eq!(settled.entry().participant_cut().fingerprint(), fingerprint);
+        assert_eq!(settled.entry().participant_cut().deadline(), deadline);
+        assert_eq!(
+            settled.entry().participant_cut().participant_count(),
+            participants
+        );
+        assert_eq!(settled.outcome(), QueryTerminalOutcome::Failed);
+        assert!(registry.get(tenant_id, &request_id).is_none());
+    }
+
     /// Proves every tenant-scoped lifecycle transition and terminal race invariant.
     #[test]
     fn tenant_scoped_registry_lifecycle_is_race_safe() {

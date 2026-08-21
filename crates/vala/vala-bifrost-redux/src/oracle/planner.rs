@@ -91,6 +91,44 @@ impl OraclePlanner {
         Self::classification(estimated_bytes, live_oracle_cpu, complex).query_class
     }
 
+    /// Pins the authenticated request against one membership snapshot and returns its class.
+    ///
+    /// This preparation has no admission, audit, registry, or execution side effects. It lets
+    /// an ingress owner choose and sign one compatible ready-Oracle participant cut before the
+    /// local or remote leader begins the shared execution operation.
+    ///
+    /// # Errors
+    /// Returns the same validation, catalog, timeout, and planning failures as Oracle planning.
+    pub async fn classify_for_forwarding(
+        &self,
+        context: &AuthorizedQueryContext,
+        request: &BifrostQueryRequest,
+        deadline: Instant,
+        catalog: &BifrostCatalog,
+        snapshot: &crate::cluster::ClusterSnapshot,
+    ) -> Result<QueryClass, BifrostError> {
+        self.validate_query(request)?;
+        let tables = parse_select_tables(&request.sql)?;
+        let live_oracle_cpu = snapshot
+            .live_oracles()
+            .into_iter()
+            .filter_map(|role| match &role.capabilities {
+                ClusterCapabilities::OracleV1(capabilities) => Some(capabilities.cpu_cores),
+                ClusterCapabilities::ScribeV1(_) => None,
+            })
+            .sum::<f64>();
+        self.pin_and_classify(
+            context,
+            &request.sql,
+            &tables,
+            deadline,
+            catalog,
+            live_oracle_cpu,
+        )
+        .await
+        .map(|planned| planned.query_class)
+    }
+
     /// Produces the class, closed reason, and predicted duration from one cut.
     #[must_use]
     pub(super) fn classification(
@@ -272,7 +310,7 @@ impl OraclePlanner {
         tables: &[TableRef],
         deadline: Instant,
         catalog: &BifrostCatalog,
-        cluster: &super::ClusterRegistry,
+        live_oracle_cpu: f64,
     ) -> Result<PlannedSqlCut, BifrostError> {
         let planning = self.try_planning()?;
         let mut cuts = Vec::with_capacity(tables.len());
@@ -294,18 +332,9 @@ impl OraclePlanner {
             cuts.push(cut);
         }
         let optimized_plan = self.prepare_optimized_sql_plan(sql, &cuts).await?;
-        let live_cpu = cluster
-            .snapshot()
-            .live_oracles()
-            .iter()
-            .filter_map(|role| match &role.capabilities {
-                ClusterCapabilities::OracleV1(capabilities) => Some(capabilities.cpu_cores),
-                ClusterCapabilities::ScribeV1(_) => None,
-            })
-            .sum::<f64>();
         let classification = Self::classification(
             estimated_bytes,
-            live_cpu,
+            live_oracle_cpu,
             optimized_plan_is_complex(&optimized_plan),
         );
         let local_bytes = cuts.iter().try_fold(0_u64, |total, cut| {

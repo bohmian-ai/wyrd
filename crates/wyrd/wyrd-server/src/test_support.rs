@@ -8,10 +8,14 @@
 
 use std::sync::{Arc, OnceLock};
 
+use crate::postgres::ServerPostgres;
+use crate::state::{AppState, Bifrost};
 use secrecy::ExposeSecret;
 use tempfile::TempDir;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_sql::{OperatorPool, ValaPostgres};
+use wyrd_auth::permission_resolver::SqlPermissionResolver;
+use wyrd_auth_verify::{TokenVerifier, WyrdAuthVerifySettings};
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_sql::WyrdPostgres;
 use wyrd_storage::StorageHandle;
@@ -97,6 +101,24 @@ fn shared() -> &'static SharedCatalog {
 /// Return a live catalog handle for constructing `AppState` in unit tests.
 pub async fn test_catalog() -> Arc<BifrostCatalog> {
     Arc::clone(&shared().catalog)
+}
+
+/// Constructs a non-Bifrost unit-test application shell around shared dependencies.
+pub fn test_app_state(
+    postgres: Arc<ServerPostgres>,
+    storage: Arc<StorageHandle>,
+    _catalog: Arc<BifrostCatalog>,
+) -> AppState {
+    let verifier = Arc::new(TokenVerifier::new(
+        std::collections::HashMap::new(),
+        "wyrd",
+        Arc::new(SqlPermissionResolver::new(Arc::new(
+            shared()._fixture.app_pool().clone(),
+        ))),
+        WyrdAuthVerifySettings::default(),
+    ));
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    AppState::new(postgres, storage, Bifrost::test_shell(verifier), shutdown)
 }
 
 /// Return the shared Vala Postgres handle used by the Redux catalog.

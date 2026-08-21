@@ -1145,14 +1145,13 @@ impl WyrdTestCluster {
         let server = self
             .server(leader_index)
             .ok_or_else(|| ClusterError::Resource("Oracle leader is absent".to_owned()))?;
-        let peer = server
-            .state()
-            .oracle_peer()
-            .ok_or_else(|| ClusterError::Resource("Oracle leader runtime is absent".to_owned()))?;
         let ca = std::fs::read(&tls.ca_path)
             .map_err(|error| ClusterError::Resource(error.to_string()))?;
         Ok(TonicOraclePeerTransport::with_credentials_and_tls(
-            peer.cluster(),
+            server
+                .state()
+                .oracle_cluster()
+                .ok_or_else(|| ClusterError::Resource("Oracle cluster is absent".to_owned()))?,
             Arc::clone(&self.oracle_peer_credentials),
             OraclePeerTls::new(ca, tls.server_name.clone()),
         ))
@@ -1164,8 +1163,8 @@ impl WyrdTestCluster {
     /// Returns a resource error when any registry refresh fails.
     pub async fn refresh_oracle_snapshots(&self) -> Result<(), ClusterError> {
         for server in self.servers.values().flatten() {
-            if let Some(peer) = server.state().oracle_peer() {
-                peer.cluster()
+            if let Some(cluster) = server.state().oracle_cluster() {
+                cluster
                     .refresh_snapshot()
                     .await
                     .map_err(|error| ClusterError::Resource(error.to_string()))?;

@@ -66,6 +66,7 @@ service OraclePeerService {
   rpc ReserveSlots(ReserveNodeSlotsRequest) returns (ReserveNodeSlotsResponse);
   rpc ReleaseSlots(ReleaseNodeSlotsRequest) returns (ReleaseNodeSlotsResponse);
   rpc ExecuteFragment(ExecuteFragmentRequest) returns (stream WorkerAttemptFrame);
+  rpc ForwardQuery(ForwardQueryRequest) returns (stream QueryStreamFrame);
 }
 service OracleLifecycleService {
   rpc ListLifecycles(ListOracleLifecyclesRequest) returns (ListOracleLifecyclesResponse);
@@ -114,6 +115,7 @@ message ReservationRejected { uint32 retry_after_ms = 1; }
 message ReleaseNodeSlotsRequest { bytes reservation_id = 1; bytes query_id = 2; string leader_node_id = 3; uint64 leader_fencing_token = 4; }
 message ReleaseNodeSlotsResponse {}
 message SignedPeerTicket { string key_id = 1; bytes claims_bytes = 2; bytes signature = 3; }
+message ForwardQueryRequest { SignedPeerTicket envelope = 1; }
 message PersistedFileAssignment { repeated string files = 1; }
 message PersistedWalRange { optional uint64 start_lsn = 1; optional uint64 end_lsn = 2; }
 message ScribeProviderCut {

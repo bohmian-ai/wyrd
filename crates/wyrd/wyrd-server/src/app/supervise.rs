@@ -137,11 +137,12 @@ pub async fn drain_with_shutdown<F, Fut>(
     shutdown: CancellationToken,
     deadline: Instant,
     before_cancel: F,
-) where
+) -> bool
+where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    drain_with_shutdown_hooks(set, shutdown, deadline, before_cancel, || async { false }).await;
+    drain_with_shutdown_hooks(set, shutdown, deadline, before_cancel, || async { false }).await
 }
 
 /// Drains supervision with ordered hooks immediately before and after cancellation.
@@ -156,7 +157,8 @@ pub async fn drain_with_shutdown_hooks<F, Fut, C, CFut>(
     deadline: Instant,
     before_cancel: F,
     after_cancel: C,
-) where
+) -> bool
+where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = ()>,
     C: FnOnce() -> CFut,
@@ -169,18 +171,18 @@ pub async fn drain_with_shutdown_hooks<F, Fut, C, CFut>(
     shutdown.cancel();
     if Instant::now() < deadline && timeout_at(deadline, after_cancel()).await.unwrap_or(false) {
         set.abort_all();
-        return;
+        return false;
     }
 
     // Phase 2 — drain within budget, then abort.
     loop {
         match timeout_at(deadline, set.join_next()).await {
             Ok(Some(joined)) => log_drain(joined),
-            Ok(None) => break,
+            Ok(None) => return true,
             Err(_elapsed) => {
                 tracing::warn!("drain deadline exceeded; aborting remaining tasks");
                 set.abort_all();
-                break;
+                return false;
             }
         }
     }

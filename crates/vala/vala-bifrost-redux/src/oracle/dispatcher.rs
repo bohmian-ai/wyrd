@@ -1,14 +1,12 @@
 //! Bounded local and tonic sealed-fragment dispatch.
 
-use std::collections::{HashMap, HashSet};
-use std::future::Future;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use futures_util::stream::FuturesUnordered;
 use futures_util::{Stream, StreamExt};
 use thiserror::Error;
 use tokio::sync::OwnedSemaphorePermit;
@@ -26,8 +24,9 @@ use wyrd_tonic::tonic::transport::Channel;
 use wyrd_tonic::tonic::{Request, Status};
 use wyrd_tonic::wyrd::v1::oracle_peer_service_client::OraclePeerServiceClient;
 
+use super::OracleSlotManager;
 use super::attempt::{AttemptBuffer, AttemptError, ValidatedAttempt};
-use super::executor::{AttemptEncoder, SealedFragmentExecutor};
+use super::executor::AttemptEncoder;
 use super::follower::{
     AuthenticatedFollowerContext, FollowerSessionFactory, FollowerSourceResolver,
     PhysicalPlanFollower, PhysicalPlanFollowerError,
@@ -39,7 +38,6 @@ use super::telemetry::{
     FragmentLocality, FragmentOutcome, FragmentTelemetry, PeerErrorClass, SecurityEventClass,
     SlotOutcome, record_peer_attempt, record_security, record_slot,
 };
-use super::{OracleExecutionError, OracleSlotManager, decode_attempt_batches};
 use crate::cluster::{ClusterRegistry, ClusterSnapshot, ROLE_LIVENESS_CUTOFF};
 
 /// Fixed private peer protocol version.
@@ -49,28 +47,34 @@ const PENDING_TTL: ChronoDuration = ChronoDuration::seconds(2);
 /// Stable peer rejection hint.
 const RESERVATION_RETRY_MS: u32 = 1_000;
 
-/// One lazily polled legacy fragment attempt retained only until old tests migrate.
-pub(super) type SealedFragmentFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<ValidatedAttempt, OracleExecutionError>> + Send + 'a>>;
-
-/// Transport failure classification used by retry policy.
+/// Closed transport failure classification used by terminal dispatch policy.
 #[derive(Debug, Error)]
 pub enum DispatchError {
-    /// Worker or transport failed and may be retried.
+    /// Worker, transport, deadline, or cancellation made this source unavailable.
     #[error("peer attempt unavailable")]
-    Retryable,
+    Unavailable,
+    /// A role-local provider reported an authenticated source absence before rows.
+    #[error("eligible follower source is unavailable: {cause:?}")]
+    EligibleSourceLoss {
+        /// Closed provider-side reason retained for terminal classification.
+        cause: EligibleSourceLossCause,
+    },
     /// The selected attempt could not reserve bounded parent memory.
     #[error("peer attempt capacity unavailable")]
     Capacity,
     /// A pinned immutable object disappeared and requires a whole-query replan.
     #[error("peer fragment references a stale object")]
     StaleObject,
-    /// Ticket or fragment contract failed and must not be retried.
+    /// Ticket or fragment contract failed terminally.
     #[error("peer security or fragment contract rejected")]
     Terminal,
-    /// All bounded distinct attempts failed.
-    #[error("sealed fragment attempts exhausted")]
-    Exhausted,
+}
+
+/// Closed causes that permit explicit degraded source completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EligibleSourceLossCause {
+    /// The authenticated role-local provider could not resolve its pinned source.
+    ProviderResolution,
 }
 
 /// Bounded role-fence-scoped pending reservation.
@@ -177,7 +181,7 @@ impl ReservationRegistry {
         let permit = self
             .slots
             .try_pending()
-            .map_err(|_| DispatchError::Retryable)?;
+            .map_err(|_| DispatchError::Unavailable)?;
         self.insert(request, now, Some(permit))
     }
 
@@ -212,10 +216,13 @@ impl ReservationRegistry {
         if request.slot_units == 0 || request.expires_at <= now {
             return Err(DispatchError::Terminal);
         }
-        let mut entries = self.entries.lock().map_err(|_| DispatchError::Retryable)?;
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| DispatchError::Unavailable)?;
         retain_live(&mut entries, now);
         if entries.len() >= self.capacity {
-            return Err(DispatchError::Retryable);
+            return Err(DispatchError::Unavailable);
         }
         let reservation_id = loop {
             let candidate = ReservationId::new(uuid::Uuid::now_v7());
@@ -310,7 +317,7 @@ impl ReservationRegistry {
                 query_class,
                 permit: Some(permit),
             })
-            .map_err(|_| DispatchError::Retryable);
+            .map_err(|_| DispatchError::Unavailable);
         if result.is_err() {
             tracing::warn!(
                 stage = "slot_reservation",
@@ -610,12 +617,20 @@ impl OraclePeerWorker {
         admitted_pool: Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>>,
     ) -> Result<WorkerExecution, DispatchError> {
         if request.target_fence.role != wyrd_spec::vala::api::ClusterRole::Oracle {
+            tracing::error!(role = ?request.target_fence.role, "Oracle peer received a non-Oracle target role");
             return Err(DispatchError::Terminal);
         }
         let expected_fence = self.oracle_fence;
         if request.target_fence.node_id != self.worker_node_id
             || request.target_fence.fencing_token != expected_fence
         {
+            tracing::error!(
+                target = %request.target_fence.node_id.as_uuid(),
+                worker = %self.worker_node_id.as_uuid(),
+                requested_fence = request.target_fence.fencing_token,
+                expected_fence,
+                "Oracle peer target fence mismatch"
+            );
             return Err(DispatchError::Terminal);
         }
         let verified = self
@@ -627,7 +642,8 @@ impl OraclePeerWorker {
                 Utc::now(),
             )
             .await
-            .map_err(|_| {
+            .map_err(|error| {
+                tracing::error!(?error, "Oracle peer ticket verification failed");
                 record_security(SecurityEventClass::Ticket);
                 DispatchError::Terminal
             })?;
@@ -662,6 +678,10 @@ impl OraclePeerWorker {
         let running = match transition {
             Ok(running) => running,
             Err(DispatchError::Terminal) => {
+                tracing::error!(
+                    reservation = %request.reservation_id.as_uuid(),
+                    "Oracle peer reservation transition was not tuple-bound"
+                );
                 self.audit_verified(tenant_id, BifrostSecurityViolationKind::PeerFence)
                     .await?;
                 return Err(DispatchError::Terminal);
@@ -670,6 +690,7 @@ impl OraclePeerWorker {
         };
         let worker_resources = self.acquire_worker_resources(capacity, running.query_class)?;
         if let Err(violation) = validate_physical_claims(&claims, &request) {
+            tracing::error!(?violation, "Oracle peer physical claims validation failed");
             self.audit_verified(tenant_id, violation).await?;
             return Err(DispatchError::Terminal);
         }
@@ -701,9 +722,20 @@ impl OraclePeerWorker {
             .await
             .map_err(|error| match error {
                 PhysicalPlanFollowerError::Preflight(_)
-                | PhysicalPlanFollowerError::PostResolutionDecode(_) => DispatchError::Terminal,
-                PhysicalPlanFollowerError::Resolution(_)
-                | PhysicalPlanFollowerError::Execution(_) => DispatchError::Retryable,
+                | PhysicalPlanFollowerError::PostResolutionDecode(_) => {
+                    tracing::error!(?error, "Oracle physical follower rejected the request");
+                    DispatchError::Terminal
+                }
+                PhysicalPlanFollowerError::Resolution(_) => {
+                    tracing::warn!(
+                        ?error,
+                        "Oracle physical follower could not resolve a pinned source"
+                    );
+                    DispatchError::EligibleSourceLoss {
+                        cause: EligibleSourceLossCause::ProviderResolution,
+                    }
+                }
+                PhysicalPlanFollowerError::Execution(_) => DispatchError::Unavailable,
             })?;
         self.physical_observer
             .oracle_executions
@@ -714,11 +746,19 @@ impl OraclePeerWorker {
             let _running = running;
             let mut stream = stream;
             let mut encoder = AttemptEncoder::default();
+            match encoder.start(stream.schema()) {
+                Ok(schema) => yield Ok(schema),
+                Err(_) => {
+                    yield Err(DispatchError::Terminal);
+                    return;
+                }
+            }
             while let Some(batch) = stream.next().await {
                 let batch = match batch {
                     Ok(batch) => batch,
-                    Err(_) => {
-                        yield Err(DispatchError::Retryable);
+                    Err(error) => {
+                        tracing::warn!(?error, "Oracle follower execution stream failed");
+                        yield Err(DispatchError::Unavailable);
                         return;
                     }
                 };
@@ -1366,12 +1406,12 @@ impl TonicOraclePeerTransport {
             .map_err(|_| DispatchError::Terminal)?
         } else {
             wyrd_tonic::transport::plaintext_endpoint(address)
-                .map_err(|_| DispatchError::Retryable)?
+                .map_err(|_| DispatchError::Unavailable)?
         };
         let channel = endpoint
             .connect()
             .await
-            .map_err(|_| DispatchError::Retryable)?;
+            .map_err(|_| DispatchError::Unavailable)?;
         Ok(OraclePeerServiceClient::new(channel))
     }
 
@@ -1420,8 +1460,8 @@ impl TonicOraclePeerTransport {
             Err(status) if status.code() == wyrd_tonic::tonic::Code::Unauthenticated => client
                 .release_slots(self.authenticated(wire, true).await?)
                 .await
-                .map_err(|status| status_error(&status))?,
-            result => result.map_err(|status| status_error(&status))?,
+                .map_err(|status| execution_status_error(&status))?,
+            result => result.map_err(|status| execution_status_error(&status))?,
         };
         Ok(())
     }
@@ -1445,13 +1485,19 @@ impl TonicOraclePeerTransport {
             Err(status) if status.code() == wyrd_tonic::tonic::Code::Unauthenticated => client
                 .execute_fragment(self.authenticated(wire, true).await?)
                 .await
-                .map_err(|status| status_error(&status))?,
-            result => result.map_err(|status| status_error(&status))?,
+                .map_err(|status| {
+                    tracing::warn!(code = ?status.code(), "Oracle peer execute retry rejected");
+                    status_error(&status)
+                })?,
+            result => result.map_err(|status| {
+                tracing::warn!(code = ?status.code(), "Oracle peer execute rejected");
+                status_error(&status)
+            })?,
         };
         let mut stream = response.into_inner();
         let output = async_stream::stream! {
             while let Some(frame) = stream.next().await {
-                yield frame.map_err(|status| status_error(&status)).and_then(|frame| frame.try_into().map_err(|_| DispatchError::Terminal));
+                yield frame.map_err(|status| execution_status_error(&status)).and_then(|frame| frame.try_into().map_err(|_| DispatchError::Terminal));
             }
         };
         Ok(Box::pin(output))
@@ -1464,7 +1510,18 @@ impl TonicOraclePeerTransport {
         force_refresh: bool,
     ) -> Result<Request<T>, DispatchError> {
         let mut request = Request::new(value);
-        let bearer = self.credentials.bearer(force_refresh).await?;
+        let bearer = self
+            .credentials
+            .bearer(force_refresh)
+            .await
+            .map_err(|error| {
+                tracing::error!(
+                    ?error,
+                    force_refresh,
+                    "Oracle peer bearer acquisition failed"
+                );
+                error
+            })?;
         let value: MetadataValue<wyrd_tonic::tonic::metadata::Ascii> = format!("Bearer {bearer}")
             .parse()
             .map_err(|_| DispatchError::Terminal)?;
@@ -1581,7 +1638,9 @@ impl OraclePeerTransportDirectory {
         candidate: &DispatchCandidate,
         request: ReserveNodeSlotsRequest,
     ) -> Result<ReserveNodeSlotsResponse, DispatchError> {
-        if self.is_local(candidate.node_id) {
+        if self.is_local(candidate.node_id)
+            && candidate.role == wyrd_spec::vala::api::ClusterRole::Oracle
+        {
             self.local.reserve(candidate.node_id, request).await
         } else {
             match &self.remote {
@@ -1606,7 +1665,9 @@ impl OraclePeerTransportDirectory {
         candidate: &DispatchCandidate,
         request: ReleaseNodeSlotsRequest,
     ) -> Result<(), DispatchError> {
-        if self.is_local(candidate.node_id) {
+        if self.is_local(candidate.node_id)
+            && candidate.role == wyrd_spec::vala::api::ClusterRole::Oracle
+        {
             self.local.release(candidate.node_id, request).await
         } else {
             match &self.remote {
@@ -1632,7 +1693,9 @@ impl OraclePeerTransportDirectory {
         request: PhysicalExecuteFragmentRequest,
         query_memory_pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
     ) -> Result<WorkerAttemptStream, DispatchError> {
-        if self.is_local(candidate.node_id) {
+        if self.is_local(candidate.node_id)
+            && candidate.role == wyrd_spec::vala::api::ClusterRole::Oracle
+        {
             self.local
                 .execute(candidate.node_id, request, Some(query_memory_pool))
                 .await
@@ -1656,9 +1719,20 @@ fn status_error(status: &Status) -> DispatchError {
         wyrd_tonic::tonic::Code::Unavailable
         | wyrd_tonic::tonic::Code::DeadlineExceeded
         | wyrd_tonic::tonic::Code::ResourceExhausted
-        | wyrd_tonic::tonic::Code::Cancelled => DispatchError::Retryable,
-        wyrd_tonic::tonic::Code::NotFound => DispatchError::StaleObject,
+        | wyrd_tonic::tonic::Code::Cancelled => DispatchError::Unavailable,
+        wyrd_tonic::tonic::Code::NotFound => DispatchError::Unavailable,
         _ => DispatchError::Terminal,
+    }
+}
+
+/// Classifies the authenticated execute stream's typed stale-object wire signal.
+fn execution_status_error(status: &Status) -> DispatchError {
+    match status.code() {
+        wyrd_tonic::tonic::Code::NotFound => DispatchError::StaleObject,
+        wyrd_tonic::tonic::Code::FailedPrecondition => DispatchError::EligibleSourceLoss {
+            cause: EligibleSourceLossCause::ProviderResolution,
+        },
+        _ => status_error(status),
     }
 }
 
@@ -1719,7 +1793,7 @@ pub struct PhysicalDispatchFragment {
     pub deadline_unix_ms: i64,
 }
 
-/// Owns claims construction, reserve/execute/release, and distinct-worker retry.
+/// Owns claims construction and one ambiguity-terminal reserve/execute/release cut.
 pub struct FragmentDispatcher {
     /// Narrow server-owned authority used to mint a fresh ticket per attempt.
     ticket_minter: Arc<dyn PeerTicketMinter>,
@@ -1728,42 +1802,6 @@ pub struct FragmentDispatcher {
 }
 
 impl FragmentDispatcher {
-    /// Polls bounded fragment attempts and drains siblings on failure.
-    pub(super) async fn dispatch_attempts(
-        attempts: Vec<SealedFragmentFuture<'_>>,
-        parallelism: usize,
-        siblings: &CancellationToken,
-        output: &mut Vec<arrow::record_batch::RecordBatch>,
-    ) -> Result<(), OracleExecutionError> {
-        let mut attempts = attempts.into_iter();
-        let mut pending = FuturesUnordered::new();
-        loop {
-            while pending.len() < parallelism {
-                let Some(attempt) = attempts.next() else {
-                    break;
-                };
-                pending.push(attempt);
-            }
-            let Some(attempt) = pending.next().await else {
-                return Ok(());
-            };
-            match attempt {
-                Ok(attempt) => {
-                    if let Err(error) = decode_attempt_batches(attempt, output) {
-                        siblings.cancel();
-                        while pending.next().await.is_some() {}
-                        return Err(error.into());
-                    }
-                }
-                Err(error) => {
-                    siblings.cancel();
-                    while pending.next().await.is_some() {}
-                    return Err(error);
-                }
-            }
-        }
-    }
-
     /// Creates a dispatcher from narrow authority and transport capabilities.
     #[must_use]
     pub fn new(
@@ -1776,15 +1814,16 @@ impl FragmentDispatcher {
         }
     }
 
-    /// Executes on at most three distinct candidates, preserving candidate order.
+    /// Executes one candidate, advancing only after an authenticated capacity rejection.
     ///
-    /// Every retry gets a new reservation, nonce, and ticket. Any accepted
-    /// pending reservation is explicitly released after failure; TTL remains
-    /// crash recovery only. Attempt bytes become visible only after footer
-    /// validation succeeds.
+    /// A timeout, cancellation, transport error, follower error, or accepted
+    /// reservation failure is terminal because delivery may be ambiguous. A
+    /// proven pre-delivery `Rejected` response may advance to the next ordered
+    /// candidate. Attempt bytes become visible only after footer validation.
     ///
     /// # Errors
-    /// Returns terminal contract errors immediately or exhaustion after three retryable failures.
+    /// Returns the first ambiguity-terminal failure or capacity when every
+    /// candidate explicitly rejects before delivery.
     pub async fn execute(
         &self,
         context: &DispatchContext,
@@ -1794,14 +1833,7 @@ impl FragmentDispatcher {
         if !self.transports.is_local(context.leader_node_id) {
             return Err(DispatchError::Terminal);
         }
-        let mut attempted = HashSet::new();
         for candidate in candidates {
-            if attempted.len() == 3 {
-                break;
-            }
-            if !attempted.insert(candidate.node_id) {
-                continue;
-            }
             if candidate.role != fragment.target_role {
                 return Err(DispatchError::Terminal);
             }
@@ -1814,20 +1846,28 @@ impl FragmentDispatcher {
                 slot_units: context.slot_units,
                 expires_at,
             };
-            let remaining = context
-                .deadline
-                .checked_duration_since(Instant::now())
-                .ok_or(DispatchError::Retryable)?;
-            let pending = match tokio::select! {
-                () = context.cancellation.cancelled() => Err(DispatchError::Retryable),
-                result = tokio::time::timeout(remaining, self.transports.reserve(candidate, reserve)) =>
-                    result.map_err(|_| DispatchError::Retryable).and_then(std::convert::identity),
-            } {
-                Err(DispatchError::Retryable) | Ok(ReserveNodeSlotsResponse::Rejected(_)) => {
-                    continue;
+            let pending = if candidate.role == wyrd_spec::vala::api::ClusterRole::Scribe {
+                PendingNodeReservation {
+                    reservation_id: ReservationId::new(uuid::Uuid::nil()),
+                    expires_at,
                 }
-                Err(error) => return Err(error),
-                Ok(ReserveNodeSlotsResponse::Pending(pending)) => pending,
+            } else {
+                let remaining = context
+                    .deadline
+                    .checked_duration_since(Instant::now())
+                    .ok_or(DispatchError::Unavailable)?;
+                match tokio::select! {
+                    () = context.cancellation.cancelled() => Err(DispatchError::Unavailable),
+                    result = tokio::time::timeout(remaining, self.transports.reserve(candidate, reserve)) =>
+                        result.map_err(|_| DispatchError::Unavailable).and_then(std::convert::identity),
+                } {
+                    Ok(ReserveNodeSlotsResponse::Rejected(_)) => continue,
+                    Err(error) => {
+                        tracing::error!(?error, "Oracle peer reservation failed terminally");
+                        return Err(error);
+                    }
+                    Ok(ReserveNodeSlotsResponse::Pending(pending)) => pending,
+                }
             };
             let release = ReleaseNodeSlotsRequest {
                 reservation_id: pending.reservation_id,
@@ -1855,7 +1895,10 @@ impl FragmentDispatcher {
                 permission_digest: context.permission_digest.clone(),
             };
             let Ok(ticket) = self.ticket_minter.mint_peer_ticket(&claims) else {
-                self.release_pending(candidate, release, context).await;
+                tracing::error!("Oracle peer ticket mint failed");
+                if candidate.role == wyrd_spec::vala::api::ClusterRole::Oracle {
+                    self.release_pending(candidate, release, context).await;
+                }
                 return Err(DispatchError::Terminal);
             };
             let request = PhysicalExecuteFragmentRequest {
@@ -1881,15 +1924,12 @@ impl FragmentDispatcher {
             if result.is_ok() {
                 return result;
             }
-            self.release_pending(candidate, release, context).await;
-            if matches!(
-                result,
-                Err(DispatchError::Terminal | DispatchError::StaleObject | DispatchError::Capacity)
-            ) {
-                return result;
+            if candidate.role == wyrd_spec::vala::api::ClusterRole::Oracle {
+                self.release_pending(candidate, release, context).await;
             }
+            return result;
         }
-        Err(DispatchError::Exhausted)
+        Err(DispatchError::Capacity)
     }
 
     /// Attempts immediate tuple-bound cleanup after any accepted-attempt failure.
@@ -1902,7 +1942,7 @@ impl FragmentDispatcher {
         let result = tokio::select! {
             biased;
             result = self.transports.release(candidate, release) => result,
-            () = tokio::time::sleep_until(context.deadline) => Err(DispatchError::Retryable),
+            () = tokio::time::sleep_until(context.deadline) => Err(DispatchError::Unavailable),
         };
         if let Err(error) = result {
             tracing::warn!(
@@ -1944,9 +1984,9 @@ impl FragmentDispatcher {
         let remaining = context
             .deadline
             .checked_duration_since(Instant::now())
-            .ok_or(DispatchError::Retryable)?;
+            .ok_or(DispatchError::Unavailable)?;
         let mut frames = match tokio::select! {
-            () = context.cancellation.cancelled() => Err(DispatchError::Retryable),
+            () = context.cancellation.cancelled() => Err(DispatchError::Unavailable),
             result = tokio::time::timeout(
                 remaining,
                 self.transports.execute(
@@ -1955,7 +1995,7 @@ impl FragmentDispatcher {
                     Arc::clone(&context.query_memory_pool),
                 ),
             ) =>
-                result.map_err(|_| DispatchError::Retryable).and_then(std::convert::identity),
+                result.map_err(|_| DispatchError::Unavailable).and_then(std::convert::identity),
         } {
             Ok(frames) => frames,
             Err(error) => {
@@ -1972,15 +2012,15 @@ impl FragmentDispatcher {
             }
         };
         while let Some(frame) = tokio::select! {
-            () = context.cancellation.cancelled() => Some(Err(DispatchError::Retryable)),
-            () = tokio::time::sleep_until(context.deadline) => Some(Err(DispatchError::Retryable)),
+            () = context.cancellation.cancelled() => Some(Err(DispatchError::Unavailable)),
+            () = tokio::time::sleep_until(context.deadline) => Some(Err(DispatchError::Unavailable)),
             frame = frames.next() => frame,
         } {
-            buffer
-                .push(frame.inspect_err(|error| {
-                    record_peer_attempt(FragmentOutcome::Failed, dispatch_error_label(error));
-                })?)
-                .map_err(attempt_error)?;
+            let frame = frame.inspect_err(|error| {
+                tracing::warn!(?error, "Oracle follower frame stream failed");
+                record_peer_attempt(FragmentOutcome::Failed, dispatch_error_label(error));
+            })?;
+            buffer.push(frame).map_err(attempt_error)?;
         }
         let attempt = buffer.finish().map_err(attempt_error)?;
         if attempt.footer.fragment_id != fragment.plan_fingerprint
@@ -1988,7 +2028,7 @@ impl FragmentDispatcher {
         {
             record_peer_attempt(FragmentOutcome::Failed, PeerErrorClass::Footer);
             telemetry.finish(FragmentOutcome::Failed, 0);
-            return Err(DispatchError::Retryable);
+            return Err(DispatchError::Unavailable);
         }
         record_peer_attempt(FragmentOutcome::Success, PeerErrorClass::None);
         telemetry.finish(FragmentOutcome::Success, attempt.footer.encoded_bytes);
@@ -2003,18 +2043,18 @@ fn attempt_error(error: AttemptError) -> DispatchError {
     if error == AttemptError::ParentCapacity {
         DispatchError::Capacity
     } else {
-        DispatchError::Retryable
+        DispatchError::Unavailable
     }
 }
 
 /// Maps internal retry classes to closed metric labels.
 fn dispatch_error_label(error: &DispatchError) -> PeerErrorClass {
     match error {
-        DispatchError::Retryable | DispatchError::StaleObject | DispatchError::Capacity => {
-            PeerErrorClass::Availability
-        }
+        DispatchError::Unavailable
+        | DispatchError::EligibleSourceLoss { .. }
+        | DispatchError::StaleObject
+        | DispatchError::Capacity => PeerErrorClass::Availability,
         DispatchError::Terminal => PeerErrorClass::Security,
-        DispatchError::Exhausted => PeerErrorClass::Exhausted,
     }
 }
 
@@ -2032,7 +2072,6 @@ mod tests {
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use iceberg::io::FileIO;
     use parquet::arrow::ArrowWriter;
     use tempfile::NamedTempFile;
 
@@ -2049,6 +2088,62 @@ mod tests {
 
     /// Deterministic verifier that preserves the already encoded claims bytes.
     struct ClaimsPassthroughVerifier;
+
+    /// Deterministic role-local provider used by worker ownership tests.
+    struct TestFollowerResolver;
+
+    #[async_trait]
+    impl FollowerSourceResolver for TestFollowerResolver {
+        /// Resolves one empty physical source with the fixture schema.
+        async fn resolve(
+            &self,
+            _target_role: ClusterRole,
+            _assignment: &FollowerScanAssignment,
+            _session: &datafusion::execution::session_state::SessionState,
+        ) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>, String> {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                false,
+            )]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(vec![1_i64]))],
+            )
+            .map_err(|error| error.to_string())?;
+            datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+                &[vec![batch]],
+                schema,
+                None,
+            )
+            .map(|plan| plan as Arc<dyn datafusion::physical_plan::ExecutionPlan>)
+            .map_err(|error| error.to_string())
+        }
+    }
+
+    /// Accepting audit collaborator for worker ownership tests.
+    struct TestOracleAudit;
+
+    #[async_trait]
+    impl super::super::OracleAudit for TestOracleAudit {
+        /// Accepts the immutable read decision in this ownership-only test.
+        async fn append_read_decision(
+            &self,
+            _context: &super::super::AuthorizedQueryContext,
+            _decision: super::super::BifrostQueryReadDecision,
+        ) -> Result<(), super::super::BifrostError> {
+            Ok(())
+        }
+
+        /// Accepts a security event in this ownership-only test.
+        async fn append_security_violation(
+            &self,
+            _context: super::super::VerifiedSecurityContext,
+            _violation: super::super::BifrostSecurityViolation,
+        ) -> Result<(), super::super::BifrostError> {
+            Ok(())
+        }
+    }
 
     #[async_trait]
     impl PeerTicketVerifier for ClaimsPassthroughVerifier {
@@ -2125,6 +2220,23 @@ mod tests {
         query_id: QueryId,
         tenant: DataTenantId,
     ) -> PhysicalExecuteFragmentRequest {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let physical_plan_bytes =
+            datafusion_proto::bytes::physical_plan_to_bytes_with_extension_codec(
+                Arc::new(super::super::codec::RemoteScanExec::new(
+                    "dispatcher-test-scan",
+                    &fragment.schema_fingerprint,
+                    schema,
+                )),
+                &super::super::codec::OraclePhysicalExtensionCodec::encoder(),
+            )
+            .expect("native physical plan encoding")
+            .to_vec();
+        let plan_fingerprint = super::super::codec::physical_plan_fingerprint(&physical_plan_bytes);
         let claims = PeerTicketClaims {
             protocol_version: PEER_PROTOCOL_VERSION,
             audience: node.as_uuid().as_bytes().to_vec(),
@@ -2135,9 +2247,9 @@ mod tests {
             tenant_id: tenant.as_uuid().as_bytes().to_vec(),
             nonce: uuid::Uuid::now_v7().as_bytes().to_vec(),
             expires_at_ms: fragment.deadline_unix_ms,
-            binding: fragment.binding.clone(),
-            fragment_digest: fragment.fragment_id.clone(),
-            manifest_digest: fragment.pinned_digest.clone(),
+            binding: "vala.bifrost.events".to_owned(),
+            fragment_digest: plan_fingerprint.clone(),
+            manifest_digest: plan_fingerprint.clone(),
             projection_digest: projection_digest(&fragment.projection),
             permission_digest: "permission".to_owned(),
         };
@@ -2148,7 +2260,7 @@ mod tests {
         .expect("deterministic ticket");
         PhysicalExecuteFragmentRequest {
             ticket,
-            physical_plan_bytes: fragment.encode().expect("fragment encoding"),
+            physical_plan_bytes,
             reservation_id,
             leader_fence: OracleRoleFence {
                 node_id: node,
@@ -2161,7 +2273,7 @@ mod tests {
                 fencing_token: fence,
             },
             assignments: vec![FollowerScanAssignment {
-                scan_id: "legacy-test-scan".to_owned(),
+                scan_id: "dispatcher-test-scan".to_owned(),
                 binding: TenantTableBinding {
                     tenant_id: tenant,
                     namespace: "vala.bifrost".to_owned(),
@@ -2171,7 +2283,7 @@ mod tests {
                 scribe_provider_cut: None,
                 schema_fingerprint: fragment.schema_fingerprint.clone(),
             }],
-            plan_fingerprint: fragment.fragment_id.clone(),
+            plan_fingerprint,
         }
     }
 
@@ -2316,8 +2428,8 @@ mod tests {
         );
     }
 
-    /// Transport that rejects the first reserve transiently and reaches the second candidate.
-    struct RetryReserveTransport {
+    /// Transport that injects one ambiguity-terminal reservation failure.
+    struct AmbiguousReserveTransport {
         /// Number of reserve calls observed across distinct candidates.
         reserve_calls: AtomicUsize,
     }
@@ -2434,19 +2546,19 @@ mod tests {
     }
 
     #[async_trait]
-    impl OraclePeerTransport for RetryReserveTransport {
-        /// Returns retryable once, then one accepted pending reservation.
+    impl OraclePeerTransport for AmbiguousReserveTransport {
+        /// Returns unavailable once; a correct dispatcher never makes a second call.
         ///
         /// # Errors
         ///
-        /// Returns [`DispatchError::Retryable`] on the injected first call.
+        /// Returns [`DispatchError::Unavailable`] on the injected first call.
         async fn reserve(
             &self,
             _worker: NodeId,
             request: ReserveNodeSlotsRequest,
         ) -> Result<ReserveNodeSlotsResponse, DispatchError> {
             if self.reserve_calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                return Err(DispatchError::Retryable);
+                return Err(DispatchError::Unavailable);
             }
             Ok(ReserveNodeSlotsResponse::Pending(PendingNodeReservation {
                 reservation_id: ReservationId::new(uuid::Uuid::now_v7()),
@@ -2454,7 +2566,7 @@ mod tests {
             }))
         }
 
-        /// Accepts cleanup for the injected second-candidate execution failure.
+        /// Accepts cleanup if an accepted reservation must be released.
         ///
         /// # Errors
         ///
@@ -2467,11 +2579,11 @@ mod tests {
             Ok(())
         }
 
-        /// Injects a terminal execute failure after the second reserve succeeds.
+        /// Injects a terminal execute failure if an invalid second call reaches execution.
         ///
         /// # Errors
         ///
-        /// Always returns [`DispatchError::Terminal`] for the focused retry test.
+        /// Always returns [`DispatchError::Terminal`] for the focused ambiguity test.
         async fn execute(
             &self,
             _worker: NodeId,
@@ -2716,7 +2828,7 @@ mod tests {
         });
 
         // The wire mapping is byte-unchanged: a saturated peer stays retryable.
-        assert!(matches!(result, Err(DispatchError::Retryable)));
+        assert!(matches!(result, Err(DispatchError::Unavailable)));
 
         let fields = probe
             .fields_for("oracle peer slot rejection")
@@ -2826,14 +2938,16 @@ mod tests {
             1,
         ));
         let (_file, fragment) = dispatcher_parquet_fragment();
-        let worker = OraclePeerWorker::new_with_resources(
+        let worker = OraclePeerWorker::new_physical_with_resources(
             node,
             fence,
             Arc::new(ClaimsPassthroughVerifier),
             Arc::new(NoopPeerSecurityAudit),
             Arc::clone(&reservations),
-            SealedFragmentExecutor::with_resources(FileIO::new_with_fs(), oracle.clone()),
             oracle.clone(),
+            Arc::new(TestFollowerResolver),
+            Arc::new(TestOracleAudit),
+            1,
         );
         let now = Utc::now();
         let pending = reservations
@@ -2896,14 +3010,16 @@ mod tests {
             1,
         ));
         let (_file, fragment) = dispatcher_parquet_fragment();
-        let worker = OraclePeerWorker::new_with_resources(
+        let worker = OraclePeerWorker::new_physical_with_resources(
             node,
             fence,
             Arc::new(ClaimsPassthroughVerifier),
             Arc::new(NoopPeerSecurityAudit),
             Arc::clone(&reservations),
-            SealedFragmentExecutor::with_resources(FileIO::new_with_fs(), oracle.clone()),
             oracle.clone(),
+            Arc::new(TestFollowerResolver),
+            Arc::new(TestOracleAudit),
+            1,
         );
         let now = Utc::now();
         let pending = reservations
@@ -2992,7 +3108,7 @@ mod tests {
             .expect("pending reservation");
         assert!(matches!(
             registry.take_for_execute(pending.reservation_id, query, leader, 13, now),
-            Err(DispatchError::Retryable)
+            Err(DispatchError::Unavailable)
         ));
         assert_eq!(registry.cleanup_expired(now), 0);
         registry
@@ -3011,7 +3127,7 @@ mod tests {
         let completion_stream = async_stream::stream! {
             let _running = RunningReservation { query_class: QueryClass::Interactive, permit: Some(permit) };
             if false {
-                yield Err(DispatchError::Retryable);
+                yield Err(DispatchError::Unavailable);
             }
         };
         let mut completion = WorkerExecution {
@@ -3042,7 +3158,7 @@ mod tests {
         let drop_stream = async_stream::stream! {
             let _running = RunningReservation { query_class: QueryClass::Interactive, permit: Some(permit) };
             futures_util::future::pending::<()>().await;
-            yield Err(DispatchError::Retryable);
+            yield Err(DispatchError::Unavailable);
         };
         let execution = WorkerExecution {
             stream: Box::pin(drop_stream),
@@ -3054,11 +3170,11 @@ mod tests {
         assert!(slots.try_running(1).is_ok());
     }
 
-    /// A retryable reserve failure advances to the next distinct candidate.
+    /// An ambiguous reserve failure is terminal to the selected candidate sequence.
     #[tokio::test]
-    async fn oracle_dispatch_retries_transient_reserve_on_next_candidate() {
+    async fn oracle_dispatch_does_not_retry_ambiguous_reserve() {
         let leader = NodeId::new(uuid::Uuid::from_u128(1));
-        let transport = Arc::new(RetryReserveTransport {
+        let transport = Arc::new(AmbiguousReserveTransport {
             reserve_calls: AtomicUsize::new(0),
         });
         let dispatcher = FragmentDispatcher::new(
@@ -3106,9 +3222,9 @@ mod tests {
                 ],
             )
             .await
-            .expect_err("second candidate reaches injected terminal execute");
-        assert!(matches!(error, DispatchError::Terminal));
-        assert_eq!(transport.reserve_calls.load(Ordering::SeqCst), 2);
+            .expect_err("ambiguous first reserve is terminal");
+        assert!(matches!(error, DispatchError::Unavailable));
+        assert_eq!(transport.reserve_calls.load(Ordering::SeqCst), 1);
     }
 
     /// A post-reserve ticket-mint failure releases pending capacity before returning.
@@ -3206,20 +3322,24 @@ mod tests {
             )
             .await
             .expect_err("stalled peer times out");
-        assert!(matches!(error, DispatchError::Exhausted));
+        assert!(matches!(error, DispatchError::Unavailable));
         assert_eq!(transport.release_calls.load(Ordering::SeqCst), 1);
     }
 
-    /// Tonic not-found preserves the stale-object signal while outages stay retryable.
+    /// Only authenticated execution not-found preserves the stale-object signal.
     #[test]
     fn oracle_tonic_status_preserves_stale_object_classification() {
         assert!(matches!(
-            status_error(&Status::not_found("stale pinned object")),
+            execution_status_error(&Status::not_found("stale pinned object")),
             DispatchError::StaleObject
         ));
         assert!(matches!(
+            status_error(&Status::not_found("missing peer")),
+            DispatchError::Unavailable
+        ));
+        assert!(matches!(
             status_error(&Status::unavailable("storage outage")),
-            DispatchError::Retryable
+            DispatchError::Unavailable
         ));
     }
 
@@ -3232,7 +3352,7 @@ mod tests {
         ));
         assert!(matches!(
             attempt_error(AttemptError::Capacity),
-            DispatchError::Retryable
+            DispatchError::Unavailable
         ));
     }
 }

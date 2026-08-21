@@ -107,6 +107,13 @@ semantically by content-addressed reference. They are evidence, not acceptance
 authority for the integrated result. Do not copy their commands, logs, task
 prose, or nested traces into terminal artifacts.
 
+Use approved candidate reviews as evidence of candidate-local code review and
+proof. Spend terminal effort on cross-task seams, aggregate intent and plan
+closure, accumulated architecture or contract drift, integrated journeys, and
+contradictory evidence. Reopen a candidate-local implementation only when an
+integrated seam or evidence inconsistency makes that prior review suspect; do
+not mechanically replay every accepted leaf review.
+
 ## Dispatch the full review roster
 
 Dispatch seven independent baseline specialists through the external Codex
@@ -176,11 +183,12 @@ report to the runner, which validates identity and publishes the evidence
 atomically. Specialists do not assign final IDs, plan, remediate, launch other
 reviewers, or communicate with the user.
 
-Each specialist report records assignment identity, inspected and sampled
-coverage, applicable requirements and task criteria, at least one material
-adversarial probe, candidate findings, clean evidence, and static limits. A
-clean report must name the most dangerous relevant invariant challenged, the
-strongest realistic counterexample attempted, and why it survived inspection.
+The immutable packet and runner record assignment identity. Each specialist
+report records inspected and sampled scope, applicable requirements and task
+criteria, at least one material adversarial probe, candidate findings, clean
+rationale, and static limits. A clean report must name the most dangerous
+relevant invariant challenged, the strongest realistic counterexample
+attempted, and why it survived inspection.
 
 ## Validate and consolidate
 

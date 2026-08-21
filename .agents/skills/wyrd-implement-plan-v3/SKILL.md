@@ -100,11 +100,19 @@ generated artifacts, conflicts, and mechanical repairs need no user approval.
    diff digest, clean worktree, prohibited writes, proof artifact identity, and
    ref anchoring. It does not rerun the full task suite or treat coordination as
    acceptance.
-3. Dispatch an independent `$wyrd-review-v3` for every candidate generation.
-   The reviewer examines actual code/diff and tests against every AC, validates
-   proof, and may run targeted checks only when evidence is missing or
-   suspicious. Review—not successful command execution—is acceptance
-   authority.
+3. Preflight each candidate packet and actual diff for high-risk review
+   boundaries. For auth, tenancy, audit, scopes, public errors, SQL/storage,
+   migrations, recovery, destructive writes, async lifecycle, cancellation,
+   locks, retries, drain, Python/PyO3/native bindings, Vala/query/admission,
+   public wire contracts, cross-owner contracts, or UI behavior, first dispatch
+   exactly one focused Terra-high companion review and persist its immutable
+   addendum. Then dispatch an independent Sol-medium `$wyrd-review-v3` for
+   every candidate generation, supplying that addendum when present. The
+   primary reviewer examines actual code/diff and tests against every AC,
+   validates proof and companion claims from source, and may run targeted
+   checks only when evidence is missing or suspicious. Review—not successful
+   command execution—is acceptance authority. Routine candidates receive no
+   companion and never inherit terminal seven-specialist fanout.
 4. On approval, reconcile actual paths and serially merge the immutable commit
    without rewriting it. Record the separate integration SHA. Never wait for
    unrelated unfinished work.
@@ -137,8 +145,11 @@ need not reserve a model slot.
 After all tasks integrate, run plan-declared integrated checks and
 `$wyrd-review-and-plan-v3`. It reviews all integrated code against intent, plan,
 and packets, validates task proof/review artifacts by reference, and checks
-cross-task seams. It never embeds or blindly reruns full task proof; targeted
-reruns are allowed only for missing, contradictory, or suspicious evidence.
+cross-task seams. It uses approved candidate reviews as leaf evidence and does
+not mechanically repeat each candidate-local code review; it reopens one only
+when a seam, integrated behavior, or evidence inconsistency makes it suspect.
+It never embeds or blindly reruns full task proof; targeted reruns are allowed
+only for missing, contradictory, or suspicious evidence.
 
 Route each reversible terminal remediation contract unchanged to
 `$wyrd-implement-v3`, grouped only by actual owner/write overlap. Each worker

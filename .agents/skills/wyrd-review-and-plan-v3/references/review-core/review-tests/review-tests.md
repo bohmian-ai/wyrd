@@ -54,4 +54,4 @@ For each finding include:
 - **Evidence**
 - **Required test and static closure oracle**
 
-Consolidate related gaps. Return the complete candidate report to the orchestrator, including clean evidence when coverage clears the repository's bar. Do not assign final `REV-NNN` IDs, write outside the assigned specialist report, or modify source.
+Consolidate related gaps. Return the complete candidate report to the orchestrator, including clean rationale when coverage clears the repository's bar. Do not assign final `REV-NNN` IDs, write outside the assigned specialist report, or modify source.

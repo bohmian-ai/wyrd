@@ -46,7 +46,7 @@ For every evidence-backed candidate include:
   and exact security regression oracle.
 
 Consolidate weaknesses sharing one exploit path or root cause. Return the
-complete candidate report to the orchestrator, including clean evidence when
+complete candidate report to the orchestrator, including clean rationale when
 no issue clears the bar. Do not assign final `REV-NNN` IDs, write outside the
 assigned specialist report, create plans, run project commands, launch agents,
 or modify source.

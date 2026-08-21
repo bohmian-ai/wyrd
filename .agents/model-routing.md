@@ -32,6 +32,7 @@ for execution. Do not upgrade a mechanical task merely because it is large.
 | `wyrd-implement-plan-v3` controller and normal integration | `gpt-5.6-sol` | medium |
 | Complex debugging or reconciliation escalation | `gpt-5.6-sol` | medium |
 | `wyrd-review-v3` | `gpt-5.6-sol` | medium |
+| `wyrd-review-v3` required high-risk companion specialist | `gpt-5.6-terra` | high |
 | `wyrd-review-and-plan-v3` root | `gpt-5.6-sol` | medium |
 | `wyrd-review-and-plan-v3` baseline and triggered specialists | `gpt-5.6-terra` | high |
 | Final independent adjudication when evidence conflicts | `gpt-5.6-sol` | high |

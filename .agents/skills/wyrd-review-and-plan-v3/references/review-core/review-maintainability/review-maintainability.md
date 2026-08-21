@@ -71,4 +71,4 @@ For each finding include:
 For every finding, cite the reference/module tree or local precedent, the exact
 ownership or dependency collision, and the caller/test/compile consequence.
 
-Consolidate duplicates. Return the complete candidate report to the orchestrator, including clean evidence when no issue clears the evidence and materiality bar. Do not assign final `REV-NNN` IDs, write outside the assigned specialist report, or modify source.
+Consolidate duplicates. Return the complete candidate report to the orchestrator, including clean rationale when no issue clears the materiality bar. Do not assign final `REV-NNN` IDs, write outside the assigned specialist report, or modify source.

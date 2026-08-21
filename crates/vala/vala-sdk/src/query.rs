@@ -209,6 +209,9 @@ impl QueryClient {
 
     /// Lists active queries visible to the authenticated tenant.
     ///
+    /// Cancelling this future abandons the pending HTTP request without
+    /// creating client-owned lifecycle state.
+    ///
     /// # Errors
     ///
     /// Returns stable authentication, authorization, audit, availability, or protocol errors.
@@ -221,6 +224,9 @@ impl QueryClient {
     }
 
     /// Gets one active query visible to the authenticated tenant.
+    ///
+    /// Cancelling this future abandons the pending HTTP request without
+    /// changing the active query.
     ///
     /// # Errors
     ///
@@ -240,6 +246,9 @@ impl QueryClient {
     }
 
     /// Requests server-side cancellation without closing a local response stream.
+    ///
+    /// Once the server accepts cancellation, cancelling this future does not
+    /// reverse the server-side lifecycle transition.
     ///
     /// # Errors
     ///

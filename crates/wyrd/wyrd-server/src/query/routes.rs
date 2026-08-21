@@ -94,6 +94,13 @@ pub fn router() -> Router<AppState> {
     tag = "Bifrost"
 )]
 /// Lists active queries for the authenticated tenant.
+///
+/// Cancelling the handler future abandons the pending owner lookup without
+/// creating durable lifecycle state.
+///
+/// # Errors
+///
+/// Returns structured authorization, audit, role-availability, or owner-control errors.
 pub(crate) async fn list_running_queries(
     State(state): State<AppState>,
     caller: Caller,
@@ -112,6 +119,14 @@ pub(crate) async fn list_running_queries(
     tag = "Bifrost"
 )]
 /// Returns one active query for the authenticated tenant.
+///
+/// Cancelling the handler future abandons the pending owner lookup without
+/// changing the active query.
+///
+/// # Errors
+///
+/// Returns structured request-ID validation, authorization, audit,
+/// role-availability, not-found, or owner-conflict errors.
 pub(crate) async fn get_running_query(
     State(state): State<AppState>,
     caller: Caller,
@@ -137,6 +152,14 @@ pub(crate) async fn get_running_query(
     tag = "Bifrost"
 )]
 /// Requests idempotent cancellation for one active query in the authenticated tenant.
+///
+/// Once an owner accepts cancellation, dropping this handler future does not
+/// undo that server-side lifecycle transition.
+///
+/// # Errors
+///
+/// Returns structured request-ID validation, authorization, audit,
+/// role-availability, not-found, or owner-conflict errors.
 pub(crate) async fn cancel_running_query(
     State(state): State<AppState>,
     caller: Caller,

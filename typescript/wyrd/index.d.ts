@@ -17,11 +17,41 @@ export declare class NativeBifrostQueryClient {
    * startup result itself.
    */
   query(request: NativeQueryRequest): Promise<NativeQueryStart>
-  /** Lists active queries for the authenticated tenant. */
+  /**
+   * Lists active queries for the authenticated tenant.
+   *
+   * Cancelling the JavaScript promise abandons the pending HTTP request and
+   * does not create client-owned lifecycle state.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the native result cannot be projected;
+   * Wyrd control failures are returned in [`NativeLifecycleResult`].
+   */
   running(): Promise<NativeLifecycleResult>
-  /** Gets one active query by canonical request ID. */
+  /**
+   * Gets one active query by canonical request ID.
+   *
+   * Cancelling the JavaScript promise abandons the pending HTTP request and
+   * does not alter the active query.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the native result cannot be projected;
+   * validation and Wyrd control failures are returned in [`NativeLifecycleResult`].
+   */
   status(requestId: string): Promise<NativeLifecycleResult>
-  /** Requests server-side cancellation without closing a local stream. */
+  /**
+   * Requests server-side cancellation without closing a local stream.
+   *
+   * Once the server accepts cancellation, abandoning the JavaScript promise
+   * does not reverse the server-side lifecycle transition.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the native result cannot be projected;
+   * validation and Wyrd control failures are returned in [`NativeLifecycleResult`].
+   */
   cancel(requestId: string): Promise<NativeLifecycleResult>
   /**
    * Sends one Arrow IPC batch through the existing Bifrost ingest wire.

@@ -202,6 +202,9 @@ impl WyrdClient {
 
     /// Sends a streaming JSON request with a caller-owned request ID and verifies its echo.
     ///
+    /// Cancelling this future before return abandons connection setup. After
+    /// return, dropping the response stops unbuffered body consumption.
+    ///
     /// # Errors
     ///
     /// Returns a stable request, authentication, transport, response, or ID-mismatch error.

@@ -1342,18 +1342,30 @@ mod tests {
             .expect("reservation release round-trips"),
             release
         );
-        let execute = domain::ExecuteFragmentRequest {
+        let execute = domain::PhysicalExecuteFragmentRequest {
             ticket: domain::SignedPeerTicket {
                 key_id: "key-1".into(),
                 claims_bytes: vec![1, 2],
                 signature: vec![3; SIGNATURE_BYTES],
             },
-            fragment_bytes: vec![4, 5],
+            physical_plan_bytes: vec![4, 5],
             reservation_id,
+            leader_fence: domain::OracleRoleFence {
+                node_id: domain::NodeId::new(uuid::Uuid::now_v7()),
+                role: domain::ClusterRole::Oracle,
+                fencing_token: 7,
+            },
+            target_fence: domain::OracleRoleFence {
+                node_id: domain::NodeId::new(uuid::Uuid::now_v7()),
+                role: domain::ClusterRole::Scribe,
+                fencing_token: 8,
+            },
+            assignments: Vec::new(),
+            plan_fingerprint: "sha256:physical-plan".to_owned(),
         };
         assert_eq!(
-            domain::ExecuteFragmentRequest::try_from(proto::ExecuteFragmentRequest::from(
-                execute.clone()
+            domain::PhysicalExecuteFragmentRequest::try_from(proto::ExecuteFragmentRequest::from(
+                execute.clone(),
             ))
             .expect("execute request round-trips"),
             execute

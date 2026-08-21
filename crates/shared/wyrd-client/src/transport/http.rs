@@ -298,6 +298,8 @@ impl HttpTransport {
     /// are decoded incrementally without buffering the result. Connection
     /// establishment is bounded by `HttpConfig::timeout_ms`; body lifetime is
     /// intentionally not subject to the ordinary total-request deadline.
+    /// Cancelling this future abandons connection setup; dropping the returned
+    /// response stops unbuffered body consumption.
     ///
     /// # Errors
     ///
@@ -321,6 +323,8 @@ impl HttpTransport {
     ///
     /// The response remains unbuffered. Success is returned only when the
     /// server echoes the exact UUIDv7 request ID in its response headers.
+    /// Cancelling this future abandons connection setup; dropping the returned
+    /// response stops unbuffered body consumption.
     ///
     /// # Errors
     ///
@@ -341,6 +345,14 @@ impl HttpTransport {
     }
 
     /// Sends one streaming request and optionally enforces the caller-owned ID echo.
+    ///
+    /// Cancelling this future abandons connection setup; a successful response
+    /// remains unbuffered and is owned by the caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns stable URL, authentication, serialization, transport, HTTP,
+    /// media-type, or request-identity errors.
     async fn request_json_stream_inner<S>(
         &self,
         method: reqwest::Method,

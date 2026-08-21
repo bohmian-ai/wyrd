@@ -1278,6 +1278,32 @@ pub struct QueryStreamFaultController {
     stall: Arc<std::sync::Mutex<Option<Arc<QueryStreamStall>>>>,
 }
 
+/// Atomic control-audit fault owned by a test server instance.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Default, Clone)]
+pub struct QueryControlAuditFaultController {
+    fail_cancel_attempts: Arc<AtomicBool>,
+}
+
+#[cfg(feature = "test-support")]
+impl QueryControlAuditFaultController {
+    /// Enables failure of cancellation pre-dispatch audit appends.
+    pub fn fail_cancel_attempts(&self) {
+        self.fail_cancel_attempts.store(true, Ordering::Release);
+    }
+
+    /// Restores cancellation pre-dispatch audit appends.
+    pub fn restore_cancel_attempts(&self) {
+        self.fail_cancel_attempts.store(false, Ordering::Release);
+    }
+
+    /// Reports whether cancellation pre-dispatch audit appends must fail.
+    #[must_use]
+    pub fn cancel_attempts_fail(&self) -> bool {
+        self.fail_cancel_attempts.load(Ordering::Acquire)
+    }
+}
+
 #[cfg(feature = "test-support")]
 impl QueryStreamFaultController {
     /// Schedule one truncation and replace any previously scheduled fault.
@@ -1950,6 +1976,9 @@ pub struct AppState {
     /// Optional deterministic stream truncation controller for test servers.
     #[cfg(feature = "test-support")]
     pub query_stream_fault: Option<QueryStreamFaultController>,
+    /// Optional deterministic lifecycle-audit fault controller for test servers.
+    #[cfg(feature = "test-support")]
+    pub query_control_audit_fault: Option<QueryControlAuditFaultController>,
 }
 
 impl AppState {
@@ -1980,6 +2009,8 @@ impl AppState {
             eval_audit: Arc::new(TracingEvalAuditWriter),
             #[cfg(feature = "test-support")]
             query_stream_fault: None,
+            #[cfg(feature = "test-support")]
+            query_control_audit_fault: None,
         }
     }
 
@@ -1995,6 +2026,17 @@ impl AppState {
     #[must_use]
     pub fn with_query_stream_fault(mut self, controller: QueryStreamFaultController) -> Self {
         self.query_stream_fault = Some(controller);
+        self
+    }
+
+    /// Attach a test-tier lifecycle-audit fault controller.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn with_query_control_audit_fault(
+        mut self,
+        controller: QueryControlAuditFaultController,
+    ) -> Self {
+        self.query_control_audit_fault = Some(controller);
         self
     }
 

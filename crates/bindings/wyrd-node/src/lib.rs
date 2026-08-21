@@ -189,7 +189,11 @@ pub struct NativeLifecycleResult {
 
 impl NativeLifecycleResult {
     /// Builds one successful JSON lifecycle projection.
-    fn success(value: serde_json::Value) -> napi::Result<Self> {
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the canonical lifecycle value cannot be serialized.
+    fn success(value: &serde_json::Value) -> napi::Result<Self> {
         Ok(Self {
             value_json: Some(serde_json::to_string(&value).map_err(napi_error)?),
             error_code: None,
@@ -427,17 +431,33 @@ impl NativeBifrostQueryClient {
     }
 
     /// Lists active queries for the authenticated tenant.
+    ///
+    /// Cancelling the JavaScript promise abandons the pending HTTP request and
+    /// does not create client-owned lifecycle state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the native result cannot be projected;
+    /// Wyrd control failures are returned in [`NativeLifecycleResult`].
     #[napi]
     pub async fn running(&self) -> napi::Result<NativeLifecycleResult> {
         match self.client.running().await {
             Ok(queries) => {
-                NativeLifecycleResult::success(serde_json::to_value(queries).map_err(napi_error)?)
+                NativeLifecycleResult::success(&serde_json::to_value(queries).map_err(napi_error)?)
             }
             Err(error) => Ok(NativeLifecycleResult::failure(&error)),
         }
     }
 
     /// Gets one active query by canonical request ID.
+    ///
+    /// Cancelling the JavaScript promise abandons the pending HTTP request and
+    /// does not alter the active query.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the native result cannot be projected;
+    /// validation and Wyrd control failures are returned in [`NativeLifecycleResult`].
     #[napi]
     pub async fn status(&self, request_id: String) -> napi::Result<NativeLifecycleResult> {
         let request_id = match parse_request_id(&request_id) {
@@ -448,13 +468,21 @@ impl NativeBifrostQueryClient {
         };
         match self.client.status(&request_id).await {
             Ok(summary) => {
-                NativeLifecycleResult::success(serde_json::to_value(summary).map_err(napi_error)?)
+                NativeLifecycleResult::success(&serde_json::to_value(summary).map_err(napi_error)?)
             }
             Err(error) => Ok(NativeLifecycleResult::failure(&error)),
         }
     }
 
     /// Requests server-side cancellation without closing a local stream.
+    ///
+    /// Once the server accepts cancellation, abandoning the JavaScript promise
+    /// does not reverse the server-side lifecycle transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the native result cannot be projected;
+    /// validation and Wyrd control failures are returned in [`NativeLifecycleResult`].
     #[napi]
     pub async fn cancel(&self, request_id: String) -> napi::Result<NativeLifecycleResult> {
         let request_id = match parse_request_id(&request_id) {
@@ -465,7 +493,7 @@ impl NativeBifrostQueryClient {
         };
         match self.client.cancel(&request_id).await {
             Ok(response) => {
-                NativeLifecycleResult::success(serde_json::to_value(response).map_err(napi_error)?)
+                NativeLifecycleResult::success(&serde_json::to_value(response).map_err(napi_error)?)
             }
             Err(error) => Ok(NativeLifecycleResult::failure(&error)),
         }
@@ -704,7 +732,7 @@ fn parse_freshness(value: &str) -> Result<FreshnessPolicy, ValaSdkError> {
 ///
 /// # Errors
 ///
-/// Returns the stable public validation error when the value is not a UUIDv7 request ID.
+/// Returns the stable public validation error when the value is not a `UUIDv7` request ID.
 fn parse_request_id(value: &str) -> Result<RequestId, ValaSdkError> {
     RequestId::parse(value).map_err(|error| {
         ValaSdkError::Transport(WyrdError::Validation {

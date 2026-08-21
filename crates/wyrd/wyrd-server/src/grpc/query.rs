@@ -4,7 +4,9 @@ use std::collections::HashMap;
 use std::pin::Pin;
 
 use futures_util::Stream;
+use vala_bifrost_redux::oracle::OracleQueryStream;
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::request_id::RequestId;
 use wyrd_tonic::tonic::{Request, Response, Status};
 use wyrd_tonic::tonic_types::{ErrorDetails, StatusExt as _};
 use wyrd_tonic::wyrd::v1::bifrost_query_service_server::{
@@ -136,6 +138,14 @@ impl BifrostQueryService for BifrostQueryGrpc {
     }
 
     /// Lists active queries for the authenticated tenant.
+    ///
+    /// Cancelling the RPC future abandons the pending owner lookup without
+    /// changing any query lifecycle.
+    ///
+    /// # Errors
+    ///
+    /// Returns stable authentication, authorization, audit, role-availability,
+    /// or owner-control status.
     async fn list_running_queries(
         &self,
         request: Request<proto::ListRunningQueriesRequest>,
@@ -152,6 +162,14 @@ impl BifrostQueryService for BifrostQueryGrpc {
     }
 
     /// Gets one active query for the authenticated tenant.
+    ///
+    /// Cancelling the RPC future abandons the pending owner lookup without
+    /// changing the active query.
+    ///
+    /// # Errors
+    ///
+    /// Returns stable authentication, request-validation, authorization,
+    /// audit, not-found, role-availability, or owner-conflict status.
     async fn get_running_query(
         &self,
         request: Request<proto::GetRunningQueryRequest>,
@@ -170,6 +188,14 @@ impl BifrostQueryService for BifrostQueryGrpc {
     }
 
     /// Requests idempotent cancellation for one active authenticated-tenant query.
+    ///
+    /// Once an exact owner accepts cancellation, cancelling the RPC future does
+    /// not reverse that owner-side transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns stable authentication, request-validation, authorization,
+    /// audit, not-found, role-availability, or owner-conflict status.
     async fn cancel_running_query(
         &self,
         request: Request<proto::CancelRunningQueryRequest>,
@@ -193,16 +219,14 @@ impl BifrostQueryService for BifrostQueryGrpc {
 }
 
 /// Echoes one verified public request identity on a unary gRPC response.
-fn insert_request_id<T>(response: &mut Response<T>, request_id: &wyrd_spec::request_id::RequestId) {
+fn insert_request_id<T>(response: &mut Response<T>, request_id: &RequestId) {
     if let Ok(value) = request_id.as_str().parse() {
         response.metadata_mut().insert("x-wyrd-request-id", value);
     }
 }
 
 /// Converts one Oracle logical stream to the canonical gRPC frame transport.
-pub(crate) fn query_stream_response(
-    result: vala_bifrost_redux::oracle::OracleQueryStream,
-) -> Response<QueryGrpcStream> {
+pub(crate) fn query_stream_response(result: OracleQueryStream) -> Response<QueryGrpcStream> {
     let schema_fingerprint = result.schema_fingerprint.clone();
     let output = QueryGrpcStreamOwner {
         query: Some(result),

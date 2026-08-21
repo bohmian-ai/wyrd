@@ -186,6 +186,8 @@ struct WyrdTestServerInner {
     _forge_role_telemetry: Option<wyrd_server::app::metrics::TestForgeRoleTelemetryGuard>,
     /// Atomic one-shot query truncation controls for language journeys.
     query_stream_fault: QueryStreamFaultController,
+    /// Atomic lifecycle-audit fault controls for causal query tests.
+    query_control_audit_fault: wyrd_server::state::QueryControlAuditFaultController,
     /// Current notification-backed schema stall used by cancellation journeys.
     query_stream_stall: std::sync::Mutex<Option<Arc<wyrd_server::state::QueryStreamStall>>>,
 }
@@ -839,6 +841,18 @@ impl WyrdTestServer {
         self.inner
             .query_stream_fault
             .set_next(QueryStreamFault::EofAfterBatch);
+    }
+
+    /// Fails cancellation audit gates before owner dispatch until restored.
+    pub fn fail_query_cancel_attempt_audit(&self) {
+        self.inner.query_control_audit_fault.fail_cancel_attempts();
+    }
+
+    /// Restores cancellation audit gates after a deterministic fault.
+    pub fn restore_query_cancel_attempt_audit(&self) {
+        self.inner
+            .query_control_audit_fault
+            .restore_cancel_attempts();
     }
 
     /// Stall the next query after its schema frame using test-tier notifications.
@@ -3105,8 +3119,11 @@ impl WyrdTestServerBuilder {
         .await
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         let query_stream_fault = QueryStreamFaultController::default();
+        let query_control_audit_fault =
+            wyrd_server::state::QueryControlAuditFaultController::default();
         let mut state = AppState::new(postgres, storage, bifrost_runtime, shutdown)
             .with_query_stream_fault(query_stream_fault.clone())
+            .with_query_control_audit_fault(query_control_audit_fault.clone())
             .with_auth(wyrd_server::components::auth::ServerAuth {
                 allow_preview: self.allow_preview_auth,
                 issuing_key: Some(Arc::clone(&issuing_key)),
@@ -3152,6 +3169,7 @@ impl WyrdTestServerBuilder {
                 node_id,
                 _forge_role_telemetry: forge_role_telemetry,
                 query_stream_fault,
+                query_control_audit_fault,
                 query_stream_stall: std::sync::Mutex::new(None),
             },
             mode: Mode::InProcess,

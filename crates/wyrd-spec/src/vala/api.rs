@@ -2740,7 +2740,7 @@ mod tests {
         };
         assert_json_round_trip(&summary);
         assert_json_round_trip(&ListRunningQueriesResponse {
-            queries: vec![summary],
+            queries: vec![summary.clone()],
         });
         assert_json_round_trip(&GetRunningQueryRequest {
             request_id: request_id.clone(),
@@ -2754,41 +2754,23 @@ mod tests {
         });
 
         let tenant_id = DataTenantId::new_v7();
-        let query_id = QueryId::new(uuid::Uuid::from_u128(11));
-        let leader = OracleRoleFence {
-            node_id: NodeId::new(uuid::Uuid::from_u128(12)),
-            role: ClusterRole::Oracle,
-            fencing_token: 13,
-        };
-        assert_json_round_trip(&AdmitOracleLifecycleRequest {
+        assert_json_round_trip(&ListOracleLifecyclesRequest { tenant_id });
+        assert_json_round_trip(&ListOracleLifecyclesResponse {
+            queries: vec![summary.clone()],
+        });
+        assert_json_round_trip(&OracleLifecycleLookupRequest {
             tenant_id,
             request_id: request_id.clone(),
-            query_id,
-            query_class: QueryClass::Interactive,
-            deadline: started_at + chrono::Duration::seconds(30),
-            cut_fingerprint: "sha256:cut".to_owned(),
-            leader: leader.clone(),
-            participants: vec![leader.clone()],
         });
-        assert_json_round_trip(&AdmitOracleLifecycleResponse { accepted: true });
-        assert_json_round_trip(&ReportOracleFollowerLifecycleRequest {
-            tenant_id,
-            request_id: request_id.clone(),
-            query_id,
-            cut_fingerprint: "sha256:cut".to_owned(),
-            follower: leader,
-            outcome: QueryTerminalOutcome::Success,
-        });
-        assert_json_round_trip(&ReportOracleFollowerLifecycleResponse {
-            completed_participants: 1,
+        assert_json_round_trip(&GetOracleLifecycleResponse {
+            query: summary.clone(),
         });
         assert_json_round_trip(&CancelOracleLifecycleRequest {
             tenant_id,
-            request_id,
-            query_id,
-            cut_fingerprint: "sha256:cut".to_owned(),
+            request_id: request_id.clone(),
         });
         assert_json_round_trip(&CancelOracleLifecycleResponse {
+            request_id,
             cancellation_started: true,
         });
 
@@ -2797,9 +2779,12 @@ mod tests {
         let _ = schemars::schema_for!(GetRunningQueryRequest);
         let _ = schemars::schema_for!(CancelRunningQueryRequest);
         let _ = schemars::schema_for!(CancelRunningQueryResponse);
-        let _ = schemars::schema_for!(AdmitOracleLifecycleRequest);
-        let _ = schemars::schema_for!(ReportOracleFollowerLifecycleRequest);
+        let _ = schemars::schema_for!(ListOracleLifecyclesRequest);
+        let _ = schemars::schema_for!(ListOracleLifecyclesResponse);
+        let _ = schemars::schema_for!(OracleLifecycleLookupRequest);
+        let _ = schemars::schema_for!(GetOracleLifecycleResponse);
         let _ = schemars::schema_for!(CancelOracleLifecycleRequest);
+        let _ = schemars::schema_for!(CancelOracleLifecycleResponse);
     }
 
     /// Proves one pure contract survives a complete JSON encode/decode cycle.

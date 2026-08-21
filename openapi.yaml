@@ -45,6 +45,13 @@ paths:
       tags:
       - Bifrost
       summary: Lists active queries for the authenticated tenant.
+      description: |-
+        Cancelling the handler future abandons the pending owner lookup without
+        creating durable lifecycle state.
+
+        # Errors
+
+        Returns structured authorization, audit, role-availability, or owner-control errors.
       operationId: list_running_queries
       responses:
         '200':
@@ -58,6 +65,14 @@ paths:
       tags:
       - Bifrost
       summary: Returns one active query for the authenticated tenant.
+      description: |-
+        Cancelling the handler future abandons the pending owner lookup without
+        changing the active query.
+
+        # Errors
+
+        Returns structured request-ID validation, authorization, audit,
+        role-availability, not-found, or owner-conflict errors.
       operationId: get_running_query
       parameters:
       - name: request_id
@@ -79,6 +94,14 @@ paths:
       tags:
       - Bifrost
       summary: Requests idempotent cancellation for one active query in the authenticated tenant.
+      description: |-
+        Once an owner accepts cancellation, dropping this handler future does not
+        undo that server-side lifecycle transition.
+
+        # Errors
+
+        Returns structured request-ID validation, authorization, audit,
+        role-availability, not-found, or owner-conflict errors.
       operationId: cancel_running_query
       parameters:
       - name: request_id

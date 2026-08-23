@@ -649,13 +649,23 @@ impl OraclePeerWorker {
             // Charge the memory governor here, alongside the running slot, so a
             // node already saturated by its own leader-side queries refuses
             // before the leader commits to this participant rather than after.
-            let leased = self.acquire_worker_resources(request.query_class);
-            let attempt = match leased {
+            let attempt = match self.acquire_worker_resources(request.query_class) {
                 Ok(worker_resources) => {
                     self.reservations
                         .reserve(request, Utc::now(), Some(worker_resources))
                 }
-                Err(error) => Err(error),
+                Err(error) => {
+                    // The slot path emits its own structured rejection; without
+                    // this arm a memory-bound refusal would be invisible, and the
+                    // two causes need different operator responses (raise the
+                    // Oracle memory budget vs. raise slot capacity).
+                    tracing::warn!(
+                        stage = "slot_reservation",
+                        query_class = ?request.query_class,
+                        "oracle peer worker memory rejection"
+                    );
+                    Err(error)
+                }
             };
             match attempt {
                 Ok(pending) => {

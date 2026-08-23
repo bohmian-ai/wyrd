@@ -137,6 +137,16 @@ struct PendingReservation {
     /// Leader-local work reuses the already-admitted query capacity and keeps
     /// this empty.
     permit: Option<OwnedSemaphorePermit>,
+    /// Remote-worker memory lease granted at reservation and held until execute
+    /// or release.
+    ///
+    /// The running-slot semaphore alone is not a sufficient capacity answer: it
+    /// counts peer fragments and is blind to the leader-side query envelopes
+    /// competing for the same node's Oracle memory budget. Charging the memory
+    /// governor here is what makes an accepted reservation a real guarantee on a
+    /// node that is simultaneously serving its own queries. Leader-local work
+    /// reuses the admitted query's pool and keeps this empty.
+    worker_resources: Option<FollowerWorkerResources>,
 }
 
 /// Running worker reservation retained through attempt-stream completion.
@@ -149,6 +159,13 @@ pub struct RunningReservation {
     /// Leader-local execution leaves this empty because the admitted query guard
     /// already retains that node's running permit for the complete query stream.
     permit: Option<OwnedSemaphorePermit>,
+    /// Remote-worker memory lease transferred from the reservation.
+    ///
+    /// Retained for the whole attempt stream so the bounded `DataFusion` pool
+    /// this fragment executes under stays charged until the stream completes,
+    /// fails, or is dropped. Leader-local execution leaves this empty and uses
+    /// the admitted query's own pool.
+    pub(crate) worker_resources: Option<FollowerWorkerResources>,
 }
 
 impl Drop for RunningReservation {
@@ -219,6 +236,7 @@ impl ReservationRegistry {
         &self,
         request: &ReserveNodeSlotsRequest,
         now: DateTime<Utc>,
+        worker_resources: Option<FollowerWorkerResources>,
     ) -> Result<PendingNodeReservation, DispatchError> {
         if request.slot_units == 0 || request.expires_at <= now {
             return Err(DispatchError::Terminal);
@@ -244,7 +262,7 @@ impl ReservationRegistry {
             );
             return Err(DispatchError::Capacity);
         };
-        self.insert(request, now, Some(permit))
+        self.insert(request, now, Some(permit), worker_resources)
     }
 
     /// Reserves tuple-bound leader-local work under admitted query capacity.
@@ -261,7 +279,7 @@ impl ReservationRegistry {
         request: &ReserveNodeSlotsRequest,
         now: DateTime<Utc>,
     ) -> Result<PendingNodeReservation, DispatchError> {
-        self.insert(request, now, None)
+        self.insert(request, now, None, None)
     }
 
     /// Inserts one validated reservation with its explicit capacity owner.
@@ -274,6 +292,7 @@ impl ReservationRegistry {
         request: &ReserveNodeSlotsRequest,
         now: DateTime<Utc>,
         permit: Option<OwnedSemaphorePermit>,
+        worker_resources: Option<FollowerWorkerResources>,
     ) -> Result<PendingNodeReservation, DispatchError> {
         if request.slot_units == 0 || request.expires_at <= now {
             return Err(DispatchError::Terminal);
@@ -295,7 +314,7 @@ impl ReservationRegistry {
         let expires_at = request.expires_at.min(now + PENDING_TTL);
         entries.insert(
             reservation_id,
-            pending_reservation(request, expires_at, permit),
+            pending_reservation(request, expires_at, permit, worker_resources),
         );
         Ok(PendingNodeReservation {
             reservation_id,
@@ -363,6 +382,7 @@ impl ReservationRegistry {
         let result = Ok(RunningReservation {
             query_class,
             permit: entry.permit.take(),
+            worker_resources: entry.worker_resources.take(),
         });
         #[cfg(feature = "test-support")]
         self.admitted_running_total
@@ -415,6 +435,7 @@ impl ReservationRegistry {
         Ok(RunningReservation {
             query_class,
             permit: None,
+            worker_resources: None,
         })
     }
 
@@ -433,6 +454,7 @@ fn pending_reservation(
     request: &ReserveNodeSlotsRequest,
     expires_at: DateTime<Utc>,
     permit: Option<OwnedSemaphorePermit>,
+    worker_resources: Option<FollowerWorkerResources>,
 ) -> PendingReservation {
     PendingReservation {
         query_id: request.query_id,
@@ -441,6 +463,7 @@ fn pending_reservation(
         query_class: request.query_class,
         expires_at,
         permit,
+        worker_resources,
     }
 }
 
@@ -467,7 +490,8 @@ pub struct WorkerExecution {
 }
 
 /// Exact role-root quantum retained by one remote follower stream.
-enum FollowerWorkerResources {
+#[derive(Debug)]
+pub(crate) enum FollowerWorkerResources {
     /// Oracle floor/elastic ownership for persisted execution.
     Oracle(crate::resources::OracleWorkerResources),
 }
@@ -622,7 +646,18 @@ impl OraclePeerWorker {
         };
         let deadline = std::time::Instant::now() + PEER_SLOT_WAIT;
         loop {
-            match self.reservations.reserve(request, Utc::now()) {
+            // Charge the memory governor here, alongside the running slot, so a
+            // node already saturated by its own leader-side queries refuses
+            // before the leader commits to this participant rather than after.
+            let leased = self.acquire_worker_resources(request.query_class);
+            let attempt = match leased {
+                Ok(worker_resources) => {
+                    self.reservations
+                        .reserve(request, Utc::now(), Some(worker_resources))
+                }
+                Err(error) => Err(error),
+            };
+            match attempt {
                 Ok(pending) => {
                     record_slot(query_class, SlotOutcome::Pending);
                     return ReserveNodeSlotsResponse::Pending(pending);
@@ -711,15 +746,25 @@ impl OraclePeerWorker {
                 )
                 .unwrap_or(0),
             );
-        let running = self
+        let mut running = self
             .claim_running_reservation(&request, capacity, &claims, tenant_id)
             .await?;
-        let worker_resources = self.acquire_worker_resources(capacity, running.query_class)?;
+        // The lease was charged at reservation; take it here so the attempt
+        // stream, not the reservation entry, owns it for the rest of execution.
+        let worker_resources = running.worker_resources.take();
         if let Err(violation) = validate_physical_claims(&claims, &request) {
             tracing::error!(?violation, "Oracle peer physical claims validation failed");
             self.audit_verified(tenant_id, violation).await?;
             return Err(DispatchError::Terminal);
         }
+        // The authenticated class decided this fragment's quantum at reservation
+        // time; emitting it here is what lets an operator tie a slow fragment
+        // back to the admission decision that sized its memory pool.
+        tracing::debug!(
+            query_class = ?running.query_class,
+            reservation = %request.reservation_id.as_uuid(),
+            "Oracle peer fragment admitted to execute"
+        );
         let follower = &self.physical_follower;
         let memory_pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> = match capacity {
             WorkerCapacity::LeaderAdmitted => admitted_pool.ok_or(DispatchError::Capacity)?,
@@ -897,7 +942,11 @@ impl OraclePeerWorker {
         Ok((claims, tenant_id))
     }
 
-    /// Acquires the one remote-worker root or reuses leader-local query ownership.
+    /// Acquires the one remote-worker memory root backing a peer reservation.
+    ///
+    /// Called from the reservation path only. The leader-local path never
+    /// reaches here because it reuses the admitted query's own envelope and pool
+    /// rather than taking a second, duplicate worker quantum.
     ///
     /// # Errors
     ///
@@ -905,23 +954,16 @@ impl OraclePeerWorker {
     /// cannot admit the remote worker quantum.
     fn acquire_worker_resources(
         &self,
-        capacity: WorkerCapacity,
         query_class: QueryClass,
-    ) -> Result<Option<FollowerWorkerResources>, DispatchError> {
-        match capacity {
-            WorkerCapacity::ReserveRunning => {
-                let class = match query_class {
-                    QueryClass::Interactive => crate::resources::OracleWorkerClass::Interactive,
-                    QueryClass::Analytical => crate::resources::OracleWorkerClass::Analytical,
-                };
-                self.oracle_resources
-                    .try_acquire_worker(class)
-                    .map(FollowerWorkerResources::Oracle)
-                    .map(Some)
-                    .map_err(|_| DispatchError::Capacity)
-            }
-            WorkerCapacity::LeaderAdmitted => Ok(None),
-        }
+    ) -> Result<FollowerWorkerResources, DispatchError> {
+        let class = match query_class {
+            QueryClass::Interactive => crate::resources::OracleWorkerClass::Interactive,
+            QueryClass::Analytical => crate::resources::OracleWorkerClass::Analytical,
+        };
+        self.oracle_resources
+            .try_acquire_worker(class)
+            .map(FollowerWorkerResources::Oracle)
+            .map_err(|_| DispatchError::Capacity)
     }
 
     /// Commits a system-chain audit before rejecting claims that lack a trusted tenant.
@@ -3189,6 +3231,7 @@ mod tests {
             .reserve(
                 &reserve_request_analytical(query, leader, 17, now + ChronoDuration::seconds(2)),
                 now,
+                None,
             )
             .expect("pending analytical reservation");
         let running = registry
@@ -3216,6 +3259,7 @@ mod tests {
             .reserve(
                 &reserve_request_analytical(query, leader, 19, now + ChronoDuration::seconds(2)),
                 now,
+                None,
             )
             .expect("pending analytical reservation");
         let running = registry
@@ -3248,6 +3292,7 @@ mod tests {
             registry.reserve(
                 &reserve_request_analytical(query, leader, 23, now + ChronoDuration::seconds(2)),
                 now,
+                None,
             )
         });
 
@@ -3285,6 +3330,7 @@ mod tests {
             .reserve(
                 &reserve_request(query, leader, 7, now + ChronoDuration::seconds(2)),
                 now,
+                None,
             )
             .expect("pending reservation");
         assert!(matches!(
@@ -3446,12 +3492,28 @@ mod tests {
             target_partitions: 1,
         });
         let now = Utc::now();
-        let pending = reservations
-            .reserve(
-                &reserve_request(query_id, node, fence, now + ChronoDuration::seconds(2)),
-                now,
-            )
-            .expect("remote pending reservation");
+        // Drive the production reservation path: the worker quantum is charged
+        // at reservation, so a test that inserted a registry entry directly
+        // would exercise an admission state the server can never produce.
+        let ReserveNodeSlotsResponse::Pending(pending) = worker
+            .reserve(&reserve_request(
+                query_id,
+                node,
+                fence,
+                now + ChronoDuration::seconds(2),
+            ))
+            .await
+        else {
+            panic!("remote pending reservation");
+        };
+        assert_eq!(
+            oracle
+                .snapshot()
+                .expect("healthy snapshot after reservation")
+                .oracle_memory_used_bytes,
+            crate::resources::ORACLE_PARTITION_MEMORY_BYTES,
+            "reservation charges the worker quantum up front"
+        );
         let request = worker_request(
             &fragment,
             pending.reservation_id,
@@ -3493,6 +3555,7 @@ mod tests {
             .reserve(
                 &reserve_request(query, leader, 9, now + ChronoDuration::milliseconds(1)),
                 now,
+                None,
             )
             .expect("pending reservation");
         assert_eq!(
@@ -3503,6 +3566,7 @@ mod tests {
             .reserve(
                 &reserve_request(query, leader, 9, now + ChronoDuration::seconds(1)),
                 now,
+                None,
             )
             .expect("replacement reservation");
         let request = ReleaseNodeSlotsRequest {
@@ -3533,7 +3597,7 @@ mod tests {
         let leader = NodeId::new(uuid::Uuid::now_v7());
         let expires = now + ChronoDuration::seconds(2);
         let pending = registry
-            .reserve(&reserve_request(query, leader, 13, expires), now)
+            .reserve(&reserve_request(query, leader, 13, expires), now, None)
             .expect("pending reservation");
         // The single running unit is committed by the reservation itself, so a
         // second concurrent reservation is refused here rather than at execute.
@@ -3541,7 +3605,7 @@ mod tests {
         // Unavailable is reserved for a fail-closed outage.
         let contender = QueryId::new(uuid::Uuid::now_v7());
         assert!(matches!(
-            registry.reserve(&reserve_request(contender, leader, 13, expires), now),
+            registry.reserve(&reserve_request(contender, leader, 13, expires), now, None),
             Err(DispatchError::Capacity)
         ));
         let running = registry
@@ -3559,7 +3623,7 @@ mod tests {
         );
         drop(running);
         registry
-            .reserve(&reserve_request(contender, leader, 13, expires), now)
+            .reserve(&reserve_request(contender, leader, 13, expires), now, None)
             .expect("released running capacity admits the next reservation");
     }
 
@@ -3578,6 +3642,7 @@ mod tests {
             .reserve(
                 &reserve_request(query, leader, 13, now + ChronoDuration::seconds(2)),
                 now,
+                None,
             )
             .expect("pending reservation");
         assert_eq!(slots.running_in_use(), 1);
@@ -3596,6 +3661,7 @@ mod tests {
             .reserve(
                 &reserve_request(query, leader, 13, expired + ChronoDuration::seconds(2)),
                 expired,
+                None,
             )
             .expect("running permit released once the reservation expired");
     }
@@ -3606,7 +3672,7 @@ mod tests {
         let slots = Arc::new(OracleSlotManager::new(1, 1));
         let permit = slots.try_running(1).expect("completion permit");
         let completion_stream = async_stream::stream! {
-            let _running = RunningReservation { query_class: QueryClass::Interactive, permit: Some(permit) };
+            let _running = RunningReservation { query_class: QueryClass::Interactive, permit: Some(permit), worker_resources: None };
             if false {
                 yield Err(DispatchError::Unavailable);
             }
@@ -3623,7 +3689,7 @@ mod tests {
         let permit = slots.try_running(1).expect("cancellation permit");
         let observed = cancellation.clone();
         let cancellation_stream = async_stream::stream! {
-            let _running = RunningReservation { query_class: QueryClass::Interactive, permit: Some(permit) };
+            let _running = RunningReservation { query_class: QueryClass::Interactive, permit: Some(permit), worker_resources: None };
             observed.cancelled().await;
         };
         let mut cancellation_stream = Box::pin(cancellation_stream);
@@ -3637,7 +3703,7 @@ mod tests {
 
         let permit = slots.try_running(1).expect("drop permit");
         let drop_stream = async_stream::stream! {
-            let _running = RunningReservation { query_class: QueryClass::Interactive, permit: Some(permit) };
+            let _running = RunningReservation { query_class: QueryClass::Interactive, permit: Some(permit), worker_resources: None };
             futures_util::future::pending::<()>().await;
             yield Err(DispatchError::Unavailable);
         };

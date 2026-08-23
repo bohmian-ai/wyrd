@@ -15,6 +15,8 @@ pub use bifrost_catalog::{
     BifrostCatalog, CreateTableRequest, PinnedIcebergFile, PinnedSealedTable, TableUid,
     project_persisted_wal_ranges,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use bifrost_catalog::{reset_sealed_pin_count_for_test, sealed_pin_count_for_test};
 pub use error::BifrostCatalogError;
 pub(crate) use logical_table_identity::{
     LogicalTableIdentity, PhysicalProjectionRole, PhysicalTableProjection,

@@ -314,7 +314,7 @@ impl Gate {
         self.query_forwarder
             .as_ref()
             .ok_or(wyrd_spec::vala::error::BifrostError::OracleRoleUnavailable)?
-            .accept(ticket)
+            .accept(ticket, None)
             .await
     }
 

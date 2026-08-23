@@ -770,7 +770,6 @@ impl OracleAdmission {
                 node_id: local_node,
                 fencing_token: self.local_role.fencing_token,
             },
-            running: None,
             physical_projections: Vec::new(),
             local_permit: Some(permit),
             delegated_grant: None,
@@ -1015,8 +1014,6 @@ pub(super) struct AdmittedQueryGuard {
     pub(super) query_id: QueryId,
     /// Fenced leader selected at admission time.
     pub(super) leader: AdmittedLeader,
-    /// Retained for peer compatibility; local admission uses `local_permit`.
-    pub(super) running: Option<OwnedSemaphorePermit>,
     /// Physical table projections charged to this query's admitted pool.
     physical_projections: Vec<
         crate::catalog::PhysicalTableProjection<crate::resources::OracleQueryMemoryReservation>,
@@ -1119,7 +1116,6 @@ impl Drop for AdmittedQueryGuard {
             permit.release_inner();
         }
         self.delegated_grant.take();
-        self.running.take();
         #[cfg(feature = "test-support")]
         if let Some(probe) = &self.resource_probe {
             probe.release_local();
@@ -1261,7 +1257,6 @@ impl AdmittedQueryGuard {
             permit.release_inner();
         }
         self.delegated_grant.take();
-        self.running.take();
         #[cfg(feature = "test-support")]
         if let Some(probe) = &self.resource_probe {
             probe.release_local();
@@ -1313,7 +1308,6 @@ pub(super) fn admitted_guard_for_test()
                 node_id: NodeId::new(uuid::Uuid::now_v7()),
                 fencing_token: 1,
             },
-            running: None,
             physical_projections: Vec::new(),
             local_permit: Some(LocalPermit {
                 shared: Arc::clone(&shared),

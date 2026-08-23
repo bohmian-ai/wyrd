@@ -22,7 +22,8 @@ use datafusion::error::DataFusionError;
 #[cfg(any(test, feature = "test-support"))]
 use datafusion::execution::memory_pool::MemoryLimit;
 use datafusion::execution::memory_pool::{
-    GreedyMemoryPool, MemoryConsumer, MemoryPool, MemoryReservation, TrackConsumersPool,
+    FairSpillPool, GreedyMemoryPool, MemoryConsumer, MemoryPool, MemoryReservation,
+    TrackConsumersPool,
 };
 use num_traits::ToPrimitive;
 use rustix::fs::statvfs;
@@ -4116,7 +4117,13 @@ pub fn oracle_partitions_for_work(admitted_ceiling: usize, work_units: usize) ->
         .max(ORACLE_MIN_TARGET_PARTITIONS)
 }
 
-/// Builds a finite first-come, first-served pool for a nested resource envelope.
+/// Builds a finite spill-fair pool for a nested resource envelope.
+///
+/// A query now runs across many execution partitions. A first-come pool lets one
+/// partition claim the whole envelope while its peers are starved into spilling
+/// early. [`FairSpillPool`] divides the envelope evenly across live spillable
+/// reservations, so each partition gets a predictable share and operators spill
+/// only when the query as a whole is genuinely out of memory.
 ///
 /// The caller must retain the outer [`BifrostResourceGovernor`] lease for at
 /// least as long as this pool can be referenced. A zero limit is normalized to
@@ -4125,7 +4132,7 @@ pub fn oracle_partitions_for_work(admitted_ceiling: usize, work_units: usize) ->
 #[must_use]
 pub(crate) fn bounded_memory_pool(limit_bytes: usize) -> Arc<dyn MemoryPool> {
     let pool: Arc<dyn MemoryPool> = Arc::new(TrackConsumersPool::new(
-        GreedyMemoryPool::new(limit_bytes.max(1)),
+        FairSpillPool::new(limit_bytes.max(1)),
         NonZeroUsize::new(16).unwrap_or(NonZeroUsize::MIN),
     ));
     #[cfg(any(test, feature = "test-support"))]

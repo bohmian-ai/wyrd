@@ -136,7 +136,7 @@ impl ReadyOracleForwarder {
         let wall_deadline =
             now + chrono::Duration::from_std(duration).map_err(|_| BifrostError::QueryTimeout)?;
         let snapshot = self.cluster.snapshot();
-        let query_class = self
+        let planned = self
             .planner
             .classify_for_forwarding(
                 &context,
@@ -146,6 +146,7 @@ impl ReadyOracleForwarder {
                 &snapshot,
             )
             .await?;
+        let query_class = planned.query_class();
         let mut candidates = eligible_oracle_candidates(&snapshot, query_class);
         if let Some(local) = candidates.iter().find(|lease| {
             lease.key.node_id == self.local_node_id
@@ -167,7 +168,10 @@ impl ReadyOracleForwarder {
                 .authority
                 .mint_forward_query(&claims)
                 .map_err(|_| BifrostError::QueryPeerSecurity)?;
-            return self.accept(ticket).await;
+            // The plan travels beside the ticket, never inside it: the ticket
+            // still carries every authorization claim, and the pinned snapshot
+            // never leaves this process.
+            return self.accept(ticket, Some(planned)).await;
         }
         let remote_candidates = candidates
             .drain(..)
@@ -205,11 +209,18 @@ impl ReadyOracleForwarder {
 
     /// Verifies and executes one signed envelope on this replica's local Oracle.
     ///
+    /// `prepared` carries a catalog snapshot this process already pinned while
+    /// classifying the same request, letting a local leader skip a redundant
+    /// second pin. It is an in-process optimization only: the ticket remains the
+    /// sole source of authorization, and a ticket arriving from a peer always
+    /// passes `None` because the pinned file list never crosses the wire.
+    ///
     /// # Errors
     /// Returns a closed authentication, policy, cut, role-fence, deadline, or query failure.
     pub async fn accept(
         &self,
         ticket: SignedPeerTicket,
+        prepared: Option<vala_bifrost_redux::oracle::PlannedSqlCut>,
     ) -> Result<OracleQueryStream, BifrostError> {
         let fence = self
             .local_fence
@@ -228,6 +239,7 @@ impl ReadyOracleForwarder {
                 claims.request,
                 claims.participant_cut,
                 claims.query_class,
+                prepared,
             )
             .await
     }

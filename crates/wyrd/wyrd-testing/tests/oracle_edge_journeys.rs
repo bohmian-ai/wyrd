@@ -2236,6 +2236,10 @@ async fn pg_bifrost_oracle_heterogeneous_distributed_query_journey() {
     let sql = format!(
         "SELECT value, COUNT(*) AS total FROM vala.bifrost.{table} GROUP BY value ORDER BY total DESC LIMIT 1"
     );
+    // Classification and execution each used to pin the catalog, so every query
+    // paid two round trips for one file list. A locally led query must now pin
+    // its single table exactly once.
+    vala_bifrost_redux::catalog::reset_sealed_pin_count_for_test();
     let mut query = tokio::spawn(async move {
         let mut stream = QueryClient::new(&reader)
             .query(&BifrostQueryRequest {
@@ -2294,6 +2298,11 @@ async fn pg_bifrost_oracle_heterogeneous_distributed_query_journey() {
         .expect("distributed query joins")
         .expect("distributed query succeeds");
     assert_eq!(total, Some(5), "leader final aggregate/order/limit");
+    assert_eq!(
+        vala_bifrost_redux::catalog::sealed_pin_count_for_test(),
+        1,
+        "a locally led query must pin its single table exactly once, not once to          classify and again to execute"
+    );
     assert_eq!(
         terminal.expect("distributed terminal").outcome,
         QueryTerminalOutcome::Success

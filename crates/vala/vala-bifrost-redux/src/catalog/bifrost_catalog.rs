@@ -261,6 +261,28 @@ pub struct BifrostCatalog {
     file_io: FileIO,
 }
 
+/// Catalog pins observed by production code paths during serialized tests.
+///
+/// Classification and execution each used to pin the catalog, costing every
+/// query two round trips for one file list. This counter lets a test assert
+/// that a locally led query pins exactly once per table.
+#[cfg(any(test, feature = "test-support"))]
+static TEST_SEALED_PIN_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Resets and returns the observed catalog-pin count for a serialized test.
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_sealed_pin_count_for_test() -> usize {
+    TEST_SEALED_PIN_COUNT.swap(0, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Returns catalog pins observed since the last reset in a serialized test.
+#[must_use]
+#[cfg(any(test, feature = "test-support"))]
+pub fn sealed_pin_count_for_test() -> usize {
+    TEST_SEALED_PIN_COUNT.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 impl BifrostCatalog {
     /// Pins one Iceberg table and its tenant-scoped hot manifest without reading rows.
     ///
@@ -272,6 +294,8 @@ impl BifrostCatalog {
         table: &TableRef,
         tenant: DataTenantId,
     ) -> Result<PinnedSealedTable, BifrostCatalogError> {
+        #[cfg(any(test, feature = "test-support"))]
+        TEST_SEALED_PIN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let fqn = table.fqn();
         let Some(_row) = self.lookup_table_row(&fqn, tenant).await? else {
             return Err(BifrostCatalogError::TableNotFound(fqn));

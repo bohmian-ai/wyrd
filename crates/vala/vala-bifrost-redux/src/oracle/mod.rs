@@ -429,16 +429,6 @@ impl AttemptPhaseTimer {
     }
 }
 
-/// Closed reason why bounded local running capacity was not acquired.
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LocalSlotAcquireError {
-    /// The immutable admission deadline elapsed before capacity became available.
-    Deadline,
-    /// Oracle lifecycle cancellation interrupted the bounded wait.
-    Cancelled,
-}
-
 /// Production metric owner for one retained local Oracle.
 ///
 /// The owner keeps the process-local slot and memory accounting needed to
@@ -944,39 +934,6 @@ impl OracleSlotManager {
         Arc::clone(&self.running)
             .try_acquire_many_owned(demand)
             .map_err(|_| BifrostError::QueryAdmissionRejected)
-    }
-
-    /// Waits for local running units within the caller's admission boundary.
-    ///
-    /// The existing pending semaphore bounds the number of callers that may
-    /// enter this wait. The returned permit is transferred into the admitted
-    /// query guard or dropped before any failed pod-local admission returns.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`LocalSlotAcquireError::Deadline`] when the immutable deadline
-    /// elapses and [`LocalSlotAcquireError::Cancelled`] when Oracle lifecycle
-    /// cancellation wins. A closed semaphore is treated as cancellation.
-    ///
-    /// # Cancellation
-    ///
-    /// Cancelling the future drops the semaphore acquisition future without
-    /// consuming capacity.
-    #[cfg(test)]
-    pub(crate) async fn acquire_running(
-        &self,
-        demand: u32,
-        deadline: Instant,
-        cancellation: &CancellationToken,
-    ) -> Result<OwnedSemaphorePermit, LocalSlotAcquireError> {
-        let acquire = Arc::clone(&self.running).acquire_many_owned(demand);
-        tokio::select! {
-            permit = acquire => permit.map_err(|_| LocalSlotAcquireError::Cancelled),
-            () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
-                Err(LocalSlotAcquireError::Deadline)
-            }
-            () = cancellation.cancelled() => Err(LocalSlotAcquireError::Cancelled),
-        }
     }
 }
 
@@ -1585,13 +1542,25 @@ struct ScribeAssignmentTable<'a> {
 }
 
 /// Pinned tables and class selected during one retry's planning phase.
-struct PlannedSqlCut {
+///
+/// Produced by classification and, when the leader is this same process,
+/// carried into execution so the catalog is pinned once per query rather than
+/// once to classify and again to execute.
+pub struct PlannedSqlCut {
     /// Exact immutable table cuts.
-    cuts: Vec<PinnedSealedTable>,
+    pub(crate) cuts: Vec<PinnedSealedTable>,
     /// Server-derived admission class.
-    query_class: QueryClass,
+    pub(crate) query_class: QueryClass,
     /// Fraction of pinned sealed bytes in the local hot tier.
-    local_ratio: f64,
+    pub(crate) local_ratio: f64,
+}
+
+impl PlannedSqlCut {
+    /// Returns the server-derived admission class chosen for this plan.
+    #[must_use]
+    pub fn query_class(&self) -> QueryClass {
+        self.query_class
+    }
 }
 
 /// Inputs for live-fence acquisition, mandatory audit, and bounded drain.
@@ -1632,6 +1601,16 @@ struct SqlAttemptInput<'a> {
     participant_cut: &'a OracleQueryAttemptCut,
     /// Server-derived class signed into the forwarding envelope.
     query_class: QueryClass,
+    /// Catalog snapshot already pinned in this process during classification.
+    ///
+    /// Present only on a first attempt whose leader is this node. Classification
+    /// must pin the catalog to size the scan, and pinning again to execute costs a
+    /// second catalog round trip for a snapshot taken microseconds later. Reusing
+    /// it means the query reads sealed files as of request arrival rather than
+    /// execution start. A forwarded query never carries one: the participant cut
+    /// transports cluster membership, not the file list, so a remote leader pins
+    /// for itself.
+    prepared: Option<PlannedSqlCut>,
 }
 
 /// Retained local query engine owner.
@@ -2026,17 +2005,28 @@ impl Oracle {
         context: AuthorizedQueryContext,
         request: BifrostQueryRequest,
     ) -> Result<OracleQueryStream, BifrostError> {
-        let (cut, query_class) = self.prepare_query_attempt(&context, &request).await?;
-        self.query_sql_with_participant_cut(context, request, cut, query_class)
-            .await
+        let (cut, planned) = self.prepare_query_attempt(&context, &request).await?;
+        let query_class = planned.query_class;
+        self.query_sql_with_cut_and_gate_lifecycle(
+            context,
+            request,
+            cut,
+            query_class,
+            None,
+            Some(planned),
+        )
+        .await
     }
 
     /// Prepares the immutable local-leader participant cut before an attempt begins.
+    ///
+    /// Returns the pinned plan alongside the cut so a local leader can execute the
+    /// catalog snapshot classification already paid for instead of pinning twice.
     async fn prepare_query_attempt(
         &self,
         context: &AuthorizedQueryContext,
         request: &BifrostQueryRequest,
-    ) -> Result<(OracleQueryAttemptCut, QueryClass), BifrostError> {
+    ) -> Result<(OracleQueryAttemptCut, PlannedSqlCut), BifrostError> {
         self.validate_query(request)?;
         if !self.is_ready() {
             return Err(BifrostError::OracleRoleUnavailable);
@@ -2047,10 +2037,11 @@ impl Oracle {
             .checked_add(duration)
             .ok_or(BifrostError::QueryTimeout)?;
         let snapshot = self.cluster.snapshot();
-        let query_class = self
+        let planned = self
             .planner
             .classify_for_forwarding(context, request, deadline, &self.catalog, &snapshot)
             .await?;
+        let query_class = planned.query_class;
         let now = chrono::Utc::now();
         let wall_deadline =
             now + chrono::Duration::from_std(duration).map_err(|_| BifrostError::QueryTimeout)?;
@@ -2072,7 +2063,7 @@ impl Oracle {
             observed_age.saturating_add(Duration::from_secs(1)),
         )
         .map_err(|_| BifrostError::OracleRoleUnavailable)?;
-        Ok((cut, query_class))
+        Ok((cut, planned))
     }
 
     /// Executes one authenticated query as the exact leader named by a signed participant cut.
@@ -2088,6 +2079,7 @@ impl Oracle {
         request: BifrostQueryRequest,
         participant_cut: OracleQueryAttemptCut,
         query_class: QueryClass,
+        prepared: Option<PlannedSqlCut>,
     ) -> Result<OracleQueryStream, BifrostError> {
         self.query_sql_with_cut_and_gate_lifecycle(
             context,
@@ -2095,6 +2087,7 @@ impl Oracle {
             participant_cut,
             query_class,
             None,
+            prepared,
         )
         .await
     }
@@ -2106,13 +2099,15 @@ impl Oracle {
         request: BifrostQueryRequest,
         gate_lifecycle: Option<Arc<crate::oracle::query_stream::QueryStreamLifecycle>>,
     ) -> Result<OracleQueryStream, BifrostError> {
-        let (cut, query_class) = self.prepare_query_attempt(&context, &request).await?;
+        let (cut, planned) = self.prepare_query_attempt(&context, &request).await?;
+        let query_class = planned.query_class;
         self.query_sql_with_cut_and_gate_lifecycle(
             context,
             request,
             cut,
             query_class,
             gate_lifecycle,
+            Some(planned),
         )
         .await
     }
@@ -2144,6 +2139,7 @@ impl Oracle {
         participant_cut: OracleQueryAttemptCut,
         query_class: QueryClass,
         gate_lifecycle: Option<Arc<crate::oracle::query_stream::QueryStreamLifecycle>>,
+        mut prepared: Option<PlannedSqlCut>,
     ) -> Result<OracleQueryStream, BifrostError> {
         self.validate_query(&request)?;
         if !self.is_ready() {
@@ -2182,6 +2178,10 @@ impl Oracle {
                         gate_lifecycle: gate_lifecycle.as_ref().map(Arc::clone),
                         participant_cut: &participant_cut,
                         query_class,
+                        // Only the first attempt may reuse the classification
+                        // snapshot. A stale-Iceberg retry exists precisely to
+                        // observe a newer catalog, so it must pin again.
+                        prepared: prepared.take(),
                     },
                     &mut query_telemetry,
                 )
@@ -2280,17 +2280,22 @@ impl Oracle {
             gate_lifecycle,
             participant_cut,
             query_class: expected_query_class,
+            prepared,
         } = input;
         let stale_replacement = StaleReplacementGate::before_output(retry_ordinal);
-        let planned = self
-            .plan_sql_attempt(
-                context,
-                &request.sql,
-                tables,
-                deadline,
-                oracle_cut_cpu_cores(participant_cut),
-            )
-            .await?;
+        let planned = match prepared {
+            Some(planned) => planned,
+            None => {
+                self.plan_sql_attempt(
+                    context,
+                    &request.sql,
+                    tables,
+                    deadline,
+                    oracle_cut_cpu_cores(participant_cut),
+                )
+                .await?
+            }
+        };
         if planned.query_class != expected_query_class {
             return Err(BifrostError::QueryPeerSecurity);
         }
@@ -5391,56 +5396,6 @@ mod tests {
         }
         // Producers pass u32::MAX, so the transmitted wire demand stays 2.
         assert_eq!(admission_limits(u32::MAX, QueryClass::Analytical).1, 2);
-    }
-
-    /// Bounded local admission waits for an executing query instead of rejecting a transient race.
-    #[tokio::test]
-    async fn local_slot_wait_admits_after_capacity_is_released() {
-        let slots = Arc::new(OracleSlotManager::new(2, 1));
-        let held = slots.try_running(1).expect("initial slot is available");
-        let cancellation = CancellationToken::new();
-        let waiting = {
-            let slots = Arc::clone(&slots);
-            let cancellation = cancellation.clone();
-            tokio::spawn(async move {
-                slots
-                    .acquire_running(1, Instant::now() + Duration::from_secs(1), &cancellation)
-                    .await
-            })
-        };
-        tokio::task::yield_now().await;
-        assert!(!waiting.is_finished());
-        drop(held);
-        let acquired = waiting
-            .await
-            .expect("local wait task completes")
-            .expect("released capacity is acquired");
-        drop(acquired);
-        assert!(slots.try_running(1).is_ok());
-    }
-
-    /// Deadline and cancellation leave the local semaphore at its configured capacity.
-    #[tokio::test]
-    async fn local_slot_wait_terminates_without_leaking_capacity() {
-        let slots = OracleSlotManager::new(2, 1);
-        let held = slots.try_running(1).expect("initial slot is available");
-        let cancellation = CancellationToken::new();
-        let deadline = slots
-            .acquire_running(1, Instant::now() + Duration::from_millis(1), &cancellation)
-            .await;
-        assert!(matches!(deadline, Err(LocalSlotAcquireError::Deadline)));
-
-        let cancelled = CancellationToken::new();
-        cancelled.cancel();
-        let cancellation_result = slots
-            .acquire_running(1, Instant::now() + Duration::from_secs(1), &cancelled)
-            .await;
-        assert!(matches!(
-            cancellation_result,
-            Err(LocalSlotAcquireError::Cancelled)
-        ));
-        drop(held);
-        assert!(slots.try_running(1).is_ok());
     }
 
     /// Tenant tripwire rejects a foreign row instead of filtering it away.

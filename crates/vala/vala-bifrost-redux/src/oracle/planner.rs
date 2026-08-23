@@ -91,11 +91,15 @@ impl OraclePlanner {
         Self::classification(estimated_bytes, live_oracle_cpu, complex).query_class
     }
 
-    /// Pins the authenticated request against one membership snapshot and returns its class.
+    /// Pins the authenticated request against one membership snapshot and returns its plan.
     ///
     /// This preparation has no admission, audit, registry, or execution side effects. It lets
     /// an ingress owner choose and sign one compatible ready-Oracle participant cut before the
     /// local or remote leader begins the shared execution operation.
+    ///
+    /// The pinned cut is returned rather than discarded so a local leader can execute the
+    /// snapshot it already paid for. A forwarded query cannot use it — the participant cut
+    /// carries cluster membership, not the file list — so a remote leader pins for itself.
     ///
     /// # Errors
     /// Returns the same validation, catalog, timeout, and planning failures as Oracle planning.
@@ -106,7 +110,7 @@ impl OraclePlanner {
         deadline: Instant,
         catalog: &BifrostCatalog,
         snapshot: &crate::cluster::ClusterSnapshot,
-    ) -> Result<QueryClass, BifrostError> {
+    ) -> Result<PlannedSqlCut, BifrostError> {
         self.validate_query(request)?;
         let tables = parse_select_tables(&request.sql)?;
         let live_oracle_cpu = snapshot
@@ -126,7 +130,6 @@ impl OraclePlanner {
             live_oracle_cpu,
         )
         .await
-        .map(|planned| planned.query_class)
     }
 
     /// Produces the class, closed reason, and predicted duration from one cut.

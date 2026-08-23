@@ -1146,8 +1146,8 @@ fn retain_worker_resources(
 mod resource_tests {
     use super::*;
     use crate::resources::{
-        BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, ORACLE_PARTITION_MEMORY_BYTES,
-        ResourceSource, SystemResourceSnapshot,
+        BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources,
+        ORACLE_PARTITION_WORKING_MEMORY_BYTES, ResourceSource, SystemResourceSnapshot,
     };
     use std::collections::BTreeSet;
     use std::path::PathBuf;
@@ -1174,6 +1174,7 @@ mod resource_tests {
                 unmanaged_reserve_bytes: None,
                 scratch_limit_bytes: None,
                 effective_cpu: None,
+                oracle_query_slot_limit: None,
                 scratch_root: PathBuf::new(),
                 volume_roots: None,
             },
@@ -1185,7 +1186,11 @@ mod resource_tests {
         let resources = oracle
             .try_acquire_worker(crate::resources::OracleWorkerClass::Interactive)
             .expect("advertised worker quantum");
-        assert_eq!(resources.memory_bytes(), ORACLE_PARTITION_MEMORY_BYTES);
+        assert_eq!(
+            resources.memory_bytes(),
+            ORACLE_PARTITION_WORKING_MEMORY_BYTES,
+            "a worker charges the slot-unit admission quantum, not the grant cap"
+        );
         let stream: WorkerAttemptStream = Box::pin(futures_util::stream::pending());
         let retained =
             retain_worker_resources(stream, Some(FollowerWorkerResources::Oracle(resources)));
@@ -1194,13 +1199,23 @@ mod resource_tests {
                 .snapshot()
                 .expect("retained snapshot")
                 .oracle_memory_used_bytes,
-            ORACLE_PARTITION_MEMORY_BYTES
+            ORACLE_PARTITION_WORKING_MEMORY_BYTES
         );
+        // Admission charges one slot-unit quantum rather than a whole grant cap,
+        // so the budget holds several workers. Drain it to prove the retained
+        // stream's quantum is genuinely held rather than merely accounted.
+        let mut drained = Vec::new();
+        while let Ok(worker) =
+            oracle.try_acquire_worker(crate::resources::OracleWorkerClass::Interactive)
+        {
+            drained.push(worker);
+        }
         assert!(
             oracle
                 .try_acquire_worker(crate::resources::OracleWorkerClass::Interactive)
                 .is_err()
         );
+        drop(drained);
         drop(retained);
         assert_eq!(
             oracle
@@ -3401,13 +3416,10 @@ mod tests {
         );
         let oracle = roles.oracle().expect("Oracle capability");
         let query_owner = oracle
-            .try_acquire_query(crate::resources::OracleResourceRequest {
-                query_class: QueryClass::Interactive,
-                memory_bytes: crate::resources::ORACLE_PARTITION_MEMORY_BYTES,
-                scratch_bytes: crate::resources::ORACLE_PARTITION_MEMORY_BYTES as u64,
-                slot_units: 1,
-                local_ratio: 1.0,
-            })
+            .try_acquire_query(crate::resources::OracleResourceRequest::for_class(
+                QueryClass::Interactive,
+                1.0,
+            ))
             .expect("exact query owner");
         let node = NodeId::new(uuid::Uuid::now_v7());
         let query_id = QueryId::new(uuid::Uuid::now_v7());
@@ -3521,7 +3533,7 @@ mod tests {
                 .snapshot()
                 .expect("healthy snapshot after reservation")
                 .oracle_memory_used_bytes,
-            crate::resources::ORACLE_PARTITION_MEMORY_BYTES,
+            crate::resources::ORACLE_PARTITION_WORKING_MEMORY_BYTES,
             "reservation charges the worker quantum up front"
         );
         let request = worker_request(
@@ -3539,7 +3551,7 @@ mod tests {
                 .snapshot()
                 .expect("healthy remote worker snapshot")
                 .oracle_memory_used_bytes,
-            crate::resources::ORACLE_PARTITION_MEMORY_BYTES
+            crate::resources::ORACLE_PARTITION_WORKING_MEMORY_BYTES
         );
         while let Some(frame) = execution.stream.next().await {
             frame.expect("remote worker frame");

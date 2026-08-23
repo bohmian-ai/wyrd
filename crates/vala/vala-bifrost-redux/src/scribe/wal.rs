@@ -60,9 +60,14 @@ fn record_wal_fsync(result: &Result<(), ScribeError>, started: Instant) {
 #[cfg(test)]
 static WAL_COUNT_ACTIVE: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
-static WAL_REPLAY_PAYLOAD_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
-#[cfg(test)]
 thread_local! {
+    /// Replay payload allocations observed on this thread.
+    ///
+    /// Thread-local rather than a process-wide static so a test that asserts an
+    /// exact count is not perturbed by replays other tests drive concurrently.
+    /// Replay decode is synchronous, so the allocation is always counted on the
+    /// thread that requested it.
+    static WAL_REPLAY_PAYLOAD_ALLOCATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static WAL_ENCODE_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static WAL_WALK_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static WAL_PARTIAL_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -1268,7 +1273,7 @@ impl WalRecord {
         let payload_len =
             usize::try_from(header.payload_len).expect("u32 fits usize on supported targets");
         #[cfg(test)]
-        WAL_REPLAY_PAYLOAD_ALLOCATIONS.fetch_add(1, Ordering::AcqRel);
+        WAL_REPLAY_PAYLOAD_ALLOCATIONS.with(|count| count.set(count.get() + 1));
         let mut payload = vec![0u8; payload_len];
         reader
             .read_exact(&mut payload)
@@ -3800,16 +3805,16 @@ fn crc32c_hash(data: &[u8]) -> u32 {
     crc32c::crc32c(data)
 }
 
-/// Resets the test-only count of replay payload allocations.
+/// Resets this thread's test-only count of replay payload allocations.
 #[cfg(test)]
 pub(crate) fn reset_replay_payload_allocations_for_test() {
-    WAL_REPLAY_PAYLOAD_ALLOCATIONS.store(0, Ordering::Release);
+    WAL_REPLAY_PAYLOAD_ALLOCATIONS.with(|count| count.set(0));
 }
 
-/// Returns the test-only count of replay payload allocations.
+/// Returns this thread's test-only count of replay payload allocations.
 #[cfg(test)]
 pub(crate) fn replay_payload_allocations_for_test() -> u64 {
-    WAL_REPLAY_PAYLOAD_ALLOCATIONS.load(Ordering::Acquire)
+    WAL_REPLAY_PAYLOAD_ALLOCATIONS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]

@@ -355,6 +355,7 @@ mod pg_tests {
             unmanaged_reserve_bytes: None,
             scratch_limit_bytes: Some(scratch_limit_bytes),
             effective_cpu: None,
+            oracle_query_slot_limit: None,
             scratch_root: std::path::PathBuf::new(),
             volume_roots: None,
         }

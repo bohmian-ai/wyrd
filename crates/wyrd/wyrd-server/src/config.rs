@@ -1188,6 +1188,13 @@ pub struct BifrostResourceConfig {
     /// Optional effective CPU cap; process/cgroup affinity may be tighter.
     #[serde(default)]
     pub effective_cpu: Option<usize>,
+    /// Optional Oracle query slot-unit concurrency limit for this node.
+    ///
+    /// Unlike the caps above this is a capacity decision rather than a detected
+    /// bound, so it may raise as well as lower the default. Leaving it unset
+    /// derives twice effective CPU, never below the portable slot-unit floor.
+    #[serde(default)]
+    pub oracle_query_slot_limit: Option<usize>,
 }
 
 fn default_scribe_coordination_threads() -> usize {
@@ -2042,6 +2049,10 @@ impl WyrdServerConfig {
         self.bifrost.resources.effective_cpu = parse_optional_env(
             "WYRD_BIFROST_EFFECTIVE_CPU",
             self.bifrost.resources.effective_cpu,
+        )?;
+        self.bifrost.resources.oracle_query_slot_limit = parse_optional_env(
+            "WYRD_BIFROST_ORACLE_QUERY_SLOT_LIMIT",
+            self.bifrost.resources.oracle_query_slot_limit,
         )?;
         // deployment_profile (APP_ENV: development | staging | production).
         // staging and production both select the hardened production profile, so

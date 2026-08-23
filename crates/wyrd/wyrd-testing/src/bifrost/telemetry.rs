@@ -6802,6 +6802,7 @@ mod tests {
                     unmanaged_reserve_bytes: None,
                     scratch_limit_bytes: Some(scratch_limit),
                     effective_cpu: None,
+                    oracle_query_slot_limit: None,
                     scratch_root: PathBuf::new(),
                     volume_roots: None,
                 },

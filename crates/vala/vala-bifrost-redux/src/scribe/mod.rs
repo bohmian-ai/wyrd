@@ -703,6 +703,7 @@ fn embedded_scribe_resources(config: &AdmissionConfig) -> crate::resources::Scri
             unmanaged_reserve_bytes: None,
             scratch_limit_bytes: Some(crate::resources::MIN_SCRATCH_FREE_BYTES),
             effective_cpu: None,
+            oracle_query_slot_limit: None,
             scratch_root: std::path::PathBuf::new(),
             volume_roots: None,
         },

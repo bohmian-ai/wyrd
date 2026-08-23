@@ -75,6 +75,7 @@ fn compose_persistence_resources(
             unmanaged_reserve_bytes: None,
             scratch_limit_bytes: None,
             effective_cpu: None,
+            oracle_query_slot_limit: None,
             scratch_root: scratch_root.path().to_owned(),
             volume_roots: Some(vala_bifrost_redux::resources::BifrostVolumeRoots {
                 wal: wal_root.path().to_owned(),
@@ -173,6 +174,7 @@ fn persistence_test_roles(memory_limit_bytes: usize) -> BifrostRoleResources {
             unmanaged_reserve_bytes: None,
             scratch_limit_bytes: None,
             effective_cpu: None,
+            oracle_query_slot_limit: None,
             scratch_root: std::path::PathBuf::new(),
             volume_roots: None,
         },

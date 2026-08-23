@@ -3444,6 +3444,12 @@ impl Oracle {
     /// `DataFusion`'s merge reservation remains enabled so external sorts retain
     /// bounded progress memory before consuming their remaining fair share.
     ///
+    /// Target partitions, batch size, and the join preference all come from one
+    /// [`OracleSessionShape`](crate::resources::OracleSessionShape) derived from
+    /// the admitted grant. This is the only site that builds them, so a query
+    /// cannot end up with a partition count sized for one ceiling and a batch
+    /// size sized for another.
+    ///
     /// # Errors
     ///
     /// Returns a stable execution error when `DataFusion` cannot construct the
@@ -3459,11 +3465,12 @@ impl Oracle {
         let runtime = self
             .spill_runtime
             .build_query_runtime(pool, admitted.spill_limit_bytes())?;
-        let target_partitions =
-            crate::resources::oracle_partitions_for_work(admitted.target_partitions(), work_units);
-        let config = datafusion::execution::context::SessionConfig::new()
-            .with_target_partitions(target_partitions)
-            .with_batch_size(1_024);
+        let shape = crate::resources::OracleSessionShape::for_grant(
+            admitted.granted_memory_bytes(),
+            admitted.target_partitions(),
+            work_units,
+        );
+        let config = shape.session_config();
         let state = datafusion::execution::session_state::SessionStateBuilder::new()
             .with_default_features()
             .with_config(config)

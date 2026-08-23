@@ -123,6 +123,7 @@ fn composed_oracle_roles() -> vala_bifrost_redux::resources::BifrostRoleResource
             unmanaged_reserve_bytes: None,
             scratch_limit_bytes: Some(1024 * 1024 * 1024),
             effective_cpu: None,
+            oracle_query_slot_limit: None,
             scratch_root: std::path::PathBuf::new(),
             volume_roots: None,
         },

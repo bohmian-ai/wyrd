@@ -1347,6 +1347,7 @@ mod source_tests {
         let plan = ResourcePlan {
             memory_limit_bytes: 256 * 1024 * 1024,
             effective_cpu: 2,
+            oracle_query_slot_limit: None,
             unmanaged_reserve_bytes: 64 * 1024 * 1024,
             managed_memory_bytes: 192 * 1024 * 1024,
             scribe_floor_bytes: 64 * 1024 * 1024,

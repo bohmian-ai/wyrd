@@ -463,6 +463,7 @@ async fn build_bifrost_external_dependencies(
             unmanaged_reserve_bytes: config.resources.unmanaged_reserve_bytes,
             scratch_limit_bytes: config.resources.scratch_limit_bytes,
             effective_cpu: config.resources.effective_cpu,
+            oracle_query_slot_limit: config.resources.oracle_query_slot_limit,
             scratch_root: oracle_scratch.clone(),
             volume_roots: Some(vala_bifrost_redux::resources::BifrostVolumeRoots {
                 wal: wal_dir.clone(),
@@ -1490,6 +1491,7 @@ impl<'a> OracleRoleBuilder<'a> {
         // from a saturation warning under load.
         tracing::info!(
             running_slots,
+            configured = resource_plan.oracle_query_slot_limit.is_some(),
             admission_waiters = config.oracle.admission_waiters,
             effective_cpu = resource_plan.effective_cpu,
             oracle_floor_bytes = resource_plan.oracle_floor_bytes,

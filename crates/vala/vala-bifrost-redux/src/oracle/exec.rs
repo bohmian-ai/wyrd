@@ -2295,6 +2295,7 @@ mod tests {
                 unmanaged_reserve_bytes: Some(256 * 1024 * 1024),
                 scratch_limit_bytes: Some(1024 * 1024 * 1024),
                 effective_cpu: None,
+                oracle_query_slot_limit: None,
                 scratch_root: std::env::temp_dir(),
                 volume_roots: None,
             },

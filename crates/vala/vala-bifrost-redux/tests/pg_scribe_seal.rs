@@ -128,6 +128,7 @@ mod pg_tests {
                     unmanaged_reserve_bytes: None,
                     scratch_limit_bytes: None,
                     effective_cpu: None,
+                    oracle_query_slot_limit: None,
                     scratch_root: scratch_dir.path().to_owned(),
                     volume_roots: Some(volume_roots),
                 },

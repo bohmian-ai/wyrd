@@ -919,27 +919,16 @@ fn acquire_waiter_resources(
     kind: AdmissionClass,
     local_ratio: f64,
 ) -> Result<crate::resources::OracleQueryResources, crate::resources::BifrostResourceError> {
-    let (query_class, memory_bytes, slot_units) = match kind {
-        AdmissionClass::Interactive => (
-            QueryClass::Interactive,
-            crate::resources::ORACLE_PARTITION_MEMORY_BYTES,
-            1,
-        ),
-        AdmissionClass::Analytical => (
-            QueryClass::Analytical,
-            2 * crate::resources::ORACLE_PARTITION_MEMORY_BYTES,
-            2,
-        ),
+    let query_class = match kind {
+        AdmissionClass::Interactive => QueryClass::Interactive,
+        AdmissionClass::Analytical => QueryClass::Analytical,
     };
     shared
         .resources
-        .try_acquire_query(crate::resources::OracleResourceRequest {
+        .try_acquire_query(crate::resources::OracleResourceRequest::for_class(
             query_class,
-            memory_bytes,
-            scratch_bytes: memory_bytes as u64,
-            slot_units,
             local_ratio,
-        })
+        ))
 }
 
 /// Notifies winners after releasing the admission mutex and repairs canceled sends.
@@ -1216,6 +1205,25 @@ impl AdmittedQueryGuard {
         })
     }
 
+    /// Returns the memory ceiling admission granted this query.
+    ///
+    /// Falls back to the working-memory floor when the permit is absent, which
+    /// is the same conservative direction every other accessor here takes: a
+    /// query with no live permit is about to be refused, and a floor-sized
+    /// session shape cannot over-commit memory on its way out.
+    #[must_use]
+    pub(super) fn granted_memory_bytes(&self) -> usize {
+        self.local_permit
+            .as_ref()
+            .and_then(|permit| permit.resources.lock().ok())
+            .and_then(|resources| {
+                resources
+                    .as_ref()
+                    .map(|resources| resources.granted_memory_bytes)
+            })
+            .unwrap_or(crate::resources::ORACLE_PARTITION_WORKING_MEMORY_BYTES)
+    }
+
     /// Returns adaptive target partitions calculated with the admitted grant.
     #[must_use]
     pub(super) fn target_partitions(&self) -> usize {
@@ -1390,6 +1398,83 @@ mod tests {
     }
 
     /// Builds the production admission owner without a database-backed registry.
+    /// Builds an Oracle capability whose shared slot pool holds two units.
+    ///
+    /// Contention between the classes is expressed through the one shared slot
+    /// ceiling rather than through a memory budget. Admission charges a
+    /// slot-unit quantum now, so a memory-sized fixture no longer forces the
+    /// interactive-blocks-analytical ordering this covers; a two-unit ceiling
+    /// does, because one interactive query holds a unit and an analytical query
+    /// needs both.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the deterministic plan or role composition fails.
+    fn two_slot_resources() -> crate::resources::OracleResources {
+        let mut policy = crate::resources::BifrostResourcePolicy {
+            roles: [crate::resources::BifrostRole::Oracle]
+                .into_iter()
+                .collect(),
+            memory_limit_bytes: None,
+            unmanaged_reserve_bytes: None,
+            scratch_limit_bytes: None,
+            effective_cpu: None,
+            oracle_query_slot_limit: None,
+            scratch_root: std::path::PathBuf::new(),
+            volume_roots: None,
+        };
+        policy.oracle_query_slot_limit = Some(2);
+        crate::resources::BifrostRuntimeResources::from_snapshot(
+            crate::resources::SystemResourceSnapshot {
+                memory_limit_bytes: 1024 * 1024 * 1024,
+                effective_cpu: 8,
+                scratch_capacity_bytes: 2 * 1024 * 1024 * 1024,
+                scratch_available_bytes: 2 * 1024 * 1024 * 1024,
+                memory_source: crate::resources::ResourceSource::Injected,
+                cpu_source: crate::resources::ResourceSource::Injected,
+            },
+            policy,
+        )
+        .expect("two-slot Oracle plan")
+        .compose_roles()
+        .expect("two-slot Oracle composition")
+        .oracle()
+        .expect("composition must enable the Oracle capability")
+    }
+
+    /// Builds an admission owner over a specific Oracle resource capability.
+    fn owner_with_resources(
+        config: OracleAdmissionConfig,
+        resources: crate::resources::OracleResources,
+    ) -> Arc<OracleAdmission> {
+        let role = RegisteredRole {
+            key: ClusterNodeKey {
+                node_id: NodeId::new(uuid::Uuid::now_v7()),
+                role: ClusterRole::Oracle,
+            },
+            fencing_token: 1,
+            capabilities: ClusterCapabilities::OracleV1(OracleCapabilitiesV1 {
+                peer_protocol_version: 1,
+                storage_protocol_version: 1,
+                cpu_cores: 1.0,
+                memory_budget_bytes: 1024,
+                cpu_cores_per_slot: 1.0,
+                memory_bytes_per_slot: 1024,
+                raw_slots: 1,
+                usable_slots: 1,
+                supported_classes: vec![QueryClass::Interactive, QueryClass::Analytical],
+                max_workers_per_query: 1,
+            }),
+        };
+        Arc::new(OracleAdmission::with_config(
+            Arc::new(OracleSlotManager::new(1, 1)),
+            role,
+            true,
+            config,
+            resources,
+        ))
+    }
+
     fn owner(config: OracleAdmissionConfig) -> Arc<OracleAdmission> {
         let role = RegisteredRole {
             key: ClusterNodeKey {
@@ -1832,7 +1917,7 @@ mod tests {
     /// Both scheduling classes contend for one allocator without resource silos.
     #[tokio::test]
     async fn oracle_classes_share_allocator_without_resource_silos() {
-        let owner = owner(OracleAdmissionConfig::default());
+        let owner = owner_with_resources(OracleAdmissionConfig::default(), two_slot_resources());
         let interactive = owner
             .admit(PreparedAdmission {
                 tenant: DataTenantId::new_v7(),

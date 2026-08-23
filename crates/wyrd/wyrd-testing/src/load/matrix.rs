@@ -1963,6 +1963,15 @@ async fn run_tenant(context: TenantRunContext) -> Result<TenantLoadResult, Clust
                             .saturating_add(query_payload_bytes(&response)?);
                     }
                     Err(error) if is_retryable_read_error(&error) => {
+                        // A silently retried read still costs a full server-side
+                        // query, so it still writes a read audit. Without the code
+                        // here, a high retry rate looks like an audit-count
+                        // mismatch rather than the refusal it actually is.
+                        tracing::warn!(
+                            code = error.code(),
+                            tenant = %tenant,
+                            "load matrix retried a refused read"
+                        );
                         result.retries += 1;
                     }
                     Err(error) => return Err(ClusterLoadError::Client(error.to_string())),

@@ -4421,7 +4421,14 @@ fn map_first_batch_failure(
     first
         .as_ref()
         .and_then(|result| result.as_ref().err())
-        .map(map_datafusion_error)
+        .map(|error| {
+            // The stable public error deliberately discards engine detail, which
+            // leaves an execution failure with no attributable cause anywhere in
+            // the logs. Record the underlying engine error once, here, before the
+            // mapping erases it.
+            tracing::warn!(%error, "Oracle query failed on its first batch");
+            map_datafusion_error(error)
+        })
 }
 
 /// Recursively rejects logical-plan variants that can write or bypass bound sources.
@@ -4721,8 +4728,16 @@ pub fn is_stale_iceberg_object_error(error: &datafusion::error::DataFusionError)
 }
 
 /// Records consumption of the sole pre-byte stale-cut replan.
+///
+/// A stale replan means a data file this query's pinned snapshot referenced was
+/// already deleted when the scan reached it — a live reader raced a Forge
+/// compaction that reclaimed its input. The query recovers by replanning, but it
+/// pays a second pin, a second admission, and a second audit, so a sustained
+/// rate here is a retention problem rather than normal operation. It is WARN,
+/// not DEBUG: correctness holds, but the cost is real and its cause is upstream.
 fn record_stale_replan() {
-    // Stale replans are terminal execution details, not an admission outcome.
+    metrics::counter!("oracle_query_stale_replans_total").increment(1);
+    tracing::warn!("Oracle replanned one query after its pinned data file was already deleted");
 }
 
 /// Release an admitted query after an attempt-local terminal error.

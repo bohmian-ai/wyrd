@@ -69,6 +69,14 @@ const SCRATCH_CLEANUP_BACKOFFS: [Duration; 3] = [
 
 /// Derives advertised Oracle worker slots from the same root lease quantum.
 ///
+/// A slot is a memory admission unit — one [`ORACLE_PARTITION_MEMORY_BYTES`]
+/// envelope — so capacity follows the memory budget. It is deliberately not
+/// clamped by core count: CPU parallelism is expressed by a query's execution
+/// partitions, and clamping admission by cores conflates the two. Doing so
+/// capped a node whose memory admitted nine concurrent queries at four, and the
+/// resulting fragment refusals surfaced to callers as failed queries rather than
+/// backpressure.
+///
 /// # Errors
 ///
 /// Returns an invalid-plan error when checked Oracle capacity arithmetic or
@@ -78,9 +86,7 @@ pub fn oracle_worker_slots(plan: ResourcePlan) -> Result<usize, BifrostResourceE
         .oracle_floor_bytes
         .checked_add(plan.elastic_memory_bytes)
         .ok_or_else(accounting_overflow)?;
-    Ok((budget / ORACLE_PARTITION_MEMORY_BYTES)
-        .min(plan.effective_cpu)
-        .max(1))
+    Ok((budget / ORACLE_PARTITION_MEMORY_BYTES).max(1))
 }
 
 /// Bifrost roles that affect protected resource planning.

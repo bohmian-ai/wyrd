@@ -332,6 +332,11 @@ impl ReservationRegistry {
             .remove(&reservation_id)
             .ok_or(DispatchError::Terminal)?;
         drop(entry);
+        // Capacity, not Unavailable: a saturated slot pool is transient
+        // backpressure, while `Unavailable` is this peer's fail-closed signal for
+        // a genuine storage or role outage. Sharing one code made the leader
+        // treat routine backpressure as an outage, fail the query terminally, and
+        // report it to the caller as a peer-security violation.
         let result = self
             .slots
             .try_running(demand)
@@ -339,7 +344,7 @@ impl ReservationRegistry {
                 query_class,
                 permit: Some(permit),
             })
-            .map_err(|_| DispatchError::Unavailable);
+            .map_err(|_| DispatchError::Capacity);
         if result.is_err() {
             tracing::warn!(
                 stage = "slot_reservation",
@@ -1013,21 +1018,28 @@ fn encode_attempt_frames(
                     return;
                 }
             };
-            if let Ok((schema, batch)) = encoder.encode(&batch) {
-                if let Some(schema) = schema {
-                    yield Ok(schema);
+            match encoder.encode(&batch) {
+                Ok((schema, batch)) => {
+                    if let Some(schema) = schema {
+                        yield Ok(schema);
+                    }
+                    yield Ok(batch);
                 }
-                yield Ok(batch);
-            } else {
-                yield Err(DispatchError::Terminal);
-                return;
+                Err(error) => {
+                    tracing::warn!(%error, "Oracle follower could not encode a fragment batch");
+                    yield Err(DispatchError::Terminal);
+                    return;
+                }
             }
         }
         // Finalize only here: the scan counters are written during execution,
         // so reading them before the stream is exhausted under-reports the scan.
         let footer = encoder
             .finish_physical(&plan_fingerprint, scan_evidence.finalize())
-            .map_err(|_| DispatchError::Terminal);
+            .map_err(|error| {
+                tracing::warn!(%error, "Oracle follower could not finalize a fragment footer");
+                DispatchError::Terminal
+            });
         if footer.is_ok() {
             physical_observer.footers_emitted.fetch_add(1, Ordering::AcqRel);
         }
@@ -1658,7 +1670,13 @@ impl TonicOraclePeerTransport {
             result => result.map_err(|status| status_error(&status))?,
         }
         .into_inner();
-        response.try_into().map_err(|_| DispatchError::Terminal)
+        response.try_into().map_err(|error| {
+            tracing::warn!(
+                ?error,
+                "Oracle leader could not decode a reservation response"
+            );
+            DispatchError::Terminal
+        })
     }
 
     /// Releases capacity for one exact planned node/fence target.
@@ -1708,7 +1726,10 @@ impl TonicOraclePeerTransport {
         let mut stream = response.into_inner();
         let output = async_stream::stream! {
             while let Some(frame) = stream.next().await {
-                yield frame.map_err(|status| stream_status_error(&status)).and_then(|frame| frame.try_into().map_err(|_| DispatchError::Terminal));
+                yield frame.map_err(|status| stream_status_error(&status)).and_then(|frame| frame.try_into().map_err(|error| {
+                    tracing::warn!(?error, "Oracle leader could not decode a worker frame");
+                    DispatchError::Terminal
+                }));
             }
         };
         Ok(Box::pin(output))
@@ -1925,11 +1946,21 @@ impl OraclePeerTransportDirectory {
 }
 
 /// Classifies tonic status without retrying security or malformed-contract failures.
+///
+/// `ResourceExhausted` is the code a healthy peer returns when it is momentarily
+/// out of admission capacity. It is transient backpressure and classifies as
+/// [`DispatchError::Unavailable`] so the leader can place the fragment elsewhere
+/// rather than failing the query.
+///
+/// `Unavailable` deliberately stays terminal. A peer uses it for a genuine
+/// storage or role outage, where silently continuing would return an incomplete
+/// answer; Bifrost fails closed on completeness instead. That is why capacity
+/// refusal must not reuse `Unavailable` — see the peer reservation path.
 fn status_error(status: &Status) -> DispatchError {
     match status.code() {
-        wyrd_tonic::tonic::Code::DeadlineExceeded | wyrd_tonic::tonic::Code::Cancelled => {
-            DispatchError::Unavailable
-        }
+        wyrd_tonic::tonic::Code::DeadlineExceeded
+        | wyrd_tonic::tonic::Code::Cancelled
+        | wyrd_tonic::tonic::Code::ResourceExhausted => DispatchError::Unavailable,
         _ => DispatchError::Terminal,
     }
 }
@@ -3193,7 +3224,7 @@ mod tests {
         });
 
         // The wire mapping is byte-unchanged: a saturated peer stays retryable.
-        assert!(matches!(result, Err(DispatchError::Unavailable)));
+        assert!(matches!(result, Err(DispatchError::Capacity)));
 
         let fields = probe
             .fields_for("oracle peer slot rejection")
@@ -3471,9 +3502,11 @@ mod tests {
                 now,
             )
             .expect("pending reservation");
+        // Capacity, not Unavailable: a saturated slot pool is backpressure, and
+        // Unavailable is reserved for a fail-closed outage.
         assert!(matches!(
             registry.take_for_execute(pending.reservation_id, query, leader, 13, now),
-            Err(DispatchError::Unavailable)
+            Err(DispatchError::Capacity)
         ));
         assert_eq!(registry.cleanup_expired(now), 0);
         registry

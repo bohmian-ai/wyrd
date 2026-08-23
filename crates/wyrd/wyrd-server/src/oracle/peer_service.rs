@@ -299,7 +299,7 @@ impl OraclePeerService for OraclePeerGrpc {
             .oracle_peer_service()
             .ok_or_else(|| Status::failed_precondition("Oracle role is not configured"))?
             .worker();
-        Ok(Response::new(worker.reserve(&request).into()))
+        Ok(Response::new(worker.reserve(&request).await.into()))
     }
 
     /// Releases one matching reservation idempotently after workload authentication.

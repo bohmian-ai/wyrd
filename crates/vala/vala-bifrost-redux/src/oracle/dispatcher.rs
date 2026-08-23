@@ -120,17 +120,23 @@ struct PendingReservation {
     leader_node_id: NodeId,
     /// Leader fence preventing stale release.
     leader_fencing_token: FencingToken,
-    /// Requested running-slot demand.
-    slot_units: u32,
     /// Admission class used by closed slot telemetry.
     query_class: QueryClass,
     /// Pending expiry used for eager reclamation.
     expires_at: DateTime<Utc>,
-    /// Remote pending slot permit held until execute or release.
+    /// Remote running-slot permit granted at reservation and held until execute
+    /// or release.
+    ///
+    /// Reservation is the capacity gate. Granting the running permit here means
+    /// a reserved fragment can always execute: a leader never dispatches to a
+    /// node that has not already seated it. Charging a separate, looser pending
+    /// pool and then acquiring the running slot at execute admitted far more
+    /// fragments than could run, so the binding refusal landed after the leader
+    /// had already committed to the fan-out.
     ///
     /// Leader-local work reuses the already-admitted query capacity and keeps
     /// this empty.
-    _permit: Option<OwnedSemaphorePermit>,
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 /// Running worker reservation retained through attempt-stream completion.
@@ -200,6 +206,11 @@ impl ReservationRegistry {
             .load(core::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Returns this registry's slot manager for waiter-bound admission.
+    pub(crate) fn slots(&self) -> &Arc<OracleSlotManager> {
+        &self.slots
+    }
+
     /// Atomically reserves one pending worker slot and returns its generated identity.
     ///
     /// # Errors
@@ -212,10 +223,27 @@ impl ReservationRegistry {
         if request.slot_units == 0 || request.expires_at <= now {
             return Err(DispatchError::Terminal);
         }
-        let permit = self
-            .slots
-            .try_pending()
-            .map_err(|_| DispatchError::Unavailable)?;
+        // Clamp leader-supplied demand to this node's own usable capacity before
+        // charging. `slot_units` arrives leader-supplied as a fixed per-class
+        // constant (`admission_limits(u32::MAX, class).1`, always 2 for
+        // Analytical) and would be structurally unschedulable on a node whose own
+        // running capacity is smaller. The clamp upholds
+        // `demand <= running_capacity.max(1)` without ever loosening the
+        // semaphore, so a refusal after it is genuine transient saturation.
+        let running_capacity = self.slots.running_capacity();
+        let capacity_slots = u32::try_from(running_capacity.max(1)).unwrap_or(u32::MAX);
+        let demand = request.slot_units.min(capacity_slots);
+        let Ok(permit) = self.slots.try_running(demand) else {
+            tracing::warn!(
+                stage = "slot_reservation",
+                query_class = ?request.query_class,
+                demand,
+                running_capacity,
+                running_in_use = self.slots.running_in_use(),
+                "oracle peer slot rejection"
+            );
+            return Err(DispatchError::Capacity);
+        };
         self.insert(request, now, Some(permit))
     }
 
@@ -296,20 +324,15 @@ impl ReservationRegistry {
     /// The ownership tuple is checked before removal, so a forged execute cannot
     /// destroy another query's pending reservation.
     ///
-    /// The demand charged against this peer's running semaphore is the
-    /// load-bearing schedulability clamp: `slot_units` arrives leader-supplied
-    /// (every producer transmits `admission_limits(u32::MAX, class).1`, always 2
-    /// for Analytical) and would be structurally unschedulable on a peer whose
-    /// own running capacity is 1. Charging
-    /// `entry.slot_units.min(running_capacity.max(1))` upholds the invariant
-    /// `demand <= running_capacity.max(1)` at this admission site without ever
-    /// loosening the semaphore. A rejection after the clamp is a genuine
-    /// transient saturation (capacity in use by another query), which is why it
-    /// maps to a retryable outcome and emits an observable structured warning.
+    /// This transition cannot fail on capacity. The running permit was charged
+    /// and stored when the reservation was accepted, so it is transferred here
+    /// rather than acquired: a peer that answered `Pending` has already
+    /// committed the capacity this fragment executes under, and the leader can
+    /// treat a completed fan-out reservation as a guarantee that every
+    /// participant will run.
     ///
     /// # Errors
-    /// Returns terminal for missing/mismatched ownership and retryable for a
-    /// concurrent running-capacity change or transient saturation.
+    /// Returns terminal for missing, expired, or mismatched ownership.
     #[tracing::instrument(name = "bifrost.oracle.slot_reservation", skip_all)]
     pub fn take_for_execute(
         &self,
@@ -331,52 +354,19 @@ impl ReservationRegistry {
             return Err(DispatchError::Terminal);
         }
         let query_class = entry.query_class;
-        let running_capacity = self.slots.running_capacity();
-        // Peer-side schedulability clamp: never charge more than this node's own
-        // usable running capacity, and never charge zero (which would bypass the
-        // semaphore). Leader-supplied demand above capacity is a fixed per-class
-        // constant, not a negotiation, so clamping here is safe and total. The
-        // capacity is a tiny slot count, so the saturating conversion never
-        // loses information in practice.
-        let capacity_slots = u32::try_from(running_capacity.max(1)).unwrap_or(u32::MAX);
-        let demand = entry.slot_units.min(capacity_slots);
-        // Acquire before removing. Removing first meant a capacity refusal
-        // destroyed the reservation, so the leader could not retry the claim it
-        // had already negotiated — one saturated instant became a failed query.
-        //
-        // Capacity, not Unavailable: a saturated slot pool is transient
-        // backpressure, while `Unavailable` is this peer's fail-closed signal for
-        // a genuine storage or role outage. Sharing one code made the leader
-        // treat routine backpressure as an outage, fail the query terminally, and
-        // report it to the caller as a peer-security violation.
-        let result = self
-            .slots
-            .try_running(demand)
-            .map(|permit| RunningReservation {
-                query_class,
-                permit: Some(permit),
-            })
-            .map_err(|_| DispatchError::Capacity);
-        if result.is_ok() {
-            entries
-                .remove(&reservation_id)
-                .ok_or(DispatchError::Terminal)?;
-        }
-        if result.is_err() {
-            tracing::warn!(
-                stage = "slot_reservation",
-                query_class = ?query_class,
-                demand,
-                running_capacity,
-                running_in_use = self.slots.running_in_use(),
-                "oracle peer slot rejection"
-            );
-        }
+        // Transfer, do not acquire. The running permit was granted when this
+        // reservation was accepted, so a reserved fragment can always execute and
+        // this transition cannot fail on capacity.
+        let mut entry = entries
+            .remove(&reservation_id)
+            .ok_or(DispatchError::Terminal)?;
+        let result = Ok(RunningReservation {
+            query_class,
+            permit: entry.permit.take(),
+        });
         #[cfg(feature = "test-support")]
-        if result.is_ok() {
-            self.admitted_running_total
-                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        }
+        self.admitted_running_total
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         record_slot(
             query_class,
             if result.is_ok() {
@@ -448,10 +438,9 @@ fn pending_reservation(
         query_id: request.query_id,
         leader_node_id: request.leader_node_id,
         leader_fencing_token: request.leader_fencing_token,
-        slot_units: request.slot_units,
         query_class: request.query_class,
         expires_at,
-        _permit: permit,
+        permit,
     }
 }
 
@@ -607,18 +596,42 @@ impl OraclePeerWorker {
         }
     }
 
-    /// Reserves bounded pending capacity for one fenced leader.
-    #[must_use]
-    pub fn reserve(&self, request: &ReserveNodeSlotsRequest) -> ReserveNodeSlotsResponse {
+    /// Reserves bounded running capacity for one fenced leader.
+    ///
+    /// Reservation is the single admission gate: accepting here grants the
+    /// running permit the fragment will later execute under, so a leader that
+    /// completes its fan-out reservation knows every participant can run.
+    /// A saturated pool is waited out for at most [`PEER_SLOT_WAIT`] before
+    /// refusing, which converts a momentary instant of contention into a
+    /// slightly delayed fragment instead of a failed query, while still
+    /// refusing sustained overload promptly enough that the leader can retry
+    /// well inside the query deadline.
+    pub async fn reserve(&self, request: &ReserveNodeSlotsRequest) -> ReserveNodeSlotsResponse {
         let query_class = request.query_class;
-        if let Ok(pending) = self.reservations.reserve(request, Utc::now()) {
-            record_slot(query_class, SlotOutcome::Pending);
-            ReserveNodeSlotsResponse::Pending(pending)
-        } else {
+        let rejected = || {
             record_slot(query_class, SlotOutcome::Rejected);
             ReserveNodeSlotsResponse::Rejected(ReservationRejected {
                 retry_after_ms: RESERVATION_RETRY_MS,
             })
+        };
+        // The waiter bound is taken before the first attempt and held for the
+        // whole wait, so a saturated node sheds new arrivals immediately instead
+        // of accumulating an unbounded set of sleepers behind one running gate.
+        let Ok(_waiter) = self.reservations.slots().try_pending() else {
+            return rejected();
+        };
+        let deadline = std::time::Instant::now() + PEER_SLOT_WAIT;
+        loop {
+            match self.reservations.reserve(request, Utc::now()) {
+                Ok(pending) => {
+                    record_slot(query_class, SlotOutcome::Pending);
+                    return ReserveNodeSlotsResponse::Pending(pending);
+                }
+                Err(DispatchError::Capacity) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(PEER_SLOT_POLL).await;
+                }
+                Err(_) => return rejected(),
+            }
         }
     }
 
@@ -784,44 +797,6 @@ impl OraclePeerWorker {
     /// or the reservation is missing, expired, or bound to different ownership,
     /// and propagates any other transition failure unchanged. Audit-append
     /// failures propagate unchanged.
-    /// Claims one running slot, briefly waiting out transient peer saturation.
-    ///
-    /// A fragment fan-out touches several peers, so an instant refusal from any
-    /// one of them fails the whole query; with N peers the chance of hitting a
-    /// momentarily saturated pool compounds. Waiting a short, bounded interval
-    /// converts a saturated instant into a slightly delayed fragment while still
-    /// refusing sustained overload. The bound stays far inside the query budget
-    /// so a peer never turns backpressure into a caller-visible timeout.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DispatchError::Capacity`] when the pool stays saturated for the
-    /// whole bound, and propagates every ownership or expiry failure unchanged.
-    async fn claim_running_slot_within(
-        &self,
-        reservation_id: ReservationId,
-        query_id: QueryId,
-        leader: NodeId,
-        claims: &PeerTicketClaims,
-    ) -> Result<RunningReservation, DispatchError> {
-        let deadline = std::time::Instant::now() + PEER_SLOT_WAIT;
-        loop {
-            let attempt = self.reservations.take_for_execute(
-                reservation_id,
-                query_id,
-                leader,
-                claims.leader_fence,
-                Utc::now(),
-            );
-            match attempt {
-                Err(DispatchError::Capacity) if std::time::Instant::now() < deadline => {
-                    tokio::time::sleep(PEER_SLOT_POLL).await;
-                }
-                settled => return settled,
-            }
-        }
-    }
-
     async fn claim_running_reservation(
         &self,
         request: &PhysicalExecuteFragmentRequest,
@@ -832,10 +807,13 @@ impl OraclePeerWorker {
         let query_id = QueryId::new(uuid_from(&claims.query_id)?);
         let leader = NodeId::new(uuid_from(&claims.leader_node_id)?);
         let transition = match capacity {
-            WorkerCapacity::ReserveRunning => {
-                self.claim_running_slot_within(request.reservation_id, query_id, leader, claims)
-                    .await
-            }
+            WorkerCapacity::ReserveRunning => self.reservations.take_for_execute(
+                request.reservation_id,
+                query_id,
+                leader,
+                claims.leader_fence,
+                Utc::now(),
+            ),
             WorkerCapacity::LeaderAdmitted => self.reservations.take_for_local_leader_execute(
                 request.reservation_id,
                 query_id,
@@ -3248,31 +3226,29 @@ mod tests {
         drop(running);
     }
 
-    /// `take_for_execute` emits a structured warning when the clamped demand is rejected.
+    /// `reserve` emits a structured warning when the clamped demand is rejected.
     ///
     /// AC3: on a capacity-1 peer already saturated by an in-flight query, the
     /// clamped Analytical demand of 1 still cannot be admitted, so the path
     /// emits the observable structured warning (stage, class, demand, running
     /// capacity, running in use) before the unchanged retryable mapping. The
-    /// warning is captured with a minimal `tracing`-only probe.
+    /// warning is captured with a minimal `tracing`-only probe. Reservation is
+    /// the site under test because it is now the single admission gate.
     #[test]
-    fn take_for_execute_rejection_emits_structured_warning() {
+    fn reserve_rejection_emits_structured_warning() {
         let slots = Arc::new(OracleSlotManager::new(1, 1));
         let held = slots.try_running(1).expect("saturating running unit");
         let registry = ReservationRegistry::new(Arc::clone(&slots), 1);
         let now = Utc::now();
         let query = QueryId::new(uuid::Uuid::now_v7());
         let leader = NodeId::new(uuid::Uuid::now_v7());
-        let pending = registry
-            .reserve(
-                &reserve_request_analytical(query, leader, 23, now + ChronoDuration::seconds(2)),
-                now,
-            )
-            .expect("pending analytical reservation");
 
         let probe = RejectionWarnProbe::default();
         let result = tracing::subscriber::with_default(probe.clone(), || {
-            registry.take_for_execute(pending.reservation_id, query, leader, 23, now)
+            registry.reserve(
+                &reserve_request_analytical(query, leader, 23, now + ChronoDuration::seconds(2)),
+                now,
+            )
         });
 
         // The wire mapping is byte-unchanged: a saturated peer stays retryable.
@@ -3540,56 +3516,88 @@ mod tests {
         assert_ne!(pending.reservation_id, replacement.reservation_id);
     }
 
-    /// A capacity refusal retains the reservation so the leader can retry it.
+    /// A reservation is a guarantee: once accepted, execution cannot be refused.
     ///
-    /// Removing the entry before acquiring the slot destroyed a reservation the
-    /// leader had already negotiated, so a single saturated instant became a
-    /// failed query rather than a brief wait. The reservation now survives a
-    /// refusal and is reclaimed by its expiry, which also returns the pending
-    /// permit.
+    /// Capacity is decided once, at reservation. A saturated peer refuses the
+    /// reservation outright — before the leader has committed to dispatching
+    /// this participant — and an accepted reservation carries the running permit
+    /// its fragment will execute under, so `take_for_execute` cannot turn a
+    /// negotiated fan-out into a failed query. Releasing the reservation returns
+    /// the permit, which is what lets the next reservation through.
     #[test]
-    fn peer_capacity_refusal_retains_reservation_until_expiry() {
-        let slots = Arc::new(OracleSlotManager::new(1, 0));
-        let registry = ReservationRegistry::new(Arc::clone(&slots), 1);
+    fn accepted_reservation_guarantees_execution_and_saturation_refuses_up_front() {
+        let slots = Arc::new(OracleSlotManager::new(1, 1));
+        let registry = ReservationRegistry::new(Arc::clone(&slots), 2);
         let now = Utc::now();
         let query = QueryId::new(uuid::Uuid::now_v7());
         let leader = NodeId::new(uuid::Uuid::now_v7());
+        let expires = now + ChronoDuration::seconds(2);
         let pending = registry
+            .reserve(&reserve_request(query, leader, 13, expires), now)
+            .expect("pending reservation");
+        // The single running unit is committed by the reservation itself, so a
+        // second concurrent reservation is refused here rather than at execute.
+        // Capacity, not Unavailable: a saturated slot pool is backpressure, and
+        // Unavailable is reserved for a fail-closed outage.
+        let contender = QueryId::new(uuid::Uuid::now_v7());
+        assert!(matches!(
+            registry.reserve(&reserve_request(contender, leader, 13, expires), now),
+            Err(DispatchError::Capacity)
+        ));
+        let running = registry
+            .take_for_execute(pending.reservation_id, query, leader, 13, now)
+            .expect("an accepted reservation always executes");
+        assert_eq!(running.query_class, QueryClass::Interactive);
+        assert!(
+            running.permit.is_some(),
+            "the reserved permit is transferred"
+        );
+        assert_eq!(
+            registry.cleanup_expired(now),
+            0,
+            "the claimed reservation left the registry"
+        );
+        drop(running);
+        registry
+            .reserve(&reserve_request(contender, leader, 13, expires), now)
+            .expect("released running capacity admits the next reservation");
+    }
+
+    /// An unclaimed reservation returns its committed running permit at expiry.
+    ///
+    /// Because reservation now charges the running slot, a leader that abandons
+    /// a fan-out mid-negotiation would strand capacity without expiry reclaim.
+    #[test]
+    fn expired_reservation_returns_its_running_permit() {
+        let slots = Arc::new(OracleSlotManager::new(1, 1));
+        let registry = ReservationRegistry::new(Arc::clone(&slots), 2);
+        let now = Utc::now();
+        let query = QueryId::new(uuid::Uuid::now_v7());
+        let leader = NodeId::new(uuid::Uuid::now_v7());
+        registry
             .reserve(
                 &reserve_request(query, leader, 13, now + ChronoDuration::seconds(2)),
                 now,
             )
             .expect("pending reservation");
-        // Capacity, not Unavailable: a saturated slot pool is backpressure, and
-        // Unavailable is reserved for a fail-closed outage.
-        assert!(matches!(
-            registry.take_for_execute(pending.reservation_id, query, leader, 13, now),
-            Err(DispatchError::Capacity)
-        ));
-        assert_eq!(
-            registry.cleanup_expired(now),
-            1,
-            "a refused claim must stay reservable until its expiry"
-        );
-        assert!(
-            matches!(
-                registry.take_for_execute(pending.reservation_id, query, leader, 13, now),
-                Err(DispatchError::Capacity)
-            ),
-            "the retained reservation must remain claimable rather than terminal"
-        );
+        assert_eq!(slots.running_in_use(), 1);
         let expired = now + ChronoDuration::seconds(3);
         assert_eq!(
             registry.cleanup_expired(expired),
             0,
-            "expiry reclaims the retained reservation"
+            "expiry reclaims the abandoned reservation"
+        );
+        assert_eq!(
+            slots.running_in_use(),
+            0,
+            "expiry returns the committed running permit"
         );
         registry
             .reserve(
                 &reserve_request(query, leader, 13, expired + ChronoDuration::seconds(2)),
                 expired,
             )
-            .expect("pending permit released once the reservation expired");
+            .expect("running permit released once the reservation expired");
     }
 
     /// Worker execution streams release running capacity on completion, cancel, and drop.

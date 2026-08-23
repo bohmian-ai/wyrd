@@ -914,7 +914,14 @@ impl OracleSlotManager {
             .saturating_sub(self.running.available_permits()) as u64
     }
 
-    /// Tries to reserve one bounded pending-admission waiter.
+    /// Tries to reserve one bounded reservation-waiter slot.
+    ///
+    /// Peer reservation is allowed to wait out momentary running-slot
+    /// saturation, and this bound caps how many such waits may be in flight at
+    /// once. It is deliberately not a dispatch gate: holding it grants no right
+    /// to execute, only the right to wait for the running gate that does. That
+    /// separation is what keeps a leader's completed fan-out reservation a real
+    /// guarantee rather than an optimistic one.
     ///
     /// # Errors
     ///

@@ -81,6 +81,18 @@ pub enum DispatchError {
     Terminal,
 }
 
+/// Longest a peer waits out a saturated running-slot pool before refusing.
+///
+/// Sized far below the query deadline so peer backpressure never becomes a
+/// caller-visible timeout — the failure mode where an uncoordinated worker-side
+/// queue outlives the dispatch RPC and surfaces as a transport error instead of
+/// a clean refusal. Long enough to absorb the brief contention that a fan-out
+/// across several peers otherwise turns into a failed query.
+const PEER_SLOT_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Interval between running-slot retries inside [`PEER_SLOT_WAIT`].
+const PEER_SLOT_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
 /// Closed reasons accompanying a partial peer attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchPartialReason {
@@ -328,10 +340,10 @@ impl ReservationRegistry {
         // loses information in practice.
         let capacity_slots = u32::try_from(running_capacity.max(1)).unwrap_or(u32::MAX);
         let demand = entry.slot_units.min(capacity_slots);
-        let entry = entries
-            .remove(&reservation_id)
-            .ok_or(DispatchError::Terminal)?;
-        drop(entry);
+        // Acquire before removing. Removing first meant a capacity refusal
+        // destroyed the reservation, so the leader could not retry the claim it
+        // had already negotiated — one saturated instant became a failed query.
+        //
         // Capacity, not Unavailable: a saturated slot pool is transient
         // backpressure, while `Unavailable` is this peer's fail-closed signal for
         // a genuine storage or role outage. Sharing one code made the leader
@@ -345,6 +357,11 @@ impl ReservationRegistry {
                 permit: Some(permit),
             })
             .map_err(|_| DispatchError::Capacity);
+        if result.is_ok() {
+            entries
+                .remove(&reservation_id)
+                .ok_or(DispatchError::Terminal)?;
+        }
         if result.is_err() {
             tracing::warn!(
                 stage = "slot_reservation",
@@ -767,6 +784,44 @@ impl OraclePeerWorker {
     /// or the reservation is missing, expired, or bound to different ownership,
     /// and propagates any other transition failure unchanged. Audit-append
     /// failures propagate unchanged.
+    /// Claims one running slot, briefly waiting out transient peer saturation.
+    ///
+    /// A fragment fan-out touches several peers, so an instant refusal from any
+    /// one of them fails the whole query; with N peers the chance of hitting a
+    /// momentarily saturated pool compounds. Waiting a short, bounded interval
+    /// converts a saturated instant into a slightly delayed fragment while still
+    /// refusing sustained overload. The bound stays far inside the query budget
+    /// so a peer never turns backpressure into a caller-visible timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DispatchError::Capacity`] when the pool stays saturated for the
+    /// whole bound, and propagates every ownership or expiry failure unchanged.
+    async fn claim_running_slot_within(
+        &self,
+        reservation_id: ReservationId,
+        query_id: QueryId,
+        leader: NodeId,
+        claims: &PeerTicketClaims,
+    ) -> Result<RunningReservation, DispatchError> {
+        let deadline = std::time::Instant::now() + PEER_SLOT_WAIT;
+        loop {
+            let attempt = self.reservations.take_for_execute(
+                reservation_id,
+                query_id,
+                leader,
+                claims.leader_fence,
+                Utc::now(),
+            );
+            match attempt {
+                Err(DispatchError::Capacity) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(PEER_SLOT_POLL).await;
+                }
+                settled => return settled,
+            }
+        }
+    }
+
     async fn claim_running_reservation(
         &self,
         request: &PhysicalExecuteFragmentRequest,
@@ -777,13 +832,10 @@ impl OraclePeerWorker {
         let query_id = QueryId::new(uuid_from(&claims.query_id)?);
         let leader = NodeId::new(uuid_from(&claims.leader_node_id)?);
         let transition = match capacity {
-            WorkerCapacity::ReserveRunning => self.reservations.take_for_execute(
-                request.reservation_id,
-                query_id,
-                leader,
-                claims.leader_fence,
-                Utc::now(),
-            ),
+            WorkerCapacity::ReserveRunning => {
+                self.claim_running_slot_within(request.reservation_id, query_id, leader, claims)
+                    .await
+            }
             WorkerCapacity::LeaderAdmitted => self.reservations.take_for_local_leader_execute(
                 request.reservation_id,
                 query_id,
@@ -3488,9 +3540,15 @@ mod tests {
         assert_ne!(pending.reservation_id, replacement.reservation_id);
     }
 
-    /// A failed pending-to-running transition removes the pending reservation and permit.
+    /// A capacity refusal retains the reservation so the leader can retry it.
+    ///
+    /// Removing the entry before acquiring the slot destroyed a reservation the
+    /// leader had already negotiated, so a single saturated instant became a
+    /// failed query rather than a brief wait. The reservation now survives a
+    /// refusal and is reclaimed by its expiry, which also returns the pending
+    /// permit.
     #[test]
-    fn peer_transition_failure_releases_reservation() {
+    fn peer_capacity_refusal_retains_reservation_until_expiry() {
         let slots = Arc::new(OracleSlotManager::new(1, 0));
         let registry = ReservationRegistry::new(Arc::clone(&slots), 1);
         let now = Utc::now();
@@ -3508,13 +3566,30 @@ mod tests {
             registry.take_for_execute(pending.reservation_id, query, leader, 13, now),
             Err(DispatchError::Capacity)
         ));
-        assert_eq!(registry.cleanup_expired(now), 0);
+        assert_eq!(
+            registry.cleanup_expired(now),
+            1,
+            "a refused claim must stay reservable until its expiry"
+        );
+        assert!(
+            matches!(
+                registry.take_for_execute(pending.reservation_id, query, leader, 13, now),
+                Err(DispatchError::Capacity)
+            ),
+            "the retained reservation must remain claimable rather than terminal"
+        );
+        let expired = now + ChronoDuration::seconds(3);
+        assert_eq!(
+            registry.cleanup_expired(expired),
+            0,
+            "expiry reclaims the retained reservation"
+        );
         registry
             .reserve(
-                &reserve_request(query, leader, 13, now + ChronoDuration::seconds(2)),
-                now,
+                &reserve_request(query, leader, 13, expired + ChronoDuration::seconds(2)),
+                expired,
             )
-            .expect("pending permit released after transition failure");
+            .expect("pending permit released once the reservation expired");
     }
 
     /// Worker execution streams release running capacity on completion, cancel, and drop.

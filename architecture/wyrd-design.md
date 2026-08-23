@@ -1097,6 +1097,176 @@ audited at their own commit boundary. A crash after the outbox commit and
 before the local checkpoint may replay one valid duplicate, but never loses an
 accepted read decision.
 
+#### Oracle admission: slots admit, grants size
+
+Oracle separates two decisions that a single constant used to conflate. Keep the
+distinction in mind throughout: the **charge** is what a query pays to start and
+is what bounds concurrency; the **grant** is the ceiling it may grow into once
+running and denies nothing to anyone else.
+
+**Admission is decided by slot capacity.** A query charges
+`ORACLE_PARTITION_WORKING_MEMORY_BYTES` (32 MiB) per slot unit against the shared
+elastic budget — an Interactive query occupies one unit, an Analytical query two.
+That charge is the working set one execution partition needs to make progress,
+not the largest envelope the query might grow into.
+
+**Sizing is a separate, derived per-query ceiling.**
+`ORACLE_PARTITION_MEMORY_BYTES` (256 MiB) is the cap on that ceiling and is never
+reserved. The grant is
+
+```
+grant = oracle_budget * query_slots / sum(running_slots)
+```
+
+clamped to `[32 MiB, 256 MiB]`, computed once at admission and held for the
+query's life.
+
+Two properties of that formula are load-bearing. The numerator is the *fixed
+configured budget*, never currently free memory: dividing free memory would make
+two identical queries receive different ceilings depending on what Scribe and
+Forge happened to be doing at that instant. And the live denominator makes the
+ceiling converge on the charge as the node saturates — at full slot occupancy
+`budget / slots` is approximately the 32 MiB a unit paid at the door, while an
+idle node opens the ceiling to the cap. That coupling is what lets admission be
+decided by slots alone, with no overcommit ratio and no kill-on-OOM backstop.
+
+This is a self-limiting design, **not a proof**. Because the grant is fixed at
+admission and held, a query admitted onto an idle node keeps its generous
+ceiling while later arrivals compute smaller ones, so the sum of *held* ceilings
+can exceed the budget during a ramp. What bounds real consumption is the charge,
+which is deducted, plus the fact that a ceiling is an upper bound most queries
+never reach. Do not restate this as a construction guarantee.
+
+**What other engines do, and where we sit.** Divide-by-concurrency is the
+minority approach, and the design record should say so plainly. Among engines
+whose source we can read, most give every query the same flat, statically
+configured cap and control load with a separate concurrency mechanism:
+redacted
+division at all (its per-query variation is closed-source enterprise code), and
+Trino and ClickHouse likewise cap per query and never divide. Apache Doris is the
+one clean open-source precedent for dividing, and it ships both a fixed
+(`mem_limit * slots / max_concurrency`) and a dynamic
+(`mem_limit * slots / sum(running_slots)`) mode — the latter is what Wyrd
+implements. The proprietary warehouses agree on the shape: Vertica
+(`queuingThreshold / PLANNEDCONCURRENCY`) and Redshift manual WLM
+(`total_mem * queue_pct / slot_count`). Vertica also confirms the
+reservation/limit split directly: `MEMORYSIZE` reserves, `MAXMEMORYSIZE` caps the
+borrow. Trino removed its reserved memory pool in favour of concurrency-based
+admission but needed a low-memory killer, because a flat cap does not bound
+aggregate use.
+
+Wyrd chose the dividing form because the fixed form is degenerate at our
+numbers — an Oracle budget divided by the resolved slot count falls below the
+32 MiB floor, so every query would clamp to the floor permanently and
+`prefer_hash_join` would never re-enable — and because a flat cap at this slot
+count would overcommit badly enough to require the killer we decline to build.
+
+**Memory admission is a stability mechanism, not a latency mechanism.** Apache
+Pinot reaches sub-second queries at petabyte scale with essentially no memory
+management in its default configuration: a no-op thread accountant, heap
+throttling off, query killing off, no per-query memory budget at admission
+anywhere in its source, and no spill path at all. It controls load purely on
+threads. That is the honest calibration for this whole subsystem — latency is won
+in partition pruning, vectorization, and I/O, and this machinery exists so a node
+degrades gracefully instead of failing under concurrency. Size its complexity
+accordingly.
+
+**Why this replaced the previous design.** One constant served as both the
+reservation debited at admission and the argument to the DataFusion pool, which
+made node concurrency `budget / ceiling`. Raising the ceiling so one query could
+use more memory silently reduced how many queries the node would accept. On a
+3 GiB container a single Analytical distributed query reserved 1.25 GiB to scan a
+handful of 5 KiB Parquet files, so a node shed load at the lowest production rung
+and callers saw failed queries rather than backpressure.
+
+**Node concurrency** defaults to `oracle_budget / ORACLE_PARTITION_WORKING_MEMORY_BYTES`
+— how many admission units the budget holds — and is overridable per deployment
+via `WYRD_BIFROST_ORACLE_QUERY_SLOT_LIMIT`. The resolved value is logged once at
+startup. Core count deliberately does not clamp it. An earlier draft did clamp it
+to a multiple of effective CPU; measurement refuted that, and the measurement is
+the authority here. On the four-core R0 box a `cpu * 4` clamp resolved to 16
+units and still shed peer work, while the unclamped divisor resolved to 78 and
+completed the same workload with zero reservation refusals and zero read
+retries. A slot unit is an admission unit, not a thread, and intra-query
+parallelism is already bounded by `target_partitions`.
+
+**One counter serves both roles, pending evidence that it should not.** The
+resolved value sizes leader admission and the peer slot manager alike, even
+though a node is normally both at once — leading its own queries while serving
+fragments for queries other nodes lead. Splitting it was considered and rejected
+for now: R0's refusals appeared on the peer side, but that is equally predicted
+by a single ceiling set too low, since a leader admits before it asks peers and
+therefore wins the race whenever slots are scarce. The unclamped default clears
+those refusals entirely, leaving no failure for a split to fix. The discriminating
+experiment, if the question returns, is to hold total slots constant and split
+them; adopt two counters only if that beats one. Note that Pinot's runner/worker
+thread pools are *not* precedent for this — they divide coordination from
+execution within a single node, and Pinot's actual query leader is a separate
+broker process.
+
+**The grant sizes the whole session, not just the pool.** One
+`OracleSessionShape` derives `target_partitions`, `batch_size`, and
+`prefer_hash_join` from the same grant, at one site, so a query cannot end up
+with a partition count sized for one ceiling and a batch size sized for another.
+DataFusion's own tuning guidance is to reduce `target_partitions` and
+`batch_size` together for memory-limited queries.
+
+`prefer_hash_join = false` on floor grants is **not** an optimization. Verified in
+the pinned dependency, `HashJoinExec` cannot spill: it holds five `try_grow`
+reservations and no spill calls, and returns resource exhaustion when its
+reservation cannot grow. `SortMergeJoinExec` and the non-grouped aggregate are
+likewise unspillable; `SortExec` and the grouped hash aggregate do spill and
+complete. Shrinking a ceiling under concurrency is therefore only safe *because*
+a small grant also routes the plan away from an operator that would hard-fail
+rather than spill; without it, the dynamic grant would convert a clean refusal
+into a failed query. For the same reason the grant is never recomputed
+mid-flight — shrinking a pool underneath a running operator is exactly how a
+non-spillable consumer hard-fails.
+
+**Deviation from DataFusion's shared-pool guidance.** DataFusion recommends one
+shared pool across concurrent queries; Wyrd grants each query its own bounded
+redacted
+stylistic. In `FairSpillPool`, fairness covers only spillable reservations, which
+receive `(pool_size - unspillable) / num_spillable`; unspillable reservations are
+served first-come-first-served off the top with no protection, and the spillable
+count spans every registered consumer pool-wide regardless of which query owns
+it. So in a shared pool one query's hash join — unspillable — shrinks the fair
+share of every other query, and the resulting `ResourcesExhausted` surfaces on
+whichever *other* query next tries to grow. The failure lands on the innocent
+query and names the wrong consumer. Per-query pools scope the failure boundary to
+the query that caused it. The cost is real and accepted: an idle query's headroom
+cannot be lent to a busy one.
+
+Note that the isolation at stake here is noisy-neighbor *performance* isolation,
+not data isolation. A shared pool never leaks tenant data; it leaks latency.
+
+**Per-tenant fairness is not part of sizing.** It is owned by `OracleAdmission`
+(per-tenant FIFO plus weighted round-robin over the durable queue). The grant
+formula is deliberately tenant-blind; duplicating fairness in the sizing rule
+would put two independent mechanisms in charge of the same outcome. Most engines
+isolate at tenant or workload-group granularity rather than per query — Trino
+resource groups, Doris workload groups, Pinot's primary/secondary split — so
+Wyrd's per-query pool sits at the strict-isolation end of that spectrum by
+choice.
+
+Scratch is not sized this way. It remains reserved at the grant cap per slot
+unit, because scratch is genuinely consumed disk rather than a ceiling: a query
+that spills must have reserved the space it spills into.
+
+**Grants are not sized from observed history, and deliberately so.** Learned
+per-shape memory sizing (SQL Server's memory grant feedback, Redshift Auto WLM)
+was evaluated and rejected. Both precedents exist because in those systems a
+grant is a true *reservation* — SQL Server queues a query on `RESOURCE_SEMAPHORE`
+until its grant can be satisfied, so an oversized grant literally blocks other
+queries from starting, which is what Microsoft means by "inhibits parallelism."
+Wyrd's ceiling reserves nothing and blocks nobody, so over-granting is already
+free and the causal chain that makes the feature valuable is severed. The
+remaining failure mode is under-granting, and there the formula works against a
+fix: it shrinks the ceiling precisely when the node is busy and has no spare
+memory to give. No open-source OLAP engine surveyed does learned per-shape
+sizing. Per-query peak usage is instead emitted as telemetry, so the question can
+be reopened against measurements rather than analogy.
+
 `Source` is the external read side ("Wyrd reads, never writes" — Doctrine #7).
 **Bifrost** is its Wyrd-owned counterpart: the public OLAP warehouse surface and
 analytical storage substrate `vala` uses to record Wyrd's **own** observations

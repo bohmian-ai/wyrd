@@ -120,10 +120,17 @@ pub async fn authenticate<R: PermissionResolver + 'static, I: IssuerConfigResolv
 
 /// Verifies owned metadata with an owned verifier for `Send` transport futures.
 ///
+/// Verification is awaited inline rather than on a spawned task. The owned
+/// `Arc` verifier and owned token already satisfy the `Send` bound every
+/// transport handler needs, so a task would add only a scheduler hop and a
+/// detach: a cancelled request would leave verification running with nothing
+/// observing its result.
+///
 /// # Errors
 ///
-/// Returns [`IngestError::Unauthenticated`] when metadata or token
-/// verification fails, including a verifier task that cannot complete.
+/// Returns [`IngestError::Unauthenticated`] when bearer metadata is missing or
+/// malformed, when the tenant cannot be read from the unverified token, or when
+/// the verifier rejects the token.
 pub async fn authenticate_owned<
     R: PermissionResolver + 'static,
     I: IssuerConfigResolver + 'static,
@@ -133,11 +140,10 @@ pub async fn authenticate_owned<
 ) -> Result<AuthContext, IngestError> {
     let token = extract_bearer(&metadata)?;
     let expected_tenant = tenant_from_unverified_access_token(token.expose_secret())?;
-    let verified_token =
-        tokio::spawn(async move { verifier.verify(&token, &expected_tenant).await })
-            .await
-            .map_err(|_| IngestError::Unauthenticated("token verification task failed".to_owned()))?
-            .map_err(|error| IngestError::Unauthenticated(error.to_string()))?;
+    let verified_token = verifier
+        .verify(&token, &expected_tenant)
+        .await
+        .map_err(|error| IngestError::Unauthenticated(error.to_string()))?;
     let request_id = read_or_mint_request_id(&metadata);
     Ok(AuthContext {
         principal: verified_token.principal.clone(),

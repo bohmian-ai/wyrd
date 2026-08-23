@@ -142,6 +142,15 @@ message WorkerAttemptFrame { oneof frame { bytes arrow_ipc_schema = 1; bytes arr
 message WorkerFooter {
   string fragment_id = 1; string manifest_digest = 2; uint64 row_count = 3;
   uint64 encoded_bytes = 4; string payload_digest = 5; bool completed = 6;
+  // Physical scan evidence the leader aggregates across the participant cut.
+  // Distinct from `encoded_bytes`, which is Arrow transport size.
+  WorkerScanStats scan_stats = 7;
+}
+message WorkerScanStats {
+  // Absent when the follower's sources report no physical IO; absent is not
+  // the same as zero, so the leader must not substitute one for the other.
+  optional uint64 bytes_scanned = 1;
+  uint64 files_scanned = 2; uint64 partitions_scanned = 3;
 }
 
 message InsertBatchRequest {

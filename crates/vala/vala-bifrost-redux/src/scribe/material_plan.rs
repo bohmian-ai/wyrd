@@ -1742,7 +1742,7 @@ mod tests {
 
     /// Encodes a nullable array, then marks its IPC field nonnullable in place.
     ///
-    /// The mutation retains otherwise canonical FlatBuffer structure while
+    /// The mutation retains otherwise canonical `FlatBuffer` structure while
     /// creating the contradictory field-node null count rejected by preflight.
     ///
     /// # Panics
@@ -1900,7 +1900,7 @@ mod tests {
                 .and_then(|value| value.nodes())
                 .map(|value| value.get(0))
                 .expect("field node");
-            (node as *const arrow::ipc::FieldNode as usize)
+            (std::ptr::from_ref::<arrow::ipc::FieldNode>(node) as usize)
                 .checked_sub(metadata.as_ptr() as usize)
                 .expect("node belongs to metadata")
                 + 8
@@ -1947,7 +1947,7 @@ mod tests {
         ));
     }
 
-    /// Nested KeyValue entries consume the same cardinality budget as top-level attributes.
+    /// Nested `KeyValue` entries consume the same cardinality budget as top-level attributes.
     #[test]
     fn otlp_count_pass_rejects_nested_attribute_cap_plus_one() {
         let value = AnyValue {
@@ -1962,7 +1962,7 @@ mod tests {
         ));
     }
 
-    /// AnyValue admission charges raw retained string and byte values exactly once.
+    /// `AnyValue` admission charges raw retained string and byte values exactly once.
     #[test]
     fn otlp_count_pass_uses_exact_raw_any_value_bytes() {
         let value = AnyValue {

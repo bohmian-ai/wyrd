@@ -149,7 +149,7 @@ fn restarted_scribe(config: RestartedScribeConfig) -> Arc<ScribeImpl> {
         ingest_limits: vala_bifrost_redux::gate::limits::IngestLimits::default(),
         wal_rotation_bytes: 512 * 1024 * 1024,
         memtable_rotation_bytes: 512 * 1024 * 1024,
-        memtable_max_age: Duration::from_secs(600),
+        memtable_max_age: Duration::from_mins(10),
         staging_file_publisher: Some(config.publisher),
     }))
 }
@@ -180,6 +180,88 @@ fn persistence_test_roles(memory_limit_bytes: usize) -> BifrostRoleResources {
     .expect("test Bifrost runtime resources")
     .compose_roles()
     .expect("test Bifrost role resources")
+}
+
+/// Opens a local-warehouse catalog and registers every replay table in it.
+///
+/// The warehouse directory is returned rather than dropped because the catalog's
+/// data lives under it for the lifetime of the fixture; dropping it early would
+/// delete the tables the restart is supposed to find. The catalog itself is not
+/// returned — registration is its only purpose here, and the restarted Scribe
+/// re-opens the catalog from the same DSN.
+///
+/// # Panics
+///
+/// Panics if the warehouse directory or catalog cannot be created, or if table
+/// registration fails.
+async fn open_replay_catalog<T: AsRef<str>>(
+    database: &PgFixture,
+    table_names: &[T],
+    tenant: DataTenantId,
+) -> tempfile::TempDir {
+    let warehouse = tempfile::tempdir().expect("warehouse");
+    let catalog = BifrostCatalog::new(
+        database.catalog_dsn().expose_secret(),
+        &BackendConfig::Local {
+            root: warehouse.path().to_path_buf(),
+        },
+        database.vala_postgres().clone(),
+    )
+    .await
+    .expect("Redux catalog");
+    register_replay_tables(&catalog, table_names, tenant).await;
+    warehouse
+}
+
+/// The admission ceiling every replay-restart fixture shares.
+///
+/// Replay must be bounded by the role resource graph under test, not by
+/// admission, so these limits sit far above any generation the suite seeds.
+fn persistence_admission_config() -> vala_bifrost_redux::scribe::admission::AdmissionConfig {
+    vala_bifrost_redux::scribe::admission::AdmissionConfig {
+        memory_limit_bytes: 4 * 1024 * 1024 * 1024,
+        scribe_memory_limit_bytes: Some(8 * 1024 * 1024 * 1024),
+        event_time_window: vala_bifrost_redux::scribe::admission::EventTimeWindow::default(),
+    }
+}
+
+/// Opens the post-restart WAL writer at fencing epoch 2.
+///
+/// The epoch must advance past the pre-restart writer so replay observes a
+/// genuine restart boundary rather than reopening the same generation.
+///
+/// # Panics
+/// Panics when the WAL directory cannot be opened at epoch 2.
+fn restarted_wal_writer(wal_root: &std::path::Path, node_id: uuid::Uuid) -> Arc<WalWriter> {
+    Arc::new(
+        WalWriter::new(wal_root, *node_id.as_bytes(), 2, WalConfig::default())
+            .expect("restarted WAL writer"),
+    )
+}
+
+/// One WAL-restart replay scenario driven by [`PersistenceFixture`].
+///
+/// Replay behaviour is a product of eight independent knobs — injected write
+/// failure, table set, generation count, per-object delays, the role resource
+/// ceiling, WAL worker count, generation size, and segment size. Naming them
+/// keeps each call site readable about which axis it is actually varying.
+struct ReplayRestartSpec<'a> {
+    /// Inject a replay write failure to exercise the refusal path.
+    fail_replay_write: bool,
+    /// Logical tables registered in the replay catalog.
+    table_names: &'a [&'a str],
+    /// Number of generations seeded into the WAL before restart.
+    generations: i64,
+    /// Per-object write delays applied in order during replay.
+    object_write_delays: &'a [Duration],
+    /// Root-derived role resources bounding replay memory.
+    memory: BifrostRoleResources,
+    /// WAL worker threads available to replay.
+    wal_io_threads: usize,
+    /// Rows written per seeded generation.
+    rows_per_generation: usize,
+    /// Optional WAL segment ceiling; `None` keeps the default.
+    wal_segment_bytes: Option<u64>,
 }
 
 impl PersistenceFixture {
@@ -279,7 +361,7 @@ impl PersistenceFixture {
             ingest_limits: vala_bifrost_redux::gate::limits::IngestLimits::default(),
             wal_rotation_bytes: 512 * 1024 * 1024,
             memtable_rotation_bytes: 512 * 1024 * 1024,
-            memtable_max_age: Duration::from_secs(600),
+            memtable_max_age: Duration::from_mins(10),
             staging_file_publisher: Some(staging_file_publisher),
         }));
         scribe.replay_wal_async().await.expect("empty WAL replay");
@@ -307,20 +389,20 @@ impl PersistenceFixture {
     }
 
     async fn start_after_wal_restart(fail_replay_write: bool) -> Self {
-        Self::start_after_wal_restart_with_keys(
+        Self::start_after_wal_restart_with_keys(ReplayRestartSpec {
             fail_replay_write,
-            &["restart_publish_events"],
-            3,
-            &[
+            table_names: &["restart_publish_events"],
+            generations: 3,
+            object_write_delays: &[
                 Duration::from_millis(300),
                 Duration::from_millis(1),
                 Duration::from_millis(1),
             ],
-            persistence_test_roles(9 * 1024 * 1024 * 1024),
-            2,
-            50_000,
-            None,
-        )
+            memory: persistence_test_roles(9 * 1024 * 1024 * 1024),
+            wal_io_threads: 2,
+            rows_per_generation: 50_000,
+            wal_segment_bytes: None,
+        })
         .await
         .expect("replay")
     }
@@ -331,16 +413,19 @@ impl PersistenceFixture {
     ///
     /// Returns [`ScribeError`] when replay seeding, Scribe construction,
     /// recovery, table registration, or configured persistence setup fails.
-    async fn start_after_wal_restart_with_keys<T: AsRef<str>>(
-        fail_replay_write: bool,
-        table_names: &[T],
-        generations: i64,
-        object_write_delays: &[Duration],
-        memory: BifrostRoleResources,
-        wal_io_threads: usize,
-        rows_per_generation: usize,
-        wal_segment_bytes: Option<u64>,
+    async fn start_after_wal_restart_with_keys(
+        spec: ReplayRestartSpec<'_>,
     ) -> Result<Self, ScribeError> {
+        let ReplayRestartSpec {
+            fail_replay_write,
+            table_names,
+            generations,
+            object_write_delays,
+            memory,
+            wal_io_threads,
+            rows_per_generation,
+            wal_segment_bytes,
+        } = spec;
         let database = PgFixture::start().await.expect("Postgres fixture");
         let tenant = database.data_tenant_id();
         let operator = Arc::new(
@@ -348,17 +433,7 @@ impl PersistenceFixture {
                 .expect("memory operator")
                 .finish(),
         );
-        let warehouse = tempfile::tempdir().expect("warehouse");
-        let catalog = BifrostCatalog::new(
-            database.catalog_dsn().expose_secret(),
-            &BackendConfig::Local {
-                root: warehouse.path().to_path_buf(),
-            },
-            database.vala_postgres().clone(),
-        )
-        .await
-        .expect("Redux catalog");
-        register_replay_tables(&catalog, table_names, tenant).await;
+        let warehouse = open_replay_catalog(&database, table_names, tenant).await;
         let wal_root = tempfile::tempdir().expect("WAL directory");
         let scratch_root = tempfile::tempdir().expect("scratch directory");
         let resources = compose_persistence_resources(&memory, &wal_root, &scratch_root);
@@ -381,11 +456,7 @@ impl PersistenceFixture {
             )
             .expect("WAL writer"),
         );
-        let admission = vala_bifrost_redux::scribe::admission::AdmissionConfig {
-            memory_limit_bytes: 4 * 1024 * 1024 * 1024,
-            scribe_memory_limit_bytes: Some(8 * 1024 * 1024 * 1024),
-            event_time_window: vala_bifrost_redux::scribe::admission::EventTimeWindow::default(),
-        };
+        let admission = persistence_admission_config();
         let first = first_replay_scribe(operator.clone(), wal.clone(), node_id, admission, &memory);
         first.replay_wal_async().await.expect("empty WAL replay");
         let replay_decoded_bytes =
@@ -407,15 +478,7 @@ impl PersistenceFixture {
                 .with_operator_pool(database.operator_pool().clone())
                 .with_output_scratch(output_scratch)
                 .with_test_faults(faults.clone());
-        let wal = Arc::new(
-            WalWriter::new(
-                wal_root.path(),
-                *node_id.as_bytes(),
-                2,
-                WalConfig::default(),
-            )
-            .expect("restarted WAL writer"),
-        );
+        let wal = restarted_wal_writer(wal_root.path(), node_id);
         let scribe = restarted_scribe(RestartedScribeConfig {
             operator: Arc::clone(&operator),
             wal,
@@ -507,7 +570,7 @@ fn first_replay_scribe(
         ingest_limits: vala_bifrost_redux::gate::limits::IngestLimits::default(),
         wal_rotation_bytes: 512 * 1024 * 1024,
         memtable_rotation_bytes: 512 * 1024 * 1024,
-        memtable_max_age: Duration::from_secs(600),
+        memtable_max_age: Duration::from_mins(10),
         staging_file_publisher: None,
     }))
 }
@@ -1438,6 +1501,63 @@ async fn sql_failure_keeps_wal_and_file_list_unchanged() {
     fixture.stop().await;
 }
 
+/// Restarts the fixture's Scribe at the next epoch and replays its WAL.
+///
+/// The stream fence is advanced first so the replacement writer is the only
+/// authorized owner of the WAL — a replacement that replayed under the old
+/// epoch would race the writer it replaced. Fresh fault and hint channels are
+/// installed on the fixture so post-restart assertions observe only the
+/// replacement's behavior, never residue from the first owner.
+///
+/// # Panics
+///
+/// Panics if the fence cannot be registered, the replacement WAL writer or
+/// Scribe resources cannot be created, or replay fails.
+async fn restart_fixture_scribe_and_replay(fixture: &mut PersistenceFixture) {
+    let node_id = fixture.node_id;
+    PersistenceFixture::register_scribe_fence(&fixture.database, node_id, 2).await;
+    let wal = Arc::new(
+        WalWriter::new(
+            fixture.wal_root.path(),
+            *node_id.as_bytes(),
+            2,
+            WalConfig::default(),
+        )
+        .expect("replacement WAL writer"),
+    );
+    let scribe_resources = fixture
+        .memory
+        .scribe()
+        .expect("replacement Scribe resources");
+    let (_, output_scratch) = scribe_resources
+        .volume_capabilities()
+        .expect("replacement output scratch");
+    let replacement_faults = PersistenceFaults::default();
+    let (publisher, hint_inbox) = staging_file_channel(16).expect("replacement hints");
+    let persistence =
+        ScribePersistenceConfig::new(Arc::new(fixture.database.vala_postgres().clone()), 16, 2)
+            .with_operator_pool(fixture.database.operator_pool().clone())
+            .with_output_scratch(output_scratch)
+            .with_test_faults(replacement_faults.clone());
+    fixture.scribe = restarted_scribe(RestartedScribeConfig {
+        operator: Arc::clone(&fixture.operator),
+        wal,
+        node_id,
+        admission: vala_bifrost_redux::scribe::admission::AdmissionConfig::default(),
+        persistence,
+        resources: scribe_resources,
+        publisher,
+        wal_io_threads: 2,
+    });
+    fixture.faults = replacement_faults;
+    fixture.hint_inbox = hint_inbox;
+    fixture
+        .scribe
+        .replay_wal_async()
+        .await
+        .expect("replacement staged publication recovery");
+}
+
 /// Proves the durable stage survives competing creators, catalog failure, and restart.
 #[tokio::test]
 async fn pg_staged_publication_race_preserves_published_remote_bytes() {
@@ -1484,48 +1604,7 @@ async fn pg_staged_publication_race_preserves_published_remote_bytes() {
     );
 
     fixture.scribe.shutdown(Instant::now()).await;
-    let node_id = fixture.node_id;
-    PersistenceFixture::register_scribe_fence(&fixture.database, node_id, 2).await;
-    let wal = Arc::new(
-        WalWriter::new(
-            fixture.wal_root.path(),
-            *node_id.as_bytes(),
-            2,
-            WalConfig::default(),
-        )
-        .expect("replacement WAL writer"),
-    );
-    let scribe_resources = fixture
-        .memory
-        .scribe()
-        .expect("replacement Scribe resources");
-    let (_, output_scratch) = scribe_resources
-        .volume_capabilities()
-        .expect("replacement output scratch");
-    let replacement_faults = PersistenceFaults::default();
-    let (publisher, hint_inbox) = staging_file_channel(16).expect("replacement hints");
-    let persistence =
-        ScribePersistenceConfig::new(Arc::new(fixture.database.vala_postgres().clone()), 16, 2)
-            .with_operator_pool(fixture.database.operator_pool().clone())
-            .with_output_scratch(output_scratch)
-            .with_test_faults(replacement_faults.clone());
-    fixture.scribe = restarted_scribe(RestartedScribeConfig {
-        operator: Arc::clone(&fixture.operator),
-        wal,
-        node_id,
-        admission: vala_bifrost_redux::scribe::admission::AdmissionConfig::default(),
-        persistence,
-        resources: scribe_resources,
-        publisher,
-        wal_io_threads: 2,
-    });
-    fixture.faults = replacement_faults;
-    fixture.hint_inbox = hint_inbox;
-    fixture
-        .scribe
-        .replay_wal_async()
-        .await
-        .expect("replacement staged publication recovery");
+    restart_fixture_scribe_and_replay(&mut fixture).await;
 
     let published = rows_for_table(&fixture, table).await;
     assert_eq!(published.len(), 1, "restart publishes one file-list row");
@@ -1542,7 +1621,7 @@ async fn pg_staged_publication_race_preserves_published_remote_bytes() {
     );
     let staged_root = fixture.wal_root.path().join("staged");
     let remaining = std::fs::read_dir(staged_root)
-        .map(|entries| entries.count())
+        .map(std::iter::Iterator::count)
         .unwrap_or_default();
     assert_eq!(
         remaining, 0,
@@ -2019,20 +2098,20 @@ async fn wal_replay_preserves_row_identity() {
 
 #[tokio::test]
 async fn replayed_generation_failure_keeps_replacement_unready() {
-    let error = match PersistenceFixture::start_after_wal_restart_with_keys(
-        true,
-        &["restart_publish_events"],
-        3,
-        &[
+    let error = match PersistenceFixture::start_after_wal_restart_with_keys(ReplayRestartSpec {
+        fail_replay_write: true,
+        table_names: &["restart_publish_events"],
+        generations: 3,
+        object_write_delays: &[
             Duration::from_millis(300),
             Duration::from_millis(1),
             Duration::from_millis(1),
         ],
-        persistence_test_roles(9 * 1024 * 1024 * 1024),
-        2,
-        25_000,
-        None,
-    )
+        memory: persistence_test_roles(9 * 1024 * 1024 * 1024),
+        wal_io_threads: 2,
+        rows_per_generation: 25_000,
+        wal_segment_bytes: None,
+    })
     .await
     {
         Ok(fixture) => {
@@ -2060,16 +2139,16 @@ async fn pg_writer_produced_large_record_replays_and_publishes_exactly_once() {
     let baseline = memory.snapshot().expect("baseline root snapshot");
     assert_eq!(baseline.plan.scribe_floor_bytes, 256 * 1024 * 1024);
     assert_eq!(baseline.plan.elastic_memory_bytes, 0);
-    let fixture = PersistenceFixture::start_after_wal_restart_with_keys(
-        false,
-        &["exact_floor_replay"],
-        1,
-        &[Duration::from_millis(1)],
+    let fixture = PersistenceFixture::start_after_wal_restart_with_keys(ReplayRestartSpec {
+        fail_replay_write: false,
+        table_names: &["exact_floor_replay"],
+        generations: 1,
+        object_write_delays: &[Duration::from_millis(1)],
         memory,
-        1,
-        10_000,
-        None,
-    )
+        wal_io_threads: 1,
+        rows_per_generation: 10_000,
+        wal_segment_bytes: None,
+    })
     .await
     .expect("exact-floor replay");
     assert!(fixture.scribe.is_ready());
@@ -2122,16 +2201,17 @@ async fn replay_total_above_ceiling_is_bounded_by_persistence_retirement() {
     let tables = (1..=table_count)
         .map(|index| format!("bounded_replay_{index}"))
         .collect::<Vec<_>>();
-    let fixture = PersistenceFixture::start_after_wal_restart_with_keys(
-        false,
-        &tables,
-        1,
-        &[Duration::from_millis(1)],
+    let tables = tables.iter().map(String::as_str).collect::<Vec<_>>();
+    let fixture = PersistenceFixture::start_after_wal_restart_with_keys(ReplayRestartSpec {
+        fail_replay_write: false,
+        table_names: &tables,
+        generations: 1,
+        object_write_delays: &[Duration::from_millis(1)],
         memory,
-        1,
+        wal_io_threads: 1,
         rows_per_generation,
-        Some(16 * 1024 * 1024),
-    )
+        wal_segment_bytes: Some(16 * 1024 * 1024),
+    })
     .await
     .expect("bounded replay completes with one WAL worker");
     assert!(
@@ -2171,16 +2251,16 @@ async fn replay_indivisible_generation_over_ceiling_stays_unready() {
         .checked_add(baseline.plan.elastic_memory_bytes)
         .expect("test Scribe ceiling fits usize");
     let oversized_rows = replay_rows_exceeding(replay_ceiling, DataTenantId::SYSTEM_OWNER);
-    let error = match PersistenceFixture::start_after_wal_restart_with_keys(
-        false,
-        &["oversized_replay"],
-        1,
-        &[Duration::from_millis(1)],
-        memory.clone(),
-        1,
-        oversized_rows,
-        None,
-    )
+    let error = match PersistenceFixture::start_after_wal_restart_with_keys(ReplayRestartSpec {
+        fail_replay_write: false,
+        table_names: &["oversized_replay"],
+        generations: 1,
+        object_write_delays: &[Duration::from_millis(1)],
+        memory: memory.clone(),
+        wal_io_threads: 1,
+        rows_per_generation: oversized_rows,
+        wal_segment_bytes: None,
+    })
     .await
     {
         Ok(fixture) => {
@@ -2232,16 +2312,16 @@ async fn replay_indivisible_generation_over_ceiling_stays_unready() {
 /// visible exactly once.
 #[tokio::test]
 async fn replayed_distinct_keys_publish_in_replay_order_and_fifo() {
-    let fixture = PersistenceFixture::start_after_wal_restart_with_keys(
-        false,
-        &["restart_key_a", "restart_key_b"],
-        2,
-        &[Duration::from_millis(100)],
-        persistence_test_roles(9 * 1024 * 1024 * 1024),
-        2,
-        50_000,
-        None,
-    )
+    let fixture = PersistenceFixture::start_after_wal_restart_with_keys(ReplayRestartSpec {
+        fail_replay_write: false,
+        table_names: &["restart_key_a", "restart_key_b"],
+        generations: 2,
+        object_write_delays: &[Duration::from_millis(100)],
+        memory: persistence_test_roles(9 * 1024 * 1024 * 1024),
+        wal_io_threads: 2,
+        rows_per_generation: 50_000,
+        wal_segment_bytes: None,
+    })
     .await
     .expect("replay");
     let deadline = Instant::now() + Duration::from_secs(20);

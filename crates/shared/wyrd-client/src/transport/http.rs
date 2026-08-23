@@ -787,8 +787,11 @@ mod tls_tests {
     /// Reqwest builds an HTTPS request before any tonic/server initialization.
     #[test]
     fn https_client_initializes_provider_standalone() {
-        let client = super::build_http_client(&crate::transport::config::HttpConfig::default())
-            .expect("standalone HTTPS client builds");
+        let client = super::build_http_client(
+            &crate::transport::config::HttpConfig::default(),
+            super::HttpClientDeadline::Total,
+        )
+        .expect("standalone HTTPS client builds");
         client
             .get("https://localhost/health")
             .build()

@@ -204,9 +204,16 @@ pub(crate) async fn sync_query(
     caller: Caller,
     Json(body): Json<BifrostQueryRequest>,
 ) -> Response {
+    let lifecycle = crate::app::metrics::GateRequestLifecycle::begin("query");
     let result = match service::stream_query(state.clone(), caller, body).await {
-        Ok(result) => result,
-        Err(error) => return query_error_response(error),
+        Ok(result) => {
+            lifecycle.complete("success");
+            result
+        }
+        Err(error) => {
+            lifecycle.complete("failed");
+            return query_error_response(error);
+        }
     };
     #[cfg(feature = "test-support")]
     let fault = state

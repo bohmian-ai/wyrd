@@ -1747,6 +1747,87 @@ impl ForgeRewritePipeline {
         state.complete()
     }
 
+    /// Encodes one physical output file for the in-flight rewrite.
+    ///
+    /// The footer phase is entered only when this call opens a new writer, so a
+    /// rewrite holds at most one footer admission per output file rather than
+    /// per batch slice. The state owning the real memory reservation is detached
+    /// and moved into the blocking encoder, then moved back, so the reservation
+    /// travels with the encoder instead of being held across the blocking call
+    /// by an async task. Both cancellation checks run before the detached state
+    /// is committed to the encoder, so a shutdown cannot strand a half-written
+    /// output.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Shutdown`] when cancellation wins either admission
+    /// race, [`ForgeError::Invariant`] when the blocking permit pool is closed
+    /// or the encoding task panics, and propagates the encoder's own error —
+    /// including [`ForgeError::EncodedRowGroupOverflow`], which the caller
+    /// bisects rather than treating as fatal.
+    async fn encode_physical_output(
+        &self,
+        state: &mut RewriteBatchState,
+        output_batch: RecordBatch,
+        output_groups: Vec<crate::parquet::memory::BoundedRowSlice>,
+        request: &RewriteRequest<'_>,
+        stop: &CancellationToken,
+    ) -> Result<(), ForgeError> {
+        let footer_phase = if state.writer.is_none() {
+            Some(tokio::select! {
+                () = stop.cancelled() => return Err(ForgeError::Shutdown),
+                phase = self.runtime().footer_phase.enter_execution() => phase?,
+            })
+        } else {
+            None
+        };
+        // Detach the state owning the real reservation while the bounded
+        // blocking encoder writes this physical output.
+        let mut detached = std::mem::replace(
+            state,
+            RewriteBatchState::with_reservation(
+                None,
+                None,
+                self.runtime().scratch_path().to_path_buf(),
+            ),
+        );
+        let schema = Arc::clone(&request.schema);
+        let iceberg_schema = Arc::clone(&request.iceberg_schema);
+        let permit = tokio::select! {
+            () = stop.cancelled() => return Err(ForgeError::Shutdown),
+            permit = self.blocking_permits.clone().acquire_owned() => permit.map_err(|error| ForgeError::Invariant {
+                detail: format!("Forge blocking permit closed: {error}"),
+            })?,
+        };
+        let encoder_flush_bytes = self.runtime().encoder_flush_bytes;
+        let object_identity = deterministic_output_path(
+            &request.binding.object_prefix,
+            request.attempt_generation,
+            detached.files.len(),
+        );
+        if let Some(footer_phase) = footer_phase {
+            detached.footer_phase = Some(footer_phase);
+        }
+        let join = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let result = detached.write_batch(
+                &schema,
+                &iceberg_schema,
+                &output_batch,
+                &output_groups,
+                &object_identity,
+                encoder_flush_bytes,
+            );
+            (detached, result)
+        });
+        let (returned, result) = join.await.map_err(|error| ForgeError::Invariant {
+            detail: format!("Forge output encoding task failed: {error}"),
+        })?;
+        *state = returned;
+        result?;
+        Ok(())
+    }
+
     /// Account for, rotate before, and encode one non-empty sorted batch.
     ///
     /// # Errors
@@ -1793,58 +1874,8 @@ impl ForgeRewritePipeline {
             }
             let (output_batch, output_groups) = physical_output_batch(batch, &group)?;
             let output_rows = u64::try_from(output_batch.num_rows()).unwrap_or(u64::MAX);
-            let footer_phase = if state.writer.is_none() {
-                Some(tokio::select! {
-                    () = stop.cancelled() => return Err(ForgeError::Shutdown),
-                    phase = self.runtime().footer_phase.enter_execution() => phase?,
-                })
-            } else {
-                None
-            };
-            // Detach the state owning the real reservation while the bounded
-            // blocking encoder writes this physical output.
-            let mut detached = std::mem::replace(
-                state,
-                RewriteBatchState::with_reservation(
-                    None,
-                    None,
-                    self.runtime().scratch_path().to_path_buf(),
-                ),
-            );
-            let schema = Arc::clone(&request.schema);
-            let iceberg_schema = Arc::clone(&request.iceberg_schema);
-            let permit = tokio::select! {
-                () = stop.cancelled() => return Err(ForgeError::Shutdown),
-                permit = self.blocking_permits.clone().acquire_owned() => permit.map_err(|error| ForgeError::Invariant {
-                    detail: format!("Forge blocking permit closed: {error}"),
-                })?,
-            };
-            let encoder_flush_bytes = self.runtime().encoder_flush_bytes;
-            let object_identity = deterministic_output_path(
-                &request.binding.object_prefix,
-                request.attempt_generation,
-                detached.files.len(),
-            );
-            if let Some(footer_phase) = footer_phase {
-                detached.footer_phase = Some(footer_phase);
-            }
-            let join = tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                let result = detached.write_batch(
-                    &schema,
-                    &iceberg_schema,
-                    &output_batch,
-                    &output_groups,
-                    &object_identity,
-                    encoder_flush_bytes,
-                );
-                (detached, result)
-            });
-            let (returned, result) = join.await.map_err(|error| ForgeError::Invariant {
-                detail: format!("Forge output encoding task failed: {error}"),
-            })?;
-            *state = returned;
-            result?;
+            self.encode_physical_output(state, output_batch, output_groups, request, stop)
+                .await?;
             state.observe_spill(self.runtime().runtime.spilling_progress().current_bytes);
             if state.should_rotate(request.target_file_size_bytes) {
                 let rotation = self
@@ -1951,12 +1982,8 @@ impl ForgeRewritePipeline {
             output_rows,
             peak_spill_bytes,
         } = batch;
-        if let Err(error) = self.await_spill_cleanup().await {
-            return Err(error);
-        }
-        if let Err(error) = result {
-            return Err(error);
-        }
+        self.await_spill_cleanup().await?;
+        result?;
         let final_spill = self.runtime().runtime.spilling_progress();
         if final_spill.active_files_count != 0 {
             return Err(ForgeError::Invariant {

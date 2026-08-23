@@ -2108,7 +2108,6 @@ mod tests {
             &Status {
                 message: "retained".to_owned(),
                 code: status::StatusCode::Error as i32,
-                ..Status::default()
             },
         );
         let expected_span = Span::decode(span_wire.as_slice()).expect("prost must decode status");

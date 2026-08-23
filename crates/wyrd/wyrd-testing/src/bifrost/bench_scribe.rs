@@ -989,7 +989,10 @@ async fn measure_public_components(
         .ok_or("missing benchmark server")?;
     let table_name = "bifrost_component_events";
     let table = TableRef::new(BifrostNamespace::Bifrost, table_name);
-    let catalog = server.state().bifrost_catalog();
+    let catalog = server
+        .state()
+        .bifrost_catalog()
+        .expect("benchmark server exposes its Bifrost catalog");
     catalog
         .create_table(vala_bifrost_redux::catalog::CreateTableRequest {
             table,

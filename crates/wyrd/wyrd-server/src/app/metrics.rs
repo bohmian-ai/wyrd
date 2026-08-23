@@ -287,7 +287,7 @@ pub fn install_recorder() -> Result<PrometheusHandle, MetricsError> {
             )
             .map_err(MetricsError::Buckets)?;
     }
-    builder
+    let handle = builder
         .set_buckets_for_metric(
             Matcher::Full(BIFROST_FORGE_TASK_SPILL_BYTES.to_owned()),
             FORGE_SPILL_BUCKETS,
@@ -299,7 +299,9 @@ pub fn install_recorder() -> Result<PrometheusHandle, MetricsError> {
         )
         .map_err(MetricsError::Buckets)?
         .install_recorder()
-        .map_err(MetricsError::Install)
+        .map_err(MetricsError::Install)?;
+    GateRequestLifecycle::register_closed_series();
+    Ok(handle)
 }
 
 /// Shared test-only Prometheus handle that installs the process recorder once.
@@ -314,6 +316,125 @@ pub(crate) fn test_prometheus_handle() -> PrometheusHandle {
     HANDLE
         .get_or_init(|| install_recorder().expect("test recorder installs exactly once"))
         .clone()
+}
+
+/// Owns exactly one terminal Gate request observation for one public request.
+///
+/// Every public Bifrost transport — the native gRPC query and ingest services
+/// and the HTTP `/v1/query` and ingest routes — begins this lifecycle at its
+/// handler entry point and settles it exactly once. A normal return calls
+/// [`GateRequestLifecycle::complete`]; a transport that drops the handler
+/// future in flight settles `cancelled` through [`Drop`]. The active-request
+/// gauge is drained on every terminal path, so an abandoned request cannot
+/// leave the gauge permanently elevated.
+///
+/// For a streaming response the terminal is recorded when the handler yields
+/// the admitted stream, not when the body finishes. Stream-lifetime outcomes
+/// belong to the separate `bifrost_gate_query_streams_total` owner, and both
+/// transports must agree on that split for the D24 ledger to reconcile.
+pub(crate) struct GateRequestLifecycle {
+    /// Closed D24 operation label shared by the counter and duration families.
+    operation: &'static str,
+    /// Monotonic request start used to derive the duration observation.
+    started: std::time::Instant,
+    /// Whether a normal return already recorded the terminal observation.
+    completed: bool,
+    /// Active-request gauge settled on every return or dropped future.
+    active: metrics::Gauge,
+}
+
+impl GateRequestLifecycle {
+    /// Closed D24 operation labels this owner may observe.
+    const OPERATIONS: [&'static str; 2] = ["query", "write"];
+    /// Closed D24 terminal outcomes this owner may observe.
+    const OUTCOMES: [&'static str; 4] = ["success", "rejected", "failed", "cancelled"];
+
+    /// Publishes every closed D24 series this owner can ever emit, at zero.
+    ///
+    /// A Prometheus counter only appears in a render once some handle has been
+    /// created for its exact label set, so a terminal that never occurred in a
+    /// window would otherwise leave a hole rather than a zero. Qualification
+    /// reads the family as a closed cross product, so the absent series and the
+    /// zero series must not be distinguishable. Called from
+    /// [`install_recorder`] immediately after the global recorder is live —
+    /// registering earlier would emit into the no-op recorder and be lost.
+    fn register_closed_series() {
+        metrics::describe_counter!(
+            "bifrost_gate_requests_total",
+            "Total Bifrost Gate requests by closed operation and terminal outcome."
+        );
+        metrics::describe_histogram!(
+            BIFROST_GATE_REQUEST_DURATION_SECONDS,
+            metrics::Unit::Seconds,
+            "Bifrost Gate request duration by closed operation and terminal outcome."
+        );
+        metrics::describe_gauge!(
+            "bifrost_gate_active_requests",
+            "Current in-flight Bifrost Gate requests by closed operation."
+        );
+        for operation in Self::OPERATIONS {
+            metrics::gauge!("bifrost_gate_active_requests", "operation" => operation).set(0.0);
+            for outcome in Self::OUTCOMES {
+                metrics::counter!(
+                    "bifrost_gate_requests_total",
+                    "operation" => operation,
+                    "outcome" => outcome
+                )
+                .increment(0);
+            }
+        }
+    }
+
+    /// Begins one request lifecycle at a public transport entry point.
+    ///
+    /// `operation` must be a closed D24 label (`"query"` or `"write"`);
+    /// admitting an open value would make the family unbounded.
+    pub(crate) fn begin(operation: &'static str) -> Self {
+        let active = metrics::gauge!("bifrost_gate_active_requests", "operation" => operation);
+        active.increment(1.0);
+        Self {
+            operation,
+            started: std::time::Instant::now(),
+            completed: false,
+            active,
+        }
+    }
+
+    /// Records the normal terminal outcome and disarms cancellation-on-drop.
+    ///
+    /// `outcome` must be a closed D24 label (`"success"`, `"rejected"`, or
+    /// `"failed"`); `"cancelled"` is owned by [`Drop`] alone so the two paths
+    /// can never both claim the same request.
+    pub(crate) fn complete(mut self, outcome: &'static str) {
+        self.record(outcome);
+        self.completed = true;
+    }
+
+    /// Emits the paired Gate request counter and duration observation.
+    fn record(&self, outcome: &'static str) {
+        metrics::counter!(
+            "bifrost_gate_requests_total",
+            "operation" => self.operation,
+            "outcome" => outcome
+        )
+        .increment(1);
+        metrics::histogram!(
+            BIFROST_GATE_REQUEST_DURATION_SECONDS,
+            "operation" => self.operation,
+            "outcome" => outcome
+        )
+        .record(self.started.elapsed().as_secs_f64());
+    }
+}
+
+impl Drop for GateRequestLifecycle {
+    /// Records `cancelled` when a transport drops the handler future in flight.
+    fn drop(&mut self) {
+        if !self.completed {
+            self.record("cancelled");
+        }
+        self.active.decrement(1.0);
+    }
 }
 
 /// Build the metrics router: `GET /metrics` renders the Prometheus snapshot.

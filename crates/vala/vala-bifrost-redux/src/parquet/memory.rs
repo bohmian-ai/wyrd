@@ -1237,33 +1237,72 @@ mod tests {
 
     /// Runs the exact helper test under the OS peak-resident-set observer.
     ///
+    /// Returns the child's peak resident set size in bytes. Both platforms report
+    /// the same underlying `getrusage` maximum-RSS figure, but through different
+    /// tools: GNU `time` writes one caller-selected field to a file and reports
+    /// KiB, while the BSD `time` shipped on macOS accepts neither `-f` nor `-o`
+    /// and prints a fixed table to stderr in bytes. Normalizing here keeps the
+    /// assertion in the caller expressed in bytes on every platform.
+    ///
     /// # Panics
     /// Panics when the platform timing tool, child test, or peak report fails.
     fn isolated_decoder_peak(path: &std::path::Path, mode: &str) -> usize {
-        let report = tempfile::NamedTempFile::new().expect("decoder peak report");
-        let output = std::process::Command::new("/usr/bin/time")
-            .args(["-f", "%M", "-o"])
-            .arg(report.path())
-            .arg(std::env::current_exe().expect("current test executable"))
-            .args([
-                "--exact",
-                "parquet::memory::tests::bifrost_standard_decoder_peak_child",
-            ])
-            .env(DECODER_PEAK_FILE_ENV, path)
-            .env(DECODER_PEAK_MODE_ENV, mode)
-            .output()
-            .expect("run isolated decoder peak child");
-        assert!(
-            output.status.success(),
-            "decoder peak child failed: {}",
+        let executable = std::env::current_exe().expect("current test executable");
+        let child_args = [
+            "--exact",
+            "parquet::memory::tests::bifrost_standard_decoder_peak_child",
+        ];
+
+        #[cfg(target_os = "linux")]
+        {
+            let report = tempfile::NamedTempFile::new().expect("decoder peak report");
+            let output = std::process::Command::new("/usr/bin/time")
+                .args(["-f", "%M", "-o"])
+                .arg(report.path())
+                .arg(&executable)
+                .args(child_args)
+                .env(DECODER_PEAK_FILE_ENV, path)
+                .env(DECODER_PEAK_MODE_ENV, mode)
+                .output()
+                .expect("run isolated decoder peak child");
+            assert!(
+                output.status.success(),
+                "decoder peak child failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let peak_kib = std::fs::read_to_string(report.path())
+                .expect("read decoder peak report")
+                .trim()
+                .parse::<usize>()
+                .expect("parse decoder peak KiB");
+            peak_kib.checked_mul(1024).expect("decoder peak bytes")
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let output = std::process::Command::new("/usr/bin/time")
+                .arg("-l")
+                .arg(&executable)
+                .args(child_args)
+                .env(DECODER_PEAK_FILE_ENV, path)
+                .env(DECODER_PEAK_MODE_ENV, mode)
+                .output()
+                .expect("run isolated decoder peak child");
+            assert!(
+                output.status.success(),
+                "decoder peak child failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
             String::from_utf8_lossy(&output.stderr)
-        );
-        let peak_kib = std::fs::read_to_string(report.path())
-            .expect("read decoder peak report")
-            .trim()
-            .parse::<usize>()
-            .expect("parse decoder peak KiB");
-        peak_kib.checked_mul(1024).expect("decoder peak bytes")
+                .lines()
+                .find_map(|line| {
+                    line.strip_suffix("maximum resident set size")?
+                        .trim()
+                        .parse::<usize>()
+                        .ok()
+                })
+                .expect("parse decoder peak bytes from the BSD time report")
+        }
     }
 
     /// Isolated child used to compare standard-decoder peak RSS with a control.
@@ -1291,7 +1330,9 @@ mod tests {
                 Field::new("payload", DataType::Utf8, false),
             ])),
             vec![
-                Arc::new(Int64Array::from_iter_values(0..rows as i64)),
+                Arc::new(Int64Array::from_iter_values(
+                    0..i64::try_from(rows).expect("row count fits i64"),
+                )),
                 Arc::new(StringArray::from(values)),
             ],
         )
@@ -1348,7 +1389,7 @@ mod tests {
     /// The independent row-count cap slices even a tiny logical batch.
     #[test]
     fn bifrost_parquet_memory_enforces_row_count_cap() {
-        let values = (0..MAX_ROW_GROUP_ROWS + 1).map(|_| String::new()).collect();
+        let values = (0..=MAX_ROW_GROUP_ROWS).map(|_| String::new()).collect();
         let slices = BifrostArrowLogicalSizer::slice(&batch(values)).expect("tiny rows fit");
         assert_eq!(slices.len(), 2);
         assert_eq!(slices[0].len, MAX_ROW_GROUP_ROWS);
@@ -1529,7 +1570,18 @@ mod tests {
         );
         let control_peak = isolated_decoder_peak(&path, "control");
         let decode_process_peak = isolated_decoder_peak(&path, "decode");
-        let decoder_peak = decode_process_peak.saturating_sub(control_peak);
+        // Guard the subtraction before trusting it. The two peaks come from
+        // separate process launches, so an incoherent pair (decode measuring
+        // below the control baseline) means the measurement captured process
+        // noise rather than decoder growth. Saturating that case to zero would
+        // let the ceiling assertion below pass without measuring anything, so
+        // refuse the reading instead of reporting a fabricated pass.
+        assert!(
+            decode_process_peak >= control_peak,
+            "decoder peak measurement is incoherent (decode {decode_process_peak} < control \
+             {control_peak}); the resident-set delta cannot be trusted"
+        );
+        let decoder_peak = decode_process_peak - control_peak;
         assert!(
             decoder_peak
                 <= usize::try_from(FOOTER_DECODE_WORKSPACE_BYTES)
@@ -1555,23 +1607,22 @@ mod tests {
         assert!(validate_encoded_footer_bytes(0).is_err());
     }
 
-    /// Nine metadata fields round-trip and every malformed contract shape refuses.
-    #[test]
-    fn bifrost_leaf_width_profile_is_schema_bound_and_canonical() {
-        let batch = batch(vec!["payload".to_owned()]);
-        let object = "s3://bucket/table/day=2026-08-14/part-00000.parquet";
-        let metadata = BifrostParquetMemoryEnvelope::metadata_for_batch(&batch, object)
-            .expect("canonical metadata");
-        assert_eq!(metadata.len(), 9);
-        let (_directory, footer) = footer_with_metadata(&batch, metadata.clone());
-        let envelope = BifrostParquetMemoryEnvelope::from_footer(
-            footer.file_metadata(),
-            batch.schema().as_ref(),
-            object,
-        )
-        .expect("canonical footer");
-        assert_eq!(envelope.leaf_width_profile.max_logical_bytes.len(), 2);
-
+    /// Asserts every canonical metadata key is required exactly once.
+    ///
+    /// Each key is dropped and then duplicated in turn, and both mutations must
+    /// refuse. Requiring presence alone would let a writer append a second,
+    /// conflicting copy of a field and have the reader silently pick one, so
+    /// exactly-once is the property under test, not merely presence.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any key can be dropped or duplicated without refusal.
+    fn assert_missing_and_duplicated_fields_refuse(
+        batch: &RecordBatch,
+        object: &str,
+        metadata: &[KeyValue],
+    ) {
+        let metadata = metadata.to_vec();
         for key in [
             KEY_RECIPE,
             KEY_ENVELOPE_VERSION,
@@ -1588,7 +1639,7 @@ mod tests {
                 .filter(|entry| entry.key != key)
                 .cloned()
                 .collect();
-            let (_directory, footer) = footer_with_metadata(&batch, missing);
+            let (_directory, footer) = footer_with_metadata(batch, missing);
             assert!(
                 BifrostParquetMemoryEnvelope::from_footer(
                     footer.file_metadata(),
@@ -1607,7 +1658,7 @@ mod tests {
                     .expect("duplicated metadata field")
                     .clone(),
             );
-            let (_directory, footer) = footer_with_metadata(&batch, duplicated);
+            let (_directory, footer) = footer_with_metadata(batch, duplicated);
             assert!(
                 BifrostParquetMemoryEnvelope::from_footer(
                     footer.file_metadata(),
@@ -1618,23 +1669,22 @@ mod tests {
                 "duplicated `{key}` must refuse"
             );
         }
+    }
 
-        let mut extra = metadata.clone();
-        extra.push(KeyValue {
-            key: "wyrd.bifrost.unexpected".to_owned(),
-            value: Some("1".to_owned()),
-        });
-        let (_directory, footer) = footer_with_metadata(&batch, extra);
-        assert!(
-            BifrostParquetMemoryEnvelope::from_footer(
-                footer.file_metadata(),
-                batch.schema().as_ref(),
-                object,
-            )
-            .is_err(),
-            "an extra metadata field must refuse"
-        );
-
+    /// Asserts every canonical metadata value is validated, not merely parsed.
+    ///
+    /// The cases cover the boundaries each field owns: an unknown recipe or
+    /// envelope version, one byte past each size ceiling, a zero where a
+    /// positive count is required, a `u64` overflow, wrong-case hex, a mismatched
+    /// object key, and leaf-profile encodings that differ from the canonical one
+    /// only by version, arity, leading zero, or whitespace. Every one must
+    /// refuse.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any malformed value is accepted.
+    fn assert_malformed_values_refuse(batch: &RecordBatch, object: &str, metadata: &[KeyValue]) {
+        let metadata = metadata.to_vec();
         for (key, malformed) in [
             (KEY_RECIPE, "bifrost-writer-v1"),
             (KEY_ENVELOPE_VERSION, "2"),
@@ -1661,7 +1711,7 @@ mod tests {
                 .find(|entry| entry.key == key)
                 .expect("metadata mutation field")
                 .value = Some(malformed.to_owned());
-            let (_directory, footer) = footer_with_metadata(&batch, invalid);
+            let (_directory, footer) = footer_with_metadata(batch, invalid);
             assert!(
                 BifrostParquetMemoryEnvelope::from_footer(
                     footer.file_metadata(),
@@ -1672,6 +1722,44 @@ mod tests {
                 "malformed `{key}` value `{malformed}` must refuse"
             );
         }
+    }
+
+    /// Nine metadata fields round-trip and every malformed contract shape refuses.
+    #[test]
+    fn bifrost_leaf_width_profile_is_schema_bound_and_canonical() {
+        let batch = batch(vec!["payload".to_owned()]);
+        let object = "s3://bucket/table/day=2026-08-14/part-00000.parquet";
+        let metadata = BifrostParquetMemoryEnvelope::metadata_for_batch(&batch, object)
+            .expect("canonical metadata");
+        assert_eq!(metadata.len(), 9);
+        let (_directory, footer) = footer_with_metadata(&batch, metadata.clone());
+        let envelope = BifrostParquetMemoryEnvelope::from_footer(
+            footer.file_metadata(),
+            batch.schema().as_ref(),
+            object,
+        )
+        .expect("canonical footer");
+        assert_eq!(envelope.leaf_width_profile.max_logical_bytes.len(), 2);
+
+        assert_missing_and_duplicated_fields_refuse(&batch, object, &metadata);
+
+        let mut extra = metadata.clone();
+        extra.push(KeyValue {
+            key: "wyrd.bifrost.unexpected".to_owned(),
+            value: Some("1".to_owned()),
+        });
+        let (_directory, footer) = footer_with_metadata(&batch, extra);
+        assert!(
+            BifrostParquetMemoryEnvelope::from_footer(
+                footer.file_metadata(),
+                batch.schema().as_ref(),
+                object,
+            )
+            .is_err(),
+            "an extra metadata field must refuse"
+        );
+
+        assert_malformed_values_refuse(&batch, object, &metadata);
 
         let other_schema = Schema::new(vec![Field::new("other", DataType::Int64, false)]);
         assert!(

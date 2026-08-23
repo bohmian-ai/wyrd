@@ -114,7 +114,19 @@ async fn run_forge_worker_process(
     if let Some(health) = state.bifrost.resource_health() {
         set.spawn(fallible_task(
             TaskId::Worker("bifrost_resource_health"),
-            async move { health.wait_for_poison().await },
+            // Poison is a terminal the supervisor reacts to, but a healthy
+            // server never publishes one, so this wait must also end on a clean
+            // shutdown. Without the cancellation arm the task can never join and
+            // every shutdown burns the full drain deadline before aborting it.
+            {
+                let shutdown = shutdown.clone();
+                async move {
+                    tokio::select! {
+                        poisoned = health.wait_for_poison() => poisoned,
+                        () = shutdown.cancelled() => Ok(()),
+                    }
+                }
+            },
         ));
     }
 

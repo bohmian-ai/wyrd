@@ -12,7 +12,7 @@ use secrecy::ExposeSecret;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::scribe::tail_rpc::{LocalTailReadTransport, TailReadTransport};
-use vala_sdk::{BifrostGrpcTransport, IngestTransport};
+use vala_sdk::BifrostGrpcTransport;
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
@@ -458,7 +458,8 @@ async fn prepare_oracle_query_fixture(
         Field::new("value", DataType::Utf8, false),
     ]));
     srv.state()
-        .bifrost
+        .bifrost_catalog()
+        .expect("test server exposes its Bifrost catalog")
         .create_table(CreateTableRequest {
             table: TableRef::new(BifrostNamespace::Bifrost, &table_name),
             user_fields: schema

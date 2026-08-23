@@ -19,6 +19,7 @@ use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::scribe::admission::{AdmissionConfig, EventTimeWindow};
 use vala_sdk::{
     BifrostFrame, BifrostGrpcTransport, CollectedQueryLimits, CollectedQueryResult, QueryClient,
+    ValaSdkError,
 };
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
@@ -37,6 +38,17 @@ use crate::bifrost::{BifrostTelemetryCapture, BifrostTopology, WyrdTestCluster};
 const TABLE_NAME: &str = "bifrost_cluster_load";
 /// Whole-scenario progress ceiling, not a latency SLO.
 const DEFAULT_SCENARIO_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Budget granted to cluster shutdown, independent of the scenario deadline.
+///
+/// Shutdown must not draw from the workload's remaining time. When the scenario
+/// deadline is what expired, no scenario time is left, so a shared budget gives
+/// shutdown zero and guarantees it also fails -- dropping the cluster with its
+/// listeners live and its temporary volume roots still in use by in-flight
+/// background work. The resulting errno cascade hides the one failure that
+/// actually mattered. An independent budget keeps the workload timeout and a
+/// genuine shutdown hang distinguishable.
+const CLUSTER_SHUTDOWN_BUDGET: Duration = Duration::from_secs(30);
 /// Exact bindings required to reconcile warmup writes.
 const WARMUP_BINDINGS: &[&str] = &[
     "gate.requests.success",
@@ -257,7 +269,11 @@ impl ClusterLoadProfile {
             || self.rows_per_batch == 0
             || self.writers_per_tenant != 2
             || self.readers_per_tenant != 2
-            || self.minimum_reads_per_tenant != self.readers_per_tenant as u32
+            || ![
+                self.readers_per_tenant as u32,
+                self.measured_batches_per_tenant.saturating_mul(2),
+            ]
+            .contains(&self.minimum_reads_per_tenant)
             || self.warmup_batches_per_tenant < 2
             || self.measured_batches_per_tenant < 8
             || self.scenario_deadline < Duration::from_millis(1)
@@ -386,8 +402,15 @@ where
     })
     .await
     .map_err(|error| ClusterLoadError::Telemetry(error.to_string()))?;
-    let evidence = ClusterTelemetryProjection::from_delta(&delta, expectation)
-        .map_err(|error| ClusterLoadError::Telemetry(error.to_string()))?;
+    let evidence =
+        ClusterTelemetryProjection::from_delta(&delta, expectation).map_err(|error| {
+            let families = delta
+                .metrics
+                .iter()
+                .map(|sample| format!("{}:{:?}", sample.family, sample.kind))
+                .collect::<std::collections::BTreeSet<_>>();
+            ClusterLoadError::Telemetry(format!("{error}; captured families={families:?}"))
+        })?;
     Ok((value, evidence))
 }
 
@@ -438,7 +461,6 @@ impl BifrostClusterLoad {
     /// table creation and tenant/bootstrap setup happen before the phase
     /// barrier and are excluded from operation counts.
     pub async fn run(mut self) -> Result<BifrostClusterLoadSummary, ClusterLoadError> {
-        let deadline = Instant::now() + self.profile.scenario_deadline;
         let result = tokio::time::timeout(self.profile.scenario_deadline, self.run_inner()).await;
         let result = match result {
             Ok(result) => result,
@@ -446,9 +468,8 @@ impl BifrostClusterLoad {
                 "scenario deadline exceeded during matrix IO".to_owned(),
             )),
         };
-        let shutdown_budget = deadline.saturating_duration_since(Instant::now());
         let shutdown = tokio::time::timeout(
-            shutdown_budget,
+            CLUSTER_SHUTDOWN_BUDGET,
             self.cluster
                 .take()
                 .expect("invariant: cluster remains owned until run completion")
@@ -817,11 +838,10 @@ async fn run_public_matrix(
             required_clean_binding_ids: &[],
         },
         || async {
-            let phase_progress = Arc::new(PhaseProgress::new(tenants.len()));
+            let failed = TenantFailure::default();
+            let phase_progress = Arc::new(PhaseProgress::new(tenants.len(), failed.clone()));
             let mut tasks = tokio::task::JoinSet::new();
-            let warmup_barrier = Arc::new(tokio::sync::Barrier::new(tenants.len()));
-            let measured_barrier = Arc::new(tokio::sync::Barrier::new(tenants.len()));
-            let completed_barrier = Arc::new(tokio::sync::Barrier::new(tenants.len()));
+            let barriers = Arc::new(TenantPhaseBarriers::new(tenants.len(), failed));
             for (tenant_index, tenant) in tenants.iter().copied().enumerate() {
                 let node_count = cluster.ready_ingest_nodes().len().max(1);
                 let pressured = profile.pressured_tenant == Some(tenant_index);
@@ -853,33 +873,35 @@ async fn run_public_matrix(
                 let query = QueryClient::new(&reader_client);
                 let profile = *profile;
                 let table = table.to_owned();
-                let warmup_barrier = Arc::clone(&warmup_barrier);
-                let measured_barrier = Arc::clone(&measured_barrier);
-                let completed_barrier = Arc::clone(&completed_barrier);
+                let barriers = Arc::clone(&barriers);
                 let phase_progress = Arc::clone(&phase_progress);
                 tasks.spawn(async move {
-                    run_tenant(TenantRunContext {
+                    // Trip the shared token before returning so no sibling is
+                    // left parked on a barrier that can no longer release.
+                    let outcome = run_tenant(TenantRunContext {
                         tenant,
                         tenant_index,
                         profile,
                         table,
                         writer: writer_transport,
                         query,
-                        warmup_barrier,
-                        measured_barrier,
-                        completed_barrier,
+                        barriers: Arc::clone(&barriers),
                         phase_progress,
                     })
-                    .await
-                    .map(|result| (tenant.to_string(), result))
+                    .await;
+                    if let Err(error) = &outcome {
+                        barriers.fail(error);
+                    }
+                    outcome.map(|result| (tenant.to_string(), result))
                 });
             }
-            phase_progress.wait_for(LoadPhase::Warmup).await;
+            phase_progress.wait_for(LoadPhase::Warmup).await?;
             publish_tenants().await?;
             Ok((phase_progress, tasks))
         },
     )
-    .await?;
+    .await
+    .map_err(|error| ClusterLoadError::Telemetry(format!("warmup: {error}")))?;
     let warmup_owners = phase_owner_checkpoint(cluster).await?;
     let warmup_owner_delta = owner_delta(matrix_owners, warmup_owners)?;
     let (_, measured) = sampled_phase(
@@ -893,11 +915,12 @@ async fn run_public_matrix(
         },
         || async {
             phase_progress.release_warmup();
-            phase_progress.wait_for(LoadPhase::Measured).await;
+            phase_progress.wait_for(LoadPhase::Measured).await?;
             Ok(())
         },
     )
-    .await?;
+    .await
+    .map_err(|error| ClusterLoadError::Telemetry(format!("measured: {error}")))?;
     let measured_owners = phase_owner_checkpoint(cluster).await?;
     let measured_owner_delta = owner_delta(warmup_owners, measured_owners)?;
 
@@ -1576,18 +1599,134 @@ struct TenantRunContext {
     writer: BifrostGrpcTransport,
     /// Public query client bound to the tenant's reader server.
     query: QueryClient,
-    /// Barrier released after warmup writes.
-    warmup_barrier: Arc<tokio::sync::Barrier>,
-    /// Barrier released before measured writers and readers start.
-    measured_barrier: Arc<tokio::sync::Barrier>,
-    /// Barrier released after all measured tasks complete.
-    completed_barrier: Arc<tokio::sync::Barrier>,
+    /// Phase barriers shared by every tenant task in this run.
+    barriers: Arc<TenantPhaseBarriers>,
     /// Shared progress evidence used to capture immutable telemetry windows.
     phase_progress: Arc<PhaseProgress>,
 }
 
+/// Abort signal shared by every rendezvous in one matrix run.
+///
+/// Both the tenant barriers and the owner's phase counters need the same
+/// answer to "is anyone still coming?". Sharing one signal keeps them from
+/// disagreeing: a tenant that fails releases its siblings' barriers and the
+/// owner's phase wait in the same instant, so the run reports the original
+/// error rather than a scenario timeout.
+#[derive(Clone, Default)]
+struct TenantFailure {
+    /// Wakes every parked rendezvous once any tenant has failed.
+    token: tokio_util::sync::CancellationToken,
+    /// First tenant error, retained so waiters report the cause rather than
+    /// the fact that they were abandoned. The owner's phase waits release
+    /// before the tenant tasks are joined, so without this the run reports
+    /// "a tenant failed" and the actual error is never surfaced.
+    cause: Arc<std::sync::OnceLock<String>>,
+}
+
+impl TenantFailure {
+    /// Records the first tenant failure and releases every parked rendezvous.
+    ///
+    /// Idempotent: concurrent failures keep the first cause, matching the
+    /// first error the joining owner would otherwise have reported.
+    fn trip(&self, error: &ClusterLoadError) {
+        let _ = self.cause.set(error.to_string());
+        self.token.cancel();
+    }
+
+    /// Resolves once any tenant has failed.
+    async fn cancelled(&self) {
+        self.token.cancelled().await;
+    }
+
+    /// Returns the first tenant failure, or a placeholder if it raced the trip.
+    fn cause(&self) -> &str {
+        self.cause
+            .get()
+            .map_or("cause not yet recorded", String::as_str)
+    }
+}
+
+/// Three-phase barrier set shared by every tenant task in one matrix run.
+///
+/// A bare [`tokio::sync::Barrier`] has no failure path. When one tenant returns
+/// early, every sibling stays parked until the scenario deadline elapses, so the
+/// matrix reports a timeout instead of the error that actually happened. This
+/// owner carries a token that the first failing tenant trips, releasing every
+/// parked sibling immediately so the original error is the one that propagates.
+struct TenantPhaseBarriers {
+    /// Released after every tenant finishes its warmup writes.
+    warmup: tokio::sync::Barrier,
+    /// Released before measured writers and readers start.
+    measured: tokio::sync::Barrier,
+    /// Released after every tenant finishes its measured tasks.
+    completed: tokio::sync::Barrier,
+    /// Shared abort signal tripped by the first failing tenant.
+    failed: TenantFailure,
+}
+
+impl TenantPhaseBarriers {
+    /// Builds one barrier set sized for a fixed tenant count.
+    fn new(tenants: usize, failed: TenantFailure) -> Self {
+        Self {
+            warmup: tokio::sync::Barrier::new(tenants),
+            measured: tokio::sync::Barrier::new(tenants),
+            completed: tokio::sync::Barrier::new(tenants),
+            failed,
+        }
+    }
+
+    /// Records that one tenant failed, releasing every parked sibling.
+    fn fail(&self, error: &ClusterLoadError) {
+        self.failed.trip(error);
+    }
+
+    /// Parks until every tenant reaches the warmup checkpoint.
+    ///
+    /// # Errors
+    /// Returns an assertion error when another tenant failed before release.
+    async fn warmup(&self) -> Result<(), ClusterLoadError> {
+        self.wait_on(&self.warmup, "warmup").await
+    }
+
+    /// Parks until every tenant is ready to begin measured IO.
+    ///
+    /// # Errors
+    /// Returns an assertion error when another tenant failed before release.
+    async fn measured(&self) -> Result<(), ClusterLoadError> {
+        self.wait_on(&self.measured, "measured").await
+    }
+
+    /// Parks until every tenant finishes its measured IO.
+    ///
+    /// # Errors
+    /// Returns an assertion error when another tenant failed before release.
+    async fn completed(&self) -> Result<(), ClusterLoadError> {
+        self.wait_on(&self.completed, "completed").await
+    }
+
+    /// Races one barrier against the shared failure token.
+    ///
+    /// # Errors
+    /// Returns an assertion error naming `phase` when the token is tripped
+    /// first, which means a sibling tenant already failed and this barrier will
+    /// never release on its own.
+    async fn wait_on(
+        &self,
+        barrier: &tokio::sync::Barrier,
+        phase: &'static str,
+    ) -> Result<(), ClusterLoadError> {
+        tokio::select! {
+            _ = barrier.wait() => Ok(()),
+            () = self.failed.cancelled() => Err(ClusterLoadError::Assertion(format!(
+                "{phase} barrier abandoned after tenant failure: {}",
+                self.failed.cause()
+            ))),
+        }
+    }
+}
+
 /// Public-load barrier reached by every tenant before the next checkpoint.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum LoadPhase {
     /// Warmup writes have completed for every tenant.
     Warmup,
@@ -1596,6 +1735,11 @@ enum LoadPhase {
 }
 
 /// Counts tenant barrier arrivals without polling production state.
+///
+/// Every wait here races the run's shared [`TenantFailure`] signal. Without
+/// that, a tenant that returns early never marks its arrival and the owner
+/// parks until the scenario deadline, which reports a timeout instead of the
+/// error that actually happened.
 struct PhaseProgress {
     /// Number of tenant tasks required for one phase completion.
     tenants: usize,
@@ -1609,11 +1753,13 @@ struct PhaseProgress {
     warmup_release: tokio::sync::Notify,
     /// Persistent release state preventing a lost notification race.
     warmup_released: AtomicBool,
+    /// Shared abort signal tripped by the first tenant that fails.
+    failed: TenantFailure,
 }
 
 impl PhaseProgress {
     /// Construct an empty progress coordinator for a fixed tenant count.
-    fn new(tenants: usize) -> Self {
+    fn new(tenants: usize, failed: TenantFailure) -> Self {
         Self {
             tenants,
             warmup: AtomicUsize::new(0),
@@ -1621,6 +1767,7 @@ impl PhaseProgress {
             notify: tokio::sync::Notify::new(),
             warmup_release: tokio::sync::Notify::new(),
             warmup_released: AtomicBool::new(false),
+            failed,
         }
     }
 
@@ -1635,13 +1782,34 @@ impl PhaseProgress {
     }
 
     /// Wait until every tenant has arrived at the selected barrier.
-    async fn wait_for(&self, phase: LoadPhase) {
+    ///
+    /// # Errors
+    /// Returns an assertion error when a tenant failed before every arrival
+    /// landed, because the remaining arrivals are then never coming.
+    async fn wait_for(&self, phase: LoadPhase) -> Result<(), ClusterLoadError> {
         let counter = match phase {
             LoadPhase::Warmup => &self.warmup,
             LoadPhase::Measured => &self.measured,
         };
-        while counter.load(Ordering::Acquire) < self.tenants {
-            self.notify.notified().await;
+        loop {
+            // Register the waiter BEFORE reading the counter. `notify_waiters`
+            // stores no permit, so a `mark` landing between a read and a later
+            // registration would be lost and this wait would never wake.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if counter.load(Ordering::Acquire) >= self.tenants {
+                return Ok(());
+            }
+            tokio::select! {
+                () = notified => {}
+                () = self.failed.cancelled() => {
+                    return Err(ClusterLoadError::Assertion(format!(
+                        "{phase:?} phase abandoned after tenant failure: {}",
+                        self.failed.cause()
+                    )));
+                }
+            }
         }
     }
 
@@ -1652,9 +1820,30 @@ impl PhaseProgress {
     }
 
     /// Wait for the owner to finish the warmup telemetry checkpoint.
-    async fn wait_warmup_release(&self) {
-        while !self.warmup_released.load(Ordering::Acquire) {
-            self.warmup_release.notified().await;
+    ///
+    /// # Errors
+    /// Returns an assertion error when a tenant failed before the owner
+    /// released the warmup checkpoint.
+    async fn wait_warmup_release(&self) -> Result<(), ClusterLoadError> {
+        loop {
+            // Same pre-registration rule as `wait_for`: the persistent flag
+            // only covers waiters that arrive after the release, not one that
+            // reads the flag and registers around it.
+            let notified = self.warmup_release.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.warmup_released.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            tokio::select! {
+                () = notified => {}
+                () = self.failed.cancelled() => {
+                    return Err(ClusterLoadError::Assertion(format!(
+                        "warmup release abandoned after tenant failure: {}",
+                        self.failed.cause()
+                    )));
+                }
+            }
         }
     }
 }
@@ -1668,9 +1857,7 @@ async fn run_tenant(context: TenantRunContext) -> Result<TenantLoadResult, Clust
         table,
         writer,
         query,
-        warmup_barrier,
-        measured_barrier,
-        completed_barrier,
+        barriers,
         phase_progress,
     } = context;
     let mut report = TenantLoadResult {
@@ -1692,10 +1879,10 @@ async fn run_tenant(context: TenantRunContext) -> Result<TenantLoadResult, Clust
             .saturating_add(payload.len() as u64);
     }
     report.warmup_acknowledged_batches = profile.warmup_batches_per_tenant;
-    warmup_barrier.wait().await;
+    barriers.warmup().await?;
     phase_progress.mark(LoadPhase::Warmup);
-    phase_progress.wait_warmup_release().await;
-    measured_barrier.wait().await;
+    phase_progress.wait_warmup_release().await?;
+    barriers.measured().await?;
     let mut tasks = tokio::task::JoinSet::new();
     for writer_index in 0..profile.writers_per_tenant {
         let writer = writer.clone();
@@ -1745,13 +1932,21 @@ async fn run_tenant(context: TenantRunContext) -> Result<TenantLoadResult, Clust
                 && attempts < target.saturating_mul(32).max(target)
             {
                 attempts = attempts.saturating_add(1);
+                let (sql, deadline_ms) = if reader_index % 2 == 0 {
+                    (
+                        format!("SELECT id, tenant, batch FROM {table} WHERE batch = 0 ORDER BY id LIMIT 1"),
+                        5_000,
+                    )
+                } else {
+                    (format!("SELECT COUNT(*) AS total FROM {table}"), 15_000)
+                };
                 let response = query
                     .collect_bounded(
                         &BifrostQueryRequest {
-                            sql: format!("SELECT id, tenant, batch FROM {table} ORDER BY id"),
+                            sql,
                             visibility: VisibilityMode::PublishedOnly,
                             freshness: FreshnessPolicy::Strict,
-                            deadline_ms: Some(5_000),
+                            deadline_ms: Some(deadline_ms),
                         },
                         CollectedQueryLimits {
                             max_rows: usize::MAX,
@@ -1767,12 +1962,11 @@ async fn run_tenant(context: TenantRunContext) -> Result<TenantLoadResult, Clust
                             .queried_bytes
                             .saturating_add(query_payload_bytes(&response)?);
                     }
-                    Err(error) if is_retryable_read_error(&error.to_string()) => {
+                    Err(error) if is_retryable_read_error(&error) => {
                         result.retries += 1;
                     }
                     Err(error) => return Err(ClusterLoadError::Client(error.to_string())),
                 }
-                let _ = reader_index;
             }
             if result.completed_reads < target && profile.pressured_tenant != Some(tenant_index) {
                 return Err(ClusterLoadError::Assertion(format!(
@@ -1797,7 +1991,7 @@ async fn run_tenant(context: TenantRunContext) -> Result<TenantLoadResult, Clust
         report.retries += result.retries;
         report.backpressure += result.backpressure;
     }
-    completed_barrier.wait().await;
+    barriers.completed().await?;
     phase_progress.mark(LoadPhase::Measured);
     report.measured_acknowledged_batches = report.acknowledged_batches;
     report.progressed_phases = u32::from(report.warmup_acknowledged_batches > 0)
@@ -1805,20 +1999,27 @@ async fn run_tenant(context: TenantRunContext) -> Result<TenantLoadResult, Clust
     Ok(report)
 }
 
-/// Classify only bounded publication/admission races as retryable read failures.
-fn is_retryable_read_error(error: &str) -> bool {
+/// Reports whether one failed measured read should be retried.
+///
+/// Matching is on stable Wyrd error codes, not on `Display` text. The prose is
+/// not a contract and drifts; a query timeout under load previously fell
+/// through every prose needle and failed its tenant outright, which ended the
+/// whole run. Codes are the contract, so a new terminal that is not listed here
+/// is treated as fatal on purpose rather than by accident.
+fn is_retryable_read_error(error: &ValaSdkError) -> bool {
     [
-        "admission rejected",
-        "backpressure",
-        "busy",
-        "not published",
-        "query execution failed",
-        "freshness",
-        "no published",
-        "temporarily unavailable",
+        // Transient saturation: the server refused or could not finish in time.
+        "WYRD_VALA_429_QUERY_ADMISSION_REJECTED",
+        "WYRD_VALA_429_INGEST_BUSY",
+        "WYRD_VALA_504_QUERY_TIMEOUT",
+        "WYRD_VALA_500_QUERY_EXECUTION_FAILED",
+        // A role or source that has not converged yet on this node.
+        "WYRD_VALA_503_ORACLE_ROLE_UNAVAILABLE",
+        "WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE",
+        "WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE",
+        "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND",
     ]
-    .iter()
-    .any(|needle| error.contains(needle))
+    .contains(&error.code())
 }
 
 /// Encode one deterministic Arrow batch for public Gate ingest.

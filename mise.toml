@@ -1299,3 +1299,29 @@ run = "bash scripts/postgres/test-roles.sh"
 hide = true
 description = "Validate the TOML-aware database task lifecycle inventory and regression fixture"
 run = "python3 scripts/postgres/check-inventory.py && python3 scripts/postgres/check-inventory.py --negative-test"
+
+[tasks."test:bifrost:oracle-distributed-parity"]
+description = "Run exact distributed Oracle execution parity tests."
+run = """
+scripts/postgres/with-test-postgres.sh -- bash -lc 'set -euo pipefail;
+mise run db:migrate:inner;
+cargo check --locked -p vala-bifrost-redux --features test-support,bench-support;
+cargo check --locked -p wyrd-server;
+cargo check --locked -p wyrd-testing;
+cargo test --locked -p vala-bifrost-redux --features test-support,bench-support --test integration -- oracle_core::remote_scan_rule_matches_expected_plan_shapes --exact --nocapture --test-threads=1;
+cargo test --locked -p vala-bifrost-redux --features test-support,bench-support --test integration -- oracle_core::participant_cut_is_selected_sorted_and_read_once --exact --nocapture --test-threads=1;
+cargo test --locked -p vala-bifrost-redux --features test-support,bench-support --test integration -- oracle_core::file_count_size_and_hash_partition_assignments_are_exact --exact --nocapture --test-threads=1;
+cargo test --locked -p vala-bifrost-redux --features test-support,bench-support --test integration -- oracle_core::later_partition_opens_while_first_is_barriered --exact --nocapture --test-threads=1;
+cargo test --locked -p vala-bifrost-redux --features test-support,bench-support --test integration -- oracle_core::completion_inversion_preserves_leader_plan_output --exact --nocapture --test-threads=1;
+cargo test --locked -p vala-bifrost-redux --features test-support,bench-support --test integration -- oracle_core::empty_oracle_skips_rpc_but_empty_scribe_executes --exact --nocapture --test-threads=1;
+cargo test --locked -p vala-bifrost-redux --features test-support,bench-support --test integration -- oracle_core::client_setup_matrix_is_partial --exact --nocapture --test-threads=1;
+cargo test --locked -p vala-bifrost-redux --features test-support,bench-support --test integration -- oracle_core::do_get_status_matrix_is_exact --exact --nocapture --test-threads=1;
+cargo test --locked -p vala-bifrost-redux --features test-support,bench-support --test integration -- oracle_core::decoder_partial_retains_prior_batches --exact --nocapture --test-threads=1;
+cargo test --locked -p vala-bifrost-redux --features test-support,bench-support --test integration -- oracle_core::post_delivery_failure_has_one_attempt --exact --nocapture --test-threads=1;
+cargo test --locked -p vala-bifrost-redux --features test-support,bench-support --test integration -- oracle_core::deadline_is_captured_once_and_never_refreshed --exact --nocapture --test-threads=1;
+cargo test --locked -p vala-bifrost-redux --features test-support,bench-support --test integration -- oracle_core::cancel_joins_every_started_partition --exact --nocapture --test-threads=1;
+cargo test --locked -p vala-bifrost-redux --features test-support,bench-support --test integration -- oracle_core::terminal_paths_release_all_distributed_owners --exact --nocapture --test-threads=1;
+cargo test --locked -p wyrd-testing --test oracle_peer -- follower_ticket_source_stream_and_cleanup_are_exact --exact --nocapture --test-threads=1;
+cargo test --locked -p wyrd-testing --test oracle -- oracle_edge_journeys::pg_bifrost_oracle_heterogeneous_distributed_query_journey --exact --ignored --nocapture --test-threads=1;
+cargo test --locked -p wyrd-testing --test cluster -- pg_bifrost_cluster_load::pg_oracle_resource_ladder_r0_distributed_execution --exact --ignored --nocapture --test-threads=1'
+"""

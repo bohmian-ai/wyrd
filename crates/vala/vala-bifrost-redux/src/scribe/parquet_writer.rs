@@ -35,7 +35,7 @@ use crate::scribe::memtable::FrozenMemtable;
 use crate::scribe::seal_key::EventDay;
 use crate::scribe::wal::ScribeAppendMeta;
 
-redacted
+/// Target rows for one whole-batch file candidate.
 const FILE_CANDIDATE_TARGET_ROWS: usize = 100 * 1024;
 
 /// One serial, seal-key-local candidate expressed as a stored-batch range.
@@ -114,7 +114,7 @@ pub(crate) fn largest_candidate_bytes(batches: &[RecordBatch]) -> Result<usize, 
 ///
 /// This is the allocation-free form of [`largest_candidate_bytes`]. Ingress
 /// and the shard owner use it before WAL mutation so their replayability check
-redacted
+/// cannot drift from the encoder's grouping rule.
 ///
 /// # Errors
 ///
@@ -964,6 +964,37 @@ mod tests {
         .expect("candidate fixture")
     }
 
+    /// Asserts one candidate list exactly partitions its batches within bounds.
+    ///
+    /// Each candidate must be non-empty, its row count must equal the sum of the
+    /// batches it spans — so grouping can neither lose nor double-count rows —
+    /// and it must stay under the target row ceiling unless it is a single
+    /// oversized batch, which has no smaller legal grouping.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any candidate is empty, miscounts its rows, or exceeds the
+    /// target without being a lone oversized batch.
+    fn assert_candidates_cover_batches_within_bounds(
+        batches: &[RecordBatch],
+        candidates: &[FileCandidate],
+    ) {
+        for candidate in candidates {
+            assert!(candidate.start < candidate.end);
+            assert_eq!(
+                candidate.rows,
+                batches[candidate.start..candidate.end]
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .sum::<usize>()
+            );
+            assert!(
+                candidate.rows <= FILE_CANDIDATE_TARGET_ROWS
+                    || candidate.end - candidate.start == 1
+            );
+        }
+    }
+
     /// Whole stored batches close before exceeding the row target independently
     /// for each seal key, while an oversized first batch remains whole.
     #[test]
@@ -1042,25 +1073,8 @@ mod tests {
         assert_eq!(second_candidates[0].start, 0);
         assert_eq!(first_candidates[2].rows, 120 * 1024);
         assert_eq!(second_candidates[1].rows, 120 * 1024);
-        for (batches, candidates) in [
-            (&first.1, &first_candidates),
-            (&second.1, &second_candidates),
-        ] {
-            for candidate in candidates {
-                assert!(candidate.start < candidate.end);
-                assert_eq!(
-                    candidate.rows,
-                    batches[candidate.start..candidate.end]
-                        .iter()
-                        .map(RecordBatch::num_rows)
-                        .sum::<usize>()
-                );
-                assert!(
-                    candidate.rows <= FILE_CANDIDATE_TARGET_ROWS
-                        || candidate.end - candidate.start == 1
-                );
-            }
-        }
+        assert_candidates_cover_batches_within_bounds(&first.1, &first_candidates);
+        assert_candidates_cover_batches_within_bounds(&second.1, &second_candidates);
         assert_eq!(
             crate::parquet::writer_properties::PARQUET_WRITE_BATCH_ROWS,
             8_192

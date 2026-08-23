@@ -91,14 +91,19 @@ impl OracleQueryAttemptCut {
         if snapshot.observed_at() > now || now - snapshot.observed_at() > maximum_age {
             return Err(OracleQueryAttemptCutError::StaleSnapshot);
         }
-        if snapshot.has_duplicate_roles() {
+        // The snapshot projects leases into a map keyed by `(node_id, role)`, so
+        // a disagreeing repeat is already collapsed to one arbitrary winner by
+        // the time participants are built and cannot be detected downstream.
+        // Consult the flag the projection recorded instead: routing a query off
+        // a cut that may have selected a stale fence is exactly the split-brain
+        // case this refusal exists to prevent.
+        if snapshot.has_conflicting_roles() {
             return Err(OracleQueryAttemptCutError::DuplicateRole);
         }
-
         let mut oracles = Self::participants(snapshot.live_oracles(), query_class)?;
         let mut scribes = Self::participants(snapshot.live_scribes(), query_class)?;
-        oracles.sort_by_key(|participant| participant.node_id);
-        scribes.sort_by_key(|participant| participant.node_id);
+        Self::sort_and_deduplicate(&mut oracles)?;
+        Self::sort_and_deduplicate(&mut scribes)?;
         let leader = oracles
             .iter()
             .find(|participant| participant.node_id == leader_node_id)
@@ -148,6 +153,38 @@ impl OracleQueryAttemptCut {
                 })
             })
             .collect()
+    }
+
+    /// Sorts stable role identities, collapses exact duplicates, and rejects conflicting fences.
+    fn sort_and_deduplicate(
+        participants: &mut Vec<OracleQueryParticipant>,
+    ) -> Result<(), OracleQueryAttemptCutError> {
+        participants.sort_by_key(|participant| {
+            (
+                participant.node_id,
+                match participant.role {
+                    ClusterRole::Oracle => 0_u8,
+                    ClusterRole::Scribe => 1_u8,
+                },
+                participant.fencing_token,
+                participant.endpoint.clone(),
+            )
+        });
+        let mut deduplicated = Vec::<OracleQueryParticipant>::with_capacity(participants.len());
+        for participant in participants.drain(..) {
+            if let Some(previous) = deduplicated.last()
+                && previous.node_id == participant.node_id
+                && previous.role == participant.role
+            {
+                if previous != &participant {
+                    return Err(OracleQueryAttemptCutError::DuplicateRole);
+                }
+                continue;
+            }
+            deduplicated.push(participant);
+        }
+        *participants = deduplicated;
+        Ok(())
     }
 
     /// Returns the source snapshot observation time.
@@ -385,13 +422,25 @@ pub(super) mod tests {
         assert_eq!(cut.scribes().len(), 1);
     }
 
-    /// Stale and duplicate membership fail rather than silently changing a cut.
+    /// A stale snapshot is refused, and repeated membership collapses or conflicts.
+    ///
+    /// Duplicate handling mirrors the ported design, which sorts participants,
+    /// collapses repeats, and re-sorts for stable ordinals rather than failing:
+    /// a registry that lists one node twice is a registry anomaly, not a query
+    /// fault, and the collapsed cut is the same set either way. Wyrd tightens
+    /// only the case the ported design cannot see, because it collapses on
+    /// address alone: two leases sharing `(node_id, role)` but disagreeing on
+    /// fencing token or endpoint are a split-brain or stale-lease signal, and
+    /// silently keeping whichever sorted first could admit the stale one. That
+    /// case fails closed with [`OracleQueryAttemptCutError::DuplicateRole`].
     ///
     /// # Panics
     ///
-    /// Panics when either invalid fixture is unexpectedly accepted.
+    /// Panics when a stale snapshot is accepted, when an exact repeat does not
+    /// collapse to a single participant, or when a conflicting fence is
+    /// admitted.
     #[test]
-    fn cut_rejects_stale_and_duplicate_membership() {
+    fn cut_rejects_stale_snapshot_collapses_repeats_and_refuses_conflicting_fence() {
         let now = Utc::now();
         let member = lease(1, ClusterRole::Oracle, 1);
         let stale =
@@ -409,9 +458,31 @@ pub(super) mod tests {
             result,
             Err(OracleQueryAttemptCutError::StaleSnapshot)
         ));
-        let duplicate = ClusterSnapshot::observed(vec![member.clone(), member.clone()], now);
+        // An exact repeat is a registry anomaly: collapse it and serve the query.
+        let repeated = ClusterSnapshot::observed(vec![member.clone(), member.clone()], now);
+        let cut = OracleQueryAttemptCut::try_from_snapshot(
+            &repeated,
+            QueryId::new(uuid::Uuid::now_v7()),
+            member.key.node_id,
+            QueryClass::Interactive,
+            now + chrono::Duration::seconds(1),
+            now,
+            Duration::from_secs(15),
+        )
+        .expect("an exact repeat collapses rather than failing the cut");
+        assert_eq!(
+            cut.oracles().len(),
+            1,
+            "the repeated lease must collapse to one participant so no node is assigned twice"
+        );
+        assert_eq!(cut.oracles()[0].node_id, member.key.node_id);
+
+        // A disagreeing fence for the same node and role is a safety signal.
+        let conflicting = lease(1, ClusterRole::Oracle, 2);
+        assert_eq!(conflicting.key, member.key, "same node and role by fixture");
+        let split_brain = ClusterSnapshot::observed(vec![member.clone(), conflicting], now);
         let result = OracleQueryAttemptCut::try_from_snapshot(
-            &duplicate,
+            &split_brain,
             QueryId::new(uuid::Uuid::now_v7()),
             member.key.node_id,
             QueryClass::Interactive,

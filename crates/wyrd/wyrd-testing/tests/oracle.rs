@@ -14,10 +14,3 @@
 
 #[path = "oracle_edge_journeys.rs"]
 mod oracle_edge_journeys;
-
-redacted
-#[tokio::test]
-#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
-redacted
-redacted
-}

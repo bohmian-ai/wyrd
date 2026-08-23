@@ -148,25 +148,48 @@ impl BifrostIngestService for BifrostIngestGrpc {
         &self,
         request: wyrd_tonic::tonic::Request<InsertBatchRequest>,
     ) -> Result<wyrd_tonic::tonic::Response<InsertBatchResponse>, Status> {
-        let auth = self
-            .bifrost
-            .gate()
-            .authenticate_ingest(request.metadata())
-            .await
-            .map_err(Status::from)?;
-        let frame = request.into_inner();
-        let batch_id = frame.wyrd_batch_id.clone();
-        self.bifrost
-            .ingest_native_frame(&auth, frame)
-            .await
-            .map_err(Status::from)?;
-        let mut response = wyrd_tonic::tonic::Response::new(InsertBatchResponse {
-            wyrd_batch_id: batch_id,
-        });
-        if let Ok(value) = auth.request_id.as_str().parse() {
-            response.metadata_mut().insert("x-wyrd-request-id", value);
+        let lifecycle = crate::app::metrics::GateRequestLifecycle::begin("write");
+        let result: Result<wyrd_tonic::tonic::Response<InsertBatchResponse>, Status> = async {
+            let auth = self
+                .bifrost
+                .gate()
+                .authenticate_ingest(request.metadata())
+                .await
+                .map_err(Status::from)?;
+            let frame = request.into_inner();
+            let batch_id = frame.wyrd_batch_id.clone();
+            self.bifrost
+                .ingest_native_frame(&auth, frame)
+                .await
+                .map_err(Status::from)?;
+            let mut response = wyrd_tonic::tonic::Response::new(InsertBatchResponse {
+                wyrd_batch_id: batch_id,
+            });
+            if let Ok(value) = auth.request_id.as_str().parse() {
+                response.metadata_mut().insert("x-wyrd-request-id", value);
+            }
+            Ok(response)
         }
-        Ok(response)
+        .await;
+        let outcome = match &result {
+            Ok(_) => "success",
+            Err(status) if status.code() == wyrd_tonic::tonic::Code::Cancelled => "cancelled",
+            Err(status)
+                if matches!(
+                    status.code(),
+                    wyrd_tonic::tonic::Code::PermissionDenied
+                        | wyrd_tonic::tonic::Code::ResourceExhausted
+                        | wyrd_tonic::tonic::Code::InvalidArgument
+                        | wyrd_tonic::tonic::Code::NotFound
+                        | wyrd_tonic::tonic::Code::Unauthenticated
+                ) =>
+            {
+                "rejected"
+            }
+            Err(_) => "failed",
+        };
+        lifecycle.complete(outcome);
+        result
     }
 }
 

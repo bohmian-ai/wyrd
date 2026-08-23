@@ -2387,6 +2387,35 @@ pub struct PhysicalExecuteFragmentRequest {
     pub plan_fingerprint: String,
 }
 
+/// Physical scan evidence one follower accumulated while executing a fragment.
+///
+/// The leader of a distributed query scans no storage of its own: every leaf of
+/// its plan is a remote scan, so its local scan metrics are legitimately empty.
+/// Followers report what their executed scans actually touched and the leader
+/// sums these across the participant cut, which is the only way a distributed
+/// query can report the same scan families a single-node query reports.
+///
+/// `bytes_scanned` is physical read volume reported by the executed scan. It is
+/// deliberately distinct from [`WorkerFooter::encoded_bytes`], which is the
+/// Arrow transport size of the rows sent back; projection, predicate pushdown,
+/// and compression make the two unrelated, and substituting one for the other
+/// would make the reported scan volume wrong rather than absent.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct WorkerScanStats {
+    /// Physical bytes the follower's executed scans read, when its sources
+    /// report physical IO at all. `None` means unavailable, not zero: a
+    /// memory-backed source reads no storage and must not be reported as a
+    /// zero-byte scan of one that does.
+    pub bytes_scanned: Option<u64>,
+    /// Number of files represented by the follower's executed scan nodes.
+    pub files_scanned: u64,
+    /// Number of file partitions represented by the follower's executed scans.
+    pub partitions_scanned: u64,
+}
+
 /// Verified worker footer for one completed attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
@@ -2403,6 +2432,8 @@ pub struct WorkerFooter {
     pub payload_digest: QueryAuditDigest,
     /// Required completion marker.
     pub completed: bool,
+    /// Physical scan evidence the leader aggregates across the participant cut.
+    pub scan_stats: WorkerScanStats,
 }
 
 /// Closed worker-attempt stream frame.

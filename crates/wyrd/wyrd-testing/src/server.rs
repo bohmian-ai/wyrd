@@ -85,6 +85,8 @@ struct TestOraclePeerCredentials {
     api_key: SecretString,
     /// Production exchange service used for each access-token acquisition.
     exchange: ExchangeApiKey,
+    /// Cached short-lived service bearer shared by every peer RPC in the cluster.
+    bearer: tokio::sync::Mutex<Option<String>>,
 }
 
 impl std::fmt::Debug for TestOraclePeerCredentials {
@@ -98,7 +100,11 @@ impl std::fmt::Debug for TestOraclePeerCredentials {
 #[async_trait]
 impl OraclePeerCredentials for TestOraclePeerCredentials {
     /// Exchange the retained API key through the production auth service.
-    async fn bearer(&self, _force_refresh: bool) -> Result<String, DispatchError> {
+    async fn bearer(&self, force_refresh: bool) -> Result<String, DispatchError> {
+        let mut cached = self.bearer.lock().await;
+        if !force_refresh && let Some(bearer) = cached.as_ref() {
+            return Ok(bearer.clone());
+        }
         let mut conn = self
             .fixture
             .tenant_conn_for(DataTenantId::SYSTEM_OWNER)
@@ -114,7 +120,9 @@ impl OraclePeerCredentials for TestOraclePeerCredentials {
             .await
             .map_err(|_| DispatchError::Terminal)?;
         conn.commit().await.map_err(|_| DispatchError::Terminal)?;
-        Ok(exchanged.access_token.expose_secret().to_owned())
+        let bearer = exchanged.access_token.expose_secret().to_owned();
+        *cached = Some(bearer.clone());
+        Ok(bearer)
     }
 }
 
@@ -348,6 +356,8 @@ enum Mode {
 pub struct WyrdTestServerBuilder {
     policy_hook: Option<Arc<dyn PolicyHook>>,
     audit_writer: Option<Arc<dyn AuthzAuditWriter>>,
+    /// Optional eval-run audit sink installed on the composed `AppState`.
+    eval_audit: Option<Arc<dyn wyrd_server::components::eval::EvalAuditWriter>>,
     allow_preview_auth: bool,
     storage_settings: Option<StorageSettings>,
     storage_handle: Option<Arc<wyrd_storage::StorageHandle>>,
@@ -399,6 +409,10 @@ pub struct WyrdTestServerBuilder {
     forge_config: Option<ForgeConfig>,
     /// Force readiness failure after listeners are bound for rollback tests.
     readiness_failure: bool,
+    /// Compose the server with no token verifier configured.
+    omit_token_verifier: bool,
+    /// Optional non-default edge limits applied to the composed `AppState`.
+    limits: Option<wyrd_server::state::LimitsConfig>,
     /// Replace the serve task with a cancellation-resistant test task.
     stalled_drain_for_test: Option<Arc<AtomicBool>>,
 }
@@ -458,16 +472,19 @@ impl Default for WyrdTestServerBuilder {
             forge_catalog: None,
             forge_config: None,
             readiness_failure: false,
+            eval_audit: None,
+            omit_token_verifier: false,
+            limits: None,
             stalled_drain_for_test: None,
         }
     }
 }
 
 /// Result of a fixture-path principal bootstrap.
-pub use crate::env::Bootstrap;
+pub use crate::principal::Bootstrap;
 
 /// Result of an authz-check request.
-pub use crate::env::CheckResult;
+pub use crate::principal::CheckResult;
 
 /// Test server errors.
 #[derive(Debug, Error)]
@@ -2301,6 +2318,15 @@ impl WyrdTestServer {
             .await
             .map_err(sql)
     }
+    /// Return the durable Scribe WAL root this fixture composed the server with.
+    ///
+    /// Durability assertions replay the WAL directly rather than trusting an
+    /// in-memory acknowledgement, so they need the same root `compose_bifrost`
+    /// was handed. Returns `None` for a target that composes no Scribe role.
+    #[must_use]
+    pub fn scribe_wal_root_for_test(&self) -> Option<&std::path::Path> {
+        self.inner._scribe_wal_root.as_ref().map(|root| root.path())
+    }
 
     async fn raw_call(
         &self,
@@ -2549,6 +2575,46 @@ impl WyrdTestServerBuilder {
     #[must_use]
     pub fn with_forge_config_for_test(mut self, config: ForgeConfig) -> Self {
         self.forge_config = Some(config);
+        self
+    }
+
+    /// Install an eval-run audit sink on the composed `AppState`.
+    ///
+    /// The default sink discards events, so a test that must prove a run
+    /// open/complete pair was audited supplies a recording writer here rather
+    /// than reaching into composed state after the fact.
+    #[must_use]
+    pub fn with_eval_audit_for_test(
+        mut self,
+        writer: Arc<dyn wyrd_server::components::eval::EvalAuditWriter>,
+    ) -> Self {
+        self.eval_audit = Some(writer);
+        self
+    }
+
+    /// Compose the server without a token verifier.
+    ///
+    /// Models a server whose auth backend is not yet configured — the state a
+    /// deployment occupies between process start and verifier provisioning.
+    /// Every `/v1` request must then answer `503 WYRD_AUTH_503_VERIFY_UNAVAILABLE`
+    /// rather than 401 or 500, so callers back off instead of treating the
+    /// window as a credential failure.
+    #[must_use]
+    pub fn without_token_verifier_for_test(mut self) -> Self {
+        self.omit_token_verifier = true;
+        self
+    }
+
+    /// Apply a non-default edge limit profile to the composed `AppState`.
+    ///
+    /// Edge behaviour that only manifests at a boundary — a body-size refusal,
+    /// a request timeout, a concurrency cap — is unreachable at the production
+    /// defaults inside a test. This knob feeds the profile through the same
+    /// `AppState::with_limits` the server uses, so the router under test is the
+    /// composed production router with one configuration value changed.
+    #[must_use]
+    pub fn with_limits_for_test(mut self, limits: wyrd_server::state::LimitsConfig) -> Self {
+        self.limits = Some(limits);
         self
     }
 
@@ -3131,12 +3197,18 @@ impl WyrdTestServerBuilder {
             .with_auth(wyrd_server::components::auth::ServerAuth {
                 allow_preview: self.allow_preview_auth,
                 issuing_key: Some(Arc::clone(&issuing_key)),
-                token_verifier: Some(Arc::clone(&verifier)),
+                token_verifier: (!self.omit_token_verifier).then(|| Arc::clone(&verifier)),
                 token_exchange_settings: exchange_settings,
                 trusted_issuer_resolver: Some(issuer_resolver),
                 workload_binding_resolver: Some(binding_resolver),
                 sealing_key: Some(sealing_key),
             });
+        if let Some(writer) = self.eval_audit {
+            state = state.with_eval_audit(writer);
+        }
+        if let Some(limits) = self.limits {
+            state = state.with_limits(limits);
+        }
         state.authz.permission_check = Arc::new(RbacCheck);
         state.authz.audit_writer = self
             .audit_writer
@@ -3347,14 +3419,20 @@ pub(crate) async fn provision_oracle_peer_credentials(
         )
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
     );
-    Ok(Arc::new(TestOraclePeerCredentials {
+    let credentials = Arc::new(TestOraclePeerCredentials {
         fixture,
         api_key: api_key.secret,
         exchange: ExchangeApiKey {
             issuing_key,
             settings: TokenExchangeSettings::default(),
         },
-    }))
+        bearer: tokio::sync::Mutex::new(None),
+    });
+    credentials
+        .bearer(false)
+        .await
+        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+    Ok(credentials)
 }
 
 async fn lookup_role_id(

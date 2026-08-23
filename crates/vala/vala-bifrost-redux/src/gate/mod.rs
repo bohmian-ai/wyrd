@@ -681,15 +681,16 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
             measured_wire_bytes: frame.arrow_ipc.len(),
             payload: IngressPayload::ArrowIpc(frame.arrow_ipc),
         };
-        let scribe = Arc::clone(scribe);
-        let admission = tokio::spawn(async move { scribe.ingest_frame(ingress).await })
-            .await
-            .map_err(|error| IngestError::Internal(format!("durable Scribe task failed: {error}")))?
-            .map_err(|error| {
-                record_gate_event("scribe_failure");
-                metrics::counter!("bifrost_gate_frames_total", "status" => "rejected").increment(1);
-                IngestError::from_scribe(error)
-            })?;
+        // The durable Scribe write stays inside this request future on purpose.
+        // Detaching it onto its own task would orphan the admission owner when a
+        // transport drops the handler: the spawned task keeps its admission slot
+        // and ingress bytes while nothing observes its terminal. Awaiting inline
+        // makes the admission guard drop with the cancelled request.
+        let admission = scribe.ingest_frame(ingress).await.map_err(|error| {
+            record_gate_event("scribe_failure");
+            metrics::counter!("bifrost_gate_frames_total", "status" => "rejected").increment(1);
+            IngestError::from_scribe(error)
+        })?;
         metrics::counter!("bifrost_gate_frames_total", "status" => "accepted").increment(1);
         record_gate_rows(
             i64::try_from(admission.rows_accepted).unwrap_or(i64::MAX),

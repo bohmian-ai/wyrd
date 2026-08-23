@@ -112,8 +112,8 @@ pub(crate) async fn capture_otlp_material_snapshot(
 /// Build a small, production-shaped limits snapshot for public OTLP boundaries.
 ///
 /// The snapshot lowers only operator-configurable ceilings. One event day is
-/// sufficient because OTLP projection stamps a single receipt day, while the
-/// one-mebibyte material ceiling keeps successful direct-write planning bounded.
+/// sufficient because OTLP projection stamps a single receipt day, and the
+/// one-mebibyte frame ceiling keeps successful direct-write planning bounded.
 #[must_use]
 pub(crate) fn public_otlp_limits(records: usize, value_depth: usize) -> IngestLimits {
     let mut limits = IngestLimits::default();
@@ -128,7 +128,6 @@ pub(crate) fn public_otlp_limits(records: usize, value_depth: usize) -> IngestLi
     limits.otlp.value_bytes = 64 * 1024;
     limits.otlp.value_depth = value_depth;
     limits.otlp.event_days = 1;
-    limits.otlp.material_bytes = 1024 * 1024;
     limits
 }
 

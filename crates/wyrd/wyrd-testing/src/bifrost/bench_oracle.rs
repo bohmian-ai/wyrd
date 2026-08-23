@@ -9,7 +9,7 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_sdk::{BifrostGrpcTransport, IngestTransport, QueryClient};
+use vala_sdk::{BifrostGrpcTransport, QueryClient};
 use wyrd_bench::{BifrostLane, BifrostScenario, NegativeFlowReport};
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
@@ -126,7 +126,8 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
     for (index, tenant) in tenants.iter().copied().enumerate() {
         ingest_server
             .state()
-            .bifrost
+            .bifrost_catalog()
+            .expect("ingest server exposes its Bifrost catalog")
             .create_table(CreateTableRequest {
                 table: TableRef::new(BifrostNamespace::Bifrost, &table_name),
                 user_fields: vec![

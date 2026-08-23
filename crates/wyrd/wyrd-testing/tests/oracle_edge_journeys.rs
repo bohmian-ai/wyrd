@@ -2157,18 +2157,20 @@ async fn pg_bifrost_oracle_distributed_journey() {
 
 /// Proves the native physical-plan cut executes persisted and live subtrees on
 /// distinct remote role owners before the leader applies the final operators.
-redacted
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn pg_bifrost_oracle_heterogeneous_distributed_query_journey() {
     let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::three_mixed())
         .await
         .expect("distributed physical cluster");
     let leader = cluster.server(0).expect("query leader");
     let writer = cluster.server(2).expect("remote Scribe writer");
     let leader_id = cluster.configured_node_ids()[0];
-redacted
+    let table = unique_table("oracle_heterogeneous_physical");
     register_table(writer, cluster.data_tenant_id(), &table)
         .await
         .expect("distributed table");
-redacted
+    let writer_client = client(writer, "heterogeneous-physical-writer")
         .await
         .expect("writer client");
     ingest(&writer_client, &format!("vala.bifrost.{table}"), &[1, 2, 3])
@@ -2213,7 +2215,7 @@ redacted
         .expect("leader query runtime")
         .oracle()
         .bind_topology_probe_for_test(Arc::clone(&probe));
-redacted
+    let reader = client(leader, "heterogeneous-physical-reader")
         .await
         .expect("reader client");
     let sql = format!(

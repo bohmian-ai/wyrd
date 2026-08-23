@@ -367,7 +367,7 @@ struct ShardRotationProjection {
 }
 
 impl ShardRotationProjection {
-redacted
+    /// Reports whether any whole-writer rotation predicate fires.
     #[must_use]
     fn should_rotate(self, wal_target: u64, memtable_target: usize) -> bool {
         self.wal_encoded > wal_target
@@ -2089,7 +2089,7 @@ impl ShardOwner {
     /// acknowledged batch can still be hot-only. Once a tenant-qualified file-list transaction
     /// covers that batch's exact slice range, replay must suppress it before rebuilding Arrow or
     /// attempting a second physical artifact set. This is the Wyrd replacement for removing the
-redacted
+    /// local WAL as the persistence-winner signal.
     ///
     /// # Errors
     ///
@@ -5314,11 +5314,89 @@ mod tests {
         assert_eq!(categories[MemoryCategory::Immutable as usize], 0);
     }
 
-    /// Replay retains one identity owner and owns retries across queue backpressure.
+    /// Drives one replay generation through queue backpressure and back.
     ///
-    /// The multi-state fixture proves identity serialization, while the
-    /// workerless one-slot runtime proves that capacity release posts the exact
-    /// generation-keyed retry command without relying on an age tick.
+    /// The one-slot persistence runtime is deliberately full at entry, so
+    /// `submit_front` must record a scheduled retry rather than a submission.
+    /// Completing the blocker then has to wake the replay waiter with the exact
+    /// generation-keyed retry command — not an age tick — which flips the front
+    /// entry to submitted. The sequence is then re-armed by refilling the slot
+    /// and submitting again, leaving the caller with a retry-scheduled front
+    /// entry to settle under shutdown.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the front entry's submitted/retry-scheduled state does not
+    /// follow that sequence, or if the retry wakeup does not arrive within one
+    /// second.
+    async fn drive_replay_backpressure_retries(
+        owner: &mut ShardOwner,
+        key: &SealKey,
+        persistence: &Arc<PersistenceRuntime>,
+        persistence_rx: &mut mpsc::Receiver<Box<PersistenceJob>>,
+        completion_rx: &mut mpsc::Receiver<ShardCommand>,
+        generation: &Arc<ImmutableGeneration>,
+    ) {
+        owner.submit_front(key);
+        assert!(
+            owner
+                .pending_generations
+                .get(key)
+                .and_then(VecDeque::front)
+                .is_some_and(|front| front.retry_scheduled && !front.submitted)
+        );
+        let blocker = persistence_rx.recv().await.expect("queued blocker");
+        persistence.complete_for_test(blocker.generation.arrow_bytes);
+        let retry = tokio::time::timeout(std::time::Duration::from_secs(1), completion_rx.recv())
+            .await
+            .expect("replay retry wakeup")
+            .expect("retry command");
+        assert!(!owner.handle_command(retry).await);
+        assert!(
+            owner
+                .pending_generations
+                .get(key)
+                .and_then(VecDeque::front)
+                .is_some_and(|front| front.submitted && !front.retry_scheduled)
+        );
+        let submitted = persistence_rx.recv().await.expect("submitted replay");
+        persistence.complete_for_test(submitted.generation.arrow_bytes);
+        drop(submitted);
+        owner
+            .pending_generations
+            .get_mut(key)
+            .and_then(VecDeque::front_mut)
+            .expect("active replay generation")
+            .submitted = false;
+        persistence
+            .try_submit(PersistenceJob {
+                generation: Arc::clone(generation),
+                binding: crate::catalog::TenantTableBinding::resolve((
+                    key.tenant,
+                    key.table.clone(),
+                ))
+                .expect("blocker binding"),
+                completion_tx: owner.completion_tx.clone(),
+                completion_waiter: None,
+                defer_manifest_advance: true,
+            })
+            .expect("refill one-slot queue");
+        owner.submit_front(key);
+        assert!(
+            owner
+                .pending_generations
+                .get(key)
+                .and_then(VecDeque::front)
+                .is_some_and(|front| front.retry_scheduled && !front.submitted)
+        );
+    }
+
+    /// Replay chunks retain exactly one committed-identity lease across states.
+    ///
+    /// Adding multiple reconstructed seal states to one chunk must neither
+    /// duplicate the identity lease nor release it early: the chunk owns a
+    /// single lease regardless of how many states it reconstructs, and dropping
+    /// the chunk returns exactly that lease.
     ///
     /// # Panics
     ///
@@ -5363,7 +5441,10 @@ mod tests {
         }
         assert_eq!(chunk.states.len(), 2);
         assert_eq!(
-            chunk.identity_memory.as_ref().map(|lease| lease.bytes()),
+            chunk
+                .identity_memory
+                .as_ref()
+                .map(crate::resources::ScribeMemoryLease::bytes),
             Some(64)
         );
         drop(chunk);
@@ -5374,7 +5455,22 @@ mod tests {
                 .scribe_memory_used_bytes,
             0
         );
+    }
 
+    /// Replay owns its own retries across persistence-queue backpressure.
+    ///
+    /// A workerless one-slot runtime proves that capacity release posts the
+    /// exact generation-keyed retry command rather than relying on an age tick,
+    /// and that aborting the runtime settles the replay response as an error
+    /// while returning every byte of immutable ownership to the root budget.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a retry or shutdown wakeup does not arrive within one second,
+    /// if the replay chunk or pending generations survive shutdown, or if the
+    /// budget does not return to its baseline.
+    #[tokio::test]
+    async fn replay_owns_retries_across_queue_backpressure_and_shutdown() {
         let key = owner_key();
         let memtable = Memtable::new();
         memtable
@@ -5438,59 +5534,15 @@ mod tests {
             response: Some(response),
         });
 
-        owner.submit_front(&key);
-        assert!(
-            owner
-                .pending_generations
-                .get(&key)
-                .and_then(VecDeque::front)
-                .is_some_and(|front| front.retry_scheduled && !front.submitted)
-        );
-        let blocker = persistence_rx.recv().await.expect("queued blocker");
-        persistence.complete_for_test(blocker.generation.arrow_bytes);
-        let retry = tokio::time::timeout(std::time::Duration::from_secs(1), completion_rx.recv())
-            .await
-            .expect("replay retry wakeup")
-            .expect("retry command");
-        assert!(!owner.handle_command(retry).await);
-        assert!(
-            owner
-                .pending_generations
-                .get(&key)
-                .and_then(VecDeque::front)
-                .is_some_and(|front| front.submitted && !front.retry_scheduled)
-        );
-        let submitted = persistence_rx.recv().await.expect("submitted replay");
-        persistence.complete_for_test(submitted.generation.arrow_bytes);
-        drop(submitted);
-        owner
-            .pending_generations
-            .get_mut(&key)
-            .and_then(VecDeque::front_mut)
-            .expect("active replay generation")
-            .submitted = false;
-        persistence
-            .try_submit(PersistenceJob {
-                generation: Arc::clone(&generation),
-                binding: crate::catalog::TenantTableBinding::resolve((
-                    key.tenant,
-                    key.table.clone(),
-                ))
-                .expect("blocker binding"),
-                completion_tx: owner.completion_tx.clone(),
-                completion_waiter: None,
-                defer_manifest_advance: true,
-            })
-            .expect("refill one-slot queue");
-        owner.submit_front(&key);
-        assert!(
-            owner
-                .pending_generations
-                .get(&key)
-                .and_then(VecDeque::front)
-                .is_some_and(|front| front.retry_scheduled && !front.submitted)
-        );
-
+        drive_replay_backpressure_retries(
+            &mut owner,
+            &key,
+            &persistence,
+            &mut persistence_rx,
+            &mut completion_rx,
+            &generation,
+        )
+        .await;
         let runtime_weak = Arc::downgrade(&persistence);
         assert_eq!(persistence.abort_retained(), 0);
         let shutdown_retry =
@@ -5520,66 +5572,34 @@ mod tests {
         drop(persistence);
         tokio::task::yield_now().await;
         assert!(runtime_weak.upgrade().is_none());
+    }
 
-        let current_key = owner_key();
-        let next_key = SealKey::new(
-            current_key.tenant,
-            TableRef::new(BifrostNamespace::Bifrost, "replay-advance-failure"),
-            current_key.day,
-        );
-        let memtable = Memtable::new();
-        memtable
-            .insert(
-                &current_key,
-                owner_event(),
-                owner_meta(&current_key),
-                owner_batch(),
-            )
-            .expect("current replay insert");
-        let current_frozen = memtable
-            .freeze(&current_key)
-            .expect("current replay freeze");
-        memtable
-            .insert(
-                &next_key,
-                owner_event(),
-                owner_meta(&next_key),
-                owner_batch(),
-            )
-            .expect("next replay insert");
-        let next_frozen = memtable.freeze(&next_key).expect("next replay freeze");
-        let wal_root = tempfile::tempdir().expect("advance-failure WAL directory");
-        let node = crate::scribe::stream_identity::NodeId::generate();
-        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
-        let wal = Arc::new(
-            WalWriter::new(
-                wal_root.path(),
-                *node.as_bytes(),
-                1,
-                crate::scribe::wal::WalConfig::default(),
-            )
-            .expect("advance-failure WAL writer"),
-        );
-        let wal_handle = wal.handle_for_shard(0).expect("advance-failure WAL handle");
-        let current = owner_generation(&current_key, &current_frozen, stream, wal_handle.clone());
-        let next = owner_generation(&next_key, &next_frozen, stream, wal_handle.clone());
+    /// Settles a chunk advance whose next generation holds a poisoned identity lock.
+    ///
+    /// The advance is driven through a real persistence completion so the
+    /// poisoned lock is observed on the production settlement path rather than
+    /// by calling the failure directly. The chunk response must surface the
+    /// poisoned-lock error, and the owner must be left with no replay chunk, no
+    /// pending generations, and every immutable byte returned to the baseline.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the response does not settle within one second, does not name
+    /// the poisoned identity owner lock, or if any ownership survives.
+    async fn settle_poisoned_advance(
+        owner: &mut ShardOwner,
+        budget: &crate::resources::ScribeResources,
+        baseline: &crate::resources::ResourceSnapshot,
+        current: &Arc<ImmutableGeneration>,
+        current_key: &SealKey,
+        next: Arc<ImmutableGeneration>,
+        next_key: &SealKey,
+    ) {
         let next_for_poison = Arc::clone(&next);
-        let (mut owner, budget) =
-            owner_for_completion_test_with_budget(memtable, &wal, wal_handle, stream);
-        let baseline = budget.snapshot().expect("advance-failure baseline");
-        let replay_bytes = current
-            .arrow_bytes
-            .checked_add(next.arrow_bytes)
-            .expect("replay immutable byte sum");
-        owner
-            .memory_ownership
-            .reserve_immutable(replay_bytes)
-            .expect("advance-failure immutable ownership");
-        owner.admission.sync_memtable_bytes(0, replay_bytes);
         owner.pending_generations.insert(
             current_key.clone(),
             VecDeque::from([PendingGeneration {
-                generation: Arc::clone(&current),
+                generation: Arc::clone(current),
                 binding: crate::catalog::TenantTableBinding::resolve((
                     current_key.tenant,
                     current_key.table.clone(),
@@ -5623,7 +5643,7 @@ mod tests {
         let completion_result = owner.handle_persistence_completion(
             PersistenceCompletion {
                 generation_id: current.generation_id,
-                file_list_key: Some(owner_file_list_key(&current_key)),
+                file_list_key: Some(owner_file_list_key(current_key)),
                 wal_segments: Vec::new(),
                 wal: current.wal.clone(),
                 arrow_bytes: current.arrow_bytes,
@@ -5654,7 +5674,24 @@ mod tests {
                 .scribe_memory_used_bytes,
             baseline.scribe_memory_used_bytes
         );
+    }
 
+    /// Settles a terminal chunk advance whose identity return itself fails.
+    ///
+    /// This is the last-writer case: the chunk has no remaining generations, so
+    /// the only work left is returning the identity lease. Arming that return to
+    /// fail proves the owner still settles the response as an error and still
+    /// returns the lease bytes to the baseline rather than leaking them.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the terminal advance succeeds, if the response does not settle
+    /// within one second, or if the budget does not return to its baseline.
+    async fn settle_failed_terminal_identity_return(
+        owner: &mut ShardOwner,
+        budget: &crate::resources::ScribeResources,
+        baseline: &crate::resources::ResourceSnapshot,
+    ) {
         let terminal_lease = budget
             .try_reserve_maintenance(MemoryCategory::Decode, 64)
             .expect("terminal identity lease");
@@ -5689,7 +5726,26 @@ mod tests {
                 .scribe_memory_used_bytes,
             baseline.scribe_memory_used_bytes
         );
+    }
 
+    /// Settles a chunk whose own retained generation holds a poisoned identity lock.
+    ///
+    /// Unlike the advance case, the poisoned lock here belongs to a generation
+    /// the chunk already owns, so the failure is raised by the advance itself
+    /// rather than by a persistence completion. The owner must still settle the
+    /// response as an error and return to the baseline.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the advance succeeds, if the response does not settle within
+    /// one second, or if the budget does not return to its baseline.
+    async fn settle_poisoned_identity_lock(
+        owner: &mut ShardOwner,
+        budget: &crate::resources::ScribeResources,
+        baseline: &crate::resources::ResourceSnapshot,
+        current_key: &SealKey,
+        stream: StreamIdentity,
+    ) {
         let lock_key = SealKey::new(
             current_key.tenant,
             TableRef::new(BifrostNamespace::Bifrost, "replay-identity-lock"),
@@ -5764,7 +5820,185 @@ mod tests {
                 .scribe_memory_used_bytes,
             baseline.scribe_memory_used_bytes
         );
+    }
 
+    /// Replay identity failures settle the chunk response and return ownership.
+    ///
+    /// Three identity failure modes run against one owner in sequence — a
+    /// poisoned identity lock during chunk advance, a failed identity return at
+    /// the terminal advance, and a poisoned lock on a later generation — because
+    /// the property under test is that the owner stays usable and fully settled
+    /// after each one, not merely that each fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any failure does not settle the replay response as an error,
+    /// leaves a replay chunk or pending generation behind, or leaves the budget
+    /// above its baseline.
+    #[tokio::test]
+    async fn replay_identity_failures_settle_response_and_release_ownership() {
+        let current_key = owner_key();
+        let next_key = SealKey::new(
+            current_key.tenant,
+            TableRef::new(BifrostNamespace::Bifrost, "replay-advance-failure"),
+            current_key.day,
+        );
+        let memtable = Memtable::new();
+        memtable
+            .insert(
+                &current_key,
+                owner_event(),
+                owner_meta(&current_key),
+                owner_batch(),
+            )
+            .expect("current replay insert");
+        let current_frozen = memtable
+            .freeze(&current_key)
+            .expect("current replay freeze");
+        memtable
+            .insert(
+                &next_key,
+                owner_event(),
+                owner_meta(&next_key),
+                owner_batch(),
+            )
+            .expect("next replay insert");
+        let next_frozen = memtable.freeze(&next_key).expect("next replay freeze");
+        let wal_root = tempfile::tempdir().expect("advance-failure WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("advance-failure WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("advance-failure WAL handle");
+        let current = owner_generation(&current_key, &current_frozen, stream, wal_handle.clone());
+        let next = owner_generation(&next_key, &next_frozen, stream, wal_handle.clone());
+        let (mut owner, budget) =
+            owner_for_completion_test_with_budget(memtable, &wal, wal_handle, stream);
+        let baseline = budget.snapshot().expect("advance-failure baseline");
+        let replay_bytes = current
+            .arrow_bytes
+            .checked_add(next.arrow_bytes)
+            .expect("replay immutable byte sum");
+        owner
+            .memory_ownership
+            .reserve_immutable(replay_bytes)
+            .expect("advance-failure immutable ownership");
+        owner.admission.sync_memtable_bytes(0, replay_bytes);
+        settle_poisoned_advance(
+            &mut owner,
+            &budget,
+            &baseline,
+            &current,
+            &current_key,
+            next,
+            &next_key,
+        )
+        .await;
+        settle_failed_terminal_identity_return(&mut owner, &budget, &baseline).await;
+        settle_poisoned_identity_lock(&mut owner, &budget, &baseline, &current_key, stream).await;
+    }
+
+    /// Asserts a retired replay generation settled exactly and released cleanly.
+    ///
+    /// The replay response must carry the same error text the visibility path
+    /// raised, so a caller sees one consistent failure rather than two
+    /// divergent ones. The owner must then hold no replay chunk and no pending
+    /// generation, while retaining exactly the one surviving generation with its
+    /// 64-byte identity lease — proving retirement released the replay-owned
+    /// bytes without also releasing the retained generation's.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the two error texts differ, if replay state survives, or if the
+    /// immutable attribution is not exactly the retained generation plus its
+    /// identity lease.
+    fn assert_retirement_settlement(
+        retirement_owner: &ShardOwner,
+        retirement_budget: &crate::resources::ScribeResources,
+        retirement_generation: &Arc<ImmutableGeneration>,
+        replay_error: &str,
+        visibility_error: &str,
+    ) {
+        assert_eq!(replay_error, visibility_error);
+        assert!(retirement_owner.replay_chunk.is_none());
+        assert!(retirement_owner.pending_generations.is_empty());
+        assert_eq!(retirement_owner.retained_generations.len(), 1);
+        assert_eq!(
+            retirement_owner.retained_generations[&retirement_generation.generation_id.0]
+                .replay_identity
+                .lock()
+                .expect("retained retirement identity")
+                .as_ref()
+                .map(crate::scribe::memory::ReplayIdentityOwnership::bytes),
+            Some(64)
+        );
+        assert_eq!(
+            retirement_owner.memory_ownership.immutable_bytes(),
+            retirement_generation.arrow_bytes
+        );
+        let retirement_snapshot = retirement_budget.memory_snapshot();
+        assert_eq!(
+            retirement_snapshot.scribe_total_bytes,
+            retirement_generation.arrow_bytes + 64
+        );
+        let retirement_attribution = retirement_budget.accounting_snapshot_for_test();
+        assert_eq!(
+            retirement_attribution.category_bytes[MemoryCategory::Decode as usize],
+            0
+        );
+        assert_eq!(
+            retirement_attribution.category_bytes[MemoryCategory::Immutable as usize],
+            retirement_generation.arrow_bytes + 64
+        );
+    }
+
+    /// Builds a default-config WAL writer and shard-0 handle for one owner test.
+    ///
+    /// The returned temporary directory must be held by the caller: dropping it
+    /// removes the WAL root out from under the writer. Shard 0 is used because
+    /// these tests drive a single owner and never exercise routing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the temporary directory, WAL writer, or shard handle cannot be
+    /// created.
+    fn retirement_wal_fixture() -> (tempfile::TempDir, StreamIdentity, Arc<WalWriter>, WalHandle) {
+        let wal_root = tempfile::tempdir().expect("retirement WAL directory");
+        let node = crate::scribe::stream_identity::NodeId::generate();
+        let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node.as_bytes(),
+                1,
+                crate::scribe::wal::WalConfig::default(),
+            )
+            .expect("retirement WAL writer"),
+        );
+        let wal_handle = wal.handle_for_shard(0).expect("retirement WAL handle");
+        (wal_root, stream, wal, wal_handle)
+    }
+
+    /// Retired replay generations settle their response and release ownership.
+    ///
+    /// A generation retired mid-replay must fail its replay response rather than
+    /// completing silently, and the immutable category must retain only the
+    /// bytes the surviving generation and its identity lease legitimately own.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the retirement response does not settle within one second or
+    /// if the immutable attribution does not match the surviving generation.
+    #[tokio::test]
+    async fn replay_retirement_settles_response_and_releases_ownership() {
+        let (_wal_root, stream, wal, wal_handle) = retirement_wal_fixture();
         let retirement_key = owner_key();
         let retirement_memtable = Memtable::new();
         retirement_memtable
@@ -5782,12 +6016,12 @@ mod tests {
             &retirement_key,
             &retirement_frozen,
             stream,
-            owner.wal_handle.clone(),
+            wal_handle.clone(),
         );
         let (mut retirement_owner, retirement_budget) = owner_for_completion_test_with_budget(
             retirement_memtable,
             &wal,
-            owner.wal_handle.clone(),
+            wal_handle.clone(),
             stream,
         );
         retirement_owner
@@ -5850,36 +6084,12 @@ mod tests {
             .expect("retirement response sender")
             .expect_err("retirement replay response must fail")
             .to_string();
-        assert_eq!(replay_error, visibility_error);
-        assert!(retirement_owner.replay_chunk.is_none());
-        assert!(retirement_owner.pending_generations.is_empty());
-        assert_eq!(retirement_owner.retained_generations.len(), 1);
-        assert_eq!(
-            retirement_owner.retained_generations[&retirement_generation.generation_id.0]
-                .replay_identity
-                .lock()
-                .expect("retained retirement identity")
-                .as_ref()
-                .map(crate::scribe::memory::ReplayIdentityOwnership::bytes),
-            Some(64)
-        );
-        assert_eq!(
-            retirement_owner.memory_ownership.immutable_bytes(),
-            retirement_generation.arrow_bytes
-        );
-        let retirement_snapshot = retirement_budget.memory_snapshot();
-        assert_eq!(
-            retirement_snapshot.scribe_total_bytes,
-            retirement_generation.arrow_bytes + 64
-        );
-        let retirement_attribution = retirement_budget.accounting_snapshot_for_test();
-        assert_eq!(
-            retirement_attribution.category_bytes[MemoryCategory::Decode as usize],
-            0
-        );
-        assert_eq!(
-            retirement_attribution.category_bytes[MemoryCategory::Immutable as usize],
-            retirement_generation.arrow_bytes + 64
+        assert_retirement_settlement(
+            &retirement_owner,
+            &retirement_budget,
+            &retirement_generation,
+            &replay_error,
+            &visibility_error,
         );
     }
 
@@ -7009,6 +7219,68 @@ mod tests {
         assert!(visibility_error.contains("generation"));
     }
 
+    /// Drains the owner's visible rows, retires the generation, and shuts it down.
+    ///
+    /// The snapshot goes through the real `Snapshot` mailbox command with a
+    /// narrow required-column projection, so this proves the persisted
+    /// generation is visible through the owner's own live-tail path rather than
+    /// by reading its internals. Retirement and shutdown then run as mailbox
+    /// commands too, so the owner task must terminate on its own.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any mailbox send or response fails, if the snapshot does not
+    /// return exactly one batch of one row, or if the owner task does not join.
+    async fn assert_visible_rows_then_retire_and_shutdown(
+        key: &SealKey,
+        stream: StreamIdentity,
+        command_tx: &mpsc::Sender<ShardCommand>,
+        task: tokio::task::JoinHandle<()>,
+    ) {
+        let binding = crate::catalog::TenantTableBinding::resolve((key.tenant, key.table.clone()))
+            .expect("owner binding");
+        let (snapshot_response, snapshot_rx) = tokio::sync::oneshot::channel();
+        command_tx
+            .send(ShardCommand::Snapshot {
+                request: FetchLiveTailRequest {
+                    binding,
+                    target_stream: stream,
+                    start_day: key.day,
+                    end_day: key.day,
+                    after_lsn: crate::scribe::wal::WalLsn::ZERO,
+                    persisted_lsn_ranges: Vec::new(),
+                    required_columns: vec!["value".to_owned()],
+                    max_batches: 4,
+                    max_retained_bytes: 1 << 20,
+                },
+                response: snapshot_response,
+            })
+            .await
+            .expect("visible snapshot command mailbox");
+        let visible = snapshot_rx
+            .await
+            .expect("snapshot response")
+            .expect("visible owner rows");
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].rows.num_rows(), 1);
+        let (retire_response, retire_result) = tokio::sync::oneshot::channel();
+        command_tx
+            .send(ShardCommand::RetireCommittedForTest {
+                response: retire_response,
+            })
+            .await
+            .expect("retirement command mailbox");
+        retire_result
+            .await
+            .expect("retirement response")
+            .expect("committed generation retirement");
+        command_tx
+            .send(ShardCommand::Shutdown)
+            .await
+            .expect("owner shutdown mailbox");
+        task.await.expect("owner task");
+    }
+
     /// Proves one real shard owner drives WAL, age, memtable, and both mailbox
     /// transitions for one generation from age expiry through visible rows.
     #[tokio::test]
@@ -7097,48 +7369,7 @@ mod tests {
                 .has_active_records()
                 .expect("fresh WAL generation")
         );
-        let binding = crate::catalog::TenantTableBinding::resolve((key.tenant, key.table.clone()))
-            .expect("owner binding");
-        let (snapshot_response, snapshot_rx) = tokio::sync::oneshot::channel();
-        command_tx
-            .send(ShardCommand::Snapshot {
-                request: FetchLiveTailRequest {
-                    binding,
-                    target_stream: stream,
-                    start_day: key.day,
-                    end_day: key.day,
-                    after_lsn: crate::scribe::wal::WalLsn::ZERO,
-                    persisted_lsn_ranges: Vec::new(),
-                    required_columns: vec!["value".to_owned()],
-                    max_batches: 4,
-                    max_retained_bytes: 1 << 20,
-                },
-                response: snapshot_response,
-            })
-            .await
-            .expect("visible snapshot command mailbox");
-        let visible = snapshot_rx
-            .await
-            .expect("snapshot response")
-            .expect("visible owner rows");
-        assert_eq!(visible.len(), 1);
-        assert_eq!(visible[0].rows.num_rows(), 1);
-        let (retire_response, retire_result) = tokio::sync::oneshot::channel();
-        command_tx
-            .send(ShardCommand::RetireCommittedForTest {
-                response: retire_response,
-            })
-            .await
-            .expect("retirement command mailbox");
-        retire_result
-            .await
-            .expect("retirement response")
-            .expect("committed generation retirement");
-        command_tx
-            .send(ShardCommand::Shutdown)
-            .await
-            .expect("owner shutdown mailbox");
-        task.await.expect("owner task");
+        assert_visible_rows_then_retire_and_shutdown(&key, stream, &command_tx, task).await;
     }
 
     #[test]

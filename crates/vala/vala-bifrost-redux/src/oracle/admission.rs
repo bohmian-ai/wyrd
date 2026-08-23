@@ -777,6 +777,7 @@ impl OracleAdmission {
             live_reservations: Vec::new(),
             cancellation: self.shared.root_cancel.child_token(),
             request_cancellation: cancellation,
+            distributed_settlement: Arc::new(DistributedQuerySettlement::default()),
             #[cfg(feature = "test-support")]
             resource_probe: None,
         })
@@ -1031,9 +1032,81 @@ pub(super) struct AdmittedQueryGuard {
     pub(super) cancellation: CancellationToken,
     /// Caller/request cancellation retained for admission ownership.
     pub(super) request_cancellation: CancellationToken,
+    /// Query-scoped join owner for every started distributed partition.
+    pub(super) distributed_settlement: Arc<DistributedQuerySettlement>,
     /// Query-keyed lifecycle observation retained through cleanup.
     #[cfg(feature = "test-support")]
     pub(super) resource_probe: Option<Arc<QueryResourceProbe>>,
+}
+
+/// Query-scoped join state preventing a distributed child from outliving admission.
+#[derive(Debug, Default)]
+pub(super) struct DistributedQuerySettlement {
+    /// Active partition futures guarded with cancellation admission.
+    active: std::sync::Mutex<usize>,
+    /// Wakes the terminal owner after the last partition future settles.
+    settled: tokio::sync::Notify,
+}
+
+impl DistributedQuerySettlement {
+    /// Starts one partition only while query cancellation remains open.
+    pub(super) fn start(
+        self: &Arc<Self>,
+        cancellation: &CancellationToken,
+    ) -> Option<DistributedPartitionGuard> {
+        let mut active = self.active.lock().ok()?;
+        if cancellation.is_cancelled() {
+            return None;
+        }
+        *active = active.checked_add(1)?;
+        Some(DistributedPartitionGuard {
+            settlement: Arc::clone(self),
+        })
+    }
+
+    /// Cancels admission for new work and waits until every started partition settles.
+    pub(super) async fn cancel_and_join(&self, cancellation: &CancellationToken) {
+        {
+            let _active = self.active.lock();
+            cancellation.cancel();
+        }
+        self.join().await;
+    }
+
+    /// Waits until no started partition future remains.
+    ///
+    /// The waiter is registered before the active count is observed.
+    /// [`tokio::sync::Notify::notify_waiters`] wakes only waiters that are
+    /// already registered, and a `Notified` future does not register until it
+    /// is first polled. Observing the count first would therefore lose the
+    /// wakeup from a guard that drops between the observation and the await,
+    /// leaving this join parked forever while the query holds admission.
+    pub(super) async fn join(&self) {
+        loop {
+            let notified = self.settled.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.active.lock().map_or(true, |active| *active == 0) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// RAII terminal for one started distributed partition future.
+pub(super) struct DistributedPartitionGuard {
+    /// Shared query settlement updated on every future terminal or drop.
+    settlement: Arc<DistributedQuerySettlement>,
+}
+
+impl Drop for DistributedPartitionGuard {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.settlement.active.lock() {
+            *active = active.saturating_sub(1);
+        }
+        self.settlement.settled.notify_waiters();
+    }
 }
 
 impl Drop for AdmittedQueryGuard {
@@ -1255,6 +1328,7 @@ pub(super) fn admitted_guard_for_test()
             live_reservations: Vec::new(),
             cancellation: cancellation.clone(),
             request_cancellation: request_cancellation.clone(),
+            distributed_settlement: Arc::new(DistributedQuerySettlement::default()),
             #[cfg(feature = "test-support")]
             resource_probe: None,
         },

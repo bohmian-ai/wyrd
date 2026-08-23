@@ -753,7 +753,7 @@ mod tests {
     }
 
     /// Builds one base mapper batch with exact nullable placeholders.
-    fn source_batch(schema: Arc<Schema>) -> RecordBatch {
+    fn source_batch(schema: &Schema) -> RecordBatch {
         let retained_schema = Arc::new(Schema::new(
             schema.fields()[..2]
                 .iter()
@@ -825,7 +825,7 @@ mod tests {
             42,
         )
         .expect("managed plan");
-        let base = source_batch(source);
+        let base = source_batch(&source);
         let retained = Arc::clone(base.column(0));
         let material = projection
             .material_plan(source_facts().into_iter())
@@ -917,7 +917,7 @@ mod tests {
             Err(ScribeError::DecodedPayloadTooLarge { .. })
         ));
         let managed = projection
-            .finish(source_batch(source), material)
+            .finish(source_batch(&source), material)
             .expect("managed batch");
         let encoded = managed.ipc_plan.encode(&managed.rows).expect("fixed IPC");
 

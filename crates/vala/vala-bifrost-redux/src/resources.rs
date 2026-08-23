@@ -992,12 +992,21 @@ fn is_authorized_staged_name(name: &str) -> bool {
 
 /// Samples current filesystem-available bytes for one registered root.
 ///
+/// The probed path is included in the failure detail. A registered volume root
+/// that has been removed underneath a running pod reports the same errno as a
+/// permission or mount fault, and without the path an operator cannot tell
+/// which of the four volume classes failed or whether the directory simply no
+/// longer exists.
+///
 /// # Errors
 ///
 /// Returns unavailable when the live filesystem probe fails or overflows.
 fn filesystem_available_bytes(path: &Path) -> Result<u64, BifrostResourceError> {
     let stats = statvfs(path).map_err(|error| BifrostResourceError::Unavailable {
-        detail: format!("cannot sample Bifrost volume free space: {error}"),
+        detail: format!(
+            "cannot sample Bifrost volume free space at {}: {error}",
+            path.display()
+        ),
     })?;
     stats
         .f_bavail
@@ -1122,6 +1131,13 @@ impl BifrostResourceHealth {
                 "reason" => reason_label
             )
             .increment(1);
+            // ERROR because this is terminal: the supervised health watcher
+            // observes it and ends the serving process. A metric alone leaves
+            // an operator with a server that stopped and no log saying why.
+            tracing::error!(
+                reason = reason_label,
+                "Bifrost resource accounting poisoned; this wyrd-server process will terminate"
+            );
             self.notify.notify_waiters();
         }
     }
@@ -1147,6 +1163,13 @@ impl BifrostResourceHealth {
     pub async fn wait_for_poison(&self) -> Result<(), BifrostResourceError> {
         loop {
             let notified = self.notify.notified();
+            tokio::pin!(notified);
+            // Register before sampling the reason. `notify_waiters` reaches only
+            // already-registered waiters and `notified()` does not register until
+            // first polled, so a poison published between the sample and the await
+            // would otherwise be dropped and this watcher would sleep through the
+            // fail-closed signal it exists to observe.
+            notified.as_mut().enable();
             if let Some(reason) = self.reason() {
                 return Err(BifrostResourceError::Poisoned {
                     detail: format!("resource health entered {reason:?}"),
@@ -2393,6 +2416,19 @@ impl BifrostResourceGovernor {
             || role_total > plan.managed_memory_bytes
             || expected_elastic != state.elastic_memory_used_bytes
         {
+            // Emit the operands: which of the five identities broke is the
+            // whole diagnosis, and it is unrecoverable from the error string.
+            tracing::error!(
+                category_total,
+                shard_total,
+                generation_total,
+                role_total,
+                expected_elastic,
+                scribe_memory_used_bytes = state.scribe_memory_used_bytes,
+                elastic_memory_used_bytes = state.elastic_memory_used_bytes,
+                managed_memory_bytes = plan.managed_memory_bytes,
+                "Scribe root attribution does not reconcile to live ownership"
+            );
             self.inner
                 .health
                 .poison(BifrostResourcePoisonReason::Accounting);
@@ -2713,7 +2749,6 @@ impl BifrostResourceGovernor {
             target_partitions,
             memory_pool,
             nested_scratch_used_bytes: Arc::new(Mutex::new(0)),
-            elastic_bytes: added_elastic,
             governor: self.clone(),
             released: false,
             volume_scratch: None,
@@ -2757,7 +2792,6 @@ impl BifrostResourceGovernor {
         record_memory_transition("oracle", "acquired", next);
         Ok(OracleMemoryLease {
             bytes,
-            elastic_bytes: added_elastic,
             governor: self.clone(),
             released: false,
         })
@@ -2821,7 +2855,6 @@ impl BifrostResourceGovernor {
         record_memory_transition("forge", "acquired", next_forge);
         Ok(ForgeRewriteResources {
             memory_bytes,
-            elastic_bytes: added_elastic,
             scratch_bytes,
             reader_permits: usize::from(reader_permits),
             memory_pool: bounded_memory_pool(memory_bytes),
@@ -2853,6 +2886,10 @@ impl BifrostResourceGovernor {
     }
 
     fn poison_locked(&self, state: &mut ResourceState, detail: &str) -> BifrostResourceError {
+        // Log the cause here rather than relying on the returned error: callers
+        // on cleanup and Drop paths routinely discard it, which is how the
+        // originating imbalance has been lost before.
+        tracing::error!(detail, "Bifrost resource accounting failed to reconcile");
         state.poisoned = true;
         state.memory_epoch = state.memory_epoch.wrapping_add(1);
         self.inner
@@ -3474,7 +3511,7 @@ impl Drop for ScribeMemoryLease {
 pub struct OracleWorkerResources {
     /// Exact floor-first root-memory ownership for this remote execution.
     lease: OracleMemoryLease,
-    /// Exact bounded DataFusion pool nested under the retained root lease.
+    /// Exact bounded `DataFusion` pool nested under the retained root lease.
     memory_pool: Arc<dyn MemoryPool>,
 }
 
@@ -3487,7 +3524,7 @@ pub struct ScribeFollowerLease {
     _permit: OwnedSemaphorePermit,
     /// Existing Scribe memory lease retained until follower stream termination.
     lease: ScribeMemoryLease,
-    /// Exact bounded DataFusion pool used by the request-local session.
+    /// Exact bounded `DataFusion` pool used by the request-local session.
     pool: Arc<dyn MemoryPool>,
 }
 
@@ -3570,8 +3607,6 @@ impl OracleFooterSlotResources {
 struct OracleMemoryLease {
     /// Total Oracle bytes owned by this lease.
     bytes: usize,
-    /// Subset borrowed from shared elastic memory.
-    elastic_bytes: usize,
     /// Root ledger that issued the ownership.
     governor: BifrostResourceGovernor,
     /// Whether exact ownership has already returned to the root.
@@ -3590,15 +3625,21 @@ impl OracleMemoryLease {
             return Ok(());
         }
         let mut state = self.governor.lock_state()?;
+        let plan = self.governor.plan();
+        let released_elastic = released_elastic_bytes(
+            state.oracle_memory_used_bytes,
+            plan.oracle_floor_bytes,
+            self.bytes,
+        );
         if state.oracle_memory_used_bytes < self.bytes
-            || state.elastic_memory_used_bytes < self.elastic_bytes
+            || state.elastic_memory_used_bytes < released_elastic
         {
             return Err(self
                 .governor
                 .poison_locked(&mut state, "Oracle role lease release underflow"));
         }
         state.oracle_memory_used_bytes -= self.bytes;
-        state.elastic_memory_used_bytes -= self.elastic_bytes;
+        state.elastic_memory_used_bytes -= released_elastic;
         state.memory_epoch = state.memory_epoch.wrapping_add(1);
         record_memory_transition("oracle", "released", state.oracle_memory_used_bytes);
         self.released = true;
@@ -3634,7 +3675,6 @@ pub struct OracleQueryResources {
     memory_pool: Arc<dyn MemoryPool>,
     /// Query-local scratch children split from the already admitted envelope.
     nested_scratch_used_bytes: Arc<Mutex<u64>>,
-    elastic_bytes: usize,
     governor: BifrostResourceGovernor,
     released: bool,
     /// Exact physical Oracle scratch ownership when live roots are registered.
@@ -3728,20 +3768,26 @@ impl OracleQueryResources {
             QueryClass::Interactive => state.oracle_interactive_queries,
             QueryClass::Analytical => state.oracle_analytical_queries,
         };
+        let plan = self.governor.plan();
+        let released_elastic = released_elastic_bytes(
+            state.oracle_memory_used_bytes,
+            plan.oracle_floor_bytes,
+            self.memory_bytes,
+        );
         if state.oracle_active_queries == 0
             || class_count == 0
             || state.oracle_query_slot_units < self.slot_units
             || state.oracle_query_memory_used_bytes < self.memory_bytes
             || state.oracle_query_scratch_used_bytes < self.scratch_bytes
             || state.oracle_memory_used_bytes < self.memory_bytes
-            || state.elastic_memory_used_bytes < self.elastic_bytes
+            || state.elastic_memory_used_bytes < released_elastic
             || state.scratch_used_bytes < self.scratch_bytes
         {
             return Err(self
                 .governor
                 .poison_locked(&mut state, "Oracle query release underflow"));
         }
-        state.elastic_memory_used_bytes -= self.elastic_bytes;
+        state.elastic_memory_used_bytes -= released_elastic;
         state.oracle_memory_used_bytes -= self.memory_bytes;
         state.scratch_used_bytes -= self.scratch_bytes;
         state.oracle_active_queries -= 1;
@@ -3876,8 +3922,6 @@ impl Drop for OracleQueryResources {
 #[derive(Debug)]
 pub struct ForgeRewriteResources {
     memory_bytes: usize,
-    /// Portion of `memory_bytes` borrowed beyond the protected Forge floor.
-    elastic_bytes: usize,
     scratch_bytes: u64,
     /// Reader permits coupled to this exact attempt lease.
     reader_permits: usize,
@@ -3936,8 +3980,14 @@ impl ForgeRewriteResources {
                 return Err(error);
             }
         };
+        let plan = self.governor.plan();
+        let released_elastic = released_elastic_bytes(
+            state.forge_memory_used_bytes,
+            plan.forge_floor_bytes,
+            self.memory_bytes,
+        );
         if state.forge_memory_used_bytes < self.memory_bytes
-            || state.elastic_memory_used_bytes < self.elastic_bytes
+            || state.elastic_memory_used_bytes < released_elastic
             || state.scratch_used_bytes < self.scratch_bytes
             || state.forge_reader_permits_used < self.reader_permits
         {
@@ -3947,7 +3997,7 @@ impl ForgeRewriteResources {
                 .poison_locked(&mut state, "Forge release underflow"));
         }
         state.forge_memory_used_bytes -= self.memory_bytes;
-        state.elastic_memory_used_bytes -= self.elastic_bytes;
+        state.elastic_memory_used_bytes -= released_elastic;
         state.scratch_used_bytes -= self.scratch_bytes;
         state.forge_reader_permits_used -= self.reader_permits;
         state.memory_epoch = state.memory_epoch.wrapping_add(1);
@@ -3990,7 +4040,7 @@ impl Drop for ForgeRewriteResources {
     }
 }
 
-redacted
+/// Computes locality parallelism clamped by exact query memory.
 ///
 /// # Errors
 ///
@@ -4178,6 +4228,30 @@ fn cap_positive(
         });
     }
     Ok(resolved)
+}
+
+/// Computes the elastic bytes a role release returns to the shared pool.
+///
+/// Elastic borrowing is a function of how far a role's *total* sits above its
+/// protected floor, never of what an individual lease borrowed when it was
+/// admitted. Replaying a per-lease borrow at release is correct only when
+/// leases release in exact reverse acquisition order; concurrent Oracle queries
+/// and Forge tasks do not, and each out-of-order release strands the difference
+/// permanently because these counters are never re-derived from ownership.
+///
+/// Worked example with a 256 MiB floor: lease A takes 256 MiB and borrows 0,
+/// lease B then takes 256 MiB and borrows 256 MiB. Releasing A first returns
+/// A's recorded 0, leaving the pool holding 256 MiB that the remaining total no
+/// longer justifies. The next reconciliation poisons accounting and terminates
+/// the process.
+///
+/// `released` must already be known not to exceed `role_used`; callers check
+/// that before poisoning on underflow. The subtraction cannot underflow because
+/// the post-release borrow is monotone in the role total.
+fn released_elastic_bytes(role_used: usize, floor: usize, released: usize) -> usize {
+    let prior_borrow = role_used.saturating_sub(floor);
+    let next_total = role_used.saturating_sub(released);
+    prior_borrow - next_total.saturating_sub(floor)
 }
 
 fn accounting_overflow() -> BifrostResourceError {
@@ -4543,18 +4617,34 @@ mod tests {
         assert_eq!(scribe.governor.plan().elastic_memory_bytes, 0);
         assert_eq!(scribe.ingress_limit_bytes(), 256 * MIB);
 
-        let generation_bytes = 96 * MIB;
+        // The exact-floor property is what this test exists to prove: the
+        // retained generation plus the producer's incremental workspace must
+        // sum to the role floor precisely. Derive the generation from the
+        // projection rather than hard-coding both sides, so a change to the
+        // workspace formula keeps the scenario exact instead of silently
+        // overshooting the floor and turning this into a refusal test.
+        let producer_delta = crate::scribe::memory::parquet_candidate_incremental_bytes(72 * MIB)
+            .expect("candidate workspace projection");
+        let generation_bytes = (256 * MIB) - producer_delta;
         let mut generation = scribe
             .try_reserve_ingress(ScribeMemoryCategory::Active, generation_bytes)
             .expect("representative generation must fit the exact Scribe floor");
         generation
             .transfer_category(ScribeMemoryCategory::Immutable)
             .expect("generation ownership must transfer to immutable");
-        let producer_delta = crate::scribe::memory::parquet_candidate_incremental_bytes(72 * MIB)
-            .expect("candidate workspace projection");
         let producer = scribe
             .try_reserve_maintenance(ScribeMemoryCategory::Persistence, producer_delta)
             .expect("producer delta must complete the exact Scribe floor");
+        // Deriving the generation makes the sum equal the floor by
+        // construction, so assert the consequence that is not tautological:
+        // the floor is genuinely full and one further byte is refused.
+        assert!(
+            matches!(
+                scribe.try_reserve_ingress(ScribeMemoryCategory::Active, 1),
+                Err(crate::contracts::ScribeError::IngestBusy { .. })
+            ),
+            "generation plus producer workspace must exactly exhaust the Scribe floor"
+        );
 
         let occupied = scribe.snapshot().expect("occupied Scribe snapshot");
         assert_eq!(
@@ -6138,6 +6228,60 @@ mod tests {
     }
 
     /// Scribe's floor remains outside every Oracle and Forge elastic lease.
+    /// Releasing role leases out of acquisition order must leave elastic
+    /// borrowing exactly equal to what the remaining role total justifies.
+    ///
+    /// Elastic borrow is a property of a role's total against its floor, not of
+    /// any one lease. Charging each release the borrow it recorded at admission
+    /// is only correct under strict LIFO release, which concurrent queries never
+    /// guarantee. Each out-of-order release used to strand the difference, and
+    /// because these counters are never re-derived, the drift accumulated until
+    /// reconciliation poisoned accounting and terminated the process.
+    #[test]
+    fn out_of_order_query_release_leaves_no_stranded_elastic_memory() {
+        let roles = BifrostRuntimeResources::composed_for_test(
+            4096 * MIB,
+            2048 * MIB as u64,
+            [BifrostRole::Scribe, BifrostRole::Oracle, BifrostRole::Forge],
+        );
+        let oracle = roles.oracle().expect("Oracle capability");
+        let baseline = roles
+            .snapshot()
+            .expect("baseline snapshot")
+            .elastic_memory_used_bytes;
+
+        // The first query fits under the Oracle floor and borrows nothing; the
+        // second is entirely elastic. Releasing the first one first is the case
+        // that used to strand its successor's borrow.
+        // The interactive quantum is exactly one role floor, so the first query
+        // borrows nothing and the second borrows a full floor's worth. That is
+        // the pairing that strands memory when the first one releases first.
+        let first = oracle
+            .try_acquire_query(interactive_query(0.0))
+            .expect("first query is admitted entirely under the Oracle floor");
+        let second = oracle
+            .try_acquire_query(interactive_query(0.0))
+            .expect("second query is admitted entirely from elastic memory");
+        drop(first);
+        drop(second);
+
+        let snapshot = roles.snapshot().expect("post-release snapshot");
+        assert_eq!(
+            snapshot.oracle_memory_used_bytes, 0,
+            "both queries released their role memory"
+        );
+        assert_eq!(
+            snapshot.elastic_memory_used_bytes, baseline,
+            "out-of-order release stranded elastic memory"
+        );
+        // Reconciliation is the check that fails closed in production, so assert
+        // the accounting it validates is actually intact rather than only the
+        // counter this test set out to fix.
+        roles
+            .snapshot()
+            .expect("resource accounting reconciles after out-of-order release");
+    }
+
     #[test]
     fn scribe_floor_survives_oracle_and_forge_elastic_pressure() {
         let roles = BifrostRuntimeResources::composed_for_test(

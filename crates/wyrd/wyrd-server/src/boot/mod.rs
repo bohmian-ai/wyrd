@@ -20,7 +20,8 @@ use vala_bifrost_redux::forge::{
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::oracle::dispatcher::{
     LocalOraclePeerTransport, OraclePeerCredentials, OraclePeerTls, OraclePeerTransportDirectory,
-    OraclePeerWorker, PEER_PROTOCOL_VERSION, ReservationRegistry, TonicOraclePeerTransport,
+    OraclePeerWorker, OraclePeerWorkerConfig, PEER_PROTOCOL_VERSION, ReservationRegistry,
+    TonicOraclePeerTransport,
 };
 use vala_bifrost_redux::oracle::{
     Oracle as OracleEngine, OracleBuildConfig, OracleConfig, OracleMemoryResources,
@@ -927,27 +928,27 @@ pub async fn compose_bifrost(
             .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
         );
         Some(Arc::new(
-            Scribe::new(
-                parts.scribe,
-                Arc::clone(&bifrost),
-                bifrost_resources.scribe().ok_or_else(|| {
+            Scribe::new(crate::state::ScribeBuildInputs {
+                ingest: parts.scribe,
+                catalog: Arc::clone(&bifrost),
+                resources: bifrost_resources.scribe().ok_or_else(|| {
                     ServerBootError::Scribe(
                         "selected Scribe role has no root-derived resource capability".to_owned(),
                     )
                 })?,
-                Arc::clone(&cluster_registry),
-                parts.scribe_role,
-                fragment_authority,
+                cluster: Arc::clone(&cluster_registry),
+                registered_role: parts.scribe_role,
+                fragment_verifier: fragment_authority,
                 fragment_security_audit,
-                query_audit.clone().ok_or_else(|| {
+                fragment_query_audit: query_audit.clone().ok_or_else(|| {
                     ServerBootError::Scribe(
                         "selected Scribe role has no tenant-tripwire audit owner".to_owned(),
                     )
                 })?,
-                !roles.contains(&BifrostRuntimeRole::Oracle),
-                parts.coordination_runtime,
-                shutdown.clone(),
-            )
+                owns_fragment_query_audit: !roles.contains(&BifrostRuntimeRole::Oracle),
+                coordination_runtime: parts.coordination_runtime,
+                role_shutdown: shutdown.clone(),
+            })
             .with_tail_authority(Arc::new(
                 crate::oracle::ScribeTailAuthority::from_pem(&signing_key, tail_audit)
                     .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
@@ -1132,7 +1133,7 @@ pub async fn build_state(
         peer_tls,
         signing_key,
         config: config.bifrost.clone(),
-        forge_config: config.forge.clone(),
+        forge_config: config.forge,
         node_id: external.node_id,
         advertise_addr: external.advertise_addr,
         wal_dir: external.wal_dir,
@@ -1483,6 +1484,18 @@ impl<'a> OracleRoleBuilder<'a> {
             config.oracle.admission_waiters,
             running_slots,
         ));
+        // Query concurrency is the single number that decides whether this node
+        // serves or queues, and it is derived rather than configured. An
+        // operator diagnosing query latency needs it at startup, not inferred
+        // from a saturation warning under load.
+        tracing::info!(
+            running_slots,
+            admission_waiters = config.oracle.admission_waiters,
+            effective_cpu = resource_plan.effective_cpu,
+            oracle_floor_bytes = resource_plan.oracle_floor_bytes,
+            elastic_memory_bytes = resource_plan.elastic_memory_bytes,
+            "Oracle admission capacity resolved"
+        );
         let reservations = Arc::new(ReservationRegistry::new(Arc::clone(&slots), 1_024));
         let snapshot = cluster.snapshot();
         validate_remote_oracle_addresses(
@@ -1585,15 +1598,17 @@ impl<'a> OracleRoleBuilder<'a> {
             vala_bifrost_redux::oracle::follower::OracleCatalogResolver::new(Arc::clone(&catalog)),
         );
         let worker = Arc::new(OraclePeerWorker::new_physical_with_resources(
-            node_id,
-            role.fencing_token,
-            verifier,
-            security_audit.clone(),
-            reservations,
-            oracle_resources.clone(),
-            follower_resolver,
-            audit.clone(),
-            running_slots,
+            OraclePeerWorkerConfig {
+                worker_node_id: node_id,
+                oracle_fence: role.fencing_token,
+                verifier,
+                security_audit: security_audit.clone(),
+                reservations,
+                oracle_resources: oracle_resources.clone(),
+                resolver: follower_resolver,
+                audit: audit.clone(),
+                target_partitions: running_slots,
+            },
         ));
         let peer = Arc::new(crate::oracle::OraclePeerRuntime::new(
             Arc::clone(&worker),
@@ -1769,18 +1784,18 @@ impl BuiltOracleRole {
             ));
         }
         let lifecycle_transport = peer.lifecycle_transport();
-        let query_runtime = match Oracle::new(
-            Arc::clone(&oracle),
+        let query_runtime = match Oracle::new(crate::state::OracleBuildInputs {
+            engine: Arc::clone(&oracle),
             catalog,
-            role.clone(),
-            Arc::clone(&cluster),
-            None,
+            registered_role: role.clone(),
+            cluster: Arc::clone(&cluster),
+            coordination_runtime: None,
             audit,
             lifecycle_transport,
             resources,
             peer,
-            shutdown,
-        ) {
+            role_shutdown: shutdown,
+        }) {
             Ok(runtime) => Arc::new(runtime),
             Err(error) => {
                 oracle.shutdown(std::time::Instant::now()).await;
@@ -1790,12 +1805,6 @@ impl BuiltOracleRole {
         };
         Ok(query_runtime)
     }
-}
-
-#[cfg(feature = "test-support")]
-/// Returns a node-stable temporary WAL root so restart tests replay backlog.
-fn test_oracle_audit_root(node_id: uuid::Uuid) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("wyrd-oracle-audit-test-{node_id}"))
 }
 
 /// Releases a reserved or active Oracle fence after partial boot failure.
@@ -2215,7 +2224,6 @@ pub(crate) mod pg_tests {
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use std::sync::Arc;
     use tempfile::tempdir;
-    use vala_bifrost_redux::oracle::dispatcher::DispatchError;
 
     /// Production and test serving paths publish the same one-composite ownership shape.
     ///
@@ -2260,65 +2268,9 @@ pub(crate) mod pg_tests {
         )
     }
 
-    /// Composes production-equivalent Oracle and Scribe capabilities from an injected snapshot.
-    pub(crate) fn oracle_scribe_test_resources()
-    -> vala_bifrost_redux::resources::BifrostRoleResources {
-        vala_bifrost_redux::resources::BifrostRuntimeResources::from_snapshot(
-            vala_bifrost_redux::resources::SystemResourceSnapshot {
-                memory_limit_bytes: 2 * 1024 * 1024 * 1024,
-                effective_cpu: 2,
-                scratch_capacity_bytes: 1024 * 1024 * 1024,
-                scratch_available_bytes: 1024 * 1024 * 1024,
-                memory_source: vala_bifrost_redux::resources::ResourceSource::Injected,
-                cpu_source: vala_bifrost_redux::resources::ResourceSource::Injected,
-            },
-            vala_bifrost_redux::resources::BifrostResourcePolicy {
-                roles: [BifrostRole::Scribe, BifrostRole::Oracle]
-                    .into_iter()
-                    .collect(),
-                memory_limit_bytes: None,
-                unmanaged_reserve_bytes: None,
-                scratch_limit_bytes: Some(512 * 1024 * 1024),
-                effective_cpu: None,
-                scratch_root: std::env::temp_dir(),
-                volume_roots: None,
-            },
-        )
-        .expect("injected server-test resource snapshot")
-        .compose_roles()
-        .expect("server-test role composition")
-    }
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
     use crate::postgres::ServerPostgres;
-
-    /// Test-only peer credential that returns a production-signed access token.
-    struct TestOraclePeerCredentials {
-        /// Access token minted by the same issuing key installed in test auth.
-        token: SecretString,
-    }
-
-    impl std::fmt::Debug for TestOraclePeerCredentials {
-        /// Redacts the bearer token from test diagnostics.
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter
-                .debug_struct("TestOraclePeerCredentials")
-                .finish_non_exhaustive()
-        }
-    }
-
-    #[async_trait]
-    impl OraclePeerCredentials for TestOraclePeerCredentials {
-        /// Returns the pre-minted token for each local peer exchange.
-        ///
-        /// # Errors
-        ///
-        /// This fixture never refreshes or rejects its pre-minted token, so it
-        /// always returns `Ok` unless the credential contract changes.
-        async fn bearer(&self, _force_refresh: bool) -> Result<String, DispatchError> {
-            Ok(self.token.expose_secret().to_owned())
-        }
-    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn state_overrides_authz_applied() {

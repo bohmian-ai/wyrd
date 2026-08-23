@@ -963,6 +963,12 @@ impl ForgeWorker {
             .await
             .map_err(ForgeError::Sql)?;
         self.forge.core.telemetry.record_quarantine_state(false);
+        tracing::info!(
+            worker = %self.owner,
+            volume = volume.as_str(),
+            slots = self.config.worker_concurrency,
+            "Forge worker started"
+        );
         let mut slots = JoinSet::new();
         for index in 0..self.config.worker_concurrency {
             let worker = self.clone();
@@ -980,6 +986,9 @@ impl ForgeWorker {
                 detail: format!("Forge worker slot panicked: {error}"),
             })??;
         }
+        // Pairs with the start event so an operator can tell a worker that
+        // drained cleanly from one that vanished.
+        tracing::info!(worker = %self.owner, "Forge worker stopped");
         Ok(())
     }
 
@@ -1134,7 +1143,25 @@ impl ForgeWorker {
                 return Ok(());
             }
             let strategy = claim.strategy.clone();
+            // One INFO per claimed task, not per file or per row: Forge tasks are
+            // coarse, so this stays bounded by compaction throughput and gives an
+            // operator the claim/settle pair that shows whether work is moving.
+            tracing::info!(
+                worker = %self.owner,
+                task_id = %task_id,
+                strategy = ?strategy,
+                "Forge task claimed"
+            );
+            let started = std::time::Instant::now();
             let result = self.execute_claim(claim, &shutdown).await;
+            tracing::info!(
+                worker = %self.owner,
+                task_id = %task_id,
+                strategy = ?strategy,
+                outcome = if result.is_ok() { "committed" } else { "failed" },
+                elapsed_ms = started.elapsed().as_millis(),
+                "Forge task settled"
+            );
             self.record_attempt(result.as_ref().err());
             #[cfg(feature = "test-support")]
             self.pause_after_attempt_for_test().await;
@@ -2252,6 +2279,67 @@ impl ForgeWorker {
         })
     }
 
+    /// Runs one claimed manifest-rewrite or snapshot-expiry task.
+    ///
+    /// The plan's own validated parameters decide which maintenance reasons are
+    /// due, so a claim cannot widen its scope at execution time. Live
+    /// replacements are reconciled first: expiry that ran against unreconciled
+    /// replacements could retire a snapshot still referenced by an in-flight
+    /// rewrite. The reconciliation clock reading is taken inside this call so
+    /// the reconciliation window is measured from execution, not from claim.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Invariant`] when the validated plan parameters are
+    /// not an object or the maintenance intent cannot be decoded, and propagates
+    /// reconciliation, catalog, and clock errors from the maintenance pass.
+    async fn dispatch_maintenance(
+        &self,
+        claim: &ForgeTaskClaim,
+        binding: &TenantTableBinding,
+        lease: &mut ForgeLease,
+        table: Table,
+        stop: &CancellationToken,
+    ) -> Result<ForgeDispatchResult, ForgeError> {
+        let intent = ForgeMaintenanceIntent::parse(
+            &claim.strategy,
+            claim
+                .plan
+                .parameters
+                .as_object()
+                .ok_or_else(|| ForgeError::Invariant {
+                    detail: "validated Forge maintenance parameters lost their object shape"
+                        .to_owned(),
+                })?,
+        )
+        .ok_or_else(|| ForgeError::Invariant {
+            detail: "validated Forge maintenance intent could not be decoded".to_owned(),
+        })?;
+        let key = super::compact::ForgeTableKey {
+            tenant: claim.data_tenant_id,
+            table_ref: binding.table_ref.clone(),
+        };
+        self.forge
+            .reconcile_live_replacements(lease, &key, binding, stop, self.forge.core.clock.now()?)
+            .await?;
+        ForgeMaintenance::new(Arc::clone(&self.forge))
+            .execute(
+                lease,
+                crate::forge::maintenance::ForgeMaintenanceRequest {
+                    key: &key,
+                    binding,
+                    table,
+                    manifest_paths: &claim.plan.inputs,
+                    manifest_rewrite_due: intent.manifest_rewrite_due,
+                    snapshot_expiry_due: intent.snapshot_expiry_due,
+                },
+                stop,
+            )
+            .await
+            .map(Box::new)
+            .map(ForgeDispatchResult::Maintenance)
+    }
+
     /// Dispatches one validated task to its exact existing rewrite owner.
     ///
     /// # Errors
@@ -2325,48 +2413,8 @@ impl ForgeWorker {
             ForgeClaimStrategy::Known(
                 ForgeTaskStrategy::ManifestRewrite | ForgeTaskStrategy::SnapshotExpiry,
             ) => {
-                let intent = ForgeMaintenanceIntent::parse(
-                    &claim.strategy,
-                    claim
-                        .plan
-                        .parameters
-                        .as_object()
-                        .ok_or_else(|| ForgeError::Invariant {
-                            detail:
-                                "validated Forge maintenance parameters lost their object shape"
-                                    .to_owned(),
-                        })?,
-                )
-                .ok_or_else(|| ForgeError::Invariant {
-                    detail: "validated Forge maintenance intent could not be decoded".to_owned(),
-                })?;
-                let key = super::compact::ForgeTableKey {
-                    tenant: claim.data_tenant_id,
-                    table_ref: binding.table_ref.clone(),
-                };
-                self.forge
-                    .reconcile_live_replacements(
-                        lease,
-                        &key,
-                        binding,
-                        stop,
-                        self.forge.core.clock.now()?,
-                    )
-                    .await?;
-                ForgeMaintenance::new(Arc::clone(&self.forge))
-                    .execute(
-                        lease,
-                        &key,
-                        binding,
-                        table,
-                        &claim.plan.inputs,
-                        intent.manifest_rewrite_due,
-                        intent.snapshot_expiry_due,
-                        stop,
-                    )
+                self.dispatch_maintenance(claim, binding, lease, table, stop)
                     .await
-                    .map(Box::new)
-                    .map(ForgeDispatchResult::Maintenance)
             }
             _ => Err(ForgeError::Invariant {
                 detail: "unsupported task passed pre-effect validation".to_owned(),

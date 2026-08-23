@@ -938,8 +938,33 @@ impl TryFrom<proto::WorkerAttemptFrame> for domain::WorkerAttemptFrame {
                         },
                     )?,
                     completed: value.completed,
+                    // An absent message means a follower that reported no scan
+                    // evidence at all, which is the same as an all-empty one.
+                    scan_stats: value.scan_stats.map(Into::into).unwrap_or_default(),
                 }))
             }
+        }
+    }
+}
+
+impl From<proto::WorkerScanStats> for domain::WorkerScanStats {
+    /// Decodes follower scan evidence, preserving absent-versus-zero bytes.
+    fn from(value: proto::WorkerScanStats) -> Self {
+        Self {
+            bytes_scanned: value.bytes_scanned,
+            files_scanned: value.files_scanned,
+            partitions_scanned: value.partitions_scanned,
+        }
+    }
+}
+
+impl From<domain::WorkerScanStats> for proto::WorkerScanStats {
+    /// Encodes follower scan evidence, preserving absent-versus-zero bytes.
+    fn from(value: domain::WorkerScanStats) -> Self {
+        Self {
+            bytes_scanned: value.bytes_scanned,
+            files_scanned: value.files_scanned,
+            partitions_scanned: value.partitions_scanned,
         }
     }
 }
@@ -958,6 +983,7 @@ impl From<domain::WorkerAttemptFrame> for proto::WorkerAttemptFrame {
                 encoded_bytes: value.encoded_bytes,
                 payload_digest: value.payload_digest.into(),
                 completed: value.completed,
+                scan_stats: Some(value.scan_stats.into()),
             }),
         };
         Self { frame: Some(frame) }
@@ -1467,6 +1493,11 @@ mod tests {
             payload_digest: domain::QueryAuditDigest::new("sha256:payload")
                 .expect("valid payload digest"),
             completed: true,
+            scan_stats: domain::WorkerScanStats {
+                bytes_scanned: Some(4_096),
+                files_scanned: 3,
+                partitions_scanned: 2,
+            },
         });
         let actual =
             domain::WorkerAttemptFrame::try_from(proto::WorkerAttemptFrame::from(expected.clone()))

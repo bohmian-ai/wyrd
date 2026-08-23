@@ -110,11 +110,17 @@ pub(crate) mod producer_lifecycle_tests {
     use crate::catalog::TableRef;
     use crate::namespaces::BifrostNamespace;
 
+    /// Shared, ordered capture of every event's `(name, value)` field pairs.
+    ///
+    /// Named so the subscriber and its assertions refer to one type rather
+    /// than repeating a four-level nesting at each use site.
+    pub(crate) type CapturedEventFields = Arc<Mutex<Vec<Vec<(String, String)>>>>;
+
     /// Captures structured tracing event fields for producer lifecycle tests.
     #[derive(Default)]
     pub(crate) struct EventCaptureSubscriber {
         /// Event fields in the order each lifecycle event was emitted.
-        pub(crate) events: Arc<Mutex<Vec<Vec<(String, String)>>>>,
+        pub(crate) events: CapturedEventFields,
     }
 
     /// Collects the fields from one tracing event.
@@ -172,11 +178,10 @@ pub(crate) mod producer_lifecycle_tests {
 
     /// Returns one named event field from a captured lifecycle event.
     pub(crate) fn field(event: &[(String, String)], name: &str) -> String {
-        event
-            .iter()
-            .find(|(field, _)| field == name)
-            .map(|(_, value)| value.clone())
-            .unwrap_or_else(|| panic!("missing event field {name}"))
+        event.iter().find(|(field, _)| field == name).map_or_else(
+            || panic!("missing event field {name}"),
+            |(_, value)| value.clone(),
+        )
     }
 
     /// Emits the same bounded generation identity for every producer transition.

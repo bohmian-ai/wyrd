@@ -60,13 +60,527 @@ use parquet::errors::ParquetError;
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 use tracing::Instrument;
 use wyrd_spec::vala::BifrostError;
-use wyrd_spec::vala::api::{BifrostSecurityPhase, BifrostSecurityViolationKind, QueryClass};
+use wyrd_spec::vala::api::WorkerFooter;
+use wyrd_spec::vala::api::{
+    BifrostSecurityPhase, BifrostSecurityViolationKind, ClusterRole, FollowerScanAssignment,
+    QueryClass, QuerySource, TenantTableBinding,
+};
 use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
 
 use super::{
     AuthorizedQueryContext, BifrostSecurityViolation, OracleAudit, OracleMemoryKind,
     OracleMemoryResources, OracleTelemetry, VerifiedSecurityContext,
 };
+
+#[cfg(feature = "test-support")]
+static REMOTE_PARTITION_ATTEMPTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Resets the production partition-open counter for one isolated journey.
+#[cfg(feature = "test-support")]
+pub fn reset_remote_partition_attempts_for_test() {
+    REMOTE_PARTITION_ATTEMPTS.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Returns authenticated production partition opens since the last reset.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn remote_partition_attempts_for_test() -> u64 {
+    REMOTE_PARTITION_ATTEMPTS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Immutable specialization for one output partition of a distributed scan.
+#[derive(Debug, Clone)]
+pub(crate) struct RemotePartitionDescriptor {
+    /// Exact authenticated participant selected by the immutable query cut.
+    pub(crate) candidate: super::dispatcher::DispatchCandidate,
+    /// Role-local sources visible to this participant and no other.
+    pub(crate) assignments: Vec<FollowerScanAssignment>,
+    /// Closed public sources represented by the assignment.
+    pub(crate) sources: Vec<QuerySource>,
+}
+
+/// Closed partition-local completion selected before aggregate terminal precedence.
+#[derive(Debug)]
+pub(crate) enum PartitionDisposition {
+    /// Pure Oracle partition with no assigned persisted files.
+    Empty { ordinal: u32 },
+    /// Footer-validated normal completion.
+    Complete {
+        ordinal: u32,
+        batches: Vec<RecordBatch>,
+        footer: WorkerFooter,
+    },
+    /// Partition-local partial retaining every batch decoded before the condition.
+    Degraded {
+        ordinal: u32,
+        decoded: Vec<RecordBatch>,
+        reason: PartitionPartialReason,
+    },
+    /// Fatal authenticated or protocol failure.
+    Failed { ordinal: u32, error: BifrostError },
+}
+
+/// Closed stable reasons recorded for a degraded partition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PartitionPartialReason {
+    /// Request/channel/ticket construction or open failed before frames.
+    Setup,
+    /// Authenticated follower deadline or cancellation status.
+    Timeout,
+    /// Authenticated pinned object disappeared.
+    FileNotFound,
+    /// Delivered decoder/frame stream ended after retaining prior batches.
+    Decoder,
+}
+
+/// Network-backed physical node whose output partitions are polled by `DataFusion`.
+pub(crate) struct RemoteScanExec {
+    /// Schema shared by the common follower plan and every partition stream.
+    schema: SchemaRef,
+    /// Cached properties exposing exactly one output partition per selected participant.
+    properties: Arc<PlanProperties>,
+    /// Server-owned authenticated dispatch capability.
+    dispatcher: Arc<super::dispatcher::FragmentDispatcher>,
+    /// Immutable query, authorization, cancellation, and deadline projection.
+    context: super::dispatcher::DispatchContext,
+    /// Query-scoped join owner shared by every output partition.
+    settlement: Arc<super::admission::DistributedQuerySettlement>,
+    /// Common physical plan bytes serialized once for all participants.
+    physical_plan_bytes: Arc<[u8]>,
+    /// Tenant-qualified binding shared by the common plan.
+    binding: TenantTableBinding,
+    /// Fingerprint of the common physical plan bytes.
+    plan_fingerprint: String,
+    /// Absolute request deadline projected into every signed partition request.
+    deadline_unix_ms: i64,
+    /// Stable per-participant specializations in cut order.
+    partitions: Vec<RemotePartitionDescriptor>,
+    /// Public freshness rule applied only after exact partition classification.
+    freshness: wyrd_spec::vala::api::FreshnessPolicy,
+    /// Aggregate-visible ordered degraded source accumulator.
+    degraded_sources: super::DegradedSourceAccumulator,
+    /// Query-scoped accumulator for participant-reported physical scan volume.
+    scan_metrics: Arc<RemoteScanMetrics>,
+    /// Test-tier barrier attached to the actual lazy partition-open boundary.
+    #[cfg(feature = "test-support")]
+    topology_probe: Option<Arc<super::OracleTopologyProbe>>,
+}
+
+impl std::fmt::Debug for RemoteScanExec {
+    /// Redacts dispatch authority while preserving physical-plan shape.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemoteScanExec")
+            .field("plan_fingerprint", &self.plan_fingerprint)
+            .field("partitions", &self.partitions.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Complete construction inputs for one distributed [`RemoteScanExec`].
+///
+/// Every field is fixed once at plan time and immutable for the life of the
+/// scan, so they are supplied as one immutable value rather than as eleven
+/// positional parameters whose order carries no meaning.
+pub(crate) struct RemoteScanConfig {
+    /// Output schema common to every participant fragment.
+    pub(crate) schema: SchemaRef,
+    /// Shared dispatcher that opens authenticated peer streams.
+    pub(crate) dispatcher: Arc<super::dispatcher::FragmentDispatcher>,
+    /// Signed dispatch facts replayed identically to every participant.
+    pub(crate) context: super::dispatcher::DispatchContext,
+    /// Query-scoped settlement registry joined at cancellation.
+    pub(crate) settlement: Arc<super::admission::DistributedQuerySettlement>,
+    /// Fragment plan serialized exactly once for byte-identical delivery.
+    pub(crate) physical_plan_bytes: Vec<u8>,
+    /// Tenant and table this scan is authorized against.
+    pub(crate) binding: TenantTableBinding,
+    /// Sealed fragment fingerprint validated by each follower.
+    pub(crate) plan_fingerprint: String,
+    /// One absolute deadline captured at ingress and propagated unchanged.
+    pub(crate) deadline_unix_ms: i64,
+    /// Stable per-participant partition descriptors in assignment order.
+    pub(crate) partitions: Vec<RemotePartitionDescriptor>,
+    /// Caller-selected source-loss policy retained through dispatch.
+    pub(crate) freshness: wyrd_spec::vala::api::FreshnessPolicy,
+    /// Shared accumulator recording ordered degradation reasons.
+    pub(crate) degraded_sources: super::DegradedSourceAccumulator,
+}
+
+impl RemoteScanExec {
+    /// Creates one common distributed scan with stable participant specializations.
+    #[must_use]
+    pub(crate) fn new(config: RemoteScanConfig) -> Self {
+        let RemoteScanConfig {
+            schema,
+            dispatcher,
+            context,
+            settlement,
+            physical_plan_bytes,
+            binding,
+            plan_fingerprint,
+            deadline_unix_ms,
+            partitions,
+            freshness,
+            degraded_sources,
+        } = config;
+        let properties = Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(Arc::clone(&schema)),
+            Partitioning::UnknownPartitioning(partitions.len()),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ));
+        Self {
+            schema,
+            properties,
+            dispatcher,
+            context,
+            settlement,
+            scan_metrics: Arc::new(RemoteScanMetrics::default()),
+            physical_plan_bytes: physical_plan_bytes.into(),
+            binding,
+            plan_fingerprint,
+            deadline_unix_ms,
+            partitions,
+            freshness,
+            degraded_sources,
+            #[cfg(feature = "test-support")]
+            topology_probe: None,
+        }
+    }
+
+    /// Installs the production-path partition-open probe used by concurrency journeys.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub(crate) fn with_topology_probe(
+        mut self,
+        probe: Option<Arc<super::OracleTopologyProbe>>,
+    ) -> Self {
+        self.topology_probe = probe;
+        self
+    }
+
+    /// Opens and decodes exactly one authenticated peer stream for a partition.
+    async fn execute_remote_partition(
+        self: Arc<Self>,
+        partition: usize,
+        _partition_guard: super::admission::DistributedPartitionGuard,
+    ) -> DataFusionResult<PartitionDisposition> {
+        let ordinal = u32::try_from(partition).unwrap_or(u32::MAX);
+        let descriptor = self.partitions.get(partition).ok_or_else(|| {
+            DataFusionError::Execution(format!("distributed scan has no partition {partition}"))
+        })?;
+        #[cfg(feature = "test-support")]
+        if descriptor.candidate.node_id != self.context.leader_node_id
+            && let Some(probe) = &self.topology_probe
+        {
+            probe
+                .pause_first_selection(descriptor.candidate.node_id)
+                .await;
+        }
+        if descriptor.candidate.role == ClusterRole::Oracle
+            && descriptor
+                .assignments
+                .iter()
+                .all(|assignment| assignment.persisted.files.is_empty())
+        {
+            return Ok(PartitionDisposition::Empty { ordinal });
+        }
+        #[cfg(feature = "test-support")]
+        REMOTE_PARTITION_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let attempt = self
+            .dispatcher
+            .execute(
+                &self.context,
+                super::common_physical_fragment(
+                    &self.physical_plan_bytes,
+                    descriptor.assignments.clone(),
+                    &self.binding,
+                    descriptor.candidate.role,
+                    &self.plan_fingerprint,
+                    self.deadline_unix_ms,
+                ),
+                std::slice::from_ref(&descriptor.candidate),
+            )
+            .await;
+        let disposition =
+            classify_partition_attempt(ordinal, partition, attempt, &descriptor.sources);
+        // Fold this participant's physical read volume into the query-scoped
+        // accumulator. The leader's own plan scans no storage, so without this
+        // a distributed query reports no scan evidence at all.
+        if let PartitionDisposition::Complete { footer, .. } = &disposition {
+            self.scan_metrics.record_footer(footer.scan_stats);
+        }
+        Ok(disposition)
+    }
+}
+
+/// Maps one dispatch outcome onto this partition's closed disposition.
+///
+/// This is the partial/terminal boundary the leader reacts to, and each arm is
+/// chosen so a single participant cannot fail a query that the rest of the cut
+/// could still answer:
+///
+/// - A successful attempt whose batches fail to decode degrades with whatever
+///   decoded before the failure rather than discarding them.
+/// - A terminal dispatch failure is a security or contract violation, so it
+///   fails the partition outright.
+/// - A stale object means the pinned cut moved and the query must replan, which
+///   is a failure rather than a degradation.
+/// - A missing file, a partial attempt, and an unavailable, source-loss, or
+///   capacity failure all degrade, preserving any batches already delivered.
+fn classify_partition_attempt(
+    ordinal: u32,
+    partition: usize,
+    attempt: Result<super::attempt::ValidatedAttempt, super::dispatcher::DispatchError>,
+    sources: &[QuerySource],
+) -> PartitionDisposition {
+    match attempt {
+        Ok(attempt) => {
+            let footer = attempt.footer.clone();
+            let mut batches = Vec::new();
+            if super::decode_attempt_batches(attempt, &mut batches).is_err() {
+                return PartitionDisposition::Degraded {
+                    ordinal,
+                    decoded: batches,
+                    reason: PartitionPartialReason::Decoder,
+                };
+            }
+            PartitionDisposition::Complete {
+                ordinal,
+                batches,
+                footer,
+            }
+        }
+        Err(super::dispatcher::DispatchError::Terminal) => PartitionDisposition::Failed {
+            ordinal,
+            error: BifrostError::QueryPeerSecurity,
+        },
+        Err(super::dispatcher::DispatchError::FileNotFound) => PartitionDisposition::Degraded {
+            ordinal,
+            decoded: Vec::new(),
+            reason: PartitionPartialReason::FileNotFound,
+        },
+        Err(super::dispatcher::DispatchError::StaleObject) => PartitionDisposition::Failed {
+            ordinal,
+            error: BifrostError::QueryVisibilityUnavailable,
+        },
+        Err(super::dispatcher::DispatchError::Partial { attempt, reason }) => {
+            let mut batches = Vec::new();
+            if let Some(attempt) = attempt {
+                for bytes in attempt.batches {
+                    let Ok(bytes) = bytes else { break };
+                    let Ok(reader) = arrow::ipc::reader::StreamReader::try_new(
+                        std::io::Cursor::new(bytes),
+                        None,
+                    ) else {
+                        break;
+                    };
+                    for batch in reader {
+                        let Ok(batch) = batch else { break };
+                        batches.push(batch);
+                    }
+                }
+            }
+            PartitionDisposition::Degraded {
+                ordinal,
+                decoded: batches,
+                reason: match reason {
+                    super::dispatcher::DispatchPartialReason::Setup => {
+                        PartitionPartialReason::Setup
+                    }
+                    super::dispatcher::DispatchPartialReason::Timeout => {
+                        PartitionPartialReason::Timeout
+                    }
+                    super::dispatcher::DispatchPartialReason::Decoder => {
+                        PartitionPartialReason::Decoder
+                    }
+                },
+            }
+        }
+        Err(
+            error @ (super::dispatcher::DispatchError::Unavailable
+            | super::dispatcher::DispatchError::EligibleSourceLoss { .. }
+            | super::dispatcher::DispatchError::Capacity),
+        ) => {
+            tracing::warn!(
+                partition,
+                ?error,
+                ?sources,
+                "distributed Oracle partition completed partial"
+            );
+            PartitionDisposition::Degraded {
+                ordinal,
+                decoded: Vec::new(),
+                reason: PartitionPartialReason::Setup,
+            }
+        }
+    }
+}
+
+impl DisplayAs for RemoteScanExec {
+    /// Formats only the common plan fingerprint and partition count.
+    fn fmt_as(
+        &self,
+        _format: DisplayFormatType,
+        formatter: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
+        write!(
+            formatter,
+            "RemoteScanExec: {}, partitions={}",
+            self.plan_fingerprint,
+            self.partitions.len()
+        )
+    }
+}
+
+impl ExecutionPlan for RemoteScanExec {
+    /// Returns the stable physical operator name.
+    fn name(&self) -> &'static str {
+        "RemoteScanExec"
+    }
+
+    /// Exposes the concrete network node to optimizers and proof tests.
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    /// Returns exact output partitioning for the immutable participant cut.
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    /// The serialized common child is intentionally not a local execution child.
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        Vec::new()
+    }
+
+    /// Preserves the immutable leaf only when no child is supplied.
+    ///
+    /// # Errors
+    /// Returns a plan error if an optimizer attempts to attach a local child.
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        if children.is_empty() {
+            Ok(self)
+        } else {
+            Err(DataFusionError::Plan(
+                "RemoteScanExec is a leaf plan".to_owned(),
+            ))
+        }
+    }
+
+    /// Returns one lazy peer stream; `DataFusion` polls sibling partitions concurrently.
+    ///
+    /// # Errors
+    /// Returns a physical error for an invalid partition or fatal peer outcome.
+    fn execute(
+        &self,
+        partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        if partition >= self.partitions.len() {
+            return Err(DataFusionError::Execution(format!(
+                "distributed scan has no partition {partition}"
+            )));
+        }
+        let schema = Arc::clone(&self.schema);
+        let owner = Arc::new(self.clone_for_execution());
+        let degraded_sources = Arc::clone(&self.degraded_sources);
+        let partition_sources = self.partitions[partition].sources.clone();
+        let stream = futures_util::stream::once(async move {
+            // Spawn only when DataFusion first polls this partition. Once started, the task is
+            // intentionally independent of the returned stream: dropping the aggregate stream
+            // cancels polling without dropping the peer future before reservation release. The
+            // query settlement owner joins it before releasing parent admission.
+            let partition_guard = owner
+                .settlement
+                .start(&owner.context.cancellation)
+                .ok_or_else(|| {
+                    DataFusionError::Execution("distributed query is cancelled".to_owned())
+                })?;
+            let partition_task = tokio::spawn(async move {
+                owner
+                    .execute_remote_partition(partition, partition_guard)
+                    .await
+            });
+            let disposition = partition_task.await.map_err(|error| {
+                DataFusionError::Execution(format!(
+                    "distributed Oracle partition task failed to join: {error}"
+                ))
+            })??;
+            match disposition {
+                PartitionDisposition::Empty { ordinal } => {
+                    let _ = ordinal;
+                    Ok(Vec::new())
+                }
+                PartitionDisposition::Complete {
+                    ordinal,
+                    batches,
+                    footer,
+                } => {
+                    let _ = (ordinal, footer);
+                    Ok(batches)
+                }
+                PartitionDisposition::Degraded {
+                    ordinal,
+                    decoded,
+                    reason,
+                } => {
+                    tracing::warn!(ordinal, ?reason, "distributed Oracle partition degraded");
+                    if let Ok(mut entries) = degraded_sources.lock() {
+                        entries.push(super::DegradedPartition {
+                            ordinal,
+                            reason: match reason {
+                                PartitionPartialReason::Setup => "setup",
+                                PartitionPartialReason::Timeout => "timeout",
+                                PartitionPartialReason::FileNotFound => "file_not_found",
+                                PartitionPartialReason::Decoder => "decoder",
+                            },
+                            sources: partition_sources,
+                        });
+                    }
+                    Ok(decoded)
+                }
+                PartitionDisposition::Failed { ordinal, error } => {
+                    tracing::error!(ordinal, ?error, "distributed Oracle partition failed");
+                    Err(DataFusionError::External(Box::new(error)))
+                }
+            }
+        })
+        .map_ok(|batches| futures_util::stream::iter(batches.into_iter().map(Ok)))
+        .try_flatten();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+    }
+}
+
+impl RemoteScanExec {
+    /// Clones immutable handles for one lazy partition stream.
+    fn clone_for_execution(&self) -> Self {
+        Self {
+            schema: Arc::clone(&self.schema),
+            properties: Arc::clone(&self.properties),
+            dispatcher: Arc::clone(&self.dispatcher),
+            context: self.context.clone(),
+            settlement: Arc::clone(&self.settlement),
+            // Shared, not fresh: every partition stream folds into the one
+            // accumulator the leader's plan node exposes to query telemetry.
+            scan_metrics: Arc::clone(&self.scan_metrics),
+            physical_plan_bytes: Arc::clone(&self.physical_plan_bytes),
+            binding: self.binding.clone(),
+            plan_fingerprint: self.plan_fingerprint.clone(),
+            deadline_unix_ms: self.deadline_unix_ms,
+            partitions: self.partitions.clone(),
+            freshness: self.freshness,
+            degraded_sources: Arc::clone(&self.degraded_sources),
+            #[cfg(feature = "test-support")]
+            topology_probe: self.topology_probe.clone(),
+        }
+    }
+}
 
 /// Shared physical scan state retained by one executing source plan.
 #[derive(Debug, Default)]
@@ -147,6 +661,55 @@ fn retain_iceberg_task(task: FileScanTask, metrics: &Arc<OracleScanMetricsHandle
     task
 }
 
+/// Physical scan volume reported by every participant of one distributed query.
+///
+/// A distributed leader's plan has only remote leaves, so its local scan
+/// counters are legitimately empty. Each follower reports what its own scans
+/// touched on its footer, and this owner sums those across the participant cut
+/// so the leader can emit the same scan families a single-node query emits.
+///
+/// Byte availability is tracked separately from the byte total because absent
+/// is not zero: a participant whose sources report no physical IO must not make
+/// the query look like it scanned zero bytes of storage that it did read.
+#[derive(Debug, Default)]
+pub(crate) struct RemoteScanMetrics {
+    /// Summed physical bytes across every participant that reported them.
+    bytes_scanned: AtomicU64,
+    /// Whether at least one participant reported physical bytes at all.
+    bytes_available: AtomicBool,
+    /// Summed file count across every completed participant.
+    files_scanned: AtomicU64,
+    /// Summed file-partition count across every completed participant.
+    partitions_scanned: AtomicU64,
+}
+
+impl RemoteScanMetrics {
+    /// Folds one completed participant's footer evidence into the running total.
+    fn record_footer(&self, stats: wyrd_spec::vala::api::WorkerScanStats) {
+        if let Some(bytes) = stats.bytes_scanned {
+            self.bytes_scanned.fetch_add(bytes, Ordering::Relaxed);
+            self.bytes_available.store(true, Ordering::Release);
+        }
+        self.files_scanned
+            .fetch_add(stats.files_scanned, Ordering::Relaxed);
+        self.partitions_scanned
+            .fetch_add(stats.partitions_scanned, Ordering::Relaxed);
+    }
+
+    /// Returns the aggregated totals, preserving absent-versus-zero bytes.
+    fn terminal_values(&self) -> (Option<u64>, u64, u64) {
+        let bytes = self
+            .bytes_available
+            .load(Ordering::Acquire)
+            .then(|| self.bytes_scanned.load(Ordering::Acquire));
+        (
+            bytes,
+            self.files_scanned.load(Ordering::Acquire),
+            self.partitions_scanned.load(Ordering::Acquire),
+        )
+    }
+}
+
 /// Terminal physical scan evidence collected from the executed `DataFusion` plan.
 ///
 /// The collector reads the pinned Parquet `bytes_scanned` metric once after
@@ -166,6 +729,8 @@ pub(crate) struct OracleQueryScanStats {
     physical_metrics: Vec<ExecutionPlanMetricsSet>,
     /// Shared dependency counters retained until terminal stream drain.
     scan_handles: Vec<Arc<OracleScanMetricsHandle>>,
+    /// Participant-reported scan accumulators from every remote scan leaf.
+    remote_handles: Vec<Arc<RemoteScanMetrics>>,
     /// Prevents duplicate terminal aggregation when a stream closes twice.
     finalized: bool,
 }
@@ -201,6 +766,15 @@ impl OracleQueryScanStats {
         }
         if available {
             self.physical_bytes_scanned = Some(total);
+        }
+        for handle in &self.remote_handles {
+            let (bytes, files, partitions) = handle.terminal_values();
+            self.files_scanned = self.files_scanned.saturating_add(files);
+            self.partitions_scanned = self.partitions_scanned.saturating_add(partitions);
+            if let Some(bytes) = bytes {
+                available = true;
+                total = total.saturating_add(bytes);
+            }
         }
         for handle in &self.scan_handles {
             let (bytes, files, partitions) = handle.terminal_values();
@@ -243,6 +817,9 @@ impl OracleQueryScanStats {
         }
         if let Some(source) = plan.as_any().downcast_ref::<HotParquetExec>() {
             stats.scan_handles.push(Arc::clone(&source.metrics));
+        }
+        if let Some(source) = plan.as_any().downcast_ref::<RemoteScanExec>() {
+            stats.remote_handles.push(Arc::clone(&source.scan_metrics));
         }
         for child in plan.children() {
             Self::visit(child.as_ref(), stats);
@@ -754,12 +1331,20 @@ impl TableProvider for OracleTableProvider {
         _limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
+        // Every remote source advertises the session's target partitions so the
+        // distributed split boundary lands on the exchange above the partial
+        // aggregate rather than on a round-robin repartition inserted to
+        // parallelize a single-partition leaf.
+        let target_partitions = state.config().target_partitions();
         if let Some(scan_id) = &self.remote_sources.iceberg_scan_id {
-            inputs.push(Arc::new(super::codec::RemoteScanExec::new(
-                scan_id.clone(),
-                super::sealed_fragment_schema_fingerprint(self.physical_schema.as_ref()),
-                Arc::clone(&self.physical_schema),
-            )));
+            inputs.push(Arc::new(
+                super::codec::RemoteSourcePlaceholderExec::new(
+                    scan_id.clone(),
+                    super::sealed_fragment_schema_fingerprint(self.physical_schema.as_ref()),
+                    Arc::clone(&self.physical_schema),
+                )
+                .with_partitions(target_partitions),
+            ));
         } else if let Some(batches) = &self.distributed_iceberg_batches {
             let published =
                 Self::validated_memory_source(batches, Arc::clone(&self.physical_schema))?;
@@ -770,11 +1355,14 @@ impl TableProvider for OracleTableProvider {
             inputs.push(published);
         }
         if let Some(scan_id) = &self.remote_sources.hot_scan_id {
-            inputs.push(Arc::new(super::codec::RemoteScanExec::new(
-                scan_id.clone(),
-                super::sealed_fragment_schema_fingerprint(self.physical_schema.as_ref()),
-                Arc::clone(&self.physical_schema),
-            )));
+            inputs.push(Arc::new(
+                super::codec::RemoteSourcePlaceholderExec::new(
+                    scan_id.clone(),
+                    super::sealed_fragment_schema_fingerprint(self.physical_schema.as_ref()),
+                    Arc::clone(&self.physical_schema),
+                )
+                .with_partitions(target_partitions),
+            ));
         } else if !self.hot_files.is_empty() {
             let hot = Arc::new(HotParquetExec::new(
                 self.hot_files.clone(),
@@ -798,11 +1386,14 @@ impl TableProvider for OracleTableProvider {
             inputs.push(hot);
         }
         for scan_id in &self.remote_sources.scribe_scan_ids {
-            inputs.push(Arc::new(super::codec::RemoteScanExec::new(
-                scan_id.clone(),
-                super::sealed_fragment_schema_fingerprint(self.physical_schema.as_ref()),
-                Arc::clone(&self.physical_schema),
-            )));
+            inputs.push(Arc::new(
+                super::codec::RemoteSourcePlaceholderExec::new(
+                    scan_id.clone(),
+                    super::sealed_fragment_schema_fingerprint(self.physical_schema.as_ref()),
+                    Arc::clone(&self.physical_schema),
+                )
+                .with_partitions(target_partitions),
+            ));
         }
         if !self.live_batches.is_empty() {
             let live = Self::validated_memory_source(

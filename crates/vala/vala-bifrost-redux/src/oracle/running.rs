@@ -196,7 +196,7 @@ impl std::fmt::Debug for RunningQueryRegistry {
         let entries = self
             .entries
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         formatter
             .debug_struct("RunningQueryRegistry")
             .field("entry_count", &entries.len())
@@ -220,7 +220,7 @@ impl RunningQueryRegistry {
         let mut entries = self
             .entries
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if entries.contains_key(&key) {
             return false;
         }
@@ -246,7 +246,7 @@ impl RunningQueryRegistry {
     ) -> Option<RunningQueryEntry> {
         self.entries
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&(tenant_id, request_id.clone()))
             .map(|state| state.entry.clone())
     }
@@ -257,7 +257,7 @@ impl RunningQueryRegistry {
         let mut summaries = self
             .entries
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .filter(|((entry_tenant, _), _)| *entry_tenant == tenant_id)
             .map(|(_, state)| state.summary())
@@ -279,7 +279,7 @@ impl RunningQueryRegistry {
         let mut entries = self
             .entries
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let state = entries.get_mut(&(tenant_id, request_id.clone()))?;
         let cancellation_started = !state.cancellation_requested;
         if cancellation_started {
@@ -306,7 +306,7 @@ impl RunningQueryRegistry {
         let mut entries = self
             .entries
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(state) = entries.get_mut(&(tenant_id, request_id.clone())) else {
             return false;
         };
@@ -337,7 +337,7 @@ impl RunningQueryRegistry {
         let mut state = self
             .entries
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&(tenant_id, request_id.clone()))?;
         state.terminal_outcome = Some(outcome);
         state
@@ -454,6 +454,74 @@ mod tests {
         assert!(registry.get(tenant_id, &request_id).is_none());
     }
 
+    /// Asserts a concurrent cancel and terminal settlement resolve to one winner.
+    ///
+    /// Both threads are released by a three-way barrier so they contend on the
+    /// same entry rather than running in a fixed order. Exactly one settlement
+    /// may be produced, and the cancel's reported `cancellation_started` must
+    /// agree with whether the token was actually cancelled — the two orderings
+    /// are both legal, but a disagreement between them is not. Afterwards the
+    /// entry must be gone, and a late cancel or settle must find nothing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either worker fails to join, if the terminal worker does not
+    /// own the settlement, if the cancellation report disagrees with the token,
+    /// or if the entry survives the race.
+    fn assert_cancel_and_terminal_race_settles_once(
+        registry: &Arc<RunningQueryRegistry>,
+        tenant_a: DataTenantId,
+    ) {
+        let race_request_id = RequestId::now_v7();
+        let race_entry = entry(tenant_a, race_request_id.clone());
+        let race_cancellation = race_entry.cancellation_token();
+        assert!(registry.insert(race_entry));
+
+        let barrier = Arc::new(Barrier::new(3));
+        let cancel_registry = Arc::clone(registry);
+        let cancel_request = race_request_id.clone();
+        let cancel_barrier = Arc::clone(&barrier);
+        let cancel = thread::spawn(move || {
+            cancel_barrier.wait();
+            cancel_registry.cancel(tenant_a, &cancel_request)
+        });
+        let terminal_registry = Arc::clone(registry);
+        let terminal_request = race_request_id.clone();
+        let terminal_barrier = Arc::clone(&barrier);
+        let terminal = thread::spawn(move || {
+            terminal_barrier.wait();
+            terminal_registry.settle_terminal(
+                tenant_a,
+                &terminal_request,
+                QueryTerminalOutcome::Failed,
+            )
+        });
+        barrier.wait();
+
+        let cancellation = cancel.join().expect("invariant: cancel worker joins");
+        let settlement = terminal.join().expect("invariant: terminal worker joins");
+        let settlement = settlement.expect("invariant: terminal worker owns settlement");
+        assert_eq!(settlement.outcome(), QueryTerminalOutcome::Failed);
+        assert_eq!(settlement.entry().request_id(), &race_request_id);
+        assert_eq!(
+            cancellation
+                .as_ref()
+                .map(|response| response.cancellation_started),
+            if race_cancellation.is_cancelled() {
+                Some(true)
+            } else {
+                None
+            }
+        );
+        assert!(registry.get(tenant_a, &race_request_id).is_none());
+        assert!(registry.cancel(tenant_a, &race_request_id).is_none());
+        assert!(
+            registry
+                .settle_terminal(tenant_a, &race_request_id, QueryTerminalOutcome::Success,)
+                .is_none()
+        );
+    }
+
     /// Proves every tenant-scoped lifecycle transition and terminal race invariant.
     #[test]
     fn tenant_scoped_registry_lifecycle_is_race_safe() {
@@ -528,54 +596,7 @@ mod tests {
         );
         assert!(registry.get(tenant_a, &request_id).is_none());
 
-        let race_request_id = RequestId::now_v7();
-        let race_entry = entry(tenant_a, race_request_id.clone());
-        let race_cancellation = race_entry.cancellation_token();
-        assert!(registry.insert(race_entry));
-
-        let barrier = Arc::new(Barrier::new(3));
-        let cancel_registry = Arc::clone(&registry);
-        let cancel_request = race_request_id.clone();
-        let cancel_barrier = Arc::clone(&barrier);
-        let cancel = thread::spawn(move || {
-            cancel_barrier.wait();
-            cancel_registry.cancel(tenant_a, &cancel_request)
-        });
-        let terminal_registry = Arc::clone(&registry);
-        let terminal_request = race_request_id.clone();
-        let terminal_barrier = Arc::clone(&barrier);
-        let terminal = thread::spawn(move || {
-            terminal_barrier.wait();
-            terminal_registry.settle_terminal(
-                tenant_a,
-                &terminal_request,
-                QueryTerminalOutcome::Failed,
-            )
-        });
-        barrier.wait();
-
-        let cancellation = cancel.join().expect("invariant: cancel worker joins");
-        let settlement = terminal.join().expect("invariant: terminal worker joins");
-        let settlement = settlement.expect("invariant: terminal worker owns settlement");
-        assert_eq!(settlement.outcome(), QueryTerminalOutcome::Failed);
-        assert_eq!(settlement.entry().request_id(), &race_request_id);
-        assert_eq!(
-            cancellation
-                .as_ref()
-                .map(|response| response.cancellation_started),
-            if race_cancellation.is_cancelled() {
-                Some(true)
-            } else {
-                None
-            }
-        );
-        assert!(registry.get(tenant_a, &race_request_id).is_none());
-        assert!(registry.cancel(tenant_a, &race_request_id).is_none());
-        assert!(
-            registry
-                .settle_terminal(tenant_a, &race_request_id, QueryTerminalOutcome::Success,)
-                .is_none()
-        );
+        assert_cancel_and_terminal_race_settles_once(&registry, tenant_a);
         assert_eq!(registry.list(tenant_a).len(), 1);
         assert_eq!(registry.list(tenant_a)[0].request_id, second_request_id);
     }

@@ -206,6 +206,22 @@ fn bifrost_error_from_code(
         "WYRD_VALA_429_QUERY_ADMISSION_REJECTED" => BifrostError::QueryAdmissionRejected,
         "WYRD_VALA_422_QUERY_MEMORY_REQUEST_TOO_LARGE" => BifrostError::QueryMemoryRequestTooLarge,
         "WYRD_VALA_500_QUERY_EXECUTION_FAILED" => BifrostError::QueryExecutionFailed,
+        // Every remaining closed query terminal. Without these a caller cannot
+        // tell a retryable timeout from a permanent authorization refusal: both
+        // arrive as an untyped upstream failure carrying only prose, and any
+        // retry policy built on that is matching on Display text.
+        "WYRD_VALA_504_QUERY_TIMEOUT" => BifrostError::QueryTimeout,
+        "WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE" => BifrostError::QueryVisibilityUnavailable,
+        "WYRD_VALA_500_QUERY_TENANT_INVARIANT" => BifrostError::QueryTenantInvariant,
+        "WYRD_VALA_500_QUERY_RECONCILIATION_INVARIANT" => {
+            BifrostError::QueryReconciliationInvariant
+        }
+        "WYRD_VALA_403_QUERY_PEER_SECURITY" => BifrostError::QueryPeerSecurity,
+        "WYRD_VALA_403_QUERY_FORBIDDEN" => BifrostError::QueryForbidden,
+        "WYRD_VALA_502_QUERY_STREAM_PROTOCOL" => BifrostError::QueryStreamProtocol,
+        "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE" => BifrostError::QueryStreamIncomplete,
+        "WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE" => BifrostError::QueryAuditUnavailable,
+        "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE" => BifrostError::QueryResultTooLarge,
         "WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE" => {
             let (value, past_bound, future_bound) = event_time_window_bounds_from_message(message);
             BifrostError::EventTimeOutOfRange {

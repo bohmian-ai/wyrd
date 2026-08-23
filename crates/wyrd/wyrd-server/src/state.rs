@@ -21,7 +21,6 @@ use vala_bifrost_redux::forge::Forge as ForgeCoordinator;
 use vala_bifrost_redux::forge::ForgeWorker;
 use vala_bifrost_redux::gate::limits::IngestLimits;
 use vala_bifrost_redux::oracle::Oracle as OracleEngine;
-use vala_bifrost_redux::oracle::dispatcher::FragmentDispatcher;
 use vala_bifrost_redux::oracle::dispatcher::{OraclePeerCredentials, OraclePeerTls};
 use vala_bifrost_redux::oracle::follower::{PhysicalPlanFollower, ScribeTailResolver};
 use vala_bifrost_redux::oracle::peer::{PeerSecurityAudit, PeerTicketVerifier};
@@ -98,6 +97,64 @@ pub struct BifrostBuildInputs {
     /// Focused production-control overrides consumed only by the shared test composer.
     #[cfg(feature = "test-support")]
     pub test_controls: Option<BifrostTestControls>,
+}
+
+/// Composed inputs for one selected Oracle query role.
+///
+/// `compose_bifrost` derives every field from the process-wide resource graph
+/// before the role exists, so they travel together as one value rather than as
+/// a long positional argument list whose order carries no meaning.
+pub struct OracleBuildInputs {
+    /// Distributed query engine this role wraps with lifecycle ownership.
+    pub engine: Arc<OracleEngine>,
+    /// Shared tenant-qualified Bifrost catalog.
+    pub catalog: Arc<BifrostCatalog>,
+    /// Cluster registration this role heartbeats against.
+    pub registered_role: RegisteredRole,
+    /// Shared current-ready cluster registry.
+    pub cluster: Arc<ClusterRegistry>,
+    /// Optional runtime keeping server-created coordination consumers alive.
+    pub coordination_runtime: Option<Arc<tokio::runtime::Runtime>>,
+    /// Audit publisher for query lifecycle transitions.
+    pub audit: Arc<crate::oracle::OracleAuditPublisher>,
+    /// Transport carrying lifecycle control to peer participants.
+    pub lifecycle_transport: Arc<crate::oracle::OracleLifecycleTransport>,
+    /// Root-derived resource capability for the Oracle role.
+    pub resources: OracleResources,
+    /// Peer runtime owning outbound fragment dispatch.
+    pub peer: Arc<crate::oracle::OraclePeerRuntime>,
+    /// Role-scoped cancellation signal.
+    pub role_shutdown: CancellationToken,
+}
+
+/// Composed inputs for one selected Scribe ingest role.
+///
+/// Mirrors [`OracleBuildInputs`]: the composer resolves each dependency from
+/// the shared resource graph, then hands the role one cohesive value.
+pub struct ScribeBuildInputs {
+    /// Embedded Scribe implementation this role wraps.
+    pub ingest: Arc<ScribeImpl>,
+    /// Shared tenant-qualified Bifrost catalog.
+    pub catalog: Arc<BifrostCatalog>,
+    /// Root-derived resource capability for the Scribe role.
+    pub resources: ScribeResources,
+    /// Shared current-ready cluster registry.
+    pub cluster: Arc<ClusterRegistry>,
+    /// Cluster registration this role heartbeats against.
+    pub registered_role: RegisteredRole,
+    /// Verifier admitting inbound peer fragment tickets.
+    pub fragment_verifier: Arc<dyn PeerTicketVerifier>,
+    /// Audit sink for refused inbound fragment requests.
+    pub fragment_security_audit: Arc<dyn PeerSecurityAudit>,
+    /// Audit publisher recording follower query execution.
+    pub fragment_query_audit: Arc<crate::oracle::OracleAuditPublisher>,
+    /// Whether this role owns `fragment_query_audit`'s shutdown, which it does
+    /// only when no local Oracle role shares the publisher.
+    pub owns_fragment_query_audit: bool,
+    /// Optional runtime keeping server-created coordination consumers alive.
+    pub coordination_runtime: Option<Arc<tokio::runtime::Runtime>>,
+    /// Role-scoped cancellation signal.
+    pub role_shutdown: CancellationToken,
 }
 
 /// Existing concrete production controls injected by server journeys.
@@ -207,11 +264,42 @@ impl Gate {
         request: BifrostQueryRequest,
     ) -> Result<OracleQueryStream, wyrd_spec::vala::error::BifrostError> {
         self.ensure_query_open()?;
-        self.query_forwarder
+        metrics::gauge!("bifrost_gate_active_streams", "operation" => "query").increment(1.0);
+        let lifecycle = Arc::new(vala_bifrost_redux::oracle::QueryStreamLifecycle::new(
+            |outcome, elapsed| {
+                metrics::counter!("bifrost_gate_query_streams_total", "outcome" => outcome)
+                    .increment(1);
+                metrics::histogram!(
+                    "bifrost_gate_query_stream_duration_seconds",
+                    "outcome" => outcome
+                )
+                .record(elapsed.as_secs_f64());
+                metrics::gauge!("bifrost_gate_active_streams", "operation" => "query")
+                    .decrement(1.0);
+            },
+        ));
+        let result = self
+            .query_forwarder
             .as_ref()
             .ok_or(wyrd_spec::vala::error::BifrostError::OracleRoleUnavailable)?
             .forward(context, request)
-            .await
+            .await;
+        match result {
+            Ok(stream) => Ok(stream.with_gate_lifecycle(lifecycle)),
+            Err(error) => {
+                lifecycle.finish(
+                    if matches!(
+                        error,
+                        wyrd_spec::vala::error::BifrostError::QueryAdmissionRejected
+                    ) {
+                        "rejected"
+                    } else {
+                        "failed"
+                    },
+                );
+                Err(error)
+            }
+        }
     }
 
     /// Verifies and executes one private signed forwarding envelope locally.
@@ -432,8 +520,6 @@ pub struct Oracle {
     engine: Arc<OracleEngine>,
     /// Oracle-owned private peer execution service.
     peer: Arc<crate::oracle::OraclePeerRuntime>,
-    /// Distributed physical-fragment dispatcher shared with the engine.
-    dispatcher: Arc<FragmentDispatcher>,
     /// Process-wide owner-local active-query registry.
     running_queries: Arc<RunningQueryRegistry>,
     /// Tenant-scoped controls over the exact running-query registry.
@@ -507,18 +593,19 @@ impl Oracle {
     ///
     /// Returns [`wyrd_spec::vala::error::BifrostError`] when the engine's sole
     /// delegated-continuity receiver was already transferred or is unavailable.
-    pub fn new(
-        engine: Arc<OracleEngine>,
-        catalog: Arc<BifrostCatalog>,
-        registered_role: RegisteredRole,
-        cluster: Arc<ClusterRegistry>,
-        coordination_runtime: Option<Arc<tokio::runtime::Runtime>>,
-        audit: Arc<crate::oracle::OracleAuditPublisher>,
-        lifecycle_transport: Arc<crate::oracle::OracleLifecycleTransport>,
-        resources: OracleResources,
-        peer: Arc<crate::oracle::OraclePeerRuntime>,
-        role_shutdown: CancellationToken,
-    ) -> Result<Self, wyrd_spec::vala::error::BifrostError> {
+    pub fn new(inputs: OracleBuildInputs) -> Result<Self, wyrd_spec::vala::error::BifrostError> {
+        let OracleBuildInputs {
+            engine,
+            catalog,
+            registered_role,
+            cluster,
+            coordination_runtime,
+            audit,
+            lifecycle_transport,
+            resources,
+            peer,
+            role_shutdown,
+        } = inputs;
         let delegated_loss = engine.take_delegated_continuity_loss()?;
         let advertise_ready = Arc::new(AtomicBool::new(true));
         let lifecycle = RoleLifecycle::serving();
@@ -541,9 +628,13 @@ impl Oracle {
         ));
         let continuity_monitor_abort = continuity_monitor.abort_handle();
         let running_queries = Arc::clone(engine.running_queries());
-        let dispatcher = engine
-            .fragment_dispatcher()
-            .expect("production Oracle composition requires its distributed dispatcher");
+        // The engine already owns the distributed dispatcher, so assert the
+        // composition invariant here rather than retaining a second handle that
+        // nothing reads.
+        assert!(
+            engine.fragment_dispatcher().is_some(),
+            "production Oracle composition requires its distributed dispatcher"
+        );
         let query_controls = crate::oracle::RunningQueryControls::new(
             Arc::clone(&running_queries),
             Arc::clone(&lifecycle_transport),
@@ -569,7 +660,6 @@ impl Oracle {
             lifecycle_transport,
             query_controls,
             peer,
-            dispatcher,
             resources,
         })
     }
@@ -760,17 +850,6 @@ impl Oracle {
     pub fn has_dedicated_coordination_runtime(&self) -> bool {
         self.coordination_runtime.is_some()
     }
-
-    /// Returns whether all three retained Oracle role tasks have reached termination.
-    #[cfg(all(test, feature = "test-support"))]
-    #[must_use]
-    pub(crate) fn role_tasks_finished_for_test(&self) -> (bool, bool, bool) {
-        (
-            self.heartbeat_abort.is_finished(),
-            self.snapshot_poller_abort.is_finished(),
-            self.continuity_monitor_abort.is_finished(),
-        )
-    }
 }
 
 /// Consumes the sole delegated-admission continuity signal for one Oracle fence.
@@ -874,19 +953,20 @@ impl Scribe {
     /// The projection shares Scribe's bounded ingress CPU lane, while an
     /// optional runtime keeps server-created coordination consumers alive.
     #[must_use]
-    pub fn new(
-        ingest: Arc<ScribeImpl>,
-        catalog: Arc<BifrostCatalog>,
-        resources: ScribeResources,
-        cluster: Arc<ClusterRegistry>,
-        registered_role: RegisteredRole,
-        fragment_verifier: Arc<dyn PeerTicketVerifier>,
-        fragment_security_audit: Arc<dyn PeerSecurityAudit>,
-        fragment_query_audit: Arc<crate::oracle::OracleAuditPublisher>,
-        owns_fragment_query_audit: bool,
-        coordination_runtime: Option<Arc<tokio::runtime::Runtime>>,
-        role_shutdown: CancellationToken,
-    ) -> Self {
+    pub fn new(inputs: ScribeBuildInputs) -> Self {
+        let ScribeBuildInputs {
+            ingest,
+            catalog,
+            resources,
+            cluster,
+            registered_role,
+            fragment_verifier,
+            fragment_security_audit,
+            fragment_query_audit,
+            owns_fragment_query_audit,
+            coordination_runtime,
+            role_shutdown,
+        } = inputs;
         let tail_service = Arc::new(
             ingest
                 .tail_service()
@@ -1133,16 +1213,6 @@ impl Scribe {
     #[must_use]
     pub fn has_dedicated_coordination_runtime(&self) -> bool {
         self.coordination_runtime.is_some()
-    }
-
-    /// Returns whether both retained Scribe role tasks have reached termination.
-    #[cfg(all(test, feature = "test-support"))]
-    #[must_use]
-    pub(crate) fn role_tasks_finished_for_test(&self) -> (bool, bool) {
-        (
-            self.heartbeat_abort.is_finished(),
-            self.snapshot_poller_abort.is_finished(),
-        )
     }
 }
 
@@ -1740,6 +1810,10 @@ impl Bifrost {
         frame: InsertBatchRequest,
     ) -> Result<u64, vala_bifrost_redux::gate::IngestError> {
         self.gate().ensure_ingest_open()?;
+        let resolution_started = std::time::Instant::now();
+        metrics::counter!("bifrost_gate_events_total", "stage" => "native_frame").increment(1);
+        metrics::counter!("bifrost_gate_frame_bytes_total")
+            .increment(u64::try_from(frame.arrow_ipc.len()).unwrap_or(u64::MAX));
         vala_bifrost_redux::gate::validate_batch(&frame, self.gate().ingest_limits())?;
         wyrd_runtime::RbacCheck
             .check(
@@ -1788,28 +1862,39 @@ impl Bifrost {
         let principal = auth.principal.clone();
         let authenticated_tenant = auth.tenant;
         let request_id = auth.request_id.clone();
-        let admission = tokio::spawn(async move {
-            scribe
-                .ingest_frame(ScribeIngressFrame {
-                    principal,
-                    authenticated_tenant,
-                    table,
-                    expected_schema_fingerprint: None,
-                    request_id,
-                    batch_id,
-                    audit_event,
-                    measured_wire_bytes: frame.arrow_ipc.len(),
-                    payload: IngressPayload::ArrowIpc(frame.arrow_ipc),
-                })
-                .await
-        })
-        .await
-        .map_err(|error| {
-            vala_bifrost_redux::gate::IngestError::Internal(format!(
-                "durable Scribe task failed: {error}"
-            ))
-        })?
-        .map_err(vala_bifrost_redux::gate::IngestError::from_scribe)?;
+        let measured_wire_bytes = frame.arrow_ipc.len();
+        // The durable Scribe write stays inside this request future on purpose.
+        // Detaching it onto its own task would orphan the admission owner when a
+        // transport drops the handler: the spawned task keeps its admission slot
+        // and ingress bytes while nothing observes its terminal. Awaiting inline
+        // makes the admission guard drop with the cancelled request, which is the
+        // same request-scoped ingest lifetime the ported design commits the WAL
+        // under.
+        let admission = scribe
+            .ingest_frame(ScribeIngressFrame {
+                principal,
+                authenticated_tenant,
+                table,
+                expected_schema_fingerprint: None,
+                request_id,
+                batch_id,
+                audit_event,
+                measured_wire_bytes,
+                payload: IngressPayload::ArrowIpc(frame.arrow_ipc),
+            })
+            .await
+            .map_err(|error| {
+                metrics::counter!("bifrost_gate_events_total", "stage" => "scribe_failure")
+                    .increment(1);
+                metrics::counter!("bifrost_gate_frames_total", "status" => "rejected").increment(1);
+                vala_bifrost_redux::gate::IngestError::from_scribe(error)
+            })?;
+        metrics::counter!("bifrost_gate_frames_total", "status" => "accepted").increment(1);
+        metrics::counter!("bifrost_gate_rows_total", "status" => "accepted")
+            .increment(admission.rows_accepted);
+        metrics::counter!("bifrost_gate_rows_total", "status" => "rejected").increment(0);
+        metrics::histogram!("bifrost_gate_resolution_seconds")
+            .record(resolution_started.elapsed().as_secs_f64());
         Ok(admission.rows_accepted)
     }
 

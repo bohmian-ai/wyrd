@@ -1356,6 +1356,106 @@ mod tests {
         );
     }
 
+    /// Asserts each Forge metric family emitted exactly its full label product.
+    ///
+    /// The caller has just driven every strategy, result, conflict, cleanup, and
+    /// resource variant once, so each family's series count must equal the
+    /// product of the enums that label it. A count below the product means a
+    /// variant emits nothing; above it means a label escaped its closed set.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any family's observed series count differs from its expected
+    /// label product.
+    #[cfg(test)]
+    fn assert_metric_label_cardinality(recorder: &BenchmarkRecorder) {
+        let snapshot = recorder.snapshot();
+        let task_durations = snapshot
+            .histograms
+            .keys()
+            .filter(|name| name.starts_with("bifrost_forge_task_duration_seconds{"))
+            .count();
+        let spills = snapshot
+            .histograms
+            .keys()
+            .filter(|name| name.starts_with("bifrost_forge_task_spill_bytes{"))
+            .count();
+        let cleanups = snapshot
+            .histograms
+            .keys()
+            .filter(|name| name.starts_with("bifrost_forge_cleanup_duration_seconds{"))
+            .count();
+        let conflicts = snapshot
+            .counters
+            .keys()
+            .filter(|name| name.starts_with("bifrost_forge_conflicts_total{"))
+            .count();
+        let resource_observations = snapshot
+            .histograms
+            .keys()
+            .filter(|name| name.starts_with("bifrost_forge_attempt_resource_bytes{"))
+            .count();
+        let resource_releases = snapshot
+            .counters
+            .keys()
+            .filter(|name| name.starts_with("bifrost_forge_attempt_resource_releases_total{"))
+            .count();
+        assert_eq!(
+            task_durations,
+            ForgeTaskMetricStrategy::ALL.len() * ForgeTaskTerminalResult::ALL.len()
+        );
+        assert_eq!(spills, ForgeTaskMetricStrategy::ALL.len());
+        assert_eq!(cleanups, ForgeCleanupKind::ALL.len());
+        assert_eq!(conflicts, ForgeConflictKind::ALL.len());
+        assert_eq!(
+            resource_observations,
+            ForgeAttemptResource::ALL.len() * ForgeResourceObservationKind::ALL.len()
+        );
+        assert_eq!(resource_releases, ForgeAttemptResource::ALL.len() * 2);
+    }
+
+    /// Asserts each owner-emitted family moves when its owner records again.
+    ///
+    /// Cardinality alone cannot distinguish a live metric from one that emitted
+    /// once and froze, so every family is driven a second time through its real
+    /// owner and required to change. Each conflict kind is checked individually
+    /// because they share one counter family and a single mis-wired kind would
+    /// otherwise hide behind its siblings.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any family does not change when its owner records again.
+    #[cfg(test)]
+    fn assert_owner_transitions(recorder: &BenchmarkRecorder, telemetry: &ForgeTelemetry) {
+        assert_owner_transition(recorder, "bifrost_forge_rewrite_output_bytes_total", || {
+            telemetry.record_rewrite_volume(ForgeMetricSource::Staging, 1, 64, 1, 32);
+        });
+        assert_owner_transition(recorder, "bifrost_forge_task_duration_seconds", || {
+            telemetry.record_task_terminal(
+                ForgeTaskMetricStrategy::StagingFold,
+                ForgeTaskTerminalResult::Succeeded,
+                Duration::from_millis(2),
+            );
+        });
+        assert_owner_transition(recorder, "bifrost_forge_oldest_backlog_seconds", || {
+            telemetry.record_planning_status(Duration::from_secs(2), 1);
+        });
+        assert_owner_transition(recorder, "bifrost_forge_fairness_lag_tasks", || {
+            telemetry.record_planning_status(Duration::from_secs(2), 2);
+        });
+        assert_owner_transition(recorder, "bifrost_forge_task_spill_bytes", || {
+            telemetry.record_task_spill(ForgeTaskMetricStrategy::StagingFold, 4096);
+        });
+        for kind in ForgeConflictKind::ALL {
+            assert_owner_transition(recorder, "bifrost_forge_conflicts_total", || {
+                telemetry.record_conflict(kind);
+            });
+        }
+        assert_owner_transition(recorder, "bifrost_forge_cleanup_duration_seconds", || {
+            telemetry.record_cleanup(ForgeCleanupKind::Expired, Duration::from_millis(3));
+        });
+    }
+
     /// Drive each real telemetry owner boundary and pin independent report sensitivity.
     #[test]
     fn forge_production_telemetry_contract() {
@@ -1413,79 +1513,9 @@ mod tests {
             let reservation = MemoryConsumer::new("forge-owner-proof").register(&pool);
             reservation.try_grow(0).expect("zero-sized Forge reserve");
 
-            let snapshot = recorder.snapshot();
-            let task_durations = snapshot
-                .histograms
-                .keys()
-                .filter(|name| name.starts_with("bifrost_forge_task_duration_seconds{"))
-                .count();
-            let spills = snapshot
-                .histograms
-                .keys()
-                .filter(|name| name.starts_with("bifrost_forge_task_spill_bytes{"))
-                .count();
-            let cleanups = snapshot
-                .histograms
-                .keys()
-                .filter(|name| name.starts_with("bifrost_forge_cleanup_duration_seconds{"))
-                .count();
-            let conflicts = snapshot
-                .counters
-                .keys()
-                .filter(|name| name.starts_with("bifrost_forge_conflicts_total{"))
-                .count();
-            let resource_observations = snapshot
-                .histograms
-                .keys()
-                .filter(|name| name.starts_with("bifrost_forge_attempt_resource_bytes{"))
-                .count();
-            let resource_releases = snapshot
-                .counters
-                .keys()
-                .filter(|name| name.starts_with("bifrost_forge_attempt_resource_releases_total{"))
-                .count();
-            assert_eq!(
-                task_durations,
-                ForgeTaskMetricStrategy::ALL.len() * ForgeTaskTerminalResult::ALL.len()
-            );
-            assert_eq!(spills, ForgeTaskMetricStrategy::ALL.len());
-            assert_eq!(cleanups, ForgeCleanupKind::ALL.len());
-            assert_eq!(conflicts, ForgeConflictKind::ALL.len());
-            assert_eq!(
-                resource_observations,
-                ForgeAttemptResource::ALL.len() * ForgeResourceObservationKind::ALL.len()
-            );
-            assert_eq!(resource_releases, ForgeAttemptResource::ALL.len() * 2);
+            assert_metric_label_cardinality(&recorder);
 
-            assert_owner_transition(
-                &recorder,
-                "bifrost_forge_rewrite_output_bytes_total",
-                || telemetry.record_rewrite_volume(ForgeMetricSource::Staging, 1, 64, 1, 32),
-            );
-            assert_owner_transition(&recorder, "bifrost_forge_task_duration_seconds", || {
-                telemetry.record_task_terminal(
-                    ForgeTaskMetricStrategy::StagingFold,
-                    ForgeTaskTerminalResult::Succeeded,
-                    Duration::from_millis(2),
-                );
-            });
-            assert_owner_transition(&recorder, "bifrost_forge_oldest_backlog_seconds", || {
-                telemetry.record_planning_status(Duration::from_secs(2), 1);
-            });
-            assert_owner_transition(&recorder, "bifrost_forge_fairness_lag_tasks", || {
-                telemetry.record_planning_status(Duration::from_secs(2), 2);
-            });
-            assert_owner_transition(&recorder, "bifrost_forge_task_spill_bytes", || {
-                telemetry.record_task_spill(ForgeTaskMetricStrategy::StagingFold, 4096);
-            });
-            for kind in ForgeConflictKind::ALL {
-                assert_owner_transition(&recorder, "bifrost_forge_conflicts_total", || {
-                    telemetry.record_conflict(kind);
-                });
-            }
-            assert_owner_transition(&recorder, "bifrost_forge_cleanup_duration_seconds", || {
-                telemetry.record_cleanup(ForgeCleanupKind::Expired, Duration::from_millis(3));
-            });
+            assert_owner_transitions(&recorder, &telemetry);
 
             assert_orphan_gc_operation_emission(&recorder, &telemetry);
 

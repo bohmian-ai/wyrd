@@ -3122,6 +3122,54 @@ mod tests {
 
     #[cfg(feature = "test-support")]
     impl IdlePersistenceFixture {
+        /// Builds Scribe-only runtime resources over the fixture's real volume roots.
+        ///
+        /// The snapshot is injected rather than probed so the fixture's capacity
+        /// is deterministic across machines, and only the Scribe role is
+        /// composed so the test exercises a single role's floor. The volume
+        /// roots are the fixture's real directories, so the WAL, output, and
+        /// scratch accounting under test is measured against actual files.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the injected snapshot and policy cannot produce valid
+        /// Bifrost runtime resources.
+        fn scribe_only_runtime_resources(
+            scratch_root: &std::path::Path,
+            wal_root: &std::path::Path,
+            scribe_output: std::path::PathBuf,
+            forge_scratch: std::path::PathBuf,
+            oracle_scratch: std::path::PathBuf,
+        ) -> crate::resources::BifrostRuntimeResources {
+            crate::resources::BifrostRuntimeResources::from_snapshot(
+                crate::resources::SystemResourceSnapshot {
+                    memory_limit_bytes: 1024 * 1024 * 1024,
+                    effective_cpu: 2,
+                    scratch_capacity_bytes: 2 * 1024 * 1024 * 1024,
+                    scratch_available_bytes: 2 * 1024 * 1024 * 1024,
+                    memory_source: crate::resources::ResourceSource::Injected,
+                    cpu_source: crate::resources::ResourceSource::Injected,
+                },
+                crate::resources::BifrostResourcePolicy {
+                    roles: std::collections::BTreeSet::from([
+                        crate::resources::BifrostRole::Scribe,
+                    ]),
+                    memory_limit_bytes: None,
+                    unmanaged_reserve_bytes: None,
+                    scratch_limit_bytes: None,
+                    effective_cpu: None,
+                    scratch_root: scratch_root.to_owned(),
+                    volume_roots: Some(crate::resources::BifrostVolumeRoots {
+                        wal: wal_root.to_owned(),
+                        scribe_output_scratch: scribe_output,
+                        forge_scratch,
+                        oracle_scratch,
+                    }),
+                },
+            )
+            .expect("test Bifrost resources")
+        }
+
         /// Starts one real persistence runtime before it accepts work.
         async fn start() -> Self {
             let database = wyrd_dev_fixtures::pg::PgFixture::start()
@@ -3163,33 +3211,13 @@ mod tests {
                 stream,
             ))
             .expect("WAL stream directory");
-            let runtime_resources = crate::resources::BifrostRuntimeResources::from_snapshot(
-                crate::resources::SystemResourceSnapshot {
-                    memory_limit_bytes: 1024 * 1024 * 1024,
-                    effective_cpu: 2,
-                    scratch_capacity_bytes: 2 * 1024 * 1024 * 1024,
-                    scratch_available_bytes: 2 * 1024 * 1024 * 1024,
-                    memory_source: crate::resources::ResourceSource::Injected,
-                    cpu_source: crate::resources::ResourceSource::Injected,
-                },
-                crate::resources::BifrostResourcePolicy {
-                    roles: std::collections::BTreeSet::from([
-                        crate::resources::BifrostRole::Scribe,
-                    ]),
-                    memory_limit_bytes: None,
-                    unmanaged_reserve_bytes: None,
-                    scratch_limit_bytes: None,
-                    effective_cpu: None,
-                    scratch_root: scratch_root.path().to_owned(),
-                    volume_roots: Some(crate::resources::BifrostVolumeRoots {
-                        wal: wal_root.path().to_owned(),
-                        scribe_output_scratch: scribe_output,
-                        forge_scratch,
-                        oracle_scratch,
-                    }),
-                },
-            )
-            .expect("test Bifrost resources");
+            let runtime_resources = Self::scribe_only_runtime_resources(
+                scratch_root.path(),
+                wal_root.path(),
+                scribe_output,
+                forge_scratch,
+                oracle_scratch,
+            );
             let roles = runtime_resources
                 .compose_roles()
                 .expect("test role resources");
@@ -3224,6 +3252,74 @@ mod tests {
                 _wal_root: wal_root,
                 _scratch_root: scratch_root,
             }
+        }
+
+        /// Builds the one bounded generation this fixture submits.
+        ///
+        /// Every field is fixed — one row, one audit event, one append meta,
+        /// LSN 1, shard 0 — so the queue gauges the caller asserts on move by a
+        /// known amount rather than by whatever a randomized fixture produced.
+        /// The WAL handle is taken from the fixture's real writer so the
+        /// persistence worker exercises a genuine durable path.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the fixture's WAL writer has no shard-0 handle.
+        fn fixture_generation(
+            &self,
+            table: crate::catalog::TableRef,
+            seal_key: &SealKey,
+            rows: Vec<arrow::record_batch::RecordBatch>,
+            schema: Arc<arrow::datatypes::Schema>,
+            batch_id: uuid::Uuid,
+        ) -> Arc<ImmutableGeneration> {
+            Arc::new(ImmutableGeneration {
+                table_key: (self.tenant, table),
+                seal_key: seal_key.clone(),
+                generation_id: GenerationId(1),
+                stream: self.stream,
+                wal_lsn_min: WalLsn::new(1),
+                wal_lsn_max: WalLsn::new(1),
+                wal_segments: Vec::new(),
+                wal: self.wal.handle_for_shard(0).expect("WAL handle"),
+                rows,
+                schema,
+                audit_events: vec![wyrd_spec::vala::api::AuditEvent {
+                    request_id: wyrd_spec::request_id::RequestId::now_v7(),
+                    trace_id: None,
+                    operation: "test".to_owned(),
+                    resource: "bifrost.idle_queue".to_owned(),
+                    card_ref: None,
+                    principal_id: wyrd_spec::auth::PrincipalId::new(uuid::Uuid::new_v4()),
+                    principal_kind: wyrd_spec::auth::PrincipalKindTag::User,
+                    auth_method: wyrd_spec::vala::api::AuthMethod::Jwt,
+                    permission: "bifrost.write".to_owned(),
+                    decision: wyrd_spec::vala::api::AuditDecision::Allow,
+                    result: wyrd_spec::vala::api::AuditResult::Success,
+                    payload_summary: "idle persistence fixture".to_owned(),
+                    detail: None,
+                }],
+                append_metas: vec![crate::scribe::wal::ScribeAppendMeta {
+                    batch_id: *batch_id.as_bytes(),
+                    schema_fingerprint: [0; 32],
+                    data_digest: [0; 32],
+                    data_len: 0,
+                    payload_digest: [0; 32],
+                    payload_len: 0,
+                    slice_index: 0,
+                    slice_count: 1,
+                    rows_accepted: 1,
+                    wal_lsn_min: WalLsn::new(1),
+                    wal_lsn_max: WalLsn::new(1),
+                    seal_key: seal_key.to_string(),
+                }],
+                row_count: 1,
+                arrow_bytes: 1,
+                replay_identity: Mutex::new(None),
+                opened_at: std::time::Instant::now(),
+                closed_at: std::time::Instant::now(),
+                shard_id: 0,
+            })
         }
 
         /// Submits one bounded generation and waits for its real worker completion.
@@ -3276,53 +3372,7 @@ mod tests {
             let (completion_tx, mut completion_rx) = mpsc::channel(1);
             self.runtime
                 .try_submit(PersistenceJob {
-                    generation: Arc::new(ImmutableGeneration {
-                        table_key: (self.tenant, table),
-                        seal_key: seal_key.clone(),
-                        generation_id: GenerationId(1),
-                        stream: self.stream,
-                        wal_lsn_min: WalLsn::new(1),
-                        wal_lsn_max: WalLsn::new(1),
-                        wal_segments: Vec::new(),
-                        wal: self.wal.handle_for_shard(0).expect("WAL handle"),
-                        rows,
-                        schema,
-                        audit_events: vec![wyrd_spec::vala::api::AuditEvent {
-                            request_id: wyrd_spec::request_id::RequestId::now_v7(),
-                            trace_id: None,
-                            operation: "test".to_owned(),
-                            resource: "bifrost.idle_queue".to_owned(),
-                            card_ref: None,
-                            principal_id: wyrd_spec::auth::PrincipalId::new(uuid::Uuid::new_v4()),
-                            principal_kind: wyrd_spec::auth::PrincipalKindTag::User,
-                            auth_method: wyrd_spec::vala::api::AuthMethod::Jwt,
-                            permission: "bifrost.write".to_owned(),
-                            decision: wyrd_spec::vala::api::AuditDecision::Allow,
-                            result: wyrd_spec::vala::api::AuditResult::Success,
-                            payload_summary: "idle persistence fixture".to_owned(),
-                            detail: None,
-                        }],
-                        append_metas: vec![crate::scribe::wal::ScribeAppendMeta {
-                            batch_id: *batch_id.as_bytes(),
-                            schema_fingerprint: [0; 32],
-                            data_digest: [0; 32],
-                            data_len: 0,
-                            payload_digest: [0; 32],
-                            payload_len: 0,
-                            slice_index: 0,
-                            slice_count: 1,
-                            rows_accepted: 1,
-                            wal_lsn_min: WalLsn::new(1),
-                            wal_lsn_max: WalLsn::new(1),
-                            seal_key: seal_key.to_string(),
-                        }],
-                        row_count: 1,
-                        arrow_bytes: 1,
-                        replay_identity: Mutex::new(None),
-                        opened_at: std::time::Instant::now(),
-                        closed_at: std::time::Instant::now(),
-                        shard_id: 0,
-                    }),
+                    generation: self.fixture_generation(table, &seal_key, rows, schema, batch_id),
                     binding,
                     completion_tx,
                     completion_waiter: None,

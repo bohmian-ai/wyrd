@@ -132,7 +132,7 @@ fn authoritative_forge_violations(
         })
         .collect::<Vec<_>>();
     let mut pending = roots
-        .into_iter()
+        .iter()
         .map(|name| {
             local_functions
                 .iter()
@@ -257,14 +257,14 @@ fn rust_impl_ranges(source: &str) -> Vec<RustImplRange> {
             break;
         };
         let open = declaration + 5 + open_relative;
-        if !owner.is_empty() {
-            if let Some(end) = matching_brace(source, open) {
-                ranges.push(RustImplRange {
-                    owner: owner.to_owned(),
-                    start: open,
-                    end,
-                });
-            }
+        if !owner.is_empty()
+            && let Some(end) = matching_brace(source, open)
+        {
+            ranges.push(RustImplRange {
+                owner: owner.to_owned(),
+                start: open,
+                end,
+            });
         }
         offset = open + 1;
     }
@@ -995,8 +995,8 @@ async fn supervised_temporary_pressure_defers_without_ownership() {
     .fetch_one(fixture.operator_pool.pool())
     .await
     .expect("durable temporary-pressure refusal");
-    assert_eq!(deferred.1, true, "refusal retains no attempt identity");
-    assert_eq!(deferred.2, true, "refusal retains no claim owner");
+    assert!(deferred.1, "refusal retains no attempt identity");
+    assert!(deferred.2, "refusal retains no claim owner");
     assert_eq!(deferred.3, 0, "refusal consumes no attempt budget");
     assert_eq!(deferred.4.as_deref(), Some("capacity_refused"));
     drop(held);
@@ -1188,7 +1188,7 @@ async fn forge_snapshot_expiry_journey() {
 /// The fixture builds real retained Iceberg history through two production
 /// staging-fold commits, then seeds an additional pool of uncompacted staging
 /// files so a staging-fold compaction candidate stays continuously available on
-redacted
+/// every planning tick. With the maintenance trigger
 /// (`maintenance_trigger_snapshot_count` / `maintenance_trigger_interval`) making
 /// expiry due independently of that backlog, and the reserved maintenance worker
 /// slot claiming maintenance ahead of ready compaction, the journey asserts that
@@ -1445,16 +1445,18 @@ async fn pg_bifrost_forge_manifest_maintenance_precedes_expiry() {
     supervised_temporary_pressure_defers_without_ownership().await;
     supervised_uncertain_commit_recovery_journey().await;
     let observer = ForgeWorkerCompletionObserver::new();
-    let mut config = ForgeConfig::default();
-    config.lease_ttl = Duration::from_secs(4);
-    config.iceberg_total_retry_timeout = Duration::from_secs(1);
-    config.catalog_request_timeout = Duration::from_secs(1);
-    config.uncertainty_margin = Duration::from_secs(1);
-    config.uncertainty_bound = Duration::from_secs(1);
-    config.manifest_rewrite_enabled = true;
-    config.manifest_rewrite_min_count = 2;
-    config.maintenance_trigger_snapshot_count = 1;
-    config.maintenance_trigger_interval = Duration::from_millis(1);
+    let config = ForgeConfig {
+        lease_ttl: Duration::from_secs(4),
+        iceberg_total_retry_timeout: Duration::from_secs(1),
+        catalog_request_timeout: Duration::from_secs(1),
+        uncertainty_margin: Duration::from_secs(1),
+        uncertainty_bound: Duration::from_secs(1),
+        manifest_rewrite_enabled: true,
+        manifest_rewrite_min_count: 2,
+        maintenance_trigger_snapshot_count: 1,
+        maintenance_trigger_interval: Duration::from_millis(1),
+        ..ForgeConfig::default()
+    };
     let server = WyrdTestServer::builder()
         .with_forge_interval(Duration::from_secs(3600))
         .with_forge_config_for_test(config)
@@ -1627,7 +1629,7 @@ async fn pg_bifrost_forge_manifest_maintenance_precedes_expiry() {
         ),
         "one SnapshotExpiry carrier completes both due maintenance effects"
     );
-    let guarded: (bool, bool, Option<uuid::Uuid>, Option<uuid::Uuid>, Option<chrono::DateTime<chrono::Utc>>, Option<i64>, Option<i64>, serde_json::Value, serde_json::Value) = sqlx::query_as(
+    let guarded: GuardedMaintenanceRow = sqlx::query_as(
         "SELECT (plan->'parameters'->>'manifest_rewrite_due')::boolean,(plan->'parameters'->>'snapshot_expiry_due')::boolean,attempt_id,claimed_by,claim_expires_at,watermark_snapshot_id,watermark_timestamp_ms,plan,evidence FROM vala.forge_tasks WHERE data_tenant_id=$1 AND table_name=$2 AND task_id=$3 AND strategy='snapshot_expiry' AND state='succeeded'",
     )
     .bind(fixture.tenant.as_uuid())
@@ -1845,13 +1847,33 @@ async fn selected_manifest_facts(
     (cardinality, live_paths, partition_spec)
 }
 
+/// One row of the manifest-maintenance guard projection.
+///
+/// `sqlx::query_as` needs the column tuple spelled out, and this projection
+/// reads nine columns spanning both maintenance-due flags, claim ownership,
+/// watermark identity, and the persisted plan and evidence documents. Naming it
+/// keeps the assertion readable and gives the shape one place to change.
+type GuardedMaintenanceRow = (
+    bool,
+    bool,
+    Option<uuid::Uuid>,
+    Option<uuid::Uuid>,
+    Option<chrono::DateTime<chrono::Utc>>,
+    Option<i64>,
+    Option<i64>,
+    serde_json::Value,
+    serde_json::Value,
+);
+
 /// Real Forge workers converge public small-file debt without constructing Oracle.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Bifrost journey lane"]
 async fn pg_bifrost_forge_small_files_converges_without_query_dependency() {
-    let mut forge_config = ForgeConfig::default();
-    forge_config.snapshot_expiry_enabled = false;
-    forge_config.max_files_per_bin = 2;
+    let forge_config = ForgeConfig {
+        snapshot_expiry_enabled: false,
+        max_files_per_bin: 2,
+        ..ForgeConfig::default()
+    };
     let cluster = WyrdTestCluster::start_spec_with_forge_config_and_completion_observer(
         BifrostClusterSpec::one_mixed().with_system_resources(forge_convergence_system_resources()),
         forge_config,
@@ -2913,10 +2935,12 @@ async fn forge_orphan_cleanup_lifecycle_journey() {
 #[tokio::test]
 #[ignore = "supporting integration seam: direct owner controls"]
 async fn supporting_preprepared_verified_output_orphan_gc_journey() {
-    let mut server_config = vala_bifrost_redux::forge::ForgeConfig::default();
-    server_config.min_files = 2;
-    server_config.max_files_per_bin = 2;
-    server_config.max_files_per_tick = 2;
+    let server_config = vala_bifrost_redux::forge::ForgeConfig {
+        min_files: 2,
+        max_files_per_bin: 2,
+        max_files_per_tick: 2,
+        ..vala_bifrost_redux::forge::ForgeConfig::default()
+    };
     let server = WyrdTestServer::builder()
         .with_forge_interval(Duration::from_secs(3600))
         .with_forge_process_role_for_test(BifrostTarget::All)
@@ -3151,12 +3175,14 @@ async fn pg_bifrost_forge_publication_recovery_and_orphan_gc() {
 /// carrier does not settle orphan collection exactly once.
 async fn supervised_prepared_audit_failure_and_gc_journey() {
     let observer = ForgeWorkerCompletionObserver::new();
-    let mut config = ForgeConfig::default();
-    config.min_files = 2;
-    config.max_files_per_bin = 64;
-    config.max_files_per_tick = 64;
-    config.orphan_gc_ttl = Duration::from_millis(1);
-    config.snapshot_retention = Duration::from_hours(48);
+    let config = ForgeConfig {
+        min_files: 2,
+        max_files_per_bin: 64,
+        max_files_per_tick: 64,
+        orphan_gc_ttl: Duration::from_millis(1),
+        snapshot_retention: Duration::from_hours(48),
+        ..ForgeConfig::default()
+    };
     let server = WyrdTestServer::builder()
         .with_forge_interval(Duration::from_secs(3600))
         .with_forge_config_for_test(config)

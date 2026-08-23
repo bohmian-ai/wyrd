@@ -645,12 +645,65 @@ impl<T> ScribeTailResolver<T> {
     }
 }
 
+/// One follower fragment execution: its output stream and its scan evidence.
+///
+/// The two are returned together because the scan metric sets must be captured
+/// from the physical plan before execution consumes it, yet can only be read
+/// for a total after the stream has drained. Pairing them makes it impossible
+/// for a caller to take the stream and silently lose the evidence.
+pub struct FollowerExecution {
+    /// Ordered record batches this fragment produces.
+    stream: SendableRecordBatchStream,
+    /// Scan metric sets pinned before execution began.
+    scan_stats: FollowerScanEvidence,
+}
+
+impl FollowerExecution {
+    /// Splits this execution into its output stream and deferred scan evidence.
+    ///
+    /// The caller drains the stream, then finalizes the evidence; the split
+    /// exists because those two steps happen in different scopes.
+    #[must_use]
+    pub fn split(self) -> (SendableRecordBatchStream, FollowerScanEvidence) {
+        (self.stream, self.scan_stats)
+    }
+}
+
+/// Scan metric sets pinned from one follower plan, read after its stream drains.
+///
+/// `DataFusion` populates scan metrics during execution, so this owner exists to
+/// make the ordering explicit: it is created before execution and consumed only
+/// once the stream is finished.
+pub struct FollowerScanEvidence(super::exec::OracleQueryScanStats);
+
+impl FollowerScanEvidence {
+    /// Reads the pinned metric sets into the wire-shaped follower totals.
+    ///
+    /// Call this only after the paired stream has drained. Finalizing earlier
+    /// reports a partial scan, and reports no bytes at all for sources whose
+    /// counters are written on their final poll.
+    #[must_use]
+    pub fn finalize(mut self) -> wyrd_spec::vala::api::WorkerScanStats {
+        self.0.finalize();
+        wyrd_spec::vala::api::WorkerScanStats {
+            bytes_scanned: self.0.physical_bytes_scanned,
+            files_scanned: self.0.files_scanned,
+            partitions_scanned: self.0.partitions_scanned,
+        }
+    }
+}
+
 #[async_trait]
 impl<T> FollowerSourceResolver for ScribeTailResolver<T>
 where
     T: LiveTailSource,
 {
     /// Fetches one ordered active-plus-unretired-immutable cohort and builds its provider.
+    ///
+    /// The single bounded snapshot is observed as one `remote`-locality
+    /// live-tail page so a distributed query, whose leader never drains a local
+    /// fence, still reports the live-tail page families an operator reads.
+    ///
     /// Cancellation before the single snapshot returns exposes no batches or
     /// provider. Cancellation during provider construction drops the complete
     /// local cohort. A retry begins again from the authenticated assignment.
@@ -723,7 +776,8 @@ where
             .map_err(|_| "Scribe batch bound does not fit this process".to_owned())?;
         let max_retained_bytes = usize::try_from(cut.maximum_retained_bytes)
             .map_err(|_| "Scribe byte bound does not fit this process".to_owned())?;
-        let batches = self
+        let fetch_started = std::time::Instant::now();
+        let fetched = self
             .tail
             .fetch(FetchLiveTailRequest {
                 binding,
@@ -736,7 +790,26 @@ where
                 max_batches,
                 max_retained_bytes,
             })
-            .await?;
+            .await;
+        // The leader skips its own fence drain whenever followers are dispatched,
+        // so this bounded snapshot is the only live-tail read a distributed query
+        // performs. It carries the `remote` locality of the same page families the
+        // single-node drain emits, keeping live-tail observation continuous across
+        // both execution shapes.
+        let page_outcome = if fetched.is_ok() { "success" } else { "failed" };
+        metrics::counter!(
+            "bifrost_oracle_tail_pages_total",
+            "locality" => "remote",
+            "outcome" => page_outcome
+        )
+        .increment(1);
+        metrics::histogram!(
+            "bifrost_oracle_tail_page_seconds",
+            "locality" => "remote",
+            "outcome" => page_outcome
+        )
+        .record(fetch_started.elapsed().as_secs_f64());
+        let batches = fetched?;
         let rows = batches
             .into_iter()
             .map(|batch| batch.rows)
@@ -864,7 +937,7 @@ fn restrict_plan_to_assigned_files(
     Ok(transformed)
 }
 
-/// Joins DataFusion's authenticated object-store authority and relative object key.
+/// Joins `DataFusion`'s authenticated object-store authority and relative object key.
 fn physical_file_location(store: &str, path: &str) -> String {
     if store == "file://" {
         return format!("file:///{}", path.trim_start_matches('/'));
@@ -932,6 +1005,8 @@ where
 /// Observable counts for the follower's effect-bearing lifecycle boundaries.
 #[derive(Debug, Default)]
 struct FollowerEffects {
+    /// Common-plan placeholder visits performed before and after source resolution.
+    preflight: AtomicUsize,
     /// Provider resolution attempts begun after successful preflight.
     resolver: AtomicUsize,
     /// Native physical decode attempts begun after complete resolution.
@@ -955,6 +1030,7 @@ where
             audit: None,
             maximum_plan_bytes: DEFAULT_MAX_PHYSICAL_PLAN_BYTES,
             effects: FollowerEffects {
+                preflight: AtomicUsize::new(0),
                 resolver: AtomicUsize::new(0),
                 decode: AtomicUsize::new(0),
                 execution: AtomicUsize::new(0),
@@ -1012,6 +1088,11 @@ where
             }
             providers.insert(scan_id, provider);
         }
+        // Re-read the immutable common plan after every source-resolution await.
+        // This closes the same fail-closed boundary as the initial preflight:
+        // source construction cannot make a missing or malformed placeholder
+        // eligible for union/substitution or output.
+        self.preflight(request, &authenticated)?;
         let codec = if let Some(audit) = &self.audit {
             OraclePhysicalExtensionCodec::decoder_with_audit(providers, Arc::clone(audit))
         } else {
@@ -1043,7 +1124,7 @@ where
         request: &PhysicalExecuteFragmentRequest,
         authenticated: AuthenticatedFollowerContext<'_>,
         memory_pool: Arc<dyn MemoryPool>,
-    ) -> Result<SendableRecordBatchStream, PhysicalPlanFollowerError> {
+    ) -> Result<FollowerExecution, PhysicalPlanFollowerError> {
         let (session, context) = self
             .sessions
             .create(memory_pool)
@@ -1052,10 +1133,18 @@ where
             .decode(request, authenticated, &session, &context)
             .await?;
         self.effects.execution.fetch_add(1, Ordering::SeqCst);
+        // Snapshot the scan metric sets before execution consumes the plan.
+        // The leader's own plan has only remote leaves, so this follower-side
+        // capture is the only place a distributed query can observe physical
+        // read volume at all.
+        let scan_stats = super::exec::OracleQueryScanStats::from_plan(plan.as_ref(), 0);
         let stream = execute_stream(plan, context)
             .map_err(|error| PhysicalPlanFollowerError::Execution(error.to_string()))?;
         self.effects.output.fetch_add(1, Ordering::SeqCst);
-        Ok(stream)
+        Ok(FollowerExecution {
+            stream,
+            scan_stats: FollowerScanEvidence(scan_stats),
+        })
     }
 
     /// Returns the directly observed resolver/decode/execution/output counts.
@@ -1069,6 +1158,12 @@ where
         )
     }
 
+    /// Returns the exact number of fail-closed common-plan placeholder visits.
+    #[cfg(test)]
+    fn preflight_count(&self) -> usize {
+        self.effects.preflight.load(Ordering::SeqCst)
+    }
+
     /// Performs the complete IO-free validation phase.
     ///
     /// # Errors
@@ -1079,6 +1174,7 @@ where
         request: &PhysicalExecuteFragmentRequest,
         authenticated: &AuthenticatedFollowerContext<'_>,
     ) -> Result<PreflightRequest, PhysicalPlanFollowerError> {
+        self.effects.preflight.fetch_add(1, Ordering::SeqCst);
         if request.physical_plan_bytes.is_empty()
             || request.physical_plan_bytes.len() > self.maximum_plan_bytes
             || request.plan_fingerprint.is_empty()
@@ -1240,9 +1336,11 @@ where
                 value.input.iter().map(AsRef::as_ref).collect()
             }
             Some(PhysicalPlanType::Union(value)) => value.inputs.iter().collect(),
-            Some(PhysicalPlanType::HashJoin(_))
-            | Some(PhysicalPlanType::NestedLoopJoin(_))
-            | Some(PhysicalPlanType::CrossJoin(_)) => {
+            Some(
+                PhysicalPlanType::HashJoin(_)
+                | PhysicalPlanType::NestedLoopJoin(_)
+                | PhysicalPlanType::CrossJoin(_),
+            ) => {
                 return Err(PhysicalPlanFollowerError::Preflight(
                     "joins are not supported by the distributed Oracle follower".to_owned(),
                 ));
@@ -1274,7 +1372,7 @@ where
 /// Returns [`PhysicalPlanFollowerError::Preflight`] for any malformed or contradictory binding.
 pub fn authenticated_preflight(
     request: &PhysicalExecuteFragmentRequest,
-    authenticated: AuthenticatedFollowerContext<'_>,
+    authenticated: &AuthenticatedFollowerContext<'_>,
 ) -> Result<(), PhysicalPlanFollowerError> {
     /// Resolver that proves the public preflight entry point performs no IO.
     struct NoResolver;
@@ -1294,7 +1392,7 @@ pub fn authenticated_preflight(
         }
     }
     PhysicalPlanFollower::new(NoResolver)
-        .preflight(request, &authenticated)
+        .preflight(request, authenticated)
         .map(|_| ())
 }
 
@@ -1321,7 +1419,7 @@ pub(crate) mod tests {
     };
 
     use super::*;
-    use crate::oracle::codec::RemoteScanExec;
+    use crate::oracle::codec::RemoteSourcePlaceholderExec;
 
     /// Builds a file-backed physical source with the exact supplied catalog paths.
     fn file_plan(schema: SchemaRef, files: &[&str]) -> Arc<dyn ExecutionPlan> {
@@ -1356,7 +1454,7 @@ pub(crate) mod tests {
         config
             .file_groups
             .iter()
-            .flat_map(|group| group.iter())
+            .flat_map(datafusion::datasource::physical_plan::FileGroup::iter)
             .map(|file| file.object_meta.location.to_string())
             .collect()
     }
@@ -1548,7 +1646,11 @@ pub(crate) mod tests {
         )]));
         let fingerprint = super::super::sealed_fragment_schema_fingerprint(schema.as_ref());
         let bytes = physical_plan_to_bytes_with_extension_codec(
-            Arc::new(RemoteScanExec::new("scan", &fingerprint, schema)),
+            Arc::new(RemoteSourcePlaceholderExec::new(
+                "scan",
+                &fingerprint,
+                schema,
+            )),
             &OraclePhysicalExtensionCodec::encoder(),
         )?
         .to_vec();
@@ -1775,10 +1877,11 @@ pub(crate) mod tests {
             .await
             .expect("validated provider decodes and executes");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(stream.schema().fields().len(), 1);
+        assert_eq!(follower.preflight_count(), 2);
+        assert_eq!(stream.split().0.schema().fields().len(), 1);
     }
 
-    /// Proves every Oracle follower request rebuilds its governed DataFusion context.
+    /// Proves every Oracle follower request rebuilds its governed `DataFusion` context.
     ///
     /// # Panics
     /// Panics if either independent request fails provider resolution, native
@@ -1803,20 +1906,93 @@ pub(crate) mod tests {
         assert_complete_preflight_matrix().await;
     }
 
-    /// The Scribe resolver projects the complete active-plus-unretired snapshot cohort.
+    /// Builds every request mutation a follower decode must refuse.
+    ///
+    /// The cases cover each independent authority the decode checks: a physical
+    /// plan whose join loses a child, a reservation the leader never issued, an
+    /// assignment whose namespace, table, or tenant does not match the
+    /// authenticated binding, a fence naming the wrong role or a stale token, an
+    /// empty Scribe provider cut, an unknown scan id, a wrong schema
+    /// fingerprint, a duplicated assignment, and undecodable plan bytes. Each
+    /// case mutates exactly one field so a refusal cannot be attributed to a
+    /// second defect.
     ///
     /// # Panics
-    /// Panics if canonical fixture construction, Memtable generation freezing,
-    /// provider resolution, or cohort execution violates its test invariant.
-    #[tokio::test]
-    async fn scribe_provider_is_active_plus_all_unretired_immutable() {
-        let tenant_id = DataTenantId::new_v7();
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "wyrd_event_time",
-            DataType::Utf8,
-            true,
-        )]));
-        let day = EventDay::new(chrono::NaiveDate::from_ymd_opt(2026, 8, 19).expect("valid day"));
+    ///
+    /// Panics if the fixture request has no assignments to mutate.
+    fn malformed_follower_requests(
+        request: &PhysicalExecuteFragmentRequest,
+        first: &PhysicalPlanNode,
+    ) -> Vec<PhysicalExecuteFragmentRequest> {
+        let mut malformed = Vec::new();
+        let mut case = request.clone();
+        case.physical_plan_bytes = PhysicalPlanNode {
+            physical_plan_type: Some(PhysicalPlanType::HashJoin(Box::new(
+                datafusion_proto::protobuf::HashJoinExecNode {
+                    left: Some(Box::new(first.clone())),
+                    ..Default::default()
+                },
+            ))),
+        }
+        .encode_to_vec();
+        case.plan_fingerprint = physical_plan_fingerprint(&case.physical_plan_bytes);
+        malformed.push(case);
+        let mut case = request.clone();
+        case.reservation_id = ReservationId::new(uuid::Uuid::now_v7());
+        malformed.push(case);
+        let mut case = request.clone();
+        case.assignments[0].binding.namespace = "vala.traces".to_owned();
+        malformed.push(case);
+        let mut case = request.clone();
+        case.assignments[0].binding.table = "other".to_owned();
+        malformed.push(case);
+        let mut case = request.clone();
+        case.assignments[0].binding.tenant_id = DataTenantId::new_v7();
+        malformed.push(case);
+        let mut case = request.clone();
+        case.target_fence.role = ClusterRole::Scribe;
+        malformed.push(case);
+        let mut case = request.clone();
+        case.target_fence.fencing_token += 1;
+        malformed.push(case);
+        let mut case = request.clone();
+        case.assignments[0].scribe_provider_cut = Some(cut(Vec::new()));
+        malformed.push(case);
+        let mut case = request.clone();
+        case.assignments[0].scan_id = "unknown".to_owned();
+        malformed.push(case);
+        let mut case = request.clone();
+        case.assignments[0].schema_fingerprint = "sha256:wrong".to_owned();
+        malformed.push(case);
+        let mut case = request.clone();
+        case.assignments.push(case.assignments[0].clone());
+        malformed.push(case);
+        let mut case = request.clone();
+        case.physical_plan_bytes = vec![0];
+        case.plan_fingerprint = physical_plan_fingerprint(&case.physical_plan_bytes);
+        malformed.push(case);
+        malformed
+    }
+
+    /// Builds the Scribe cohort fixture: two frozen generations plus a live one.
+    ///
+    /// Two rows are inserted and frozen individually so the memtable holds two
+    /// distinct unretired immutable generations, then a third row is left in the
+    /// active generation. This is the exact shape the resolver must project in
+    /// full — active plus every unretired immutable — so a resolver that
+    /// returned only the active generation, or only the newest immutable one,
+    /// would be caught.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any insert or freeze fails, which would mean the fixture no
+    /// longer has the cohort shape the test asserts against.
+    fn scribe_cohort_memtable(
+        tenant_id: DataTenantId,
+        day: EventDay,
+        schema: &Arc<Schema>,
+    ) -> (SealKey, Arc<Memtable>) {
+        let schema = Arc::clone(schema);
         let batch = |value: &str| {
             RecordBatch::try_new(
                 Arc::clone(&schema),
@@ -1871,6 +2047,24 @@ pub(crate) mod tests {
         memtable
             .insert(&key, event(), meta(9), batch("active"))
             .expect("active row inserts");
+        (key, memtable)
+    }
+
+    /// The Scribe resolver projects the complete active-plus-unretired snapshot cohort.
+    ///
+    /// # Panics
+    /// Panics if canonical fixture construction, Memtable generation freezing,
+    /// provider resolution, or cohort execution violates its test invariant.
+    #[tokio::test]
+    async fn scribe_provider_is_active_plus_all_unretired_immutable() {
+        let tenant_id = DataTenantId::new_v7();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "wyrd_event_time",
+            DataType::Utf8,
+            true,
+        )]));
+        let day = EventDay::new(chrono::NaiveDate::from_ymd_opt(2026, 8, 19).expect("valid day"));
+        let (_key, memtable) = scribe_cohort_memtable(tenant_id, day, &schema);
         let role_resources = crate::resources::BifrostRuntimeResources::composed_for_test(
             crate::resources::MIN_UNMANAGED_RESERVE_BYTES
                 + crate::resources::ROLE_MEMORY_FLOOR_BYTES,
@@ -1947,7 +2141,7 @@ pub(crate) mod tests {
         let first = PhysicalPlanNode::decode(request.physical_plan_bytes.as_slice())
             .expect("first extension decodes");
         let second_bytes = physical_plan_to_bytes_with_extension_codec(
-            Arc::new(RemoteScanExec::new(
+            Arc::new(RemoteSourcePlaceholderExec::new(
                 "scan-two",
                 &request.assignments[0].schema_fingerprint,
                 Arc::new(Schema::new(vec![Field::new(
@@ -1980,53 +2174,7 @@ pub(crate) mod tests {
                 .preflight(&multiple, &authenticated(&request, &binding))
                 .is_ok()
         );
-        let mut malformed = Vec::new();
-        let mut case = request.clone();
-        case.physical_plan_bytes = PhysicalPlanNode {
-            physical_plan_type: Some(PhysicalPlanType::HashJoin(Box::new(
-                datafusion_proto::protobuf::HashJoinExecNode {
-                    left: Some(Box::new(first.clone())),
-                    ..Default::default()
-                },
-            ))),
-        }
-        .encode_to_vec();
-        case.plan_fingerprint = physical_plan_fingerprint(&case.physical_plan_bytes);
-        malformed.push(case);
-        let mut case = request.clone();
-        case.reservation_id = ReservationId::new(uuid::Uuid::now_v7());
-        malformed.push(case);
-        let mut case = request.clone();
-        case.assignments[0].binding.namespace = "vala.traces".to_owned();
-        malformed.push(case);
-        let mut case = request.clone();
-        case.assignments[0].binding.table = "other".to_owned();
-        malformed.push(case);
-        let mut case = request.clone();
-        case.assignments[0].binding.tenant_id = DataTenantId::new_v7();
-        malformed.push(case);
-        let mut case = request.clone();
-        case.target_fence.role = ClusterRole::Scribe;
-        malformed.push(case);
-        let mut case = request.clone();
-        case.target_fence.fencing_token += 1;
-        malformed.push(case);
-        let mut case = request.clone();
-        case.assignments[0].scribe_provider_cut = Some(cut(Vec::new()));
-        malformed.push(case);
-        let mut case = request.clone();
-        case.assignments[0].scan_id = "unknown".to_owned();
-        malformed.push(case);
-        let mut case = request.clone();
-        case.assignments[0].schema_fingerprint = "sha256:wrong".to_owned();
-        malformed.push(case);
-        let mut case = request.clone();
-        case.assignments.push(case.assignments[0].clone());
-        malformed.push(case);
-        let mut case = request.clone();
-        case.physical_plan_bytes = vec![0];
-        case.plan_fingerprint = physical_plan_fingerprint(&case.physical_plan_bytes);
-        malformed.push(case);
+        let malformed = malformed_follower_requests(&request, &first);
         for case in malformed {
             let state = SessionStateBuilder::new().with_default_features().build();
             assert!(

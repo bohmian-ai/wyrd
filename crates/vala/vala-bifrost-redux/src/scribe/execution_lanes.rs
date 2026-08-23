@@ -12,7 +12,6 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
-use num_traits::ToPrimitive;
 use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 
 use crate::catalog::TenantTableBinding;
@@ -46,11 +45,79 @@ pub(crate) const PERSISTENCE_QUEUE_ITEMS: usize = 64;
 #[cfg(test)]
 const WAL_IO_QUEUE_ITEMS: usize = 256;
 
-fn record_lane_state(lane: &'static str, queued: usize, active: usize) {
-    metrics::gauge!("bifrost_scribe_lane_queued", "lane" => lane)
-        .set(queued.to_f64().unwrap_or(f64::MAX));
-    metrics::gauge!("bifrost_scribe_lane_active", "lane" => lane)
-        .set(active.to_f64().unwrap_or(f64::MAX));
+/// Publish both lane gauges at zero so the lane's series exist before any job.
+///
+/// A Prometheus gauge only appears in a render once a handle has been created
+/// for its exact label set, so a lane that never received work would otherwise
+/// leave a hole rather than a zero and be indistinguishable from a lane that is
+/// absent. Called once per pool from its constructor, which is also the only
+/// point at which the lane's occupancy is authoritatively zero.
+fn register_lane_gauges(lane: &'static str) {
+    metrics::gauge!("bifrost_scribe_lane_queued", "lane" => lane).increment(0.0);
+    metrics::gauge!("bifrost_scribe_lane_active", "lane" => lane).increment(0.0);
+}
+
+/// Wait until a lane's outstanding-job counter reaches zero.
+///
+/// The wake edge is the `Notify::notify_waiters()` call a lane worker makes
+/// immediately after decrementing `depth` on its terminal. That call wakes only
+/// waiters that are *already registered*, and `Notify::notified()` does not
+/// register a waiter until its future is first polled. Building the future,
+/// observing a non-zero `depth`, and only then awaiting therefore drops any
+/// notification published in between, parking the drain forever on a lane that
+/// has already gone idle. The window is small but genuinely reachable: the
+/// decrement and the notify run on a Rayon worker thread concurrent with this
+/// caller.
+///
+/// Registering with [`tokio::sync::futures::Notified::enable`] before sampling
+/// `depth` closes it. Any `notify_waiters()` published after that registration
+/// is delivered to this waiter, and the loop re-checks `depth` after each wake
+/// so a superseded or spurious edge simply re-arms. Returns immediately when
+/// the lane is already idle.
+async fn wait_lane_drained(depth: &AtomicUsize, drained: &Notify) {
+    loop {
+        let notified = drained.notified();
+        tokio::pin!(notified);
+        // Register before the load: a terminal that lands between the two must
+        // wake this waiter rather than fall into a gap where it does not exist.
+        notified.as_mut().enable();
+        if depth.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        notified.await;
+    }
+}
+
+/// Count one job entering the lane's application queue.
+///
+/// Paired one-to-one with the `depth` increment at submit. The gauge is moved
+/// additively rather than set from a snapshot of `depth`: a read-then-set
+/// publishes a value another thread may already have superseded, which leaves
+/// the gauge stale — including stale non-zero once the lane has quiesced.
+/// Every mutation of this gauge is a single `+1`/`-1` at the transition that
+/// causes it, so concurrent lane workers compose instead of clobbering.
+fn record_lane_enqueued(lane: &'static str) {
+    metrics::gauge!("bifrost_scribe_lane_queued", "lane" => lane).increment(1.0);
+}
+
+/// Count one queued job becoming an actively running job on a lane worker.
+///
+/// Paired one-to-one with the `active` increment inside the Rayon closure. See
+/// [`record_lane_enqueued`] for why this is additive rather than a snapshot.
+fn record_lane_started(lane: &'static str) {
+    metrics::gauge!("bifrost_scribe_lane_active", "lane" => lane).increment(1.0);
+}
+
+/// Release one job from both lane gauges once its worker closure has finished.
+///
+/// Paired one-to-one with the `depth`/`active` decrements in the Rayon closure,
+/// which run on every terminal including a caught panic. Because each of the
+/// three prior transitions moved the gauges by exactly one, a quiesced lane
+/// settles at exactly zero rather than at whichever snapshot happened to be
+/// written last.
+fn record_lane_finished(lane: &'static str) {
+    metrics::gauge!("bifrost_scribe_lane_queued", "lane" => lane).decrement(1.0);
+    metrics::gauge!("bifrost_scribe_lane_active", "lane" => lane).decrement(1.0);
 }
 
 fn record_lane_job(lane: &'static str, succeeded: bool, elapsed: std::time::Duration) {
@@ -69,7 +136,7 @@ fn record_lane_job(lane: &'static str, succeeded: bool, elapsed: std::time::Dura
 /// production telemetry; this makes it a first-class
 /// `bifrost_scribe_lane_saturation_total{lane}` counter so a lane shedding load
 /// is distinguishable from a memory-ceiling rejection. The `lane` label reuses
-/// the closed lane vocabulary shared with [`record_lane_state`] and
+/// the closed lane vocabulary shared with [`record_lane_enqueued`] and
 /// [`record_lane_job`] and carries no tenant, table, or request identity.
 fn record_lane_saturation(lane: &'static str) {
     metrics::counter!("bifrost_scribe_lane_saturation_total", "lane" => lane).increment(1);
@@ -122,7 +189,7 @@ impl ScribeIngressCpuPool {
             .num_threads(worker_count.max(1))
             .thread_name(|index| format!("wyrd-scribe-ingress-cpu-{index}"))
             .build()?;
-        record_lane_state("ingress", 0, 0);
+        register_lane_gauges("ingress");
         Ok(Self {
             pool: Arc::new(pool),
             permits: Arc::new(Semaphore::new(capacity)),
@@ -166,11 +233,7 @@ impl ScribeIngressCpuPool {
             });
         };
         self.depth.fetch_add(1, Ordering::AcqRel);
-        record_lane_state(
-            "ingress",
-            self.depth.load(Ordering::Acquire),
-            self.active.load(Ordering::Acquire),
-        );
+        record_lane_enqueued("ingress");
         let (sender, receiver) = oneshot::channel();
         let depth = Arc::clone(&self.depth);
         let active = Arc::clone(&self.active);
@@ -181,11 +244,7 @@ impl ScribeIngressCpuPool {
         self.pool.spawn_fifo(move || {
             let started = std::time::Instant::now();
             active.fetch_add(1, Ordering::AcqRel);
-            record_lane_state(
-                "ingress",
-                depth.load(Ordering::Acquire),
-                active.load(Ordering::Acquire),
-            );
+            record_lane_started("ingress");
             let result = catch_unwind(AssertUnwindSafe(|| {
                 decode(
                     payload,
@@ -198,11 +257,7 @@ impl ScribeIngressCpuPool {
             }));
             depth.fetch_sub(1, Ordering::AcqRel);
             active.fetch_sub(1, Ordering::AcqRel);
-            record_lane_state(
-                "ingress",
-                depth.load(Ordering::Acquire),
-                active.load(Ordering::Acquire),
-            );
+            record_lane_finished("ingress");
             drained.notify_waiters();
             drop(permit);
             let result = if let Ok(result) = result {
@@ -240,11 +295,7 @@ impl ScribeIngressCpuPool {
             });
         };
         self.depth.fetch_add(1, Ordering::AcqRel);
-        record_lane_state(
-            "ingress",
-            self.depth.load(Ordering::Acquire),
-            self.active.load(Ordering::Acquire),
-        );
+        record_lane_enqueued("ingress");
         let (sender, receiver) = oneshot::channel();
         let depth = Arc::clone(&self.depth);
         let active = Arc::clone(&self.active);
@@ -255,19 +306,11 @@ impl ScribeIngressCpuPool {
         self.pool.spawn_fifo(move || {
             let started = std::time::Instant::now();
             active.fetch_add(1, Ordering::AcqRel);
-            record_lane_state(
-                "ingress",
-                depth.load(Ordering::Acquire),
-                active.load(Ordering::Acquire),
-            );
+            record_lane_started("ingress");
             let result = catch_unwind(AssertUnwindSafe(job));
             depth.fetch_sub(1, Ordering::AcqRel);
             active.fetch_sub(1, Ordering::AcqRel);
-            record_lane_state(
-                "ingress",
-                depth.load(Ordering::Acquire),
-                active.load(Ordering::Acquire),
-            );
+            record_lane_finished("ingress");
             drained.notify_waiters();
             drop(permit);
             let result = if let Ok(result) = result {
@@ -302,14 +345,15 @@ impl ScribeIngressCpuPool {
         }
     }
 
+    /// Wait until every job submitted to this lane has reached a terminal.
+    ///
+    /// Shutdown uses this to establish that no worker thread is still touching
+    /// WAL state, resource leases, or lane metrics before the owning Scribe
+    /// releases them. Delegates to [`wait_lane_drained`], which registers for
+    /// the drain edge before sampling the counter so an already-idle lane
+    /// cannot be missed.
     pub(crate) async fn drain(&self) {
-        loop {
-            let notified = self.drained.notified();
-            if self.depth.load(Ordering::Acquire) == 0 {
-                return;
-            }
-            notified.await;
-        }
+        wait_lane_drained(&self.depth, &self.drained).await;
     }
 
     #[cfg(test)]
@@ -1004,17 +1048,25 @@ pub(crate) enum ScribePersistenceCpuOp {
         replayed: Box<ReplayedSealKey>,
     },
     /// Test-only stalled work proving a detached job retains its root owner.
+    ///
+    /// Boxed like every sibling so this test-only variant does not set the
+    /// size of the operation every production submission moves through.
     #[cfg(test)]
-    HoldMemory {
-        /// Root-backed bytes that must remain charged through job completion.
-        memory: crate::resources::ScribeMemoryLease,
-        /// Lifecycle owner that must remain active through job completion.
-        lifecycle: crate::scribe::telemetry::ScribeIngressLifecycleOwner,
-        /// Deterministic signal emitted after the detached job owns the lease.
-        started: std::sync::mpsc::SyncSender<()>,
-        /// Deterministic release gate controlled by the cancellation test.
-        release: std::sync::mpsc::Receiver<()>,
-    },
+    HoldMemory(Box<HoldMemoryOp>),
+}
+
+/// Move-only inputs for the test-only stalled-ownership persistence job.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct HoldMemoryOp {
+    /// Root-backed bytes that must remain charged through job completion.
+    memory: crate::resources::ScribeMemoryLease,
+    /// Lifecycle owner that must remain active through job completion.
+    lifecycle: crate::scribe::telemetry::ScribeIngressLifecycleOwner,
+    /// Deterministic signal emitted after the detached job owns the lease.
+    started: std::sync::mpsc::SyncSender<()>,
+    /// Deterministic release gate controlled by the cancellation test.
+    release: std::sync::mpsc::Receiver<()>,
 }
 
 /// Move-only inputs for one bounded Parquet encoding lane operation.
@@ -1107,12 +1159,13 @@ fn execute_persistence_operation(
             Ok(ScribePersistenceCpuResult::ReplayRestored(Box::new(frozen)))
         }
         #[cfg(test)]
-        ScribePersistenceCpuOp::HoldMemory {
-            memory,
-            mut lifecycle,
-            started,
-            release,
-        } => {
+        ScribePersistenceCpuOp::HoldMemory(held) => {
+            let HoldMemoryOp {
+                memory,
+                mut lifecycle,
+                started,
+                release,
+            } = *held;
             lifecycle.materialized(1024);
             started.send(()).map_err(|error| ScribeError::Internal {
                 detail: format!("stalled ownership test could not signal start: {error}"),
@@ -1189,7 +1242,7 @@ impl ScribePersistenceCpuPool {
             .num_threads(worker_count.max(1))
             .thread_name(|index| format!("wyrd-scribe-persistence-cpu-{index}"))
             .build()?;
-        record_lane_state("persistence", 0, 0);
+        register_lane_gauges("persistence");
         Ok(Self {
             pool: Arc::new(pool),
             permits: Arc::new(Semaphore::new(capacity)),
@@ -1254,30 +1307,18 @@ impl ScribePersistenceCpuPool {
         let delay = self.preprocess_delay;
         let (sender, receiver) = oneshot::channel();
         depth.fetch_add(1, Ordering::AcqRel);
-        record_lane_state(
-            "persistence",
-            depth.load(Ordering::Acquire),
-            self.active.load(Ordering::Acquire),
-        );
+        record_lane_enqueued("persistence");
         let active = Arc::clone(&self.active);
         self.pool.spawn_fifo(move || {
             let started = std::time::Instant::now();
             active.fetch_add(1, Ordering::AcqRel);
-            record_lane_state(
-                "persistence",
-                depth.load(Ordering::Acquire),
-                active.load(Ordering::Acquire),
-            );
+            record_lane_started("persistence");
             let result = catch_unwind(AssertUnwindSafe(|| {
                 execute_persistence_operation(operation, delay)
             }));
             depth.fetch_sub(1, Ordering::AcqRel);
             active.fetch_sub(1, Ordering::AcqRel);
-            record_lane_state(
-                "persistence",
-                depth.load(Ordering::Acquire),
-                active.load(Ordering::Acquire),
-            );
+            record_lane_finished("persistence");
             drained.notify_waiters();
             drop(permit);
             let result = result.unwrap_or_else(|_| {
@@ -1310,14 +1351,15 @@ impl ScribePersistenceCpuPool {
         }
     }
 
+    /// Wait until every job submitted to this lane has reached a terminal.
+    ///
+    /// Shutdown uses this to establish that no worker thread is still touching
+    /// WAL state, resource leases, or lane metrics before the owning Scribe
+    /// releases them. Delegates to [`wait_lane_drained`], which registers for
+    /// the drain edge before sampling the counter so an already-idle lane
+    /// cannot be missed.
     pub(crate) async fn drain(&self) {
-        loop {
-            let notified = self.drained.notified();
-            if self.depth.load(Ordering::Acquire) == 0 {
-                return;
-            }
-            notified.await;
-        }
+        wait_lane_drained(&self.depth, &self.drained).await;
     }
 
     #[cfg(test)]
@@ -1483,7 +1525,7 @@ impl ScribeWalIoPool {
             .num_threads(worker_count.max(1))
             .thread_name(|index| format!("wyrd-scribe-wal-io-{index}"))
             .build()?;
-        record_lane_state("wal_io", 0, 0);
+        register_lane_gauges("wal_io");
         Ok(Self {
             pool: Arc::new(pool),
             permits: Arc::new(Semaphore::new(capacity)),
@@ -1535,28 +1577,16 @@ impl ScribeWalIoPool {
         let delay = self.sync_delay;
         let (sender, receiver) = oneshot::channel();
         depth.fetch_add(1, Ordering::AcqRel);
-        record_lane_state(
-            "wal_io",
-            depth.load(Ordering::Acquire),
-            self.active.load(Ordering::Acquire),
-        );
+        record_lane_enqueued("wal_io");
         let active = Arc::clone(&self.active);
         self.pool.spawn_fifo(move || {
             let started = std::time::Instant::now();
             active.fetch_add(1, Ordering::AcqRel);
-            record_lane_state(
-                "wal_io",
-                depth.load(Ordering::Acquire),
-                active.load(Ordering::Acquire),
-            );
+            record_lane_started("wal_io");
             let result = catch_unwind(AssertUnwindSafe(|| execute_wal_io(operation, delay)));
             depth.fetch_sub(1, Ordering::AcqRel);
             active.fetch_sub(1, Ordering::AcqRel);
-            record_lane_state(
-                "wal_io",
-                depth.load(Ordering::Acquire),
-                active.load(Ordering::Acquire),
-            );
+            record_lane_finished("wal_io");
             drained.notify_waiters();
             drop(permit);
             let result = result.unwrap_or_else(|_| {
@@ -1589,14 +1619,15 @@ impl ScribeWalIoPool {
         }
     }
 
+    /// Wait until every job submitted to this lane has reached a terminal.
+    ///
+    /// Shutdown uses this to establish that no worker thread is still touching
+    /// WAL state, resource leases, or lane metrics before the owning Scribe
+    /// releases them. Delegates to [`wait_lane_drained`], which registers for
+    /// the drain edge before sampling the counter so an already-idle lane
+    /// cannot be missed.
     pub(crate) async fn drain(&self) {
-        loop {
-            let notified = self.drained.notified();
-            if self.depth.load(Ordering::Acquire) == 0 {
-                return;
-            }
-            notified.await;
-        }
+        wait_lane_drained(&self.depth, &self.drained).await;
     }
 
     #[cfg(test)]
@@ -1883,7 +1914,7 @@ mod tests {
     use super::{
         ReplayRetirementSettlement, ScribeIngressCpuPool, ScribePersistenceCpuOp,
         ScribePersistenceCpuPool, ScribeWalIoPool, decode, record_lane_saturation,
-        source_schema_fingerprint, stamp_correlation_columns,
+        source_schema_fingerprint, stamp_correlation_columns, wait_lane_drained,
     };
     use crate::contracts::{IngressPayload, ScribeError};
     use crate::resources::{BifrostRole, BifrostRuntimeResources, ScribeMemoryCategory};
@@ -1892,6 +1923,8 @@ mod tests {
     use crate::scribe::replay::ReplayedSealKey;
     use crate::scribe::seal_key::SealKey;
     use crate::scribe::stream_identity::StreamIdentity;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
 
     fn principal() -> Principal {
         Principal::new(
@@ -2012,6 +2045,82 @@ mod tests {
         assert_eq!(snapshot.panicked, 1);
     }
 
+    /// An already-idle lane must settle the drain without needing a wake edge.
+    ///
+    /// The lane worker publishes `notify_waiters()` only on a terminal, so a
+    /// drain that arrives after the last job finished will never see another
+    /// edge. It has to observe the zeroed counter directly or hang.
+    #[tokio::test]
+    async fn drain_returns_immediately_when_lane_is_already_idle() {
+        let depth = AtomicUsize::new(0);
+        let drained = Notify::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wait_lane_drained(&depth, &drained),
+        )
+        .await
+        .expect("an idle lane must not park the drain");
+    }
+
+    /// A terminal published concurrently with the drain must still wake it.
+    ///
+    /// Covers the ordinary concurrent case: a worker reaches its terminal on
+    /// another thread while the drain is waiting, and the drain settles rather
+    /// than parking. This is coverage, **not** a lost-wakeup regression test —
+    /// the lost-wakeup window in the pre-`enable` implementation spans only the
+    /// few instructions between sampling `depth` and registering the waiter,
+    /// and a sibling thread cannot be steered into it (this test passes against
+    /// the unfixed implementation). The registration-before-sample ordering in
+    /// [`wait_lane_drained`] rests on Tokio's documented `Notified::enable`
+    /// contract, not on this test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn drain_observes_terminal_published_concurrently() {
+        for iteration in 0..2_000 {
+            let depth = Arc::new(AtomicUsize::new(1));
+            let drained = Arc::new(Notify::new());
+            let worker_depth = Arc::clone(&depth);
+            let worker_drained = Arc::clone(&drained);
+            // Mirror a lane worker terminal exactly: decrement, then notify.
+            let worker = std::thread::spawn(move || {
+                worker_depth.fetch_sub(1, Ordering::AcqRel);
+                worker_drained.notify_waiters();
+            });
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                wait_lane_drained(&depth, &drained),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!("drain missed a concurrent terminal on iteration {iteration}")
+            });
+            worker.join().expect("lane terminal thread");
+        }
+    }
+
+    /// Draining the production ingress pool settles after real submitted work.
+    ///
+    /// Exercises the drain through `ScribeIngressCpuPool::drain`, so the Rayon
+    /// closure — not a hand-built counter — is what publishes the terminal,
+    /// and asserts the lane's own counter reaches zero with it. Guards the
+    /// production drain path against ordinary regressions such as a missing
+    /// notify or a counter that never settles; it does not reach the narrow
+    /// lost-wakeup interleaving.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ingress_pool_drain_settles_after_submitted_work() {
+        let pool = ScribeIngressCpuPool::new(2);
+        for iteration in 0..500 {
+            let job = pool.run(|| Ok::<_, crate::contracts::ScribeError>(()));
+            let (job_result, drain_result) = tokio::join!(
+                job,
+                tokio::time::timeout(std::time::Duration::from_secs(5), pool.drain())
+            );
+            assert!(job_result.is_ok(), "lane job {iteration} must succeed");
+            drain_result
+                .unwrap_or_else(|_| panic!("ingress drain parked on iteration {iteration}"));
+            assert_eq!(pool.snapshot().depth, 0);
+        }
+    }
+
     #[test]
     fn persistence_cpu_runs_on_separate_named_rayon_thread() {
         assert!(
@@ -2042,12 +2151,14 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
         let waiter = tokio::spawn(async move {
             submitted
-                .submit(ScribePersistenceCpuOp::HoldMemory {
-                    memory,
-                    lifecycle: lifecycle_owner,
-                    started: started_tx,
-                    release: release_rx,
-                })
+                .submit(ScribePersistenceCpuOp::HoldMemory(Box::new(
+                    super::HoldMemoryOp {
+                        memory,
+                        lifecycle: lifecycle_owner,
+                        started: started_tx,
+                        release: release_rx,
+                    },
+                )))
                 .await
         });
         tokio::task::spawn_blocking(move || started_rx.recv())

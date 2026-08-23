@@ -24,6 +24,13 @@ pub struct ValidatedAttempt {
     pub footer: WorkerFooter,
 }
 
+/// Decoded batch payloads retained when a delivered stream ends partially.
+#[derive(Debug)]
+pub struct PartialAttempt {
+    /// Batches decoded before the partition-local partial condition.
+    pub batches: AttemptBatchReader,
+}
+
 /// Validated batch reader over either retained memory or a private spill file.
 #[derive(Debug)]
 pub enum AttemptBatchReader {
@@ -137,6 +144,12 @@ pub struct AttemptBuffer {
 }
 
 impl AttemptBuffer {
+    /// Returns whether the authenticated stream delivered its terminal footer.
+    #[must_use]
+    pub const fn has_footer(&self) -> bool {
+        self.footer.is_some()
+    }
+
     /// Creates a bounded attempt buffer.
     #[must_use]
     pub fn new(limit: usize) -> Self {
@@ -296,6 +309,38 @@ impl AttemptBuffer {
             footer,
         })
     }
+
+    /// Transfers every completely decoded batch without requiring a footer.
+    ///
+    /// This is used only after an authenticated delivered stream reaches an
+    /// Partial terminal. Schema frames remain mandatory and schema
+    /// mismatch is rejected before this boundary.
+    ///
+    /// # Errors
+    /// Returns a schema or spill error when retained payloads are not decodable.
+    pub fn finish_partial(self) -> Result<PartialAttempt, AttemptError> {
+        self.schema.ok_or(AttemptError::Schema)?;
+        let batches = match self.payload {
+            AttemptPayload::Memory(batches) => AttemptBatchReader::Memory {
+                batches: batches.into_iter(),
+                memory_reservation: self.memory_reservation,
+            },
+            AttemptPayload::Spill {
+                mut file,
+                batch_count,
+            } => {
+                file.as_file_mut()
+                    .seek(SeekFrom::Start(0))
+                    .map_err(|_| AttemptError::Spill)?;
+                AttemptBatchReader::Spill {
+                    file,
+                    remaining: batch_count,
+                    memory_reservation: self.memory_reservation,
+                }
+            }
+        };
+        Ok(PartialAttempt { batches })
+    }
 }
 
 /// Reads the exact row count from one Arrow IPC stream batch.
@@ -395,6 +440,7 @@ mod tests {
                 encoded_bytes: u64::try_from(batch.len() + 1).expect("encoded bytes"),
                 payload_digest: QueryAuditDigest::new(digest).expect("digest"),
                 completed: true,
+                scan_stats: wyrd_spec::vala::api::WorkerScanStats::default(),
             }))
             .expect("footer");
         let validated = buffer.finish().expect("validated attempt");
@@ -403,6 +449,24 @@ mod tests {
             Ok(vec![batch])
         );
         assert_eq!(validated.footer.row_count, 2);
+    }
+
+    /// A delivered partial stream retains every completely decoded prior batch.
+    #[test]
+    fn oracle_partial_attempt_retains_decoded_batches_without_footer() {
+        let batch = batch_bytes();
+        let mut buffer = AttemptBuffer::with_spill_limit(1024 * 1024, 1);
+        buffer
+            .push(WorkerAttemptFrame::Schema(vec![1]))
+            .expect("schema");
+        buffer
+            .push(WorkerAttemptFrame::Batch(batch.clone()))
+            .expect("batch");
+        let partial = buffer.finish_partial().expect("partial attempt");
+        assert_eq!(
+            partial.batches.collect::<Result<Vec<_>, _>>(),
+            Ok(vec![batch])
+        );
     }
 
     /// Query-envelope ownership remains charged through validated-reader drop.
@@ -445,6 +509,7 @@ mod tests {
                 payload_digest: QueryAuditDigest::new(hex::encode(Sha256::digest(&batch)))
                     .expect("digest"),
                 completed: true,
+                scan_stats: wyrd_spec::vala::api::WorkerScanStats::default(),
             }))
             .expect("footer");
         assert!(matches!(mismatch.finish(), Err(AttemptError::Footer)));

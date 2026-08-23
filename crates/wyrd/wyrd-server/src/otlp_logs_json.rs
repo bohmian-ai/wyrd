@@ -481,7 +481,7 @@ mod tests {
 
     /// Computes exact vector layouts and recursive backing for attributes.
     fn decoded_attributes_capacity(attributes: &[KeyValue]) -> usize {
-        attributes.len() * size_of::<KeyValue>()
+        size_of_val(attributes)
             + attributes
                 .iter()
                 .map(|attribute| {

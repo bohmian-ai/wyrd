@@ -88,8 +88,9 @@ pub struct RegisteredRole {
 pub struct ClusterSnapshot {
     /// Database-observation time represented by this immutable membership cut.
     observed_at: chrono::DateTime<Utc>,
-    /// Whether construction received the same role identity more than once.
-    duplicate_roles: bool,
+    /// Whether construction received one role identity twice with disagreeing
+    /// routing or fencing facts. An exact repeat is not a conflict.
+    conflicting_roles: bool,
     /// Ready, fresh leases keyed by their composite node and closed role values.
     roles: HashMap<SnapshotKey, ClusterRoleLease>,
 }
@@ -139,19 +140,28 @@ impl ClusterSnapshot {
     /// Builds an immutable snapshot with its authoritative observation time.
     #[must_use]
     pub fn observed(roles: Vec<ClusterRoleLease>, observed_at: chrono::DateTime<Utc>) -> Self {
-        let duplicate_roles = roles.len()
-            != roles
-                .iter()
-                .map(|lease| SnapshotKey::from(lease.key))
-                .collect::<std::collections::HashSet<_>>()
-                .len();
+        let mut conflicting_roles = false;
+        let mut projected = HashMap::<SnapshotKey, ClusterRoleLease>::with_capacity(roles.len());
+        for lease in roles {
+            let key = SnapshotKey::from(lease.key);
+            if let Some(existing) = projected.get(&key) {
+                // A repeated identity is only a conflict when the two leases
+                // disagree about where the role answers or which fence it holds.
+                // Timestamps and capability documents skew benignly between two
+                // observations of a healthy node, so comparing whole leases here
+                // would refuse queries over ordinary heartbeat drift.
+                if existing.fencing_token != lease.fencing_token
+                    || existing.address != lease.address
+                {
+                    conflicting_roles = true;
+                }
+            }
+            projected.insert(key, lease);
+        }
         Self {
             observed_at,
-            duplicate_roles,
-            roles: roles
-                .into_iter()
-                .map(|lease| (SnapshotKey::from(lease.key), lease))
-                .collect(),
+            conflicting_roles,
+            roles: projected,
         }
     }
 
@@ -161,10 +171,19 @@ impl ClusterSnapshot {
         self.observed_at
     }
 
-    /// Reports whether the source projection contained a duplicate role identity.
+    /// Reports whether one role identity was observed twice with disagreeing
+    /// routing or fencing facts.
+    ///
+    /// An exact repeat is a registry anomaly and collapses silently, matching
+    /// the ported design, which sorts and deduplicates membership rather than
+    /// failing. A disagreeing repeat is different in kind: it means two live
+    /// leases claim the same `(node_id, role)` from different addresses or
+    /// under different fences, so the projection cannot say which one is
+    /// authoritative. Callers that route work off this snapshot must fail
+    /// closed rather than route to an arbitrary winner.
     #[must_use]
-    pub const fn has_duplicate_roles(&self) -> bool {
-        self.duplicate_roles
+    pub const fn has_conflicting_roles(&self) -> bool {
+        self.conflicting_roles
     }
 
     /// Returns the live Scribe projection without relying on a positional role order.

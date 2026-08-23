@@ -533,7 +533,7 @@ impl Forge {
     /// Terminally reset one proven abandoned operation for delayed orphan GC.
     ///
     /// This method is the logical-enqueue side of the deletion boundary adapted
-redacted
+    /// here: it persists the exact output generation as `Reset` but
     /// never touches object storage. `orphan_gc` alone owns the TTL, refreshed
     /// protection checks, physical deletion, and terminal deletion audit.
     ///

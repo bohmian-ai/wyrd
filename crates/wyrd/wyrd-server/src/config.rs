@@ -395,15 +395,6 @@ pub struct BifrostRoles {
 }
 
 impl BifrostRoles {
-    /// Constructs a validated internal role set for shared composition tests.
-    #[cfg(any(test, feature = "test-support"))]
-    #[must_use]
-    pub(crate) fn from_selected(selected: impl IntoIterator<Item = BifrostRuntimeRole>) -> Self {
-        Self {
-            selected: selected.into_iter().collect(),
-        }
-    }
-
     /// Constructs the exact effective roles for one public process target.
     #[must_use]
     pub fn for_target(target: BifrostTarget) -> Self {
@@ -1221,17 +1212,17 @@ fn default_ingest_request_bytes() -> usize {
     vala_bifrost_redux::gate::limits::BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES
 }
 
-redacted
+/// Returns the WAL rotation target.
 fn default_scribe_wal_rotation_bytes() -> u64 {
     512 * 1024 * 1024
 }
 
-redacted
+/// Returns the memtable rotation target.
 fn default_scribe_memtable_rotation_bytes() -> usize {
     512 * 1024 * 1024
 }
 
-redacted
+/// Returns the active memtable age target.
 fn default_scribe_memtable_max_age_secs() -> u64 {
     600
 }
@@ -4137,8 +4128,10 @@ minimum_slots = 2
     /// Panics when any invalid configuration is accepted.
     #[test]
     fn delegated_admission_rejects_invalid_timing() {
-        let mut runtime = OracleRuntimeConfig::default();
-        runtime.delegated_allocation_units = 0;
+        let mut runtime = OracleRuntimeConfig {
+            delegated_allocation_units: 0,
+            ..OracleRuntimeConfig::default()
+        };
         assert!(runtime.delegated_admission_config().is_err());
         runtime.delegated_allocation_units = 1;
         runtime.delegated_renewal_ms = runtime.delegated_validity_ms;

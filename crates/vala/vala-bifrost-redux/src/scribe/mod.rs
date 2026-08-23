@@ -405,8 +405,15 @@ impl Drop for ShutdownCancellationFinalizer<'_> {
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Default)]
 pub struct IngestStall {
-    /// Signals the caller after a public write reaches the barrier.
-    entered: tokio::sync::Notify,
+    /// Records that one public write reached the barrier.
+    ///
+    /// The flag is the durable edge; [`IngestStall::entered_notify`] only wakes
+    /// a waiter that was already parked. Both are required because the write
+    /// runs on its own task and may reach the barrier before the asserting task
+    /// first polls [`IngestStall::wait_entered`].
+    entered: AtomicBool,
+    /// Wakes a parked waiter after a public write reaches the barrier.
+    entered_notify: tokio::sync::Notify,
     /// Signals a waiting write to continue when the test releases it.
     release: tokio::sync::Notify,
     /// Records that the stalled write future released its Scribe owner.
@@ -418,8 +425,14 @@ pub struct IngestStall {
 #[cfg(any(test, feature = "test-support"))]
 impl IngestStall {
     /// Wait until one public write is blocked at this barrier.
+    ///
+    /// The waiter is registered before the flag is observed.
+    /// [`tokio::sync::Notify::notify_waiters`] wakes only already-registered
+    /// waiters, and a `Notified` future does not register until it is first
+    /// polled, so observing the flag first would lose the edge published by a
+    /// write that reaches the barrier in between and park this caller forever.
     pub async fn wait_entered(&self) {
-        self.entered.notified().await;
+        Self::wait_for_edge(&self.entered, &self.entered_notify).await;
     }
 
     /// Release a blocked public write without changing its outcome.
@@ -428,16 +441,39 @@ impl IngestStall {
     }
 
     /// Wait until the stalled write future releases its Scribe owner.
+    ///
+    /// Cancelling the returned future abandons the observation only; the
+    /// published edge stays latched, so a later caller still observes it.
     pub async fn wait_completed(&self) {
-        while !self.completed.load(Ordering::Acquire) {
-            self.completed_notify.notified().await;
-        }
+        Self::wait_for_edge(&self.completed, &self.completed_notify).await;
+    }
+
+    /// Publish the exact entry edge owned by the stalled write future.
+    fn enter(&self) {
+        self.entered.store(true, Ordering::Release);
+        self.entered_notify.notify_waiters();
     }
 
     /// Publish the exact completion edge owned by the stalled write future.
     fn complete(&self) {
         self.completed.store(true, Ordering::Release);
         self.completed_notify.notify_waiters();
+    }
+
+    /// Await one latched barrier edge without losing a concurrent publication.
+    ///
+    /// Registers the waiter, then re-checks the flag, so an edge published
+    /// between the previous check and this registration is still observed.
+    async fn wait_for_edge(flag: &AtomicBool, notify: &tokio::sync::Notify) {
+        loop {
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if flag.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -509,7 +545,7 @@ impl ScribePressureConfig {
 }
 
 impl Default for ScribePressureConfig {
-redacted
+    /// The rotation defaults: 75% high-water, 50% low-water, 600 s max age.
     fn default() -> Self {
         Self::new(75, 50, Duration::from_mins(10))
     }
@@ -1067,8 +1103,11 @@ impl ScribeImpl {
     ///
     /// Public journey fixtures use this builder before wrapping Scribe in an
     /// `Arc`, ensuring the server adapter, Gate, and Scribe observe one exact
-    /// lowerable limits snapshot without changing production defaults.
-    #[cfg(feature = "test-support")]
+    /// lowerable limits snapshot without changing production defaults. The
+    /// in-crate unit tests use the same builder, so it is compiled for `test`
+    /// as well as for the `test-support` feature; gating it on the feature
+    /// alone breaks the crate's own default-feature test build.
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn with_ingest_limits_for_test(
         mut self,
@@ -2073,10 +2112,16 @@ mod constructor_rotation_tests {
         );
         let admission = AdmissionConfig::default();
         let configured_request_bytes = 201 * 1024 * 1024;
-        let mut ingest_limits = crate::gate::limits::IngestLimits::default();
-        ingest_limits.max_frame_bytes = configured_request_bytes;
-        ingest_limits.max_decoding_message_size = configured_request_bytes + 64 * 1024;
-        ingest_limits.otlp.request_bytes = configured_request_bytes;
+        let defaults = crate::gate::limits::IngestLimits::default();
+        let ingest_limits = crate::gate::limits::IngestLimits {
+            max_frame_bytes: configured_request_bytes,
+            max_decoding_message_size: configured_request_bytes + 64 * 1024,
+            otlp: crate::gate::limits::OtlpWireLimits {
+                request_bytes: configured_request_bytes,
+                ..defaults.otlp
+            },
+            ..defaults
+        };
         let scribe = ScribeImpl::new_for_embedded_with_runtime_config_and_admission_and_memory(
             operator,
             wal,

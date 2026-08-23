@@ -666,7 +666,7 @@ impl ScribeImpl {
             .ok()
             .and_then(|mut current| current.take())
         {
-            stall.entered.notify_waiters();
+            stall.enter();
             let _completion = super::IngestStallCompletion(&stall);
             stall.release.notified().await;
         }

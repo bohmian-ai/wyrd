@@ -179,7 +179,7 @@ impl OraclePeerGrpc {
             leader_fence: request.leader_fence.clone(),
             local_fence: request.target_fence.clone(),
         };
-        authenticated_preflight(&request, authenticated.clone()).map_err(|error| {
+        authenticated_preflight(&request, &authenticated).map_err(|error| {
             tracing::error!(?error, "Scribe physical follower rejected the request");
             DispatchError::Terminal
         })?;
@@ -192,7 +192,7 @@ impl OraclePeerGrpc {
                 vala_bifrost_redux::resources::ORACLE_PARTITION_MEMORY_BYTES,
             )
             .map_err(|_| DispatchError::Capacity)?;
-        let mut batches = scribe
+        let execution = scribe
             .fragment_follower()
             .execute(&request, authenticated, lease.memory_pool())
             .await
@@ -205,8 +205,11 @@ impl OraclePeerGrpc {
                 PhysicalPlanFollowerError::Execution(_) => DispatchError::Unavailable,
             })?;
         scribe.record_fragment_execution();
+        // Split now, finalize after drain: the scan counters are written during
+        // execution, and the leader has no physical scan of its own to report.
+        let (mut batches, scan_evidence) = execution.split();
         let plan_fingerprint = request.plan_fingerprint;
-        let scribe_owner = Arc::clone(&scribe);
+        let scribe_owner = Arc::clone(scribe);
         let output = async_stream::stream! {
             let _lease = lease;
             let mut encoder = AttemptEncoder::default();
@@ -232,7 +235,7 @@ impl OraclePeerGrpc {
                 yield Ok(batch);
             }
             let footer = encoder
-                .finish_physical(&plan_fingerprint)
+                .finish_physical(&plan_fingerprint, scan_evidence.finalize())
                 .map_err(|_| DispatchError::Terminal);
             if footer.is_ok() {
                 scribe_owner.record_fragment_footer();
@@ -383,10 +386,13 @@ fn conversion_status(error: PrivateConversionError) -> Status {
 /// Maps peer pressure, retryable failures, and terminal contract failures separately.
 fn dispatch_status(error: DispatchError) -> Status {
     match error {
+        DispatchError::Partial { .. } => Status::deadline_exceeded(error.to_string()),
         DispatchError::Unavailable => Status::unavailable(error.to_string()),
         DispatchError::EligibleSourceLoss { .. } => Status::failed_precondition(error.to_string()),
         DispatchError::Capacity => Status::resource_exhausted(error.to_string()),
-        DispatchError::StaleObject => Status::not_found(error.to_string()),
+        DispatchError::StaleObject | DispatchError::FileNotFound => {
+            Status::not_found(error.to_string())
+        }
         DispatchError::Terminal => Status::permission_denied(error.to_string()),
     }
 }
@@ -424,7 +430,10 @@ mod tests {
         let mut encoder = AttemptEncoder::default();
         let schema_frame = start_scribe_attempt(&mut encoder, schema).expect("schema starts");
         let footer_frame = encoder
-            .finish_physical("empty-scribe-plan")
+            .finish_physical(
+                "empty-scribe-plan",
+                wyrd_spec::vala::api::WorkerScanStats::default(),
+            )
             .expect("empty result completes");
         assert!(matches!(
             schema_frame,

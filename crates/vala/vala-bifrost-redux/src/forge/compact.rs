@@ -54,11 +54,11 @@ const DEFAULT_MAX_CONCURRENT_READS: usize = 4;
 const DEFAULT_SPILL_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const DEFAULT_MAX_OPEN_OPERATIONS_PER_TABLE: usize = 256;
 const DEFAULT_MAX_RETAINED_SNAPSHOTS_PER_TABLE: usize = 256;
-redacted
+/// Small-file candidacy threshold.
 pub(crate) const DEFAULT_SMALL_FILE_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
-redacted
+/// Target size for one manifest rewrite bin.
 pub(crate) const DEFAULT_MANIFEST_REWRITE_TARGET_SIZE_BYTES: u64 = 8 * 1024 * 1024;
-redacted
+/// Minimum count for an under-filled manifest bin.
 pub(crate) const DEFAULT_MANIFEST_REWRITE_MIN_COUNT: usize = 100;
 /// Default commit count past `retain_last` that makes snapshot expiry due on
 /// its own. Chosen well above ordinary per-tick compaction commit counts so a

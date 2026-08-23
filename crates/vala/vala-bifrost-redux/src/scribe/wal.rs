@@ -4543,6 +4543,39 @@ mod tests {
         assert!(!first.path.exists());
     }
 
+    /// Finds two batch ids that route to the same fixed shard.
+    ///
+    /// Segment-pin behavior is only observable when two replay groups land in
+    /// one segment, which requires both batches to route to the same shard.
+    /// Search from `first + 1` upward so the pair is deterministic for a given
+    /// seal key rather than depending on hash luck.
+    ///
+    /// Returns both batch ids and the shard they share.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no later batch id routes to the same shard, which would mean
+    /// the fixed shard count or routing function changed underneath this test.
+    fn co_sharded_batch_pair(seal_key: &SealKey, first: u8) -> ([u8; 16], [u8; 16], usize) {
+        let first_batch = [first; 16];
+        let shard = crate::scribe::routing::shard_for(
+            seal_key.tenant,
+            &seal_key.table,
+            uuid::Uuid::from_bytes(first_batch),
+        );
+        let second_batch = (first.saturating_add(1)..=u8::MAX)
+            .map(|value| [value; 16])
+            .find(|batch_id| {
+                crate::scribe::routing::shard_for(
+                    seal_key.tenant,
+                    &seal_key.table,
+                    uuid::Uuid::from_bytes(*batch_id),
+                ) == shard
+            })
+            .expect("a second batch routes to the same fixed shard");
+        (first_batch, second_batch, shard)
+    }
+
     /// A cancelled replay keeps a shared segment until a restart publishes its final group.
     #[test]
     fn replay_segment_pin_preserves_unread_group_across_restart() {
@@ -4556,22 +4589,7 @@ mod tests {
             WalConfig::new(16 * 1024 * 1024).expect("single-segment config"),
         )
         .expect("first writer");
-        let first_batch = [1_u8; 16];
-        let shard = crate::scribe::routing::shard_for(
-            seal_key.tenant,
-            &seal_key.table,
-            uuid::Uuid::from_bytes(first_batch),
-        );
-        let second_batch = (2_u8..=u8::MAX)
-            .map(|value| [value; 16])
-            .find(|batch_id| {
-                crate::scribe::routing::shard_for(
-                    seal_key.tenant,
-                    &seal_key.table,
-                    uuid::Uuid::from_bytes(*batch_id),
-                ) == shard
-            })
-            .expect("a second batch routes to the same fixed shard");
+        let (first_batch, second_batch, shard) = co_sharded_batch_pair(&seal_key, 1);
         for batch_id in [first_batch, second_batch] {
             writer
                 .append_and_commit_for_replay_test(&seal_key, batch_id, b"audit", b"payload")
@@ -4668,22 +4686,7 @@ mod tests {
             WalConfig::new(16 * 1024 * 1024).expect("single-segment config"),
         )
         .expect("first writer");
-        let first_batch = [3_u8; 16];
-        let shard = crate::scribe::routing::shard_for(
-            seal_key.tenant,
-            &seal_key.table,
-            uuid::Uuid::from_bytes(first_batch),
-        );
-        let second_batch = (4_u8..=u8::MAX)
-            .map(|value| [value; 16])
-            .find(|batch_id| {
-                crate::scribe::routing::shard_for(
-                    seal_key.tenant,
-                    &seal_key.table,
-                    uuid::Uuid::from_bytes(*batch_id),
-                ) == shard
-            })
-            .expect("a second batch routes to the same fixed shard");
+        let (first_batch, second_batch, _shard) = co_sharded_batch_pair(&seal_key, 3);
         let audit = replay_audit();
         for batch_id in [first_batch, second_batch] {
             writer

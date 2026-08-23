@@ -155,15 +155,14 @@ impl ReadyOracleForwarder {
                     .is_some_and(|oracle| oracle.is_ready())
                 && self.local_fence == Some(lease.fencing_token)
         }) {
-            let claims = forwarding_claims(
-                &snapshot,
-                (local.key.node_id, local.fencing_token),
+            let claims = ForwardingAttempt {
                 context,
                 request,
                 query_class,
                 now,
                 wall_deadline,
-            )?;
+            }
+            .into_claims(&snapshot, (local.key.node_id, local.fencing_token))?;
             let ticket = self
                 .authority
                 .mint_forward_query(&claims)
@@ -184,11 +183,13 @@ impl ReadyOracleForwarder {
             &snapshot,
             remote_candidates,
             monotonic_deadline,
-            context,
-            request,
-            query_class,
-            now,
-            wall_deadline,
+            ForwardingAttempt {
+                context,
+                request,
+                query_class,
+                now,
+                wall_deadline,
+            },
             |_node_id, address| self.connect(address),
             |claims| {
                 self.authority
@@ -419,11 +420,7 @@ async fn route_remote_once<C, E, O, I, CF, CFut, EF, DF, DFut>(
     snapshot: &ClusterSnapshot,
     candidates: I,
     connect_deadline: Instant,
-    context: AuthorizedQueryContext,
-    request: BifrostQueryRequest,
-    query_class: QueryClass,
-    now: chrono::DateTime<chrono::Utc>,
-    wall_deadline: chrono::DateTime<chrono::Utc>,
+    attempt: ForwardingAttempt,
     connect: CF,
     make_envelope: EF,
     deliver: DF,
@@ -438,65 +435,91 @@ where
 {
     let (leader, connected) =
         connect_before_delivery(candidates, connect_deadline, connect).await?;
-    let claims = forwarding_claims(
-        snapshot,
-        leader,
-        context,
-        request,
-        query_class,
-        now,
-        wall_deadline,
-    )?;
+    let claims = attempt.into_claims(snapshot, leader)?;
     let visibility = claims.request.visibility;
     let envelope = make_envelope(&claims)?;
     deliver(leader, connected, envelope, visibility).await
 }
 
-/// Builds the one signed-envelope payload from the same captured membership snapshot.
-fn forwarding_claims(
-    snapshot: &ClusterSnapshot,
-    leader: (NodeId, u64),
-    context: AuthorizedQueryContext,
-    request: BifrostQueryRequest,
-    query_class: QueryClass,
-    now: chrono::DateTime<chrono::Utc>,
-    wall_deadline: chrono::DateTime<chrono::Utc>,
-) -> Result<ForwardQueryClaims, BifrostError> {
-    let observed_age = now
-        .signed_duration_since(snapshot.observed_at())
-        .to_std()
-        .unwrap_or_default();
-    let attempt_id = QueryId::new(
-        uuid::Uuid::parse_str(context.request_id.as_str())
-            .map_err(|_| BifrostError::QueryPeerSecurity)?,
-    );
-    let participant_cut = OracleQueryAttemptCut::try_from_snapshot(
-        snapshot,
-        attempt_id,
-        leader.0,
-        query_class,
-        wall_deadline,
-        now,
-        observed_age.saturating_add(Duration::from_secs(1)),
-    )
-    .map_err(|_| BifrostError::OracleRoleUnavailable)?;
-    let mut nonce = vec![0_u8; 16];
-    rand::rng().fill_bytes(&mut nonce);
-    Ok(ForwardQueryClaims {
-        protocol_version: 1,
-        audience: leader.0,
-        worker_fence: leader.1,
-        nonce,
-        expires_at_ms: (now + FORWARD_ENVELOPE_TTL)
-            .min(wall_deadline)
-            .timestamp_millis(),
-        context,
-        request,
-        query_class,
-        participant_cut_fingerprint: participant_cut.fingerprint(),
-        absolute_deadline_ms: participant_cut.deadline().timestamp_millis(),
-        participant_cut,
-    })
+/// The caller-supplied inputs one forwarding attempt signs into its envelope.
+///
+/// Every field is fixed before a leader is chosen, so they travel as one value
+/// through candidate connection and are consumed exactly once when the elected
+/// leader is known. Keeping them together also guarantees a retry cannot mix
+/// inputs from two different attempts.
+pub(crate) struct ForwardingAttempt {
+    /// Authenticated caller identity and request id for this attempt.
+    pub context: AuthorizedQueryContext,
+    /// The query being forwarded, unchanged from ingress.
+    pub request: BifrostQueryRequest,
+    /// Admission class governing the participant cut.
+    pub query_class: QueryClass,
+    /// Ingress wall clock, used for envelope TTL and snapshot-age accounting.
+    pub now: chrono::DateTime<chrono::Utc>,
+    /// One absolute deadline captured at ingress and propagated unchanged.
+    pub wall_deadline: chrono::DateTime<chrono::Utc>,
+}
+
+impl ForwardingAttempt {
+    /// Builds the one signed-envelope payload from the captured membership
+    /// snapshot and the elected leader.
+    ///
+    /// Derives the participant cut from `snapshot` rather than re-reading
+    /// membership, so the fingerprint the follower verifies describes exactly
+    /// the cut the leader routed against.
+    ///
+    /// # Errors
+    /// Returns [`BifrostError::QueryPeerSecurity`] when the request id is not a
+    /// UUID, and [`BifrostError::OracleRoleUnavailable`] when the snapshot
+    /// cannot yield a valid participant cut.
+    fn into_claims(
+        self,
+        snapshot: &ClusterSnapshot,
+        leader: (NodeId, u64),
+    ) -> Result<ForwardQueryClaims, BifrostError> {
+        let Self {
+            context,
+            request,
+            query_class,
+            now,
+            wall_deadline,
+        } = self;
+        let observed_age = now
+            .signed_duration_since(snapshot.observed_at())
+            .to_std()
+            .unwrap_or_default();
+        let attempt_id = QueryId::new(
+            uuid::Uuid::parse_str(context.request_id.as_str())
+                .map_err(|_| BifrostError::QueryPeerSecurity)?,
+        );
+        let participant_cut = OracleQueryAttemptCut::try_from_snapshot(
+            snapshot,
+            attempt_id,
+            leader.0,
+            query_class,
+            wall_deadline,
+            now,
+            observed_age.saturating_add(Duration::from_secs(1)),
+        )
+        .map_err(|_| BifrostError::OracleRoleUnavailable)?;
+        let mut nonce = vec![0_u8; 16];
+        rand::rng().fill_bytes(&mut nonce);
+        Ok(ForwardQueryClaims {
+            protocol_version: 1,
+            audience: leader.0,
+            worker_fence: leader.1,
+            nonce,
+            expires_at_ms: (now + FORWARD_ENVELOPE_TTL)
+                .min(wall_deadline)
+                .timestamp_millis(),
+            context,
+            request,
+            query_class,
+            participant_cut_fingerprint: participant_cut.fingerprint(),
+            absolute_deadline_ms: participant_cut.deadline().timestamp_millis(),
+            participant_cut,
+        })
+    }
 }
 
 /// Counts rows in one bounded Arrow IPC batch frame before protocol conversion.
@@ -504,10 +527,9 @@ fn forwarded_batch_rows(bytes: &[u8]) -> Result<u64, BifrostError> {
     if bytes.len() > MAX_FORWARDED_BATCH_BYTES {
         return Err(BifrostError::QueryExecutionFailed);
     }
-    let reader = StreamReader::try_new(Cursor::new(bytes), None)
+    let mut reader = StreamReader::try_new(Cursor::new(bytes), None)
         .map_err(|_| BifrostError::QueryExecutionFailed)?;
-    reader.fold(Ok(0_u64), |rows, batch| {
-        let rows = rows?;
+    reader.try_fold(0_u64, |rows, batch| {
         let batch = batch.map_err(|_| BifrostError::QueryExecutionFailed)?;
         rows.checked_add(
             u64::try_from(batch.num_rows()).map_err(|_| BifrostError::QueryExecutionFailed)?,
@@ -617,11 +639,13 @@ mod tests {
             &snapshot,
             candidates(),
             Instant::now() + Duration::from_secs(1),
-            context,
-            request,
-            QueryClass::Interactive,
-            observed_at,
-            wall_deadline,
+            ForwardingAttempt {
+                context,
+                request,
+                query_class: QueryClass::Interactive,
+                now: observed_at,
+                wall_deadline,
+            },
             {
                 let connect_order = Arc::clone(&connect_order);
                 move |node_id, _address| {
@@ -665,13 +689,14 @@ mod tests {
             vec![first, second],
             "the third snapshot candidate is outside the two-connect ceiling"
         );
-        let delivered = delivered.lock().expect("delivery lock");
-        assert_eq!(delivered.len(), 1);
-        assert_eq!(delivered[0].0, (second, 22));
-        assert_eq!((delivered[0].1, delivered[0].2), (second, 22));
-        assert!(!delivered[0].3.is_empty());
-        assert_eq!(delivered[0].4, expected_participants);
-        drop(delivered);
+        {
+            let delivered = delivered.lock().expect("delivery lock");
+            assert_eq!(delivered.len(), 1);
+            assert_eq!(delivered[0].0, (second, 22));
+            assert_eq!((delivered[0].1, delivered[0].2), (second, 22));
+            assert!(!delivered[0].3.is_empty());
+            assert_eq!(delivered[0].4, expected_participants);
+        }
 
         let ambiguous_connect_order = Arc::new(Mutex::new(Vec::new()));
         let ambiguous_deliveries = Arc::new(Mutex::new(Vec::new()));
@@ -680,11 +705,13 @@ mod tests {
             &snapshot,
             candidates(),
             Instant::now() + Duration::from_secs(1),
-            context,
-            request,
-            QueryClass::Interactive,
-            observed_at,
-            wall_deadline,
+            ForwardingAttempt {
+                context,
+                request,
+                query_class: QueryClass::Interactive,
+                now: observed_at,
+                wall_deadline,
+            },
             {
                 let ambiguous_connect_order = Arc::clone(&ambiguous_connect_order);
                 move |node_id, _address| {

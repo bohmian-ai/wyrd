@@ -551,8 +551,12 @@ fn default_oracle_max_queue_wait_ms() -> u64 {
     250
 }
 /// Default exact demand amount; allocation is still bounded by durable availability.
+///
+/// Each allocation costs one `PostgreSQL` round trip regardless of how many
+/// units it returns, so a single-unit block forces one round trip per query and
+/// cannot keep pace with concurrent readers. A batch amortizes that cost.
 fn default_oracle_delegated_allocation_units() -> u32 {
-    1
+    vala_bifrost_redux::oracle::DEFAULT_DELEGATED_ALLOCATION_UNITS
 }
 /// Default renewal cadence inherited from role heartbeat membership.
 fn default_oracle_delegated_renewal_ms() -> u64 {

@@ -112,9 +112,9 @@ use exec::{
     RemotePersistedSources,
 };
 pub use ownership::{
-    DelegatedAdmissionBlock, DelegatedAdmissionRequest, DelegatedOracleAdmission,
-    DelegatedOracleAdmissionConfig, DelegatedOracleAdmissionError, DelegatedOracleAdmissionGrant,
-    DelegatedOracleAdmissionWorker,
+    DEFAULT_DELEGATED_ALLOCATION_UNITS, DelegatedAdmissionBlock, DelegatedAdmissionRequest,
+    DelegatedOracleAdmission, DelegatedOracleAdmissionConfig, DelegatedOracleAdmissionError,
+    DelegatedOracleAdmissionGrant, DelegatedOracleAdmissionWorker,
 };
 pub use participant_cut::{
     OracleQueryAttemptCut, OracleQueryAttemptCutError, OracleQueryParticipant,
@@ -368,6 +368,65 @@ pub struct OracleSlotManager {
     pending_limit: usize,
     /// Immutable configured running capacity used for placement calculations.
     running_limit: usize,
+}
+
+/// Per-phase stopwatch for one SQL attempt after planning completes.
+///
+/// A single attempt total cannot distinguish real execution from time spent
+/// queued for admission, and those two call for opposite fixes: queueing is an
+/// admission-sizing problem, execution is a planning or parallelism problem.
+/// Splitting admit, audit-and-drain, and execute makes the dominant cost
+/// attributable from a single log line.
+///
+/// Elapsed values are cumulative from construction; each phase method converts
+/// its slice by subtracting the phases already recorded.
+struct AttemptPhaseTimer {
+    /// Monotonic origin, taken once planning has produced its cuts.
+    started_at: Instant,
+    /// Milliseconds spent acquiring admission.
+    admit_ms: u128,
+    /// Milliseconds spent auditing the cut and draining live tails.
+    drained_ms: u128,
+}
+
+impl AttemptPhaseTimer {
+    /// Starts the stopwatch for one attempt.
+    fn started() -> Self {
+        Self {
+            started_at: Instant::now(),
+            admit_ms: 0,
+            drained_ms: 0,
+        }
+    }
+
+    /// Records the admission phase as complete.
+    fn admitted(&mut self) {
+        self.admit_ms = self.started_at.elapsed().as_millis();
+    }
+
+    /// Records the audit-and-drain phase as complete.
+    fn drained(&mut self) {
+        self.drained_ms = self
+            .started_at
+            .elapsed()
+            .as_millis()
+            .saturating_sub(self.admit_ms);
+    }
+
+    /// Emits the three phase durations, deriving execution from the remainder.
+    fn emit(&self) {
+        tracing::debug!(
+            admit_ms = self.admit_ms,
+            drained_ms = self.drained_ms,
+            execute_ms = self
+                .started_at
+                .elapsed()
+                .as_millis()
+                .saturating_sub(self.admit_ms)
+                .saturating_sub(self.drained_ms),
+            "Oracle SQL attempt phase timings"
+        );
+    }
 }
 
 /// Closed reason why bounded local running capacity was not acquired.
@@ -2158,6 +2217,55 @@ impl Oracle {
     /// # Errors
     /// Returns stable planning, admission, audit, timeout, execution, or
     /// cleanup errors. Failed attempts release admitted state before return.
+    /// Acquires every owner one planned attempt needs before it may execute.
+    ///
+    /// Admission, the execution session, retained physical projections, and the
+    /// running-query registration are acquired together because a failure in any
+    /// of them must release the ones already taken. The session's parallelism is
+    /// narrowed here to the work the pinned cut actually offers.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable admission, lease, projection, or running-query
+    /// conflict error, having already released any owner acquired earlier in the
+    /// sequence.
+    async fn admit_and_lease_attempt(
+        &self,
+        context: &AuthorizedQueryContext,
+        planned: &PlannedSqlCut,
+        participant_cut: &OracleQueryAttemptCut,
+        deadline: Instant,
+        phases: &mut AttemptPhaseTimer,
+    ) -> Result<
+        (
+            SessionContext,
+            AdmittedQueryGuard,
+            RunningQueryTerminalOwner,
+        ),
+        BifrostError,
+    > {
+        let admitted = self
+            .admit_sql_query(
+                context,
+                planned.query_class,
+                planned.local_ratio,
+                deadline,
+                participant_cut.attempt_id(),
+            )
+            .await?;
+        phases.admitted();
+        let (session, mut admitted) = self.lease_session(
+            deadline,
+            admitted,
+            Self::scannable_work_units(&planned.cuts),
+            "lease rejection",
+        )?;
+        admitted.retain_physical_projections(&planned.cuts)?;
+        let running_query =
+            self.register_running_query(context, planned.query_class, &admitted, participant_cut)?;
+        Ok((session, admitted, running_query))
+    }
+
     async fn run_sql_attempt(
         &self,
         input: SqlAttemptInput<'_>,
@@ -2187,24 +2295,10 @@ impl Oracle {
             return Err(BifrostError::QueryPeerSecurity);
         }
         self.ensure_query_telemetry(query_telemetry, request.visibility, planned.query_class);
-        // Split plan / admit / audit+drain / execute. A single attempt total
-        // cannot distinguish real work from time spent queued for a slot, and
-        // those call for opposite fixes.
-        let planned_at = std::time::Instant::now();
-        let admitted = self
-            .admit_sql_query(
-                context,
-                planned.query_class,
-                planned.local_ratio,
-                deadline,
-                participant_cut.attempt_id(),
-            )
+        let mut phases = AttemptPhaseTimer::started();
+        let (session, mut admitted, running_query) = self
+            .admit_and_lease_attempt(context, &planned, participant_cut, deadline, &mut phases)
             .await?;
-        let admit_ms = planned_at.elapsed().as_millis();
-        let (session, mut admitted) = self.lease_session(deadline, admitted, "lease rejection")?;
-        admitted.retain_physical_projections(&planned.cuts)?;
-        let running_query =
-            self.register_running_query(context, planned.query_class, &admitted, participant_cut)?;
         let mut drained = match self
             .audit_and_drain_cut(CutAuditInput {
                 context,
@@ -2221,7 +2315,7 @@ impl Oracle {
             Ok(drained) => drained,
             Err(error) => return release_error(deadline, admitted, error, "audit rejection"),
         };
-        let drained_ms = planned_at.elapsed().as_millis().saturating_sub(admit_ms);
+        phases.drained();
         admitted.live_reservations = std::mem::take(&mut drained.reservations);
         let degraded_tails = drained.degraded;
         let (schema, batches, scan_stats, degraded_sources) = match self
@@ -2242,16 +2336,7 @@ impl Oracle {
             .await
         {
             Ok(execution) => {
-                tracing::debug!(
-                    admit_ms,
-                    drained_ms,
-                    execute_ms = planned_at
-                        .elapsed()
-                        .as_millis()
-                        .saturating_sub(admit_ms)
-                        .saturating_sub(drained_ms),
-                    "Oracle SQL attempt phase timings"
-                );
+                phases.emit();
                 execution
             }
             Err(OracleExecutionError::Public(error)) => {
@@ -2331,9 +2416,7 @@ impl Oracle {
         deadline: Instant,
         attempt_id: QueryId,
     ) -> Result<AdmittedQueryGuard, BifrostError> {
-        let delegated = self
-            .acquire_delegated_admission(context, query_class, deadline)
-            .await?;
+        let delegated = self.acquire_delegated_admission(context, query_class)?;
         let mut admitted = self
             .admission
             .admit_for_attempt(
@@ -2351,45 +2434,42 @@ impl Oracle {
         Ok(admitted)
     }
 
-    /// Acquires one dynamic-tenant delegated unit before local query admission.
+    /// Charges one dynamic-tenant delegated unit before local query admission.
     ///
     /// Both generic SQL and typed analytical plans use this exact background-
     /// backed gate, preserving admission-before-execution without giving either
     /// request path a `PostgreSQL` capability.
     ///
+    /// This is synchronous and never waits. Durable capacity is refilled by a
+    /// background worker; a query that arrives ahead of a refill is covered by
+    /// bounded overdraft and proceeds under the local per-tenant ceilings. There
+    /// is therefore no deadline to observe here — the operation cannot block, so
+    /// it cannot consume the caller's remaining query budget.
+    ///
     /// # Errors
     ///
-    /// Returns a stable timeout, capacity rejection, or Oracle-unavailable
-    /// error when delegated admission cannot issue a complete unit.
-    async fn acquire_delegated_admission(
+    /// Returns [`BifrostError::QueryAdmissionRejected`] when overdraft is
+    /// exhausted, and [`BifrostError::OracleRoleUnavailable`] when delegated
+    /// continuity is closed or local state cannot be read.
+    fn acquire_delegated_admission(
         &self,
         context: &AuthorizedQueryContext,
         query_class: QueryClass,
-        deadline: Instant,
     ) -> Result<DelegatedOracleAdmissionGrant, BifrostError> {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .ok_or(BifrostError::QueryTimeout)?;
-        let delegated = tokio::select! {
-            () = self.shutdown.cancelled() => return Err(BifrostError::QueryTimeout),
-            result = tokio::time::timeout(
-                remaining,
-                self.delegated_admission.acquire(DelegatedAdmissionRequest {
-                    tenant_id: context.data_tenant_id,
-                    principal_id: context.principal.id,
-                    query_class,
-                }),
-            ) => result.map_err(|_| BifrostError::QueryTimeout)?,
-        }
-        .map_err(|error| match error {
-            DelegatedOracleAdmissionError::QueueFull => BifrostError::QueryAdmissionRejected,
-            DelegatedOracleAdmissionError::InvalidConfig
-            | DelegatedOracleAdmissionError::ContinuityLost
-            | DelegatedOracleAdmissionError::StateUnavailable => {
-                BifrostError::OracleRoleUnavailable
-            }
-        })?;
-        Ok(delegated)
+        self.delegated_admission
+            .acquire(DelegatedAdmissionRequest {
+                tenant_id: context.data_tenant_id,
+                principal_id: context.principal.id,
+                query_class,
+            })
+            .map_err(|error| match error {
+                DelegatedOracleAdmissionError::QueueFull => BifrostError::QueryAdmissionRejected,
+                DelegatedOracleAdmissionError::InvalidConfig
+                | DelegatedOracleAdmissionError::ContinuityLost
+                | DelegatedOracleAdmissionError::StateUnavailable => {
+                    BifrostError::OracleRoleUnavailable
+                }
+            })
     }
 
     /// Delegates one SQL metadata attempt to the planner owner.
@@ -2596,9 +2676,7 @@ impl Oracle {
             query_class: class,
             predicted_scan_seconds: 0.0,
         });
-        let delegated = self
-            .acquire_delegated_admission(&context, class, options.deadline)
-            .await?;
+        let delegated = self.acquire_delegated_admission(&context, class)?;
         let mut admitted = self
             .admission
             .admit(admission::PreparedAdmission {
@@ -2703,6 +2781,7 @@ impl Oracle {
         let (session, mut admitted) = self.lease_session(
             options.deadline,
             admitted,
+            Self::scannable_work_units(&cuts),
             "typed execution lease rejection",
         )?;
         admitted.retain_physical_projections(&cuts)?;
@@ -3360,6 +3439,7 @@ impl Oracle {
     fn execution_session(
         &self,
         admitted: &AdmittedQueryGuard,
+        work_units: usize,
     ) -> Result<SessionContext, BifrostError> {
         let pool = admitted
             .memory_pool()
@@ -3367,8 +3447,10 @@ impl Oracle {
         let runtime = self
             .spill_runtime
             .build_query_runtime(pool, admitted.spill_limit_bytes())?;
+        let target_partitions =
+            crate::resources::oracle_partitions_for_work(admitted.target_partitions(), work_units);
         let config = datafusion::execution::context::SessionConfig::new()
-            .with_target_partitions(admitted.target_partitions())
+            .with_target_partitions(target_partitions)
             .with_batch_size(1_024);
         let state = datafusion::execution::session_state::SessionStateBuilder::new()
             .with_default_features()
@@ -3391,9 +3473,10 @@ impl Oracle {
         &self,
         deadline: Instant,
         admitted: AdmittedQueryGuard,
+        work_units: usize,
         failure_phase: &'static str,
     ) -> Result<(SessionContext, AdmittedQueryGuard), BifrostError> {
-        match self.execution_session(&admitted) {
+        match self.execution_session(&admitted, work_units) {
             Ok(session) => Ok((session, admitted)),
             Err(error) => release_error(deadline, admitted, error, failure_phase),
         }
@@ -3428,6 +3511,21 @@ impl Oracle {
     }
 
     /// Sums immutable selected file sizes before execution starts.
+    /// Counts the independently scannable files pinned across one cut set.
+    ///
+    /// This is the parallelism budget the cut actually offers. `DataFusion`
+    /// cannot usefully spread a scan across more partitions than there are
+    /// files to read, so this bounds the admitted partition ceiling before the
+    /// session is built. Both sealed Iceberg files and hot Scribe files count,
+    /// since each is an independently openable scan target.
+    fn scannable_work_units(cuts: &[PinnedSealedTable]) -> usize {
+        cuts.iter().fold(0_usize, |total, cut| {
+            total
+                .saturating_add(cut.iceberg_files.len())
+                .saturating_add(cut.hot_files.len())
+        })
+    }
+
     fn logical_selected_bytes(cuts: &[PinnedSealedTable]) -> u64 {
         cuts.iter().fold(0_u64, |total, cut| {
             let iceberg = cut

@@ -155,14 +155,29 @@ fn assert_active_spill_query_resources(server: &wyrd_testing::WyrdTestServer, sc
         .checked_add(snapshot.elastic_memory_used_bytes)
         .expect("fixed query memory fits usize");
     assert_eq!(query_memory, 256 << 20);
+    // A fully local scan hides no IO latency, so parallelism tracks cores rather
+    // than fanning out; it is bounded by the working memory each partition needs
+    // and never collapses to a single serial partition.
+    let partitions = vala_bifrost_redux::resources::oracle_target_partitions(
+        snapshot.plan.effective_cpu,
+        1.0,
+        query_memory,
+    )
+    .expect("active partition plan");
     assert_eq!(
-        vala_bifrost_redux::resources::oracle_target_partitions(
-            snapshot.plan.effective_cpu,
-            1.0,
-            query_memory,
-        )
-        .expect("active partition plan"),
-        1
+        partitions,
+        snapshot
+            .plan
+            .effective_cpu
+            .min(
+                query_memory / vala_bifrost_redux::resources::ORACLE_PARTITION_WORKING_MEMORY_BYTES
+            )
+            .max(vala_bifrost_redux::resources::ORACLE_MIN_TARGET_PARTITIONS),
+        "local partition plan must follow cores clamped by per-partition working memory"
+    );
+    assert!(
+        partitions >= vala_bifrost_redux::resources::ORACLE_MIN_TARGET_PARTITIONS,
+        "an admitted query must never execute on a single serial partition"
     );
 }
 

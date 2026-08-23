@@ -43,6 +43,20 @@ pub const FORGE_MEMORY_FLOOR_BYTES: usize = 64 * MIB;
 pub const MIN_SCRATCH_FREE_BYTES: u64 = 256 * MIB as u64;
 /// Memory represented by one Oracle execution partition.
 pub const ORACLE_PARTITION_MEMORY_BYTES: usize = 256 * MIB;
+/// Working memory one `DataFusion` execution partition needs to make progress.
+///
+/// This is deliberately far smaller than [`ORACLE_PARTITION_MEMORY_BYTES`], which
+/// sizes a whole query's memory envelope. Dividing a query envelope by the
+/// envelope quantum always yields one partition, which silently serializes every
+/// Interactive query onto a single core. Partition parallelism is bounded by CPU
+/// and by available work; memory only clamps it downward once a query envelope
+/// can no longer give each partition room to run.
+pub const ORACLE_PARTITION_WORKING_MEMORY_BYTES: usize = 32 * MIB;
+/// Fewest execution partitions any admitted Oracle query receives.
+///
+/// A single partition removes intra-query parallelism entirely, so even the
+/// smallest query keeps two.
+pub const ORACLE_MIN_TARGET_PARTITIONS: usize = 2;
 /// Fixed Oracle footer-planning slot acquired before metadata I/O.
 pub const ORACLE_METADATA_MEMORY_BYTES: usize = 40 * MIB;
 /// Retry delays for exact-prefix scratch cleanup before fail-stop poisoning.
@@ -4040,12 +4054,24 @@ impl Drop for ForgeRewriteResources {
     }
 }
 
-/// Computes locality parallelism clamped by exact query memory.
+/// Computes the ceiling on execution partitions an admitted query may use.
+///
+/// Parallelism is driven by CPU and by how much of the pinned input is remote:
+/// a fully remote scan overlaps IO latency across up to four partitions per core,
+/// while a fully local scan stays at one partition per core because there is no
+/// latency to hide. Memory participates only as a downward clamp, using
+/// [`ORACLE_PARTITION_WORKING_MEMORY_BYTES`] — the memory one partition needs to
+/// run — rather than the whole-query envelope quantum. Clamping by the envelope
+/// quantum would collapse every Interactive query to a single serial partition.
+///
+/// The result is a ceiling, not a final value. Callers narrow it further by the
+/// work actually available in the pinned cut; see
+/// [`oracle_partitions_for_work`].
 ///
 /// # Errors
 ///
-/// Returns [`BifrostResourceError::InvalidPlan`] for zero CPU, non-finite or
-/// out-of-range locality, zero memory, or checked `cpu * 4` overflow.
+/// Returns [`BifrostResourceError::InvalidPlan`] for zero CPU or non-finite or
+/// out-of-range locality, and an overflow error for checked `cpu * 4` overflow.
 pub fn oracle_target_partitions(
     effective_cpu: usize,
     local_ratio: f64,
@@ -4069,8 +4095,25 @@ pub fn oracle_target_partitions(
     let locality = effective_cpu
         .checked_add(remote_partitions)
         .ok_or_else(accounting_overflow)?;
-    let memory = memory_bytes / ORACLE_PARTITION_MEMORY_BYTES;
-    Ok(locality.min(memory).max(1))
+    let memory = memory_bytes / ORACLE_PARTITION_WORKING_MEMORY_BYTES;
+    Ok(locality.min(memory).max(ORACLE_MIN_TARGET_PARTITIONS))
+}
+
+/// Narrows an admitted partition ceiling to the work the pinned cut actually has.
+///
+/// Splitting a two-file scan across sixteen partitions costs more in task setup
+/// and empty-stream merging than it recovers in parallelism, so parallelism is
+/// capped at one partition per scannable unit. The floor still applies, so a
+/// single-file query keeps [`ORACLE_MIN_TARGET_PARTITIONS`] rather than
+/// collapsing to a serial plan.
+///
+/// A zero work count means the cut pinned nothing scannable; the query still
+/// receives the floor so its empty plan executes normally.
+#[must_use]
+pub fn oracle_partitions_for_work(admitted_ceiling: usize, work_units: usize) -> usize {
+    admitted_ceiling
+        .min(work_units.max(ORACLE_MIN_TARGET_PARTITIONS))
+        .max(ORACLE_MIN_TARGET_PARTITIONS)
 }
 
 /// Builds a finite first-come, first-served pool for a nested resource envelope.
@@ -5321,11 +5364,64 @@ mod tests {
             20
         );
         assert_eq!(oracle_target_partitions(8, 1.0, 8 * gib).expect("local"), 8);
-        assert_eq!(
-            oracle_target_partitions(8, 0.0, 256 * MIB).expect("bounded"),
-            1
-        );
         assert!(oracle_target_partitions(usize::MAX, 0.0, gib).is_err());
+    }
+
+    /// An Interactive envelope keeps CPU parallelism instead of collapsing to one.
+    ///
+    /// The Interactive class is granted exactly one
+    /// [`ORACLE_PARTITION_MEMORY_BYTES`] envelope. Clamping partitions by that
+    /// same quantum yielded one serial partition for every interactive query
+    /// regardless of core count; the working-memory quantum preserves CPU-driven
+    /// parallelism while still bounding memory per partition.
+    #[test]
+    fn interactive_envelope_keeps_cpu_parallelism() {
+        let interactive = oracle_target_partitions(8, 0.0, ORACLE_PARTITION_MEMORY_BYTES)
+            .expect("interactive envelope admits partitions");
+        assert_eq!(
+            interactive,
+            ORACLE_PARTITION_MEMORY_BYTES / ORACLE_PARTITION_WORKING_MEMORY_BYTES,
+            "interactive partitions must be bounded by working memory, not the envelope quantum"
+        );
+        assert!(
+            interactive > 1,
+            "an interactive query must never execute on a single serial partition"
+        );
+    }
+
+    /// Every admitted query keeps the minimum partition floor.
+    #[test]
+    fn partition_ceiling_never_falls_below_the_floor() {
+        assert_eq!(
+            oracle_target_partitions(1, 1.0, ORACLE_PARTITION_WORKING_MEMORY_BYTES)
+                .expect("single-core local scan"),
+            ORACLE_MIN_TARGET_PARTITIONS
+        );
+    }
+
+    /// Work narrowing caps parallelism at the scannable units and holds the floor.
+    #[test]
+    fn work_narrowing_caps_partitions_without_breaking_the_floor() {
+        assert_eq!(
+            oracle_partitions_for_work(32, 5),
+            5,
+            "a five-unit cut must not fan out to the full admitted ceiling"
+        );
+        assert_eq!(
+            oracle_partitions_for_work(32, 64),
+            32,
+            "work beyond the admitted ceiling cannot raise parallelism"
+        );
+        assert_eq!(
+            oracle_partitions_for_work(32, 1),
+            ORACLE_MIN_TARGET_PARTITIONS,
+            "a single-unit cut still keeps the minimum partition floor"
+        );
+        assert_eq!(
+            oracle_partitions_for_work(32, 0),
+            ORACLE_MIN_TARGET_PARTITIONS,
+            "an empty cut still executes at the minimum partition floor"
+        );
     }
 
     /// Portable source precedence selects the tightest injected host/cgroup bounds.

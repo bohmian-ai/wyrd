@@ -6,6 +6,7 @@ use crate::namespaces::BifrostNamespace;
 use crate::schema::SchemaFingerprint;
 use crate::scribe::ScribeAppend;
 use crate::scribe::ScribeImpl;
+use crate::scribe::admission::EventTimeWindow;
 use crate::scribe::seal_key::{EventDay, SealKey};
 use crate::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use crate::scribe::tail_rpc::FetchLiveTailRequest;
@@ -20,6 +21,28 @@ use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
 use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::request_id::RequestId;
+
+/// Returns an event day the production admission window still admits,
+/// `days_before_receipt` days below the current receipt instant.
+///
+/// These fixtures must not pin an absolute date. A pinned day silently ages
+/// out of `[receipt - past, receipt + future]` as wall-clock advances, so the
+/// append it feeds starts failing with `EventTimeOutOfRange` on some later
+/// date and the test stops covering the path it names. Deriving the day from
+/// the window keeps every case correct at any wall-clock time.
+///
+/// The underlying instant is UTC noon, so `batch` rebuilding noon on this day
+/// reproduces exactly the instant the window was checked against.
+///
+/// # Panics
+/// Panics when the derived instant is not representable as a UTC date.
+fn fixture_event_day(days_before_receipt: i64) -> NaiveDate {
+    chrono::DateTime::from_timestamp_micros(
+        EventTimeWindow::default().admitted_event_time_micros(days_before_receipt),
+    )
+    .expect("derived event time must be representable")
+    .date_naive()
+}
 
 /// Build the fixed one-row event-time batch for Scribe path tests.
 ///
@@ -64,7 +87,7 @@ fn principal(tenant: DataTenantId) -> Principal {
 async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
     let tenant = DataTenantId::new_v7();
     let table = TableRef::new(BifrostNamespace::Bifrost, "scribe_tail");
-    let day = NaiveDate::from_ymd_opt(2026, 7, 24).expect("test day");
+    let day = fixture_event_day(1);
     let rows = batch(day);
     let batch_id = Uuid::now_v7();
     let temp_dir = TempDir::new().expect("WAL temp dir");
@@ -151,8 +174,8 @@ async fn oracle_hot_snapshot_preserves_pointer_identity_and_day_isolation() {
     let tenant = DataTenantId::new_v7();
     let pointer_table = TableRef::new(BifrostNamespace::Bifrost, "scribe_pointer_identity");
     let day_table = TableRef::new(BifrostNamespace::Bifrost, "scribe_day_isolation");
-    let day_one = NaiveDate::from_ymd_opt(2026, 7, 24).expect("day one");
-    let day_two = NaiveDate::from_ymd_opt(2026, 7, 25).expect("day two");
+    let day_one = fixture_event_day(2);
+    let day_two = fixture_event_day(1);
     let source = batch(day_one);
     let source_value = source.column(1).clone();
     let temp_dir = TempDir::new().expect("WAL temp dir");
@@ -366,7 +389,7 @@ fn concrete_wal_disk_failure_rejects_before_file_mutation() {
     let seal_key = SealKey::new(
         DataTenantId::new_v7(),
         TableRef::new(BifrostNamespace::Bifrost, "scribe_wal_failure"),
-        EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 24).expect("test day")),
+        EventDay::new(fixture_event_day(1)),
     );
 
     let error = writer
@@ -381,7 +404,7 @@ fn concrete_wal_disk_failure_rejects_before_file_mutation() {
 async fn shard_wal_failure_reaches_the_durable_completion() {
     let tenant = DataTenantId::new_v7();
     let table = TableRef::new(BifrostNamespace::Bifrost, "scribe_wal_failure");
-    let day = NaiveDate::from_ymd_opt(2026, 7, 24).expect("test day");
+    let day = fixture_event_day(1);
     let temp_dir = TempDir::new().expect("WAL temp dir");
     let operator = Arc::new(
         opendal::Operator::new(opendal::services::Memory::default())

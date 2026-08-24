@@ -311,8 +311,8 @@ async fn seed_reset_generations(
 ) -> Vec<String> {
     fixture.append_forge_file(2).await;
     fixture.append_forge_file(3).await;
-    let rows: Vec<(uuid::Uuid, String, chrono::NaiveDate)> = sqlx::query_as(
-        "SELECT id, file_path, partition_day FROM vala.file_list \
+    let rows: Vec<(uuid::Uuid, String, String, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "SELECT id, file_path, partition_granularity, partition_start FROM vala.file_list \
          WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 \
            AND committed_snapshot_id IS NULL ORDER BY id",
     )
@@ -323,8 +323,14 @@ async fn seed_reset_generations(
     .await
     .expect("reset staging rows");
     assert_eq!(rows.len(), 2);
-    let partition_day = rows[0].2;
-    assert!(rows.iter().all(|row| row.2 == partition_day));
+    let partition_day = vala_bifrost_redux::catalog::layout::TimePartition::from_durable_columns(
+        &rows[0].2, rows[0].3,
+    )
+    .expect("durable file-list rows carry an exact time partition");
+    assert!(
+        rows.iter()
+            .all(|row| row.2 == rows[0].2 && row.3 == rows[0].3)
+    );
     let outputs = (0..output_count)
         .map(|ordinal| {
             format!(

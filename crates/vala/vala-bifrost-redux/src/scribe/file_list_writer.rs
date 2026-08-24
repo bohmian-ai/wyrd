@@ -10,6 +10,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::AuditEvent;
 
 use crate::catalog::TenantTableBinding;
+use crate::catalog::layout::TimePartition;
 use crate::contracts::ScribeError;
 use crate::scribe::memtable::FrozenMemtable;
 use crate::scribe::parquet_writer::ParquetEncoded;
@@ -80,8 +81,8 @@ pub struct FileListArtifactInsert {
     pub min_event_time: chrono::DateTime<chrono::Utc>,
     /// Maximum event timestamp for this artifact.
     pub max_event_time: chrono::DateTime<chrono::Utc>,
-    /// Partition day inherited from the generation seal key.
-    pub partition_day: chrono::NaiveDate,
+    /// Exact time partition inherited from the generation seal key.
+    pub partition: TimePartition,
     /// Producing Scribe node.
     pub node_id: Uuid,
     /// Producing writer epoch.
@@ -119,7 +120,8 @@ type ExistingArtifactRow = (
     i64,
     chrono::DateTime<chrono::Utc>,
     chrono::DateTime<chrono::Utc>,
-    chrono::NaiveDate,
+    String,
+    chrono::DateTime<chrono::Utc>,
     Option<String>,
 );
 
@@ -171,8 +173,9 @@ fn artifact_replay_matches(
                 && actual.5 == expected.row_count
                 && actual.6 == expected.min_event_time
                 && actual.7 == expected.max_event_time
-                && actual.8 == expected.partition_day
-                && actual.9.as_deref() == Some(expected.file_checksum.as_str())
+                && actual.8 == expected.partition.granularity_str()
+                && actual.9 == expected.partition.start_utc()
+                && actual.10.as_deref() == Some(expected.file_checksum.as_str())
         })
 }
 
@@ -290,7 +293,7 @@ pub fn build_artifact_inserts(
                 })?,
                 min_event_time,
                 max_event_time,
-                partition_day: encoded.partition_day.as_naive_date(),
+                partition: encoded.partition,
                 node_id,
                 writer_epoch,
                 wal_lsn_min,
@@ -334,7 +337,8 @@ pub struct FileListInsert<'a> {
     pub row_count: i64,
     pub min_event_time: chrono::DateTime<chrono::Utc>,
     pub max_event_time: chrono::DateTime<chrono::Utc>,
-    pub partition_day: chrono::NaiveDate,
+    /// Exact time partition inherited from the generation seal key.
+    pub partition: TimePartition,
     pub node_id: Uuid,
     pub writer_epoch: i64,
     pub wal_lsn_min: i64,
@@ -481,7 +485,7 @@ pub fn build_insert<'a>(
         row_count,
         min_event_time,
         max_event_time,
-        partition_day: encoded.partition_day.as_naive_date(),
+        partition: encoded.partition,
         node_id: node_uuid,
         writer_epoch,
         wal_lsn_min,
@@ -622,8 +626,8 @@ pub async fn insert_artifact_set_and_audit_fenced(
     for row in rows {
         inserted += sqlx::query(
             "INSERT INTO vala.file_list \
-             (id,data_tenant_id,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_day,node_id,writer_epoch,wal_lsn_min,wal_lsn_max,file_ordinal,file_checksum) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) \
+             (id,data_tenant_id,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_granularity,partition_start,node_id,writer_epoch,wal_lsn_min,wal_lsn_max,file_ordinal,file_checksum) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) \
              ON CONFLICT (data_tenant_id,node_id,writer_epoch,wal_lsn_min,wal_lsn_max,file_ordinal) DO NOTHING",
         )
         .bind(row.id)
@@ -635,7 +639,8 @@ pub async fn insert_artifact_set_and_audit_fenced(
         .bind(row.row_count)
         .bind(row.min_event_time)
         .bind(row.max_event_time)
-        .bind(row.partition_day)
+        .bind(row.partition.granularity_str())
+        .bind(row.partition.start_utc())
         .bind(row.node_id)
         .bind(row.writer_epoch)
         .bind(row.wal_lsn_min)
@@ -653,7 +658,7 @@ pub async fn insert_artifact_set_and_audit_fenced(
         });
     }
     let existing: Vec<ExistingArtifactRow> = sqlx::query_as(
-        "SELECT file_ordinal,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_day,file_checksum FROM vala.file_list \
+        "SELECT file_ordinal,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_granularity,partition_start,file_checksum FROM vala.file_list \
          WHERE data_tenant_id=$1 AND node_id=$2 AND writer_epoch=$3 AND wal_lsn_min=$4 AND wal_lsn_max=$5 \
          ORDER BY file_ordinal FOR UPDATE",
     )
@@ -861,8 +866,8 @@ async fn insert_file(
     sqlx::query(
         r"INSERT INTO vala.file_list (
  id,data_tenant_id,namespace,table_name,file_path,file_size,row_count,
- min_event_time,max_event_time,partition_day,node_id,writer_epoch,wal_lsn_min,wal_lsn_max)
- VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+ min_event_time,max_event_time,partition_granularity,partition_start,node_id,writer_epoch,wal_lsn_min,wal_lsn_max)
+ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
  ON CONFLICT (data_tenant_id,node_id,writer_epoch,wal_lsn_min,wal_lsn_max,file_ordinal) DO NOTHING",
     )
     .bind(row.id)
@@ -874,7 +879,8 @@ async fn insert_file(
     .bind(row.row_count)
     .bind(row.min_event_time)
     .bind(row.max_event_time)
-    .bind(row.partition_day)
+    .bind(row.partition.granularity_str())
+    .bind(row.partition.start_utc())
     .bind(row.node_id)
     .bind(row.writer_epoch)
     .bind(row.wal_lsn_min)
@@ -958,7 +964,8 @@ pub async fn insert_and_audit(
  row_count,
  min_event_time,
  max_event_time,
- partition_day,
+ partition_granularity,
+ partition_start,
  node_id,
  writer_epoch,
  wal_lsn_min,
@@ -978,7 +985,8 @@ pub async fn insert_and_audit(
  $11,
  $12,
  $13,
- $14
+ $14,
+ $15
  )
  ON CONFLICT (data_tenant_id, node_id, writer_epoch, wal_lsn_min, wal_lsn_max, file_ordinal) DO NOTHING
  ",
@@ -992,7 +1000,8 @@ pub async fn insert_and_audit(
     .bind(row.row_count)
     .bind(row.min_event_time)
     .bind(row.max_event_time)
-    .bind(row.partition_day)
+    .bind(row.partition.granularity_str())
+    .bind(row.partition.start_utc())
     .bind(row.node_id)
     .bind(row.writer_epoch)
     .bind(row.wal_lsn_min)
@@ -1039,8 +1048,8 @@ pub async fn insert_artifact_set_and_audit(
     for row in rows {
         inserted += sqlx::query(
             "INSERT INTO vala.file_list \
-             (id,data_tenant_id,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_day,node_id,writer_epoch,wal_lsn_min,wal_lsn_max,file_ordinal,file_checksum) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) \
+             (id,data_tenant_id,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_granularity,partition_start,node_id,writer_epoch,wal_lsn_min,wal_lsn_max,file_ordinal,file_checksum) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) \
              ON CONFLICT (data_tenant_id,node_id,writer_epoch,wal_lsn_min,wal_lsn_max,file_ordinal) DO NOTHING",
         )
         .bind(row.id)
@@ -1052,7 +1061,8 @@ pub async fn insert_artifact_set_and_audit(
         .bind(row.row_count)
         .bind(row.min_event_time)
         .bind(row.max_event_time)
-        .bind(row.partition_day)
+        .bind(row.partition.granularity_str())
+        .bind(row.partition.start_utc())
         .bind(row.node_id)
         .bind(row.writer_epoch)
         .bind(row.wal_lsn_min)
@@ -1069,7 +1079,7 @@ pub async fn insert_artifact_set_and_audit(
         });
     }
     let existing: Vec<ExistingArtifactRow> = sqlx::query_as(
-        "SELECT file_ordinal,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_day,file_checksum FROM vala.file_list \
+        "SELECT file_ordinal,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_granularity,partition_start,file_checksum FROM vala.file_list \
          WHERE data_tenant_id=wyrd.current_tenant() AND node_id=$1 AND writer_epoch=$2 AND wal_lsn_min=$3 AND wal_lsn_max=$4 \
          ORDER BY file_ordinal FOR UPDATE",
     )

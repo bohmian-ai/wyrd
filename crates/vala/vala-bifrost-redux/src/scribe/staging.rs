@@ -16,7 +16,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::AuditEvent;
 
 /// Version of the durable Scribe publication-manifest contract.
-const PUBLICATION_MANIFEST_VERSION: u8 = 1;
+const PUBLICATION_MANIFEST_VERSION: u8 = 2;
 /// Maximum durable metadata accepted during fail-closed startup recovery.
 const MAX_PUBLICATION_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -94,8 +94,12 @@ struct DurableFileListRow {
     min_event_time: chrono::DateTime<chrono::Utc>,
     /// Maximum event time.
     max_event_time: chrono::DateTime<chrono::Utc>,
-    /// Event-day partition.
-    partition_day: chrono::NaiveDate,
+    /// Exact typed time partition of the staged artifact.
+    ///
+    /// Stored as the public wire value so the manifest carries the same
+    /// granularity/start pair the WAL, object path, and file-list row carry,
+    /// and so deserialization re-validates the canonical boundary.
+    partition: wyrd_spec::vala::api::TimePartitionWire,
     /// Producing node.
     node_id: Uuid,
     /// Producing fenced epoch.
@@ -126,7 +130,7 @@ impl From<&FileListArtifactInsert> for DurableFileListRow {
             row_count: row.row_count,
             min_event_time: row.min_event_time,
             max_event_time: row.max_event_time,
-            partition_day: row.partition_day,
+            partition: row.partition.to_wire(),
             node_id: row.node_id,
             writer_epoch: row.writer_epoch,
             wal_lsn_min: row.wal_lsn_min,
@@ -153,7 +157,7 @@ impl From<DurableFileListRow> for FileListArtifactInsert {
             row_count: row.row_count,
             min_event_time: row.min_event_time,
             max_event_time: row.max_event_time,
-            partition_day: row.partition_day,
+            partition: crate::catalog::layout::TimePartition::from_wire(row.partition),
             node_id: row.node_id,
             writer_epoch: row.writer_epoch,
             wal_lsn_min: row.wal_lsn_min,
@@ -1542,7 +1546,9 @@ mod tests {
             row_count: 1,
             min_event_time: now,
             max_event_time: now,
-            partition_day: now.date_naive(),
+            partition: crate::catalog::TimeGranularity::Hour
+                .bucket(now)
+                .expect("fixture instant buckets"),
             node_id,
             writer_epoch: 11,
             wal_lsn_min: 1,
@@ -1614,7 +1620,9 @@ mod tests {
             row_count: 1,
             min_event_time: now,
             max_event_time: now,
-            partition_day: now.date_naive(),
+            partition: crate::catalog::TimeGranularity::Hour
+                .bucket(now)
+                .expect("fixture instant buckets"),
             node_id,
             writer_epoch: 11,
             wal_lsn_min: 1,

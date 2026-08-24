@@ -205,7 +205,7 @@ impl TailStreamDiscovery for RegistryTailStreamDiscovery {
                     });
                 }
                 routes.push(DiscoveredTailRoute {
-                    event_day: stream.event_day,
+                    time_partition: stream.time_partition,
                     stream: stream.stream,
                     transport: Arc::clone(&transport),
                 });

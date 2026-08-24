@@ -125,10 +125,24 @@ struct AdmittedRowContext {
     native_source_count: usize,
 }
 
+/// The registered contract Scribe resolves for one logical frame before it
+/// plans any material.
+///
+/// Both halves come from the same control row: the schema the caller must
+/// match, and the canonical layout that fixes how the rows are partitioned.
+struct LogicalFrameContract {
+    /// Catalog fingerprint required of the caller-owned source schema.
+    expected_schema_fingerprint: crate::schema::fingerprint::SchemaFingerprint,
+    /// Registered partition granularity every slice of this frame is bucketed to.
+    partition_granularity: crate::catalog::TimeGranularity,
+}
+
 /// Root admission state established before any scalable materialization.
 struct RootAdmission {
     /// Catalog fingerprint required of the caller-owned source schema.
     expected_schema_fingerprint: crate::schema::fingerprint::SchemaFingerprint,
+    /// Registered partition granularity applied to every prepared slice.
+    partition_granularity: crate::catalog::TimeGranularity,
     /// One authoritative receipt time shared by planning and projection.
     receipt_micros: i64,
     /// Complete immutable source-derived material plan.
@@ -144,41 +158,60 @@ struct RootAdmission {
 impl ScribeImpl {
     /// Resolves one authenticated logical frame under the Scribe catalog owner.
     ///
+    /// The catalog owner is authoritative for both halves of the contract: a
+    /// caller-supplied fingerprint is honored as an override, but the partition
+    /// granularity always comes from the registered canonical layout so no
+    /// ingest path can invent one. Only the embedded engine seam, which has no
+    /// catalog owner, falls back to the default hourly granularity, and it must
+    /// supply its own fingerprint.
+    ///
     /// # Errors
     ///
-    /// Returns [`ScribeError`] when no logical-ingress catalog exists, built-in
-    /// provisioning or fingerprint lookup fails, or tenant/binding validation
-    /// rejects the frame.
+    /// Returns [`ScribeError`] when no logical-ingress catalog exists and the
+    /// frame carries no fingerprint, when built-in provisioning or the
+    /// registration lookup fails, or when the registered layout is undecodable.
     async fn resolve_logical_frame(
         &self,
         frame: &ScribeIngressFrame,
-    ) -> Result<crate::schema::fingerprint::SchemaFingerprint, ScribeError> {
-        let expected = if let Some(expected) = frame.expected_schema_fingerprint {
-            expected
-        } else {
-            let catalog = self.catalog.as_ref().ok_or_else(|| ScribeError::Internal {
-                detail: "Scribe logical ingress requires its catalog owner".to_owned(),
-            })?;
-            if let Some(definition) = crate::tables::builtin_table(
+    ) -> Result<LogicalFrameContract, ScribeError> {
+        let Some(catalog) = self.catalog.as_ref() else {
+            let expected_schema_fingerprint =
                 frame
-                    .table
-                    .namespace
-                    .as_str()
-                    .strip_prefix("vala.")
-                    .unwrap_or_default(),
-                &frame.table.name,
-            ) {
-                catalog
-                    .ensure_builtin(frame.authenticated_tenant, definition)
-                    .await
-                    .map_err(scribe_catalog_error)?;
-            }
-            catalog
-                .table_schema_fingerprint(&frame.table, frame.authenticated_tenant)
-                .await
-                .map_err(scribe_catalog_error)?
+                    .expected_schema_fingerprint
+                    .ok_or_else(|| ScribeError::Internal {
+                        detail: "Scribe logical ingress requires its catalog owner".to_owned(),
+                    })?;
+            return Ok(LogicalFrameContract {
+                expected_schema_fingerprint,
+                partition_granularity: crate::catalog::TimeGranularity::Hour,
+            });
         };
-        Ok(expected)
+        if let Some(definition) = crate::tables::builtin_table(
+            frame
+                .table
+                .namespace
+                .as_str()
+                .strip_prefix("vala.")
+                .unwrap_or_default(),
+            &frame.table.name,
+        ) {
+            catalog
+                .ensure_builtin(frame.authenticated_tenant, definition)
+                .await
+                .map_err(scribe_catalog_error)?;
+        }
+        let (registered_fingerprint, layout) = catalog
+            .table_registration(&frame.table, frame.authenticated_tenant)
+            .await
+            .map_err(scribe_catalog_error)?;
+        Ok(LogicalFrameContract {
+            expected_schema_fingerprint: frame
+                .expected_schema_fingerprint
+                .unwrap_or(registered_fingerprint),
+            partition_granularity: crate::catalog::TimeGranularity::from_wire(
+                layout.partition.granularity,
+            ),
+        })
     }
 
     /// Computes one immutable material plan before root admission or binding.
@@ -190,7 +223,6 @@ impl ScribeImpl {
     fn plan_transport_payload(
         &self,
         frame: &ScribeIngressFrame,
-        receipt_micros: i64,
         physical_binding_peak_bytes: usize,
     ) -> Result<MaterialPlan, ScribeError> {
         let planner = ScribeIngressPlanner::new(self.ingest_limits);
@@ -202,19 +234,16 @@ impl ScribeImpl {
                 &request.request,
                 request.decode_bytes,
                 physical_binding_peak_bytes,
-                receipt_micros,
             ),
             IngressPayload::OtlpMetrics(request) => planner.plan_metrics(
                 &request.request,
                 request.decode_bytes,
                 physical_binding_peak_bytes,
-                receipt_micros,
             ),
             IngressPayload::OtlpLogs(request) => planner.plan_logs(
                 &request.request,
                 request.decode_bytes,
                 physical_binding_peak_bytes,
-                receipt_micros,
             ),
             IngressPayload::ProjectedArrow(batches) => planner.plan_projected(
                 batches,
@@ -372,13 +401,15 @@ impl ScribeImpl {
     ) -> Result<RootAdmission, ScribeError> {
         validate_logical_transport_frame(frame, self.ingest_limits.otlp.request_bytes)?;
         let decode_owner = take_transport_decode_owner(&mut frame.payload)?;
-        let expected_schema_fingerprint = self.resolve_logical_frame(frame).await?;
+        let LogicalFrameContract {
+            expected_schema_fingerprint,
+            partition_granularity,
+        } = self.resolve_logical_frame(frame).await?;
         let receipt_micros = crate::scribe::execution_lanes::current_receipt_micros()?;
         let binding_facts =
             crate::catalog::TenantTableBinding::facts(&frame.authenticated_tenant, &frame.table)
                 .map_err(|_| ScribeError::InvalidFrame)?;
-        let material_plan =
-            self.plan_transport_payload(frame, receipt_micros, binding_facts.peak_bytes)?;
+        let material_plan = self.plan_transport_payload(frame, binding_facts.peak_bytes)?;
         if let MaximumEnvelopeDecision::IntrinsicRefusal {
             demand_bytes,
             limit_bytes,
@@ -420,6 +451,7 @@ impl ScribeImpl {
         self.pause_admitted_ingest_for_test().await;
         Ok(RootAdmission {
             expected_schema_fingerprint,
+            partition_granularity,
             receipt_micros,
             material_plan,
             memory,
@@ -483,6 +515,7 @@ impl ScribeImpl {
         let mut lifecycle = self.ingress_lifecycle.begin();
         let RootAdmission {
             expected_schema_fingerprint,
+            partition_granularity,
             receipt_micros,
             material_plan,
             mut memory,
@@ -541,6 +574,7 @@ impl ScribeImpl {
             memory,
             tenant,
             table: binding.table_ref,
+            partition_granularity,
             queued_at: Instant::now(),
             durable_ack: Some(durable_tx),
             lifecycle,

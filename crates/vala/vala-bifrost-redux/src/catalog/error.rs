@@ -20,6 +20,14 @@ pub enum BifrostCatalogError {
     /// The supplied schema does not match the tenant-scoped registration.
     #[error("schema fingerprint mismatch for table: {0}")]
     FingerprintMismatch(String),
+    /// A physical-layout declaration was rejected, or a valid declaration
+    /// conflicted with the registered canonical layout.
+    ///
+    /// The variant carries the already-public error so the exact field,
+    /// violation, and column survive to the HTTP, MCP, and SDK boundaries
+    /// unchanged.
+    #[error("physical layout rejected: {0}")]
+    Layout(wyrd_spec::vala::BifrostError),
     /// Durable catalog metadata is internally inconsistent.
     #[error("catalog metadata inconsistency: {0}")]
     MetadataMismatch(String),
@@ -53,6 +61,7 @@ impl BifrostCatalogError {
             Self::ReservedColumn(column) => PublicError::ReservedColumn { column },
             Self::TableNotFound(table) => PublicError::TableNotFound { table },
             Self::FingerprintMismatch(table) => PublicError::FingerprintMismatch { table },
+            Self::Layout(error) => error,
             Self::MetadataMismatch(detail) | Self::InvalidBinding(detail) => {
                 PublicError::MetadataMismatch { detail }
             }

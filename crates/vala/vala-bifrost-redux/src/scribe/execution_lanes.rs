@@ -1088,6 +1088,13 @@ pub(crate) struct EncodeParquetOp {
     pub(crate) object_base: String,
     /// Exact pre-writer footer child retained through sealed inspection.
     pub(crate) footer_reservation: crate::scribe::memory::EncodedFooterReservation,
+    /// Registered physical write recipe resolved before the lane was entered.
+    ///
+    /// The blocking CPU lane owns no catalog capability, so the seal and
+    /// persistence dispatchers resolve the table's canonical layout and hand
+    /// it down with the operation, mirroring how an Iceberg write task binds
+    /// its spec and sort order before the first row is written.
+    pub(crate) layout: std::sync::Arc<crate::catalog::layout::PhysicalLayout>,
 }
 
 /// Results produced by [`ScribePersistenceCpuPool`].
@@ -1129,6 +1136,7 @@ fn execute_persistence_operation(
                 scratch_dir,
                 object_base,
                 footer_reservation,
+                layout,
             } = *operation;
             match candidate {
                 Some(candidate) => encode_candidate(
@@ -1140,6 +1148,7 @@ fn execute_persistence_operation(
                         first_ordinal,
                         scratch_dir: &scratch_dir,
                         object_base: &object_base,
+                        layout: &layout,
                     },
                     footer_reservation,
                 ),
@@ -1149,6 +1158,7 @@ fn execute_persistence_operation(
                     tenant,
                     &scratch_dir,
                     &object_base,
+                    &layout,
                     footer_reservation,
                 ),
             }
@@ -2319,9 +2329,7 @@ mod tests {
         SealKey::new(
             crate::test_support::tenant(),
             crate::catalog::TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "idle"),
-            crate::scribe::seal_key::EventDay::new(
-                chrono::NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid test day"),
-            ),
+            crate::test_support::day_partition(2026, 1, 1),
         )
     }
 

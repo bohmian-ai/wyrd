@@ -4,14 +4,13 @@ use crate::catalog::TableRef;
 use crate::namespaces::BifrostNamespace;
 use crate::scribe::ScribeImpl;
 use crate::scribe::audit_envelope::encode_audit_event;
-use crate::scribe::seal_key::{EventDay, SealKey};
+use crate::scribe::seal_key::SealKey;
 use crate::scribe::stream_identity::NodeId;
 use crate::scribe::wal::{WalConfig, WalWriter};
 use arrow::array::{Int32Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
-use chrono::NaiveDate;
 use opendal::services::Memory;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -87,7 +86,7 @@ fn seal_key(tenant: DataTenantId, table: &str) -> SealKey {
     SealKey::new(
         tenant,
         TableRef::new(BifrostNamespace::Bifrost, table),
-        EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 24).expect("test day")),
+        crate::test_support::day_partition(2026, 7, 24),
     )
 }
 

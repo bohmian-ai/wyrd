@@ -1,7 +1,7 @@
 mod pg_tests {
     //! Postgres-backed contract tests for organization-qualified file-list identity.
 
-    use chrono::{DateTime, NaiveDate, Utc};
+    use chrono::{DateTime, Utc};
     use opendal::services::Memory;
     use secrecy::ExposeSecret;
     use sqlx::types::Uuid;
@@ -22,7 +22,7 @@ mod pg_tests {
     use vala_bifrost_redux::scribe::file_list_writer::{
         PublicationFenceBarrier, insert_and_audit_fenced_with_barrier,
     };
-    use vala_bifrost_redux::scribe::seal_key::{EventDay, SealKey};
+    use vala_bifrost_redux::scribe::seal_key::SealKey;
     use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
     use vala_sql::queries::file_list::{HotFileCatalog, HotFileCut};
     use wyrd_dev_fixtures::pg::PgFixture;
@@ -108,6 +108,7 @@ mod pg_tests {
                 false,
             )],
             tenant,
+            physical_layout: None,
             audit: None,
         }
     }
@@ -130,7 +131,7 @@ mod pg_tests {
             row_count: 1,
             min_event_time: event_time,
             max_event_time: event_time,
-            partition_day: NaiveDate::from_ymd_opt(1970, 1, 1).expect("date"),
+            partition: vala_bifrost_redux::partition_fixtures::day_partition(1970, 1, 1),
             node_id,
             writer_epoch,
             wal_lsn_min,
@@ -155,7 +156,7 @@ mod pg_tests {
             row_count: 1,
             min_event_time: event_time,
             max_event_time: event_time,
-            partition_day: NaiveDate::from_ymd_opt(1970, 1, 1).expect("date"),
+            partition: vala_bifrost_redux::partition_fixtures::day_partition(1970, 1, 1),
             node_id,
             writer_epoch: 7,
             wal_lsn_min: 10,
@@ -253,7 +254,13 @@ mod pg_tests {
         let (group_columns, group_predicate) = index_shape(&pool, "file_list_group_idx").await;
         assert_eq!(
             group_columns,
-            ["data_tenant_id", "namespace", "table_name", "partition_day"]
+            [
+                "data_tenant_id",
+                "namespace",
+                "table_name",
+                "partition_granularity",
+                "partition_start"
+            ]
         );
         assert!(
             group_predicate
@@ -340,6 +347,7 @@ mod pg_tests {
                 table: table.clone(),
                 user_fields: user_fields.clone(),
                 tenant: tenant_a,
+                physical_layout: None,
                 audit: None,
             })
             .await
@@ -349,6 +357,7 @@ mod pg_tests {
                 table: table.clone(),
                 user_fields,
                 tenant: tenant_b,
+                physical_layout: None,
                 audit: None,
             })
             .await
@@ -710,7 +719,7 @@ mod pg_tests {
         let seal_key = SealKey::new(
             tenant_a,
             logical_table(),
-            EventDay::new(NaiveDate::from_ymd_opt(1970, 1, 1).expect("date")),
+            vala_bifrost_redux::partition_fixtures::day_partition(1970, 1, 1),
         );
         let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant_b)
             .await

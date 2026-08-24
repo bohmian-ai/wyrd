@@ -433,8 +433,7 @@ async fn build_bifrost_external_dependencies(
         .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
     );
     let node_id = NodeId::generate();
-    let advertise_addr =
-        std::env::var("WYRD_SERVER_ADVERTISE_ADDR").unwrap_or_else(|_| "127.0.0.1:0".to_owned());
+    let advertise_addr = config.oracle.advertise_addr.clone();
     let cluster = Arc::new(ClusterRegistry::new(
         postgres.vala().clone(),
         ClusterNodeId::new(node_id.as_uuid()),
@@ -997,7 +996,7 @@ pub async fn compose_bifrost(
                 .as_ref()
                 .map(|runtime| runtime.registered_role().fencing_token),
             credentials: peer_credentials,
-            tls: deployment_profile.is_production().then_some(peer_tls),
+            tls: peer_tls,
             authority: forwarding_authority,
             config: OracleConfig::default(),
         },
@@ -1105,7 +1104,7 @@ pub async fn build_state(
         &config.bifrost.oracle.peer_ca_certificate_path,
         &config.bifrost.oracle.peer_server_name,
     ) {
-        (Some(path), Some(server_name)) => OraclePeerTls::new(
+        (Some(path), Some(server_name)) => Some(OraclePeerTls::new(
             std::fs::read(path).map_err(|error| {
                 ServerBootError::OraclePeer(format!(
                     "failed to read Oracle peer CA certificate {}: {error}",
@@ -1113,13 +1112,13 @@ pub async fn build_state(
                 ))
             })?,
             server_name.clone(),
-        ),
+        )),
         _ if config.role.serves_api() => {
             return Err(ServerBootError::OraclePeer(
                 "API-serving Bifrost targets require Oracle peer TLS CA and server name".to_owned(),
             ));
         }
-        _ => OraclePeerTls::new(Vec::new(), "unused.invalid".to_owned()),
+        _ => None,
     };
     let bifrost = compose_bifrost(crate::state::BifrostBuildInputs {
         target: config.role,
@@ -1335,8 +1334,8 @@ struct OracleRoleBuilder<'a> {
     spill_root: Option<std::path::PathBuf>,
     /// Shared outbound peer bearer owner.
     peer_credentials: Arc<dyn OraclePeerCredentials>,
-    /// Immutable peer TLS trust policy.
-    peer_tls: OraclePeerTls,
+    /// Immutable peer TLS trust policy, present only when CA material is configured.
+    peer_tls: Option<OraclePeerTls>,
     /// Shared query audit used by the leader and role-local tenant tripwires.
     audit: Option<Arc<OracleAuditPublisher>>,
     /// One process-wide shutdown token injected into every Oracle owner.
@@ -1533,11 +1532,11 @@ impl<'a> OracleRoleBuilder<'a> {
                 "Oracle peer credential lacks platform service authority".to_owned(),
             ));
         }
-        let remote_transport = Arc::new(if deployment_profile.is_production() {
+        let remote_transport = Arc::new(if let Some(tls) = tail_tls.clone() {
             TonicOraclePeerTransport::with_credentials_and_tls(
                 Arc::clone(&cluster),
                 Arc::clone(&peer_credentials),
-                tail_tls.clone(),
+                tls,
             )
         } else {
             TonicOraclePeerTransport::with_credentials(
@@ -1545,12 +1544,12 @@ impl<'a> OracleRoleBuilder<'a> {
                 Arc::clone(&peer_credentials),
             )
         });
-        let lifecycle_transport = Arc::new(if deployment_profile.is_production() {
+        let lifecycle_transport = Arc::new(if let Some(tls) = tail_tls.clone() {
             crate::oracle::OracleLifecycleTransport::with_tls(
                 Arc::clone(&cluster),
                 Arc::clone(&peer_credentials),
                 node_id,
-                tail_tls.clone(),
+                tls,
             )
         } else {
             crate::oracle::OracleLifecycleTransport::new(
@@ -1577,7 +1576,7 @@ impl<'a> OracleRoleBuilder<'a> {
         let tail_discovery = Arc::new(crate::oracle::RegistryTailStreamDiscovery::new(
             Arc::clone(&cluster),
             Arc::clone(&peer_credentials),
-            Some(tail_tls),
+            tail_tls,
             Arc::clone(&tail_authority)
                 as Arc<dyn vala_bifrost_redux::scribe::tail_rpc::TailTicketMinter>,
             node_id,

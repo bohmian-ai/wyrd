@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
-use chrono::Datelike;
 use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::{
     MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
@@ -39,6 +38,28 @@ use sha2::{Digest, Sha256};
 use crate::parquet::object_uploader::{
     BifrostParquetUploader, BifrostUploadRole, ParquetObjectIdentity,
 };
+
+/// Recovers the table's canonical Bloom column union from its Iceberg
+/// properties.
+///
+/// Forge rewrites must reproduce the exact `bifrost-writer-v2` footer recipe
+/// that Scribe wrote, so the union is read back from the registered table
+/// rather than reconstructed from a fixed list.
+///
+/// # Errors
+/// Returns [`ForgeError::InvalidConfig`] when the property is absent or is not
+/// the canonical JSON string array; Forge fails closed rather than writing a
+/// file whose footer misrepresents the recipe.
+pub(crate) fn table_bloom_columns(
+    metadata: &iceberg::spec::TableMetadata,
+) -> Result<Arc<[String]>, super::ForgeError> {
+    crate::catalog::layout::PhysicalLayout::bloom_columns_from_property(
+        metadata
+            .properties()
+            .get(crate::catalog::layout::BLOOM_COLUMNS_PROPERTY),
+    )
+    .map_err(|detail| super::ForgeError::InvalidConfig { detail })
+}
 
 /// Attempt-local aggregate pool view recording the root reservation peak.
 #[derive(Debug)]
@@ -361,7 +382,7 @@ impl Drop for ForgeAttemptResources {
 
 #[cfg(test)]
 use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat};
-use iceberg::spec::{DataFile, Literal, SchemaRef as IcebergSchemaRef, Struct};
+use iceberg::spec::{DataFile, SchemaRef as IcebergSchemaRef, Struct};
 use iceberg::writer::file_writer::ParquetWriter;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
@@ -570,8 +591,14 @@ pub(crate) struct RewriteRequest<'a> {
     pub(crate) iceberg_schema: IcebergSchemaRef,
     /// Ordered source files read through the shared bounded rewrite contract.
     pub(crate) source_files: &'a [RewriteSourceFile],
-    /// Physical day partition shared by every source file.
-    pub(crate) partition_day: chrono::NaiveDate,
+    /// Exact physical time partition shared by every source file.
+    pub(crate) partition: crate::catalog::layout::TimePartition,
+    /// Canonical Bloom column union registered for the destination table.
+    ///
+    /// Forge reproduces the same footer recipe Scribe wrote, so a rewritten
+    /// file is byte-comparable to its inputs under one `bifrost-writer-v2`
+    /// marker rather than silently losing or gaining Bloom filters.
+    pub(crate) bloom_columns: Arc<[String]>,
     /// Destination Iceberg table location used in `DataFile` paths.
     pub(crate) table_location: &'a str,
     /// Destination partition-spec identifier.
@@ -762,6 +789,8 @@ struct RewriteBatchState {
     scratch_peak_bytes: Option<Arc<AtomicU64>>,
     /// Per-output NaN counts keyed by Iceberg field ID.
     nan_value_counts: NanValueCountVisitor,
+    /// Canonical Bloom column union applied to every output this state writes.
+    bloom_columns: Arc<[String]>,
 }
 
 impl RewriteBatchState {
@@ -769,7 +798,7 @@ impl RewriteBatchState {
     /// a shared `DataFusion` reservation.
     #[cfg(test)]
     fn new() -> Self {
-        Self::with_reservation(None, None, std::env::temp_dir())
+        Self::with_reservation(None, None, std::env::temp_dir(), Arc::from([]))
     }
 
     /// Create state with an optional shared-pool output reservation.
@@ -777,6 +806,7 @@ impl RewriteBatchState {
         reservation: Option<datafusion::execution::memory_pool::MemoryReservation>,
         output_scratch: Option<OutputScratchReservation>,
         scratch_dir: PathBuf,
+        bloom_columns: Arc<[String]>,
     ) -> Self {
         let output_scratch_limit_bytes = output_scratch
             .as_ref()
@@ -787,6 +817,7 @@ impl RewriteBatchState {
         Self {
             writer: None,
             footer_phase: None,
+            bloom_columns,
             scratch_dir,
             scratch_path: None,
             writer_rows: 0,
@@ -910,6 +941,7 @@ impl RewriteBatchState {
                     Some(bifrost_writer_properties_with_metadata(
                         batch.num_rows(),
                         metadata,
+                        &self.bloom_columns,
                     )),
                 )
                 .map_err(|error| ForgeError::Parquet {
@@ -1121,8 +1153,8 @@ struct OutputMetadataRequest {
     table_path: String,
     /// Object-store key stamped into the writer-v2 footer for later reads.
     object_identity: String,
-    /// Day partition assigned to the entire output.
-    partition_day: chrono::NaiveDate,
+    /// Exact time partition assigned to the entire output.
+    partition: crate::catalog::layout::TimePartition,
     /// Iceberg partition-spec identifier for the destination table.
     partition_spec_id: i32,
     /// Iceberg sort-order identifier for the destination table.
@@ -1475,7 +1507,7 @@ fn finalize_output_metadata(request: OutputMetadataRequest) -> Result<FinalizedO
         expected_schema,
         table_path,
         object_identity,
-        partition_day,
+        partition,
         partition_spec_id,
         sort_order_id,
         checksum_chunk_bytes,
@@ -1529,10 +1561,8 @@ fn finalize_output_metadata(request: OutputMetadataRequest) -> Result<FinalizedO
     .map_err(|error| ForgeError::Invariant {
         detail: format!("Forge output metadata conversion failed: {error}"),
     })?;
-    let partition = Struct::from_iter([Some(Literal::date(
-        partition_day.num_days_from_ce() - 719_163,
-    ))]);
-    file.partition(partition)
+    let partition_value = Struct::from_iter([Some(partition.iceberg_partition_literal())]);
+    file.partition(partition_value)
         .partition_spec_id(partition_spec_id)
         .sort_order_id(sort_order_id);
     let file = file.build().map_err(|error| ForgeError::Invariant {
@@ -1687,6 +1717,7 @@ impl ForgeRewritePipeline {
                 Some(reservation),
                 None,
                 self.runtime().scratch_path().to_path_buf(),
+                Arc::clone(&request.bloom_columns),
             )
             .fail(ForgeError::ExecutionEnvelopeExceeded {
                 resource: "memory",
@@ -1700,6 +1731,7 @@ impl ForgeRewritePipeline {
                     Some(reservation),
                     None,
                     self.runtime().scratch_path().to_path_buf(),
+                    Arc::clone(&request.bloom_columns),
                 )
                 .fail(error);
             }
@@ -1708,6 +1740,7 @@ impl ForgeRewritePipeline {
             Some(reservation),
             Some(output_scratch),
             self.runtime().scratch_path().to_path_buf(),
+            Arc::clone(&request.bloom_columns),
         );
         while let Some(batch) = tokio::select! {
             () = stop.cancelled() => return state.fail(ForgeError::Shutdown),
@@ -1789,6 +1822,7 @@ impl ForgeRewritePipeline {
                 None,
                 None,
                 self.runtime().scratch_path().to_path_buf(),
+                Arc::clone(&request.bloom_columns),
             ),
         );
         let schema = Arc::clone(&request.schema);
@@ -2176,7 +2210,7 @@ impl ForgeRewritePipeline {
             return Err(ForgeError::Shutdown);
         }
         let object_identity = object_path.clone();
-        let partition_day = request.partition_day;
+        let partition = request.partition;
         let partition_spec_id = request.partition_spec_id;
         let sort_order_id = request.sort_order_id;
         let iceberg_schema = Arc::clone(&request.iceberg_schema);
@@ -2200,7 +2234,7 @@ impl ForgeRewritePipeline {
                 expected_schema,
                 table_path,
                 object_identity,
-                partition_day,
+                partition,
                 partition_spec_id,
                 sort_order_id,
                 checksum_chunk_bytes,
@@ -3151,6 +3185,100 @@ mod tests {
 
     use super::*;
 
+    /// The one exact-partition contract Forge's rewrite pipeline depends on.
+    ///
+    /// A rewrite must reproduce the destination table's registered physical
+    /// identity rather than a fixed recipe, so this proves the three seams
+    /// that carry it: the Bloom union is recovered from the table property and
+    /// fails closed when it is absent or malformed; `Hour` and `Day` are
+    /// distinct identities that survive the Iceberg transform round trip and
+    /// never alias one another; and the object-path projection separates them.
+    #[test]
+    fn time_partition_rewrite_contract() {
+        use crate::catalog::layout::{PhysicalLayout, TimeGranularity, TimePartition};
+
+        // The Bloom union is table state, not a recipe: a rewrite reads it back
+        // from the property the catalog persisted.
+        let stored = vec![
+            "data_tenant_id".to_owned(),
+            "run_id".to_owned(),
+            "customer".to_owned(),
+        ];
+        let property = serde_json::to_string(&stored).expect("fixture serializes");
+        let recovered = PhysicalLayout::bloom_columns_from_property(Some(&property))
+            .expect("a well-formed property is recovered verbatim");
+        assert_eq!(recovered.as_ref(), stored.as_slice());
+
+        // Absent or malformed table state fails closed rather than silently
+        // rewriting with no Bloom filters at all.
+        assert!(PhysicalLayout::bloom_columns_from_property(None).is_err());
+        let malformed = "not-a-json-array".to_owned();
+        assert!(PhysicalLayout::bloom_columns_from_property(Some(&malformed)).is_err());
+
+        // Hour and Day are distinct identities. The same instant is a legal
+        // boundary for both, and the two must never compare or hash equal.
+        let midnight = chrono::DateTime::from_timestamp(1_787_443_200, 0)
+            .expect("fixture instant is representable");
+        let hour = TimePartition::new(TimeGranularity::Hour, midnight)
+            .expect("midnight is an exact hour boundary");
+        let day = TimePartition::new(TimeGranularity::Day, midnight)
+            .expect("midnight is an exact day boundary");
+        assert_ne!(hour, day);
+        assert_eq!(hour.start_utc(), day.start_utc());
+        assert_ne!(hour.granularity_tag(), day.granularity_tag());
+
+        // Each survives the Iceberg transform round trip Forge uses to stamp
+        // and re-read a rewritten file's partition, and the transform values
+        // are not interchangeable between granularities.
+        for partition in [hour, day] {
+            let value = partition.iceberg_transform_value();
+            let round_tripped =
+                TimePartition::from_iceberg_transform_value(partition.granularity(), value)
+                    .expect("a stamped transform value is recoverable");
+            assert_eq!(round_tripped, partition);
+        }
+        assert_ne!(
+            hour.iceberg_transform_value(),
+            day.iceberg_transform_value()
+        );
+        assert_ne!(
+            hour.iceberg_partition_literal(),
+            day.iceberg_partition_literal(),
+            "hour stamps an int literal and day a date literal"
+        );
+
+        // Non-boundary instants are unrepresentable, so a rewrite cannot invent
+        // a partition that no writer could have produced.
+        let mid_hour = chrono::DateTime::from_timestamp(1_787_443_200 + 1_800, 0)
+            .expect("fixture instant is representable");
+        assert!(TimePartition::new(TimeGranularity::Hour, mid_hour).is_err());
+        assert!(TimePartition::new(TimeGranularity::Day, mid_hour).is_err());
+
+        // The object-path projection separates the two, so an hourly and a
+        // daily rewrite of the same instant cannot collide on one key.
+        assert_ne!(hour.as_path_components(), day.as_path_components());
+        assert!(
+            hour.as_path_components()
+                .contains("partition_granularity=hour")
+        );
+        assert!(
+            day.as_path_components()
+                .contains("partition_granularity=day")
+        );
+
+        // Durable file-list columns rebuild the same identity a rewrite grouped
+        // on, and an unknown token is refused rather than defaulted.
+        for partition in [hour, day] {
+            let rebuilt = TimePartition::from_durable_columns(
+                partition.granularity_str(),
+                partition.start_utc(),
+            )
+            .expect("durable columns rebuild the exact partition");
+            assert_eq!(rebuilt, partition);
+        }
+        assert!(TimePartition::from_durable_columns("month", midnight).is_err());
+    }
+
     /// Builds the tenant-qualified table binding retained by attempt tests.
     fn attempt_binding() -> crate::catalog::TenantTableBinding {
         crate::catalog::TenantTableBinding::resolve((
@@ -3546,8 +3674,12 @@ mod tests {
             record_count: 1,
             schema_id: 1,
             partition_spec_id: 1,
-            partition_day: chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
-                .expect("fixed parity day is valid"),
+            partition: crate::catalog::layout::TimePartition::new(
+                crate::catalog::TimeGranularity::Hour,
+                chrono::DateTime::from_timestamp(1_767_312_000, 0)
+                    .expect("fixed parity instant is representable"),
+            )
+            .expect("fixed parity instant is an exact hour boundary"),
             sort_order_id: Some(1),
             writer_recipe_version: Some(BIFROST_WRITER_RECIPE_VERSION.to_owned()),
             min_event_time: chrono::DateTime::from_timestamp(1, 0)
@@ -3821,7 +3953,12 @@ mod tests {
             vec![Arc::new(Int64Array::from_iter_values(0..4096))],
         )
         .expect("batch");
-        let mut state = RewriteBatchState::with_reservation(None, None, root.path().to_path_buf());
+        let mut state = RewriteBatchState::with_reservation(
+            None,
+            None,
+            root.path().to_path_buf(),
+            Arc::from(["data_tenant_id".to_owned()]),
+        );
         let phase = Arc::new(ForgeFooterPhase::new(8, 32).expect("footer phase"));
         state.footer_phase = Some(ForgeFooterPhaseGuard {
             owner: Arc::clone(&phase),
@@ -3928,7 +4065,7 @@ mod tests {
             .content(DataContentType::Data)
             .file_path("table/data/forge.parquet".to_owned())
             .file_format(DataFileFormat::Parquet)
-            .partition(Struct::from_iter([Some(Literal::date(0))]))
+            .partition(Struct::from_iter([Some(iceberg::spec::Literal::date(0))]))
             .partition_spec_id(0)
             .record_count(7)
             .file_size_in_bytes(128)

@@ -40,7 +40,7 @@ use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::{CardRef, CardRefScope};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    AcquireTailFenceRequest as DomainAcquireTailFenceRequest, EventDay,
+    AcquireTailFenceRequest as DomainAcquireTailFenceRequest,
     SchemaFingerprint as WireSchemaFingerprint, TailCursor,
     TailPageRequest as DomainTailPageRequest, TenantTableBinding,
 };
@@ -133,8 +133,8 @@ fn mint_service_jwt(state: &AppState, tenant: DataTenantId) -> String {
 ///
 /// Production Scribe admission bounds event time to a window around now, so a
 /// frozen literal would age out of the accepted range and start failing. The
-/// batch timestamp and the fence request's `event_day` both derive from this
-/// one value so they always name the same UTC day.
+/// batch timestamp and the fence request's time partition both derive from
+/// this one value so they always name the same UTC partition.
 fn fixture_event_time() -> DateTime<Utc> {
     Utc::now()
 }
@@ -176,8 +176,10 @@ fn non_empty_tail_request(tenant: DataTenantId) -> DomainAcquireTailFenceRequest
             namespace: "bifrost".to_owned(),
             table: "events".to_owned(),
         },
-        event_day: EventDay::new(fixture_event_time().format("%Y-%m-%d").to_string())
-            .expect("fixture day is valid"),
+        time_partition: vala_bifrost_redux::catalog::TimeGranularity::Hour
+            .bucket(fixture_event_time())
+            .expect("fixture instant buckets to an exact hour")
+            .to_wire(),
         exclusive_sealed: TailCursor {
             writer_epoch: 1,
             wal_lsn: 0,
@@ -519,6 +521,7 @@ async fn embedded_ingest_resolves_catalog_and_durably_acknowledges_arrow() {
             tenant,
             TableRef::new(BifrostNamespace::Datasets, TABLE_NAME),
             vec![Field::new("value", DataType::Int64, false)],
+            None,
             None,
         )
         .await

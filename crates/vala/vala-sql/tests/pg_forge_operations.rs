@@ -2532,7 +2532,11 @@ mod pg_tests {
                 base_snapshot_id: 100,
                 committed_snapshot_id: None,
                 partition_spec_id: 3,
-                partition_day: "2026-09-01".to_owned(),
+                time_partition: wyrd_spec::vala::api::TimePartitionWire::new(
+                    wyrd_spec::vala::api::TimeGranularityWire::Day,
+                    chrono::DateTime::from_timestamp(1_756_684_800, 0).expect("fixture instant"),
+                )
+                .expect("fixture instant is an exact day boundary"),
                 target_file_size_bytes: 1024,
                 input_paths: vec![StoragePath::new("table/live-a.parquet").expect("valid path")],
                 output_paths: vec![
@@ -2556,7 +2560,7 @@ mod pg_tests {
                 AuditDetail::ForgeIcebergRewrite {
                     base_snapshot_id,
                     partition_spec_id,
-                    partition_day,
+                    time_partition,
                     target_file_size_bytes,
                     input_paths,
                     output_paths,
@@ -2569,7 +2573,7 @@ mod pg_tests {
                     base_snapshot_id: *base_snapshot_id,
                     committed_snapshot_id: Some(101),
                     partition_spec_id: *partition_spec_id,
-                    partition_day: partition_day.clone(),
+                    time_partition: *time_partition,
                     target_file_size_bytes: *target_file_size_bytes,
                     input_paths: input_paths.clone(),
                     output_paths: output_paths.clone(),

@@ -7,9 +7,10 @@ use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::vala::api::QueryTerminalOutcome;
 
 use crate::catalog::TableRef;
+use crate::catalog::layout::{TimeGranularity, TimePartition};
 use crate::contracts::ScribeError;
 use crate::namespaces::BifrostNamespace;
-use crate::scribe::seal_key::{EventDay, SealKey};
+use crate::scribe::seal_key::SealKey;
 use crate::scribe::wal::{PreparedWalAppend, WalConfig, WalWriter};
 
 /// Closed Oracle telemetry label domains exported only for benchmark contracts.
@@ -142,11 +143,11 @@ impl WalBenchSupport {
         let seal_key = SealKey::new(
             self.tenant,
             TableRef::new(BifrostNamespace::Bifrost, "bench"),
-            EventDay::new(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).ok_or_else(|| {
-                ScribeError::Internal {
-                    detail: "benchmark WAL epoch day is invalid".to_owned(),
-                }
-            })?),
+            TimePartition::new(TimeGranularity::Day, chrono::DateTime::UNIX_EPOCH).map_err(
+                |error| ScribeError::Internal {
+                    detail: format!("benchmark WAL epoch partition is invalid: {error}"),
+                },
+            )?,
         );
         Ok(PreparedWalAppendFixture {
             append: PreparedWalAppend::new(

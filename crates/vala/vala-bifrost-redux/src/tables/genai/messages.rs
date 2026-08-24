@@ -2,8 +2,9 @@ use arrow::datatypes::Field;
 
 use crate::tables::fields::{boolean, fixed_binary, float64, int64, ts_us_utc, utf8};
 use crate::tables::{
-    CorrelationPolicy, DeclaredIndex, DomainTable, IndexKind, PayloadClass, SortKey,
+    CorrelationPolicy, DomainTable, PayloadClass, hourly_layout, sort_asc_nulls_first, sort_desc,
 };
+use wyrd_spec::vala::api::PhysicalLayoutWire;
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 pub struct MessagesTable;
@@ -66,33 +67,13 @@ impl DomainTable for MessagesTable {
         ]
     }
 
-    fn sort_keys() -> Vec<SortKey> {
-        vec![
-            SortKey {
-                column: WYRD_EVENT_TIME.into(),
-                ascending: false,
-                nulls_first: false,
-            },
-            SortKey {
-                column: "conversation_id".into(),
-                ascending: true,
-                nulls_first: true,
-            },
-        ]
-    }
-
-    fn declared_indexes() -> Vec<DeclaredIndex> {
-        vec![
-            DeclaredIndex {
-                name: "messages_conversation_id_lookup".into(),
-                columns: vec!["conversation_id".into()],
-                kind: IndexKind::BloomFilter,
-            },
-            DeclaredIndex {
-                name: "messages_model_bloom".into(),
-                columns: vec!["request_model".into()],
-                kind: IndexKind::BloomFilter,
-            },
-        ]
+    fn physical_layout() -> PhysicalLayoutWire {
+        hourly_layout(
+            vec![
+                sort_desc(WYRD_EVENT_TIME),
+                sort_asc_nulls_first("conversation_id"),
+            ],
+            &["conversation_id", "request_model"],
+        )
     }
 }

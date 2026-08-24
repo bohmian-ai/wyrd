@@ -182,6 +182,24 @@ pub enum ForgeError {
 }
 
 impl ForgeError {
+    /// Builds a grouping failure from a borrowed diagnostic.
+    ///
+    /// This exists so row-decoding helpers can be parameterized by the variant
+    /// their caller must surface without duplicating the struct literal.
+    #[must_use]
+    pub fn group(detail: String) -> Self {
+        Self::Group { detail }
+    }
+
+    /// Builds a reconciliation failure from a borrowed diagnostic.
+    ///
+    /// Companion to [`Self::group`] for recovery paths that must fail closed as
+    /// a reconciliation mismatch rather than a planning-time grouping refusal.
+    #[must_use]
+    pub fn reconciliation(detail: String) -> Self {
+        Self::Reconciliation { detail }
+    }
+
     /// Classifies one execution failure without parsing diagnostic strings.
     #[must_use]
     pub fn failure_class(&self) -> ForgeFailureClass {

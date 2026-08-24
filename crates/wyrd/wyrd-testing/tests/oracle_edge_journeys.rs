@@ -14,7 +14,7 @@ use axum::body::Body;
 use axum::http::{HeaderValue, Response, header};
 use axum::routing::post;
 use axum::{Json, Router};
-use chrono::{NaiveDate, Utc};
+use chrono::{NaiveDate, Timelike, Utc};
 use opendal::Buffer;
 use parquet::arrow::ArrowWriter;
 use secrecy::SecretString;
@@ -42,9 +42,8 @@ use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    AuditDecision, AuditEvent, AuditResult, AuthMethod, BifrostQueryRequest, EventDay,
-    FreshnessPolicy, QueryClass, QueryTerminalErrorCode, QueryTerminalOutcome, QueryWarning,
-    VisibilityMode,
+    AuditDecision, AuditEvent, AuditResult, AuthMethod, BifrostQueryRequest, FreshnessPolicy,
+    QueryClass, QueryTerminalErrorCode, QueryTerminalOutcome, QueryWarning, VisibilityMode,
 };
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_testing::bifrost::{
@@ -65,6 +64,22 @@ use wyrd_tonic::wyrd::v1 as proto;
 use wyrd_tonic::wyrd::v1::bifrost_query_service_client::BifrostQueryServiceClient;
 use wyrd_tonic::wyrd::v1::vala_query_service_client::ValaQueryServiceClient;
 use wyrd_tonic::wyrd::v1::{QueryTracesRequest, QueryWindow};
+
+/// Exact hour partition the live Scribe tail is writing into right now.
+///
+/// Registrations in these journeys take the default `hour(wyrd_event_time)`
+/// layout, so tail observation must name the current hour rather than the day.
+fn current_hour_partition() -> wyrd_spec::vala::api::TimePartitionWire {
+    wyrd_spec::vala::api::TimePartitionWire::new(
+        wyrd_spec::vala::api::TimeGranularityWire::Hour,
+        chrono::Utc::now()
+            .with_minute(0)
+            .and_then(|value| value.with_second(0))
+            .and_then(|value| value.with_nanosecond(0))
+            .expect("truncating to the hour is always representable"),
+    )
+    .expect("an hour-truncated instant is an exact hourly partition boundary")
+}
 
 type JourneyError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -1978,10 +1993,9 @@ async fn pg_bifrost_oracle_two_server_scribe_tail_boundary_journey() {
     ingest(&writer_client, &format!("vala.bifrost.{table}"), &[3])
         .await
         .expect("post-seal write on Server A");
-    let event_day =
-        EventDay::new(chrono::Utc::now().format("%Y-%m-%d").to_string()).expect("event day");
+    let event_day = current_hour_partition();
     cluster
-        .observe_live_tail(&format!("vala.bifrost.{table}"), event_day.clone())
+        .observe_live_tail(&format!("vala.bifrost.{table}"), event_day)
         .await
         .expect("observation-only live-tail discovery");
     assert_eq!(
@@ -2195,7 +2209,7 @@ async fn pg_bifrost_oracle_heterogeneous_distributed_query_journey() {
     ingest(&writer_client, &format!("vala.bifrost.{table}"), &[4, 5])
         .await
         .expect("live rows");
-    let day = EventDay::new(chrono::Utc::now().format("%Y-%m-%d").to_string()).expect("event day");
+    let day = current_hour_partition();
     cluster
         .observe_live_tail(&format!("vala.bifrost.{table}"), day)
         .await
@@ -3803,7 +3817,14 @@ async fn seed_foreign_trace_row(
             row_count: 1,
             min_event_time: Utc::now(),
             max_event_time: Utc::now(),
-            partition_day: NaiveDate::from_ymd_opt(2023, 11, 14).ok_or("invalid fixture day")?,
+            partition: vala_bifrost_redux::catalog::layout::TimePartition::new(
+                vala_bifrost_redux::catalog::layout::TimeGranularity::Day,
+                NaiveDate::from_ymd_opt(2023, 11, 14)
+                    .ok_or("invalid fixture day")?
+                    .and_hms_opt(0, 0, 0)
+                    .ok_or("invalid fixture midnight")?
+                    .and_utc(),
+            )?,
             node_id: uuid::Uuid::now_v7(),
             writer_epoch: 1,
             wal_lsn_min: 9_101,
@@ -3854,10 +3875,7 @@ async fn oracle_production_telemetry_contract() {
         .await
         .expect("telemetry live ingest");
     cluster
-        .observe_live_tail(
-            &format!("vala.bifrost.{table}"),
-            EventDay::new(chrono::Utc::now().format("%Y-%m-%d").to_string()).expect("event day"),
-        )
+        .observe_live_tail(&format!("vala.bifrost.{table}"), current_hour_partition())
         .await
         .expect("telemetry tail observation");
     assert_eq!(
@@ -4281,7 +4299,7 @@ async fn public_roundtrip(
     if flush {
         ingest_server.flush_bifrost().await?;
     } else {
-        let day = EventDay::new(chrono::Utc::now().format("%Y-%m-%d").to_string())?;
+        let day = current_hour_partition();
         cluster
             .observe_live_tail(&format!("vala.bifrost.{table}"), day)
             .await?;
@@ -4349,6 +4367,7 @@ async fn register_table(
                 Field::new("value", DataType::Utf8, false),
             ],
             tenant,
+            physical_layout: None,
             audit: None,
         })
         .await?;
@@ -4369,6 +4388,7 @@ async fn register_paired_table(
             table: TableRef::new(BifrostNamespace::Bifrost, table),
             user_fields: vec![Field::new("row_id", DataType::Int64, false)],
             tenant,
+            physical_layout: None,
             audit: None,
         })
         .await?;
@@ -4741,7 +4761,10 @@ async fn seed_foreign_hot_row(
             row_count: 1,
             min_event_time: Utc::now(),
             max_event_time: Utc::now(),
-            partition_day: NaiveDate::from_ymd_opt(1970, 1, 1).ok_or("invalid fixture day")?,
+            partition: vala_bifrost_redux::catalog::layout::TimePartition::new(
+                vala_bifrost_redux::catalog::layout::TimeGranularity::Day,
+                chrono::DateTime::UNIX_EPOCH,
+            )?,
             node_id: uuid::Uuid::now_v7(),
             writer_epoch: 1,
             wal_lsn_min: 9_001,
@@ -4794,7 +4817,10 @@ async fn seed_missing_hot_row(
             row_count: 1,
             min_event_time: Utc::now(),
             max_event_time: Utc::now(),
-            partition_day: NaiveDate::from_ymd_opt(1970, 1, 1).ok_or("invalid fixture day")?,
+            partition: vala_bifrost_redux::catalog::layout::TimePartition::new(
+                vala_bifrost_redux::catalog::layout::TimeGranularity::Day,
+                chrono::DateTime::UNIX_EPOCH,
+            )?,
             node_id: uuid::Uuid::now_v7(),
             writer_epoch: 1,
             wal_lsn_min: 9_002,

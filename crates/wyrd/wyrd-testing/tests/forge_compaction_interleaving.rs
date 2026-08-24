@@ -538,7 +538,11 @@ async fn live_replacement_context(
         .discover_live_rewrites_for_test(
             &fixture.binding,
             &table,
-            chrono::NaiveDate::from_ymd_opt(2026, 7, 15).expect("current day"),
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 15)
+                .expect("current day")
+                .and_hms_opt(0, 0, 0)
+                .expect("midnight")
+                .and_utc(),
         )
         .await
         .expect("wrapped catalog live rewrite discovery");
@@ -849,7 +853,11 @@ async fn prepare_cancelled_live_rewrite(
         .discover_live_rewrites_for_test(
             &fixture.binding,
             &table,
-            chrono::NaiveDate::from_ymd_opt(2026, 7, 15).expect("current day"),
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 15)
+                .expect("current day")
+                .and_hms_opt(0, 0, 0)
+                .expect("midnight")
+                .and_utc(),
         )
         .await
         .expect("live rewrite discovery");
@@ -1285,7 +1293,15 @@ async fn cancellation_at_reset_delete_keeps_prepared_without_terminal() {
     assert_eq!(
         lifecycle.publisher.try_publish(StagingFileCommitted::new(
             fixture.binding.clone(),
-            chrono::NaiveDate::from_ymd_opt(2026, 7, 15).expect("partition day"),
+            vala_bifrost_redux::catalog::layout::TimePartition::new(
+                vala_bifrost_redux::catalog::layout::TimeGranularity::Day,
+                chrono::NaiveDate::from_ymd_opt(2026, 7, 15)
+                    .expect("partition day")
+                    .and_hms_opt(0, 0, 0)
+                    .expect("midnight")
+                    .and_utc(),
+            )
+            .expect("midnight is a daily partition boundary"),
         )),
         StagingPublishOutcome::Published
     );
@@ -2113,7 +2129,15 @@ async fn periodic_and_hints_serialize_without_false_terminal_audit() {
         Arc::clone(&hinted.object_store),
     );
     hinted_lifecycle.hold_next_attempt();
-    let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("partition day");
+    let day = vala_bifrost_redux::catalog::layout::TimePartition::new(
+        vala_bifrost_redux::catalog::layout::TimeGranularity::Day,
+        chrono::NaiveDate::from_ymd_opt(2026, 7, 14)
+            .expect("partition day")
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight")
+            .and_utc(),
+    )
+    .expect("midnight is a daily partition boundary");
     assert_eq!(
         hinted_lifecycle
             .publisher
@@ -2276,7 +2300,15 @@ async fn forge_commit_cancellation_windows_reconcile_once() {
         Arc::clone(&before.object_store),
     );
     before_lifecycle.hold_next_attempt();
-    let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("partition day");
+    let day = vala_bifrost_redux::catalog::layout::TimePartition::new(
+        vala_bifrost_redux::catalog::layout::TimeGranularity::Day,
+        chrono::NaiveDate::from_ymd_opt(2026, 7, 14)
+            .expect("partition day")
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight")
+            .and_utc(),
+    )
+    .expect("midnight is a daily partition boundary");
     assert_eq!(
         before_lifecycle
             .publisher

@@ -31,6 +31,7 @@ pub mod telemetry;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_projection_oracle;
 pub mod wal;
+mod write_recipe;
 
 #[cfg(test)]
 #[path = "tests/pg_scribe_crash_injection.rs"]
@@ -41,6 +42,9 @@ mod pg_scribe_restart;
 #[cfg(test)]
 #[path = "tests/scribe_persistence_path.rs"]
 mod scribe_persistence_path;
+#[cfg(test)]
+#[path = "tests/time_partition.rs"]
+mod tests;
 #[cfg(test)]
 #[path = "tests/wal_closeout.rs"]
 mod wal_closeout;
@@ -153,7 +157,7 @@ pub fn constrained_datafusion_memory_pool(limit_bytes: usize) -> Arc<dyn MemoryP
 /// Memtable key for per-bucket row-count inspection.
 ///
 /// Type alias for [`SealKey`] — memtable buckets are keyed by
-/// (`tenant`, `table`, `event_day`).
+/// (`tenant`, `table`, `time_partition`).
 pub type MemtableKey = SealKey;
 
 /// The three concrete execution lanes owned by the Bifrost server boot path.
@@ -2713,7 +2717,7 @@ impl ScribeImpl {
                 if let Some(publisher) = &self.staging_file_publisher {
                     let _ = publisher.try_publish(crate::maintenance::StagingFileCommitted::new(
                         binding,
-                        token.seal_key.day.as_naive_date(),
+                        token.seal_key.partition,
                     ));
                 }
                 Ok::<(), ScribeError>(())
@@ -2830,7 +2834,7 @@ impl ScribeImpl {
                 if let Some(publisher) = &self.staging_file_publisher {
                     let _ = publisher.try_publish(crate::maintenance::StagingFileCommitted::new(
                         binding,
-                        token.seal_key.day.as_naive_date(),
+                        token.seal_key.partition,
                     ));
                 }
                 Ok(true)

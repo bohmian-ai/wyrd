@@ -723,10 +723,10 @@ impl<'forge> ForgeScheduler<'forge> {
             &demand.table_ref,
         )?;
         let table = self.forge.load_table(&binding.table_ident()).await?;
-        let current_day = self.forge.core.clock.now()?.date_naive();
+        let now = self.forge.core.clock.now()?;
         let discovered = self
             .forge
-            .discover_live_rewrites(&binding, &table, current_day)
+            .discover_live_rewrites(&binding, &table, now)
             .await?;
         let compaction_debt_files = discovered
             .groups()
@@ -749,7 +749,7 @@ impl<'forge> ForgeScheduler<'forge> {
             })?;
         let mut candidates = self
             .forge
-            .discover_staging_task_candidates(&binding, current_day, self.capacity)
+            .discover_staging_task_candidates(&binding, now, self.capacity)
             .await?;
         if candidates.is_empty() {
             candidates = discovered
@@ -914,12 +914,7 @@ impl<'forge> ForgeScheduler<'forge> {
         &self,
         binding: &crate::catalog::TenantTableBinding,
     ) -> Result<bool, ForgeError> {
-        let resource = ForgeGroupKey {
-            tenant: binding.tenant,
-            table_ref: binding.table_ref.clone(),
-            partition_day: chrono::NaiveDate::MIN,
-        }
-        .audit_resource();
+        let resource = ForgeGroupKey::table_audit_resource(binding.tenant, &binding.table_ref);
         let operations = ForgeOperations::new(&resource, ForgeOperationFamily::IcebergRewrite)
             .map_err(ForgeError::Sql)?;
         let mut conn = self

@@ -1107,6 +1107,7 @@ impl MaterializerBackend for RealMaterializerBackend<'_> {
                     Field::new("payload", DataType::Utf8, false),
                 ],
                 tenant,
+                physical_layout: None,
                 audit: None,
             })
             .await

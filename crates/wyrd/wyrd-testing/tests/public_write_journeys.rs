@@ -573,6 +573,7 @@ async fn pg_bifrost_scribe_shard_rotation_replay_journey() {
                 Field::new("value", DataType::Utf8, false),
             ],
             tenant,
+            physical_layout: None,
             audit: None,
         })
         .await
@@ -586,6 +587,7 @@ async fn pg_bifrost_scribe_shard_rotation_replay_journey() {
                     Field::new("value", DataType::Utf8, false),
                 ],
                 tenant,
+                physical_layout: None,
                 audit: None,
             })
             .await
@@ -1191,6 +1193,7 @@ async fn pg_bifrost_scribe_shard_rotation_replay_journey() {
                 Field::new("value", DataType::Utf8, false),
             ],
             tenant: unrelated_tenant,
+            physical_layout: None,
             audit: None,
         })
         .await
@@ -1615,6 +1618,7 @@ async fn run_multitenant_public_journey() -> Result<(), Box<dyn std::error::Erro
                     Field::new("value", DataType::Utf8, false),
                 ],
                 tenant,
+                physical_layout: None,
                 audit: None,
             })
             .await?;
@@ -1962,6 +1966,7 @@ async fn fresh_boot_provisions_redux_before_first_write() {
                 Field::new("value", DataType::Utf8, false),
             ],
             tenant,
+            physical_layout: None,
             audit: None,
         })
         .await
@@ -2017,6 +2022,7 @@ async fn run_closeout_journey(
                 Field::new("value", DataType::Utf8, false),
             ],
             tenant,
+            physical_layout: None,
             audit: None,
         })
         .await?;
@@ -2225,6 +2231,7 @@ async fn run_delayed_fsync_journey(
                 Field::new("value", DataType::Utf8, false),
             ],
             tenant,
+            physical_layout: None,
             audit: None,
         })
         .await?;

@@ -3,14 +3,14 @@ use std::time::{Duration as StdDuration, Instant};
 
 use arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use chrono::{Duration, NaiveDate, Utc};
+use chrono::{Duration, Utc};
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
 use vala_bifrost_redux::scribe::file_list_writer::FileListCommitKey;
 use vala_bifrost_redux::scribe::memtable::Memtable;
-use vala_bifrost_redux::scribe::seal_key::{EventDay, SealKey};
+use vala_bifrost_redux::scribe::seal_key::SealKey;
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use vala_bifrost_redux::scribe::tail_rpc::{
     FetchLiveTailService, LocalTailPage, ScribeTailReader, TailFenceConfig, TailReadError,
@@ -19,8 +19,8 @@ use vala_bifrost_redux::scribe::wal::{ScribeAppendMeta, WalLsn};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
     AcquireTailFenceRequest, AuditDecision, AuditEvent, AuditResult, AuthMethod,
-    EventDay as WireEventDay, SchemaFingerprint as WireSchemaFingerprint, TailCursor,
-    TailPageRequest, TenantTableBinding as WireBinding,
+    SchemaFingerprint as WireSchemaFingerprint, TailCursor, TailPageRequest,
+    TenantTableBinding as WireBinding,
 };
 
 /// Returns the production-shaped root capability used by direct tail fixtures.
@@ -97,7 +97,8 @@ fn fence_request(binding: &TenantTableBinding, stream: StreamIdentity) -> Acquir
             namespace: "bifrost".to_owned(),
             table: binding.table_ref.name.clone(),
         },
-        event_day: WireEventDay::new("2026-07-14").expect("fixture event day"),
+        time_partition: vala_bifrost_redux::partition_fixtures::day_partition(2026, 7, 14)
+            .to_wire(),
         exclusive_sealed: TailCursor {
             writer_epoch: u64::try_from(stream.writer_epoch.as_i64()).expect("positive epoch"),
             wal_lsn: 0,
@@ -115,7 +116,7 @@ fn append(memtable: &Memtable, tenant: DataTenantId, table: &TableRef, lsn: u64,
     let key = SealKey::new(
         tenant,
         table.clone(),
-        EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("date")),
+        vala_bifrost_redux::partition_fixtures::day_partition(2026, 7, 14),
     );
     memtable
         .insert(
@@ -348,7 +349,7 @@ async fn seal_and_rotation_preserve_fence() {
     let key = SealKey::new(
         tenant,
         table.clone(),
-        EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("date")),
+        vala_bifrost_redux::partition_fixtures::day_partition(2026, 7, 14),
     );
     let frozen = memtable.freeze(&key).expect("active generation seals");
     let first = reader

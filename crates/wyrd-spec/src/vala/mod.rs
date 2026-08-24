@@ -46,7 +46,7 @@ pub use audit_detail::{
     audit_detail_canonical_json,
 };
 pub use correlation::{CorrelationColumns, CorrelationContext};
-pub use error::BifrostError;
+pub use error::{BifrostError, PhysicalLayoutField, PhysicalLayoutViolation};
 pub use managed_columns::{
     CARD_REF, CARD_UID, DATA_TENANT_ID, ManagedColumnSet, PRINCIPAL_ID,
     RESERVED_CORRELATION_COLUMNS, RESERVED_MANAGED_COLUMNS, RUN_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME,

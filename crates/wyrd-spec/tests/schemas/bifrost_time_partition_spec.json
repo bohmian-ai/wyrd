@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TimePartitionSpecWire",
+  "description": "The single time-partition declaration of a Bifrost table.\n\n`column` must be `wyrd_event_time`; it is carried explicitly so the wire contract stays self-describing and generated SDKs do not have to assume the invariant.",
+  "type": "object",
+  "required": [
+    "column",
+    "granularity"
+  ],
+  "properties": {
+    "column": {
+      "description": "Partitioned column; only `wyrd_event_time` is accepted.",
+      "type": "string"
+    },
+    "granularity": {
+      "description": "Partition granularity.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/TimeGranularityWire"
+        }
+      ]
+    }
+  },
+  "definitions": {
+    "TimeGranularityWire": {
+      "description": "Time-partition granularity on the wire.\n\nBifrost v1 partitions every table on `wyrd_event_time` and admits exactly these two Iceberg-native transforms; nothing else is representable.",
+      "oneOf": [
+        {
+          "description": "One partition per UTC hour.",
+          "type": "string",
+          "enum": [
+            "hour"
+          ]
+        },
+        {
+          "description": "One partition per UTC day.",
+          "type": "string",
+          "enum": [
+            "day"
+          ]
+        }
+      ]
+    }
+  }
+}

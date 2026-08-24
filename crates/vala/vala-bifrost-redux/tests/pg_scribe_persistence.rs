@@ -29,7 +29,6 @@ use vala_bifrost_redux::scribe::audit_envelope::encode_audit_event;
 use vala_bifrost_redux::scribe::file_list_writer::PublicationFenceBarrier;
 use vala_bifrost_redux::scribe::memory::MemoryCategory;
 use vala_bifrost_redux::scribe::persistence::PersistenceFaults;
-use vala_bifrost_redux::scribe::seal_key::EventDay;
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use vala_bifrost_redux::scribe::tail_rpc::FetchLiveTailRequest;
 use vala_bifrost_redux::scribe::wal::{WalConfig, WalLsn, WalWriter};
@@ -591,6 +590,7 @@ async fn register_replay_tables<T: AsRef<str>>(
                     .map(|index| Field::new(format!("value_{index}"), DataType::Int64, false))
                     .collect(),
                 tenant,
+                physical_layout: None,
                 audit: None,
             })
             .await
@@ -612,7 +612,15 @@ fn write_replay_records<T: AsRef<str>>(
     rows_per_generation: usize,
 ) -> usize {
     let mut decoded_bytes = 0_usize;
-    let replay_day = chrono::Utc::now().date_naive();
+    let replay_day = vala_bifrost_redux::catalog::layout::TimePartition::new(
+        vala_bifrost_redux::catalog::layout::TimeGranularity::Day,
+        chrono::Utc::now()
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight")
+            .and_utc(),
+    )
+    .expect("midnight is a daily partition boundary");
     for table_name in table_names {
         let table_name = table_name.as_ref();
         for value in 1_i64..=generations {
@@ -626,7 +634,7 @@ fn write_replay_records<T: AsRef<str>>(
             let key = vala_bifrost_redux::scribe::seal_key::SealKey::new(
                 tenant,
                 table(table_name),
-                vala_bifrost_redux::scribe::seal_key::EventDay::new(replay_day),
+                replay_day,
             );
             wal.append_and_commit_for_replay_test(&key, batch_id, &audit, &data)
                 .expect("complete replay WAL batch");
@@ -796,6 +804,44 @@ async fn append_one(fixture: &PersistenceFixture, table_name: &str, value: i64) 
     append_with_batch_id(fixture, table_name, value, uuid::Uuid::now_v7()).await;
 }
 
+/// Registers the control row the seal path resolves its write recipe from.
+///
+/// These fixtures drive `ScribeImpl` directly rather than through the catalog,
+/// so they own the one registration production requires before a table may be
+/// sealed. The user projection is recovered from the batch about to be appended
+/// — every managed column the ingest path stamps is filtered out and then
+/// re-derived through the production helper — so the registered layout names
+/// exactly the columns the seal will see.
+///
+/// Registration is skipped when a control row for the table already exists, so a
+/// fixture that also registers through the catalog keeps that row rather than
+/// racing a second one against the unique `(data_tenant_id, fqn)` constraint.
+///
+/// # Panics
+///
+/// Panics when the schema does not canonicalize, or when the tenant connection,
+/// lookup, upsert, or commit fails.
+async fn register_control_row(fixture: &PersistenceFixture, table_name: &str, rows: &RecordBatch) {
+    let user_fields = rows
+        .schema()
+        .fields()
+        .iter()
+        .filter(|field| !crate::control_row_fixture::is_managed_column(field.name()))
+        .map(|field| field.as_ref().clone())
+        .collect::<Vec<_>>();
+    let schema = Schema::new(vala_bifrost_redux::schema::with_managed_columns(
+        user_fields,
+    ));
+    crate::control_row_fixture::register_control_row(
+        fixture.database.vala_postgres(),
+        fixture.tenant,
+        BifrostNamespace::Bifrost.as_str(),
+        table_name,
+        &schema,
+    )
+    .await;
+}
+
 /// Append one generation carrying a caller-chosen `batch_id`.
 ///
 /// [`append_one`] mints a fresh `now_v7` id per call, which spreads generations
@@ -809,6 +855,7 @@ async fn append_with_batch_id(
     batch_id: uuid::Uuid,
 ) {
     let rows = batch(value);
+    register_control_row(fixture, table_name, &rows).await;
     fixture
         .scribe
         .append(ScribeAppend {
@@ -883,14 +930,25 @@ async fn hot_values_for_cut(
         .scribe
         .tail_service()
         .expect("production tail service");
-    let today = EventDay::new(chrono::Utc::now().date_naive());
+    // These fixtures register the hourly omission default, so the cut must be
+    // expressed in hours. The range spans the previous hour as well as the
+    // current one so a batch appended just before an hour boundary is still
+    // inside the requested cut.
+    let now = chrono::Utc::now();
+    let granularity = vala_bifrost_redux::catalog::layout::TimeGranularity::Hour;
+    let start_partition = granularity
+        .bucket(now - chrono::Duration::hours(1))
+        .expect("a truncated instant is an exact hourly boundary");
+    let end_partition = granularity
+        .bucket(now)
+        .expect("a truncated instant is an exact hourly boundary");
     service
         .fetch_hot_batches(FetchLiveTailRequest {
             binding: TenantTableBinding::resolve((fixture.tenant, table(table_name)))
                 .expect("tenant table binding"),
             target_stream: service.stream(),
-            start_day: today,
-            end_day: today,
+            start_partition,
+            end_partition,
             after_lsn: WalLsn::ZERO,
             persisted_lsn_ranges: persisted_ranges,
             required_columns: vec!["value".to_owned()],
@@ -1380,6 +1438,7 @@ async fn pg_later_candidate_failure_and_cancellation_leave_no_partial_generation
             ],
         )
         .expect("whole candidate batch");
+        register_control_row(&fixture, table_name, &rows).await;
         fixture
             .scribe
             .append(ScribeAppend {
@@ -1732,6 +1791,7 @@ async fn multi_candidate_generation_publishes_one_fenced_set_with_deterministic_
             ],
         )
         .expect("whole candidate batch");
+        register_control_row(&fixture, table_name, &rows).await;
         fixture
             .scribe
             .append(ScribeAppend {
@@ -1979,7 +2039,7 @@ async fn three_generations_same_key_remain_fifo_and_file_paths_are_object_keys()
     assert_eq!(objects.len(), 3);
     assert!(persisted.windows(2).all(|pair| pair[0].0 < pair[1].0));
     for (_, _, path) in persisted {
-        assert_eq!(path.matches("day=").count(), 1);
+        assert_eq!(path.matches("partition_granularity=").count(), 1);
         assert!(
             objects.contains(&path),
             "file_list path must be an object key"
@@ -2454,6 +2514,7 @@ async fn near_full_root_immutable_owner_still_allows_incremental_candidate_progr
         ],
     )
     .expect("near-target persistence batch");
+    register_control_row(&fixture, "persistence_range_overlap", &rows).await;
     let request_id = RequestId::now_v7();
     let measured_wire_bytes =
         vala_bifrost_redux::gate::limits::BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES;
@@ -2534,6 +2595,16 @@ async fn native_caller_event_time_lands_on_two_partition_days() {
         first_day_micros,
         second_day_micros,
     );
+    register_control_row(
+        &fixture,
+        "native_event_time_events",
+        &RecordBatch::new_empty(Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]))),
+    )
+    .await;
     fixture
         .scribe
         .ingest_native_for_test(frame)
@@ -2552,28 +2623,43 @@ async fn native_caller_event_time_lands_on_two_partition_days() {
         2,
         "two distinct event days must publish two file-list entries"
     );
-    let day_paths: Vec<String> = object_paths(&fixture)
+    // Object keys carry the exact partition, not a bare day: the table resolves
+    // to the hourly omission default, so two event times a day apart land in two
+    // distinct `partition_start=` segments under one `partition_granularity`.
+    let partition_paths: Vec<String> = object_paths(&fixture)
         .await
         .into_iter()
-        .filter(|path| path.contains("day="))
+        .filter(|path| path.contains("partition_start="))
         .collect();
     assert_eq!(
-        day_paths.len(),
+        partition_paths.len(),
         2,
-        "two distinct event days must land in two partition-day objects: {day_paths:?}"
+        "two distinct event days must land in two partition objects: {partition_paths:?}"
     );
-    let mut days: Vec<String> = day_paths
+    let mut partitions: Vec<String> = partition_paths
         .iter()
         .filter_map(|path| {
             path.split('/')
-                .find(|segment| segment.starts_with("day="))
+                .find(|segment| segment.starts_with("partition_start="))
                 .map(str::to_owned)
         })
         .collect();
-    days.sort();
-    days.dedup();
-    assert_eq!(days.len(), 2, "partition days must be distinct: {days:?}");
-    assert!(days.iter().any(|day| day.contains(&first_day.to_string())));
-    assert!(days.iter().any(|day| day.contains(&second_day.to_string())));
+    partitions.sort();
+    partitions.dedup();
+    assert_eq!(
+        partitions.len(),
+        2,
+        "partitions must be distinct: {partitions:?}"
+    );
+    assert!(
+        partitions
+            .iter()
+            .any(|partition| partition.contains(&first_day.to_string()))
+    );
+    assert!(
+        partitions
+            .iter()
+            .any(|partition| partition.contains(&second_day.to_string()))
+    );
     fixture.stop().await;
 }

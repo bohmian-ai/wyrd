@@ -10,12 +10,13 @@ use crate::scribe::admission::EventTimeWindow;
 use crate::scribe::audit_envelope::encode_audit_event;
 use crate::scribe::memory::MemoryCategory;
 use crate::scribe::replay::replay_wal_directory;
-use crate::scribe::seal_key::{EventDay, SealKey};
+use crate::scribe::seal_key::SealKey;
 use crate::scribe::stream_identity::NodeId;
 use crate::scribe::wal::{SegmentHeader, WalConfig, WalWriter};
 use arrow::array::{Int64Array, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
+use chrono::Datelike as _;
 use opendal::services::Memory;
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -30,7 +31,7 @@ fn key(tenant: DataTenantId, table: &str) -> SealKey {
     SealKey::new(
         tenant,
         TableRef::new(BifrostNamespace::Bifrost, table),
-        fixture_event_day(),
+        fixture_event_partition(),
     )
 }
 
@@ -44,19 +45,20 @@ fn fixture_event_time_micros() -> i64 {
     EventTimeWindow::default().admitted_event_time_micros(1)
 }
 
-/// The event day covering [`fixture_event_time_micros`].
+/// The exact daily partition covering [`fixture_event_time_micros`].
 ///
 /// Both come from the same instant, so a `SealKey` built here cannot drift
-/// onto a different calendar day than the row it seals.
+/// onto a different partition than the row it seals. Built through the shared
+/// [`crate::partition_fixtures::day_partition`] constructor so this module
+/// never derives its own partition boundary.
 ///
 /// # Panics
 /// Panics when the derived instant is not representable as a UTC date.
-fn fixture_event_day() -> EventDay {
-    EventDay::new(
-        chrono::DateTime::from_timestamp_micros(fixture_event_time_micros())
-            .expect("derived event time must be representable")
-            .date_naive(),
-    )
+fn fixture_event_partition() -> crate::catalog::layout::TimePartition {
+    let date = chrono::DateTime::from_timestamp_micros(fixture_event_time_micros())
+        .expect("derived event time must be representable")
+        .date_naive();
+    crate::partition_fixtures::day_partition(date.year(), date.month(), date.day())
 }
 
 /// Encode the fixed closeout audit payload.

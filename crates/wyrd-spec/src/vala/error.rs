@@ -697,4 +697,169 @@ column to let the server stamp receipt time."
         /// The inclusive future bound used for this batch (epoch-microseconds rendered as a string).
         future_bound: String,
     },
+
+    /// A register request declared a physical layout Bifrost cannot canonicalize.
+    ///
+    /// The fault is reported before any SQL transaction, Iceberg call, or audit
+    /// append, so no durable state changed. The triple
+    /// (`field`, `violation`, `column`) names the exact declaration at fault.
+    #[error("invalid physical layout for table {table}: {field:?}/{violation:?}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_400_BIFROST_INVALID_PHYSICAL_LAYOUT",
+        status = 400,
+        title = "Invalid Bifrost physical layout",
+        remediation = "Use wyrd_event_time with hour or day, unique schema columns, and supported sort/null values."
+    )]
+    InvalidPhysicalLayout {
+        /// Canonical `<namespace>.<name>` of the table being registered.
+        table: String,
+        /// Declaration slot that failed validation.
+        field: PhysicalLayoutField,
+        /// Why the declaration in `field` is not acceptable.
+        violation: PhysicalLayoutViolation,
+        /// Offending bounded schema/layout identifier when the fault names one.
+        column: Option<String>,
+    },
+
+    /// A register retry supplied a valid layout that differs from the layout the
+    /// table is already registered with.
+    ///
+    /// Fingerprint equality is checked first, so this variant means the schema
+    /// matched and only the canonical physical layout diverged. Nothing was
+    /// mutated.
+    #[error("physical layout mismatch for table: {table}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_409_BIFROST_LAYOUT_MISMATCH",
+        status = 409,
+        title = "Bifrost physical layout mismatch",
+        remediation = "Retry with the table's registered physical layout or register a different table."
+    )]
+    PhysicalLayoutMismatch {
+        /// Canonical `<namespace>.<name>` of the conflicting table.
+        table: String,
+    },
+}
+
+/// Declaration slot named by [`BifrostError::InvalidPhysicalLayout`].
+///
+/// Each variant maps one-to-one onto a field of the public
+/// `PhysicalLayoutWire` request shape so a client can point at the exact
+/// declaration it must correct.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PhysicalLayoutField {
+    /// The `partition` object itself, including its required presence.
+    Partition,
+    /// The partition's `granularity` token.
+    Granularity,
+    /// An entry of `sort_keys`, identified by its `column`.
+    SortKey,
+    /// A sort key's `direction` token.
+    SortDirection,
+    /// A sort key's `null_order` token.
+    NullOrder,
+    /// An entry of `bloom_columns`.
+    BloomColumn,
+}
+
+/// Why the declaration named by [`PhysicalLayoutField`] was rejected.
+///
+/// The set is closed so SDKs can branch on it without parsing prose; no backend
+/// or parser message crosses the public boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PhysicalLayoutViolation {
+    /// A required declaration was absent.
+    Missing,
+    /// The same identifier was declared more than once in one list.
+    Duplicate,
+    /// The declaration referenced a server-owned managed column.
+    ReservedManagedColumn,
+    /// The declaration referenced a name absent from the physical schema.
+    UnknownColumn,
+    /// The column exists but cannot serve this declaration slot.
+    UnsupportedColumn,
+    /// The token is outside the closed set this slot accepts.
+    UnsupportedValue,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every declaration slot in the public layout contract, in declaration order.
+    const ALL_FIELDS: [PhysicalLayoutField; 6] = [
+        PhysicalLayoutField::Partition,
+        PhysicalLayoutField::Granularity,
+        PhysicalLayoutField::SortKey,
+        PhysicalLayoutField::SortDirection,
+        PhysicalLayoutField::NullOrder,
+        PhysicalLayoutField::BloomColumn,
+    ];
+
+    /// Every rejection class in the public layout contract, in declaration order.
+    const ALL_VIOLATIONS: [PhysicalLayoutViolation; 6] = [
+        PhysicalLayoutViolation::Missing,
+        PhysicalLayoutViolation::Duplicate,
+        PhysicalLayoutViolation::ReservedManagedColumn,
+        PhysicalLayoutViolation::UnknownColumn,
+        PhysicalLayoutViolation::UnsupportedColumn,
+        PhysicalLayoutViolation::UnsupportedValue,
+    ];
+
+    /// Pins the generated code/status of both layout errors and proves every
+    /// `(field, violation)` pair survives a public serde round trip carrying only
+    /// bounded identifiers.
+    #[test]
+    fn physical_layout_error_contract() {
+        let mismatch = BifrostError::PhysicalLayoutMismatch {
+            table: "obs.events".to_owned(),
+        };
+        assert_eq!(mismatch.code(), "WYRD_VALA_409_BIFROST_LAYOUT_MISMATCH");
+        assert_eq!(mismatch.status(), 409);
+
+        for field in ALL_FIELDS {
+            for violation in ALL_VIOLATIONS {
+                for column in [None, Some("wyrd_event_time".to_owned())] {
+                    let error = BifrostError::InvalidPhysicalLayout {
+                        table: "obs.events".to_owned(),
+                        field,
+                        violation,
+                        column: column.clone(),
+                    };
+                    assert_eq!(
+                        error.code(),
+                        "WYRD_VALA_400_BIFROST_INVALID_PHYSICAL_LAYOUT"
+                    );
+                    assert_eq!(error.status(), 400);
+
+                    let json = serde_json::to_string(&error).expect("layout error serializes");
+                    let restored: BifrostError =
+                        serde_json::from_str(&json).expect("layout error deserializes");
+                    assert_eq!(restored, error);
+                    assert!(
+                        !json.contains("panic") && json.len() < 512,
+                        "public layout error must stay bounded: {json}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Confirms the closed token vocabulary is snake_case on the wire so SDKs can
+    /// branch on the exact strings the generated schemas publish.
+    #[test]
+    fn physical_layout_tokens_are_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&PhysicalLayoutViolation::ReservedManagedColumn)
+                .expect("violation serializes"),
+            "\"reserved_managed_column\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PhysicalLayoutField::SortDirection).expect("field serializes"),
+            "\"sort_direction\""
+        );
+    }
 }

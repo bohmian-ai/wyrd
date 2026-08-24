@@ -1469,8 +1469,8 @@ async fn pg_bifrost_forge_manifest_maintenance_precedes_expiry() {
         .forge_clock()
         .advance(chrono::Duration::days(1) + chrono::Duration::minutes(3))
         .expect("close supervised maintenance staging partition");
-    let latest_uncompacted_partition: Option<chrono::NaiveDate> = sqlx::query_scalar(
-        "SELECT max(partition_day) FROM vala.file_list \
+    let latest_uncompacted_partition: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+        "SELECT max(partition_start) FROM vala.file_list \
          WHERE data_tenant_id=$1 AND namespace=$2 AND table_name=$3 \
          AND NOT compacted",
     )
@@ -1481,13 +1481,12 @@ async fn pg_bifrost_forge_manifest_maintenance_precedes_expiry() {
     .await
     .expect("supervised maintenance uncompacted partition day");
     assert!(
-        latest_uncompacted_partition.is_some_and(|partition_day| {
-            partition_day
+        latest_uncompacted_partition.is_some_and(|partition_start| {
+            partition_start
                 < server
                     .forge_clock()
                     .now()
                     .expect("supervised maintenance Forge clock")
-                    .date_naive()
         }),
         "all uncompacted maintenance inputs must belong to a closed partition"
     );
@@ -2141,6 +2140,7 @@ async fn prepare_forge_convergence_table(
                 Field::new("value", DataType::Utf8, false),
             ],
             tenant: cluster.data_tenant_id(),
+            physical_layout: None,
             audit: None,
         })
         .await?;
@@ -2377,7 +2377,15 @@ async fn unhealthy_scratch_takeover_journey() {
     telemetry_scheduler
         .record_hint(StagingFileCommitted::new(
             fixture.binding.clone(),
-            chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("takeover hint day"),
+            vala_bifrost_redux::catalog::layout::TimePartition::new(
+                vala_bifrost_redux::catalog::layout::TimeGranularity::Day,
+                chrono::NaiveDate::from_ymd_opt(2026, 7, 14)
+                    .expect("takeover hint day")
+                    .and_hms_opt(0, 0, 0)
+                    .expect("midnight")
+                    .and_utc(),
+            )
+            .expect("midnight is a daily partition boundary"),
         ))
         .await
         .expect("takeover telemetry hint");
@@ -2765,8 +2773,12 @@ async fn forge_orphan_cleanup_lifecycle_journey() {
     let server = start_maintenance_journey_server().await;
     let fixture = native_forge_group(&server, "journey_orphan_cleanup").await;
     commit_journey_staging_snapshot(&server, &fixture).await;
-    let (input_path, partition_day): (String, chrono::NaiveDate) = sqlx::query_as(
-        "SELECT file_path,partition_day FROM vala.file_list \
+    let (input_path, partition_granularity, partition_start): (
+        String,
+        String,
+        chrono::DateTime<chrono::Utc>,
+    ) = sqlx::query_as(
+        "SELECT file_path, partition_granularity, partition_start FROM vala.file_list \
          WHERE data_tenant_id=$1 AND namespace=$2 AND table_name=$3 \
          AND committed_snapshot_id IS NOT NULL ORDER BY id LIMIT 1",
     )
@@ -2776,6 +2788,11 @@ async fn forge_orphan_cleanup_lifecycle_journey() {
     .fetch_one(fixture.operator_pool.pool())
     .await
     .expect("journey live input path");
+    let partition = vala_bifrost_redux::catalog::layout::TimePartition::from_durable_columns(
+        &partition_granularity,
+        partition_start,
+    )
+    .expect("durable file-list rows carry an exact time partition");
     let table = fixture
         .catalog
         .load_table(&fixture.binding.table_ident())
@@ -2806,7 +2823,7 @@ async fn forge_orphan_cleanup_lifecycle_journey() {
         base_snapshot_id,
         committed_snapshot_id: None,
         partition_spec_id: table.metadata().default_partition_spec_id(),
-        partition_day: partition_day.to_string(),
+        time_partition: partition.to_wire(),
         target_file_size_bytes: 1,
         input_paths: vec![StoragePath::new(input_path).expect("journey live input storage path")],
         output_paths: vec![
@@ -2833,7 +2850,7 @@ async fn forge_orphan_cleanup_lifecycle_journey() {
     .expect("journey reset lease query")
     .expect("journey reset lease");
     forge
-        .append_prepared_live_rewrite_for_test(&mut lease, &fixture.binding, partition_day, detail)
+        .append_prepared_live_rewrite_for_test(&mut lease, &fixture.binding, partition, detail)
         .await
         .expect("journey Prepared live rewrite");
     let reconcile_now = chrono::Utc::now()
@@ -2957,17 +2974,23 @@ async fn supporting_preprepared_verified_output_orphan_gc_journey() {
         .forge_clock()
         .advance(chrono::Duration::days(1) + chrono::Duration::minutes(3))
         .expect("age committed files beyond the live-rewrite cutoff");
-    let partition_day: chrono::NaiveDate = sqlx::query_scalar(
-        "SELECT partition_day FROM vala.file_list \
-         WHERE data_tenant_id=$1 AND namespace=$2 AND table_name=$3 \
-         AND committed_snapshot_id IS NOT NULL ORDER BY partition_day LIMIT 1",
+    let (partition_granularity, partition_start): (String, chrono::DateTime<chrono::Utc>) =
+        sqlx::query_as(
+            "SELECT partition_granularity, partition_start FROM vala.file_list \
+             WHERE data_tenant_id=$1 AND namespace=$2 AND table_name=$3 \
+             AND committed_snapshot_id IS NOT NULL ORDER BY partition_start LIMIT 1",
+        )
+        .bind(fixture.tenant.as_uuid())
+        .bind(&fixture.binding.logical_namespace)
+        .bind(&fixture.binding.table_name)
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("live-rewrite partition cutoff");
+    let partition_day = vala_bifrost_redux::catalog::layout::TimePartition::from_durable_columns(
+        &partition_granularity,
+        partition_start,
     )
-    .bind(fixture.tenant.as_uuid())
-    .bind(&fixture.binding.logical_namespace)
-    .bind(&fixture.binding.table_name)
-    .fetch_one(fixture.operator_pool.pool())
-    .await
-    .expect("live-rewrite partition cutoff");
+    .expect("durable file-list rows carry an exact time partition");
     assert_eq!(
         server
             .forge_publisher()
@@ -3195,8 +3218,8 @@ async fn supervised_prepared_audit_failure_and_gc_journey() {
         .forge_clock()
         .advance(chrono::Duration::days(1) + chrono::Duration::minutes(3))
         .expect("close supervised publication staging partition");
-    let latest_uncompacted_partition: Option<chrono::NaiveDate> = sqlx::query_scalar(
-        "SELECT max(partition_day) FROM vala.file_list \
+    let latest_uncompacted_partition: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+        "SELECT max(partition_start) FROM vala.file_list \
          WHERE data_tenant_id=$1 AND namespace=$2 AND table_name=$3 \
          AND NOT compacted",
     )
@@ -3207,13 +3230,12 @@ async fn supervised_prepared_audit_failure_and_gc_journey() {
     .await
     .expect("supervised publication uncompacted partition day");
     assert!(
-        latest_uncompacted_partition.is_some_and(|partition_day| {
-            partition_day
+        latest_uncompacted_partition.is_some_and(|partition_start| {
+            partition_start
                 < server
                     .forge_clock()
                     .now()
                     .expect("supervised publication Forge clock")
-                    .date_naive()
         }),
         "all uncompacted publication inputs must belong to a closed partition"
     );
@@ -4769,6 +4791,7 @@ async fn provision_tenants(server: &WyrdTestServer, scenario: Scenario) -> Vec<T
                     Field::new("value", DataType::Utf8, false),
                 ],
                 tenant: id,
+                physical_layout: None,
                 audit: None,
             })
             .await

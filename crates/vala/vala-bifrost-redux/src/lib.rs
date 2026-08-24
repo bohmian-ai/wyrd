@@ -25,8 +25,60 @@ pub mod schema;
 pub mod scribe;
 pub mod tables;
 
+/// Exact-partition fixtures shared by unit, integration, and harness tests.
+///
+/// The constructors live in the library rather than in each test file so every
+/// tier builds partitions through the one checked
+/// [`TimePartition::new`](crate::catalog::layout::TimePartition::new) path and
+/// no test invents its own boundary arithmetic.
+#[cfg(any(test, feature = "test-support"))]
+pub mod partition_fixtures {
+    /// Builds the exact daily partition starting at `year-month-day` UTC.
+    ///
+    /// Tests that only need *some* valid partition use this instead of
+    /// re-deriving a midnight boundary at every call site.
+    ///
+    /// # Panics
+    /// Panics when the supplied date is not a real calendar date.
+    pub fn day_partition(year: i32, month: u32, day: u32) -> crate::catalog::layout::TimePartition {
+        let start = chrono::NaiveDate::from_ymd_opt(year, month, day)
+            .expect("fixture date is a real calendar date")
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is a valid time")
+            .and_utc();
+        crate::catalog::layout::TimePartition::new(
+            crate::catalog::layout::TimeGranularity::Day,
+            start,
+        )
+        .expect("midnight is a daily partition boundary")
+    }
+
+    /// Builds the exact hourly partition starting at `year-month-day hour` UTC.
+    ///
+    /// # Panics
+    /// Panics when the supplied date or hour is not a real UTC instant.
+    pub fn hour_partition(
+        year: i32,
+        month: u32,
+        day: u32,
+        hour: u32,
+    ) -> crate::catalog::layout::TimePartition {
+        let start = chrono::NaiveDate::from_ymd_opt(year, month, day)
+            .expect("fixture date is a real calendar date")
+            .and_hms_opt(hour, 0, 0)
+            .expect("fixture hour is a valid time")
+            .and_utc();
+        crate::catalog::layout::TimePartition::new(
+            crate::catalog::layout::TimeGranularity::Hour,
+            start,
+        )
+        .expect("a whole hour is an hourly partition boundary")
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
+    pub(crate) use crate::partition_fixtures::{day_partition, hour_partition};
     use std::collections::HashMap;
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU64, Ordering};

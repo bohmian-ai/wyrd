@@ -100,7 +100,8 @@ same tenant, table, and partition day.
 
 Forge selects exact tenant/table matches where `compacted = false`. Files must
 also be at least two minutes old; that delay keeps a just-sealed file out of a
-maintenance race. Candidates are grouped by `partition_day` and passed to a
+maintenance race. Candidates are grouped by their exact time partition
+(`partition_granularity`, `partition_start`) and passed to a
 deterministic bin-packer.
 
 The bin-packer sorts by event-time bounds and file ID, then applies the target

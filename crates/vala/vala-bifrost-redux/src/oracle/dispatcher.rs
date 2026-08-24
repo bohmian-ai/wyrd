@@ -42,12 +42,14 @@ use crate::cluster::{ClusterRegistry, ClusterSnapshot, ROLE_LIVENESS_CUTOFF};
 
 /// Fixed private peer protocol version.
 ///
-/// Protocol v2 binds the assignment-authority digest
-/// ([`crate::peer::assignment_authority_digest_for`]) into signed ticket
-/// claims and is a homogeneous cutover: v1 tickets are rejected outright by
+/// Protocol v3 binds the exact-partition assignment-authority digest
+/// ([`crate::oracle::peer::assignment_authority_digest_for`]) into signed
+/// ticket claims. It differs from v2 only in the Scribe-cut encoding, whose
+/// two day strings became two typed `(granularity, start)` partitions, and it
+/// is a homogeneous cutover: v2 tickets are rejected outright by
 /// [`validated_claim_identifiers`] rather than accepted through a dual
 /// decoder.
-pub const PEER_PROTOCOL_VERSION: u32 = 2;
+pub const PEER_PROTOCOL_VERSION: u32 = 3;
 /// Pending reservation time to live.
 const PENDING_TTL: ChronoDuration = ChronoDuration::seconds(2);
 /// Stable peer rejection hint.
@@ -2652,7 +2654,8 @@ mod tests {
     use datafusion::execution::memory_pool::GreedyMemoryPool;
     use wyrd_spec::vala::api::{
         ClusterCapabilities, ClusterNodeKey, ClusterRole, ClusterRoleLease, FollowerScanAssignment,
-        OracleCapabilitiesV1, PersistedFileAssignment, TenantTableBinding,
+        OracleCapabilitiesV1, PersistedFileAssignment, PersistedWalRange, ScribeProviderCut,
+        TenantTableBinding, TimeGranularityWire,
     };
 
     /// Deterministic verifier that preserves the already encoded claims bytes.
@@ -2779,6 +2782,47 @@ mod tests {
     }
 
     /// Encodes one matching worker request for a retained reservation.
+    /// Hourly Scribe provider cut every protocol-v3 dispatcher fixture carries.
+    ///
+    /// The digest only covers the partition bounds when a cut is present, so
+    /// the authority contract needs a fixture cut to tamper with. The two
+    /// bounds are adjacent hours, which keeps [`ScribeProviderCut::is_valid`]
+    /// satisfied while leaving both granularity and start free to mutate.
+    /// `writer_epoch` must equal the target role fence, which follower
+    /// preflight compares before it will admit the cut at all.
+    fn fixture_scribe_cut(writer_epoch: u64) -> ScribeProviderCut {
+        ScribeProviderCut {
+            writer_epoch,
+            start_partition: fixture_partition(TimeGranularityWire::Hour, 1_787_493_600_000_000),
+            end_partition: fixture_partition(TimeGranularityWire::Hour, 1_787_497_200_000_000),
+            required_columns: vec!["data_tenant_id".to_owned()],
+            persisted_cursor: 41,
+            persisted_ranges: vec![PersistedWalRange {
+                start_lsn: 1,
+                end_lsn: 40,
+            }],
+            maximum_batch_count: 16,
+            maximum_retained_bytes: 1_048_576,
+        }
+    }
+
+    /// Builds one canonical partition from epoch microseconds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `start_micros` is not the exact boundary of `granularity`;
+    /// every call site passes a boundary literal.
+    fn fixture_partition(
+        granularity: TimeGranularityWire,
+        start_micros: i64,
+    ) -> wyrd_spec::vala::api::TimePartitionWire {
+        wyrd_spec::vala::api::TimePartitionWire::new(
+            granularity,
+            chrono::DateTime::from_timestamp_micros(start_micros).expect("fixture instant"),
+        )
+        .expect("fixture instant is an exact partition boundary")
+    }
+
     fn worker_request(
         fragment: &SealedScanFragment,
         reservation_id: ReservationId,
@@ -2787,6 +2831,44 @@ mod tests {
         query_id: QueryId,
         tenant: DataTenantId,
     ) -> PhysicalExecuteFragmentRequest {
+        worker_request_with_cut(
+            fragment,
+            reservation_id,
+            node,
+            fence,
+            query_id,
+            tenant,
+            None,
+        )
+    }
+
+    /// Builds one signed worker request, optionally carrying a Scribe cut.
+    ///
+    /// A cut is only legal on a Scribe target fence, so the target role is
+    /// derived from its presence rather than passed separately; the leader
+    /// fence stays Oracle either way. The signed
+    /// `assignment_authority_digest` is minted over the finished assignment,
+    /// so a caller that mutates the request afterwards is exactly the tamper
+    /// case protocol v3 must reject.
+    ///
+    /// # Panics
+    ///
+    /// Panics when plan encoding, digest computation, or ticket minting fails,
+    /// all of which are deterministic for these fixtures.
+    fn worker_request_with_cut(
+        fragment: &SealedScanFragment,
+        reservation_id: ReservationId,
+        node: NodeId,
+        fence: FencingToken,
+        query_id: QueryId,
+        tenant: DataTenantId,
+        scribe_provider_cut: Option<ScribeProviderCut>,
+    ) -> PhysicalExecuteFragmentRequest {
+        let target_role = if scribe_provider_cut.is_some() {
+            ClusterRole::Scribe
+        } else {
+            ClusterRole::Oracle
+        };
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
             DataType::Int64,
@@ -2812,7 +2894,7 @@ mod tests {
                 table: "events".to_owned(),
             },
             persisted: PersistedFileAssignment { files: Vec::new() },
-            scribe_provider_cut: None,
+            scribe_provider_cut,
             schema_fingerprint: fragment.schema_fingerprint.clone(),
             required_columns: vec!["data_tenant_id".to_owned()],
             predicates: Vec::new(),
@@ -2853,7 +2935,7 @@ mod tests {
             },
             target_fence: OracleRoleFence {
                 node_id: node,
-                role: ClusterRole::Oracle,
+                role: target_role,
                 fencing_token: fence,
             },
             assignments,
@@ -3651,7 +3733,7 @@ mod tests {
 
     /// Builds a counting-resolver worker plus one valid request for it.
     ///
-    /// The v2 authority proofs each need an isolated worker, its own
+    /// The v3 authority proofs each need an isolated worker, its own
     /// reservation registry, and a request already reserved against it; the
     /// only thing they vary is the fence and how they then tamper with the
     /// request, so the identical setup is built once here. The returned
@@ -3705,16 +3787,86 @@ mod tests {
         (worker, resolver, request)
     }
 
-    /// Protocol-v2 assignment-authority contract, proven as one seam:
+    /// Proves every Scribe-cut partition component is covered by the v3
+    /// assignment-authority digest.
     ///
-    /// - a valid v2 request whose recomputed digest matches the signed
-    ///   claims executes and reaches the resolver exactly once;
-    /// - every digest-covered tamper class (`required_columns`, predicates,
-    ///   files) is rejected terminally before the resolver is ever called;
-    /// - an explicit v1 `protocol_version` ticket is rejected by the same
-    ///   gate protocol v2 replaced, proving there is no dual decoder.
+    /// A cut-bearing assignment can never reach `execute_local`: an Oracle peer
+    /// worker refuses a non-Oracle target role, and follower preflight refuses
+    /// an Oracle assignment that carries a cut. The partition contract is
+    /// therefore proven where the dispatcher actually mints and compares it,
+    /// over the same `assignment_authority_digest_for` seam the ticket claims
+    /// are built from.
+    ///
+    /// # Panics
+    ///
+    /// Panics when mutating either bound's granularity or start instant leaves
+    /// the digest unchanged, or when an identical cut fails to reproduce it.
+    fn assert_partition_components_are_digest_covered(
+        tenant: DataTenantId,
+        fragment: &SealedScanFragment,
+    ) {
+        let cut_assignment = |cut: ScribeProviderCut| FollowerScanAssignment {
+            scan_id: "dispatcher-test-scan".to_owned(),
+            binding: TenantTableBinding {
+                tenant_id: tenant,
+                namespace: "vala.bifrost".to_owned(),
+                table: "events".to_owned(),
+            },
+            persisted: PersistedFileAssignment { files: Vec::new() },
+            scribe_provider_cut: Some(cut),
+            schema_fingerprint: fragment.schema_fingerprint.clone(),
+            required_columns: vec!["data_tenant_id".to_owned()],
+            predicates: Vec::new(),
+        };
+        let digest_of = |cut: ScribeProviderCut| {
+            crate::oracle::peer::assignment_authority_digest_for(&[cut_assignment(cut)])
+                .expect("deterministic fixture digest")
+        };
+        let baseline = digest_of(fixture_scribe_cut(7));
+
+        let mut start_granularity = fixture_scribe_cut(7);
+        start_granularity.start_partition =
+            fixture_partition(TimeGranularityWire::Day, 1_787_443_200_000_000);
+        start_granularity.end_partition =
+            fixture_partition(TimeGranularityWire::Day, 1_787_443_200_000_000);
+
+        let mut start_micros = fixture_scribe_cut(7);
+        start_micros.start_partition =
+            fixture_partition(TimeGranularityWire::Hour, 1_787_490_000_000_000);
+
+        let mut end_micros = fixture_scribe_cut(7);
+        end_micros.end_partition =
+            fixture_partition(TimeGranularityWire::Hour, 1_787_500_800_000_000);
+
+        for (label, mutated) in [
+            ("start granularity", start_granularity),
+            ("start micros", start_micros),
+            ("end micros", end_micros),
+        ] {
+            assert_ne!(
+                digest_of(mutated),
+                baseline,
+                "{label} must change the v3 assignment-authority digest"
+            );
+        }
+
+        // The digest a leader mints is exactly what a worker recomputes, so
+        // a matching cut reproduces the baseline byte for byte.
+        assert_eq!(digest_of(fixture_scribe_cut(7)), baseline);
+    }
+
+    /// Protocol-v3 exact-partition assignment-authority contract, proven as
+    /// one seam:
+    ///
+    /// - a valid v3 request whose recomputed digest matches the signed claims
+    ///   executes and reaches the resolver exactly once;
+    /// - every digest-covered tamper class is rejected terminally before the
+    ///   resolver is ever called, including each Scribe-cut partition
+    ///   granularity and start mutated independently;
+    /// - an explicit v2 `protocol_version` ticket is rejected by the same gate
+    ///   protocol v3 replaced, proving there is no dual decoder.
     #[tokio::test]
-    async fn follower_assignment_v2_authority_contract() {
+    async fn follower_assignment_v3_partition_authority_contract() {
         let roles = crate::resources::BifrostRuntimeResources::composed_for_test(
             1024 * 1024 * 1024,
             1024 * 1024 * 1024,
@@ -3724,7 +3876,7 @@ mod tests {
         let (_file, fragment) = dispatcher_parquet_fragment();
         let tenant = DataTenantId::new_v7();
 
-        // A valid v2 request executes and reaches the resolver exactly once.
+        // A valid v3 request executes and reaches the resolver exactly once.
         {
             let (worker, resolver, request) =
                 counting_worker_request(&oracle, &fragment, tenant, 51);
@@ -3736,7 +3888,7 @@ mod tests {
                     )),
                 )
                 .await
-                .expect("valid v2 assignment authority digest executes");
+                .expect("valid v3 assignment authority digest executes");
             assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
         }
 
@@ -3775,16 +3927,19 @@ mod tests {
             );
         }
 
-        // An explicit v1 `protocol_version` ticket is rejected: protocol v2
-        // fully replaced v1 rather than accepting both.
+        // Each Scribe-cut partition component is digest-covered.
+        assert_partition_components_are_digest_covered(tenant, &fragment);
+
+        // An explicit v2 `protocol_version` ticket is rejected: protocol v3
+        // fully replaced v2 rather than accepting both.
         {
             let (worker, resolver, mut request) =
                 counting_worker_request(&oracle, &fragment, tenant, 53);
             let mut claims = PeerTicketClaims::decode(request.ticket.claims_bytes.as_slice())
                 .expect("decode fixture claims");
-            claims.protocol_version = 1;
+            claims.protocol_version = 2;
             let mut bytes = Vec::new();
-            claims.encode(&mut bytes).expect("encode v1 claims");
+            claims.encode(&mut bytes).expect("encode v2 claims");
             request.ticket.claims_bytes = bytes.clone();
             request.ticket.signature = bytes;
             let result = worker
@@ -3799,7 +3954,7 @@ mod tests {
             assert_eq!(
                 resolver.calls.load(Ordering::SeqCst),
                 0,
-                "an explicit v1 protocol_version ticket must never reach the resolver"
+                "an explicit v2 protocol_version ticket must never reach the resolver"
             );
         }
     }

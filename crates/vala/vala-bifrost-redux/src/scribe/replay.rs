@@ -1137,10 +1137,10 @@ fn merge_replayed_state(
 mod tests {
     use super::*;
     use crate::catalog::TableRef;
-    use crate::scribe::seal_key::EventDay;
+
     use crate::scribe::stream_identity::{NodeId, WriterEpoch};
     use crate::scribe::wal::{PreparedWalAppend, WalWriter};
-    use chrono::NaiveDate;
+
     use std::path::PathBuf;
     use tempfile::TempDir;
     use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
@@ -1152,7 +1152,7 @@ mod tests {
         SealKey::new(
             tenant,
             TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "events"),
-            EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("date")),
+            crate::test_support::day_partition(2026, 7, 14),
         )
     }
 
@@ -1319,7 +1319,7 @@ mod tests {
         let second_key = SealKey::new(
             tenant_id,
             TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "events"),
-            EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 15).expect("date")),
+            crate::test_support::day_partition(2026, 7, 15),
         );
         let event = |resource: &str| AuditEvent {
             request_id: RequestId::now_v7(),
@@ -1387,7 +1387,7 @@ mod tests {
             SealKey::new(
                 tenant,
                 TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "events"),
-                EventDay::new(NaiveDate::from_ymd_opt(2026, 7, day).expect("cohort event day")),
+                crate::test_support::day_partition(2026, 7, day),
             )
         });
         let event = AuditEvent {
@@ -2379,7 +2379,7 @@ mod tests {
         let temp_dir = TempDir::new().expect("temp dir");
         let tenant = DataTenantId::new_v7();
         let table = TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "events");
-        let day = EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("date"));
+        let day = crate::test_support::day_partition(2026, 7, 14);
         let seal_key = SealKey::new(tenant, table, day);
         let writer = WalWriter::new(temp_dir.path(), [9_u8; 16], 1, WalConfig::default())
             .expect("wal writer");

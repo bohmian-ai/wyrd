@@ -2,8 +2,9 @@ use arrow::datatypes::Field;
 
 use crate::tables::fields::{boolean, float64, int32, int64, ts_us_utc, utf8};
 use crate::tables::{
-    CorrelationPolicy, DeclaredIndex, DomainTable, IndexKind, PayloadClass, SortKey,
+    CorrelationPolicy, DomainTable, PayloadClass, hourly_layout, sort_asc, sort_desc,
 };
+use wyrd_spec::vala::api::PhysicalLayoutWire;
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 pub struct PointsTable;
@@ -46,31 +47,14 @@ impl DomainTable for PointsTable {
         ]
     }
 
-    fn sort_keys() -> Vec<SortKey> {
-        vec![
-            SortKey {
-                column: WYRD_EVENT_TIME.into(),
-                ascending: false,
-                nulls_first: false,
-            },
-            SortKey {
-                column: "metric_name".into(),
-                ascending: true,
-                nulls_first: false,
-            },
-            SortKey {
-                column: "service_name".into(),
-                ascending: true,
-                nulls_first: false,
-            },
-        ]
-    }
-
-    fn declared_indexes() -> Vec<DeclaredIndex> {
-        vec![DeclaredIndex {
-            name: "metrics_name_bloom".into(),
-            columns: vec!["metric_name".into()],
-            kind: IndexKind::BloomFilter,
-        }]
+    fn physical_layout() -> PhysicalLayoutWire {
+        hourly_layout(
+            vec![
+                sort_desc(WYRD_EVENT_TIME),
+                sort_asc("metric_name"),
+                sort_asc("service_name"),
+            ],
+            &["metric_name"],
+        )
     }
 }

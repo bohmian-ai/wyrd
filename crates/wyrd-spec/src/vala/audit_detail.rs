@@ -9,7 +9,7 @@ use crate::ids::CardUid;
 use crate::origin::Origin;
 use crate::reference::CardRef;
 use crate::vala::api::AuditDecision;
-use crate::vala::api::{QueryClass, VisibilityMode};
+use crate::vala::api::{QueryClass, TimePartitionWire, VisibilityMode};
 
 /// Error returned when an audit-detail identifier is empty, malformed, or
 /// contains a value that must never enter an audit record.
@@ -373,8 +373,8 @@ pub enum AuditDetail {
         committed_snapshot_id: Option<i64>,
         /// Destination partition specification identity.
         partition_spec_id: i32,
-        /// Shared day partition for every exact input.
-        partition_day: String,
+        /// Shared exact time partition for every input in the rewrite group.
+        time_partition: TimePartitionWire,
         /// Target output size captured from the table metadata.
         target_file_size_bytes: u64,
         /// Exact ordered catalog paths deleted by the Iceberg action.
@@ -394,7 +394,7 @@ pub enum AuditDetail {
         operation_id: uuid::Uuid,
         /// Durable phase represented by this audit row.
         phase: ForgeCompactionPhase,
-        /// Canonical tenant/table/day group identity.
+        /// Canonical tenant/table/partition group identity.
         group: String,
         /// Exact staging rows transitioned by the operation.
         input_file_ids: Vec<uuid::Uuid>,
@@ -755,7 +755,11 @@ mod tests {
             base_snapshot_id: 41,
             committed_snapshot_id: None,
             partition_spec_id: 3,
-            partition_day: "2026-09-01".to_owned(),
+            time_partition: crate::vala::api::TimePartitionWire::new(
+                crate::vala::api::TimeGranularityWire::Hour,
+                chrono::DateTime::from_timestamp(1_767_312_000, 0).expect("fixture instant"),
+            )
+            .expect("fixture instant is an exact hour boundary"),
             target_file_size_bytes: 1024,
             input_paths: vec![StoragePath::new("table/live-a.parquet").expect("valid input")],
             output_paths: vec![StoragePath::new("table/rewrite-a.parquet").expect("valid output")],

@@ -38,8 +38,12 @@ pub struct OtlpWireLimits {
     pub value_bytes: usize,
     /// Largest recursive `AnyValue` nesting depth.
     pub value_depth: usize,
-    /// Largest number of distinct event-day partitions.
-    pub event_days: usize,
+    /// Largest number of distinct time partitions one source may span.
+    ///
+    /// A source is split before WAL into at most this many distinct
+    /// [`TimePartition`](crate::catalog::layout::TimePartition) values, and the
+    /// material plan reserves durable slice metadata for that ceiling.
+    pub time_partitions: usize,
 }
 
 /// Canonical OTLP V1 defaults used to initialize decode and projection limits.
@@ -51,7 +55,7 @@ pub const OTLP_WIRE_LIMITS: OtlpWireLimits = OtlpWireLimits {
     attributes: 1_048_576,
     value_bytes: 32 * 1024 * 1024,
     value_depth: 8,
-    event_days: 32,
+    time_partitions: 32,
 };
 
 /// Byte-weighted process admission for encoded HTTP and tonic bodies.

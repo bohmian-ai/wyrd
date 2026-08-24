@@ -999,6 +999,7 @@ pub(crate) async fn provision_named_tables(
                     table: TableRef::new(BifrostNamespace::Bifrost, table),
                     user_fields: fields.clone(),
                     tenant: *tenant,
+                    physical_layout: None,
                     audit: None,
                 })
                 .await?;

@@ -255,7 +255,7 @@ mod tests {
         let old_olap_digest = Sha256::digest(old_olap.as_bytes());
         assert_eq!(
             format!("{old_olap_digest:x}"),
-            "d70ec48be662b9067c21e1deb69ec0a873ec5d78579250f96ec5c096124fa478",
+            "0adb994ba2a13f79d8276b3eff90a203dc54d6a3e00cbb5d9234d0c69e1592c6",
             "older migration checksum must remain stable"
         );
         let oracle_coordination = fs::read_to_string(

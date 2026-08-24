@@ -135,6 +135,7 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
                     Field::new("value", DataType::Utf8, false),
                 ],
                 tenant,
+                physical_layout: None,
                 audit: None,
             })
             .await?;
@@ -163,12 +164,13 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
     }
     let case_id = scenario.case_id.as_deref().unwrap_or_default();
     let visibility = if case_id.contains("fused") {
-        let day =
-            wyrd_spec::vala::api::EventDay::new(chrono::Utc::now().format("%Y-%m-%d").to_string())?;
+        let partition = vala_bifrost_redux::catalog::TimeGranularity::Hour
+            .bucket(chrono::Utc::now())?
+            .to_wire();
         for (index, tenant) in tenants.iter().copied().enumerate() {
             ingest_server.flush_bifrost_for_tenant(tenant).await?;
             cluster
-                .observe_live_tail_for_tenant(tenant, &table_fqn, day.clone())
+                .observe_live_tail_for_tenant(tenant, &table_fqn, partition)
                 .await?;
             let writer = authenticated_client_for_tenant(
                 ingest_server,

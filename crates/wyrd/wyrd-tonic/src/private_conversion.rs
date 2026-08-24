@@ -16,6 +16,46 @@ const SIGNATURE_BYTES: usize = 64;
 /// Hard protocol ceiling for an ASCII signing-key identifier.
 const MAX_KEY_ID_BYTES: usize = 64;
 
+/// Decodes one required [`proto::TimePartition`] into its validated domain value.
+///
+/// The protobuf enum's zero tag means "unspecified" and is rejected rather than
+/// defaulted, and a start instant that is not the exact UTC boundary of its
+/// granularity is rejected before any caller can act on the message.
+///
+/// # Errors
+/// Returns [`PrivateConversionError::Missing`] when the nested message is
+/// absent, [`PrivateConversionError::RequiredEnum`] for tag `0` or an unknown
+/// tag, and [`PrivateConversionError::Invalid`] for a noncanonical or
+/// unrepresentable start.
+fn time_partition(
+    value: Option<proto::TimePartition>,
+    field: &'static str,
+) -> Result<domain::TimePartitionWire, PrivateConversionError> {
+    let value = value.ok_or(PrivateConversionError::Missing(field))?;
+    let granularity = match proto::TimeGranularity::try_from(value.granularity) {
+        Ok(proto::TimeGranularity::Hour) => domain::TimeGranularityWire::Hour,
+        Ok(proto::TimeGranularity::Day) => domain::TimeGranularityWire::Day,
+        Ok(proto::TimeGranularity::Unspecified) | Err(_) => {
+            return Err(PrivateConversionError::RequiredEnum(field));
+        }
+    };
+    let start = chrono::DateTime::from_timestamp_micros(value.start_unix_micros)
+        .ok_or(PrivateConversionError::Invalid { field })?;
+    domain::TimePartitionWire::new(granularity, start)
+        .map_err(|_| PrivateConversionError::Invalid { field })
+}
+
+/// Encodes one validated partition value into its protobuf message.
+fn time_partition_proto(value: domain::TimePartitionWire) -> proto::TimePartition {
+    proto::TimePartition {
+        granularity: match value.granularity() {
+            domain::TimeGranularityWire::Hour => proto::TimeGranularity::Hour as i32,
+            domain::TimeGranularityWire::Day => proto::TimeGranularity::Day as i32,
+        },
+        start_unix_micros: value.start_unix_micros(),
+    }
+}
+
 /// Error returned before malformed private input reaches a runtime owner.
 #[derive(Debug, thiserror::Error)]
 pub enum PrivateConversionError {
@@ -40,6 +80,32 @@ pub enum PrivateConversionError {
         /// Field that violated its invariant.
         field: &'static str,
     },
+}
+
+impl TryFrom<proto::TimePartition> for domain::TimePartitionWire {
+    type Error = PrivateConversionError;
+
+    /// Decodes one partition identity and revalidates its exact boundary.
+    ///
+    /// The private wire carries granularity and start micros separately, so the
+    /// decoded pair is re-checked against the canonical boundary rule before any
+    /// runtime owner observes it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrivateConversionError::RequiredEnum`] when the granularity is
+    /// unspecified or unknown, and [`PrivateConversionError::Invalid`] when the
+    /// start instant is unrepresentable or is not the exact start of its unit.
+    fn try_from(value: proto::TimePartition) -> Result<Self, Self::Error> {
+        time_partition(Some(value), "time_partition")
+    }
+}
+
+impl From<domain::TimePartitionWire> for proto::TimePartition {
+    /// Encodes one already-validated partition identity onto the private wire.
+    fn from(value: domain::TimePartitionWire) -> Self {
+        time_partition_proto(value)
+    }
 }
 
 impl TryFrom<proto::TailCursor> for domain::TailCursor {
@@ -148,8 +214,7 @@ impl TryFrom<proto::AcquireTailFenceRequest> for domain::AcquireTailFenceRequest
                 .binding
                 .ok_or(PrivateConversionError::Missing("binding"))?
                 .try_into()?,
-            event_day: domain::EventDay::new(value.event_day)
-                .map_err(|_| PrivateConversionError::Invalid { field: "event_day" })?,
+            time_partition: time_partition(value.time_partition, "time_partition")?,
             exclusive_sealed: value
                 .exclusive_sealed
                 .ok_or(PrivateConversionError::Missing("exclusive_sealed"))?
@@ -171,7 +236,7 @@ impl From<domain::AcquireTailFenceRequest> for proto::AcquireTailFenceRequest {
         Self {
             query_id: value.query_id.as_bytes().to_vec(),
             binding: Some(value.binding.into()),
-            event_day: value.event_day.as_str().to_owned(),
+            time_partition: Some(time_partition_proto(value.time_partition)),
             exclusive_sealed: Some(value.exclusive_sealed.into()),
             deadline_unix_ms: unix_millis(value.deadline),
             schema_fingerprint: value.schema_fingerprint.as_str().to_owned(),
@@ -222,8 +287,7 @@ impl TryFrom<proto::TailReadFence> for domain::TailReadFence {
                 .binding
                 .ok_or(PrivateConversionError::Missing("binding"))?
                 .try_into()?,
-            event_day: domain::EventDay::new(value.event_day)
-                .map_err(|_| PrivateConversionError::Invalid { field: "event_day" })?,
+            time_partition: time_partition(value.time_partition, "time_partition")?,
             stream,
             exclusive_sealed,
             inclusive_live,
@@ -244,7 +308,7 @@ impl From<domain::TailReadFence> for proto::TailReadFence {
         Self {
             fence_id: value.fence_id.as_uuid().as_bytes().to_vec(),
             binding: Some(value.binding.into()),
-            event_day: value.event_day.as_str().to_owned(),
+            time_partition: Some(time_partition_proto(value.time_partition)),
             stream: Some(value.stream.into()),
             exclusive_sealed: Some(value.exclusive_sealed.into()),
             inclusive_live: Some(value.inclusive_live.into()),
@@ -935,8 +999,8 @@ impl TryFrom<proto::ScribeProviderCut> for domain::ScribeProviderCut {
     fn try_from(value: proto::ScribeProviderCut) -> Result<Self, Self::Error> {
         let cut = Self {
             writer_epoch: value.writer_epoch,
-            start_event_day: value.start_event_day,
-            end_event_day: value.end_event_day,
+            start_partition: time_partition(value.start_partition, "start_partition")?,
+            end_partition: time_partition(value.end_partition, "end_partition")?,
             required_columns: value.required_columns,
             persisted_cursor: value.persisted_cursor,
             persisted_ranges: value
@@ -970,8 +1034,8 @@ impl From<domain::ScribeProviderCut> for proto::ScribeProviderCut {
     fn from(value: domain::ScribeProviderCut) -> Self {
         Self {
             writer_epoch: value.writer_epoch,
-            start_event_day: value.start_event_day,
-            end_event_day: value.end_event_day,
+            start_partition: Some(time_partition_proto(value.start_partition)),
+            end_partition: Some(time_partition_proto(value.end_partition)),
             required_columns: value.required_columns,
             persisted_cursor: value.persisted_cursor,
             persisted_ranges: value
@@ -1402,6 +1466,120 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    /// Builds one hourly partition from its exact epoch-microsecond boundary.
+    fn hour_partition(start_unix_micros: i64) -> domain::TimePartitionWire {
+        partition(domain::TimeGranularityWire::Hour, start_unix_micros)
+    }
+
+    /// Builds one partition from a granularity and an exact boundary.
+    fn partition(
+        granularity: domain::TimeGranularityWire,
+        start_unix_micros: i64,
+    ) -> domain::TimePartitionWire {
+        let start = chrono::DateTime::from_timestamp_micros(start_unix_micros)
+            .expect("fixture start is representable");
+        domain::TimePartitionWire::new(granularity, start).expect("fixture start is canonical")
+    }
+
+    /// Every partition-bearing private message round-trips its exact typed
+    /// partition, and every malformed encoding is rejected before a caller can
+    /// act on it: the unspecified enum tag, an unknown tag, a noncanonical
+    /// start for each granularity, and an absent nested message.
+    #[test]
+    fn scribe_cut_v3_contract() {
+        for granularity in [
+            domain::TimeGranularityWire::Hour,
+            domain::TimeGranularityWire::Day,
+        ] {
+            let start = match granularity {
+                domain::TimeGranularityWire::Hour => 1_787_493_600_000_000,
+                domain::TimeGranularityWire::Day => 1_787_443_200_000_000,
+            };
+            let expected = partition(granularity, start);
+            let restored = time_partition(Some(time_partition_proto(expected)), "time_partition")
+                .expect("valid partition round-trips");
+            assert_eq!(restored, expected);
+        }
+
+        let cut = domain::ScribeProviderCut {
+            writer_epoch: 7,
+            start_partition: hour_partition(1_787_493_600_000_000),
+            end_partition: hour_partition(1_787_497_200_000_000),
+            required_columns: vec!["service_name".to_owned()],
+            persisted_cursor: 41,
+            persisted_ranges: vec![domain::PersistedWalRange {
+                start_lsn: 1,
+                end_lsn: 40,
+            }],
+            maximum_batch_count: 16,
+            maximum_retained_bytes: 1_048_576,
+        };
+        assert_eq!(
+            domain::ScribeProviderCut::try_from(proto::ScribeProviderCut::from(cut.clone()))
+                .expect("valid cut round-trips"),
+            cut
+        );
+
+        // The protobuf zero tag is "unspecified" and must never default.
+        assert!(matches!(
+            time_partition(
+                Some(proto::TimePartition {
+                    granularity: proto::TimeGranularity::Unspecified as i32,
+                    start_unix_micros: 1_787_493_600_000_000,
+                }),
+                "time_partition"
+            ),
+            Err(PrivateConversionError::RequiredEnum("time_partition"))
+        ));
+
+        // An unknown tag is rejected the same way, not silently mapped.
+        assert!(matches!(
+            time_partition(
+                Some(proto::TimePartition {
+                    granularity: 9,
+                    start_unix_micros: 1_787_493_600_000_000,
+                }),
+                "time_partition"
+            ),
+            Err(PrivateConversionError::RequiredEnum("time_partition"))
+        ));
+
+        // Noncanonical starts fail per granularity.
+        for (granularity, start) in [
+            (proto::TimeGranularity::Hour, 1_787_493_600_000_001),
+            (proto::TimeGranularity::Day, 1_787_493_600_000_000),
+        ] {
+            assert!(matches!(
+                time_partition(
+                    Some(proto::TimePartition {
+                        granularity: granularity as i32,
+                        start_unix_micros: start,
+                    }),
+                    "time_partition"
+                ),
+                Err(PrivateConversionError::Invalid {
+                    field: "time_partition"
+                })
+            ));
+        }
+
+        // An absent nested message is missing, never an implicit epoch value.
+        assert!(matches!(
+            time_partition(None, "time_partition"),
+            Err(PrivateConversionError::Missing("time_partition"))
+        ));
+
+        // A cut whose endpoints disagree on granularity is not a valid range.
+        let mut mixed = cut;
+        mixed.end_partition = partition(domain::TimeGranularityWire::Day, 1_787_443_200_000_000);
+        assert!(matches!(
+            domain::ScribeProviderCut::try_from(proto::ScribeProviderCut::from(mixed)),
+            Err(PrivateConversionError::Invalid {
+                field: "scribe_provider_cut"
+            })
+        ));
+    }
+
     /// A valid private tail cursor round-trips its exact row identity.
     #[test]
     fn tail_cursor_round_trips() {
@@ -1433,7 +1611,7 @@ mod tests {
         let acquire = domain::AcquireTailFenceRequest {
             query_id: uuid::Uuid::now_v7(),
             binding: binding.clone(),
-            event_day: domain::EventDay::new("2026-07-30").expect("valid event day"),
+            time_partition: hour_partition(1_787_493_600_000_000),
             exclusive_sealed: cursor.clone(),
             deadline: chrono::DateTime::from_timestamp_millis(50).expect("valid timestamp"),
             schema_fingerprint: domain::SchemaFingerprint::new("schema-1")
@@ -1451,7 +1629,7 @@ mod tests {
         let fence = domain::TailReadFence {
             fence_id: domain::TailFenceId::new(uuid::Uuid::now_v7()),
             binding,
-            event_day: domain::EventDay::new("2026-07-30").expect("valid event day"),
+            time_partition: hour_partition(1_787_493_600_000_000),
             stream: domain::TailStreamIdentity {
                 node_id: domain::NodeId::new(uuid::Uuid::now_v7()),
                 writer_epoch: 4,

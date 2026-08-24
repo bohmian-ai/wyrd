@@ -6,24 +6,25 @@ use std::sync::Arc;
 use arrow::datatypes::{Field, Schema};
 use iceberg::TableCreation;
 use iceberg::io::{FileIO, FileIOBuilder};
-use iceberg::spec::{FormatVersion, NullOrder, SortDirection, SortField, SortOrder, Transform};
+use iceberg::spec::{FormatVersion, Transform};
 use sha2::{Digest as _, Sha256};
 use vala_sql::ValaPostgres;
 use vala_sql::queries::file_list::HotFileCatalog;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
-    AuditEvent, BifrostTableDescription, BifrostTableEntry, PersistedWalRange,
+    AuditEvent, BifrostTableDescription, BifrostTableEntry, PersistedWalRange, PhysicalLayoutWire,
     persisted_wal_ranges_are_valid,
 };
 use wyrd_storage::settings::BackendConfig;
 
 use crate::catalog::error::BifrostCatalogError;
 use crate::catalog::iceberg_sql;
+use crate::catalog::layout::PhysicalLayout;
 use crate::catalog::storage::{iceberg_storage_factory, warehouse_uri};
 use crate::catalog::wire::{
-    entry_from_row, fields_from_stored_schema, reject_reserved_field_names,
+    entry_from_row, fields_from_stored_schema, layout_wire_from_row, reject_reserved_field_names,
 };
-use crate::catalog::{TableRef, TenantTableBinding, build_partition_spec};
+use crate::catalog::{TableRef, TenantTableBinding};
 use crate::namespaces::BifrostNamespace;
 use crate::provider::ReduxTableProvider;
 use crate::schema::{SchemaFingerprint, with_managed_columns};
@@ -37,44 +38,6 @@ fn digest_strings(values: impl IntoIterator<Item = String>) -> String {
         digest.update(value.as_bytes());
     }
     hex::encode(digest.finalize())
-}
-
-/// Build the fixed ascending sort order used by every Redux Bifrost table.
-///
-/// # Errors
-/// Returns a metadata mismatch when either system sort column is absent or
-/// Iceberg rejects the bound sort fields for the physical schema.
-fn forge_sort_order(schema: &iceberg::spec::Schema) -> Result<SortOrder, BifrostCatalogError> {
-    let tenant_id = schema
-        .field_by_name("data_tenant_id")
-        .ok_or_else(|| {
-            BifrostCatalogError::MetadataMismatch("physical schema lacks data_tenant_id".to_owned())
-        })?
-        .id;
-    let event_time_id = schema
-        .field_by_name("wyrd_event_time")
-        .ok_or_else(|| {
-            BifrostCatalogError::MetadataMismatch(
-                "physical schema lacks wyrd_event_time".to_owned(),
-            )
-        })?
-        .id;
-    SortOrder::builder()
-        .with_order_id(1)
-        .with_sort_field(SortField {
-            source_id: tenant_id,
-            transform: Transform::Identity,
-            direction: SortDirection::Ascending,
-            null_order: NullOrder::Last,
-        })
-        .with_sort_field(SortField {
-            source_id: event_time_id,
-            transform: Transform::Identity,
-            direction: SortDirection::Ascending,
-            null_order: NullOrder::Last,
-        })
-        .build(schema)
-        .map_err(|error| BifrostCatalogError::MetadataMismatch(error.to_string()))
 }
 
 /// Opaque 16-byte table identity stored in `vala.bifrost_tables`.
@@ -107,6 +70,12 @@ pub struct CreateTableRequest {
     pub user_fields: Vec<Field>,
     /// Authenticated organization that owns the registration and physical table.
     pub tenant: DataTenantId,
+    /// Optional caller-declared physical layout.
+    ///
+    /// `None` means "no declaration": the catalog resolves the canonical
+    /// default layout. `Some` is canonicalized and validated against the
+    /// complete physical schema before any durable mutation.
+    pub physical_layout: Option<PhysicalLayoutWire>,
     /// Optional audit event committed with the tenant-scoped control row.
     pub audit: Option<AuditEvent>,
 }
@@ -600,6 +569,7 @@ impl BifrostCatalog {
         tenant: DataTenantId,
         table: TableRef,
         user_fields: Vec<Field>,
+        physical_layout: Option<PhysicalLayoutWire>,
         audit: Option<AuditEvent>,
     ) -> Result<TableUid, BifrostCatalogError> {
         if table.namespace != BifrostNamespace::Datasets {
@@ -612,6 +582,7 @@ impl BifrostCatalog {
                 table,
                 user_fields,
                 tenant,
+                physical_layout,
                 audit,
             },
             None,
@@ -640,6 +611,7 @@ impl BifrostCatalog {
                 table: TableRef::new(namespace, definition.name),
                 user_fields: (definition.arrow_fields)(),
                 tenant,
+                physical_layout: Some((definition.physical_layout)()),
                 audit: None,
             },
             Some((definition.schema)()),
@@ -647,6 +619,21 @@ impl BifrostCatalog {
         .await
     }
 
+    /// Resolve one canonical layout and register the tenant-qualified table.
+    ///
+    /// The order is fixed and fail-closed: caller input is rejected, the
+    /// binding and physical schema are resolved, the layout is canonicalized —
+    /// all before a transaction opens. Inside the tenant transaction the
+    /// advisory lock serializes concurrent registrations of the same FQN; an
+    /// existing row is compared on schema fingerprint first, then on layout, so
+    /// a schema conflict never masquerades as a layout conflict. An exact
+    /// repeat of a prior registration is a no-op returning the same
+    /// [`TableUid`].
+    ///
+    /// # Errors
+    /// Returns [`BifrostCatalogError::Layout`] for an invalid or conflicting
+    /// declaration, [`BifrostCatalogError::FingerprintMismatch`] for a schema
+    /// conflict, and metadata, Iceberg, SQL, or audit errors otherwise.
     async fn create_table_locked(
         &self,
         request: CreateTableRequest,
@@ -658,6 +645,19 @@ impl BifrostCatalog {
         let fqn = binding.table_ref.fqn();
         let fingerprint =
             SchemaFingerprint::from_arrow_schema(&Schema::new(request.user_fields.clone()));
+        let arrow_schema = canonical_schema
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(|| Schema::new(with_managed_columns(request.user_fields.clone())));
+        let layout =
+            PhysicalLayout::canonicalize(&fqn, &arrow_schema, request.physical_layout.as_ref())
+                .map_err(BifrostCatalogError::Layout)?;
+        let layout_wire = layout.to_wire();
+        let layout_json = serde_json::to_value(&layout_wire).map_err(|error| {
+            BifrostCatalogError::MetadataMismatch(format!(
+                "canonical physical layout for {fqn} is not encodable: {error}"
+            ))
+        })?;
 
         let mut conn = self.postgres.tenant_conn(request.tenant).await?;
         acquire_table_advisory_lock(&mut conn, request.tenant, &fqn).await?;
@@ -669,21 +669,18 @@ impl BifrostCatalog {
             if row.fingerprint.as_slice() != fingerprint.as_ref() {
                 return Err(BifrostCatalogError::FingerprintMismatch(fqn));
             }
+            if layout_wire_from_row(&row)? != layout_wire {
+                return Err(BifrostCatalogError::Layout(
+                    wyrd_spec::vala::BifrostError::PhysicalLayoutMismatch { table: fqn },
+                ));
+            }
             if !physical_exists {
                 return Err(BifrostCatalogError::MetadataMismatch(format!(
                     "control registration exists without physical table: {table_ident}"
                 )));
             }
             let physical = self.catalog.load_table(&table_ident).await?;
-            self.validate_physical_table(
-                &physical,
-                &binding,
-                canonical_schema
-                    .as_deref()
-                    .unwrap_or(&Schema::new(with_managed_columns(
-                        request.user_fields.clone(),
-                    ))),
-            )?;
+            self.validate_physical_table(&physical, &binding, &arrow_schema, &layout)?;
             conn.commit().await?;
             return TableUid::from_row(&row.table_uid, &row.fqn);
         }
@@ -691,26 +688,16 @@ impl BifrostCatalog {
         self.ensure_namespace(binding.physical_namespace()).await?;
         if physical_exists {
             let physical = self.catalog.load_table(&table_ident).await?;
-            self.validate_physical_table(
-                &physical,
-                &binding,
-                canonical_schema
-                    .as_deref()
-                    .unwrap_or(&Schema::new(with_managed_columns(
-                        request.user_fields.clone(),
-                    ))),
-            )?;
+            self.validate_physical_table(&physical, &binding, &arrow_schema, &layout)?;
         } else {
-            let arrow_schema = canonical_schema
-                .as_deref()
-                .cloned()
-                .unwrap_or_else(|| Schema::new(with_managed_columns(request.user_fields.clone())));
             let iceberg_schema =
                 iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&arrow_schema)?;
-            let partition_columns = binding.partition_columns();
-            let partition_spec = build_partition_spec(&iceberg_schema, &partition_columns)
+            let partition_spec = layout
+                .iceberg_partition_spec(&iceberg_schema)
                 .map_err(BifrostCatalogError::MetadataMismatch)?;
-            let sort_order = forge_sort_order(&iceberg_schema)?;
+            let sort_order = layout
+                .iceberg_sort_order(&iceberg_schema)
+                .map_err(BifrostCatalogError::MetadataMismatch)?;
             let location = format!(
                 "{}/{}",
                 self.warehouse.trim_end_matches('/'),
@@ -723,6 +710,10 @@ impl BifrostCatalog {
                 .format_version(FormatVersion::V2)
                 .partition_spec(partition_spec)
                 .sort_order(sort_order)
+                .properties(std::collections::HashMap::from([(
+                    crate::catalog::layout::BLOOM_COLUMNS_PROPERTY.to_owned(),
+                    layout.bloom_columns_property(),
+                )]))
                 .build();
             self.catalog
                 .create_table(binding.physical_namespace(), creation)
@@ -735,7 +726,7 @@ impl BifrostCatalog {
             table_uid.as_bytes(),
             &fqn,
             &fingerprint.0,
-            &["wyrd_event_time".to_owned()],
+            &layout_json,
         )
         .await?;
         if let Some(event) = request.audit.as_ref() {
@@ -755,9 +746,10 @@ impl BifrostCatalog {
     /// Verify that a registered table still carries Bifrost's complete physical recipe.
     ///
     /// Registration and reconciliation call this before accepting existing
-    /// physical state, preventing a control-plane row from silently pointing
-    /// at a table with a different location, schema, day partition, or Forge
-    /// sort recipe.
+    /// physical state, preventing a control-plane row from silently pointing at
+    /// a table with a different location, schema, time partition, or Forge sort
+    /// recipe. Every physical assertion is derived from `layout`, so the
+    /// canonical layout is the single authority for what "correct" means.
     ///
     /// # Errors
     ///
@@ -769,6 +761,7 @@ impl BifrostCatalog {
         table: &iceberg::table::Table,
         binding: &TenantTableBinding,
         expected_schema: &Schema,
+        layout: &PhysicalLayout,
     ) -> Result<(), BifrostCatalogError> {
         let expected_location = format!(
             "{}/{}",
@@ -788,26 +781,39 @@ impl BifrostCatalog {
                 "physical table schema mismatch: expected {expected_schema:?}, actual {actual_schema:?}"
             )));
         }
+        let schema = table.metadata().current_schema();
+        let partition_source_id = schema
+            .field_by_name(layout.partition().column())
+            .map(|field| field.id)
+            .ok_or_else(|| {
+                BifrostCatalogError::MetadataMismatch(format!(
+                    "physical schema lacks partition column {}",
+                    layout.partition().column()
+                ))
+            })?;
+        let expected_partition_name = layout.iceberg_partition_field_name();
         let fields = table.metadata().default_partition_spec().fields();
         if fields.len() != 1
-            || fields[0].source_id
-                != table
-                    .metadata()
-                    .current_schema()
-                    .field_by_name("wyrd_event_time")
-                    .map(|field| field.id)
-                    .unwrap_or_default()
-            || fields[0].name != "wyrd_event_time_day"
-            || fields[0].transform != iceberg::spec::Transform::Day
+            || fields[0].source_id != partition_source_id
+            || fields[0].name != expected_partition_name
+            || fields[0].transform != layout.iceberg_transform()
         {
-            return Err(BifrostCatalogError::MetadataMismatch(
-                "physical table partition spec mismatch".to_owned(),
-            ));
+            return Err(BifrostCatalogError::MetadataMismatch(format!(
+                "physical table partition spec mismatch: expected one {expected_partition_name} field"
+            )));
         }
-        let schema = table.metadata().current_schema();
-        let expected_sort_fields = ["data_tenant_id", "wyrd_event_time"]
-            .into_iter()
-            .map(|name| schema.field_by_name(name).map(|field| field.id))
+        let expected_sort_fields = layout
+            .sort_keys()
+            .iter()
+            .map(|key| {
+                schema.field_by_name(&key.column).map(|field| {
+                    (
+                        field.id,
+                        key.direction.to_iceberg(),
+                        key.null_order.to_iceberg(),
+                    )
+                })
+            })
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| {
                 BifrostCatalogError::MetadataMismatch(
@@ -816,21 +822,49 @@ impl BifrostCatalog {
             })?;
         let sort_fields = &table.metadata().default_sort_order().fields;
         if sort_fields.len() != expected_sort_fields.len()
-            || sort_fields
-                .iter()
-                .zip(expected_sort_fields)
-                .any(|(field, source_id)| {
+            || sort_fields.iter().zip(expected_sort_fields).any(
+                |(field, (source_id, direction, null_order))| {
                     field.source_id != source_id
                         || field.transform != Transform::Identity
-                        || field.direction != SortDirection::Ascending
-                        || field.null_order != NullOrder::Last
-                })
+                        || field.direction != direction
+                        || field.null_order != null_order
+                },
+            )
         {
             return Err(BifrostCatalogError::MetadataMismatch(
                 "physical table sort order mismatch".to_owned(),
             ));
         }
         Ok(())
+    }
+
+    /// Return the registered schema fingerprint and canonical physical layout
+    /// for one tenant/logical table in a single control-row read.
+    ///
+    /// Scribe calls this once per admitted frame to resolve the table's
+    /// partition granularity and Bloom recipe before planning, so no ingest
+    /// path invents or defaults a layout of its own.
+    ///
+    /// # Errors
+    /// Returns [`BifrostCatalogError::TableNotFound`] when the tenant does not
+    /// own the registration, or a metadata error for a malformed fingerprint or
+    /// an undecodable stored layout.
+    pub async fn table_registration(
+        &self,
+        table: &TableRef,
+        tenant: DataTenantId,
+    ) -> Result<(SchemaFingerprint, PhysicalLayoutWire), BifrostCatalogError> {
+        let fqn = table.fqn();
+        let row = self
+            .lookup_table_row(&fqn, tenant)
+            .await?
+            .ok_or_else(|| BifrostCatalogError::TableNotFound(fqn.clone()))?;
+        let fingerprint: [u8; 32] = row.fingerprint.as_slice().try_into().map_err(|_| {
+            BifrostCatalogError::MetadataMismatch(format!(
+                "schema fingerprint length mismatch for {fqn}"
+            ))
+        })?;
+        Ok((SchemaFingerprint(fingerprint), layout_wire_from_row(&row)?))
     }
 
     /// Return the registered user-schema fingerprint for one tenant/logical table.
@@ -913,6 +947,7 @@ impl BifrostCatalog {
         Ok(BifrostTableDescription {
             entry: entry_from_row(&row)?,
             fields: fields_from_stored_schema(&arrow_schema)?,
+            physical_layout: layout_wire_from_row(&row)?,
         })
     }
 

@@ -365,8 +365,8 @@ pub struct ScribeRuntimeConfig {
     #[serde(default = "default_ingest_otlp_value_depth")]
     pub ingest_otlp_value_depth: usize,
     /// Maximum distinct event-day partitions in one request.
-    #[serde(default = "default_ingest_event_days")]
-    pub ingest_event_days: usize,
+    #[serde(default = "default_ingest_time_partitions")]
+    pub ingest_time_partitions: usize,
     /// Fixed WAL header and digest workspace bytes retained by an ingress root.
     #[serde(default = "default_ingest_wal_workspace_bytes")]
     pub ingest_wal_workspace_bytes: usize,
@@ -534,8 +534,14 @@ pub struct OracleRuntimeConfig {
     pub audit_relay_shutdown_timeout_ms: u64,
 }
 
+/// Default loopback peer advertisement used by single-node development boots.
+///
+/// The scheme is mandatory: this value is published into `vala.cluster_nodes`
+/// and later dialed through `Endpoint::from_shared`, which cannot parse a
+/// schemeless authority. Production boots reject this default because
+/// [`WyrdServerConfig::validate`] requires `https://` under that profile.
 fn default_oracle_advertise_addr() -> String {
-    "127.0.0.1:50052".to_owned()
+    "http://127.0.0.1:50052".to_owned()
 }
 fn default_oracle_cpu_cores() -> f64 {
     1.0
@@ -1284,8 +1290,8 @@ fn default_ingest_otlp_value_depth() -> usize {
 }
 
 /// Returns the immutable V1 event-day hard maximum.
-fn default_ingest_event_days() -> usize {
-    vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS.event_days
+fn default_ingest_time_partitions() -> usize {
+    vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS.time_partitions
 }
 
 /// Returns the immutable V1 WAL-workspace hard maximum.
@@ -1316,7 +1322,7 @@ impl Default for ScribeRuntimeConfig {
             ingest_otlp_attributes: default_ingest_otlp_attributes(),
             ingest_otlp_value_bytes: default_ingest_otlp_value_bytes(),
             ingest_otlp_value_depth: default_ingest_otlp_value_depth(),
-            ingest_event_days: default_ingest_event_days(),
+            ingest_time_partitions: default_ingest_time_partitions(),
             ingest_wal_workspace_bytes: default_ingest_wal_workspace_bytes(),
         }
     }
@@ -1411,9 +1417,9 @@ impl ScribeRuntimeConfig {
                 default_ingest_otlp_value_depth(),
             ),
             (
-                "ingest_event_days",
-                self.ingest_event_days,
-                default_ingest_event_days(),
+                "ingest_time_partitions",
+                self.ingest_time_partitions,
+                default_ingest_time_partitions(),
             ),
             (
                 "ingest_wal_workspace_bytes",
@@ -1457,7 +1463,7 @@ impl ScribeRuntimeConfig {
                 attributes: self.ingest_otlp_attributes,
                 value_bytes: self.ingest_otlp_value_bytes,
                 value_depth: self.ingest_otlp_value_depth,
-                event_days: self.ingest_event_days,
+                time_partitions: self.ingest_time_partitions,
             },
             native_fields: self.ingest_native_fields,
             native_sources: self.ingest_native_sources,
@@ -2107,6 +2113,9 @@ impl WyrdServerConfig {
         }
         if let Some(val) = env_opt("WYRD_ORACLE_PEER_SERVER_NAME")? {
             self.bifrost.oracle.peer_server_name = Some(val);
+        }
+        if let Some(val) = env_opt("WYRD_ORACLE_ADVERTISE_ADDR")? {
+            self.bifrost.oracle.advertise_addr = val;
         }
 
         // telemetry.endpoint
@@ -3150,6 +3159,41 @@ minimum_slots = 2
             .expect("complete production Oracle TLS configuration validates");
     }
 
+    /// Proves the advertised peer address always carries a dialable scheme and
+    /// that the environment override lands on the same validated field.
+    ///
+    /// The advertisement is published into `vala.cluster_nodes` and later dialed
+    /// through `Endpoint::from_shared`, which rejects a schemeless authority, so
+    /// a missing scheme is unroutable rather than merely untidy. Routing the
+    /// environment override through `apply_env_overrides` keeps one validated
+    /// source of truth instead of a second unvalidated read at boot.
+    #[test]
+    fn oracle_advertise_addr_carries_scheme_and_honors_env_override() {
+        let default_addr = WyrdServerConfig::default().bifrost.oracle.advertise_addr;
+        assert!(
+            default_addr.starts_with("http://") || default_addr.starts_with("https://"),
+            "default advertisement must carry a dialable scheme, got {default_addr}"
+        );
+
+        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        temp_env::with_vars(
+            [(
+                "WYRD_ORACLE_ADVERTISE_ADDR",
+                Some("https://oracle-0.peers.svc:50052"),
+            )],
+            || {
+                let mut config = WyrdServerConfig::default();
+                config
+                    .apply_env_overrides()
+                    .expect("advertisement override applies");
+                assert_eq!(
+                    config.bifrost.oracle.advertise_addr,
+                    "https://oracle-0.peers.svc:50052"
+                );
+            },
+        );
+    }
+
     /// Proves status alone cannot activate Oracle without benchmark evidence.
     #[test]
     fn oracle_calibration_rejects_minimal_approved_profile() {
@@ -3235,7 +3279,7 @@ minimum_slots = 2
         assert_rejected!(ingest_otlp_attributes, 0);
         assert_rejected!(ingest_otlp_value_bytes, 0);
         assert_rejected!(ingest_otlp_value_depth, 0);
-        assert_rejected!(ingest_event_days, 0);
+        assert_rejected!(ingest_time_partitions, 0);
         assert_rejected!(ingest_wal_workspace_bytes, 0);
         assert_rejected!(ingest_native_fields, default_ingest_native_fields() + 1);
         assert_rejected!(ingest_native_sources, default_ingest_native_sources() + 1);
@@ -3252,7 +3296,7 @@ minimum_slots = 2
             ingest_otlp_value_depth,
             default_ingest_otlp_value_depth() + 1
         );
-        assert_rejected!(ingest_event_days, default_ingest_event_days() + 1);
+        assert_rejected!(ingest_time_partitions, default_ingest_time_partitions() + 1);
         assert_rejected!(
             ingest_wal_workspace_bytes,
             default_ingest_wal_workspace_bytes() + 1
@@ -3295,7 +3339,7 @@ minimum_slots = 2
             ingest_otlp_attributes: 16,
             ingest_otlp_value_bytes: 512,
             ingest_otlp_value_depth: 3,
-            ingest_event_days: 2,
+            ingest_time_partitions: 2,
             ingest_wal_workspace_bytes: 256,
             ..ScribeRuntimeConfig::default()
         };
@@ -3312,7 +3356,7 @@ minimum_slots = 2
         assert_eq!(frozen.otlp.attributes, 16);
         assert_eq!(frozen.otlp.value_bytes, 512);
         assert_eq!(frozen.otlp.value_depth, 3);
-        assert_eq!(frozen.otlp.event_days, 2);
+        assert_eq!(frozen.otlp.time_partitions, 2);
         assert_eq!(frozen.wal_workspace_bytes, 256);
     }
 

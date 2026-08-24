@@ -4,7 +4,6 @@ use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
-use chrono::NaiveDate;
 use std::sync::Arc;
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -12,7 +11,7 @@ use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::scribe::audit_envelope::encode_audit_event;
 use vala_bifrost_redux::scribe::replay::replay_wal_directory;
-use vala_bifrost_redux::scribe::seal_key::{EventDay, SealKey};
+use vala_bifrost_redux::scribe::seal_key::SealKey;
 use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::ids::DataTenantId;
@@ -59,7 +58,7 @@ fn seal_key(tenant: DataTenantId) -> SealKey {
     SealKey::new(
         tenant,
         TableRef::new(BifrostNamespace::Bifrost, "scribe_idempotent"),
-        EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 24).expect("test day")),
+        vala_bifrost_redux::partition_fixtures::day_partition(2026, 7, 24),
     )
 }
 

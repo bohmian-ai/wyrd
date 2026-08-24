@@ -3145,17 +3145,13 @@ impl WyrdTestServerBuilder {
             Some(credentials) => credentials,
             None => provision_oracle_peer_credentials(Arc::clone(&fixture)).await?,
         };
-        let peer_tls = if let Some(tls) = &self.oracle_peer_tls {
-            vala_bifrost_redux::oracle::dispatcher::OraclePeerTls::new(
+        let peer_tls = match &self.oracle_peer_tls {
+            Some(tls) => Some(vala_bifrost_redux::oracle::dispatcher::OraclePeerTls::new(
                 std::fs::read(&tls.ca_path)
                     .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
                 tls.server_name.clone(),
-            )
-        } else {
-            vala_bifrost_redux::oracle::dispatcher::OraclePeerTls::new(
-                Vec::new(),
-                "unused.invalid".to_owned(),
-            )
+            )),
+            None => None,
         };
         let mut bifrost_config = BifrostRuntimeConfig::default();
         bifrost_config.scribe.ingest_request_bytes = self.scribe_ingest_limits.max_frame_bytes;
@@ -3179,10 +3175,15 @@ impl WyrdTestServerBuilder {
             config: bifrost_config,
             forge_config: forge_runtime,
             node_id,
-            advertise_addr: self.bind_addrs.map_or_else(
-                || "http://127.0.0.1:0".to_owned(),
-                |(_, grpc)| format!("http://{grpc}"),
-            ),
+            // Must agree with `WyrdTestServer::grpc_url`: the address published
+            // into cluster membership is dialed by peer transports, and a TLS
+            // transport refuses a peer advertising a plaintext scheme.
+            advertise_addr: match (self.bind_addrs, self.oracle_peer_tls.is_some()) {
+                (Some((_, grpc)), true) => format!("https://localhost:{}", grpc.port()),
+                (Some((_, grpc)), false) => format!("http://{grpc}"),
+                (None, true) => "https://localhost:0".to_owned(),
+                (None, false) => "http://127.0.0.1:0".to_owned(),
+            },
             wal_dir: wal_root.path().to_owned(),
             shutdown: shutdown.clone(),
             test_controls: Some(test_controls),

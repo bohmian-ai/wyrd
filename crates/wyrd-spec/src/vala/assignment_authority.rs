@@ -177,7 +177,14 @@ pub enum AssignmentDigestError {
     },
 }
 
-const ASSIGNMENT_AUTHORITY_DOMAIN: &[u8] = b"wyrd.oracle.assignment-authority.v2\0";
+/// Domain separator for the v3 assignment-authority digest.
+///
+/// v3 differs from v2 only in the Scribe-cut encoding: the two length-prefixed
+/// event-day strings are replaced by two fixed-width typed partitions. Every
+/// other count, length, option, predicate, file, projection, cursor, range, and
+/// numeric rule is unchanged. The domain is bumped so a v2 signature can never
+/// validate against v3 bytes.
+const ASSIGNMENT_AUTHORITY_DOMAIN: &[u8] = b"wyrd.oracle.assignment-authority.v3\0";
 
 /// Appends a length-prefixed UTF-8 string: a big-endian `u32` byte length
 /// followed by the raw UTF-8 bytes.
@@ -242,13 +249,24 @@ fn push_predicate(
     push_option(buffer, predicate.literal(), push_literal)
 }
 
+/// Appends one typed partition as `granularity_tag:u8 || start_unix_micros:i64`
+/// big-endian.
+///
+/// Tag `0` is reserved for "unspecified" and is unreachable here because
+/// [`crate::vala::api::TimePartitionWire`] cannot hold it; a decoder that sees
+/// `0` must reject the bytes rather than defaulting.
+fn push_time_partition(buffer: &mut Vec<u8>, partition: crate::vala::api::TimePartitionWire) {
+    buffer.push(partition.granularity_tag());
+    buffer.extend_from_slice(&partition.start_unix_micros().to_be_bytes());
+}
+
 fn push_scribe_cut(
     buffer: &mut Vec<u8>,
     cut: &crate::vala::api::ScribeProviderCut,
 ) -> Result<(), AssignmentDigestError> {
     buffer.extend_from_slice(&cut.writer_epoch.to_be_bytes());
-    push_string(buffer, &cut.start_event_day)?;
-    push_string(buffer, &cut.end_event_day)?;
+    push_time_partition(buffer, cut.start_partition);
+    push_time_partition(buffer, cut.end_partition);
     push_count(
         buffer,
         cut.required_columns.len(),
@@ -380,14 +398,43 @@ pub fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vala::api::ScribeProviderCut;
+    use crate::vala::api::{ScribeProviderCut, TimeGranularityWire, TimePartitionWire};
 
-    /// Normative vector from the task packet: one assignment, no Scribe cut,
-    /// tenant `00112233-4455-6677-8899-aabbccddeeff`, table `logs.records`,
-    /// fingerprint `00..1f`, one file, three required columns, and a single
-    /// `Eq(service_name, "api")` predicate must encode to exactly 239 bytes
-    /// and hash to the fixed digest below. Asserting both the byte length and
-    /// the hash prevents a compensating pair of layout mistakes from passing.
+    /// Builds the normative v3 Scribe cut: writer epoch 7, the two hourly
+    /// partitions `2026-08-23T14:00:00Z` and `2026-08-23T15:00:00Z`, the three
+    /// standard required columns, persisted cursor 41 with the single range
+    /// `[1, 40]`, 16 maximum batches, and 1 MiB maximum retained bytes.
+    fn normative_scribe_cut(required_columns: &[String]) -> ScribeProviderCut {
+        ScribeProviderCut {
+            writer_epoch: 7,
+            start_partition: hour_partition(1_787_493_600_000_000),
+            end_partition: hour_partition(1_787_497_200_000_000),
+            required_columns: required_columns.to_vec(),
+            persisted_cursor: 41,
+            persisted_ranges: vec![crate::vala::api::PersistedWalRange {
+                start_lsn: 1,
+                end_lsn: 40,
+            }],
+            maximum_batch_count: 16,
+            maximum_retained_bytes: 1_048_576,
+        }
+    }
+
+    /// Builds one hourly partition from its exact epoch-microsecond boundary.
+    fn hour_partition(start_unix_micros: i64) -> TimePartitionWire {
+        let start = chrono::DateTime::from_timestamp_micros(start_unix_micros)
+            .expect("fixture start is representable");
+        TimePartitionWire::new(TimeGranularityWire::Hour, start)
+            .expect("fixture start is canonical")
+    }
+
+    /// Normative v3 vector from the task packet: one assignment for tenant
+    /// `00112233-4455-6677-8899-aabbccddeeff`, table `logs.records`, fingerprint
+    /// `00..1f`, one file, three required columns, a single
+    /// `Eq(service_name, "api")` predicate, and the normative Scribe cut must
+    /// encode to exactly 362 bytes and hash to the fixed digest below. Asserting
+    /// both the byte length and the hash prevents a compensating pair of layout
+    /// mistakes from passing.
     #[test]
     fn normative_vector_encodes_to_fixed_length_and_digest() {
         let fingerprint: String = (0u8..32).map(|byte| format!("{byte:02x}")).collect();
@@ -402,6 +449,7 @@ mod tests {
             "service_name".to_string(),
             ScanLiteral::Utf8("api".to_string()),
         )];
+        let cut = normative_scribe_cut(&required_columns);
         let assignment = AssignmentDigestInput {
             scan_id: "scan-1",
             tenant_uuid,
@@ -409,7 +457,7 @@ mod tests {
             table: "records",
             schema_fingerprint_hex: &fingerprint,
             files: &files,
-            scribe_cut: None,
+            scribe_cut: Some(&cut),
             required_columns: &required_columns,
             predicates: &predicates,
         };
@@ -417,15 +465,67 @@ mod tests {
         let bytes = encode_assignment_authority_bytes(std::slice::from_ref(&assignment)).unwrap();
         assert_eq!(
             bytes.len(),
-            239,
-            "normative vector must encode to exactly 239 bytes"
+            362,
+            "normative vector must encode to exactly 362 bytes"
         );
 
         let digest = assignment_authority_digest(std::slice::from_ref(&assignment)).unwrap();
         assert_eq!(
             digest,
-            "1b565ec74ce58909f7f5d6fa35a2de2048ccea823ddec2339cd72b9434c0e208"
+            "60dfb9453fa65f0752431b3feaf8ca5f9a9f7dfa0bab7c87b8724e209bbbe579"
         );
+    }
+
+    /// Each partition bound is independently authoritative: changing either
+    /// endpoint's granularity or start instant must move the digest, so a
+    /// signed cut cannot be replayed against a different partition range.
+    #[test]
+    fn every_partition_bound_component_changes_the_digest() {
+        let (fingerprint, tenant_uuid, files, required_columns, predicates) = base_vector();
+        let baseline_cut = normative_scribe_cut(&required_columns);
+        let digest_with = |cut: &ScribeProviderCut| {
+            digest_of(&AssignmentDigestInput {
+                scan_id: "scan-1",
+                tenant_uuid,
+                namespace: "logs",
+                table: "records",
+                schema_fingerprint_hex: &fingerprint,
+                files: &files,
+                scribe_cut: Some(cut),
+                required_columns: &required_columns,
+                predicates: &predicates,
+            })
+        };
+        let baseline = digest_with(&baseline_cut);
+
+        let mut moved_start = baseline_cut.clone();
+        moved_start.start_partition = hour_partition(1_787_490_000_000_000);
+        assert_ne!(baseline, digest_with(&moved_start));
+
+        let mut moved_end = baseline_cut.clone();
+        moved_end.end_partition = hour_partition(1_787_500_800_000_000);
+        assert_ne!(baseline, digest_with(&moved_end));
+
+        let day_start = chrono::DateTime::from_timestamp_micros(1_787_443_200_000_000)
+            .expect("fixture start is representable");
+        let mut regranulated = baseline_cut.clone();
+        regranulated.start_partition = TimePartitionWire::new(TimeGranularityWire::Day, day_start)
+            .expect("fixture day start is canonical");
+        regranulated.end_partition = regranulated.start_partition;
+        assert_ne!(baseline, digest_with(&regranulated));
+    }
+
+    /// A partition start that is not the exact boundary of its granularity is
+    /// unrepresentable, so no noncanonical value can ever reach the digest.
+    #[test]
+    fn noncanonical_partition_starts_are_unrepresentable() {
+        let off_hour = chrono::DateTime::from_timestamp_micros(1_787_493_600_000_001)
+            .expect("fixture start is representable");
+        assert!(TimePartitionWire::new(TimeGranularityWire::Hour, off_hour).is_err());
+
+        let mid_day = chrono::DateTime::from_timestamp_micros(1_787_493_600_000_000)
+            .expect("fixture start is representable");
+        assert!(TimePartitionWire::new(TimeGranularityWire::Day, mid_day).is_err());
     }
 
     fn base_vector() -> (
@@ -645,16 +745,7 @@ mod tests {
             required_columns: &required_columns,
             predicates: &predicates,
         });
-        let cut = ScribeProviderCut {
-            writer_epoch: 1,
-            start_event_day: "2026-01-01".to_string(),
-            end_event_day: "2026-01-01".to_string(),
-            required_columns: required_columns.clone(),
-            persisted_cursor: 10,
-            persisted_ranges: vec![],
-            maximum_batch_count: 8,
-            maximum_retained_bytes: 1024,
-        };
+        let cut = normative_scribe_cut(&required_columns);
         let with_cut = digest_of(&AssignmentDigestInput {
             scan_id: "scan-1",
             tenant_uuid,

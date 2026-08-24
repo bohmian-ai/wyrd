@@ -191,9 +191,7 @@ pub(crate) mod producer_lifecycle_tests {
             seal_key: SealKey::new(
                 crate::test_support::tenant(),
                 TableRef::new(BifrostNamespace::Bifrost, "producer_lifecycle"),
-                crate::scribe::seal_key::EventDay::new(
-                    chrono::NaiveDate::from_ymd_opt(2026, 8, 19).expect("valid event day"),
-                ),
+                crate::test_support::day_partition(2026, 8, 19),
             ),
             shard_id: 3,
             writer_epoch: 41,
@@ -266,7 +264,7 @@ pub struct ScribeIngressLifecycleSnapshot {
     /// Source descriptors represented by completed plans.
     pub planned_sources: u64,
     /// Event-day descriptors represented by completed plans.
-    pub planned_event_days: u64,
+    pub planned_time_partitions: u64,
     /// Rows represented by completed plans.
     pub planned_rows: u64,
     /// Root reservations successfully established.
@@ -400,9 +398,9 @@ impl ScribeIngressLifecycleOwner {
             state.planned_sources = state
                 .planned_sources
                 .saturating_add(u64::try_from(plan.source_count).unwrap_or(u64::MAX));
-            state.planned_event_days = state
-                .planned_event_days
-                .saturating_add(u64::try_from(plan.event_day_count).unwrap_or(u64::MAX));
+            state.planned_time_partitions = state
+                .planned_time_partitions
+                .saturating_add(u64::try_from(plan.time_partition_count).unwrap_or(u64::MAX));
             state.planned_rows = state
                 .planned_rows
                 .saturating_add(u64::try_from(plan.rows).unwrap_or(u64::MAX));
@@ -678,7 +676,7 @@ mod tests {
 
     use super::ScribeIngressLifecycle;
     use crate::scribe::material_plan::{
-        IngestMaterialPlan, IngestPath, MAX_EVENT_DAYS, MAX_SOURCE_PLANS, SourceMaterialPlan,
+        IngestMaterialPlan, IngestPath, MAX_SOURCE_PLANS, SourceMaterialPlan,
     };
 
     /// Builds one exact scalar plan used to exercise lifecycle accounting.
@@ -696,8 +694,7 @@ mod tests {
             sources: [SourceMaterialPlan::default(); MAX_SOURCE_PLANS],
             source_count: 2,
             rows: 7,
-            event_days: [0; MAX_EVENT_DAYS],
-            event_day_count: 1,
+            time_partition_count: 1,
             current_material_bytes: 32,
             active_output_bytes: 24,
             persistence_candidate_bytes: 24,
@@ -726,7 +723,7 @@ mod tests {
         assert_eq!(snapshot.plans, 1);
         assert_eq!(snapshot.planned_bytes, 128);
         assert_eq!(snapshot.planned_sources, 2);
-        assert_eq!(snapshot.planned_event_days, 1);
+        assert_eq!(snapshot.planned_time_partitions, 1);
         assert_eq!(snapshot.planned_rows, 7);
         assert_eq!(snapshot.reserved_bytes, 128);
         assert_eq!(snapshot.materialized_bytes, 48);

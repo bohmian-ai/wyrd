@@ -74,6 +74,7 @@ async fn server_retains_bifrost_volume_roots_across_public_write_and_query() {
             table: TableRef::new(BifrostNamespace::Bifrost, table_name),
             user_fields: vec![Field::new("value", DataType::Int64, false)],
             tenant: server.data_tenant_id(),
+            physical_layout: None,
             audit: None,
         })
         .await
@@ -158,6 +159,7 @@ async fn pg_post_boot_tenants_use_dynamic_oracle_admission() {
                 table: TableRef::new(BifrostNamespace::Bifrost, table_name),
                 user_fields: vec![Field::new("value", DataType::Int64, false)],
                 tenant,
+                physical_layout: None,
                 audit: None,
             })
             .await

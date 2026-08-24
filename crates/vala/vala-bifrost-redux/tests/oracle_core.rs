@@ -14,7 +14,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::reader::StreamReader;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use chrono::{NaiveDate, Utc};
+use chrono::Utc;
 use futures_util::StreamExt;
 use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Literal, Struct};
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -44,7 +44,7 @@ use vala_bifrost_redux::oracle::{
 use vala_bifrost_redux::schema::with_managed_columns;
 use vala_bifrost_redux::scribe::file_list_writer::{FileListInsert, insert_and_audit};
 use vala_bifrost_redux::scribe::memtable::Memtable;
-use vala_bifrost_redux::scribe::seal_key::{EventDay, SealKey};
+use vala_bifrost_redux::scribe::seal_key::SealKey;
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use vala_bifrost_redux::scribe::tail_rpc::{
     FenceRelease, FetchLiveTailService, LocalTailPage, LocalTailReadTransport, ScribeTailReader,
@@ -470,6 +470,7 @@ impl OracleFixture {
                 table: table.clone(),
                 user_fields: vec![Field::new("value", DataType::Int64, false)],
                 tenant,
+                physical_layout: None,
                 audit: None,
             })
             .await
@@ -827,7 +828,7 @@ impl OracleFixture {
                 row_count: i64::try_from(row_count).expect("row count"),
                 min_event_time: Utc::now(),
                 max_event_time: Utc::now(),
-                partition_day: NaiveDate::from_ymd_opt(1970, 1, 1).expect("day"),
+                partition: vala_bifrost_redux::partition_fixtures::day_partition(1970, 1, 1),
                 node_id,
                 writer_epoch,
                 wal_lsn_min: 1,
@@ -919,7 +920,7 @@ impl OracleFixture {
                 row_count: 1,
                 min_event_time: Utc::now(),
                 max_event_time: Utc::now(),
-                partition_day: NaiveDate::from_ymd_opt(1970, 1, 1).expect("day"),
+                partition: vala_bifrost_redux::partition_fixtures::day_partition(1970, 1, 1),
                 node_id: uuid::Uuid::now_v7(),
                 writer_epoch: 1,
                 wal_lsn_min: 1,
@@ -1087,7 +1088,7 @@ impl TailReadTransport for FenceProbeTransport {
         Ok(wyrd_spec::vala::api::TailReadFence {
             fence_id: wyrd_spec::vala::api::TailFenceId::new(uuid::Uuid::now_v7()),
             binding: request.binding,
-            event_day: request.event_day,
+            time_partition: request.time_partition,
             stream: wyrd_spec::vala::api::TailStreamIdentity {
                 node_id: self.node_id,
                 writer_epoch: request.exclusive_sealed.writer_epoch,
@@ -1154,7 +1155,7 @@ impl TailReadTransport for CleanupReleaseProbeTransport {
         Ok(wyrd_spec::vala::api::TailReadFence {
             fence_id: wyrd_spec::vala::api::TailFenceId::new(uuid::Uuid::now_v7()),
             binding: request.binding,
-            event_day: request.event_day,
+            time_partition: request.time_partition,
             stream: wyrd_spec::vala::api::TailStreamIdentity {
                 node_id: self.node_id,
                 writer_epoch: request.exclusive_sealed.writer_epoch,
@@ -2219,7 +2220,7 @@ async fn pg_bifrost_oracle_multitenant_isolation_and_fairness_journey_telemetry(
         fixture.table.fqn(),
         node_id,
         1,
-        wyrd_spec::vala::api::EventDay::new("1970-01-01").expect("wire day"),
+        vala_bifrost_redux::partition_fixtures::day_partition(1970, 1, 1).to_wire(),
         transport,
     );
     let oracle = fixture
@@ -2534,10 +2535,10 @@ async fn oracle_fused_live_only_real_scribe_and_degraded_policy() {
 
 /// Builds one real local Scribe tail containing a single live-only row.
 fn live_only_tail_directory(fixture: &OracleFixture) -> Arc<TailTransportDirectory> {
-    let day = NaiveDate::from_ymd_opt(1970, 1, 1).expect("day");
+    let day = vala_bifrost_redux::partition_fixtures::day_partition(1970, 1, 1);
     let stream = StreamIdentity::new(NodeId::new(uuid::Uuid::now_v7()), WriterEpoch::new(7));
     let memtable = Arc::new(Memtable::new());
-    let key = SealKey::new(fixture.tenant, fixture.table.clone(), EventDay::new(day));
+    let key = SealKey::new(fixture.tenant, fixture.table.clone(), day);
     let schema = Arc::new(Schema::new(with_managed_columns(vec![Field::new(
         "value",
         DataType::Int64,
@@ -2597,7 +2598,7 @@ fn live_only_tail_directory(fixture: &OracleFixture) -> Arc<TailTransportDirecto
         fixture.table.fqn(),
         wyrd_spec::vala::api::NodeId::new(stream.node_id.as_uuid()),
         u64::try_from(stream.writer_epoch.as_i64()).expect("epoch"),
-        wyrd_spec::vala::api::EventDay::new("1970-01-01").expect("wire day"),
+        vala_bifrost_redux::partition_fixtures::day_partition(1970, 1, 1).to_wire(),
         Arc::new(LocalTailReadTransport::new(reader)),
     );
     tails
@@ -2660,7 +2661,7 @@ async fn pg_bifrost_oracle_recovery_terminal_journey_partial_fence_cleanup() {
             fixture.table.fqn(),
             node_id,
             writer_epoch,
-            wyrd_spec::vala::api::EventDay::new("1970-01-01").expect("wire day"),
+            vala_bifrost_redux::partition_fixtures::day_partition(1970, 1, 1).to_wire(),
             Arc::new(FenceProbeTransport {
                 node_id,
                 fail_acquire,
@@ -2711,7 +2712,7 @@ async fn fused_audit_failure_releases_every_fence_before_return() {
             fixture.table.fqn(),
             node_id,
             writer_epoch,
-            wyrd_spec::vala::api::EventDay::new("1970-01-01").expect("wire day"),
+            vala_bifrost_redux::partition_fixtures::day_partition(1970, 1, 1).to_wire(),
             Arc::new(FenceProbeTransport {
                 node_id,
                 fail_acquire: false,
@@ -2759,7 +2760,7 @@ async fn fused_post_acquisition_timeout_releases_before_return() {
             fixture.table.fqn(),
             node_id,
             writer_epoch,
-            wyrd_spec::vala::api::EventDay::new("1970-01-01").expect("wire day"),
+            vala_bifrost_redux::partition_fixtures::day_partition(1970, 1, 1).to_wire(),
             Arc::new(CleanupReleaseProbeTransport {
                 node_id,
                 block_release,
@@ -2824,7 +2825,7 @@ async fn typed_fused_acquisition_failure_precedes_audit_and_read() {
         fixture.table.fqn(),
         node_id,
         1,
-        wyrd_spec::vala::api::EventDay::new("1970-01-01").expect("wire day"),
+        vala_bifrost_redux::partition_fixtures::day_partition(1970, 1, 1).to_wire(),
         Arc::new(FenceProbeTransport {
             node_id,
             fail_acquire: true,
@@ -2903,7 +2904,7 @@ async fn typed_plan_waits_for_delegated_admission_before_execution() {
         fixture.table.fqn(),
         node_id,
         1,
-        wyrd_spec::vala::api::EventDay::new("1970-01-01").expect("wire day"),
+        vala_bifrost_redux::partition_fixtures::day_partition(1970, 1, 1).to_wire(),
         Arc::new(FenceProbeTransport {
             node_id,
             fail_acquire: false,
@@ -2957,7 +2958,7 @@ async fn typed_fused_success_commits_one_decision_and_output() {
         fixture.table.fqn(),
         node_id,
         1,
-        wyrd_spec::vala::api::EventDay::new("1970-01-01").expect("wire day"),
+        vala_bifrost_redux::partition_fixtures::day_partition(1970, 1, 1).to_wire(),
         Arc::new(FenceProbeTransport {
             node_id,
             fail_acquire: false,
@@ -3194,7 +3195,7 @@ async fn typed_fused_audit_failure_releases_before_return() {
         fixture.table.fqn(),
         node_id,
         1,
-        wyrd_spec::vala::api::EventDay::new("1970-01-01").expect("wire day"),
+        vala_bifrost_redux::partition_fixtures::day_partition(1970, 1, 1).to_wire(),
         Arc::new(FenceProbeTransport {
             node_id,
             fail_acquire: false,
@@ -3251,7 +3252,7 @@ async fn remote_fence_release_failure_is_observed_without_drop_spawn() {
         fixture.table.fqn(),
         node_id,
         1,
-        wyrd_spec::vala::api::EventDay::new("1970-01-01").expect("wire day"),
+        vala_bifrost_redux::partition_fixtures::day_partition(1970, 1, 1).to_wire(),
         Arc::new(FenceProbeTransport {
             node_id,
             fail_acquire: false,

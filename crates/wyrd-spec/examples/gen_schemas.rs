@@ -57,9 +57,10 @@ use wyrd_spec::vala::api::{
     BifrostPermissionDescriptor, BifrostQueryRequest, BifrostTableDescription, BifrostTableEntry,
     CancelRunningQueryRequest, CancelRunningQueryResponse, DataTypeSpec,
     FieldSpec as BifrostFieldSpec, GetRunningQueryRequest, ListRunningQueriesResponse,
-    PartitionColumnSpec, PartitionTransformWire, QueryParam, RegisterOutcome, RegisterTableRequest,
+    NullOrderWire, PhysicalLayoutWire, QueryParam, RegisterOutcome, RegisterTableRequest,
     RegisterTableResponse, RunningQueryLifecycleState, RunningQueryProgress, RunningQuerySummary,
-    SyncQueryRequest, TableStatus, TimeUnit,
+    SortDirectionWire, SortKeyWire, SyncQueryRequest, TableStatus, TimeGranularityWire,
+    TimePartitionSpecWire, TimeUnit,
 };
 use wyrd_spec::vala::eval::{
     AgentTurnSubmission, ComparisonOperator, ConversationTurn, DagError, EvalCondition,
@@ -193,8 +194,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<DataTypeSpec>(out, golden, "bifrost_data_type_spec")?;
     write::<BifrostFieldSpec>(out, golden, "bifrost_field_spec")?;
     write::<TimeUnit>(out, golden, "bifrost_time_unit")?;
-    write::<PartitionTransformWire>(out, golden, "bifrost_partition_transform")?;
-    write::<PartitionColumnSpec>(out, golden, "bifrost_partition_column_spec")?;
+    write::<TimeGranularityWire>(out, golden, "bifrost_time_granularity")?;
+    write::<SortDirectionWire>(out, golden, "bifrost_sort_direction")?;
+    write::<NullOrderWire>(out, golden, "bifrost_null_order")?;
+    write::<TimePartitionSpecWire>(out, golden, "bifrost_time_partition_spec")?;
+    write::<SortKeyWire>(out, golden, "bifrost_sort_key")?;
+    write::<PhysicalLayoutWire>(out, golden, "bifrost_physical_layout")?;
     write::<RegisterTableRequest>(out, golden, "bifrost_register_table_request")?;
     write::<RegisterOutcome>(out, golden, "bifrost_register_outcome")?;
     write::<RegisterTableResponse>(out, golden, "bifrost_register_table_response")?;

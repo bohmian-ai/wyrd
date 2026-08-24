@@ -1966,6 +1966,18 @@ impl PersistenceWorker {
         context: PersistenceCandidate<'_>,
         parquet_owner: &mut Option<ScribeMemoryLease>,
     ) -> Result<ParquetEncoded, ScribeError> {
+        let layout = crate::scribe::write_recipe::resolve_write_recipe(
+            self.operator_pool
+                .as_ref()
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "writer-v2 encoding requires the operator control capability"
+                        .to_owned(),
+                })?
+                .pool(),
+            context.binding,
+            &context.frozen.schema,
+        )
+        .await?;
         let (scratch, object_base, footer_reservation) = self.prepare_encoding(
             context.generation,
             context.binding,
@@ -1984,6 +1996,7 @@ impl PersistenceWorker {
                 tenant: context.binding.tenant,
                 candidate: Some(context.candidate),
                 first_ordinal: context.first_ordinal,
+                layout,
                 scratch_dir: scratch.path().to_path_buf(),
                 object_base,
                 footer_reservation,
@@ -2322,7 +2335,7 @@ impl PersistenceWorker {
             })?;
         let object_base = ScribeArtifactIdentity::new(
             binding,
-            generation.seal_key.day,
+            generation.seal_key.partition,
             &generation.stream.node_id.to_string(),
             generation.stream.writer_epoch.as_i64(),
             generation.shard_id,
@@ -2578,7 +2591,7 @@ impl PersistenceWorker {
         let mover = ScribeStageMover::new(Arc::clone(&self.wal), (*self.operator).clone());
         let object_base = ScribeArtifactIdentity::new(
             binding,
-            generation.seal_key.day,
+            generation.seal_key.partition,
             &generation.stream.node_id.to_string(),
             generation.stream.writer_epoch.as_i64(),
             generation.shard_id,
@@ -2660,7 +2673,7 @@ impl PersistenceWorker {
         if let Some(publisher) = &self.staging_file_publisher {
             let event = crate::maintenance::StagingFileCommitted::new(
                 binding.clone(),
-                generation.seal_key.day.as_naive_date(),
+                generation.seal_key.partition,
             );
             let _ = publisher.try_publish(event);
         }
@@ -2702,7 +2715,7 @@ impl PersistenceWorker {
         if let Some(publisher) = &self.staging_file_publisher {
             let _ = publisher.try_publish(crate::maintenance::StagingFileCommitted::new(
                 binding.clone(),
-                generation.seal_key.day.as_naive_date(),
+                generation.seal_key.partition,
             ));
         }
         if !defer_manifest_advance {
@@ -2792,8 +2805,8 @@ mod tests {
     use std::task::{Context, Poll};
 
     use crate::catalog::TableRef;
+
     use crate::namespaces::BifrostNamespace;
-    use crate::scribe::seal_key::EventDay;
     use crate::scribe::telemetry::producer_lifecycle_tests::{EventCaptureSubscriber, field};
     use crate::test_support::{SpanCaptureSubscriber, has_span_outcome};
 
@@ -2803,9 +2816,7 @@ mod tests {
             seal_key: SealKey::new(
                 crate::test_support::tenant(),
                 TableRef::new(BifrostNamespace::Bifrost, "producer_lifecycle"),
-                EventDay::new(
-                    chrono::NaiveDate::from_ymd_opt(2026, 8, 19).expect("valid event day"),
-                ),
+                crate::test_support::day_partition(2026, 8, 19),
             ),
             shard_id: 3,
             writer_epoch: 41,
@@ -3112,8 +3123,9 @@ mod tests {
         stream: StreamIdentity,
         /// Tenant that owns the representative generation.
         tenant: wyrd_spec::DataTenantId,
-        /// Database retained until worker shutdown completes.
-        _database: wyrd_dev_fixtures::pg::PgFixture,
+        /// Database retained until worker shutdown completes, and the source of
+        /// the tenant connection the fixture registers its control row through.
+        database: wyrd_dev_fixtures::pg::PgFixture,
         /// WAL directory retained until worker shutdown completes.
         _wal_root: tempfile::TempDir,
         /// Scratch namespace roots retained until worker shutdown completes.
@@ -3249,7 +3261,7 @@ mod tests {
                 wal,
                 stream,
                 tenant,
-                _database: database,
+                database,
                 _wal_root: wal_root,
                 _scratch_root: scratch_root,
             }
@@ -3323,23 +3335,13 @@ mod tests {
             })
         }
 
-        /// Submits one bounded generation and waits for its real worker completion.
-        async fn submit_and_drain(&self) {
-            let table = crate::catalog::TableRef::new(
-                crate::namespaces::BifrostNamespace::Bifrost,
-                "idle_queue",
-            );
-            let seal_key = SealKey::new(
-                self.tenant,
-                table.clone(),
-                crate::scribe::seal_key::EventDay::new(
-                    chrono::NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid test day"),
-                ),
-            );
-            let binding =
-                TenantTableBinding::resolve((self.tenant, table.clone())).expect("binding");
-            let batch_id = uuid::Uuid::now_v7();
-            let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+        /// Returns the physical Arrow schema every fixture generation writes.
+        ///
+        /// Registration and submission must agree exactly: the write recipe is
+        /// re-canonicalized against the sealed schema, so a column present in
+        /// one and absent from the other fails the seal closed.
+        fn fixture_schema() -> Arc<arrow::datatypes::Schema> {
+            Arc::new(arrow::datatypes::Schema::new(vec![
                 arrow::datatypes::Field::new(
                     wyrd_spec::vala::managed_columns::DATA_TENANT_ID,
                     arrow::datatypes::DataType::Utf8,
@@ -3354,7 +3356,57 @@ mod tests {
                     false,
                 ),
                 arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
-            ]));
+            ]))
+        }
+
+        /// Registers the control row the seal path resolves its write recipe from.
+        ///
+        /// The fixture drives the persistence worker directly rather than through
+        /// the catalog, so it owns the one registration the worker requires. The
+        /// layout is the canonical omission default, matching a table registered
+        /// without a declaration.
+        async fn register_control_row(&self, table: &crate::catalog::TableRef) {
+            let fqn = table.fqn();
+            let layout = crate::catalog::layout::PhysicalLayout::canonicalize(
+                &fqn,
+                &Self::fixture_schema(),
+                None,
+            )
+            .expect("the fixture schema canonicalizes");
+            let mut conn = self
+                .database
+                .vala_postgres()
+                .tenant_conn(self.tenant)
+                .await
+                .expect("fixture tenant connection");
+            vala_sql::queries::olap_catalog::upsert_table(
+                &mut conn,
+                uuid::Uuid::now_v7().as_bytes(),
+                &fqn,
+                &[0_u8; 32],
+                &serde_json::to_value(layout.to_wire()).expect("canonical layout encodes"),
+            )
+            .await
+            .expect("register the fixture control row");
+            conn.commit().await.expect("commit the fixture control row");
+        }
+
+        /// Submits one bounded generation and waits for its real worker completion.
+        async fn submit_and_drain(&self) {
+            let table = crate::catalog::TableRef::new(
+                crate::namespaces::BifrostNamespace::Bifrost,
+                "idle_queue",
+            );
+            let seal_key = SealKey::new(
+                self.tenant,
+                table.clone(),
+                crate::test_support::day_partition(2026, 1, 1),
+            );
+            let binding =
+                TenantTableBinding::resolve((self.tenant, table.clone())).expect("binding");
+            let batch_id = uuid::Uuid::now_v7();
+            self.register_control_row(&table).await;
+            let schema = Self::fixture_schema();
             let rows = vec![
                 arrow::record_batch::RecordBatch::try_new(
                     Arc::clone(&schema),

@@ -12,13 +12,6 @@ pub(crate) const PARQUET_WRITE_BATCH_ROWS: usize = 8_192;
 
 use super::memory::MAX_ROW_GROUP_ROWS;
 const BLOOM_FPP: f64 = 0.01;
-const BLOOM_COLUMNS: [&str; 5] = [
-    "data_tenant_id",
-    "run_id",
-    "card_uid",
-    "trace_id",
-    "span_id",
-];
 
 fn bloom_filter_ndv(row_count: usize) -> u64 {
     let ndv =
@@ -36,20 +29,23 @@ fn bloom_filter_ndv(row_count: usize) -> u64 {
 /// scan-bound, so the extra compression over SNAPPY is worth it). Row groups are capped at 131,072
 /// rows because parquet-58 has no byte-based row-group flush.
 ///
-/// Bloom filters are enabled only for the identity and correlation columns used
-/// by tenant- and trace-scoped reads. Payload and message columns stay
-/// unallowlisted so they cannot inflate every file's footer.
+/// Bloom filters are enabled only for `bloom_columns`, the canonical union the
+/// registered physical layout resolved from the managed floor and the table's
+/// declarations. Every other column stays unallowlisted so payload and message
+/// columns cannot inflate a file's footer.
 ///
 /// # Panics
 /// Never panics — ZSTD level 3 is always valid.
-pub fn bifrost_writer_properties(row_count: usize) -> WriterProperties {
-    bifrost_writer_properties_with_metadata(row_count, Vec::new())
+pub fn bifrost_writer_properties(row_count: usize, bloom_columns: &[String]) -> WriterProperties {
+    bifrost_writer_properties_with_metadata(row_count, Vec::new(), bloom_columns)
 }
 
 /// Parquet properties carrying the exact writer-v2 footer metadata.
 ///
 /// The caller must construct metadata through the common memory-contract
-/// owner so producer paths cannot invent alternate field spellings.
+/// owner so producer paths cannot invent alternate field spellings, and must
+/// pass the canonical Bloom column union resolved from the table's registered
+/// physical layout so every producer writes one identical footer recipe.
 ///
 /// # Panics
 ///
@@ -58,6 +54,7 @@ pub fn bifrost_writer_properties(row_count: usize) -> WriterProperties {
 pub fn bifrost_writer_properties_with_metadata(
     row_count: usize,
     metadata: Vec<KeyValue>,
+    bloom_columns: &[String],
 ) -> WriterProperties {
     let bloom_ndv = bloom_filter_ndv(row_count);
     let mut builder = WriterProperties::builder()
@@ -78,8 +75,8 @@ pub fn bifrost_writer_properties_with_metadata(
         builder = builder.set_key_value_metadata(Some(metadata));
     }
 
-    for column in BLOOM_COLUMNS {
-        let path = ColumnPath::from(column);
+    for column in bloom_columns {
+        let path = ColumnPath::from(column.as_str());
         builder = builder
             .set_column_bloom_filter_enabled(path.clone(), true)
             .set_column_bloom_filter_fpp(path.clone(), BLOOM_FPP)
@@ -93,9 +90,25 @@ pub fn bifrost_writer_properties_with_metadata(
 mod tests {
     use super::*;
 
+    /// The canonical union a traces table resolves: managed floor plus the
+    /// declaration-only correlation columns.
+    fn declared_recipe() -> Vec<String> {
+        [
+            "data_tenant_id",
+            "run_id",
+            "card_uid",
+            "trace_id",
+            "span_id",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+    }
+
     #[test]
     fn writer_recipe_metadata_is_deterministic() {
-        let properties = bifrost_writer_properties(50_000);
+        let bloom_columns = declared_recipe();
+        let properties = bifrost_writer_properties(50_000, &bloom_columns);
         let timestamp = ColumnPath::from("wyrd_event_time");
 
         assert_eq!(
@@ -118,9 +131,9 @@ mod tests {
         );
         assert!(!properties.offset_index_disabled());
 
-        for column in BLOOM_COLUMNS {
+        for column in &bloom_columns {
             let properties_for_column = properties
-                .bloom_filter_properties(&ColumnPath::from(column))
+                .bloom_filter_properties(&ColumnPath::from(column.as_str()))
                 .expect("allowlisted column has a bloom filter");
             assert!((properties_for_column.fpp - BLOOM_FPP).abs() < f64::EPSILON);
             assert_eq!(properties_for_column.ndv, 1_000);
@@ -132,6 +145,31 @@ mod tests {
                     .bloom_filter_properties(&ColumnPath::from(column))
                     .is_none(),
                 "unallowlisted column {column} must not have a bloom filter"
+            );
+        }
+    }
+
+    /// A column outside the resolved union never receives a Bloom filter, so a
+    /// table that does not declare `trace_id` cannot inherit another table's
+    /// footer recipe.
+    #[test]
+    fn writer_recipe_blooms_exactly_the_resolved_union() {
+        let floor = ["data_tenant_id".to_owned(), "run_id".to_owned()];
+        let properties = bifrost_writer_properties(50_000, &floor);
+        for column in &floor {
+            assert!(
+                properties
+                    .bloom_filter_properties(&ColumnPath::from(column.as_str()))
+                    .is_some(),
+                "resolved column {column} must have a bloom filter"
+            );
+        }
+        for column in ["trace_id", "span_id", "card_uid"] {
+            assert!(
+                properties
+                    .bloom_filter_properties(&ColumnPath::from(column))
+                    .is_none(),
+                "undeclared column {column} must not have a bloom filter"
             );
         }
     }

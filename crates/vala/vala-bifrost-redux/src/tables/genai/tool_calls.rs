@@ -2,8 +2,9 @@ use arrow::datatypes::Field;
 
 use crate::tables::fields::{fixed_binary, int64, ts_us_utc, utf8};
 use crate::tables::{
-    CorrelationPolicy, DeclaredIndex, DomainTable, IndexKind, PayloadClass, SortKey,
+    CorrelationPolicy, DomainTable, PayloadClass, hourly_layout, sort_asc_nulls_first, sort_desc,
 };
+use wyrd_spec::vala::api::PhysicalLayoutWire;
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 pub struct ToolCallsTable;
@@ -44,33 +45,13 @@ impl DomainTable for ToolCallsTable {
         ]
     }
 
-    fn sort_keys() -> Vec<SortKey> {
-        vec![
-            SortKey {
-                column: WYRD_EVENT_TIME.into(),
-                ascending: false,
-                nulls_first: false,
-            },
-            SortKey {
-                column: "conversation_id".into(),
-                ascending: true,
-                nulls_first: true,
-            },
-        ]
-    }
-
-    fn declared_indexes() -> Vec<DeclaredIndex> {
-        vec![
-            DeclaredIndex {
-                name: "tool_calls_tool_name_bloom".into(),
-                columns: vec!["tool_name".into()],
-                kind: IndexKind::BloomFilter,
-            },
-            DeclaredIndex {
-                name: "tool_calls_conversation_id_lookup".into(),
-                columns: vec!["conversation_id".into()],
-                kind: IndexKind::BloomFilter,
-            },
-        ]
+    fn physical_layout() -> PhysicalLayoutWire {
+        hourly_layout(
+            vec![
+                sort_desc(WYRD_EVENT_TIME),
+                sort_asc_nulls_first("conversation_id"),
+            ],
+            &["tool_name", "conversation_id"],
+        )
     }
 }

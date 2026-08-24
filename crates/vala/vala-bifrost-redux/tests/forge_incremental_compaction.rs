@@ -439,6 +439,7 @@ mod pg_tests {
                     table: binding.table_ref.clone(),
                     user_fields: vec![Field::new("value", DataType::Int64, false)],
                     tenant: binding.tenant,
+                    physical_layout: None,
                     audit: None,
                 })
                 .await
@@ -479,15 +480,20 @@ mod pg_tests {
             let partition_fields = table.metadata().default_partition_spec().fields();
             assert_eq!(partition_fields.len(), 1);
             assert_eq!(partition_fields[0].source_id, event_time_id);
-            assert_eq!(partition_fields[0].name, "wyrd_event_time_day");
-            assert_eq!(partition_fields[0].transform, Transform::Day);
+            assert_eq!(partition_fields[0].name, "wyrd_event_time_hour");
+            assert_eq!(partition_fields[0].transform, Transform::Hour);
 
             let sort_fields = &table.metadata().default_sort_order().fields;
             assert_eq!(sort_fields.len(), 2);
-            for (field, source_id) in sort_fields.iter().zip([tenant_id, event_time_id]) {
+            // The canonical layout leads with the ascending tenant prefix and
+            // then orders newest-first on event time.
+            for (field, (source_id, direction)) in sort_fields.iter().zip([
+                (tenant_id, SortDirection::Ascending),
+                (event_time_id, SortDirection::Descending),
+            ]) {
                 assert_eq!(field.source_id, source_id);
                 assert_eq!(field.transform, Transform::Identity);
-                assert_eq!(field.direction, SortDirection::Ascending);
+                assert_eq!(field.direction, direction);
                 assert_eq!(field.null_order, NullOrder::Last);
             }
         }
@@ -976,10 +982,11 @@ mod pg_tests {
                 .expect("registered fixture table");
             let schema = iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema())
                 .expect("registered Arrow schema");
-            let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("day");
-            let base = chrono::DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
-                .expect("time")
-                .timestamp_micros();
+            let base_event_time = fixture_seed_event_time();
+            let partition = registered_granularity(&table)
+                .bucket(base_event_time)
+                .expect("a fixture event time always buckets");
+            let base = base_event_time.timestamp_micros();
             let mut rows = Vec::new();
             for index in 0..count {
                 let index = start
@@ -1048,6 +1055,7 @@ mod pg_tests {
                         vala_bifrost_redux::parquet::writer_properties::bifrost_writer_properties_with_metadata(
                             batch.num_rows(),
                             metadata,
+                            &[],
                         ),
                     ),
                 )
@@ -1060,7 +1068,8 @@ mod pg_tests {
                     .expect("object");
                 rows.push((path, index, row_count));
             }
-            self.persist_seed_rows(binding, rows, base, day, aged).await;
+            self.persist_seed_rows(binding, rows, base, partition, aged)
+                .await;
         }
 
         /// Persists generated fixture objects into the durable staging roster.
@@ -1069,14 +1078,14 @@ mod pg_tests {
             binding: &TenantTableBinding,
             rows: Vec<(String, i64, i64)>,
             base: i64,
-            day: chrono::NaiveDate,
+            partition: vala_bifrost_redux::catalog::layout::TimePartition,
             aged: bool,
         ) {
             let mut conn = vala_sql::TenantConn::acquire(self.pg.app_pool(), self.tenant)
                 .await
                 .expect("tenant conn");
             for (object_path, index, row_count) in rows {
-                sqlx::query("INSERT INTO vala.file_list (id,data_tenant_id,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_day,node_id,writer_epoch,wal_lsn_min,wal_lsn_max) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)").bind(uuid::Uuid::now_v7()).bind(self.tenant.as_uuid()).bind(&binding.logical_namespace).bind(&binding.table_name).bind(object_path).bind(100_i64).bind(row_count).bind(chrono::DateTime::from_timestamp_micros(base + index).expect("min")).bind(chrono::DateTime::from_timestamp_micros(base + index + row_count).expect("max")).bind(day).bind(uuid::Uuid::now_v7()).bind(1_i64).bind(index * 2 + 1).bind(index * 2 + 2).execute(&mut **conn.transaction()).await.expect("file list");
+                sqlx::query("INSERT INTO vala.file_list (id,data_tenant_id,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_granularity,partition_start,node_id,writer_epoch,wal_lsn_min,wal_lsn_max) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)").bind(uuid::Uuid::now_v7()).bind(self.tenant.as_uuid()).bind(&binding.logical_namespace).bind(&binding.table_name).bind(object_path).bind(100_i64).bind(row_count).bind(chrono::DateTime::from_timestamp_micros(base + index).expect("min")).bind(chrono::DateTime::from_timestamp_micros(base + index + row_count).expect("max")).bind(partition.granularity_str()).bind(partition.start_utc()).bind(uuid::Uuid::now_v7()).bind(1_i64).bind(index * 2 + 1).bind(index * 2 + 2).execute(&mut **conn.transaction()).await.expect("file list");
             }
             conn.commit().await.expect("commit");
             if aged {
@@ -1117,6 +1126,7 @@ mod pg_tests {
                     table: binding.table_ref.clone(),
                     user_fields: vec![Field::new("value", DataType::Int64, false)],
                     tenant: binding.tenant,
+                    physical_layout: None,
                     audit: None,
                 })
                 .await
@@ -1267,15 +1277,15 @@ mod pg_tests {
                 .expect("event time field")
                 .id;
             let base = event_time.timestamp_micros();
-            let day = event_time.date_naive();
-            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch");
-            let partition_days = i32::try_from(day.signed_duration_since(epoch).num_days())
-                .expect("fixture partition day fits i32");
+            let partition_value = registered_granularity(table)
+                .bucket(event_time)
+                .expect("a fixture event time always buckets")
+                .iceberg_transform_value();
             let data_file = DataFileBuilder::default()
                 .content(DataContentType::Data)
                 .file_path(catalog_path)
                 .file_format(DataFileFormat::Parquet)
-                .partition(Struct::from_iter([Some(Literal::int(partition_days))]))
+                .partition(Struct::from_iter([Some(Literal::int(partition_value))]))
                 .record_count(100_000)
                 .file_size_in_bytes(size)
                 .lower_bounds(std::collections::HashMap::from([(
@@ -1358,11 +1368,7 @@ mod pg_tests {
             assert_eq!(self.delete_file_list_history().await, 2);
             let live = self
                 .forge
-                .discover_live_rewrites_for_test(
-                    &self.binding,
-                    &table,
-                    chrono::Utc::now().date_naive(),
-                )
+                .discover_live_rewrites_for_test(&self.binding, &table, chrono::Utc::now())
                 .await
                 .expect("two-file live debt");
             let [group] = live.groups_for_test() else {
@@ -1380,6 +1386,65 @@ mod pg_tests {
             assert_eq!(files, 2);
             assert!(bytes > 0);
             (files, bytes)
+        }
+    }
+
+    /// The single event time every seeded fixture row carries.
+    ///
+    /// Seed rows, reconciliation stamps, and hand-built audit details all have
+    /// to name the same partition, so they all derive it from this instant
+    /// rather than each restating a boundary.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if this literal stops being a valid RFC 3339 instant.
+    fn fixture_seed_event_time() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
+            .expect("the fixture seed instant is valid RFC 3339")
+            .into()
+    }
+
+    /// The partition every seeded fixture row lands in for one registered table.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the table is not registered or its spec is not the Bifrost
+    /// recipe.
+    async fn fixture_seed_partition(
+        fixture: &Fixture,
+    ) -> vala_bifrost_redux::catalog::layout::TimePartition {
+        let table = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("registered fixture table");
+        registered_granularity(&table)
+            .bucket(fixture_seed_event_time())
+            .expect("a fixture event time always buckets")
+    }
+
+    /// Reads the exact time granularity a registered fixture table declares.
+    ///
+    /// Fixture rows and hand-built Iceberg data files must land in the same
+    /// partition the catalog itself derived at registration, so both read the
+    /// granularity back off the table's own partition spec rather than
+    /// restating it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the spec does not carry exactly one time transform, which
+    /// only happens if registration stopped emitting the Bifrost recipe.
+    fn registered_granularity(
+        table: &iceberg::table::Table,
+    ) -> vala_bifrost_redux::catalog::layout::TimeGranularity {
+        use vala_bifrost_redux::catalog::layout::TimeGranularity;
+        let [field] = table.metadata().default_partition_spec().fields() else {
+            panic!("the Bifrost recipe declares exactly one partition field");
+        };
+        match field.transform {
+            Transform::Hour => TimeGranularity::Hour,
+            Transform::Day => TimeGranularity::Day,
+            other => panic!("Bifrost partitions only hourly or daily, found {other:?}"),
         }
     }
 
@@ -1894,13 +1959,17 @@ mod pg_tests {
             .await
             .expect("orphan object");
         let now = chrono::Utc::now();
+        let orphan_partition = vala_bifrost_redux::catalog::layout::TimeGranularity::Day
+            .bucket(now)
+            .expect("the current instant always buckets");
         sqlx::query(
             "INSERT INTO vala.file_list (
                 id, data_tenant_id, namespace, table_name, file_path, file_size,
-                row_count, min_event_time, max_event_time, partition_day,
+                row_count, min_event_time, max_event_time,
+                partition_granularity, partition_start,
                 node_id, writer_epoch, wal_lsn_min, wal_lsn_max,
                 compacted, committed_snapshot_id
-             ) VALUES ($1,$2,$3,$4,$5,1,1,$6,$6,$7,$8,1,1,2,true,1)",
+             ) VALUES ($1,$2,$3,$4,$5,1,1,$6,$6,$7,$8,$9,1,1,2,true,1)",
         )
         .bind(uuid::Uuid::now_v7())
         .bind(fixture.tenant.as_uuid())
@@ -1908,7 +1977,8 @@ mod pg_tests {
         .bind(&fixture.binding.table_name)
         .bind(&path)
         .bind(now)
-        .bind(now.date_naive())
+        .bind(orphan_partition.granularity_str())
+        .bind(orphan_partition.start_utc())
         .bind(uuid::Uuid::now_v7())
         .execute(
             &fixture
@@ -4458,11 +4528,7 @@ mod pg_tests {
             .expect("base snapshot table");
         let plan = fixture
             .forge
-            .discover_live_rewrites_for_test(
-                &fixture.binding,
-                &table,
-                chrono::Utc::now().date_naive(),
-            )
+            .discover_live_rewrites_for_test(&fixture.binding, &table, chrono::Utc::now())
             .await
             .expect("historical live plan");
         let base_snapshot_id = plan.base_snapshot_id_for_test();
@@ -4553,11 +4619,7 @@ mod pg_tests {
             .expect("cap-plus-one bounded snapshot");
         let refusal = bounded
             .forge
-            .discover_live_rewrites_for_test(
-                &bounded.binding,
-                &table,
-                chrono::Utc::now().date_naive(),
-            )
+            .discover_live_rewrites_for_test(&bounded.binding, &table, chrono::Utc::now())
             .await;
         assert!(matches!(refusal, Err(ForgeError::Capacity { .. })));
         let refused_tasks: i64 =
@@ -6188,7 +6250,7 @@ mod pg_tests {
         ids: &[uuid::Uuid],
         detail: &AuditDetail,
     ) {
-        let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("fixture day");
+        let day = fixture_seed_partition(fixture).await;
         match phase {
             ForgeCompactionPhase::Recovered => fixture
                 .forge
@@ -6680,7 +6742,11 @@ mod pg_tests {
     async fn current_snapshot_preserves_manifest_writer_schema_identity() {
         let fixture = Fixture::new().await;
         let (table, old_schema_id, current_schema_id) = mixed_schema_current_table(&fixture).await;
-        let current_day = chrono::NaiveDate::from_ymd_opt(2026, 7, 15).expect("fixed day");
+        let current_day = chrono::NaiveDate::from_ymd_opt(2026, 7, 15)
+            .expect("fixed day")
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight")
+            .and_utc();
 
         let first = fixture
             .forge
@@ -6773,7 +6839,11 @@ mod pg_tests {
             .load_table(&fixture.binding.table_ident())
             .await
             .expect("live target table");
-        let current_day = chrono::NaiveDate::from_ymd_opt(2026, 7, 15).expect("fixed day");
+        let current_day = chrono::NaiveDate::from_ymd_opt(2026, 7, 15)
+            .expect("fixed day")
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight")
+            .and_utc();
         let plan = fixture
             .forge
             .discover_live_rewrites_for_test(&fixture.binding, &table, current_day)
@@ -6997,7 +7067,7 @@ mod pg_tests {
             base_snapshot_id,
             committed_snapshot_id: None,
             partition_spec_id,
-            partition_day: "2026-07-14".to_owned(),
+            time_partition: fixture_seed_partition(&fixture).await.to_wire(),
             target_file_size_bytes: 3_000_000,
             input_paths,
             output_paths: vec![

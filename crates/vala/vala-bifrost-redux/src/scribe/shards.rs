@@ -1655,8 +1655,8 @@ impl ShardOwner {
             request.binding.tenant,
             &request.binding.table_ref,
             &crate::scribe::memtable::ProviderCut {
-                start_day: request.start_day,
-                end_day: request.end_day,
+                start_partition: request.start_partition,
+                end_partition: request.end_partition,
                 required_columns: &request.required_columns,
                 persisted_cursor: request.after_lsn,
                 persisted_ranges: &request.persisted_lsn_ranges,
@@ -2112,12 +2112,14 @@ impl ShardOwner {
                     MAX(file_ordinal)::smallint AS last_ordinal \
              FROM vala.file_list \
              WHERE data_tenant_id=wyrd.current_tenant() AND namespace=$1 AND table_name=$2 \
-               AND partition_day=$3 AND node_id=$4 AND writer_epoch=$5 \
+               AND partition_granularity=$3 AND partition_start=$4 \
+               AND node_id=$5 AND writer_epoch=$6 \
              GROUP BY wal_lsn_min, wal_lsn_max",
         )
         .bind(replayed.seal_key.table.namespace.as_str())
         .bind(&replayed.seal_key.table.name)
-        .bind(replayed.seal_key.day.as_naive_date())
+        .bind(replayed.seal_key.partition.granularity_str())
+        .bind(replayed.seal_key.partition.start_utc())
         .bind(replayed.stream.node_id.as_uuid())
         .bind(replayed.stream.writer_epoch.as_i64())
         .fetch_all(&mut **conn.transaction())
@@ -4590,7 +4592,7 @@ fn record_retirement(freed_bytes: usize) {
 mod tests {
     use super::*;
     use crate::namespaces::BifrostNamespace;
-    use crate::scribe::seal_key::{EventDay, SealKey};
+    use crate::scribe::seal_key::SealKey;
     use crate::scribe::wal::{ScribeAppendMeta, WalLsn};
     use arrow::array::{Int64Array, TimestampMicrosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -4812,7 +4814,7 @@ mod tests {
         let second = SealKey::new(
             first.tenant,
             TableRef::new(BifrostNamespace::Bifrost, "owner-test-second"),
-            first.day,
+            first.partition,
         );
         let memtable = Memtable::new();
         for key in [&first, &second] {
@@ -4896,7 +4898,7 @@ mod tests {
         let second = SealKey::new(
             first.tenant,
             TableRef::new(BifrostNamespace::Bifrost, "age-owner-peer"),
-            first.day,
+            first.partition,
         );
         let memtable = Memtable::new();
         for key in [&first, &second] {
@@ -4988,7 +4990,7 @@ mod tests {
         let second = SealKey::new(
             first.tenant,
             TableRef::new(BifrostNamespace::Bifrost, "pressure-owner-peer"),
-            first.day,
+            first.partition,
         );
         let memtable = Memtable::new();
         for key in [&first, &second] {
@@ -5423,7 +5425,7 @@ mod tests {
             let seal_key = SealKey::new(
                 DataTenantId::new_v7(),
                 TableRef::new(BifrostNamespace::Bifrost, table),
-                EventDay::new(NaiveDate::from_ymd_opt(2026, 8, 18).expect("date")),
+                crate::test_support::day_partition(2026, 8, 18),
             );
             chunk.states.insert(
                 seal_key.as_path_components(),
@@ -5749,7 +5751,7 @@ mod tests {
         let lock_key = SealKey::new(
             current_key.tenant,
             TableRef::new(BifrostNamespace::Bifrost, "replay-identity-lock"),
-            current_key.day,
+            current_key.partition,
         );
         owner
             .memtable
@@ -5841,7 +5843,7 @@ mod tests {
         let next_key = SealKey::new(
             current_key.tenant,
             TableRef::new(BifrostNamespace::Bifrost, "replay-advance-failure"),
-            current_key.day,
+            current_key.partition,
         );
         let memtable = Memtable::new();
         memtable
@@ -6243,7 +6245,7 @@ mod tests {
         SealKey::new(
             DataTenantId::new_v7(),
             TableRef::new(BifrostNamespace::Bifrost, "owner-test"),
-            EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 24).expect("valid date")),
+            crate::test_support::day_partition(2026, 7, 24),
         )
     }
 
@@ -6605,7 +6607,7 @@ mod tests {
         SealKey::new(
             DataTenantId::new_v7(),
             TableRef::new(BifrostNamespace::Bifrost, "bad/name"),
-            EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 24).expect("valid date")),
+            crate::test_support::day_partition(2026, 7, 24),
         )
     }
 
@@ -6750,6 +6752,7 @@ mod tests {
             memory,
             tenant: key.tenant,
             table: key.table,
+            partition_granularity: key.partition.granularity(),
             queued_at: std::time::Instant::now(),
             durable_ack: None,
             lifecycle,
@@ -6923,7 +6926,7 @@ mod tests {
         let ghost = SealKey::new(
             DataTenantId::new_v7(),
             TableRef::new(BifrostNamespace::Bifrost, "ghost"),
-            EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 25).expect("valid date")),
+            crate::test_support::day_partition(2026, 7, 25),
         );
         owner.seal_retry.insert(ghost);
 
@@ -7245,8 +7248,8 @@ mod tests {
                 request: FetchLiveTailRequest {
                     binding,
                     target_stream: stream,
-                    start_day: key.day,
-                    end_day: key.day,
+                    start_partition: key.partition,
+                    end_partition: key.partition,
                     after_lsn: crate::scribe::wal::WalLsn::ZERO,
                     persisted_lsn_ranges: Vec::new(),
                     required_columns: vec!["value".to_owned()],
@@ -7419,12 +7422,12 @@ mod tests {
         let first = SealKey::new(
             tenant,
             table.clone(),
-            EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date")),
+            crate::test_support::day_partition(2026, 7, 14),
         );
         let second = SealKey::new(
             tenant,
             table,
-            EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 15).expect("valid date")),
+            crate::test_support::day_partition(2026, 7, 15),
         );
         let (sender, receiver) = watch::channel(None);
         sender.send_replace(Some(PressureSignal {

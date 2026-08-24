@@ -1725,7 +1725,7 @@ impl ForgeFixture {
             .expect("Forge fixture append object");
         let file_id = uuid::Uuid::now_v7();
         sqlx::query(
-            "INSERT INTO vala.file_list (id, data_tenant_id, namespace, table_name, file_path, file_size, row_count, min_event_time, max_event_time, partition_day, node_id, writer_epoch, wal_lsn_min, wal_lsn_max) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+            "INSERT INTO vala.file_list (id, data_tenant_id, namespace, table_name, file_path, file_size, row_count, min_event_time, max_event_time, partition_granularity, partition_start, node_id, writer_epoch, wal_lsn_min, wal_lsn_max) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
         )
         .bind(file_id)
         .bind(self.tenant.as_uuid())
@@ -1736,7 +1736,8 @@ impl ForgeFixture {
         .bind(i64::try_from(rows).expect("Forge fixture row count"))
         .bind(chrono::DateTime::from_timestamp_micros(base).expect("timestamp"))
         .bind(chrono::DateTime::from_timestamp_micros(base + 1_000_000).expect("timestamp"))
-        .bind(partition_day)
+        .bind("day")
+        .bind(day_partition_start(partition_day))
         .bind(uuid::Uuid::now_v7())
         .bind(1_i64)
         .bind(sequence * 2 + 1)
@@ -1762,7 +1763,7 @@ impl ForgeFixture {
     /// skip deletion even though it was absent from the initial live set.
     pub async fn protect_path(&self, path: &str) {
         sqlx::query(
-            "INSERT INTO vala.file_list (id, data_tenant_id, namespace, table_name, file_path, file_size, row_count, min_event_time, max_event_time, partition_day, node_id, writer_epoch, wal_lsn_min, wal_lsn_max) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+            "INSERT INTO vala.file_list (id, data_tenant_id, namespace, table_name, file_path, file_size, row_count, min_event_time, max_event_time, partition_granularity, partition_start, node_id, writer_epoch, wal_lsn_min, wal_lsn_max) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
         )
         .bind(uuid::Uuid::now_v7())
         .bind(self.tenant.as_uuid())
@@ -1773,7 +1774,10 @@ impl ForgeFixture {
         .bind(1_i64)
         .bind(chrono::DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z").expect("timestamp"))
         .bind(chrono::DateTime::parse_from_rfc3339("2026-07-14T12:00:01Z").expect("timestamp"))
-        .bind(chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("partition day"))
+        .bind("day")
+        .bind(day_partition_start(
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("partition day"),
+        ))
         .bind(uuid::Uuid::now_v7())
         .bind(1_i64)
         .bind(1_i64)
@@ -1854,6 +1858,33 @@ pub async fn seed_forge_group_for_tenant_with_schema(
     .await
 }
 
+/// Exact UTC start of `day`, the durable partition-start column value.
+///
+/// Every fixture row in this harness belongs to a daily partition, so the
+/// helper keeps the `(granularity, start)` pair the file-list check constraint
+/// enforces in one place instead of repeating midnight arithmetic per insert.
+fn day_partition_start(day: chrono::NaiveDate) -> chrono::DateTime<chrono::Utc> {
+    day.and_hms_opt(0, 0, 0)
+        .expect("midnight is always representable")
+        .and_utc()
+}
+
+/// Daily layout declaration every Forge fixture table registers with.
+///
+/// Bifrost's default is `hour(wyrd_event_time)`; these fixtures seed day-granular
+/// file-list rows, so they declare the matching daily partition rather than
+/// letting the default disagree with the rows they insert.
+fn daily_layout_declaration() -> wyrd_spec::vala::api::PhysicalLayoutWire {
+    wyrd_spec::vala::api::PhysicalLayoutWire {
+        partition: wyrd_spec::vala::api::TimePartitionSpecWire {
+            column: "wyrd_event_time".to_owned(),
+            granularity: wyrd_spec::vala::api::TimeGranularityWire::Day,
+        },
+        sort_keys: Vec::new(),
+        bloom_columns: Vec::new(),
+    }
+}
+
 /// Create a durable Forge fixture with explicit partition days and an optional
 /// table-specific schema column.
 pub async fn seed_forge_group_for_tenant_with_schema_and_days(
@@ -1930,6 +1961,7 @@ async fn seed_forge_group_with_resources(
             table: binding.table_ref.clone(),
             user_fields: fields,
             tenant,
+            physical_layout: Some(daily_layout_declaration()),
             audit: None,
         })
         .await
@@ -2003,7 +2035,8 @@ async fn seed_forge_group_with_resources(
             let metadata = BifrostParquetMemoryEnvelope::metadata_for_batch(&batch, &path)
                 .expect("Forge fixture writer-v2 metadata");
             let mut bytes = Vec::new();
-            let properties = bifrost_writer_properties_with_metadata(batch.num_rows(), metadata);
+            let properties =
+                bifrost_writer_properties_with_metadata(batch.num_rows(), metadata, &[]);
             let mut writer = ArrowWriter::try_new(&mut bytes, batch.schema(), Some(properties))
                 .expect("Parquet writer");
             writer.write(&batch).expect("Parquet batch");
@@ -2016,7 +2049,7 @@ async fn seed_forge_group_with_resources(
             let min_time = chrono::DateTime::from_timestamp_micros(base + file_number * 1_000_000)
                 .expect("Forge fixture timestamp");
             sqlx::query(
-            "INSERT INTO vala.file_list (id, data_tenant_id, namespace, table_name, file_path, file_size, row_count, min_event_time, max_event_time, partition_day, node_id, writer_epoch, wal_lsn_min, wal_lsn_max) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+            "INSERT INTO vala.file_list (id, data_tenant_id, namespace, table_name, file_path, file_size, row_count, min_event_time, max_event_time, partition_granularity, partition_start, node_id, writer_epoch, wal_lsn_min, wal_lsn_max) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
         )
         .bind(uuid::Uuid::now_v7())
         .bind(tenant.as_uuid())
@@ -2027,7 +2060,8 @@ async fn seed_forge_group_with_resources(
         .bind(2_i64)
         .bind(min_time)
         .bind(min_time + chrono::Duration::milliseconds(1))
-        .bind(*partition_day)
+        .bind("day")
+        .bind(day_partition_start(*partition_day))
         .bind(uuid::Uuid::now_v7())
         .bind(1_i64)
         .bind(file_number * 2 + 1)

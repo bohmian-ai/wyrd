@@ -978,7 +978,7 @@ struct LiveTailRoute {
     /// Current writer epoch for this Scribe boot.
     writer_epoch: u64,
     /// UTC event day served by the registered live stream.
-    event_day: wyrd_spec::vala::api::EventDay,
+    time_partition: wyrd_spec::vala::api::TimePartitionWire,
     /// Transport reaching the exact stream owner.
     transport: Arc<dyn TailReadTransport>,
 }
@@ -1021,7 +1021,7 @@ impl TailTransportDirectory {
         table: impl Into<String>,
         node_id: wyrd_spec::vala::api::NodeId,
         writer_epoch: u64,
-        event_day: wyrd_spec::vala::api::EventDay,
+        time_partition: wyrd_spec::vala::api::TimePartitionWire,
         transport: Arc<dyn TailReadTransport>,
     ) {
         self.insert_live_stream_route(
@@ -1029,7 +1029,7 @@ impl TailTransportDirectory {
             None,
             node_id,
             writer_epoch,
-            event_day,
+            time_partition,
             transport,
         );
     }
@@ -1044,7 +1044,7 @@ impl TailTransportDirectory {
         table: impl Into<String>,
         node_id: wyrd_spec::vala::api::NodeId,
         writer_epoch: u64,
-        event_day: wyrd_spec::vala::api::EventDay,
+        time_partition: wyrd_spec::vala::api::TimePartitionWire,
         transport: Arc<dyn TailReadTransport>,
     ) {
         self.insert_live_stream_route(
@@ -1052,7 +1052,7 @@ impl TailTransportDirectory {
             Some(tenant.as_uuid()),
             node_id,
             writer_epoch,
-            event_day,
+            time_partition,
             transport,
         );
     }
@@ -1064,7 +1064,7 @@ impl TailTransportDirectory {
         tenant: Option<uuid::Uuid>,
         node_id: wyrd_spec::vala::api::NodeId,
         writer_epoch: u64,
-        event_day: wyrd_spec::vala::api::EventDay,
+        time_partition: wyrd_spec::vala::api::TimePartitionWire,
         transport: Arc<dyn TailReadTransport>,
     ) {
         if let Ok(mut transports) = self.transports.write() {
@@ -1078,19 +1078,19 @@ impl TailTransportDirectory {
             routes.retain(|route| {
                 route.node_id != node_id.as_uuid()
                     || route.writer_epoch != writer_epoch
-                    || route.event_day != event_day
+                    || route.time_partition != time_partition
             });
             routes.push(LiveTailRoute {
                 node_id: node_id.as_uuid(),
                 writer_epoch,
-                event_day,
+                time_partition,
                 transport,
             });
             routes.sort_by(|left, right| {
-                (left.node_id, left.writer_epoch, left.event_day.as_str()).cmp(&(
+                (left.node_id, left.writer_epoch, left.time_partition).cmp(&(
                     right.node_id,
                     right.writer_epoch,
-                    right.event_day.as_str(),
+                    right.time_partition,
                 ))
             });
         }
@@ -4680,17 +4680,17 @@ fn build_scribe_follower_sources(
                 .unwrap_or(0);
             let persisted_ranges = project_persisted_wal_ranges(&stream_rows, cursor)
                 .map_err(BifrostCatalogError::into_public)?;
-            let mut days = stream_rows
+            let mut partitions = stream_rows
                 .iter()
-                .map(|row| row.partition_day.format("%Y-%m-%d").to_string())
-                .collect::<Vec<_>>();
-            days.sort();
-            let fallback_day = observed_at.date_naive().format("%Y-%m-%d").to_string();
-            let start_day = days
-                .first()
-                .cloned()
-                .unwrap_or_else(|| fallback_day.clone());
-            let end_day = days.last().cloned().unwrap_or(fallback_day);
+                .map(crate::oracle::tail_fence::hot_row_partition)
+                .collect::<Result<Vec<_>, _>>()?;
+            partitions.sort();
+            let fallback = crate::catalog::TimeGranularity::Hour
+                .bucket(observed_at)
+                .map(crate::catalog::layout::TimePartition::to_wire)
+                .map_err(|_| BifrostError::QueryVisibilityUnavailable)?;
+            let start_partition = partitions.first().copied().unwrap_or(fallback);
+            let end_partition = partitions.last().copied().unwrap_or(fallback);
             Ok(ScribeFollowerSource {
                 table: table.table.clone(),
                 node_id,
@@ -4704,8 +4704,8 @@ fn build_scribe_follower_sources(
                     persisted: PersistedFileAssignment { files: Vec::new() },
                     scribe_provider_cut: Some(ScribeProviderCut {
                         writer_epoch,
-                        start_event_day: start_day,
-                        end_event_day: end_day,
+                        start_partition,
+                        end_partition,
                         required_columns: table
                             .physical_schema
                             .fields()
@@ -5181,8 +5181,8 @@ mod tests {
         let mut scribe_assignment = test_persisted_assignment("spans", &[]);
         scribe_assignment.scribe_provider_cut = Some(ScribeProviderCut {
             writer_epoch: 7,
-            start_event_day: "2026-08-20".to_owned(),
-            end_event_day: "2026-08-20".to_owned(),
+            start_partition: crate::test_support::day_partition(2026, 8, 20).to_wire(),
+            end_partition: crate::test_support::day_partition(2026, 8, 20).to_wire(),
             required_columns: vec!["event_id".to_owned()],
             persisted_cursor: 0,
             persisted_ranges: Vec::new(),
@@ -5270,8 +5270,8 @@ mod tests {
         iceberg.persisted.files.clear();
         iceberg.scribe_provider_cut = Some(ScribeProviderCut {
             writer_epoch: 7,
-            start_event_day: "2026-08-20".to_owned(),
-            end_event_day: "2026-08-20".to_owned(),
+            start_partition: crate::test_support::day_partition(2026, 8, 20).to_wire(),
+            end_partition: crate::test_support::day_partition(2026, 8, 20).to_wire(),
             required_columns: vec!["event_id".to_owned()],
             persisted_cursor: 0,
             persisted_ranges: Vec::new(),
@@ -5831,8 +5831,8 @@ mod tests {
 
         let mut cut = ScribeProviderCut {
             writer_epoch: 1,
-            start_event_day: "2026-08-19".to_owned(),
-            end_event_day: "2026-08-19".to_owned(),
+            start_partition: crate::test_support::day_partition(2026, 8, 19).to_wire(),
+            end_partition: crate::test_support::day_partition(2026, 8, 19).to_wire(),
             required_columns: vec!["wyrd_event_time".to_owned()],
             persisted_cursor: 7,
             persisted_ranges: vec![PersistedWalRange {

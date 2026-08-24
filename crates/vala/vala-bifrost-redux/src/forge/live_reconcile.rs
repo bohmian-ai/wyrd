@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Utc};
 use iceberg::spec::DataContentType;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -18,6 +18,7 @@ use super::lease::ForgeLease;
 use super::metrics::RewritePathContract;
 use super::path::catalog_path_to_object_key;
 use crate::catalog::TenantTableBinding;
+use crate::catalog::layout::TimePartition;
 
 /// Whether later table stages may perform destructive maintenance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,8 +109,8 @@ struct PreparedRewrite {
     group: String,
     /// Destination partition spec.
     partition_spec_id: i32,
-    /// Destination day.
-    partition_day: NaiveDate,
+    /// Destination time partition.
+    partition: TimePartition,
     /// Exact prepared inputs.
     input_paths: Vec<StoragePath>,
     /// Exact prepared outputs.
@@ -193,12 +194,7 @@ impl Forge {
         stop: &CancellationToken,
         now: DateTime<Utc>,
     ) -> Result<IcebergReconciliationOutcome, ForgeError> {
-        let resource = ForgeGroupKey {
-            tenant: key.tenant,
-            table_ref: key.table_ref.clone(),
-            partition_day: NaiveDate::MIN,
-        }
-        .audit_resource();
+        let resource = ForgeGroupKey::table_audit_resource(key.tenant, &key.table_ref);
         let operations = ForgeOperations::new(&resource, ForgeOperationFamily::IcebergRewrite)
             .map_err(ForgeError::Sql)?;
         let mut conn = self
@@ -455,7 +451,7 @@ impl Forge {
         let group_key = ForgeGroupKey {
             tenant: context.key.tenant,
             table_ref: context.key.table_ref.clone(),
-            partition_day: prepared.partition_day,
+            partition: prepared.partition,
         };
         let uncertainty =
             chrono::Duration::from_std(self.core.config.uncertainty_bound).map_err(|error| {
@@ -651,7 +647,7 @@ fn validate_retained_snapshot_count(count: usize, cap: usize) -> Result<(), Forg
 /// # Errors
 ///
 /// Returns reconciliation error for the wrong detail, identity, empty or
-/// duplicate paths, malformed day, resource mismatch, or partition mismatch.
+/// duplicate paths, malformed partition, resource mismatch, or layout mismatch.
 fn parse_prepared(
     row: &ForgeOperationStateRow,
     key: &ForgeTableKey,
@@ -662,7 +658,7 @@ fn parse_prepared(
         group,
         base_snapshot_id: _,
         partition_spec_id,
-        partition_day,
+        time_partition,
         input_paths,
         output_paths,
         ..
@@ -672,12 +668,7 @@ fn parse_prepared(
             detail: "open live operation is not a Prepared rewrite".to_owned(),
         });
     };
-    let expected = ForgeGroupKey {
-        tenant: key.tenant,
-        table_ref: key.table_ref.clone(),
-        partition_day: NaiveDate::MIN,
-    }
-    .audit_resource();
+    let expected = ForgeGroupKey::table_audit_resource(key.tenant, &key.table_ref);
     if row.operation_id != *operation_id
         || row.resource != expected
         || group != &expected
@@ -700,11 +691,7 @@ fn parse_prepared(
         operation_id: *operation_id,
         group: group.clone(),
         partition_spec_id: *partition_spec_id,
-        partition_day: NaiveDate::parse_from_str(partition_day, "%Y-%m-%d").map_err(|error| {
-            ForgeError::Reconciliation {
-                detail: format!("invalid Prepared partition day: {error}"),
-            }
-        })?,
+        partition: TimePartition::from_wire(*time_partition),
         input_paths: input_paths.clone(),
         output_paths: output_paths.clone(),
     })
@@ -844,7 +831,7 @@ fn iceberg_terminal_detail(
         group,
         base_snapshot_id,
         partition_spec_id,
-        partition_day,
+        time_partition,
         target_file_size_bytes,
         input_paths,
         output_paths,
@@ -871,7 +858,7 @@ fn iceberg_terminal_detail(
         base_snapshot_id: *base_snapshot_id,
         committed_snapshot_id,
         partition_spec_id: *partition_spec_id,
-        partition_day: partition_day.clone(),
+        time_partition: *time_partition,
         target_file_size_bytes: *target_file_size_bytes,
         input_paths: input_paths.clone(),
         output_paths: output_paths.clone(),
@@ -892,7 +879,12 @@ mod tests {
             base_snapshot_id: 7,
             committed_snapshot_id: None,
             partition_spec_id: 1,
-            partition_day: "2026-07-30".to_owned(),
+            time_partition: TimePartition::new(
+                crate::catalog::TimeGranularity::Hour,
+                DateTime::from_timestamp(1_767_312_000, 0).expect("fixture hour is representable"),
+            )
+            .expect("fixture hour is an exact hour boundary")
+            .to_wire(),
             target_file_size_bytes: 1024,
             input_paths: vec![StoragePath::new("table/input.parquet").expect("valid input")],
             output_paths: vec![StoragePath::new("table/output.parquet").expect("valid output")],

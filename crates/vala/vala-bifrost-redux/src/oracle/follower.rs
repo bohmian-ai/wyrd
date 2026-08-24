@@ -49,8 +49,8 @@ use wyrd_spec::vala::api::{
 use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
 
 use super::codec::{OraclePhysicalExtensionCodec, PreflightExtension, physical_plan_fingerprint};
+use crate::catalog::layout::TimePartition;
 use crate::catalog::{BifrostCatalog, TableRef, TenantTableBinding as CatalogTableBinding};
-use crate::scribe::seal_key::EventDay;
 use crate::scribe::stream_identity::StreamIdentity;
 use crate::scribe::tail_rpc::{FetchLiveTailRequest, FetchLiveTailService, HotBatch};
 use crate::scribe::wal::WalLsn;
@@ -887,8 +887,8 @@ where
                 .map(|plan| plan as Arc<dyn ExecutionPlan>)
                 .map_err(|_| "authenticated Scribe empty provider failed".to_owned());
         }
-        let start_day = parse_event_day(&cut.start_event_day)?;
-        let end_day = parse_event_day(&cut.end_event_day)?;
+        let start_partition = TimePartition::from_wire(cut.start_partition);
+        let end_partition = TimePartition::from_wire(cut.end_partition);
         let max_batches = usize::try_from(cut.maximum_batch_count)
             .map_err(|_| "Scribe batch bound does not fit this process".to_owned())?;
         let max_retained_bytes = usize::try_from(cut.maximum_retained_bytes)
@@ -899,8 +899,8 @@ where
             .fetch(FetchLiveTailRequest {
                 binding,
                 target_stream: stream,
-                start_day,
-                end_day,
+                start_partition,
+                end_partition,
                 after_lsn: checked_wal_lsn(cut.persisted_cursor)?,
                 persisted_lsn_ranges,
                 required_columns: cut.required_columns.clone(),
@@ -1076,16 +1076,6 @@ fn checked_wal_lsn(value: u64) -> Result<WalLsn, String> {
     } else {
         Ok(WalLsn::new(value))
     }
-}
-
-/// Parses one canonical UTC event-day endpoint.
-///
-/// # Errors
-/// Returns an error when the endpoint is not an ISO calendar date.
-fn parse_event_day(value: &str) -> Result<EventDay, String> {
-    chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
-        .map(EventDay::new)
-        .map_err(|_| "Scribe event-day endpoint is invalid".to_owned())
 }
 
 /// Concrete owner of preflight, provider resolution, and `DataFusion` decode.
@@ -1363,9 +1353,6 @@ where
         }
         if let Some(cut) = &assignment.scribe_provider_cut
             && (cut.writer_epoch != target_fence
-                || cut.start_event_day.is_empty()
-                || cut.end_event_day.is_empty()
-                || cut.start_event_day > cut.end_event_day
                 || cut.required_columns.is_empty()
                 || cut.maximum_batch_count == 0
                 || cut.maximum_retained_bytes == 0
@@ -1739,8 +1726,8 @@ pub(crate) mod tests {
     fn cut(ranges: Vec<PersistedWalRange>) -> ScribeProviderCut {
         ScribeProviderCut {
             writer_epoch: 2,
-            start_event_day: "2026-08-19".to_owned(),
-            end_event_day: "2026-08-19".to_owned(),
+            start_partition: crate::test_support::day_partition(2026, 8, 19).to_wire(),
+            end_partition: crate::test_support::day_partition(2026, 8, 19).to_wire(),
             required_columns: vec!["wyrd_event_time".to_owned()],
             persisted_cursor: 7,
             persisted_ranges: ranges,
@@ -2203,7 +2190,7 @@ pub(crate) mod tests {
     /// longer has the cohort shape the test asserts against.
     fn scribe_cohort_memtable(
         tenant_id: DataTenantId,
-        day: EventDay,
+        day: TimePartition,
         schema: &Arc<Schema>,
     ) -> (SealKey, Arc<Memtable>) {
         let schema = Arc::clone(schema);
@@ -2277,7 +2264,7 @@ pub(crate) mod tests {
             DataType::Utf8,
             true,
         )]));
-        let day = EventDay::new(chrono::NaiveDate::from_ymd_opt(2026, 8, 19).expect("valid day"));
+        let day = crate::test_support::day_partition(2026, 8, 19);
         let (_key, memtable) = scribe_cohort_memtable(tenant_id, day, &schema);
         let role_resources = crate::resources::BifrostRuntimeResources::composed_for_test(
             crate::resources::MIN_UNMANAGED_RESERVE_BYTES

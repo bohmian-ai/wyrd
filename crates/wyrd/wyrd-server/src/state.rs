@@ -79,7 +79,12 @@ pub struct BifrostBuildInputs {
     /// Existing outbound peer bearer owner.
     pub peer_credentials: Arc<dyn OraclePeerCredentials>,
     /// Immutable peer TLS trust policy validated before composition.
-    pub peer_tls: OraclePeerTls,
+    ///
+    /// `Some` exactly when peer CA material is configured. This is the single
+    /// predicate deciding whether outbound peer transports use TLS, matching
+    /// what `TonicOraclePeerTransport` already requires of advertised
+    /// addresses; it is deliberately not keyed on the deployment profile.
+    pub peer_tls: Option<OraclePeerTls>,
     /// Existing boot-loaded signing authority used to mint peer and tail tickets.
     pub signing_key: SecretString,
     /// Immutable role configuration snapshot.

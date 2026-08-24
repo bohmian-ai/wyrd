@@ -1,7 +1,7 @@
 //! In-memory row buffer keyed by seal-key with seal predicate.
 //!
 //! The memtable holds Arrow buffers + paired `AuditEvent` lists per
-//! `SealKey = (DataTenantId, TableRef, EventDay)`. Rotation is driven by
+//! `SealKey = (DataTenantId, TableRef, TimePartition)`. Rotation is driven by
 //! retained Arrow size, active-generation age, and global pressure. Automatic
 //! writer rotation swaps every non-empty bucket as one shard cohort; selective
 //! pressure and explicit seals continue to freeze individual keys.
@@ -816,33 +816,69 @@ impl Memtable {
             .map(|(_, _, _, seal_key)| seal_key)
     }
 
-    /// Return writable and immutable append batches for one exact day range.
+    /// Return writable and immutable append batches for one exact partition range.
     ///
     /// Structural pruning happens while the memtable locks are held: tenant,
-    /// table, and partition day are compared against the exact request. The
+    /// table, and time partition are compared against the exact request. The
     /// selected columns are then projected before the detached snapshot is
     /// returned, so a snapshot never exposes an unrelated bucket or an
     /// unrequested Arrow column.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::IngestBusy`] before projection when the batch or
+    /// Returns [`ScribeError::Internal`] when the requested range is inverted,
+    /// [`ScribeError::IngestBusy`] before projection when the batch or
     /// retained-byte ceiling is exhausted, or an internal error when locks,
     /// checked arithmetic, column selection, or Arrow projection fail.
     pub(crate) fn readable_batches_for_range(
         &self,
         tenant: DataTenantId,
         table: &crate::catalog::TableRef,
-        start_day: crate::scribe::seal_key::EventDay,
-        end_day: crate::scribe::seal_key::EventDay,
+        start_partition: crate::catalog::layout::TimePartition,
+        end_partition: crate::catalog::layout::TimePartition,
         required_columns: &[String],
         limits: ReadableBatchLimits,
     ) -> Result<Vec<ReadableBatch>, ScribeError> {
-        if start_day > end_day {
+        if start_partition > end_partition {
             return Err(ScribeError::Internal {
-                detail: "live-tail start day is after end day".to_owned(),
+                detail: "live-tail start partition is after end partition".to_owned(),
             });
         }
+        self.collect_readable_batches(
+            tenant,
+            table,
+            Some(&(start_partition..=end_partition)),
+            required_columns,
+            limits,
+        )
+    }
+
+    /// Collects readable batches, optionally restricted to one partition range.
+    ///
+    /// `partitions` is `None` for a whole-table scan; production tail reads
+    /// always supply an exact inclusive range. Keeping the option here means a
+    /// whole-table scan does not need a synthetic minimum/maximum partition,
+    /// which would be wrong anyway because partition ordering is keyed on
+    /// granularity before start.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::IngestBusy`] before projection when the batch or
+    /// retained-byte ceiling is exhausted, or an internal error when locks,
+    /// checked arithmetic, column selection, or Arrow projection fail.
+    fn collect_readable_batches(
+        &self,
+        tenant: DataTenantId,
+        table: &crate::catalog::TableRef,
+        partitions: Option<&std::ops::RangeInclusive<crate::catalog::layout::TimePartition>>,
+        required_columns: &[String],
+        limits: ReadableBatchLimits,
+    ) -> Result<Vec<ReadableBatch>, ScribeError> {
+        let selects = |seal_key: &SealKey| {
+            seal_key.tenant == tenant
+                && seal_key.table == *table
+                && partitions.is_none_or(|range| range.contains(&seal_key.partition))
+        };
         let writable = self.writable.lock().map_err(|e| ScribeError::Internal {
             detail: format!("memtable bucket lock poisoned: {e}"),
         })?;
@@ -853,18 +889,12 @@ impl Memtable {
             ReadableBatchCollector::new(limits.max_batches, limits.max_retained_bytes);
 
         for (seal_key, bucket) in writable.iter() {
-            if seal_key.tenant == tenant
-                && seal_key.table == *table
-                && (start_day..=end_day).contains(&seal_key.day)
-            {
+            if selects(seal_key) {
                 bucket.append_readable_batches(required_columns, &mut batches)?;
             }
         }
         for (seal_key, entries) in immutable.iter() {
-            if seal_key.tenant == tenant
-                && seal_key.table == *table
-                && (start_day..=end_day).contains(&seal_key.day)
-            {
+            if selects(seal_key) {
                 for entry in entries {
                     entry
                         .frozen
@@ -897,8 +927,8 @@ impl Memtable {
         let batches = self.readable_batches_for_range(
             tenant,
             table,
-            cut.start_day,
-            cut.end_day,
+            cut.start_partition,
+            cut.end_partition,
             cut.required_columns,
             cut.limits,
         )?;
@@ -925,11 +955,10 @@ impl Memtable {
         table: &crate::catalog::TableRef,
     ) -> Result<Vec<ReadableBatch>, ScribeError> {
         let stats = self.stats()?;
-        self.readable_batches_for_range(
+        self.collect_readable_batches(
             tenant,
             table,
-            crate::scribe::seal_key::EventDay::new(chrono::NaiveDate::MIN),
-            crate::scribe::seal_key::EventDay::new(chrono::NaiveDate::MAX),
+            None,
             &[],
             ReadableBatchLimits {
                 max_batches: stats.writable_rows.saturating_add(stats.immutable_rows),
@@ -1371,7 +1400,7 @@ impl MemtableBucket {
         append_projected_batches(
             &self.batches,
             &self.metas,
-            self.seal_key.day,
+            self.seal_key.partition,
             &projection,
             output,
         )
@@ -1466,7 +1495,7 @@ impl ImmutableEntry {
 #[derive(Debug, Clone)]
 pub struct ReadableBatch {
     /// Exact partition day owning the batch.
-    pub partition_day: crate::scribe::seal_key::EventDay,
+    pub partition_day: crate::catalog::layout::TimePartition,
     /// WAL metadata for the append.
     pub meta: ScribeAppendMeta,
     /// Arrow rows for the append.
@@ -1485,9 +1514,9 @@ pub(crate) struct ReadableBatchLimits {
 /// Manifest-pinned bounds defining one atomic hot-provider query cut.
 pub(crate) struct ProviderCut<'a> {
     /// First included event day.
-    pub(crate) start_day: crate::scribe::seal_key::EventDay,
+    pub(crate) start_partition: crate::catalog::layout::TimePartition,
     /// Last included event day.
-    pub(crate) end_day: crate::scribe::seal_key::EventDay,
+    pub(crate) end_partition: crate::catalog::layout::TimePartition,
     /// Requested projection in caller order.
     pub(crate) required_columns: &'a [String],
     /// Inclusive persisted prefix owned by the pinned manifest.
@@ -1578,7 +1607,7 @@ impl FrozenMemtable {
         append_projected_batches(
             &self.batches,
             &self.metas,
-            self.seal_key.day,
+            self.seal_key.partition,
             &projection,
             output,
         )
@@ -1595,7 +1624,7 @@ impl FrozenMemtable {
 fn append_projected_batches(
     batches: &[RecordBatch],
     metas: &[ScribeAppendMeta],
-    partition_day: crate::scribe::seal_key::EventDay,
+    partition_day: crate::catalog::layout::TimePartition,
     projection: &[usize],
     output: &mut ReadableBatchCollector,
 ) -> Result<(), ScribeError> {
@@ -1716,15 +1745,15 @@ fn estimate_batch_bytes(batch: &RecordBatch) -> usize {
 mod tests {
     use super::*;
     use crate::catalog::TableRef;
+
     use crate::namespaces::BifrostNamespace;
     use crate::scribe::preprocess::AppendSliceId;
     use crate::scribe::replay::{ReplayedAppendMeta, ReplayedSealKey};
-    use crate::scribe::seal_key::EventDay;
     use crate::scribe::wal::WalLsn;
     use arrow::array::{Int32Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::ipc::writer::StreamWriter;
-    use chrono::NaiveDate;
+
     use std::sync::Arc;
     use std::sync::Barrier;
 
@@ -1773,7 +1802,7 @@ mod tests {
         SealKey::new(
             crate::test_support::tenant(),
             TableRef::new(BifrostNamespace::Bifrost, "events"),
-            EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date")),
+            crate::test_support::day_partition(2026, 7, 14),
         )
     }
 
@@ -1786,7 +1815,7 @@ mod tests {
         let second = SealKey::new(
             first.tenant,
             TableRef::new(BifrostNamespace::Bifrost, "spans"),
-            first.day,
+            first.partition,
         );
         memtable
             .insert(
@@ -1848,12 +1877,12 @@ mod tests {
         let second = SealKey::new(
             first.tenant,
             TableRef::new(BifrostNamespace::Bifrost, "metrics"),
-            first.day,
+            first.partition,
         );
         let empty = SealKey::new(
             first.tenant,
             TableRef::new(BifrostNamespace::Bifrost, "empty"),
-            first.day,
+            first.partition,
         );
         for (key, lsn) in [(&first, 1), (&second, 2)] {
             memtable
@@ -1920,8 +1949,8 @@ mod tests {
                 key.tenant,
                 &key.table,
                 &ProviderCut {
-                    start_day: key.day,
-                    end_day: key.day,
+                    start_partition: key.partition,
+                    end_partition: key.partition,
                     required_columns: &[],
                     persisted_cursor: WalLsn::ZERO,
                     persisted_ranges: &[],
@@ -1941,8 +1970,8 @@ mod tests {
                 key.tenant,
                 &key.table,
                 &ProviderCut {
-                    start_day: key.day,
-                    end_day: key.day,
+                    start_partition: key.partition,
+                    end_partition: key.partition,
                     required_columns: &[],
                     persisted_cursor: WalLsn::ZERO,
                     persisted_ranges: &[(WalLsn::new(2), WalLsn::new(2))],
@@ -2178,8 +2207,8 @@ mod tests {
             .readable_batches_for_range(
                 tenant,
                 &seal_key.table,
-                seal_key.day,
-                seal_key.day,
+                seal_key.partition,
+                seal_key.partition,
                 &[],
                 ReadableBatchLimits {
                     max_batches: 2,
@@ -2194,8 +2223,8 @@ mod tests {
             memtable.readable_batches_for_range(
                 tenant,
                 &seal_key.table,
-                seal_key.day,
-                seal_key.day,
+                seal_key.partition,
+                seal_key.partition,
                 &[],
                 ReadableBatchLimits {
                     max_batches: 1,
@@ -2209,8 +2238,8 @@ mod tests {
             memtable.readable_batches_for_range(
                 tenant,
                 &seal_key.table,
-                seal_key.day,
-                seal_key.day,
+                seal_key.partition,
+                seal_key.partition,
                 &[],
                 ReadableBatchLimits {
                     max_batches: 2,
@@ -2332,7 +2361,7 @@ mod tests {
         let empty_key = SealKey::new(
             seal_key.tenant,
             seal_key.table.clone(),
-            EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 16).expect("valid date")),
+            crate::test_support::day_partition(2026, 7, 16),
         );
         memtable.writable.lock().expect("writable lock").insert(
             empty_key.clone(),
@@ -2374,7 +2403,7 @@ mod tests {
         let second = SealKey::new(
             seal_key.tenant,
             TableRef::new(BifrostNamespace::Bifrost, "age_peer"),
-            seal_key.day,
+            seal_key.partition,
         );
         memtable
             .insert(
@@ -2487,7 +2516,7 @@ mod tests {
         let second = SealKey::new(
             first.tenant,
             first.table.clone(),
-            EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 15).expect("valid date")),
+            crate::test_support::day_partition(2026, 7, 15),
         );
         memtable
             .insert(
@@ -2538,7 +2567,7 @@ mod tests {
             seal_key: SealKey::new(
                 base.tenant,
                 base.table.clone(),
-                EventDay::new(NaiveDate::from_ymd_opt(2026, 7, day).expect("valid date")),
+                crate::test_support::day_partition(2026, 7, day),
             ),
             writable_bytes: bytes,
             first_insert_at: Instant::now(),
@@ -2630,7 +2659,7 @@ mod tests {
         let second = SealKey::new(
             first.tenant,
             first.table.clone(),
-            EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 15).expect("valid date")),
+            crate::test_support::day_partition(2026, 7, 15),
         );
         let now = Instant::now();
         let selected = Memtable::select_pressure_victims(
@@ -2659,7 +2688,7 @@ mod tests {
         let second = SealKey::new(
             first.tenant,
             first.table.clone(),
-            EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 15).expect("valid date")),
+            crate::test_support::day_partition(2026, 7, 15),
         );
         let now = Instant::now();
         let selected = Memtable::select_oldest_wal_victim(&[
@@ -2770,12 +2799,12 @@ mod tests {
         let key1 = SealKey::new(
             tenant,
             table.clone(),
-            EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid")),
+            crate::test_support::day_partition(2026, 7, 14),
         );
         let key2 = SealKey::new(
             tenant,
             table,
-            EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 15).expect("valid")),
+            crate::test_support::day_partition(2026, 7, 15),
         );
 
         // Insert to key1

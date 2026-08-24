@@ -2102,9 +2102,9 @@ impl WyrdTestCluster {
     pub async fn observe_live_tail(
         &self,
         table: &str,
-        event_day: wyrd_spec::vala::api::EventDay,
+        time_partition: wyrd_spec::vala::api::TimePartitionWire,
     ) -> Result<(), ClusterError> {
-        self.observe_live_tail_for_tenant(self.data_tenant_id(), table, event_day)
+        self.observe_live_tail_for_tenant(self.data_tenant_id(), table, time_partition)
             .await
     }
 
@@ -2121,11 +2121,11 @@ impl WyrdTestCluster {
         &self,
         tenant: wyrd_spec::DataTenantId,
         table: &str,
-        event_day: wyrd_spec::vala::api::EventDay,
+        time_partition: wyrd_spec::vala::api::TimePartitionWire,
     ) -> Result<(), ClusterError> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            match self.observe_live_tail_once(tenant, table, &event_day) {
+            match self.observe_live_tail_once(tenant, table, &time_partition) {
                 Ok(()) => return Ok(()),
                 Err(error) if tokio::time::Instant::now() < deadline => {
                     tokio::task::yield_now().await;
@@ -2141,7 +2141,7 @@ impl WyrdTestCluster {
         &self,
         tenant: wyrd_spec::DataTenantId,
         table: &str,
-        event_day: &wyrd_spec::vala::api::EventDay,
+        time_partition: &wyrd_spec::vala::api::TimePartitionWire,
     ) -> Result<(), ClusterError> {
         let canonical = table.strip_prefix("vala.").unwrap_or(table);
         let (namespace, table_name) = canonical.split_once('.').ok_or_else(|| {
@@ -2164,14 +2164,17 @@ impl WyrdTestCluster {
             let streams = reader
                 .list_active_streams(&binding)
                 .map_err(|error| ClusterError::Resource(error.to_string()))?;
-            if streams.iter().any(|(day, _)| day == event_day) {
+            if streams
+                .iter()
+                .any(|(partition, _)| partition == time_partition)
+            {
                 found = true;
             }
         }
         found.then_some(()).ok_or_else(|| {
             ClusterError::Resource(format!(
                 "no Scribe has an active stream for {}",
-                event_day.as_str()
+                time_partition.start_utc().to_rfc3339()
             ))
         })
     }

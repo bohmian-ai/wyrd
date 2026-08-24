@@ -2,9 +2,10 @@ use arrow::datatypes::{DataType, Field};
 
 use crate::tables::fields::utf8;
 use crate::tables::{
-    CorrelationPolicy, DeclaredIndex, DomainTable, IndexKind, PayloadClass, SortKey,
+    CorrelationPolicy, DomainTable, PayloadClass, hourly_layout, sort_asc, sort_desc,
 };
-use wyrd_spec::vala::managed_columns::{DATA_TENANT_ID, WYRD_EVENT_TIME};
+use wyrd_spec::vala::api::PhysicalLayoutWire;
+use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 /// `vala.system.audit_log` — 17 audit content columns plus the managed
 /// physical columns, `CorrelationPolicy::None` (C-01).
@@ -38,38 +39,10 @@ impl DomainTable for AuditLogTable {
         ]
     }
 
-    fn sort_keys() -> Vec<SortKey> {
-        vec![
-            SortKey {
-                column: WYRD_EVENT_TIME.into(),
-                ascending: false,
-                nulls_first: false,
-            },
-            SortKey {
-                column: DATA_TENANT_ID.into(),
-                ascending: true,
-                nulls_first: false,
-            },
-            SortKey {
-                column: "seq".into(),
-                ascending: true,
-                nulls_first: false,
-            },
-        ]
-    }
-
-    fn declared_indexes() -> Vec<DeclaredIndex> {
-        vec![
-            DeclaredIndex {
-                name: "audit_log_seq_bloom".into(),
-                columns: vec!["seq".into()],
-                kind: IndexKind::BloomFilter,
-            },
-            DeclaredIndex {
-                name: "audit_log_operation_bloom".into(),
-                columns: vec!["operation".into()],
-                kind: IndexKind::BloomFilter,
-            },
-        ]
+    fn physical_layout() -> PhysicalLayoutWire {
+        hourly_layout(
+            vec![sort_desc(WYRD_EVENT_TIME), sort_asc("seq")],
+            &["seq", "operation"],
+        )
     }
 }

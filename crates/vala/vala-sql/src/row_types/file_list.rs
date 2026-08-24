@@ -1,6 +1,6 @@
 //! Typed rows returned from the tenant-scoped `vala.file_list` manifest.
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 /// One validated sealed Parquet manifest entry.
@@ -24,8 +24,10 @@ pub struct HotFileRow {
     pub file_size: i64,
     /// Number of rows in the file.
     pub row_count: i64,
-    /// Partition day.
-    pub partition_day: NaiveDate,
+    /// Partition granularity token: `hour` or `day`.
+    pub partition_granularity: String,
+    /// Exact UTC start boundary of the partition.
+    pub partition_start: DateTime<Utc>,
     /// Whether Forge has published the file into Iceberg.
     pub compacted: bool,
     /// Iceberg snapshot that contains this file, when published.

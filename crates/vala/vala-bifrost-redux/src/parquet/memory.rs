@@ -1411,6 +1411,7 @@ mod tests {
                 crate::parquet::writer_properties::bifrost_writer_properties_with_metadata(
                     batch.num_rows(),
                     metadata,
+                    &[],
                 ),
             ),
         )
@@ -1449,6 +1450,7 @@ mod tests {
                 crate::parquet::writer_properties::bifrost_writer_properties_with_metadata(
                     1,
                     Vec::new(),
+                    &[],
                 ),
             ),
         )
@@ -1484,6 +1486,7 @@ mod tests {
                 crate::parquet::writer_properties::bifrost_writer_properties_with_metadata(
                     batch.num_rows(),
                     metadata,
+                    &[],
                 ),
             ),
         )

@@ -15,8 +15,8 @@ pub struct BifrostTableRow {
     pub fingerprint: Vec<u8>,
     /// Lifecycle status: `active`, `deprecated`, or `quarantined`.
     pub status: String,
-    /// Declared partition columns.
-    pub partition_columns: Vec<String>,
+    /// Canonical physical layout as the exact `PhysicalLayoutWire` JSON object.
+    pub physical_layout: serde_json::Value,
     /// Wall-clock registration time.
     pub registered_at: chrono::DateTime<chrono::Utc>,
     /// Wall-clock last-update time.

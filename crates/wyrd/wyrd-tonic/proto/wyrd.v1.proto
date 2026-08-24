@@ -78,17 +78,23 @@ service OracleLifecycleService {
   rpc CancelLifecycle(CancelOracleLifecycleRequest) returns (CancelOracleLifecycleResponse);
 }
 message TenantTableBinding { string tenant_id = 1; string namespace = 2; string table = 3; }
+// Closed partition granularity. Tag 0 is invalid on the wire: a decoder that
+// sees it must reject the message rather than defaulting to a granularity.
+enum TimeGranularity { TIME_GRANULARITY_UNSPECIFIED = 0; TIME_GRANULARITY_HOUR = 1; TIME_GRANULARITY_DAY = 2; }
+// One exact partition. start_unix_micros must be the exact UTC boundary of
+// granularity; a noncanonical start fails conversion.
+message TimePartition { TimeGranularity granularity = 1; sint64 start_unix_micros = 2; }
 message TailCursor { uint64 writer_epoch = 1; uint64 wal_lsn = 2; bytes batch_id = 3; uint32 row_ordinal = 4; }
 message TailStreamIdentity { string node_id = 1; uint64 writer_epoch = 2; }
 message AcquireTailFenceRequest {
-  TenantTableBinding binding = 1; string event_day = 2; TailCursor exclusive_sealed = 3;
+  TenantTableBinding binding = 1; TimePartition time_partition = 2; TailCursor exclusive_sealed = 3;
   uint64 deadline_unix_ms = 4; string schema_fingerprint = 5; uint32 tail_protocol_version = 6;
   // Private server-to-server authorization envelope.  The field is intentionally
   // opaque to public SDKs and is verified by the Scribe tail authority.
   bytes tail_ticket = 7; bytes query_id = 8;
 }
 message TailReadFence {
-  bytes fence_id = 1; TenantTableBinding binding = 2; string event_day = 3;
+  bytes fence_id = 1; TenantTableBinding binding = 2; TimePartition time_partition = 3;
   TailStreamIdentity stream = 4; TailCursor exclusive_sealed = 5;
   TailCursor inclusive_live = 6; string schema_fingerprint = 7;
   uint32 tail_protocol_version = 8; uint64 expires_at_unix_ms = 9; bytes capability = 10;
@@ -98,7 +104,7 @@ message TailPage { repeated bytes arrow_ipc_batches = 1; oneof next_cursor { Tai
 message ReleaseTailFenceRequest { bytes fence_id = 1; bytes tail_capability = 2; bytes query_id = 3; }
 message ReleaseTailFenceResponse {}
 message ListActiveStreamsRequest { bytes tail_ticket = 1; TenantTableBinding binding = 2; bytes query_id = 3; }
-message ActiveTailStream { string event_day = 1; TailStreamIdentity stream = 2; }
+message ActiveTailStream { TimePartition time_partition = 1; TailStreamIdentity stream = 2; }
 message ListActiveStreamsResponse { repeated ActiveTailStream streams = 1; }
 enum QueryClass { QUERY_CLASS_UNSPECIFIED = 0; QUERY_CLASS_INTERACTIVE = 1; QUERY_CLASS_ANALYTICAL = 2; }
 enum ClusterRole { CLUSTER_ROLE_UNSPECIFIED = 0; CLUSTER_ROLE_SCRIBE = 1; CLUSTER_ROLE_ORACLE = 2; }
@@ -123,7 +129,7 @@ message ForwardQueryRequest { SignedPeerTicket envelope = 1; }
 message PersistedFileAssignment { repeated string files = 1; }
 message PersistedWalRange { optional uint64 start_lsn = 1; optional uint64 end_lsn = 2; }
 message ScribeProviderCut {
-  uint64 writer_epoch = 1; string start_event_day = 2; string end_event_day = 3;
+  uint64 writer_epoch = 1; TimePartition start_partition = 2; TimePartition end_partition = 3;
   repeated string required_columns = 4; uint64 persisted_cursor = 5;
   repeated PersistedWalRange persisted_ranges = 6; uint32 maximum_batch_count = 7;
   uint64 maximum_retained_bytes = 8;

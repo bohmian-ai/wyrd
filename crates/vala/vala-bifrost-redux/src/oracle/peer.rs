@@ -57,6 +57,15 @@ pub struct PeerTicketClaims {
     /// Digest of the leader-authorized permissions.
     #[prost(string, tag = "14")]
     pub permission_digest: String,
+    /// Canonical assignment-authority digest (see
+    /// [`wyrd_spec::vala::assignment_authority`]) binding every dispatched
+    /// [`wyrd_spec::vala::api::FollowerScanAssignment`]'s identity, files,
+    /// schema fingerprint, and closed predicate/projection closure into one
+    /// signed value. The follower recomputes this over its actual received
+    /// assignments and rejects any mismatch before resolving a provider or
+    /// issuing object I/O.
+    #[prost(string, tag = "15")]
+    pub assignment_authority_digest: String,
 }
 
 /// Claims bytes accepted after signature and fence checks.
@@ -290,6 +299,40 @@ pub fn projection_digest(projection: &[String]) -> String {
         hash.update([0]);
     }
     hex::encode(hash.finalize())
+}
+
+/// Recomputes the canonical assignment-authority digest for one follower's
+/// full set of dispatched scan assignments.
+///
+/// Both the leader (at mint time) and the follower (at verification time)
+/// call this over the same list, in the same order, so a matching digest
+/// proves the follower's actual assignments are exactly the ones the leader
+/// signed — including every file, schema fingerprint, and closed predicate.
+///
+/// # Errors
+/// Returns [`PeerSecurityError::Encoding`] when a schema fingerprint is not
+/// canonical 64-hex, or a field exceeds the digest's length domain.
+pub fn assignment_authority_digest_for(
+    assignments: &[wyrd_spec::vala::api::FollowerScanAssignment],
+) -> Result<String, PeerSecurityError> {
+    let inputs = assignments
+        .iter()
+        .map(
+            |assignment| wyrd_spec::vala::assignment_authority::AssignmentDigestInput {
+                scan_id: assignment.scan_id.as_str(),
+                tenant_uuid: assignment.binding.tenant_id.as_uuid(),
+                namespace: assignment.binding.namespace.as_str(),
+                table: assignment.binding.table.as_str(),
+                schema_fingerprint_hex: assignment.schema_fingerprint.as_str(),
+                files: &assignment.persisted.files,
+                scribe_cut: assignment.scribe_provider_cut.as_ref(),
+                required_columns: &assignment.required_columns,
+                predicates: &assignment.predicates,
+            },
+        )
+        .collect::<Vec<_>>();
+    wyrd_spec::vala::assignment_authority::assignment_authority_digest(&inputs)
+        .map_err(|_| PeerSecurityError::Encoding)
 }
 
 #[cfg(test)]

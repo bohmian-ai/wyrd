@@ -1887,7 +1887,7 @@ impl ClusterCapabilities {
                 Ok(())
             }
             (ClusterRole::Oracle, Self::OracleV1(value))
-                if value.peer_protocol_version == 1
+                if value.peer_protocol_version == 2
                     && value.storage_protocol_version == 1
                     && value.cpu_cores.is_finite()
                     && value.cpu_cores > 0.0
@@ -2353,6 +2353,13 @@ pub struct FollowerScanAssignment {
     pub scribe_provider_cut: Option<ScribeProviderCut>,
     /// Schema fingerprint bound to the encoded placeholder.
     pub schema_fingerprint: String,
+    /// Required output/predicate/hidden-tenant projection closure, in the
+    /// stable order the leaf union and remote placeholder must expose.
+    pub required_columns: Vec<String>,
+    /// Closed leaf predicates pushed to this assignment's readers, in filter
+    /// order. Recognized predicates are always `Inexact`; DataFusion retains
+    /// its own residual filter above the table provider regardless.
+    pub predicates: Vec<crate::vala::assignment_authority::ScanPredicate>,
 }
 
 /// Ticket-bound worker fragment execution request.
@@ -2414,6 +2421,14 @@ pub struct WorkerScanStats {
     pub files_scanned: u64,
     /// Number of file partitions represented by the follower's executed scans.
     pub partitions_scanned: u64,
+    /// Row groups the follower retained after closed-predicate statistics
+    /// pruning. Observable only on the follower: the leader's plan carries a
+    /// remote placeholder in place of the executed scan leaf.
+    pub row_groups_scanned: u64,
+    /// Row groups the follower excluded by closed-predicate statistics
+    /// pruning, reported alongside `row_groups_scanned` so an operator can see
+    /// how much a pushed-down predicate actually saved.
+    pub row_groups_pruned: u64,
 }
 
 /// Verified worker footer for one completed attempt.

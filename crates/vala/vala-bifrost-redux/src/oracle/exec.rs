@@ -357,6 +357,14 @@ fn classify_partition_attempt(
             ordinal,
             error: BifrostError::QueryPeerSecurity,
         },
+        // A foreign-tenant row refused by the physical tripwire fails the
+        // partition outright rather than degrading it: the refusal is a
+        // property of the scanned data, so no other candidate would succeed
+        // and a degraded result would silently drop a tenant-isolation breach.
+        Err(super::dispatcher::DispatchError::TenantInvariant) => PartitionDisposition::Failed {
+            ordinal,
+            error: BifrostError::QueryTenantInvariant,
+        },
         Err(super::dispatcher::DispatchError::FileNotFound) => PartitionDisposition::Degraded {
             ordinal,
             decoded: Vec::new(),
@@ -584,7 +592,7 @@ impl RemoteScanExec {
 
 /// Shared physical scan state retained by one executing source plan.
 #[derive(Debug, Default)]
-struct OracleScanMetricsHandle {
+pub(super) struct OracleScanMetricsHandle {
     /// Iceberg's dependency-reported requested-range counter.
     iceberg: Mutex<Option<ScanMetrics>>,
     /// Requested bytes from governed hot Parquet range reads.
@@ -599,6 +607,10 @@ struct OracleScanMetricsHandle {
     hot_files: AtomicU64,
     /// Whether the ranged reader received at least one hot object.
     hot_partitions: AtomicU64,
+    /// Row groups retained after closed-predicate statistics pruning.
+    row_groups_selected: AtomicU64,
+    /// Row groups excluded by closed-predicate statistics pruning.
+    row_groups_pruned: AtomicU64,
 }
 
 impl OracleScanMetricsHandle {
@@ -616,16 +628,28 @@ impl OracleScanMetricsHandle {
     }
 
     /// Records one governed range request immediately before storage await.
-    fn record_hot_range(&self, bytes: usize) {
+    pub(super) fn record_hot_range(&self, bytes: usize) {
         self.hot_bytes
             .fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
         self.hot_available.store(true, Ordering::Release);
     }
 
     /// Records one hot file delivered to the ranged Parquet reader.
-    fn record_hot_file(&self) {
+    pub(super) fn record_hot_file(&self) {
         self.hot_files.fetch_add(1, Ordering::Relaxed);
         self.hot_partitions.store(1, Ordering::Relaxed);
+    }
+
+    /// Records one file's closed-predicate row-group pruning outcome.
+    ///
+    /// Called once per opened hot Parquet file, including files whose row
+    /// groups were all pruned, so the selected/pruned pair always accounts
+    /// for every row group the reader inspected.
+    pub(super) fn record_row_groups(&self, selection: &RowGroupSelection) {
+        self.row_groups_selected
+            .fetch_add(selection.retained.len() as u64, Ordering::Relaxed);
+        self.row_groups_pruned
+            .fetch_add(selection.pruned, Ordering::Relaxed);
     }
 
     /// Returns terminal dependency counters without substituting metadata sizes.
@@ -651,6 +675,14 @@ impl OracleScanMetricsHandle {
             .load(Ordering::Acquire)
             .saturating_add(self.hot_partitions.load(Ordering::Acquire));
         (available.then_some(total), files, partitions)
+    }
+
+    /// Returns the terminal `(selected, pruned)` row-group counters.
+    fn terminal_row_groups(&self) -> (u64, u64) {
+        (
+            self.row_groups_selected.load(Ordering::Acquire),
+            self.row_groups_pruned.load(Ordering::Acquire),
+        )
     }
 }
 
@@ -681,6 +713,10 @@ pub(crate) struct RemoteScanMetrics {
     files_scanned: AtomicU64,
     /// Summed file-partition count across every completed participant.
     partitions_scanned: AtomicU64,
+    /// Summed retained row groups across every completed participant.
+    row_groups_scanned: AtomicU64,
+    /// Summed pruned row groups across every completed participant.
+    row_groups_pruned: AtomicU64,
 }
 
 impl RemoteScanMetrics {
@@ -694,6 +730,10 @@ impl RemoteScanMetrics {
             .fetch_add(stats.files_scanned, Ordering::Relaxed);
         self.partitions_scanned
             .fetch_add(stats.partitions_scanned, Ordering::Relaxed);
+        self.row_groups_scanned
+            .fetch_add(stats.row_groups_scanned, Ordering::Relaxed);
+        self.row_groups_pruned
+            .fetch_add(stats.row_groups_pruned, Ordering::Relaxed);
     }
 
     /// Returns the aggregated totals, preserving absent-versus-zero bytes.
@@ -706,6 +746,18 @@ impl RemoteScanMetrics {
             bytes,
             self.files_scanned.load(Ordering::Acquire),
             self.partitions_scanned.load(Ordering::Acquire),
+        )
+    }
+
+    /// Returns the aggregated retained and pruned row-group totals.
+    ///
+    /// Reported separately from [`Self::terminal_values`] because row-group
+    /// evidence exists only for participants running a Parquet leaf; a cut
+    /// with no such participant contributes a true zero, not an absence.
+    fn terminal_row_groups(&self) -> (u64, u64) {
+        (
+            self.row_groups_scanned.load(Ordering::Acquire),
+            self.row_groups_pruned.load(Ordering::Acquire),
         )
     }
 }
@@ -723,6 +775,10 @@ pub(crate) struct OracleQueryScanStats {
     pub(crate) files_scanned: u64,
     /// Number of file partitions represented by executed scan nodes.
     pub(crate) partitions_scanned: u64,
+    /// Row groups retained after closed-predicate statistics pruning.
+    pub(crate) row_groups_scanned: u64,
+    /// Row groups excluded by closed-predicate statistics pruning.
+    pub(crate) row_groups_pruned: u64,
     /// Immutable-cut file sizes selected before physical execution.
     pub(crate) logical_bytes_selected: u64,
     /// Shared file-source metric sets retained until terminal stream drain.
@@ -769,8 +825,11 @@ impl OracleQueryScanStats {
         }
         for handle in &self.remote_handles {
             let (bytes, files, partitions) = handle.terminal_values();
+            let (selected_groups, pruned_groups) = handle.terminal_row_groups();
             self.files_scanned = self.files_scanned.saturating_add(files);
             self.partitions_scanned = self.partitions_scanned.saturating_add(partitions);
+            self.row_groups_scanned = self.row_groups_scanned.saturating_add(selected_groups);
+            self.row_groups_pruned = self.row_groups_pruned.saturating_add(pruned_groups);
             if let Some(bytes) = bytes {
                 available = true;
                 total = total.saturating_add(bytes);
@@ -778,8 +837,11 @@ impl OracleQueryScanStats {
         }
         for handle in &self.scan_handles {
             let (bytes, files, partitions) = handle.terminal_values();
+            let (selected_groups, pruned_groups) = handle.terminal_row_groups();
             self.files_scanned = self.files_scanned.saturating_add(files);
             self.partitions_scanned = self.partitions_scanned.saturating_add(partitions);
+            self.row_groups_scanned = self.row_groups_scanned.saturating_add(selected_groups);
+            self.row_groups_pruned = self.row_groups_pruned.saturating_add(pruned_groups);
             if let Some(bytes) = bytes {
                 available = true;
                 total = total.saturating_add(bytes);
@@ -820,6 +882,12 @@ impl OracleQueryScanStats {
         }
         if let Some(source) = plan.as_any().downcast_ref::<RemoteScanExec>() {
             stats.remote_handles.push(Arc::clone(&source.scan_metrics));
+        }
+        if let Some(source) = plan
+            .as_any()
+            .downcast_ref::<super::follower::FollowerHotParquetExec>()
+        {
+            stats.scan_handles.push(Arc::clone(source.metrics()));
         }
         for child in plan.children() {
             Self::visit(child.as_ref(), stats);
@@ -869,6 +937,29 @@ where
     } else {
         DataFusionError::External(Box::new(error))
     }
+}
+
+/// Detects the tenant tripwire's terminal refusal anywhere in an execution
+/// error chain.
+///
+/// [`TenantTripwireExec`] fails a stream with
+/// [`BifrostError::QueryTenantInvariant`] the moment a physically scanned row
+/// carries a foreign tenant. That refusal is a security outcome, not a
+/// transport failure, so every layer that classifies a stream error must
+/// recognize it here rather than collapsing it into a retryable class and
+/// losing the reason the query was refused.
+pub(crate) fn is_tenant_invariant_error(error: &DataFusionError) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(source) = current {
+        if matches!(
+            source.downcast_ref::<BifrostError>(),
+            Some(BifrostError::QueryTenantInvariant)
+        ) {
+            return true;
+        }
+        current = source.source();
+    }
+    false
 }
 
 /// Detects only the marker emitted by authenticated Iceberg object access.
@@ -1195,6 +1286,62 @@ impl fmt::Debug for OracleTableProvider {
 }
 
 impl OracleTableProvider {
+    /// Splits the caller's filters into the closed predicate vocabulary and the
+    /// original expressions that produced it.
+    ///
+    /// The first element is every closed leaf recovered from filters that
+    /// decomposed entirely (see [`classify_filter`]); it drives provider-local
+    /// pruning and travels to followers as the signed scan closure. The second
+    /// is the subset of the caller's own expressions that classified fully
+    /// `Supported`, forwarded verbatim to the Iceberg provider so it can build
+    /// Iceberg predicates for manifest and row-group pruning. Pushdown is
+    /// reported `Inexact`, so `DataFusion` still applies its residual filter
+    /// above this provider in both cases.
+    fn closed_pushdown(
+        &self,
+        filters: &[Expr],
+    ) -> (
+        Vec<wyrd_spec::vala::assignment_authority::ScanPredicate>,
+        Vec<Expr>,
+    ) {
+        let mut predicates = Vec::new();
+        let mut supported = Vec::new();
+        for filter in filters {
+            if let FilterClassification::Supported(leaves) = self.classify_filter_for_table(filter)
+            {
+                predicates.extend(leaves);
+                supported.push(filter.clone());
+            }
+        }
+        (predicates, supported)
+    }
+
+    /// Builds one remote-source placeholder leaf for a dispatched scan id.
+    ///
+    /// The placeholder stands in for a subtree the splitter will hand to a
+    /// follower. It carries the physical schema fingerprint the follower
+    /// revalidates, the session's target partitions so the split boundary
+    /// lands on the exchange rather than a repartition, and the closed
+    /// predicate/projection closure `execute_distributed_session` later
+    /// recovers to overwrite that scan id's safe pre-planning default.
+    fn remote_placeholder(
+        &self,
+        scan_id: &str,
+        target_partitions: usize,
+        required_columns: &[String],
+        predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
+    ) -> Arc<dyn ExecutionPlan> {
+        Arc::new(
+            super::codec::RemoteSourcePlaceholderExec::new(
+                scan_id.to_owned(),
+                super::assignment_schema_fingerprint(self.physical_schema.as_ref()),
+                Arc::clone(&self.physical_schema),
+            )
+            .with_partitions(target_partitions)
+            .with_closure(required_columns.to_vec(), predicates.to_vec()),
+        )
+    }
+
     /// Converts footer-validated distributed batches into the leader memory source.
     pub(super) fn validated_memory_source(
         batches: &Vec<RecordBatch>,
@@ -1284,6 +1431,46 @@ impl OracleTableProvider {
     }
 }
 
+impl OracleTableProvider {
+    /// Classifies one `DataFusion` filter for pushdown against this table.
+    ///
+    /// Wraps [`classify_filter`] with the schema check the closed subset
+    /// depends on: every leaf column must resolve by name against the complete
+    /// physical schema. A filter naming a column this table does not have is
+    /// `Unsupported`, so a qualified reference belonging to another relation
+    /// can never be pruned against this source.
+    fn classify_filter_for_table(&self, filter: &Expr) -> FilterClassification {
+        classify_filter_for_schema(&self.physical_schema, filter)
+    }
+}
+
+/// Classifies one `DataFusion` filter for pushdown against `physical_schema`.
+///
+/// [`classify_filter`] alone decides only whether the expression shape is in
+/// the closed subset. It accepts a column reference whether or not
+/// `DataFusion` qualified it, because a planned query always qualifies column
+/// references against the registered relation and rejecting qualified
+/// references would make pushdown unreachable in practice. The ownership
+/// check therefore happens here instead: every leaf column must resolve by
+/// name against the complete physical schema, so a reference belonging to a
+/// different relation makes the whole filter `Unsupported` and can never
+/// prune this source.
+fn classify_filter_for_schema(physical_schema: &Schema, filter: &Expr) -> FilterClassification {
+    match classify_filter(filter) {
+        FilterClassification::Supported(leaves) => {
+            if leaves
+                .iter()
+                .all(|leaf| physical_schema.column_with_name(leaf.column()).is_some())
+            {
+                FilterClassification::Supported(leaves)
+            } else {
+                FilterClassification::Unsupported
+            }
+        }
+        FilterClassification::Unsupported => FilterClassification::Unsupported,
+    }
+}
+
 #[async_trait]
 impl TableProvider for OracleTableProvider {
     /// Exposes this provider for `DataFusion` downcasts.
@@ -1301,16 +1488,22 @@ impl TableProvider for OracleTableProvider {
         TableType::Base
     }
 
-    /// Reports no pushed filters because Oracle applies complete SQL semantics
-    /// above its tenant-tripwired disjoint source union.
+    /// Reports `Inexact` for every filter that decomposes entirely into the
+    /// closed predicate vocabulary (see [`classify_filter`]) and
+    /// `Unsupported` for anything else. `Inexact` keeps `DataFusion`'s own
+    /// residual filter above this provider even though the provider also
+    /// applies the same closed predicates locally.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        Ok(vec![
-            TableProviderFilterPushDown::Unsupported;
-            filters.len()
-        ])
+        Ok(filters
+            .iter()
+            .map(|filter| match self.classify_filter_for_table(filter) {
+                FilterClassification::Supported(_) => TableProviderFilterPushDown::Inexact,
+                FilterClassification::Unsupported => TableProviderFilterPushDown::Unsupported,
+            })
+            .collect())
     }
 
     /// Builds the exact `Iceberg + hot + live -> tripwire` disjoint source.
@@ -1327,9 +1520,12 @@ impl TableProvider for OracleTableProvider {
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-        _limit: Option<usize>,
+        filters: &[Expr],
+        limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let (supported_predicates, supported_filters) = self.closed_pushdown(filters);
+        let required_columns =
+            required_columns_closure(&self.public_schema, projection, &supported_predicates);
         let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
         // Every remote source advertises the session's target partitions so the
         // distributed split boundary lands on the exchange above the partial
@@ -1337,31 +1533,32 @@ impl TableProvider for OracleTableProvider {
         // parallelize a single-partition leaf.
         let target_partitions = state.config().target_partitions();
         if let Some(scan_id) = &self.remote_sources.iceberg_scan_id {
-            inputs.push(Arc::new(
-                super::codec::RemoteSourcePlaceholderExec::new(
-                    scan_id.clone(),
-                    super::sealed_fragment_schema_fingerprint(self.physical_schema.as_ref()),
-                    Arc::clone(&self.physical_schema),
-                )
-                .with_partitions(target_partitions),
+            inputs.push(self.remote_placeholder(
+                scan_id,
+                target_partitions,
+                &required_columns,
+                &supported_predicates,
             ));
         } else if let Some(batches) = &self.distributed_iceberg_batches {
             let published =
                 Self::validated_memory_source(batches, Arc::clone(&self.physical_schema))?;
             inputs.push(published);
         } else {
-            let published = self.iceberg.scan(state, None, &[], None).await?;
+            // `limit` is forwarded only as a per-leaf upper bound; DataFusion's
+            // own global limit above this provider remains authoritative.
+            let published = self
+                .iceberg
+                .scan(state, None, &supported_filters, limit)
+                .await?;
             let published = Arc::new(OracleIcebergScanExec::from_plan(published.as_ref())?);
             inputs.push(published);
         }
         if let Some(scan_id) = &self.remote_sources.hot_scan_id {
-            inputs.push(Arc::new(
-                super::codec::RemoteSourcePlaceholderExec::new(
-                    scan_id.clone(),
-                    super::sealed_fragment_schema_fingerprint(self.physical_schema.as_ref()),
-                    Arc::clone(&self.physical_schema),
-                )
-                .with_partitions(target_partitions),
+            inputs.push(self.remote_placeholder(
+                scan_id,
+                target_partitions,
+                &required_columns,
+                &supported_predicates,
             ));
         } else if !self.hot_files.is_empty() {
             let hot = Arc::new(HotParquetExec::new(
@@ -1374,6 +1571,7 @@ impl TableProvider for OracleTableProvider {
                     telemetry: Arc::clone(&self.telemetry),
                     query_class: self.query_class,
                     metrics: Arc::new(OracleScanMetricsHandle::default()),
+                    predicates: supported_predicates.clone(),
                 },
             ));
             inputs.push(hot);
@@ -1386,13 +1584,11 @@ impl TableProvider for OracleTableProvider {
             inputs.push(hot);
         }
         for scan_id in &self.remote_sources.scribe_scan_ids {
-            inputs.push(Arc::new(
-                super::codec::RemoteSourcePlaceholderExec::new(
-                    scan_id.clone(),
-                    super::sealed_fragment_schema_fingerprint(self.physical_schema.as_ref()),
-                    Arc::clone(&self.physical_schema),
-                )
-                .with_partitions(target_partitions),
+            inputs.push(self.remote_placeholder(
+                scan_id,
+                target_partitions,
+                &required_columns,
+                &supported_predicates,
             ));
         }
         if !self.live_batches.is_empty() {
@@ -1409,7 +1605,22 @@ impl TableProvider for OracleTableProvider {
             self.table.clone(),
             Arc::clone(&self.audit),
         )?);
-        project_plan(tripwire, projection)
+        // Provider-local filter over the closed predicates. This is a real
+        // pruning aid, not a substitute for correctness: pushdown is reported
+        // `Inexact`, so DataFusion still applies its own residual copy above
+        // this provider regardless of what happens here.
+        let physical_predicates = supported_predicates
+            .iter()
+            .map(|predicate| scan_predicate_physical_expr(predicate, &tripwire.schema()))
+            .collect::<DataFusionResult<Vec<_>>>()?;
+        let filtered: Arc<dyn ExecutionPlan> =
+            match conjoin_physical_predicates(physical_predicates) {
+                Some(predicate) => Arc::new(
+                    datafusion::physical_plan::filter::FilterExec::try_new(predicate, tripwire)?,
+                ),
+                None => tripwire,
+            };
+        project_plan(filtered, projection)
     }
 }
 
@@ -1794,6 +2005,9 @@ struct HotParquetExec {
     query_class: QueryClass,
     /// Shared terminal metric owner retained by query telemetry.
     metrics: Arc<OracleScanMetricsHandle>,
+    /// Closed predicate conjunction used to skip a file whose footer
+    /// statistics prove no row group can satisfy every leaf.
+    predicates: Vec<wyrd_spec::vala::assignment_authority::ScanPredicate>,
     /// Deterministic reader injected only by focused unit tests.
     #[cfg(test)]
     reader_override: Option<HotReadOverride>,
@@ -1813,6 +2027,8 @@ struct HotParquetRuntime {
     query_class: QueryClass,
     /// Terminal scan metrics retained through stream completion.
     metrics: Arc<OracleScanMetricsHandle>,
+    /// Closed predicate conjunction pushed down to this hot leaf's readers.
+    predicates: Vec<wyrd_spec::vala::assignment_authority::ScanPredicate>,
 }
 
 impl fmt::Debug for HotParquetExec {
@@ -1841,6 +2057,7 @@ impl HotParquetExec {
             telemetry: runtime.telemetry,
             query_class: runtime.query_class,
             metrics: runtime.metrics,
+            predicates: runtime.predicates,
             #[cfg(test)]
             reader_override: None,
             properties: plan_properties(Arc::clone(&schema)),
@@ -1940,6 +2157,7 @@ fn hot_stream(
     let telemetry = Arc::clone(&exec.telemetry);
     let query_class = exec.query_class;
     let metrics = Arc::clone(&exec.metrics);
+    let predicates = exec.predicates.clone();
     #[cfg(test)]
     let reader_override = exec.reader_override.clone();
     async_stream::try_stream! {
@@ -1969,10 +2187,22 @@ fn hot_stream(
             } else {
                 reader
             };
+            // Recorded before the footer is read so a file observation exists
+            // for every attempt on this file, including one whose reader fails
+            // or is abandoned mid-open. Row-group pruning is reported
+            // separately, so a file whose groups are all pruned still counts as
+            // opened rather than vanishing from the scan accounting.
             metrics.record_hot_file();
-            let mut batches = ParquetRecordBatchStreamBuilder::new(reader)
+            let builder = ParquetRecordBatchStreamBuilder::new(reader)
                 .await
-                .map_err(|error| DataFusionError::External(Box::new(error)))?
+                .map_err(|error| DataFusionError::External(Box::new(error)))?;
+            let selection = select_row_groups_for_predicates(builder.metadata(), &predicates);
+            metrics.record_row_groups(&selection);
+            if selection.excludes_file() {
+                continue;
+            }
+            let mut batches = builder
+                .with_row_groups(selection.retained)
                 .with_batch_size(HOT_BATCH_ROWS)
                 .build()
                 .map_err(|error| DataFusionError::External(Box::new(error)))?;
@@ -2019,6 +2249,502 @@ fn tenant_mismatch_row(
         .ok_or_else(|| DataFusionError::External(Box::new(BifrostError::QueryTenantInvariant)))?;
     let expected = tenant.to_string();
     Ok((0..values.len()).find(|row| values.is_null(*row) || values.value(*row) != expected))
+}
+
+/// Result of classifying one `DataFusion` filter expression against the
+/// closed predicate pushdown vocabulary.
+enum FilterClassification {
+    /// The whole expression decomposed into closed leaves; `DataFusion` still
+    /// retains its own residual copy because pushdown is reported `Inexact`.
+    Supported(Vec<wyrd_spec::vala::assignment_authority::ScanPredicate>),
+    /// At least one leaf fell outside the closed subset.
+    Unsupported,
+}
+
+/// Classifies one filter expression: recursively flattens `AND`, and
+/// classifies each leaf as a closed [`ScanPredicate`](wyrd_spec::vala::assignment_authority::ScanPredicate)
+/// comparison or null-check. Any `OR`, `NOT`, cast, function call, arithmetic,
+/// column-to-column comparison, qualified/unknown column, non-finite float,
+/// or unrecognized literal type makes the entire expression `Unsupported` —
+/// classification never partially decomposes one filter.
+fn classify_filter(expr: &Expr) -> FilterClassification {
+    let mut leaves = Vec::new();
+    if flatten_supported_conjunction(expr, &mut leaves) {
+        FilterClassification::Supported(leaves)
+    } else {
+        FilterClassification::Unsupported
+    }
+}
+
+/// Recursively decomposes `AND` conjunctions into closed leaves.
+///
+/// Returns `false` (leaving `out` in an unspecified partial state that the
+/// caller discards) as soon as one leaf is not representable in the closed
+/// subset.
+fn flatten_supported_conjunction(
+    expr: &Expr,
+    out: &mut Vec<wyrd_spec::vala::assignment_authority::ScanPredicate>,
+) -> bool {
+    match expr {
+        Expr::BinaryExpr(binary) if binary.op == datafusion::logical_expr::Operator::And => {
+            flatten_supported_conjunction(&binary.left, out)
+                && flatten_supported_conjunction(&binary.right, out)
+        }
+        Expr::BinaryExpr(binary) => {
+            let Some(predicate) = classify_comparison(&binary.left, binary.op, &binary.right)
+            else {
+                return false;
+            };
+            out.push(predicate);
+            true
+        }
+        Expr::IsNull(inner) => {
+            let Some(column) = column_name_for_pushdown(inner) else {
+                return false;
+            };
+            out.push(wyrd_spec::vala::assignment_authority::ScanPredicate::IsNull(column));
+            true
+        }
+        Expr::IsNotNull(inner) => {
+            let Some(column) = column_name_for_pushdown(inner) else {
+                return false;
+            };
+            out.push(wyrd_spec::vala::assignment_authority::ScanPredicate::IsNotNull(column));
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Returns the bare column name of `expr`, or `None` when `expr` is not a
+/// column reference.
+///
+/// A table qualifier is accepted and discarded: `DataFusion` qualifies every
+/// column reference against the registered relation, so a filter reaching a
+/// registered provider always arrives as `catalog.schema.table.column`.
+/// Rejecting qualified references here would make the closed subset
+/// unreachable in practice. The bare name is authoritative because the caller
+/// resolves it against the complete physical schema before it can prune, and
+/// an unresolvable name classifies the whole filter `Unsupported`.
+fn column_name_for_pushdown(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Column(column) => Some(column.name.clone()),
+        _ => None,
+    }
+}
+
+/// Classifies one binary comparison as a closed leaf predicate.
+///
+/// A literal on the left is normalized by reversing the operator so the
+/// returned predicate always carries `(column, literal)`. Returns `None` for
+/// any operator outside the closed comparison set, a non-finite float
+/// literal, a literal type outside the closed [`ScanLiteral`](wyrd_spec::vala::assignment_authority::ScanLiteral)
+/// vocabulary, or an operand pair that is not exactly one unqualified column
+/// and one closed literal.
+fn classify_comparison(
+    left: &Expr,
+    op: datafusion::logical_expr::Operator,
+    right: &Expr,
+) -> Option<wyrd_spec::vala::assignment_authority::ScanPredicate> {
+    use wyrd_spec::vala::assignment_authority::ScanPredicate;
+
+    let normalized_op = closed_comparison_op(op)?;
+    let (column, literal_expr, normalized_op) = match (
+        column_name_for_pushdown(left),
+        column_name_for_pushdown(right),
+    ) {
+        (Some(column), None) => (column, right, normalized_op),
+        (None, Some(column)) => (column, left, reverse_comparison_op(normalized_op)),
+        _ => return None,
+    };
+    let literal = classify_literal(literal_expr)?;
+    Some(match normalized_op {
+        ClosedComparisonOp::Eq => ScanPredicate::Eq(column, literal),
+        ClosedComparisonOp::NotEq => ScanPredicate::NotEq(column, literal),
+        ClosedComparisonOp::Lt => ScanPredicate::Lt(column, literal),
+        ClosedComparisonOp::LtEq => ScanPredicate::LtEq(column, literal),
+        ClosedComparisonOp::Gt => ScanPredicate::Gt(column, literal),
+        ClosedComparisonOp::GtEq => ScanPredicate::GtEq(column, literal),
+    })
+}
+
+/// Closed comparison operators reachable through predicate pushdown.
+#[derive(Clone, Copy)]
+enum ClosedComparisonOp {
+    /// `=`
+    Eq,
+    /// `!=`
+    NotEq,
+    /// `<`
+    Lt,
+    /// `<=`
+    LtEq,
+    /// `>`
+    Gt,
+    /// `>=`
+    GtEq,
+}
+
+/// Maps a `DataFusion` operator onto the closed comparison set, or `None`
+/// when it falls outside `Eq`/`NotEq`/`Lt`/`LtEq`/`Gt`/`GtEq`.
+fn closed_comparison_op(op: datafusion::logical_expr::Operator) -> Option<ClosedComparisonOp> {
+    use datafusion::logical_expr::Operator;
+    match op {
+        Operator::Eq => Some(ClosedComparisonOp::Eq),
+        Operator::NotEq => Some(ClosedComparisonOp::NotEq),
+        Operator::Lt => Some(ClosedComparisonOp::Lt),
+        Operator::LtEq => Some(ClosedComparisonOp::LtEq),
+        Operator::Gt => Some(ClosedComparisonOp::Gt),
+        Operator::GtEq => Some(ClosedComparisonOp::GtEq),
+        _ => None,
+    }
+}
+
+/// Reverses a closed comparison operator, used when the literal appears on
+/// the left of the original expression.
+fn reverse_comparison_op(op: ClosedComparisonOp) -> ClosedComparisonOp {
+    match op {
+        ClosedComparisonOp::Eq => ClosedComparisonOp::Eq,
+        ClosedComparisonOp::NotEq => ClosedComparisonOp::NotEq,
+        ClosedComparisonOp::Lt => ClosedComparisonOp::Gt,
+        ClosedComparisonOp::LtEq => ClosedComparisonOp::GtEq,
+        ClosedComparisonOp::Gt => ClosedComparisonOp::Lt,
+        ClosedComparisonOp::GtEq => ClosedComparisonOp::LtEq,
+    }
+}
+
+/// Classifies one literal expression into the closed [`ScanLiteral`](wyrd_spec::vala::assignment_authority::ScanLiteral)
+/// vocabulary.
+///
+/// Returns `None` for any `ScalarValue` variant outside `Boolean`/`Int64`/
+/// `UInt64`/`Float64`/`Utf8`/`TimestampMicrosecond`, a null literal, or a
+/// non-finite `f64`.
+fn classify_literal(expr: &Expr) -> Option<wyrd_spec::vala::assignment_authority::ScanLiteral> {
+    use datafusion::scalar::ScalarValue;
+    use wyrd_spec::vala::assignment_authority::ScanLiteral;
+
+    let Expr::Literal(value, _) = expr else {
+        return None;
+    };
+    match value {
+        ScalarValue::Boolean(Some(inner)) => Some(ScanLiteral::Bool(*inner)),
+        ScalarValue::Int64(Some(inner)) => Some(ScanLiteral::I64(*inner)),
+        ScalarValue::UInt64(Some(inner)) => Some(ScanLiteral::U64(*inner)),
+        ScalarValue::Float64(Some(inner)) if inner.is_finite() => {
+            Some(ScanLiteral::F64Bits(inner.to_bits()))
+        }
+        ScalarValue::Utf8(Some(inner)) => Some(ScanLiteral::Utf8(inner.clone())),
+        ScalarValue::TimestampMicrosecond(Some(inner), _) => {
+            Some(ScanLiteral::TimestampMicros(*inner))
+        }
+        _ => None,
+    }
+}
+
+/// Computes the canonical `required_columns` closure: `DataFusion`'s requested
+/// scan output (by name, or every public column when `projection` is
+/// `None`), followed by the first occurrence of each predicate column in
+/// filter order, followed by the always-present hidden tenant column —
+/// stably deduplicated. Names resolve against the full physical schema.
+fn required_columns_closure(
+    public_schema: &Schema,
+    projection: Option<&Vec<usize>>,
+    predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
+) -> Vec<String> {
+    let scan_output_names: Vec<String> = match projection {
+        Some(projection) => projection
+            .iter()
+            .filter_map(|index| public_schema.fields().get(*index))
+            .map(|field| field.name().clone())
+            .collect(),
+        None => public_schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect(),
+    };
+    let mut required = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for name in scan_output_names
+        .into_iter()
+        .chain(
+            predicates
+                .iter()
+                .map(|predicate| predicate.column().to_string()),
+        )
+        .chain(std::iter::once(DATA_TENANT_ID.to_string()))
+    {
+        if seen.insert(name.clone()) {
+            required.push(name);
+        }
+    }
+    required
+}
+
+/// Builds the physical predicate for one closed comparison/null-check leaf
+/// against `schema`.
+///
+/// # Errors
+/// Returns a `DataFusion` plan error when the predicate's column is absent
+/// from `schema`.
+fn scan_predicate_physical_expr(
+    predicate: &wyrd_spec::vala::assignment_authority::ScanPredicate,
+    schema: &SchemaRef,
+) -> DataFusionResult<Arc<dyn datafusion::physical_expr::PhysicalExpr>> {
+    use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::PhysicalExpr;
+    use datafusion::physical_expr::expressions::{BinaryExpr, IsNotNullExpr, IsNullExpr, Literal};
+    use datafusion::scalar::ScalarValue;
+    use wyrd_spec::vala::assignment_authority::{ScanLiteral, ScanPredicate};
+
+    let column_expr = |name: &str| -> DataFusionResult<Arc<dyn PhysicalExpr>> {
+        Ok(Arc::new(Column::new_with_schema(name, schema)?))
+    };
+    let literal_expr = |literal: &ScanLiteral| -> Arc<dyn PhysicalExpr> {
+        let scalar = match literal {
+            ScanLiteral::Bool(inner) => ScalarValue::Boolean(Some(*inner)),
+            ScanLiteral::I64(inner) => ScalarValue::Int64(Some(*inner)),
+            ScanLiteral::U64(inner) => ScalarValue::UInt64(Some(*inner)),
+            ScanLiteral::F64Bits(inner) => ScalarValue::Float64(Some(f64::from_bits(*inner))),
+            ScanLiteral::Utf8(inner) => ScalarValue::Utf8(Some(inner.clone())),
+            ScanLiteral::TimestampMicros(inner) => {
+                ScalarValue::TimestampMicrosecond(Some(*inner), None)
+            }
+        };
+        Arc::new(Literal::new(scalar))
+    };
+    let comparison = |column: &str, op: Operator, literal: &ScanLiteral| {
+        Ok(Arc::new(BinaryExpr::new(
+            column_expr(column)?,
+            op,
+            literal_expr(literal),
+        )) as Arc<dyn PhysicalExpr>)
+    };
+    match predicate {
+        ScanPredicate::Eq(column, literal) => comparison(column, Operator::Eq, literal),
+        ScanPredicate::NotEq(column, literal) => comparison(column, Operator::NotEq, literal),
+        ScanPredicate::Lt(column, literal) => comparison(column, Operator::Lt, literal),
+        ScanPredicate::LtEq(column, literal) => comparison(column, Operator::LtEq, literal),
+        ScanPredicate::Gt(column, literal) => comparison(column, Operator::Gt, literal),
+        ScanPredicate::GtEq(column, literal) => comparison(column, Operator::GtEq, literal),
+        ScanPredicate::IsNull(column) => Ok(Arc::new(IsNullExpr::new(column_expr(column)?))),
+        ScanPredicate::IsNotNull(column) => Ok(Arc::new(IsNotNullExpr::new(column_expr(column)?))),
+    }
+}
+
+/// Combines one or more physical predicates into a single conjunction, or
+/// `None` when the list is empty.
+fn conjoin_physical_predicates(
+    predicates: Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>>,
+) -> Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>> {
+    use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::expressions::BinaryExpr;
+    predicates
+        .into_iter()
+        .reduce(|left, right| Arc::new(BinaryExpr::new(left, Operator::And, right)))
+}
+
+/// One statistic bound value in the closed subset this pruning path
+/// understands. Two bounds are only ever compared after both are derived
+/// from the same predicate literal's type, so the derived ordering is exact.
+#[derive(Debug, Clone, PartialEq, PartialOrd)]
+enum StatBound {
+    /// Boolean bound, ordered `false < true`.
+    Bool(bool),
+    /// Signed 64-bit bound, shared by `I64` and `TimestampMicros` literals.
+    I64(i64),
+    /// UTF-8 bound compared by byte order.
+    Utf8(String),
+}
+
+/// Converts one closed predicate literal into its comparable statistic bound.
+/// Returns `None` for `U64`/`F64Bits`, whose Parquet physical encoding this
+/// pruning path does not decode; callers must treat that as "never exclude".
+fn literal_bound(
+    literal: &wyrd_spec::vala::assignment_authority::ScanLiteral,
+) -> Option<StatBound> {
+    use wyrd_spec::vala::assignment_authority::ScanLiteral;
+    match literal {
+        ScanLiteral::Bool(value) => Some(StatBound::Bool(*value)),
+        ScanLiteral::I64(value) | ScanLiteral::TimestampMicros(value) => {
+            Some(StatBound::I64(*value))
+        }
+        ScanLiteral::Utf8(value) => Some(StatBound::Utf8(value.clone())),
+        ScanLiteral::U64(_) | ScanLiteral::F64Bits(_) => None,
+    }
+}
+
+/// Reads one column chunk's typed min/max as comparable bounds, matched
+/// against `target`'s variant. Returns `None` when the physical statistics
+/// type does not correspond to `target`, or either bound is unset.
+fn statistics_bound(
+    stats: &parquet::file::statistics::Statistics,
+    target: &StatBound,
+) -> Option<(StatBound, StatBound)> {
+    use parquet::file::statistics::Statistics;
+    match (stats, target) {
+        (Statistics::Boolean(value), StatBound::Bool(_)) => Some((
+            StatBound::Bool(*value.min_opt()?),
+            StatBound::Bool(*value.max_opt()?),
+        )),
+        (Statistics::Int64(value), StatBound::I64(_)) => Some((
+            StatBound::I64(*value.min_opt()?),
+            StatBound::I64(*value.max_opt()?),
+        )),
+        (Statistics::ByteArray(value), StatBound::Utf8(_)) => Some((
+            StatBound::Utf8(String::from_utf8_lossy(value.min_opt()?.data()).into_owned()),
+            StatBound::Utf8(String::from_utf8_lossy(value.max_opt()?.data()).into_owned()),
+        )),
+        _ => None,
+    }
+}
+
+/// Returns the Parquet leaf column index whose name matches `column`, or
+/// `None` when the physical schema carries no column by that name.
+fn parquet_column_index(
+    metadata: &parquet::file::metadata::ParquetMetaData,
+    column: &str,
+) -> Option<usize> {
+    let schema = metadata.file_metadata().schema_descr();
+    (0..schema.num_columns()).find(|&index| schema.column(index).name() == column)
+}
+
+/// Returns true only when Parquet footer statistics prove no row in
+/// `row_group_index` can satisfy `predicate`. An absent, type-mismatched, or
+/// undecoded statistic always keeps the row group; this function never
+/// produces a false exclusion.
+fn leaf_excludes_row_group(
+    metadata: &parquet::file::metadata::ParquetMetaData,
+    row_group_index: usize,
+    predicate: &wyrd_spec::vala::assignment_authority::ScanPredicate,
+) -> bool {
+    use wyrd_spec::vala::assignment_authority::ScanPredicate;
+
+    let Some(column_index) = parquet_column_index(metadata, predicate.column()) else {
+        return false;
+    };
+    let row_group = metadata.row_group(row_group_index);
+    let Some(stats) = row_group.column(column_index).statistics() else {
+        return false;
+    };
+    match predicate {
+        ScanPredicate::IsNull(_) => stats.null_count_opt() == Some(0),
+        ScanPredicate::IsNotNull(_) => {
+            let rows = u64::try_from(row_group.num_rows()).unwrap_or(0);
+            stats.null_count_opt() == Some(rows)
+        }
+        ScanPredicate::Eq(_, literal) => {
+            let Some(target) = literal_bound(literal) else {
+                return false;
+            };
+            let Some((min, max)) = statistics_bound(stats, &target) else {
+                return false;
+            };
+            target < min || max < target
+        }
+        ScanPredicate::NotEq(_, literal) => {
+            let Some(target) = literal_bound(literal) else {
+                return false;
+            };
+            let Some((min, max)) = statistics_bound(stats, &target) else {
+                return false;
+            };
+            min == max && min == target
+        }
+        ScanPredicate::Lt(_, literal) => {
+            let Some(target) = literal_bound(literal) else {
+                return false;
+            };
+            let Some((min, _)) = statistics_bound(stats, &target) else {
+                return false;
+            };
+            matches!(
+                min.partial_cmp(&target),
+                Some(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater)
+            )
+        }
+        ScanPredicate::LtEq(_, literal) => {
+            let Some(target) = literal_bound(literal) else {
+                return false;
+            };
+            let Some((min, _)) = statistics_bound(stats, &target) else {
+                return false;
+            };
+            target < min
+        }
+        ScanPredicate::Gt(_, literal) => {
+            let Some(target) = literal_bound(literal) else {
+                return false;
+            };
+            let Some((_, max)) = statistics_bound(stats, &target) else {
+                return false;
+            };
+            matches!(
+                target.partial_cmp(&max),
+                Some(std::cmp::Ordering::Equal | std::cmp::Ordering::Greater)
+            )
+        }
+        ScanPredicate::GtEq(_, literal) => {
+            let Some(target) = literal_bound(literal) else {
+                return false;
+            };
+            let Some((_, max)) = statistics_bound(stats, &target) else {
+                return false;
+            };
+            max < target
+        }
+    }
+}
+
+/// Row groups retained after closed-predicate statistics pruning for one
+/// Parquet file, together with how many the pruning removed.
+///
+/// `retained` is the exact ordered row-group index list a
+/// `ParquetRecordBatchStreamBuilder` should be restricted to. An empty
+/// `retained` with a non-zero `pruned` means the whole file is excluded and
+/// the caller must skip it without opening any data page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RowGroupSelection {
+    /// Ordered row-group indices whose statistics can still satisfy every leaf.
+    pub(super) retained: Vec<usize>,
+    /// Number of row groups excluded by at least one predicate leaf.
+    pub(super) pruned: u64,
+}
+
+impl RowGroupSelection {
+    /// Reports whether the predicates excluded every row group in the file.
+    pub(super) fn excludes_file(&self) -> bool {
+        self.retained.is_empty() && self.pruned > 0
+    }
+}
+
+/// Selects the row groups of `metadata` whose statistics can still satisfy the
+/// closed predicate conjunction, pruning the rest.
+///
+/// A row group is pruned only when at least one leaf proves it cannot contain a
+/// matching row; absent, type-mismatched, or unusable statistics always retain
+/// it, so pruning is a pure IO optimization and never changes results. An empty
+/// predicate conjunction retains every row group and prunes none.
+pub(super) fn select_row_groups_for_predicates(
+    metadata: &parquet::file::metadata::ParquetMetaData,
+    predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
+) -> RowGroupSelection {
+    let total = metadata.num_row_groups();
+    if predicates.is_empty() || total == 0 {
+        return RowGroupSelection {
+            retained: (0..total).collect(),
+            pruned: 0,
+        };
+    }
+    let retained: Vec<usize> = (0..total)
+        .filter(|row_group_index| {
+            !predicates
+                .iter()
+                .any(|predicate| leaf_excludes_row_group(metadata, *row_group_index, predicate))
+        })
+        .collect();
+    let pruned = (total - retained.len()) as u64;
+    RowGroupSelection { retained, pruned }
 }
 
 /// Projects one physical batch to the pinned schema by field name.
@@ -2718,6 +3444,7 @@ mod tests {
                     telemetry: Arc::clone(&telemetry),
                     query_class: QueryClass::Interactive,
                     metrics: Arc::clone(&metrics),
+                    predicates: Vec::new(),
                 },
             );
             (exec, metrics)
@@ -2927,6 +3654,7 @@ mod tests {
                 memory_pool: Arc::clone(&query_pool),
                 telemetry: Arc::clone(&telemetry),
                 query_class: QueryClass::Interactive,
+                predicates: Vec::new(),
                 metrics: Arc::clone(&metrics),
             },
         )
@@ -3114,6 +3842,7 @@ mod tests {
                 telemetry: Arc::clone(&telemetry),
                 query_class: QueryClass::Interactive,
                 metrics: Arc::new(OracleScanMetricsHandle::default()),
+                predicates: Vec::new(),
             },
         )
         .with_test_reader(Arc::new(move |_, range| {
@@ -3209,6 +3938,7 @@ mod tests {
                     telemetry: Arc::clone(&telemetry),
                     query_class: QueryClass::Interactive,
                     metrics: Arc::clone(&metrics),
+                    predicates: Vec::new(),
                 },
             )
             .with_test_reader(reader);
@@ -3272,5 +4002,224 @@ mod tests {
             requested_bytes.load(Ordering::Acquire),
             4,
         );
+    }
+
+    /// Pins the closed predicate classifier, the projection-closure
+    /// algorithm, and the `Inexact`/`Unsupported` pushdown report against the
+    /// full physical schema and a requested output projection.
+    ///
+    /// Covers: supported `AND` conjunction of typed comparisons and a null
+    /// leaf; a literal-on-the-left comparison normalized by reversing the
+    /// operator; the exact stable-dedup closure order (scan output, then
+    /// first-occurrence predicate columns, then the always-present hidden
+    /// tenant column); and every closed-subset-violating shape (`OR`, `NOT`,
+    /// cast, column-to-column, non-finite float) reported `Unsupported`.
+    #[test]
+    fn closed_predicate_projection_contract() {
+        use datafusion::logical_expr::{col, lit};
+        use datafusion::scalar::ScalarValue;
+        use wyrd_spec::vala::assignment_authority::{ScanLiteral, ScanPredicate};
+
+        let physical_schema = Schema::new(vec![
+            Field::new("service_name", DataType::Utf8, true),
+            Field::new("duration_ms", DataType::Int64, true),
+            Field::new("wyrd_event_time", DataType::Int64, true),
+            Field::new(DATA_TENANT_ID, DataType::Utf8, false),
+        ]);
+
+        // Supported AND conjunction: comparison + null-check, and a
+        // literal-on-the-left comparison normalized by operator reversal.
+        let supported = col("service_name")
+            .eq(lit("api"))
+            .and(col("duration_ms").is_not_null())
+            .and(lit(500_i64).gt(col("duration_ms")));
+        match classify_filter(&supported) {
+            FilterClassification::Supported(leaves) => {
+                assert_eq!(
+                    leaves,
+                    vec![
+                        ScanPredicate::Eq(
+                            "service_name".to_string(),
+                            ScanLiteral::Utf8("api".to_string())
+                        ),
+                        ScanPredicate::IsNotNull("duration_ms".to_string()),
+                        // `500 > duration_ms` normalizes to `duration_ms < 500`.
+                        ScanPredicate::Lt("duration_ms".to_string(), ScanLiteral::I64(500)),
+                    ]
+                );
+            }
+            FilterClassification::Unsupported => panic!("expected supported classification"),
+        }
+
+        // Closed-subset violations: OR, NOT, cast, column-to-column, and a
+        // non-finite float literal all classify Unsupported.
+        let or_expr = col("service_name")
+            .eq(lit("api"))
+            .or(col("duration_ms").eq(lit(1_i64)));
+        assert!(matches!(
+            classify_filter(&or_expr),
+            FilterClassification::Unsupported
+        ));
+        let not_expr = Expr::Not(Box::new(col("duration_ms").is_null()));
+        assert!(matches!(
+            classify_filter(&not_expr),
+            FilterClassification::Unsupported
+        ));
+        let cast_expr = Expr::Cast(datafusion::logical_expr::Cast::new(
+            Box::new(col("duration_ms")),
+            DataType::Utf8,
+        ))
+        .eq(lit("500"));
+        assert!(matches!(
+            classify_filter(&cast_expr),
+            FilterClassification::Unsupported
+        ));
+        let column_to_column = col("duration_ms").eq(col("wyrd_event_time"));
+        assert!(matches!(
+            classify_filter(&column_to_column),
+            FilterClassification::Unsupported
+        ));
+        let non_finite = col("duration_ms").eq(Expr::Literal(
+            ScalarValue::Float64(Some(f64::INFINITY)),
+            None,
+        ));
+        assert!(matches!(
+            classify_filter(&non_finite),
+            FilterClassification::Unsupported
+        ));
+
+        // `supports_filters_pushdown` reports exactly Inexact/Unsupported per
+        // classification, never Exact — DataFusion always keeps its residual.
+        let provider_filters = [&supported, &or_expr];
+        let pushdown = provider_filters
+            .iter()
+            .map(
+                |filter| match classify_filter_for_schema(&physical_schema, filter) {
+                    FilterClassification::Supported(_) => TableProviderFilterPushDown::Inexact,
+                    FilterClassification::Unsupported => TableProviderFilterPushDown::Unsupported,
+                },
+            )
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pushdown,
+            vec![
+                TableProviderFilterPushDown::Inexact,
+                TableProviderFilterPushDown::Unsupported,
+            ]
+        );
+    }
+
+    /// The projection closure is `scan output + predicate columns + hidden
+    /// tenant column`, in that order, stably deduplicated.
+    ///
+    /// Order is part of the contract, not an implementation detail: the
+    /// closure is hashed into the assignment-authority digest, so two
+    /// components deriving the same set in a different order would produce
+    /// different digests and refuse each other's assignments.
+    #[test]
+    fn closed_predicate_projection_closure_order_is_stable() {
+        use datafusion::logical_expr::{col, lit};
+
+        let physical_schema = Schema::new(vec![
+            Field::new("service_name", DataType::Utf8, true),
+            Field::new("duration_ms", DataType::Int64, true),
+            Field::new("wyrd_event_time", DataType::Int64, true),
+            Field::new(DATA_TENANT_ID, DataType::Utf8, false),
+        ]);
+        let public_schema = schema_without(&physical_schema, DATA_TENANT_ID).unwrap();
+        let supported = col("service_name")
+            .eq(lit("api"))
+            .and(col("duration_ms").is_not_null());
+
+        // Projection-closure order: requested scan output first, then the
+        // first occurrence of each predicate column in filter order, then
+        // the always-present hidden tenant column, stably deduplicated
+        // (`duration_ms` appears in both the projection and the predicates).
+        let leaves = match classify_filter(&supported) {
+            FilterClassification::Supported(leaves) => leaves,
+            FilterClassification::Unsupported => unreachable!(),
+        };
+        let projection = vec![
+            public_schema.index_of("duration_ms").unwrap(),
+            public_schema.index_of("wyrd_event_time").unwrap(),
+        ];
+        let closure = required_columns_closure(&public_schema, Some(&projection), &leaves);
+        assert_eq!(
+            closure,
+            vec![
+                "duration_ms".to_string(),
+                "wyrd_event_time".to_string(),
+                "service_name".to_string(),
+                DATA_TENANT_ID.to_string(),
+            ]
+        );
+
+        // A `None` projection closes over every public column.
+        let full_closure = required_columns_closure(&public_schema, None, &[]);
+        assert_eq!(
+            full_closure,
+            vec![
+                "service_name".to_string(),
+                "duration_ms".to_string(),
+                "wyrd_event_time".to_string(),
+                DATA_TENANT_ID.to_string(),
+            ]
+        );
+    }
+
+    /// Column ownership, not qualification, decides pushdown eligibility.
+    ///
+    /// A planned `SELECT ... WHERE value = 'x'` reaches the provider with the
+    /// reference already qualified against the registered relation
+    /// (`vala.bifrost.<table>.service_name`), never bare. Treating a qualified
+    /// reference as outside the closed subset therefore makes pushdown
+    /// unreachable for every real query while still passing hand-built
+    /// unqualified unit fixtures, so this pins both halves: a qualified
+    /// reference to an owned column is `Inexact`, and a reference to a column
+    /// this table does not own is `Unsupported` regardless of qualification.
+    #[test]
+    fn qualified_column_references_push_down_only_for_owned_columns() {
+        use datafusion::common::{Column, TableReference};
+        use datafusion::logical_expr::{col, lit};
+        use wyrd_spec::vala::assignment_authority::{ScanLiteral, ScanPredicate};
+
+        let physical_schema = Schema::new(vec![
+            Field::new("service_name", DataType::Utf8, true),
+            Field::new(DATA_TENANT_ID, DataType::Utf8, false),
+        ]);
+
+        let qualified_owned = Expr::Column(Column::new(
+            Some(TableReference::full("vala", "bifrost", "events")),
+            "service_name",
+        ))
+        .eq(lit("api"));
+        match classify_filter_for_schema(&physical_schema, &qualified_owned) {
+            FilterClassification::Supported(leaves) => assert_eq!(
+                leaves,
+                vec![ScanPredicate::Eq(
+                    "service_name".to_string(),
+                    ScanLiteral::Utf8("api".to_string())
+                )]
+            ),
+            FilterClassification::Unsupported => {
+                panic!("a qualified reference to an owned column must push down")
+            }
+        }
+
+        // Same shape, column this table does not own: rejected by the schema
+        // check rather than by the expression classifier.
+        let qualified_foreign = Expr::Column(Column::new(
+            Some(TableReference::full("vala", "bifrost", "other")),
+            "other_column",
+        ))
+        .eq(lit("api"));
+        assert!(matches!(
+            classify_filter_for_schema(&physical_schema, &qualified_foreign),
+            FilterClassification::Unsupported
+        ));
+        assert!(matches!(
+            classify_filter_for_schema(&physical_schema, &col("other_column").eq(lit("api"))),
+            FilterClassification::Unsupported
+        ));
     }
 }

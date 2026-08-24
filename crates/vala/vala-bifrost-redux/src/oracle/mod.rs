@@ -24,7 +24,6 @@ use datafusion::physical_plan::{SendableRecordBatchStream, execute_stream};
 use datafusion::sql::parser::{DFParser, Statement as DfStatement};
 use datafusion::sql::resolve::resolve_table_references;
 use datafusion::sql::sqlparser::ast::Statement as SqlStatement;
-use datafusion_proto::bytes::physical_plan_to_bytes_with_extension_codec;
 use futures_util::{Stream, StreamExt};
 use sha2::{Digest as _, Sha256};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -46,6 +45,7 @@ use wyrd_spec::vala::api::{
     QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome, ScribeProviderCut,
     SourceCompletion, SourceCompletionOutcome, TenantTableBinding, VisibilityMode,
 };
+use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
 
 use crate::catalog::{
     BifrostCatalog, BifrostCatalogError, PinnedSealedTable, TableRef, project_persisted_wal_ranges,
@@ -55,7 +55,6 @@ use crate::schema::SchemaFingerprint;
 use crate::scribe::tail_rpc::{TAIL_PROTOCOL_VERSION, TailReadTransport};
 
 mod admission;
-pub mod assignment;
 pub mod attempt;
 pub mod codec;
 pub mod dispatcher;
@@ -474,6 +473,8 @@ impl OracleTelemetry {
                 "oracle_query_bytes_returned_total",
                 "oracle_query_files_scanned_total",
                 "oracle_query_partitions_scanned_total",
+                "oracle_query_row_groups_scanned_total",
+                "oracle_query_row_groups_pruned_total",
                 "oracle_query_spill_bytes_total",
                 "oracle_query_spill_files_total",
             ] {
@@ -748,6 +749,16 @@ impl QueryTelemetryGuard {
             "class" => query_class_label(self.query_class)
         )
         .increment(self.scan_stats.partitions_scanned);
+        metrics::counter!(
+            "oracle_query_row_groups_scanned_total",
+            "class" => query_class_label(self.query_class)
+        )
+        .increment(self.scan_stats.row_groups_scanned);
+        metrics::counter!(
+            "oracle_query_row_groups_pruned_total",
+            "class" => query_class_label(self.query_class)
+        )
+        .increment(self.scan_stats.row_groups_pruned);
         if let Some(bytes) = self.scan_stats.physical_bytes_scanned {
             metrics::counter!(
                 "oracle_query_bytes_scanned_total",
@@ -1206,6 +1217,46 @@ pub struct BifrostSecurityViolation {
     pub phase: BifrostSecurityPhase,
 }
 
+/// Audit writer that accepts every decision without persisting it.
+///
+/// Peer transport and fencing proofs assert on routing, reservation, and frame
+/// behavior, not on the audit chain. Binding this writer keeps the worker's
+/// real fail-closed audit call on the path while removing the Postgres
+/// dependency those proofs do not need. Any test that asserts audit content
+/// must use a writer that actually records.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AcceptingOracleAudit;
+
+#[cfg(feature = "test-support")]
+#[async_trait]
+impl OracleAudit for AcceptingOracleAudit {
+    /// Accepts the read decision so the worker proceeds to serve rows.
+    ///
+    /// # Errors
+    /// Never returns an error.
+    async fn append_read_decision(
+        &self,
+        _context: &AuthorizedQueryContext,
+        _decision: BifrostQueryReadDecision,
+    ) -> Result<(), BifrostError> {
+        Ok(())
+    }
+
+    /// Accepts the security violation so refusal reporting is not masked by an
+    /// audit failure.
+    ///
+    /// # Errors
+    /// Never returns an error.
+    async fn append_security_violation(
+        &self,
+        _context: VerifiedSecurityContext,
+        _violation: BifrostSecurityViolation,
+    ) -> Result<(), BifrostError> {
+        Ok(())
+    }
+}
+
 /// SQL-backed audit writer used by the T3 Postgres integration harness.
 ///
 /// Production composition may provide a broader audit owner, while this
@@ -1443,12 +1494,20 @@ impl CutAssignments {
     /// and each live Scribe tail — is registered through this one path so the
     /// assignment and its `source_groups` entry can never disagree about which
     /// table a scan id belongs to.
+    ///
+    /// The recorded closure is a safe pre-planning default: the full physical
+    /// schema with no predicates. `execute_distributed_session` overwrites it
+    /// with the real closed predicate and projection closure recovered from
+    /// this scan id's `RemoteScanExec` once the physical plan exists; a scan id
+    /// with no recovered closure (e.g. pruned out of the final plan) keeps this
+    /// unpruned default rather than being narrowed to an empty projection.
     fn record_scan(
         &mut self,
         scan_id: &str,
         table_name: &str,
         binding: &TenantTableBinding,
         schema_fingerprint: &str,
+        physical_schema: &Schema,
         files: Vec<String>,
     ) {
         self.oracle_assignments.insert(
@@ -1459,6 +1518,12 @@ impl CutAssignments {
                 persisted: PersistedFileAssignment { files },
                 scribe_provider_cut: None,
                 schema_fingerprint: schema_fingerprint.to_owned(),
+                required_columns: physical_schema
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().clone())
+                    .collect(),
+                predicates: Vec::new(),
             },
         );
         self.source_groups
@@ -3155,77 +3220,31 @@ impl Oracle {
     /// Returns [`BifrostError::QueryExecutionFailed`] when the cut's Iceberg
     /// schema cannot be converted to Arrow, and a mapped `DataFusion` error when
     /// the provider cannot be built or registered.
-    async fn register_cut_provider(
+    /// Builds one pinned table's provider and registers it on the session.
+    ///
+    /// Owns the tail of cut registration: choosing local versus distributed
+    /// source material, assembling [`OracleTableInputs`], and installing the
+    /// provider under the cut's binding. A distributed cut reads nothing
+    /// locally — its persisted files travel to followers as assignments — so
+    /// its local hot-file list is deliberately empty. `distributed` and the
+    /// canonical table name are re-derived here rather than threaded in, so
+    /// this tail cannot disagree with the caller about either.
+    ///
+    /// # Errors
+    ///
+    /// Returns a mapped `DataFusion` error when local hot sources cannot be
+    /// resolved or the provider cannot be constructed, and the stable
+    /// registration error when the binding cannot be installed.
+    async fn register_table_provider(
         &self,
         cut: PinnedSealedTable,
         session: &SessionContext,
         input: &SqlCutInput<'_>,
         live_batches: &mut HashMap<String, Vec<RecordBatch>>,
-        scribe_sources: &mut HashMap<String, Vec<ScribeFollowerSource>>,
-        assignments: &mut CutAssignments,
+        remote_sources: RemotePersistedSources,
     ) -> Result<(), OracleExecutionError> {
         let distributed = self.fragment_dispatcher.is_some();
         let table_name = cut.binding.table_ref.fqn();
-        let physical_schema = Arc::new(
-            iceberg::arrow::schema_to_arrow_schema(cut.iceberg_table.metadata().current_schema())
-                .map_err(|_| BifrostError::QueryExecutionFailed)?,
-        );
-        let schema_fingerprint = sealed_fragment_schema_fingerprint(physical_schema.as_ref());
-        let binding = TenantTableBinding {
-            tenant_id: input.context.data_tenant_id,
-            namespace: cut.binding.logical_namespace.clone(),
-            table: cut.binding.table_ref.name.clone(),
-        };
-        let mut remote_sources = RemotePersistedSources::default();
-        let mut common_scan_ids = Vec::new();
-        if distributed {
-            let scan_id = format!("oracle:{table_name}:iceberg");
-            let mut files = cut
-                .iceberg_files
-                .iter()
-                .map(|file| file.file_path.clone())
-                .collect::<Vec<_>>();
-            files.sort();
-            assignments.record_scan(&scan_id, &table_name, &binding, &schema_fingerprint, files);
-            common_scan_ids.push(scan_id.clone());
-            remote_sources.iceberg_scan_id = Some(scan_id);
-        }
-        if distributed && !cut.hot_files.is_empty() {
-            let scan_id = format!("oracle:{table_name}:hot");
-            let mut files = cut
-                .hot_files
-                .iter()
-                .map(|file| file.file_path.clone())
-                .collect::<Vec<_>>();
-            files.sort();
-            assignments.record_scan(&scan_id, &table_name, &binding, &schema_fingerprint, files);
-            common_scan_ids.push(scan_id.clone());
-            remote_sources.hot_scan_id = Some(scan_id);
-        }
-        let table_scribes = scribe_sources.remove(&table_name).unwrap_or_default();
-        for template in &table_scribes {
-            let live_scan_id = template.assignment.scan_id.clone();
-            assignments.record_scan(
-                &live_scan_id,
-                &table_name,
-                &binding,
-                &schema_fingerprint,
-                Vec::new(),
-            );
-            common_scan_ids.push(live_scan_id.clone());
-            remote_sources.scribe_scan_ids.push(live_scan_id);
-        }
-        for source in table_scribes {
-            let node_assignments = assignments
-                .scribe_assignments
-                .entry(source.node_id)
-                .or_default();
-            for scan_id in &common_scan_ids {
-                let mut assignment = source.assignment.clone();
-                assignment.scan_id.clone_from(scan_id);
-                node_assignments.insert(scan_id.clone(), assignment);
-            }
-        }
         let local_hot_files = if distributed {
             Vec::new()
         } else {
@@ -3259,6 +3278,125 @@ impl Oracle {
         Ok(())
     }
 
+    async fn register_cut_provider(
+        &self,
+        cut: PinnedSealedTable,
+        session: &SessionContext,
+        input: &SqlCutInput<'_>,
+        live_batches: &mut HashMap<String, Vec<RecordBatch>>,
+        scribe_sources: &mut HashMap<String, Vec<ScribeFollowerSource>>,
+        assignments: &mut CutAssignments,
+    ) -> Result<(), OracleExecutionError> {
+        let distributed = self.fragment_dispatcher.is_some();
+        let table_name = cut.binding.table_ref.fqn();
+        let physical_schema = Arc::new(
+            iceberg::arrow::schema_to_arrow_schema(cut.iceberg_table.metadata().current_schema())
+                .map_err(|_| BifrostError::QueryExecutionFailed)?,
+        );
+        let schema_fingerprint = assignment_schema_fingerprint(physical_schema.as_ref());
+        let binding = TenantTableBinding {
+            tenant_id: input.context.data_tenant_id,
+            namespace: cut.binding.logical_namespace.clone(),
+            table: cut.binding.table_ref.name.clone(),
+        };
+        let mut remote_sources = RemotePersistedSources::default();
+        let mut common_scan_ids = Vec::new();
+        if distributed {
+            let scan_id = format!("oracle:{table_name}:iceberg");
+            let mut files = cut
+                .iceberg_files
+                .iter()
+                .map(|file| file.file_path.clone())
+                .collect::<Vec<_>>();
+            files.sort();
+            assignments.record_scan(
+                &scan_id,
+                &table_name,
+                &binding,
+                &schema_fingerprint,
+                physical_schema.as_ref(),
+                files,
+            );
+            common_scan_ids.push(scan_id.clone());
+            remote_sources.iceberg_scan_id = Some(scan_id);
+        }
+        if distributed && !cut.hot_files.is_empty() {
+            let scan_id = format!("oracle:{table_name}:hot");
+            let mut files = cut
+                .hot_files
+                .iter()
+                .map(|file| file.file_path.clone())
+                .collect::<Vec<_>>();
+            files.sort();
+            assignments.record_scan(
+                &scan_id,
+                &table_name,
+                &binding,
+                &schema_fingerprint,
+                physical_schema.as_ref(),
+                files,
+            );
+            common_scan_ids.push(scan_id.clone());
+            remote_sources.hot_scan_id = Some(scan_id);
+        }
+        let table_scribes = scribe_sources.remove(&table_name).unwrap_or_default();
+        for template in &table_scribes {
+            let live_scan_id = template.assignment.scan_id.clone();
+            assignments.record_scan(
+                &live_scan_id,
+                &table_name,
+                &binding,
+                &schema_fingerprint,
+                physical_schema.as_ref(),
+                Vec::new(),
+            );
+            common_scan_ids.push(live_scan_id.clone());
+            remote_sources.scribe_scan_ids.push(live_scan_id);
+        }
+        for source in table_scribes {
+            let node_assignments = assignments
+                .scribe_assignments
+                .entry(source.node_id)
+                .or_default();
+            for scan_id in &common_scan_ids {
+                let mut assignment = source.assignment.clone();
+                assignment.scan_id.clone_from(scan_id);
+                node_assignments.insert(scan_id.clone(), assignment);
+            }
+        }
+        self.register_table_provider(cut, session, input, live_batches, remote_sources)
+            .await?;
+        Ok(())
+    }
+
+    /// Rejects dispatch when any distributed assignment's projection closure
+    /// would drop the hidden tenant column.
+    ///
+    /// This is the last construction-time gate before a
+    /// [`FollowerScanAssignment`] is signed into the assignment-authority
+    /// digest and dispatched. A defaulted or mis-merged `required_columns`
+    /// that omitted [`DATA_TENANT_ID`] would still pass a signature check —
+    /// the signature proves the digest matches what was signed, not that
+    /// the signed projection was safe — so this invariant must be enforced
+    /// here, before signing, rather than trusted implicitly.
+    ///
+    /// # Errors
+    /// Returns [`BifrostError::QueryTenantInvariant`] when `required_columns`
+    /// is empty or does not contain [`DATA_TENANT_ID`].
+    fn ensure_required_columns_closure(
+        assignment: &FollowerScanAssignment,
+    ) -> Result<(), BifrostError> {
+        if assignment.required_columns.is_empty()
+            || !assignment
+                .required_columns
+                .iter()
+                .any(|column| column == DATA_TENANT_ID)
+        {
+            return Err(BifrostError::QueryTenantInvariant);
+        }
+        Ok(())
+    }
+
     /// Splits one complete native plan, dispatches its disjoint follower children, and runs finals.
     async fn execute_distributed_session(
         &self,
@@ -3283,9 +3421,9 @@ impl Oracle {
         let logical_bytes_selected = input.logical_bytes_selected;
         let participant_cut = input.participant_cut;
         let DistributedScanAssignments {
-            oracle_assignments,
+            mut oracle_assignments,
             source_groups,
-            scribe_assignments,
+            mut scribe_assignments,
         } = assignments;
         let dispatcher = self
             .fragment_dispatcher
@@ -3293,6 +3431,35 @@ impl Oracle {
             .ok_or(BifrostError::QueryExecutionFailed)?;
         let (distributed_session, split) =
             plan_distributed_split(session, sql, source_groups, participant_cut).await?;
+        // The optimized physical plan is the first point at which the real
+        // predicate/projection closure for each distributed leaf is known
+        // (`oracle_assignments`/`scribe_assignments` are built before SQL
+        // planning as a safe, unpruned full-schema placeholder). Overwrite
+        // each assignment's closure with what the provider actually attached
+        // to its `RemoteScanExec` placeholder during `scan()`; a scan id with
+        // no recovered closure keeps its existing safe default rather than
+        // being narrowed to an empty (tenant-dropping) projection.
+        let remote_scan_closures = splitter::collect_remote_scan_closures(split.leader.as_ref());
+        for (scan_id, (required_columns, predicates)) in &remote_scan_closures {
+            if let Some(assignment) = oracle_assignments.get_mut(scan_id) {
+                assignment.required_columns.clone_from(required_columns);
+                assignment.predicates.clone_from(predicates);
+            }
+            for assignments in scribe_assignments.values_mut() {
+                if let Some(assignment) = assignments.get_mut(scan_id) {
+                    assignment.required_columns.clone_from(required_columns);
+                    assignment.predicates.clone_from(predicates);
+                }
+            }
+        }
+        for assignment in oracle_assignments.values() {
+            Self::ensure_required_columns_closure(assignment)?;
+        }
+        for assignments in scribe_assignments.values() {
+            for assignment in assignments.values() {
+                Self::ensure_required_columns_closure(assignment)?;
+            }
+        }
         let permission_digest = audit_digest(&context.permission)?.as_str().to_owned();
         let dispatch_context = dispatcher::DispatchContext {
             query_id: admitted.query_id,
@@ -3404,13 +3571,8 @@ impl Oracle {
             return Err(BifrostError::QueryExecutionFailed.into());
         }
         let remote_schema = follower.plan.schema();
-        let physical_plan_bytes = physical_plan_to_bytes_with_extension_codec(
-            follower.plan,
-            &codec::OraclePhysicalExtensionCodec::encoder(),
-        )
-        .map_err(|error| map_datafusion_error(&error))?
-        .to_vec();
-        let plan_fingerprint = codec::physical_plan_fingerprint(&physical_plan_bytes);
+        let (physical_plan_bytes, plan_fingerprint) = codec::encode_follower_subtree(follower.plan)
+            .map_err(|error| map_datafusion_error(&error))?;
         let partitions =
             fan_participant_partitions(&follower.source_scan_ids, &oracle_templates, build)?;
         let remote = exec::RemoteScanExec::new(exec::RemoteScanConfig {
@@ -3630,12 +3792,18 @@ async fn await_first_batch(
         .map_err(|_| BifrostError::QueryTimeout)
 }
 
-/// Computes the executor fingerprint after canonicalizing equivalent UTC timezone spellings.
+/// Computes the fingerprint a follower scan assignment must carry for a schema,
+/// after canonicalizing equivalent UTC timezone spellings.
 ///
 /// Iceberg projects UTC as `+00:00`, while Arrow's Parquet reader projects the
 /// same logical timezone as `UTC`. This boundary removes that adapter spelling
 /// drift without weakening any column, order, or non-UTC type check.
-pub(super) fn sealed_fragment_schema_fingerprint(schema: &Schema) -> String {
+///
+/// Every component that builds or validates a `FollowerScanAssignment` must use
+/// this function; the follower compares its own result against the assignment's
+/// value after resolving the provider, so an independently derived fingerprint
+/// is rejected on any spelling difference.
+pub fn assignment_schema_fingerprint(schema: &Schema) -> String {
     let fields = schema
         .fields()
         .iter()
@@ -4550,7 +4718,14 @@ fn build_scribe_follower_sources(
                         maximum_retained_bytes: u64::try_from(attempt_max_bytes)
                             .map_err(|_| BifrostError::QueryVisibilityUnavailable)?,
                     }),
-                    schema_fingerprint: sealed_fragment_schema_fingerprint(&table.physical_schema),
+                    schema_fingerprint: assignment_schema_fingerprint(&table.physical_schema),
+                    required_columns: table
+                        .physical_schema
+                        .fields()
+                        .iter()
+                        .map(|field| field.name().clone())
+                        .collect(),
+                    predicates: Vec::new(),
                 },
             })
         })
@@ -4741,6 +4916,16 @@ pub fn is_stale_iceberg_object_error(error: &datafusion::error::DataFusionError)
     exec::is_stale_iceberg_object_error(error)
 }
 
+/// Reports whether an execution error carries the tenant tripwire's refusal.
+///
+/// Re-exported for the private peer service, which classifies follower stream
+/// errors outside this crate and must preserve the tenant-invariant outcome
+/// instead of reporting a generic worker failure.
+#[must_use]
+pub fn is_tenant_invariant_error(error: &datafusion::error::DataFusionError) -> bool {
+    exec::is_tenant_invariant_error(error)
+}
+
 /// Records consumption of the sole pre-byte stale-cut replan.
 ///
 /// A stale replan means a data file this query's pinned snapshot referenced was
@@ -4840,7 +5025,34 @@ mod tests {
             },
             scribe_provider_cut: None,
             schema_fingerprint: format!("schema-{scan_id}"),
+            required_columns: vec!["data_tenant_id".to_owned()],
+            predicates: Vec::new(),
         }
+    }
+
+    /// A distributed assignment whose `required_columns` omits the hidden
+    /// tenant column, or is empty, is rejected before dispatch. A signed
+    /// digest over a wrong projection would still verify cleanly, so this
+    /// invariant must be enforced by construction rather than trusted.
+    #[test]
+    fn required_columns_closure_rejects_missing_or_empty_tenant_column() {
+        let mut assignment = test_persisted_assignment("scan-1", &["s3://bucket/a.parquet"]);
+        assert!(
+            Oracle::ensure_required_columns_closure(&assignment).is_ok(),
+            "fixture default includes data_tenant_id"
+        );
+
+        assignment.required_columns = vec!["service_name".to_owned()];
+        assert!(matches!(
+            Oracle::ensure_required_columns_closure(&assignment),
+            Err(BifrostError::QueryTenantInvariant)
+        ));
+
+        assignment.required_columns = Vec::new();
+        assert!(matches!(
+            Oracle::ensure_required_columns_closure(&assignment),
+            Err(BifrostError::QueryTenantInvariant)
+        ));
     }
 
     /// Every pinned Scribe receives exactly one empty-persisted hot cut per pinned table.
@@ -5605,8 +5817,8 @@ mod tests {
             false,
         )]);
         assert_eq!(
-            sealed_fragment_schema_fingerprint(&iceberg),
-            sealed_fragment_schema_fingerprint(&parquet),
+            assignment_schema_fingerprint(&iceberg),
+            assignment_schema_fingerprint(&parquet),
         );
     }
 

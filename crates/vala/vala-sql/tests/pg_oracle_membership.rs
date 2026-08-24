@@ -193,7 +193,7 @@ async fn same_node_roles_have_independent_fences() {
         },
         address: "http://oracle:5002".into(),
         capabilities: ClusterCapabilities::OracleV1(wyrd_spec::vala::api::OracleCapabilitiesV1 {
-            peer_protocol_version: 1,
+            peer_protocol_version: 2,
             storage_protocol_version: 1,
             cpu_cores: 4.0,
             memory_budget_bytes: 4096,

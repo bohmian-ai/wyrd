@@ -367,7 +367,7 @@ pub(super) mod tests {
             capability_version: 1,
             capabilities: match role {
                 ClusterRole::Oracle => ClusterCapabilities::OracleV1(OracleCapabilitiesV1 {
-                    peer_protocol_version: 1,
+                    peer_protocol_version: 2,
                     storage_protocol_version: 1,
                     cpu_cores: 1.0,
                     memory_budget_bytes: 1024,
@@ -640,7 +640,7 @@ pub(super) mod tests {
         });
         assert_cut_mutation(cut, &format!("{prefix}.capabilities.variant"), |changed| {
             select(changed).capabilities = ClusterCapabilities::OracleV1(OracleCapabilitiesV1 {
-                peer_protocol_version: 1,
+                peer_protocol_version: 2,
                 storage_protocol_version: 1,
                 cpu_cores: 1.0,
                 memory_budget_bytes: 1024,

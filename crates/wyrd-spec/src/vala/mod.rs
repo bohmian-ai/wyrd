@@ -13,6 +13,9 @@
 
 /// Public Bifrost wire contracts — table management, query, and ingest types.
 pub mod api;
+/// Closed scan-predicate/literal vocabulary and the v2 signed
+/// assignment-authority digest.
+pub mod assignment_authority;
 /// Typed and redacted audit detail contracts.
 pub mod audit_detail;
 /// Observation correlation: the code axis carried on a run and the reserved

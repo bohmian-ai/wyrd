@@ -128,10 +128,29 @@ message ScribeProviderCut {
   repeated PersistedWalRange persisted_ranges = 6; uint32 maximum_batch_count = 7;
   uint64 maximum_retained_bytes = 8;
 }
+enum ScanPredicateOp {
+  SCAN_PREDICATE_OP_UNSPECIFIED = 0;
+  SCAN_PREDICATE_OP_EQ = 1;
+  SCAN_PREDICATE_OP_NOT_EQ = 2;
+  SCAN_PREDICATE_OP_LT = 3;
+  SCAN_PREDICATE_OP_LT_EQ = 4;
+  SCAN_PREDICATE_OP_GT = 5;
+  SCAN_PREDICATE_OP_GT_EQ = 6;
+  SCAN_PREDICATE_OP_IS_NULL = 7;
+  SCAN_PREDICATE_OP_IS_NOT_NULL = 8;
+}
+message ScanLiteral {
+  oneof value {
+    bool bool_value = 1; int64 i64_value = 2; uint64 u64_value = 3;
+    uint64 f64_bits_value = 4; string utf8_value = 5; int64 timestamp_micros_value = 6;
+  }
+}
+message ScanPredicate { ScanPredicateOp op = 1; string column = 2; ScanLiteral literal = 3; }
 message FollowerScanAssignment {
   string scan_id = 1; TenantTableBinding binding = 2;
   PersistedFileAssignment persisted = 3; ScribeProviderCut scribe_provider_cut = 4;
   string schema_fingerprint = 5;
+  repeated string required_columns = 6; repeated ScanPredicate predicates = 7;
 }
 message ExecuteFragmentRequest {
   SignedPeerTicket ticket = 1; bytes physical_plan_bytes = 2; bytes reservation_id = 3;
@@ -151,6 +170,10 @@ message WorkerScanStats {
   // the same as zero, so the leader must not substitute one for the other.
   optional uint64 bytes_scanned = 1;
   uint64 files_scanned = 2; uint64 partitions_scanned = 3;
+  // Row groups retained and excluded by closed-predicate statistics pruning
+  // on the follower. The leader's own plan carries only a remote placeholder,
+  // so these can only be observed where the physical read happened.
+  uint64 row_groups_scanned = 4; uint64 row_groups_pruned = 5;
 }
 
 message InsertBatchRequest {

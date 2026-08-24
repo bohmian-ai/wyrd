@@ -1255,6 +1255,13 @@
           ]
         },
         {
+          "description": "Peer assignment-authority digest mismatch: the recomputed digest over the follower's actual dispatched assignments does not match the digest signed into the ticket claims, so the closed predicate and projection closure cannot be trusted.",
+          "type": "string",
+          "enum": [
+            "peer_assignment_authority"
+          ]
+        },
+        {
           "description": "Invalid Scribe-tail ticket audience.",
           "type": "string",
           "enum": [

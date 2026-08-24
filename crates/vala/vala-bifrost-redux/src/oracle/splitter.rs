@@ -21,8 +21,8 @@ use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 
+use super::assignment_schema_fingerprint;
 use super::codec::RemoteSourcePlaceholderExec;
-use super::sealed_fragment_schema_fingerprint;
 
 /// One native follower subtree and the leader placeholder that receives its Arrow output.
 #[derive(Debug)]
@@ -172,7 +172,7 @@ fn split_physical_plan_with_context(
         return Ok(SplitPhysicalPlan {
             leader: Arc::new(RemoteSourcePlaceholderExec::new(
                 "oracle-result-0".to_owned(),
-                sealed_fragment_schema_fingerprint(schema.as_ref()),
+                assignment_schema_fingerprint(schema.as_ref()),
                 schema,
             )),
             followers,
@@ -194,7 +194,7 @@ fn split_physical_plan_with_context(
         return Ok(SplitPhysicalPlan {
             leader: Arc::new(RemoteSourcePlaceholderExec::new(
                 result_scan_id,
-                sealed_fragment_schema_fingerprint(schema.as_ref()),
+                assignment_schema_fingerprint(schema.as_ref()),
                 schema,
             )),
             followers,
@@ -400,7 +400,7 @@ fn capture_follower(
     });
     Arc::new(RemoteSourcePlaceholderExec::new(
         result_scan_id,
-        sealed_fragment_schema_fingerprint(schema.as_ref()),
+        assignment_schema_fingerprint(schema.as_ref()),
         schema,
     ))
 }
@@ -500,6 +500,58 @@ fn collect_scans(plan: &dyn ExecutionPlan, seen: &mut HashSet<String>, scans: &m
     }
     for child in plan.children() {
         collect_scans(child.as_ref(), seen, scans);
+    }
+}
+
+/// Collects the closed predicate/projection closure the provider attached to
+/// every [`RemoteSourcePlaceholderExec`] placeholder in `plan` (see
+/// `oracle::exec::OracleTableProvider::scan` and
+/// [`RemoteSourcePlaceholderExec::with_closure`]).
+///
+/// This is the caller's only way to learn what the already-optimized,
+/// already-planned physical tree actually pushed down: `oracle_assignments`
+/// is built as a safe full-schema placeholder before `SessionContext::sql`
+/// runs, and only `scan()` — invoked during `create_physical_plan()` — knows
+/// the real requested projection and supported filters. A scan id with no
+/// entry here means the placeholder was pruned out of the final plan or
+/// never received a closure; the caller must keep that assignment's existing
+/// safe default rather than treat the absence as "empty projection".
+pub(super) fn collect_remote_scan_closures(
+    plan: &dyn ExecutionPlan,
+) -> HashMap<
+    String,
+    (
+        Vec<String>,
+        Vec<wyrd_spec::vala::assignment_authority::ScanPredicate>,
+    ),
+> {
+    let mut closures = HashMap::new();
+    collect_closures(plan, &mut closures);
+    closures
+}
+
+/// Depth-first closure collection mirroring [`collect_scans`].
+fn collect_closures(
+    plan: &dyn ExecutionPlan,
+    closures: &mut HashMap<
+        String,
+        (
+            Vec<String>,
+            Vec<wyrd_spec::vala::assignment_authority::ScanPredicate>,
+        ),
+    >,
+) {
+    if let Some(scan) = plan.as_any().downcast_ref::<RemoteSourcePlaceholderExec>()
+        && !scan.scan_id().starts_with("oracle-result-")
+        && !scan.required_columns().is_empty()
+    {
+        closures.insert(
+            scan.scan_id().to_owned(),
+            (scan.required_columns().to_vec(), scan.predicates().to_vec()),
+        );
+    }
+    for child in plan.children() {
+        collect_closures(child.as_ref(), closures);
     }
 }
 
@@ -671,7 +723,7 @@ mod tests {
             Ok(Arc::new(
                 RemoteSourcePlaceholderExec::new(
                     self.scan_id.clone(),
-                    sealed_fragment_schema_fingerprint(self.schema.as_ref()),
+                    assignment_schema_fingerprint(self.schema.as_ref()),
                     Arc::clone(&self.schema),
                 )
                 .with_partitions(state.config().target_partitions()),
@@ -846,7 +898,7 @@ mod tests {
         )]));
         let remote = Arc::new(RemoteSourcePlaceholderExec::new(
             "scan".to_owned(),
-            sealed_fragment_schema_fingerprint(schema.as_ref()),
+            assignment_schema_fingerprint(schema.as_ref()),
             schema,
         ));
         let plan = Arc::new(GlobalLimitExec::new(remote, 0, Some(1)));

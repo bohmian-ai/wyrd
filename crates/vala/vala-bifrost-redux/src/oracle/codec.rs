@@ -32,6 +32,28 @@ pub fn physical_plan_fingerprint(bytes: &[u8]) -> String {
     format!("sha256:{:x}", digest.finalize())
 }
 
+/// Encodes one follower subtree into the exact bytes dispatched to a worker,
+/// together with the codec fingerprint bound into its ticket and footer.
+///
+/// The leader and any harness that dispatches a fragment must produce
+/// byte-identical output, because the fingerprint is what a follower checks
+/// the received plan against. Keeping the encoder and the fingerprint in one
+/// operation is what makes that impossible to get wrong at a call site.
+///
+/// # Errors
+///
+/// Returns the `DataFusion` error raised when the subtree contains a node the
+/// Oracle extension codec cannot encode.
+pub fn encode_follower_subtree(plan: Arc<dyn ExecutionPlan>) -> Result<(Vec<u8>, String)> {
+    let bytes = datafusion_proto::bytes::physical_plan_to_bytes_with_extension_codec(
+        plan,
+        &OraclePhysicalExtensionCodec::encoder(),
+    )?
+    .to_vec();
+    let fingerprint = physical_plan_fingerprint(&bytes);
+    Ok((bytes, fingerprint))
+}
+
 /// Versioned extension envelope stored in a `DataFusion` extension node.
 #[derive(Clone, PartialEq, Message)]
 struct OracleExtensionEnvelope {
@@ -93,10 +115,22 @@ pub struct RemoteSourcePlaceholderExec {
     schema_fingerprint: String,
     /// Empty executable carrying the placeholder schema and plan properties.
     empty: datafusion::physical_plan::empty::EmptyExec,
+    /// Closed projection closure computed by the provider's classifier —
+    /// see `oracle::exec::required_columns_closure`. Defaults to empty until
+    /// [`Self::with_closure`] attaches the real value computed during
+    /// `OracleTableProvider::scan`; the caller must never dispatch a wire
+    /// assignment with an empty closure (that would drop the hidden tenant
+    /// column), so an empty value here is a signal to keep the assignment's
+    /// existing safe full-schema default rather than overwrite it.
+    required_columns: Vec<String>,
+    /// Closed leaf predicates computed by the same classifier, in filter order.
+    predicates: Vec<wyrd_spec::vala::assignment_authority::ScanPredicate>,
 }
 
 impl RemoteSourcePlaceholderExec {
-    /// Creates one remote source placeholder.
+    /// Creates one remote source placeholder with no attached predicate
+    /// closure. Callers that have a real classifier result should chain
+    /// [`Self::with_closure`] immediately.
     #[must_use]
     pub fn new(
         scan_id: impl Into<String>,
@@ -107,6 +141,8 @@ impl RemoteSourcePlaceholderExec {
             scan_id: scan_id.into(),
             schema_fingerprint: schema_fingerprint.into(),
             empty: datafusion::physical_plan::empty::EmptyExec::new(schema),
+            required_columns: Vec::new(),
+            predicates: Vec::new(),
         }
     }
 
@@ -129,10 +165,38 @@ impl RemoteSourcePlaceholderExec {
         self
     }
 
+    /// Attaches the provider's closed predicate/projection closure computed
+    /// during `scan()`. This is the value the dispatcher reads back off the
+    /// planned physical tree to fill the wire `FollowerScanAssignment`.
+    #[must_use]
+    pub fn with_closure(
+        mut self,
+        required_columns: Vec<String>,
+        predicates: Vec<wyrd_spec::vala::assignment_authority::ScanPredicate>,
+    ) -> Self {
+        self.required_columns = required_columns;
+        self.predicates = predicates;
+        self
+    }
+
     /// Returns the stable scan identity.
     #[must_use]
     pub fn scan_id(&self) -> &str {
         &self.scan_id
+    }
+
+    /// Returns the attached projection closure, or an empty slice when no
+    /// closure was attached (the caller must treat that as "no update",
+    /// never as "project nothing").
+    #[must_use]
+    pub fn required_columns(&self) -> &[String] {
+        &self.required_columns
+    }
+
+    /// Returns the attached closed predicates, in filter order.
+    #[must_use]
+    pub fn predicates(&self) -> &[wyrd_spec::vala::assignment_authority::ScanPredicate] {
+        &self.predicates
     }
 }
 
@@ -611,7 +675,7 @@ mod tests {
             *source = Some(Arc::clone(&plan));
             return Ok(Arc::new(RemoteSourcePlaceholderExec::new(
                 "scan",
-                super::super::sealed_fragment_schema_fingerprint(plan.schema().as_ref()),
+                super::super::assignment_schema_fingerprint(plan.schema().as_ref()),
                 plan.schema(),
             )));
         }

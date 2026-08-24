@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::compute::cast;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -46,6 +46,7 @@ use wyrd_spec::vala::api::{
     ClusterRole, FollowerScanAssignment, OracleRoleFence, PhysicalExecuteFragmentRequest,
     ReservationId, TenantTableBinding,
 };
+use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
 
 use super::codec::{OraclePhysicalExtensionCodec, PreflightExtension, physical_plan_fingerprint};
 use crate::catalog::{BifrostCatalog, TableRef, TenantTableBinding as CatalogTableBinding};
@@ -150,13 +151,18 @@ impl FollowerSessionFactory {
                 .build()
                 .map_err(|_| "governed follower runtime construction failed".to_owned())?,
         );
+        let mut config = SessionConfig::new()
+            .with_target_partitions(self.target_partitions)
+            .with_batch_size(1_024);
+        // Applies the same `OracleSessionShape` the leader's session uses
+        // (see `Oracle::execution_session`): Parquet-level predicate and
+        // index pushdown must also be enabled on the follower, since this is
+        // the session that actually opens the dispatched files and prunes
+        // their row groups/pages.
+        crate::resources::OracleSessionShape::apply(&mut config);
         let state = SessionStateBuilder::new()
             .with_default_features()
-            .with_config(
-                SessionConfig::new()
-                    .with_target_partitions(self.target_partitions)
-                    .with_batch_size(1_024),
-            )
+            .with_config(config)
             .with_runtime_env(runtime)
             .build();
         let task = Arc::new(TaskContext::from(&state));
@@ -223,8 +229,12 @@ struct FollowerHotFile {
 }
 
 /// Bounded lazy Parquet leaf for an authenticated Oracle hot-file assignment.
+///
+/// Visible to sibling `oracle` submodules so [`super::exec::OracleQueryScanStats`]
+/// can fold this follower-local leaf into the same closed physical
+/// scan-evidence counters produced for a local `HotParquetExec` read.
 #[derive(Debug)]
-struct FollowerHotParquetExec {
+pub(super) struct FollowerHotParquetExec {
     /// Canonical assigned objects in deterministic assignment order.
     files: Vec<FollowerHotFile>,
     /// Shared tenant-qualified Iceberg storage reader.
@@ -233,6 +243,11 @@ struct FollowerHotParquetExec {
     schema: arrow::datatypes::SchemaRef,
     /// Request-local pool backed by the retained Oracle worker lease.
     memory_pool: Arc<dyn MemoryPool>,
+    /// Shared terminal metric owner retained by query telemetry.
+    metrics: Arc<super::exec::OracleScanMetricsHandle>,
+    /// Closed predicate conjunction bound to this assignment, used to skip a
+    /// file whose footer statistics prove no row group can satisfy every leaf.
+    predicates: Vec<wyrd_spec::vala::assignment_authority::ScanPredicate>,
     /// Cached bounded single-partition leaf properties.
     properties: Arc<PlanProperties>,
 }
@@ -244,6 +259,7 @@ impl FollowerHotParquetExec {
         file_io: iceberg::io::FileIO,
         schema: arrow::datatypes::SchemaRef,
         memory_pool: Arc<dyn MemoryPool>,
+        predicates: Vec<wyrd_spec::vala::assignment_authority::ScanPredicate>,
     ) -> Self {
         let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
@@ -256,8 +272,15 @@ impl FollowerHotParquetExec {
             file_io,
             schema,
             memory_pool,
+            predicates,
+            metrics: Arc::new(super::exec::OracleScanMetricsHandle::default()),
             properties,
         }
+    }
+
+    /// Returns the shared terminal metric owner for this follower leaf.
+    pub(super) fn metrics(&self) -> &Arc<super::exec::OracleScanMetricsHandle> {
+        &self.metrics
     }
 }
 
@@ -327,6 +350,8 @@ impl ExecutionPlan for FollowerHotParquetExec {
         let schema = Arc::clone(&self.schema);
         let output_schema = Arc::clone(&schema);
         let memory_pool = Arc::clone(&self.memory_pool);
+        let metrics = Arc::clone(&self.metrics);
+        let predicates = self.predicates.clone();
         let stream = async_stream::try_stream! {
             for file in files {
                 let input = file_io
@@ -336,10 +361,28 @@ impl ExecutionPlan for FollowerHotParquetExec {
                     .reader()
                     .await
                     .map_err(|error| DataFusionError::External(Box::new(error)))?;
-                let reader = FollowerParquetReader::new(reader, file.size, Arc::clone(&memory_pool));
-                let mut batches = ParquetRecordBatchStreamBuilder::new(reader)
+                let reader = FollowerParquetReader::new(
+                    reader,
+                    file.size,
+                    Arc::clone(&memory_pool),
+                    Arc::clone(&metrics),
+                );
+                // Recorded before the footer is read, matching the leader's
+                // hot path: every attempt on this file publishes one file
+                // observation even when the reader fails mid-open, and
+                // row-group pruning is reported separately.
+                metrics.record_hot_file();
+                let builder = ParquetRecordBatchStreamBuilder::new(reader)
                     .await
-                    .map_err(|error| DataFusionError::External(Box::new(error)))?
+                    .map_err(|error| DataFusionError::External(Box::new(error)))?;
+                let selection =
+                    super::exec::select_row_groups_for_predicates(builder.metadata(), &predicates);
+                metrics.record_row_groups(&selection);
+                if selection.excludes_file() {
+                    continue;
+                }
+                let mut batches = builder
+                    .with_row_groups(selection.retained)
                     .with_batch_size(1_024)
                     .build()
                     .map_err(|error| DataFusionError::External(Box::new(error)))?;
@@ -415,15 +458,23 @@ struct FollowerParquetReader {
     size: u64,
     /// Request-local worker pool backing every range reservation.
     memory_pool: Arc<dyn MemoryPool>,
+    /// Shared terminal metric owner recording each accepted range read.
+    metrics: Arc<super::exec::OracleScanMetricsHandle>,
 }
 
 impl FollowerParquetReader {
     /// Creates one bounded reader for a metadata-validated object.
-    fn new(reader: Box<dyn FileRead>, size: u64, memory_pool: Arc<dyn MemoryPool>) -> Self {
+    fn new(
+        reader: Box<dyn FileRead>,
+        size: u64,
+        memory_pool: Arc<dyn MemoryPool>,
+        metrics: Arc<super::exec::OracleScanMetricsHandle>,
+    ) -> Self {
         Self {
             reader,
             size,
             memory_pool,
+            metrics,
         }
     }
 }
@@ -455,6 +506,7 @@ impl AsyncFileReader for FollowerParquetReader {
                 .read(range)
                 .await
                 .map_err(|error| ParquetError::General(error.to_string()))?;
+            self.metrics.record_hot_range(bytes.len());
             if bytes.len() != requested {
                 return Err(ParquetError::General(
                     "hot Parquet range returned a short read".to_owned(),
@@ -506,6 +558,17 @@ impl FollowerSourceResolver for OracleCatalogResolver {
             .provider(&table, assignment.binding.tenant_id)
             .await
             .map_err(|_| "authenticated Oracle catalog provider failed".to_owned())?;
+        // Validates the full physical schema fingerprint against the
+        // authenticated table's actual schema immediately after catalog
+        // resolution and before any per-file object I/O (the hot-file branch
+        // below issues metadata HEAD requests). `decode` repeats this check
+        // once more after every scan id in the request resolves, but that
+        // later check alone would let a mismatched hot assignment reach
+        // storage first.
+        let actual = super::assignment_schema_fingerprint(provider.schema().as_ref());
+        if actual != assignment.schema_fingerprint {
+            return Err("resolved provider schema fingerprint differs from assignment".to_owned());
+        }
         if assignment.persisted.files.is_empty() {
             let schema = provider.schema();
             let batch = arrow::record_batch::RecordBatch::new_empty(Arc::clone(&schema));
@@ -558,9 +621,61 @@ impl FollowerSourceResolver for OracleCatalogResolver {
                 self.catalog.file_io().clone(),
                 provider.schema(),
                 session.runtime_env().memory_pool.clone(),
+                assignment.predicates.clone(),
             )));
         }
         restrict_plan_to_assigned_files(plan, &assigned_locations)
+    }
+}
+
+/// Follower resolver that serves one fixed in-memory cohort for every
+/// assignment it receives.
+///
+/// Peer transport proofs — fencing, ticket verification, TLS, footer framing,
+/// reservation release — need a follower that produces a deterministic,
+/// schema-stable result without a tenant catalog or object storage behind it.
+/// The worker still runs the real decode, tenant tripwire, and footer path over
+/// whatever this returns, so only provider acquisition is short-circuited.
+#[cfg(feature = "test-support")]
+#[derive(Debug)]
+pub struct FixedCohortResolver {
+    /// Schema every resolved source reports; must match the fingerprint the
+    /// dispatched assignment carries or decode rejects the plan.
+    schema: SchemaRef,
+    /// Cohort replayed for each resolution, in one partition.
+    batches: Vec<RecordBatch>,
+}
+
+#[cfg(feature = "test-support")]
+impl FixedCohortResolver {
+    /// Binds the cohort this resolver replays.
+    #[must_use]
+    pub fn new(schema: SchemaRef, batches: Vec<RecordBatch>) -> Self {
+        Self { schema, batches }
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[async_trait]
+impl FollowerSourceResolver for FixedCohortResolver {
+    /// Returns the bound cohort as a single-partition in-memory source.
+    ///
+    /// # Errors
+    /// Returns a redacted message when `DataFusion` rejects the cohort against
+    /// the bound schema.
+    async fn resolve(
+        &self,
+        _target_role: ClusterRole,
+        _assignment: &FollowerScanAssignment,
+        _session: &SessionState,
+    ) -> Result<Arc<dyn ExecutionPlan>, String> {
+        MemorySourceConfig::try_new_exec(
+            std::slice::from_ref(&self.batches),
+            Arc::clone(&self.schema),
+            None,
+        )
+        .map(|plan| plan as Arc<dyn ExecutionPlan>)
+        .map_err(|_| "fixed cohort resolver rejected its bound cohort".to_owned())
     }
 }
 
@@ -689,6 +804,8 @@ impl FollowerScanEvidence {
             bytes_scanned: self.0.physical_bytes_scanned,
             files_scanned: self.0.files_scanned,
             partitions_scanned: self.0.partitions_scanned,
+            row_groups_scanned: self.0.row_groups_scanned,
+            row_groups_pruned: self.0.row_groups_pruned,
         }
     }
 }
@@ -1080,7 +1197,7 @@ where
                 .resolve(request.target_fence.role, &assignment, session)
                 .await
                 .map_err(PhysicalPlanFollowerError::Resolution)?;
-            let actual = super::sealed_fragment_schema_fingerprint(provider.schema().as_ref());
+            let actual = super::assignment_schema_fingerprint(provider.schema().as_ref());
             if actual != assignment.schema_fingerprint {
                 return Err(PhysicalPlanFollowerError::Resolution(
                     "resolved provider schema fingerprint differs from assignment".to_owned(),
@@ -1169,6 +1286,109 @@ where
     /// # Errors
     /// Returns a preflight error for any malformed request, contradictory
     /// authenticated binding, unsupported plan node, or inconsistent scan set.
+    /// Validates one authenticated assignment beyond its identity and binding.
+    ///
+    /// Runs the checks that are about the assignment's *content* rather than
+    /// its identity: the persisted file list must be unique and ordered, the
+    /// signed projection closure must retain the hidden tenant column, every
+    /// closed predicate must reference a column inside that closure, the role
+    /// must match the presence or absence of a Scribe provider cut, and a cut
+    /// must be internally valid, pinned to `target_fence`, and copy the
+    /// top-level closure byte-for-byte.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PhysicalPlanFollowerError::Preflight`] naming the refused
+    /// invariant. Every refusal happens before any provider resolution or
+    /// object I/O.
+    fn validate_assignment(
+        assignment: &FollowerScanAssignment,
+        target_role: ClusterRole,
+        target_fence: wyrd_spec::vala::api::FencingToken,
+    ) -> Result<(), PhysicalPlanFollowerError> {
+        if !Self::valid_persisted_files(&assignment.persisted.files) {
+            return Err(PhysicalPlanFollowerError::Preflight(
+                "persisted assignment is not unique and ordered".to_owned(),
+            ));
+        }
+        // Defense in depth: the leader already refuses to sign an
+        // assignment whose projection closure drops the hidden tenant
+        // column (see `Oracle::ensure_required_columns_closure`), and the
+        // assignment-authority digest recomputed above proves this
+        // follower's copy matches what was signed byte-for-byte. Still,
+        // this follower independently re-derives the same invariant from
+        // the authenticated assignment rather than trusting the digest
+        // match alone to imply a safe projection was ever validated.
+        if assignment.required_columns.is_empty()
+            || !assignment
+                .required_columns
+                .iter()
+                .any(|column| column == DATA_TENANT_ID)
+        {
+            return Err(PhysicalPlanFollowerError::Preflight(
+                "assignment projection closure omits the hidden tenant column".to_owned(),
+            ));
+        }
+        // Every closed predicate's column must already be part of the
+        // signed projection closure (`required_columns` is defined as
+        // `scan_output_names + predicate_names + [data_tenant_id]`), so a
+        // predicate referencing a column outside that closure indicates a
+        // malformed assignment rather than a merely unusual one.
+        if assignment.predicates.iter().any(|predicate| {
+            !assignment
+                .required_columns
+                .iter()
+                .any(|column| column == predicate.column())
+        }) {
+            return Err(PhysicalPlanFollowerError::Preflight(
+                "assignment predicate references a column outside the projection closure"
+                    .to_owned(),
+            ));
+        }
+        match target_role {
+            ClusterRole::Oracle if assignment.scribe_provider_cut.is_some() => {
+                return Err(PhysicalPlanFollowerError::Preflight(
+                    "Oracle assignment contains a Scribe provider cut".to_owned(),
+                ));
+            }
+            ClusterRole::Scribe
+                if assignment.scribe_provider_cut.is_none()
+                    || !assignment.persisted.files.is_empty() =>
+            {
+                return Err(PhysicalPlanFollowerError::Preflight(
+                    "Scribe assignment lacks an explicit hot-provider cut".to_owned(),
+                ));
+            }
+            ClusterRole::Oracle | ClusterRole::Scribe => {}
+        }
+        if let Some(cut) = &assignment.scribe_provider_cut
+            && (cut.writer_epoch != target_fence
+                || cut.start_event_day.is_empty()
+                || cut.end_event_day.is_empty()
+                || cut.start_event_day > cut.end_event_day
+                || cut.required_columns.is_empty()
+                || cut.maximum_batch_count == 0
+                || cut.maximum_retained_bytes == 0
+                || !cut.is_valid())
+        {
+            return Err(PhysicalPlanFollowerError::Preflight(
+                "invalid Scribe provider cut".to_owned(),
+            ));
+        }
+        // The top-level assignment projection is authoritative; a Scribe
+        // cut carries its own `required_columns` for the memory-provider
+        // wire shape, but it must copy the signed top-level closure
+        // byte-for-byte rather than union or narrow it independently.
+        if let Some(cut) = &assignment.scribe_provider_cut
+            && cut.required_columns != assignment.required_columns
+        {
+            return Err(PhysicalPlanFollowerError::Preflight(
+                "Scribe provider cut projection differs from the assignment closure".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     fn preflight(
         &self,
         request: &PhysicalExecuteFragmentRequest,
@@ -1211,41 +1431,11 @@ where
                     "invalid or duplicate assignment".to_owned(),
                 ));
             }
-            if !Self::valid_persisted_files(&assignment.persisted.files) {
-                return Err(PhysicalPlanFollowerError::Preflight(
-                    "persisted assignment is not unique and ordered".to_owned(),
-                ));
-            }
-            match request.target_fence.role {
-                ClusterRole::Oracle if assignment.scribe_provider_cut.is_some() => {
-                    return Err(PhysicalPlanFollowerError::Preflight(
-                        "Oracle assignment contains a Scribe provider cut".to_owned(),
-                    ));
-                }
-                ClusterRole::Scribe
-                    if assignment.scribe_provider_cut.is_none()
-                        || !assignment.persisted.files.is_empty() =>
-                {
-                    return Err(PhysicalPlanFollowerError::Preflight(
-                        "Scribe assignment lacks an explicit hot-provider cut".to_owned(),
-                    ));
-                }
-                ClusterRole::Oracle | ClusterRole::Scribe => {}
-            }
-            if let Some(cut) = &assignment.scribe_provider_cut
-                && (cut.writer_epoch != request.target_fence.fencing_token
-                    || cut.start_event_day.is_empty()
-                    || cut.end_event_day.is_empty()
-                    || cut.start_event_day > cut.end_event_day
-                    || cut.required_columns.is_empty()
-                    || cut.maximum_batch_count == 0
-                    || cut.maximum_retained_bytes == 0
-                    || !cut.is_valid())
-            {
-                return Err(PhysicalPlanFollowerError::Preflight(
-                    "invalid Scribe provider cut".to_owned(),
-                ));
-            }
+            Self::validate_assignment(
+                assignment,
+                request.target_fence.role,
+                request.target_fence.fencing_token,
+            )?;
         }
         if encoded.len() != assignments.len()
             || encoded.iter().any(|(scan_id, fingerprint)| {
@@ -1644,7 +1834,7 @@ pub(crate) mod tests {
             DataType::Int64,
             true,
         )]));
-        let fingerprint = super::super::sealed_fragment_schema_fingerprint(schema.as_ref());
+        let fingerprint = super::super::assignment_schema_fingerprint(schema.as_ref());
         let bytes = physical_plan_to_bytes_with_extension_codec(
             Arc::new(RemoteSourcePlaceholderExec::new(
                 "scan",
@@ -1683,6 +1873,8 @@ pub(crate) mod tests {
                     },
                     scribe_provider_cut: None,
                     schema_fingerprint: fingerprint,
+                    required_columns: vec!["data_tenant_id".to_owned()],
+                    predicates: Vec::new(),
                 }],
                 plan_fingerprint: physical_plan_fingerprint(&bytes),
             },
@@ -1752,9 +1944,11 @@ pub(crate) mod tests {
                     binding,
                     persisted: PersistedFileAssignment { files: Vec::new() },
                     scribe_provider_cut: Some(cut(ranges)),
-                    schema_fingerprint: super::super::sealed_fragment_schema_fingerprint(
+                    schema_fingerprint: super::super::assignment_schema_fingerprint(
                         schema.as_ref(),
                     ),
+                    required_columns: vec!["data_tenant_id".to_owned()],
+                    predicates: Vec::new(),
                 },
                 &session,
             )
@@ -1806,6 +2000,8 @@ pub(crate) mod tests {
             persisted: PersistedFileAssignment { files: Vec::new() },
             scribe_provider_cut: Some(cut(Vec::new())),
             schema_fingerprint: "schema".to_owned(),
+            required_columns: vec!["data_tenant_id".to_owned()],
+            predicates: Vec::new(),
         };
         let session = SessionContext::new().state();
         resolver
@@ -1879,6 +2075,24 @@ pub(crate) mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(follower.preflight_count(), 2);
         assert_eq!(stream.split().0.schema().fields().len(), 1);
+    }
+
+    /// Every follower session enables Parquet-level predicate and index
+    /// pushdown, so a closed leaf predicate actually prunes row groups and
+    /// pages at the reader rather than only being re-applied by the
+    /// residual `FilterExec` `DataFusion` keeps above the provider.
+    #[tokio::test]
+    async fn oracle_reader_session_options_contract() {
+        let (state, _context) = FollowerSessionFactory::new(1)
+            .create(Arc::new(
+                datafusion::execution::memory_pool::GreedyMemoryPool::new(1024),
+            ))
+            .expect("governed follower session context");
+        let parquet_options = &state.config().options().execution.parquet;
+        assert!(parquet_options.pushdown_filters);
+        assert!(parquet_options.reorder_filters);
+        assert!(parquet_options.bloom_filter_on_read);
+        assert!(parquet_options.enable_page_index);
     }
 
     /// Proves every Oracle follower request rebuilds its governed `DataFusion` context.
@@ -2095,9 +2309,11 @@ pub(crate) mod tests {
                     binding,
                     persisted: PersistedFileAssignment { files: Vec::new() },
                     scribe_provider_cut: Some(cut(Vec::new())),
-                    schema_fingerprint: super::super::sealed_fragment_schema_fingerprint(
+                    schema_fingerprint: super::super::assignment_schema_fingerprint(
                         schema.as_ref(),
                     ),
+                    required_columns: vec!["data_tenant_id".to_owned()],
+                    predicates: Vec::new(),
                 },
                 &session,
             )

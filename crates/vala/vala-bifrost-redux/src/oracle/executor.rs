@@ -878,7 +878,7 @@ fn prepare_batch(
 ) -> Result<RecordBatch, ExecutorError> {
     let batch = apply_predicates(batch, &fragment.predicates)?;
     let batch = project(batch, &fragment.projection)?;
-    let actual = super::sealed_fragment_schema_fingerprint(&batch.schema());
+    let actual = super::assignment_schema_fingerprint(&batch.schema());
     if actual != fragment.schema_fingerprint {
         return Err(ExecutorError::Schema);
     }
@@ -1108,7 +1108,8 @@ mod tests {
         schema: &SchemaRef,
         size_bytes: u64,
     ) -> SealedScanFragment {
-        let leaf = crate::oracle::fragment::PreparedSealedLeaf {
+        let mut fragment = SealedScanFragment {
+            fragment_id: String::new(),
             binding: Path::new(&scan_file.location)
                 .parent()
                 .expect("fixture parent")
@@ -1124,15 +1125,13 @@ mod tests {
             }],
             projection: vec!["value".to_owned()],
             predicates: Vec::new(),
-            schema_fingerprint: crate::oracle::sealed_fragment_schema_fingerprint(schema),
+            schema_fingerprint: crate::oracle::assignment_schema_fingerprint(schema),
+            estimated_rows: scan_file.estimated_rows,
+            estimated_bytes: size_bytes,
             deadline_unix_ms: Utc::now().timestamp_millis() + 60_000,
         };
-        crate::oracle::fragment::FragmentPlanner
-            .plan(&leaf, &crate::oracle::fragment::FragmentConfig::default())
-            .expect("validated deterministic fragment")
-            .into_iter()
-            .next()
-            .expect("one deterministic fragment")
+        fragment.fragment_id = fragment.digest();
+        fragment
     }
 
     /// Closed predicates filter before projection without admitting SQL text.

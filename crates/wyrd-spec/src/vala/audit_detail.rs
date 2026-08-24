@@ -185,6 +185,11 @@ pub enum BifrostSecurityViolationKind {
     PeerManifest,
     /// Peer fragment digest mismatch.
     PeerFragment,
+    /// Peer assignment-authority digest mismatch: the recomputed digest over
+    /// the follower's actual dispatched assignments does not match the
+    /// digest signed into the ticket claims, so the closed predicate and
+    /// projection closure cannot be trusted.
+    PeerAssignmentAuthority,
     /// Invalid Scribe-tail ticket audience.
     TailAudience,
     /// Scribe-tail tenant or table binding mismatch.

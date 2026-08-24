@@ -856,6 +856,26 @@ impl BifrostCatalog {
         Ok(SchemaFingerprint(fingerprint))
     }
 
+    /// Return the physical Arrow schema a follower scan assignment must be
+    /// built against for one tenant-qualified table.
+    ///
+    /// This is the provider's schema including managed columns, not the
+    /// registered user schema. Both the assignment's projection closure and its
+    /// fingerprint are derived from it, and the follower re-derives the same
+    /// schema after resolution, so a caller that guesses either one is rejected.
+    ///
+    /// # Errors
+    /// Returns a catalog error when the tenant does not own the registration or
+    /// the physical provider cannot be built.
+    pub async fn assignment_schema(
+        &self,
+        table: &TableRef,
+        tenant: DataTenantId,
+    ) -> Result<arrow::datatypes::SchemaRef, BifrostCatalogError> {
+        let provider = self.provider(table, tenant).await?;
+        Ok(datafusion::datasource::TableProvider::schema(&provider))
+    }
+
     /// List registrations visible under the exact tenant RLS bind.
     ///
     /// # Errors

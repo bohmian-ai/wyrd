@@ -41,7 +41,13 @@ use super::telemetry::{
 use crate::cluster::{ClusterRegistry, ClusterSnapshot, ROLE_LIVENESS_CUTOFF};
 
 /// Fixed private peer protocol version.
-pub const PEER_PROTOCOL_VERSION: u32 = 1;
+///
+/// Protocol v2 binds the assignment-authority digest
+/// ([`crate::peer::assignment_authority_digest_for`]) into signed ticket
+/// claims and is a homogeneous cutover: v1 tickets are rejected outright by
+/// [`validated_claim_identifiers`] rather than accepted through a dual
+/// decoder.
+pub const PEER_PROTOCOL_VERSION: u32 = 2;
 /// Pending reservation time to live.
 const PENDING_TTL: ChronoDuration = ChronoDuration::seconds(2);
 /// Stable peer rejection hint.
@@ -79,6 +85,14 @@ pub enum DispatchError {
     /// Ticket or fragment contract failed terminally.
     #[error("peer security or fragment contract rejected")]
     Terminal,
+    /// The tenant tripwire refused a physically scanned foreign-tenant row.
+    ///
+    /// Kept distinct from [`DispatchError::Terminal`] so the leader reports
+    /// the tenant-isolation reason rather than a generic peer-security or
+    /// retryable-worker outcome. It is never retried on another candidate:
+    /// the refusal is a property of the data, not of the worker.
+    #[error("peer fragment refused a foreign-tenant row")]
+    TenantInvariant,
 }
 
 /// Longest a peer waits out a saturated running-slot pool before refusing.
@@ -740,6 +754,59 @@ impl OraclePeerWorker {
     ///
     /// # Errors
     /// Returns terminal security/contract failures or retryable capacity/storage failures.
+    /// Runs the last pre-execution refusals for an already-authenticated fragment.
+    ///
+    /// Both checks happen after the ticket verified and before
+    /// `follower.execute` resolves a provider or issues any object I/O:
+    /// the physical claims must still describe this exact request, and the
+    /// assignment-authority digest recomputed over the assignments this
+    /// follower physically received must equal the digest signed into the
+    /// verified claims. A valid signature only proves the claims bytes were
+    /// not altered in transit, not that the dispatched closure matches what
+    /// the leader signed, so the digest is recomputed here rather than
+    /// trusted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DispatchError::Terminal`] when either check refuses, after
+    /// appending the matching verified security violation. Propagates the
+    /// audit append failure unchanged when the chain itself cannot record the
+    /// refusal, so the worker fails closed rather than serving unattributably.
+    async fn admit_verified_fragment(
+        &self,
+        request: &PhysicalExecuteFragmentRequest,
+        claims: &PeerTicketClaims,
+        tenant_id: DataTenantId,
+        running: &RunningReservation,
+    ) -> Result<(), DispatchError> {
+        if let Err(violation) = validate_physical_claims(claims, request) {
+            tracing::error!(?violation, "Oracle peer physical claims validation failed");
+            self.audit_verified(tenant_id, violation).await?;
+            return Err(DispatchError::Terminal);
+        }
+        // The authenticated class decided this fragment's quantum at reservation
+        // time; emitting it here is what lets an operator tie a slow fragment
+        // back to the admission decision that sized its memory pool.
+        tracing::debug!(
+            query_class = ?running.query_class,
+            reservation = %request.reservation_id.as_uuid(),
+            "Oracle peer fragment admitted to execute"
+        );
+        match super::peer::assignment_authority_digest_for(&request.assignments) {
+            Ok(recomputed) if recomputed == claims.assignment_authority_digest => {}
+            _ => {
+                tracing::error!("Oracle peer assignment-authority digest mismatch");
+                self.audit_verified(
+                    tenant_id,
+                    BifrostSecurityViolationKind::PeerAssignmentAuthority,
+                )
+                .await?;
+                return Err(DispatchError::Terminal);
+            }
+        }
+        Ok(())
+    }
+
     async fn execute_with_capacity(
         &self,
         request: PhysicalExecuteFragmentRequest,
@@ -762,19 +829,8 @@ impl OraclePeerWorker {
         // The lease was charged at reservation; take it here so the attempt
         // stream, not the reservation entry, owns it for the rest of execution.
         let worker_resources = running.worker_resources.take();
-        if let Err(violation) = validate_physical_claims(&claims, &request) {
-            tracing::error!(?violation, "Oracle peer physical claims validation failed");
-            self.audit_verified(tenant_id, violation).await?;
-            return Err(DispatchError::Terminal);
-        }
-        // The authenticated class decided this fragment's quantum at reservation
-        // time; emitting it here is what lets an operator tie a slow fragment
-        // back to the admission decision that sized its memory pool.
-        tracing::debug!(
-            query_class = ?running.query_class,
-            reservation = %request.reservation_id.as_uuid(),
-            "Oracle peer fragment admitted to execute"
-        );
+        self.admit_verified_fragment(&request, &claims, tenant_id, &running)
+            .await?;
         let follower = &self.physical_follower;
         let memory_pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> = match capacity {
             WorkerCapacity::LeaderAdmitted => admitted_pool.ok_or(DispatchError::Capacity)?,
@@ -800,27 +856,47 @@ impl OraclePeerWorker {
                 },
                 memory_pool,
             )
-            .await
-            .map_err(|error| match error {
-                PhysicalPlanFollowerError::Preflight(_)
-                | PhysicalPlanFollowerError::PostResolutionDecode(_) => {
-                    tracing::error!(?error, "Oracle physical follower rejected the request");
-                    DispatchError::Terminal
-                }
-                PhysicalPlanFollowerError::Resolution(_) => {
-                    tracing::warn!(
-                        ?error,
-                        "Oracle physical follower could not resolve a pinned source"
-                    );
-                    DispatchError::EligibleSourceLoss {
-                        cause: EligibleSourceLossCause::ProviderResolution,
+            .await;
+        let stream = match stream {
+            Ok(stream) => stream,
+            Err(error) => {
+                return Err(match error {
+                    // A plan whose bytes do not match the signed digest, or
+                    // whose fences, bindings, or assignments contradict the
+                    // verified ticket, is a contract refusal of an
+                    // authenticated peer's request. It is detected here before
+                    // any object I/O, and it must be attributable afterwards,
+                    // so it joins the tenant's security chain rather than only
+                    // the local trace.
+                    PhysicalPlanFollowerError::Preflight(_) => {
+                        tracing::error!(?error, "Oracle physical follower rejected the request");
+                        self.audit_verified(tenant_id, BifrostSecurityViolationKind::PeerFragment)
+                            .await?;
+                        DispatchError::Terminal
                     }
-                }
-                PhysicalPlanFollowerError::Execution(_) => {
-                    tracing::warn!(?error, "Oracle physical follower execution could not start");
-                    DispatchError::Unavailable
-                }
-            })?;
+                    PhysicalPlanFollowerError::PostResolutionDecode(_) => {
+                        tracing::error!(?error, "Oracle physical follower rejected the request");
+                        DispatchError::Terminal
+                    }
+                    PhysicalPlanFollowerError::Resolution(_) => {
+                        tracing::warn!(
+                            ?error,
+                            "Oracle physical follower could not resolve a pinned source"
+                        );
+                        DispatchError::EligibleSourceLoss {
+                            cause: EligibleSourceLossCause::ProviderResolution,
+                        }
+                    }
+                    PhysicalPlanFollowerError::Execution(_) => {
+                        tracing::warn!(
+                            ?error,
+                            "Oracle physical follower execution could not start"
+                        );
+                        DispatchError::Unavailable
+                    }
+                });
+            }
+        };
         self.physical_observer
             .oracle_executions
             .fetch_add(1, Ordering::AcqRel);
@@ -923,6 +999,12 @@ impl OraclePeerWorker {
                 expected_fence,
                 "Oracle peer target fence mismatch"
             );
+            // Refused before ticket verification, so no tenant is established
+            // and this joins the unverified rejection chain. Recording it is
+            // what makes a leader replaying a superseded fence visible to an
+            // operator instead of only to this pod's trace.
+            self.audit_unverified(BifrostSecurityViolationKind::PeerFence)
+                .await?;
             return Err(DispatchError::Terminal);
         }
         let verified = self
@@ -1020,13 +1102,23 @@ impl OraclePeerWorker {
 /// the same plan fingerprint: the follower validates one sealed fragment, and
 /// splitting these into distinct digests would imply a per-stage binding the
 /// protocol does not have.
+///
+/// The assignment-authority digest is computed here, over the exact assignments
+/// this fragment will dispatch, so protocol v2 followers can recompute it from
+/// what they physically received and refuse a closure that was altered after
+/// the leader signed it.
+///
+/// # Errors
+///
+/// Returns [`DispatchError::Terminal`] when the fragment's assignments cannot
+/// produce a canonical authority digest; such a fragment must never be signed.
 fn peer_ticket_claims(
     candidate: &DispatchCandidate,
     context: &DispatchContext,
     fragment: &PhysicalDispatchFragment,
     pending: &PendingNodeReservation,
-) -> PeerTicketClaims {
-    PeerTicketClaims {
+) -> Result<PeerTicketClaims, DispatchError> {
+    Ok(PeerTicketClaims {
         protocol_version: PEER_PROTOCOL_VERSION,
         audience: candidate.node_id.as_uuid().as_bytes().to_vec(),
         worker_fence: candidate.worker_fence,
@@ -1044,7 +1136,11 @@ fn peer_ticket_claims(
         manifest_digest: fragment.plan_fingerprint.clone(),
         projection_digest: fragment.plan_fingerprint.clone(),
         permission_digest: context.permission_digest.clone(),
-    }
+        assignment_authority_digest: super::peer::assignment_authority_digest_for(
+            &fragment.assignments,
+        )
+        .map_err(|_| DispatchError::Terminal)?,
+    })
 }
 
 /// Encodes one follower record-batch stream into the peer attempt frame protocol.
@@ -1096,7 +1192,15 @@ fn encode_attempt_frames(
                 Ok(batch) => batch,
                 Err(error) => {
                     tracing::warn!(?error, "Oracle follower execution stream failed");
-                    yield Err(DispatchError::Unavailable);
+                    // A foreign-tenant row refused by the physical tripwire is a
+                    // property of the scanned data, not of this worker, so it is
+                    // reported as a tenant-isolation outcome that the leader will
+                    // not retry on another candidate.
+                    if super::exec::is_tenant_invariant_error(&error) {
+                        yield Err(DispatchError::TenantInvariant);
+                    } else {
+                        yield Err(DispatchError::Unavailable);
+                    }
                     return;
                 }
             };
@@ -2066,6 +2170,11 @@ fn status_error(status: &Status) -> DispatchError {
 fn execution_status_error(status: &Status) -> DispatchError {
     match status.code() {
         wyrd_tonic::tonic::Code::NotFound => DispatchError::FileNotFound,
+        // The private peer protocol reserves `Aborted` for the tenant
+        // tripwire so a foreign-tenant refusal on a remote worker reaches the
+        // leader as a tenant-isolation outcome instead of a generic
+        // security or retryable failure.
+        wyrd_tonic::tonic::Code::Aborted => DispatchError::TenantInvariant,
         wyrd_tonic::tonic::Code::FailedPrecondition => DispatchError::EligibleSourceLoss {
             cause: EligibleSourceLossCause::ProviderResolution,
         },
@@ -2235,6 +2344,9 @@ impl FragmentDispatcher {
         if !self.transports.is_local(context.leader_node_id) {
             return Err(DispatchError::Terminal);
         }
+        // Last retryable attempt failure, kept so an exhausted candidate list
+        // reports the real cause instead of a bare admission failure.
+        let mut last_retryable: Option<Result<ValidatedAttempt, DispatchError>> = None;
         for candidate in candidates {
             if candidate.role != fragment.target_role {
                 return Err(DispatchError::Terminal);
@@ -2257,7 +2369,7 @@ impl FragmentDispatcher {
                 leader_node_id: context.leader_node_id,
                 leader_fencing_token: context.leader_fence,
             };
-            let claims = peer_ticket_claims(candidate, context, &fragment, &pending);
+            let claims = peer_ticket_claims(candidate, context, &fragment, &pending)?;
             let Ok(ticket) = self.ticket_minter.mint_peer_ticket(&claims) else {
                 tracing::error!("Oracle peer ticket mint failed");
                 if candidate.role == wyrd_spec::vala::api::ClusterRole::Oracle {
@@ -2294,9 +2406,24 @@ impl FragmentDispatcher {
             if candidate.role == wyrd_spec::vala::api::ClusterRole::Oracle {
                 self.release_pending(candidate, release, context).await;
             }
-            return result;
+            // A transient loss on one worker — a restarting peer, a reset
+            // connection, a source that briefly could not be opened — must not
+            // fail the query while another candidate can still serve it. Only a
+            // failure that would recur or must not be retried elsewhere ends the
+            // dispatch here: a contract or security refusal, a foreign-tenant
+            // row, a pinned object that no longer exists, and admission
+            // pressure that the next candidate would also hit.
+            match result {
+                Err(DispatchError::Unavailable | DispatchError::EligibleSourceLoss { .. }) => {
+                    last_retryable = Some(result);
+                }
+                _ => return result,
+            }
         }
-        Err(DispatchError::Capacity)
+        // Reaching here means every candidate either rejected its reservation
+        // or failed retryably. Report the last real failure when there was one
+        // so the caller sees why, and admission pressure otherwise.
+        last_retryable.unwrap_or(Err(DispatchError::Capacity))
     }
 
     /// Attempts immediate tuple-bound cleanup after any accepted-attempt failure.
@@ -2345,8 +2472,9 @@ impl FragmentDispatcher {
     ///
     /// Returns [`DispatchError::Unavailable`] when the deadline has already
     /// passed, [`DispatchError::Terminal`], [`DispatchError::StaleObject`], and
-    /// [`DispatchError::FileNotFound`] unchanged, and otherwise a
-    /// [`DispatchPartialReason::Setup`] partial carrying no attempt.
+    /// [`DispatchError::FileNotFound`] unchanged, [`DispatchError::TenantInvariant`]
+    /// unchanged, and otherwise a [`DispatchPartialReason::Setup`] partial
+    /// carrying no attempt.
     async fn open_attempt_frames(
         &self,
         candidate: &DispatchCandidate,
@@ -2383,6 +2511,10 @@ impl FragmentDispatcher {
                     DispatchError::Terminal => DispatchError::Terminal,
                     DispatchError::StaleObject => DispatchError::StaleObject,
                     DispatchError::FileNotFound => DispatchError::FileNotFound,
+                    // A foreign-tenant refusal is a property of the data, not
+                    // of this candidate, so it must never soften into a setup
+                    // partial that another participant's rows could mask.
+                    DispatchError::TenantInvariant => DispatchError::TenantInvariant,
                     DispatchError::Partial { attempt, reason } => {
                         DispatchError::Partial { attempt, reason }
                     }
@@ -2491,7 +2623,7 @@ fn dispatch_error_label(error: &DispatchError) -> PeerErrorClass {
         | DispatchError::StaleObject
         | DispatchError::FileNotFound
         | DispatchError::Capacity => PeerErrorClass::Availability,
-        DispatchError::Terminal => PeerErrorClass::Security,
+        DispatchError::Terminal | DispatchError::TenantInvariant => PeerErrorClass::Security,
     }
 }
 
@@ -2620,7 +2752,8 @@ mod tests {
         writer.close().expect("Parquet close");
         let size_bytes = file.as_file().metadata().expect("file metadata").len();
         let location = file.path().to_string_lossy().into_owned();
-        let leaf = crate::oracle::fragment::PreparedSealedLeaf {
+        let mut fragment = SealedScanFragment {
+            fragment_id: String::new(),
             binding: Path::new(&location)
                 .parent()
                 .expect("fixture parent")
@@ -2636,15 +2769,12 @@ mod tests {
             }],
             projection: vec!["value".to_owned()],
             predicates: Vec::new(),
-            schema_fingerprint: crate::oracle::sealed_fragment_schema_fingerprint(&schema),
+            schema_fingerprint: crate::oracle::assignment_schema_fingerprint(&schema),
+            estimated_rows: 3,
+            estimated_bytes: size_bytes,
             deadline_unix_ms: Utc::now().timestamp_millis() + 60_000,
         };
-        let fragment = crate::oracle::fragment::FragmentPlanner
-            .plan(&leaf, &crate::oracle::fragment::FragmentConfig::default())
-            .expect("validated fragment")
-            .into_iter()
-            .next()
-            .expect("one fragment");
+        fragment.fragment_id = fragment.digest();
         (file, fragment)
     }
 
@@ -2674,6 +2804,19 @@ mod tests {
             .expect("native physical plan encoding")
             .to_vec();
         let plan_fingerprint = super::super::codec::physical_plan_fingerprint(&physical_plan_bytes);
+        let assignments = vec![FollowerScanAssignment {
+            scan_id: "dispatcher-test-scan".to_owned(),
+            binding: TenantTableBinding {
+                tenant_id: tenant,
+                namespace: "vala.bifrost".to_owned(),
+                table: "events".to_owned(),
+            },
+            persisted: PersistedFileAssignment { files: Vec::new() },
+            scribe_provider_cut: None,
+            schema_fingerprint: fragment.schema_fingerprint.clone(),
+            required_columns: vec!["data_tenant_id".to_owned()],
+            predicates: Vec::new(),
+        }];
         let claims = PeerTicketClaims {
             protocol_version: PEER_PROTOCOL_VERSION,
             audience: node.as_uuid().as_bytes().to_vec(),
@@ -2689,6 +2832,10 @@ mod tests {
             manifest_digest: plan_fingerprint.clone(),
             projection_digest: projection_digest(&fragment.projection),
             permission_digest: "permission".to_owned(),
+            assignment_authority_digest: crate::oracle::peer::assignment_authority_digest_for(
+                &assignments,
+            )
+            .expect("deterministic fixture digest"),
         };
         let ticket = DeterministicTestSigner {
             key_id: "test".to_owned(),
@@ -2709,17 +2856,7 @@ mod tests {
                 role: ClusterRole::Oracle,
                 fencing_token: fence,
             },
-            assignments: vec![FollowerScanAssignment {
-                scan_id: "dispatcher-test-scan".to_owned(),
-                binding: TenantTableBinding {
-                    tenant_id: tenant,
-                    namespace: "vala.bifrost".to_owned(),
-                    table: "events".to_owned(),
-                },
-                persisted: PersistedFileAssignment { files: Vec::new() },
-                scribe_provider_cut: None,
-                schema_fingerprint: fragment.schema_fingerprint.clone(),
-            }],
+            assignments,
             plan_fingerprint,
         }
     }
@@ -2741,7 +2878,7 @@ mod tests {
             fencing_token: fence,
             capability_version: 1,
             capabilities: ClusterCapabilities::OracleV1(OracleCapabilitiesV1 {
-                peer_protocol_version: 1,
+                peer_protocol_version: 2,
                 storage_protocol_version: 1,
                 cpu_cores: 1.0,
                 memory_budget_bytes: 1,
@@ -2772,7 +2909,12 @@ mod tests {
                 binding: binding.clone(),
                 persisted: PersistedFileAssignment { files: Vec::new() },
                 scribe_provider_cut: None,
-                schema_fingerprint: "schema".to_owned(),
+                // Canonical 64-lowercase-hex placeholder: the assignment-
+                // authority digest requires this shape even in fixtures that
+                // never exercise object storage.
+                schema_fingerprint: "0".repeat(64),
+                required_columns: vec!["data_tenant_id".to_owned()],
+                predicates: Vec::new(),
             }],
             binding,
             target_role: ClusterRole::Oracle,
@@ -2891,6 +3033,7 @@ mod tests {
                 DispatchError::Partial { .. } => "partial",
                 DispatchError::Capacity => "capacity",
                 DispatchError::EligibleSourceLoss { .. } => "source_loss",
+                DispatchError::TenantInvariant => "tenant_invariant",
             };
             assert_eq!(
                 observed, expected,
@@ -3404,6 +3547,261 @@ mod tests {
         drop(leader_slot);
         assert!(slots.try_pending().is_ok());
         assert!(slots.try_running(1).is_ok());
+    }
+
+    /// A follower whose received assignment was tampered with after the
+    /// leader signed the ticket is rejected before any provider resolution
+    /// or object I/O, even though the ticket's own signature still verifies.
+    ///
+    /// The signature only proves the claims bytes were not altered in
+    /// transit; it says nothing about whether the assignments physically
+    /// dispatched alongside the ticket match what was signed. Recomputing
+    /// and comparing the assignment-authority digest is what catches a
+    /// tampered `required_columns`/predicate/file list here.
+    #[tokio::test]
+    async fn tampered_assignment_authority_digest_is_rejected_before_execution() {
+        let roles = crate::resources::BifrostRuntimeResources::composed_for_test(
+            1024 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            [crate::resources::BifrostRole::Oracle],
+        );
+        let oracle = roles.oracle().expect("Oracle capability");
+        let node = NodeId::new(uuid::Uuid::now_v7());
+        let query_id = QueryId::new(uuid::Uuid::now_v7());
+        let tenant = DataTenantId::new_v7();
+        let fence = 41;
+        let reservations = Arc::new(ReservationRegistry::new(
+            Arc::new(OracleSlotManager::new(1, 1)),
+            1,
+        ));
+        let (_file, fragment) = dispatcher_parquet_fragment();
+        let worker = OraclePeerWorker::new_physical_with_resources(OraclePeerWorkerConfig {
+            worker_node_id: node,
+            oracle_fence: fence,
+            verifier: Arc::new(ClaimsPassthroughVerifier),
+            security_audit: Arc::new(NoopPeerSecurityAudit),
+            reservations: Arc::clone(&reservations),
+            oracle_resources: oracle.clone(),
+            resolver: Arc::new(TestFollowerResolver),
+            audit: Arc::new(TestOracleAudit),
+            target_partitions: 1,
+        });
+        let now = Utc::now();
+        let pending = reservations
+            .reserve_local(
+                &reserve_request(query_id, node, fence, now + ChronoDuration::seconds(2)),
+                now,
+            )
+            .expect("leader-local pending reservation");
+        let mut request = worker_request(
+            &fragment,
+            pending.reservation_id,
+            node,
+            fence,
+            query_id,
+            tenant,
+        );
+        // Tamper with the dispatched assignment after the ticket was signed
+        // over the original closure: this must be caught even though the
+        // ticket signature itself still verifies cleanly.
+        request.assignments[0].required_columns = vec!["tampered_column".to_owned()];
+
+        let result = worker
+            .execute_local(
+                request,
+                Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
+                    2 * 1024 * 1024,
+                )),
+            )
+            .await;
+        let Err(error) = result else {
+            panic!("tampered assignment closure must be rejected before execution");
+        };
+        assert!(matches!(error, DispatchError::Terminal));
+    }
+
+    /// One digest-covered mutation applied to a dispatched request.
+    ///
+    /// Named so the tamper table stays readable; the boxed closure is what
+    /// lets each case mutate a different field of the same fixture request.
+    type TamperCase = Box<dyn Fn(&mut PhysicalExecuteFragmentRequest)>;
+
+    /// Counts resolver invocations so a test can prove a rejected request
+    /// never reaches provider resolution or object I/O.
+    struct CountingFollowerResolver {
+        /// Number of times [`FollowerSourceResolver::resolve`] was called.
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl FollowerSourceResolver for CountingFollowerResolver {
+        /// Records the call, then delegates to the fixed empty test schema.
+        async fn resolve(
+            &self,
+            target_role: ClusterRole,
+            assignment: &FollowerScanAssignment,
+            session: &datafusion::execution::session_state::SessionState,
+        ) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            TestFollowerResolver
+                .resolve(target_role, assignment, session)
+                .await
+        }
+    }
+
+    /// Builds a counting-resolver worker plus one valid request for it.
+    ///
+    /// The v2 authority proofs each need an isolated worker, its own
+    /// reservation registry, and a request already reserved against it; the
+    /// only thing they vary is the fence and how they then tamper with the
+    /// request, so the identical setup is built once here. The returned
+    /// resolver is the same instance the worker holds, so a caller can assert
+    /// on how many times provider resolution was reached.
+    fn counting_worker_request(
+        oracle: &crate::resources::OracleResources,
+        fragment: &SealedScanFragment,
+        tenant: DataTenantId,
+        fence: FencingToken,
+    ) -> (
+        OraclePeerWorker,
+        Arc<CountingFollowerResolver>,
+        PhysicalExecuteFragmentRequest,
+    ) {
+        let node = NodeId::new(uuid::Uuid::now_v7());
+        let query_id = QueryId::new(uuid::Uuid::now_v7());
+        let reservations = Arc::new(ReservationRegistry::new(
+            Arc::new(OracleSlotManager::new(1, 1)),
+            1,
+        ));
+        let resolver = Arc::new(CountingFollowerResolver {
+            calls: AtomicUsize::new(0),
+        });
+        let worker = OraclePeerWorker::new_physical_with_resources(OraclePeerWorkerConfig {
+            worker_node_id: node,
+            oracle_fence: fence,
+            verifier: Arc::new(ClaimsPassthroughVerifier),
+            security_audit: Arc::new(NoopPeerSecurityAudit),
+            reservations: Arc::clone(&reservations),
+            oracle_resources: oracle.clone(),
+            resolver: Arc::clone(&resolver) as Arc<dyn FollowerSourceResolver>,
+            audit: Arc::new(TestOracleAudit),
+            target_partitions: 1,
+        });
+        let now = Utc::now();
+        let pending = reservations
+            .reserve_local(
+                &reserve_request(query_id, node, fence, now + ChronoDuration::seconds(2)),
+                now,
+            )
+            .expect("leader-local pending reservation");
+        let request = worker_request(
+            fragment,
+            pending.reservation_id,
+            node,
+            fence,
+            query_id,
+            tenant,
+        );
+        (worker, resolver, request)
+    }
+
+    /// Protocol-v2 assignment-authority contract, proven as one seam:
+    ///
+    /// - a valid v2 request whose recomputed digest matches the signed
+    ///   claims executes and reaches the resolver exactly once;
+    /// - every digest-covered tamper class (`required_columns`, predicates,
+    ///   files) is rejected terminally before the resolver is ever called;
+    /// - an explicit v1 `protocol_version` ticket is rejected by the same
+    ///   gate protocol v2 replaced, proving there is no dual decoder.
+    #[tokio::test]
+    async fn follower_assignment_v2_authority_contract() {
+        let roles = crate::resources::BifrostRuntimeResources::composed_for_test(
+            1024 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            [crate::resources::BifrostRole::Oracle],
+        );
+        let oracle = roles.oracle().expect("Oracle capability");
+        let (_file, fragment) = dispatcher_parquet_fragment();
+        let tenant = DataTenantId::new_v7();
+
+        // A valid v2 request executes and reaches the resolver exactly once.
+        {
+            let (worker, resolver, request) =
+                counting_worker_request(&oracle, &fragment, tenant, 51);
+            worker
+                .execute_local(
+                    request,
+                    Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
+                        2 * 1024 * 1024,
+                    )),
+                )
+                .await
+                .expect("valid v2 assignment authority digest executes");
+            assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        }
+
+        // Every digest-covered tamper is rejected before the resolver runs.
+        let tamper_cases: Vec<TamperCase> = vec![
+            Box::new(|request| {
+                request.assignments[0].required_columns = vec!["tampered_column".to_owned()];
+            }),
+            Box::new(|request| {
+                request.assignments[0]
+                    .persisted
+                    .files
+                    .push("s3://bucket/tampered.parquet".to_owned());
+            }),
+            Box::new(|request| {
+                request.assignments[0].schema_fingerprint = "f".repeat(64);
+            }),
+        ];
+        for tamper in tamper_cases {
+            let (worker, resolver, mut request) =
+                counting_worker_request(&oracle, &fragment, tenant, 52);
+            tamper(&mut request);
+            let result = worker
+                .execute_local(
+                    request,
+                    Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
+                        2 * 1024 * 1024,
+                    )),
+                )
+                .await;
+            assert!(matches!(result, Err(DispatchError::Terminal)));
+            assert_eq!(
+                resolver.calls.load(Ordering::SeqCst),
+                0,
+                "a tampered assignment-authority digest must never reach the resolver"
+            );
+        }
+
+        // An explicit v1 `protocol_version` ticket is rejected: protocol v2
+        // fully replaced v1 rather than accepting both.
+        {
+            let (worker, resolver, mut request) =
+                counting_worker_request(&oracle, &fragment, tenant, 53);
+            let mut claims = PeerTicketClaims::decode(request.ticket.claims_bytes.as_slice())
+                .expect("decode fixture claims");
+            claims.protocol_version = 1;
+            let mut bytes = Vec::new();
+            claims.encode(&mut bytes).expect("encode v1 claims");
+            request.ticket.claims_bytes = bytes.clone();
+            request.ticket.signature = bytes;
+            let result = worker
+                .execute_local(
+                    request,
+                    Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
+                        2 * 1024 * 1024,
+                    )),
+                )
+                .await;
+            assert!(matches!(result, Err(DispatchError::Terminal)));
+            assert_eq!(
+                resolver.calls.load(Ordering::SeqCst),
+                0,
+                "an explicit v1 protocol_version ticket must never reach the resolver"
+            );
+        }
     }
 
     /// Leader-admitted execution reaches a frame while its exact query lease is active.

@@ -167,6 +167,19 @@ impl OraclePeerGrpc {
             tracing::error!("Scribe peer physical claims validation failed");
             return Err(DispatchError::Terminal);
         }
+        // Recomputed last, before any provider or tail I/O: a valid
+        // signature only proves the claims were not tampered with in
+        // transit, not that the signed closed-predicate/projection closure
+        // matches what this Scribe worker actually received.
+        match vala_bifrost_redux::oracle::peer::assignment_authority_digest_for(
+            &request.assignments,
+        ) {
+            Ok(recomputed) if recomputed == claims.assignment_authority_digest => {}
+            _ => {
+                tracing::error!("Scribe peer assignment-authority digest mismatch");
+                return Err(DispatchError::Terminal);
+            }
+        }
         let binding = request
             .assignments
             .first()
@@ -224,6 +237,8 @@ impl OraclePeerGrpc {
                 let batch = batch.map_err(|error| {
                     if vala_bifrost_redux::oracle::is_stale_iceberg_object_error(&error) {
                         DispatchError::StaleObject
+                    } else if vala_bifrost_redux::oracle::is_tenant_invariant_error(&error) {
+                        DispatchError::TenantInvariant
                     } else {
                         DispatchError::Unavailable
                     }
@@ -394,6 +409,9 @@ fn dispatch_status(error: DispatchError) -> Status {
             Status::not_found(error.to_string())
         }
         DispatchError::Terminal => Status::permission_denied(error.to_string()),
+        // Distinct from `permission_denied` so the leader can recover the
+        // tenant-isolation reason; see `execution_status_error`.
+        DispatchError::TenantInvariant => Status::aborted(error.to_string()),
     }
 }
 

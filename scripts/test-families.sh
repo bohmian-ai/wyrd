@@ -33,7 +33,6 @@ FAMILY_SKALD=(
 )
 
 FAMILY_VALA=(
-  vala-bifrost
   vala-bifrost-redux
   vala-core
   vala-drift

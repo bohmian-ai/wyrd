@@ -197,7 +197,7 @@ async fn reserve_role_pair() -> RolePair {
         .reserve_oracle(
             "127.0.0.1:50052",
             OracleCapabilitiesV1 {
-                peer_protocol_version: 1,
+                peer_protocol_version: 2,
                 storage_protocol_version: 1,
                 cpu_cores: 1.0,
                 memory_budget_bytes: 256 * 1024 * 1024,
@@ -482,7 +482,7 @@ impl OracleFixture {
             .register_oracle(
                 "127.0.0.1:0",
                 OracleCapabilitiesV1 {
-                    peer_protocol_version: 1,
+                    peer_protocol_version: 2,
                     storage_protocol_version: 1,
                     cpu_cores: 4.0,
                     memory_budget_bytes: 512 * 1024 * 1024,

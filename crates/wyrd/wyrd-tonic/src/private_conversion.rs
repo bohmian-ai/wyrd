@@ -4,6 +4,7 @@ use std::str::FromStr;
 
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api as domain;
+use wyrd_spec::vala::assignment_authority;
 use wyrd_spec::DataTenantId;
 
 use crate::wyrd::v1 as proto;
@@ -734,20 +735,158 @@ impl From<domain::SignedPeerTicket> for proto::SignedPeerTicket {
     }
 }
 
+impl TryFrom<proto::ScanLiteral> for assignment_authority::ScanLiteral {
+    type Error = PrivateConversionError;
+
+    /// Decodes one closed scalar literal from its protobuf oneof.
+    ///
+    /// # Errors
+    /// Returns [`PrivateConversionError::Missing`] when the oneof carries no
+    /// variant.
+    fn try_from(value: proto::ScanLiteral) -> Result<Self, Self::Error> {
+        use crate::wyrd::v1::scan_literal::Value;
+        match value
+            .value
+            .ok_or(PrivateConversionError::Missing("scan_literal.value"))?
+        {
+            Value::BoolValue(inner) => Ok(Self::Bool(inner)),
+            Value::I64Value(inner) => Ok(Self::I64(inner)),
+            Value::U64Value(inner) => Ok(Self::U64(inner)),
+            Value::F64BitsValue(inner) => Ok(Self::F64Bits(inner)),
+            Value::Utf8Value(inner) => Ok(Self::Utf8(inner)),
+            Value::TimestampMicrosValue(inner) => Ok(Self::TimestampMicros(inner)),
+        }
+    }
+}
+
+impl From<assignment_authority::ScanLiteral> for proto::ScanLiteral {
+    /// Encodes one closed scalar literal into its protobuf oneof.
+    fn from(value: assignment_authority::ScanLiteral) -> Self {
+        use crate::wyrd::v1::scan_literal::Value;
+        let value = match value {
+            assignment_authority::ScanLiteral::Bool(inner) => Value::BoolValue(inner),
+            assignment_authority::ScanLiteral::I64(inner) => Value::I64Value(inner),
+            assignment_authority::ScanLiteral::U64(inner) => Value::U64Value(inner),
+            assignment_authority::ScanLiteral::F64Bits(inner) => Value::F64BitsValue(inner),
+            assignment_authority::ScanLiteral::Utf8(inner) => Value::Utf8Value(inner),
+            assignment_authority::ScanLiteral::TimestampMicros(inner) => {
+                Value::TimestampMicrosValue(inner)
+            }
+        };
+        Self { value: Some(value) }
+    }
+}
+
+impl TryFrom<proto::ScanPredicate> for assignment_authority::ScanPredicate {
+    type Error = PrivateConversionError;
+
+    /// Decodes one closed leaf predicate, validating the op/literal-presence
+    /// shape the wire enum requires (comparisons carry a literal, null
+    /// checks do not).
+    ///
+    /// # Errors
+    /// Returns [`PrivateConversionError`] when the operator is unspecified or
+    /// unknown, the column is empty, or the literal is present/absent in
+    /// violation of the operator's closed shape.
+    fn try_from(value: proto::ScanPredicate) -> Result<Self, Self::Error> {
+        nonempty(&value.column, "scan_predicate.column")?;
+        let op = proto::ScanPredicateOp::try_from(value.op)
+            .map_err(|_| PrivateConversionError::RequiredEnum("scan_predicate.op"))?;
+        let literal = value.literal;
+        match op {
+            proto::ScanPredicateOp::Unspecified => {
+                Err(PrivateConversionError::RequiredEnum("scan_predicate.op"))
+            }
+            proto::ScanPredicateOp::IsNull => {
+                if literal.is_some() {
+                    return Err(PrivateConversionError::Invalid {
+                        field: "scan_predicate.literal",
+                    });
+                }
+                Ok(Self::IsNull(value.column))
+            }
+            proto::ScanPredicateOp::IsNotNull => {
+                if literal.is_some() {
+                    return Err(PrivateConversionError::Invalid {
+                        field: "scan_predicate.literal",
+                    });
+                }
+                Ok(Self::IsNotNull(value.column))
+            }
+            comparison => {
+                let literal: assignment_authority::ScanLiteral = literal
+                    .ok_or(PrivateConversionError::Missing("scan_predicate.literal"))?
+                    .try_into()?;
+                Ok(match comparison {
+                    proto::ScanPredicateOp::Eq => Self::Eq(value.column, literal),
+                    proto::ScanPredicateOp::NotEq => Self::NotEq(value.column, literal),
+                    proto::ScanPredicateOp::Lt => Self::Lt(value.column, literal),
+                    proto::ScanPredicateOp::LtEq => Self::LtEq(value.column, literal),
+                    proto::ScanPredicateOp::Gt => Self::Gt(value.column, literal),
+                    proto::ScanPredicateOp::GtEq => Self::GtEq(value.column, literal),
+                    proto::ScanPredicateOp::Unspecified
+                    | proto::ScanPredicateOp::IsNull
+                    | proto::ScanPredicateOp::IsNotNull => unreachable!(
+                        "comparison arm excludes IsNull/IsNotNull/Unspecified by construction"
+                    ),
+                })
+            }
+        }
+    }
+}
+
+impl From<assignment_authority::ScanPredicate> for proto::ScanPredicate {
+    /// Encodes one closed leaf predicate into its protobuf op/column/literal
+    /// shape.
+    fn from(value: assignment_authority::ScanPredicate) -> Self {
+        let op = match &value {
+            assignment_authority::ScanPredicate::Eq(..) => proto::ScanPredicateOp::Eq,
+            assignment_authority::ScanPredicate::NotEq(..) => proto::ScanPredicateOp::NotEq,
+            assignment_authority::ScanPredicate::Lt(..) => proto::ScanPredicateOp::Lt,
+            assignment_authority::ScanPredicate::LtEq(..) => proto::ScanPredicateOp::LtEq,
+            assignment_authority::ScanPredicate::Gt(..) => proto::ScanPredicateOp::Gt,
+            assignment_authority::ScanPredicate::GtEq(..) => proto::ScanPredicateOp::GtEq,
+            assignment_authority::ScanPredicate::IsNull(_) => proto::ScanPredicateOp::IsNull,
+            assignment_authority::ScanPredicate::IsNotNull(_) => proto::ScanPredicateOp::IsNotNull,
+        };
+        let column = value.column().to_string();
+        let literal = value.literal().cloned().map(Into::into);
+        Self {
+            op: op as i32,
+            column,
+            literal,
+        }
+    }
+}
+
 impl TryFrom<proto::FollowerScanAssignment> for domain::FollowerScanAssignment {
     type Error = PrivateConversionError;
 
     /// Decodes one role-local scan assignment and preserves wrapper presence.
     ///
+    /// This is a hard v2-only decode: `required_columns` is required and
+    /// non-empty on every wire assignment, always including the hidden
+    /// tenant column. There is no v1 fallback and no default-empty
+    /// projection — a peer advertising v1 semantics by omitting this field
+    /// is rejected outright rather than silently admitted with an
+    /// unprojected (tenant-dropping) closure.
+    ///
     /// # Errors
     /// Returns [`PrivateConversionError`] when identity, binding, persisted
-    /// assignment, or schema fingerprint is absent.
+    /// assignment, schema fingerprint, or `required_columns` is absent, or a
+    /// closed predicate is malformed.
     fn try_from(value: proto::FollowerScanAssignment) -> Result<Self, Self::Error> {
         nonempty(&value.scan_id, "scan_id")?;
         nonempty(&value.schema_fingerprint, "schema_fingerprint")?;
+        nonempty_vec(&value.required_columns, "required_columns")?;
         let persisted = value
             .persisted
             .ok_or(PrivateConversionError::Missing("persisted"))?;
+        let predicates = value
+            .predicates
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             scan_id: value.scan_id,
             binding: value
@@ -762,6 +901,8 @@ impl TryFrom<proto::FollowerScanAssignment> for domain::FollowerScanAssignment {
                 .map(TryInto::try_into)
                 .transpose()?,
             schema_fingerprint: value.schema_fingerprint,
+            required_columns: value.required_columns,
+            predicates,
         })
     }
 }
@@ -777,6 +918,8 @@ impl From<domain::FollowerScanAssignment> for proto::FollowerScanAssignment {
             }),
             scribe_provider_cut: value.scribe_provider_cut.map(Into::into),
             schema_fingerprint: value.schema_fingerprint,
+            required_columns: value.required_columns,
+            predicates: value.predicates.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -954,6 +1097,8 @@ impl From<proto::WorkerScanStats> for domain::WorkerScanStats {
             bytes_scanned: value.bytes_scanned,
             files_scanned: value.files_scanned,
             partitions_scanned: value.partitions_scanned,
+            row_groups_scanned: value.row_groups_scanned,
+            row_groups_pruned: value.row_groups_pruned,
         }
     }
 }
@@ -965,6 +1110,8 @@ impl From<domain::WorkerScanStats> for proto::WorkerScanStats {
             bytes_scanned: value.bytes_scanned,
             files_scanned: value.files_scanned,
             partitions_scanned: value.partitions_scanned,
+            row_groups_scanned: value.row_groups_scanned,
+            row_groups_pruned: value.row_groups_pruned,
         }
     }
 }
@@ -1080,6 +1227,26 @@ fn unix_millis(value: chrono::DateTime<chrono::Utc>) -> u64 {
 fn nonempty(value: &str, field: &'static str) -> Result<(), PrivateConversionError> {
     if value.trim().is_empty() {
         Err(PrivateConversionError::Invalid { field })
+    } else {
+        Ok(())
+    }
+}
+
+/// Validates one required, non-empty repeated field.
+///
+/// `required_columns` is a hard v2 requirement on every
+/// [`proto::FollowerScanAssignment`]: it always carries the hidden tenant
+/// column alongside the requested projection, so an empty list can only mean
+/// a v1 peer or a malformed wire value, never a legitimate "no projection"
+/// assignment. Rejecting it here — before any provider or object I/O sees
+/// the assignment — is what keeps an omitted or defaulted field from
+/// silently becoming a tenant-isolation hole instead of a decode failure.
+///
+/// # Errors
+/// Returns [`PrivateConversionError::Missing`] when `values` is empty.
+fn nonempty_vec<T>(values: &[T], field: &'static str) -> Result<(), PrivateConversionError> {
+    if values.is_empty() {
+        Err(PrivateConversionError::Missing(field))
     } else {
         Ok(())
     }
@@ -1497,11 +1664,159 @@ mod tests {
                 bytes_scanned: Some(4_096),
                 files_scanned: 3,
                 partitions_scanned: 2,
+                row_groups_scanned: 5,
+                row_groups_pruned: 7,
             },
         });
         let actual =
             domain::WorkerAttemptFrame::try_from(proto::WorkerAttemptFrame::from(expected.clone()))
                 .expect("valid footer round-trips");
         assert_eq!(actual, expected);
+    }
+
+    /// Every closed scalar/op round-trips through the v2 wire, and malformed
+    /// closed-shape input (unspecified op, literal on a null-check, missing
+    /// literal on a comparison) is rejected before it reaches the domain type.
+    #[test]
+    fn follower_assignment_v2_contract() {
+        let predicates = vec![
+            assignment_authority::ScanPredicate::Eq(
+                "service_name".into(),
+                assignment_authority::ScanLiteral::Utf8("api".into()),
+            ),
+            assignment_authority::ScanPredicate::NotEq(
+                "status".into(),
+                assignment_authority::ScanLiteral::I64(-1),
+            ),
+            assignment_authority::ScanPredicate::Lt(
+                "duration_ms".into(),
+                assignment_authority::ScanLiteral::U64(500),
+            ),
+            assignment_authority::ScanPredicate::LtEq(
+                "score".into(),
+                assignment_authority::ScanLiteral::F64Bits(1.5_f64.to_bits()),
+            ),
+            assignment_authority::ScanPredicate::Gt(
+                "wyrd_event_time".into(),
+                assignment_authority::ScanLiteral::TimestampMicros(1_000_000),
+            ),
+            assignment_authority::ScanPredicate::GtEq(
+                "active".into(),
+                assignment_authority::ScanLiteral::Bool(true),
+            ),
+            assignment_authority::ScanPredicate::IsNull("optional_field".into()),
+            assignment_authority::ScanPredicate::IsNotNull("required_field".into()),
+        ];
+
+        let expected = domain::FollowerScanAssignment {
+            scan_id: "scan-1".into(),
+            binding: domain::TenantTableBinding {
+                tenant_id: wyrd_spec::DataTenantId::new_v7(),
+                namespace: "logs".into(),
+                table: "records".into(),
+            },
+            persisted: domain::PersistedFileAssignment {
+                files: vec!["s3://bucket/logs/a.parquet".into()],
+            },
+            scribe_provider_cut: None,
+            schema_fingerprint: "0".repeat(64),
+            required_columns: vec![
+                "service_name".into(),
+                "wyrd_event_time".into(),
+                "data_tenant_id".into(),
+            ],
+            predicates,
+        };
+
+        let actual = domain::FollowerScanAssignment::try_from(proto::FollowerScanAssignment::from(
+            expected.clone(),
+        ))
+        .expect("valid v2 assignment round-trips");
+        assert_eq!(actual, expected);
+
+        // Unspecified op is rejected before the literal is inspected.
+        let unspecified_op = proto::FollowerScanAssignment::from(expected.clone());
+        let mut malformed = unspecified_op.clone();
+        malformed.predicates = vec![proto::ScanPredicate {
+            op: proto::ScanPredicateOp::Unspecified as i32,
+            column: "x".into(),
+            literal: None,
+        }];
+        assert!(matches!(
+            domain::FollowerScanAssignment::try_from(malformed),
+            Err(PrivateConversionError::RequiredEnum("scan_predicate.op"))
+        ));
+
+        // A literal on a null-check violates the closed shape.
+        let mut literal_on_null_check = unspecified_op.clone();
+        literal_on_null_check.predicates = vec![proto::ScanPredicate {
+            op: proto::ScanPredicateOp::IsNull as i32,
+            column: "x".into(),
+            literal: Some(proto::ScanLiteral {
+                value: Some(crate::wyrd::v1::scan_literal::Value::BoolValue(true)),
+            }),
+        }];
+        assert!(matches!(
+            domain::FollowerScanAssignment::try_from(literal_on_null_check),
+            Err(PrivateConversionError::Invalid {
+                field: "scan_predicate.literal"
+            })
+        ));
+
+        // A missing literal on a comparison is rejected.
+        let mut missing_literal = unspecified_op.clone();
+        missing_literal.predicates = vec![proto::ScanPredicate {
+            op: proto::ScanPredicateOp::Eq as i32,
+            column: "x".into(),
+            literal: None,
+        }];
+        assert!(matches!(
+            domain::FollowerScanAssignment::try_from(missing_literal),
+            Err(PrivateConversionError::Missing("scan_predicate.literal"))
+        ));
+
+        // An empty predicate column is rejected regardless of operator.
+        let mut empty_column = unspecified_op;
+        empty_column.predicates = vec![proto::ScanPredicate {
+            op: proto::ScanPredicateOp::IsNull as i32,
+            column: String::new(),
+            literal: None,
+        }];
+        assert!(matches!(
+            domain::FollowerScanAssignment::try_from(empty_column),
+            Err(PrivateConversionError::Invalid {
+                field: "scan_predicate.column"
+            })
+        ));
+    }
+
+    /// A v1-shaped peer that omits `required_columns` is rejected outright:
+    /// there is no dual decoder and no default-empty projection fallback.
+    /// An empty `required_columns` would silently drop the hidden tenant
+    /// column, so decoding must fail closed rather than admit the
+    /// assignment with an unprojected read.
+    #[test]
+    fn follower_assignment_v1_shaped_peer_is_rejected() {
+        let expected = domain::FollowerScanAssignment {
+            scan_id: "scan-1".into(),
+            binding: domain::TenantTableBinding {
+                tenant_id: wyrd_spec::DataTenantId::new_v7(),
+                namespace: "logs".into(),
+                table: "records".into(),
+            },
+            persisted: domain::PersistedFileAssignment {
+                files: vec!["s3://bucket/logs/a.parquet".into()],
+            },
+            scribe_provider_cut: None,
+            schema_fingerprint: "0".repeat(64),
+            required_columns: vec!["data_tenant_id".into()],
+            predicates: Vec::new(),
+        };
+        let mut v1_shaped = proto::FollowerScanAssignment::from(expected);
+        v1_shaped.required_columns = Vec::new();
+        assert!(matches!(
+            domain::FollowerScanAssignment::try_from(v1_shaped),
+            Err(PrivateConversionError::Missing("required_columns"))
+        ));
     }
 }

@@ -4351,7 +4351,27 @@ impl OracleSessionShape {
             .with_target_partitions(self.target_partitions)
             .with_batch_size(self.batch_size);
         config.options_mut().optimizer.prefer_hash_join = self.prefer_hash_join;
+        Self::apply(&mut config);
         config
+    }
+
+    /// Applies the fixed Parquet reader pushdown and indexing options every
+    /// Oracle session (leader or follower) must set identically.
+    ///
+    /// A closed leaf predicate recognized by `OracleTableProvider`'s classifier
+    /// only prunes files, row groups, and pages if the `DataFusion` session that
+    /// actually opens the Parquet files enables pushdown, reorders filters ahead
+    /// of decoding, and consults bloom filters/page indexes. Both the leader's
+    /// query-execution session ([`Self::session_config`]) and the follower's
+    /// per-request dispatch session (`FollowerSessionFactory::create`) route
+    /// through this one function rather than setting the four options inline,
+    /// so the two paths cannot silently drift apart.
+    pub fn apply(config: &mut datafusion::execution::context::SessionConfig) {
+        let parquet_options = &mut config.options_mut().execution.parquet;
+        parquet_options.pushdown_filters = true;
+        parquet_options.reorder_filters = true;
+        parquet_options.bloom_filter_on_read = true;
+        parquet_options.enable_page_index = true;
     }
 }
 
@@ -4720,6 +4740,21 @@ mod tests {
     use datafusion::execution::memory_pool::MemoryConsumer;
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
+
+    /// Every Oracle session owner must set all four Parquet reader pushdown
+    /// and indexing options to exactly `true`; a closed leaf predicate only
+    /// prunes files, row groups, and pages when the reader is configured to
+    /// use it.
+    #[test]
+    fn oracle_reader_session_options_contract() {
+        let mut config = datafusion::execution::context::SessionConfig::new();
+        OracleSessionShape::apply(&mut config);
+        let parquet_options = &config.options().execution.parquet;
+        assert!(parquet_options.pushdown_filters);
+        assert!(parquet_options.reorder_filters);
+        assert!(parquet_options.bloom_filter_on_read);
+        assert!(parquet_options.enable_page_index);
+    }
 
     /// Returns a valid envelope for resource-ledger tests that do not execute it.
     fn envelope() -> vala_sql::row_types::forge_tasks::ForgeTaskEnvelope {

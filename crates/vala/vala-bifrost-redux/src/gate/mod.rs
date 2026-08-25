@@ -1681,7 +1681,7 @@ mod tests {
     /// # Panics
     ///
     /// Panics when a 16-byte non-UUIDv7 identity is admitted, a short identity
-    /// is admitted, or a valid UUIDv7 is refused.
+    /// is admitted, or a valid `UUIDv7` is refused.
     #[test]
     fn batch_identity_acceptance_is_unchanged() {
         let limits = IngestLimits::default();
@@ -1689,7 +1689,6 @@ mod tests {
             table: "vala.traces.spans".to_owned(),
             wyrd_batch_id: batch_id.into(),
             arrow_ipc: Vec::new().into(),
-            ..Default::default()
         };
 
         let uuid_v4 = uuid::Uuid::new_v4();

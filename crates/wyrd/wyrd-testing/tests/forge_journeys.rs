@@ -2308,7 +2308,7 @@ async fn unhealthy_scratch_takeover_journey() {
     let checkpoint = telemetry
         .checkpoint()
         .expect("takeover causal telemetry checkpoint");
-    let fixture = native_forge_group(&server, "journey_unhealthy_scratch_takeover").await;
+    let fixture = seed_forge_group(&server, "journey_unhealthy_scratch_takeover").await;
     sqlx::query("DELETE FROM vala.forge_tasks WHERE data_tenant_id=$1")
         .bind(fixture.tenant.as_uuid())
         .execute(fixture.operator_pool.pool())

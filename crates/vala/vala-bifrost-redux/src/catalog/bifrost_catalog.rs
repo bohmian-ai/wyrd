@@ -653,15 +653,12 @@ impl BifrostCatalog {
         let fqn = binding.table_ref.fqn();
         let fingerprint =
             SchemaFingerprint::from_arrow_schema(&Schema::new(request.user_fields.clone()));
-        let arrow_schema = builtin.map_or_else(
-            || Schema::new(with_managed_columns(request.user_fields.clone())),
-            |definition| (*(definition.schema)()).clone(),
-        );
-        let layout = match (builtin, request.physical_layout.as_ref()) {
-            (Some(_), Some(declared)) => PhysicalLayout::builtin(&fqn, &arrow_schema, declared),
-            (_, declared) => PhysicalLayout::canonicalize(&fqn, &arrow_schema, declared),
-        }
-        .map_err(BifrostCatalogError::Layout)?;
+        let (arrow_schema, layout) = resolve_registration_layout(
+            &fqn,
+            &request.user_fields,
+            request.physical_layout.as_ref(),
+            builtin,
+        )?;
         let layout_wire = layout.to_wire();
         let layout_json = serde_json::to_value(&layout_wire).map_err(|error| {
             BifrostCatalogError::MetadataMismatch(format!(
@@ -1035,6 +1032,43 @@ pub(crate) fn schema_shape_matches(expected: &Schema, actual: &Schema) -> bool {
                     && expected.is_nullable() == actual.is_nullable()
                     && data_type_shape_matches(expected.data_type(), actual.data_type())
             })
+}
+
+/// Resolves the physical schema and canonical layout one registration writes.
+///
+/// The physical schema is the built-in's own complete schema when `builtin` is
+/// present, and `user_fields` plus the managed column set otherwise.
+///
+/// The author of the declaration decides the resolver. A built-in resolves
+/// through [`PhysicalLayout::builtin`] because it legitimately sorts and Blooms
+/// on its own managed columns — every built-in defaults to `wyrd_event_time
+/// DESC` — which the untrusted [`PhysicalLayout::canonicalize`] path rejects as
+/// a reserved managed column. Caller registrations keep that rejection. Both
+/// resolvers apply identical schema, duplicate, and canonical-form rules, so a
+/// built-in and a dynamic table declaring the same layout canonicalize
+/// identically.
+///
+/// # Errors
+///
+/// Returns [`BifrostCatalogError::Layout`] when the declaration names an
+/// unsupported partition column, a column absent from the resolved schema, a
+/// repeated column, or a reserved managed column in a caller declaration.
+fn resolve_registration_layout(
+    fqn: &str,
+    user_fields: &[Field],
+    declared: Option<&PhysicalLayoutWire>,
+    builtin: Option<&'static BuiltinTableDefinition>,
+) -> Result<(Schema, PhysicalLayout), BifrostCatalogError> {
+    let arrow_schema = builtin.map_or_else(
+        || Schema::new(with_managed_columns(user_fields.to_vec())),
+        |definition| (*(definition.schema)()).clone(),
+    );
+    let layout = match (builtin, declared) {
+        (Some(_), Some(declared)) => PhysicalLayout::builtin(fqn, &arrow_schema, declared),
+        (_, declared) => PhysicalLayout::canonicalize(fqn, &arrow_schema, declared),
+    }
+    .map_err(BifrostCatalogError::Layout)?;
+    Ok((arrow_schema, layout))
 }
 
 fn data_type_shape_matches(

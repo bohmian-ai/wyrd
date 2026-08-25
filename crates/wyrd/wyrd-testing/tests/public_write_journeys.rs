@@ -2522,7 +2522,9 @@ fn encode(rows: RecordBatch, schema: Arc<Schema>) -> Vec<u8> {
 #[tokio::test]
 #[ignore = "requires the real Postgres-backed Bifrost journey lane"]
 async fn coordination_runtime_owner_drops_without_panic() {
-    let mut server = wyrd_testing::WyrdTestServer::start_bound()
+    let mut server = wyrd_testing::WyrdTestServer::builder()
+        .with_forge_process_role_for_test(BifrostTarget::Scribe)
+        .start_bound()
         .await
         .expect("bound Bifrost server with a live Scribe role");
     let tenant = server.data_tenant_id();
@@ -2583,6 +2585,7 @@ async fn coordination_runtime_owner_drops_without_panic() {
 #[ignore = "requires the real Postgres-backed Bifrost journey lane"]
 async fn serve_task_panic_fails_shutdown() {
     let server = wyrd_testing::WyrdTestServer::builder()
+        .with_forge_process_role_for_test(BifrostTarget::Scribe)
         .with_serve_task_panic_for_test()
         .start_bound()
         .await

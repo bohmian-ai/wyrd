@@ -2164,26 +2164,6 @@ impl Oracle {
         .await
     }
 
-    /// Starts a locally selected query while retaining an optional Gate lifecycle owner.
-    pub(crate) async fn query_sql_with_gate_lifecycle(
-        &self,
-        context: AuthorizedQueryContext,
-        request: BifrostQueryRequest,
-        gate_lifecycle: Option<Arc<crate::oracle::query_stream::QueryStreamLifecycle>>,
-    ) -> Result<OracleQueryStream, BifrostError> {
-        let (cut, planned) = self.prepare_query_attempt(&context, &request).await?;
-        let query_class = planned.query_class;
-        self.query_sql_with_cut_and_gate_lifecycle(
-            context,
-            request,
-            cut,
-            query_class,
-            gate_lifecycle,
-            Some(planned),
-        )
-        .await
-    }
-
     /// Starts a SQL query while retaining an optional Gate lifecycle owner.
     ///
     /// The lifecycle owner is attached before the first frame is emitted, so

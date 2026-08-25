@@ -4770,7 +4770,6 @@ mod tests {
             footer_encoded_bytes: 8 * MIB as u64,
             footer_decode_workspace_bytes: 32 * MIB as u64,
             sort_spill_bytes: MIB as u64,
-            output_scratch_bytes: MIB as u64,
         }
     }
 

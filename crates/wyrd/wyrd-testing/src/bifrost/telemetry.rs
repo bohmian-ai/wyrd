@@ -6827,7 +6827,6 @@ mod tests {
                         footer_encoded_bytes: 1,
                         footer_decode_workspace_bytes: 1,
                         sort_spill_bytes: 1,
-                        output_scratch_bytes: 1,
                     },
                     memory_bytes: 5,
                     scratch_bytes: 1,

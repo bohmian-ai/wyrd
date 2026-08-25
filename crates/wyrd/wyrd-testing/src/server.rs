@@ -1432,7 +1432,6 @@ impl WyrdTestServer {
             footer_encoded_bytes: 0,
             footer_decode_workspace_bytes: 0,
             sort_spill_bytes: 0,
-            output_scratch_bytes: 0,
         };
         resources
             .try_acquire_rewrite(ForgeRewriteRequest {

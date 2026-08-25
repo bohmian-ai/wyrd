@@ -892,7 +892,6 @@ mod pg_tests {
                         footer_encoded_bytes: 8 * 1024 * 1024,
                         footer_decode_workspace_bytes: 32 * 1024 * 1024,
                         sort_spill_bytes: 512 * 1024 * 1024,
-                        output_scratch_bytes: 512 * 1024 * 1024,
                     }),
                     files: 1,
                     bytes: 1,
@@ -2609,8 +2608,8 @@ mod pg_tests {
         vala_bifrost_redux::forge::reset_scratch_peak_for_test();
         let outcome = fixture.schedule_and_execute().await;
         assert_eq!(outcome.tasks_enqueued, 1, "outcome: {outcome:?}");
-        let envelope: (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
-            "SELECT decoded_batch_bytes,decoded_input_bytes,sort_working_bytes,sort_merge_reservation_bytes,encoder_buffer_bytes,upload_chunk_bytes,sort_spill_bytes,output_scratch_bytes,estimated_memory_bytes,footer_encoded_bytes FROM vala.forge_tasks WHERE data_tenant_id=$1 ORDER BY created_at DESC LIMIT 1",
+        let envelope: (i64, i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT decoded_batch_bytes,decoded_input_bytes,sort_working_bytes,sort_merge_reservation_bytes,encoder_buffer_bytes,upload_chunk_bytes,sort_spill_bytes,estimated_memory_bytes,footer_encoded_bytes FROM vala.forge_tasks WHERE data_tenant_id=$1 ORDER BY created_at DESC LIMIT 1",
         )
         .bind(fixture.tenant.as_uuid())
         .fetch_one(fixture.operator_pool.pool())
@@ -2633,13 +2632,13 @@ mod pg_tests {
         );
         let peak_memory = vala_bifrost_redux::resources::memory_peak_for_test();
         assert!(
-            peak_memory <= usize::try_from(envelope.8).expect("resident total"),
+            peak_memory <= usize::try_from(envelope.7).expect("resident total"),
             "leased-pool peak must remain independent of total output: {peak_memory}"
         );
         assert_eq!(envelope.2, 2 * envelope.0 + envelope.3);
         assert_eq!(
-            envelope.8,
-            envelope.1 + envelope.2 + envelope.4 + envelope.5 + envelope.9
+            envelope.7,
+            envelope.1 + envelope.2 + envelope.4 + envelope.5 + envelope.8
         );
         assert!(
             vala_bifrost_redux::resources::memory_consumer_peak_for_test(
@@ -2658,7 +2657,7 @@ mod pg_tests {
         );
         assert!(
             vala_bifrost_redux::forge::scratch_peak_for_test()
-                <= u64::try_from(envelope.6 + envelope.7).expect("scratch total")
+                <= u64::try_from(envelope.6).expect("sort spill term")
         );
         let released = fixture
             .forge
@@ -5327,7 +5326,7 @@ mod pg_tests {
         let decoded = 16_i64 * 1024 * 1024;
         let merge = 1024_i64 * 1024;
         let updated = sqlx::query(
-            "UPDATE vala.forge_tasks SET decoded_batch_bytes=$2,decoded_input_bytes=$2,estimated_parallelism=1,sort_merge_reservation_bytes=$3,sort_working_bytes=2*$2+$3,sort_spill_bytes=1,estimated_memory_bytes=3*$2+$3+encoder_buffer_bytes+upload_chunk_bytes+footer_encoded_bytes,estimated_spill_bytes=1+output_scratch_bytes WHERE data_tenant_id=$1 AND state='ready'",
+            "UPDATE vala.forge_tasks SET decoded_batch_bytes=$2,decoded_input_bytes=$2,estimated_parallelism=1,sort_merge_reservation_bytes=$3,sort_working_bytes=2*$2+$3,sort_spill_bytes=1,estimated_memory_bytes=3*$2+$3+encoder_buffer_bytes+upload_chunk_bytes+footer_encoded_bytes,estimated_spill_bytes=1 WHERE data_tenant_id=$1 AND state='ready'",
         )
         .bind(fixture.tenant.as_uuid())
         .bind(decoded)
@@ -5441,7 +5440,7 @@ mod pg_tests {
             .expect("planning pass");
         assert_eq!(planned.tasks_enqueued, 1);
         sqlx::query(
-            "UPDATE vala.forge_tasks SET envelope_version=0, decoded_batch_bytes=NULL, decoded_input_bytes=NULL, sort_working_bytes=NULL, sort_merge_reservation_bytes=NULL, encoder_buffer_bytes=NULL, upload_chunk_bytes=NULL, footer_encoded_bytes=NULL, footer_decode_workspace_bytes=NULL, sort_spill_bytes=NULL, output_scratch_bytes=NULL, estimated_files=1, estimated_bytes=9223372036854775807, estimated_parallelism=1, estimated_memory_bytes=9223372036854775807, estimated_spill_bytes=9223372036854775807, large_task_ceiling_bytes=9223372036854775807 WHERE data_tenant_id=$1 AND state='ready'",
+            "UPDATE vala.forge_tasks SET envelope_version=0, decoded_batch_bytes=NULL, decoded_input_bytes=NULL, sort_working_bytes=NULL, sort_merge_reservation_bytes=NULL, encoder_buffer_bytes=NULL, upload_chunk_bytes=NULL, footer_encoded_bytes=NULL, footer_decode_workspace_bytes=NULL, sort_spill_bytes=NULL, estimated_files=1, estimated_bytes=9223372036854775807, estimated_parallelism=1, estimated_memory_bytes=9223372036854775807, estimated_spill_bytes=9223372036854775807, large_task_ceiling_bytes=9223372036854775807 WHERE data_tenant_id=$1 AND state='ready'",
         )
         .bind(fixture.tenant.as_uuid())
         .execute(fixture.operator_pool.pool())
@@ -5529,7 +5528,6 @@ mod pg_tests {
                         footer_encoded_bytes: 8 * 1024 * 1024,
                         footer_decode_workspace_bytes: 32 * 1024 * 1024,
                         sort_spill_bytes: 512 * 1024 * 1024,
-                        output_scratch_bytes: 512 * 1024 * 1024,
                     }),
                     files: 2,
                     bytes: 200,

@@ -1017,16 +1017,32 @@ pub async fn compose_bifrost(
             config: OracleConfig::default(),
         },
     ));
-    let gate = crate::state::Gate::new(
-        token_verifier,
-        scribe_config.ingest_limits(),
-        bifrost_resources.transport_admission(),
-    )
-    .with_query_forwarder(query_forwarder);
-    #[cfg(feature = "test-support")]
-    let gate = gate.with_test_resources(bifrost_resources.clone());
+    let interceptor =
+        vala_bifrost_redux::gate::auth::ingest_auth_interceptor(Arc::clone(&token_verifier));
+    let ingest_limits = scribe_config.ingest_limits();
+    let gate = match scribe.as_ref() {
+        Some(runtime) => vala_bifrost_redux::gate::Gate::with_scribe(
+            Arc::clone(runtime.ingest()),
+            interceptor,
+            ingest_limits,
+        ),
+        None => vala_bifrost_redux::gate::Gate::without_scribe(interceptor, ingest_limits),
+    }
+    .with_query_dispatch(
+        Arc::clone(&query_forwarder) as Arc<dyn vala_bifrost_redux::contracts::OracleQueryDispatch>
+    );
     Ok(crate::state::ComposedBifrost {
-        bifrost: crate::state::Bifrost::assembled(gate, scribe, forge, oracle),
+        bifrost: crate::state::Bifrost::assembled(crate::state::BifrostComposition {
+            gate,
+            scribe,
+            forge,
+            oracle,
+            transport: bifrost_resources.transport_admission(),
+            token_verifier,
+            query_forwarder: Some(query_forwarder),
+            #[cfg(feature = "test-support")]
+            resources: Some(bifrost_resources.clone()),
+        }),
         coordination_runtime,
     })
 }

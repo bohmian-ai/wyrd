@@ -179,7 +179,7 @@ where
         let maximum_message_size = self.decoding_limit.for_service(ScribeOtlpService::Traces);
         Box::pin(async move {
             let metadata = MetadataMap::from_headers(request.headers().clone());
-            let auth = match gate.gate().authenticate_ingest(&metadata).await {
+            let auth = match gate.gate().authenticate_otlp_metadata(&metadata).await {
                 Ok(auth) => auth,
                 Err(error) => return Ok(Status::from(error).into_http()),
             };
@@ -217,6 +217,7 @@ impl UnaryService<DecodedOtlp<ExportTraceServiceRequest>> for TraceExportUnary {
         Box::pin(async move {
             let auth = auth.ok_or_else(|| Status::internal("OTLP authentication was consumed"))?;
             let outcome = gate
+                .gate()
                 .ingest_decoded_resource_spans(&auth, request.into_inner())
                 .await
                 .map_err(Status::from)?;
@@ -319,6 +320,7 @@ impl Decoder for TraceRequestDecoder {
         record_codec_activity("reserve");
         let owner = self
             .gate
+            .gate()
             .reserve_otlp_decode(plan.decode_bytes)
             .map_err(Status::from)?;
         record_codec_activity("decode");
@@ -381,7 +383,7 @@ where
         let maximum_message_size = self.decoding_limit.for_service(ScribeOtlpService::Metrics);
         Box::pin(async move {
             let metadata = MetadataMap::from_headers(request.headers().clone());
-            let auth = match gate.gate().authenticate_ingest(&metadata).await {
+            let auth = match gate.gate().authenticate_otlp_metadata(&metadata).await {
                 Ok(auth) => auth,
                 Err(error) => return Ok(Status::from(error).into_http()),
             };
@@ -422,6 +424,7 @@ impl UnaryService<DecodedOtlp<ExportMetricsServiceRequest>> for MetricsExportUna
         Box::pin(async move {
             let auth = auth.ok_or_else(|| Status::internal("OTLP authentication was consumed"))?;
             let outcome = gate
+                .gate()
                 .ingest_decoded_resource_metrics(&auth, request.into_inner())
                 .await
                 .map_err(Status::from)?;
@@ -488,6 +491,7 @@ impl Decoder for MetricsRequestDecoder {
         record_codec_activity("reserve");
         let owner = self
             .gate
+            .gate()
             .reserve_otlp_decode(plan.decode_bytes)
             .map_err(Status::from)?;
         record_codec_activity("decode");
@@ -550,7 +554,7 @@ where
         let maximum_message_size = self.decoding_limit.for_service(ScribeOtlpService::Logs);
         Box::pin(async move {
             let metadata = MetadataMap::from_headers(request.headers().clone());
-            let auth = match gate.gate().authenticate_ingest(&metadata).await {
+            let auth = match gate.gate().authenticate_otlp_metadata(&metadata).await {
                 Ok(auth) => auth,
                 Err(error) => return Ok(Status::from(error).into_http()),
             };
@@ -591,6 +595,7 @@ impl UnaryService<DecodedOtlp<ExportLogsServiceRequest>> for LogsExportUnary {
         Box::pin(async move {
             let auth = auth.ok_or_else(|| Status::internal("OTLP authentication was consumed"))?;
             let outcome = gate
+                .gate()
                 .ingest_decoded_resource_logs(&auth, request.into_inner())
                 .await
                 .map_err(Status::from)?;
@@ -657,6 +662,7 @@ impl Decoder for LogsRequestDecoder {
         record_codec_activity("reserve");
         let owner = self
             .gate
+            .gate()
             .reserve_otlp_decode(plan.decode_bytes)
             .map_err(Status::from)?;
         record_codec_activity("decode");

@@ -1,6 +1,6 @@
 //! `wyrd.v1.ValaQueryService` gRPC implementation.
 //!
-//! Auth is completed in each handler (same pattern as `BifrostIngestGrpc`):
+//! Auth is completed in each handler (same pattern as the Gate ingest service):
 //! `x-wyrd-access-token` bearer is extracted from the tonic `MetadataMap`,
 //! verified via `state.auth.token_verifier`, and wrapped into a `Caller`.
 //! Plan building and execution reuse the same `vala_query::service` and

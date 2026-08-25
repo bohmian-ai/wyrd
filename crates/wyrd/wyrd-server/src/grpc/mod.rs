@@ -2,8 +2,10 @@
 //!
 //! Boot wiring imports via `wyrd_server::grpc::*`. Most symbols here are a
 //! `pub use` that forwards to the owning `wyrd_tonic` crate. The one body this
-//! module owns is [`build_app_grpc`]: the single code path that mounts the C1
-//! ingest service, shared by `main.rs` and the `wyrd-testing` harness.
+//! module owns is [`build_app_grpc`]: the single code path that mounts the
+//! Gate-served ingest service, shared by `main.rs` and the `wyrd-testing`
+//! harness. The ingest service itself is `vala_bifrost_redux::gate::Gate`; this
+//! module binds the socket and wraps it in transport admission, nothing more.
 pub use wyrd_tonic::error;
 pub use wyrd_tonic::health::WyrdHealthSentinel;
 pub use wyrd_tonic::server::*;
@@ -30,13 +32,8 @@ use wyrd_tonic::tonic::codegen::http::{Request, Response};
 use wyrd_tonic::tonic::server::NamedService;
 use wyrd_tonic::tonic::transport::server::Router as TonicRouter;
 use wyrd_tonic::tonic_health::pb::health_server::{Health, HealthServer};
-use wyrd_tonic::wyrd::v1::bifrost_ingest_service_server::{
-    BifrostIngestService, BifrostIngestServiceServer,
-};
-use wyrd_tonic::wyrd::v1::{InsertBatchRequest, InsertBatchResponse};
 
 use crate::AppState;
-use crate::state::Bifrost;
 
 /// Encoded bytes occupied by the gRPC compression flag and big-endian length.
 const GRPC_FRAME_HEADER_BYTES: usize = 5;
@@ -122,96 +119,6 @@ where
     }
 }
 
-/// Native Arrow transport adapter for the one Bifrost server facade.
-#[derive(Clone)]
-struct BifrostIngestGrpc {
-    /// Complete process composition used for Gate admission and Scribe dispatch.
-    bifrost: Arc<Bifrost>,
-}
-
-impl BifrostIngestGrpc {
-    /// Creates the native adapter without constructing another Gate or Scribe owner.
-    fn new(bifrost: Arc<Bifrost>) -> Self {
-        Self { bifrost }
-    }
-
-    /// Wraps the adapter in the generated service using Gate's immutable message limit.
-    fn into_server(self) -> BifrostIngestServiceServer<Self> {
-        let size = self.bifrost.gate().otlp_decoding_message_size();
-        BifrostIngestServiceServer::new(self).max_decoding_message_size(size)
-    }
-}
-
-/// Counts one refused native write against the closed Gate rejection taxonomy.
-///
-/// Gate owns the projection, so this only forwards it: a refusal that
-/// [`vala_bifrost_redux::gate::IngestError::rejection_reason`] declines to
-/// classify is a Wyrd internal failure, and it is deliberately left out of the
-/// rejection family so a server defect cannot inflate the caller-attributed
-/// rejection rate. That request still settles its terminal outcome as
-/// `failed` through the lifecycle owner.
-fn reject_write(
-    lifecycle: &crate::app::metrics::GateRequestLifecycle,
-    error: &vala_bifrost_redux::gate::IngestError,
-) {
-    if let Some(reason) = error.rejection_reason() {
-        lifecycle.reject(reason);
-    }
-}
-
-#[wyrd_tonic::tonic::async_trait]
-impl BifrostIngestService for BifrostIngestGrpc {
-    async fn insert_batch(
-        &self,
-        request: wyrd_tonic::tonic::Request<InsertBatchRequest>,
-    ) -> Result<wyrd_tonic::tonic::Response<InsertBatchResponse>, Status> {
-        let lifecycle = crate::app::metrics::GateRequestLifecycle::begin("write");
-        let result: Result<wyrd_tonic::tonic::Response<InsertBatchResponse>, Status> = async {
-            let auth = self
-                .bifrost
-                .gate()
-                .authenticate_ingest(request.metadata())
-                .await
-                .inspect_err(|error| reject_write(&lifecycle, error))
-                .map_err(Status::from)?;
-            let frame = request.into_inner();
-            let batch_id = frame.wyrd_batch_id.clone();
-            self.bifrost
-                .ingest_native_frame(&auth, frame)
-                .await
-                .inspect_err(|error| reject_write(&lifecycle, error))
-                .map_err(Status::from)?;
-            let mut response = wyrd_tonic::tonic::Response::new(InsertBatchResponse {
-                wyrd_batch_id: batch_id,
-            });
-            if let Ok(value) = auth.request_id.as_str().parse() {
-                response.metadata_mut().insert("x-wyrd-request-id", value);
-            }
-            Ok(response)
-        }
-        .await;
-        let outcome = match &result {
-            Ok(_) => "success",
-            Err(status) if status.code() == wyrd_tonic::tonic::Code::Cancelled => "cancelled",
-            Err(status)
-                if matches!(
-                    status.code(),
-                    wyrd_tonic::tonic::Code::PermissionDenied
-                        | wyrd_tonic::tonic::Code::ResourceExhausted
-                        | wyrd_tonic::tonic::Code::InvalidArgument
-                        | wyrd_tonic::tonic::Code::NotFound
-                        | wyrd_tonic::tonic::Code::Unauthenticated
-                ) =>
-            {
-                "rejected"
-            }
-            Err(_) => "failed",
-        };
-        lifecycle.complete(outcome);
-        result
-    }
-}
-
 /// Build the application gRPC router: health (unauthenticated) plus the C1
 /// ingest service with auth completed in the handler.
 ///
@@ -251,7 +158,7 @@ where
     let transport = state.bifrost.transport_admission();
     let router = router
         .add_service(GrpcTransportAdmissionService::new(
-            BifrostIngestGrpc::new(Arc::clone(&bifrost)).into_server(),
+            state.bifrost.gate().clone().into_server(),
             transport.clone(),
         ))
         .add_service(GrpcTransportAdmissionService::new(

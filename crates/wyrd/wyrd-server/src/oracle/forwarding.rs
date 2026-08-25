@@ -60,6 +60,28 @@ pub struct ReadyOracleForwarder {
     planner: OraclePlanner,
 }
 
+/// Presents the cluster-aware forwarder as the Gate's one SQL dispatch seam.
+///
+/// Gate owns authentication, admission closure, and request accounting; role
+/// selection, ticket minting, fencing, and peer transport stay here, on the
+/// server tier that owns Wyrd auth, tenancy, and audit.
+#[async_trait::async_trait]
+impl vala_bifrost_redux::contracts::OracleQueryDispatch for ReadyOracleForwarder {
+    /// Forwards one authorized SQL request to the selected ready Oracle.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable validation, catalog, role, transport, security,
+    /// admission, timeout, or execution failure produced by [`Self::forward`].
+    async fn dispatch_sql(
+        &self,
+        context: AuthorizedQueryContext,
+        request: BifrostQueryRequest,
+    ) -> Result<OracleQueryStream, BifrostError> {
+        self.forward(context, request).await
+    }
+}
+
 /// Explicit dependencies consumed by the one ready-Oracle forwarding owner.
 pub struct ReadyOracleForwarderInputs {
     /// Current-ready membership authority.

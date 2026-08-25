@@ -210,6 +210,7 @@ async fn export_traces(
             let plan = preflight_trace_protobuf(&body, bifrost.gate().otlp_wire_limits())
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
             let owner = bifrost
+                .gate()
                 .reserve_otlp_decode(plan.decode_bytes)
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
             let request = decode_trace_protobuf(&body)
@@ -229,6 +230,7 @@ async fn export_traces(
                     )
                 })?;
             let mut owner = bifrost
+                .gate()
                 .reserve_otlp_decode(total)
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
             let scratch = owner
@@ -242,6 +244,7 @@ async fn export_traces(
         }
     };
     let outcome = bifrost
+        .gate()
         .ingest_decoded_resource_spans(&auth, DecodedOtlp::new(request, body.len(), owner))
         .await
         .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
@@ -289,6 +292,7 @@ async fn export_metrics(
             let plan = preflight_metrics_protobuf(&body, bifrost.gate().otlp_wire_limits())
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
             let owner = bifrost
+                .gate()
                 .reserve_otlp_decode(plan.decode_bytes)
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
             let request = decode_metrics_protobuf(&body, plan)
@@ -308,6 +312,7 @@ async fn export_metrics(
                     )
                 })?;
             let mut owner = bifrost
+                .gate()
                 .reserve_otlp_decode(total)
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
             let scratch = owner
@@ -322,6 +327,7 @@ async fn export_metrics(
         }
     };
     let outcome = bifrost
+        .gate()
         .ingest_decoded_resource_metrics(&auth, DecodedOtlp::new(request, body.len(), owner))
         .await
         .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
@@ -369,6 +375,7 @@ async fn export_logs(
             let plan = preflight_logs_protobuf(&body, bifrost.gate().otlp_wire_limits())
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
             let owner = bifrost
+                .gate()
                 .reserve_otlp_decode(plan.decode_bytes)
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
             let request = decode_logs_protobuf(&body)
@@ -388,6 +395,7 @@ async fn export_logs(
                     )
                 })?;
             let mut owner = bifrost
+                .gate()
                 .reserve_otlp_decode(total)
                 .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
             let scratch = owner
@@ -401,6 +409,7 @@ async fn export_logs(
         }
     };
     let outcome = bifrost
+        .gate()
         .ingest_decoded_resource_logs(&auth, DecodedOtlp::new(request, body.len(), owner))
         .await
         .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;

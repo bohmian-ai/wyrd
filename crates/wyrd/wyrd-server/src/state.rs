@@ -12,11 +12,7 @@ use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::timeout_at;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::BifrostCatalog;
-use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::cluster::{ClusterRegistry, RegisteredRole};
-use vala_bifrost_redux::contracts::{
-    DecodedOtlp, IngressPayload, Scribe as ScribeContract, ScribeIngressFrame, ScribeOtlpOutcome,
-};
 use vala_bifrost_redux::forge::Forge as ForgeCoordinator;
 use vala_bifrost_redux::forge::ForgeWorker;
 use vala_bifrost_redux::gate::limits::IngestLimits;
@@ -33,14 +29,9 @@ use vala_bifrost_redux::scribe::tail_rpc::{
     FetchLiveTailService, ScribeTailReader, TailFenceConfig,
 };
 use wyrd_auth_verify::TokenVerifier;
-use wyrd_runtime::PermissionCheck;
 use wyrd_storage::StorageHandle;
 use wyrd_telemetry::TelemetryGuard;
-use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
-use wyrd_tonic::otlp::metrics_service::ExportMetricsServiceRequest;
-use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
 use wyrd_tonic::tonic_health::server::HealthReporter;
-use wyrd_tonic::wyrd::v1::InsertBatchRequest;
 
 use crate::auth::permission_resolver::SqlPermissionResolver;
 use crate::auth::pg_resolvers::PgIssuerResolver;
@@ -49,7 +40,6 @@ use crate::components::eval::{EvalAuditWriter, EvalRuns, TracingEvalAuditWriter,
 use crate::components::health::ReadinessSnapshot;
 use crate::config::{BifrostRuntimeConfig, BifrostTarget, DeploymentProfile, ForgeRuntimeConfig};
 use crate::postgres::ServerPostgres;
-use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_spec::vala::api::BifrostQueryRequest;
 
 /// Production [`TokenVerifier`] specialization: SQL-backed permission resolution
@@ -250,217 +240,13 @@ pub struct BifrostTestControls {
     /// Optional accelerated role cadence already installed on the shared registry.
     pub role_timing: Option<vala_bifrost_redux::cluster::RoleTiming>,
 }
-/// Production Gate specialization used by AppState.
-/// Focused public-ingest admission state retained by the server Gate.
-#[derive(Clone)]
-pub struct IngestAdmission {
-    /// Immutable transport and typed-ingress limits.
-    limits: IngestLimits,
-    /// Shared bounded encoded-transport capacity from the process resource graph.
-    transport: vala_bifrost_redux::gate::limits::BifrostTransportAdmission,
-    /// Shared admission closure observed by every public protocol.
-    closed: Arc<AtomicBool>,
-}
-
-/// Focused public-query admission policy retained by the server Gate.
-#[derive(Clone)]
-pub struct QueryAdmission {
-    /// Shared admission closure observed by every public protocol.
-    closed: Arc<AtomicBool>,
-}
-
-/// One server-owned public authentication and admission boundary.
-#[derive(Clone)]
-pub struct Gate {
-    /// Exact production token verifier shared with every Bifrost public transport.
-    token_verifier: Arc<WyrdTokenVerifier>,
-    /// Existing bounded ingest admission policy.
-    ingest_admission: IngestAdmission,
-    /// Existing bounded query admission policy.
-    query_admission: QueryAdmission,
-    /// Canonical ready-Oracle selector and authenticated private forwarder.
-    query_forwarder: Option<Arc<crate::oracle::ReadyOracleForwarder>>,
-    /// Read-only proof handle for test-tier inspection of the production graph.
-    #[cfg(feature = "test-support")]
-    test_resources: Option<BifrostRoleResources>,
-}
-
-impl Gate {
-    /// Creates the one server Gate from boot-validated dependencies.
-    #[must_use]
-    pub(crate) fn new(
-        token_verifier: Arc<WyrdTokenVerifier>,
-        limits: IngestLimits,
-        transport: vala_bifrost_redux::gate::limits::BifrostTransportAdmission,
-    ) -> Self {
-        let closed = Arc::new(AtomicBool::new(false));
-        Self {
-            token_verifier,
-            ingest_admission: IngestAdmission {
-                limits,
-                transport,
-                closed: Arc::clone(&closed),
-            },
-            query_admission: QueryAdmission { closed },
-            query_forwarder: None,
-            #[cfg(feature = "test-support")]
-            test_resources: None,
-        }
-    }
-
-    /// Attaches the canonical query forwarder composed from the shared production graph.
-    #[must_use]
-    pub(crate) fn with_query_forwarder(
-        mut self,
-        forwarder: Arc<crate::oracle::ReadyOracleForwarder>,
-    ) -> Self {
-        self.query_forwarder = Some(forwarder);
-        self
-    }
-
-    /// Routes an authenticated query through the one ready-Oracle forwarding owner.
-    ///
-    /// # Errors
-    /// Returns a closed Gate, role, forwarding, admission, or query failure.
-    pub async fn forward_query(
-        &self,
-        context: AuthorizedQueryContext,
-        request: BifrostQueryRequest,
-    ) -> Result<OracleQueryStream, wyrd_spec::vala::error::BifrostError> {
-        self.ensure_query_open()?;
-        metrics::gauge!("bifrost_gate_active_streams", "operation" => "query").increment(1.0);
-        let lifecycle = Arc::new(vala_bifrost_redux::oracle::QueryStreamLifecycle::new(
-            |outcome, elapsed| {
-                metrics::counter!("bifrost_gate_query_streams_total", "outcome" => outcome)
-                    .increment(1);
-                metrics::histogram!(
-                    "bifrost_gate_query_stream_duration_seconds",
-                    "outcome" => outcome
-                )
-                .record(elapsed.as_secs_f64());
-                metrics::gauge!("bifrost_gate_active_streams", "operation" => "query")
-                    .decrement(1.0);
-            },
-        ));
-        let result = self
-            .query_forwarder
-            .as_ref()
-            .ok_or(wyrd_spec::vala::error::BifrostError::OracleRoleUnavailable)?
-            .forward(context, request)
-            .await;
-        match result {
-            Ok(stream) => Ok(stream.with_gate_lifecycle(lifecycle)),
-            Err(error) => {
-                lifecycle.finish(
-                    if matches!(
-                        error,
-                        wyrd_spec::vala::error::BifrostError::QueryAdmissionRejected
-                    ) {
-                        "rejected"
-                    } else {
-                        "failed"
-                    },
-                );
-                Err(error)
-            }
-        }
-    }
-
-    /// Verifies and executes one private signed forwarding envelope locally.
-    ///
-    /// # Errors
-    /// Returns role-unavailable or a closed forwarding security/query failure.
-    pub(crate) async fn accept_forwarded_query(
-        &self,
-        ticket: wyrd_spec::vala::api::SignedPeerTicket,
-    ) -> Result<OracleQueryStream, wyrd_spec::vala::error::BifrostError> {
-        self.ensure_query_open()?;
-        self.query_forwarder
-            .as_ref()
-            .ok_or(wyrd_spec::vala::error::BifrostError::OracleRoleUnavailable)?
-            .accept(ticket, None)
-            .await
-    }
-
-    /// Attaches read-only inspection of the already-composed production resources.
-    #[cfg(feature = "test-support")]
-    #[must_use]
-    pub(crate) fn with_test_resources(mut self, resources: BifrostRoleResources) -> Self {
-        self.test_resources = Some(resources);
-        self
-    }
-
-    /// Authenticates one private peer request through the same token verifier as public Gate work.
-    ///
-    /// # Errors
-    /// Returns the stable authentication refusal without consulting a role provider.
-    pub async fn authenticate_peer(
-        &self,
-        metadata: &wyrd_tonic::tonic::metadata::MetadataMap,
-    ) -> Result<vala_bifrost_redux::gate::AuthContext, vala_bifrost_redux::gate::IngestError> {
-        vala_bifrost_redux::gate::auth::authenticate(self.token_verifier.as_ref(), metadata).await
-    }
-
-    /// Authenticates one public ingest request after checking Gate admission.
-    ///
-    /// # Errors
-    /// Returns the stable authentication or closed-admission refusal.
-    pub async fn authenticate_ingest(
-        &self,
-        metadata: &wyrd_tonic::tonic::metadata::MetadataMap,
-    ) -> Result<vala_bifrost_redux::gate::AuthContext, vala_bifrost_redux::gate::IngestError> {
-        self.ensure_ingest_open()?;
-        self.authenticate_peer(metadata).await
-    }
-
-    /// Returns the immutable OTLP wire limits.
-    #[must_use]
-    pub const fn otlp_wire_limits(&self) -> vala_bifrost_redux::gate::limits::OtlpWireLimits {
-        self.ingest_admission.limits.otlp
-    }
-
-    /// Returns the maximum gRPC decoding message size.
-    #[must_use]
-    pub const fn otlp_decoding_message_size(&self) -> usize {
-        self.ingest_admission.limits.max_decoding_message_size
-    }
-
-    /// Borrows the immutable typed-ingest limits.
-    #[must_use]
-    pub const fn ingest_limits(&self) -> &IngestLimits {
-        &self.ingest_admission.limits
-    }
-
-    /// Rejects ingest after the one Gate begins shutdown.
-    ///
-    /// # Errors
-    /// Returns the stable closed-ingress error after shutdown begins.
-    pub fn ensure_ingest_open(&self) -> Result<(), vala_bifrost_redux::gate::IngestError> {
-        if self.ingest_admission.closed.load(Ordering::Acquire) {
-            Err(vala_bifrost_redux::gate::IngestError::IngressClosed)
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Rejects query work after the one Gate begins shutdown.
-    ///
-    /// # Errors
-    /// Returns the stable unavailable error after shutdown begins.
-    pub fn ensure_query_open(&self) -> Result<(), wyrd_spec::vala::error::BifrostError> {
-        if self.query_admission.closed.load(Ordering::Acquire) {
-            Err(wyrd_spec::vala::error::BifrostError::OracleRoleUnavailable)
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Closes all admission represented by this Gate.
-    pub fn close(&self) {
-        self.ingest_admission.closed.store(true, Ordering::Release);
-        self.query_admission.closed.store(true, Ordering::Release);
-    }
-}
+/// The one monomorphic Bifrost Gate specialization served by this process.
+///
+/// [`WyrdTokenVerifier`] already fixes both resolver parameters, so the alias
+/// keeps [`Bifrost`] and [`AppState`] non-generic while the Gate itself stays
+/// generic for other embedders.
+pub type ServerGate =
+    vala_bifrost_redux::gate::Gate<SqlPermissionResolver, PgIssuerResolver>;
 
 /// Ordered local lifecycle states for one independently fenced role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -981,6 +767,16 @@ where
 }
 
 impl Scribe {
+    /// Borrows the durable Scribe implementation handed to the one Gate.
+    ///
+    /// Boot needs the exact allocation so the Gate and the lifecycle owner
+    /// never select different writers; the field itself stays private so no
+    /// request path can reach around the runtime that owns its lifecycle.
+    #[must_use]
+    pub(crate) const fn ingest(&self) -> &Arc<ScribeImpl> {
+        &self.ingest
+    }
+
     /// Reports whether the injected process shutdown token reached Scribe lifecycle work.
     #[cfg(feature = "test-support")]
     #[must_use]
@@ -1543,29 +1339,74 @@ impl Forge {
 /// reconstruct sibling state from [`AppState`].
 #[derive(Clone)]
 pub struct Bifrost {
-    /// One public authentication and admission owner.
-    gate: Gate,
+    /// The one public authentication, admission, and dispatch owner.
+    gate: ServerGate,
     /// Selected Scribe runtime, when this process owns the role.
     scribe: Option<Arc<Scribe>>,
     /// Selected Forge runtime, when this process owns a coordinator or worker.
     forge: Option<Arc<Forge>>,
     /// Selected Oracle runtime, when this process owns the role.
     oracle: Option<Arc<Oracle>>,
+    /// Process-wide encoded-body admission shared by every transport edge.
+    transport: vala_bifrost_redux::gate::limits::BifrostTransportAdmission,
+    /// Verifier shared by public Gate work and the private peer service.
+    token_verifier: Arc<WyrdTokenVerifier>,
+    /// Retained forwarder, reachable by the private peer inbound handler.
+    query_forwarder: Option<Arc<crate::oracle::ReadyOracleForwarder>>,
+    /// Read-only proof handle for test-tier inspection of the production graph.
+    #[cfg(feature = "test-support")]
+    test_resources: Option<BifrostRoleResources>,
+}
+
+/// Complete immutable composition retained by one published [`Bifrost`].
+///
+/// The values travel together because they are derived once, in boot order,
+/// from the same resource graph; passing them positionally would let a future
+/// caller silently transpose the two `Arc`-shaped role runtimes.
+pub(crate) struct BifrostComposition {
+    /// The one public Gate composed from the boot-validated dependency graph.
+    pub(crate) gate: ServerGate,
+    /// Selected Scribe runtime, when this process owns the role.
+    pub(crate) scribe: Option<Arc<Scribe>>,
+    /// Selected Forge runtime, when this process owns a coordinator or worker.
+    pub(crate) forge: Option<Arc<Forge>>,
+    /// Selected Oracle runtime, when this process owns the role.
+    pub(crate) oracle: Option<Arc<Oracle>>,
+    /// Process-wide encoded-body admission shared by every transport edge.
+    pub(crate) transport: vala_bifrost_redux::gate::limits::BifrostTransportAdmission,
+    /// Verifier shared by public Gate work and the private peer service.
+    pub(crate) token_verifier: Arc<WyrdTokenVerifier>,
+    /// Canonical ready-Oracle selector and authenticated private forwarder.
+    pub(crate) query_forwarder: Option<Arc<crate::oracle::ReadyOracleForwarder>>,
+    /// Already-composed production resources exposed only to the test tier.
+    #[cfg(feature = "test-support")]
+    pub(crate) resources: Option<BifrostRoleResources>,
 }
 
 impl Bifrost {
     /// Assembles the complete immutable process composition before publication.
-    pub(crate) fn assembled(
-        gate: Gate,
-        scribe: Option<Arc<Scribe>>,
-        forge: Option<Arc<Forge>>,
-        oracle: Option<Arc<Oracle>>,
-    ) -> Arc<Self> {
+    pub(crate) fn assembled(composition: BifrostComposition) -> Arc<Self> {
+        let BifrostComposition {
+            gate,
+            scribe,
+            forge,
+            oracle,
+            transport,
+            token_verifier,
+            query_forwarder,
+            #[cfg(feature = "test-support")]
+            resources,
+        } = composition;
         Arc::new(Self {
             gate,
             scribe,
             forge,
             oracle,
+            transport,
+            token_verifier,
+            query_forwarder,
+            #[cfg(feature = "test-support")]
+            test_resources: resources,
         })
     }
 
@@ -1574,14 +1415,19 @@ impl Bifrost {
     #[must_use]
     pub fn test_shell(token_verifier: Arc<WyrdTokenVerifier>) -> Arc<Self> {
         Arc::new(Self {
-            gate: Gate::new(
-                token_verifier,
-                vala_bifrost_redux::gate::limits::IngestLimits::default(),
-                vala_bifrost_redux::gate::limits::BifrostTransportAdmission::default(),
+            gate: ServerGate::without_scribe(
+                vala_bifrost_redux::gate::auth::ingest_auth_interceptor(Arc::clone(
+                    &token_verifier,
+                )),
+                IngestLimits::default(),
             ),
             scribe: None,
             forge: None,
             oracle: None,
+            transport: vala_bifrost_redux::gate::limits::BifrostTransportAdmission::default(),
+            token_verifier,
+            query_forwarder: None,
+            test_resources: None,
         })
     }
 
@@ -1593,8 +1439,28 @@ impl Bifrost {
 
     /// Borrows the one public Gate.
     #[must_use]
-    pub const fn gate(&self) -> &Gate {
+    pub const fn gate(&self) -> &ServerGate {
         &self.gate
+    }
+
+    /// Borrows the verifier shared by public Gate work and the peer service.
+    ///
+    /// The private peer inbound handler authenticates through the same engine
+    /// as public ingest; exposing the verifier here keeps that from becoming a
+    /// third authentication path.
+    #[must_use]
+    pub fn token_verifier(&self) -> &WyrdTokenVerifier {
+        &self.token_verifier
+    }
+
+    /// Borrows the retained ready-Oracle forwarder, when this process has one.
+    ///
+    /// Public SQL reaches the forwarder through the Gate dispatch seam. This
+    /// accessor exists for the private peer inbound path, which executes an
+    /// already-signed envelope rather than beginning a public request.
+    #[must_use]
+    pub(crate) fn query_forwarder(&self) -> Option<&Arc<crate::oracle::ReadyOracleForwarder>> {
+        self.query_forwarder.as_ref()
     }
 
     /// Borrows the selected Oracle runtime.
@@ -1636,7 +1502,7 @@ impl Bifrost {
     #[cfg(feature = "test-support")]
     #[must_use]
     pub(crate) fn resources(&self) -> Option<&BifrostRoleResources> {
-        self.gate.test_resources.as_ref()
+        self.test_resources.as_ref()
     }
 
     /// Borrows the selected Forge runtime.
@@ -1670,7 +1536,7 @@ impl Bifrost {
     pub fn transport_admission(
         &self,
     ) -> vala_bifrost_redux::gate::limits::BifrostTransportAdmission {
-        self.gate.ingest_admission.transport.clone()
+        self.transport.clone()
     }
 
     /// Returns the shared root-health signal through one selected role capability.
@@ -1683,265 +1549,6 @@ impl Bifrost {
             .or_else(|| self.forge.as_ref().map(|forge| forge.resources.health()))
     }
 
-    /// Reserves Scribe-owned memory for one preflighted OTLP decode.
-    ///
-    /// # Errors
-    /// Returns the stable closed or bounded-resource refusal before decoding.
-    pub fn reserve_otlp_decode(
-        &self,
-        bytes: usize,
-    ) -> Result<vala_bifrost_redux::contracts::OtlpDecodeOwner, vala_bifrost_redux::gate::IngestError>
-    {
-        self.gate().ensure_ingest_open()?;
-        self.scribe
-            .as_ref()
-            .ok_or(vala_bifrost_redux::gate::IngestError::IngressClosed)?
-            .ingest
-            .reserve_otlp_decode(bytes)
-            .map_err(vala_bifrost_redux::gate::IngestError::from_scribe)
-    }
-
-    /// Routes one authenticated trace export through Gate into the selected Scribe.
-    ///
-    /// # Errors
-    /// Returns the stable Gate, authorization, or Scribe error.
-    pub async fn ingest_decoded_resource_spans(
-        &self,
-        auth: &vala_bifrost_redux::gate::AuthContext,
-        decoded: DecodedOtlp<ExportTraceServiceRequest>,
-    ) -> Result<vala_bifrost_redux::gate::IngestOutcome, vala_bifrost_redux::gate::IngestError>
-    {
-        match self
-            .dispatch_otlp(
-                auth,
-                TableRef::new(BifrostNamespace::Traces, "spans"),
-                decoded.wire_bytes,
-                IngressPayload::OtlpTraces(decoded),
-            )
-            .await?
-        {
-            ScribeOtlpOutcome::Traces(outcome) => Ok(outcome),
-            _ => Err(vala_bifrost_redux::gate::IngestError::Internal(
-                "Scribe returned the wrong OTLP outcome".to_owned(),
-            )),
-        }
-    }
-
-    /// Routes one authenticated metrics export through Gate into the selected Scribe.
-    ///
-    /// # Errors
-    /// Returns the stable Gate, authorization, or Scribe error.
-    pub async fn ingest_decoded_resource_metrics(
-        &self,
-        auth: &vala_bifrost_redux::gate::AuthContext,
-        decoded: DecodedOtlp<ExportMetricsServiceRequest>,
-    ) -> Result<vala_bifrost_redux::gate::MetricsOutcome, vala_bifrost_redux::gate::IngestError>
-    {
-        match self
-            .dispatch_otlp(
-                auth,
-                TableRef::new(BifrostNamespace::Metrics, "points"),
-                decoded.wire_bytes,
-                IngressPayload::OtlpMetrics(decoded),
-            )
-            .await?
-        {
-            ScribeOtlpOutcome::Metrics(outcome) => Ok(outcome),
-            _ => Err(vala_bifrost_redux::gate::IngestError::Internal(
-                "Scribe returned the wrong OTLP outcome".to_owned(),
-            )),
-        }
-    }
-
-    /// Routes one authenticated log export through Gate into the selected Scribe.
-    ///
-    /// # Errors
-    /// Returns the stable Gate, authorization, or Scribe error.
-    pub async fn ingest_decoded_resource_logs(
-        &self,
-        auth: &vala_bifrost_redux::gate::AuthContext,
-        decoded: DecodedOtlp<ExportLogsServiceRequest>,
-    ) -> Result<vala_bifrost_redux::gate::LogsOutcome, vala_bifrost_redux::gate::IngestError> {
-        match self
-            .dispatch_otlp(
-                auth,
-                TableRef::new(BifrostNamespace::Logs, "records"),
-                decoded.wire_bytes,
-                IngressPayload::OtlpLogs(decoded),
-            )
-            .await?
-        {
-            ScribeOtlpOutcome::Logs(outcome) => Ok(outcome),
-            _ => Err(vala_bifrost_redux::gate::IngestError::Internal(
-                "Scribe returned the wrong OTLP outcome".to_owned(),
-            )),
-        }
-    }
-
-    /// Routes one authenticated OTLP payload through the exact Scribe frame contract.
-    async fn dispatch_otlp(
-        &self,
-        auth: &vala_bifrost_redux::gate::AuthContext,
-        table: TableRef,
-        measured_wire_bytes: usize,
-        payload: IngressPayload,
-    ) -> Result<ScribeOtlpOutcome, vala_bifrost_redux::gate::IngestError> {
-        self.gate().ensure_ingest_open()?;
-        if measured_wire_bytes > self.gate().ingest_limits().max_frame_bytes {
-            return Err(vala_bifrost_redux::gate::IngestError::PayloadTooLarge {
-                bytes: u64::try_from(measured_wire_bytes).unwrap_or(u64::MAX),
-                limit: u64::try_from(self.gate().ingest_limits().max_frame_bytes)
-                    .unwrap_or(u64::MAX),
-            });
-        }
-        wyrd_runtime::RbacCheck
-            .check(
-                &auth.principal,
-                &wyrd_runtime::Permission::bifrost_record_write(),
-            )
-            .into_result()
-            .map_err(vala_bifrost_redux::gate::IngestError::from_rbac)?;
-        let audit_event = wyrd_spec::vala::api::AuditEvent {
-            request_id: auth.request_id.clone(),
-            trace_id: None,
-            operation: "bifrost.otlp".to_owned(),
-            resource: table.fqn(),
-            card_ref: auth.principal.card_ref().cloned(),
-            principal_id: auth.principal.id,
-            principal_kind: auth.principal.kind.tag(),
-            auth_method: wyrd_spec::vala::api::AuthMethod::Jwt,
-            permission: "bifrost:record:write".to_owned(),
-            decision: wyrd_spec::vala::api::AuditDecision::Allow,
-            result: wyrd_spec::vala::api::AuditResult::Success,
-            payload_summary: "one bounded OTLP frame".to_owned(),
-            detail: None,
-        };
-        self.scribe
-            .as_ref()
-            .ok_or(vala_bifrost_redux::gate::IngestError::IngressClosed)?
-            .ingest
-            .ingest_frame(ScribeIngressFrame {
-                principal: auth.principal.clone(),
-                authenticated_tenant: auth.tenant,
-                table,
-                expected_schema_fingerprint: None,
-                request_id: auth.request_id.clone(),
-                batch_id: uuid::Uuid::now_v7(),
-                audit_event,
-                measured_wire_bytes,
-                payload,
-            })
-            .await
-            .map_err(vala_bifrost_redux::gate::IngestError::from_scribe)?
-            .otlp_outcome
-            .ok_or_else(|| {
-                vala_bifrost_redux::gate::IngestError::Internal(
-                    "Scribe omitted the OTLP outcome".to_owned(),
-                )
-            })
-    }
-
-    /// Routes one authenticated native Arrow frame through Gate into the selected Scribe.
-    ///
-    /// Once admitted, the durable append is detached from transport cancellation so a
-    /// disconnected caller can retry the same batch identity against Scribe deduplication.
-    ///
-    /// # Errors
-    /// Returns the stable Gate validation, authorization, role, or Scribe refusal.
-    pub async fn ingest_native_frame(
-        &self,
-        auth: &vala_bifrost_redux::gate::AuthContext,
-        frame: InsertBatchRequest,
-    ) -> Result<u64, vala_bifrost_redux::gate::IngestError> {
-        self.gate().ensure_ingest_open()?;
-        let resolution_started = std::time::Instant::now();
-        metrics::counter!("bifrost_gate_events_total", "stage" => "native_frame").increment(1);
-        metrics::counter!("bifrost_gate_frame_bytes_total")
-            .increment(u64::try_from(frame.arrow_ipc.len()).unwrap_or(u64::MAX));
-        vala_bifrost_redux::gate::validate_batch(&frame, self.gate().ingest_limits())?;
-        wyrd_runtime::RbacCheck
-            .check(
-                &auth.principal,
-                &wyrd_runtime::Permission::bifrost_record_write(),
-            )
-            .into_result()
-            .map_err(vala_bifrost_redux::gate::IngestError::from_rbac)?;
-        let (namespace, name) = vala_bifrost_redux::gate::resolve_fqn(&frame.table)?;
-        if namespace == BifrostNamespace::Audit {
-            return Err(
-                vala_bifrost_redux::gate::IngestError::ReservedBuiltinWriteDenied {
-                    table: frame.table,
-                },
-            );
-        }
-        let batch_id =
-            uuid::Uuid::from_bytes(frame.wyrd_batch_id.as_ref().try_into().map_err(|_| {
-                vala_bifrost_redux::gate::IngestError::RequestValidation(
-                    "invalid batch id".to_owned(),
-                )
-            })?);
-        let table = TableRef::new(namespace, name);
-        let audit_event = wyrd_spec::vala::api::AuditEvent {
-            request_id: auth.request_id.clone(),
-            trace_id: None,
-            operation: "bifrost.ingest_batch".to_owned(),
-            resource: table.fqn(),
-            card_ref: auth.principal.card_ref().cloned(),
-            principal_id: auth.principal.id,
-            principal_kind: auth.principal.kind.tag(),
-            auth_method: wyrd_spec::vala::api::AuthMethod::Jwt,
-            permission: "bifrost:record:write".to_owned(),
-            decision: wyrd_spec::vala::api::AuditDecision::Allow,
-            result: wyrd_spec::vala::api::AuditResult::Success,
-            payload_summary: "one bounded native batch".to_owned(),
-            detail: None,
-        };
-        let scribe = Arc::clone(
-            &self
-                .scribe
-                .as_ref()
-                .ok_or(vala_bifrost_redux::gate::IngestError::IngressClosed)?
-                .ingest,
-        );
-        let principal = auth.principal.clone();
-        let authenticated_tenant = auth.tenant;
-        let request_id = auth.request_id.clone();
-        let measured_wire_bytes = frame.arrow_ipc.len();
-        // The durable Scribe write stays inside this request future on purpose.
-        // Detaching it onto its own task would orphan the admission owner when a
-        // transport drops the handler: the spawned task keeps its admission slot
-        // and ingress bytes while nothing observes its terminal. Awaiting inline
-        // makes the admission guard drop with the cancelled request, which is the
-        // same request-scoped ingest lifetime the ported design commits the WAL
-        // under.
-        let admission = scribe
-            .ingest_frame(ScribeIngressFrame {
-                principal,
-                authenticated_tenant,
-                table,
-                expected_schema_fingerprint: None,
-                request_id,
-                batch_id,
-                audit_event,
-                measured_wire_bytes,
-                payload: IngressPayload::ArrowIpc(frame.arrow_ipc),
-            })
-            .await
-            .map_err(|error| {
-                metrics::counter!("bifrost_gate_events_total", "stage" => "scribe_failure")
-                    .increment(1);
-                metrics::counter!("bifrost_gate_frames_total", "status" => "rejected").increment(1);
-                vala_bifrost_redux::gate::IngestError::from_scribe(error)
-            })?;
-        metrics::counter!("bifrost_gate_frames_total", "status" => "accepted").increment(1);
-        metrics::counter!("bifrost_gate_rows_total", "status" => "accepted")
-            .increment(admission.rows_accepted);
-        metrics::counter!("bifrost_gate_rows_total", "status" => "rejected").increment(0);
-        metrics::histogram!("bifrost_gate_resolution_seconds")
-            .record(resolution_started.elapsed().as_secs_f64());
-        Ok(admission.rows_accepted)
-    }
-
     /// Dispatches one authorized SQL request through Gate into the selected Oracle.
     ///
     /// # Errors
@@ -1951,7 +1558,7 @@ impl Bifrost {
         context: AuthorizedQueryContext,
         request: BifrostQueryRequest,
     ) -> Result<OracleQueryStream, wyrd_spec::vala::error::BifrostError> {
-        self.gate().forward_query(context, request).await
+        self.gate().query_sql(context, request).await
     }
 
     /// Dispatches one authorized logical plan through Gate into the selected Oracle.

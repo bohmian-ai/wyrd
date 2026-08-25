@@ -62,7 +62,12 @@ impl OraclePeerGrpc {
         &self,
         metadata: &wyrd_tonic::tonic::metadata::MetadataMap,
     ) -> Result<Principal, Status> {
-        let auth = match self.bifrost.gate().authenticate_peer(metadata).await {
+        let auth = match vala_bifrost_redux::gate::auth::authenticate(
+            self.bifrost.token_verifier(),
+            metadata,
+        )
+        .await
+        {
             Ok(auth) => auth,
             Err(error) => {
                 self.audit_denial(BifrostSecurityViolationKind::PeerAudience)
@@ -383,10 +388,16 @@ impl OraclePeerService for OraclePeerGrpc {
             claims_bytes: envelope.claims_bytes,
             signature: envelope.signature,
         };
+        self.bifrost
+            .gate()
+            .ensure_query_open()
+            .map_err(|error| crate::grpc::query::query_status(error.into()))?;
         let stream = self
             .bifrost
-            .gate()
-            .accept_forwarded_query(ticket)
+            .query_forwarder()
+            .ok_or(wyrd_spec::vala::error::BifrostError::OracleRoleUnavailable)
+            .map_err(|error| crate::grpc::query::query_status(error.into()))?
+            .accept(ticket, None)
             .await
             .map_err(|error| crate::grpc::query::query_status(error.into()))?;
         Ok(crate::grpc::query::query_stream_response(stream))

@@ -119,8 +119,7 @@ impl BifrostQueryService for BifrostQueryGrpc {
         &self,
         request: Request<BifrostQueryRequest>,
     ) -> Result<Response<Self::QueryStream>, Status> {
-        let lifecycle = crate::app::metrics::GateRequestLifecycle::begin("query");
-        let result = async {
+        async {
             let caller = caller(self.state.clone(), request.metadata().clone()).await?;
             let request_id = caller.request_id.clone();
             let request = wyrd_spec::vala::api::BifrostQueryRequest::try_from(request.into_inner())
@@ -138,9 +137,7 @@ impl BifrostQueryService for BifrostQueryGrpc {
             }
             Ok(response)
         }
-        .await;
-        lifecycle.complete(if result.is_ok() { "success" } else { "failed" });
-        result
+        .await
     }
 
     /// Lists active queries for the authenticated tenant.

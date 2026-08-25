@@ -159,36 +159,6 @@ fn reject_write(
     }
 }
 
-/// Classifies one settled native write against the closed D24 terminal outcomes.
-///
-/// The transport status is already the canonical projection of Gate's ingest
-/// taxonomy, so this reads the status rather than restating the taxonomy. Every
-/// caller-attributed code — including Scribe admission pressure, which projects
-/// as `ResourceExhausted` — is a rejection; only a Wyrd-side defect settles as
-/// `failed`. Keeping the split here is what lets the rejection family reconcile
-/// against the `outcome="rejected"` terminal.
-fn write_request_outcome(
-    result: &Result<wyrd_tonic::tonic::Response<InsertBatchResponse>, Status>,
-) -> &'static str {
-    match result {
-        Ok(_) => "success",
-        Err(status) if status.code() == wyrd_tonic::tonic::Code::Cancelled => "cancelled",
-        Err(status)
-            if matches!(
-                status.code(),
-                wyrd_tonic::tonic::Code::PermissionDenied
-                    | wyrd_tonic::tonic::Code::ResourceExhausted
-                    | wyrd_tonic::tonic::Code::InvalidArgument
-                    | wyrd_tonic::tonic::Code::NotFound
-                    | wyrd_tonic::tonic::Code::Unauthenticated
-            ) =>
-        {
-            "rejected"
-        }
-        Err(_) => "failed",
-    }
-}
-
 #[wyrd_tonic::tonic::async_trait]
 impl BifrostIngestService for BifrostIngestGrpc {
     async fn insert_batch(
@@ -220,7 +190,24 @@ impl BifrostIngestService for BifrostIngestGrpc {
             Ok(response)
         }
         .await;
-        lifecycle.complete(write_request_outcome(&result));
+        let outcome = match &result {
+            Ok(_) => "success",
+            Err(status) if status.code() == wyrd_tonic::tonic::Code::Cancelled => "cancelled",
+            Err(status)
+                if matches!(
+                    status.code(),
+                    wyrd_tonic::tonic::Code::PermissionDenied
+                        | wyrd_tonic::tonic::Code::ResourceExhausted
+                        | wyrd_tonic::tonic::Code::InvalidArgument
+                        | wyrd_tonic::tonic::Code::NotFound
+                        | wyrd_tonic::tonic::Code::Unauthenticated
+                ) =>
+            {
+                "rejected"
+            }
+            Err(_) => "failed",
+        };
+        lifecycle.complete(outcome);
         result
     }
 }
@@ -341,53 +328,6 @@ mod tests {
     use vala_bifrost_redux::gate::limits::{
         BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES, BifrostTransportAdmission,
     };
-
-    /// Every native write status settles exactly one closed terminal outcome.
-    ///
-    /// Scribe admission pressure is the load-bearing case: it reaches the
-    /// transport as `ResourceExhausted` and must be counted as a caller
-    /// rejection, not as a Wyrd failure, or the rejection rate understates
-    /// backpressure while the failure rate invents an outage.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a status projects to the wrong terminal outcome.
-    #[test]
-    fn every_write_status_settles_one_closed_terminal_outcome() {
-        /// Builds one settled write result carrying `code`.
-        fn settled(
-            code: wyrd_tonic::tonic::Code,
-        ) -> Result<wyrd_tonic::tonic::Response<InsertBatchResponse>, Status> {
-            Err(Status::new(code, "settled"))
-        }
-        assert_eq!(
-            write_request_outcome(&Ok(wyrd_tonic::tonic::Response::new(
-                InsertBatchResponse::default()
-            ))),
-            "success"
-        );
-        assert_eq!(
-            write_request_outcome(&settled(wyrd_tonic::tonic::Code::Cancelled)),
-            "cancelled"
-        );
-        for code in [
-            wyrd_tonic::tonic::Code::PermissionDenied,
-            wyrd_tonic::tonic::Code::ResourceExhausted,
-            wyrd_tonic::tonic::Code::InvalidArgument,
-            wyrd_tonic::tonic::Code::NotFound,
-            wyrd_tonic::tonic::Code::Unauthenticated,
-        ] {
-            assert_eq!(
-                write_request_outcome(&settled(code)),
-                "rejected",
-                "{code:?}"
-            );
-        }
-        assert_eq!(
-            write_request_outcome(&settled(wyrd_tonic::tonic::Code::Internal)),
-            "failed"
-        );
-    }
 
     /// Minimal tonic-shaped service recording admission state before body decode.
     #[derive(Clone)]

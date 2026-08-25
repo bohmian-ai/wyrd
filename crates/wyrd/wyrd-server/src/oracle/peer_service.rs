@@ -385,6 +385,7 @@ impl OraclePeerService for OraclePeerGrpc {
         };
         let stream = self
             .bifrost
+            .gate()
             .accept_forwarded_query(ticket)
             .await
             .map_err(|error| crate::grpc::query::query_status(error.into()))?;

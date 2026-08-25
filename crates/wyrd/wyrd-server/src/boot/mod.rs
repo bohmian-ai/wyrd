@@ -1021,19 +1021,12 @@ pub async fn compose_bifrost(
         token_verifier,
         scribe_config.ingest_limits(),
         bifrost_resources.transport_admission(),
-    );
-    // Gate reaches Scribe through the same ingress handle the role runtime
-    // retains, so a Scribe-less target composes a Gate that authenticates and
-    // then refuses ingest as a closed role rather than one that cannot be built.
-    let gate = match scribe.as_ref() {
-        Some(scribe) => gate.with_scribe(scribe.ingress()),
-        None => gate,
-    };
-    let bifrost = crate::state::Bifrost::assembled(gate, scribe, forge, oracle, query_forwarder);
+    )
+    .with_query_forwarder(query_forwarder);
     #[cfg(feature = "test-support")]
-    let bifrost = bifrost.with_test_resources(bifrost_resources.clone());
+    let gate = gate.with_test_resources(bifrost_resources.clone());
     Ok(crate::state::ComposedBifrost {
-        bifrost,
+        bifrost: crate::state::Bifrost::assembled(gate, scribe, forge, oracle),
         coordination_runtime,
     })
 }

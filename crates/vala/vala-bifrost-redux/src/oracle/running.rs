@@ -377,7 +377,6 @@ mod tests {
             capability_version: 1,
             capabilities: match role {
                 ClusterRole::Oracle => ClusterCapabilities::OracleV1(OracleCapabilitiesV1 {
-                    peer_protocol_version: 2,
                     storage_protocol_version: 1,
                     cpu_cores: 1.0,
                     memory_budget_bytes: 1024,

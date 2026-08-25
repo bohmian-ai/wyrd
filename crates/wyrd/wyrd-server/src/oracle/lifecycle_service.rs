@@ -336,7 +336,6 @@ pub(crate) mod pg_tests {
             fencing_token: 1,
             capability_version: 1,
             capabilities: ClusterCapabilities::OracleV1(OracleCapabilitiesV1 {
-                peer_protocol_version: 2,
                 storage_protocol_version: 1,
                 cpu_cores: 1.0,
                 memory_budget_bytes: 1024,

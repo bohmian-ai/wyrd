@@ -20,7 +20,6 @@ use wyrd_spec::vala::api::{NodeId, OracleAdmissionDemand, QueryClass};
 async fn register_oracle(fixture: &PgFixture, node_id: NodeId) -> u64 {
     let nodes = ClusterNodes::new(fixture.vala_postgres().clone());
     let capabilities = ClusterCapabilities::OracleV1(OracleCapabilitiesV1 {
-        peer_protocol_version: 2,
         storage_protocol_version: 1,
         cpu_cores: 1.0,
         memory_budget_bytes: 1024,

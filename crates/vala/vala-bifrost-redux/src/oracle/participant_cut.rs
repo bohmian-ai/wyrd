@@ -278,7 +278,6 @@ impl OracleQueryAttemptCut {
             }
             ClusterCapabilities::OracleV1(value) => {
                 digest.update([1]);
-                digest.update(value.peer_protocol_version.to_be_bytes());
                 digest.update(value.storage_protocol_version.to_be_bytes());
                 digest.update(value.cpu_cores.to_bits().to_be_bytes());
                 digest.update(value.memory_budget_bytes.to_be_bytes());
@@ -367,7 +366,6 @@ pub(super) mod tests {
             capability_version: 1,
             capabilities: match role {
                 ClusterRole::Oracle => ClusterCapabilities::OracleV1(OracleCapabilitiesV1 {
-                    peer_protocol_version: 2,
                     storage_protocol_version: 1,
                     cpu_cores: 1.0,
                     memory_budget_bytes: 1024,
@@ -585,10 +583,10 @@ pub(super) mod tests {
         assert_cut_mutation(cut, &format!("{prefix}.fencing_token"), |changed| {
             select(changed).fencing_token += 1;
         });
-        for field in 0..11 {
+        for field in 0..10 {
             assert_cut_mutation(cut, &format!("{prefix}.capabilities.{field}"), |changed| {
                 let participant = select(changed);
-                if field == 10 {
+                if field == 9 {
                     participant.capabilities =
                         ClusterCapabilities::ScribeV1(ScribeCapabilitiesV1 {
                             tail_protocol_version: 1,
@@ -599,16 +597,15 @@ pub(super) mod tests {
                     panic!("invariant: Oracle fingerprint fixture has Oracle capabilities");
                 };
                 match field {
-                    0 => value.peer_protocol_version += 1,
-                    1 => value.storage_protocol_version += 1,
-                    2 => value.cpu_cores += 1.0,
-                    3 => value.memory_budget_bytes += 1,
-                    4 => value.cpu_cores_per_slot += 1.0,
-                    5 => value.memory_bytes_per_slot += 1,
-                    6 => value.raw_slots += 1,
-                    7 => value.usable_slots += 1,
-                    8 => value.supported_classes.push(QueryClass::Analytical),
-                    9 => value.max_workers_per_query += 1,
+                    0 => value.storage_protocol_version += 1,
+                    1 => value.cpu_cores += 1.0,
+                    2 => value.memory_budget_bytes += 1,
+                    3 => value.cpu_cores_per_slot += 1.0,
+                    4 => value.memory_bytes_per_slot += 1,
+                    5 => value.raw_slots += 1,
+                    6 => value.usable_slots += 1,
+                    7 => value.supported_classes.push(QueryClass::Analytical),
+                    8 => value.max_workers_per_query += 1,
                     _ => unreachable!("bounded Oracle capability fixture"),
                 }
             });
@@ -640,7 +637,6 @@ pub(super) mod tests {
         });
         assert_cut_mutation(cut, &format!("{prefix}.capabilities.variant"), |changed| {
             select(changed).capabilities = ClusterCapabilities::OracleV1(OracleCapabilitiesV1 {
-                peer_protocol_version: 2,
                 storage_protocol_version: 1,
                 cpu_cores: 1.0,
                 memory_budget_bytes: 1024,

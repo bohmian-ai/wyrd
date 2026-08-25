@@ -40,15 +40,20 @@ use super::telemetry::{
 };
 use crate::cluster::{ClusterRegistry, ClusterSnapshot, ROLE_LIVENESS_CUTOFF};
 
-/// Fixed private peer protocol version.
+/// Fixed private peer protocol version carried in signed peer ticket claims.
+///
+/// The minter stamps this value into [`PeerTicketClaims::protocol_version`] and
+/// the verifier requires it exactly, so a ticket minted by a binary speaking a
+/// different peer wire is rejected instead of being decoded against the wrong
+/// claim encoding. Both sides read this one constant, so the check cannot
+/// desynchronize within a build.
 ///
 /// Protocol v3 binds the exact-partition assignment-authority digest
-/// ([`crate::oracle::peer::assignment_authority_digest_for`]) into signed
-/// ticket claims. It differs from v2 only in the Scribe-cut encoding, whose
-/// two day strings became two typed `(granularity, start)` partitions, and it
-/// is a homogeneous cutover: v2 tickets are rejected outright by
-/// [`validated_claim_identifiers`] rather than accepted through a dual
-/// decoder.
+/// ([`crate::oracle::peer::assignment_authority_digest_for`]) into those
+/// claims. It differs from v2 only in the Scribe-cut encoding, whose two day
+/// strings became two typed `(granularity, start)` partitions, and it is a
+/// homogeneous cutover: v2 tickets are rejected outright by
+/// [`validated_claim_identifiers`] rather than accepted through a dual decoder.
 pub const PEER_PROTOCOL_VERSION: u32 = 3;
 /// Pending reservation time to live.
 const PENDING_TTL: ChronoDuration = ChronoDuration::seconds(2);
@@ -2960,7 +2965,6 @@ mod tests {
             fencing_token: fence,
             capability_version: 1,
             capabilities: ClusterCapabilities::OracleV1(OracleCapabilitiesV1 {
-                peer_protocol_version: 2,
                 storage_protocol_version: 1,
                 cpu_cores: 1.0,
                 memory_budget_bytes: 1,

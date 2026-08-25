@@ -20,8 +20,7 @@ use vala_bifrost_redux::forge::{
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::oracle::dispatcher::{
     LocalOraclePeerTransport, OraclePeerCredentials, OraclePeerTls, OraclePeerTransportDirectory,
-    OraclePeerWorker, OraclePeerWorkerConfig, PEER_PROTOCOL_VERSION, ReservationRegistry,
-    TonicOraclePeerTransport,
+    OraclePeerWorker, OraclePeerWorkerConfig, ReservationRegistry, TonicOraclePeerTransport,
 };
 use vala_bifrost_redux::oracle::{
     Oracle as OracleEngine, OracleBuildConfig, OracleConfig, OracleMemoryResources,
@@ -1510,8 +1509,6 @@ impl<'a> OracleRoleBuilder<'a> {
         })?;
         ensure_oracle_admission_policies(&operator_pool, oracle_config).await?;
         let capabilities = OracleCapabilitiesV1 {
-            peer_protocol_version: u16::try_from(PEER_PROTOCOL_VERSION)
-                .map_err(|_| ServerBootError::OraclePeer("peer protocol exceeds u16".to_owned()))?,
             storage_protocol_version: 1,
             cpu_cores: configured_cpu,
             memory_budget_bytes,

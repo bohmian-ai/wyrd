@@ -1896,8 +1896,6 @@ pub struct ScribeCapabilitiesV1 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct OracleCapabilitiesV1 {
-    /// Peer execution protocol version.
-    pub peer_protocol_version: u16,
     /// Shared storage protocol version.
     pub storage_protocol_version: u16,
     /// CPU cores available to Oracle work.
@@ -1941,8 +1939,7 @@ impl ClusterCapabilities {
                 Ok(())
             }
             (ClusterRole::Oracle, Self::OracleV1(value))
-                if value.peer_protocol_version == 2
-                    && value.storage_protocol_version == 1
+                if value.storage_protocol_version == 1
                     && value.cpu_cores.is_finite()
                     && value.cpu_cores > 0.0
                     && value.cpu_cores_per_slot.is_finite()

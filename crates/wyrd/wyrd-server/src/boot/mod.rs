@@ -559,8 +559,12 @@ pub async fn compose_bifrost(
     // Declared outside the Scribe block because the composed graph must never
     // reach the `Runtime` value: `ScribeBootParts` and the role structs carry a
     // `Handle` only, and this slot hands the executor straight to the single
-    // `ScribeCoordinationRuntime` owner returned from this function.
-    let mut coordination_runtime: Option<tokio::runtime::Runtime> = None;
+    // `ScribeCoordinationRuntime` owner returned from this function. It is the
+    // owner type from the start rather than a bare `Option<Runtime>` so that an
+    // early error return from any later stage releases the executor through the
+    // same non-blocking path, instead of running blocking `Runtime` drop glue on
+    // this async frame.
+    let mut coordination_runtime = ScribeCoordinationRuntime::new(None);
     let scribe = if roles.contains(&BifrostRuntimeRole::Scribe) {
         let scribe_role = cluster_registry
             .reserve_scribe(
@@ -637,7 +641,7 @@ pub async fn compose_bifrost(
                 ServerBootError::Scribe(format!("coordination runtime failed: {error}"))
             })?;
         let coordination_handle = runtime.handle().clone();
-        coordination_runtime = Some(runtime);
+        coordination_runtime = ScribeCoordinationRuntime::new(Some(runtime));
         #[cfg(feature = "test-support")]
         let wal_sync_delay = test_controls
             .as_ref()
@@ -1024,7 +1028,7 @@ pub async fn compose_bifrost(
     let gate = gate.with_test_resources(bifrost_resources.clone());
     Ok(crate::state::ComposedBifrost {
         bifrost: crate::state::Bifrost::assembled(gate, scribe, forge, oracle),
-        coordination_runtime: crate::state::ScribeCoordinationRuntime::new(coordination_runtime),
+        coordination_runtime,
     })
 }
 

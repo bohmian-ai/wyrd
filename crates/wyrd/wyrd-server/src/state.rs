@@ -13,9 +13,7 @@ use tokio::time::timeout_at;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::cluster::{ClusterRegistry, RegisteredRole};
-use vala_bifrost_redux::contracts::{
-    DecodedOtlp, Scribe as ScribeContract,
-};
+use vala_bifrost_redux::contracts::{DecodedOtlp, Scribe as ScribeContract};
 use vala_bifrost_redux::forge::Forge as ForgeCoordinator;
 use vala_bifrost_redux::forge::ForgeWorker;
 use vala_bifrost_redux::oracle::Oracle as OracleEngine;

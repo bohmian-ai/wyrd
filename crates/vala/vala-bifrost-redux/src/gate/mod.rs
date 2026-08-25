@@ -378,10 +378,13 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
         if namespace == BifrostNamespace::Audit {
             return Err(IngestError::ReservedBuiltinWriteDenied { table: frame.table });
         }
-        let batch_id =
-            uuid::Uuid::from_bytes(frame.wyrd_batch_id.as_ref().try_into().map_err(|_| {
-                IngestError::RequestValidation("invalid batch id".to_owned())
-            })?);
+        let batch_id = uuid::Uuid::from_bytes(
+            frame
+                .wyrd_batch_id
+                .as_ref()
+                .try_into()
+                .map_err(|_| IngestError::RequestValidation("invalid batch id".to_owned()))?,
+        );
         let table = TableRef::new(namespace, name);
         let audit_event = wyrd_spec::vala::api::AuditEvent {
             request_id: auth.request_id.clone(),

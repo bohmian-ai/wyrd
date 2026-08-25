@@ -1213,16 +1213,16 @@ pub struct BifrostResourceConfig {
 ///
 /// The derivation therefore starts from detected parallelism — matching the
 /// sibling ingress and persistence derivations, including their `map_or(4, ..)`
-/// fallback for platforms that cannot report it — then applies two bounds.
-/// `min(SCRIBE_SHARD_COUNT)` caps threads at the number of lanes there are to
+/// fallback for platforms that cannot report it — then clamps it between two
+/// bounds. The upper bound caps threads at the number of lanes there are to
 /// run, so a large host does not spawn coordination threads that can never own
-/// a lane. `max(2)` preserves the historical floor so a single-core box still
-/// gets a second thread to make progress on while one lane blocks in `COMMIT`.
+/// a lane. The lower bound preserves the historical floor so a single-core box
+/// still gets a second thread to make progress on while one lane blocks in
+/// `COMMIT`. The bounds are constant and ordered, so the clamp cannot panic.
 fn default_scribe_coordination_threads() -> usize {
     std::thread::available_parallelism()
         .map_or(4, std::num::NonZeroUsize::get)
-        .min(vala_bifrost_redux::scribe::routing::SCRIBE_SHARD_COUNT)
-        .max(2)
+        .clamp(2, vala_bifrost_redux::scribe::routing::SCRIBE_SHARD_COUNT)
 }
 
 fn default_scribe_ingress_cpu_threads() -> usize {

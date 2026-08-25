@@ -2543,7 +2543,11 @@ async fn coordination_runtime_owner_drops_without_panic() {
         .await
         .expect("coordination-runtime journey writer");
     transport
-        .insert_batch(TABLE_FQN, uuid::Uuid::now_v7().into_bytes(), ipc(&[1, 2, 3]))
+        .insert_batch(
+            TABLE_FQN,
+            uuid::Uuid::now_v7().into_bytes(),
+            ipc(&[1, 2, 3]),
+        )
         .await
         .expect("real ingest through the composed Scribe shard lanes");
     drop(transport);

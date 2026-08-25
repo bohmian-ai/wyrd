@@ -10,7 +10,9 @@ use wyrd_telemetry::TelemetryGuard;
 
 use crate::app::metrics::{WyrdTelemetryRuntime, metrics_router, serve_metrics};
 use crate::app::supervise::{TaskExit, TaskId, fallible_task, supervise, worker_task};
-use crate::boot::{BootedServer, StateOverrides, build_state, production_guards, spawn_forge_worker};
+use crate::boot::{
+    BootedServer, StateOverrides, build_state, production_guards, spawn_forge_worker,
+};
 use crate::config::{ServeMode, WyrdServerConfig};
 use crate::state::AppState;
 

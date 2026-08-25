@@ -208,7 +208,6 @@ struct ScribeBootParts {
     /// Recovered Scribe allocation that Gate wraps for ingest.
     scribe: Arc<ScribeImpl>,
     /// Independently fenced Scribe role registered during this boot.
-
     scribe_role: RegisteredRole,
 }
 
@@ -787,7 +786,10 @@ pub async fn compose_bifrost(
             }
             return Err(ServerBootError::Scribe(error.to_string()));
         }
-        Some(ScribeBootParts { scribe, scribe_role })
+        Some(ScribeBootParts {
+            scribe,
+            scribe_role,
+        })
     } else {
         None
     };

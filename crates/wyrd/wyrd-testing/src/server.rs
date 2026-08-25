@@ -68,7 +68,8 @@ use wyrd_server::config::{
 };
 use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::state::{
-    BifrostBuildInputs, BifrostTestControls, QueryStreamFault, QueryStreamFaultController,
+    BifrostBuildInputs, BifrostShutdownReport, BifrostTestControls, ComposedBifrost,
+    QueryStreamFault, QueryStreamFaultController, ScribeCoordinationRuntime,
 };
 use wyrd_server::{AppState, WyrdServer, WyrdServerConfig, build_router};
 use wyrd_spec::DataTenantId;
@@ -147,12 +148,33 @@ use crate::time::ClockHandle;
 /// Dedicated least-privilege role assigned to the test Oracle Service.
 const ORACLE_PEER_ROLE: &str = "bifrost_oracle_peer";
 
+/// Separates a serve-task join failure from the server's own terminal outcome.
+///
+/// The load-bearing case is [`tokio::task::JoinError::is_panic`]: a panic on the
+/// serve stack unwinds a `tokio-runtime-worker` thread that libtest never
+/// attributes, so discarding the join result lets a panicking run finish green.
+/// Returning it as [`WyrdTestServerError::Join`] makes every teardown seam that
+/// joins the serve task fail loudly instead. The inner `Result` is the server's
+/// own outcome and is left to the caller, which decides whether a terminal exit
+/// is expected.
+///
+/// # Errors
+/// Returns [`WyrdTestServerError::Join`] when the serve task panicked or was
+/// cancelled before producing an outcome.
+fn serve_task_outcome(
+    join: Result<Result<BifrostShutdownReport, wyrd_server::BootExit>, tokio::task::JoinError>,
+) -> Result<Result<BifrostShutdownReport, wyrd_server::BootExit>, WyrdTestServerError> {
+    join.map_err(|error| WyrdTestServerError::Join(format!("bound serve task: {error}")))
+}
+
 /// Wyrd server test harness supporting in-process and real-socket modes.
 pub struct WyrdTestServer {
     inner: WyrdTestServerInner,
     mode: Mode,
     shutdown_token: Option<CancellationToken>,
-    serve_handle: Option<JoinHandle<Result<(), wyrd_server::BootExit>>>,
+    /// Serve task for a bound server, yielding the production Bifrost drain
+    /// outcome so teardown seams can assert what actually drained.
+    serve_handle: Option<JoinHandle<Result<BifrostShutdownReport, wyrd_server::BootExit>>>,
     /// Optional fixed HTTP/gRPC addresses reserved by a multi-node harness.
     requested_bind: Option<(std::net::SocketAddr, std::net::SocketAddr)>,
     /// Optional TLS material applied when this in-process server binds.
@@ -161,6 +183,8 @@ pub struct WyrdTestServer {
     readiness_failure: bool,
     /// Optional test-only serve task that ignores cancellation until aborted.
     stalled_drain_for_test: Option<Arc<AtomicBool>>,
+    /// Test-only request to panic the bound serve task after its drain returns.
+    serve_task_panic_for_test: bool,
 }
 
 struct WyrdTestServerInner {
@@ -198,6 +222,13 @@ struct WyrdTestServerInner {
     query_control_audit_fault: wyrd_server::state::QueryControlAuditFaultController,
     /// Current notification-backed schema stall used by cancellation journeys.
     query_stream_stall: std::sync::Mutex<Option<Arc<wyrd_server::state::QueryStreamStall>>>,
+    /// Sole owner of the dedicated Scribe coordination runtime this server composed.
+    ///
+    /// The harness calls `compose_bifrost` directly, so a bound test server
+    /// builds the same dedicated executor production does and must retain the
+    /// same single owner. Declared last so struct drop order releases it after
+    /// `state`, which is the order production teardown also takes.
+    _coordination_runtime: ScribeCoordinationRuntime,
 }
 
 /// Concrete lifecycle evidence returned after one test server stops.
@@ -415,6 +446,8 @@ pub struct WyrdTestServerBuilder {
     limits: Option<wyrd_server::state::LimitsConfig>,
     /// Replace the serve task with a cancellation-resistant test task.
     stalled_drain_for_test: Option<Arc<AtomicBool>>,
+    /// Test-only request to panic the bound serve task after its drain returns.
+    serve_task_panic_for_test: bool,
 }
 
 /// Test-only file paths for a shared Oracle TLS identity and trust root.
@@ -476,6 +509,7 @@ impl Default for WyrdTestServerBuilder {
             omit_token_verifier: false,
             limits: None,
             stalled_drain_for_test: None,
+            serve_task_panic_for_test: false,
         }
     }
 }
@@ -578,19 +612,71 @@ impl WyrdTestServer {
 
     /// Shut down the server, cancelling the serve task and dropping fixtures.
     ///
+    /// A serve task that panicked is a real production defect, so its
+    /// [`JoinError`] is propagated rather than discarded: swallowing it lets a
+    /// panic on a `tokio-runtime-worker` thread finish the run green, which is
+    /// precisely the failure mode this seam exists to catch. A join *timeout*
+    /// remains tolerated — the bounded budget here is deliberately short and a
+    /// slow drain is not the same signal as a panic.
+    ///
     /// # Errors
-    /// Returns an error if the serve task join times out.
+    /// Returns [`WyrdTestServerError::Join`] when the serve task panicked or
+    /// when the final blocking drop cannot be joined.
     pub async fn shutdown(mut self) -> Result<(), WyrdTestServerError> {
         if let Some(token) = self.shutdown_token.take() {
             token.cancel();
         }
-        if let Some(handle) = self.serve_handle.take() {
-            let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        if let Some(handle) = self.serve_handle.take()
+            && let Ok(join) = tokio::time::timeout(Duration::from_secs(2), handle).await
+            && let Err(exit) = serve_task_outcome(join)?
+        {
+            tracing::warn!(?exit, "bound serve task exited terminally during shutdown");
         }
         tokio::task::spawn_blocking(move || drop(self))
             .await
             .map_err(|error| WyrdTestServerError::Join(error.to_string()))?;
         Ok(())
+    }
+
+    /// Cancel the serve task, join it in place, and return its drain outcome.
+    ///
+    /// Unlike [`shutdown`](Self::shutdown) and
+    /// [`shutdown_and_inspect`](Self::shutdown_and_inspect) this seam borrows
+    /// `self` instead of consuming it, so the caller keeps the harness — and
+    /// therefore the last [`AppState`] — alive past the join. That is what makes
+    /// production teardown reproducible from a test: once the serve task has
+    /// dropped its own `AppState` clone, the caller's frame owns the final
+    /// reference and drops it wherever the test chooses, rather than inside the
+    /// `spawn_blocking` that `shutdown` uses.
+    ///
+    /// The returned [`BifrostShutdownReport`] is the report `BoundServer::run`
+    /// produced from the real production drain, not a test-invoked second
+    /// shutdown.
+    ///
+    /// # Errors
+    /// Returns [`WyrdTestServerError::Start`] when no bound serve task is
+    /// running or when the server exited terminally, and
+    /// [`WyrdTestServerError::Join`] when the serve task panicked or the join
+    /// exceeded its bounded budget.
+    pub async fn cancel_and_join_for_test(
+        &mut self,
+    ) -> Result<BifrostShutdownReport, WyrdTestServerError> {
+        if let Some(token) = self.shutdown_token.take() {
+            token.cancel();
+        }
+        let handle = self.serve_handle.take().ok_or_else(|| {
+            WyrdTestServerError::Start(
+                "in-place teardown requires a running bound server".to_owned(),
+            )
+        })?;
+        let join = tokio::time::timeout(Duration::from_secs(70), handle)
+            .await
+            .map_err(|_| {
+                WyrdTestServerError::Join("serve task did not join before its deadline".to_owned())
+            })?;
+        serve_task_outcome(join)?.map_err(|exit| {
+            WyrdTestServerError::Start(format!("server exited terminally: {exit:?}"))
+        })
     }
 
     /// Abruptly terminate the test server without running graceful Scribe drain.
@@ -646,7 +732,7 @@ impl WyrdTestServer {
             })?
             .map_err(|error| WyrdTestServerError::Join(error.to_string()))?;
         let terminal = match result {
-            Ok(()) => Err(WyrdTestServerError::Start(
+            Ok(_report) => Err(WyrdTestServerError::Start(
                 "production supervisor exited cleanly while terminal failure was required"
                     .to_owned(),
             )),
@@ -2421,9 +2507,13 @@ impl WyrdTestServer {
             let worker =
                 wyrd_server::boot::spawn_forge_worker(&state, shutdown_token.clone(), 1, 1)
                     .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+            // A dedicated Forge worker never runs the bounded Bifrost drain, so
+            // its serve task reports that nothing drained rather than claiming a
+            // drain outcome it did not produce.
             let serve_handle = wyrd_runtime::runtime().spawn(async move {
                 worker
                     .await
+                    .map(|()| BifrostShutdownReport::none_drained())
                     .map_err(|error| wyrd_server::BootExit::Other(Box::new(error)))
             });
             self.shutdown_token = Some(shutdown_token);
@@ -2463,24 +2553,36 @@ impl WyrdTestServer {
             .ok_or_else(|| WyrdTestServerError::Bind("no gRPC address bound".to_owned()))?;
         let base_url = format!("http://{addr}");
 
-        let serve_handle = if let Some(aborted) = self.stalled_drain_for_test.take() {
-            wyrd_runtime::runtime().spawn(async move {
-                struct AbortObservation(Arc<AtomicBool>);
+        let serve_handle: JoinHandle<Result<BifrostShutdownReport, wyrd_server::BootExit>> =
+            if let Some(aborted) = self.stalled_drain_for_test.take() {
+                wyrd_runtime::runtime().spawn(async move {
+                    struct AbortObservation(Arc<AtomicBool>);
 
-                impl Drop for AbortObservation {
-                    fn drop(&mut self) {
-                        self.0.store(true, Ordering::SeqCst);
+                    impl Drop for AbortObservation {
+                        fn drop(&mut self) {
+                            self.0.store(true, Ordering::SeqCst);
+                        }
                     }
-                }
 
-                let _observation = AbortObservation(aborted);
-                let _bound = bound;
-                std::future::pending::<()>().await;
-                Ok(())
-            })
-        } else {
-            wyrd_runtime::runtime().spawn(async move { bound.run().await })
-        };
+                    let _observation = AbortObservation(aborted);
+                    let _bound = bound;
+                    std::future::pending::<()>().await;
+                    // Invariant: `pending()` never resolves, so this arm only ever
+                    // leaves the future by abort. Fabricating a `BifrostShutdownReport`
+                    // here would compile silently and hand a future teardown assertion
+                    // a drain outcome that no drain produced.
+                    unreachable!("stalled-drain serve task never completes; it is only aborted")
+                })
+            } else if self.serve_task_panic_for_test {
+                // Serves normally so bound startup reaches readiness, then panics on
+                // the serve stack once the production drain returns.
+                wyrd_runtime::runtime().spawn(async move {
+                    let _report = bound.run().await;
+                    panic!("test-injected serve-task panic after drain");
+                })
+            } else {
+                wyrd_runtime::runtime().spawn(async move { bound.run().await })
+            };
 
         self.shutdown_token = Some(shutdown_token);
         self.serve_handle = Some(serve_handle);
@@ -2621,6 +2723,19 @@ impl WyrdTestServerBuilder {
     #[must_use]
     pub fn with_readiness_failure_for_test(mut self) -> Self {
         self.readiness_failure = true;
+        self
+    }
+
+    /// Panic the bound serve task once its production drain has returned.
+    ///
+    /// The panic is deferred until after `BoundServer::run` completes so bound
+    /// startup still reaches readiness; a task that panicked earlier would fail
+    /// startup rollback instead of teardown. Aborting the task would instead
+    /// surface [`tokio::task::JoinError::is_cancelled`], which is not the signal
+    /// a teardown seam is required to refuse.
+    #[must_use]
+    pub fn with_serve_task_panic_for_test(mut self) -> Self {
+        self.serve_task_panic_for_test = true;
         self
     }
 
@@ -3159,7 +3274,10 @@ impl WyrdTestServerBuilder {
             ..ForgeRuntimeConfig::default()
         };
         let shutdown = CancellationToken::new();
-        let bifrost_runtime = wyrd_server::boot::compose_bifrost(BifrostBuildInputs {
+        let ComposedBifrost {
+            bifrost: bifrost_runtime,
+            coordination_runtime,
+        } = wyrd_server::boot::compose_bifrost(BifrostBuildInputs {
             target,
             deployment_profile: DeploymentProfile::Development,
             postgres: postgres.as_ref().clone(),
@@ -3248,6 +3366,7 @@ impl WyrdTestServerBuilder {
                 query_stream_fault,
                 query_control_audit_fault,
                 query_stream_stall: std::sync::Mutex::new(None),
+                _coordination_runtime: coordination_runtime,
             },
             mode: Mode::InProcess,
             shutdown_token: None,
@@ -3256,6 +3375,7 @@ impl WyrdTestServerBuilder {
             requested_oracle_peer_tls: self.oracle_peer_tls,
             readiness_failure: self.readiness_failure,
             stalled_drain_for_test: self.stalled_drain_for_test,
+            serve_task_panic_for_test: self.serve_task_panic_for_test,
         })
     }
 

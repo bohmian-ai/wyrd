@@ -107,7 +107,7 @@ hide = true
 description = """Run the current Bifrost/Scribe Rust user-journey tests (marked #[ignore]
 so they stay out of the fast lane) against live Postgres."""
 run = """
-cargo test --locked -p vala-sdk --test pg_bifrost_e2e -- --test-threads=1
+cargo test --locked -p vala-sdk --test pg_bifrost_e2e -- --include-ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test journeys -- public_write_read_journey --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test journeys -- production_recorder_exposes_bifrost_owner_families --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test journeys -- public_write_compact_read_journey --ignored --test-threads=1
@@ -117,6 +117,8 @@ cargo test --locked -p wyrd-testing --test journeys -- unhealthy_scratch_volume_
 cargo test --locked -p wyrd-testing --test journeys -- pg_bifrost_forge_small_files_converges_without_query_dependency --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test journeys -- supervised_forge_panic_fails_stop_and_recovers_exactly_once --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test journeys -- public_ack_restart_read_exact_once_journey --ignored --test-threads=1
+cargo test --locked -p wyrd-testing --test journeys -- coordination_runtime_owner_drops_without_panic --ignored --test-threads=1
+cargo test --locked -p wyrd-testing --test journeys -- serve_task_panic_fails_shutdown --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test otlp -- --test-threads=1
 cargo test --locked -p wyrd-testing --test oracle -- pg_bifrost_oracle_published_journey --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test oracle -- pg_bifrost_oracle_fused_reconcile_journey --ignored --test-threads=1
@@ -304,7 +306,7 @@ cargo test --locked -p wyrd-auth -- --test-threads=1
 cargo test --locked -p wyrd-server -- --test-threads=1
 cargo test --locked -p wyrd-testing -- --test-threads=1
 cargo test --locked -p wyrd-client --test pg_auth_e2e_against_fixture --test pg_discovery_against_fixture -- --test-threads=1
-cargo test --locked -p vala-sdk --test pg_bifrost_e2e -- --test-threads=1
+cargo test --locked -p vala-sdk --test pg_bifrost_e2e -- --include-ignored --test-threads=1
 """
 
 [tasks."identity:e2e"]

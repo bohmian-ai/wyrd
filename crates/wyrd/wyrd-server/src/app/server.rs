@@ -715,12 +715,12 @@ impl BoundServer {
                 Err(error) => {
                     tracing::warn!(%error, "Bifrost shutdown did not complete cleanly");
                     bifrost.abort();
-                    (BifrostShutdownReport::aborted(), Some(error))
+                    (BifrostShutdownReport::none_drained(), Some(error))
                 }
             }
         } else {
             bifrost.abort();
-            (BifrostShutdownReport::aborted(), None)
+            (BifrostShutdownReport::none_drained(), None)
         };
 
         tracing::info!("wyrd-server shutdown complete");
@@ -868,7 +868,7 @@ mod pg_tests {
         let result = server_shutdown_result(
             Some("worker exited".to_owned()),
             Some(wyrd_spec::vala::error::BifrostError::ScribeRoleUnavailable),
-            BifrostShutdownReport::aborted(),
+            BifrostShutdownReport::none_drained(),
         );
 
         let BootExit::Other(error) =

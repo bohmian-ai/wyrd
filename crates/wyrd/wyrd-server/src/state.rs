@@ -2070,14 +2070,16 @@ pub struct BifrostShutdownReport {
 }
 
 impl BifrostShutdownReport {
-    /// Returns the report describing a teardown that aborted instead of draining.
+    /// Returns the report for a teardown in which no subsystem drained.
     ///
-    /// [`Bifrost::abort`] closes admission and cancels role owners without
-    /// claiming a flush, so no subsystem drained. This constructor exists so
-    /// that path reports that fact explicitly rather than open-coding an
-    /// all-`false` literal whose meaning depends on the reader.
+    /// Two paths legitimately produce it. [`Bifrost::abort`] closes admission
+    /// and cancels role owners without claiming a flush, so an aborted teardown
+    /// drained nothing. A process topology that never runs the bounded Bifrost
+    /// drain at all — a dedicated Forge worker, for instance — reports the same
+    /// thing. Naming the value keeps those paths from open-coding an all-`false`
+    /// literal whose meaning depends on the reader.
     #[must_use]
-    pub(crate) const fn aborted() -> Self {
+    pub const fn none_drained() -> Self {
         Self {
             scribe_drained: false,
             forge_drained: false,

@@ -723,10 +723,10 @@ impl<'forge> ForgeScheduler<'forge> {
             &demand.table_ref,
         )?;
         let table = self.forge.load_table(&binding.table_ident()).await?;
-        let current_day = self.forge.core.clock.now()?.date_naive();
+        let now = self.forge.core.clock.now()?;
         let discovered = self
             .forge
-            .discover_live_rewrites(&binding, &table, current_day)
+            .discover_live_rewrites(&binding, &table, now)
             .await?;
         let compaction_debt_files = discovered
             .groups()
@@ -749,7 +749,7 @@ impl<'forge> ForgeScheduler<'forge> {
             })?;
         let mut candidates = self
             .forge
-            .discover_staging_task_candidates(&binding, current_day, self.capacity)
+            .discover_staging_task_candidates(&binding, now, self.capacity)
             .await?;
         if candidates.is_empty() {
             candidates = discovered
@@ -764,7 +764,7 @@ impl<'forge> ForgeScheduler<'forge> {
                 })
                 .collect::<Result<Vec<_>, ForgeError>>()?;
         }
-redacted
+        // Manifest rewrite and snapshot expiry are schedulable separately,
         // then executes rewrite first when both have work.  Keep that split:
         // a fragmented manifest list must not wait for snapshot retention to
         // become eligible, while expiry retains its acknowledgement/no-work
@@ -914,12 +914,7 @@ redacted
         &self,
         binding: &crate::catalog::TenantTableBinding,
     ) -> Result<bool, ForgeError> {
-        let resource = ForgeGroupKey {
-            tenant: binding.tenant,
-            table_ref: binding.table_ref.clone(),
-            partition_day: chrono::NaiveDate::MIN,
-        }
-        .audit_resource();
+        let resource = ForgeGroupKey::table_audit_resource(binding.tenant, &binding.table_ref);
         let operations = ForgeOperations::new(&resource, ForgeOperationFamily::IcebergRewrite)
             .map_err(ForgeError::Sql)?;
         let mut conn = self
@@ -935,6 +930,100 @@ redacted
             .map_err(ForgeError::Sql)?;
         conn.commit().await.map_err(ForgeError::Sql)?;
         Ok(!page.operations.is_empty() || page.overflowed)
+    }
+
+    /// Selects the manifests this maintenance pass may rewrite, if any.
+    ///
+    /// Returns an empty selection when manifest rewrite is disabled, so the
+    /// caller's downstream logic sees the same shape either way and only the
+    /// expiry/reconciliation reasons can keep the candidate alive. Only data
+    /// manifests with a nonnegative recorded length are eligible; the final
+    /// bounding applies the tick's file and byte ceilings.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a manifest reports a negative length after being filtered to
+    /// nonnegative lengths, which would mean the metadata changed mid-read.
+    fn select_maintenance_rewrite_paths(
+        &self,
+        manifests: &iceberg::spec::ManifestList,
+    ) -> Vec<String> {
+        if !self.forge.core.config.manifest_rewrite_enabled {
+            return Vec::new();
+        }
+        let candidates = manifests
+            .entries()
+            .iter()
+            .filter(|manifest| {
+                manifest.content == iceberg::spec::ManifestContentType::Data
+                    && manifest.manifest_length >= 0
+            })
+            .map(|manifest| ManifestRewriteCandidate {
+                path: manifest.manifest_path.clone(),
+                size_bytes: u64::try_from(manifest.manifest_length)
+                    .expect("nonnegative manifest length fits u64"),
+                partition_spec_id: manifest.partition_spec_id,
+                sequence_number: manifest.sequence_number,
+            })
+            .collect::<Vec<_>>();
+        select_bounded_manifest_rewrite_paths(
+            &candidates,
+            self.forge.core.config.manifest_rewrite_target_size_bytes,
+            self.forge.core.config.manifest_rewrite_min_count,
+            self.forge.core.config.max_files_per_tick,
+            self.forge.core.config.max_bytes_per_tick,
+        )
+    }
+
+    /// Bounds the maintenance inputs to one tick and returns their byte estimate.
+    ///
+    /// The file ceiling is applied first, then the byte ceiling stops accrual —
+    /// but never below one input, so a single oversized manifest still makes
+    /// progress instead of producing an empty plan forever. Paths are sorted and
+    /// deduplicated so the resulting plan hash is stable for the same manifest
+    /// set regardless of manifest-list order. Each recorded size is floored at
+    /// one byte so a zero-length manifest still contributes a distinguishable
+    /// term.
+    ///
+    /// Returns the bounded paths, their per-input byte sizes, and the summed
+    /// estimate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Invariant`] when a manifest reports a negative
+    /// length or when the byte estimate overflows.
+    fn bound_maintenance_inputs(
+        &self,
+        maintenance_inputs: Vec<&iceberg::spec::ManifestFile>,
+    ) -> Result<(Vec<String>, Vec<u64>, u64), ForgeError> {
+        let mut inputs = Vec::new();
+        let mut input_bytes = Vec::new();
+        let mut bytes = 0_u64;
+        for manifest in maintenance_inputs
+            .into_iter()
+            .take(self.forge.core.config.max_files_per_tick)
+        {
+            let size =
+                u64::try_from(manifest.manifest_length).map_err(|_| ForgeError::Invariant {
+                    detail: "Iceberg manifest length is negative".to_owned(),
+                })?;
+            let Some(next) = bytes.checked_add(size) else {
+                return Err(ForgeError::Invariant {
+                    detail: "manifest maintenance byte estimate overflowed".to_owned(),
+                });
+            };
+            if !inputs.is_empty() && next > self.forge.core.config.max_bytes_per_tick {
+                break;
+            }
+            bytes = next;
+            inputs.push(manifest.manifest_path.clone());
+            input_bytes.push(size.max(1));
+        }
+        let mut input_terms = inputs.into_iter().zip(input_bytes).collect::<Vec<_>>();
+        input_terms.sort_by(|left, right| left.0.cmp(&right.0));
+        input_terms.dedup_by(|left, right| left.0 == right.0);
+        let (inputs, input_bytes): (Vec<_>, Vec<_>) = input_terms.into_iter().unzip();
+        Ok((inputs, input_bytes, bytes))
     }
 
     /// Builds one bounded lifecycle task from the current manifest list.
@@ -965,32 +1054,7 @@ redacted
             .load()
             .await
             .map_err(ForgeError::Catalog)?;
-        let selected_paths = if self.forge.core.config.manifest_rewrite_enabled {
-            let candidates = manifests
-                .entries()
-                .iter()
-                .filter(|manifest| {
-                    manifest.content == iceberg::spec::ManifestContentType::Data
-                        && manifest.manifest_length >= 0
-                })
-                .map(|manifest| ManifestRewriteCandidate {
-                    path: manifest.manifest_path.clone(),
-                    size_bytes: u64::try_from(manifest.manifest_length)
-                        .expect("nonnegative manifest length fits u64"),
-                    partition_spec_id: manifest.partition_spec_id,
-                    sequence_number: manifest.sequence_number,
-                })
-                .collect::<Vec<_>>();
-            select_bounded_manifest_rewrite_paths(
-                &candidates,
-                self.forge.core.config.manifest_rewrite_target_size_bytes,
-                self.forge.core.config.manifest_rewrite_min_count,
-                self.forge.core.config.max_files_per_tick,
-                self.forge.core.config.max_bytes_per_tick,
-            )
-        } else {
-            Vec::new()
-        };
+        let selected_paths = self.select_maintenance_rewrite_paths(&manifests);
         if selected_paths.is_empty() && !snapshot_expiry_due && !reconciliation_due {
             return Ok(None);
         }
@@ -1004,33 +1068,8 @@ redacted
                 .filter(|manifest| selected.contains(&manifest.manifest_path))
                 .collect::<Vec<_>>()
         };
-        let mut inputs = Vec::new();
-        let mut input_bytes = Vec::new();
-        let mut bytes = 0_u64;
-        for manifest in maintenance_inputs
-            .into_iter()
-            .take(self.forge.core.config.max_files_per_tick)
-        {
-            let size =
-                u64::try_from(manifest.manifest_length).map_err(|_| ForgeError::Invariant {
-                    detail: "Iceberg manifest length is negative".to_owned(),
-                })?;
-            let Some(next) = bytes.checked_add(size) else {
-                return Err(ForgeError::Invariant {
-                    detail: "manifest maintenance byte estimate overflowed".to_owned(),
-                });
-            };
-            if !inputs.is_empty() && next > self.forge.core.config.max_bytes_per_tick {
-                break;
-            }
-            bytes = next;
-            inputs.push(manifest.manifest_path.clone());
-            input_bytes.push(size.max(1));
-        }
-        let mut input_terms = inputs.into_iter().zip(input_bytes).collect::<Vec<_>>();
-        input_terms.sort_by(|left, right| left.0.cmp(&right.0));
-        input_terms.dedup_by(|left, right| left.0 == right.0);
-        let (mut inputs, mut input_bytes): (Vec<_>, Vec<_>) = input_terms.into_iter().unzip();
+        let (mut inputs, mut input_bytes, mut bytes) =
+            self.bound_maintenance_inputs(maintenance_inputs)?;
         if inputs.is_empty() && reconciliation_due {
             inputs.push(format!("forge://reconcile/{}", snapshot.snapshot_id()));
             input_bytes.push(1);
@@ -1303,6 +1342,7 @@ mod source_tests {
         let plan = ResourcePlan {
             memory_limit_bytes: 256 * 1024 * 1024,
             effective_cpu: 2,
+            oracle_query_slot_limit: None,
             unmanaged_reserve_bytes: 64 * 1024 * 1024,
             managed_memory_bytes: 192 * 1024 * 1024,
             scribe_floor_bytes: 64 * 1024 * 1024,

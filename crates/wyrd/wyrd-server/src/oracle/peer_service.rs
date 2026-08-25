@@ -62,7 +62,12 @@ impl OraclePeerGrpc {
         &self,
         metadata: &wyrd_tonic::tonic::metadata::MetadataMap,
     ) -> Result<Principal, Status> {
-        let auth = match self.bifrost.gate().authenticate_peer(metadata).await {
+        let auth = match vala_bifrost_redux::gate::auth::authenticate(
+            self.bifrost.token_verifier(),
+            metadata,
+        )
+        .await
+        {
             Ok(auth) => auth,
             Err(error) => {
                 self.audit_denial(BifrostSecurityViolationKind::PeerAudience)
@@ -167,6 +172,19 @@ impl OraclePeerGrpc {
             tracing::error!("Scribe peer physical claims validation failed");
             return Err(DispatchError::Terminal);
         }
+        // Recomputed last, before any provider or tail I/O: a valid
+        // signature only proves the claims were not tampered with in
+        // transit, not that the signed closed-predicate/projection closure
+        // matches what this Scribe worker actually received.
+        match vala_bifrost_redux::oracle::peer::assignment_authority_digest_for(
+            &request.assignments,
+        ) {
+            Ok(recomputed) if recomputed == claims.assignment_authority_digest => {}
+            _ => {
+                tracing::error!("Scribe peer assignment-authority digest mismatch");
+                return Err(DispatchError::Terminal);
+            }
+        }
         let binding = request
             .assignments
             .first()
@@ -179,7 +197,7 @@ impl OraclePeerGrpc {
             leader_fence: request.leader_fence.clone(),
             local_fence: request.target_fence.clone(),
         };
-        authenticated_preflight(&request, authenticated.clone()).map_err(|error| {
+        authenticated_preflight(&request, &authenticated).map_err(|error| {
             tracing::error!(?error, "Scribe physical follower rejected the request");
             DispatchError::Terminal
         })?;
@@ -192,7 +210,7 @@ impl OraclePeerGrpc {
                 vala_bifrost_redux::resources::ORACLE_PARTITION_MEMORY_BYTES,
             )
             .map_err(|_| DispatchError::Capacity)?;
-        let mut batches = scribe
+        let execution = scribe
             .fragment_follower()
             .execute(&request, authenticated, lease.memory_pool())
             .await
@@ -205,8 +223,11 @@ impl OraclePeerGrpc {
                 PhysicalPlanFollowerError::Execution(_) => DispatchError::Unavailable,
             })?;
         scribe.record_fragment_execution();
+        // Split now, finalize after drain: the scan counters are written during
+        // execution, and the leader has no physical scan of its own to report.
+        let (mut batches, scan_evidence) = execution.split();
         let plan_fingerprint = request.plan_fingerprint;
-        let scribe_owner = Arc::clone(&scribe);
+        let scribe_owner = Arc::clone(scribe);
         let output = async_stream::stream! {
             let _lease = lease;
             let mut encoder = AttemptEncoder::default();
@@ -221,6 +242,8 @@ impl OraclePeerGrpc {
                 let batch = batch.map_err(|error| {
                     if vala_bifrost_redux::oracle::is_stale_iceberg_object_error(&error) {
                         DispatchError::StaleObject
+                    } else if vala_bifrost_redux::oracle::is_tenant_invariant_error(&error) {
+                        DispatchError::TenantInvariant
                     } else {
                         DispatchError::Unavailable
                     }
@@ -232,7 +255,7 @@ impl OraclePeerGrpc {
                 yield Ok(batch);
             }
             let footer = encoder
-                .finish_physical(&plan_fingerprint)
+                .finish_physical(&plan_fingerprint, scan_evidence.finalize())
                 .map_err(|_| DispatchError::Terminal);
             if footer.is_ok() {
                 scribe_owner.record_fragment_footer();
@@ -296,7 +319,7 @@ impl OraclePeerService for OraclePeerGrpc {
             .oracle_peer_service()
             .ok_or_else(|| Status::failed_precondition("Oracle role is not configured"))?
             .worker();
-        Ok(Response::new(worker.reserve(&request).into()))
+        Ok(Response::new(worker.reserve(&request).await.into()))
     }
 
     /// Releases one matching reservation idempotently after workload authentication.
@@ -365,10 +388,16 @@ impl OraclePeerService for OraclePeerGrpc {
             claims_bytes: envelope.claims_bytes,
             signature: envelope.signature,
         };
+        self.bifrost
+            .gate()
+            .ensure_query_open()
+            .map_err(|error| crate::grpc::query::query_status(error.into()))?;
         let stream = self
             .bifrost
-            .gate()
-            .accept_forwarded_query(ticket)
+            .query_forwarder()
+            .ok_or(wyrd_spec::vala::error::BifrostError::OracleRoleUnavailable)
+            .map_err(|error| crate::grpc::query::query_status(error.into()))?
+            .accept(ticket, None)
             .await
             .map_err(|error| crate::grpc::query::query_status(error.into()))?;
         Ok(crate::grpc::query::query_stream_response(stream))
@@ -383,11 +412,17 @@ fn conversion_status(error: PrivateConversionError) -> Status {
 /// Maps peer pressure, retryable failures, and terminal contract failures separately.
 fn dispatch_status(error: DispatchError) -> Status {
     match error {
+        DispatchError::Partial { .. } => Status::deadline_exceeded(error.to_string()),
         DispatchError::Unavailable => Status::unavailable(error.to_string()),
         DispatchError::EligibleSourceLoss { .. } => Status::failed_precondition(error.to_string()),
         DispatchError::Capacity => Status::resource_exhausted(error.to_string()),
-        DispatchError::StaleObject => Status::not_found(error.to_string()),
+        DispatchError::StaleObject | DispatchError::FileNotFound => {
+            Status::not_found(error.to_string())
+        }
         DispatchError::Terminal => Status::permission_denied(error.to_string()),
+        // Distinct from `permission_denied` so the leader can recover the
+        // tenant-isolation reason; see `execution_status_error`.
+        DispatchError::TenantInvariant => Status::aborted(error.to_string()),
     }
 }
 
@@ -424,7 +459,10 @@ mod tests {
         let mut encoder = AttemptEncoder::default();
         let schema_frame = start_scribe_attempt(&mut encoder, schema).expect("schema starts");
         let footer_frame = encoder
-            .finish_physical("empty-scribe-plan")
+            .finish_physical(
+                "empty-scribe-plan",
+                wyrd_spec::vala::api::WorkerScanStats::default(),
+            )
             .expect("empty result completes");
         assert!(matches!(
             schema_frame,

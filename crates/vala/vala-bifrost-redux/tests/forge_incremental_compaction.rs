@@ -355,6 +355,7 @@ mod pg_tests {
             unmanaged_reserve_bytes: None,
             scratch_limit_bytes: Some(scratch_limit_bytes),
             effective_cpu: None,
+            oracle_query_slot_limit: None,
             scratch_root: std::path::PathBuf::new(),
             volume_roots: None,
         }
@@ -438,6 +439,7 @@ mod pg_tests {
                     table: binding.table_ref.clone(),
                     user_fields: vec![Field::new("value", DataType::Int64, false)],
                     tenant: binding.tenant,
+                    physical_layout: None,
                     audit: None,
                 })
                 .await
@@ -478,15 +480,20 @@ mod pg_tests {
             let partition_fields = table.metadata().default_partition_spec().fields();
             assert_eq!(partition_fields.len(), 1);
             assert_eq!(partition_fields[0].source_id, event_time_id);
-            assert_eq!(partition_fields[0].name, "wyrd_event_time_day");
-            assert_eq!(partition_fields[0].transform, Transform::Day);
+            assert_eq!(partition_fields[0].name, "wyrd_event_time_hour");
+            assert_eq!(partition_fields[0].transform, Transform::Hour);
 
             let sort_fields = &table.metadata().default_sort_order().fields;
             assert_eq!(sort_fields.len(), 2);
-            for (field, source_id) in sort_fields.iter().zip([tenant_id, event_time_id]) {
+            // The canonical layout leads with the ascending tenant prefix and
+            // then orders newest-first on event time.
+            for (field, (source_id, direction)) in sort_fields.iter().zip([
+                (tenant_id, SortDirection::Ascending),
+                (event_time_id, SortDirection::Descending),
+            ]) {
                 assert_eq!(field.source_id, source_id);
                 assert_eq!(field.transform, Transform::Identity);
-                assert_eq!(field.direction, SortDirection::Ascending);
+                assert_eq!(field.direction, direction);
                 assert_eq!(field.null_order, NullOrder::Last);
             }
         }
@@ -715,6 +722,8 @@ mod pg_tests {
                 snapshot_retention: Duration::from_nanos(1),
                 orphan_gc_ttl: Duration::from_nanos(1),
                 iceberg_total_retry_timeout: retry_timeout,
+                manifest_rewrite_enabled: true,
+                manifest_rewrite_min_count: 2,
                 ..ForgeConfig::default()
             })
         }
@@ -883,13 +892,12 @@ mod pg_tests {
                         footer_encoded_bytes: 8 * 1024 * 1024,
                         footer_decode_workspace_bytes: 32 * 1024 * 1024,
                         sort_spill_bytes: 512 * 1024 * 1024,
-                        output_scratch_bytes: 512 * 1024 * 1024,
                     }),
                     files: 1,
                     bytes: 1,
                     parallelism: 1,
                     memory_bytes: 106 * 1024 * 1024,
-                    spill_bytes: 1024 * 1024 * 1024,
+                    spill_bytes: 512 * 1024 * 1024,
                     large_ceiling_bytes: 2 * 1024 * 1024 * 1024,
                 },
                 ready_at: chrono::Utc::now() - chrono::Duration::seconds(1),
@@ -975,10 +983,11 @@ mod pg_tests {
                 .expect("registered fixture table");
             let schema = iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema())
                 .expect("registered Arrow schema");
-            let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("day");
-            let base = chrono::DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
-                .expect("time")
-                .timestamp_micros();
+            let base_event_time = fixture_seed_event_time();
+            let partition = registered_granularity(&table)
+                .bucket(base_event_time)
+                .expect("a fixture event time always buckets");
+            let base = base_event_time.timestamp_micros();
             let mut rows = Vec::new();
             for index in 0..count {
                 let index = start
@@ -1047,6 +1056,7 @@ mod pg_tests {
                         vala_bifrost_redux::parquet::writer_properties::bifrost_writer_properties_with_metadata(
                             batch.num_rows(),
                             metadata,
+                            &[],
                         ),
                     ),
                 )
@@ -1059,7 +1069,8 @@ mod pg_tests {
                     .expect("object");
                 rows.push((path, index, row_count));
             }
-            self.persist_seed_rows(binding, rows, base, day, aged).await;
+            self.persist_seed_rows(binding, rows, base, partition, aged)
+                .await;
         }
 
         /// Persists generated fixture objects into the durable staging roster.
@@ -1068,14 +1079,14 @@ mod pg_tests {
             binding: &TenantTableBinding,
             rows: Vec<(String, i64, i64)>,
             base: i64,
-            day: chrono::NaiveDate,
+            partition: vala_bifrost_redux::catalog::layout::TimePartition,
             aged: bool,
         ) {
             let mut conn = vala_sql::TenantConn::acquire(self.pg.app_pool(), self.tenant)
                 .await
                 .expect("tenant conn");
             for (object_path, index, row_count) in rows {
-                sqlx::query("INSERT INTO vala.file_list (id,data_tenant_id,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_day,node_id,writer_epoch,wal_lsn_min,wal_lsn_max) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)").bind(uuid::Uuid::now_v7()).bind(self.tenant.as_uuid()).bind(&binding.logical_namespace).bind(&binding.table_name).bind(object_path).bind(100_i64).bind(row_count).bind(chrono::DateTime::from_timestamp_micros(base + index).expect("min")).bind(chrono::DateTime::from_timestamp_micros(base + index + row_count).expect("max")).bind(day).bind(uuid::Uuid::now_v7()).bind(1_i64).bind(index * 2 + 1).bind(index * 2 + 2).execute(&mut **conn.transaction()).await.expect("file list");
+                sqlx::query("INSERT INTO vala.file_list (id,data_tenant_id,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_granularity,partition_start,node_id,writer_epoch,wal_lsn_min,wal_lsn_max) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)").bind(uuid::Uuid::now_v7()).bind(self.tenant.as_uuid()).bind(&binding.logical_namespace).bind(&binding.table_name).bind(object_path).bind(100_i64).bind(row_count).bind(chrono::DateTime::from_timestamp_micros(base + index).expect("min")).bind(chrono::DateTime::from_timestamp_micros(base + index + row_count).expect("max")).bind(partition.granularity_str()).bind(partition.start_utc()).bind(uuid::Uuid::now_v7()).bind(1_i64).bind(index * 2 + 1).bind(index * 2 + 2).execute(&mut **conn.transaction()).await.expect("file list");
             }
             conn.commit().await.expect("commit");
             if aged {
@@ -1116,6 +1127,7 @@ mod pg_tests {
                     table: binding.table_ref.clone(),
                     user_fields: vec![Field::new("value", DataType::Int64, false)],
                     tenant: binding.tenant,
+                    physical_layout: None,
                     audit: None,
                 })
                 .await
@@ -1266,15 +1278,15 @@ mod pg_tests {
                 .expect("event time field")
                 .id;
             let base = event_time.timestamp_micros();
-            let day = event_time.date_naive();
-            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch");
-            let partition_days = i32::try_from(day.signed_duration_since(epoch).num_days())
-                .expect("fixture partition day fits i32");
+            let partition_value = registered_granularity(table)
+                .bucket(event_time)
+                .expect("a fixture event time always buckets")
+                .iceberg_transform_value();
             let data_file = DataFileBuilder::default()
                 .content(DataContentType::Data)
                 .file_path(catalog_path)
                 .file_format(DataFileFormat::Parquet)
-                .partition(Struct::from_iter([Some(Literal::int(partition_days))]))
+                .partition(Struct::from_iter([Some(Literal::int(partition_value))]))
                 .record_count(100_000)
                 .file_size_in_bytes(size)
                 .lower_bounds(std::collections::HashMap::from([(
@@ -1357,11 +1369,7 @@ mod pg_tests {
             assert_eq!(self.delete_file_list_history().await, 2);
             let live = self
                 .forge
-                .discover_live_rewrites_for_test(
-                    &self.binding,
-                    &table,
-                    chrono::Utc::now().date_naive(),
-                )
+                .discover_live_rewrites_for_test(&self.binding, &table, chrono::Utc::now())
                 .await
                 .expect("two-file live debt");
             let [group] = live.groups_for_test() else {
@@ -1379,6 +1387,65 @@ mod pg_tests {
             assert_eq!(files, 2);
             assert!(bytes > 0);
             (files, bytes)
+        }
+    }
+
+    /// The single event time every seeded fixture row carries.
+    ///
+    /// Seed rows, reconciliation stamps, and hand-built audit details all have
+    /// to name the same partition, so they all derive it from this instant
+    /// rather than each restating a boundary.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if this literal stops being a valid RFC 3339 instant.
+    fn fixture_seed_event_time() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
+            .expect("the fixture seed instant is valid RFC 3339")
+            .into()
+    }
+
+    /// The partition every seeded fixture row lands in for one registered table.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the table is not registered or its spec is not the Bifrost
+    /// recipe.
+    async fn fixture_seed_partition(
+        fixture: &Fixture,
+    ) -> vala_bifrost_redux::catalog::layout::TimePartition {
+        let table = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("registered fixture table");
+        registered_granularity(&table)
+            .bucket(fixture_seed_event_time())
+            .expect("a fixture event time always buckets")
+    }
+
+    /// Reads the exact time granularity a registered fixture table declares.
+    ///
+    /// Fixture rows and hand-built Iceberg data files must land in the same
+    /// partition the catalog itself derived at registration, so both read the
+    /// granularity back off the table's own partition spec rather than
+    /// restating it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the spec does not carry exactly one time transform, which
+    /// only happens if registration stopped emitting the Bifrost recipe.
+    fn registered_granularity(
+        table: &iceberg::table::Table,
+    ) -> vala_bifrost_redux::catalog::layout::TimeGranularity {
+        use vala_bifrost_redux::catalog::layout::TimeGranularity;
+        let [field] = table.metadata().default_partition_spec().fields() else {
+            panic!("the Bifrost recipe declares exactly one partition field");
+        };
+        match field.transform {
+            Transform::Hour => TimeGranularity::Hour,
+            Transform::Day => TimeGranularity::Day,
+            other => panic!("Bifrost partitions only hourly or daily, found {other:?}"),
         }
     }
 
@@ -1863,12 +1930,22 @@ mod pg_tests {
         .expect("fixture lease")
     }
 
-    /// Proves terminal file-list history neither grants nor suppresses GC eligibility.
+    /// Proves terminal file-list history neither protects an expired object nor
+    /// is required to reclaim it.
+    ///
+    /// Physical reclamation of a never-published Forge generation belongs to
+    /// `orphan_gc` alone, gated on refreshed catalog, non-terminal `file_list`,
+    /// and open-operation protection plus the TTL floor under the exact table
+    /// lease. A terminal `file_list` row is none of those, so it must neither
+    /// suppress the delete nor stand in for the protection set: one pass
+    /// reclaims the aged, unreferenced generation without any terminal operation
+    /// evidence naming it, which is what makes an attempt that died before its
+    /// `Prepared` transition reclaimable at all.
     ///
     /// # Panics
     ///
     /// Panics when the real catalog roster, tenant row, object store, or Forge
-    /// GC workflow violates exact Reset provenance.
+    /// GC workflow violates exact orphan provenance.
     #[tokio::test]
     async fn terminal_file_list_history_does_not_protect_expired_object() {
         let fixture = Fixture::new_with_config(
@@ -1893,13 +1970,17 @@ mod pg_tests {
             .await
             .expect("orphan object");
         let now = chrono::Utc::now();
+        let orphan_partition = vala_bifrost_redux::catalog::layout::TimeGranularity::Day
+            .bucket(now)
+            .expect("the current instant always buckets");
         sqlx::query(
             "INSERT INTO vala.file_list (
                 id, data_tenant_id, namespace, table_name, file_path, file_size,
-                row_count, min_event_time, max_event_time, partition_day,
+                row_count, min_event_time, max_event_time,
+                partition_granularity, partition_start,
                 node_id, writer_epoch, wal_lsn_min, wal_lsn_max,
                 compacted, committed_snapshot_id
-             ) VALUES ($1,$2,$3,$4,$5,1,1,$6,$6,$7,$8,1,1,2,true,1)",
+             ) VALUES ($1,$2,$3,$4,$5,1,1,$6,$6,$7,$8,$9,1,1,2,true,1)",
         )
         .bind(uuid::Uuid::now_v7())
         .bind(fixture.tenant.as_uuid())
@@ -1907,7 +1988,8 @@ mod pg_tests {
         .bind(&fixture.binding.table_name)
         .bind(&path)
         .bind(now)
-        .bind(now.date_naive())
+        .bind(orphan_partition.granularity_str())
+        .bind(orphan_partition.start_utc())
         .bind(uuid::Uuid::now_v7())
         .execute(
             &fixture
@@ -1920,42 +2002,15 @@ mod pg_tests {
         .expect("terminal staging history");
         tokio::time::sleep(Duration::from_millis(5)).await;
 
-        let protected = fixture
-            .forge
-            .run_orphan_gc_for_test(&fixture.binding)
-            .await
-            .expect("Forge GC pass");
-        assert_eq!(protected, 0);
-        assert!(fixture.staging.stat(&path).await.is_ok());
-
-        let resource = format!(
-            "bifrost://{}/{}/{}",
-            fixture.tenant, fixture.binding.table_ref.namespace, fixture.binding.table_ref.name
-        );
-        let operation_id = uuid::Uuid::now_v7();
-        let prepared = operation_event(
-            "forge.file_compact.prepared",
-            &resource,
-            reset_detail_for_output(
-                operation_id,
-                &resource,
-                ForgeCompactionPhase::Prepared,
-                &path,
-            ),
-        );
-        append_operation(&fixture, ForgeOperationFamily::StagingFold, &prepared, true).await;
-        let reset = operation_event(
-            "forge.file_compact.reset",
-            &resource,
-            reset_detail_for_output(operation_id, &resource, ForgeCompactionPhase::Reset, &path),
-        );
-        append_operation(&fixture, ForgeOperationFamily::StagingFold, &reset, false).await;
         let deleted = fixture
             .forge
             .run_orphan_gc_for_test(&fixture.binding)
             .await
-            .expect("proven Forge GC pass");
-        assert_eq!(deleted, 1);
+            .expect("Forge GC pass");
+        assert_eq!(
+            deleted, 1,
+            "terminal file-list history must not suppress orphan reclamation"
+        );
         assert!(fixture.staging.stat(&path).await.is_err());
     }
 
@@ -2553,8 +2608,8 @@ mod pg_tests {
         vala_bifrost_redux::forge::reset_scratch_peak_for_test();
         let outcome = fixture.schedule_and_execute().await;
         assert_eq!(outcome.tasks_enqueued, 1, "outcome: {outcome:?}");
-        let envelope: (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
-            "SELECT decoded_batch_bytes,decoded_input_bytes,sort_working_bytes,sort_merge_reservation_bytes,encoder_buffer_bytes,upload_chunk_bytes,sort_spill_bytes,output_scratch_bytes,estimated_memory_bytes,footer_encoded_bytes FROM vala.forge_tasks WHERE data_tenant_id=$1 ORDER BY created_at DESC LIMIT 1",
+        let envelope: (i64, i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT decoded_batch_bytes,decoded_input_bytes,sort_working_bytes,sort_merge_reservation_bytes,encoder_buffer_bytes,upload_chunk_bytes,sort_spill_bytes,estimated_memory_bytes,footer_encoded_bytes FROM vala.forge_tasks WHERE data_tenant_id=$1 ORDER BY created_at DESC LIMIT 1",
         )
         .bind(fixture.tenant.as_uuid())
         .fetch_one(fixture.operator_pool.pool())
@@ -2577,13 +2632,13 @@ mod pg_tests {
         );
         let peak_memory = vala_bifrost_redux::resources::memory_peak_for_test();
         assert!(
-            peak_memory <= usize::try_from(envelope.8).expect("resident total"),
+            peak_memory <= usize::try_from(envelope.7).expect("resident total"),
             "leased-pool peak must remain independent of total output: {peak_memory}"
         );
         assert_eq!(envelope.2, 2 * envelope.0 + envelope.3);
         assert_eq!(
-            envelope.8,
-            envelope.1 + envelope.2 + envelope.4 + envelope.5 + envelope.9
+            envelope.7,
+            envelope.1 + envelope.2 + envelope.4 + envelope.5 + envelope.8
         );
         assert!(
             vala_bifrost_redux::resources::memory_consumer_peak_for_test(
@@ -2602,7 +2657,7 @@ mod pg_tests {
         );
         assert!(
             vala_bifrost_redux::forge::scratch_peak_for_test()
-                <= u64::try_from(envelope.6 + envelope.7).expect("scratch total")
+                <= u64::try_from(envelope.6).expect("sort spill term")
         );
         let released = fixture
             .forge
@@ -3552,6 +3607,8 @@ mod pg_tests {
             ForgeConfig {
                 maintenance_trigger_interval: Duration::from_nanos(1),
                 snapshot_retention: Duration::from_nanos(1),
+                manifest_rewrite_enabled: true,
+                manifest_rewrite_min_count: 2,
                 ..ForgeConfig::default()
             },
             true,
@@ -3694,6 +3751,8 @@ mod pg_tests {
             ForgeConfig {
                 maintenance_trigger_interval: Duration::from_nanos(1),
                 snapshot_retention: Duration::from_nanos(1),
+                manifest_rewrite_enabled: true,
+                manifest_rewrite_min_count: 2,
                 ..ForgeConfig::default()
             },
             true,
@@ -3803,6 +3862,8 @@ mod pg_tests {
                 maintenance_trigger_interval: Duration::from_nanos(1),
                 snapshot_retention: Duration::from_nanos(1),
                 orphan_gc_ttl: Duration::from_nanos(1),
+                manifest_rewrite_enabled: true,
+                manifest_rewrite_min_count: 2,
                 ..ForgeConfig::default()
             },
             true,
@@ -4457,11 +4518,7 @@ mod pg_tests {
             .expect("base snapshot table");
         let plan = fixture
             .forge
-            .discover_live_rewrites_for_test(
-                &fixture.binding,
-                &table,
-                chrono::Utc::now().date_naive(),
-            )
+            .discover_live_rewrites_for_test(&fixture.binding, &table, chrono::Utc::now())
             .await
             .expect("historical live plan");
         let base_snapshot_id = plan.base_snapshot_id_for_test();
@@ -4552,11 +4609,7 @@ mod pg_tests {
             .expect("cap-plus-one bounded snapshot");
         let refusal = bounded
             .forge
-            .discover_live_rewrites_for_test(
-                &bounded.binding,
-                &table,
-                chrono::Utc::now().date_naive(),
-            )
+            .discover_live_rewrites_for_test(&bounded.binding, &table, chrono::Utc::now())
             .await;
         assert!(matches!(refusal, Err(ForgeError::Capacity { .. })));
         let refused_tasks: i64 =
@@ -5273,7 +5326,7 @@ mod pg_tests {
         let decoded = 16_i64 * 1024 * 1024;
         let merge = 1024_i64 * 1024;
         let updated = sqlx::query(
-            "UPDATE vala.forge_tasks SET decoded_batch_bytes=$2,decoded_input_bytes=$2,estimated_parallelism=1,sort_merge_reservation_bytes=$3,sort_working_bytes=2*$2+$3,sort_spill_bytes=1,estimated_memory_bytes=3*$2+$3+encoder_buffer_bytes+upload_chunk_bytes+footer_encoded_bytes,estimated_spill_bytes=1+output_scratch_bytes WHERE data_tenant_id=$1 AND state='ready'",
+            "UPDATE vala.forge_tasks SET decoded_batch_bytes=$2,decoded_input_bytes=$2,estimated_parallelism=1,sort_merge_reservation_bytes=$3,sort_working_bytes=2*$2+$3,sort_spill_bytes=1,estimated_memory_bytes=3*$2+$3+encoder_buffer_bytes+upload_chunk_bytes+footer_encoded_bytes,estimated_spill_bytes=1 WHERE data_tenant_id=$1 AND state='ready'",
         )
         .bind(fixture.tenant.as_uuid())
         .bind(decoded)
@@ -5387,7 +5440,7 @@ mod pg_tests {
             .expect("planning pass");
         assert_eq!(planned.tasks_enqueued, 1);
         sqlx::query(
-            "UPDATE vala.forge_tasks SET envelope_version=0, decoded_batch_bytes=NULL, decoded_input_bytes=NULL, sort_working_bytes=NULL, sort_merge_reservation_bytes=NULL, encoder_buffer_bytes=NULL, upload_chunk_bytes=NULL, footer_encoded_bytes=NULL, footer_decode_workspace_bytes=NULL, sort_spill_bytes=NULL, output_scratch_bytes=NULL, estimated_files=1, estimated_bytes=9223372036854775807, estimated_parallelism=1, estimated_memory_bytes=9223372036854775807, estimated_spill_bytes=9223372036854775807, large_task_ceiling_bytes=9223372036854775807 WHERE data_tenant_id=$1 AND state='ready'",
+            "UPDATE vala.forge_tasks SET envelope_version=0, decoded_batch_bytes=NULL, decoded_input_bytes=NULL, sort_working_bytes=NULL, sort_merge_reservation_bytes=NULL, encoder_buffer_bytes=NULL, upload_chunk_bytes=NULL, footer_encoded_bytes=NULL, footer_decode_workspace_bytes=NULL, sort_spill_bytes=NULL, estimated_files=1, estimated_bytes=9223372036854775807, estimated_parallelism=1, estimated_memory_bytes=9223372036854775807, estimated_spill_bytes=9223372036854775807, large_task_ceiling_bytes=9223372036854775807 WHERE data_tenant_id=$1 AND state='ready'",
         )
         .bind(fixture.tenant.as_uuid())
         .execute(fixture.operator_pool.pool())
@@ -5475,13 +5528,12 @@ mod pg_tests {
                         footer_encoded_bytes: 8 * 1024 * 1024,
                         footer_decode_workspace_bytes: 32 * 1024 * 1024,
                         sort_spill_bytes: 512 * 1024 * 1024,
-                        output_scratch_bytes: 512 * 1024 * 1024,
                     }),
                     files: 2,
                     bytes: 200,
                     parallelism: 1,
                     memory_bytes: 106 * 1024 * 1024,
-                    spill_bytes: 1024 * 1024 * 1024,
+                    spill_bytes: 512 * 1024 * 1024,
                     large_ceiling_bytes: 2 * 1024 * 1024 * 1024,
                 },
                 ready_at: chrono::Utc::now(),
@@ -5672,6 +5724,8 @@ mod pg_tests {
                 maintenance_trigger_interval: Duration::from_nanos(1),
                 snapshot_retention: Duration::from_nanos(1),
                 orphan_gc_ttl: Duration::from_nanos(1),
+                manifest_rewrite_enabled: true,
+                manifest_rewrite_min_count: 2,
                 ..ForgeConfig::default()
             },
             true,
@@ -6187,7 +6241,7 @@ mod pg_tests {
         ids: &[uuid::Uuid],
         detail: &AuditDetail,
     ) {
-        let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("fixture day");
+        let day = fixture_seed_partition(fixture).await;
         match phase {
             ForgeCompactionPhase::Recovered => fixture
                 .forge
@@ -6679,7 +6733,11 @@ mod pg_tests {
     async fn current_snapshot_preserves_manifest_writer_schema_identity() {
         let fixture = Fixture::new().await;
         let (table, old_schema_id, current_schema_id) = mixed_schema_current_table(&fixture).await;
-        let current_day = chrono::NaiveDate::from_ymd_opt(2026, 7, 15).expect("fixed day");
+        let current_day = chrono::NaiveDate::from_ymd_opt(2026, 7, 15)
+            .expect("fixed day")
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight")
+            .and_utc();
 
         let first = fixture
             .forge
@@ -6772,7 +6830,11 @@ mod pg_tests {
             .load_table(&fixture.binding.table_ident())
             .await
             .expect("live target table");
-        let current_day = chrono::NaiveDate::from_ymd_opt(2026, 7, 15).expect("fixed day");
+        let current_day = chrono::NaiveDate::from_ymd_opt(2026, 7, 15)
+            .expect("fixed day")
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight")
+            .and_utc();
         let plan = fixture
             .forge
             .discover_live_rewrites_for_test(&fixture.binding, &table, current_day)
@@ -6869,9 +6931,17 @@ mod pg_tests {
         );
     }
 
-    /// Aged abandoned live outputs are rechecked, deleted, and reset exactly once.
+    /// Aged abandoned live outputs are terminally reset exactly once and left
+    /// intact for delayed orphan GC.
+    ///
+    /// Reconciliation is the logical-enqueue side of the deletion boundary: it
+    /// records the exact output generation as `Reset` and never touches object
+    /// storage, so `orphan_gc` alone owns TTL, refreshed protection, physical
+    /// deletion, and the deletion audit. The surviving object is the observable
+    /// proof of that split, and the replay proves the closed reset is not
+    /// reopened.
     #[tokio::test]
-    async fn live_reconciliation_deletes_abandoned_output_and_replays_reset() {
+    async fn live_reconciliation_resets_abandoned_output_and_replays_reset() {
         let fixture = Fixture::new_with_config(
             ForgeConfig {
                 max_concurrent_reads: 2,
@@ -6898,11 +6968,12 @@ mod pg_tests {
         assert_eq!(outcome.reset, 1);
         assert!(!outcome.blocked);
         assert!(
-            !fixture
+            fixture
                 .staging
                 .exists(&output_key)
                 .await
-                .expect("reset output existence check")
+                .expect("reset output existence check"),
+            "a logical reset must leave its output generation for orphan GC"
         );
         let replay = fixture
             .forge
@@ -6996,7 +7067,7 @@ mod pg_tests {
             base_snapshot_id,
             committed_snapshot_id: None,
             partition_spec_id,
-            partition_day: "2026-07-14".to_owned(),
+            time_partition: fixture_seed_partition(fixture).await.to_wire(),
             target_file_size_bytes: 3_000_000,
             input_paths,
             output_paths: vec![

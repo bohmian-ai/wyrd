@@ -9,7 +9,7 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_sdk::{BifrostGrpcTransport, IngestTransport, QueryClient};
+use vala_sdk::{BifrostGrpcTransport, QueryClient};
 use wyrd_bench::{BifrostLane, BifrostScenario, NegativeFlowReport};
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
@@ -126,7 +126,8 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
     for (index, tenant) in tenants.iter().copied().enumerate() {
         ingest_server
             .state()
-            .bifrost
+            .bifrost_catalog()
+            .expect("ingest server exposes its Bifrost catalog")
             .create_table(CreateTableRequest {
                 table: TableRef::new(BifrostNamespace::Bifrost, &table_name),
                 user_fields: vec![
@@ -134,6 +135,7 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
                     Field::new("value", DataType::Utf8, false),
                 ],
                 tenant,
+                physical_layout: None,
                 audit: None,
             })
             .await?;
@@ -162,12 +164,13 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
     }
     let case_id = scenario.case_id.as_deref().unwrap_or_default();
     let visibility = if case_id.contains("fused") {
-        let day =
-            wyrd_spec::vala::api::EventDay::new(chrono::Utc::now().format("%Y-%m-%d").to_string())?;
+        let partition = vala_bifrost_redux::catalog::TimeGranularity::Hour
+            .bucket(chrono::Utc::now())?
+            .to_wire();
         for (index, tenant) in tenants.iter().copied().enumerate() {
             ingest_server.flush_bifrost_for_tenant(tenant).await?;
             cluster
-                .observe_live_tail_for_tenant(tenant, &table_fqn, day.clone())
+                .observe_live_tail_for_tenant(tenant, &table_fqn, partition)
                 .await?;
             let writer = authenticated_client_for_tenant(
                 ingest_server,

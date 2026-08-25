@@ -25,7 +25,7 @@ use wyrd_tonic::tonic::{Request, Status};
 use wyrd_tonic::wyrd::v1::oracle_peer_service_client::OraclePeerServiceClient;
 
 use super::OracleSlotManager;
-use super::attempt::{AttemptBuffer, AttemptError, ValidatedAttempt};
+use super::attempt::{AttemptBuffer, AttemptError, PartialAttempt, ValidatedAttempt};
 use super::executor::AttemptEncoder;
 use super::follower::{
     AuthenticatedFollowerContext, FollowerSessionFactory, FollowerSourceResolver,
@@ -40,8 +40,21 @@ use super::telemetry::{
 };
 use crate::cluster::{ClusterRegistry, ClusterSnapshot, ROLE_LIVENESS_CUTOFF};
 
-/// Fixed private peer protocol version.
-pub const PEER_PROTOCOL_VERSION: u32 = 1;
+/// Fixed private peer protocol version carried in signed peer ticket claims.
+///
+/// The minter stamps this value into [`PeerTicketClaims::protocol_version`] and
+/// the verifier requires it exactly, so a ticket minted by a binary speaking a
+/// different peer wire is rejected instead of being decoded against the wrong
+/// claim encoding. Both sides read this one constant, so the check cannot
+/// desynchronize within a build.
+///
+/// Protocol v3 binds the exact-partition assignment-authority digest
+/// ([`crate::oracle::peer::assignment_authority_digest_for`]) into those
+/// claims. It differs from v2 only in the Scribe-cut encoding, whose two day
+/// strings became two typed `(granularity, start)` partitions, and it is a
+/// homogeneous cutover: v2 tickets are rejected outright by
+/// [`validated_claim_identifiers`] rather than accepted through a dual decoder.
+pub const PEER_PROTOCOL_VERSION: u32 = 3;
 /// Pending reservation time to live.
 const PENDING_TTL: ChronoDuration = ChronoDuration::seconds(2);
 /// Stable peer rejection hint.
@@ -50,6 +63,14 @@ const RESERVATION_RETRY_MS: u32 = 1_000;
 /// Closed transport failure classification used by terminal dispatch policy.
 #[derive(Debug, Error)]
 pub enum DispatchError {
+    /// Pinned partial outcome with every previously decoded batch retained.
+    #[error("peer attempt completed partially")]
+    Partial {
+        /// Delivered batch payloads, absent when setup failed before delivery.
+        attempt: Option<PartialAttempt>,
+        /// Stable partition-local reason selected at the failing boundary.
+        reason: DispatchPartialReason,
+    },
     /// Worker, transport, deadline, or cancellation made this source unavailable.
     #[error("peer attempt unavailable")]
     Unavailable,
@@ -65,9 +86,43 @@ pub enum DispatchError {
     /// A pinned immutable object disappeared and requires a whole-query replan.
     #[error("peer fragment references a stale object")]
     StaleObject,
+    /// A delivered follower reported the pinned Parquet file-not-found partial.
+    #[error("search parquet file not found")]
+    FileNotFound,
     /// Ticket or fragment contract failed terminally.
     #[error("peer security or fragment contract rejected")]
     Terminal,
+    /// The tenant tripwire refused a physically scanned foreign-tenant row.
+    ///
+    /// Kept distinct from [`DispatchError::Terminal`] so the leader reports
+    /// the tenant-isolation reason rather than a generic peer-security or
+    /// retryable-worker outcome. It is never retried on another candidate:
+    /// the refusal is a property of the data, not of the worker.
+    #[error("peer fragment refused a foreign-tenant row")]
+    TenantInvariant,
+}
+
+/// Longest a peer waits out a saturated running-slot pool before refusing.
+///
+/// Sized far below the query deadline so peer backpressure never becomes a
+/// caller-visible timeout — the failure mode where an uncoordinated worker-side
+/// queue outlives the dispatch RPC and surfaces as a transport error instead of
+/// a clean refusal. Long enough to absorb the brief contention that a fan-out
+/// across several peers otherwise turns into a failed query.
+const PEER_SLOT_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Interval between running-slot retries inside [`PEER_SLOT_WAIT`].
+const PEER_SLOT_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Closed reasons accompanying a partial peer attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchPartialReason {
+    /// Ticket, request, channel, or stream-open construction failed.
+    Setup,
+    /// Deadline or cancellation selected before normal footer completion.
+    Timeout,
+    /// Delivered frame or payload decoding ended after prior batches.
+    Decoder,
 }
 
 /// Closed causes that permit explicit degraded source completion.
@@ -86,17 +141,33 @@ struct PendingReservation {
     leader_node_id: NodeId,
     /// Leader fence preventing stale release.
     leader_fencing_token: FencingToken,
-    /// Requested running-slot demand.
-    slot_units: u32,
     /// Admission class used by closed slot telemetry.
     query_class: QueryClass,
     /// Pending expiry used for eager reclamation.
     expires_at: DateTime<Utc>,
-    /// Remote pending slot permit held until execute or release.
+    /// Remote running-slot permit granted at reservation and held until execute
+    /// or release.
+    ///
+    /// Reservation is the capacity gate. Granting the running permit here means
+    /// a reserved fragment can always execute: a leader never dispatches to a
+    /// node that has not already seated it. Charging a separate, looser pending
+    /// pool and then acquiring the running slot at execute admitted far more
+    /// fragments than could run, so the binding refusal landed after the leader
+    /// had already committed to the fan-out.
     ///
     /// Leader-local work reuses the already-admitted query capacity and keeps
     /// this empty.
-    _permit: Option<OwnedSemaphorePermit>,
+    permit: Option<OwnedSemaphorePermit>,
+    /// Remote-worker memory lease granted at reservation and held until execute
+    /// or release.
+    ///
+    /// The running-slot semaphore alone is not a sufficient capacity answer: it
+    /// counts peer fragments and is blind to the leader-side query envelopes
+    /// competing for the same node's Oracle memory budget. Charging the memory
+    /// governor here is what makes an accepted reservation a real guarantee on a
+    /// node that is simultaneously serving its own queries. Leader-local work
+    /// reuses the admitted query's pool and keeps this empty.
+    worker_resources: Option<FollowerWorkerResources>,
 }
 
 /// Running worker reservation retained through attempt-stream completion.
@@ -109,6 +180,13 @@ pub struct RunningReservation {
     /// Leader-local execution leaves this empty because the admitted query guard
     /// already retains that node's running permit for the complete query stream.
     permit: Option<OwnedSemaphorePermit>,
+    /// Remote-worker memory lease transferred from the reservation.
+    ///
+    /// Retained for the whole attempt stream so the bounded `DataFusion` pool
+    /// this fragment executes under stays charged until the stream completes,
+    /// fails, or is dropped. Leader-local execution leaves this empty and uses
+    /// the admitted query's own pool.
+    pub(crate) worker_resources: Option<FollowerWorkerResources>,
 }
 
 impl Drop for RunningReservation {
@@ -166,6 +244,11 @@ impl ReservationRegistry {
             .load(core::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Returns this registry's slot manager for waiter-bound admission.
+    pub(crate) fn slots(&self) -> &Arc<OracleSlotManager> {
+        &self.slots
+    }
+
     /// Atomically reserves one pending worker slot and returns its generated identity.
     ///
     /// # Errors
@@ -174,15 +257,33 @@ impl ReservationRegistry {
         &self,
         request: &ReserveNodeSlotsRequest,
         now: DateTime<Utc>,
+        worker_resources: Option<FollowerWorkerResources>,
     ) -> Result<PendingNodeReservation, DispatchError> {
         if request.slot_units == 0 || request.expires_at <= now {
             return Err(DispatchError::Terminal);
         }
-        let permit = self
-            .slots
-            .try_pending()
-            .map_err(|_| DispatchError::Unavailable)?;
-        self.insert(request, now, Some(permit))
+        // Clamp leader-supplied demand to this node's own usable capacity before
+        // charging. `slot_units` arrives leader-supplied as a fixed per-class
+        // constant (`admission_limits(u32::MAX, class).1`, always 2 for
+        // Analytical) and would be structurally unschedulable on a node whose own
+        // running capacity is smaller. The clamp upholds
+        // `demand <= running_capacity.max(1)` without ever loosening the
+        // semaphore, so a refusal after it is genuine transient saturation.
+        let running_capacity = self.slots.running_capacity();
+        let capacity_slots = u32::try_from(running_capacity.max(1)).unwrap_or(u32::MAX);
+        let demand = request.slot_units.min(capacity_slots);
+        let Ok(permit) = self.slots.try_running(demand) else {
+            tracing::warn!(
+                stage = "slot_reservation",
+                query_class = ?request.query_class,
+                demand,
+                running_capacity,
+                running_in_use = self.slots.running_in_use(),
+                "oracle peer slot rejection"
+            );
+            return Err(DispatchError::Capacity);
+        };
+        self.insert(request, now, Some(permit), worker_resources)
     }
 
     /// Reserves tuple-bound leader-local work under admitted query capacity.
@@ -199,7 +300,7 @@ impl ReservationRegistry {
         request: &ReserveNodeSlotsRequest,
         now: DateTime<Utc>,
     ) -> Result<PendingNodeReservation, DispatchError> {
-        self.insert(request, now, None)
+        self.insert(request, now, None, None)
     }
 
     /// Inserts one validated reservation with its explicit capacity owner.
@@ -212,6 +313,7 @@ impl ReservationRegistry {
         request: &ReserveNodeSlotsRequest,
         now: DateTime<Utc>,
         permit: Option<OwnedSemaphorePermit>,
+        worker_resources: Option<FollowerWorkerResources>,
     ) -> Result<PendingNodeReservation, DispatchError> {
         if request.slot_units == 0 || request.expires_at <= now {
             return Err(DispatchError::Terminal);
@@ -233,7 +335,7 @@ impl ReservationRegistry {
         let expires_at = request.expires_at.min(now + PENDING_TTL);
         entries.insert(
             reservation_id,
-            pending_reservation(request, expires_at, permit),
+            pending_reservation(request, expires_at, permit, worker_resources),
         );
         Ok(PendingNodeReservation {
             reservation_id,
@@ -262,20 +364,15 @@ impl ReservationRegistry {
     /// The ownership tuple is checked before removal, so a forged execute cannot
     /// destroy another query's pending reservation.
     ///
-    /// The demand charged against this peer's running semaphore is the
-    /// load-bearing schedulability clamp: `slot_units` arrives leader-supplied
-    /// (every producer transmits `admission_limits(u32::MAX, class).1`, always 2
-    /// for Analytical) and would be structurally unschedulable on a peer whose
-    /// own running capacity is 1. Charging
-    /// `entry.slot_units.min(running_capacity.max(1))` upholds the invariant
-    /// `demand <= running_capacity.max(1)` at this admission site without ever
-    /// loosening the semaphore. A rejection after the clamp is a genuine
-    /// transient saturation (capacity in use by another query), which is why it
-    /// maps to a retryable outcome and emits an observable structured warning.
+    /// This transition cannot fail on capacity. The running permit was charged
+    /// and stored when the reservation was accepted, so it is transferred here
+    /// rather than acquired: a peer that answered `Pending` has already
+    /// committed the capacity this fragment executes under, and the leader can
+    /// treat a completed fan-out reservation as a guarantee that every
+    /// participant will run.
     ///
     /// # Errors
-    /// Returns terminal for missing/mismatched ownership and retryable for a
-    /// concurrent running-capacity change or transient saturation.
+    /// Returns terminal for missing, expired, or mismatched ownership.
     #[tracing::instrument(name = "bifrost.oracle.slot_reservation", skip_all)]
     pub fn take_for_execute(
         &self,
@@ -297,42 +394,20 @@ impl ReservationRegistry {
             return Err(DispatchError::Terminal);
         }
         let query_class = entry.query_class;
-        let running_capacity = self.slots.running_capacity();
-        // Peer-side schedulability clamp: never charge more than this node's own
-        // usable running capacity, and never charge zero (which would bypass the
-        // semaphore). Leader-supplied demand above capacity is a fixed per-class
-        // constant, not a negotiation, so clamping here is safe and total. The
-        // capacity is a tiny slot count, so the saturating conversion never
-        // loses information in practice.
-        let capacity_slots = u32::try_from(running_capacity.max(1)).unwrap_or(u32::MAX);
-        let demand = entry.slot_units.min(capacity_slots);
-        let entry = entries
+        // Transfer, do not acquire. The running permit was granted when this
+        // reservation was accepted, so a reserved fragment can always execute and
+        // this transition cannot fail on capacity.
+        let mut entry = entries
             .remove(&reservation_id)
             .ok_or(DispatchError::Terminal)?;
-        drop(entry);
-        let result = self
-            .slots
-            .try_running(demand)
-            .map(|permit| RunningReservation {
-                query_class,
-                permit: Some(permit),
-            })
-            .map_err(|_| DispatchError::Unavailable);
-        if result.is_err() {
-            tracing::warn!(
-                stage = "slot_reservation",
-                query_class = ?query_class,
-                demand,
-                running_capacity,
-                running_in_use = self.slots.running_in_use(),
-                "oracle peer slot rejection"
-            );
-        }
+        let result = Ok(RunningReservation {
+            query_class,
+            permit: entry.permit.take(),
+            worker_resources: entry.worker_resources.take(),
+        });
         #[cfg(feature = "test-support")]
-        if result.is_ok() {
-            self.admitted_running_total
-                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        }
+        self.admitted_running_total
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         record_slot(
             query_class,
             if result.is_ok() {
@@ -381,6 +456,7 @@ impl ReservationRegistry {
         Ok(RunningReservation {
             query_class,
             permit: None,
+            worker_resources: None,
         })
     }
 
@@ -399,15 +475,16 @@ fn pending_reservation(
     request: &ReserveNodeSlotsRequest,
     expires_at: DateTime<Utc>,
     permit: Option<OwnedSemaphorePermit>,
+    worker_resources: Option<FollowerWorkerResources>,
 ) -> PendingReservation {
     PendingReservation {
         query_id: request.query_id,
         leader_node_id: request.leader_node_id,
         leader_fencing_token: request.leader_fencing_token,
-        slot_units: request.slot_units,
         query_class: request.query_class,
         expires_at,
-        _permit: permit,
+        permit,
+        worker_resources,
     }
 }
 
@@ -434,13 +511,14 @@ pub struct WorkerExecution {
 }
 
 /// Exact role-root quantum retained by one remote follower stream.
-enum FollowerWorkerResources {
+#[derive(Debug)]
+pub(crate) enum FollowerWorkerResources {
     /// Oracle floor/elastic ownership for persisted execution.
     Oracle(crate::resources::OracleWorkerResources),
 }
 
 impl FollowerWorkerResources {
-    /// Returns the exact bounded DataFusion pool retained by this role lease.
+    /// Returns the exact bounded `DataFusion` pool retained by this role lease.
     fn memory_pool(&self) -> Arc<dyn datafusion::execution::memory_pool::MemoryPool> {
         match self {
             Self::Oracle(resources) => resources.memory_pool(),
@@ -489,20 +567,48 @@ struct PhysicalWorkerObserver {
     footers_emitted: std::sync::atomic::AtomicU64,
 }
 
+/// Complete construction inputs for one production [`OraclePeerWorker`].
+///
+/// Boot, journey fixtures, and unit tests all build the same worker from the
+/// same fixed identity, security, and resource dependencies. Naming them keeps
+/// the two `Arc<dyn ...>` audit/verifier pairs from being transposable at a
+/// call site.
+pub struct OraclePeerWorkerConfig {
+    /// Identity of the node this worker answers for.
+    pub worker_node_id: NodeId,
+    /// Role fence every accepted fragment must match.
+    pub oracle_fence: FencingToken,
+    /// Verifier for inbound peer tickets.
+    pub verifier: Arc<dyn PeerTicketVerifier>,
+    /// Sink for peer security audit records.
+    pub security_audit: Arc<dyn PeerSecurityAudit>,
+    /// Shared registry backing local fragment reservations.
+    pub reservations: Arc<ReservationRegistry>,
+    /// Root-issued Oracle capability bounding follower execution.
+    pub oracle_resources: crate::resources::OracleResources,
+    /// Resolver that binds assigned sources to concrete providers.
+    pub resolver: Arc<dyn FollowerSourceResolver>,
+    /// Sink for Oracle query audit records.
+    pub audit: Arc<dyn super::OracleAudit>,
+    /// Follower session partition width.
+    pub target_partitions: usize,
+}
+
 impl OraclePeerWorker {
     /// Creates the production worker with native physical-plan execution enabled.
     #[must_use]
-    pub fn new_physical_with_resources(
-        worker_node_id: NodeId,
-        oracle_fence: FencingToken,
-        verifier: Arc<dyn PeerTicketVerifier>,
-        security_audit: Arc<dyn PeerSecurityAudit>,
-        reservations: Arc<ReservationRegistry>,
-        oracle_resources: crate::resources::OracleResources,
-        resolver: Arc<dyn FollowerSourceResolver>,
-        audit: Arc<dyn super::OracleAudit>,
-        target_partitions: usize,
-    ) -> Self {
+    pub fn new_physical_with_resources(config: OraclePeerWorkerConfig) -> Self {
+        let OraclePeerWorkerConfig {
+            worker_node_id,
+            oracle_fence,
+            verifier,
+            security_audit,
+            reservations,
+            oracle_resources,
+            resolver,
+            audit,
+            target_partitions,
+        } = config;
         let follower = PhysicalPlanFollower::new(resolver)
             .with_audit(audit)
             .with_session_factory(FollowerSessionFactory::new(target_partitions));
@@ -535,18 +641,63 @@ impl OraclePeerWorker {
         }
     }
 
-    /// Reserves bounded pending capacity for one fenced leader.
-    #[must_use]
-    pub fn reserve(&self, request: &ReserveNodeSlotsRequest) -> ReserveNodeSlotsResponse {
+    /// Reserves bounded running capacity for one fenced leader.
+    ///
+    /// Reservation is the single admission gate: accepting here grants the
+    /// running permit the fragment will later execute under, so a leader that
+    /// completes its fan-out reservation knows every participant can run.
+    /// A saturated pool is waited out for at most [`PEER_SLOT_WAIT`] before
+    /// refusing, which converts a momentary instant of contention into a
+    /// slightly delayed fragment instead of a failed query, while still
+    /// refusing sustained overload promptly enough that the leader can retry
+    /// well inside the query deadline.
+    pub async fn reserve(&self, request: &ReserveNodeSlotsRequest) -> ReserveNodeSlotsResponse {
         let query_class = request.query_class;
-        if let Ok(pending) = self.reservations.reserve(request, Utc::now()) {
-            record_slot(query_class, SlotOutcome::Pending);
-            ReserveNodeSlotsResponse::Pending(pending)
-        } else {
+        let rejected = || {
             record_slot(query_class, SlotOutcome::Rejected);
             ReserveNodeSlotsResponse::Rejected(ReservationRejected {
                 retry_after_ms: RESERVATION_RETRY_MS,
             })
+        };
+        // The waiter bound is taken before the first attempt and held for the
+        // whole wait, so a saturated node sheds new arrivals immediately instead
+        // of accumulating an unbounded set of sleepers behind one running gate.
+        let Ok(_waiter) = self.reservations.slots().try_pending() else {
+            return rejected();
+        };
+        let deadline = std::time::Instant::now() + PEER_SLOT_WAIT;
+        loop {
+            // Charge the memory governor here, alongside the running slot, so a
+            // node already saturated by its own leader-side queries refuses
+            // before the leader commits to this participant rather than after.
+            let attempt = match self.acquire_worker_resources(request.query_class) {
+                Ok(worker_resources) => {
+                    self.reservations
+                        .reserve(request, Utc::now(), Some(worker_resources))
+                }
+                Err(error) => {
+                    // The slot path emits its own structured rejection; without
+                    // this arm a memory-bound refusal would be invisible, and the
+                    // two causes need different operator responses (raise the
+                    // Oracle memory budget vs. raise slot capacity).
+                    tracing::warn!(
+                        stage = "slot_reservation",
+                        query_class = ?request.query_class,
+                        "oracle peer worker memory rejection"
+                    );
+                    Err(error)
+                }
+            };
+            match attempt {
+                Ok(pending) => {
+                    record_slot(query_class, SlotOutcome::Pending);
+                    return ReserveNodeSlotsResponse::Pending(pending);
+                }
+                Err(DispatchError::Capacity) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(PEER_SLOT_POLL).await;
+                }
+                Err(_) => return rejected(),
+            }
         }
     }
 
@@ -610,12 +761,236 @@ impl OraclePeerWorker {
     ///
     /// # Errors
     /// Returns terminal security/contract failures or retryable capacity/storage failures.
+    /// Runs the last pre-execution refusals for an already-authenticated fragment.
+    ///
+    /// Both checks happen after the ticket verified and before
+    /// `follower.execute` resolves a provider or issues any object I/O:
+    /// the physical claims must still describe this exact request, and the
+    /// assignment-authority digest recomputed over the assignments this
+    /// follower physically received must equal the digest signed into the
+    /// verified claims. A valid signature only proves the claims bytes were
+    /// not altered in transit, not that the dispatched closure matches what
+    /// the leader signed, so the digest is recomputed here rather than
+    /// trusted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DispatchError::Terminal`] when either check refuses, after
+    /// appending the matching verified security violation. Propagates the
+    /// audit append failure unchanged when the chain itself cannot record the
+    /// refusal, so the worker fails closed rather than serving unattributably.
+    async fn admit_verified_fragment(
+        &self,
+        request: &PhysicalExecuteFragmentRequest,
+        claims: &PeerTicketClaims,
+        tenant_id: DataTenantId,
+        running: &RunningReservation,
+    ) -> Result<(), DispatchError> {
+        if let Err(violation) = validate_physical_claims(claims, request) {
+            tracing::error!(?violation, "Oracle peer physical claims validation failed");
+            self.audit_verified(tenant_id, violation).await?;
+            return Err(DispatchError::Terminal);
+        }
+        // The authenticated class decided this fragment's quantum at reservation
+        // time; emitting it here is what lets an operator tie a slow fragment
+        // back to the admission decision that sized its memory pool.
+        tracing::debug!(
+            query_class = ?running.query_class,
+            reservation = %request.reservation_id.as_uuid(),
+            "Oracle peer fragment admitted to execute"
+        );
+        match super::peer::assignment_authority_digest_for(&request.assignments) {
+            Ok(recomputed) if recomputed == claims.assignment_authority_digest => {}
+            _ => {
+                tracing::error!("Oracle peer assignment-authority digest mismatch");
+                self.audit_verified(
+                    tenant_id,
+                    BifrostSecurityViolationKind::PeerAssignmentAuthority,
+                )
+                .await?;
+                return Err(DispatchError::Terminal);
+            }
+        }
+        Ok(())
+    }
+
     async fn execute_with_capacity(
         &self,
         request: PhysicalExecuteFragmentRequest,
         capacity: WorkerCapacity,
         admitted_pool: Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>>,
     ) -> Result<WorkerExecution, DispatchError> {
+        let (claims, tenant_id) = self.verify_fragment_authority(&request).await?;
+        let follower_deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(
+                u64::try_from(
+                    claims
+                        .expires_at_ms
+                        .saturating_sub(Utc::now().timestamp_millis()),
+                )
+                .unwrap_or(0),
+            );
+        let mut running = self
+            .claim_running_reservation(&request, capacity, &claims, tenant_id)
+            .await?;
+        // The lease was charged at reservation; take it here so the attempt
+        // stream, not the reservation entry, owns it for the rest of execution.
+        let worker_resources = running.worker_resources.take();
+        self.admit_verified_fragment(&request, &claims, tenant_id, &running)
+            .await?;
+        let follower = &self.physical_follower;
+        let memory_pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> = match capacity {
+            WorkerCapacity::LeaderAdmitted => admitted_pool.ok_or(DispatchError::Capacity)?,
+            WorkerCapacity::ReserveRunning => {
+                let resources = worker_resources.as_ref().ok_or(DispatchError::Capacity)?;
+                resources.memory_pool()
+            }
+        };
+        let binding = request
+            .assignments
+            .first()
+            .map(|assignment| assignment.binding.clone())
+            .ok_or(DispatchError::Terminal)?;
+        let stream = follower
+            .execute(
+                &request,
+                AuthenticatedFollowerContext {
+                    tenant_id,
+                    table_binding: &binding,
+                    reservation_id: &request.reservation_id,
+                    leader_fence: request.leader_fence.clone(),
+                    local_fence: request.target_fence.clone(),
+                },
+                memory_pool,
+            )
+            .await;
+        let stream = match stream {
+            Ok(stream) => stream,
+            Err(error) => {
+                return Err(match error {
+                    // A plan whose bytes do not match the signed digest, or
+                    // whose fences, bindings, or assignments contradict the
+                    // verified ticket, is a contract refusal of an
+                    // authenticated peer's request. It is detected here before
+                    // any object I/O, and it must be attributable afterwards,
+                    // so it joins the tenant's security chain rather than only
+                    // the local trace.
+                    PhysicalPlanFollowerError::Preflight(_) => {
+                        tracing::error!(?error, "Oracle physical follower rejected the request");
+                        self.audit_verified(tenant_id, BifrostSecurityViolationKind::PeerFragment)
+                            .await?;
+                        DispatchError::Terminal
+                    }
+                    PhysicalPlanFollowerError::PostResolutionDecode(_) => {
+                        tracing::error!(?error, "Oracle physical follower rejected the request");
+                        DispatchError::Terminal
+                    }
+                    PhysicalPlanFollowerError::Resolution(_) => {
+                        tracing::warn!(
+                            ?error,
+                            "Oracle physical follower could not resolve a pinned source"
+                        );
+                        DispatchError::EligibleSourceLoss {
+                            cause: EligibleSourceLossCause::ProviderResolution,
+                        }
+                    }
+                    PhysicalPlanFollowerError::Execution(_) => {
+                        tracing::warn!(
+                            ?error,
+                            "Oracle physical follower execution could not start"
+                        );
+                        DispatchError::Unavailable
+                    }
+                });
+            }
+        };
+        self.physical_observer
+            .oracle_executions
+            .fetch_add(1, Ordering::AcqRel);
+        let (stream, scan_evidence) = stream.split();
+        let output = encode_attempt_frames(
+            stream,
+            scan_evidence,
+            running,
+            follower_deadline,
+            request.plan_fingerprint.clone(),
+            Arc::clone(&self.physical_observer),
+        );
+        Ok(WorkerExecution {
+            stream: retain_worker_resources(output, worker_resources),
+        })
+    }
+
+    /// Converts this fragment's pending reservation into a running one.
+    ///
+    /// The transition is tuple-bound: the reservation must already be held for
+    /// exactly this query, leader, and leader fence. A remote worker consumes a
+    /// running permit; the leader-local path reuses the query's own admitted
+    /// slot instead of taking a duplicate. A tuple mismatch is a fence violation
+    /// rather than an ordinary refusal, so it is audited before it is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DispatchError::Terminal`] when a claim identifier is malformed
+    /// or the reservation is missing, expired, or bound to different ownership,
+    /// and propagates any other transition failure unchanged. Audit-append
+    /// failures propagate unchanged.
+    async fn claim_running_reservation(
+        &self,
+        request: &PhysicalExecuteFragmentRequest,
+        capacity: WorkerCapacity,
+        claims: &PeerTicketClaims,
+        tenant_id: DataTenantId,
+    ) -> Result<RunningReservation, DispatchError> {
+        let query_id = QueryId::new(uuid_from(&claims.query_id)?);
+        let leader = NodeId::new(uuid_from(&claims.leader_node_id)?);
+        let transition = match capacity {
+            WorkerCapacity::ReserveRunning => self.reservations.take_for_execute(
+                request.reservation_id,
+                query_id,
+                leader,
+                claims.leader_fence,
+                Utc::now(),
+            ),
+            WorkerCapacity::LeaderAdmitted => self.reservations.take_for_local_leader_execute(
+                request.reservation_id,
+                query_id,
+                leader,
+                claims.leader_fence,
+                Utc::now(),
+            ),
+        };
+        match transition {
+            Ok(running) => Ok(running),
+            Err(DispatchError::Terminal) => {
+                tracing::error!(
+                    reservation = %request.reservation_id.as_uuid(),
+                    "Oracle peer reservation transition was not tuple-bound"
+                );
+                self.audit_verified(tenant_id, BifrostSecurityViolationKind::PeerFence)
+                    .await?;
+                Err(DispatchError::Terminal)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Proves one inbound fragment is addressed to this worker by an authorized leader.
+    ///
+    /// Runs the complete security preamble in fixed order: target role, target
+    /// fence identity, peer-ticket signature, claim decoding, and claim identity
+    /// validation. Every refusal is audited before it is returned, so no
+    /// follower work, reservation transition, or resource acquisition can be
+    /// reached by an unauthenticated or misaddressed request.
+    ///
+    /// # Errors
+    /// Returns [`DispatchError::Terminal`] for a wrong role, a fence mismatch,
+    /// an unverifiable ticket, undecodable claims, or claim identifiers that
+    /// fail validation. Audit-append failures propagate unchanged.
+    async fn verify_fragment_authority(
+        &self,
+        request: &PhysicalExecuteFragmentRequest,
+    ) -> Result<(PeerTicketClaims, DataTenantId), DispatchError> {
         if request.target_fence.role != wyrd_spec::vala::api::ClusterRole::Oracle {
             tracing::error!(role = ?request.target_fence.role, "Oracle peer received a non-Oracle target role");
             return Err(DispatchError::Terminal);
@@ -631,6 +1006,12 @@ impl OraclePeerWorker {
                 expected_fence,
                 "Oracle peer target fence mismatch"
             );
+            // Refused before ticket verification, so no tenant is established
+            // and this joins the unverified rejection chain. Recording it is
+            // what makes a leader replaying a superseded fence visible to an
+            // operator instead of only to this pod's trace.
+            self.audit_unverified(BifrostSecurityViolationKind::PeerFence)
+                .await?;
             return Err(DispatchError::Terminal);
         }
         let verified = self
@@ -657,136 +1038,14 @@ impl OraclePeerWorker {
             self.audit_unverified(*violation).await?;
         }
         let tenant_id = tenant_validation.map_err(|_| DispatchError::Terminal)?;
-        let query_id = QueryId::new(uuid_from(&claims.query_id)?);
-        let leader = NodeId::new(uuid_from(&claims.leader_node_id)?);
-        let transition = match capacity {
-            WorkerCapacity::ReserveRunning => self.reservations.take_for_execute(
-                request.reservation_id,
-                query_id,
-                leader,
-                claims.leader_fence,
-                Utc::now(),
-            ),
-            WorkerCapacity::LeaderAdmitted => self.reservations.take_for_local_leader_execute(
-                request.reservation_id,
-                query_id,
-                leader,
-                claims.leader_fence,
-                Utc::now(),
-            ),
-        };
-        let running = match transition {
-            Ok(running) => running,
-            Err(DispatchError::Terminal) => {
-                tracing::error!(
-                    reservation = %request.reservation_id.as_uuid(),
-                    "Oracle peer reservation transition was not tuple-bound"
-                );
-                self.audit_verified(tenant_id, BifrostSecurityViolationKind::PeerFence)
-                    .await?;
-                return Err(DispatchError::Terminal);
-            }
-            Err(error) => return Err(error),
-        };
-        let worker_resources = self.acquire_worker_resources(capacity, running.query_class)?;
-        if let Err(violation) = validate_physical_claims(&claims, &request) {
-            tracing::error!(?violation, "Oracle peer physical claims validation failed");
-            self.audit_verified(tenant_id, violation).await?;
-            return Err(DispatchError::Terminal);
-        }
-        let follower = &self.physical_follower;
-        let memory_pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> = match capacity {
-            WorkerCapacity::LeaderAdmitted => admitted_pool.ok_or(DispatchError::Capacity)?,
-            WorkerCapacity::ReserveRunning => {
-                let resources = worker_resources.as_ref().ok_or(DispatchError::Capacity)?;
-                resources.memory_pool()
-            }
-        };
-        let binding = request
-            .assignments
-            .first()
-            .map(|assignment| assignment.binding.clone())
-            .ok_or(DispatchError::Terminal)?;
-        let stream = follower
-            .execute(
-                &request,
-                AuthenticatedFollowerContext {
-                    tenant_id,
-                    table_binding: &binding,
-                    reservation_id: &request.reservation_id,
-                    leader_fence: request.leader_fence.clone(),
-                    local_fence: request.target_fence.clone(),
-                },
-                memory_pool,
-            )
-            .await
-            .map_err(|error| match error {
-                PhysicalPlanFollowerError::Preflight(_)
-                | PhysicalPlanFollowerError::PostResolutionDecode(_) => {
-                    tracing::error!(?error, "Oracle physical follower rejected the request");
-                    DispatchError::Terminal
-                }
-                PhysicalPlanFollowerError::Resolution(_) => {
-                    tracing::warn!(
-                        ?error,
-                        "Oracle physical follower could not resolve a pinned source"
-                    );
-                    DispatchError::EligibleSourceLoss {
-                        cause: EligibleSourceLossCause::ProviderResolution,
-                    }
-                }
-                PhysicalPlanFollowerError::Execution(_) => DispatchError::Unavailable,
-            })?;
-        self.physical_observer
-            .oracle_executions
-            .fetch_add(1, Ordering::AcqRel);
-        let plan_fingerprint = request.plan_fingerprint.clone();
-        let physical_observer = Arc::clone(&self.physical_observer);
-        let output = async_stream::stream! {
-            let _running = running;
-            let mut stream = stream;
-            let mut encoder = AttemptEncoder::default();
-            match encoder.start(stream.schema()) {
-                Ok(schema) => yield Ok(schema),
-                Err(_) => {
-                    yield Err(DispatchError::Terminal);
-                    return;
-                }
-            }
-            while let Some(batch) = stream.next().await {
-                let batch = match batch {
-                    Ok(batch) => batch,
-                    Err(error) => {
-                        tracing::warn!(?error, "Oracle follower execution stream failed");
-                        yield Err(DispatchError::Unavailable);
-                        return;
-                    }
-                };
-                match encoder.encode(&batch) {
-                    Ok((schema, batch)) => {
-                        if let Some(schema) = schema {
-                            yield Ok(schema);
-                        }
-                        yield Ok(batch);
-                    }
-                    Err(_) => {
-                        yield Err(DispatchError::Terminal);
-                        return;
-                    }
-                }
-            }
-            let footer = encoder.finish_physical(&plan_fingerprint).map_err(|_| DispatchError::Terminal);
-            if footer.is_ok() {
-                physical_observer.footers_emitted.fetch_add(1, Ordering::AcqRel);
-            }
-            yield footer;
-        };
-        Ok(WorkerExecution {
-            stream: retain_worker_resources(Box::pin(output), worker_resources),
-        })
+        Ok((claims, tenant_id))
     }
 
-    /// Acquires the one remote-worker root or reuses leader-local query ownership.
+    /// Acquires the one remote-worker memory root backing a peer reservation.
+    ///
+    /// Called from the reservation path only. The leader-local path never
+    /// reaches here because it reuses the admitted query's own envelope and pool
+    /// rather than taking a second, duplicate worker quantum.
     ///
     /// # Errors
     ///
@@ -794,23 +1053,16 @@ impl OraclePeerWorker {
     /// cannot admit the remote worker quantum.
     fn acquire_worker_resources(
         &self,
-        capacity: WorkerCapacity,
         query_class: QueryClass,
-    ) -> Result<Option<FollowerWorkerResources>, DispatchError> {
-        match capacity {
-            WorkerCapacity::ReserveRunning => {
-                let class = match query_class {
-                    QueryClass::Interactive => crate::resources::OracleWorkerClass::Interactive,
-                    QueryClass::Analytical => crate::resources::OracleWorkerClass::Analytical,
-                };
-                self.oracle_resources
-                    .try_acquire_worker(class)
-                    .map(FollowerWorkerResources::Oracle)
-                    .map(Some)
-                    .map_err(|_| DispatchError::Capacity)
-            }
-            WorkerCapacity::LeaderAdmitted => Ok(None),
-        }
+    ) -> Result<FollowerWorkerResources, DispatchError> {
+        let class = match query_class {
+            QueryClass::Interactive => crate::resources::OracleWorkerClass::Interactive,
+            QueryClass::Analytical => crate::resources::OracleWorkerClass::Analytical,
+        };
+        self.oracle_resources
+            .try_acquire_worker(class)
+            .map(FollowerWorkerResources::Oracle)
+            .map_err(|_| DispatchError::Capacity)
     }
 
     /// Commits a system-chain audit before rejecting claims that lack a trusted tenant.
@@ -849,6 +1101,145 @@ impl OraclePeerWorker {
     }
 }
 
+/// Builds the signed peer-ticket claims delivered to one dispatch candidate.
+///
+/// The ticket expires at the earlier of the candidate's pending reservation and
+/// the query's own absolute deadline, so a peer can never hold work past either
+/// bound. The fragment digest, manifest digest, and projection digest all carry
+/// the same plan fingerprint: the follower validates one sealed fragment, and
+/// splitting these into distinct digests would imply a per-stage binding the
+/// protocol does not have.
+///
+/// The assignment-authority digest is computed here, over the exact assignments
+/// this fragment will dispatch, so protocol v2 followers can recompute it from
+/// what they physically received and refuse a closure that was altered after
+/// the leader signed it.
+///
+/// # Errors
+///
+/// Returns [`DispatchError::Terminal`] when the fragment's assignments cannot
+/// produce a canonical authority digest; such a fragment must never be signed.
+fn peer_ticket_claims(
+    candidate: &DispatchCandidate,
+    context: &DispatchContext,
+    fragment: &PhysicalDispatchFragment,
+    pending: &PendingNodeReservation,
+) -> Result<PeerTicketClaims, DispatchError> {
+    Ok(PeerTicketClaims {
+        protocol_version: PEER_PROTOCOL_VERSION,
+        audience: candidate.node_id.as_uuid().as_bytes().to_vec(),
+        worker_fence: candidate.worker_fence,
+        leader_node_id: context.leader_node_id.as_uuid().as_bytes().to_vec(),
+        leader_fence: context.leader_fence,
+        query_id: context.query_id.as_uuid().as_bytes().to_vec(),
+        tenant_id: context.tenant_id.as_bytes().to_vec(),
+        nonce: uuid::Uuid::new_v4().as_bytes().to_vec(),
+        expires_at_ms: pending
+            .expires_at
+            .timestamp_millis()
+            .min(fragment.deadline_unix_ms),
+        binding: format!("{}.{}", fragment.binding.namespace, fragment.binding.table),
+        fragment_digest: fragment.plan_fingerprint.clone(),
+        manifest_digest: fragment.plan_fingerprint.clone(),
+        projection_digest: fragment.plan_fingerprint.clone(),
+        permission_digest: context.permission_digest.clone(),
+        assignment_authority_digest: super::peer::assignment_authority_digest_for(
+            &fragment.assignments,
+        )
+        .map_err(|_| DispatchError::Terminal)?,
+    })
+}
+
+/// Encodes one follower record-batch stream into the peer attempt frame protocol.
+///
+/// Emits the schema frame first, then one encoded frame per batch, then the
+/// physical footer. The returned stream owns `running` for its whole life, so
+/// the reservation is released exactly when the last frame has been produced
+/// or the consumer drops the stream.
+///
+/// `scan_evidence` is finalized after the last batch and carried on the footer
+/// so the leader can report physical read volume for a plan whose own leaves
+/// are all remote.
+///
+/// The absolute `follower_deadline` is enforced between batches rather than
+/// around the whole stream: a deadline reached after frames have already been
+/// delivered yields a [`DispatchPartialReason::Timeout`] partial so the leader
+/// keeps the batches it received, while a decode or footer failure yields a
+/// terminal because those indicate a contract violation rather than a bound.
+fn encode_attempt_frames(
+    stream: datafusion::execution::SendableRecordBatchStream,
+    scan_evidence: super::follower::FollowerScanEvidence,
+    running: RunningReservation,
+    follower_deadline: tokio::time::Instant,
+    plan_fingerprint: String,
+    physical_observer: Arc<PhysicalWorkerObserver>,
+) -> WorkerAttemptStream {
+    Box::pin(async_stream::stream! {
+        let _running = running;
+        let mut stream = stream;
+        let mut encoder = AttemptEncoder::default();
+        match encoder.start(stream.schema()) {
+            Ok(schema) => yield Ok(schema),
+            Err(_) => {
+                yield Err(DispatchError::Terminal);
+                return;
+            }
+        }
+        while let Some(batch) = tokio::select! {
+            () = tokio::time::sleep_until(follower_deadline) => {
+                yield Err(DispatchError::Partial {
+                    attempt: None,
+                    reason: DispatchPartialReason::Timeout,
+                });
+                return;
+            }
+            batch = stream.next() => batch,
+        } {
+            let batch = match batch {
+                Ok(batch) => batch,
+                Err(error) => {
+                    tracing::warn!(?error, "Oracle follower execution stream failed");
+                    // A foreign-tenant row refused by the physical tripwire is a
+                    // property of the scanned data, not of this worker, so it is
+                    // reported as a tenant-isolation outcome that the leader will
+                    // not retry on another candidate.
+                    if super::exec::is_tenant_invariant_error(&error) {
+                        yield Err(DispatchError::TenantInvariant);
+                    } else {
+                        yield Err(DispatchError::Unavailable);
+                    }
+                    return;
+                }
+            };
+            match encoder.encode(&batch) {
+                Ok((schema, batch)) => {
+                    if let Some(schema) = schema {
+                        yield Ok(schema);
+                    }
+                    yield Ok(batch);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Oracle follower could not encode a fragment batch");
+                    yield Err(DispatchError::Terminal);
+                    return;
+                }
+            }
+        }
+        // Finalize only here: the scan counters are written during execution,
+        // so reading them before the stream is exhausted under-reports the scan.
+        let footer = encoder
+            .finish_physical(&plan_fingerprint, scan_evidence.finalize())
+            .map_err(|error| {
+                tracing::warn!(%error, "Oracle follower could not finalize a fragment footer");
+                DispatchError::Terminal
+            });
+        if footer.is_ok() {
+            physical_observer.footers_emitted.fetch_add(1, Ordering::AcqRel);
+        }
+        yield footer;
+    })
+}
+
 /// Retains one coarse root quantum until the remote attempt stream terminates.
 fn retain_worker_resources(
     mut stream: WorkerAttemptStream,
@@ -866,8 +1257,8 @@ fn retain_worker_resources(
 mod resource_tests {
     use super::*;
     use crate::resources::{
-        BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, ORACLE_PARTITION_MEMORY_BYTES,
-        ResourceSource, SystemResourceSnapshot,
+        BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources,
+        ORACLE_PARTITION_WORKING_MEMORY_BYTES, ResourceSource, SystemResourceSnapshot,
     };
     use std::collections::BTreeSet;
     use std::path::PathBuf;
@@ -894,6 +1285,7 @@ mod resource_tests {
                 unmanaged_reserve_bytes: None,
                 scratch_limit_bytes: None,
                 effective_cpu: None,
+                oracle_query_slot_limit: None,
                 scratch_root: PathBuf::new(),
                 volume_roots: None,
             },
@@ -905,7 +1297,11 @@ mod resource_tests {
         let resources = oracle
             .try_acquire_worker(crate::resources::OracleWorkerClass::Interactive)
             .expect("advertised worker quantum");
-        assert_eq!(resources.memory_bytes(), ORACLE_PARTITION_MEMORY_BYTES);
+        assert_eq!(
+            resources.memory_bytes(),
+            ORACLE_PARTITION_WORKING_MEMORY_BYTES,
+            "a worker charges the slot-unit admission quantum, not the grant cap"
+        );
         let stream: WorkerAttemptStream = Box::pin(futures_util::stream::pending());
         let retained =
             retain_worker_resources(stream, Some(FollowerWorkerResources::Oracle(resources)));
@@ -914,13 +1310,23 @@ mod resource_tests {
                 .snapshot()
                 .expect("retained snapshot")
                 .oracle_memory_used_bytes,
-            ORACLE_PARTITION_MEMORY_BYTES
+            ORACLE_PARTITION_WORKING_MEMORY_BYTES
         );
+        // Admission charges one slot-unit quantum rather than a whole grant cap,
+        // so the budget holds several workers. Drain it to prove the retained
+        // stream's quantum is genuinely held rather than merely accounted.
+        let mut drained = Vec::new();
+        while let Ok(worker) =
+            oracle.try_acquire_worker(crate::resources::OracleWorkerClass::Interactive)
+        {
+            drained.push(worker);
+        }
         assert!(
             oracle
                 .try_acquire_worker(crate::resources::OracleWorkerClass::Interactive)
                 .is_err()
         );
+        drop(drained);
         drop(retained);
         assert_eq!(
             oracle
@@ -1142,6 +1548,31 @@ enum PeerTopologyMismatch {
     PlaintextAddress,
 }
 
+/// Maps one peer-address resolution mismatch onto its dispatch disposition.
+///
+/// Address resolution runs before any RPC is opened, so no frames can have been
+/// delivered and the classes are separated by cause rather than sharing one
+/// terminal outcome:
+///
+/// - A plaintext address is a trust-policy refusal, never an availability
+///   problem, so it stays terminal and is never downgraded.
+/// - A newer fence means the pinned participant cut moved under the query. That
+///   is precisely the stale-cut condition the single pre-output replan exists to
+///   serve, so it keeps the stale-object class.
+/// - Absence, unreadiness, and an expired heartbeat are ordinary pre-`do_get`
+///   transport failures. They degrade only their own partition and leave the
+///   rest of the cut free to answer. Classifying them stale instead let one
+///   participant's heartbeat gap fail an entire query.
+const fn dispatch_error_for_topology_mismatch(mismatch: PeerTopologyMismatch) -> DispatchError {
+    match mismatch {
+        PeerTopologyMismatch::PlaintextAddress => DispatchError::Terminal,
+        PeerTopologyMismatch::Fence => DispatchError::StaleObject,
+        PeerTopologyMismatch::Missing
+        | PeerTopologyMismatch::Unready
+        | PeerTopologyMismatch::Expired => DispatchError::Unavailable,
+    }
+}
+
 /// Resolves one exact candidate from a single immutable membership cut.
 ///
 /// # Errors
@@ -1328,6 +1759,17 @@ impl TonicOraclePeerTransport {
             }
             return Ok(address.clone());
         }
+        // Prefer the endpoint the immutable cut already authenticated. Trust
+        // policy is still enforced here because it is a property of the address
+        // itself and needs no membership lookup. A participant that has since
+        // stopped serving surfaces as an ordinary connect failure, which is the
+        // pre-`do_get` transport-failure path, not a membership verdict.
+        if let Some(endpoint) = &candidate.endpoint {
+            if self.tls.is_some() && !endpoint.starts_with("https://") {
+                return Err(DispatchError::Terminal);
+            }
+            return Ok(endpoint.clone());
+        }
         let snapshot = self.snapshot();
         match resolve_snapshot_candidate(&snapshot, candidate, self.tls.is_some(), Utc::now()) {
             Ok(address) => Ok(address.to_owned()),
@@ -1338,11 +1780,7 @@ impl TonicOraclePeerTransport {
                     mismatch = ?mismatch,
                     "Oracle peer topology target is stale"
                 );
-                if mismatch == PeerTopologyMismatch::PlaintextAddress {
-                    Err(DispatchError::Terminal)
-                } else {
-                    Err(DispatchError::StaleObject)
-                }
+                Err(dispatch_error_for_topology_mismatch(mismatch))
             }
         }
     }
@@ -1363,6 +1801,7 @@ impl TonicOraclePeerTransport {
                     node_id: worker,
                     role: wyrd_spec::vala::api::ClusterRole::Oracle,
                     worker_fence: 0,
+                    endpoint: None,
                 })
                 .ok_or(DispatchError::StaleObject);
         }
@@ -1374,6 +1813,7 @@ impl TonicOraclePeerTransport {
             node_id: worker,
             role: wyrd_spec::vala::api::ClusterRole::Oracle,
             worker_fence: lease.fencing_token,
+            endpoint: None,
         })
     }
 
@@ -1403,7 +1843,7 @@ impl TonicOraclePeerTransport {
                 &tls.ca_certificate_pem,
                 tls.server_name.clone(),
             )
-            .map_err(|_| DispatchError::Terminal)?
+            .map_err(|_| DispatchError::Unavailable)?
         } else {
             wyrd_tonic::transport::plaintext_endpoint(address)
                 .map_err(|_| DispatchError::Unavailable)?
@@ -1438,7 +1878,13 @@ impl TonicOraclePeerTransport {
             result => result.map_err(|status| status_error(&status))?,
         }
         .into_inner();
-        response.try_into().map_err(|_| DispatchError::Terminal)
+        response.try_into().map_err(|error| {
+            tracing::warn!(
+                ?error,
+                "Oracle leader could not decode a reservation response"
+            );
+            DispatchError::Terminal
+        })
     }
 
     /// Releases capacity for one exact planned node/fence target.
@@ -1478,26 +1924,20 @@ impl TonicOraclePeerTransport {
     ) -> Result<WorkerAttemptStream, DispatchError> {
         let mut client = self.client(candidate).await?;
         let wire: wyrd_tonic::wyrd::v1::ExecuteFragmentRequest = request.into();
-        let response = match client
-            .execute_fragment(self.authenticated(wire.clone(), false).await?)
+        let response = client
+            .execute_fragment(self.authenticated(wire, false).await?)
             .await
-        {
-            Err(status) if status.code() == wyrd_tonic::tonic::Code::Unauthenticated => client
-                .execute_fragment(self.authenticated(wire, true).await?)
-                .await
-                .map_err(|status| {
-                    tracing::warn!(code = ?status.code(), "Oracle peer execute retry rejected");
-                    status_error(&status)
-                })?,
-            result => result.map_err(|status| {
+            .map_err(|status| {
                 tracing::warn!(code = ?status.code(), "Oracle peer execute rejected");
-                status_error(&status)
-            })?,
-        };
+                execution_status_error(&status)
+            })?;
         let mut stream = response.into_inner();
         let output = async_stream::stream! {
             while let Some(frame) = stream.next().await {
-                yield frame.map_err(|status| execution_status_error(&status)).and_then(|frame| frame.try_into().map_err(|_| DispatchError::Terminal));
+                yield frame.map_err(|status| stream_status_error(&status)).and_then(|frame| frame.try_into().map_err(|error| {
+                    tracing::warn!(?error, "Oracle leader could not decode a worker frame");
+                    DispatchError::Terminal
+                }));
             }
         };
         Ok(Box::pin(output))
@@ -1524,7 +1964,7 @@ impl TonicOraclePeerTransport {
             })?;
         let value: MetadataValue<wyrd_tonic::tonic::metadata::Ascii> = format!("Bearer {bearer}")
             .parse()
-            .map_err(|_| DispatchError::Terminal)?;
+            .map_err(|_| DispatchError::Unavailable)?;
         request.metadata_mut().insert("x-wyrd-access-token", value);
         Ok(request)
     }
@@ -1714,13 +2154,21 @@ impl OraclePeerTransportDirectory {
 }
 
 /// Classifies tonic status without retrying security or malformed-contract failures.
+///
+/// `ResourceExhausted` is the code a healthy peer returns when it is momentarily
+/// out of admission capacity. It is transient backpressure and classifies as
+/// [`DispatchError::Unavailable`] so the leader can place the fragment elsewhere
+/// rather than failing the query.
+///
+/// `Unavailable` deliberately stays terminal. A peer uses it for a genuine
+/// storage or role outage, where silently continuing would return an incomplete
+/// answer; Bifrost fails closed on completeness instead. That is why capacity
+/// refusal must not reuse `Unavailable` — see the peer reservation path.
 fn status_error(status: &Status) -> DispatchError {
     match status.code() {
-        wyrd_tonic::tonic::Code::Unavailable
-        | wyrd_tonic::tonic::Code::DeadlineExceeded
-        | wyrd_tonic::tonic::Code::ResourceExhausted
-        | wyrd_tonic::tonic::Code::Cancelled => DispatchError::Unavailable,
-        wyrd_tonic::tonic::Code::NotFound => DispatchError::Unavailable,
+        wyrd_tonic::tonic::Code::DeadlineExceeded
+        | wyrd_tonic::tonic::Code::Cancelled
+        | wyrd_tonic::tonic::Code::ResourceExhausted => DispatchError::Unavailable,
         _ => DispatchError::Terminal,
     }
 }
@@ -1728,7 +2176,12 @@ fn status_error(status: &Status) -> DispatchError {
 /// Classifies the authenticated execute stream's typed stale-object wire signal.
 fn execution_status_error(status: &Status) -> DispatchError {
     match status.code() {
-        wyrd_tonic::tonic::Code::NotFound => DispatchError::StaleObject,
+        wyrd_tonic::tonic::Code::NotFound => DispatchError::FileNotFound,
+        // The private peer protocol reserves `Aborted` for the tenant
+        // tripwire so a foreign-tenant refusal on a remote worker reaches the
+        // leader as a tenant-isolation outcome instead of a generic
+        // security or retryable failure.
+        wyrd_tonic::tonic::Code::Aborted => DispatchError::TenantInvariant,
         wyrd_tonic::tonic::Code::FailedPrecondition => DispatchError::EligibleSourceLoss {
             cause: EligibleSourceLossCause::ProviderResolution,
         },
@@ -1736,8 +2189,18 @@ fn execution_status_error(status: &Status) -> DispatchError {
     }
 }
 
+/// Classifies errors after a stream was delivered as partition-local decoder partials.
+fn stream_status_error(status: &Status) -> DispatchError {
+    match status.code() {
+        wyrd_tonic::tonic::Code::Unauthenticated
+        | wyrd_tonic::tonic::Code::PermissionDenied
+        | wyrd_tonic::tonic::Code::InvalidArgument => DispatchError::Terminal,
+        _ => DispatchError::Unavailable,
+    }
+}
+
 /// Immutable worker candidate with its role fence.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct DispatchCandidate {
     /// Worker node identity.
     pub node_id: NodeId,
@@ -1745,6 +2208,17 @@ pub struct DispatchCandidate {
     pub role: wyrd_spec::vala::api::ClusterRole,
     /// Current role fence.
     pub worker_fence: FencingToken,
+    /// Private endpoint carried from the authenticated participant cut.
+    ///
+    /// The cut already selected and authenticated this endpoint when the
+    /// participant was chosen, and the cut is immutable for the whole attempt.
+    /// Re-deriving the address from live membership at dispatch time would
+    /// reintroduce exactly the membership refresh the cut exists to prevent: a
+    /// participant admitted by the cut can disappear from a later, independently
+    /// refreshed snapshot and be reported absent even though it is serving.
+    ///
+    /// `None` falls back to snapshot resolution for callers that have no cut.
+    pub endpoint: Option<String>,
 }
 
 /// Immutable query and authorization bindings used for all fragment attempts.
@@ -1814,6 +2288,50 @@ impl FragmentDispatcher {
         }
     }
 
+    /// Reserves one candidate's slots, or reports that it declined.
+    ///
+    /// Scribe candidates hold no slot registry, so they are admitted with a nil
+    /// reservation without a round trip. An Oracle candidate is reserved under
+    /// the query's remaining deadline and its cancellation token, so a cancelled
+    /// or expired query stops reserving rather than continuing down the
+    /// candidate list.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DispatchError::Unavailable`] when the deadline has already
+    /// passed, the query was cancelled, or the reserve call timed out, and
+    /// propagates a terminal reservation failure unchanged. `Ok(None)` means the
+    /// candidate rejected the reservation and the caller should try the next one.
+    async fn reserve_candidate(
+        &self,
+        candidate: &DispatchCandidate,
+        reserve: ReserveNodeSlotsRequest,
+        context: &DispatchContext,
+    ) -> Result<Option<PendingNodeReservation>, DispatchError> {
+        if candidate.role == wyrd_spec::vala::api::ClusterRole::Scribe {
+            return Ok(Some(PendingNodeReservation {
+                reservation_id: ReservationId::new(uuid::Uuid::nil()),
+                expires_at: reserve.expires_at,
+            }));
+        }
+        let remaining = context
+            .deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(DispatchError::Unavailable)?;
+        match tokio::select! {
+            () = context.cancellation.cancelled() => Err(DispatchError::Unavailable),
+            result = tokio::time::timeout(remaining, self.transports.reserve(candidate, reserve)) =>
+                result.map_err(|_| DispatchError::Unavailable).and_then(std::convert::identity),
+        } {
+            Ok(ReserveNodeSlotsResponse::Rejected(_)) => Ok(None),
+            Ok(ReserveNodeSlotsResponse::Pending(pending)) => Ok(Some(pending)),
+            Err(error) => {
+                tracing::error!(?error, "Oracle peer reservation failed terminally");
+                Err(error)
+            }
+        }
+    }
+
     /// Executes one candidate, advancing only after an authenticated capacity rejection.
     ///
     /// A timeout, cancellation, transport error, follower error, or accepted
@@ -1833,6 +2351,9 @@ impl FragmentDispatcher {
         if !self.transports.is_local(context.leader_node_id) {
             return Err(DispatchError::Terminal);
         }
+        // Last retryable attempt failure, kept so an exhausted candidate list
+        // reports the real cause instead of a bare admission failure.
+        let mut last_retryable: Option<Result<ValidatedAttempt, DispatchError>> = None;
         for candidate in candidates {
             if candidate.role != fragment.target_role {
                 return Err(DispatchError::Terminal);
@@ -1846,28 +2367,8 @@ impl FragmentDispatcher {
                 slot_units: context.slot_units,
                 expires_at,
             };
-            let pending = if candidate.role == wyrd_spec::vala::api::ClusterRole::Scribe {
-                PendingNodeReservation {
-                    reservation_id: ReservationId::new(uuid::Uuid::nil()),
-                    expires_at,
-                }
-            } else {
-                let remaining = context
-                    .deadline
-                    .checked_duration_since(Instant::now())
-                    .ok_or(DispatchError::Unavailable)?;
-                match tokio::select! {
-                    () = context.cancellation.cancelled() => Err(DispatchError::Unavailable),
-                    result = tokio::time::timeout(remaining, self.transports.reserve(candidate, reserve)) =>
-                        result.map_err(|_| DispatchError::Unavailable).and_then(std::convert::identity),
-                } {
-                    Ok(ReserveNodeSlotsResponse::Rejected(_)) => continue,
-                    Err(error) => {
-                        tracing::error!(?error, "Oracle peer reservation failed terminally");
-                        return Err(error);
-                    }
-                    Ok(ReserveNodeSlotsResponse::Pending(pending)) => pending,
-                }
+            let Some(pending) = self.reserve_candidate(candidate, reserve, context).await? else {
+                continue;
             };
             let release = ReleaseNodeSlotsRequest {
                 reservation_id: pending.reservation_id,
@@ -1875,31 +2376,16 @@ impl FragmentDispatcher {
                 leader_node_id: context.leader_node_id,
                 leader_fencing_token: context.leader_fence,
             };
-            let claims = PeerTicketClaims {
-                protocol_version: PEER_PROTOCOL_VERSION,
-                audience: candidate.node_id.as_uuid().as_bytes().to_vec(),
-                worker_fence: candidate.worker_fence,
-                leader_node_id: context.leader_node_id.as_uuid().as_bytes().to_vec(),
-                leader_fence: context.leader_fence,
-                query_id: context.query_id.as_uuid().as_bytes().to_vec(),
-                tenant_id: context.tenant_id.as_bytes().to_vec(),
-                nonce: uuid::Uuid::new_v4().as_bytes().to_vec(),
-                expires_at_ms: pending
-                    .expires_at
-                    .timestamp_millis()
-                    .min(fragment.deadline_unix_ms),
-                binding: format!("{}.{}", fragment.binding.namespace, fragment.binding.table),
-                fragment_digest: fragment.plan_fingerprint.clone(),
-                manifest_digest: fragment.plan_fingerprint.clone(),
-                projection_digest: fragment.plan_fingerprint.clone(),
-                permission_digest: context.permission_digest.clone(),
-            };
+            let claims = peer_ticket_claims(candidate, context, &fragment, &pending)?;
             let Ok(ticket) = self.ticket_minter.mint_peer_ticket(&claims) else {
                 tracing::error!("Oracle peer ticket mint failed");
                 if candidate.role == wyrd_spec::vala::api::ClusterRole::Oracle {
                     self.release_pending(candidate, release, context).await;
                 }
-                return Err(DispatchError::Terminal);
+                return Err(DispatchError::Partial {
+                    attempt: None,
+                    reason: DispatchPartialReason::Setup,
+                });
             };
             let request = PhysicalExecuteFragmentRequest {
                 ticket,
@@ -1927,9 +2413,24 @@ impl FragmentDispatcher {
             if candidate.role == wyrd_spec::vala::api::ClusterRole::Oracle {
                 self.release_pending(candidate, release, context).await;
             }
-            return result;
+            // A transient loss on one worker — a restarting peer, a reset
+            // connection, a source that briefly could not be opened — must not
+            // fail the query while another candidate can still serve it. Only a
+            // failure that would recur or must not be retried elsewhere ends the
+            // dispatch here: a contract or security refusal, a foreign-tenant
+            // row, a pinned object that no longer exists, and admission
+            // pressure that the next candidate would also hit.
+            match result {
+                Err(DispatchError::Unavailable | DispatchError::EligibleSourceLoss { .. }) => {
+                    last_retryable = Some(result);
+                }
+                _ => return result,
+            }
         }
-        Err(DispatchError::Capacity)
+        // Reaching here means every candidate either rejected its reservation
+        // or failed retryably. Report the last real failure when there was one
+        // so the caller sees why, and admission pressure otherwise.
+        last_retryable.unwrap_or(Err(DispatchError::Capacity))
     }
 
     /// Attempts immediate tuple-bound cleanup after any accepted-attempt failure.
@@ -1962,6 +2463,79 @@ impl FragmentDispatcher {
         skip_all,
         fields(locality = if candidate.node_id == context.leader_node_id { "local" } else { "remote" })
     )]
+
+    /// Opens one authenticated peer stream and classifies an open failure.
+    ///
+    /// The open is bounded by both the query's remaining deadline and its
+    /// cancellation token, so neither an unresponsive peer nor an abandoned
+    /// query can hold the attempt open. Classification of a failure here is the
+    /// partial/terminal boundary: a terminal, stale-object, or missing-file
+    /// failure keeps its own meaning because the leader must react to each
+    /// differently, while an unavailable, source-loss, or capacity failure
+    /// becomes a setup partial — no frames were delivered, so the leader may
+    /// keep what other participants produced instead of failing the query.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DispatchError::Unavailable`] when the deadline has already
+    /// passed, [`DispatchError::Terminal`], [`DispatchError::StaleObject`], and
+    /// [`DispatchError::FileNotFound`] unchanged, [`DispatchError::TenantInvariant`]
+    /// unchanged, and otherwise a [`DispatchPartialReason::Setup`] partial
+    /// carrying no attempt.
+    async fn open_attempt_frames(
+        &self,
+        candidate: &DispatchCandidate,
+        request: PhysicalExecuteFragmentRequest,
+        context: &DispatchContext,
+    ) -> Result<WorkerAttemptStream, DispatchError> {
+        let remaining = context
+            .deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(DispatchError::Unavailable)?;
+        match tokio::select! {
+            () = context.cancellation.cancelled() => Err(DispatchError::Unavailable),
+            result = tokio::time::timeout(
+                remaining,
+                self.transports.execute(
+                    candidate,
+                    request,
+                    Arc::clone(&context.query_memory_pool),
+                ),
+            ) =>
+                result.map_err(|_| DispatchError::Unavailable).and_then(std::convert::identity),
+        } {
+            Ok(frames) => Ok(frames),
+            Err(error) => {
+                tracing::warn!(
+                    stage = "remote_execute_open",
+                    query_class = ?context.query_class,
+                    candidate_node = %candidate.node_id.as_uuid(),
+                    ?error,
+                    "oracle peer remote execute open failed"
+                );
+                record_peer_attempt(FragmentOutcome::Failed, dispatch_error_label(&error));
+                Err(match error {
+                    DispatchError::Terminal => DispatchError::Terminal,
+                    DispatchError::StaleObject => DispatchError::StaleObject,
+                    DispatchError::FileNotFound => DispatchError::FileNotFound,
+                    // A foreign-tenant refusal is a property of the data, not
+                    // of this candidate, so it must never soften into a setup
+                    // partial that another participant's rows could mask.
+                    DispatchError::TenantInvariant => DispatchError::TenantInvariant,
+                    DispatchError::Partial { attempt, reason } => {
+                        DispatchError::Partial { attempt, reason }
+                    }
+                    DispatchError::Unavailable
+                    | DispatchError::EligibleSourceLoss { .. }
+                    | DispatchError::Capacity => DispatchError::Partial {
+                        attempt: None,
+                        reason: DispatchPartialReason::Setup,
+                    },
+                })
+            }
+        }
+    }
+
     async fn execute_attempt(
         &self,
         candidate: &DispatchCandidate,
@@ -1981,32 +2555,9 @@ impl FragmentDispatcher {
             &context.query_memory_pool,
         )
         .map_err(attempt_error)?;
-        let remaining = context
-            .deadline
-            .checked_duration_since(Instant::now())
-            .ok_or(DispatchError::Unavailable)?;
-        let mut frames = match tokio::select! {
-            () = context.cancellation.cancelled() => Err(DispatchError::Unavailable),
-            result = tokio::time::timeout(
-                remaining,
-                self.transports.execute(
-                    candidate,
-                    request,
-                    Arc::clone(&context.query_memory_pool),
-                ),
-            ) =>
-                result.map_err(|_| DispatchError::Unavailable).and_then(std::convert::identity),
-        } {
+        let mut frames = match self.open_attempt_frames(candidate, request, context).await {
             Ok(frames) => frames,
             Err(error) => {
-                tracing::warn!(
-                    stage = "remote_execute_open",
-                    query_class = ?context.query_class,
-                    candidate_node = %candidate.node_id.as_uuid(),
-                    ?error,
-                    "oracle peer remote execute open failed"
-                );
-                record_peer_attempt(FragmentOutcome::Failed, dispatch_error_label(&error));
                 telemetry.finish(FragmentOutcome::Failed, 0);
                 return Err(error);
             }
@@ -2016,11 +2567,34 @@ impl FragmentDispatcher {
             () = tokio::time::sleep_until(context.deadline) => Some(Err(DispatchError::Unavailable)),
             frame = frames.next() => frame,
         } {
-            let frame = frame.inspect_err(|error| {
-                tracing::warn!(?error, "Oracle follower frame stream failed");
-                record_peer_attempt(FragmentOutcome::Failed, dispatch_error_label(error));
-            })?;
-            buffer.push(frame).map_err(attempt_error)?;
+            let frame = match frame {
+                Ok(frame) => frame,
+                Err(DispatchError::Terminal) => return Err(DispatchError::Terminal),
+                Err(error) => {
+                    tracing::warn!(?error, "Oracle follower frame stream completed partially");
+                    record_peer_attempt(FragmentOutcome::Failed, dispatch_error_label(&error));
+                    return Err(DispatchError::Partial {
+                        attempt: buffer.finish_partial().ok(),
+                        reason: DispatchPartialReason::Timeout,
+                    });
+                }
+            };
+            if let Err(error) = buffer.push(frame) {
+                return if error == AttemptError::Schema {
+                    Err(DispatchError::Terminal)
+                } else {
+                    Err(DispatchError::Partial {
+                        attempt: buffer.finish_partial().ok(),
+                        reason: DispatchPartialReason::Decoder,
+                    })
+                };
+            }
+        }
+        if !buffer.has_footer() {
+            return Err(DispatchError::Partial {
+                attempt: buffer.finish_partial().ok(),
+                reason: DispatchPartialReason::Decoder,
+            });
         }
         let attempt = buffer.finish().map_err(attempt_error)?;
         if attempt.footer.fragment_id != fragment.plan_fingerprint
@@ -2050,11 +2624,13 @@ fn attempt_error(error: AttemptError) -> DispatchError {
 /// Maps internal retry classes to closed metric labels.
 fn dispatch_error_label(error: &DispatchError) -> PeerErrorClass {
     match error {
-        DispatchError::Unavailable
+        DispatchError::Partial { .. }
+        | DispatchError::Unavailable
         | DispatchError::EligibleSourceLoss { .. }
         | DispatchError::StaleObject
+        | DispatchError::FileNotFound
         | DispatchError::Capacity => PeerErrorClass::Availability,
-        DispatchError::Terminal => PeerErrorClass::Security,
+        DispatchError::Terminal | DispatchError::TenantInvariant => PeerErrorClass::Security,
     }
 }
 
@@ -2083,7 +2659,8 @@ mod tests {
     use datafusion::execution::memory_pool::GreedyMemoryPool;
     use wyrd_spec::vala::api::{
         ClusterCapabilities, ClusterNodeKey, ClusterRole, ClusterRoleLease, FollowerScanAssignment,
-        OracleCapabilitiesV1, PersistedFileAssignment, TenantTableBinding,
+        OracleCapabilitiesV1, PersistedFileAssignment, PersistedWalRange, ScribeProviderCut,
+        TenantTableBinding, TimeGranularityWire,
     };
 
     /// Deterministic verifier that preserves the already encoded claims bytes.
@@ -2183,7 +2760,8 @@ mod tests {
         writer.close().expect("Parquet close");
         let size_bytes = file.as_file().metadata().expect("file metadata").len();
         let location = file.path().to_string_lossy().into_owned();
-        let leaf = crate::oracle::fragment::PreparedSealedLeaf {
+        let mut fragment = SealedScanFragment {
+            fragment_id: String::new(),
             binding: Path::new(&location)
                 .parent()
                 .expect("fixture parent")
@@ -2199,19 +2777,57 @@ mod tests {
             }],
             projection: vec!["value".to_owned()],
             predicates: Vec::new(),
-            schema_fingerprint: crate::oracle::sealed_fragment_schema_fingerprint(&schema),
+            schema_fingerprint: crate::oracle::assignment_schema_fingerprint(&schema),
+            estimated_rows: 3,
+            estimated_bytes: size_bytes,
             deadline_unix_ms: Utc::now().timestamp_millis() + 60_000,
         };
-        let fragment = crate::oracle::fragment::FragmentPlanner
-            .plan(&leaf, &crate::oracle::fragment::FragmentConfig::default())
-            .expect("validated fragment")
-            .into_iter()
-            .next()
-            .expect("one fragment");
+        fragment.fragment_id = fragment.digest();
         (file, fragment)
     }
 
     /// Encodes one matching worker request for a retained reservation.
+    /// Hourly Scribe provider cut every protocol-v3 dispatcher fixture carries.
+    ///
+    /// The digest only covers the partition bounds when a cut is present, so
+    /// the authority contract needs a fixture cut to tamper with. The two
+    /// bounds are adjacent hours, which keeps [`ScribeProviderCut::is_valid`]
+    /// satisfied while leaving both granularity and start free to mutate.
+    /// `writer_epoch` must equal the target role fence, which follower
+    /// preflight compares before it will admit the cut at all.
+    fn fixture_scribe_cut(writer_epoch: u64) -> ScribeProviderCut {
+        ScribeProviderCut {
+            writer_epoch,
+            start_partition: fixture_partition(TimeGranularityWire::Hour, 1_787_493_600_000_000),
+            end_partition: fixture_partition(TimeGranularityWire::Hour, 1_787_497_200_000_000),
+            required_columns: vec!["data_tenant_id".to_owned()],
+            persisted_cursor: 41,
+            persisted_ranges: vec![PersistedWalRange {
+                start_lsn: 1,
+                end_lsn: 40,
+            }],
+            maximum_batch_count: 16,
+            maximum_retained_bytes: 1_048_576,
+        }
+    }
+
+    /// Builds one canonical partition from epoch microseconds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `start_micros` is not the exact boundary of `granularity`;
+    /// every call site passes a boundary literal.
+    fn fixture_partition(
+        granularity: TimeGranularityWire,
+        start_micros: i64,
+    ) -> wyrd_spec::vala::api::TimePartitionWire {
+        wyrd_spec::vala::api::TimePartitionWire::new(
+            granularity,
+            chrono::DateTime::from_timestamp_micros(start_micros).expect("fixture instant"),
+        )
+        .expect("fixture instant is an exact partition boundary")
+    }
+
     fn worker_request(
         fragment: &SealedScanFragment,
         reservation_id: ReservationId,
@@ -2220,6 +2836,44 @@ mod tests {
         query_id: QueryId,
         tenant: DataTenantId,
     ) -> PhysicalExecuteFragmentRequest {
+        worker_request_with_cut(
+            fragment,
+            reservation_id,
+            node,
+            fence,
+            query_id,
+            tenant,
+            None,
+        )
+    }
+
+    /// Builds one signed worker request, optionally carrying a Scribe cut.
+    ///
+    /// A cut is only legal on a Scribe target fence, so the target role is
+    /// derived from its presence rather than passed separately; the leader
+    /// fence stays Oracle either way. The signed
+    /// `assignment_authority_digest` is minted over the finished assignment,
+    /// so a caller that mutates the request afterwards is exactly the tamper
+    /// case protocol v3 must reject.
+    ///
+    /// # Panics
+    ///
+    /// Panics when plan encoding, digest computation, or ticket minting fails,
+    /// all of which are deterministic for these fixtures.
+    fn worker_request_with_cut(
+        fragment: &SealedScanFragment,
+        reservation_id: ReservationId,
+        node: NodeId,
+        fence: FencingToken,
+        query_id: QueryId,
+        tenant: DataTenantId,
+        scribe_provider_cut: Option<ScribeProviderCut>,
+    ) -> PhysicalExecuteFragmentRequest {
+        let target_role = if scribe_provider_cut.is_some() {
+            ClusterRole::Scribe
+        } else {
+            ClusterRole::Oracle
+        };
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
             DataType::Int64,
@@ -2227,7 +2881,7 @@ mod tests {
         )]));
         let physical_plan_bytes =
             datafusion_proto::bytes::physical_plan_to_bytes_with_extension_codec(
-                Arc::new(super::super::codec::RemoteScanExec::new(
+                Arc::new(super::super::codec::RemoteSourcePlaceholderExec::new(
                     "dispatcher-test-scan",
                     &fragment.schema_fingerprint,
                     schema,
@@ -2237,6 +2891,19 @@ mod tests {
             .expect("native physical plan encoding")
             .to_vec();
         let plan_fingerprint = super::super::codec::physical_plan_fingerprint(&physical_plan_bytes);
+        let assignments = vec![FollowerScanAssignment {
+            scan_id: "dispatcher-test-scan".to_owned(),
+            binding: TenantTableBinding {
+                tenant_id: tenant,
+                namespace: "vala.bifrost".to_owned(),
+                table: "events".to_owned(),
+            },
+            persisted: PersistedFileAssignment { files: Vec::new() },
+            scribe_provider_cut,
+            schema_fingerprint: fragment.schema_fingerprint.clone(),
+            required_columns: vec!["data_tenant_id".to_owned()],
+            predicates: Vec::new(),
+        }];
         let claims = PeerTicketClaims {
             protocol_version: PEER_PROTOCOL_VERSION,
             audience: node.as_uuid().as_bytes().to_vec(),
@@ -2252,6 +2919,10 @@ mod tests {
             manifest_digest: plan_fingerprint.clone(),
             projection_digest: projection_digest(&fragment.projection),
             permission_digest: "permission".to_owned(),
+            assignment_authority_digest: crate::oracle::peer::assignment_authority_digest_for(
+                &assignments,
+            )
+            .expect("deterministic fixture digest"),
         };
         let ticket = DeterministicTestSigner {
             key_id: "test".to_owned(),
@@ -2269,20 +2940,10 @@ mod tests {
             },
             target_fence: OracleRoleFence {
                 node_id: node,
-                role: ClusterRole::Oracle,
+                role: target_role,
                 fencing_token: fence,
             },
-            assignments: vec![FollowerScanAssignment {
-                scan_id: "dispatcher-test-scan".to_owned(),
-                binding: TenantTableBinding {
-                    tenant_id: tenant,
-                    namespace: "vala.bifrost".to_owned(),
-                    table: "events".to_owned(),
-                },
-                persisted: PersistedFileAssignment { files: Vec::new() },
-                scribe_provider_cut: None,
-                schema_fingerprint: fragment.schema_fingerprint.clone(),
-            }],
+            assignments,
             plan_fingerprint,
         }
     }
@@ -2304,7 +2965,6 @@ mod tests {
             fencing_token: fence,
             capability_version: 1,
             capabilities: ClusterCapabilities::OracleV1(OracleCapabilitiesV1 {
-                peer_protocol_version: 1,
                 storage_protocol_version: 1,
                 cpu_cores: 1.0,
                 memory_budget_bytes: 1,
@@ -2335,7 +2995,12 @@ mod tests {
                 binding: binding.clone(),
                 persisted: PersistedFileAssignment { files: Vec::new() },
                 scribe_provider_cut: None,
-                schema_fingerprint: "schema".to_owned(),
+                // Canonical 64-lowercase-hex placeholder: the assignment-
+                // authority digest requires this shape even in fixtures that
+                // never exercise object storage.
+                schema_fingerprint: "0".repeat(64),
+                required_columns: vec!["data_tenant_id".to_owned()],
+                predicates: Vec::new(),
             }],
             binding,
             target_role: ClusterRole::Oracle,
@@ -2353,6 +3018,7 @@ mod tests {
             node_id: node,
             role: ClusterRole::Oracle,
             worker_fence: 7,
+            endpoint: None,
         };
         let matching = ClusterSnapshot::new(vec![topology_lease(
             node,
@@ -2409,6 +3075,7 @@ mod tests {
                     node_id: node,
                     role: ClusterRole::Oracle,
                     worker_fence: 8,
+                    endpoint: None,
                 },
                 true,
                 now,
@@ -2426,6 +3093,61 @@ mod tests {
             resolve_snapshot_candidate(&plaintext, &candidate, true, now),
             Err(PeerTopologyMismatch::PlaintextAddress)
         );
+    }
+
+    /// Every peer-address mismatch maps to the disposition its cause earns.
+    ///
+    /// This matrix is the pre-RPC half of the partition disposition contract.
+    /// It is pinned exhaustively because collapsing any row into a terminal
+    /// outcome fails a whole query for a condition that only one participant
+    /// experienced, and collapsing the fence row into a degrade would silently
+    /// answer from a cut that has already moved.
+    #[test]
+    fn peer_topology_mismatch_maps_to_its_exact_disposition() {
+        for (mismatch, expected) in [
+            (PeerTopologyMismatch::PlaintextAddress, "terminal"),
+            (PeerTopologyMismatch::Fence, "stale"),
+            (PeerTopologyMismatch::Missing, "unavailable"),
+            (PeerTopologyMismatch::Unready, "unavailable"),
+            (PeerTopologyMismatch::Expired, "unavailable"),
+        ] {
+            let observed = match dispatch_error_for_topology_mismatch(mismatch) {
+                DispatchError::Terminal => "terminal",
+                DispatchError::StaleObject => "stale",
+                DispatchError::Unavailable => "unavailable",
+                DispatchError::FileNotFound => "file_not_found",
+                DispatchError::Partial { .. } => "partial",
+                DispatchError::Capacity => "capacity",
+                DispatchError::EligibleSourceLoss { .. } => "source_loss",
+                DispatchError::TenantInvariant => "tenant_invariant",
+            };
+            assert_eq!(
+                observed, expected,
+                "{mismatch:?} must resolve to {expected}"
+            );
+        }
+    }
+
+    /// An unavailable participant degrades only its own partition.
+    ///
+    /// Proves the end of the chain the mapping above feeds: a peer that is
+    /// absent, unready, or past its heartbeat cutoff must leave the remaining
+    /// participants free to answer instead of failing the query.
+    #[test]
+    fn absent_participant_degrades_only_its_partition() {
+        for mismatch in [
+            PeerTopologyMismatch::Missing,
+            PeerTopologyMismatch::Unready,
+            PeerTopologyMismatch::Expired,
+        ] {
+            assert!(
+                !matches!(
+                    dispatch_error_for_topology_mismatch(mismatch),
+                    DispatchError::Terminal | DispatchError::StaleObject
+                ),
+                "{mismatch:?} must not fail the whole query"
+            );
+        }
     }
 
     /// Transport that injects one ambiguity-terminal reservation failure.
@@ -2763,6 +3485,7 @@ mod tests {
             .reserve(
                 &reserve_request_analytical(query, leader, 17, now + ChronoDuration::seconds(2)),
                 now,
+                None,
             )
             .expect("pending analytical reservation");
         let running = registry
@@ -2790,6 +3513,7 @@ mod tests {
             .reserve(
                 &reserve_request_analytical(query, leader, 19, now + ChronoDuration::seconds(2)),
                 now,
+                None,
             )
             .expect("pending analytical reservation");
         let running = registry
@@ -2800,35 +3524,34 @@ mod tests {
         drop(running);
     }
 
-    /// `take_for_execute` emits a structured warning when the clamped demand is rejected.
+    /// `reserve` emits a structured warning when the clamped demand is rejected.
     ///
     /// AC3: on a capacity-1 peer already saturated by an in-flight query, the
     /// clamped Analytical demand of 1 still cannot be admitted, so the path
     /// emits the observable structured warning (stage, class, demand, running
     /// capacity, running in use) before the unchanged retryable mapping. The
-    /// warning is captured with a minimal `tracing`-only probe.
+    /// warning is captured with a minimal `tracing`-only probe. Reservation is
+    /// the site under test because it is now the single admission gate.
     #[test]
-    fn take_for_execute_rejection_emits_structured_warning() {
+    fn reserve_rejection_emits_structured_warning() {
         let slots = Arc::new(OracleSlotManager::new(1, 1));
         let held = slots.try_running(1).expect("saturating running unit");
         let registry = ReservationRegistry::new(Arc::clone(&slots), 1);
         let now = Utc::now();
         let query = QueryId::new(uuid::Uuid::now_v7());
         let leader = NodeId::new(uuid::Uuid::now_v7());
-        let pending = registry
-            .reserve(
-                &reserve_request_analytical(query, leader, 23, now + ChronoDuration::seconds(2)),
-                now,
-            )
-            .expect("pending analytical reservation");
 
         let probe = RejectionWarnProbe::default();
         let result = tracing::subscriber::with_default(probe.clone(), || {
-            registry.take_for_execute(pending.reservation_id, query, leader, 23, now)
+            registry.reserve(
+                &reserve_request_analytical(query, leader, 23, now + ChronoDuration::seconds(2)),
+                now,
+                None,
+            )
         });
 
         // The wire mapping is byte-unchanged: a saturated peer stays retryable.
-        assert!(matches!(result, Err(DispatchError::Unavailable)));
+        assert!(matches!(result, Err(DispatchError::Capacity)));
 
         let fields = probe
             .fields_for("oracle peer slot rejection")
@@ -2861,6 +3584,7 @@ mod tests {
             .reserve(
                 &reserve_request(query, leader, 7, now + ChronoDuration::seconds(2)),
                 now,
+                None,
             )
             .expect("pending reservation");
         assert!(matches!(
@@ -2911,6 +3635,334 @@ mod tests {
         assert!(slots.try_running(1).is_ok());
     }
 
+    /// A follower whose received assignment was tampered with after the
+    /// leader signed the ticket is rejected before any provider resolution
+    /// or object I/O, even though the ticket's own signature still verifies.
+    ///
+    /// The signature only proves the claims bytes were not altered in
+    /// transit; it says nothing about whether the assignments physically
+    /// dispatched alongside the ticket match what was signed. Recomputing
+    /// and comparing the assignment-authority digest is what catches a
+    /// tampered `required_columns`/predicate/file list here.
+    #[tokio::test]
+    async fn tampered_assignment_authority_digest_is_rejected_before_execution() {
+        let roles = crate::resources::BifrostRuntimeResources::composed_for_test(
+            1024 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            [crate::resources::BifrostRole::Oracle],
+        );
+        let oracle = roles.oracle().expect("Oracle capability");
+        let node = NodeId::new(uuid::Uuid::now_v7());
+        let query_id = QueryId::new(uuid::Uuid::now_v7());
+        let tenant = DataTenantId::new_v7();
+        let fence = 41;
+        let reservations = Arc::new(ReservationRegistry::new(
+            Arc::new(OracleSlotManager::new(1, 1)),
+            1,
+        ));
+        let (_file, fragment) = dispatcher_parquet_fragment();
+        let worker = OraclePeerWorker::new_physical_with_resources(OraclePeerWorkerConfig {
+            worker_node_id: node,
+            oracle_fence: fence,
+            verifier: Arc::new(ClaimsPassthroughVerifier),
+            security_audit: Arc::new(NoopPeerSecurityAudit),
+            reservations: Arc::clone(&reservations),
+            oracle_resources: oracle.clone(),
+            resolver: Arc::new(TestFollowerResolver),
+            audit: Arc::new(TestOracleAudit),
+            target_partitions: 1,
+        });
+        let now = Utc::now();
+        let pending = reservations
+            .reserve_local(
+                &reserve_request(query_id, node, fence, now + ChronoDuration::seconds(2)),
+                now,
+            )
+            .expect("leader-local pending reservation");
+        let mut request = worker_request(
+            &fragment,
+            pending.reservation_id,
+            node,
+            fence,
+            query_id,
+            tenant,
+        );
+        // Tamper with the dispatched assignment after the ticket was signed
+        // over the original closure: this must be caught even though the
+        // ticket signature itself still verifies cleanly.
+        request.assignments[0].required_columns = vec!["tampered_column".to_owned()];
+
+        let result = worker
+            .execute_local(
+                request,
+                Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
+                    2 * 1024 * 1024,
+                )),
+            )
+            .await;
+        let Err(error) = result else {
+            panic!("tampered assignment closure must be rejected before execution");
+        };
+        assert!(matches!(error, DispatchError::Terminal));
+    }
+
+    /// One digest-covered mutation applied to a dispatched request.
+    ///
+    /// Named so the tamper table stays readable; the boxed closure is what
+    /// lets each case mutate a different field of the same fixture request.
+    type TamperCase = Box<dyn Fn(&mut PhysicalExecuteFragmentRequest)>;
+
+    /// Counts resolver invocations so a test can prove a rejected request
+    /// never reaches provider resolution or object I/O.
+    struct CountingFollowerResolver {
+        /// Number of times [`FollowerSourceResolver::resolve`] was called.
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl FollowerSourceResolver for CountingFollowerResolver {
+        /// Records the call, then delegates to the fixed empty test schema.
+        async fn resolve(
+            &self,
+            target_role: ClusterRole,
+            assignment: &FollowerScanAssignment,
+            session: &datafusion::execution::session_state::SessionState,
+        ) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            TestFollowerResolver
+                .resolve(target_role, assignment, session)
+                .await
+        }
+    }
+
+    /// Builds a counting-resolver worker plus one valid request for it.
+    ///
+    /// The v3 authority proofs each need an isolated worker, its own
+    /// reservation registry, and a request already reserved against it; the
+    /// only thing they vary is the fence and how they then tamper with the
+    /// request, so the identical setup is built once here. The returned
+    /// resolver is the same instance the worker holds, so a caller can assert
+    /// on how many times provider resolution was reached.
+    fn counting_worker_request(
+        oracle: &crate::resources::OracleResources,
+        fragment: &SealedScanFragment,
+        tenant: DataTenantId,
+        fence: FencingToken,
+    ) -> (
+        OraclePeerWorker,
+        Arc<CountingFollowerResolver>,
+        PhysicalExecuteFragmentRequest,
+    ) {
+        let node = NodeId::new(uuid::Uuid::now_v7());
+        let query_id = QueryId::new(uuid::Uuid::now_v7());
+        let reservations = Arc::new(ReservationRegistry::new(
+            Arc::new(OracleSlotManager::new(1, 1)),
+            1,
+        ));
+        let resolver = Arc::new(CountingFollowerResolver {
+            calls: AtomicUsize::new(0),
+        });
+        let worker = OraclePeerWorker::new_physical_with_resources(OraclePeerWorkerConfig {
+            worker_node_id: node,
+            oracle_fence: fence,
+            verifier: Arc::new(ClaimsPassthroughVerifier),
+            security_audit: Arc::new(NoopPeerSecurityAudit),
+            reservations: Arc::clone(&reservations),
+            oracle_resources: oracle.clone(),
+            resolver: Arc::clone(&resolver) as Arc<dyn FollowerSourceResolver>,
+            audit: Arc::new(TestOracleAudit),
+            target_partitions: 1,
+        });
+        let now = Utc::now();
+        let pending = reservations
+            .reserve_local(
+                &reserve_request(query_id, node, fence, now + ChronoDuration::seconds(2)),
+                now,
+            )
+            .expect("leader-local pending reservation");
+        let request = worker_request(
+            fragment,
+            pending.reservation_id,
+            node,
+            fence,
+            query_id,
+            tenant,
+        );
+        (worker, resolver, request)
+    }
+
+    /// Proves every Scribe-cut partition component is covered by the v3
+    /// assignment-authority digest.
+    ///
+    /// A cut-bearing assignment can never reach `execute_local`: an Oracle peer
+    /// worker refuses a non-Oracle target role, and follower preflight refuses
+    /// an Oracle assignment that carries a cut. The partition contract is
+    /// therefore proven where the dispatcher actually mints and compares it,
+    /// over the same `assignment_authority_digest_for` seam the ticket claims
+    /// are built from.
+    ///
+    /// # Panics
+    ///
+    /// Panics when mutating either bound's granularity or start instant leaves
+    /// the digest unchanged, or when an identical cut fails to reproduce it.
+    fn assert_partition_components_are_digest_covered(
+        tenant: DataTenantId,
+        fragment: &SealedScanFragment,
+    ) {
+        let cut_assignment = |cut: ScribeProviderCut| FollowerScanAssignment {
+            scan_id: "dispatcher-test-scan".to_owned(),
+            binding: TenantTableBinding {
+                tenant_id: tenant,
+                namespace: "vala.bifrost".to_owned(),
+                table: "events".to_owned(),
+            },
+            persisted: PersistedFileAssignment { files: Vec::new() },
+            scribe_provider_cut: Some(cut),
+            schema_fingerprint: fragment.schema_fingerprint.clone(),
+            required_columns: vec!["data_tenant_id".to_owned()],
+            predicates: Vec::new(),
+        };
+        let digest_of = |cut: ScribeProviderCut| {
+            crate::oracle::peer::assignment_authority_digest_for(&[cut_assignment(cut)])
+                .expect("deterministic fixture digest")
+        };
+        let baseline = digest_of(fixture_scribe_cut(7));
+
+        let mut start_granularity = fixture_scribe_cut(7);
+        start_granularity.start_partition =
+            fixture_partition(TimeGranularityWire::Day, 1_787_443_200_000_000);
+        start_granularity.end_partition =
+            fixture_partition(TimeGranularityWire::Day, 1_787_443_200_000_000);
+
+        let mut start_micros = fixture_scribe_cut(7);
+        start_micros.start_partition =
+            fixture_partition(TimeGranularityWire::Hour, 1_787_490_000_000_000);
+
+        let mut end_micros = fixture_scribe_cut(7);
+        end_micros.end_partition =
+            fixture_partition(TimeGranularityWire::Hour, 1_787_500_800_000_000);
+
+        for (label, mutated) in [
+            ("start granularity", start_granularity),
+            ("start micros", start_micros),
+            ("end micros", end_micros),
+        ] {
+            assert_ne!(
+                digest_of(mutated),
+                baseline,
+                "{label} must change the v3 assignment-authority digest"
+            );
+        }
+
+        // The digest a leader mints is exactly what a worker recomputes, so
+        // a matching cut reproduces the baseline byte for byte.
+        assert_eq!(digest_of(fixture_scribe_cut(7)), baseline);
+    }
+
+    /// Protocol-v3 exact-partition assignment-authority contract, proven as
+    /// one seam:
+    ///
+    /// - a valid v3 request whose recomputed digest matches the signed claims
+    ///   executes and reaches the resolver exactly once;
+    /// - every digest-covered tamper class is rejected terminally before the
+    ///   resolver is ever called, including each Scribe-cut partition
+    ///   granularity and start mutated independently;
+    /// - an explicit v2 `protocol_version` ticket is rejected by the same gate
+    ///   protocol v3 replaced, proving there is no dual decoder.
+    #[tokio::test]
+    async fn follower_assignment_v3_partition_authority_contract() {
+        let roles = crate::resources::BifrostRuntimeResources::composed_for_test(
+            1024 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            [crate::resources::BifrostRole::Oracle],
+        );
+        let oracle = roles.oracle().expect("Oracle capability");
+        let (_file, fragment) = dispatcher_parquet_fragment();
+        let tenant = DataTenantId::new_v7();
+
+        // A valid v3 request executes and reaches the resolver exactly once.
+        {
+            let (worker, resolver, request) =
+                counting_worker_request(&oracle, &fragment, tenant, 51);
+            worker
+                .execute_local(
+                    request,
+                    Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
+                        2 * 1024 * 1024,
+                    )),
+                )
+                .await
+                .expect("valid v3 assignment authority digest executes");
+            assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        }
+
+        // Every digest-covered tamper is rejected before the resolver runs.
+        let tamper_cases: Vec<TamperCase> = vec![
+            Box::new(|request| {
+                request.assignments[0].required_columns = vec!["tampered_column".to_owned()];
+            }),
+            Box::new(|request| {
+                request.assignments[0]
+                    .persisted
+                    .files
+                    .push("s3://bucket/tampered.parquet".to_owned());
+            }),
+            Box::new(|request| {
+                request.assignments[0].schema_fingerprint = "f".repeat(64);
+            }),
+        ];
+        for tamper in tamper_cases {
+            let (worker, resolver, mut request) =
+                counting_worker_request(&oracle, &fragment, tenant, 52);
+            tamper(&mut request);
+            let result = worker
+                .execute_local(
+                    request,
+                    Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
+                        2 * 1024 * 1024,
+                    )),
+                )
+                .await;
+            assert!(matches!(result, Err(DispatchError::Terminal)));
+            assert_eq!(
+                resolver.calls.load(Ordering::SeqCst),
+                0,
+                "a tampered assignment-authority digest must never reach the resolver"
+            );
+        }
+
+        // Each Scribe-cut partition component is digest-covered.
+        assert_partition_components_are_digest_covered(tenant, &fragment);
+
+        // An explicit v2 `protocol_version` ticket is rejected: protocol v3
+        // fully replaced v2 rather than accepting both.
+        {
+            let (worker, resolver, mut request) =
+                counting_worker_request(&oracle, &fragment, tenant, 53);
+            let mut claims = PeerTicketClaims::decode(request.ticket.claims_bytes.as_slice())
+                .expect("decode fixture claims");
+            claims.protocol_version = 2;
+            let mut bytes = Vec::new();
+            claims.encode(&mut bytes).expect("encode v2 claims");
+            request.ticket.claims_bytes = bytes.clone();
+            request.ticket.signature = bytes;
+            let result = worker
+                .execute_local(
+                    request,
+                    Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
+                        2 * 1024 * 1024,
+                    )),
+                )
+                .await;
+            assert!(matches!(result, Err(DispatchError::Terminal)));
+            assert_eq!(
+                resolver.calls.load(Ordering::SeqCst),
+                0,
+                "an explicit v2 protocol_version ticket must never reach the resolver"
+            );
+        }
+    }
+
     /// Leader-admitted execution reaches a frame while its exact query lease is active.
     #[tokio::test]
     async fn oracle_peer_leader_admitted_executes_under_active_query_owner() {
@@ -2921,13 +3973,10 @@ mod tests {
         );
         let oracle = roles.oracle().expect("Oracle capability");
         let query_owner = oracle
-            .try_acquire_query(crate::resources::OracleResourceRequest {
-                query_class: QueryClass::Interactive,
-                memory_bytes: crate::resources::ORACLE_PARTITION_MEMORY_BYTES,
-                scratch_bytes: crate::resources::ORACLE_PARTITION_MEMORY_BYTES as u64,
-                slot_units: 1,
-                local_ratio: 1.0,
-            })
+            .try_acquire_query(crate::resources::OracleResourceRequest::for_class(
+                QueryClass::Interactive,
+                1.0,
+            ))
             .expect("exact query owner");
         let node = NodeId::new(uuid::Uuid::now_v7());
         let query_id = QueryId::new(uuid::Uuid::now_v7());
@@ -2938,17 +3987,17 @@ mod tests {
             1,
         ));
         let (_file, fragment) = dispatcher_parquet_fragment();
-        let worker = OraclePeerWorker::new_physical_with_resources(
-            node,
-            fence,
-            Arc::new(ClaimsPassthroughVerifier),
-            Arc::new(NoopPeerSecurityAudit),
-            Arc::clone(&reservations),
-            oracle.clone(),
-            Arc::new(TestFollowerResolver),
-            Arc::new(TestOracleAudit),
-            1,
-        );
+        let worker = OraclePeerWorker::new_physical_with_resources(OraclePeerWorkerConfig {
+            worker_node_id: node,
+            oracle_fence: fence,
+            verifier: Arc::new(ClaimsPassthroughVerifier),
+            security_audit: Arc::new(NoopPeerSecurityAudit),
+            reservations: Arc::clone(&reservations),
+            oracle_resources: oracle.clone(),
+            resolver: Arc::new(TestFollowerResolver),
+            audit: Arc::new(TestOracleAudit),
+            target_partitions: 1,
+        });
         let now = Utc::now();
         let pending = reservations
             .reserve_local(
@@ -3010,24 +4059,40 @@ mod tests {
             1,
         ));
         let (_file, fragment) = dispatcher_parquet_fragment();
-        let worker = OraclePeerWorker::new_physical_with_resources(
-            node,
-            fence,
-            Arc::new(ClaimsPassthroughVerifier),
-            Arc::new(NoopPeerSecurityAudit),
-            Arc::clone(&reservations),
-            oracle.clone(),
-            Arc::new(TestFollowerResolver),
-            Arc::new(TestOracleAudit),
-            1,
-        );
+        let worker = OraclePeerWorker::new_physical_with_resources(OraclePeerWorkerConfig {
+            worker_node_id: node,
+            oracle_fence: fence,
+            verifier: Arc::new(ClaimsPassthroughVerifier),
+            security_audit: Arc::new(NoopPeerSecurityAudit),
+            reservations: Arc::clone(&reservations),
+            oracle_resources: oracle.clone(),
+            resolver: Arc::new(TestFollowerResolver),
+            audit: Arc::new(TestOracleAudit),
+            target_partitions: 1,
+        });
         let now = Utc::now();
-        let pending = reservations
-            .reserve(
-                &reserve_request(query_id, node, fence, now + ChronoDuration::seconds(2)),
-                now,
-            )
-            .expect("remote pending reservation");
+        // Drive the production reservation path: the worker quantum is charged
+        // at reservation, so a test that inserted a registry entry directly
+        // would exercise an admission state the server can never produce.
+        let ReserveNodeSlotsResponse::Pending(pending) = worker
+            .reserve(&reserve_request(
+                query_id,
+                node,
+                fence,
+                now + ChronoDuration::seconds(2),
+            ))
+            .await
+        else {
+            panic!("remote pending reservation");
+        };
+        assert_eq!(
+            oracle
+                .snapshot()
+                .expect("healthy snapshot after reservation")
+                .oracle_memory_used_bytes,
+            crate::resources::ORACLE_PARTITION_WORKING_MEMORY_BYTES,
+            "reservation charges the worker quantum up front"
+        );
         let request = worker_request(
             &fragment,
             pending.reservation_id,
@@ -3043,7 +4108,7 @@ mod tests {
                 .snapshot()
                 .expect("healthy remote worker snapshot")
                 .oracle_memory_used_bytes,
-            crate::resources::ORACLE_PARTITION_MEMORY_BYTES
+            crate::resources::ORACLE_PARTITION_WORKING_MEMORY_BYTES
         );
         while let Some(frame) = execution.stream.next().await {
             frame.expect("remote worker frame");
@@ -3069,6 +4134,7 @@ mod tests {
             .reserve(
                 &reserve_request(query, leader, 9, now + ChronoDuration::milliseconds(1)),
                 now,
+                None,
             )
             .expect("pending reservation");
         assert_eq!(
@@ -3079,6 +4145,7 @@ mod tests {
             .reserve(
                 &reserve_request(query, leader, 9, now + ChronoDuration::seconds(1)),
                 now,
+                None,
             )
             .expect("replacement reservation");
         let request = ReleaseNodeSlotsRequest {
@@ -3092,31 +4159,90 @@ mod tests {
         assert_ne!(pending.reservation_id, replacement.reservation_id);
     }
 
-    /// A failed pending-to-running transition removes the pending reservation and permit.
+    /// A reservation is a guarantee: once accepted, execution cannot be refused.
+    ///
+    /// Capacity is decided once, at reservation. A saturated peer refuses the
+    /// reservation outright — before the leader has committed to dispatching
+    /// this participant — and an accepted reservation carries the running permit
+    /// its fragment will execute under, so `take_for_execute` cannot turn a
+    /// negotiated fan-out into a failed query. Releasing the reservation returns
+    /// the permit, which is what lets the next reservation through.
     #[test]
-    fn peer_transition_failure_releases_reservation() {
-        let slots = Arc::new(OracleSlotManager::new(1, 0));
-        let registry = ReservationRegistry::new(Arc::clone(&slots), 1);
+    fn accepted_reservation_guarantees_execution_and_saturation_refuses_up_front() {
+        let slots = Arc::new(OracleSlotManager::new(1, 1));
+        let registry = ReservationRegistry::new(Arc::clone(&slots), 2);
         let now = Utc::now();
         let query = QueryId::new(uuid::Uuid::now_v7());
         let leader = NodeId::new(uuid::Uuid::now_v7());
+        let expires = now + ChronoDuration::seconds(2);
         let pending = registry
-            .reserve(
-                &reserve_request(query, leader, 13, now + ChronoDuration::seconds(2)),
-                now,
-            )
+            .reserve(&reserve_request(query, leader, 13, expires), now, None)
             .expect("pending reservation");
+        // The single running unit is committed by the reservation itself, so a
+        // second concurrent reservation is refused here rather than at execute.
+        // Capacity, not Unavailable: a saturated slot pool is backpressure, and
+        // Unavailable is reserved for a fail-closed outage.
+        let contender = QueryId::new(uuid::Uuid::now_v7());
         assert!(matches!(
-            registry.take_for_execute(pending.reservation_id, query, leader, 13, now),
-            Err(DispatchError::Unavailable)
+            registry.reserve(&reserve_request(contender, leader, 13, expires), now, None),
+            Err(DispatchError::Capacity)
         ));
-        assert_eq!(registry.cleanup_expired(now), 0);
+        let running = registry
+            .take_for_execute(pending.reservation_id, query, leader, 13, now)
+            .expect("an accepted reservation always executes");
+        assert_eq!(running.query_class, QueryClass::Interactive);
+        assert!(
+            running.permit.is_some(),
+            "the reserved permit is transferred"
+        );
+        assert_eq!(
+            registry.cleanup_expired(now),
+            0,
+            "the claimed reservation left the registry"
+        );
+        drop(running);
+        registry
+            .reserve(&reserve_request(contender, leader, 13, expires), now, None)
+            .expect("released running capacity admits the next reservation");
+    }
+
+    /// An unclaimed reservation returns its committed running permit at expiry.
+    ///
+    /// Because reservation now charges the running slot, a leader that abandons
+    /// a fan-out mid-negotiation would strand capacity without expiry reclaim.
+    #[test]
+    fn expired_reservation_returns_its_running_permit() {
+        let slots = Arc::new(OracleSlotManager::new(1, 1));
+        let registry = ReservationRegistry::new(Arc::clone(&slots), 2);
+        let now = Utc::now();
+        let query = QueryId::new(uuid::Uuid::now_v7());
+        let leader = NodeId::new(uuid::Uuid::now_v7());
         registry
             .reserve(
                 &reserve_request(query, leader, 13, now + ChronoDuration::seconds(2)),
                 now,
+                None,
             )
-            .expect("pending permit released after transition failure");
+            .expect("pending reservation");
+        assert_eq!(slots.running_in_use(), 1);
+        let expired = now + ChronoDuration::seconds(3);
+        assert_eq!(
+            registry.cleanup_expired(expired),
+            0,
+            "expiry reclaims the abandoned reservation"
+        );
+        assert_eq!(
+            slots.running_in_use(),
+            0,
+            "expiry returns the committed running permit"
+        );
+        registry
+            .reserve(
+                &reserve_request(query, leader, 13, expired + ChronoDuration::seconds(2)),
+                expired,
+                None,
+            )
+            .expect("running permit released once the reservation expired");
     }
 
     /// Worker execution streams release running capacity on completion, cancel, and drop.
@@ -3125,7 +4251,7 @@ mod tests {
         let slots = Arc::new(OracleSlotManager::new(1, 1));
         let permit = slots.try_running(1).expect("completion permit");
         let completion_stream = async_stream::stream! {
-            let _running = RunningReservation { query_class: QueryClass::Interactive, permit: Some(permit) };
+            let _running = RunningReservation { query_class: QueryClass::Interactive, permit: Some(permit), worker_resources: None };
             if false {
                 yield Err(DispatchError::Unavailable);
             }
@@ -3142,7 +4268,7 @@ mod tests {
         let permit = slots.try_running(1).expect("cancellation permit");
         let observed = cancellation.clone();
         let cancellation_stream = async_stream::stream! {
-            let _running = RunningReservation { query_class: QueryClass::Interactive, permit: Some(permit) };
+            let _running = RunningReservation { query_class: QueryClass::Interactive, permit: Some(permit), worker_resources: None };
             observed.cancelled().await;
         };
         let mut cancellation_stream = Box::pin(cancellation_stream);
@@ -3156,7 +4282,7 @@ mod tests {
 
         let permit = slots.try_running(1).expect("drop permit");
         let drop_stream = async_stream::stream! {
-            let _running = RunningReservation { query_class: QueryClass::Interactive, permit: Some(permit) };
+            let _running = RunningReservation { query_class: QueryClass::Interactive, permit: Some(permit), worker_resources: None };
             futures_util::future::pending::<()>().await;
             yield Err(DispatchError::Unavailable);
         };
@@ -3213,11 +4339,13 @@ mod tests {
                         node_id: first,
                         role: ClusterRole::Oracle,
                         worker_fence: 2,
+                        endpoint: None,
                     },
                     DispatchCandidate {
                         node_id: second,
                         role: ClusterRole::Oracle,
                         worker_fence: 3,
+                        endpoint: None,
                     },
                 ],
             )
@@ -3267,12 +4395,27 @@ mod tests {
                     node_id: leader,
                     role: ClusterRole::Oracle,
                     worker_fence: 5,
+                    endpoint: None,
                 }],
             )
             .await
             .expect_err("mint failure is terminal");
 
-        assert!(matches!(error, DispatchError::Terminal));
+        // A mint failure is request *setup*, not a rejection by the peer, and the
+        // ported design degrades setup failures rather than failing the query:
+        // when it cannot build the authenticated client for a node it substitutes
+        // an empty stream and records a partial error, reserving a terminal for a
+        // peer that answered and refused. Classifying this as terminal would fail
+        // whole queries over one node's transient credential problem.
+        assert!(matches!(
+            error,
+            DispatchError::Partial {
+                attempt: None,
+                reason: DispatchPartialReason::Setup,
+            }
+        ));
+        // The reservation must still be surrendered, and no fragment may be sent
+        // to a peer whose request was never successfully signed.
         assert_eq!(transport.release_calls.load(Ordering::SeqCst), 1);
         assert_eq!(transport.execute_calls.load(Ordering::SeqCst), 0);
     }
@@ -3318,27 +4461,39 @@ mod tests {
                     node_id: leader,
                     role: ClusterRole::Oracle,
                     worker_fence: 1,
+                    endpoint: None,
                 }],
             )
             .await
             .expect_err("stalled peer times out");
-        assert!(matches!(error, DispatchError::Unavailable));
+        assert!(matches!(
+            error,
+            DispatchError::Partial { attempt: None, .. }
+        ));
         assert_eq!(transport.release_calls.load(Ordering::SeqCst), 1);
     }
 
-    /// Only authenticated execution not-found preserves the stale-object signal.
+    /// Only authenticated delivered execution not-found preserves file-loss partiality.
     #[test]
     fn oracle_tonic_status_preserves_stale_object_classification() {
         assert!(matches!(
             execution_status_error(&Status::not_found("stale pinned object")),
-            DispatchError::StaleObject
+            DispatchError::FileNotFound
         ));
         assert!(matches!(
             status_error(&Status::not_found("missing peer")),
-            DispatchError::Unavailable
+            DispatchError::Terminal
         ));
         assert!(matches!(
             status_error(&Status::unavailable("storage outage")),
+            DispatchError::Terminal
+        ));
+        assert!(matches!(
+            status_error(&Status::cancelled("cancelled")),
+            DispatchError::Unavailable
+        ));
+        assert!(matches!(
+            status_error(&Status::deadline_exceeded("deadline")),
             DispatchError::Unavailable
         ));
     }

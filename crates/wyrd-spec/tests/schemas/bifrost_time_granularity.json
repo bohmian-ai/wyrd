@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TimeGranularityWire",
+  "description": "Time-partition granularity on the wire.\n\nBifrost v1 partitions every table on `wyrd_event_time` and admits exactly these two Iceberg-native transforms; nothing else is representable.",
+  "oneOf": [
+    {
+      "description": "One partition per UTC hour.",
+      "type": "string",
+      "enum": [
+        "hour"
+      ]
+    },
+    {
+      "description": "One partition per UTC day.",
+      "type": "string",
+      "enum": [
+        "day"
+      ]
+    }
+  ]
+}

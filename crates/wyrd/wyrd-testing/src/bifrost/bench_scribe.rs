@@ -12,12 +12,12 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use vala_bifrost_redux::bench_support::WalBenchSupport;
+use vala_bifrost_redux::catalog::TimeGranularity;
 use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
 use vala_bifrost_redux::contracts::ScribeAppend;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
 use vala_bifrost_redux::scribe::persistence::PersistenceFaults;
-use vala_bifrost_redux::scribe::seal_key::EventDay;
 use vala_bifrost_redux::scribe::tail_rpc::FetchLiveTailRequest;
 use vala_bifrost_redux::scribe::wal::WalLsn;
 use vala_sdk::{BifrostFrame, BifrostGrpcTransport};
@@ -298,7 +298,7 @@ async fn query_scribe_rows(
     harness: &BifrostHarness,
     scenario: &BifrostScenario,
 ) -> Result<u64, BenchError> {
-    let day = EventDay::new(chrono::Utc::now().date_naive());
+    let partition = TimeGranularity::Hour.bucket(chrono::Utc::now())?;
     let mut rows = 0_u64;
     for (tenant_index, tenant) in harness.tenants().iter().copied().enumerate() {
         let scribe = harness
@@ -318,8 +318,8 @@ async fn query_scribe_rows(
                 tail.fetch_hot_batches(FetchLiveTailRequest {
                     binding,
                     target_stream: tail.stream(),
-                    start_day: day,
-                    end_day: day,
+                    start_partition: partition,
+                    end_partition: partition,
                     after_lsn: WalLsn::ZERO,
                     persisted_lsn_ranges: Vec::new(),
                     required_columns: vec!["value".to_owned()],
@@ -989,7 +989,10 @@ async fn measure_public_components(
         .ok_or("missing benchmark server")?;
     let table_name = "bifrost_component_events";
     let table = TableRef::new(BifrostNamespace::Bifrost, table_name);
-    let catalog = server.state().bifrost_catalog();
+    let catalog = server
+        .state()
+        .bifrost_catalog()
+        .expect("benchmark server exposes its Bifrost catalog");
     catalog
         .create_table(vala_bifrost_redux::catalog::CreateTableRequest {
             table,
@@ -998,6 +1001,7 @@ async fn measure_public_components(
                 Field::new("value", DataType::Utf8, false),
             ],
             tenant,
+            physical_layout: None,
             audit: None,
         })
         .await?;

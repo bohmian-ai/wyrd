@@ -24,15 +24,14 @@ use wyrd_tonic::wyrd::v1::{InsertBatchRequest, InsertBatchResponse};
 
 use crate::catalog::TableRef;
 use crate::contracts::{
-    DecodedOtlp, IngressPayload, OtlpDecodeOwner, Scribe, ScribeIngressFrame, ScribeOtlpOutcome,
+    DecodedOtlp, IngressPayload, OracleQueryDispatch, OtlpDecodeOwner, Scribe, ScribeIngressFrame,
+    ScribeOtlpOutcome,
 };
 pub use crate::gate::auth::{AuthContext, IngestAuthInterceptor, WYRD_REQUEST_ID_METADATA};
 pub use crate::gate::error::IngestError;
 pub use crate::gate::limits::{IngestLimits, OtlpWireLimits};
 use crate::namespaces::BifrostNamespace;
-use crate::oracle::{
-    AuthorizedQueryContext, Oracle, OracleQueryStream, QueryOptions, QueryStreamLifecycle,
-};
+use crate::oracle::{AuthorizedQueryContext, OracleQueryStream, QueryStreamLifecycle};
 pub use crate::otlp_contract::{IngestOutcome, LogsOutcome, MetricsOutcome};
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::error::BifrostError;
@@ -64,6 +63,18 @@ fn record_gate_request(operation: &'static str, outcome: &'static str, elapsed: 
 fn record_gate_rejection(operation: &'static str, reason: &'static str) {
     metrics::counter!("bifrost_gate_rejections_total", "operation" => operation, "reason" => reason)
         .increment(1);
+}
+
+/// Records one refused native write against the one Gate rejection taxonomy.
+///
+/// The projection lives on [`IngestError::rejection_reason`], so no call site
+/// restates it. A refusal the projection declines to classify is a Wyrd
+/// internal failure and is deliberately left out of the rejection family: a
+/// server defect must not inflate the caller-attributed rejection rate.
+fn record_write_rejection(error: &IngestError) {
+    if let Some(reason) = error.rejection_reason() {
+        record_gate_rejection("write", reason);
+    }
 }
 
 /// Owns exactly one terminal Gate request metric across return or cancellation.
@@ -108,8 +119,17 @@ impl Drop for GateRequestLifecycle {
     }
 }
 
-/// Describe and initialize the D24 Gate families at process boot.
-fn initialize_gate_metrics() {
+/// Describe and initialize the closed Gate metric families at process boot.
+///
+/// Every series this owner can ever emit is published at zero here. A
+/// Prometheus counter appears in a render only after a handle exists for its
+/// exact label set, so a terminal or refusal that never occurred in a scrape
+/// window would otherwise leave a hole rather than a zero. Qualification reads
+/// each family as a closed cross product, so an absent series and a zero series
+/// must not be distinguishable. The server calls this immediately after the
+/// global recorder is live; registering earlier would emit into the no-op
+/// recorder and be lost.
+pub fn initialize_gate_metrics() {
     metrics::describe_counter!(
         "bifrost_gate_requests_total",
         "Total Bifrost Gate requests by operation and terminal outcome."
@@ -150,6 +170,14 @@ fn initialize_gate_metrics() {
             )
             .increment(0);
         }
+        for reason in crate::gate::error::GATE_REJECTION_REASONS {
+            metrics::counter!(
+                "bifrost_gate_rejections_total",
+                "operation" => operation,
+                "reason" => reason
+            )
+            .increment(0);
+        }
     }
     for outcome in ["success", "rejected", "failed", "cancelled"] {
         metrics::counter!("bifrost_gate_query_streams_total", "outcome" => outcome).increment(0);
@@ -163,11 +191,15 @@ fn initialize_gate_metrics() {
 /// The Scribe dependency is mandatory at construction.
 #[derive(Clone)]
 pub struct Gate<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> {
+    /// Optional durable write capability; absent on a query-only replica.
     scribe: Option<Arc<dyn Scribe>>,
-    /// Optional retained Oracle used by the server's stable local query dispatch.
-    oracle: Option<Arc<Oracle>>,
+    /// Optional SQL dispatch seam reaching an Oracle this Gate does not own.
+    query: Option<Arc<dyn OracleQueryDispatch>>,
+    /// Immutable transport and typed-ingress bounds.
     limits: IngestLimits,
+    /// Shared bearer-token verification adapter for every public transport.
     auth: IngestAuthInterceptor<R, I>,
+    /// Shared admission closure observed by ingest and query alike.
     closed: Arc<AtomicBool>,
 }
 
@@ -176,10 +208,16 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
     ///
     /// # Errors
     ///
-    /// Returns a stable ingress refusal when Scribe is absent, the ingress
-    /// envelope is occupied, or Scribe resource accounting fails while
-    /// reserving the preflighted typed-request capacity.
+    /// Returns [`IngestError::IngressClosed`] when lifecycle shutdown already
+    /// closed this Gate or Scribe is absent, and a stable ingress refusal when
+    /// the ingress envelope is occupied or Scribe resource accounting fails
+    /// while reserving the preflighted typed-request capacity. The closure
+    /// check runs before any reservation, so a draining replica never holds
+    /// Scribe memory for a request it will refuse.
     pub fn reserve_otlp_decode(&self, bytes: usize) -> Result<OtlpDecodeOwner, IngestError> {
+        if self.is_closed() {
+            return Err(IngestError::IngressClosed);
+        }
         self.scribe
             .as_ref()
             .ok_or(IngestError::IngressClosed)?
@@ -209,7 +247,7 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
         initialize_gate_metrics();
         Self {
             scribe: Some(scribe),
-            oracle: None,
+            query: None,
             limits,
             auth,
             closed: Arc::new(AtomicBool::new(false)),
@@ -226,7 +264,7 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
         initialize_gate_metrics();
         Self {
             scribe: Some(scribe),
-            oracle: None,
+            query: None,
             limits,
             auth,
             closed: Arc::new(AtomicBool::new(false)),
@@ -243,17 +281,21 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
         initialize_gate_metrics();
         Self {
             scribe: None,
-            oracle: None,
+            query: None,
             limits,
             auth,
             closed: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Attaches the independently optional retained Oracle query owner.
+    /// Attaches the seam through which this Gate dispatches public SQL.
+    ///
+    /// The dispatcher owns role selection. A Gate without one refuses every
+    /// query with [`BifrostError::OracleRoleUnavailable`], which is how an
+    /// ingest-only replica is expressed.
     #[must_use]
-    pub fn with_oracle(mut self, oracle: Arc<Oracle>) -> Self {
-        self.oracle = Some(oracle);
+    pub fn with_query_dispatch(mut self, query: Arc<dyn OracleQueryDispatch>) -> Self {
+        self.query = Some(query);
         self
     }
 
@@ -272,15 +314,46 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
     #[cfg(feature = "test-support")]
     #[must_use]
     pub fn is_closed_for_test(&self) -> bool {
+        self.is_closed()
+    }
+
+    /// Reads the one shared admission-closure flag.
+    ///
+    /// Ingest admission, query admission, and OTLP decode reservation all
+    /// consult this single atomic so `close()` cannot leave one public surface
+    /// admitting while another refuses.
+    fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
     }
 
+    /// Refuses new ingest once the Gate is closed or Scribe is not ready.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngestError::IngressClosed`] after `close()` and while the
+    /// local Scribe is absent or still recovering.
     fn ensure_open(&self) -> Result<(), IngestError> {
-        if self.closed.load(Ordering::Acquire) {
+        if self.is_closed() {
             return Err(IngestError::IngressClosed);
         }
         if !self.scribe.as_ref().is_some_and(|scribe| scribe.is_ready()) {
             return Err(IngestError::IngressClosed);
+        }
+        Ok(())
+    }
+
+    /// Refuses new query admission once lifecycle shutdown has closed the Gate.
+    ///
+    /// Unlike [`Self::ensure_open`], this consults only the shared closure
+    /// flag: a query-serving replica has no Scribe and must still admit reads
+    /// until it begins draining.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::OracleRoleUnavailable`] after `close()`.
+    pub fn ensure_query_open(&self) -> Result<(), BifrostError> {
+        if self.is_closed() {
+            return Err(BifrostError::OracleRoleUnavailable);
         }
         Ok(())
     }
@@ -327,12 +400,19 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
         BifrostIngestServiceServer::new(self).max_decoding_message_size(size)
     }
 
-    /// Dispatches authorized public SQL only to a ready local Oracle.
+    /// Dispatches one authorized public SQL request through the query seam.
+    ///
+    /// Gate owns the closed request lifecycle, admission closure, and stream
+    /// accounting; the attached [`OracleQueryDispatch`] owns role selection and
+    /// may execute locally, forward to a fenced peer, or refuse. The Gate
+    /// stream lifecycle is attached to the returned stream after dispatch, so
+    /// local and forwarded execution are accounted identically.
     ///
     /// # Errors
     ///
-    /// Returns role unavailable before planning when this Gate has no ready
-    /// Oracle, otherwise returns the retained Oracle's stable query errors.
+    /// Returns [`BifrostError::OracleRoleUnavailable`] before any accounting
+    /// when this Gate is closed or has no query dispatcher, otherwise returns
+    /// the dispatcher's stable query errors.
     #[tracing::instrument(
         name = "bifrost.gate.role_dispatch",
         skip_all,
@@ -343,8 +423,9 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
         context: AuthorizedQueryContext,
         request: BifrostQueryRequest,
     ) -> Result<OracleQueryStream, BifrostError> {
+        self.ensure_query_open()?;
         let request_lifecycle = GateRequestLifecycle::begin("query");
-        let Some(oracle) = &self.oracle else {
+        let Some(dispatch) = &self.query else {
             metrics::counter!(
                 "bifrost_gate_role_unavailable_total",
                 "required_role" => "oracle",
@@ -355,17 +436,6 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
             request_lifecycle.complete("rejected");
             return Err(BifrostError::OracleRoleUnavailable);
         };
-        if !oracle.is_ready() {
-            metrics::counter!(
-                "bifrost_gate_role_unavailable_total",
-                "required_role" => "oracle",
-                "reason" => "not_ready"
-            )
-            .increment(1);
-            record_gate_rejection("query", "role_unavailable");
-            request_lifecycle.complete("rejected");
-            return Err(BifrostError::OracleRoleUnavailable);
-        }
         metrics::gauge!("bifrost_gate_active_streams", "operation" => "query").increment(1.0);
         let lifecycle = Arc::new(QueryStreamLifecycle::new(|outcome, elapsed| {
             metrics::counter!("bifrost_gate_query_streams_total", "outcome" => outcome)
@@ -374,13 +444,14 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
                 .record(elapsed.as_secs_f64());
             metrics::gauge!("bifrost_gate_active_streams", "operation" => "query").decrement(1.0);
         }));
-        let result = oracle
-            .query_sql_with_gate_lifecycle(context, request, Some(Arc::clone(&lifecycle)))
+        let result = dispatch
+            .dispatch_sql(context, request)
             .instrument(tracing::info_span!(
                 "bifrost.gate.query",
                 operation = "query"
             ))
-            .await;
+            .await
+            .map(|stream| stream.with_gate_lifecycle(Arc::clone(&lifecycle)));
         if matches!(&result, Err(BifrostError::QueryAdmissionRejected)) {
             record_gate_rejection("query", "oracle_admission");
             lifecycle.finish("rejected");
@@ -392,44 +463,6 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
             request_lifecycle.complete("success");
         }
         result
-    }
-
-    /// Dispatches an authorized typed logical plan only to a ready local Oracle.
-    ///
-    /// # Errors
-    ///
-    /// Returns role unavailable before admission when this Gate has no ready
-    /// Oracle, otherwise returns the retained Oracle's stable query errors.
-    #[tracing::instrument(
-        name = "bifrost.gate.role_dispatch",
-        skip_all,
-        fields(required_role = "oracle", operation = "query_plan")
-    )]
-    pub async fn query_plan(
-        &self,
-        context: AuthorizedQueryContext,
-        plan: datafusion::logical_expr::LogicalPlan,
-        options: QueryOptions,
-    ) -> Result<OracleQueryStream, BifrostError> {
-        let Some(oracle) = &self.oracle else {
-            metrics::counter!(
-                "bifrost_gate_role_unavailable_total",
-                "required_role" => "oracle",
-                "reason" => "not_configured"
-            )
-            .increment(1);
-            return Err(BifrostError::OracleRoleUnavailable);
-        };
-        if !oracle.is_ready() {
-            metrics::counter!(
-                "bifrost_gate_role_unavailable_total",
-                "required_role" => "oracle",
-                "reason" => "not_ready"
-            )
-            .increment(1);
-            return Err(BifrostError::OracleRoleUnavailable);
-        }
-        oracle.query_plan(context, plan, options).await
     }
 
     /// Routes one adapter-decoded trace export and its move-only owner.
@@ -681,15 +714,16 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
             measured_wire_bytes: frame.arrow_ipc.len(),
             payload: IngressPayload::ArrowIpc(frame.arrow_ipc),
         };
-        let scribe = Arc::clone(scribe);
-        let admission = tokio::spawn(async move { scribe.ingest_frame(ingress).await })
-            .await
-            .map_err(|error| IngestError::Internal(format!("durable Scribe task failed: {error}")))?
-            .map_err(|error| {
-                record_gate_event("scribe_failure");
-                metrics::counter!("bifrost_gate_frames_total", "status" => "rejected").increment(1);
-                IngestError::from_scribe(error)
-            })?;
+        // The durable Scribe write stays inside this request future on purpose.
+        // Detaching it onto its own task would orphan the admission owner when a
+        // transport drops the handler: the spawned task keeps its admission slot
+        // and ingress bytes while nothing observes its terminal. Awaiting inline
+        // makes the admission guard drop with the cancelled request.
+        let admission = scribe.ingest_frame(ingress).await.map_err(|error| {
+            record_gate_event("scribe_failure");
+            metrics::counter!("bifrost_gate_frames_total", "status" => "rejected").increment(1);
+            IngestError::from_scribe(error)
+        })?;
         metrics::counter!("bifrost_gate_frames_total", "status" => "accepted").increment(1);
         record_gate_rows(
             i64::try_from(admission.rows_accepted).unwrap_or(i64::MAX),
@@ -738,43 +772,13 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Bifrost
                 .map_err(Status::from)?;
             let frame = request.into_inner();
             validate_batch(&frame, &self.limits)
-                .inspect_err(|error| {
-                    record_gate_rejection(
-                        "write",
-                        match error {
-                            IngestError::PayloadTooLarge { .. } => "payload_limit",
-                            _ => "validation",
-                        },
-                    );
-                })
+                .inspect_err(record_write_rejection)
                 .map_err(Status::from)?;
             self.dispatch_native_frame(&self.limits, &auth, frame.clone())
                 .await
                 .inspect_err(|error| {
                     record_gate_event("native_rejection");
-                    let reason = match error {
-                        IngestError::RbacDenied { .. }
-                        | IngestError::ReservedBuiltinWriteDenied { .. }
-                        | IngestError::CardScopeDenied { .. }
-                        | IngestError::CardUnresolved { .. } => "permission",
-                        IngestError::PayloadTooLarge { .. } => "payload_limit",
-                        IngestError::RequestValidation(_)
-                        | IngestError::Decode(_)
-                        | IngestError::EventTimeOutOfRange { .. }
-                        | IngestError::TooManyRows { .. } => "validation",
-                        IngestError::TableNotFound { .. } | IngestError::SchemaMismatch { .. } => {
-                            "catalog"
-                        }
-                        IngestError::IngressClosed => "role_unavailable",
-                        IngestError::IngestBusy { .. } | IngestError::WalDiskFull => {
-                            "scribe_admission"
-                        }
-                        IngestError::Unauthenticated(_) | IngestError::PrincipalUnresolved => {
-                            "auth"
-                        }
-                        IngestError::Internal(_) => return,
-                    };
-                    record_gate_rejection("write", reason);
+                    record_write_rejection(error);
                 })
                 .map_err(Status::from)?;
             let mut response = Response::new(InsertBatchResponse {
@@ -865,12 +869,15 @@ mod tests {
     use super::{AuthContext, Gate, IngestError};
     use crate::contracts::{DecodedOtlp, IngressPayload, ScribeOtlpOutcome};
     use async_trait::async_trait;
+    use futures_util::StreamExt as _;
     use wyrd_auth_oidc::IssuerConfigResolver;
     use wyrd_auth_verify::PermissionResolver;
     use wyrd_runtime::{Permission, PermissionSet, Principal, PrincipalKind};
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::ids::DataTenantId;
     use wyrd_spec::request_id::RequestId;
+    use wyrd_spec::vala::api::QueryStreamFrame;
+    use wyrd_spec::vala::error::BifrostError;
     use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
 
     /// One exact Gate family description captured during owner initialization.
@@ -1354,6 +1361,349 @@ mod tests {
             .await
             .expect_err("Gate must fail closed while Scribe recovery is incomplete");
         assert!(matches!(error, IngestError::IngressClosed));
+    }
+
+    /// Test double standing in for the server-tier SQL dispatch owner.
+    ///
+    /// It records that Gate reached the seam and returns either a synthetic
+    /// stream that emits one successful terminal, or a stable refusal, so the
+    /// Gate-side accounting can be asserted without an Oracle.
+    struct TestQueryDispatch {
+        /// Number of times Gate handed a request across the seam.
+        calls: Arc<AtomicUsize>,
+        /// Refusal returned instead of a stream, when set.
+        refusal: Option<BifrostError>,
+    }
+
+    #[async_trait]
+    impl crate::contracts::OracleQueryDispatch for TestQueryDispatch {
+        /// Records one dispatch and returns the configured stream or refusal.
+        ///
+        /// # Errors
+        ///
+        /// Returns the configured [`BifrostError`] when this double was built
+        /// to refuse.
+        async fn dispatch_sql(
+            &self,
+            _context: crate::oracle::AuthorizedQueryContext,
+            _request: wyrd_spec::vala::api::BifrostQueryRequest,
+        ) -> Result<crate::oracle::OracleQueryStream, BifrostError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(error) = &self.refusal {
+                return Err(error.clone());
+            }
+            let frames = futures_util::stream::iter([Ok(QueryStreamFrame::Terminal(
+                wyrd_spec::vala::api::QueryTerminalFrame {
+                    outcome: wyrd_spec::vala::api::QueryTerminalOutcome::Success,
+                    freshness: wyrd_spec::vala::api::QueryFreshness::Complete,
+                    row_count: 0,
+                    warnings: Vec::new(),
+                    source_completion: Vec::new(),
+                    error: None,
+                },
+            ))]);
+            Ok(crate::oracle::OracleQueryStream::test_new(
+                "seam".to_owned(),
+                Box::pin(frames),
+                tokio_util::sync::CancellationToken::new(),
+            ))
+        }
+    }
+
+    /// Builds one authorized query context without a server or Postgres.
+    fn query_context() -> crate::oracle::AuthorizedQueryContext {
+        let auth = auth_context(true);
+        crate::oracle::AuthorizedQueryContext {
+            principal: auth.principal,
+            data_tenant_id: auth.tenant,
+            request_id: auth.request_id,
+            trace_id: None,
+            auth_method: wyrd_spec::vala::api::AuthMethod::Jwt,
+            permission: "bifrost:record:read".to_owned(),
+        }
+    }
+
+    /// Builds one minimal well-formed public SQL request.
+    fn query_request() -> wyrd_spec::vala::api::BifrostQueryRequest {
+        wyrd_spec::vala::api::BifrostQueryRequest {
+            sql: "SELECT 1".to_owned(),
+            visibility: wyrd_spec::vala::api::VisibilityMode::PublishedOnly,
+            freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
+            deadline_ms: None,
+        }
+    }
+
+    /// Builds a query-only Gate: no Scribe, optionally one dispatch seam.
+    fn query_gate(
+        dispatch: Option<Arc<TestQueryDispatch>>,
+    ) -> Gate<TestPermissionResolver, TestIssuerResolver> {
+        let gate = Gate::without_scribe(test_interceptor(), IngestLimits::default());
+        match dispatch {
+            Some(dispatch) => gate.with_query_dispatch(dispatch),
+            None => gate,
+        }
+    }
+
+    /// Gate owns the whole query request lifecycle around the dispatch seam.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a refusal reaches stream accounting, when a dispatched
+    /// stream does not carry the Gate lifecycle, or when either path fails to
+    /// settle exactly one terminal request outcome.
+    #[test]
+    fn query_dispatch_seam_owns_the_request_lifecycle() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let unconfigured = query_gate(None);
+        let error = metrics::with_local_recorder(&recorder, || {
+            wyrd_runtime::runtime()
+                .block_on(unconfigured.query_sql(query_context(), query_request()))
+        })
+        .expect_err("a Gate with no dispatch seam must refuse");
+        assert!(matches!(error, BifrostError::OracleRoleUnavailable));
+        let snapshot = recorder.snapshot();
+        assert_eq!(
+            snapshot
+                .counters
+                .get("bifrost_gate_requests_total{operation=\"query\",outcome=\"rejected\"}"),
+            Some(&1)
+        );
+        assert_eq!(
+            snapshot.counters.get(
+                "bifrost_gate_rejections_total{operation=\"query\",reason=\"role_unavailable\"}"
+            ),
+            Some(&1)
+        );
+        assert_eq!(
+            snapshot
+                .gauges
+                .get("bifrost_gate_active_streams{operation=\"query\"}"),
+            None,
+            "a refusal before dispatch must not touch stream accounting"
+        );
+
+        let dispatched = query_gate(Some(Arc::new(TestQueryDispatch {
+            calls: Arc::clone(&calls),
+            refusal: None,
+        })));
+        metrics::with_local_recorder(&recorder, || {
+            wyrd_runtime::runtime().block_on(async {
+                let stream = dispatched
+                    .query_sql(query_context(), query_request())
+                    .await
+                    .expect("the seam returns an admitted stream");
+                let mut frames = stream.frames;
+                while frames.next().await.is_some() {}
+            });
+        });
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let snapshot = recorder.snapshot();
+        assert_eq!(
+            snapshot
+                .counters
+                .get("bifrost_gate_requests_total{operation=\"query\",outcome=\"success\"}"),
+            Some(&1)
+        );
+        assert_eq!(
+            snapshot
+                .counters
+                .get("bifrost_gate_query_streams_total{outcome=\"success\"}"),
+            Some(&1),
+            "the dispatched stream must carry the Gate stream lifecycle"
+        );
+    }
+
+    /// A closed Gate refuses queries even with no Scribe present.
+    #[tokio::test]
+    async fn closed_gate_refuses_queries_without_a_scribe() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gate = query_gate(Some(Arc::new(TestQueryDispatch {
+            calls: Arc::clone(&calls),
+            refusal: None,
+        })));
+        gate.close();
+
+        assert!(matches!(
+            gate.ensure_query_open(),
+            Err(BifrostError::OracleRoleUnavailable)
+        ));
+        let error = gate
+            .query_sql(query_context(), query_request())
+            .await
+            .expect_err("a closed Gate must refuse queries");
+        assert!(matches!(error, BifrostError::OracleRoleUnavailable));
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "a closed Gate must refuse before reaching the dispatch seam"
+        );
+    }
+
+    /// A closed Gate refuses OTLP decode before reserving Scribe memory.
+    #[test]
+    fn closed_gate_refuses_otlp_decode_before_reserving() {
+        let gate = Gate::with_test_scribe(
+            Arc::new(NotReadyScribe),
+            test_interceptor(),
+            IngestLimits::default(),
+        );
+        gate.close();
+
+        let error = gate
+            .reserve_otlp_decode(1024)
+            .expect_err("a closed Gate must refuse decode reservation");
+        assert!(matches!(error, IngestError::IngressClosed));
+    }
+
+    /// Every write refusal records exactly the label the one taxonomy projects.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a variant records a different label than
+    /// [`IngestError::rejection_reason`] projects, or when an internal failure
+    /// is attributed to the caller.
+    #[test]
+    fn insert_batch_uses_the_one_rejection_taxonomy() {
+        let cases = [
+            IngestError::Unauthenticated("no bearer".to_owned()),
+            IngestError::PrincipalUnresolved,
+            IngestError::RbacDenied {
+                detail: "bifrost:record:write denied".to_owned(),
+            },
+            IngestError::ReservedBuiltinWriteDenied {
+                table: "vala.audit.events".to_owned(),
+            },
+            IngestError::RequestValidation("bad batch id".to_owned()),
+            IngestError::Decode("truncated frame".to_owned()),
+            IngestError::PayloadTooLarge { bytes: 2, limit: 1 },
+            IngestError::TableNotFound {
+                table: "vala.traces.absent".to_owned(),
+            },
+            IngestError::IngressClosed,
+            IngestError::WalDiskFull,
+        ];
+        for error in cases {
+            let recorder = wyrd_bench::BenchmarkRecorder::default();
+            metrics::with_local_recorder(&recorder, || super::record_write_rejection(&error));
+            let reason = error
+                .rejection_reason()
+                .expect("every case is a caller-attributed rejection");
+            assert_eq!(
+                recorder.snapshot().counters.get(&format!(
+                    "bifrost_gate_rejections_total{{operation=\"write\",reason=\"{reason}\"}}"
+                )),
+                Some(&1),
+                "{error} must record exactly its projected reason"
+            );
+        }
+
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        let internal = IngestError::Internal("wyrd defect".to_owned());
+        metrics::with_local_recorder(&recorder, || super::record_write_rejection(&internal));
+        assert!(
+            recorder.snapshot().counters.is_empty(),
+            "a server defect must not be attributed to the caller"
+        );
+    }
+
+    /// One refusal advances only its own reason label.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the projected series does not advance by exactly one or an
+    /// unrelated reason moves.
+    #[test]
+    fn gate_rejection_increments_only_the_projected_reason() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        let error = IngestError::TableNotFound {
+            table: "vala.bifrost/absent".to_owned(),
+        };
+        let reason = error
+            .rejection_reason()
+            .expect("a table-not-found refusal is a caller-attributed rejection");
+        metrics::with_local_recorder(&recorder, || {
+            super::initialize_gate_metrics();
+            super::record_write_rejection(&error);
+        });
+
+        let snapshot = recorder.snapshot();
+        assert_eq!(
+            snapshot.counters.get(&format!(
+                "bifrost_gate_rejections_total{{operation=\"write\",reason=\"{reason}\"}}"
+            )),
+            Some(&1),
+            "the projected reason must advance by exactly one"
+        );
+        for other in crate::gate::error::GATE_REJECTION_REASONS {
+            if other == reason {
+                continue;
+            }
+            assert_eq!(
+                snapshot.counters.get(&format!(
+                    "bifrost_gate_rejections_total{{operation=\"write\",reason=\"{other}\"}}"
+                )),
+                Some(&0),
+                "an unrelated reason must not move"
+            );
+        }
+    }
+
+    /// Boot publishes the whole closed rejection table at zero.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any `operation` x `reason` pair is absent from the
+    /// initialized registry, which would make an absent series and a zero
+    /// series indistinguishable to a scrape.
+    #[test]
+    fn initialize_gate_metrics_zero_registers_the_closed_rejection_table() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        metrics::with_local_recorder(&recorder, super::initialize_gate_metrics);
+
+        let snapshot = recorder.snapshot();
+        for operation in ["write", "query"] {
+            for reason in crate::gate::error::GATE_REJECTION_REASONS {
+                assert_eq!(
+                    snapshot.counters.get(&format!(
+                        "bifrost_gate_rejections_total{{operation=\"{operation}\",reason=\"{reason}\"}}"
+                    )),
+                    Some(&0),
+                    "missing seeded rejection series for {operation}/{reason}"
+                );
+            }
+        }
+    }
+
+    /// Native batch identity acceptance is unchanged in both directions.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a 16-byte non-UUIDv7 identity is admitted, a short identity
+    /// is admitted, or a valid `UUIDv7` is refused.
+    #[test]
+    fn batch_identity_acceptance_is_unchanged() {
+        let limits = IngestLimits::default();
+        let frame = |batch_id: Vec<u8>| wyrd_tonic::wyrd::v1::InsertBatchRequest {
+            table: "vala.traces.spans".to_owned(),
+            wyrd_batch_id: batch_id.into(),
+            arrow_ipc: Vec::new().into(),
+        };
+
+        let uuid_v4 = uuid::Uuid::new_v4();
+        assert!(matches!(
+            super::validate_batch(&frame(uuid_v4.as_bytes().to_vec()), &limits),
+            Err(IngestError::RequestValidation(_)),
+        ));
+        assert!(matches!(
+            super::validate_batch(&frame(vec![0_u8; 15]), &limits),
+            Err(IngestError::RequestValidation(_))
+        ));
+        assert!(
+            super::validate_batch(&frame(uuid::Uuid::now_v7().as_bytes().to_vec()), &limits)
+                .is_ok()
+        );
     }
 
     /// Query request lifecycles emit one exact terminal and drain active work.

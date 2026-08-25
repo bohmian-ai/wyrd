@@ -56,7 +56,7 @@ mod pg_tests {
                 bytes: 100,
                 parallelism: 1,
                 memory_bytes: 40 * 1024 * 1024,
-                spill_bytes: 100,
+                spill_bytes: 50,
                 large_ceiling_bytes: 64 * 1024 * 1024,
                 envelope: Some(vala_sql::row_types::forge_tasks::ForgeTaskEnvelope {
                     version: vala_sql::row_types::forge_tasks::FORGE_ENVELOPE_VERSION,
@@ -70,7 +70,6 @@ mod pg_tests {
                     footer_encoded_bytes: 8 * 1024 * 1024,
                     footer_decode_workspace_bytes: 32 * 1024 * 1024,
                     sort_spill_bytes: 50,
-                    output_scratch_bytes: 50,
                 }),
             },
             ready_at: Utc::now() - Duration::seconds(1),
@@ -223,7 +222,7 @@ mod pg_tests {
     async fn make_legacy(admin: &PgPool, task_id: Uuid, oversized: bool) {
         let estimate = if oversized { 100_000_i64 } else { 100_i64 };
         sqlx::query(
-            "UPDATE vala.forge_tasks SET envelope_version=0, decoded_batch_bytes=NULL, decoded_input_bytes=NULL, sort_working_bytes=NULL, sort_merge_reservation_bytes=NULL, encoder_buffer_bytes=NULL, upload_chunk_bytes=NULL, footer_encoded_bytes=NULL, footer_decode_workspace_bytes=NULL, sort_spill_bytes=NULL, output_scratch_bytes=NULL, estimated_files=1, estimated_bytes=$2, estimated_parallelism=1, estimated_memory_bytes=$2, estimated_spill_bytes=$2, large_task_ceiling_bytes=$2 WHERE task_id=$1",
+            "UPDATE vala.forge_tasks SET envelope_version=0, decoded_batch_bytes=NULL, decoded_input_bytes=NULL, sort_working_bytes=NULL, sort_merge_reservation_bytes=NULL, encoder_buffer_bytes=NULL, upload_chunk_bytes=NULL, footer_encoded_bytes=NULL, footer_decode_workspace_bytes=NULL, sort_spill_bytes=NULL, estimated_files=1, estimated_bytes=$2, estimated_parallelism=1, estimated_memory_bytes=$2, estimated_spill_bytes=$2, large_task_ceiling_bytes=$2 WHERE task_id=$1",
         )
         .bind(task_id)
         .bind(estimate)

@@ -71,7 +71,7 @@ After all tasks are accepted:
 1. run every plan-required integrated test and user journey;
 2. run format, lint, typecheck, codegen, schema, docs, migration, and boundary
    gates required by the affected surfaces;
-3. run `mise run pre-pr` only when the plan, `AGENTS.md`, shared CI/build/test
+3. run `mise run gate` only when the plan, `AGENTS.md`, shared CI/build/test
    infrastructure, release scope, or user requires it;
 4. otherwise run the exact whole-plan closeout gate named by the plan and
    current repository task definitions;

@@ -16,6 +16,19 @@ mod pg_tests {
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
 
+    /// Canonical default layout JSON stored on every registration in this file.
+    ///
+    /// The catalog column is opaque JSON to `vala-sql`; these tests only need a
+    /// value that matches the wire contract the server persists, so they build
+    /// the `hour(wyrd_event_time)` default rather than a bespoke shape.
+    fn layout_fixture() -> serde_json::Value {
+        serde_json::json!({
+            "partition": { "column": "wyrd_event_time", "granularity": "hour" },
+            "sort_keys": [],
+            "bloom_columns": []
+        })
+    }
+
     #[tokio::test]
     async fn schema_usage_grant_lets_wyrd_app_register_bifrost_table() {
         let fixture = PgFixture::start().await.expect("fixture");
@@ -38,14 +51,12 @@ mod pg_tests {
 
         let table_uid = [1u8; 16];
         let fingerprint = [0u8; 32];
-        let partition_columns = vec!["day".to_string()];
-
         upsert_table(
             &mut conn,
             &table_uid,
             "space.table",
             &fingerprint,
-            &partition_columns,
+            &layout_fixture(),
         )
         .await
         .expect("wyrd_app must reach vala.bifrost_tables once USAGE ON SCHEMA vala is granted");
@@ -73,9 +84,15 @@ mod pg_tests {
             let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
                 .await
                 .unwrap();
-            upsert_table(&mut conn, &[7_u8; 16], "datasets.same", &[3_u8; 32], &[])
-                .await
-                .unwrap();
+            upsert_table(
+                &mut conn,
+                &[7_u8; 16],
+                "datasets.same",
+                &[3_u8; 32],
+                &layout_fixture(),
+            )
+            .await
+            .unwrap();
             conn.commit().await.unwrap();
         }
 

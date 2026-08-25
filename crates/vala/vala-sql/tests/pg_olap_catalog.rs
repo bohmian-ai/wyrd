@@ -7,6 +7,19 @@ mod pg_tests {
     use wyrd_spec::DataTenantId;
     use wyrd_sql::TenantConn;
 
+    /// Canonical default layout JSON stored on every registration in this file.
+    ///
+    /// The catalog column is opaque JSON to `vala-sql`; these tests only need a
+    /// value that matches the wire contract the server persists, so they build
+    /// the `hour(wyrd_event_time)` default rather than a bespoke shape.
+    fn layout_fixture() -> serde_json::Value {
+        serde_json::json!({
+            "partition": { "column": "wyrd_event_time", "granularity": "hour" },
+            "sort_keys": [],
+            "bloom_columns": []
+        })
+    }
+
     /// Proves Forge sees only active registrations in tenant/FQN order.
     #[tokio::test]
     async fn active_table_inventory_is_operator_visible_ordered_and_status_filtered() {
@@ -31,7 +44,7 @@ mod pg_tests {
             let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
                 .await
                 .expect("tenant connection");
-            upsert_table(&mut conn, &uid, fqn, &[7_u8; 32], &[])
+            upsert_table(&mut conn, &uid, fqn, &[7_u8; 32], &layout_fixture())
                 .await
                 .expect("insert registration");
             conn.commit().await.expect("commit registration");

@@ -30,8 +30,6 @@ use crate::contracts::ScribeError;
 pub(crate) const MAX_SOURCE_PLANS: usize = 64;
 /// Maximum top-level fields in the canonical native schema.
 pub(crate) const MAX_NATIVE_FIELDS: usize = 256;
-/// Maximum distinct event days in one request.
-pub(crate) const MAX_EVENT_DAYS: usize = crate::gate::limits::OTLP_WIRE_LIMITS.event_days;
 /// Metadata-only facts for one current source.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct SourceMaterialPlan {
@@ -87,10 +85,14 @@ pub(crate) struct IngestMaterialPlan {
     pub(crate) source_count: usize,
     /// Total logical rows counted without materialization.
     pub(crate) rows: usize,
-    /// Sorted-free fixed set of OTLP event-day ordinals encountered by count pass.
-    pub(crate) event_days: [u64; MAX_EVENT_DAYS],
-    /// Live prefix length in `event_days`.
-    pub(crate) event_day_count: usize,
+    /// Distinct time partitions this plan admits for the request.
+    ///
+    /// Always at least one for a non-empty request: an OTLP export derives one
+    /// partition from its single receipt time, while a native or projected
+    /// Arrow source is admitted for the full per-source ceiling because its
+    /// rows are not decoded during planning. The value therefore matches the
+    /// durable slice metadata the plan reserves rather than being left at zero.
+    pub(crate) time_partition_count: usize,
     /// Largest current-only decoded or projected source.
     pub(crate) current_material_bytes: usize,
     /// Aggregate native rows transferred into active memtable ownership.
@@ -146,7 +148,7 @@ pub(crate) fn configured_maximum_envelope_bytes(
     let durable_metadata = limits
         .native_sources
         .max(1)
-        .checked_mul(limits.otlp.event_days.max(1))
+        .checked_mul(limits.otlp.time_partitions.max(1))
         .and_then(|count| count.checked_mul(crate::scribe::shards::DURABLE_SLICE_LAYOUT_BYTES))
         .ok_or_else(overflow)?;
     let preflight = limits
@@ -575,14 +577,13 @@ impl NativeScan {
             sources: self.sources,
             source_count: self.source_count,
             rows: self.rows,
-            event_days: [0; MAX_EVENT_DAYS],
-            event_day_count: 0,
+            time_partition_count: self.limits.otlp.time_partitions,
             current_material_bytes,
             active_output_bytes: self.active_output_bytes,
             persistence_candidate_bytes: self.active_output_bytes,
             durable_metadata_bytes: self
                 .source_count
-                .checked_mul(self.limits.otlp.event_days)
+                .checked_mul(self.limits.otlp.time_partitions)
                 .and_then(|count| {
                     count.checked_mul(crate::scribe::shards::DURABLE_SLICE_LAYOUT_BYTES)
                 })
@@ -684,8 +685,7 @@ impl ScribeIngressPlanner {
             sources,
             source_count: usize::from(rows != 0),
             rows,
-            event_days: [0; MAX_EVENT_DAYS],
-            event_day_count: 0,
+            time_partition_count: self.limits.otlp.time_partitions,
             current_material_bytes,
             active_output_bytes: 0,
             persistence_candidate_bytes: decoded_bytes,
@@ -734,7 +734,6 @@ impl ScribeIngressPlanner {
         request: &ExportTraceServiceRequest,
         request_bytes: usize,
         name_bytes: usize,
-        receipt_micros: i64,
     ) -> Result<IngestMaterialPlan, ScribeError> {
         let mut counts = OtlpCounts::new(self.limits);
         for resource in &request.resource_spans {
@@ -776,7 +775,7 @@ impl ScribeIngressPlanner {
                 }
             }
         }
-        counts.finish(request_bytes, name_bytes, receipt_micros)
+        counts.finish(request_bytes, name_bytes)
     }
 
     /// Counts a typed metrics request without projecting records.
@@ -790,7 +789,6 @@ impl ScribeIngressPlanner {
         request: &ExportMetricsServiceRequest,
         request_bytes: usize,
         name_bytes: usize,
-        receipt_micros: i64,
     ) -> Result<IngestMaterialPlan, ScribeError> {
         let mut counts = OtlpCounts::new(self.limits);
         for resource in &request.resource_metrics {
@@ -844,7 +842,7 @@ impl ScribeIngressPlanner {
                 }
             }
         }
-        counts.finish(request_bytes, name_bytes, receipt_micros)
+        counts.finish(request_bytes, name_bytes)
     }
 
     /// Counts a typed logs request without projecting records.
@@ -858,7 +856,6 @@ impl ScribeIngressPlanner {
         request: &ExportLogsServiceRequest,
         request_bytes: usize,
         name_bytes: usize,
-        receipt_micros: i64,
     ) -> Result<IngestMaterialPlan, ScribeError> {
         let mut counts = OtlpCounts::new(self.limits);
         for resource in &request.resource_logs {
@@ -889,7 +886,7 @@ impl ScribeIngressPlanner {
                 }
             }
         }
-        counts.finish(request_bytes, name_bytes, receipt_micros)
+        counts.finish(request_bytes, name_bytes)
     }
 }
 
@@ -1301,8 +1298,6 @@ struct OtlpCounts {
     attributes: usize,
     /// Cumulative borrowed key/value/body bytes.
     value_bytes: usize,
-    /// Fixed set of nonzero Unix-day ordinals.
-    event_days: [u64; MAX_EVENT_DAYS],
 }
 
 impl OtlpCounts {
@@ -1316,7 +1311,6 @@ impl OtlpCounts {
             records: 0,
             attributes: 0,
             value_bytes: 0,
-            event_days: [0; MAX_EVENT_DAYS],
         }
     }
 
@@ -1391,10 +1385,9 @@ impl OtlpCounts {
     ///
     /// Returns a stable material-too-large refusal for checked capacity excess.
     fn finish(
-        mut self,
+        self,
         request_bytes: usize,
         name_bytes: usize,
-        receipt_micros: i64,
     ) -> Result<IngestMaterialPlan, ScribeError> {
         if request_bytes > self.limits.otlp.request_bytes {
             return Err(ScribeError::PayloadTooLarge {
@@ -1414,8 +1407,6 @@ impl OtlpCounts {
             })?;
         let mut sources = [SourceMaterialPlan::default(); MAX_SOURCE_PLANS];
         if self.records != 0 {
-            self.event_days[0] = u64::try_from(receipt_micros.div_euclid(86_400_000_000))
-                .map_err(|_| ScribeError::InvalidFrame)?;
             sources[0] = SourceMaterialPlan {
                 rows: self.records,
                 body_bytes: current_material_bytes,
@@ -1439,8 +1430,7 @@ impl OtlpCounts {
             sources,
             source_count: usize::from(self.records != 0),
             rows: self.records,
-            event_days: self.event_days,
-            event_day_count: usize::from(self.records != 0),
+            time_partition_count: usize::from(self.records != 0),
             current_material_bytes,
             active_output_bytes: 0,
             persistence_candidate_bytes: 0,
@@ -1742,7 +1732,7 @@ mod tests {
 
     /// Encodes a nullable array, then marks its IPC field nonnullable in place.
     ///
-    /// The mutation retains otherwise canonical FlatBuffer structure while
+    /// The mutation retains otherwise canonical `FlatBuffer` structure while
     /// creating the contradictory field-node null count rejected by preflight.
     ///
     /// # Panics
@@ -1900,7 +1890,7 @@ mod tests {
                 .and_then(|value| value.nodes())
                 .map(|value| value.get(0))
                 .expect("field node");
-            (node as *const arrow::ipc::FieldNode as usize)
+            (std::ptr::from_ref::<arrow::ipc::FieldNode>(node) as usize)
                 .checked_sub(metadata.as_ptr() as usize)
                 .expect("node belongs to metadata")
                 + 8
@@ -1942,12 +1932,12 @@ mod tests {
             }],
         };
         assert!(matches!(
-            ScribeIngressPlanner::default().plan_logs(&request, 1, 0, 0),
+            ScribeIngressPlanner::default().plan_logs(&request, 1, 0),
             Err(ScribeError::InvalidFrame)
         ));
     }
 
-    /// Nested KeyValue entries consume the same cardinality budget as top-level attributes.
+    /// Nested `KeyValue` entries consume the same cardinality budget as top-level attributes.
     #[test]
     fn otlp_count_pass_rejects_nested_attribute_cap_plus_one() {
         let value = AnyValue {
@@ -1962,7 +1952,7 @@ mod tests {
         ));
     }
 
-    /// AnyValue admission charges raw retained string and byte values exactly once.
+    /// `AnyValue` admission charges raw retained string and byte values exactly once.
     #[test]
     fn otlp_count_pass_uses_exact_raw_any_value_bytes() {
         let value = AnyValue {

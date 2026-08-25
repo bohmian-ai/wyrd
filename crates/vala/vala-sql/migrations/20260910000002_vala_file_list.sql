@@ -2,7 +2,7 @@
 --
 -- Scribe INSERTs one row per sealed file; Forge SELECTs + UPDATEs
 -- (compacted = true, committed_snapshot_id); Oracle SELECTs for fused scan.
--- RLS on data_tenant_id. One row = one physical Parquet file = one partition_day.
+-- RLS on data_tenant_id. One row = one physical Parquet file = one time partition.
 --
 -- Writer stream identity: Each Scribe pod runs a writer stream identified by
 -- (node_id, writer_epoch). node_id is the pod's stable UUID; writer_epoch is
@@ -21,7 +21,14 @@ CREATE TABLE vala.file_list (
     row_count             bigint NOT NULL,
     min_event_time        timestamptz NOT NULL,
     max_event_time        timestamptz NOT NULL,
-    partition_day         date NOT NULL,
+    -- Exact time partition: the granularity token plus its UTC start boundary.
+    -- The CHECK makes a noncanonical start unrepresentable, so the pair is a
+    -- true identity rather than two loosely related columns.
+    partition_granularity text NOT NULL CHECK (partition_granularity IN ('hour', 'day')),
+    partition_start       timestamptz NOT NULL,
+    CONSTRAINT file_list_partition_start_is_canonical
+        CHECK (date_trunc(partition_granularity, partition_start AT TIME ZONE 'UTC')
+               = partition_start AT TIME ZONE 'UTC'),
     compacted             bool NOT NULL DEFAULT false,
     committed_snapshot_id bigint,
     -- Writer stream identity: (node_id, writer_epoch) identifies the pod-local
@@ -36,7 +43,8 @@ CREATE TABLE vala.file_list (
 
 -- Forge compaction lookup: uncompacted files grouped by partition.
 CREATE INDEX file_list_group_idx
-    ON vala.file_list (data_tenant_id, namespace, table_name, partition_day)
+    ON vala.file_list (data_tenant_id, namespace, table_name,
+                       partition_granularity, partition_start)
     WHERE NOT compacted;
 
 -- Tenant-scoped table queries (RLS enforced).

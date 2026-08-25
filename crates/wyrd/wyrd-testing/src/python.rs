@@ -12,7 +12,7 @@ use secrecy::ExposeSecret;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::scribe::tail_rpc::{LocalTailReadTransport, TailReadTransport};
-use vala_sdk::{BifrostGrpcTransport, IngestTransport};
+use vala_sdk::BifrostGrpcTransport;
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
@@ -458,7 +458,8 @@ async fn prepare_oracle_query_fixture(
         Field::new("value", DataType::Utf8, false),
     ]));
     srv.state()
-        .bifrost
+        .bifrost_catalog()
+        .expect("test server exposes its Bifrost catalog")
         .create_table(CreateTableRequest {
             table: TableRef::new(BifrostNamespace::Bifrost, &table_name),
             user_fields: schema
@@ -467,6 +468,7 @@ async fn prepare_oracle_query_fixture(
                 .map(|field| field.as_ref().clone())
                 .collect(),
             tenant: srv.data_tenant_id(),
+            physical_layout: None,
             audit: None,
         })
         .await
@@ -518,13 +520,10 @@ async fn prepare_oracle_query_fixture(
         .map_err(harness_error)?
         .stream();
     let writer_epoch = u64::try_from(stream.writer_epoch.as_i64()).map_err(harness_error)?;
-    let event_day = wyrd_spec::vala::api::EventDay::new(
-        chrono::Utc::now()
-            .date_naive()
-            .format("%Y-%m-%d")
-            .to_string(),
-    )
-    .map_err(harness_error)?;
+    let time_partition = vala_bifrost_redux::catalog::TimeGranularity::Hour
+        .bucket(chrono::Utc::now())
+        .map_err(harness_error)?
+        .to_wire();
     let tail_transport: std::sync::Arc<dyn TailReadTransport> =
         std::sync::Arc::new(LocalTailReadTransport::new(ingest.tail_reader()));
     let oracle = srv
@@ -540,7 +539,7 @@ async fn prepare_oracle_query_fixture(
         &table_fqn,
         wyrd_spec::vala::api::NodeId::new(stream.node_id.as_uuid()),
         writer_epoch,
-        event_day,
+        time_partition,
         tail_transport,
     );
     if !fused {

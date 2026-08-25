@@ -91,11 +91,15 @@ impl OraclePlanner {
         Self::classification(estimated_bytes, live_oracle_cpu, complex).query_class
     }
 
-    /// Pins the authenticated request against one membership snapshot and returns its class.
+    /// Pins the authenticated request against one membership snapshot and returns its plan.
     ///
     /// This preparation has no admission, audit, registry, or execution side effects. It lets
     /// an ingress owner choose and sign one compatible ready-Oracle participant cut before the
     /// local or remote leader begins the shared execution operation.
+    ///
+    /// The pinned cut is returned rather than discarded so a local leader can execute the
+    /// snapshot it already paid for. A forwarded query cannot use it — the participant cut
+    /// carries cluster membership, not the file list — so a remote leader pins for itself.
     ///
     /// # Errors
     /// Returns the same validation, catalog, timeout, and planning failures as Oracle planning.
@@ -106,7 +110,7 @@ impl OraclePlanner {
         deadline: Instant,
         catalog: &BifrostCatalog,
         snapshot: &crate::cluster::ClusterSnapshot,
-    ) -> Result<QueryClass, BifrostError> {
+    ) -> Result<PlannedSqlCut, BifrostError> {
         self.validate_query(request)?;
         let tables = parse_select_tables(&request.sql)?;
         let live_oracle_cpu = snapshot
@@ -126,7 +130,6 @@ impl OraclePlanner {
             live_oracle_cpu,
         )
         .await
-        .map(|planned| planned.query_class)
     }
 
     /// Produces the class, closed reason, and predicted duration from one cut.
@@ -313,6 +316,11 @@ impl OraclePlanner {
         live_oracle_cpu: f64,
     ) -> Result<PlannedSqlCut, BifrostError> {
         let planning = self.try_planning()?;
+        // DEBUG, not INFO: one event per catalog pin per query is per-request
+        // decision detail, not a lifecycle transition. It is the only way to
+        // attribute pre-fragment query latency, which is otherwise invisible
+        // between admission and the first fragment dispatch.
+        let pin_started = std::time::Instant::now();
         let mut cuts = Vec::with_capacity(tables.len());
         let mut estimated_bytes = 0_u64;
         for table in tables {
@@ -331,7 +339,24 @@ impl OraclePlanner {
                 .ok_or(BifrostError::QueryAdmissionRejected)?;
             cuts.push(cut);
         }
+        let pinned_elapsed = pin_started.elapsed();
+        let hot_files = cuts.iter().map(|cut| cut.hot_files.len()).sum::<usize>();
+        let iceberg_files = cuts
+            .iter()
+            .map(|cut| cut.iceberg_files.len())
+            .sum::<usize>();
         let optimized_plan = self.prepare_optimized_sql_plan(sql, &cuts).await?;
+        tracing::debug!(
+            tables = tables.len(),
+            hot_files,
+            iceberg_files,
+            pin_ms = pinned_elapsed.as_millis(),
+            optimize_ms = pin_started
+                .elapsed()
+                .saturating_sub(pinned_elapsed)
+                .as_millis(),
+            "Oracle pinned one sealed cut"
+        );
         let classification = Self::classification(
             estimated_bytes,
             live_oracle_cpu,

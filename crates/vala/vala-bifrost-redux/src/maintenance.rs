@@ -1,32 +1,29 @@
 //! Local, lossy wake-up signals shared by Scribe persistence and Forge.
 
-use chrono::NaiveDate;
 use thiserror::Error;
 
 use crate::catalog::TenantTableBinding;
+use crate::catalog::layout::TimePartition;
 
-/// The exact durable table and partition day whose file-list row was committed.
+/// The exact durable table and time partition whose file-list row was committed.
 #[derive(Debug, Clone)]
 pub struct StagingFileCommitted {
     /// Resolved tenant/table identity validated by the committing Scribe path.
     binding: TenantTableBinding,
-    /// Event-time day represented by the committed staged file.
-    partition_day: NaiveDate,
+    /// Exact partition represented by the committed staged file.
+    partition: TimePartition,
 }
 
 impl StagingFileCommitted {
     /// Construct a wake-up signal without carrying any durable file metadata.
     #[must_use]
-    pub fn new(binding: TenantTableBinding, partition_day: NaiveDate) -> Self {
-        Self {
-            binding,
-            partition_day,
-        }
+    pub fn new(binding: TenantTableBinding, partition: TimePartition) -> Self {
+        Self { binding, partition }
     }
 
     /// Consume the signal into the exact identity Forge uses for discovery.
-    pub(crate) fn into_parts(self) -> (TenantTableBinding, NaiveDate) {
-        (self.binding, self.partition_day)
+    pub(crate) fn into_parts(self) -> (TenantTableBinding, TimePartition) {
+        (self.binding, self.partition)
     }
 }
 
@@ -178,7 +175,11 @@ mod tests {
         let binding =
             TenantTableBinding::resolve((tenant, TableRef::new(BifrostNamespace::Traces, "spans")))
                 .expect("binding");
-        let day = NaiveDate::from_ymd_opt(2026, 1, 2).expect("day");
+        let day = TimePartition::new(
+            crate::catalog::TimeGranularity::Hour,
+            chrono::DateTime::from_timestamp(1_767_312_000, 0).expect("instant"),
+        )
+        .expect("hour boundary");
         assert_eq!(
             publisher.try_publish(StagingFileCommitted::new(binding.clone(), day)),
             StagingPublishOutcome::Published
@@ -207,7 +208,11 @@ mod tests {
                 TableRef::new(BifrostNamespace::Traces, "spans"),
             ))
             .expect("binding");
-            let day = NaiveDate::from_ymd_opt(2026, 1, 2).expect("day");
+            let day = TimePartition::new(
+                crate::catalog::TimeGranularity::Hour,
+                chrono::DateTime::from_timestamp(1_767_312_000, 0).expect("instant"),
+            )
+            .expect("hour boundary");
             assert_eq!(
                 publisher.try_publish(StagingFileCommitted::new(binding.clone(), day)),
                 StagingPublishOutcome::Published

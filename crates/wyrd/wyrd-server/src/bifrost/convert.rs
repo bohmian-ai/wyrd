@@ -10,13 +10,10 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit as ArrowTimeUnit};
-use vala_bifrost_redux::catalog::PartitionTransform;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::schema::SchemaFingerprint;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::vala::api::{
-    DataTypeSpec, FieldSpec, PartitionColumnSpec, PartitionTransformWire, TimeUnit,
-};
+use wyrd_spec::vala::api::{DataTypeSpec, FieldSpec, TimeUnit};
 
 /// Resolve a wire namespace string (e.g. `"vala.bifrost"`) to its engine enum.
 ///
@@ -163,31 +160,6 @@ pub fn field_from_arrow(field: &Field) -> Result<FieldSpec, WyrdError> {
     })
 }
 
-/// Map a wire partition column to the engine `(column, transform)` pair.
-///
-/// The wire enum carries an `Hour` transform the engine does not implement; it is
-/// rejected as a client error rather than silently downgraded.
-pub fn partition_column_to_engine(
-    spec: &PartitionColumnSpec,
-) -> Result<(String, PartitionTransform), WyrdError> {
-    let transform = match &spec.transform {
-        PartitionTransformWire::Identity => PartitionTransform::Identity,
-        PartitionTransformWire::Year => PartitionTransform::Year,
-        PartitionTransformWire::Month => PartitionTransform::Month,
-        PartitionTransformWire::Day => PartitionTransform::Day,
-        PartitionTransformWire::Bucket { n } => PartitionTransform::Bucket(*n),
-        PartitionTransformWire::Truncate { w } => PartitionTransform::Truncate(*w),
-        PartitionTransformWire::Hour => {
-            return Err(WyrdError::Validation {
-                message: "the hour partition transform is not supported by the Bifrost engine"
-                    .to_owned(),
-                details: serde_json::json!({ "column": spec.column, "transform": "hour" }),
-            });
-        }
-    };
-    Ok((spec.column.clone(), transform))
-}
-
 /// Lower-case hex of a byte slice — matches the engine's wire encoding.
 pub fn to_hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
@@ -269,30 +241,6 @@ mod tests {
         let schema = Schema::new(arrow_fields.clone());
         let expected = to_hex(&SchemaFingerprint::from_arrow_schema(&schema).0);
         assert_eq!(forward_fp, expected);
-    }
-
-    #[test]
-    fn bifrost_tables_partition_transform_maps_all_and_rejects_hour() {
-        let ok = partition_column_to_engine(&PartitionColumnSpec {
-            column: "day".to_owned(),
-            transform: PartitionTransformWire::Day,
-        })
-        .expect("day maps");
-        assert_eq!(ok, ("day".to_owned(), PartitionTransform::Day));
-
-        let bucket = partition_column_to_engine(&PartitionColumnSpec {
-            column: "id".to_owned(),
-            transform: PartitionTransformWire::Bucket { n: 8 },
-        })
-        .expect("bucket maps");
-        assert_eq!(bucket, ("id".to_owned(), PartitionTransform::Bucket(8)));
-
-        let err = partition_column_to_engine(&PartitionColumnSpec {
-            column: "ts".to_owned(),
-            transform: PartitionTransformWire::Hour,
-        })
-        .expect_err("hour is rejected");
-        assert_eq!(err.status(), 400);
     }
 
     #[test]

@@ -84,40 +84,6 @@ pub enum ClosedLeafPredicate {
     },
 }
 
-/// Prepared sealed leaf input used by [`FragmentPlanner`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PreparedSealedLeaf {
-    /// Tenant-qualified logical binding.
-    pub binding: String,
-    /// Immutable source tier.
-    pub tier: SealedSourceTier,
-    /// Pinned snapshot or manifest digest.
-    pub pinned_digest: String,
-    /// Ordered object work.
-    pub files: Vec<SealedScanFile>,
-    /// Projection columns, in requested order.
-    pub projection: Vec<String>,
-    /// Closed leaf predicates; no SQL or physical plan text is accepted.
-    pub predicates: Vec<ClosedLeafPredicate>,
-    /// Expected schema fingerprint.
-    pub schema_fingerprint: String,
-    /// Absolute hard deadline represented as Unix milliseconds.
-    pub deadline_unix_ms: i64,
-}
-
-/// Deterministic bounded fragment configuration.
-#[derive(Debug, Clone, Copy)]
-pub struct FragmentConfig {
-    /// Maximum files represented by one fragment.
-    pub max_files: usize,
-}
-
-impl Default for FragmentConfig {
-    fn default() -> Self {
-        Self { max_files: 16 }
-    }
-}
-
 /// A closed micro-fragment containing only immutable sealed scan work.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SealedScanFragment {
@@ -145,70 +111,20 @@ pub struct SealedScanFragment {
     pub deadline_unix_ms: i64,
 }
 
-/// Fragment planning failure.
+/// Sealed-fragment encoding failure.
+///
+/// The former `FragmentPlanner`/`PreparedSealedLeaf`/`FragmentConfig`
+/// chunking path produced no dispatched fragment in production — every real
+/// [`SealedScanFragment`] is now built directly from the closed predicate and
+/// projection closure computed during query splitting (see
+/// `splitter::collect_remote_scan_closures`) and executed through
+/// `executor::SealedFragmentExecutor`. Only the encode/decode boundary this
+/// type still owns can fail.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum FragmentError {
-    /// The configured fragment size cannot make progress.
-    #[error("fragment file limit must be positive")]
-    InvalidLimit,
-    /// The leaf has no immutable work.
-    #[error("sealed leaf has no files")]
-    EmptyLeaf,
-    /// A manifest estimate overflowed its fixed wire width.
-    #[error("sealed fragment estimate overflow")]
-    EstimateOverflow,
     /// A fragment could not be encoded into its closed transport shape.
     #[error("sealed fragment encoding failed")]
     Encoding,
-}
-
-/// Stateless owner for deterministic sealed-leaf fragmentation.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct FragmentPlanner;
-
-impl FragmentPlanner {
-    /// Splits an eligible leaf into ordered deterministic micro-fragments.
-    ///
-    /// # Errors
-    /// Returns [`FragmentError`] when the limit is zero or the leaf is empty.
-    pub fn plan(
-        &self,
-        leaf: &PreparedSealedLeaf,
-        config: &FragmentConfig,
-    ) -> Result<Vec<SealedScanFragment>, FragmentError> {
-        if config.max_files == 0 {
-            return Err(FragmentError::InvalidLimit);
-        }
-        if leaf.files.is_empty() {
-            return Err(FragmentError::EmptyLeaf);
-        }
-        leaf.files
-            .chunks(config.max_files)
-            .map(|files| {
-                let estimated_rows = files
-                    .iter()
-                    .try_fold(0_u64, |total, file| total.checked_add(file.estimated_rows));
-                let estimated_bytes = files
-                    .iter()
-                    .try_fold(0_u64, |total, file| total.checked_add(file.size_bytes));
-                let mut fragment = SealedScanFragment {
-                    fragment_id: String::new(),
-                    binding: leaf.binding.clone(),
-                    tier: leaf.tier,
-                    pinned_digest: leaf.pinned_digest.clone(),
-                    files: files.to_vec(),
-                    projection: leaf.projection.clone(),
-                    predicates: leaf.predicates.clone(),
-                    schema_fingerprint: leaf.schema_fingerprint.clone(),
-                    estimated_rows: estimated_rows.ok_or(FragmentError::EstimateOverflow)?,
-                    estimated_bytes: estimated_bytes.ok_or(FragmentError::EstimateOverflow)?,
-                    deadline_unix_ms: leaf.deadline_unix_ms,
-                };
-                fragment.fragment_id = fragment.digest();
-                Ok(fragment)
-            })
-            .collect()
-    }
 }
 
 impl SealedScanFragment {
@@ -321,9 +237,10 @@ fn update_predicate_digest(hash: &mut Sha256, predicate: &ClosedLeafPredicate) {
 mod tests {
     use super::*;
 
-    /// Produces one deterministic closed leaf for fragmentation tests.
-    fn leaf() -> PreparedSealedLeaf {
-        PreparedSealedLeaf {
+    /// Produces one deterministic closed fragment for identity tests.
+    fn fragment() -> SealedScanFragment {
+        SealedScanFragment {
+            fragment_id: String::new(),
             binding: "file:///warehouse/tenants/t/table".to_owned(),
             tier: SealedSourceTier::HotSealed,
             pinned_digest: "manifest".to_owned(),
@@ -344,45 +261,26 @@ mod tests {
             projection: vec!["value".to_owned()],
             predicates: Vec::new(),
             schema_fingerprint: "schema".to_owned(),
+            estimated_rows: 5,
+            estimated_bytes: 30,
             deadline_unix_ms: i64::MAX,
         }
     }
 
-    /// Fragment IDs and bytes remain stable while deadline changes do not alter identity.
+    /// Fragment IDs remain stable while deadline changes do not alter identity,
+    /// and the encode/decode boundary round-trips exactly.
     #[test]
     fn oracle_fragment_identity_is_deterministic_and_deadline_independent() {
-        let planner = FragmentPlanner;
-        let mut first = leaf();
-        let fragments = planner
-            .plan(&first, &FragmentConfig { max_files: 1 })
-            .expect("fragment plan");
-        first.deadline_unix_ms -= 1;
-        let repeated = planner
-            .plan(&first, &FragmentConfig { max_files: 1 })
-            .expect("fragment plan");
-        assert_eq!(fragments[0].fragment_id, repeated[0].fragment_id);
-        let encoded = fragments[0].encode().expect("fragment encode");
+        let mut first = fragment();
+        first.fragment_id = first.digest();
+        let mut repeated = fragment();
+        repeated.deadline_unix_ms -= 1;
+        repeated.fragment_id = repeated.digest();
+        assert_eq!(first.fragment_id, repeated.fragment_id);
+        let encoded = first.encode().expect("fragment encode");
         assert_eq!(
             SealedScanFragment::decode(&encoded).expect("fragment decode"),
-            fragments[0]
-        );
-        assert_eq!(fragments[0].estimated_bytes, 10);
-        assert_eq!(fragments[0].estimated_rows, 2);
-    }
-
-    /// Empty work and a zero file bound fail before producing a fragment.
-    #[test]
-    fn oracle_fragment_planner_rejects_non_progressing_work() {
-        let planner = FragmentPlanner;
-        assert_eq!(
-            planner.plan(&leaf(), &FragmentConfig { max_files: 0 }),
-            Err(FragmentError::InvalidLimit)
-        );
-        let mut empty = leaf();
-        empty.files.clear();
-        assert_eq!(
-            planner.plan(&empty, &FragmentConfig::default()),
-            Err(FragmentError::EmptyLeaf)
+            first
         );
     }
 

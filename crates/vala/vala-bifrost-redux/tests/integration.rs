@@ -1,3 +1,5 @@
+#[path = "control_row_fixture.rs"]
+mod control_row_fixture;
 #[path = "forge_incremental_compaction.rs"]
 mod forge_incremental_compaction;
 #[path = "immutable_tier_retention.rs"]

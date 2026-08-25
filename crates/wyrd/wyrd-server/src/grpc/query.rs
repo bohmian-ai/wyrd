@@ -119,22 +119,25 @@ impl BifrostQueryService for BifrostQueryGrpc {
         &self,
         request: Request<BifrostQueryRequest>,
     ) -> Result<Response<Self::QueryStream>, Status> {
-        let caller = caller(self.state.clone(), request.metadata().clone()).await?;
-        let request_id = caller.request_id.clone();
-        let request = wyrd_spec::vala::api::BifrostQueryRequest::try_from(request.into_inner())
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        let result = Box::pin(crate::query::service::stream_query(
-            self.state.clone(),
-            caller,
-            request,
-        ))
-        .await
-        .map_err(query_status)?;
-        let mut response = query_stream_response(result);
-        if let Ok(value) = request_id.as_str().parse() {
-            response.metadata_mut().insert("x-wyrd-request-id", value);
+        async {
+            let caller = caller(self.state.clone(), request.metadata().clone()).await?;
+            let request_id = caller.request_id.clone();
+            let request = wyrd_spec::vala::api::BifrostQueryRequest::try_from(request.into_inner())
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            let result = Box::pin(crate::query::service::stream_query(
+                self.state.clone(),
+                caller,
+                request,
+            ))
+            .await
+            .map_err(query_status)?;
+            let mut response = query_stream_response(result);
+            if let Ok(value) = request_id.as_str().parse() {
+                response.metadata_mut().insert("x-wyrd-request-id", value);
+            }
+            Ok(response)
         }
-        Ok(response)
+        .await
     }
 
     /// Lists active queries for the authenticated tenant.

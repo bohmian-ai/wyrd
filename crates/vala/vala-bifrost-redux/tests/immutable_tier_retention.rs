@@ -2,12 +2,11 @@ use std::sync::Arc;
 
 use arrow::array::{Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
-use chrono::NaiveDate;
 use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::scribe::file_list_writer::FileListCommitKey;
 use vala_bifrost_redux::scribe::memtable::Memtable;
-use vala_bifrost_redux::scribe::seal_key::{EventDay, SealKey};
+use vala_bifrost_redux::scribe::seal_key::SealKey;
 use vala_bifrost_redux::scribe::wal::{ScribeAppendMeta, WalLsn};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
@@ -37,7 +36,7 @@ fn pending_is_readable_and_only_committed_generation_retires() {
     let key = SealKey::new(
         tenant,
         table.clone(),
-        EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("date")),
+        vala_bifrost_redux::partition_fixtures::day_partition(2026, 7, 14),
     );
     let schema = Arc::new(Schema::new(vec![Field::new(
         "value",

@@ -24,6 +24,8 @@ use wyrd_spec::vala::api::AuditEvent;
 use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
 
 use crate::catalog::TenantTableBinding;
+use crate::catalog::layout::PhysicalLayout;
+use crate::catalog::layout::TimePartition;
 use crate::contracts::ScribeError;
 use crate::parquet::memory::{
     BifrostArrowLogicalSizer, BifrostParquetMemoryEnvelope, BoundedRowSlice, MAX_FILE_BYTES,
@@ -32,10 +34,9 @@ use crate::parquet::memory::{
 use crate::parquet::writer_properties::bifrost_writer_properties_with_metadata;
 use crate::resources::ScribeGenerationScratch;
 use crate::scribe::memtable::FrozenMemtable;
-use crate::scribe::seal_key::EventDay;
 use crate::scribe::wal::ScribeAppendMeta;
 
-redacted
+/// Target rows for one whole-batch file candidate.
 const FILE_CANDIDATE_TARGET_ROWS: usize = 100 * 1024;
 
 /// One serial, seal-key-local candidate expressed as a stored-batch range.
@@ -114,7 +115,7 @@ pub(crate) fn largest_candidate_bytes(batches: &[RecordBatch]) -> Result<usize, 
 ///
 /// This is the allocation-free form of [`largest_candidate_bytes`]. Ingress
 /// and the shard owner use it before WAL mutation so their replayability check
-redacted
+/// cannot drift from the encoder's grouping rule.
 ///
 /// # Errors
 ///
@@ -159,7 +160,7 @@ pub struct ParquetEncoded {
     /// Row group statistics.
     pub row_group_stats: Vec<RowGroupStats>,
     /// Partition day (from seal-key, not row min/max).
-    pub partition_day: EventDay,
+    pub partition: TimePartition,
     /// `AuditEvent` list threaded forward for 's seal transaction.
     pub audit_events: Vec<AuditEvent>,
     /// `ScribeAppendMeta` list threaded forward for 's `file_list` INSERT.
@@ -344,7 +345,7 @@ pub struct RowGroupStats {
 
 /// Encode a frozen memtable snapshot to ordered scratch-backed Parquet artifacts.
 ///
-/// Returns encoded bytes, row-group stats, `partition_day` (from seal-key), and the paired
+/// Returns encoded bytes, row-group stats, `partition` (from seal-key), and the paired
 /// `AuditEvent` + `ScribeAppendMeta` lists unmodified (threaded forward for 's seal
 /// transaction).
 ///
@@ -357,6 +358,7 @@ pub(crate) fn encode_batch(
     seal_tenant: DataTenantId,
     scratch_dir: &Path,
     object_base: &str,
+    layout: &PhysicalLayout,
     footer_reservation: crate::scribe::memory::EncodedFooterReservation,
 ) -> Result<ParquetEncoded, ScribeError> {
     ParquetBatchEncoder {
@@ -367,6 +369,7 @@ pub(crate) fn encode_batch(
         first_ordinal: 0,
         scratch_dir,
         object_base,
+        layout,
         footer_reservation,
     }
     .encode()
@@ -393,6 +396,7 @@ pub(crate) fn encode_candidate(
         first_ordinal: request.first_ordinal,
         scratch_dir: request.scratch_dir,
         object_base: request.object_base,
+        layout: request.layout,
         footer_reservation,
     }
     .encode()
@@ -415,6 +419,8 @@ pub(crate) struct CandidateEncodeRequest<'a> {
     pub(crate) scratch_dir: &'a Path,
     /// Deterministic generation object prefix.
     pub(crate) object_base: &'a str,
+    /// Registered physical write recipe applied to every artifact.
+    pub(crate) layout: &'a PhysicalLayout,
 }
 
 /// Owns one bounded Parquet encoding workflow and its footer reservation.
@@ -433,6 +439,8 @@ struct ParquetBatchEncoder<'a> {
     scratch_dir: &'a Path,
     /// Deterministic object identity prefix for artifact ordinals.
     object_base: &'a str,
+    /// Registered physical write recipe governing sort order and Bloom columns.
+    layout: &'a PhysicalLayout,
     /// Move-only memory child retained through footer inspection.
     footer_reservation: crate::scribe::memory::EncodedFooterReservation,
 }
@@ -476,7 +484,7 @@ impl ParquetBatchEncoder<'_> {
         Ok(ParquetEncoded {
             artifacts: BoundedParquetArtifactSet::encoded(artifacts)?,
             row_group_stats,
-            partition_day: self.frozen.seal_key.day,
+            partition: self.frozen.seal_key.partition,
             audit_events: self.frozen.events.clone(),
             append_metas: self.frozen.metas.clone(),
         })
@@ -519,7 +527,7 @@ impl ParquetBatchEncoder<'_> {
         })?;
         debug_assert_eq!(encoder_batch.num_rows(), candidate.rows);
         let stamped_batch = stamp_tenant(&encoder_batch, self.seal_tenant)?;
-        sort_batch(&stamped_batch)
+        sort_batch(&stamped_batch, self.layout)
     }
 
     /// Encodes logical slices, bisecting any oversized physical row group.
@@ -596,6 +604,7 @@ impl ParquetBatchEncoder<'_> {
             Some(bifrost_writer_properties_with_metadata(
                 artifact_batch.num_rows(),
                 metadata,
+                self.layout.bloom_columns(),
             )),
         )
         .map_err(|error| ScribeError::Internal {
@@ -705,41 +714,36 @@ fn stamp_tenant(
     })
 }
 
-/// Sort a `RecordBatch` by (`data_tenant_id`, `wyrd_event_time`) using Arrow compute kernels.
+/// Sort a `RecordBatch` by the table's registered physical sort order.
+///
+/// The canonical order always begins with the injected `data_tenant_id`
+/// ascending nulls-last prefix and continues with the table's declared keys in
+/// declaration order, so the rows Scribe writes match the sort order stamped on
+/// the destination Iceberg table.
 ///
 /// # Errors
-/// Returns [`ScribeError::Internal`] if sorting fails.
-fn sort_batch(batch: &RecordBatch) -> Result<RecordBatch, ScribeError> {
-    // Find column indices
+/// Returns [`ScribeError::Internal`] when a sort column named by the resolved
+/// layout is absent from the batch schema, or when the Arrow sort fails.
+fn sort_batch(batch: &RecordBatch, layout: &PhysicalLayout) -> Result<RecordBatch, ScribeError> {
     let schema = batch.schema();
-    let tenant_idx = schema
-        .index_of("data_tenant_id")
-        .map_err(|_| ScribeError::Internal {
-            detail: "data_tenant_id column not found".to_string(),
-        })?;
-    let time_idx = schema
-        .index_of("wyrd_event_time")
-        .map_err(|_| ScribeError::Internal {
-            detail: "wyrd_event_time column not found".to_string(),
-        })?;
-
-    // Build sort columns: (data_tenant_id ASC, wyrd_event_time ASC)
-    let sort_columns = vec![
-        SortColumn {
-            values: batch.column(tenant_idx).clone(),
-            options: Some(arrow::compute::SortOptions {
-                descending: false,
-                nulls_first: false,
-            }),
-        },
-        SortColumn {
-            values: batch.column(time_idx).clone(),
-            options: Some(arrow::compute::SortOptions {
-                descending: false,
-                nulls_first: false,
-            }),
-        },
-    ];
+    let sort_columns = layout
+        .sort_keys()
+        .iter()
+        .map(|key| {
+            let index = schema
+                .index_of(key.column())
+                .map_err(|_| ScribeError::Internal {
+                    detail: format!("sort column {} not found in sealed schema", key.column()),
+                })?;
+            Ok(SortColumn {
+                values: batch.column(index).clone(),
+                options: Some(arrow::compute::SortOptions {
+                    descending: key.is_descending(),
+                    nulls_first: key.nulls_first(),
+                }),
+            })
+        })
+        .collect::<Result<Vec<_>, ScribeError>>()?;
 
     // Compute sort indices
     let indices = lexsort_to_indices(&sort_columns, None).map_err(|e| ScribeError::Internal {
@@ -945,7 +949,7 @@ mod tests {
     use super::*;
     use arrow::array::{NullArray, RecordBatch, StringArray, TimestampMicrosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-    use chrono::NaiveDate;
+
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::file::reader::{FileReader, SerializedFileReader};
     use std::sync::Arc;
@@ -953,7 +957,7 @@ mod tests {
 
     use crate::catalog::TableRef;
     use crate::namespaces::BifrostNamespace;
-    use crate::scribe::seal_key::{EventDay, SealKey};
+    use crate::scribe::seal_key::{SealKey, TimePartition};
 
     /// Builds one metadata-light stored batch with the requested row count.
     fn candidate_batch(rows: usize) -> RecordBatch {
@@ -964,6 +968,37 @@ mod tests {
         .expect("candidate fixture")
     }
 
+    /// Asserts one candidate list exactly partitions its batches within bounds.
+    ///
+    /// Each candidate must be non-empty, its row count must equal the sum of the
+    /// batches it spans — so grouping can neither lose nor double-count rows —
+    /// and it must stay under the target row ceiling unless it is a single
+    /// oversized batch, which has no smaller legal grouping.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any candidate is empty, miscounts its rows, or exceeds the
+    /// target without being a lone oversized batch.
+    fn assert_candidates_cover_batches_within_bounds(
+        batches: &[RecordBatch],
+        candidates: &[FileCandidate],
+    ) {
+        for candidate in candidates {
+            assert!(candidate.start < candidate.end);
+            assert_eq!(
+                candidate.rows,
+                batches[candidate.start..candidate.end]
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .sum::<usize>()
+            );
+            assert!(
+                candidate.rows <= FILE_CANDIDATE_TARGET_ROWS
+                    || candidate.end - candidate.start == 1
+            );
+        }
+    }
+
     /// Whole stored batches close before exceeding the row target independently
     /// for each seal key, while an oversized first batch remains whole.
     #[test]
@@ -972,7 +1007,7 @@ mod tests {
             SealKey::new(
                 DataTenantId::new_v7(),
                 TableRef::new(BifrostNamespace::Bifrost, "candidate-first"),
-                EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("first day")),
+                crate::test_support::day_partition(2026, 7, 14),
             ),
             vec![
                 candidate_batch(60 * 1024),
@@ -986,7 +1021,7 @@ mod tests {
             SealKey::new(
                 DataTenantId::new_v7(),
                 TableRef::new(BifrostNamespace::Bifrost, "candidate-second"),
-                EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 15).expect("second day")),
+                crate::test_support::day_partition(2026, 7, 15),
             ),
             vec![
                 candidate_batch(100 * 1024 - 1),
@@ -1042,25 +1077,8 @@ mod tests {
         assert_eq!(second_candidates[0].start, 0);
         assert_eq!(first_candidates[2].rows, 120 * 1024);
         assert_eq!(second_candidates[1].rows, 120 * 1024);
-        for (batches, candidates) in [
-            (&first.1, &first_candidates),
-            (&second.1, &second_candidates),
-        ] {
-            for candidate in candidates {
-                assert!(candidate.start < candidate.end);
-                assert_eq!(
-                    candidate.rows,
-                    batches[candidate.start..candidate.end]
-                        .iter()
-                        .map(RecordBatch::num_rows)
-                        .sum::<usize>()
-                );
-                assert!(
-                    candidate.rows <= FILE_CANDIDATE_TARGET_ROWS
-                        || candidate.end - candidate.start == 1
-                );
-            }
-        }
+        assert_candidates_cover_batches_within_bounds(&first.1, &first_candidates);
+        assert_candidates_cover_batches_within_bounds(&second.1, &second_candidates);
         assert_eq!(
             crate::parquet::writer_properties::PARQUET_WRITE_BATCH_ROWS,
             8_192
@@ -1080,8 +1098,25 @@ mod tests {
         );
     }
 
+    /// Builds the canonical hourly write recipe for a test schema.
+    ///
+    /// Tests exercise the same resolution path production uses: declare the
+    /// built-in hourly layout, then let `PhysicalLayout` inject the tenant sort
+    /// prefix and the managed Bloom floor.
+    ///
+    /// # Panics
+    /// Panics when the schema cannot carry the built-in declaration.
+    fn test_layout(schema: &Schema) -> PhysicalLayout {
+        PhysicalLayout::builtin(
+            "vala.bifrost.test",
+            schema,
+            &crate::tables::hourly_layout(vec![crate::tables::sort_asc("wyrd_event_time")], &[]),
+        )
+        .expect("test schema carries the built-in hourly layout")
+    }
+
     fn build_test_frozen(
-        seal_day: NaiveDate,
+        seal_partition: TimePartition,
         seal_tenant: DataTenantId,
         tenant_ids: Vec<&str>,
         timestamps: Vec<i64>,
@@ -1107,7 +1142,7 @@ mod tests {
         let seal_key = SealKey::new(
             seal_tenant,
             TableRef::new(BifrostNamespace::Bifrost, "events"),
-            EventDay::new(seal_day),
+            seal_partition,
         );
 
         FrozenMemtable {
@@ -1131,12 +1166,14 @@ mod tests {
         tenant: DataTenantId,
     ) -> (tempfile::TempDir, ParquetEncoded) {
         let scratch = tempfile::tempdir().expect("test scratch");
+        let layout = test_layout(frozen.schema.as_ref());
         let encoded = encode_batch(
             frozen,
             binding,
             tenant,
             scratch.path(),
             "s3://bucket/table/day=2026-07-14/scribe-test-0",
+            &layout,
             crate::scribe::memory::EncodedFooterReservation::for_test(),
         )
         .expect("writer-v2 encode");
@@ -1171,7 +1208,7 @@ mod tests {
     fn forced_seal_multi_candidate_member_has_one_deterministic_artifact_set() {
         let tenant = DataTenantId::new_v7();
         let tenant_string = tenant.to_string();
-        let day = NaiveDate::from_ymd_opt(2026, 7, 14).expect("test day");
+        let day = crate::test_support::day_partition(2026, 7, 14);
         let schema = Arc::new(Schema::new(vec![
             Field::new("data_tenant_id", DataType::Utf8, false),
             Field::new(
@@ -1185,7 +1222,7 @@ mod tests {
             seal_key: SealKey::new(
                 tenant,
                 TableRef::new(BifrostNamespace::Bifrost, "forced_member"),
-                EventDay::new(day),
+                day,
             ),
             shard_id: 3,
             schema,
@@ -1219,6 +1256,7 @@ mod tests {
         first_ordinal: usize,
     ) -> (tempfile::TempDir, Result<ParquetEncoded, ScribeError>) {
         let scratch = tempfile::tempdir().expect("candidate scratch");
+        let layout = test_layout(frozen.schema.as_ref());
         let encoded = encode_candidate(
             CandidateEncodeRequest {
                 frozen,
@@ -1232,6 +1270,7 @@ mod tests {
                 first_ordinal,
                 scratch_dir: scratch.path(),
                 object_base: "tenant/table/member",
+                layout: &layout,
             },
             crate::scribe::memory::EncodedFooterReservation::for_test(),
         );
@@ -1274,7 +1313,7 @@ mod tests {
     fn serial_candidate_encoding_preserves_sort_tenant_and_global_identity() {
         let tenant = DataTenantId::new_v7();
         let tenant_string = tenant.to_string();
-        let day = NaiveDate::from_ymd_opt(2026, 7, 14).expect("test day");
+        let day = crate::test_support::day_partition(2026, 7, 14);
         let schema = Arc::new(Schema::new(vec![
             Field::new("data_tenant_id", DataType::Utf8, false),
             Field::new(
@@ -1301,7 +1340,7 @@ mod tests {
             seal_key: SealKey::new(
                 tenant,
                 TableRef::new(BifrostNamespace::Bifrost, "serial_candidates"),
-                EventDay::new(day),
+                day,
             ),
             shard_id: 4,
             schema: Arc::clone(&schema),
@@ -1343,23 +1382,23 @@ mod tests {
     }
 
     #[test]
-    fn parquet_writer_partition_day_matches_seal_key() {
-        // Regression test for C2: partition_day = seal_key.event_day, not row min/max
-        let seal_day = NaiveDate::from_ymd_opt(2026, 7, 14).unwrap();
+    fn parquet_writer_partition_matches_seal_key() {
+        // Regression test for C2: partition = seal_key.partition, not row min/max
+        let seal_partition = crate::test_support::day_partition(2026, 7, 14);
         let tenant = DataTenantId::new_v7();
         let tenant_string = tenant.to_string();
         let frozen = build_test_frozen(
-            seal_day,
+            seal_partition,
             tenant,
             vec![tenant_string.as_str(), tenant_string.as_str()],
-            vec![1_000_000, 2_000_000], // timestamps don't matter for partition_day
+            vec![1_000_000, 2_000_000], // timestamps don't matter for the partition
         );
 
         let binding =
             TenantTableBinding::resolve((frozen.seal_key.tenant, frozen.seal_key.table.clone()))
                 .unwrap();
         let (_scratch, encoded) = encode_for_test(&frozen, &binding, frozen.seal_key.tenant);
-        assert_eq!(encoded.partition_day.as_date(), &seal_day);
+        assert_eq!(encoded.partition, seal_partition);
     }
 
     #[test]
@@ -1369,7 +1408,7 @@ mod tests {
         let tenant_string = tenant.to_string();
 
         let frozen = build_test_frozen(
-            NaiveDate::from_ymd_opt(2026, 7, 14).unwrap(),
+            crate::test_support::day_partition(2026, 7, 14),
             tenant,
             vec![
                 tenant_string.as_str(),
@@ -1424,7 +1463,7 @@ mod tests {
         let tenant = DataTenantId::new_v7();
         let tenant_string = tenant.to_string();
         let frozen = build_test_frozen(
-            NaiveDate::from_ymd_opt(2026, 7, 14).unwrap(),
+            crate::test_support::day_partition(2026, 7, 14),
             tenant,
             vec![tenant_string.as_str(), tenant_string.as_str()],
             vec![1_000_000, 2_000_000],
@@ -1472,7 +1511,7 @@ mod tests {
         let tenant = DataTenantId::new_v7();
         let tenant_string = tenant.to_string();
         let frozen = build_test_frozen(
-            NaiveDate::from_ymd_opt(2026, 7, 14).unwrap(),
+            crate::test_support::day_partition(2026, 7, 14),
             tenant,
             vec![tenant_string.as_str()],
             vec![1_000_000],
@@ -1551,7 +1590,8 @@ mod tests {
         )
         .unwrap();
 
-        let sorted = sort_batch(&batch).unwrap();
+        let layout = test_layout(batch.schema().as_ref());
+        let sorted = sort_batch(&batch, &layout).unwrap();
         let tenants = sorted
             .column_by_name(DATA_TENANT_ID)
             .unwrap()
@@ -1587,7 +1627,7 @@ mod tests {
             seal_key: SealKey::new(
                 tenant,
                 TableRef::new(BifrostNamespace::Bifrost, "events"),
-                EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).unwrap()),
+                crate::test_support::day_partition(2026, 7, 14),
             ),
             shard_id: 0,
             schema,
@@ -1601,12 +1641,14 @@ mod tests {
         let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone())).unwrap();
 
         let scratch = tempfile::tempdir().unwrap();
+        let layout = test_layout(frozen.schema.as_ref());
         let error = encode_batch(
             &frozen,
             &binding,
             tenant,
             scratch.path(),
             "object",
+            &layout,
             crate::scribe::memory::EncodedFooterReservation::for_test(),
         )
         .unwrap_err();
@@ -1622,7 +1664,7 @@ mod tests {
         let expected_string = expected.to_string();
         let observed_string = observed.to_string();
         let frozen = build_test_frozen(
-            NaiveDate::from_ymd_opt(2026, 7, 14).unwrap(),
+            crate::test_support::day_partition(2026, 7, 14),
             expected,
             vec![expected_string.as_str(), observed_string.as_str()],
             vec![1, 2],
@@ -1631,12 +1673,14 @@ mod tests {
             TenantTableBinding::resolve((expected, frozen.seal_key.table.clone())).unwrap();
 
         let scratch = tempfile::tempdir().unwrap();
+        let layout = test_layout(frozen.schema.as_ref());
         let error = encode_batch(
             &frozen,
             &binding,
             expected,
             scratch.path(),
             "object",
+            &layout,
             crate::scribe::memory::EncodedFooterReservation::for_test(),
         )
         .unwrap_err();
@@ -1651,7 +1695,7 @@ mod tests {
         let seal_tenant = DataTenantId::new_v7();
         let binding_tenant = DataTenantId::new_v7();
         let frozen = build_test_frozen(
-            NaiveDate::from_ymd_opt(2026, 7, 14).unwrap(),
+            crate::test_support::day_partition(2026, 7, 14),
             seal_tenant,
             vec![seal_tenant.to_string().as_str()],
             vec![1],
@@ -1660,12 +1704,14 @@ mod tests {
             TenantTableBinding::resolve((binding_tenant, frozen.seal_key.table.clone())).unwrap();
 
         let scratch = tempfile::tempdir().unwrap();
+        let layout = test_layout(frozen.schema.as_ref());
         let error = encode_batch(
             &frozen,
             &binding,
             seal_tenant,
             scratch.path(),
             "object",
+            &layout,
             crate::scribe::memory::EncodedFooterReservation::for_test(),
         )
         .unwrap_err();

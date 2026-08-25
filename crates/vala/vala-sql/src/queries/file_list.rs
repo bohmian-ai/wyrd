@@ -68,7 +68,7 @@ impl HotFileCatalog {
         pinned_operation: Option<uuid::Uuid>,
     ) -> Result<HotFileCut, SqlError> {
         let rows = sqlx::query_as::<_, HotFileRow>(
-            "SELECT id, data_tenant_id, namespace, table_name, file_path, file_ordinal, file_checksum, file_size, row_count, partition_day, compacted, committed_snapshot_id, publication_operation_id, node_id, writer_epoch, wal_lsn_min, wal_lsn_max, created_at FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 ORDER BY partition_day, created_at, file_ordinal, id",
+            "SELECT id, data_tenant_id, namespace, table_name, file_path, file_ordinal, file_checksum, file_size, row_count, partition_granularity, partition_start, compacted, committed_snapshot_id, publication_operation_id, node_id, writer_epoch, wal_lsn_min, wal_lsn_max, created_at FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 ORDER BY partition_granularity, partition_start, created_at, file_ordinal, id",
         )
         .bind(uuid::Uuid::from(conn.data_tenant_id()))
         .bind(&self.namespace)
@@ -173,7 +173,9 @@ mod tests {
             file_checksum: None,
             file_size: 1,
             row_count: 1,
-            partition_day: chrono::NaiveDate::from_ymd_opt(2026, 8, 12).expect("valid day"),
+            partition_granularity: "hour".to_owned(),
+            partition_start: chrono::DateTime::from_timestamp_micros(1_787_493_600_000_000)
+                .expect("fixture partition start"),
             compacted,
             committed_snapshot_id: committed,
             publication_operation_id: operation,

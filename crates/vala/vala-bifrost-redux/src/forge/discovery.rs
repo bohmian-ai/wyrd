@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Utc};
 use iceberg::spec::{
     DataContentType, DataFileFormat, ManifestContentType, PrimitiveLiteral, PrimitiveType,
 };
@@ -17,6 +17,8 @@ use super::right_size::{
     IcebergRewriteReason, IcebergTablePlan, validate_supported_layout,
 };
 use crate::catalog::TenantTableBinding;
+use crate::catalog::TimeGranularity;
+use crate::catalog::layout::TimePartition;
 
 /// Checked count and byte ceilings for one live Iceberg manifest projection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,7 +81,7 @@ impl Forge {
                 .ok_or_else(|| ForgeError::Invariant {
                     detail: "current snapshot schema is absent from metadata".to_owned(),
                 })?;
-        validate_supported_layout(
+        let granularity = validate_supported_layout(
             schema,
             table.metadata().default_partition_spec(),
             table.metadata().default_sort_order(),
@@ -103,7 +105,7 @@ impl Forge {
         )?;
         let limits = ForgeDiscoveryLimits::from_config(&self.core.config)?;
         let mut files = self
-            .live_candidates_bounded(binding, table, snapshot, limits)
+            .live_candidates_bounded(binding, table, snapshot, granularity, limits)
             .await?;
         files.sort_by(|left, right| left.catalog_path().cmp(right.catalog_path()));
         Ok((snapshot.snapshot_id(), policy, files))
@@ -123,7 +125,7 @@ impl Forge {
         &self,
         binding: &TenantTableBinding,
         table: &Table,
-        current_day: NaiveDate,
+        now: DateTime<Utc>,
     ) -> Result<IcebergTablePlan, ForgeError> {
         let Some(snapshot) = table.metadata().current_snapshot() else {
             return Ok(IcebergTablePlan {
@@ -144,7 +146,7 @@ impl Forge {
                         "current snapshot schema {schema_id} is absent from table metadata"
                     ),
                 })?;
-        validate_supported_layout(
+        let granularity = validate_supported_layout(
             policy_schema,
             table.metadata().default_partition_spec(),
             table.metadata().default_sort_order(),
@@ -169,10 +171,10 @@ impl Forge {
         let limits = ForgeDiscoveryLimits::from_config(&self.core.config)?;
         Ok(plan_candidates(
             &policy,
-            self.live_candidates_bounded(binding, table, snapshot, limits)
+            self.live_candidates_bounded(binding, table, snapshot, granularity, limits)
                 .await?,
             snapshot.snapshot_id(),
-            current_day,
+            now,
         ))
     }
 
@@ -200,7 +202,24 @@ impl Forge {
                 .ok_or_else(|| ForgeError::Reconciliation {
                     detail: "exact live rewrite has no current snapshot".to_owned(),
                 })?;
-        let candidates = self.live_candidates(binding, table, snapshot).await?;
+        let schema_id = snapshot.schema_id().ok_or_else(|| ForgeError::Invariant {
+            detail: "exact live rewrite snapshot lacks a schema identity".to_owned(),
+        })?;
+        let schema =
+            table
+                .metadata()
+                .schema_by_id(schema_id)
+                .ok_or_else(|| ForgeError::Invariant {
+                    detail: "exact live rewrite schema is absent from table metadata".to_owned(),
+                })?;
+        let granularity = validate_supported_layout(
+            schema,
+            table.metadata().default_partition_spec(),
+            table.metadata().default_sort_order(),
+        )?;
+        let candidates = self
+            .live_candidates(binding, table, snapshot, granularity)
+            .await?;
         let planned = inputs.iter().map(String::as_str).collect::<BTreeSet<_>>();
         if planned.len() != inputs.len() {
             return Err(ForgeError::Invariant {
@@ -222,7 +241,7 @@ impl Forge {
         if files.iter().any(|file| {
             file.schema_id != first.schema_id
                 || file.partition_spec_id != first.partition_spec_id
-                || file.partition_day != first.partition_day
+                || file.partition != first.partition
                 || file.sort_order_id != first.sort_order_id
                 || file.writer_recipe_version != first.writer_recipe_version
         }) {
@@ -251,10 +270,9 @@ impl Forge {
         &self,
         binding: &TenantTableBinding,
         table: &Table,
-        current_day: NaiveDate,
+        now: DateTime<Utc>,
     ) -> Result<IcebergTablePlan, ForgeError> {
-        self.discover_live_rewrites(binding, table, current_day)
-            .await
+        self.discover_live_rewrites(binding, table, now).await
     }
 
     /// Convert each alive data entry in one observed snapshot into a candidate.
@@ -268,8 +286,9 @@ impl Forge {
         binding: &TenantTableBinding,
         table: &Table,
         snapshot: &iceberg::spec::SnapshotRef,
+        granularity: TimeGranularity,
     ) -> Result<Vec<IcebergCandidateFile>, ForgeError> {
-        self.live_candidates_with_limits(binding, table, snapshot, None)
+        self.live_candidates_with_limits(binding, table, snapshot, granularity, None)
             .await
     }
 
@@ -284,9 +303,10 @@ impl Forge {
         binding: &TenantTableBinding,
         table: &Table,
         snapshot: &iceberg::spec::SnapshotRef,
+        granularity: TimeGranularity,
         limits: ForgeDiscoveryLimits,
     ) -> Result<Vec<IcebergCandidateFile>, ForgeError> {
-        self.live_candidates_with_limits(binding, table, snapshot, Some(limits))
+        self.live_candidates_with_limits(binding, table, snapshot, granularity, Some(limits))
             .await
     }
 
@@ -301,6 +321,7 @@ impl Forge {
         binding: &TenantTableBinding,
         table: &Table,
         snapshot: &iceberg::spec::SnapshotRef,
+        granularity: TimeGranularity,
         limits: Option<ForgeDiscoveryLimits>,
     ) -> Result<Vec<IcebergCandidateFile>, ForgeError> {
         let manifests = table
@@ -359,7 +380,7 @@ impl Forge {
                     data_file.file_size_in_bytes(),
                     limits,
                 )?;
-                let partition_day = partition_day(data_file.partition().fields())?;
+                let partition = decode_partition(data_file.partition().fields(), granularity)?;
                 let min_event_time =
                     event_time_bound(data_file.lower_bounds(), event_time_field_id)?;
                 let max_event_time =
@@ -377,7 +398,7 @@ impl Forge {
                     record_count: data_file.record_count(),
                     schema_id: writer_schema_id,
                     partition_spec_id: manifest.metadata().partition_spec().spec_id(),
-                    partition_day,
+                    partition,
                     sort_order_id: data_file.sort_order_id().map(i64::from),
                     writer_recipe_version: writer_recipe_version(data_file.file_path()),
                     min_event_time,
@@ -452,21 +473,21 @@ fn plan_candidates(
     policy: &ForgeRightSizePolicy,
     mut candidates: Vec<IcebergCandidateFile>,
     base_snapshot_id: i64,
-    current_day: NaiveDate,
+    now: DateTime<Utc>,
 ) -> IcebergTablePlan {
     candidates.sort_by(|left, right| left.sort_key().cmp(&right.sort_key()));
-    let mut by_partition = BTreeMap::<(i32, NaiveDate), Vec<IcebergCandidateFile>>::new();
+    let mut by_partition = BTreeMap::<(i32, TimePartition), Vec<IcebergCandidateFile>>::new();
     for candidate in candidates {
         by_partition
-            .entry((candidate.partition_spec_id, candidate.partition_day))
+            .entry((candidate.partition_spec_id, candidate.partition))
             .or_default()
             .push(candidate);
     }
     let mut groups = Vec::new();
-    for ((_, partition_day), candidates) in by_partition {
+    for ((_, partition), candidates) in by_partition {
         groups.extend(
             policy
-                .plan_partition(candidates, partition_day >= current_day)
+                .plan_partition(candidates, partition.is_open_at(now))
                 .groups,
         );
     }
@@ -481,24 +502,33 @@ fn plan_candidates(
     }
 }
 
-/// Decode the required day partition value from Forge's single-field layout.
+/// Decode the required time-partition value from Forge's single-field layout.
+///
+/// `granularity` comes from the table's own default partition spec, so an
+/// hourly table decodes hours-since-epoch and a daily table decodes
+/// days-since-epoch from the same integer literal.
 ///
 /// # Errors
 ///
-/// Returns [`ForgeError::Invariant`] when the partition tuple is absent or is
-/// not Iceberg's integer days-since-epoch representation.
-fn partition_day(fields: &[Option<iceberg::spec::Literal>]) -> Result<NaiveDate, ForgeError> {
-    let Some(Some(iceberg::spec::Literal::Primitive(PrimitiveLiteral::Int(days)))) = fields.first()
+/// Returns [`ForgeError::Invariant`] when the partition tuple is absent, is not
+/// Iceberg's integer transform representation, or names an unrepresentable
+/// instant.
+fn decode_partition(
+    fields: &[Option<iceberg::spec::Literal>],
+    granularity: TimeGranularity,
+) -> Result<TimePartition, ForgeError> {
+    let Some(Some(iceberg::spec::Literal::Primitive(PrimitiveLiteral::Int(value)))) =
+        fields.first()
     else {
         return Err(ForgeError::Invariant {
-            detail: "live manifest entry has an invalid day partition".to_owned(),
+            detail: "live manifest entry has an invalid time partition".to_owned(),
         });
     };
-    NaiveDate::from_ymd_opt(1970, 1, 1)
-        .and_then(|epoch| epoch.checked_add_signed(chrono::Duration::days(i64::from(*days))))
-        .ok_or_else(|| ForgeError::Invariant {
-            detail: "live manifest entry has an out-of-range day partition".to_owned(),
-        })
+    TimePartition::from_iceberg_transform_value(granularity, *value).map_err(|error| {
+        ForgeError::Invariant {
+            detail: format!("live manifest entry has an out-of-range time partition: {error}"),
+        }
+    })
 }
 
 /// Decode one timestamp-with-time-zone metric bound in microseconds.
@@ -562,8 +592,17 @@ mod tests {
     use super::*;
     use crate::parquet::writer_properties::BIFROST_WRITER_RECIPE_VERSION;
 
+    /// Builds the fixture hour partition shared by the discovery regressions.
+    fn hour(epoch_hour: i64) -> TimePartition {
+        TimePartition::new(
+            TimeGranularity::Hour,
+            DateTime::from_timestamp(epoch_hour * 3_600, 0).expect("fixture hour is representable"),
+        )
+        .expect("fixture hour is an exact hour boundary")
+    }
+
     /// Build a complete candidate so equality proves every manifest identity field.
-    fn candidate(path: &str, day: NaiveDate, schema_id: i32) -> IcebergCandidateFile {
+    fn candidate(path: &str, partition: TimePartition, schema_id: i32) -> IcebergCandidateFile {
         IcebergCandidateFile {
             catalog_path: path.to_owned(),
             object_path: path.to_owned(),
@@ -571,7 +610,7 @@ mod tests {
             record_count: 3,
             schema_id,
             partition_spec_id: 1,
-            partition_day: day,
+            partition,
             sort_order_id: Some(1),
             writer_recipe_version: Some("bifrost-writer-v1".to_owned()),
             min_event_time: DateTime::from_timestamp(1, 0).expect("fixed timestamp is valid"),
@@ -585,7 +624,7 @@ mod tests {
     /// Proves manifest enumeration order cannot change the complete table plan.
     #[test]
     fn manifest_candidates_are_stable_across_manifest_order() {
-        let day = NaiveDate::from_ymd_opt(2026, 7, 29).expect("fixed day is valid");
+        let day = hour(400_000);
         let policy = ForgeRightSizePolicy::new(100, 1, 1, 1).expect("policy is valid");
         let first = plan_candidates(
             &policy,
@@ -594,7 +633,7 @@ mod tests {
                 candidate("a.parquet", day, 0),
             ],
             42,
-            day,
+            day.start_utc(),
         );
         let second = plan_candidates(
             &policy,
@@ -603,7 +642,7 @@ mod tests {
                 candidate("b.parquet", day, 1),
             ],
             42,
-            day,
+            day.start_utc(),
         );
 
         assert_eq!(first, second);
@@ -615,15 +654,17 @@ mod tests {
         ));
     }
 
-    /// Proves open-day treatment is determined only by the supplied current day.
+    /// Proves open-partition treatment follows the supplied wall clock against
+    /// each partition's own exclusive end, so an hourly table closes hourly.
     #[test]
-    fn open_partition_uses_supplied_current_day() {
-        let today = NaiveDate::from_ymd_opt(2026, 7, 29).expect("fixed day is valid");
+    fn open_partition_uses_supplied_wall_clock() {
+        let current_hour = hour(400_000);
+        let now = current_hour.start_utc();
         let policy = ForgeRightSizePolicy::new(100, 1, 1, 1).expect("policy is valid");
-        let yesterday = today.pred_opt().expect("fixed day has predecessor");
-        let tomorrow = today.succ_opt().expect("fixed day has successor");
-        let current = |path: &str, day| {
-            let mut file = candidate(path, day, 1);
+        let previous = hour(399_999);
+        let next = hour(400_001);
+        let current = |path: &str, partition| {
+            let mut file = candidate(path, partition, 1);
             file.writer_recipe_version = Some(BIFROST_WRITER_RECIPE_VERSION.to_owned());
             file
         };
@@ -631,9 +672,9 @@ mod tests {
         assert_eq!(
             plan_candidates(
                 &policy,
-                vec![current("a", yesterday), current("b", yesterday)],
+                vec![current("a", previous), current("b", previous)],
                 1,
-                today
+                now
             )
             .groups
             .len(),
@@ -642,9 +683,9 @@ mod tests {
         assert_eq!(
             plan_candidates(
                 &policy,
-                vec![current("a", today), current("b", today)],
+                vec![current("a", current_hour), current("b", current_hour)],
                 1,
-                today
+                now
             )
             .groups
             .len(),
@@ -653,9 +694,9 @@ mod tests {
         assert_eq!(
             plan_candidates(
                 &policy,
-                vec![current("a", tomorrow), current("b", tomorrow)],
+                vec![current("a", next), current("b", next)],
                 1,
-                today
+                now
             )
             .groups
             .len(),
@@ -678,7 +719,7 @@ mod tests {
         )
         .expect("timestamp datum parses");
         assert!(event_time_bound(&HashMap::from([(7, out_of_range)]), 7).is_err());
-        assert!(partition_day(&[]).is_err());
+        assert!(decode_partition(&[], TimeGranularity::Hour).is_err());
     }
 
     /// Proves inverted decoded bounds fail before candidate planning.

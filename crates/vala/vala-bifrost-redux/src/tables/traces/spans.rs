@@ -2,9 +2,10 @@ use arrow::datatypes::Field;
 
 use crate::tables::fields::{fixed_binary, int64, ts_us_utc, utf8};
 use crate::tables::{
-    CorrelationPolicy, DeclaredIndex, DomainTable, EntityBoundsMapping, IndexKind, PayloadClass,
-    SortKey,
+    CorrelationPolicy, DomainTable, EntityBoundsMapping, PayloadClass, hourly_layout, sort_asc,
+    sort_desc,
 };
+use wyrd_spec::vala::api::PhysicalLayoutWire;
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 pub struct SpansTable;
@@ -39,39 +40,11 @@ impl DomainTable for SpansTable {
         ]
     }
 
-    fn sort_keys() -> Vec<SortKey> {
-        vec![
-            SortKey {
-                column: WYRD_EVENT_TIME.into(),
-                ascending: false,
-                nulls_first: false,
-            },
-            SortKey {
-                column: "data_tenant_id".into(),
-                ascending: true,
-                nulls_first: false,
-            },
-            SortKey {
-                column: "trace_id".into(),
-                ascending: true,
-                nulls_first: false,
-            },
-        ]
-    }
-
-    fn declared_indexes() -> Vec<DeclaredIndex> {
-        vec![
-            DeclaredIndex {
-                name: "spans_trace_id_lookup".into(),
-                columns: vec!["trace_id".into()],
-                kind: IndexKind::BloomFilter,
-            },
-            DeclaredIndex {
-                name: "spans_service_bloom".into(),
-                columns: vec!["service_name".into()],
-                kind: IndexKind::BloomFilter,
-            },
-        ]
+    fn physical_layout() -> PhysicalLayoutWire {
+        hourly_layout(
+            vec![sort_desc(WYRD_EVENT_TIME), sort_asc("trace_id")],
+            &["trace_id", "span_id", "service_name"],
+        )
     }
 
     fn entity_bounds_mapping() -> Option<EntityBoundsMapping> {

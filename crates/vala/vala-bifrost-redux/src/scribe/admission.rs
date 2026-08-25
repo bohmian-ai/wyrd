@@ -54,6 +54,50 @@ impl EventTimeWindow {
         let hi = receipt_micros.saturating_add(future_micros);
         event_micros >= lo && event_micros <= hi
     }
+
+    /// Returns the UTC-noon instant `days_before_receipt` days below the
+    /// production receipt instant, in the microsecond unit
+    /// [`Self::contains`] itself compares against.
+    ///
+    /// Scribe fixtures must never pin an absolute event-time literal. A pinned
+    /// instant silently ages out of `[receipt - past, receipt + future]` as
+    /// wall-clock advances, so a fixture that passes today becomes a permanent
+    /// failure on some later date and stops proving anything about the path it
+    /// covers. Deriving the instant here -- from this window, against the same
+    /// [`crate::scribe::execution_lanes::current_receipt_micros`] clock the
+    /// enforcement path reads -- keeps a fixture correct at any wall-clock
+    /// time without restating the bound arithmetic outside this type.
+    ///
+    /// Noon is chosen so the returned instant sits at least twelve hours from
+    /// either surrounding day boundary. A caller that derives an `EventDay`
+    /// from this value therefore lands on the same calendar day as the value
+    /// itself no matter when the test runs.
+    ///
+    /// # Panics
+    /// Panics when the receipt clock is unavailable, when `days_before_receipt`
+    /// does not land on a representable instant, or when the derived instant
+    /// falls outside this window. Each case would leave a fixture asserting
+    /// against an event time the production admission path would refuse, which
+    /// is precisely the condition this accessor exists to prevent.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn admitted_event_time_micros(&self, days_before_receipt: i64) -> i64 {
+        let receipt_micros = crate::scribe::execution_lanes::current_receipt_micros()
+            .expect("receipt clock must be readable to derive an admitted event time");
+        let receipt = chrono::DateTime::from_timestamp_micros(receipt_micros)
+            .expect("receipt instant must be representable");
+        let event_micros = (receipt - chrono::Duration::days(days_before_receipt))
+            .date_naive()
+            .and_hms_opt(12, 0, 0)
+            .expect("noon must be a valid time on any date")
+            .and_utc()
+            .timestamp_micros();
+        assert!(
+            self.contains(event_micros, receipt_micros),
+            "derived event time {event_micros} must lie inside the admission window"
+        );
+        event_micros
+    }
 }
 
 impl Default for EventTimeWindow {

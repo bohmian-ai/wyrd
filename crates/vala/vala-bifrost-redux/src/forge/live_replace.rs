@@ -5,7 +5,6 @@ use std::sync::Arc;
 #[cfg(feature = "test-support")]
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use chrono::NaiveDate;
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use sha2::{Digest, Sha256};
@@ -26,6 +25,7 @@ use super::rewrite::{
 };
 use super::right_size::IcebergRewriteGroup;
 use crate::catalog::TenantTableBinding;
+use crate::catalog::layout::TimePartition;
 use crate::parquet::writer_properties::BIFROST_WRITER_RECIPE_VERSION;
 
 #[cfg(feature = "test-support")]
@@ -315,8 +315,7 @@ impl Forge {
             detail: "non-empty live rewrite group lost its first input".to_owned(),
         })?;
         if group.files.iter().any(|file| {
-            file.partition_day != first.partition_day
-                || file.partition_spec_id != first.partition_spec_id
+            file.partition != first.partition || file.partition_spec_id != first.partition_spec_id
         }) {
             return Err(ForgeError::Invariant {
                 detail: "live rewrite group crosses a partition boundary".to_owned(),
@@ -325,7 +324,7 @@ impl Forge {
         let key = ForgeGroupKey {
             tenant: binding.tenant,
             table_ref: binding.table_ref.clone(),
-            partition_day: first.partition_day,
+            partition: first.partition,
         };
         let target_file_size_bytes = u64::try_from(
             table
@@ -351,7 +350,7 @@ impl Forge {
             &key.audit_resource(),
             base_snapshot_id,
             first.partition_spec_id,
-            first.partition_day,
+            first.partition,
             &source_files,
         );
         let schema = Arc::new(
@@ -367,7 +366,8 @@ impl Forge {
                     schema,
                     iceberg_schema: table.metadata().current_schema().clone(),
                     source_files: &source_files,
-                    partition_day: first.partition_day,
+                    partition: first.partition,
+                    bloom_columns: crate::forge::rewrite::table_bloom_columns(table.metadata())?,
                     table_location: table.metadata().location(),
                     partition_spec_id: table.metadata().default_partition_spec_id(),
                     sort_order_id: i32::try_from(table.metadata().default_sort_order_id())
@@ -596,13 +596,13 @@ impl Forge {
         &self,
         lease: &mut ForgeLease,
         binding: &TenantTableBinding,
-        partition_day: NaiveDate,
+        partition: TimePartition,
         detail: AuditDetail,
     ) -> Result<(), ForgeError> {
         let key = ForgeGroupKey {
             tenant: binding.tenant,
             table_ref: binding.table_ref.clone(),
-            partition_day,
+            partition,
         };
         self.append_live_audit(lease, &key, "forge.iceberg_rewrite.prepared", detail)
             .await
@@ -675,14 +675,15 @@ pub(crate) fn iceberg_rewrite_operation_id(
     resource: &str,
     base_snapshot_id: i64,
     partition_spec_id: i32,
-    partition_day: NaiveDate,
+    partition: TimePartition,
     source_files: &[RewriteSourceFile],
 ) -> Uuid {
     let mut hasher = Sha256::new();
     update_frame(&mut hasher, resource.as_bytes());
     hasher.update(base_snapshot_id.to_be_bytes());
     hasher.update(partition_spec_id.to_be_bytes());
-    update_frame(&mut hasher, partition_day.to_string().as_bytes());
+    update_frame(&mut hasher, partition.granularity_str().as_bytes());
+    hasher.update(partition.start_unix_micros().to_be_bytes());
     hasher.update(
         u32::try_from(source_files.len())
             .unwrap_or(u32::MAX)
@@ -740,7 +741,7 @@ fn live_detail(
         base_snapshot_id: operation.base_snapshot_id,
         committed_snapshot_id,
         partition_spec_id: operation.partition_spec_id,
-        partition_day: operation.key.partition_day.to_string(),
+        time_partition: operation.key.partition.to_wire(),
         target_file_size_bytes: operation.target_file_size_bytes,
         input_paths,
         output_paths,
@@ -750,14 +751,22 @@ fn live_detail(
 
 #[cfg(test)]
 mod tests {
-    use chrono::NaiveDate;
+    use super::{RewriteSourceFile, TimePartition, iceberg_rewrite_operation_id};
 
-    use super::{RewriteSourceFile, iceberg_rewrite_operation_id};
+    /// Builds the fixture hour partition shared by the identity regressions.
+    fn fixture_partition() -> TimePartition {
+        TimePartition::new(
+            crate::catalog::TimeGranularity::Hour,
+            chrono::DateTime::from_timestamp(1_767_312_000, 0)
+                .expect("fixture hour is representable"),
+        )
+        .expect("fixture hour is an exact hour boundary")
+    }
 
     /// Proves framing distinguishes strings that would collide under delimiters.
     #[test]
     fn length_framed_operation_identity_distinguishes_ambiguous_inputs() {
-        let day = NaiveDate::from_ymd_opt(2026, 9, 1).expect("valid test day");
+        let day = fixture_partition();
         let left = [RewriteSourceFile {
             catalog_path: "a|bc".to_owned(),
             object_path: "a|bc".to_owned(),
@@ -787,7 +796,7 @@ mod tests {
     /// Proves the explicit plan base, including a non-ASCII resource, affects identity.
     #[test]
     fn operation_identity_uses_explicit_plan_base() {
-        let day = NaiveDate::from_ymd_opt(2026, 9, 1).expect("valid test day");
+        let day = fixture_partition();
         let files = [RewriteSourceFile {
             catalog_path: "live/é.parquet".to_owned(),
             object_path: "live/é.parquet".to_owned(),
@@ -797,7 +806,7 @@ mod tests {
         let operation_id = iceberg_rewrite_operation_id("bifrost://t/é", 41, 3, day, &files);
         assert_eq!(
             operation_id,
-            uuid::Uuid::parse_str("7360b1c2-10cf-b354-4d58-56d0db85a2c7")
+            uuid::Uuid::parse_str("37f8ee6d-19c6-0cd7-627d-f2f1edf99501")
                 .expect("fixed operation UUID")
         );
         assert_ne!(

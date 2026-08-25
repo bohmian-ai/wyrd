@@ -28,7 +28,9 @@ use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use parquet::file::reader::{ChunkReader, Length};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use wyrd_spec::vala::api::{QueryAuditDigest, QueryClass, WorkerAttemptFrame, WorkerFooter};
+use wyrd_spec::vala::api::{
+    QueryAuditDigest, QueryClass, WorkerAttemptFrame, WorkerFooter, WorkerScanStats,
+};
 
 use super::fragment::{
     ClosedLeafPredicate, LeafComparison, LeafScalar, SealedScanFile, SealedScanFragment,
@@ -876,7 +878,7 @@ fn prepare_batch(
 ) -> Result<RecordBatch, ExecutorError> {
     let batch = apply_predicates(batch, &fragment.predicates)?;
     let batch = project(batch, &fragment.projection)?;
-    let actual = super::sealed_fragment_schema_fingerprint(&batch.schema());
+    let actual = super::assignment_schema_fingerprint(&batch.schema());
     if actual != fragment.schema_fingerprint {
         return Err(ExecutorError::Schema);
     }
@@ -975,16 +977,25 @@ impl AttemptEncoder {
             encoded_bytes: u64::try_from(self.encoded_bytes).map_err(|_| ExecutorError::Decode)?,
             payload_digest,
             completed: true,
+            // The sealed-fragment protocol carries no executed physical plan of
+            // its own, so it reports no scan evidence rather than a fabricated
+            // zero-byte scan.
+            scan_stats: WorkerScanStats::default(),
         }))
     }
 
     /// Finalizes a native physical-plan attempt under its immutable fingerprint.
+    ///
+    /// `scan_stats` is the follower's finalized physical read volume, which the
+    /// leader sums across the participant cut because its own plan scans no
+    /// storage.
     ///
     /// # Errors
     /// Returns a closed empty, digest, or checked byte-conversion failure.
     pub fn finish_physical(
         self,
         plan_fingerprint: &str,
+        scan_stats: WorkerScanStats,
     ) -> Result<WorkerAttemptFrame, ExecutorError> {
         if self.schema.is_none() {
             return Err(ExecutorError::Empty);
@@ -1000,6 +1011,7 @@ impl AttemptEncoder {
             encoded_bytes: u64::try_from(self.encoded_bytes).map_err(|_| ExecutorError::Decode)?,
             payload_digest,
             completed: true,
+            scan_stats,
         }))
     }
 }
@@ -1096,7 +1108,8 @@ mod tests {
         schema: &SchemaRef,
         size_bytes: u64,
     ) -> SealedScanFragment {
-        let leaf = crate::oracle::fragment::PreparedSealedLeaf {
+        let mut fragment = SealedScanFragment {
+            fragment_id: String::new(),
             binding: Path::new(&scan_file.location)
                 .parent()
                 .expect("fixture parent")
@@ -1112,15 +1125,13 @@ mod tests {
             }],
             projection: vec!["value".to_owned()],
             predicates: Vec::new(),
-            schema_fingerprint: crate::oracle::sealed_fragment_schema_fingerprint(schema),
+            schema_fingerprint: crate::oracle::assignment_schema_fingerprint(schema),
+            estimated_rows: scan_file.estimated_rows,
+            estimated_bytes: size_bytes,
             deadline_unix_ms: Utc::now().timestamp_millis() + 60_000,
         };
-        crate::oracle::fragment::FragmentPlanner
-            .plan(&leaf, &crate::oracle::fragment::FragmentConfig::default())
-            .expect("validated deterministic fragment")
-            .into_iter()
-            .next()
-            .expect("one deterministic fragment")
+        fragment.fragment_id = fragment.digest();
+        fragment
     }
 
     /// Closed predicates filter before projection without admitting SQL text.

@@ -170,9 +170,9 @@ mod tests {
     use crate::scribe::file_list_writer::FileListCommitKey;
     use crate::scribe::parquet_writer::{BoundedParquetArtifact, BoundedParquetArtifactSet};
     use crate::scribe::seal::{PostCommitBatch, PostCommitToken};
-    use crate::scribe::seal_key::{EventDay, SealKey};
+    use crate::scribe::seal_key::SealKey;
     use crate::scribe::wal::WalLsn;
-    use chrono::NaiveDate;
+
     use wyrd_spec::DataTenantId;
 
     use crate::test_support::{SpanCaptureSubscriber, has_span_outcome};
@@ -222,7 +222,7 @@ mod tests {
         let key = SealKey::new(
             tenant,
             table,
-            EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("date")),
+            crate::test_support::day_partition(2026, 7, 14),
         );
         let token = PostCommitToken {
             seal_id: 9,
@@ -317,7 +317,7 @@ mod tests {
         let seal_key = SealKey::new(
             tenant,
             TableRef::new(BifrostNamespace::Bifrost, "events"),
-            EventDay::new(NaiveDate::from_ymd_opt(2026, 8, 14).expect("date")),
+            crate::test_support::day_partition(2026, 8, 14),
         );
         let token = PostCommitToken {
             seal_id: 12,
@@ -445,7 +445,7 @@ impl ScribeCommitCompletion {
         if let Some(publisher) = &self.staging_file_publisher {
             let _ = publisher.try_publish(crate::maintenance::StagingFileCommitted::new(
                 binding,
-                token.seal_key.day.as_naive_date(),
+                token.seal_key.partition,
             ));
         }
         token.visibility.succeed();
@@ -577,6 +577,26 @@ struct PreparedSealEncoding {
     parquet_owner: ScribeMemoryLease,
 }
 
+/// Borrowed inputs one Parquet encode of a frozen generation needs.
+///
+/// These travel together from [`SealDriver::prepare_seal_encoding`] into the
+/// persistence CPU lane and are grouped so the encode entry point stays a
+/// single cohesive request rather than a positional argument list.
+struct ParquetEncodeRequest<'a> {
+    /// Frozen generation whose batches are encoded.
+    frozen: &'a FrozenMemtable,
+    /// Tenant-qualified destination table binding.
+    binding: &'a TenantTableBinding,
+    /// Authenticated tenant the encoded rows belong to.
+    tenant: wyrd_spec::ids::DataTenantId,
+    /// Registered physical layout reproducing the table's writer recipe.
+    layout: std::sync::Arc<crate::catalog::layout::PhysicalLayout>,
+    /// Admitted scratch directory the encoder writes through.
+    scratch_dir: &'a std::path::Path,
+    /// Deterministic object-store prefix every artifact is keyed under.
+    object_base: &'a str,
+}
+
 impl SealDriver {
     /// Encodes one frozen generation under its scratch and memory owners.
     ///
@@ -589,9 +609,16 @@ impl SealDriver {
         frozen: &FrozenMemtable,
         seal_key: &SealKey,
         binding: &TenantTableBinding,
+        conn: &mut TenantConn<'_>,
         node_id: &str,
         writer_epoch: i64,
     ) -> Result<PreparedSealEncoding, ScribeError> {
+        let layout = crate::scribe::write_recipe::resolve_write_recipe(
+            &mut **conn.transaction(),
+            binding,
+            &frozen.schema,
+        )
+        .await?;
         let memory = self.memory.as_ref().ok_or_else(|| ScribeError::Internal {
             detail: "Scribe writer-v2 memory owner is unavailable before encoding".to_owned(),
         })?;
@@ -625,39 +652,21 @@ impl SealDriver {
             .map_err(|error| ScribeError::Internal {
                 detail: format!("Scribe seal scratch admission failed: {error}"),
             })?;
-        let wal_lsn_min = frozen
-            .metas
-            .iter()
-            .map(|meta| meta.wal_lsn_min.as_u64())
-            .min()
-            .unwrap_or(0);
-        let wal_lsn_max = frozen
-            .metas
-            .iter()
-            .map(|meta| meta.wal_lsn_max.as_u64())
-            .max()
-            .unwrap_or(0);
-        let object_base = ScribeArtifactIdentity::new(
-            binding,
-            seal_key.day,
-            node_id,
-            writer_epoch,
-            frozen.shard_id,
-            wal_lsn_min,
-            wal_lsn_max,
-        )?
-        .object_base();
+        let object_base = Self::seal_object_base(frozen, seal_key, binding, node_id, writer_epoch)?;
         let footer_reservation = crate::scribe::memory::EncodedFooterReservation::transfer_from(
             &mut parquet_owner,
             frozen.arrow_bytes,
         )?;
         let mut encoded = self
             .encode_parquet(
-                frozen,
-                binding,
-                seal_key.tenant,
-                scratch.path(),
-                &object_base,
+                ParquetEncodeRequest {
+                    frozen,
+                    binding,
+                    tenant: seal_key.tenant,
+                    layout,
+                    scratch_dir: scratch.path(),
+                    object_base: &object_base,
+                },
                 footer_reservation,
             )
             .await?;
@@ -774,7 +783,7 @@ impl SealDriver {
             encoded_bytes,
             parquet_owner,
         } = self
-            .prepare_seal_encoding(frozen, seal_key, binding, node_id, writer_epoch)
+            .prepare_seal_encoding(frozen, seal_key, binding, conn, node_id, writer_epoch)
             .await?;
 
         // 3. PutObject
@@ -854,6 +863,49 @@ impl SealDriver {
         })
     }
 
+    /// Derives the deterministic object-base prefix every artifact of this
+    /// seal is written under.
+    ///
+    /// The prefix binds the generation's exact time partition, writing node,
+    /// writer epoch, shard, and the inclusive WAL LSN span it covers, so two
+    /// generations can never collide on one key and a replayed generation
+    /// reproduces the same base byte for byte.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the artifact identity is not constructible
+    /// from the binding, partition, node, or epoch.
+    fn seal_object_base(
+        frozen: &FrozenMemtable,
+        seal_key: &SealKey,
+        binding: &TenantTableBinding,
+        node_id: &str,
+        writer_epoch: i64,
+    ) -> Result<String, ScribeError> {
+        let wal_lsn_min = frozen
+            .metas
+            .iter()
+            .map(|meta| meta.wal_lsn_min.as_u64())
+            .min()
+            .unwrap_or(0);
+        let wal_lsn_max = frozen
+            .metas
+            .iter()
+            .map(|meta| meta.wal_lsn_max.as_u64())
+            .max()
+            .unwrap_or(0);
+        Ok(ScribeArtifactIdentity::new(
+            binding,
+            seal_key.partition,
+            node_id,
+            writer_epoch,
+            frozen.shard_id,
+            wal_lsn_min,
+            wal_lsn_max,
+        )?
+        .object_base())
+    }
+
     /// Encodes one frozen generation through the admitted persistence CPU lane.
     ///
     /// # Errors
@@ -862,13 +914,17 @@ impl SealDriver {
     /// ownership, or detached task completion fails.
     async fn encode_parquet(
         &self,
-        frozen: &FrozenMemtable,
-        binding: &TenantTableBinding,
-        tenant: wyrd_spec::ids::DataTenantId,
-        scratch_dir: &std::path::Path,
-        object_base: &str,
+        request: ParquetEncodeRequest<'_>,
         footer_reservation: crate::scribe::memory::EncodedFooterReservation,
     ) -> Result<ParquetEncoded, ScribeError> {
+        let ParquetEncodeRequest {
+            frozen,
+            binding,
+            tenant,
+            layout,
+            scratch_dir,
+            object_base,
+        } = request;
         match self
             .persistence_cpu
             .submit(ScribePersistenceCpuOp::EncodeParquet(Box::new(
@@ -878,6 +934,7 @@ impl SealDriver {
                     tenant,
                     candidate: None,
                     first_ordinal: 0,
+                    layout,
                     scratch_dir: scratch_dir.to_path_buf(),
                     object_base: object_base.to_owned(),
                     footer_reservation,

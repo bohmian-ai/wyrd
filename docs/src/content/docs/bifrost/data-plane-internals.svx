@@ -60,7 +60,8 @@ Steps 4 and 5 are the durability boundary. Any Scribe crash before step 4 rolls 
 | `row_count` | `bigint` | Rows in file |
 | `min_event_time` | `timestamptz` | Partition-pruning bound |
 | `max_event_time` | `timestamptz` | Partition-pruning bound |
-| `partition_day` | `date` | `Day(event_time)` partition |
+| `partition_granularity` | `text` | Partition granularity token (`hour` or `day`) |
+| `partition_start` | `timestamptz` | Canonical start of the `event_time` partition |
 | `compacted` | `bool` | Flipped to `true` when Forge folds the file into a snapshot |
 | `committed_snapshot_id` | `bigint` | Iceberg snapshot ID after compaction; NULL until compacted |
 | `node_id` | `text` | Emitting Scribe pod |

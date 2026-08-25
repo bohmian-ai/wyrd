@@ -54,10 +54,10 @@ fi
 # N-API cdylibs link against symbols supplied by Node and therefore cannot be
 # executed as ordinary Rust lib-test binaries. Their compile/type/unit coverage
 # must remain explicit in the aggregate gate instead of being silently exempt.
-pre_pr_body=$(sed -n '/^\[tasks\."pre-pr"\]/,/^\[tasks\./p' "$REPO_ROOT/mise.toml")
+gate_body=$(sed -n '/^\[tasks\."gate"\]/,/^\[tasks\./p' "$REPO_ROOT/mise.toml")
 for task in ts:napi:check ts:typecheck ts:test:unit; do
-  if ! printf '%s\n' "$pre_pr_body" | grep -F "\"$task\"" >/dev/null; then
-    echo "FAIL: pre-pr is missing required N-API/TypeScript gate: $task"
+  if ! printf '%s\n' "$gate_body" | grep -F "\"$task\"" >/dev/null; then
+    echo "FAIL: gate is missing required N-API/TypeScript task: $task"
     exit 1
   fi
 done

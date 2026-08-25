@@ -13,7 +13,7 @@ use crate::state::{AppState, Bifrost};
 use secrecy::ExposeSecret;
 use tempfile::TempDir;
 use vala_bifrost_redux::catalog::BifrostCatalog;
-use vala_sql::{OperatorPool, ValaPostgres};
+use vala_sql::ValaPostgres;
 use wyrd_auth::permission_resolver::SqlPermissionResolver;
 use wyrd_auth_verify::{TokenVerifier, WyrdAuthVerifySettings};
 use wyrd_dev_fixtures::pg::PgFixture;
@@ -124,14 +124,6 @@ pub fn test_app_state(
 /// Return the shared Vala Postgres handle used by the Redux catalog.
 pub(crate) async fn test_vala_postgres() -> ValaPostgres {
     shared().vala_postgres().clone()
-}
-
-/// Return the shared cross-tenant operator pool used by Forge leases.
-pub(crate) async fn test_operator_pool() -> OperatorPool {
-    shared()
-        .wyrd_postgres()
-        .operator_pool()
-        .expect("shared PgFixture always configures the platform-admin operator pool")
 }
 
 /// Return a server Postgres owner over the shared fixture's exact runtime handles.

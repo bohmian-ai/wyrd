@@ -340,10 +340,10 @@
             "kind",
             "operation_id",
             "output_paths",
-            "partition_day",
             "partition_spec_id",
             "phase",
             "target_file_size_bytes",
+            "time_partition",
             "writer_recipe_version"
           ],
           "properties": {
@@ -389,10 +389,6 @@
                 "type": "string"
               }
             },
-            "partition_day": {
-              "description": "Shared day partition for every exact input.",
-              "type": "string"
-            },
             "partition_spec_id": {
               "description": "Destination partition specification identity.",
               "type": "integer",
@@ -411,6 +407,14 @@
               "type": "integer",
               "format": "uint64",
               "minimum": 0.0
+            },
+            "time_partition": {
+              "description": "Shared exact time partition for every input in the rewrite group.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/TimePartitionWire"
+                }
+              ]
             },
             "writer_recipe_version": {
               "description": "Physical recipe used to produce the outputs.",
@@ -433,7 +437,7 @@
           ],
           "properties": {
             "group": {
-              "description": "Canonical tenant/table/day group identity.",
+              "description": "Canonical tenant/table/partition group identity.",
               "type": "string"
             },
             "input_file_ids": {
@@ -1255,6 +1259,13 @@
           ]
         },
         {
+          "description": "Peer assignment-authority digest mismatch: the recomputed digest over the follower's actual dispatched assignments does not match the digest signed into the ticket claims, so the closed predicate and projection closure cannot be trusted.",
+          "type": "string",
+          "enum": [
+            "peer_assignment_authority"
+          ]
+        },
+        {
           "description": "Invalid Scribe-tail ticket audience.",
           "type": "string",
           "enum": [
@@ -1770,6 +1781,48 @@
           ]
         }
       ]
+    },
+    "TimeGranularityWire": {
+      "description": "Time-partition granularity on the wire.\n\nBifrost v1 partitions every table on `wyrd_event_time` and admits exactly these two Iceberg-native transforms; nothing else is representable.",
+      "oneOf": [
+        {
+          "description": "One partition per UTC hour.",
+          "type": "string",
+          "enum": [
+            "hour"
+          ]
+        },
+        {
+          "description": "One partition per UTC day.",
+          "type": "string",
+          "enum": [
+            "day"
+          ]
+        }
+      ]
+    },
+    "TimePartitionWire": {
+      "description": "Validated time-partition value carried by private tail and follower contracts.\n\nThe pair `(granularity, start_utc)` is the one durable partition identity in Bifrost: WAL slices, seal keys, object paths, file-list rows, Forge audit detail, and tail fences all carry exactly this value. `start_utc` is always the exact UTC boundary of the partition, so two values are equal if and only if they name the same physical partition.",
+      "type": "object",
+      "required": [
+        "granularity",
+        "start_utc"
+      ],
+      "properties": {
+        "granularity": {
+          "description": "Partition granularity.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/TimeGranularityWire"
+            }
+          ]
+        },
+        "start_utc": {
+          "description": "Exact UTC start boundary of the partition.",
+          "type": "string",
+          "format": "date-time"
+        }
+      }
     },
     "VersionBlock": {
       "description": "Semver-compatible version string.",

@@ -365,8 +365,8 @@ pub struct ScribeRuntimeConfig {
     #[serde(default = "default_ingest_otlp_value_depth")]
     pub ingest_otlp_value_depth: usize,
     /// Maximum distinct event-day partitions in one request.
-    #[serde(default = "default_ingest_event_days")]
-    pub ingest_event_days: usize,
+    #[serde(default = "default_ingest_time_partitions")]
+    pub ingest_time_partitions: usize,
     /// Fixed WAL header and digest workspace bytes retained by an ingress root.
     #[serde(default = "default_ingest_wal_workspace_bytes")]
     pub ingest_wal_workspace_bytes: usize,
@@ -395,15 +395,6 @@ pub struct BifrostRoles {
 }
 
 impl BifrostRoles {
-    /// Constructs a validated internal role set for shared composition tests.
-    #[cfg(any(test, feature = "test-support"))]
-    #[must_use]
-    pub(crate) fn from_selected(selected: impl IntoIterator<Item = BifrostRuntimeRole>) -> Self {
-        Self {
-            selected: selected.into_iter().collect(),
-        }
-    }
-
     /// Constructs the exact effective roles for one public process target.
     #[must_use]
     pub fn for_target(target: BifrostTarget) -> Self {
@@ -543,8 +534,14 @@ pub struct OracleRuntimeConfig {
     pub audit_relay_shutdown_timeout_ms: u64,
 }
 
+/// Default loopback peer advertisement used by single-node development boots.
+///
+/// The scheme is mandatory: this value is published into `vala.cluster_nodes`
+/// and later dialed through `Endpoint::from_shared`, which cannot parse a
+/// schemeless authority. Production boots reject this default because
+/// [`WyrdServerConfig::validate`] requires `https://` under that profile.
 fn default_oracle_advertise_addr() -> String {
-    "127.0.0.1:50052".to_owned()
+    "http://127.0.0.1:50052".to_owned()
 }
 fn default_oracle_cpu_cores() -> f64 {
     1.0
@@ -560,8 +557,12 @@ fn default_oracle_max_queue_wait_ms() -> u64 {
     250
 }
 /// Default exact demand amount; allocation is still bounded by durable availability.
+///
+/// Each allocation costs one `PostgreSQL` round trip regardless of how many
+/// units it returns, so a single-unit block forces one round trip per query and
+/// cannot keep pace with concurrent readers. A batch amortizes that cost.
 fn default_oracle_delegated_allocation_units() -> u32 {
-    1
+    vala_bifrost_redux::oracle::DEFAULT_DELEGATED_ALLOCATION_UNITS
 }
 /// Default renewal cadence inherited from role heartbeat membership.
 fn default_oracle_delegated_renewal_ms() -> u64 {
@@ -1193,10 +1194,35 @@ pub struct BifrostResourceConfig {
     /// Optional effective CPU cap; process/cgroup affinity may be tighter.
     #[serde(default)]
     pub effective_cpu: Option<usize>,
+    /// Optional Oracle query slot-unit concurrency limit for this node.
+    ///
+    /// Unlike the caps above this is a capacity decision rather than a detected
+    /// bound, so it may raise as well as lower the default. Leaving it unset
+    /// derives twice effective CPU, never below the portable slot-unit floor.
+    #[serde(default)]
+    pub oracle_query_slot_limit: Option<usize>,
 }
 
+/// Derives the dedicated Scribe coordination-runtime worker count.
+///
+/// The coordination runtime hosts one long-lived task per Scribe shard lane
+/// (`SCRIBE_SHARD_COUNT` of them) plus the reconciliation and persistence
+/// loops. Those shard owners are not pure channel-awaiters: each performs
+/// synchronous Arrow memtable insertion inline and awaits a Postgres `COMMIT`,
+/// so a thread count well below the lane count serializes independent lanes.
+///
+/// The derivation therefore starts from detected parallelism — matching the
+/// sibling ingress and persistence derivations, including their `map_or(4, ..)`
+/// fallback for platforms that cannot report it — then clamps it between two
+/// bounds. The upper bound caps threads at the number of lanes there are to
+/// run, so a large host does not spawn coordination threads that can never own
+/// a lane. The lower bound preserves the historical floor so a single-core box
+/// still gets a second thread to make progress on while one lane blocks in
+/// `COMMIT`. The bounds are constant and ordered, so the clamp cannot panic.
 fn default_scribe_coordination_threads() -> usize {
-    2
+    std::thread::available_parallelism()
+        .map_or(4, std::num::NonZeroUsize::get)
+        .clamp(2, vala_bifrost_redux::scribe::routing::SCRIBE_SHARD_COUNT)
 }
 
 fn default_scribe_ingress_cpu_threads() -> usize {
@@ -1221,17 +1247,17 @@ fn default_ingest_request_bytes() -> usize {
     vala_bifrost_redux::gate::limits::BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES
 }
 
-redacted
+/// Returns the WAL rotation target.
 fn default_scribe_wal_rotation_bytes() -> u64 {
     512 * 1024 * 1024
 }
 
-redacted
+/// Returns the memtable rotation target.
 fn default_scribe_memtable_rotation_bytes() -> usize {
     512 * 1024 * 1024
 }
 
-redacted
+/// Returns the active memtable age target.
 fn default_scribe_memtable_max_age_secs() -> u64 {
     600
 }
@@ -1282,8 +1308,8 @@ fn default_ingest_otlp_value_depth() -> usize {
 }
 
 /// Returns the immutable V1 event-day hard maximum.
-fn default_ingest_event_days() -> usize {
-    vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS.event_days
+fn default_ingest_time_partitions() -> usize {
+    vala_bifrost_redux::gate::limits::OTLP_WIRE_LIMITS.time_partitions
 }
 
 /// Returns the immutable V1 WAL-workspace hard maximum.
@@ -1314,7 +1340,7 @@ impl Default for ScribeRuntimeConfig {
             ingest_otlp_attributes: default_ingest_otlp_attributes(),
             ingest_otlp_value_bytes: default_ingest_otlp_value_bytes(),
             ingest_otlp_value_depth: default_ingest_otlp_value_depth(),
-            ingest_event_days: default_ingest_event_days(),
+            ingest_time_partitions: default_ingest_time_partitions(),
             ingest_wal_workspace_bytes: default_ingest_wal_workspace_bytes(),
         }
     }
@@ -1409,9 +1435,9 @@ impl ScribeRuntimeConfig {
                 default_ingest_otlp_value_depth(),
             ),
             (
-                "ingest_event_days",
-                self.ingest_event_days,
-                default_ingest_event_days(),
+                "ingest_time_partitions",
+                self.ingest_time_partitions,
+                default_ingest_time_partitions(),
             ),
             (
                 "ingest_wal_workspace_bytes",
@@ -1455,7 +1481,7 @@ impl ScribeRuntimeConfig {
                 attributes: self.ingest_otlp_attributes,
                 value_bytes: self.ingest_otlp_value_bytes,
                 value_depth: self.ingest_otlp_value_depth,
-                event_days: self.ingest_event_days,
+                time_partitions: self.ingest_time_partitions,
             },
             native_fields: self.ingest_native_fields,
             native_sources: self.ingest_native_sources,
@@ -2048,6 +2074,10 @@ impl WyrdServerConfig {
             "WYRD_BIFROST_EFFECTIVE_CPU",
             self.bifrost.resources.effective_cpu,
         )?;
+        self.bifrost.resources.oracle_query_slot_limit = parse_optional_env(
+            "WYRD_BIFROST_ORACLE_QUERY_SLOT_LIMIT",
+            self.bifrost.resources.oracle_query_slot_limit,
+        )?;
         // deployment_profile (APP_ENV: development | staging | production).
         // staging and production both select the hardened production profile, so
         // both fail closed without a signing key; only development is lenient.
@@ -2101,6 +2131,9 @@ impl WyrdServerConfig {
         }
         if let Some(val) = env_opt("WYRD_ORACLE_PEER_SERVER_NAME")? {
             self.bifrost.oracle.peer_server_name = Some(val);
+        }
+        if let Some(val) = env_opt("WYRD_ORACLE_ADVERTISE_ADDR")? {
+            self.bifrost.oracle.advertise_addr = val;
         }
 
         // telemetry.endpoint
@@ -3144,6 +3177,41 @@ minimum_slots = 2
             .expect("complete production Oracle TLS configuration validates");
     }
 
+    /// Proves the advertised peer address always carries a dialable scheme and
+    /// that the environment override lands on the same validated field.
+    ///
+    /// The advertisement is published into `vala.cluster_nodes` and later dialed
+    /// through `Endpoint::from_shared`, which rejects a schemeless authority, so
+    /// a missing scheme is unroutable rather than merely untidy. Routing the
+    /// environment override through `apply_env_overrides` keeps one validated
+    /// source of truth instead of a second unvalidated read at boot.
+    #[test]
+    fn oracle_advertise_addr_carries_scheme_and_honors_env_override() {
+        let default_addr = WyrdServerConfig::default().bifrost.oracle.advertise_addr;
+        assert!(
+            default_addr.starts_with("http://") || default_addr.starts_with("https://"),
+            "default advertisement must carry a dialable scheme, got {default_addr}"
+        );
+
+        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        temp_env::with_vars(
+            [(
+                "WYRD_ORACLE_ADVERTISE_ADDR",
+                Some("https://oracle-0.peers.svc:50052"),
+            )],
+            || {
+                let mut config = WyrdServerConfig::default();
+                config
+                    .apply_env_overrides()
+                    .expect("advertisement override applies");
+                assert_eq!(
+                    config.bifrost.oracle.advertise_addr,
+                    "https://oracle-0.peers.svc:50052"
+                );
+            },
+        );
+    }
+
     /// Proves status alone cannot activate Oracle without benchmark evidence.
     #[test]
     fn oracle_calibration_rejects_minimal_approved_profile() {
@@ -3180,7 +3248,17 @@ minimum_slots = 2
     #[test]
     fn scribe_runtime_defaults_match_configured_ingest_contract() {
         let cfg = ScribeRuntimeConfig::default();
-        assert_eq!(cfg.coordination_threads, 2);
+        // Asserted as bounds rather than by restating the derivation: an
+        // assertion that recomputes the implementation expression can never
+        // fail, while these bounds are exactly the properties a wrong formula
+        // violates — never below the two-thread floor, never above the number
+        // of shard lanes the runtime has to host.
+        assert!(
+            (2..=vala_bifrost_redux::scribe::routing::SCRIBE_SHARD_COUNT)
+                .contains(&cfg.coordination_threads),
+            "coordination threads {} must stay within the shard-lane bounds",
+            cfg.coordination_threads
+        );
         assert_eq!(cfg.wal_disk_limit_bytes, None);
         assert_eq!(cfg.ingest_request_bytes, 200 * 1024 * 1024);
         assert_eq!(cfg.wal_rotation_bytes, 512 * 1024 * 1024);
@@ -3229,7 +3307,7 @@ minimum_slots = 2
         assert_rejected!(ingest_otlp_attributes, 0);
         assert_rejected!(ingest_otlp_value_bytes, 0);
         assert_rejected!(ingest_otlp_value_depth, 0);
-        assert_rejected!(ingest_event_days, 0);
+        assert_rejected!(ingest_time_partitions, 0);
         assert_rejected!(ingest_wal_workspace_bytes, 0);
         assert_rejected!(ingest_native_fields, default_ingest_native_fields() + 1);
         assert_rejected!(ingest_native_sources, default_ingest_native_sources() + 1);
@@ -3246,7 +3324,7 @@ minimum_slots = 2
             ingest_otlp_value_depth,
             default_ingest_otlp_value_depth() + 1
         );
-        assert_rejected!(ingest_event_days, default_ingest_event_days() + 1);
+        assert_rejected!(ingest_time_partitions, default_ingest_time_partitions() + 1);
         assert_rejected!(
             ingest_wal_workspace_bytes,
             default_ingest_wal_workspace_bytes() + 1
@@ -3289,7 +3367,7 @@ minimum_slots = 2
             ingest_otlp_attributes: 16,
             ingest_otlp_value_bytes: 512,
             ingest_otlp_value_depth: 3,
-            ingest_event_days: 2,
+            ingest_time_partitions: 2,
             ingest_wal_workspace_bytes: 256,
             ..ScribeRuntimeConfig::default()
         };
@@ -3306,7 +3384,7 @@ minimum_slots = 2
         assert_eq!(frozen.otlp.attributes, 16);
         assert_eq!(frozen.otlp.value_bytes, 512);
         assert_eq!(frozen.otlp.value_depth, 3);
-        assert_eq!(frozen.otlp.event_days, 2);
+        assert_eq!(frozen.otlp.time_partitions, 2);
         assert_eq!(frozen.wal_workspace_bytes, 256);
     }
 
@@ -4137,8 +4215,10 @@ minimum_slots = 2
     /// Panics when any invalid configuration is accepted.
     #[test]
     fn delegated_admission_rejects_invalid_timing() {
-        let mut runtime = OracleRuntimeConfig::default();
-        runtime.delegated_allocation_units = 0;
+        let mut runtime = OracleRuntimeConfig {
+            delegated_allocation_units: 0,
+            ..OracleRuntimeConfig::default()
+        };
         assert!(runtime.delegated_admission_config().is_err());
         runtime.delegated_allocation_units = 1;
         runtime.delegated_renewal_ms = runtime.delegated_validity_ms;

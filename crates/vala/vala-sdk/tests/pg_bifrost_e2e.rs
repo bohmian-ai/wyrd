@@ -124,6 +124,7 @@ mod pg_tests {
                 table: TableRef::new(BifrostNamespace::Bifrost, &table_name),
                 user_fields: vec![Field::new("value", DataType::Int64, false)],
                 tenant: srv.data_tenant_id(),
+                physical_layout: None,
                 audit: None,
             })
             .await
@@ -758,6 +759,7 @@ mod pg_tests {
                     Field::new("value", DataType::Utf8, false),
                 ],
                 tenant: srv.data_tenant_id(),
+                physical_layout: None,
                 audit: None,
             })
             .await
@@ -824,6 +826,7 @@ mod pg_tests {
                     Field::new("value", DataType::Utf8, false),
                 ],
                 tenant: srv.data_tenant_id(),
+                physical_layout: None,
                 audit: None,
             })
             .await
@@ -922,6 +925,7 @@ mod pg_tests {
                     Field::new("value", DataType::Utf8, false),
                 ],
                 tenant: srv.data_tenant_id(),
+                physical_layout: None,
                 audit: None,
             })
             .await

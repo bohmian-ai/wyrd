@@ -55,6 +55,15 @@ struct CapabilityWire {
     writer_epoch: u64,
     /// Retained fence identity.
     fence_id: uuid::Uuid,
+    /// Granularity tag of the exact time partition the fence is bound to.
+    ///
+    /// Bound alongside `partition_start_unix_micros` so a capability minted for
+    /// one hour cannot be replayed against another partition of the same
+    /// stream: both the tag and the start must match the fence presented at
+    /// page or release time.
+    partition_granularity: u8,
+    /// UTC start of the exact time partition, in microseconds since the epoch.
+    partition_start_unix_micros: i64,
     /// Capability expiry in epoch milliseconds.
     expires_ms: i64,
     /// Narrow page/release audience.
@@ -259,6 +268,8 @@ impl TailTicketMinter for ScribeTailAuthority {
             node_id: fence.stream.node_id.as_uuid(),
             writer_epoch: fence.stream.writer_epoch,
             fence_id: fence.fence_id.as_uuid(),
+            partition_granularity: fence.time_partition.granularity_tag(),
+            partition_start_unix_micros: fence.time_partition.start_unix_micros(),
             expires_ms: fence.expires_at.timestamp_millis(),
             audience: Self::audience(TailTicketAudience::Page),
         };
@@ -572,6 +583,8 @@ impl TailTicketVerifier for ScribeTailAuthority {
             || wire.node_id != fence.stream.node_id.as_uuid()
             || wire.writer_epoch != fence.stream.writer_epoch
             || wire.fence_id != fence.fence_id.as_uuid()
+            || wire.partition_granularity != fence.time_partition.granularity_tag()
+            || wire.partition_start_unix_micros != fence.time_partition.start_unix_micros()
             || wire.audience != Self::audience(audience)
             || DateTime::from_timestamp_millis(wire.expires_ms)
                 .is_none_or(|expiry| expiry <= Utc::now())
@@ -600,7 +613,8 @@ mod tests {
     };
     use wyrd_spec::DataTenantId;
     use wyrd_spec::vala::api::{
-        EventDay, SchemaFingerprint, TailCursor, TailReadFence, TailStreamIdentity,
+        SchemaFingerprint, TailCursor, TailReadFence, TailStreamIdentity, TimeGranularityWire,
+        TimePartitionWire,
     };
 
     const PRIVATE_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEID78cHNjuFihX8aWPytQRoR2iUKHVXgdh92bcTcjQTYV\n-----END PRIVATE KEY-----\n";
@@ -676,7 +690,11 @@ mod tests {
                 namespace: "bifrost".to_owned(),
                 table: "events".to_owned(),
             },
-            event_day: EventDay::new("2026-08-03").expect("fixture day"),
+            time_partition: TimePartitionWire::new(
+                TimeGranularityWire::Hour,
+                chrono::DateTime::from_timestamp(1_754_179_200, 0).expect("fixture instant"),
+            )
+            .expect("fixture instant is an exact hour boundary"),
             stream: TailStreamIdentity {
                 node_id: wyrd_spec::vala::api::NodeId::new(uuid::Uuid::new_v4()),
                 writer_epoch: 1,
@@ -773,6 +791,77 @@ mod tests {
                 .await,
             Err(TailReadError::Authorization { detail }) if detail == "injected audit outage"
         ));
+    }
+
+    /// A page capability is bound to one exact `TimePartition`, so it cannot be
+    /// replayed against a neighbouring hour or against a day that begins at the
+    /// same instant.
+    ///
+    /// Granularity and start are separate fields in the signed tuple; a
+    /// capability that only bound the start instant would authorize a whole
+    /// day's rows for an hour's fence.
+    #[tokio::test]
+    async fn tail_capability_binds_time_partition() {
+        let audit = Arc::new(RecordingAudit::default());
+        let authority = authority(Arc::clone(&audit));
+        let claims = claims(TailTicketAudience::Page, 7);
+        let expires_at = chrono::Utc::now() + chrono::Duration::seconds(5);
+        let fence = fence_for(&claims, expires_at);
+        let capability = authority
+            .mint_tail_capability(&claims, &fence)
+            .expect("capability signs");
+
+        // The minting fence itself verifies.
+        authority
+            .verify_tail_capability(
+                &capability,
+                claims.query_id,
+                claims.tenant_id,
+                &claims.canonical_table,
+                &fence,
+                TailTicketAudience::Page,
+            )
+            .await
+            .expect("the exact minting fence verifies");
+
+        let start = fence.time_partition.start_utc();
+        let mut neighbouring_hour = fence.clone();
+        neighbouring_hour.time_partition = TimePartitionWire::new(
+            TimeGranularityWire::Hour,
+            start + chrono::Duration::hours(1),
+        )
+        .expect("the following hour is an exact boundary");
+
+        let mut same_instant_day = fence.clone();
+        same_instant_day.time_partition = TimePartitionWire::new(TimeGranularityWire::Day, start)
+            .expect("the fixture instant is also an exact day boundary");
+
+        for (label, forged) in [
+            ("neighbouring hour", neighbouring_hour),
+            ("same-instant day", same_instant_day),
+        ] {
+            let outcome = authority
+                .verify_tail_capability(
+                    &capability,
+                    claims.query_id,
+                    claims.tenant_id,
+                    &claims.canonical_table,
+                    &forged,
+                    TailTicketAudience::Page,
+                )
+                .await;
+            assert!(
+                matches!(outcome, Err(TailReadError::Authorization { .. })),
+                "{label} must not satisfy a capability minted for another partition"
+            );
+        }
+
+        let reasons = audit.reasons.lock().expect("audit lock").clone();
+        assert_eq!(
+            reasons,
+            vec!["binding".to_owned(), "binding".to_owned()],
+            "each partition mismatch is audited as a verified binding violation"
+        );
     }
 
     /// Expired capabilities are rejected even when retained metadata remains present.

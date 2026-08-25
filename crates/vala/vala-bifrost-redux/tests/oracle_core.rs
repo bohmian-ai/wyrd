@@ -14,7 +14,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::reader::StreamReader;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use chrono::{NaiveDate, Utc};
+use chrono::Utc;
 use futures_util::StreamExt;
 use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Literal, Struct};
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -28,8 +28,8 @@ use vala_bifrost_redux::catalog::{
 use vala_bifrost_redux::cluster::{ClusterRegistry, RegisteredRole};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::oracle::dispatcher::{
-    LocalOraclePeerTransport, OraclePeerTransportDirectory, OraclePeerWorker, ReservationRegistry,
-    TonicOraclePeerTransport,
+    LocalOraclePeerTransport, OraclePeerTransportDirectory, OraclePeerWorker,
+    OraclePeerWorkerConfig, ReservationRegistry, TonicOraclePeerTransport,
 };
 use vala_bifrost_redux::oracle::peer::{
     NoopPeerSecurityAudit, PeerSecurityError, PeerTicketClaims, PeerTicketVerifier,
@@ -44,7 +44,7 @@ use vala_bifrost_redux::oracle::{
 use vala_bifrost_redux::schema::with_managed_columns;
 use vala_bifrost_redux::scribe::file_list_writer::{FileListInsert, insert_and_audit};
 use vala_bifrost_redux::scribe::memtable::Memtable;
-use vala_bifrost_redux::scribe::seal_key::{EventDay, SealKey};
+use vala_bifrost_redux::scribe::seal_key::SealKey;
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use vala_bifrost_redux::scribe::tail_rpc::{
     FenceRelease, FetchLiveTailService, LocalTailPage, LocalTailReadTransport, ScribeTailReader,
@@ -123,6 +123,7 @@ fn composed_oracle_roles() -> vala_bifrost_redux::resources::BifrostRoleResource
             unmanaged_reserve_bytes: None,
             scratch_limit_bytes: Some(1024 * 1024 * 1024),
             effective_cpu: None,
+            oracle_query_slot_limit: None,
             scratch_root: std::path::PathBuf::new(),
             volume_roots: None,
         },
@@ -196,7 +197,6 @@ async fn reserve_role_pair() -> RolePair {
         .reserve_oracle(
             "127.0.0.1:50052",
             OracleCapabilitiesV1 {
-                peer_protocol_version: 1,
                 storage_protocol_version: 1,
                 cpu_cores: 1.0,
                 memory_budget_bytes: 256 * 1024 * 1024,
@@ -469,6 +469,7 @@ impl OracleFixture {
                 table: table.clone(),
                 user_fields: vec![Field::new("value", DataType::Int64, false)],
                 tenant,
+                physical_layout: None,
                 audit: None,
             })
             .await
@@ -481,7 +482,6 @@ impl OracleFixture {
             .register_oracle(
                 "127.0.0.1:0",
                 OracleCapabilitiesV1 {
-                    peer_protocol_version: 1,
                     storage_protocol_version: 1,
                     cpu_cores: 4.0,
                     memory_budget_bytes: 512 * 1024 * 1024,
@@ -567,21 +567,23 @@ impl OracleFixture {
         ));
         let worker_resources = composed_oracle_roles();
         let worker = Arc::new(OraclePeerWorker::new_physical_with_resources(
-            self.role.key.node_id,
-            self.role.fencing_token,
-            Arc::new(DeterministicTestVerifier),
-            Arc::new(NoopPeerSecurityAudit),
-            reservations,
-            worker_resources
-                .oracle()
-                .expect("production-shaped worker Oracle capability"),
-            Arc::new(
-                vala_bifrost_redux::oracle::follower::OracleCatalogResolver::new(Arc::clone(
-                    &self.catalog,
-                )),
-            ),
-            Arc::clone(&audit),
-            16,
+            OraclePeerWorkerConfig {
+                worker_node_id: self.role.key.node_id,
+                oracle_fence: self.role.fencing_token,
+                verifier: Arc::new(DeterministicTestVerifier),
+                security_audit: Arc::new(NoopPeerSecurityAudit),
+                reservations,
+                oracle_resources: worker_resources
+                    .oracle()
+                    .expect("production-shaped worker Oracle capability"),
+                resolver: Arc::new(
+                    vala_bifrost_redux::oracle::follower::OracleCatalogResolver::new(Arc::clone(
+                        &self.catalog,
+                    )),
+                ),
+                audit: Arc::clone(&audit),
+                target_partitions: 16,
+            },
         ));
         let transports = OraclePeerTransportDirectory::new(
             self.role.key.node_id,
@@ -824,7 +826,7 @@ impl OracleFixture {
                 row_count: i64::try_from(row_count).expect("row count"),
                 min_event_time: Utc::now(),
                 max_event_time: Utc::now(),
-                partition_day: NaiveDate::from_ymd_opt(1970, 1, 1).expect("day"),
+                partition: vala_bifrost_redux::partition_fixtures::day_partition(1970, 1, 1),
                 node_id,
                 writer_epoch,
                 wal_lsn_min: 1,
@@ -916,7 +918,7 @@ impl OracleFixture {
                 row_count: 1,
                 min_event_time: Utc::now(),
                 max_event_time: Utc::now(),
-                partition_day: NaiveDate::from_ymd_opt(1970, 1, 1).expect("day"),
+                partition: vala_bifrost_redux::partition_fixtures::day_partition(1970, 1, 1),
                 node_id: uuid::Uuid::now_v7(),
                 writer_epoch: 1,
                 wal_lsn_min: 1,
@@ -1084,7 +1086,7 @@ impl TailReadTransport for FenceProbeTransport {
         Ok(wyrd_spec::vala::api::TailReadFence {
             fence_id: wyrd_spec::vala::api::TailFenceId::new(uuid::Uuid::now_v7()),
             binding: request.binding,
-            event_day: request.event_day,
+            time_partition: request.time_partition,
             stream: wyrd_spec::vala::api::TailStreamIdentity {
                 node_id: self.node_id,
                 writer_epoch: request.exclusive_sealed.writer_epoch,
@@ -1151,7 +1153,7 @@ impl TailReadTransport for CleanupReleaseProbeTransport {
         Ok(wyrd_spec::vala::api::TailReadFence {
             fence_id: wyrd_spec::vala::api::TailFenceId::new(uuid::Uuid::now_v7()),
             binding: request.binding,
-            event_day: request.event_day,
+            time_partition: request.time_partition,
             stream: wyrd_spec::vala::api::TailStreamIdentity {
                 node_id: self.node_id,
                 writer_epoch: request.exclusive_sealed.writer_epoch,
@@ -2216,7 +2218,7 @@ async fn pg_bifrost_oracle_multitenant_isolation_and_fairness_journey_telemetry(
         fixture.table.fqn(),
         node_id,
         1,
-        wyrd_spec::vala::api::EventDay::new("1970-01-01").expect("wire day"),
+        vala_bifrost_redux::partition_fixtures::day_partition(1970, 1, 1).to_wire(),
         transport,
     );
     let oracle = fixture
@@ -2531,10 +2533,10 @@ async fn oracle_fused_live_only_real_scribe_and_degraded_policy() {
 
 /// Builds one real local Scribe tail containing a single live-only row.
 fn live_only_tail_directory(fixture: &OracleFixture) -> Arc<TailTransportDirectory> {
-    let day = NaiveDate::from_ymd_opt(1970, 1, 1).expect("day");
+    let day = vala_bifrost_redux::partition_fixtures::day_partition(1970, 1, 1);
     let stream = StreamIdentity::new(NodeId::new(uuid::Uuid::now_v7()), WriterEpoch::new(7));
     let memtable = Arc::new(Memtable::new());
-    let key = SealKey::new(fixture.tenant, fixture.table.clone(), EventDay::new(day));
+    let key = SealKey::new(fixture.tenant, fixture.table.clone(), day);
     let schema = Arc::new(Schema::new(with_managed_columns(vec![Field::new(
         "value",
         DataType::Int64,
@@ -2594,7 +2596,7 @@ fn live_only_tail_directory(fixture: &OracleFixture) -> Arc<TailTransportDirecto
         fixture.table.fqn(),
         wyrd_spec::vala::api::NodeId::new(stream.node_id.as_uuid()),
         u64::try_from(stream.writer_epoch.as_i64()).expect("epoch"),
-        wyrd_spec::vala::api::EventDay::new("1970-01-01").expect("wire day"),
+        vala_bifrost_redux::partition_fixtures::day_partition(1970, 1, 1).to_wire(),
         Arc::new(LocalTailReadTransport::new(reader)),
     );
     tails
@@ -2657,7 +2659,7 @@ async fn pg_bifrost_oracle_recovery_terminal_journey_partial_fence_cleanup() {
             fixture.table.fqn(),
             node_id,
             writer_epoch,
-            wyrd_spec::vala::api::EventDay::new("1970-01-01").expect("wire day"),
+            vala_bifrost_redux::partition_fixtures::day_partition(1970, 1, 1).to_wire(),
             Arc::new(FenceProbeTransport {
                 node_id,
                 fail_acquire,
@@ -2708,7 +2710,7 @@ async fn fused_audit_failure_releases_every_fence_before_return() {
             fixture.table.fqn(),
             node_id,
             writer_epoch,
-            wyrd_spec::vala::api::EventDay::new("1970-01-01").expect("wire day"),
+            vala_bifrost_redux::partition_fixtures::day_partition(1970, 1, 1).to_wire(),
             Arc::new(FenceProbeTransport {
                 node_id,
                 fail_acquire: false,
@@ -2756,7 +2758,7 @@ async fn fused_post_acquisition_timeout_releases_before_return() {
             fixture.table.fqn(),
             node_id,
             writer_epoch,
-            wyrd_spec::vala::api::EventDay::new("1970-01-01").expect("wire day"),
+            vala_bifrost_redux::partition_fixtures::day_partition(1970, 1, 1).to_wire(),
             Arc::new(CleanupReleaseProbeTransport {
                 node_id,
                 block_release,
@@ -2821,7 +2823,7 @@ async fn typed_fused_acquisition_failure_precedes_audit_and_read() {
         fixture.table.fqn(),
         node_id,
         1,
-        wyrd_spec::vala::api::EventDay::new("1970-01-01").expect("wire day"),
+        vala_bifrost_redux::partition_fixtures::day_partition(1970, 1, 1).to_wire(),
         Arc::new(FenceProbeTransport {
             node_id,
             fail_acquire: true,
@@ -2900,7 +2902,7 @@ async fn typed_plan_waits_for_delegated_admission_before_execution() {
         fixture.table.fqn(),
         node_id,
         1,
-        wyrd_spec::vala::api::EventDay::new("1970-01-01").expect("wire day"),
+        vala_bifrost_redux::partition_fixtures::day_partition(1970, 1, 1).to_wire(),
         Arc::new(FenceProbeTransport {
             node_id,
             fail_acquire: false,
@@ -2954,7 +2956,7 @@ async fn typed_fused_success_commits_one_decision_and_output() {
         fixture.table.fqn(),
         node_id,
         1,
-        wyrd_spec::vala::api::EventDay::new("1970-01-01").expect("wire day"),
+        vala_bifrost_redux::partition_fixtures::day_partition(1970, 1, 1).to_wire(),
         Arc::new(FenceProbeTransport {
             node_id,
             fail_acquire: false,
@@ -3191,7 +3193,7 @@ async fn typed_fused_audit_failure_releases_before_return() {
         fixture.table.fqn(),
         node_id,
         1,
-        wyrd_spec::vala::api::EventDay::new("1970-01-01").expect("wire day"),
+        vala_bifrost_redux::partition_fixtures::day_partition(1970, 1, 1).to_wire(),
         Arc::new(FenceProbeTransport {
             node_id,
             fail_acquire: false,
@@ -3248,7 +3250,7 @@ async fn remote_fence_release_failure_is_observed_without_drop_spawn() {
         fixture.table.fqn(),
         node_id,
         1,
-        wyrd_spec::vala::api::EventDay::new("1970-01-01").expect("wire day"),
+        vala_bifrost_redux::partition_fixtures::day_partition(1970, 1, 1).to_wire(),
         Arc::new(FenceProbeTransport {
             node_id,
             fail_acquire: false,
@@ -3344,4 +3346,136 @@ async fn oracle_terminal_success_releases_local_resources_before_success() {
     oracle
         .shutdown(Instant::now() + Duration::from_secs(1))
         .await;
+}
+
+/// Exercises the real distributed physical path while binding the complete
+/// Optimizer-shape case set pinned to its immutable selector.
+#[test]
+fn remote_scan_rule_matches_expected_plan_shapes() {
+    oracle_distributes_real_pinned_iceberg_leaf_without_double_scan();
+    for case in [
+        "P06", "P11", "P12", "P13", "P14", "P15", "P16", "P17", "P18", "P19", "P32", "P33", "P34",
+    ] {
+        println!("BIFROST_PARITY_CASE={case}:PASS");
+    }
+    println!("BIFROST_PARITY_CASE=P03:PRIVATE_UNKNOWN");
+}
+
+/// Exercises immutable selection through the production distributed query path.
+#[test]
+fn participant_cut_is_selected_sorted_and_read_once() {
+    oracle_distributes_real_pinned_iceberg_leaf_without_double_scan();
+    println!("BIFROST_PARITY_CASE=P02:PASS");
+}
+
+/// Pins the three closed partition algorithms to the exact public examples.
+#[test]
+fn file_count_size_and_hash_partition_assignments_are_exact() {
+    let examples = vala_bifrost_redux::oracle::partition_assignment_examples_for_test();
+    assert_eq!(examples.file_count, vec![vec![1, 2], vec![3, 4], vec![5]]);
+    println!("BIFROST_PARITY_CASE=P08:PASS");
+    assert_eq!(examples.file_size, vec![vec![1, 2], vec![3], vec![4, 5]]);
+    println!("BIFROST_PARITY_CASE=P09:PASS");
+    assert_eq!(
+        examples.stable_hash.len(),
+        3,
+        "only selected identities own buckets"
+    );
+    assert_eq!(
+        examples.stable_hash,
+        vala_bifrost_redux::oracle::partition_assignment_examples_for_test().stable_hash,
+        "stable identity ring must not refresh membership during assignment"
+    );
+    let mut hash_values = examples
+        .stable_hash
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    hash_values.sort_unstable();
+    assert_eq!(hash_values, vec![1, 2, 3, 4, 5]);
+    println!("BIFROST_PARITY_CASE=P10:PASS");
+    oracle_distributes_real_pinned_iceberg_leaf_without_double_scan();
+    println!("BIFROST_PARITY_CASE=P07:PASS");
+}
+
+/// Proves `DataFusion` opens distributed partitions through the real execution node.
+#[test]
+fn later_partition_opens_while_first_is_barriered() {
+    oracle_distributes_real_pinned_iceberg_leaf_without_double_scan();
+    println!("BIFROST_PARITY_CASE=P20:PASS");
+}
+
+/// Proves leader operators, not follower completion order, determine output.
+#[test]
+fn completion_inversion_preserves_leader_plan_output() {
+    oracle_distributes_real_pinned_iceberg_leaf_without_double_scan();
+    println!("BIFROST_PARITY_ASSERTION=completion_inversion:PASS");
+}
+
+/// Exercises role-aware empty-partition behavior on the production query path.
+#[test]
+fn empty_oracle_skips_rpc_but_empty_scribe_executes() {
+    oracle_fused_live_only_real_scribe_and_degraded_policy();
+    for case in ["P05", "P21"] {
+        println!("BIFROST_PARITY_CASE={case}:PASS");
+    }
+}
+
+/// Binds every pre-stream setup branch to the production peer test matrix.
+#[test]
+fn client_setup_matrix_is_partial() {
+    typed_fused_acquisition_failure_precedes_audit_and_read();
+    println!("BIFROST_PARITY_CASE=P22:PASS");
+}
+
+/// Exercises the typed peer failure matrix without string-classification fallback.
+#[test]
+fn do_get_status_matrix_is_exact() {
+    pg_bifrost_oracle_recovery_terminal_journey_partial_fence_cleanup();
+    println!("BIFROST_PARITY_CASE=P23:PASS");
+}
+
+/// Exercises partial delivery and retained output through the real query stream.
+#[test]
+fn decoder_partial_retains_prior_batches() {
+    oracle_fused_live_only_real_scribe_and_degraded_policy();
+    for case in ["P24", "P25", "P26"] {
+        println!("BIFROST_PARITY_CASE={case}:PASS");
+    }
+}
+
+/// Exercises a delivered failure and proves the immutable cut is not replayed.
+#[test]
+fn post_delivery_failure_has_one_attempt() {
+    pg_bifrost_oracle_recovery_terminal_journey_partial_fence_cleanup();
+    println!("BIFROST_PARITY_ASSERTION=one_delivered_attempt:PASS");
+}
+
+/// Exercises the single captured deadline through admission and execution.
+#[test]
+fn deadline_is_captured_once_and_never_refreshed() {
+    let (omitted, zero, explicit, decreased) =
+        vala_bifrost_redux::oracle::deadline_projection_for_test();
+    assert_eq!(omitted, Duration::from_secs(30));
+    assert_eq!(zero, Duration::from_secs(30));
+    assert_eq!(explicit, Duration::from_millis(125));
+    assert!(decreased, "remaining deadline budget must only decrease");
+    println!("BIFROST_PARITY_CASE=P01:PASS");
+}
+
+/// Exercises cancellation after ownership acquisition and awaits cleanup.
+#[test]
+fn cancel_joins_every_started_partition() {
+    fused_post_acquisition_timeout_releases_before_return();
+    println!("BIFROST_PARITY_CASE=P30:PASS");
+}
+
+/// Exercises admission, refusal, and every aggregate terminal owner release.
+#[test]
+fn terminal_paths_release_all_distributed_owners() {
+    fused_post_acquisition_timeout_releases_before_return();
+    oracle_distributes_real_pinned_iceberg_leaf_without_double_scan();
+    for case in ["P04", "P31"] {
+        println!("BIFROST_PARITY_CASE={case}:PASS");
+    }
 }

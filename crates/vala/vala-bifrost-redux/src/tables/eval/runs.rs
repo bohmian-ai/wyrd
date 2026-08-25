@@ -2,8 +2,9 @@ use arrow::datatypes::Field;
 
 use crate::tables::fields::{fixed_binary, float64, int32, int64, ts_us_utc, utf8};
 use crate::tables::{
-    CorrelationPolicy, DeclaredIndex, DomainTable, IndexKind, PayloadClass, SortKey,
+    CorrelationPolicy, DomainTable, PayloadClass, hourly_layout, sort_asc_nulls_first, sort_desc,
 };
+use wyrd_spec::vala::api::PhysicalLayoutWire;
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 pub struct RunsTable;
@@ -33,38 +34,14 @@ impl DomainTable for RunsTable {
         ]
     }
 
-    fn sort_keys() -> Vec<SortKey> {
-        vec![
-            SortKey {
-                column: WYRD_EVENT_TIME.into(),
-                ascending: false,
-                nulls_first: false,
-            },
-            SortKey {
-                column: "eval_ref".into(),
-                ascending: true,
-                nulls_first: true,
-            },
-            SortKey {
-                column: "run_id".into(),
-                ascending: true,
-                nulls_first: true,
-            },
-        ]
-    }
-
-    fn declared_indexes() -> Vec<DeclaredIndex> {
-        vec![
-            DeclaredIndex {
-                name: "eval_runs_run_id_lookup".into(),
-                columns: vec!["run_id".into()],
-                kind: IndexKind::BloomFilter,
-            },
-            DeclaredIndex {
-                name: "eval_runs_eval_ref_bloom".into(),
-                columns: vec!["eval_ref".into()],
-                kind: IndexKind::BloomFilter,
-            },
-        ]
+    fn physical_layout() -> PhysicalLayoutWire {
+        hourly_layout(
+            vec![
+                sort_desc(WYRD_EVENT_TIME),
+                sort_asc_nulls_first("eval_ref"),
+                sort_asc_nulls_first("run_id"),
+            ],
+            &["run_id", "eval_ref"],
+        )
     }
 }

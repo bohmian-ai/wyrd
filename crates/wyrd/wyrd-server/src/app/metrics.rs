@@ -287,7 +287,7 @@ pub fn install_recorder() -> Result<PrometheusHandle, MetricsError> {
             )
             .map_err(MetricsError::Buckets)?;
     }
-    builder
+    let handle = builder
         .set_buckets_for_metric(
             Matcher::Full(BIFROST_FORGE_TASK_SPILL_BYTES.to_owned()),
             FORGE_SPILL_BUCKETS,
@@ -299,7 +299,9 @@ pub fn install_recorder() -> Result<PrometheusHandle, MetricsError> {
         )
         .map_err(MetricsError::Buckets)?
         .install_recorder()
-        .map_err(MetricsError::Install)
+        .map_err(MetricsError::Install)?;
+    vala_bifrost_redux::gate::initialize_gate_metrics();
+    Ok(handle)
 }
 
 /// Shared test-only Prometheus handle that installs the process recorder once.

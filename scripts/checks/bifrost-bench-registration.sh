@@ -55,32 +55,4 @@ forbid '--bench bench_bifrost_cluster' mise.toml
 # The deleted balanced-RPS cluster bench target is unregistered.
 forbid 'name = "bench_bifrost_cluster"' crates/wyrd/wyrd-testing/Cargo.toml
 
-# Every symbol, file, and target retired by the balanced-RPS deletion cone stays
-# absent from the tree. The checked-in ledger is the source of truth; assert each
-# ledgered name is gone (word-boundary fixed-string match, so retained names such
-# as BifrostCapacityStage never collide with deleted CapacityStage). Canonical
-# plan history, the ledger, and this checker are the only permitted mentions.
-ledger="scripts/checks/bifrost-bench-deletion-ledger.tsv"
-if [[ ! -f "$ledger" ]]; then
-  echo "missing Bifrost benchmark deletion ledger: $ledger" >&2
-  exit 1
-fi
-while IFS=$'\t' read -r kind name _file _replacement; do
-  [[ "$kind" == \#* || -z "$kind" ]] && continue
-  if git grep -n -w -I -F -e "$name" -- \
-      ':(exclude).dev/plan/**' \
-      ":(exclude)$ledger" \
-      ':(exclude)scripts/checks/bifrost-bench-registration.sh' \
-      'crates/**' 'scripts/**' 'benches/**' 'benchmarks/**' 'mise.toml' \
-      >/dev/null 2>&1; then
-    echo "ledgered deleted Bifrost benchmark name still present in tree: $name (see $ledger)" >&2
-    git grep -n -w -I -F -e "$name" -- \
-      ':(exclude).dev/plan/**' \
-      ":(exclude)$ledger" \
-      ':(exclude)scripts/checks/bifrost-bench-registration.sh' \
-      'crates/**' 'scripts/**' 'benches/**' 'benchmarks/**' 'mise.toml' >&2 || true
-    exit 1
-  fi
-done < "$ledger"
-
 echo "Bifrost tiered-runner benchmark registration passed"

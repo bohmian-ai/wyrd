@@ -68,6 +68,7 @@ pub async fn seed_query_fixture(
                 .map(|field| field.as_ref().clone())
                 .collect(),
             tenant: server.data_tenant_id(),
+            physical_layout: None,
             audit: None,
         })
         .await

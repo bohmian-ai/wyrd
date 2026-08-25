@@ -101,6 +101,26 @@ impl OraclePeerRuntime {
     }
 }
 
+impl OraclePeerRuntime {
+    /// Returns the fenced worker mounted by the generated tonic service.
+    #[must_use]
+    pub fn worker(&self) -> Arc<OraclePeerWorker> {
+        Arc::clone(&self.worker)
+    }
+
+    /// Returns the scrubbed security writer retained by the peer service.
+    #[must_use]
+    pub fn security_audit(&self) -> Arc<PostgresPeerSecurityAudit> {
+        Arc::clone(&self.security_audit)
+    }
+
+    /// Returns the one authenticated lifecycle transport built at boot.
+    #[must_use]
+    pub fn lifecycle_transport(&self) -> Arc<OracleLifecycleTransport> {
+        Arc::clone(&self.lifecycle_transport)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,7 +142,6 @@ mod tests {
             .register_oracle(
                 "http://oracle.test",
                 OracleCapabilitiesV1 {
-                    peer_protocol_version: 1,
                     storage_protocol_version: 1,
                     cpu_cores: 1.0,
                     memory_budget_bytes: 1024,
@@ -209,25 +228,5 @@ mod tests {
         ));
         assert!(!mismatch_ready.load(Ordering::Acquire));
         assert!(mismatch_shutdown.is_cancelled());
-    }
-}
-
-impl OraclePeerRuntime {
-    /// Returns the fenced worker mounted by the generated tonic service.
-    #[must_use]
-    pub fn worker(&self) -> Arc<OraclePeerWorker> {
-        Arc::clone(&self.worker)
-    }
-
-    /// Returns the scrubbed security writer retained by the peer service.
-    #[must_use]
-    pub fn security_audit(&self) -> Arc<PostgresPeerSecurityAudit> {
-        Arc::clone(&self.security_audit)
-    }
-
-    /// Returns the one authenticated lifecycle transport built at boot.
-    #[must_use]
-    pub fn lifecycle_transport(&self) -> Arc<OracleLifecycleTransport> {
-        Arc::clone(&self.lifecycle_transport)
     }
 }

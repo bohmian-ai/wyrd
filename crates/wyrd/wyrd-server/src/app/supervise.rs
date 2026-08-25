@@ -199,21 +199,32 @@ fn classify_first(joined: Result<TaskExit, tokio::task::JoinError>, terminal: &m
             id,
             outcome: Err(msg),
         }) => {
-            tracing::warn!(?id, error = %msg, "task failed; initiating shutdown");
+            // ERROR, not WARN: this ends the serving process. An operator
+            // reading a WARN-filtered log would see the server stop with no
+            // record of why, which is exactly how this class of failure has
+            // been missed before.
+            tracing::error!(
+                ?id,
+                error = %msg,
+                "supervised task failed; terminating this wyrd-server process"
+            );
             *terminal = Some(format!("{id:?} failed: {msg}"));
         }
         Ok(TaskExit {
             id,
             outcome: Ok(()),
         }) => {
-            tracing::warn!(
+            tracing::error!(
                 ?id,
-                "task exited before shutdown signal; initiating shutdown"
+                "supervised task exited before shutdown signal; terminating this wyrd-server process"
             );
             *terminal = Some(format!("{id:?} exited before shutdown signal"));
         }
         Err(join_error) => {
-            tracing::warn!(error = %join_error, "task panicked; initiating shutdown");
+            tracing::error!(
+                error = %join_error,
+                "supervised task panicked; terminating this wyrd-server process"
+            );
             *terminal = Some(format!("task panicked: {join_error}"));
         }
     }

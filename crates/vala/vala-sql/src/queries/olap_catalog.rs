@@ -22,25 +22,25 @@ pub async fn upsert_table(
     table_uid: &[u8; 16],
     fqn: &str,
     fingerprint: &[u8; 32],
-    partition_columns: &[String],
+    physical_layout: &serde_json::Value,
 ) -> Result<(), SqlError> {
     sqlx::query(
         r#"
         INSERT INTO vala.bifrost_tables
-            (data_tenant_id, table_uid, fqn, fingerprint, partition_columns, origin, actor)
+            (data_tenant_id, table_uid, fqn, fingerprint, physical_layout, origin, actor)
         VALUES (wyrd.current_tenant(), $1, $2, $3, $4, 'system', 'system')
         ON CONFLICT (data_tenant_id, table_uid)
         DO UPDATE SET
-            fqn               = EXCLUDED.fqn,
-            fingerprint       = EXCLUDED.fingerprint,
-            partition_columns = EXCLUDED.partition_columns,
-            updated_at        = now()
+            fqn             = EXCLUDED.fqn,
+            fingerprint     = EXCLUDED.fingerprint,
+            physical_layout = EXCLUDED.physical_layout,
+            updated_at      = now()
         "#,
     )
     .bind(table_uid.as_slice())
     .bind(fqn)
     .bind(fingerprint.as_slice())
-    .bind(partition_columns)
+    .bind(physical_layout)
     .execute(&mut **conn.transaction())
     .await
     .map_err(SqlError::from)?;
@@ -58,7 +58,7 @@ pub async fn get_by_fqn(
     sqlx::query_as::<_, BifrostTableRow>(
         r#"
         SELECT data_tenant_id, table_uid, fqn, fingerprint, status,
-               partition_columns, registered_at, updated_at, origin, actor
+               physical_layout, registered_at, updated_at, origin, actor
           FROM vala.bifrost_tables
          WHERE fqn = $1
         "#,
@@ -79,7 +79,7 @@ pub async fn list_tables_for_tenant(
     sqlx::query_as::<_, BifrostTableRow>(
         r#"
         SELECT data_tenant_id, table_uid, fqn, fingerprint, status,
-               partition_columns, registered_at, updated_at, origin, actor
+               physical_layout, registered_at, updated_at, origin, actor
           FROM vala.bifrost_tables
         "#,
     )

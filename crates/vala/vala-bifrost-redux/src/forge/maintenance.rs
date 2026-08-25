@@ -21,7 +21,7 @@ use crate::catalog::TenantTableBinding;
 
 /// One already-filtered data manifest considered by the shared rewrite planner.
 ///
-redacted
+/// This deliberately carries only the manifest-rewrite planning
 /// inputs so scheduling and execution cannot drift in their completed-bin
 /// predicate.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,7 +38,7 @@ pub(super) struct ManifestRewriteCandidate {
 
 /// Selects at most one worthwhile oldest-first manifest bin per partition spec.
 ///
-redacted
+/// This is the synchronous Wyrd form of
 /// `gc.rs::plan_manifest_rewrite`: a completed bin and a final bin both must
 /// reduce at least two manifests to one. A final bin is useful only when it
 /// reaches the target bytes or the configured minimum count.
@@ -300,10 +300,158 @@ pub(super) struct ForgeMaintenanceResult {
     pub(super) expiry_terminals: Vec<PendingExpiryTerminal>,
 }
 
+/// The exact table, plan inputs, and due-work flags for one maintenance pass.
+///
+/// The dispatcher derives all six values from one validated claim, so they
+/// travel together rather than as six positional parameters in which the two
+/// adjacent booleans would be silently transposable.
+pub(super) struct ForgeMaintenanceRequest<'a> {
+    /// Identity of the table being maintained.
+    pub(super) key: &'a ForgeTableKey,
+    /// Tenant and table binding authorizing this pass.
+    pub(super) binding: &'a TenantTableBinding,
+    /// Loaded Iceberg table this pass commits against.
+    pub(super) table: Table,
+    /// Manifest paths selected by the claimed plan.
+    pub(super) manifest_paths: &'a [String],
+    /// Whether this pass must rewrite manifests.
+    pub(super) manifest_rewrite_due: bool,
+    /// Whether this pass must expire snapshots.
+    pub(super) snapshot_expiry_due: bool,
+}
+
 impl ForgeMaintenance {
     /// Constructs a lifecycle owner over the worker's existing Forge graph.
     pub(super) fn new(forge: Arc<Forge>) -> Self {
         Self { forge }
+    }
+
+    /// Selects the bounded set of manifests this pass may rewrite.
+    ///
+    /// Only data manifests the claimed plan already named are eligible, so a
+    /// pass can never widen its own scope from live table metadata. A table with
+    /// no current snapshot selects nothing. The final bounding applies the
+    /// tick's file and byte ceilings, so one pass cannot rewrite an unbounded
+    /// amount of metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Catalog`] when the current snapshot's manifest list
+    /// cannot be loaded.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a manifest reports a negative length after being filtered to
+    /// nonnegative lengths, which would mean the metadata changed mid-read.
+    async fn select_rewrite_paths(
+        &self,
+        table: &Table,
+        manifest_paths: &[String],
+    ) -> Result<Vec<String>, ForgeError> {
+        let Some(snapshot) = table.metadata().current_snapshot() else {
+            return Ok(Vec::new());
+        };
+        let manifests = table
+            .manifest_list_reader(snapshot)
+            .load()
+            .await
+            .map_err(ForgeError::Catalog)?;
+        let candidates = manifests
+            .entries()
+            .iter()
+            .filter(|manifest| {
+                manifest.content == iceberg::spec::ManifestContentType::Data
+                    && manifest_paths.contains(&manifest.manifest_path)
+                    && manifest.manifest_length >= 0
+            })
+            .map(|manifest| ManifestRewriteCandidate {
+                path: manifest.manifest_path.clone(),
+                size_bytes: u64::try_from(manifest.manifest_length)
+                    .expect("nonnegative manifest length fits u64"),
+                partition_spec_id: manifest.partition_spec_id,
+                sequence_number: manifest.sequence_number,
+            })
+            .collect::<Vec<_>>();
+        Ok(select_bounded_manifest_rewrite_paths(
+            &candidates,
+            self.forge.core.config.manifest_rewrite_target_size_bytes,
+            self.forge.core.config.manifest_rewrite_min_count,
+            self.forge.core.config.max_files_per_tick,
+            self.forge.core.config.max_bytes_per_tick,
+        ))
+    }
+
+    /// Submits one bounded manifest rewrite under the tick's retry timeout.
+    ///
+    /// Submission acceptance is unknowable once the request is in flight, so
+    /// both the timeout and cancellation paths return a reconciliation error
+    /// naming that uncertainty: a successor must reload metadata before it
+    /// retries rather than assuming the rewrite did not land. A stale selection
+    /// is not an error — the expiry stage that follows reconciles it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Catalog`] when the catalog rejects the rewrite, and
+    /// [`ForgeError::Reconciliation`] when the submission times out or is
+    /// cancelled with unknown acceptance.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation racing submission leaves acceptance unknown and is reported
+    /// as a reconciliation error, never as a clean stop.
+    async fn submit_manifest_rewrite(
+        &self,
+        table: &Table,
+        rewrite_paths: Vec<String>,
+        stop: &CancellationToken,
+    ) -> Result<(), ForgeError> {
+        let rewrite = rewrite_manifests(
+            self.forge.core.catalog.as_ref(),
+            table,
+            ManifestRewriteSelection {
+                manifest_paths: rewrite_paths,
+            },
+            ManifestRewriteLimits {
+                max_manifests: self.forge.core.config.max_files_per_tick,
+                max_entries: self.forge.core.config.max_files_per_tick,
+                max_bytes: self.forge.core.config.manifest_rewrite_target_size_bytes,
+            },
+        );
+        #[cfg(feature = "test-support")]
+        if self
+            .forge
+            .core
+            .maintenance_controls
+            .manifest
+            .pause(stop)
+            .await
+        {
+            return Err(ForgeError::Reconciliation {
+                detail: "Iceberg manifest rewrite was cancelled at submission with unknown acceptance; reload metadata before retry".to_owned(),
+            });
+        }
+        tokio::pin!(rewrite);
+        let rewritten = tokio::select! {
+            response = tokio::time::timeout(
+                self.forge.core.config.iceberg_total_retry_timeout,
+                &mut rewrite,
+            ) => match response {
+                Ok(Ok(rewritten)) => rewritten,
+                Ok(Err(error)) => return Err(ForgeError::Catalog(error)),
+                Err(_) => return Err(ForgeError::Reconciliation {
+                    detail: "Iceberg manifest rewrite timed out with unknown acceptance; reload metadata before retry"
+                        .to_owned(),
+                }),
+            },
+            () = stop.cancelled() => return Err(ForgeError::Reconciliation {
+                detail: "Iceberg manifest rewrite was cancelled with unknown acceptance; reload metadata before retry"
+                    .to_owned(),
+            }),
+        };
+        if rewritten.outcome == ManifestRewriteOutcome::Stale {
+            tracing::debug!("manifest rewrite selection became stale; reconciling expiry state");
+        }
+        Ok(())
     }
 
     /// Runs manifest rewrite, watermarked expiry, and never-published cleanup in order.
@@ -331,14 +479,17 @@ impl ForgeMaintenance {
     pub(super) async fn execute(
         &self,
         lease: &mut ForgeLease,
-        key: &ForgeTableKey,
-        binding: &TenantTableBinding,
-        table: Table,
-        manifest_paths: &[String],
-        manifest_rewrite_due: bool,
-        snapshot_expiry_due: bool,
+        request: ForgeMaintenanceRequest<'_>,
         stop: &CancellationToken,
     ) -> Result<ForgeMaintenanceResult, ForgeError> {
+        let ForgeMaintenanceRequest {
+            key,
+            binding,
+            table,
+            manifest_paths,
+            manifest_rewrite_due,
+            snapshot_expiry_due,
+        } = request;
         require_running(stop)?;
         lease.require_fence(&self.forge.core.operator_pool).await?;
         if !lease.commit_window_fits(self.forge.core.config.commit_window()) {
@@ -360,91 +511,11 @@ impl ForgeMaintenance {
                         .to_owned(),
             });
         }
-        let rewrite_paths =
-            if manifest_rewrite_due && self.forge.core.config.manifest_rewrite_enabled {
-                if let Some(snapshot) = table.metadata().current_snapshot() {
-                    let manifests = table
-                        .manifest_list_reader(snapshot)
-                        .load()
-                        .await
-                        .map_err(ForgeError::Catalog)?;
-                    let candidates = manifests
-                        .entries()
-                        .iter()
-                        .filter(|manifest| {
-                            manifest.content == iceberg::spec::ManifestContentType::Data
-                                && manifest_paths.contains(&manifest.manifest_path)
-                                && manifest.manifest_length >= 0
-                        })
-                        .map(|manifest| ManifestRewriteCandidate {
-                            path: manifest.manifest_path.clone(),
-                            size_bytes: u64::try_from(manifest.manifest_length)
-                                .expect("nonnegative manifest length fits u64"),
-                            partition_spec_id: manifest.partition_spec_id,
-                            sequence_number: manifest.sequence_number,
-                        })
-                        .collect::<Vec<_>>();
-                    select_bounded_manifest_rewrite_paths(
-                        &candidates,
-                        self.forge.core.config.manifest_rewrite_target_size_bytes,
-                        self.forge.core.config.manifest_rewrite_min_count,
-                        self.forge.core.config.max_files_per_tick,
-                        self.forge.core.config.max_bytes_per_tick,
-                    )
-                } else {
-                    Vec::new()
-                }
-            } else {
-                Vec::new()
-            };
-        if !rewrite_paths.is_empty() {
-            let rewrite = rewrite_manifests(
-                self.forge.core.catalog.as_ref(),
-                &table,
-                ManifestRewriteSelection {
-                    manifest_paths: rewrite_paths,
-                },
-                ManifestRewriteLimits {
-                    max_manifests: self.forge.core.config.max_files_per_tick,
-                    max_entries: self.forge.core.config.max_files_per_tick,
-                    max_bytes: self.forge.core.config.manifest_rewrite_target_size_bytes,
-                },
-            );
-            #[cfg(feature = "test-support")]
-            if self
-                .forge
-                .core
-                .maintenance_controls
-                .manifest
-                .pause(stop)
-                .await
-            {
-                return Err(ForgeError::Reconciliation {
-                    detail: "Iceberg manifest rewrite was cancelled at submission with unknown acceptance; reload metadata before retry".to_owned(),
-                });
-            }
-            tokio::pin!(rewrite);
-            let rewritten = tokio::select! {
-                response = tokio::time::timeout(
-                    self.forge.core.config.iceberg_total_retry_timeout,
-                    &mut rewrite,
-                ) => match response {
-                    Ok(Ok(rewritten)) => rewritten,
-                    Ok(Err(error)) => return Err(ForgeError::Catalog(error)),
-                    Err(_) => return Err(ForgeError::Reconciliation {
-                        detail: "Iceberg manifest rewrite timed out with unknown acceptance; reload metadata before retry"
-                            .to_owned(),
-                    }),
-                },
-                () = stop.cancelled() => return Err(ForgeError::Reconciliation {
-                    detail: "Iceberg manifest rewrite was cancelled with unknown acceptance; reload metadata before retry"
-                        .to_owned(),
-                }),
-            };
-            if rewritten.outcome == ManifestRewriteOutcome::Stale {
-                tracing::debug!(
-                    "manifest rewrite selection became stale; reconciling expiry state"
-                );
+        if manifest_rewrite_due && self.forge.core.config.manifest_rewrite_enabled {
+            let rewrite_paths = self.select_rewrite_paths(&table, manifest_paths).await?;
+            if !rewrite_paths.is_empty() {
+                self.submit_manifest_rewrite(&table, rewrite_paths, stop)
+                    .await?;
             }
         }
         lease.require_fence(&self.forge.core.operator_pool).await?;
@@ -522,6 +593,19 @@ impl ForgeMaintenance {
     }
 }
 
+/// Rejects a maintenance stage before it starts when shared authority is cancelled.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::Shutdown`] when claim, table-lease, or process authority was lost.
+fn require_running(stop: &CancellationToken) -> Result<(), ForgeError> {
+    if stop.is_cancelled() {
+        Err(ForgeError::Shutdown)
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -543,7 +627,7 @@ mod tests {
         }
     }
 
-redacted
+    /// Applies the completed-bin and final-bin reduction predicates.
     #[test]
     fn manifest_selector_requires_two_manifests_and_selects_completed_bins() {
         assert!(select_manifest_rewrite_paths(&[candidate("only", 99, 0, 0)], 100, 1).is_empty());
@@ -624,18 +708,5 @@ redacted
         let candidates = [candidate("old-a", 50, 0, 1), candidate("old-b", 50, 0, 2)];
         assert!(manifest_rewrite_is_due(&candidates, 100, 2));
         assert!(!manifest_rewrite_is_due(&candidates[..1], 100, 2));
-    }
-}
-
-/// Rejects a maintenance stage before it starts when shared authority is cancelled.
-///
-/// # Errors
-///
-/// Returns [`ForgeError::Shutdown`] when claim, table-lease, or process authority was lost.
-fn require_running(stop: &CancellationToken) -> Result<(), ForgeError> {
-    if stop.is_cancelled() {
-        Err(ForgeError::Shutdown)
-    } else {
-        Ok(())
     }
 }

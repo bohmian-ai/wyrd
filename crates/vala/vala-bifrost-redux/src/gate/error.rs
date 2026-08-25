@@ -132,7 +132,56 @@ pub enum IngestError {
     Internal(String),
 }
 
+/// Closed set of Gate rejection reasons projected from [`IngestError`].
+///
+/// This is the single source of the `reason` label space carried by
+/// `bifrost_gate_rejections_total`. The transport owner seeds every
+/// `operation` x `reason` pair to zero when it installs the recorder, so an
+/// absent series and a zero series are never distinguishable, and it emits
+/// through [`IngestError::rejection_reason`] so the taxonomy is never restated
+/// at a call site.
+pub const GATE_REJECTION_REASONS: [&str; 8] = [
+    "auth",
+    "permission",
+    "validation",
+    "payload_limit",
+    "catalog",
+    "role_unavailable",
+    "scribe_admission",
+    "oracle_admission",
+];
+
 impl IngestError {
+    /// Projects this refusal into its closed Gate rejection reason.
+    ///
+    /// Gate owns the taxonomy because it owns [`IngestError`]; the transport
+    /// owner turns the returned label into one `bifrost_gate_rejections_total`
+    /// increment without restating the mapping. Every returned value is a
+    /// member of [`GATE_REJECTION_REASONS`].
+    ///
+    /// Returns `None` for [`IngestError::Internal`], which is a server failure
+    /// rather than a rejection: counting it as a rejection would attribute a
+    /// Wyrd defect to caller behavior and inflate the rejection rate that
+    /// admission alerting reads.
+    #[must_use]
+    pub const fn rejection_reason(&self) -> Option<&'static str> {
+        Some(match self {
+            Self::RbacDenied { .. }
+            | Self::ReservedBuiltinWriteDenied { .. }
+            | Self::CardScopeDenied { .. }
+            | Self::CardUnresolved { .. } => "permission",
+            Self::PayloadTooLarge { .. } => "payload_limit",
+            Self::RequestValidation(_)
+            | Self::Decode(_)
+            | Self::EventTimeOutOfRange { .. }
+            | Self::TooManyRows { .. } => "validation",
+            Self::TableNotFound { .. } | Self::SchemaMismatch { .. } => "catalog",
+            Self::IngressClosed => "role_unavailable",
+            Self::IngestBusy { .. } | Self::WalDiskFull => "scribe_admission",
+            Self::Unauthenticated(_) | Self::PrincipalUnresolved => "auth",
+            Self::Internal(_) => return None,
+        })
+    }
     /// Project the Gate taxonomy into the derive-backed public Wyrd catalog.
     ///
     /// This is the sole ingest identity projection. HTTP supplies the endpoint
@@ -362,6 +411,34 @@ mod tests {
     use crate::contracts::ScribeError;
     use wyrd_tonic::tonic::Code;
     use wyrd_tonic::tonic_types::StatusExt;
+
+    /// Every refusal projects into the closed reason set, and only Internal opts out.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a variant yields a reason outside
+    /// [`super::GATE_REJECTION_REASONS`], or when a caller-attributed refusal
+    /// declines to classify — either would silently drop a refusal out of
+    /// `bifrost_gate_rejections_total`.
+    #[test]
+    fn every_ingest_refusal_projects_into_the_closed_reason_set() {
+        for (error, _, _, _) in ingest_cases() {
+            let internal = matches!(error, IngestError::Internal(_));
+            match error.rejection_reason() {
+                Some(reason) => {
+                    assert!(!internal, "an internal failure must not be a rejection");
+                    assert!(
+                        super::GATE_REJECTION_REASONS.contains(&reason),
+                        "reason {reason} escapes the closed rejection label set"
+                    );
+                }
+                None => assert!(
+                    internal,
+                    "only an internal failure may decline a rejection reason"
+                ),
+            }
+        }
+    }
 
     /// Build the complete Gate error matrix used by both transport tests.
     fn ingest_cases() -> Vec<(IngestError, &'static str, u16, Code)> {

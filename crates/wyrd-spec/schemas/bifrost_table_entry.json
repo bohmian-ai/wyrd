@@ -7,7 +7,6 @@
     "fingerprint",
     "name",
     "namespace",
-    "partition_columns",
     "registered_at",
     "status",
     "table_uid",
@@ -25,13 +24,6 @@
     "namespace": {
       "description": "Namespace component of the fully-qualified name (`<ns>.<name>` → ns).",
       "type": "string"
-    },
-    "partition_columns": {
-      "description": "Declared partition columns.",
-      "type": "array",
-      "items": {
-        "type": "string"
-      }
     },
     "registered_at": {
       "description": "Wall-clock registration time.",

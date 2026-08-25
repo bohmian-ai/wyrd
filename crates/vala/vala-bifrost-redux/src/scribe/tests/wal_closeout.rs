@@ -6,16 +6,17 @@ use crate::catalog::TableRef;
 use crate::contracts::{ScribeAppend, ScribeError};
 use crate::namespaces::BifrostNamespace;
 use crate::schema::fingerprint::SchemaFingerprint;
+use crate::scribe::admission::EventTimeWindow;
 use crate::scribe::audit_envelope::encode_audit_event;
 use crate::scribe::memory::MemoryCategory;
 use crate::scribe::replay::replay_wal_directory;
-use crate::scribe::seal_key::{EventDay, SealKey};
+use crate::scribe::seal_key::SealKey;
 use crate::scribe::stream_identity::NodeId;
 use crate::scribe::wal::{SegmentHeader, WalConfig, WalWriter};
 use arrow::array::{Int64Array, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use chrono::NaiveDate;
+use chrono::Datelike as _;
 use opendal::services::Memory;
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -30,8 +31,34 @@ fn key(tenant: DataTenantId, table: &str) -> SealKey {
     SealKey::new(
         tenant,
         TableRef::new(BifrostNamespace::Bifrost, table),
-        EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 24).expect("test day")),
+        fixture_event_partition(),
     )
+}
+
+/// The one admitted event-time instant every closeout fixture shares.
+///
+/// Derived from the production admission window rather than pinned, so the
+/// batch this module builds stays inside `[receipt - past, receipt + future]`
+/// at any wall-clock time. A pinned literal here ages out of the window and
+/// turns every appending test in this file into a permanent failure.
+fn fixture_event_time_micros() -> i64 {
+    EventTimeWindow::default().admitted_event_time_micros(1)
+}
+
+/// The exact daily partition covering [`fixture_event_time_micros`].
+///
+/// Both come from the same instant, so a `SealKey` built here cannot drift
+/// onto a different partition than the row it seals. Built through the shared
+/// [`crate::partition_fixtures::day_partition`] constructor so this module
+/// never derives its own partition boundary.
+///
+/// # Panics
+/// Panics when the derived instant is not representable as a UTC date.
+fn fixture_event_partition() -> crate::catalog::layout::TimePartition {
+    let date = chrono::DateTime::from_timestamp_micros(fixture_event_time_micros())
+        .expect("derived event time must be representable")
+        .date_naive();
+    crate::partition_fixtures::day_partition(date.year(), date.month(), date.day())
 }
 
 /// Encode the fixed closeout audit payload.
@@ -78,15 +105,8 @@ fn batch_with_value(value: i64) -> RecordBatch {
         ])),
         vec![
             Arc::new(
-                TimestampMicrosecondArray::from(vec![
-                    NaiveDate::from_ymd_opt(2026, 7, 24)
-                        .expect("date")
-                        .and_hms_opt(12, 0, 0)
-                        .expect("time")
-                        .and_utc()
-                        .timestamp_micros(),
-                ])
-                .with_timezone("UTC"),
+                TimestampMicrosecondArray::from(vec![fixture_event_time_micros()])
+                    .with_timezone("UTC"),
             ),
             Arc::new(Int64Array::from(vec![value])),
         ],
@@ -483,7 +503,14 @@ async fn sync_failure_has_no_ack_or_memtable_visibility() {
     let error = append(&scribe, tenant, "sync_failure", Uuid::now_v7())
         .await
         .expect_err("sync failure must not acknowledge");
-    assert!(error.to_string().contains("sync failure"));
+    // Assert the variant, not the wording. A non-disk-full fsync failure is
+    // modelled as `Internal` by `WalSegment::sync_data`, and the injection
+    // returns that same variant, so this holds for the real failure too;
+    // `WalDiskFull` stays distinct because only it marks the disk hard-failed.
+    assert!(
+        matches!(error, ScribeError::Internal { .. }),
+        "sync failure must surface as a typed Internal error; got {error:?}"
+    );
     let stats = scribe.memtable_stats().expect("memtable stats");
     assert_eq!(stats.writable_rows + stats.immutable_rows, 0);
     assert!(

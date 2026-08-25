@@ -621,7 +621,7 @@ mod tests {
         (authority, audit)
     }
 
-    /// Builds one fully bound v1 claim for authority tests.
+    /// Builds one fully bound v2 claim for authority tests.
     fn claims(
         worker: NodeId,
         worker_fence: u64,
@@ -629,7 +629,7 @@ mod tests {
         now: DateTime<Utc>,
     ) -> PeerTicketClaims {
         PeerTicketClaims {
-            protocol_version: 1,
+            protocol_version: vala_bifrost_redux::oracle::dispatcher::PEER_PROTOCOL_VERSION,
             audience: worker.as_uuid().as_bytes().to_vec(),
             worker_fence,
             leader_node_id: uuid::Uuid::from_u128(2).as_bytes().to_vec(),
@@ -643,6 +643,7 @@ mod tests {
             manifest_digest: "manifest".to_owned(),
             projection_digest: "projection".to_owned(),
             permission_digest: "permission".to_owned(),
+            assignment_authority_digest: "assignment-authority".to_owned(),
         }
     }
 

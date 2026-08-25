@@ -4,7 +4,7 @@ mod pg_tests {
     //! Tests verify:
     //! - Seal writes exactly one `vala.file_list` row with correct metadata
     //! - Seal emits one `vala.audit_outbox` row per append (preserves principal)
-    //! - Cross-day batches produce separate `file_list` rows per `partition_day`
+    //! - Cross-boundary batches produce separate `file_list` rows per time partition
     //! - Seal tx failure leaves no `file_list` or audit rows (rollback atomicity)
     //!
     //! Skipped when `WYRD_DATABASE_URL` is unset (credential-free default suite).
@@ -16,6 +16,7 @@ mod pg_tests {
     use sha2::{Digest, Sha256};
     use sqlx::types::Uuid;
     use std::sync::Arc;
+    use vala_bifrost_redux::catalog::layout::TimePartition;
     use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
     use vala_bifrost_redux::contracts::ScribeAppend;
     use vala_bifrost_redux::namespaces::BifrostNamespace;
@@ -68,6 +69,46 @@ mod pg_tests {
         setup_with_faults_at_memory_limit_and_identity(faults, memory_limit_bytes, 1, None).await
     }
 
+    /// Builds the injected Scribe-only resource snapshot the seal fixtures share.
+    ///
+    /// Seal tests pin memory and scratch explicitly so admission decisions are
+    /// deterministic rather than host-dependent, and they compose only the
+    /// `Scribe` role so role budgeting matches a Scribe-target deployment.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the pinned snapshot and policy do not compose into a valid
+    /// Bifrost resource budget, which is a fixture defect.
+    fn seal_runtime_resources(
+        memory_limit_bytes: usize,
+        scratch_root: &std::path::Path,
+        volume_roots: vala_bifrost_redux::resources::BifrostVolumeRoots,
+    ) -> vala_bifrost_redux::resources::BifrostRuntimeResources {
+        vala_bifrost_redux::resources::BifrostRuntimeResources::from_snapshot(
+            vala_bifrost_redux::resources::SystemResourceSnapshot {
+                memory_limit_bytes,
+                effective_cpu: 4,
+                scratch_capacity_bytes: 1024 * 1024 * 1024,
+                scratch_available_bytes: 1024 * 1024 * 1024,
+                memory_source: vala_bifrost_redux::resources::ResourceSource::Injected,
+                cpu_source: vala_bifrost_redux::resources::ResourceSource::Injected,
+            },
+            vala_bifrost_redux::resources::BifrostResourcePolicy {
+                roles: std::collections::BTreeSet::from([
+                    vala_bifrost_redux::resources::BifrostRole::Scribe,
+                ]),
+                memory_limit_bytes: None,
+                unmanaged_reserve_bytes: None,
+                scratch_limit_bytes: None,
+                effective_cpu: None,
+                oracle_query_slot_limit: None,
+                scratch_root: scratch_root.to_owned(),
+                volume_roots: Some(volume_roots),
+            },
+        )
+        .expect("test Bifrost resources")
+    }
+
     /// Starts a direct-seal fixture with a caller-selected durable stream identity.
     async fn setup_with_faults_at_memory_limit_and_identity(
         faults: PersistenceFaults,
@@ -111,28 +152,7 @@ mod pg_tests {
         );
 
         let runtime_resources =
-            vala_bifrost_redux::resources::BifrostRuntimeResources::from_snapshot(
-                vala_bifrost_redux::resources::SystemResourceSnapshot {
-                    memory_limit_bytes,
-                    effective_cpu: 4,
-                    scratch_capacity_bytes: 1024 * 1024 * 1024,
-                    scratch_available_bytes: 1024 * 1024 * 1024,
-                    memory_source: vala_bifrost_redux::resources::ResourceSource::Injected,
-                    cpu_source: vala_bifrost_redux::resources::ResourceSource::Injected,
-                },
-                vala_bifrost_redux::resources::BifrostResourcePolicy {
-                    roles: std::collections::BTreeSet::from([
-                        vala_bifrost_redux::resources::BifrostRole::Scribe,
-                    ]),
-                    memory_limit_bytes: None,
-                    unmanaged_reserve_bytes: None,
-                    scratch_limit_bytes: None,
-                    effective_cpu: None,
-                    scratch_root: scratch_dir.path().to_owned(),
-                    volume_roots: Some(volume_roots),
-                },
-            )
-            .expect("test Bifrost resources");
+            seal_runtime_resources(memory_limit_bytes, scratch_dir.path(), volume_roots);
         let resources = runtime_resources
             .compose_roles()
             .expect("test role resources");
@@ -180,6 +200,23 @@ mod pg_tests {
                 rotation_for_test: None,
             },
         );
+
+        // The seal path re-resolves the stored layout for every generation, so
+        // the fixture publishes the same control row registration would have.
+        // The canonical layout names only managed columns, so the fixture user
+        // projection is enough to canonicalize it.
+        let registered_schema =
+            Schema::new(vala_bifrost_redux::schema::with_managed_columns(vec![
+                Field::new("value", DataType::UInt64, false),
+            ]));
+        crate::control_row_fixture::register_control_row(
+            fixture.vala_postgres(),
+            tenant,
+            BifrostNamespace::Bifrost.as_str(),
+            "events",
+            &registered_schema,
+        )
+        .await;
 
         (fixture, tenant, scribe, operator)
     }
@@ -450,18 +487,18 @@ mod pg_tests {
         DataTenantId,
         Arc<opendal::Operator>,
         TenantTableBinding,
-        chrono::NaiveDate,
+        DateTime<Utc>,
     ) {
         let (fixture, tenant, scribe, operator) =
             setup_with_faults_at_memory_limit(PersistenceFaults::default(), 832 * 1024 * 1024)
                 .await;
         let binding = TenantTableBinding::resolve((tenant, events_table())).expect("binding");
-        let expected_day = Utc::now().date_naive();
-        let base_time = expected_day
+        let expected_event_time = Utc::now()
+            .date_naive()
             .and_hms_opt(12, 0, 0)
             .expect("current day accepts noon")
-            .and_utc()
-            .timestamp_micros();
+            .and_utc();
+        let base_time = expected_event_time.timestamp_micros();
         let batch = make_batch(50_000, base_time);
         scribe
             .append(ScribeAppend {
@@ -480,9 +517,18 @@ mod pg_tests {
             .await
             .expect("tenant conn");
         let post_commit = scribe.force_seal(&mut conn).await.expect("force_seal");
-        assert_eq!(
-            scribe.memory_snapshot().scribe_total_bytes,
-            (256 - 8) * 1024 * 1024
+        // The seal reservation is derived from the largest encode candidate, so
+        // it is a property of the fixture batch rather than a fixed envelope.
+        // What the exact floor guarantees is that a 50k-row generation still
+        // encodes while the whole charge stays inside the Scribe budget.
+        let sealed = scribe.memory_snapshot();
+        assert!(
+            sealed.scribe_total_bytes > 0,
+            "the open seal still holds its encode reservation"
+        );
+        assert!(
+            sealed.scribe_total_bytes <= sealed.scribe_limit_bytes,
+            "the seal reservation stays inside the Scribe budget at the exact floor"
         );
         let commit_result = conn.commit().await;
         complete_post_commit(&scribe, post_commit, &commit_result).await;
@@ -491,28 +537,51 @@ mod pg_tests {
                 [vala_bifrost_redux::scribe::memory::MemoryCategory::Persistence as usize],
             0
         );
-        (fixture, tenant, operator, binding, expected_day)
+        (fixture, tenant, operator, binding, expected_event_time)
     }
 
     /// One complete durable file-list projection for a sealed writer-v2 object.
-    type SealedFileRow = (
-        Uuid,
-        Uuid,
-        String,
-        String,
-        String,
-        i64,
-        i64,
-        String,
-        i64,
-        i64,
-        Uuid,
-        i64,
-        DateTime<chrono::Utc>,
-        DateTime<chrono::Utc>,
-        i16,
-        Option<String>,
-    );
+    ///
+    /// The projection is a named struct rather than a tuple because the row
+    /// carries both durable partition columns, which puts it past the arity
+    /// `sqlx` implements `FromRow` for on tuples.
+    #[derive(sqlx::FromRow)]
+    struct SealedFileRow {
+        /// Durable row identity.
+        id: Uuid,
+        /// Owning data tenant.
+        data_tenant_id: Uuid,
+        /// Logical namespace of the sealed table.
+        namespace: String,
+        /// Table name within the namespace.
+        table_name: String,
+        /// Object-store path of the sealed Parquet file.
+        file_path: String,
+        /// Rows encoded into the object.
+        row_count: i64,
+        /// Encoded object size in bytes.
+        file_size: i64,
+        /// Durable partition granularity token.
+        partition_granularity: String,
+        /// Durable partition start boundary.
+        partition_start: DateTime<Utc>,
+        /// Lowest WAL LSN covered by the object.
+        wal_lsn_min: i64,
+        /// Highest WAL LSN covered by the object.
+        wal_lsn_max: i64,
+        /// Writer stream node identity.
+        node_id: Uuid,
+        /// Writer stream epoch.
+        writer_epoch: i64,
+        /// Minimum event time in the object.
+        min_event_time: DateTime<Utc>,
+        /// Maximum event time in the object.
+        max_event_time: DateTime<Utc>,
+        /// Ordinal of the object within its seal.
+        file_ordinal: i16,
+        /// Writer-v2 content checksum.
+        file_checksum: Option<String>,
+    }
 
     /// Loads the sole durable writer-v2 row emitted by the fixture.
     async fn load_sealed_file_row(fixture: &PgFixture, tenant: DataTenantId) -> SealedFileRow {
@@ -521,7 +590,8 @@ mod pg_tests {
             .expect("tenant conn2");
         let rows: Vec<SealedFileRow> = sqlx::query_as(
             r"SELECT id,data_tenant_id,namespace,table_name,file_path,row_count,file_size,
-               partition_day::text,wal_lsn_min,wal_lsn_max,node_id,writer_epoch,
+               partition_granularity,partition_start,wal_lsn_min,wal_lsn_max,
+               node_id,writer_epoch,
                min_event_time,max_event_time,file_ordinal,file_checksum
                FROM vala.file_list WHERE namespace='vala.bifrost' AND table_name='events'",
         )
@@ -535,9 +605,10 @@ mod pg_tests {
     /// Proves the caller-owned seal driver emits writer-v2 at the 832 MiB floor.
     #[tokio::test]
     async fn scribe_seal_driver_writer_v2_is_bounded_at_exact_floor() {
-        let (fixture, tenant, operator, binding, expected_day) = seal_writer_v2_at_floor().await;
+        let (fixture, tenant, operator, binding, expected_event_time) =
+            seal_writer_v2_at_floor().await;
         let row = load_sealed_file_row(&fixture, tenant).await;
-        let (
+        let SealedFileRow {
             id,
             data_tenant_id,
             namespace,
@@ -545,7 +616,8 @@ mod pg_tests {
             file_path,
             row_count,
             file_size,
-            partition_day,
+            partition_granularity,
+            partition_start,
             wal_lsn_min,
             wal_lsn_max,
             node_id,
@@ -554,7 +626,7 @@ mod pg_tests {
             max_event_time,
             file_ordinal,
             file_checksum,
-        ) = &row;
+        } = &row;
 
         assert_ne!(*id, Uuid::nil(), "id should be non-nil UUID");
         assert_eq!(*data_tenant_id, tenant.as_uuid());
@@ -572,7 +644,17 @@ mod pg_tests {
         assert!(file_path.contains("-wal-"));
         assert_eq!(*row_count, 50_000);
         assert!(*file_size > 0, "file_size should be positive");
-        assert_eq!(partition_day, &expected_day.to_string());
+        let partition =
+            TimePartition::from_durable_columns(partition_granularity, *partition_start)
+                .expect("durable partition columns round-trip through the engine type");
+        assert_eq!(
+            partition,
+            partition
+                .granularity()
+                .bucket(expected_event_time)
+                .expect("an admitted event time always buckets"),
+            "the sealed row lands in the canonical partition of its own event time"
+        );
         assert!(*wal_lsn_min >= 0, "wal_lsn_min should be non-negative");
         assert!(*wal_lsn_max >= 0, "wal_lsn_max should be non-negative");
         assert!(*wal_lsn_min <= *wal_lsn_max, "LSN range should be valid");
@@ -724,23 +806,18 @@ mod pg_tests {
         }
     }
 
-    #[tokio::test]
-    async fn pg_scribe_cross_day_batch_produces_two_files() {
-        let (fixture, tenant, scribe, operator) = setup().await;
-
-        let day1 = Utc::now().date_naive();
-        let day2 = day1.succ_opt().expect("current date has a successor");
-        let day1_time = day1
-            .and_hms_opt(23, 59, 50)
-            .expect("current day accepts boundary time")
-            .and_utc()
-            .timestamp_micros();
-        let day2_time = day2
-            .and_hms_opt(0, 0, 10)
-            .expect("next day accepts boundary time")
-            .and_utc()
-            .timestamp_micros();
-
+    /// Builds one 100-row append that straddles a UTC day boundary.
+    ///
+    /// Sixty rows land 100ms apart from `day1_time` and forty from `day2_time`,
+    /// so a single logical append must fan out across two daily partitions.
+    /// The seal path then has to emit one file per partition rather than one
+    /// file per append, which is what the caller asserts.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the row index does not fit `u64` or the columns do not match
+    /// the declared schema, both of which are fixture defects.
+    fn cross_day_batch(day1_time: i64, day2_time: i64) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new(
                 "wyrd_event_time",
@@ -764,14 +841,34 @@ mod pg_tests {
             timestamps.push(day2_time + ((i - 60) * 100_000));
             values.push(u64::try_from(i).expect("bounded row index"));
         }
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(TimestampMicrosecondArray::from(timestamps).with_timezone("UTC")),
                 Arc::new(UInt64Array::from(values)),
             ],
         )
-        .expect("batch");
+        .expect("batch")
+    }
+
+    #[tokio::test]
+    async fn pg_scribe_cross_day_batch_produces_two_files() {
+        let (fixture, tenant, scribe, operator) = setup().await;
+
+        let day1 = Utc::now().date_naive();
+        let day2 = day1.succ_opt().expect("current date has a successor");
+        let day1_instant = day1
+            .and_hms_opt(23, 59, 50)
+            .expect("current day accepts boundary time")
+            .and_utc();
+        let day2_instant = day2
+            .and_hms_opt(0, 0, 10)
+            .expect("next day accepts boundary time")
+            .and_utc();
+        let day1_time = day1_instant.timestamp_micros();
+        let day2_time = day2_instant.timestamp_micros();
+
+        let batch = cross_day_batch(day1_time, day2_time);
 
         let principal = principal_for_tenant(tenant);
         let fingerprint = schema_fingerprint(&batch);
@@ -798,32 +895,56 @@ mod pg_tests {
         let commit_result = conn.commit().await;
         complete_post_commit(&scribe, post_commit, &commit_result).await;
 
-        // Verify two file_list rows with distinct partition_day
+        // Verify two file_list rows in distinct time partitions.
         let mut conn2 = vala_sql::TenantConn::acquire(pool, tenant)
             .await
             .expect("tenant conn2");
         let tx = conn2.transaction();
-        let rows: Vec<(String, i64, String)> = sqlx::query_as(
+        let rows: Vec<(String, DateTime<Utc>, i64, String)> = sqlx::query_as(
             r"
-            SELECT partition_day::text, row_count, file_path
+            SELECT partition_granularity, partition_start, row_count, file_path
             FROM vala.file_list
             WHERE namespace = 'vala.bifrost' AND table_name = 'events'
-            ORDER BY partition_day
+            ORDER BY partition_granularity, partition_start
             ",
         )
         .fetch_all(&mut **tx)
         .await
         .expect("file_list query");
 
-        assert_eq!(rows.len(), 2, "expected two file_list rows (one per day)");
-        assert_eq!(rows[0].0, day1.to_string());
-        assert_eq!(rows[0].1, 60, "first day should have 60 rows");
-        assert_eq!(rows[0].2.matches("day=").count(), 1);
-        assert!(rows[0].2.contains(&format!("day={day1}/")));
-        assert_eq!(rows[1].0, day2.to_string());
-        assert_eq!(rows[1].1, 40, "second day should have 40 rows");
-        assert_eq!(rows[1].2.matches("day=").count(), 1);
-        assert!(rows[1].2.contains(&format!("day={day2}/")));
+        assert_eq!(
+            rows.len(),
+            2,
+            "expected two file_list rows (one per time partition)"
+        );
+        let durable_partition = |row: &(String, DateTime<Utc>, i64, String)| {
+            TimePartition::from_durable_columns(&row.0, row.1)
+                .expect("durable partition columns round-trip through the engine type")
+        };
+        let first = durable_partition(&rows[0]);
+        let second = durable_partition(&rows[1]);
+        assert_ne!(
+            first, second,
+            "the two sides of the boundary must seal into distinct partitions"
+        );
+        assert_eq!(
+            first,
+            first
+                .granularity()
+                .bucket(day1_instant)
+                .expect("an admitted event time always buckets")
+        );
+        assert_eq!(rows[0].2, 60, "the earlier partition should have 60 rows");
+        assert!(rows[0].3.contains(&first.as_path_components()));
+        assert_eq!(
+            second,
+            second
+                .granularity()
+                .bucket(day2_instant)
+                .expect("an admitted event time always buckets")
+        );
+        assert_eq!(rows[1].2, 40, "the later partition should have 40 rows");
+        assert!(rows[1].3.contains(&second.as_path_components()));
         let objects = operator
             .list_with("")
             .recursive(true)
@@ -832,7 +953,7 @@ mod pg_tests {
             .into_iter()
             .map(|entry| entry.path().to_owned())
             .collect::<Vec<_>>();
-        assert!(rows.iter().all(|row| objects.contains(&row.2)));
+        assert!(rows.iter().all(|row| objects.contains(&row.3)));
     }
 
     /// A rolled-back seal publishes neither a file nor a visibility audit.

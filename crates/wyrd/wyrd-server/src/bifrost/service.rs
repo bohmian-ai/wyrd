@@ -10,8 +10,8 @@ use vala_bifrost_redux::catalog::{BifrostCatalogError, TableRef};
 use wyrd_runtime::Permission;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
-    AuditDecision, AuditResult, BifrostTableDescription, BifrostTableEntry, RegisterOutcome,
-    RegisterTableRequest, RegisterTableResponse,
+    AuditDecision, AuditResult, BifrostTableDescription, BifrostTableEntry, PhysicalLayoutWire,
+    RegisterOutcome, RegisterTableRequest, RegisterTableResponse,
 };
 
 use wyrd_runtime::PermissionVerdict;
@@ -67,6 +67,49 @@ async fn authorize_audited(
     }
 }
 
+/// Rejects a re-registration whose declared layout differs from the one the
+/// table was created with.
+///
+/// A retry of the same registration must be idempotent, so the incoming
+/// declaration is canonicalized against the table's stored physical schema and
+/// compared with the stored canonical layout. Comparing canonical forms means
+/// an equivalent-but-differently-spelled declaration (an omitted default, a
+/// duplicate tenant sort key) still retries cleanly, while a genuinely
+/// different physical layout conflicts.
+///
+/// # Errors
+///
+/// Returns [`wyrd_spec::vala::BifrostError::PhysicalLayoutMismatch`]
+/// (`WYRD_VALA_409_BIFROST_LAYOUT_MISMATCH`) when the layouts differ, and a
+/// validation error when the incoming declaration is not valid against the
+/// stored schema.
+fn assert_registered_layout_matches(
+    fqn: &str,
+    existing: &BifrostTableDescription,
+    declared: Option<&PhysicalLayoutWire>,
+) -> Result<(), WyrdError> {
+    let stored_schema = arrow::datatypes::Schema::new(
+        existing
+            .fields
+            .iter()
+            .map(convert::field_to_arrow)
+            .collect::<Vec<_>>(),
+    );
+    let canonical = vala_bifrost_redux::catalog::layout::PhysicalLayout::canonicalize(
+        fqn,
+        &stored_schema,
+        declared,
+    )
+    .map_err(WyrdError::from)?;
+    if canonical.to_wire() == existing.physical_layout {
+        return Ok(());
+    }
+    Err(wyrd_spec::vala::BifrostError::PhysicalLayoutMismatch {
+        table: fqn.to_owned(),
+    }
+    .into())
+}
+
 /// Register (idempotently create) a Bifrost table.
 ///
 /// Dataset registration requires `bifrost_table:write`. A matching-fingerprint re-register returns
@@ -91,23 +134,6 @@ pub async fn register_table(
     let user_fields: Vec<Field> = body.fields.iter().map(convert::field_to_arrow).collect();
     let fingerprint = convert::fingerprint_hex(&user_fields);
 
-    let mut partition_columns = Vec::with_capacity(body.partition_columns.len());
-    for spec in &body.partition_columns {
-        partition_columns.push(convert::partition_column_to_engine(spec)?);
-    }
-    if !partition_columns.is_empty()
-        && partition_columns
-            != [(
-                "wyrd_event_time".to_owned(),
-                vala_bifrost_redux::catalog::PartitionTransform::Day,
-            )]
-    {
-        return Err(WyrdError::Validation {
-            message: "Redux Bifrost tables use the fixed wyrd_event_time/day partition".to_owned(),
-            details: serde_json::json!({ "table": fqn_for_audit }),
-        });
-    }
-
     let fqn = format!("{}.{}", ns.as_str(), body.name);
     let table = TableRef::new(ns, body.name.clone());
     let catalog = state
@@ -119,6 +145,7 @@ pub async fn register_table(
     match catalog.describe_table(&table, caller.data_tenant_id).await {
         Ok(existing) => {
             if existing.entry.fingerprint == fingerprint {
+                assert_registered_layout_matches(&fqn, &existing, body.physical_layout.as_ref())?;
                 Ok(RegisterTableResponse {
                     outcome: RegisterOutcome::AlreadyExists,
                     table_uid: existing.entry.table_uid,
@@ -141,7 +168,13 @@ pub async fn register_table(
                 "bifrost table registered",
             );
             let table_uid = catalog
-                .register_dataset(caller.data_tenant_id, table, user_fields, Some(event))
+                .register_dataset(
+                    caller.data_tenant_id,
+                    table,
+                    user_fields,
+                    body.physical_layout.clone(),
+                    Some(event),
+                )
                 .await
                 .map_err(map_engine_error)?;
             Ok(RegisterTableResponse {
@@ -258,7 +291,7 @@ mod pg_tests {
             namespace: "vala.datasets".to_owned(),
             name: name.to_owned(),
             fields,
-            partition_columns: vec![],
+            physical_layout: None,
         }
     }
 

@@ -122,7 +122,8 @@ Postgres table tracking all sealed Parquet files:
 | `row_count` | `BIGINT NOT NULL` | Rows in file |
 | `min_event_time` | `TIMESTAMPTZ NOT NULL` | Earliest `wyrd_event_time` |
 | `max_event_time` | `TIMESTAMPTZ NOT NULL` | Latest `wyrd_event_time` |
-| `partition_day` | `DATE NOT NULL` | Exactly one Day per file |
+| `partition_granularity` | `TEXT NOT NULL` | `hour` or `day` |
+| `partition_start` | `TIMESTAMPTZ NOT NULL` | Exactly one time partition per file |
 | `compacted` | `BOOLEAN NOT NULL DEFAULT false` | `false` until Forge folds into snapshot |
 | `committed_snapshot_id` | `BIGINT` nullable | Iceberg snapshot ID (NULL until Forge commits) |
 | `node_id` | `TEXT NOT NULL` | Scribe pod ID |

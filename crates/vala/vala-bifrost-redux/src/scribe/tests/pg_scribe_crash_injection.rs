@@ -6,14 +6,13 @@ use crate::scribe::audit_envelope::encode_audit_event;
 use crate::scribe::manifest::{Manifest, read_manifest, write_atomic};
 use crate::scribe::replay::{replay_wal_directory, replay_wal_directory_stream};
 use crate::scribe::routing::shard_for;
-use crate::scribe::seal_key::{EventDay, SealKey};
+use crate::scribe::seal_key::SealKey;
 use crate::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use crate::scribe::wal::{WalConfig, WalLsn, WalRecord, WalWriter};
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
-use chrono::NaiveDate;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::Arc;
@@ -74,7 +73,7 @@ fn key() -> SealKey {
     SealKey::new(
         DataTenantId::new_v7(),
         TableRef::new(BifrostNamespace::Bifrost, "scribe_crash"),
-        EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 24).expect("test day")),
+        crate::test_support::day_partition(2026, 7, 24),
     )
 }
 

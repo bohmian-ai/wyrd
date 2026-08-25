@@ -103,7 +103,6 @@ mod pg_tests {
         .bind(node_id)
         .bind(serde_json::json!({
             "kind":"oracle_v1",
-            "peer_protocol_version":1,
             "storage_protocol_version":1
         }))
         .execute(&pool)

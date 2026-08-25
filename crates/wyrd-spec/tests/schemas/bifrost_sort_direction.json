@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SortDirectionWire",
+  "description": "Sort direction of one declared physical sort key.",
+  "oneOf": [
+    {
+      "description": "Ascending.",
+      "type": "string",
+      "enum": [
+        "asc"
+      ]
+    },
+    {
+      "description": "Descending.",
+      "type": "string",
+      "enum": [
+        "desc"
+      ]
+    }
+  ]
+}

@@ -2,8 +2,9 @@ use arrow::datatypes::Field;
 
 use crate::tables::fields::{fixed_binary, int64, utf8};
 use crate::tables::{
-    CorrelationPolicy, DeclaredIndex, DomainTable, IndexKind, PayloadClass, SortKey,
+    CorrelationPolicy, DomainTable, PayloadClass, hourly_layout, sort_asc, sort_desc,
 };
+use wyrd_spec::vala::api::PhysicalLayoutWire;
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 pub struct LinksTable;
@@ -28,33 +29,10 @@ impl DomainTable for LinksTable {
         ]
     }
 
-    fn sort_keys() -> Vec<SortKey> {
-        vec![
-            SortKey {
-                column: WYRD_EVENT_TIME.into(),
-                ascending: false,
-                nulls_first: false,
-            },
-            SortKey {
-                column: "trace_id".into(),
-                ascending: true,
-                nulls_first: false,
-            },
-        ]
-    }
-
-    fn declared_indexes() -> Vec<DeclaredIndex> {
-        vec![
-            DeclaredIndex {
-                name: "links_trace_id_lookup".into(),
-                columns: vec!["trace_id".into()],
-                kind: IndexKind::BloomFilter,
-            },
-            DeclaredIndex {
-                name: "links_linked_trace_id_lookup".into(),
-                columns: vec!["linked_trace_id".into()],
-                kind: IndexKind::BloomFilter,
-            },
-        ]
+    fn physical_layout() -> PhysicalLayoutWire {
+        hourly_layout(
+            vec![sort_desc(WYRD_EVENT_TIME), sort_asc("trace_id")],
+            &["trace_id", "span_id", "linked_trace_id"],
+        )
     }
 }

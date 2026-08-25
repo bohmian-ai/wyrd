@@ -485,7 +485,7 @@ mod tests {
             attributes: 1024,
             value_bytes: 1 << 20,
             value_depth: 8,
-            event_days: 32,
+            time_partitions: 32,
         }
     }
 }

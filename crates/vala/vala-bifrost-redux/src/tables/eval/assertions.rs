@@ -2,8 +2,10 @@ use arrow::datatypes::Field;
 
 use crate::tables::fields::{fixed_binary, float64, ts_us_utc, utf8};
 use crate::tables::{
-    CorrelationPolicy, DeclaredIndex, DomainTable, IndexKind, PayloadClass, SortKey,
+    CorrelationPolicy, DomainTable, PayloadClass, hourly_layout, sort_asc, sort_asc_nulls_first,
+    sort_desc,
 };
+use wyrd_spec::vala::api::PhysicalLayoutWire;
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 pub struct AssertionsTable;
@@ -30,31 +32,14 @@ impl DomainTable for AssertionsTable {
         ]
     }
 
-    fn sort_keys() -> Vec<SortKey> {
-        vec![
-            SortKey {
-                column: WYRD_EVENT_TIME.into(),
-                ascending: false,
-                nulls_first: false,
-            },
-            SortKey {
-                column: "run_id".into(),
-                ascending: true,
-                nulls_first: true,
-            },
-            SortKey {
-                column: "assertion_name".into(),
-                ascending: true,
-                nulls_first: false,
-            },
-        ]
-    }
-
-    fn declared_indexes() -> Vec<DeclaredIndex> {
-        vec![DeclaredIndex {
-            name: "assertions_run_id_lookup".into(),
-            columns: vec!["run_id".into()],
-            kind: IndexKind::BloomFilter,
-        }]
+    fn physical_layout() -> PhysicalLayoutWire {
+        hourly_layout(
+            vec![
+                sort_desc(WYRD_EVENT_TIME),
+                sort_asc_nulls_first("run_id"),
+                sort_asc("assertion_name"),
+            ],
+            &["run_id"],
+        )
     }
 }

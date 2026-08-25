@@ -25,11 +25,13 @@ mod pg_tests {
             INSERT INTO vala.file_list (
                 id, data_tenant_id, namespace, table_name, file_path,
                 file_size, row_count, min_event_time, max_event_time,
-                partition_day, node_id, writer_epoch, wal_lsn_min, wal_lsn_max,
+                partition_granularity, partition_start, node_id, writer_epoch,
+                wal_lsn_min, wal_lsn_max,
                 compacted, committed_snapshot_id
             ) VALUES (
                 $1, $2, 'vala.traces', 'spans', $3,
-                $4, 100, now(), now(), current_date,
+                $4, 100, now(), now(),
+                'day', date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC',
                 $5, 1, 100, 200, $6, $7
             )
             "#,

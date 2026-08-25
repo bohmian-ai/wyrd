@@ -32,6 +32,28 @@ pub fn physical_plan_fingerprint(bytes: &[u8]) -> String {
     format!("sha256:{:x}", digest.finalize())
 }
 
+/// Encodes one follower subtree into the exact bytes dispatched to a worker,
+/// together with the codec fingerprint bound into its ticket and footer.
+///
+/// The leader and any harness that dispatches a fragment must produce
+/// byte-identical output, because the fingerprint is what a follower checks
+/// the received plan against. Keeping the encoder and the fingerprint in one
+/// operation is what makes that impossible to get wrong at a call site.
+///
+/// # Errors
+///
+/// Returns the `DataFusion` error raised when the subtree contains a node the
+/// Oracle extension codec cannot encode.
+pub fn encode_follower_subtree(plan: Arc<dyn ExecutionPlan>) -> Result<(Vec<u8>, String)> {
+    let bytes = datafusion_proto::bytes::physical_plan_to_bytes_with_extension_codec(
+        plan,
+        &OraclePhysicalExtensionCodec::encoder(),
+    )?
+    .to_vec();
+    let fingerprint = physical_plan_fingerprint(&bytes);
+    Ok((bytes, fingerprint))
+}
+
 /// Versioned extension envelope stored in a `DataFusion` extension node.
 #[derive(Clone, PartialEq, Message)]
 struct OracleExtensionEnvelope {
@@ -75,7 +97,10 @@ pub(crate) enum PreflightExtension {
     /// One tenant tripwire whose child remains in the native plan tree.
     TenantTripwire {
         /// Authenticated query facts encoded by the leader.
-        context: super::AuthorizedQueryContext,
+        ///
+        /// Boxed because this context dwarfs every sibling variant; keeping it
+        /// inline would make each `PreflightExtension` pay its full size.
+        context: Box<super::AuthorizedQueryContext>,
         /// Canonical table label used by security audit.
         table: String,
     },
@@ -83,17 +108,29 @@ pub(crate) enum PreflightExtension {
 
 /// Leaf placeholder substituted for one Wyrd-owned source before serialization.
 #[derive(Debug)]
-pub struct RemoteScanExec {
+pub struct RemoteSourcePlaceholderExec {
     /// Stable request-local identity.
     scan_id: String,
     /// Expected provider schema fingerprint.
     schema_fingerprint: String,
     /// Empty executable carrying the placeholder schema and plan properties.
     empty: datafusion::physical_plan::empty::EmptyExec,
+    /// Closed projection closure computed by the provider's classifier —
+    /// see `oracle::exec::required_columns_closure`. Defaults to empty until
+    /// [`Self::with_closure`] attaches the real value computed during
+    /// `OracleTableProvider::scan`; the caller must never dispatch a wire
+    /// assignment with an empty closure (that would drop the hidden tenant
+    /// column), so an empty value here is a signal to keep the assignment's
+    /// existing safe full-schema default rather than overwrite it.
+    required_columns: Vec<String>,
+    /// Closed leaf predicates computed by the same classifier, in filter order.
+    predicates: Vec<wyrd_spec::vala::assignment_authority::ScanPredicate>,
 }
 
-impl RemoteScanExec {
-    /// Creates one remote source placeholder.
+impl RemoteSourcePlaceholderExec {
+    /// Creates one remote source placeholder with no attached predicate
+    /// closure. Callers that have a real classifier result should chain
+    /// [`Self::with_closure`] immediately.
     #[must_use]
     pub fn new(
         scan_id: impl Into<String>,
@@ -104,7 +141,42 @@ impl RemoteScanExec {
             scan_id: scan_id.into(),
             schema_fingerprint: schema_fingerprint.into(),
             empty: datafusion::physical_plan::empty::EmptyExec::new(schema),
+            required_columns: Vec::new(),
+            predicates: Vec::new(),
         }
+    }
+
+    /// Advertises the session's target partition count for this source.
+    ///
+    /// Physical planning decides where to parallelize from the partitioning a
+    /// leaf reports. A single-partition leaf makes `DataFusion` insert a
+    /// round-robin repartition directly above it, and that repartition then
+    /// becomes the innermost exchange -- so the split boundary lands under the
+    /// partial aggregate and the follower receives a bare scan instead of a
+    /// reduced one. Reporting the session's target partitions keeps the boundary
+    /// at the exchange above the partial aggregate.
+    ///
+    /// The count is planning-only. On the leader this placeholder is replaced by
+    /// the remote scan, whose partitioning is the selected participant count; on
+    /// a follower it is replaced by the resolved provider's own partitioning.
+    #[must_use]
+    pub fn with_partitions(mut self, partitions: usize) -> Self {
+        self.empty = self.empty.with_partitions(partitions.max(1));
+        self
+    }
+
+    /// Attaches the provider's closed predicate/projection closure computed
+    /// during `scan()`. This is the value the dispatcher reads back off the
+    /// planned physical tree to fill the wire `FollowerScanAssignment`.
+    #[must_use]
+    pub fn with_closure(
+        mut self,
+        required_columns: Vec<String>,
+        predicates: Vec<wyrd_spec::vala::assignment_authority::ScanPredicate>,
+    ) -> Self {
+        self.required_columns = required_columns;
+        self.predicates = predicates;
+        self
     }
 
     /// Returns the stable scan identity.
@@ -112,9 +184,23 @@ impl RemoteScanExec {
     pub fn scan_id(&self) -> &str {
         &self.scan_id
     }
+
+    /// Returns the attached projection closure, or an empty slice when no
+    /// closure was attached (the caller must treat that as "no update",
+    /// never as "project nothing").
+    #[must_use]
+    pub fn required_columns(&self) -> &[String] {
+        &self.required_columns
+    }
+
+    /// Returns the attached closed predicates, in filter order.
+    #[must_use]
+    pub fn predicates(&self) -> &[wyrd_spec::vala::assignment_authority::ScanPredicate] {
+        &self.predicates
+    }
 }
 
-impl DisplayAs for RemoteScanExec {
+impl DisplayAs for RemoteSourcePlaceholderExec {
     /// Formats only non-secret placeholder identity.
     ///
     /// # Errors
@@ -124,14 +210,14 @@ impl DisplayAs for RemoteScanExec {
         _display: DisplayFormatType,
         formatter: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
-        write!(formatter, "RemoteScanExec: {}", self.scan_id)
+        write!(formatter, "RemoteSourcePlaceholderExec: {}", self.scan_id)
     }
 }
 
-impl ExecutionPlan for RemoteScanExec {
+impl ExecutionPlan for RemoteSourcePlaceholderExec {
     /// Returns the stable diagnostic operator name.
     fn name(&self) -> &'static str {
-        "RemoteScanExec"
+        "RemoteSourcePlaceholderExec"
     }
     /// Enables extension-codec downcasting.
     fn as_any(&self) -> &dyn Any {
@@ -313,7 +399,7 @@ impl OraclePhysicalExtensionCodec {
                     ));
                 }
                 Ok(PreflightExtension::TenantTripwire {
-                    context,
+                    context: Box::new(context),
                     table: payload.table,
                 })
             }
@@ -405,7 +491,8 @@ impl PhysicalExtensionCodec for OraclePhysicalExtensionCodec {
     /// # Errors
     /// Returns a plan error for any other extension type or protobuf failure.
     fn try_encode(&self, node: Arc<dyn ExecutionPlan>, buf: &mut Vec<u8>) -> Result<()> {
-        let (type_tag, payload) = if let Some(scan) = node.as_any().downcast_ref::<RemoteScanExec>()
+        let (type_tag, payload) = if let Some(scan) =
+            node.as_any().downcast_ref::<RemoteSourcePlaceholderExec>()
         {
             (
                 ORACLE_REMOTE_SCAN_TAG,
@@ -545,7 +632,7 @@ mod tests {
         /// Delegates physical execution to the empty provider.
         ///
         /// # Errors
-        /// Returns the delegated DataFusion execution error.
+        /// Returns the delegated `DataFusion` execution error.
         fn execute(
             &self,
             partition: usize,
@@ -586,9 +673,9 @@ mod tests {
                 ));
             }
             *source = Some(Arc::clone(&plan));
-            return Ok(Arc::new(RemoteScanExec::new(
+            return Ok(Arc::new(RemoteSourcePlaceholderExec::new(
                 "scan",
-                super::super::sealed_fragment_schema_fingerprint(plan.schema().as_ref()),
+                super::super::assignment_schema_fingerprint(plan.schema().as_ref()),
                 plan.schema(),
             )));
         }
@@ -641,7 +728,7 @@ mod tests {
             display.contains("GlobalLimitExec") || display.contains("fetch=1"),
             "limit is absent from {display}"
         );
-        assert!(display.contains("RemoteScanExec"));
+        assert!(display.contains("RemoteSourcePlaceholderExec"));
         let bytes = physical_plan_to_bytes_with_extension_codec(
             outbound,
             &OraclePhysicalExtensionCodec::encoder(),

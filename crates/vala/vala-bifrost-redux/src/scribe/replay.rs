@@ -1137,10 +1137,10 @@ fn merge_replayed_state(
 mod tests {
     use super::*;
     use crate::catalog::TableRef;
-    use crate::scribe::seal_key::EventDay;
+
     use crate::scribe::stream_identity::{NodeId, WriterEpoch};
     use crate::scribe::wal::{PreparedWalAppend, WalWriter};
-    use chrono::NaiveDate;
+
     use std::path::PathBuf;
     use tempfile::TempDir;
     use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
@@ -1152,7 +1152,7 @@ mod tests {
         SealKey::new(
             tenant,
             TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "events"),
-            EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("date")),
+            crate::test_support::day_partition(2026, 7, 14),
         )
     }
 
@@ -1165,6 +1165,8 @@ mod tests {
     /// producer admission.
     #[test]
     fn replay_decode_failure_drops_payload_before_identity_lease() {
+        /// One mebibyte in bytes, used by every reservation in this test.
+        const MIB: usize = 1024 * 1024;
         let resources =
             crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
         let baseline = resources.snapshot().expect("baseline snapshot");
@@ -1188,7 +1190,6 @@ mod tests {
             baseline.scribe_memory_used_bytes
         );
 
-        const MIB: usize = 1024 * 1024;
         let roles = crate::resources::BifrostRuntimeResources::composed_for_test(
             832 * MIB,
             512 * MIB as u64,
@@ -1318,7 +1319,7 @@ mod tests {
         let second_key = SealKey::new(
             tenant_id,
             TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "events"),
-            EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 15).expect("date")),
+            crate::test_support::day_partition(2026, 7, 15),
         );
         let event = |resource: &str| AuditEvent {
             request_id: RequestId::now_v7(),
@@ -1386,7 +1387,7 @@ mod tests {
             SealKey::new(
                 tenant,
                 TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "events"),
-                EventDay::new(NaiveDate::from_ymd_opt(2026, 7, day).expect("cohort event day")),
+                crate::test_support::day_partition(2026, 7, day),
             )
         });
         let event = AuditEvent {
@@ -2103,6 +2104,82 @@ mod tests {
         assert_eq!(state.append_metas[1].append_slice_id.slice_index, 1);
     }
 
+    /// Writes one writer-ordered WAL group and returns its complete batch count.
+    ///
+    /// Three batches are appended and then committed, while a fourth is appended
+    /// as two cross-segment slices and deliberately left uncommitted. The
+    /// commits are issued only after every append, so replay must hand off each
+    /// committed unit on its own rather than waiting for the group, and the
+    /// uncommitted batch must never surface. The payload is sized against the
+    /// small rotating WAL config so the pending batch genuinely straddles a
+    /// segment boundary. Every touched segment is fsynced before returning, so
+    /// the replay under test reads durable bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any append, commit, or segment sync fails.
+    fn write_writer_ordered_group(
+        wal: &WalWriter,
+        seal_key: &SealKey,
+        audit: &[u8],
+        shard_id: u8,
+        tenant: DataTenantId,
+    ) -> usize {
+        let complete_batches = [[1_u8; 16], [2_u8; 16], [3_u8; 16]];
+        let pending_batch = [4_u8; 16];
+        let payload = vec![9_u8; 6 * 1024];
+        let mut digests = Vec::new();
+        let mut touched = Vec::new();
+
+        for batch_id in complete_batches {
+            let mut append = PreparedWalAppend::new(
+                WalLsn::ZERO,
+                batch_id,
+                Bytes::copy_from_slice(audit),
+                Bytes::copy_from_slice(&payload),
+            )
+            .for_slice(seal_key.clone(), [3; 32]);
+            append.shard_id = Some(shard_id);
+            let result = wal.append_prepared(append).expect("writer slice");
+            let mut digest = Sha256::new();
+            digest.update(0_u32.to_le_bytes());
+            digest.update(result.payload_len.to_le_bytes());
+            digest.update(result.payload_digest);
+            digests.push(digest.finalize().into());
+            touched.extend(result.touched_segments);
+        }
+
+        for slice_index in 0_u32..2 {
+            let mut append = PreparedWalAppend::new(
+                WalLsn::ZERO,
+                pending_batch,
+                Bytes::copy_from_slice(audit),
+                Bytes::copy_from_slice(&payload),
+            )
+            .for_slice(seal_key.clone(), [3; 32]);
+            append.assign_slice_ordinal(slice_index, 2);
+            append.shard_id = Some(shard_id);
+            touched.extend(
+                wal.append_prepared(append)
+                    .expect("cross-segment pending slice")
+                    .touched_segments,
+            );
+        }
+
+        for (batch_id, digest) in complete_batches.into_iter().zip(digests) {
+            let mut commit =
+                PreparedWalAppend::commit(batch_id, *tenant.as_uuid().as_bytes(), 1, digest);
+            commit.shard_id = Some(shard_id);
+            touched.extend(
+                wal.append_prepared(commit)
+                    .expect("writer group commit")
+                    .touched_segments,
+            );
+        }
+        WalWriter::sync_segments(&touched).expect("sync writer group");
+        complete_batches.len()
+    }
+
     /// Proves production writer ordering emits each committed batch while an
     /// unrelated cross-segment slice set remains pending under a near-full
     /// replay root reservation.
@@ -2141,58 +2218,8 @@ mod tests {
             uuid::Uuid::nil(),
         ))
         .expect("fixed shard count fits u8");
-        let complete_batches = [[1_u8; 16], [2_u8; 16], [3_u8; 16]];
-        let pending_batch = [4_u8; 16];
-        let payload = vec![9_u8; 6 * 1024];
-        let mut digests = Vec::new();
-        let mut touched = Vec::new();
-
-        for batch_id in complete_batches {
-            let mut append = PreparedWalAppend::new(
-                WalLsn::ZERO,
-                batch_id,
-                Bytes::copy_from_slice(&audit),
-                Bytes::copy_from_slice(&payload),
-            )
-            .for_slice(seal_key.clone(), [3; 32]);
-            append.shard_id = Some(shard_id);
-            let result = wal.append_prepared(append).expect("writer slice");
-            let mut digest = Sha256::new();
-            digest.update(0_u32.to_le_bytes());
-            digest.update(result.payload_len.to_le_bytes());
-            digest.update(result.payload_digest);
-            digests.push(digest.finalize().into());
-            touched.extend(result.touched_segments);
-        }
-
-        for slice_index in 0_u32..2 {
-            let mut append = PreparedWalAppend::new(
-                WalLsn::ZERO,
-                pending_batch,
-                Bytes::copy_from_slice(&audit),
-                Bytes::copy_from_slice(&payload),
-            )
-            .for_slice(seal_key.clone(), [3; 32]);
-            append.assign_slice_ordinal(slice_index, 2);
-            append.shard_id = Some(shard_id);
-            touched.extend(
-                wal.append_prepared(append)
-                    .expect("cross-segment pending slice")
-                    .touched_segments,
-            );
-        }
-
-        for (batch_id, digest) in complete_batches.into_iter().zip(digests) {
-            let mut commit =
-                PreparedWalAppend::commit(batch_id, *tenant.as_uuid().as_bytes(), 1, digest);
-            commit.shard_id = Some(shard_id);
-            touched.extend(
-                wal.append_prepared(commit)
-                    .expect("writer group commit")
-                    .touched_segments,
-            );
-        }
-        WalWriter::sync_segments(&touched).expect("sync writer group");
+        let complete_batches =
+            write_writer_ordered_group(&wal, &seal_key, &audit, shard_id, tenant);
 
         let resources =
             crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
@@ -2218,7 +2245,7 @@ mod tests {
         )
         .expect("replay writer-ordered group");
 
-        assert_eq!(chunks.len(), complete_batches.len());
+        assert_eq!(chunks.len(), complete_batches);
         assert!(chunks.iter().all(|chunk| {
             chunk
                 .states
@@ -2352,7 +2379,7 @@ mod tests {
         let temp_dir = TempDir::new().expect("temp dir");
         let tenant = DataTenantId::new_v7();
         let table = TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "events");
-        let day = EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("date"));
+        let day = crate::test_support::day_partition(2026, 7, 14);
         let seal_key = SealKey::new(tenant, table, day);
         let writer = WalWriter::new(temp_dir.path(), [9_u8; 16], 1, WalConfig::default())
             .expect("wal writer");

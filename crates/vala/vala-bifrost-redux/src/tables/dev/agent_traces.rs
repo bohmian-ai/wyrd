@@ -2,9 +2,10 @@ use arrow::datatypes::Field;
 
 use crate::tables::fields::{fixed_binary, ts_us_utc, utf8};
 use crate::tables::{
-    CorrelationPolicy, DeclaredIndex, DomainTable, EntityBoundsMapping, IndexKind, PayloadClass,
-    SortKey,
+    CorrelationPolicy, DomainTable, EntityBoundsMapping, PayloadClass, hourly_layout, sort_asc,
+    sort_desc,
 };
+use wyrd_spec::vala::api::PhysicalLayoutWire;
 
 pub struct AgentTracesTable;
 
@@ -34,34 +35,11 @@ impl DomainTable for AgentTracesTable {
         ]
     }
 
-    fn sort_keys() -> Vec<SortKey> {
-        vec![
-            SortKey {
-                column: "started_at".into(),
-                ascending: false,
-                nulls_first: false,
-            },
-            SortKey {
-                column: "dev_session_id".into(),
-                ascending: true,
-                nulls_first: false,
-            },
-        ]
-    }
-
-    fn declared_indexes() -> Vec<DeclaredIndex> {
-        vec![
-            DeclaredIndex {
-                name: "agent_traces_dev_session_lookup".into(),
-                columns: vec!["dev_session_id".into()],
-                kind: IndexKind::BloomFilter,
-            },
-            DeclaredIndex {
-                name: "agent_traces_repo_bloom".into(),
-                columns: vec!["repo".into()],
-                kind: IndexKind::BloomFilter,
-            },
-        ]
+    fn physical_layout() -> PhysicalLayoutWire {
+        hourly_layout(
+            vec![sort_desc("started_at"), sort_asc("dev_session_id")],
+            &["dev_session_id", "repo"],
+        )
     }
 
     fn entity_bounds_mapping() -> Option<EntityBoundsMapping> {

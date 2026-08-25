@@ -371,9 +371,10 @@ behavior has no cross-boundary state (record the reason).
 
 ### Verification Scope
 
-Run verification for the code you changed. `mise run pre-pr` is the aggregate
-CI gate; it is intentionally broad and slow, so do not make it the default
-requirement for every plan, PR, or implementation slice.
+Run verification for the code you changed. `mise run gate` is the CI aggregate;
+CI runs it on every push. It is intentionally broad and slow, and it is not the
+local bar — do not make it the default requirement for a plan, PR, or
+implementation slice.
 
 ```bash
 # Always run the relevant format and lint checks.
@@ -387,7 +388,7 @@ Then run the narrowest `mise` test/check tasks that cover the touched surface:
 
 - Rust crate change: prefer the nearest crate-specific `mise run ...` task
   (`test:wyrd`, `test:skald`, `test:vala`, `test:shared`, `test:sql`,
-  `test:storage:matrix`, etc.). Whole-crate tests should use `mise` when a task exists because some
+  `test:bifrost`, `test:storage:matrix`, etc.). Whole-crate tests should use `mise` when a task exists because some
   crates need external dependencies, migrations, generated artifacts, or
   environment variables that the mise task sets up. Use raw `cargo test` only
   when no relevant mise task exists or when narrowing to a single pure unit
@@ -403,10 +404,10 @@ Then run the narrowest `mise` test/check tasks that cover the touched surface:
 - Example change: run the touched example task, or `mise run check:examples`
   when the change affects shared example behavior.
 
-Run `mise run pre-pr` when the change is intentionally broad, crosses several
-ownership boundaries, changes shared CI/build/test infrastructure, prepares a
-release, or when the user explicitly asks for the full gate. It remains useful
-as a final confidence sweep; it is not the normal bar for every local PR.
+Run `mise run gate` locally only when the change is intentionally broad, crosses
+several ownership boundaries, changes shared CI/build/test infrastructure,
+prepares a release, or when the user explicitly asks for it. Otherwise let CI
+run it.
 
 Real cloud storage integration tests (`test:storage:*:cloud`) run against live
 infrastructure separately.
@@ -449,13 +450,41 @@ A change is not done until:
 - No legacy names, routes, package names, or compatibility aliases were added.
 - Format, lints, and the targeted tests/checks for the touched surface pass.
   Prefer the smallest `mise` task set that proves the change. Do not require
-  `mise run pre-pr` unless the verification scope in §11 calls for the aggregate
-  gate.
+  `mise run gate` unless the verification scope in §11 calls for the CI
+  aggregate.
 - Do not circumvent a gate to make it pass: never weaken or disable a check,
   add `#[allow]`, delete or `#[ignore]` a failing test, or broaden a boundary
   glob to hide a real violation. Fix the underlying cause. Only use a check's
   own sanctioned mechanism (e.g. the documented per-file allowlist) when the
   usage is legitimately test-only and matches an existing in-pattern precedent.
+
+### Adding And Retiring Checks
+
+A repository check is a permanent cost paid on every run by every contributor.
+It must earn that cost by protecting a property that is still reachable.
+
+Before adding a check, state the property it protects and why the compiler,
+type system, or an ordinary test cannot protect it. A check that restates a
+rule already enforced somewhere else is not free; it is a second place to
+update and a second way to be confusing. Do not add a check that verifies
+another check.
+
+A check is a candidate for deletion when the failure it prevents is no longer
+reachable from the current tree. The common case is a name-ban: a check that
+greps for identifiers, crates, directories, or prose that a completed change
+removed. Once the thing is gone and its owner is gone, the ban protects
+nothing and only constrains future naming. Delete it.
+
+Distinguish this from a check that enforces a live boundary — tier and
+dependency direction, PyO3 scope, tenant isolation, single authoritative
+impl, generated-artifact drift, ownership of a durable resource. Those
+describe an invariant that can be violated by code someone could write
+tomorrow, so they stay regardless of age.
+
+Removing a check is a material decision: say which check, which property it
+claimed, and why that property is now unreachable or enforced elsewhere. This
+is not a licence to delete a check that is merely inconvenient or currently
+failing — that is circumventing a gate, which the previous rule prohibits.
 
 ## 13. Git Identity Rules
 

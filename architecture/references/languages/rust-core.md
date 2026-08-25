@@ -566,6 +566,43 @@ async code.
   `wyrd-runtime` bridge.
 - Use bounded concurrency and timeouts for external calls.
 
+### Recorded deviation: Scribe CPU lanes run on fixed Rayon pools
+
+Tokio is Wyrd's only async runtime, and the rule above bans ad hoc runtimes.
+Scribe's CPU-bound work is a bounded, recorded exception: `vala-bifrost-redux`
+owns three fixed `rayon::ThreadPool` lanes in
+`scribe/execution_lanes.rs` — ingress decode, persistence encode, and WAL
+filesystem IO.
+
+The reason is that these are sustained CPU and blocking-IO workloads, not
+awaited IO. Running OTLP decode, Parquet encode, and WAL fsync on Tokio worker
+threads starves the async reactor and delays every unrelated request on the pod;
+`spawn_blocking` is also wrong here because its pool is unbounded and shared, so
+a decode burst becomes untracked backpressure with no lane attribution.
+
+This is a deviation, so it carries obligations. A CPU lane is legitimate only
+when it:
+
+- is a **fixed** pool sized at boot, never per request, with named worker
+  threads (`wyrd-scribe-ingress-cpu-<n>`) so saturation is attributable in a
+  stack dump;
+- is **admission-bounded by the application**, not by Rayon. Each lane holds a
+  `Semaphore` whose exhaustion returns a typed refusal (`ScribeError::IngestBusy`)
+  rather than queueing without limit. Rayon must never be the thing that applies
+  backpressure, because its queue is invisible to the resource governor;
+- **accounts every job**, tracking queue depth, active jobs, completions,
+  failures, panics, and saturation events, and exports them under the closed
+  `bifrost_scribe_lane_*` metric families keyed by lane;
+- **catches panics** at the lane boundary so one poisoned job cannot abort the
+  process or silently drop its permit;
+- **drains on shutdown** by closing admission first and then waiting for active
+  jobs, so a lane cannot outlive the subsystem that owns it.
+
+Do not add a CPU lane elsewhere by copying this pattern. A new lane is a design
+decision that must be recorded here, and lanes stay inside the crate that owns
+the workload. Everything else — request handling, planning, validation,
+transformation — stays synchronous or on Tokio per the rules above.
+
 ## Errors
 
 Rust errors should be useful before they become HTTP or Python errors:

@@ -68,7 +68,8 @@ use wyrd_server::config::{
 };
 use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::state::{
-    BifrostBuildInputs, BifrostTestControls, QueryStreamFault, QueryStreamFaultController,
+    BifrostBuildInputs, BifrostShutdownReport, BifrostTestControls, ComposedBifrost,
+    QueryStreamFault, QueryStreamFaultController, ScribeCoordinationRuntime,
 };
 use wyrd_server::{AppState, WyrdServer, WyrdServerConfig, build_router};
 use wyrd_spec::DataTenantId;
@@ -85,6 +86,8 @@ struct TestOraclePeerCredentials {
     api_key: SecretString,
     /// Production exchange service used for each access-token acquisition.
     exchange: ExchangeApiKey,
+    /// Cached short-lived service bearer shared by every peer RPC in the cluster.
+    bearer: tokio::sync::Mutex<Option<String>>,
 }
 
 impl std::fmt::Debug for TestOraclePeerCredentials {
@@ -98,7 +101,11 @@ impl std::fmt::Debug for TestOraclePeerCredentials {
 #[async_trait]
 impl OraclePeerCredentials for TestOraclePeerCredentials {
     /// Exchange the retained API key through the production auth service.
-    async fn bearer(&self, _force_refresh: bool) -> Result<String, DispatchError> {
+    async fn bearer(&self, force_refresh: bool) -> Result<String, DispatchError> {
+        let mut cached = self.bearer.lock().await;
+        if !force_refresh && let Some(bearer) = cached.as_ref() {
+            return Ok(bearer.clone());
+        }
         let mut conn = self
             .fixture
             .tenant_conn_for(DataTenantId::SYSTEM_OWNER)
@@ -114,7 +121,9 @@ impl OraclePeerCredentials for TestOraclePeerCredentials {
             .await
             .map_err(|_| DispatchError::Terminal)?;
         conn.commit().await.map_err(|_| DispatchError::Terminal)?;
-        Ok(exchanged.access_token.expose_secret().to_owned())
+        let bearer = exchanged.access_token.expose_secret().to_owned();
+        *cached = Some(bearer.clone());
+        Ok(bearer)
     }
 }
 
@@ -139,12 +148,33 @@ use crate::time::ClockHandle;
 /// Dedicated least-privilege role assigned to the test Oracle Service.
 const ORACLE_PEER_ROLE: &str = "bifrost_oracle_peer";
 
+/// Separates a serve-task join failure from the server's own terminal outcome.
+///
+/// The load-bearing case is [`tokio::task::JoinError::is_panic`]: a panic on the
+/// serve stack unwinds a `tokio-runtime-worker` thread that libtest never
+/// attributes, so discarding the join result lets a panicking run finish green.
+/// Returning it as [`WyrdTestServerError::Join`] makes every teardown seam that
+/// joins the serve task fail loudly instead. The inner `Result` is the server's
+/// own outcome and is left to the caller, which decides whether a terminal exit
+/// is expected.
+///
+/// # Errors
+/// Returns [`WyrdTestServerError::Join`] when the serve task panicked or was
+/// cancelled before producing an outcome.
+fn serve_task_outcome(
+    join: Result<Result<BifrostShutdownReport, wyrd_server::BootExit>, tokio::task::JoinError>,
+) -> Result<Result<BifrostShutdownReport, wyrd_server::BootExit>, WyrdTestServerError> {
+    join.map_err(|error| WyrdTestServerError::Join(format!("bound serve task: {error}")))
+}
+
 /// Wyrd server test harness supporting in-process and real-socket modes.
 pub struct WyrdTestServer {
     inner: WyrdTestServerInner,
     mode: Mode,
     shutdown_token: Option<CancellationToken>,
-    serve_handle: Option<JoinHandle<Result<(), wyrd_server::BootExit>>>,
+    /// Serve task for a bound server, yielding the production Bifrost drain
+    /// outcome so teardown seams can assert what actually drained.
+    serve_handle: Option<JoinHandle<Result<BifrostShutdownReport, wyrd_server::BootExit>>>,
     /// Optional fixed HTTP/gRPC addresses reserved by a multi-node harness.
     requested_bind: Option<(std::net::SocketAddr, std::net::SocketAddr)>,
     /// Optional TLS material applied when this in-process server binds.
@@ -153,6 +183,8 @@ pub struct WyrdTestServer {
     readiness_failure: bool,
     /// Optional test-only serve task that ignores cancellation until aborted.
     stalled_drain_for_test: Option<Arc<AtomicBool>>,
+    /// Test-only request to panic the bound serve task after its drain returns.
+    serve_task_panic_for_test: bool,
 }
 
 struct WyrdTestServerInner {
@@ -190,6 +222,13 @@ struct WyrdTestServerInner {
     query_control_audit_fault: wyrd_server::state::QueryControlAuditFaultController,
     /// Current notification-backed schema stall used by cancellation journeys.
     query_stream_stall: std::sync::Mutex<Option<Arc<wyrd_server::state::QueryStreamStall>>>,
+    /// Sole owner of the dedicated Scribe coordination runtime this server composed.
+    ///
+    /// The harness calls `compose_bifrost` directly, so a bound test server
+    /// builds the same dedicated executor production does and must retain the
+    /// same single owner. Declared last so struct drop order releases it after
+    /// `state`, which is the order production teardown also takes.
+    _coordination_runtime: ScribeCoordinationRuntime,
 }
 
 /// Concrete lifecycle evidence returned after one test server stops.
@@ -348,6 +387,8 @@ enum Mode {
 pub struct WyrdTestServerBuilder {
     policy_hook: Option<Arc<dyn PolicyHook>>,
     audit_writer: Option<Arc<dyn AuthzAuditWriter>>,
+    /// Optional eval-run audit sink installed on the composed `AppState`.
+    eval_audit: Option<Arc<dyn wyrd_server::components::eval::EvalAuditWriter>>,
     allow_preview_auth: bool,
     storage_settings: Option<StorageSettings>,
     storage_handle: Option<Arc<wyrd_storage::StorageHandle>>,
@@ -399,8 +440,14 @@ pub struct WyrdTestServerBuilder {
     forge_config: Option<ForgeConfig>,
     /// Force readiness failure after listeners are bound for rollback tests.
     readiness_failure: bool,
+    /// Compose the server with no token verifier configured.
+    omit_token_verifier: bool,
+    /// Optional non-default edge limits applied to the composed `AppState`.
+    limits: Option<wyrd_server::state::LimitsConfig>,
     /// Replace the serve task with a cancellation-resistant test task.
     stalled_drain_for_test: Option<Arc<AtomicBool>>,
+    /// Test-only request to panic the bound serve task after its drain returns.
+    serve_task_panic_for_test: bool,
 }
 
 /// Test-only file paths for a shared Oracle TLS identity and trust root.
@@ -458,16 +505,20 @@ impl Default for WyrdTestServerBuilder {
             forge_catalog: None,
             forge_config: None,
             readiness_failure: false,
+            eval_audit: None,
+            omit_token_verifier: false,
+            limits: None,
             stalled_drain_for_test: None,
+            serve_task_panic_for_test: false,
         }
     }
 }
 
 /// Result of a fixture-path principal bootstrap.
-pub use crate::env::Bootstrap;
+pub use crate::principal::Bootstrap;
 
 /// Result of an authz-check request.
-pub use crate::env::CheckResult;
+pub use crate::principal::CheckResult;
 
 /// Test server errors.
 #[derive(Debug, Error)]
@@ -561,19 +612,71 @@ impl WyrdTestServer {
 
     /// Shut down the server, cancelling the serve task and dropping fixtures.
     ///
+    /// A serve task that panicked is a real production defect, so its
+    /// [`JoinError`] is propagated rather than discarded: swallowing it lets a
+    /// panic on a `tokio-runtime-worker` thread finish the run green, which is
+    /// precisely the failure mode this seam exists to catch. A join *timeout*
+    /// remains tolerated — the bounded budget here is deliberately short and a
+    /// slow drain is not the same signal as a panic.
+    ///
     /// # Errors
-    /// Returns an error if the serve task join times out.
+    /// Returns [`WyrdTestServerError::Join`] when the serve task panicked or
+    /// when the final blocking drop cannot be joined.
     pub async fn shutdown(mut self) -> Result<(), WyrdTestServerError> {
         if let Some(token) = self.shutdown_token.take() {
             token.cancel();
         }
-        if let Some(handle) = self.serve_handle.take() {
-            let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        if let Some(handle) = self.serve_handle.take()
+            && let Ok(join) = tokio::time::timeout(Duration::from_secs(2), handle).await
+            && let Err(exit) = serve_task_outcome(join)?
+        {
+            tracing::warn!(?exit, "bound serve task exited terminally during shutdown");
         }
         tokio::task::spawn_blocking(move || drop(self))
             .await
             .map_err(|error| WyrdTestServerError::Join(error.to_string()))?;
         Ok(())
+    }
+
+    /// Cancel the serve task, join it in place, and return its drain outcome.
+    ///
+    /// Unlike [`shutdown`](Self::shutdown) and
+    /// [`shutdown_and_inspect`](Self::shutdown_and_inspect) this seam borrows
+    /// `self` instead of consuming it, so the caller keeps the harness — and
+    /// therefore the last [`AppState`] — alive past the join. That is what makes
+    /// production teardown reproducible from a test: once the serve task has
+    /// dropped its own `AppState` clone, the caller's frame owns the final
+    /// reference and drops it wherever the test chooses, rather than inside the
+    /// `spawn_blocking` that `shutdown` uses.
+    ///
+    /// The returned [`BifrostShutdownReport`] is the report `BoundServer::run`
+    /// produced from the real production drain, not a test-invoked second
+    /// shutdown.
+    ///
+    /// # Errors
+    /// Returns [`WyrdTestServerError::Start`] when no bound serve task is
+    /// running or when the server exited terminally, and
+    /// [`WyrdTestServerError::Join`] when the serve task panicked or the join
+    /// exceeded its bounded budget.
+    pub async fn cancel_and_join_for_test(
+        &mut self,
+    ) -> Result<BifrostShutdownReport, WyrdTestServerError> {
+        if let Some(token) = self.shutdown_token.take() {
+            token.cancel();
+        }
+        let handle = self.serve_handle.take().ok_or_else(|| {
+            WyrdTestServerError::Start(
+                "in-place teardown requires a running bound server".to_owned(),
+            )
+        })?;
+        let join = tokio::time::timeout(Duration::from_secs(70), handle)
+            .await
+            .map_err(|_| {
+                WyrdTestServerError::Join("serve task did not join before its deadline".to_owned())
+            })?;
+        serve_task_outcome(join)?.map_err(|exit| {
+            WyrdTestServerError::Start(format!("server exited terminally: {exit:?}"))
+        })
     }
 
     /// Abruptly terminate the test server without running graceful Scribe drain.
@@ -629,7 +732,7 @@ impl WyrdTestServer {
             })?
             .map_err(|error| WyrdTestServerError::Join(error.to_string()))?;
         let terminal = match result {
-            Ok(()) => Err(WyrdTestServerError::Start(
+            Ok(_report) => Err(WyrdTestServerError::Start(
                 "production supervisor exited cleanly while terminal failure was required"
                     .to_owned(),
             )),
@@ -1415,7 +1518,6 @@ impl WyrdTestServer {
             footer_encoded_bytes: 0,
             footer_decode_workspace_bytes: 0,
             sort_spill_bytes: 0,
-            output_scratch_bytes: 0,
         };
         resources
             .try_acquire_rewrite(ForgeRewriteRequest {
@@ -2301,6 +2403,15 @@ impl WyrdTestServer {
             .await
             .map_err(sql)
     }
+    /// Return the durable Scribe WAL root this fixture composed the server with.
+    ///
+    /// Durability assertions replay the WAL directly rather than trusting an
+    /// in-memory acknowledgement, so they need the same root `compose_bifrost`
+    /// was handed. Returns `None` for a target that composes no Scribe role.
+    #[must_use]
+    pub fn scribe_wal_root_for_test(&self) -> Option<&std::path::Path> {
+        self.inner._scribe_wal_root.as_ref().map(|root| root.path())
+    }
 
     async fn raw_call(
         &self,
@@ -2396,9 +2507,13 @@ impl WyrdTestServer {
             let worker =
                 wyrd_server::boot::spawn_forge_worker(&state, shutdown_token.clone(), 1, 1)
                     .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+            // A dedicated Forge worker never runs the bounded Bifrost drain, so
+            // its serve task reports that nothing drained rather than claiming a
+            // drain outcome it did not produce.
             let serve_handle = wyrd_runtime::runtime().spawn(async move {
                 worker
                     .await
+                    .map(|()| BifrostShutdownReport::none_drained())
                     .map_err(|error| wyrd_server::BootExit::Other(Box::new(error)))
             });
             self.shutdown_token = Some(shutdown_token);
@@ -2438,24 +2553,36 @@ impl WyrdTestServer {
             .ok_or_else(|| WyrdTestServerError::Bind("no gRPC address bound".to_owned()))?;
         let base_url = format!("http://{addr}");
 
-        let serve_handle = if let Some(aborted) = self.stalled_drain_for_test.take() {
-            wyrd_runtime::runtime().spawn(async move {
-                struct AbortObservation(Arc<AtomicBool>);
+        let serve_handle: JoinHandle<Result<BifrostShutdownReport, wyrd_server::BootExit>> =
+            if let Some(aborted) = self.stalled_drain_for_test.take() {
+                wyrd_runtime::runtime().spawn(async move {
+                    struct AbortObservation(Arc<AtomicBool>);
 
-                impl Drop for AbortObservation {
-                    fn drop(&mut self) {
-                        self.0.store(true, Ordering::SeqCst);
+                    impl Drop for AbortObservation {
+                        fn drop(&mut self) {
+                            self.0.store(true, Ordering::SeqCst);
+                        }
                     }
-                }
 
-                let _observation = AbortObservation(aborted);
-                let _bound = bound;
-                std::future::pending::<()>().await;
-                Ok(())
-            })
-        } else {
-            wyrd_runtime::runtime().spawn(async move { bound.run().await })
-        };
+                    let _observation = AbortObservation(aborted);
+                    let _bound = bound;
+                    std::future::pending::<()>().await;
+                    // Invariant: `pending()` never resolves, so this arm only ever
+                    // leaves the future by abort. Fabricating a `BifrostShutdownReport`
+                    // here would compile silently and hand a future teardown assertion
+                    // a drain outcome that no drain produced.
+                    unreachable!("stalled-drain serve task never completes; it is only aborted")
+                })
+            } else if self.serve_task_panic_for_test {
+                // Serves normally so bound startup reaches readiness, then panics on
+                // the serve stack once the production drain returns.
+                wyrd_runtime::runtime().spawn(async move {
+                    let _report = bound.run().await;
+                    panic!("test-injected serve-task panic after drain");
+                })
+            } else {
+                wyrd_runtime::runtime().spawn(async move { bound.run().await })
+            };
 
         self.shutdown_token = Some(shutdown_token);
         self.serve_handle = Some(serve_handle);
@@ -2552,10 +2679,63 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Install an eval-run audit sink on the composed `AppState`.
+    ///
+    /// The default sink discards events, so a test that must prove a run
+    /// open/complete pair was audited supplies a recording writer here rather
+    /// than reaching into composed state after the fact.
+    #[must_use]
+    pub fn with_eval_audit_for_test(
+        mut self,
+        writer: Arc<dyn wyrd_server::components::eval::EvalAuditWriter>,
+    ) -> Self {
+        self.eval_audit = Some(writer);
+        self
+    }
+
+    /// Compose the server without a token verifier.
+    ///
+    /// Models a server whose auth backend is not yet configured — the state a
+    /// deployment occupies between process start and verifier provisioning.
+    /// Every `/v1` request must then answer `503 WYRD_AUTH_503_VERIFY_UNAVAILABLE`
+    /// rather than 401 or 500, so callers back off instead of treating the
+    /// window as a credential failure.
+    #[must_use]
+    pub fn without_token_verifier_for_test(mut self) -> Self {
+        self.omit_token_verifier = true;
+        self
+    }
+
+    /// Apply a non-default edge limit profile to the composed `AppState`.
+    ///
+    /// Edge behaviour that only manifests at a boundary — a body-size refusal,
+    /// a request timeout, a concurrency cap — is unreachable at the production
+    /// defaults inside a test. This knob feeds the profile through the same
+    /// `AppState::with_limits` the server uses, so the router under test is the
+    /// composed production router with one configuration value changed.
+    #[must_use]
+    pub fn with_limits_for_test(mut self, limits: wyrd_server::state::LimitsConfig) -> Self {
+        self.limits = Some(limits);
+        self
+    }
+
     /// Force the bound readiness phase to fail and exercise startup rollback.
     #[must_use]
     pub fn with_readiness_failure_for_test(mut self) -> Self {
         self.readiness_failure = true;
+        self
+    }
+
+    /// Panic the bound serve task once its production drain has returned.
+    ///
+    /// The panic is deferred until after `BoundServer::run` completes so bound
+    /// startup still reaches readiness; a task that panicked earlier would fail
+    /// startup rollback instead of teardown. Aborting the task would instead
+    /// surface [`tokio::task::JoinError::is_cancelled`], which is not the signal
+    /// a teardown seam is required to refuse.
+    #[must_use]
+    pub fn with_serve_task_panic_for_test(mut self) -> Self {
+        self.serve_task_panic_for_test = true;
         self
     }
 
@@ -3026,6 +3206,7 @@ impl WyrdTestServerBuilder {
                     unmanaged_reserve_bytes: None,
                     scratch_limit_bytes: None,
                     effective_cpu: None,
+                    oracle_query_slot_limit: None,
                     scratch_root,
                     volume_roots,
                 },
@@ -3078,17 +3259,13 @@ impl WyrdTestServerBuilder {
             Some(credentials) => credentials,
             None => provision_oracle_peer_credentials(Arc::clone(&fixture)).await?,
         };
-        let peer_tls = if let Some(tls) = &self.oracle_peer_tls {
-            vala_bifrost_redux::oracle::dispatcher::OraclePeerTls::new(
+        let peer_tls = match &self.oracle_peer_tls {
+            Some(tls) => Some(vala_bifrost_redux::oracle::dispatcher::OraclePeerTls::new(
                 std::fs::read(&tls.ca_path)
                     .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
                 tls.server_name.clone(),
-            )
-        } else {
-            vala_bifrost_redux::oracle::dispatcher::OraclePeerTls::new(
-                Vec::new(),
-                "unused.invalid".to_owned(),
-            )
+            )),
+            None => None,
         };
         let mut bifrost_config = BifrostRuntimeConfig::default();
         bifrost_config.scribe.ingest_request_bytes = self.scribe_ingest_limits.max_frame_bytes;
@@ -3097,7 +3274,10 @@ impl WyrdTestServerBuilder {
             ..ForgeRuntimeConfig::default()
         };
         let shutdown = CancellationToken::new();
-        let bifrost_runtime = wyrd_server::boot::compose_bifrost(BifrostBuildInputs {
+        let ComposedBifrost {
+            bifrost: bifrost_runtime,
+            coordination_runtime,
+        } = wyrd_server::boot::compose_bifrost(BifrostBuildInputs {
             target,
             deployment_profile: DeploymentProfile::Development,
             postgres: postgres.as_ref().clone(),
@@ -3112,10 +3292,15 @@ impl WyrdTestServerBuilder {
             config: bifrost_config,
             forge_config: forge_runtime,
             node_id,
-            advertise_addr: self.bind_addrs.map_or_else(
-                || "http://127.0.0.1:0".to_owned(),
-                |(_, grpc)| format!("http://{grpc}"),
-            ),
+            // Must agree with `WyrdTestServer::grpc_url`: the address published
+            // into cluster membership is dialed by peer transports, and a TLS
+            // transport refuses a peer advertising a plaintext scheme.
+            advertise_addr: match (self.bind_addrs, self.oracle_peer_tls.is_some()) {
+                (Some((_, grpc)), true) => format!("https://localhost:{}", grpc.port()),
+                (Some((_, grpc)), false) => format!("http://{grpc}"),
+                (None, true) => "https://localhost:0".to_owned(),
+                (None, false) => "http://127.0.0.1:0".to_owned(),
+            },
             wal_dir: wal_root.path().to_owned(),
             shutdown: shutdown.clone(),
             test_controls: Some(test_controls),
@@ -3131,12 +3316,18 @@ impl WyrdTestServerBuilder {
             .with_auth(wyrd_server::components::auth::ServerAuth {
                 allow_preview: self.allow_preview_auth,
                 issuing_key: Some(Arc::clone(&issuing_key)),
-                token_verifier: Some(Arc::clone(&verifier)),
+                token_verifier: (!self.omit_token_verifier).then(|| Arc::clone(&verifier)),
                 token_exchange_settings: exchange_settings,
                 trusted_issuer_resolver: Some(issuer_resolver),
                 workload_binding_resolver: Some(binding_resolver),
                 sealing_key: Some(sealing_key),
             });
+        if let Some(writer) = self.eval_audit {
+            state = state.with_eval_audit(writer);
+        }
+        if let Some(limits) = self.limits {
+            state = state.with_limits(limits);
+        }
         state.authz.permission_check = Arc::new(RbacCheck);
         state.authz.audit_writer = self
             .audit_writer
@@ -3175,6 +3366,7 @@ impl WyrdTestServerBuilder {
                 query_stream_fault,
                 query_control_audit_fault,
                 query_stream_stall: std::sync::Mutex::new(None),
+                _coordination_runtime: coordination_runtime,
             },
             mode: Mode::InProcess,
             shutdown_token: None,
@@ -3183,6 +3375,7 @@ impl WyrdTestServerBuilder {
             requested_oracle_peer_tls: self.oracle_peer_tls,
             readiness_failure: self.readiness_failure,
             stalled_drain_for_test: self.stalled_drain_for_test,
+            serve_task_panic_for_test: self.serve_task_panic_for_test,
         })
     }
 
@@ -3347,14 +3540,20 @@ pub(crate) async fn provision_oracle_peer_credentials(
         )
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
     );
-    Ok(Arc::new(TestOraclePeerCredentials {
+    let credentials = Arc::new(TestOraclePeerCredentials {
         fixture,
         api_key: api_key.secret,
         exchange: ExchangeApiKey {
             issuing_key,
             settings: TokenExchangeSettings::default(),
         },
-    }))
+        bearer: tokio::sync::Mutex::new(None),
+    });
+    credentials
+        .bearer(false)
+        .await
+        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+    Ok(credentials)
 }
 
 async fn lookup_role_id(
@@ -3649,6 +3848,7 @@ mod production_composition_tests {
                 unmanaged_reserve_bytes: None,
                 scratch_limit_bytes: None,
                 effective_cpu: None,
+                oracle_query_slot_limit: None,
                 scratch_root: scratch.path().to_owned(),
                 volume_roots: None,
             },

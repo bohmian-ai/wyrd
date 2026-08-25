@@ -4,7 +4,6 @@ use iceberg::{NamespaceIdent, TableIdent};
 use thiserror::Error;
 use wyrd_spec::DataTenantId;
 
-use crate::catalog::partition_spec::PartitionTransform;
 use crate::catalog::table_ref::{TableRef, is_safe_name};
 
 /// The logical table plus the authenticated organization that owns its data.
@@ -253,18 +252,6 @@ impl TenantTableBinding {
         }
         (path == prefix || path.starts_with(&format!("{prefix}/"))).then(|| path.to_owned())
     }
-
-    /// Return the single partition transform used by every physical table.
-    #[must_use]
-    pub const fn partition_transform(&self) -> PartitionTransform {
-        PartitionTransform::Day
-    }
-
-    /// Return the canonical partition source and transform.
-    #[must_use]
-    pub fn partition_columns(&self) -> [(String, PartitionTransform); 1] {
-        [("wyrd_event_time".to_owned(), self.partition_transform())]
-    }
 }
 
 #[cfg(test)]
@@ -386,18 +373,6 @@ mod tests {
         assert_eq!(
             TenantTableBinding::resolve((crate::test_support::nil_tenant(), table())),
             Err(TenantTableBindingError::InvalidTenant)
-        );
-    }
-
-    #[test]
-    fn tenant_table_binding_uses_day_partition_only() {
-        let binding =
-            TenantTableBinding::resolve((DataTenantId::new_v7(), table())).expect("binding");
-
-        assert_eq!(binding.partition_transform(), PartitionTransform::Day);
-        assert_eq!(
-            binding.partition_columns(),
-            [("wyrd_event_time".to_owned(), PartitionTransform::Day)]
         );
     }
 

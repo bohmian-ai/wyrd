@@ -170,10 +170,10 @@ pub fn read_manifest(path: impl AsRef<Path>) -> Result<Option<Manifest>, ScribeE
 mod tests {
     use super::*;
     use crate::catalog::TableRef;
+
     use crate::namespaces::BifrostNamespace;
-    use crate::scribe::seal_key::EventDay;
     use crate::scribe::stream_identity::{NodeId, WriterEpoch};
-    use chrono::NaiveDate;
+
     use tempfile::TempDir;
 
     #[test]
@@ -186,7 +186,7 @@ mod tests {
 
         let tenant = crate::test_support::tenant();
         let table = TableRef::new(BifrostNamespace::Bifrost, "events");
-        let day = EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).unwrap());
+        let day = crate::test_support::day_partition(2026, 7, 14);
         let seal_key = SealKey::new(tenant, table, day);
 
         manifest.update_sealed_lsn(&seal_key, WalLsn::new(100));
@@ -208,7 +208,7 @@ mod tests {
         let seal_key = SealKey::new(
             crate::test_support::tenant(),
             TableRef::new(BifrostNamespace::Bifrost, "events"),
-            EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).unwrap()),
+            crate::test_support::day_partition(2026, 7, 14),
         );
 
         manifest.update_sealed_lsn(&seal_key, WalLsn::new(100));
@@ -228,7 +228,7 @@ mod tests {
         let mut manifest1 = Manifest::new(identity);
         let tenant = crate::test_support::tenant();
         let table = TableRef::new(BifrostNamespace::Bifrost, "events");
-        let day = EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).unwrap());
+        let day = crate::test_support::day_partition(2026, 7, 14);
         let seal_key = SealKey::new(tenant, table, day);
 
         manifest1.update_sealed_lsn(&seal_key, WalLsn::new(50));

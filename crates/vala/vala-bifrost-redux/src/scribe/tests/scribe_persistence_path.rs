@@ -6,14 +6,14 @@ use crate::namespaces::BifrostNamespace;
 use crate::schema::SchemaFingerprint;
 use crate::scribe::ScribeAppend;
 use crate::scribe::ScribeImpl;
-use crate::scribe::seal_key::{EventDay, SealKey};
+use crate::scribe::admission::EventTimeWindow;
+use crate::scribe::seal_key::SealKey;
 use crate::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use crate::scribe::tail_rpc::FetchLiveTailRequest;
 use crate::scribe::wal::{WalConfig, WalLsn, WalWriter};
 use arrow::array::{ArrayRef, Int64Array, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use chrono::NaiveDate;
 use tempfile::TempDir;
 use uuid::Uuid;
 use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
@@ -21,16 +21,39 @@ use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 
+/// Returns an event partition the production admission window still admits,
+/// `days_before_receipt` days below the current receipt instant.
+///
+/// These fixtures must not pin an absolute date. A pinned instant silently ages
+/// out of `[receipt - past, receipt + future]` as wall-clock advances, so the
+/// append it feeds starts failing with `EventTimeOutOfRange` on some later
+/// date and the test stops covering the path it names. Deriving the day from
+/// the window keeps every case correct at any wall-clock time.
+///
+/// The partition is returned at hourly granularity because these fixtures drive
+/// Scribe without a catalog registration, and an unregistered table resolves to
+/// the hourly omission default. A seal key bucketed any other way would land in
+/// a partition no tail request in this file selects.
+///
+/// # Panics
+/// Panics when the derived instant is not representable, or is not an exact
+/// hour boundary after truncation.
+fn fixture_event_day(days_before_receipt: i64) -> crate::catalog::layout::TimePartition {
+    let instant = chrono::DateTime::from_timestamp_micros(
+        EventTimeWindow::default().admitted_event_time_micros(days_before_receipt),
+    )
+    .expect("derived event time must be representable");
+    crate::catalog::TimeGranularity::Hour
+        .bucket(instant)
+        .expect("a truncated instant is an exact hourly boundary")
+}
+
 /// Build the fixed one-row event-time batch for Scribe path tests.
 ///
 /// # Panics
 /// Panics when static time or Arrow fixture construction fails.
-fn batch(day: NaiveDate) -> RecordBatch {
-    let timestamp = day
-        .and_hms_opt(12, 0, 0)
-        .expect("valid test time")
-        .and_utc()
-        .timestamp_micros();
+fn batch(partition: crate::catalog::layout::TimePartition) -> RecordBatch {
+    let timestamp = partition.start_utc().timestamp_micros();
     RecordBatch::try_new(
         Arc::new(Schema::new(vec![
             Field::new(
@@ -64,7 +87,7 @@ fn principal(tenant: DataTenantId) -> Principal {
 async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
     let tenant = DataTenantId::new_v7();
     let table = TableRef::new(BifrostNamespace::Bifrost, "scribe_tail");
-    let day = NaiveDate::from_ymd_opt(2026, 7, 24).expect("test day");
+    let day = fixture_event_day(1);
     let rows = batch(day);
     let batch_id = Uuid::now_v7();
     let temp_dir = TempDir::new().expect("WAL temp dir");
@@ -121,8 +144,8 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
     let request = FetchLiveTailRequest {
         binding,
         target_stream: stream,
-        start_day: EventDay::new(day),
-        end_day: EventDay::new(day),
+        start_partition: day,
+        end_partition: day,
         after_lsn: WalLsn::ZERO,
         persisted_lsn_ranges: Vec::new(),
         required_columns: vec!["value".to_owned()],
@@ -151,8 +174,8 @@ async fn oracle_hot_snapshot_preserves_pointer_identity_and_day_isolation() {
     let tenant = DataTenantId::new_v7();
     let pointer_table = TableRef::new(BifrostNamespace::Bifrost, "scribe_pointer_identity");
     let day_table = TableRef::new(BifrostNamespace::Bifrost, "scribe_day_isolation");
-    let day_one = NaiveDate::from_ymd_opt(2026, 7, 24).expect("day one");
-    let day_two = NaiveDate::from_ymd_opt(2026, 7, 25).expect("day two");
+    let day_one = fixture_event_day(2);
+    let day_two = fixture_event_day(1);
     let source = batch(day_one);
     let source_value = source.column(1).clone();
     let temp_dir = TempDir::new().expect("WAL temp dir");
@@ -219,7 +242,7 @@ async fn assert_pointer_identity(
     scribe: &ScribeImpl,
     tenant: DataTenantId,
     table: &TableRef,
-    day: NaiveDate,
+    day: crate::catalog::layout::TimePartition,
     source_value: &ArrayRef,
     stream: StreamIdentity,
 ) {
@@ -229,8 +252,8 @@ async fn assert_pointer_identity(
         .fetch_hot_batches(FetchLiveTailRequest {
             binding: TenantTableBinding::resolve((tenant, table.clone())).expect("pointer binding"),
             target_stream: stream,
-            start_day: EventDay::new(day),
-            end_day: EventDay::new(day),
+            start_partition: day,
+            end_partition: day,
             after_lsn: WalLsn::ZERO,
             persisted_lsn_ranges: Vec::new(),
             required_columns: vec!["value".to_owned()],
@@ -247,22 +270,18 @@ async fn assert_pointer_identity(
 ///
 /// # Panics
 /// Panics when the static cross-day Arrow fixture cannot be built.
-fn cross_day_batch(schema: Arc<Schema>, day_one: NaiveDate, day_two: NaiveDate) -> RecordBatch {
+fn cross_day_batch(
+    schema: Arc<Schema>,
+    day_one: crate::catalog::layout::TimePartition,
+    day_two: crate::catalog::layout::TimePartition,
+) -> RecordBatch {
     RecordBatch::try_new(
         schema,
         vec![
             Arc::new(
                 TimestampMicrosecondArray::from(vec![
-                    day_one
-                        .and_hms_opt(12, 0, 0)
-                        .expect("day one time")
-                        .and_utc()
-                        .timestamp_micros(),
-                    day_two
-                        .and_hms_opt(12, 0, 0)
-                        .expect("day two time")
-                        .and_utc()
-                        .timestamp_micros(),
+                    day_one.start_utc().timestamp_micros(),
+                    day_two.start_utc().timestamp_micros(),
                 ])
                 .with_timezone("UTC"),
             ),
@@ -277,15 +296,15 @@ async fn assert_cross_day_materialization(
     scribe: &ScribeImpl,
     tenant: DataTenantId,
     table: &TableRef,
-    day_one: NaiveDate,
-    day_two: NaiveDate,
+    day_one: crate::catalog::layout::TimePartition,
+    day_two: crate::catalog::layout::TimePartition,
     stream: StreamIdentity,
 ) {
-    let read_day = |day: NaiveDate| FetchLiveTailRequest {
+    let read_day = |day: crate::catalog::layout::TimePartition| FetchLiveTailRequest {
         binding: TenantTableBinding::resolve((tenant, table.clone())).expect("day binding"),
         target_stream: stream,
-        start_day: EventDay::new(day),
-        end_day: EventDay::new(day),
+        start_partition: day,
+        end_partition: day,
         after_lsn: WalLsn::ZERO,
         persisted_lsn_ranges: Vec::new(),
         required_columns: vec!["value".to_owned()],
@@ -328,7 +347,7 @@ fn hot_value(rows: &RecordBatch) -> i64 {
 async fn assert_other_tenant_isolated(
     scribe: &ScribeImpl,
     table: &TableRef,
-    day: NaiveDate,
+    day: crate::catalog::layout::TimePartition,
     stream: StreamIdentity,
 ) {
     let other = scribe
@@ -338,8 +357,8 @@ async fn assert_other_tenant_isolated(
             binding: TenantTableBinding::resolve((DataTenantId::new_v7(), table.clone()))
                 .expect("other tenant binding"),
             target_stream: stream,
-            start_day: EventDay::new(day),
-            end_day: EventDay::new(day),
+            start_partition: day,
+            end_partition: day,
             after_lsn: WalLsn::ZERO,
             persisted_lsn_ranges: Vec::new(),
             required_columns: vec!["value".to_owned()],
@@ -366,7 +385,7 @@ fn concrete_wal_disk_failure_rejects_before_file_mutation() {
     let seal_key = SealKey::new(
         DataTenantId::new_v7(),
         TableRef::new(BifrostNamespace::Bifrost, "scribe_wal_failure"),
-        EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 24).expect("test day")),
+        fixture_event_day(1),
     );
 
     let error = writer
@@ -381,7 +400,7 @@ fn concrete_wal_disk_failure_rejects_before_file_mutation() {
 async fn shard_wal_failure_reaches_the_durable_completion() {
     let tenant = DataTenantId::new_v7();
     let table = TableRef::new(BifrostNamespace::Bifrost, "scribe_wal_failure");
-    let day = NaiveDate::from_ymd_opt(2026, 7, 24).expect("test day");
+    let day = fixture_event_day(1);
     let temp_dir = TempDir::new().expect("WAL temp dir");
     let operator = Arc::new(
         opendal::Operator::new(opendal::services::Memory::default())

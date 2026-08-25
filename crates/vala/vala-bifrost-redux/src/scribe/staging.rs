@@ -16,7 +16,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::AuditEvent;
 
 /// Version of the durable Scribe publication-manifest contract.
-const PUBLICATION_MANIFEST_VERSION: u8 = 1;
+const PUBLICATION_MANIFEST_VERSION: u8 = 2;
 /// Maximum durable metadata accepted during fail-closed startup recovery.
 const MAX_PUBLICATION_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -94,8 +94,12 @@ struct DurableFileListRow {
     min_event_time: chrono::DateTime<chrono::Utc>,
     /// Maximum event time.
     max_event_time: chrono::DateTime<chrono::Utc>,
-    /// Event-day partition.
-    partition_day: chrono::NaiveDate,
+    /// Exact typed time partition of the staged artifact.
+    ///
+    /// Stored as the public wire value so the manifest carries the same
+    /// granularity/start pair the WAL, object path, and file-list row carry,
+    /// and so deserialization re-validates the canonical boundary.
+    partition: wyrd_spec::vala::api::TimePartitionWire,
     /// Producing node.
     node_id: Uuid,
     /// Producing fenced epoch.
@@ -126,7 +130,7 @@ impl From<&FileListArtifactInsert> for DurableFileListRow {
             row_count: row.row_count,
             min_event_time: row.min_event_time,
             max_event_time: row.max_event_time,
-            partition_day: row.partition_day,
+            partition: row.partition.to_wire(),
             node_id: row.node_id,
             writer_epoch: row.writer_epoch,
             wal_lsn_min: row.wal_lsn_min,
@@ -153,7 +157,7 @@ impl From<DurableFileListRow> for FileListArtifactInsert {
             row_count: row.row_count,
             min_event_time: row.min_event_time,
             max_event_time: row.max_event_time,
-            partition_day: row.partition_day,
+            partition: crate::catalog::layout::TimePartition::from_wire(row.partition),
             node_id: row.node_id,
             writer_epoch: row.writer_epoch,
             wal_lsn_min: row.wal_lsn_min,
@@ -1401,7 +1405,7 @@ mod tests {
         assert!(staging.root.join("member-0.winner").exists());
     }
 
-redacted
+    /// Proves the four crash cuts classify only pre-manifest data as
     /// orphan and complete every manifest-backed winner lifecycle.
     ///
     /// # Panics
@@ -1542,7 +1546,9 @@ redacted
             row_count: 1,
             min_event_time: now,
             max_event_time: now,
-            partition_day: now.date_naive(),
+            partition: crate::catalog::TimeGranularity::Hour
+                .bucket(now)
+                .expect("fixture instant buckets"),
             node_id,
             writer_epoch: 11,
             wal_lsn_min: 1,
@@ -1577,6 +1583,235 @@ redacted
         assert_eq!(recovered[0].actor_stream, actor);
         assert_eq!(recovered[0].rows[0].file_path, object_key);
         assert_eq!(recovered[0].audit_events, events);
+    }
+
+    /// Publishes the elected artifact and returns its manifest's durable bytes.
+    ///
+    /// The publication is written through the production `persist_publication`
+    /// path so the manifest the restart later recovers is the real one, not a
+    /// fixture approximation. The returned length is the on-disk manifest size,
+    /// which the caller folds into the expected durable WAL occupancy.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the publication cannot be persisted or its manifest cannot be
+    /// stat-ed.
+    async fn publish_elected_artifact(
+        staging: &ScribeStaging,
+        object_key: &str,
+        content: &[u8],
+        digest: [u8; 32],
+        claim: &StagedArtifactClaim,
+    ) -> u64 {
+        let node_id = Uuid::from_bytes([7_u8; 16]);
+        let actor = StreamIdentity::new(
+            crate::scribe::stream_identity::NodeId::new(node_id),
+            crate::scribe::stream_identity::WriterEpoch::new(11),
+        );
+        let tenant = DataTenantId::new_v7();
+        let now = chrono::Utc::now();
+        let rows = vec![FileListArtifactInsert {
+            id: Uuid::now_v7(),
+            data_tenant_id: tenant,
+            namespace: "vala.traces".to_owned(),
+            table_name: "spans".to_owned(),
+            file_path: object_key.to_owned(),
+            file_size: i64::try_from(content.len()).expect("fixture length"),
+            row_count: 1,
+            min_event_time: now,
+            max_event_time: now,
+            partition: crate::catalog::TimeGranularity::Hour
+                .bucket(now)
+                .expect("fixture instant buckets"),
+            node_id,
+            writer_epoch: 11,
+            wal_lsn_min: 1,
+            wal_lsn_max: 2,
+            file_ordinal: 0,
+            file_checksum: hex::encode(digest),
+        }];
+        let events = vec![AuditEvent::new(
+            RequestId::now_v7(),
+            None,
+            "bifrost.scribe.publish".to_owned(),
+            "vala.traces.spans".to_owned(),
+            None,
+            PrincipalId::new(Uuid::now_v7()),
+            PrincipalKindTag::User,
+            AuthMethod::Internal,
+            "bifrost.scribe".to_owned(),
+            AuditDecision::Allow,
+            AuditResult::Success,
+            "redacted".to_owned(),
+        )];
+        staging
+            .persist_publication(
+                "generation-9",
+                actor,
+                &rows,
+                &events,
+                std::slice::from_ref(claim),
+            )
+            .await
+            .expect("publication manifest");
+        let publication_path = staging.root.join("generation-9.publication.json");
+
+        tokio::fs::metadata(&publication_path)
+            .await
+            .expect("publication metadata")
+            .len()
+    }
+
+    /// Stages one uncommitted attempt and returns its bytes and manifest path.
+    ///
+    /// The attempt is deliberately left pending — staged and fsynced, with its
+    /// attempt manifest written, but never elected — so the restart has an
+    /// unresolved election to reconstruct. Growth is reserved and committed
+    /// through the production WAL volume so the durable counter reflects it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if growth cannot be reserved or committed, or if the staged copy,
+    /// manifest write, or directory fsync fails.
+    async fn stage_pending_attempt(
+        staging: &ScribeStaging,
+        writer: &Arc<WalWriter>,
+        source: &std::path::Path,
+        digest: [u8; 32],
+        content: &[u8],
+    ) -> (u64, std::path::PathBuf) {
+        let pending_identity = "generation-10-artifact-0";
+        let pending_attempt = Uuid::now_v7();
+        let pending_prefix = format!("{pending_identity}.{pending_attempt}");
+        let pending_path = staging.root.join(format!("{pending_prefix}.par.tmp"));
+        let pending_manifest_path = staging.root.join(format!("{pending_prefix}.attempt.json"));
+        let pending_manifest = AttemptManifest {
+            logical_identity: pending_identity.to_owned(),
+            attempt_id: pending_attempt,
+            object_key: "tenant/table/recovered-election.parquet".to_owned(),
+            sha256: digest,
+            length: content.len() as u64,
+        };
+        let pending_manifest_bytes = serde_json::to_vec(&pending_manifest)
+            .expect("pending attempt manifest representation")
+            .len() as u64;
+        let pending_bytes = (content.len() as u64)
+            .checked_add(pending_manifest_bytes)
+            .expect("pending stage bytes");
+        let pending_growth = writer
+            .reserve_staged_growth(pending_bytes)
+            .expect("pending stage growth")
+            .expect("production WAL volume");
+        copy_fsynced(
+            source,
+            &pending_path,
+            digest,
+            content.len() as u64,
+            &mut [0_u8; 8],
+        )
+        .await
+        .expect("pending stage copy");
+        sync_directory(&staging.root)
+            .await
+            .expect("pending stage directory fsync");
+        write_manifest_fsynced(&pending_manifest_path, &pending_manifest)
+            .await
+            .expect("pending attempt manifest");
+        sync_directory(&staging.root)
+            .await
+            .expect("pending manifest directory fsync");
+        pending_growth.commit().expect("pending stage commit");
+        (pending_bytes, pending_manifest_path)
+    }
+
+    /// Asserts a restart reconstructs the exact namespace and retires it fully.
+    ///
+    /// Registering a fresh governor over the same roots must reconcile to
+    /// exactly the durable bytes the pre-restart run accounted for — no more, so
+    /// unauthorized files are excluded, and no less, so authorized staged files
+    /// are not lost. Recovery must then resolve the pending election, growing
+    /// the counter by exactly the winner marker, and cleaning up every recovered
+    /// claim and the publication must return the counter to zero.
+    ///
+    /// # Panics
+    ///
+    /// Panics if registration, recovery, or cleanup fails, or if any usage
+    /// reading differs from the exact expected occupancy.
+    async fn assert_restart_reconstructs_and_retires(
+        roots: BifrostVolumeRoots,
+        wal_root: &std::path::Path,
+        expected: u64,
+        claim: &StagedArtifactClaim,
+        pending_manifest_path: &std::path::Path,
+    ) {
+        let restarted =
+            BifrostVolumeGovernor::register(roots, 1024 * 1024, BifrostResourceHealth::default())
+                .expect("restart volume registration");
+        assert_eq!(
+            restarted
+                .usage_for_test(BifrostVolumeClass::Wal)
+                .expect("reconciled usage"),
+            (expected, 0, 0),
+            "restart counts only WAL and authorized staged files"
+        );
+        let restarted_writer = Arc::new(
+            WalWriter::new_with_volume(
+                wal_root,
+                [7_u8; 16],
+                11,
+                WalConfig::default(),
+                restarted.capabilities().wal,
+            )
+            .expect("restarted governed WAL writer"),
+        );
+        let restarted_staging = ScribeStaging::new(restarted_writer);
+        let recovered_claims = restarted_staging
+            .recover(&mut [0_u8; 8])
+            .await
+            .expect("stage recovery");
+        let recovered_publications = restarted_staging
+            .recover_publications(&mut [0_u8; 8])
+            .await
+            .expect("publication recovery");
+        assert_eq!(recovered_claims.len(), 2);
+        assert!(recovered_claims.contains(claim));
+        assert_eq!(recovered_publications.len(), 1);
+        let recovered_winner_bytes = u64::try_from(
+            pending_manifest_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("pending manifest filename")
+                .len(),
+        )
+        .expect("winner marker bytes");
+        assert_eq!(
+            restarted
+                .usage_for_test(BifrostVolumeClass::Wal)
+                .expect("post-election usage"),
+            (
+                expected
+                    .checked_add(recovered_winner_bytes)
+                    .expect("post-election durable bytes"),
+                0,
+                0
+            )
+        );
+        for recovered_claim in &recovered_claims {
+            restarted_staging
+                .cleanup_published(recovered_claim)
+                .await
+                .expect("stage cleanup");
+        }
+        restarted_staging
+            .cleanup_publication("generation-9")
+            .await
+            .expect("publication cleanup");
+        assert_eq!(
+            restarted
+                .usage_for_test(BifrostVolumeClass::Wal)
+                .expect("settled usage"),
+            (0, 0, 0)
+        );
     }
 
     /// Proves restart reconstructs every authorized stage byte and exact cleanup.
@@ -1642,95 +1877,10 @@ redacted
         {
             StageElection::Winner(claim) | StageElection::ExistingWinner(claim) => claim,
         };
-        let node_id = Uuid::from_bytes([7_u8; 16]);
-        let actor = StreamIdentity::new(
-            crate::scribe::stream_identity::NodeId::new(node_id),
-            crate::scribe::stream_identity::WriterEpoch::new(11),
-        );
-        let tenant = DataTenantId::new_v7();
-        let now = chrono::Utc::now();
-        let rows = vec![FileListArtifactInsert {
-            id: Uuid::now_v7(),
-            data_tenant_id: tenant,
-            namespace: "vala.traces".to_owned(),
-            table_name: "spans".to_owned(),
-            file_path: object_key.to_owned(),
-            file_size: i64::try_from(content.len()).expect("fixture length"),
-            row_count: 1,
-            min_event_time: now,
-            max_event_time: now,
-            partition_day: now.date_naive(),
-            node_id,
-            writer_epoch: 11,
-            wal_lsn_min: 1,
-            wal_lsn_max: 2,
-            file_ordinal: 0,
-            file_checksum: hex::encode(digest),
-        }];
-        let events = vec![AuditEvent::new(
-            RequestId::now_v7(),
-            None,
-            "bifrost.scribe.publish".to_owned(),
-            "vala.traces.spans".to_owned(),
-            None,
-            PrincipalId::new(Uuid::now_v7()),
-            PrincipalKindTag::User,
-            AuthMethod::Internal,
-            "bifrost.scribe".to_owned(),
-            AuditDecision::Allow,
-            AuditResult::Success,
-            "redacted".to_owned(),
-        )];
-        staging
-            .persist_publication("generation-9", actor, &rows, &events, &[claim.clone()])
-            .await
-            .expect("publication manifest");
-        let publication_path = staging.root.join("generation-9.publication.json");
-        let publication_bytes = tokio::fs::metadata(&publication_path)
-            .await
-            .expect("publication metadata")
-            .len();
-        let pending_identity = "generation-10-artifact-0";
-        let pending_attempt = Uuid::now_v7();
-        let pending_prefix = format!("{pending_identity}.{pending_attempt}");
-        let pending_path = staging.root.join(format!("{pending_prefix}.par.tmp"));
-        let pending_manifest_path = staging.root.join(format!("{pending_prefix}.attempt.json"));
-        let pending_manifest = AttemptManifest {
-            logical_identity: pending_identity.to_owned(),
-            attempt_id: pending_attempt,
-            object_key: "tenant/table/recovered-election.parquet".to_owned(),
-            sha256: digest,
-            length: content.len() as u64,
-        };
-        let pending_manifest_bytes = serde_json::to_vec(&pending_manifest)
-            .expect("pending attempt manifest representation")
-            .len() as u64;
-        let pending_bytes = (content.len() as u64)
-            .checked_add(pending_manifest_bytes)
-            .expect("pending stage bytes");
-        let pending_growth = writer
-            .reserve_staged_growth(pending_bytes)
-            .expect("pending stage growth")
-            .expect("production WAL volume");
-        copy_fsynced(
-            &source,
-            &pending_path,
-            digest,
-            content.len() as u64,
-            &mut [0_u8; 8],
-        )
-        .await
-        .expect("pending stage copy");
-        sync_directory(&staging.root)
-            .await
-            .expect("pending stage directory fsync");
-        write_manifest_fsynced(&pending_manifest_path, &pending_manifest)
-            .await
-            .expect("pending attempt manifest");
-        sync_directory(&staging.root)
-            .await
-            .expect("pending manifest directory fsync");
-        pending_growth.commit().expect("pending stage commit");
+        let publication_bytes =
+            publish_elected_artifact(&staging, object_key, content, digest, &claim).await;
+        let (pending_bytes, pending_manifest_path) =
+            stage_pending_attempt(&staging, &writer, &source, digest, content).await;
         let expected = claim
             .accounted_bytes
             .checked_add(publication_bytes)
@@ -1750,82 +1900,19 @@ redacted
         drop(writer);
         drop(governor);
 
-        let restarted = BifrostVolumeGovernor::register(
+        assert_restart_reconstructs_and_retires(
             BifrostVolumeRoots {
                 wal: wal_root.clone(),
                 scribe_output_scratch: scribe_scratch,
                 forge_scratch,
                 oracle_scratch,
             },
-            1024 * 1024,
-            BifrostResourceHealth::default(),
+            &wal_root,
+            expected,
+            &claim,
+            &pending_manifest_path,
         )
-        .expect("restart volume registration");
-        assert_eq!(
-            restarted
-                .usage_for_test(BifrostVolumeClass::Wal)
-                .expect("reconciled usage"),
-            (expected, 0, 0),
-            "restart counts only WAL and authorized staged files"
-        );
-        let restarted_writer = Arc::new(
-            WalWriter::new_with_volume(
-                &wal_root,
-                [7_u8; 16],
-                11,
-                WalConfig::default(),
-                restarted.capabilities().wal,
-            )
-            .expect("restarted governed WAL writer"),
-        );
-        let restarted_staging = ScribeStaging::new(restarted_writer);
-        let recovered_claims = restarted_staging
-            .recover(&mut [0_u8; 8])
-            .await
-            .expect("stage recovery");
-        let recovered_publications = restarted_staging
-            .recover_publications(&mut [0_u8; 8])
-            .await
-            .expect("publication recovery");
-        assert_eq!(recovered_claims.len(), 2);
-        assert!(recovered_claims.contains(&claim));
-        assert_eq!(recovered_publications.len(), 1);
-        let recovered_winner_bytes = u64::try_from(
-            pending_manifest_path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .expect("pending manifest filename")
-                .len(),
-        )
-        .expect("winner marker bytes");
-        assert_eq!(
-            restarted
-                .usage_for_test(BifrostVolumeClass::Wal)
-                .expect("post-election usage"),
-            (
-                expected
-                    .checked_add(recovered_winner_bytes)
-                    .expect("post-election durable bytes"),
-                0,
-                0
-            )
-        );
-        for recovered_claim in &recovered_claims {
-            restarted_staging
-                .cleanup_published(recovered_claim)
-                .await
-                .expect("stage cleanup");
-        }
-        restarted_staging
-            .cleanup_publication("generation-9")
-            .await
-            .expect("publication cleanup");
-        assert_eq!(
-            restarted
-                .usage_for_test(BifrostVolumeClass::Wal)
-                .expect("settled usage"),
-            (0, 0, 0)
-        );
+        .await;
         assert!(unrelated.exists(), "unrelated namespace file is untouched");
     }
 }

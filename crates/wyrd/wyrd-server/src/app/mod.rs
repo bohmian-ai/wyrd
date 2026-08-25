@@ -10,7 +10,9 @@ use wyrd_telemetry::TelemetryGuard;
 
 use crate::app::metrics::{WyrdTelemetryRuntime, metrics_router, serve_metrics};
 use crate::app::supervise::{TaskExit, TaskId, fallible_task, supervise, worker_task};
-use crate::boot::{StateOverrides, build_state, production_guards, spawn_forge_worker};
+use crate::boot::{
+    BootedServer, StateOverrides, build_state, production_guards, spawn_forge_worker,
+};
 use crate::config::{ServeMode, WyrdServerConfig};
 use crate::state::AppState;
 
@@ -58,7 +60,15 @@ pub async fn run(mode: Option<ServeMode>) -> Result<(), BootExit> {
 
     let mode = mode.unwrap_or(config.serve.mode);
 
-    let state = build_state(&config, telemetry.clone(), StateOverrides::default())
+    // `coordination_runtime` is the sole owner of the dedicated Scribe executor.
+    // It is bound here, outside the serving future, so it outlives the Bifrost
+    // drain that `BoundServer::run` performs and is released only once serving
+    // has returned. Its drop is non-blocking, which is required because this
+    // frame is inside `#[tokio::main]`.
+    let BootedServer {
+        state,
+        coordination_runtime,
+    } = build_state(&config, telemetry.clone(), StateOverrides::default())
         .await
         .map_err(|e| BootExit::Other(Box::new(e)))?;
 
@@ -76,6 +86,7 @@ pub async fn run(mode: Option<ServeMode>) -> Result<(), BootExit> {
             .await
     };
 
+    drop(coordination_runtime); // release Scribe coordination threads after drain
     drop(telemetry); // flush OTLP exporters after serving stops
     drop(telemetry_runtime);
     result
@@ -114,7 +125,19 @@ async fn run_forge_worker_process(
     if let Some(health) = state.bifrost.resource_health() {
         set.spawn(fallible_task(
             TaskId::Worker("bifrost_resource_health"),
-            async move { health.wait_for_poison().await },
+            // Poison is a terminal the supervisor reacts to, but a healthy
+            // server never publishes one, so this wait must also end on a clean
+            // shutdown. Without the cancellation arm the task can never join and
+            // every shutdown burns the full drain deadline before aborting it.
+            {
+                let shutdown = shutdown.clone();
+                async move {
+                    tokio::select! {
+                        poisoned = health.wait_for_poison() => poisoned,
+                        () = shutdown.cancelled() => Ok(()),
+                    }
+                }
+            },
         ));
     }
 

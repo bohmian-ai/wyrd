@@ -6802,6 +6802,7 @@ mod tests {
                     unmanaged_reserve_bytes: None,
                     scratch_limit_bytes: Some(scratch_limit),
                     effective_cpu: None,
+                    oracle_query_slot_limit: None,
                     scratch_root: PathBuf::new(),
                     volume_roots: None,
                 },
@@ -6826,10 +6827,9 @@ mod tests {
                         footer_encoded_bytes: 1,
                         footer_decode_workspace_bytes: 1,
                         sort_spill_bytes: 1,
-                        output_scratch_bytes: 1,
                     },
                     memory_bytes: 5,
-                    scratch_bytes: 2,
+                    scratch_bytes: 1,
                     reader_permits: 1,
                 })
                 .expect("real Forge rewrite acquisition");

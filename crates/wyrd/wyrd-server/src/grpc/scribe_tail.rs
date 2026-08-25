@@ -146,8 +146,8 @@ impl ScribeTailService for ScribeTailGrpc {
         Ok(Response::new(ListActiveStreamsResponse {
             streams: streams
                 .into_iter()
-                .map(|(event_day, stream)| proto::ActiveTailStream {
-                    event_day: event_day.as_str().to_owned(),
+                .map(|(time_partition, stream)| proto::ActiveTailStream {
+                    time_partition: Some(time_partition.into()),
                     stream: Some(stream.into()),
                 })
                 .collect(),

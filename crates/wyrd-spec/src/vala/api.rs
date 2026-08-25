@@ -89,8 +89,6 @@ pub struct BifrostTableEntry {
     pub status: TableStatus,
     /// Lower-case hex of the 32-byte user-schema fingerprint.
     pub fingerprint: String,
-    /// Declared partition columns.
-    pub partition_columns: Vec<String>,
     /// Wall-clock registration time.
     pub registered_at: DateTime<Utc>,
     /// Wall-clock last-update time.
@@ -108,6 +106,8 @@ pub struct BifrostTableDescription {
     /// [`FieldSpec::metadata`]); the server-stamped `wyrd_*`/`data_tenant_id`
     /// system columns are excluded.
     pub fields: Vec<FieldSpec>,
+    /// The server-resolved canonical physical layout, fully populated.
+    pub physical_layout: PhysicalLayoutWire,
 }
 
 // ── Arrow-free schema / field wire types ────────────────────────────────────
@@ -251,41 +251,90 @@ pub struct BifrostPermissionDescriptor {
     pub action: String,
 }
 
-/// Partition transform on the wire. Arrow/Iceberg-free mirror of the engine
-/// `PartitionTransform`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+/// Time-partition granularity on the wire.
+///
+/// Bifrost v1 partitions every table on `wyrd_event_time` and admits exactly
+/// these two Iceberg-native transforms; nothing else is representable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub enum PartitionTransformWire {
-    /// Identity (value as-is).
-    Identity,
-    /// Truncate a timestamp to the year.
-    Year,
-    /// Truncate a timestamp to the month.
-    Month,
-    /// Truncate a timestamp to the day.
-    Day,
-    /// Truncate a timestamp to the hour.
+#[serde(rename_all = "snake_case")]
+pub enum TimeGranularityWire {
+    /// One partition per UTC hour.
     Hour,
-    /// Hash into `n` buckets.
-    Bucket {
-        /// Bucket count.
-        n: i32,
-    },
-    /// Truncate to width `w`.
-    Truncate {
-        /// Truncation width.
-        w: i32,
-    },
+    /// One partition per UTC day.
+    Day,
 }
 
-/// One partition-column declaration on the register request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+/// Sort direction of one declared physical sort key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct PartitionColumnSpec {
-    /// Column to partition on.
+#[serde(rename_all = "snake_case")]
+pub enum SortDirectionWire {
+    /// Ascending.
+    Asc,
+    /// Descending.
+    Desc,
+}
+
+/// Null placement of one declared physical sort key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum NullOrderWire {
+    /// Nulls sort before non-null values.
+    First,
+    /// Nulls sort after non-null values.
+    Last,
+}
+
+/// The single time-partition declaration of a Bifrost table.
+///
+/// `column` must be `wyrd_event_time`; it is carried explicitly so the wire
+/// contract stays self-describing and generated SDKs do not have to assume the
+/// invariant.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct TimePartitionSpecWire {
+    /// Partitioned column; only `wyrd_event_time` is accepted.
     pub column: String,
-    /// Transform applied to the column value.
-    pub transform: PartitionTransformWire,
+    /// Partition granularity.
+    pub granularity: TimeGranularityWire,
+}
+
+/// One declared physical sort key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct SortKeyWire {
+    /// Sorted column; must exist in the complete physical schema.
+    pub column: String,
+    /// Sort direction.
+    pub direction: SortDirectionWire,
+    /// Null placement.
+    pub null_order: NullOrderWire,
+}
+
+/// The authoritative physical layout of one Bifrost table.
+///
+/// The same shape is used three ways: as the optional declaration on
+/// [`RegisterTableRequest`], as the canonical server-resolved layout returned by
+/// [`BifrostTableDescription`], and as the exact JSON persisted in the control
+/// row. In the latter two it is always fully populated: the canonical sort order
+/// begins with the injected `data_tenant_id` prefix and the Bloom list begins
+/// with the schema-present managed floor.
+///
+/// On the request path, an omitted `sort_keys` and an explicit empty
+/// `sort_keys` mean different things — see [`RegisterTableRequest`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct PhysicalLayoutWire {
+    /// Required time partition.
+    pub partition: TimePartitionSpecWire,
+    /// Ordered sort keys.
+    #[serde(default)]
+    pub sort_keys: Vec<SortKeyWire>,
+    /// Ordered Bloom-filtered columns.
+    #[serde(default)]
+    pub bloom_columns: Vec<String>,
 }
 
 /// Register (create) a Bifrost table.
@@ -298,9 +347,14 @@ pub struct RegisterTableRequest {
     pub name: String,
     /// User fields only; `wyrd_*`/`card_ref`/`run_id` reserved names are rejected.
     pub fields: Vec<FieldSpec>,
-    /// Declared partition columns.
-    #[serde(default)]
-    pub partition_columns: Vec<PartitionColumnSpec>,
+    /// Optional physical layout declaration.
+    ///
+    /// Omitting the field entirely resolves to `hour(wyrd_event_time)`, the
+    /// default sort, and the managed Bloom floor. Supplying the object requires
+    /// `partition`; within it, an explicit empty `sort_keys` means "tenant prefix
+    /// only" and an explicit empty `bloom_columns` means "managed floor only".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_layout: Option<PhysicalLayoutWire>,
 }
 
 /// Whether a register call created a new table or matched an existing one.
@@ -1842,8 +1896,6 @@ pub struct ScribeCapabilitiesV1 {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct OracleCapabilitiesV1 {
-    /// Peer execution protocol version.
-    pub peer_protocol_version: u16,
     /// Shared storage protocol version.
     pub storage_protocol_version: u16,
     /// CPU cores available to Oracle work.
@@ -1887,8 +1939,7 @@ impl ClusterCapabilities {
                 Ok(())
             }
             (ClusterRole::Oracle, Self::OracleV1(value))
-                if value.peer_protocol_version == 1
-                    && value.storage_protocol_version == 1
+                if value.storage_protocol_version == 1
                     && value.cpu_cores.is_finite()
                     && value.cpu_cores > 0.0
                     && value.cpu_cores_per_slot.is_finite()
@@ -1982,48 +2033,166 @@ private_uuid_id!(
     "Opaque identity for one pending Oracle worker reservation."
 );
 
-/// Validated UTC event-day carried by private tail contracts.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+/// Validated time-partition value carried by private tail and follower
+/// contracts.
+///
+/// The pair `(granularity, start_utc)` is the one durable partition identity in
+/// Bifrost: WAL slices, seal keys, object paths, file-list rows, Forge audit
+/// detail, and tail fences all carry exactly this value. `start_utc` is always
+/// the exact UTC boundary of the partition, so two values are equal if and only
+/// if they name the same physical partition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(transparent)]
-pub struct EventDay(
-    /// Canonical validated `YYYY-MM-DD` text.
-    String,
-);
+pub struct TimePartitionWire {
+    /// Partition granularity.
+    granularity: TimeGranularityWire,
+    /// Exact UTC start boundary of the partition.
+    start_utc: DateTime<Utc>,
+}
 
-impl EventDay {
-    /// Parses one canonical `YYYY-MM-DD` UTC event day.
+impl TimePartitionWire {
+    /// Constructs one canonical partition value.
     ///
     /// # Errors
-    /// Returns [`QueryContractError`] when the value is not a calendar date.
-    pub fn new(value: impl Into<String>) -> Result<Self, QueryContractError> {
-        let value = value.into();
-        chrono::NaiveDate::parse_from_str(&value, "%Y-%m-%d").map_err(|_| {
-            QueryContractError::InvalidTerminal {
-                reason: "event_day must be YYYY-MM-DD",
-            }
-        })?;
-        Ok(Self(value))
+    /// Returns [`QueryContractError`] when `start_utc` is not the exact boundary
+    /// of its granularity: minute, second, and sub-second components must be
+    /// zero for [`TimeGranularityWire::Hour`], and the hour must also be zero for
+    /// [`TimeGranularityWire::Day`].
+    pub fn new(
+        granularity: TimeGranularityWire,
+        start_utc: DateTime<Utc>,
+    ) -> Result<Self, QueryContractError> {
+        if !partition_start_is_canonical(granularity, start_utc) {
+            return Err(QueryContractError::InvalidTerminal {
+                reason: "time partition start must be the exact UTC boundary of its granularity",
+            });
+        }
+        Ok(Self {
+            granularity,
+            start_utc,
+        })
     }
 
-    /// Borrows the canonical event day.
+    /// Returns the partition granularity.
     #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
+    pub const fn granularity(&self) -> TimeGranularityWire {
+        self.granularity
+    }
+
+    /// Returns the exact UTC start boundary.
+    #[must_use]
+    pub const fn start_utc(&self) -> DateTime<Utc> {
+        self.start_utc
+    }
+
+    /// Returns the signed epoch-microsecond start used by digests and protobuf.
+    #[must_use]
+    pub fn start_unix_micros(&self) -> i64 {
+        self.start_utc.timestamp_micros()
+    }
+
+    /// Returns the durable one-byte granularity tag used by digests, WAL slices,
+    /// and protobuf conversion. Tag `0` is reserved for "unspecified" and is
+    /// never produced here.
+    #[must_use]
+    pub const fn granularity_tag(&self) -> u8 {
+        match self.granularity {
+            TimeGranularityWire::Hour => 1,
+            TimeGranularityWire::Day => 2,
+        }
+    }
+
+    /// Renders the canonical object-path segment pair, for example
+    /// `partition_granularity=hour/partition_start=2026-08-23T14Z`.
+    #[must_use]
+    pub fn as_path_components(&self) -> String {
+        format!(
+            "partition_granularity={}/partition_start={}",
+            self.granularity_str(),
+            self.start_utc.format("%Y-%m-%dT%HZ")
+        )
+    }
+
+    /// Returns the lower-case durable granularity token (`hour` or `day`).
+    #[must_use]
+    pub const fn granularity_str(&self) -> &'static str {
+        match self.granularity {
+            TimeGranularityWire::Hour => "hour",
+            TimeGranularityWire::Day => "day",
+        }
     }
 }
 
-impl<'de> Deserialize<'de> for EventDay {
-    /// Deserializes an event-day string while enforcing its canonical date form.
+impl PartialOrd for TimePartitionWire {
+    /// Delegates to the total order defined by [`Ord`].
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TimePartitionWire {
+    /// Orders by granularity tag first, then by start instant, so a sorted list
+    /// never interleaves two granularities. Callers that need a comparable range
+    /// must first prove both endpoints share one granularity.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.granularity_tag()
+            .cmp(&other.granularity_tag())
+            .then(self.start_utc.cmp(&other.start_utc))
+    }
+}
+
+impl std::fmt::Display for TimePartitionWire {
+    /// Renders `<granularity>:<RFC 3339 start>` for logs and error text.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}:{}",
+            self.granularity_str(),
+            self.start_utc.to_rfc3339()
+        )
+    }
+}
+
+impl<'de> Deserialize<'de> for TimePartitionWire {
+    /// Deserializes a partition value while restoring its boundary invariant.
     ///
     /// # Errors
-    /// Returns a deserializer error when the input is not text or is not a
-    /// calendar date formatted as `YYYY-MM-DD`.
+    /// Returns a deserializer error when the object is malformed or when the
+    /// start instant is not the exact boundary of the declared granularity.
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+        /// Unvalidated mirror used only to reach the checked constructor.
+        #[derive(Deserialize)]
+        struct Raw {
+            /// Declared granularity.
+            granularity: TimeGranularityWire,
+            /// Declared start instant.
+            start_utc: DateTime<Utc>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        Self::new(raw.granularity, raw.start_utc).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Reports whether `start_utc` is the exact UTC boundary for `granularity`.
+///
+/// Shared by the checked constructor and by durable decoders that must reject a
+/// noncanonical start before restoring any state.
+#[must_use]
+pub fn partition_start_is_canonical(
+    granularity: TimeGranularityWire,
+    start_utc: DateTime<Utc>,
+) -> bool {
+    use chrono::Timelike as _;
+
+    let sub_hour_is_zero =
+        start_utc.minute() == 0 && start_utc.second() == 0 && start_utc.nanosecond() == 0;
+    match granularity {
+        TimeGranularityWire::Hour => sub_hour_is_zero,
+        TimeGranularityWire::Day => sub_hour_is_zero && start_utc.hour() == 0,
     }
 }
 
@@ -2116,8 +2285,8 @@ pub struct AcquireTailFenceRequest {
     pub query_id: uuid::Uuid,
     /// Tenant/table binding.
     pub binding: TenantTableBinding,
-    /// UTC event-day string.
-    pub event_day: EventDay,
+    /// Exact time partition the fence is bound to.
+    pub time_partition: TimePartitionWire,
     /// Exclusive sealed cursor.
     pub exclusive_sealed: TailCursor,
     /// Absolute execution deadline.
@@ -2136,8 +2305,8 @@ pub struct TailReadFence {
     pub fence_id: TailFenceId,
     /// Tenant/table binding.
     pub binding: TenantTableBinding,
-    /// UTC event-day string.
-    pub event_day: EventDay,
+    /// Exact time partition the fence is bound to.
+    pub time_partition: TimePartitionWire,
     /// Fenced stream identity.
     pub stream: TailStreamIdentity,
     /// Exclusive sealed cursor.
@@ -2289,10 +2458,10 @@ pub struct PersistedWalRange {
 pub struct ScribeProviderCut {
     /// Exact writer epoch selected from the signed participant incarnation.
     pub writer_epoch: u64,
-    /// Inclusive first event day in the provider projection.
-    pub start_event_day: String,
-    /// Inclusive final event day in the provider projection.
-    pub end_event_day: String,
+    /// Inclusive first partition in the provider projection.
+    pub start_partition: TimePartitionWire,
+    /// Inclusive final partition in the provider projection.
+    pub end_partition: TimePartitionWire,
     /// Required columns in stable projection order.
     pub required_columns: Vec<String>,
     /// Highest persisted stream cursor visible to this cut.
@@ -2310,8 +2479,8 @@ impl ScribeProviderCut {
     #[must_use]
     pub fn is_valid(&self) -> bool {
         self.writer_epoch > 0
-            && !self.start_event_day.is_empty()
-            && self.start_event_day <= self.end_event_day
+            && self.start_partition.granularity() == self.end_partition.granularity()
+            && self.start_partition <= self.end_partition
             && !self.required_columns.is_empty()
             && self.maximum_batch_count > 0
             && self.maximum_retained_bytes > 0
@@ -2353,6 +2522,13 @@ pub struct FollowerScanAssignment {
     pub scribe_provider_cut: Option<ScribeProviderCut>,
     /// Schema fingerprint bound to the encoded placeholder.
     pub schema_fingerprint: String,
+    /// Required output/predicate/hidden-tenant projection closure, in the
+    /// stable order the leaf union and remote placeholder must expose.
+    pub required_columns: Vec<String>,
+    /// Closed leaf predicates pushed to this assignment's readers, in filter
+    /// order. Recognized predicates are always `Inexact`; DataFusion retains
+    /// its own residual filter above the table provider regardless.
+    pub predicates: Vec<crate::vala::assignment_authority::ScanPredicate>,
 }
 
 /// Ticket-bound worker fragment execution request.
@@ -2387,6 +2563,43 @@ pub struct PhysicalExecuteFragmentRequest {
     pub plan_fingerprint: String,
 }
 
+/// Physical scan evidence one follower accumulated while executing a fragment.
+///
+/// The leader of a distributed query scans no storage of its own: every leaf of
+/// its plan is a remote scan, so its local scan metrics are legitimately empty.
+/// Followers report what their executed scans actually touched and the leader
+/// sums these across the participant cut, which is the only way a distributed
+/// query can report the same scan families a single-node query reports.
+///
+/// `bytes_scanned` is physical read volume reported by the executed scan. It is
+/// deliberately distinct from [`WorkerFooter::encoded_bytes`], which is the
+/// Arrow transport size of the rows sent back; projection, predicate pushdown,
+/// and compression make the two unrelated, and substituting one for the other
+/// would make the reported scan volume wrong rather than absent.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct WorkerScanStats {
+    /// Physical bytes the follower's executed scans read, when its sources
+    /// report physical IO at all. `None` means unavailable, not zero: a
+    /// memory-backed source reads no storage and must not be reported as a
+    /// zero-byte scan of one that does.
+    pub bytes_scanned: Option<u64>,
+    /// Number of files represented by the follower's executed scan nodes.
+    pub files_scanned: u64,
+    /// Number of file partitions represented by the follower's executed scans.
+    pub partitions_scanned: u64,
+    /// Row groups the follower retained after closed-predicate statistics
+    /// pruning. Observable only on the follower: the leader's plan carries a
+    /// remote placeholder in place of the executed scan leaf.
+    pub row_groups_scanned: u64,
+    /// Row groups the follower excluded by closed-predicate statistics
+    /// pruning, reported alongside `row_groups_scanned` so an operator can see
+    /// how much a pushed-down predicate actually saved.
+    pub row_groups_pruned: u64,
+}
+
 /// Verified worker footer for one completed attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
@@ -2403,6 +2616,8 @@ pub struct WorkerFooter {
     pub payload_digest: QueryAuditDigest,
     /// Required completion marker.
     pub completed: bool,
+    /// Physical scan evidence the leader aggregates across the participant cut.
+    pub scan_stats: WorkerScanStats,
 }
 
 /// Closed worker-attempt stream frame.
@@ -2935,9 +3150,10 @@ mod bifrost_wire_tests {
     //! Contract tests for the Arrow-free Bifrost wire types in `crate::vala::api`.
 
     use crate::vala::api::{
-        BifrostTableDescription, BifrostTableEntry, DataTypeSpec, FieldSpec, PartitionColumnSpec,
-        PartitionTransformWire, QueryParam, RegisterOutcome, RegisterTableRequest,
-        RegisterTableResponse, SyncQueryRequest, TableStatus, TimeUnit,
+        BifrostTableDescription, BifrostTableEntry, DataTypeSpec, FieldSpec, NullOrderWire,
+        PhysicalLayoutWire, QueryParam, RegisterOutcome, RegisterTableRequest,
+        RegisterTableResponse, SortDirectionWire, SortKeyWire, SyncQueryRequest, TableStatus,
+        TimeGranularityWire, TimePartitionSpecWire, TimeUnit,
     };
     use schemars::schema_for;
 
@@ -3013,12 +3229,33 @@ mod bifrost_wire_tests {
         );
     }
 
+    /// An omitted `physical_layout` stays `None` on the wire so the server can
+    /// distinguish "no declaration" (defaults apply) from an explicit object.
     #[test]
-    fn bifrost_wire_register_request_defaults_partition() {
+    fn bifrost_wire_register_request_omits_physical_layout() {
         let req: RegisterTableRequest =
             serde_json::from_str(r#"{"namespace":"vala.bifrost","name":"events","fields":[]}"#)
                 .expect("deserialize");
-        assert!(req.partition_columns.is_empty());
+        assert!(req.physical_layout.is_none());
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert!(!json.contains("physical_layout"), "{json}");
+    }
+
+    /// An explicit object with empty lists is distinct from omission and keeps
+    /// its empty `sort_keys`/`bloom_columns` through a round trip.
+    #[test]
+    fn bifrost_wire_register_request_keeps_explicit_empty_layout_lists() {
+        let req: RegisterTableRequest = serde_json::from_str(
+            r#"{"namespace":"vala.bifrost","name":"events","fields":[],
+                "physical_layout":{"partition":{"column":"wyrd_event_time","granularity":"hour"},
+                "sort_keys":[],"bloom_columns":[]}}"#,
+        )
+        .expect("deserialize");
+        let layout = req.physical_layout.as_ref().expect("explicit layout");
+        assert_eq!(layout.partition.granularity, TimeGranularityWire::Hour);
+        assert!(layout.sort_keys.is_empty());
+        assert!(layout.bloom_columns.is_empty());
+        bifrost_wire_round_trip(&req);
     }
 
     #[test]
@@ -3056,7 +3293,6 @@ mod bifrost_wire_tests {
             table_uid: "ab".repeat(16),
             status: TableStatus::Active,
             fingerprint: "01".repeat(32),
-            partition_columns: vec!["day".to_string()],
             registered_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -3068,6 +3304,18 @@ mod bifrost_wire_tests {
                 nullable: false,
                 metadata: Default::default(),
             }],
+            physical_layout: PhysicalLayoutWire {
+                partition: TimePartitionSpecWire {
+                    column: "wyrd_event_time".to_string(),
+                    granularity: TimeGranularityWire::Hour,
+                },
+                sort_keys: vec![SortKeyWire {
+                    column: "data_tenant_id".to_string(),
+                    direction: SortDirectionWire::Asc,
+                    null_order: NullOrderWire::Last,
+                }],
+                bloom_columns: vec!["data_tenant_id".to_string()],
+            },
         };
         bifrost_wire_round_trip(&entry);
         bifrost_wire_round_trip(&desc);
@@ -3088,15 +3336,23 @@ mod bifrost_wire_tests {
     }
 
     #[test]
-    fn bifrost_wire_register_response_and_partition_round_trip() {
+    fn bifrost_wire_register_response_and_layout_round_trip() {
         bifrost_wire_round_trip(&RegisterTableResponse {
             outcome: RegisterOutcome::Created,
             table_uid: "ab".repeat(16),
             fingerprint: "01".repeat(32),
         });
-        bifrost_wire_round_trip(&PartitionColumnSpec {
-            column: "day".to_string(),
-            transform: PartitionTransformWire::Bucket { n: 16 },
+        bifrost_wire_round_trip(&PhysicalLayoutWire {
+            partition: TimePartitionSpecWire {
+                column: "wyrd_event_time".to_string(),
+                granularity: TimeGranularityWire::Day,
+            },
+            sort_keys: vec![SortKeyWire {
+                column: "wyrd_event_time".to_string(),
+                direction: SortDirectionWire::Desc,
+                null_order: NullOrderWire::Last,
+            }],
+            bloom_columns: vec!["run_id".to_string()],
         });
     }
 

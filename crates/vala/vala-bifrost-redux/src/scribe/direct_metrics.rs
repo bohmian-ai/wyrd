@@ -1750,8 +1750,14 @@ mod tests {
             actual.expect("accepted rows").rows.num_rows(),
             mapped.records.len()
         );
-        assert_eq!(outcome.accepted_points, mapped.records.len() as i64);
-        assert_eq!(outcome.rejected_points, mapped.rejected.len() as i64);
+        assert_eq!(
+            outcome.accepted_points,
+            i64::try_from(mapped.records.len()).expect("accepted point count fits i64")
+        );
+        assert_eq!(
+            outcome.rejected_points,
+            i64::try_from(mapped.rejected.len()).expect("rejected point count fits i64")
+        );
         assert_eq!(outcome.rejection_message, expected_reason);
     }
 

@@ -9,6 +9,12 @@
 //! been WAL-synced and inserted into the active memtable. Idempotency is
 //! tracked by the batch identity `batch_id` during retention; the recovery
 //! path keys off the batch and seal key.
+//!
+//! `OracleQueryDispatch` is the read-side counterpart: the seam through which
+//! Gate reaches an Oracle it does not own. Unlike `Scribe`, its signature is
+//! stated in Oracle types, so this module depends on `crate::oracle`. That
+//! direction is deliberate and acyclic — `crate::oracle` never imports this
+//! module — and is recorded here so it does not read as drift.
 
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -17,7 +23,11 @@ use wyrd_runtime::principal::Principal;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::AuditEvent;
 
+use wyrd_spec::vala::api::BifrostQueryRequest;
+use wyrd_spec::vala::error::BifrostError;
+
 use crate::catalog::TableRef;
+use crate::oracle::{AuthorizedQueryContext, OracleQueryStream};
 use crate::schema::fingerprint::SchemaFingerprint;
 use crate::scribe::stream_identity::StreamIdentity;
 
@@ -365,6 +375,37 @@ impl From<vala_sql::SqlError> for ScribeError {
             detail: e.to_string(),
         }
     }
+}
+
+/// The one seam through which Gate reaches an Oracle it does not own.
+///
+/// Gate owns authentication, admission closure, and the closed request-metric
+/// taxonomy for a public SQL query; it does not own role selection. A
+/// server-tier implementation may execute locally, forward to a fenced peer, or
+/// refuse. Gate treats every outcome identically: it hands the authorized
+/// request across and accounts for whatever comes back.
+///
+/// Typed logical plans are deliberately absent. They are local-only, never
+/// forwarded, and carry no Gate request metrics, so routing them through this
+/// seam would invent behavior.
+#[async_trait]
+pub trait OracleQueryDispatch: Send + Sync + 'static {
+    /// Executes one already-authenticated public SQL request.
+    ///
+    /// The implementation owns role selection and every retry or fencing
+    /// decision it needs; Gate observes only the returned stream or error.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable Bifrost validation, catalog, role, transport,
+    /// security, admission, timeout, or execution failure.
+    /// [`BifrostError::OracleRoleUnavailable`] means no Oracle was reachable,
+    /// whether local or remote.
+    async fn dispatch_sql(
+        &self,
+        context: AuthorizedQueryContext,
+        request: BifrostQueryRequest,
+    ) -> Result<OracleQueryStream, BifrostError>;
 }
 
 /// Durable transport-neutral Scribe write boundary.

@@ -15,7 +15,6 @@ use arrow::array::{Array, StringArray};
 use arrow::compute::cast;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use chrono::NaiveDate;
 use futures_util::future::ready;
 use futures_util::stream::{self, BoxStream};
 use iceberg::spec::DataFile;
@@ -48,17 +47,18 @@ use super::right_size::{
     validate_supported_layout,
 };
 use crate::catalog::TenantTableBinding;
+use crate::catalog::layout::TimePartition;
 use crate::parquet::writer_properties::BIFROST_WRITER_RECIPE_VERSION;
 
 const DEFAULT_MAX_CONCURRENT_READS: usize = 4;
 const DEFAULT_SPILL_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const DEFAULT_MAX_OPEN_OPERATIONS_PER_TABLE: usize = 256;
 const DEFAULT_MAX_RETAINED_SNAPSHOTS_PER_TABLE: usize = 256;
-redacted
+/// Small-file candidacy threshold.
 pub(crate) const DEFAULT_SMALL_FILE_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
-redacted
+/// Target size for one manifest rewrite bin.
 pub(crate) const DEFAULT_MANIFEST_REWRITE_TARGET_SIZE_BYTES: u64 = 8 * 1024 * 1024;
-redacted
+/// Minimum count for an under-filled manifest bin.
 pub(crate) const DEFAULT_MANIFEST_REWRITE_MIN_COUNT: usize = 100;
 /// Default commit count past `retain_last` that makes snapshot expiry due on
 /// its own. Chosen well above ordinary per-tick compaction commit counts so a
@@ -585,8 +585,8 @@ impl ForgeTickOutcome {
 struct InterruptedStagingRow {
     /// Candidate file data needed by exact reset and retry.
     file: CandidateFile,
-    /// Partition day that must agree across the exact set.
-    partition_day: NaiveDate,
+    /// Exact time partition that must agree across the exact set.
+    partition: TimePartition,
     /// Whether the prepared projection marked this input compacted.
     compacted: bool,
     /// Prepared operation identity stamped on the input.
@@ -629,11 +629,7 @@ impl InterruptedStagingRow {
                     }
                 })?,
             },
-            partition_day: row.try_get("partition_day").map_err(|error| {
-                ForgeError::Reconciliation {
-                    detail: error.to_string(),
-                }
-            })?,
+            partition: row_time_partition(row, ForgeError::reconciliation)?,
             compacted: row
                 .try_get("compacted")
                 .map_err(|error| ForgeError::Reconciliation {
@@ -650,7 +646,7 @@ impl InterruptedStagingRow {
 
 /// Exact invariant-bearing projection left between SQL prepare and acknowledgement.
 struct InterruptedStagingTask {
-    /// Tenant/table/day identity shared by all prepared inputs.
+    /// Tenant/table/partition identity shared by all prepared inputs.
     key: ForgeGroupKey,
     /// Ordered files and checked byte total needed for a later retry.
     bin: RewriteBin,
@@ -662,7 +658,7 @@ impl InterruptedStagingTask {
     /// Reconstructs one exact interrupted projection from decoded SQL rows.
     ///
     /// A complete uncompacted set is ordinary work and returns `None`. Mixed
-    /// day, compacted, or operation state fails closed.
+    /// partition, compacted, or operation state fails closed.
     ///
     /// # Errors
     ///
@@ -680,12 +676,9 @@ impl InterruptedStagingTask {
             .map(|row| InterruptedStagingRow::decode(&row))
             .collect::<Result<Vec<_>, _>>()?;
         let first = &rows[0];
-        if rows
-            .iter()
-            .any(|row| row.partition_day != first.partition_day)
-        {
+        if rows.iter().any(|row| row.partition != first.partition) {
             return Err(ForgeError::Reconciliation {
-                detail: "interrupted staging task crosses a partition day".to_owned(),
+                detail: "interrupted staging task crosses a time partition".to_owned(),
             });
         }
         if rows.iter().any(|row| row.compacted != first.compacted) {
@@ -704,7 +697,7 @@ impl InterruptedStagingTask {
         if !first.compacted {
             return Ok(None);
         }
-        let partition_day = first.partition_day;
+        let partition = first.partition;
         let operation_id = first
             .operation_id
             .ok_or_else(|| ForgeError::Reconciliation {
@@ -722,7 +715,7 @@ impl InterruptedStagingTask {
             key: ForgeGroupKey {
                 tenant: binding.tenant,
                 table_ref: binding.table_ref.clone(),
-                partition_day,
+                partition,
             },
             bin: RewriteBin { files, total_bytes },
             operation_id,
@@ -846,7 +839,7 @@ impl Forge {
     /// Discovers bounded per-partition staging bins for durable task planning.
     ///
     /// Each returned candidate is executable by one task and one Iceberg
-    /// transaction. Cross-day staging rows therefore never enter a single
+    /// transaction. Cross-partition staging rows therefore never enter a single
     /// durable payload that the worker could only publish partially. `capacity`
     /// is the scheduler's live governor-clamped envelope authority.
     ///
@@ -856,14 +849,15 @@ impl Forge {
     pub(super) async fn discover_staging_task_candidates(
         &self,
         binding: &TenantTableBinding,
-        current_day: NaiveDate,
+        now: chrono::DateTime<chrono::Utc>,
         capacity: super::planner::ForgeCapacity,
     ) -> Result<Vec<ForgePlanCandidate>, ForgeError> {
         let rows = sqlx::query(
-            r"SELECT id,file_path,file_size,min_event_time,max_event_time,partition_day
+            r"SELECT id,file_path,file_size,min_event_time,max_event_time,
+                      partition_granularity,partition_start
                 FROM vala.file_list
                WHERE data_tenant_id=$1 AND namespace=$2 AND table_name=$3 AND NOT compacted
-               ORDER BY partition_day,min_event_time,max_event_time,id
+               ORDER BY partition_granularity,partition_start,min_event_time,max_event_time,id
                LIMIT $4",
         )
         .bind(binding.tenant.as_uuid())
@@ -875,19 +869,15 @@ impl Forge {
         .fetch_all(self.core.operator_pool.pool())
         .await
         .map_err(|error| ForgeError::Sql(error.into()))?;
-        let mut grouped = BTreeMap::<NaiveDate, Vec<CandidateFile>>::new();
+        let mut grouped = BTreeMap::<TimePartition, Vec<CandidateFile>>::new();
         for row in rows {
-            let day = row
-                .try_get("partition_day")
-                .map_err(|error| ForgeError::Group {
-                    detail: error.to_string(),
-                })?;
+            let partition = row_time_partition(&row, ForgeError::group)?;
             let size: i64 = row
                 .try_get("file_size")
                 .map_err(|error| ForgeError::Group {
                     detail: error.to_string(),
                 })?;
-            grouped.entry(day).or_default().push(CandidateFile {
+            grouped.entry(partition).or_default().push(CandidateFile {
                 id: row.try_get("id").map_err(|error| ForgeError::Group {
                     detail: error.to_string(),
                 })?,
@@ -913,13 +903,13 @@ impl Forge {
         }
         let policy = self.table_right_size_policy(binding).await?;
         let mut candidates = Vec::new();
-        for (day, files) in grouped {
+        for (partition, files) in grouped {
             for bin in plan_staging_bins(
                 &policy,
                 &files,
                 self.core.config.max_files_per_bin,
-                day,
-                current_day,
+                partition,
+                now,
             ) {
                 let total_bytes = bin.total_bytes;
                 let mut input_terms = bin
@@ -1022,11 +1012,12 @@ impl Forge {
             });
         }
         let rows = sqlx::query(
-            r"SELECT id,file_path,file_size,min_event_time,max_event_time,partition_day
+            r"SELECT id,file_path,file_size,min_event_time,max_event_time,
+                      partition_granularity,partition_start
                  FROM vala.file_list
                 WHERE data_tenant_id=$1 AND namespace=$2 AND table_name=$3
                   AND file_path=ANY($4) AND NOT compacted
-                ORDER BY partition_day,min_event_time,max_event_time,id",
+                ORDER BY partition_granularity,partition_start,min_event_time,max_event_time,id",
         )
         .bind(binding.tenant.as_uuid())
         .bind(&binding.logical_namespace)
@@ -1041,19 +1032,15 @@ impl Forge {
             });
         }
         let mut files = Vec::with_capacity(rows.len());
-        let mut partition_day = None;
+        let mut partition = None;
         for row in rows {
-            let day: NaiveDate =
-                row.try_get("partition_day")
-                    .map_err(|error| ForgeError::Group {
-                        detail: error.to_string(),
-                    })?;
-            if partition_day
-                .replace(day)
-                .is_some_and(|current| current != day)
+            let observed = row_time_partition(&row, ForgeError::group)?;
+            if partition
+                .replace(observed)
+                .is_some_and(|current| current != observed)
             {
                 return Err(ForgeError::Group {
-                    detail: "exact staging task crosses a partition day".to_owned(),
+                    detail: "exact staging task crosses a time partition".to_owned(),
                 });
             }
             let size: i64 = row
@@ -1095,8 +1082,8 @@ impl Forge {
                 detail: "exact staging task path set changed before execution".to_owned(),
             });
         }
-        let partition_day = partition_day.ok_or_else(|| ForgeError::Group {
-            detail: "exact staging task lost its partition day".to_owned(),
+        let partition = partition.ok_or_else(|| ForgeError::Group {
+            detail: "exact staging task lost its time partition".to_owned(),
         })?;
         let total_bytes = files.iter().try_fold(0_u64, |total, file| {
             total
@@ -1108,7 +1095,7 @@ impl Forge {
         let key = ForgeGroupKey {
             tenant: binding.tenant,
             table_ref: binding.table_ref.clone(),
-            partition_day,
+            partition,
         };
         Ok((key, RewriteBin { files, total_bytes }))
     }
@@ -1168,10 +1155,11 @@ impl Forge {
         inputs: &[String],
     ) -> Result<Option<InterruptedStagingTask>, ForgeError> {
         let rows = sqlx::query(
-            r"SELECT id,file_path,file_size,min_event_time,max_event_time,partition_day,compacted,publication_operation_id
+            r"SELECT id,file_path,file_size,min_event_time,max_event_time,
+                      partition_granularity,partition_start,compacted,publication_operation_id
                  FROM vala.file_list
                 WHERE data_tenant_id=$1 AND namespace=$2 AND table_name=$3 AND file_path=ANY($4)
-                ORDER BY partition_day,min_event_time,max_event_time,id",
+                ORDER BY partition_granularity,partition_start,min_event_time,max_event_time,id",
         )
         .bind(binding.tenant.as_uuid())
         .bind(&binding.logical_namespace)
@@ -1186,7 +1174,7 @@ impl Forge {
     /// Finalizes the exact staging projection after task-tagged commit recovery.
     ///
     /// The persisted task input paths remain authoritative. Recovery accepts
-    /// only compacted rows from that exact set, requires one partition day,
+    /// only compacted rows from that exact set, requires one time partition,
     /// and transitions the one matching prepared compaction operation. A
     /// replay after the projection and audit transaction committed is a no-op.
     ///
@@ -1208,11 +1196,11 @@ impl Forge {
             });
         }
         let rows = sqlx::query(
-            r"SELECT id,file_path,partition_day,committed_snapshot_id
+            r"SELECT id,file_path,partition_granularity,partition_start,committed_snapshot_id
                  FROM vala.file_list
                 WHERE data_tenant_id=$1 AND namespace=$2 AND table_name=$3
                   AND file_path=ANY($4) AND compacted
-                ORDER BY partition_day,id",
+                ORDER BY partition_granularity,partition_start,id",
         )
         .bind(binding.tenant.as_uuid())
         .bind(&binding.logical_namespace)
@@ -1227,22 +1215,18 @@ impl Forge {
                     .to_owned(),
             });
         }
-        let mut partition_day = None;
+        let mut partition = None;
         let mut file_ids = Vec::with_capacity(rows.len());
         let mut actual_paths = BTreeSet::new();
         let mut already_stamped = true;
         for row in rows {
-            let day: NaiveDate =
-                row.try_get("partition_day")
-                    .map_err(|error| ForgeError::Reconciliation {
-                        detail: error.to_string(),
-                    })?;
-            if partition_day
-                .replace(day)
-                .is_some_and(|current| current != day)
+            let observed = row_time_partition(&row, ForgeError::reconciliation)?;
+            if partition
+                .replace(observed)
+                .is_some_and(|current| current != observed)
             {
                 return Err(ForgeError::Reconciliation {
-                    detail: "recovered staging task crosses a partition day".to_owned(),
+                    detail: "recovered staging task crosses a time partition".to_owned(),
                 });
             }
             file_ids.push(
@@ -1283,8 +1267,8 @@ impl Forge {
         let key = ForgeGroupKey {
             tenant: binding.tenant,
             table_ref: binding.table_ref.clone(),
-            partition_day: partition_day.ok_or_else(|| ForgeError::Reconciliation {
-                detail: "recovered staging task lost its partition day".to_owned(),
+            partition: partition.ok_or_else(|| ForgeError::Reconciliation {
+                detail: "recovered staging task lost its time partition".to_owned(),
             })?,
         };
         let detail = self
@@ -1352,6 +1336,34 @@ impl Forge {
     }
 }
 
+/// Decodes the exact time partition carried by one `vala.file_list` row.
+///
+/// The durable representation is the `(partition_granularity, partition_start)`
+/// column pair; `wrap` selects the failure variant the calling workflow must
+/// surface, because planning refuses as a grouping error while recovery refuses
+/// as a reconciliation mismatch.
+///
+/// # Errors
+///
+/// Returns `wrap`-built errors when either column is absent or mistyped, or
+/// when the pair does not name a canonical partition boundary.
+fn row_time_partition(
+    row: &PgRow,
+    wrap: fn(String) -> ForgeError,
+) -> Result<TimePartition, ForgeError> {
+    let granularity: String = row
+        .try_get("partition_granularity")
+        .map_err(|error| wrap(error.to_string()))?;
+    let start: chrono::DateTime<chrono::Utc> = row
+        .try_get("partition_start")
+        .map_err(|error| wrap(error.to_string()))?;
+    TimePartition::from_durable_columns(&granularity, start).map_err(|error| {
+        wrap(format!(
+            "file_list row has an invalid time partition: {error}"
+        ))
+    })
+}
+
 /// Map durable staging facts into the live-file policy without reusing its
 /// separate [`CandidateFile`] domain, then map selected groups back to rewrite
 /// bins by their stable object paths.
@@ -1359,8 +1371,8 @@ fn plan_staging_bins(
     policy: &ForgeRightSizePolicy,
     files: &[CandidateFile],
     max_files: usize,
-    partition_day: NaiveDate,
-    current_day: NaiveDate,
+    partition: TimePartition,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Vec<RewriteBin> {
     if max_files == 0 {
         return Vec::new();
@@ -1377,7 +1389,7 @@ fn plan_staging_bins(
                 record_count: 0,
                 schema_id: policy.schema_id(),
                 partition_spec_id: policy.partition_spec_id(),
-                partition_day,
+                partition,
                 sort_order_id: Some(policy.sort_order_id()),
                 writer_recipe_version: Some(BIFROST_WRITER_RECIPE_VERSION.to_owned()),
                 min_event_time: file.min_event_time,
@@ -1388,7 +1400,8 @@ fn plan_staging_bins(
             }
         })
         .collect();
-    let plan = policy.plan_partition(live, partition_day >= current_day);
+    let partition_is_open = partition.is_open_at(now);
+    let plan = policy.plan_partition(live, partition_is_open);
     let groups = plan
         .groups
         .into_iter()
@@ -1399,7 +1412,7 @@ fn plan_staging_bins(
                 .filter(|chunk| {
                     reason != IcebergRewriteReason::Undersized
                         || chunk.len() >= 2
-                        || partition_day < current_day
+                        || !partition_is_open
                 })
                 .map(ToOwned::to_owned)
                 .collect::<Vec<_>>()
@@ -1418,7 +1431,7 @@ fn plan_staging_bins(
             })
         })
         .collect::<Vec<_>>();
-    if partition_day < current_day && !by_path.is_empty() {
+    if !partition_is_open && !by_path.is_empty() {
         let mut remaining = by_path.into_values().collect::<Vec<_>>();
         remaining.sort_by(|left, right| left.path.cmp(&right.path));
         bins.extend(remaining.chunks(max_files).map(|files| RewriteBin {
@@ -1525,7 +1538,8 @@ impl Forge {
                     schema,
                     iceberg_schema: table.metadata().current_schema().clone(),
                     source_files: &source_files,
-                    partition_day: key.partition_day,
+                    partition: key.partition,
+                    bloom_columns: crate::forge::rewrite::table_bloom_columns(table.metadata())?,
                     table_location: table.metadata().location(),
                     partition_spec_id: table.metadata().default_partition_spec_id(),
                     sort_order_id: i32::try_from(table.metadata().default_sort_order_id())
@@ -1921,14 +1935,15 @@ impl Forge {
             r"UPDATE vala.file_list
               SET compacted = true, publication_operation_id = $1
             WHERE data_tenant_id = $2 AND namespace = $3 AND table_name = $4
-              AND partition_day = $5 AND id = ANY($6)
+              AND partition_granularity = $5 AND partition_start = $6 AND id = ANY($7)
               AND committed_snapshot_id IS NULL",
         )
         .bind(operation_id)
         .bind(key.tenant.as_uuid())
         .bind(key.table_ref.namespace.as_str())
         .bind(&key.table_ref.name)
-        .bind(key.partition_day)
+        .bind(key.partition.granularity_str())
+        .bind(key.partition.start_utc())
         .bind(&ids)
         .execute(&mut **conn.transaction())
         .await
@@ -1974,15 +1989,16 @@ impl Forge {
             r"UPDATE vala.file_list
               SET committed_snapshot_id = $1
             WHERE data_tenant_id = $2 AND namespace = $3 AND table_name = $4
-              AND partition_day = $5 AND id = ANY($6)
-              AND compacted AND publication_operation_id = $7
+              AND partition_granularity = $5 AND partition_start = $6 AND id = ANY($7)
+              AND compacted AND publication_operation_id = $8
               AND (committed_snapshot_id IS NULL OR committed_snapshot_id = $1)",
         )
         .bind(snapshot_id)
         .bind(key.tenant.as_uuid())
         .bind(key.table_ref.namespace.as_str())
         .bind(&key.table_ref.name)
-        .bind(key.partition_day)
+        .bind(key.partition.granularity_str())
+        .bind(key.partition.start_utc())
         .bind(&ids)
         .bind(operation_id)
         .execute(&mut **conn.transaction())
@@ -2036,14 +2052,15 @@ impl Forge {
               SET compacted = false, committed_snapshot_id = NULL,
                   publication_operation_id = NULL
             WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3
-              AND partition_day = $4 AND id = ANY($5)
+              AND partition_granularity = $4 AND partition_start = $5 AND id = ANY($6)
               AND committed_snapshot_id IS NULL
-              AND publication_operation_id = $6",
+              AND publication_operation_id = $7",
         )
         .bind(key.tenant.as_uuid())
         .bind(key.table_ref.namespace.as_str())
         .bind(&key.table_ref.name)
-        .bind(key.partition_day)
+        .bind(key.partition.granularity_str())
+        .bind(key.partition.start_utc())
         .bind(&ids)
         .bind(operation_id)
         .execute(&mut **conn.transaction())
@@ -2097,7 +2114,7 @@ impl Forge {
             r"UPDATE vala.file_list
               SET committed_snapshot_id = $1
             WHERE data_tenant_id = $2 AND namespace = $3 AND table_name = $4
-              AND partition_day = $5 AND id = ANY($6)
+              AND partition_granularity = $5 AND partition_start = $6 AND id = ANY($7)
               AND compacted
               AND (committed_snapshot_id IS NULL OR committed_snapshot_id = $1)",
         )
@@ -2105,7 +2122,8 @@ impl Forge {
         .bind(key.tenant.as_uuid())
         .bind(key.table_ref.namespace.as_str())
         .bind(&key.table_ref.name)
-        .bind(key.partition_day)
+        .bind(key.partition.granularity_str())
+        .bind(key.partition.start_utc())
         .bind(input_file_ids)
         .execute(&mut **conn.transaction())
         .await
@@ -2151,13 +2169,14 @@ impl Forge {
               SET compacted = false, committed_snapshot_id = NULL,
                   publication_operation_id = NULL
             WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3
-              AND partition_day = $4 AND id = ANY($5)
+              AND partition_granularity = $4 AND partition_start = $5 AND id = ANY($6)
               AND committed_snapshot_id IS NULL",
         )
         .bind(key.tenant.as_uuid())
         .bind(key.table_ref.namespace.as_str())
         .bind(&key.table_ref.name)
-        .bind(key.partition_day)
+        .bind(key.partition.granularity_str())
+        .bind(key.partition.start_utc())
         .bind(input_file_ids)
         .execute(&mut **conn.transaction())
         .await
@@ -2189,7 +2208,7 @@ impl Forge {
         &self,
         lease: &mut ForgeLease,
         binding: &TenantTableBinding,
-        partition_day: NaiveDate,
+        partition: TimePartition,
         input_file_ids: &[Uuid],
         detail: &AuditDetail,
         snapshot_id: i64,
@@ -2197,7 +2216,7 @@ impl Forge {
         let key = ForgeGroupKey {
             tenant: binding.tenant,
             table_ref: binding.table_ref.clone(),
-            partition_day,
+            partition,
         };
         self.stamp_reconciled(lease, &key, input_file_ids, detail, snapshot_id)
             .await
@@ -2214,14 +2233,14 @@ impl Forge {
         &self,
         lease: &mut ForgeLease,
         binding: &TenantTableBinding,
-        partition_day: NaiveDate,
+        partition: TimePartition,
         input_file_ids: &[Uuid],
         detail: &AuditDetail,
     ) -> Result<(), ForgeError> {
         let key = ForgeGroupKey {
             tenant: binding.tenant,
             table_ref: binding.table_ref.clone(),
-            partition_day,
+            partition,
         };
         self.reset_reconciled(lease, &key, input_file_ids, detail)
             .await
@@ -2238,14 +2257,14 @@ impl Forge {
         &self,
         lease: &mut ForgeLease,
         binding: &TenantTableBinding,
-        partition_day: NaiveDate,
+        partition: TimePartition,
         detail: AuditDetail,
         operation: &str,
     ) -> Result<(), ForgeError> {
         let key = ForgeGroupKey {
             tenant: binding.tenant,
             table_ref: binding.table_ref.clone(),
-            partition_day,
+            partition,
         };
         lease.require_fence(&self.core.operator_pool).await?;
         let mut conn = self
@@ -2412,7 +2431,8 @@ fn operation_id(key: &ForgeGroupKey, bin: &RewriteBin, generation: Uuid) -> Uuid
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(key.audit_resource());
-    hasher.update(key.partition_day.to_string());
+    hasher.update(key.partition.granularity_str());
+    hasher.update(key.partition.start_unix_micros().to_le_bytes());
     hasher.update(generation.as_bytes());
     for file in &bin.files {
         hasher.update(file.id.as_bytes());
@@ -2570,7 +2590,7 @@ mod tests {
     #[test]
     fn compacted_output_uses_shared_writer_properties() {
         assert_eq!(
-            crate::parquet::writer_properties::bifrost_writer_properties(10)
+            crate::parquet::writer_properties::bifrost_writer_properties(10, &[])
                 .max_row_group_row_count(),
             Some(131_072)
         );
@@ -2651,11 +2671,20 @@ mod tests {
         assert!(over_bound.validate().is_err());
     }
 
+    /// Builds the fixture hour partition shared by the staging-planner regressions.
+    fn staging_hour() -> TimePartition {
+        TimePartition::new(
+            crate::catalog::TimeGranularity::Hour,
+            DateTime::from_timestamp(1_767_312_000, 0).expect("fixture hour is representable"),
+        )
+        .expect("fixture hour is an exact hour boundary")
+    }
+
     /// Closed staging debt keeps a healthy singleton actionable beside policy groups.
     #[test]
     fn staging_planner_maps_policy_groups_without_healthy_fillers() {
         let policy = ForgeRightSizePolicy::new(100, 1, 1, 1).expect("policy");
-        let day = NaiveDate::from_ymd_opt(2026, 1, 1).expect("day");
+        let day = staging_hour();
         let timestamp = DateTime::from_timestamp(1, 0).expect("timestamp");
         let file = |id: u128, path: &str, size| CandidateFile {
             id: Uuid::from_u128(id),
@@ -2673,7 +2702,7 @@ mod tests {
             ],
             256,
             day,
-            day.succ_opt().expect("next day"),
+            day.end_utc(),
         );
         assert_eq!(bins.len(), 2);
         assert_eq!(
@@ -2714,7 +2743,7 @@ mod tests {
     #[test]
     fn staging_planner_discards_undersized_singleton_remainder() {
         let policy = ForgeRightSizePolicy::new(100, 1, 1, 1).expect("policy");
-        let day = NaiveDate::from_ymd_opt(2026, 1, 1).expect("day");
+        let day = staging_hour();
         let timestamp = DateTime::from_timestamp(1, 0).expect("timestamp");
         let file = |id: u128, path: &str| CandidateFile {
             id: Uuid::from_u128(id),
@@ -2728,7 +2757,7 @@ mod tests {
             &[file(1, "small-a"), file(2, "small-b"), file(3, "small-c")],
             2,
             day,
-            day.succ_opt().expect("next day"),
+            day.end_utc(),
         );
         assert_eq!(bins.len(), 2);
         assert_eq!(bins[0].files.len(), 2);
@@ -2741,7 +2770,7 @@ mod tests {
     #[test]
     fn accepted_open_partition_tail_is_not_pending_work() {
         let policy = ForgeRightSizePolicy::new(100, 1, 1, 1).expect("policy");
-        let day = NaiveDate::from_ymd_opt(2026, 1, 1).expect("day");
+        let day = staging_hour();
         let timestamp = DateTime::from_timestamp(1, 0).expect("timestamp");
         let tail = CandidateFile {
             id: Uuid::from_u128(1),
@@ -2750,7 +2779,7 @@ mod tests {
             min_event_time: timestamp,
             max_event_time: timestamp,
         };
-        let bins = plan_staging_bins(&policy, &[tail], 256, day, day);
+        let bins = plan_staging_bins(&policy, &[tail], 256, day, day.start_utc());
         assert!(bins.is_empty());
         let outcome = ForgeTickOutcome {
             tables_discovered: 1,
@@ -2768,7 +2797,7 @@ mod tests {
     #[test]
     fn closed_partition_staging_singleton_is_actionable() {
         let policy = ForgeRightSizePolicy::new(100, 1, 1, 1).expect("policy");
-        let day = NaiveDate::from_ymd_opt(2026, 1, 1).expect("day");
+        let day = staging_hour();
         let timestamp = DateTime::from_timestamp(1, 0).expect("timestamp");
         let tail = CandidateFile {
             id: Uuid::from_u128(1),
@@ -2778,13 +2807,7 @@ mod tests {
             max_event_time: timestamp,
         };
 
-        let bins = plan_staging_bins(
-            &policy,
-            &[tail],
-            256,
-            day,
-            day.succ_opt().expect("next day"),
-        );
+        let bins = plan_staging_bins(&policy, &[tail], 256, day, day.end_utc());
 
         assert_eq!(bins.len(), 1);
         assert_eq!(bins[0].files.len(), 1);

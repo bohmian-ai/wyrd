@@ -28,7 +28,7 @@ use crate::grpc::{
     GrpcRouterConfig, build_app_grpc, drive_health_status, publish_initial_health,
     serve_grpc_with_listener,
 };
-use crate::state::AppState;
+use crate::state::{AppState, BifrostShutdownReport};
 
 type BoxWorker = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
@@ -38,16 +38,23 @@ fn shutdown_deadline_active(deadline: std::time::Instant) -> bool {
 }
 
 /// Resolves supervisor and Bifrost terminal state without discarding lifecycle failures.
+///
+/// `report` is the drain outcome the caller already computed; it is returned
+/// only on the clean path so a lifecycle failure can never be mistaken for a
+/// completed drain. A supervisor terminal message and a Bifrost lifecycle error
+/// both remain terminal, with the Bifrost error taking precedence because it
+/// describes the state the process is actually leaving behind.
 fn server_shutdown_result(
     terminal: Option<String>,
     bifrost_error: Option<wyrd_spec::vala::error::BifrostError>,
-) -> Result<(), BootExit> {
+    report: BifrostShutdownReport,
+) -> Result<BifrostShutdownReport, BootExit> {
     match (terminal, bifrost_error) {
         (_, Some(error)) => Err(BootExit::Other(Box::new(error))),
         (Some(message), None) => Err(BootExit::Other(
             Box::<dyn std::error::Error + Send + Sync>::from(message),
         )),
-        (None, None) => Ok(()),
+        (None, None) => Ok(report),
     }
 }
 
@@ -276,7 +283,10 @@ impl WyrdServer {
     /// Returns [`BootExit::Other`] on listener bind failure or a terminal task
     /// error.
     pub async fn serve(self, mode: ServeMode) -> Result<(), BootExit> {
-        self.bind(mode).await?.run().await
+        // The drain report is a result of *running* the server, which the
+        // process entry point has no use for; absorbing it here keeps
+        // `serve`'s public signature and every caller below it unchanged.
+        self.bind(mode).await?.run().await.map(|_report| ())
     }
 
     /// Bind every listener the `mode` requires **now**, returning a
@@ -466,16 +476,41 @@ impl BoundServer {
     /// Spawn all tasks on the pre-bound listeners and drive the supervised
     /// lifecycle to completion.
     ///
+    /// The [`BifrostShutdownReport`] returned on the clean path is the outcome
+    /// of the bounded Bifrost drain this method performs. It is a first-class
+    /// result rather than an internal detail because the drain ordering it
+    /// records — in particular `scribe_drained` — is what a caller holding the
+    /// Scribe coordination-runtime owner needs in order to know that releasing
+    /// that executor cannot abandon a live shard owner.
+    ///
+    /// When the shutdown deadline is already exhausted the server aborts
+    /// instead of draining, and the returned report is all-`false`: that is the
+    /// accurate description of an aborted teardown, not a placeholder.
+    ///
     /// # Errors
-    /// Returns [`BootExit::Other`] on a terminal task error or if the process-
-    /// global metrics recorder fails to install.
-    pub async fn run(mut self) -> Result<(), BootExit> {
+    /// Returns [`BootExit::Other`] on a terminal task error, a Bifrost
+    /// lifecycle failure, or if the process-global metrics recorder fails to
+    /// install.
+    pub async fn run(mut self) -> Result<BifrostShutdownReport, BootExit> {
         let shutdown = self.state.shutdown_token.clone();
         let mut set: JoinSet<TaskExit> = JoinSet::new();
         if let Some(health) = self.state.bifrost.resource_health() {
             set.spawn(fallible_task(
                 TaskId::Worker("bifrost_resource_health"),
-                async move { health.wait_for_poison().await },
+                // Poison is a terminal the supervisor reacts to, but a healthy
+                // server never publishes one, so this wait must also end on a
+                // clean shutdown. Without the cancellation arm the task can
+                // never join and every shutdown burns the full drain deadline
+                // before aborting it.
+                {
+                    let shutdown = shutdown.clone();
+                    async move {
+                        tokio::select! {
+                            poisoned = health.wait_for_poison() => poisoned,
+                            () = shutdown.cancelled() => Ok(()),
+                        }
+                    }
+                },
             ));
         }
 
@@ -674,22 +709,22 @@ impl BoundServer {
             )
             .await;
         }
-        let bifrost_shutdown_error = if shutdown_deadline_active(deadline) {
+        let (report, bifrost_shutdown_error) = if shutdown_deadline_active(deadline) {
             match bifrost.shutdown(deadline).await {
-                Ok(_) => None,
+                Ok(report) => (report, None),
                 Err(error) => {
                     tracing::warn!(%error, "Bifrost shutdown did not complete cleanly");
                     bifrost.abort();
-                    Some(error)
+                    (BifrostShutdownReport::none_drained(), Some(error))
                 }
             }
         } else {
             bifrost.abort();
-            None
+            (BifrostShutdownReport::none_drained(), None)
         };
 
         tracing::info!("wyrd-server shutdown complete");
-        server_shutdown_result(terminal, bifrost_shutdown_error)
+        server_shutdown_result(terminal, bifrost_shutdown_error, report)
     }
 }
 
@@ -833,6 +868,7 @@ mod pg_tests {
         let result = server_shutdown_result(
             Some("worker exited".to_owned()),
             Some(wyrd_spec::vala::error::BifrostError::ScribeRoleUnavailable),
+            BifrostShutdownReport::none_drained(),
         );
 
         let BootExit::Other(error) =

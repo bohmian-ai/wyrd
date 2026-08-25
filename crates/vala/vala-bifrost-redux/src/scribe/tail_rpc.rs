@@ -19,10 +19,10 @@ use wyrd_tonic::tonic::{Request, transport::Channel};
 use wyrd_tonic::wyrd::v1::scribe_tail_service_client::ScribeTailServiceClient;
 
 use crate::catalog::TenantTableBinding;
+use crate::catalog::layout::TimePartition;
 use crate::contracts::ScribeError;
 use crate::scribe::memtable::{Memtable, ReadableBatchLimits};
 use crate::scribe::routing::shard_for;
-use crate::scribe::seal_key::EventDay;
 use crate::scribe::shards::ScribeShardRuntime;
 use crate::scribe::stream_identity::StreamIdentity;
 use crate::scribe::wal::WalLsn;
@@ -336,12 +336,12 @@ pub struct LocalTailPage {
     pub complete: bool,
 }
 
-/// One active event-day scope returned by private Scribe discovery.
+/// One active partition scope returned by private Scribe discovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveTailStream {
-    /// Event day whose live rows remain in Scribe memory.
-    pub event_day: tail::EventDay,
-    /// Exact Scribe stream incarnation serving that day.
+    /// Exact partition whose live rows remain in Scribe memory.
+    pub time_partition: tail::TimePartitionWire,
+    /// Exact Scribe stream incarnation serving that partition.
     pub stream: tail::TailStreamIdentity,
 }
 
@@ -542,7 +542,10 @@ impl TailReadTransport for LocalTailReadTransport {
         self.reader.list_active_streams(&binding).map(|streams| {
             streams
                 .into_iter()
-                .map(|(event_day, stream)| ActiveTailStream { event_day, stream })
+                .map(|(time_partition, stream)| ActiveTailStream {
+                    time_partition,
+                    stream,
+                })
                 .collect()
         })
     }
@@ -746,8 +749,11 @@ impl TonicTailReadTransport {
             .streams
             .into_iter()
             .map(|stream| {
-                let event_day =
-                    tail::EventDay::new(stream.event_day).map_err(|_| TailReadError::Binding)?;
+                let time_partition: tail::TimePartitionWire = stream
+                    .time_partition
+                    .ok_or(TailReadError::Binding)?
+                    .try_into()
+                    .map_err(|_| TailReadError::Binding)?;
                 let stream = stream.stream.ok_or_else(|| TailReadError::State {
                     detail: "active tail stream omitted identity".to_owned(),
                 })?;
@@ -756,7 +762,7 @@ impl TonicTailReadTransport {
                         detail: "active tail stream node id is invalid".to_owned(),
                     })?;
                 Ok(ActiveTailStream {
-                    event_day,
+                    time_partition,
                     stream: tail::TailStreamIdentity {
                         node_id: tail::NodeId::new(node_id),
                         writer_epoch: stream.writer_epoch,
@@ -1146,16 +1152,13 @@ fn canonical_table_name(namespace: &str, table: &str) -> String {
     }
 }
 
-/// Parses the validated wire event-day into the local memtable partition key.
+/// Converts the validated wire partition into the local memtable partition key.
 ///
-/// # Errors
-///
-/// Returns [`TailReadError::Binding`] when the wire date cannot form the local
-/// UTC day representation.
-fn event_day_from_wire(event_day: &tail::EventDay) -> Result<EventDay, TailReadError> {
-    chrono::NaiveDate::parse_from_str(event_day.as_str(), "%Y-%m-%d")
-        .map(EventDay::new)
-        .map_err(|_| TailReadError::Binding)
+/// Both representations already guarantee an exact unit boundary, so the
+/// conversion is infallible and exists only to keep the transport type out of
+/// the memtable layer.
+fn partition_from_wire(time_partition: tail::TimePartitionWire) -> TimePartition {
+    TimePartition::from_wire(time_partition)
 }
 
 /// Verifies that retained batches use the schema selected during planning.
@@ -1763,7 +1766,7 @@ impl ScribeTailReader {
     pub fn list_active_streams(
         &self,
         binding: &tail::TenantTableBinding,
-    ) -> Result<Vec<(tail::EventDay, tail::TailStreamIdentity)>, TailReadError> {
+    ) -> Result<Vec<(tail::TimePartitionWire, tail::TailStreamIdentity)>, TailReadError> {
         let binding = binding_from_wire(binding)?;
         let keys = self
             .source
@@ -1783,19 +1786,19 @@ impl ScribeTailReader {
             u64::try_from(stream.writer_epoch.as_i64()).map_err(|_| TailReadError::State {
                 detail: "Scribe writer epoch is negative".to_owned(),
             })?;
-        let mut days = keys
+        let mut partitions = keys
             .into_iter()
             .filter(|key| key.table == binding.table_ref)
-            .map(|key| key.day.as_string())
+            .map(|key| key.partition)
             .collect::<Vec<_>>();
-        days.sort();
-        days.dedup();
-        Ok(days
+        partitions.sort();
+        partitions.dedup();
+        Ok(partitions
             .into_iter()
-            .filter_map(|day| tail::EventDay::new(day).ok())
-            .map(|day| {
+            .map(TimePartition::to_wire)
+            .map(|partition| {
                 (
-                    day,
+                    partition,
                     tail::TailStreamIdentity {
                         node_id: tail::NodeId::new(stream.node_id.as_uuid()),
                         writer_epoch,
@@ -1837,7 +1840,7 @@ impl ScribeTailReader {
             return Err(TailReadError::DeadlineElapsed);
         }
         let binding = binding_from_wire(&request.binding)?;
-        let event_day = event_day_from_wire(&request.event_day)?;
+        let time_partition = partition_from_wire(request.time_partition);
         let stream = self.source.stream();
         let stream_epoch =
             u64::try_from(stream.writer_epoch.as_i64()).map_err(|_| TailReadError::State {
@@ -1852,8 +1855,8 @@ impl ScribeTailReader {
             .fetch_hot_batches(FetchLiveTailRequest {
                 binding: binding.clone(),
                 target_stream: stream,
-                start_day: event_day,
-                end_day: event_day,
+                start_partition: time_partition,
+                end_partition: time_partition,
                 after_lsn: WalLsn::ZERO,
                 persisted_lsn_ranges: Vec::new(),
                 required_columns: Vec::new(),
@@ -1896,7 +1899,7 @@ impl ScribeTailReader {
         let fence = tail::TailReadFence {
             fence_id: tail::TailFenceId::new(uuid::Uuid::now_v7()),
             binding: request.binding,
-            event_day: request.event_day,
+            time_partition: request.time_partition,
             stream: tail::TailStreamIdentity {
                 node_id: tail::NodeId::new(stream.node_id.as_uuid()),
                 writer_epoch: stream_epoch,
@@ -2321,9 +2324,9 @@ pub struct FetchLiveTailRequest {
     /// The writer stream the caller believes it is talking to.
     pub target_stream: StreamIdentity,
     /// Inclusive first partition day governed by the query.
-    pub start_day: EventDay,
+    pub start_partition: TimePartition,
     /// Inclusive last partition day governed by the query.
-    pub end_day: EventDay,
+    pub end_partition: TimePartition,
     /// Emit only records with `LSN > after_lsn`.
     pub after_lsn: WalLsn,
     /// Manifest-pinned inclusive WAL ranges already owned by persisted files.
@@ -2365,7 +2368,7 @@ impl FetchLiveTailRequest {
 #[derive(Debug, Clone)]
 pub struct HotBatch {
     /// Exact partition day owning the batch.
-    pub partition_day: EventDay,
+    pub partition_day: TimePartition,
     /// WAL LSN of the append.
     pub wal_lsn: WalLsn,
     /// Idempotency identity of the append.
@@ -2524,7 +2527,7 @@ impl FetchLiveTailService {
                 actual: self.stream,
             });
         }
-        if request.start_day > request.end_day {
+        if request.start_partition > request.end_partition {
             return Err(ScribeError::Internal {
                 detail: "live-tail start day is after end day".to_owned(),
             });
@@ -2541,8 +2544,8 @@ impl FetchLiveTailService {
             .readable_batches_for_range(
                 request.binding.tenant,
                 &request.binding.table_ref,
-                request.start_day,
-                request.end_day,
+                request.start_partition,
+                request.end_partition,
                 &request.required_columns,
                 ReadableBatchLimits {
                     max_batches: request.max_batches,
@@ -2579,8 +2582,7 @@ mod tests {
     use wyrd_spec::DataTenantId;
     use wyrd_spec::vala::api as tail;
     use wyrd_spec::vala::api::{
-        AcquireTailFenceRequest, EventDay, SchemaFingerprint, TailCursor, TailPageRequest,
-        TenantTableBinding,
+        AcquireTailFenceRequest, SchemaFingerprint, TailCursor, TailPageRequest, TenantTableBinding,
     };
 
     /// Builds one production-shaped Scribe root for direct tail-reader tests.
@@ -2597,7 +2599,7 @@ mod tests {
                 namespace: "bifrost".to_owned(),
                 table: "events".to_owned(),
             },
-            event_day: EventDay::new("2026-07-14").expect("fixture day"),
+            time_partition: crate::test_support::day_partition(2026, 7, 14).to_wire(),
             exclusive_sealed: TailCursor {
                 writer_epoch: 1,
                 wal_lsn: 0,
@@ -2908,7 +2910,7 @@ mod tests {
         let fence = tail::TailReadFence {
             fence_id: tail::TailFenceId::new(uuid::Uuid::now_v7()),
             binding: request.binding,
-            event_day: request.event_day,
+            time_partition: request.time_partition,
             stream: tail::TailStreamIdentity {
                 node_id: tail::NodeId::new(stream.node_id.as_uuid()),
                 writer_epoch: 1,

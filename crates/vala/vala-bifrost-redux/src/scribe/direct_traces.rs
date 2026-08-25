@@ -1199,8 +1199,14 @@ mod tests {
             actual.expect("accepted row").rows.num_rows(),
             mapped.records.len()
         );
-        assert_eq!(outcome.accepted_spans, mapped.records.len() as i64);
-        assert_eq!(outcome.rejected_spans, mapped.rejected.len() as i64);
+        assert_eq!(
+            outcome.accepted_spans,
+            i64::try_from(mapped.records.len()).expect("accepted span count fits i64")
+        );
+        assert_eq!(
+            outcome.rejected_spans,
+            i64::try_from(mapped.rejected.len()).expect("rejected span count fits i64")
+        );
         assert_eq!(outcome.rejection_message, expected_reason);
     }
 

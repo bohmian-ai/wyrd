@@ -250,3 +250,58 @@ async fn cluster_load_cancellation_and_shutdown_release_all_owners() {
     assert!(summary.cleanup.listeners_stopped);
     assert!(summary.cleanup.servers_stopped);
 }
+
+/// Runs the immutable Task 3B R0 topology and workload through public Gate.
+///
+/// # Panics
+///
+/// Panics unless all eight dynamic tenants complete exact writes and reads on
+/// three Server pods plus three dedicated ForgeWorker pods with zero owners.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires managed Postgres and the immutable Task 3B R0 lane"]
+async fn pg_oracle_resource_ladder_r0_distributed_execution() {
+    let mut profile = ClusterLoadProfile::multi_tenant_three_server_three_worker();
+    profile.minimum_reads_per_tenant = 16;
+    assert_eq!(profile.tenants, 8);
+    assert_eq!(profile.warmup_batches_per_tenant, 2);
+    assert_eq!(profile.measured_batches_per_tenant, 8);
+    assert_eq!(profile.rows_per_batch, 64);
+    let summary = BifrostClusterLoad::start(profile)
+        .await
+        .expect("R0 cluster starts")
+        .run()
+        .await
+        .expect("R0 distributed execution completes");
+    assert_eq!(summary.tenants.len(), 8);
+    assert!(summary.tenants.values().all(|tenant| {
+        tenant.acknowledged_rows == 512
+            && tenant.final_rows == 512
+            && tenant.final_terminal_count == 1
+            && tenant.tenant_audit_rows > 0
+    }));
+    assert_eq!(summary.cleanup.scribe_queued, 0);
+    assert_eq!(summary.cleanup.scribe_inflight, 0);
+    assert_eq!(summary.cleanup.oracle_tail_fences, 0);
+    assert_eq!(summary.cleanup.forge_active_claims, 0);
+    assert_eq!(summary.cleanup.forge_active_attempts, 0);
+    assert_eq!(summary.cleanup.gate_active_streams, 0);
+    assert_eq!(summary.cleanup.supervised_tasks, 0);
+    assert!(summary.cleanup.listeners_stopped);
+    assert!(summary.cleanup.servers_stopped);
+    assert_eq!(
+        summary
+            .tenants
+            .values()
+            .map(|tenant| tenant.completed_reads)
+            .sum::<u32>(),
+        128
+    );
+    assert_eq!(
+        summary
+            .tenants
+            .values()
+            .map(|tenant| tenant.retries)
+            .sum::<u32>(),
+        0
+    );
+}

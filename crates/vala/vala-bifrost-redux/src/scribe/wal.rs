@@ -1,6 +1,7 @@
 //! Write-Ahead Log (WAL) for Scribe — crash-consistent framed records.
 //!
-//! Every prepared day slice emits one self-describing v4 `SLICE` record. After
+//! Every prepared partition slice emits one self-describing v5 `SLICE` record.
+//! After
 //! all ordered slices are durable, one `COMMIT` record authenticates their
 //! complete digest before replay may restore any of them.
 //!
@@ -17,7 +18,6 @@
 //! before replay.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fmt::Write as FmtWrite;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -33,9 +33,10 @@ use uuid::Uuid;
 use wyrd_spec::ids::DataTenantId;
 
 use crate::catalog::TableRef;
+use crate::catalog::layout::TimePartition;
 use crate::contracts::ScribeError;
 use crate::resources::{ScribeMemoryLease, ScribeResources};
-use crate::scribe::seal_key::{EventDay, SealKey};
+use crate::scribe::seal_key::SealKey;
 use crate::scribe::stream_identity::StreamIdentity;
 
 /// Record one physical WAL append attempt while preserving its original result.
@@ -60,9 +61,14 @@ fn record_wal_fsync(result: &Result<(), ScribeError>, started: Instant) {
 #[cfg(test)]
 static WAL_COUNT_ACTIVE: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
-static WAL_REPLAY_PAYLOAD_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
-#[cfg(test)]
 thread_local! {
+    /// Replay payload allocations observed on this thread.
+    ///
+    /// Thread-local rather than a process-wide static so a test that asserts an
+    /// exact count is not perturbed by replays other tests drive concurrently.
+    /// Replay decode is synchronous, so the allocation is always counted on the
+    /// thread that requested it.
+    static WAL_REPLAY_PAYLOAD_ALLOCATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static WAL_ENCODE_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static WAL_WALK_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static WAL_PARTIAL_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -149,7 +155,7 @@ pub struct SegmentHeader {
 
 const WAL_MAGIC: u32 = 0x5741_5257; // "WRAW"
 /// The only persisted WAL version accepted by this Scribe.
-const WAL_VERSION: u16 = 4;
+const WAL_VERSION: u16 = 5;
 const SEGMENT_HEADER_SIZE: usize = 64;
 #[cfg(test)]
 const APPEND_FRAME_MAGIC_V3: [u8; 4] = *b"SWF3";
@@ -158,7 +164,7 @@ const RECORD_HEADER_SIZE: usize = 72;
 /// `u16` wire encoding of the immutable v4 record-header length.
 const RECORD_HEADER_SIZE_U16: u16 = 72;
 /// Exact v4 record magic.
-const RECORD_MAGIC: [u8; 8] = *b"WYRDWAL4";
+const RECORD_MAGIC: [u8; 8] = *b"WYRDWAL5";
 /// A record carrying one ordered batch slice.
 const RECORD_FLAG_SLICE: u32 = 1;
 /// A record carrying the digest that closes one ordered slice set.
@@ -609,27 +615,15 @@ impl PreparedWalAppend {
                 .map_err(|_| ScribeError::Internal {
                     detail: "WAL table FQN exceeds v3 payload limits".to_owned(),
                 })?;
-        let mut day_len = 0;
-        write!(
-            CountWriter(&mut day_len),
-            "{}",
-            seal_key.day.as_date().format("%Y-%m-%d")
-        )
-        .map_err(|_| ScribeError::Internal {
-            detail: "WAL partition day exceeds v3 payload limits".to_owned(),
-        })?;
-        let day_len = u8::try_from(day_len).map_err(|_| ScribeError::Internal {
-            detail: "WAL partition day exceeds v3 payload limits".to_owned(),
-        })?;
         let audit_len = u32::try_from(self.audit.len()).map_err(|_| ScribeError::Internal {
             detail: "WAL audit payload exceeds v3 payload limits".to_owned(),
         })?;
         let data_len = u32::try_from(self.data.len()).map_err(|_| ScribeError::Internal {
             detail: "WAL Arrow payload exceeds v3 payload limits".to_owned(),
         })?;
-        let payload_len = 63usize
+        let payload_len = 62usize
             .saturating_add(usize::from(table_len))
-            .saturating_add(usize::from(day_len))
+            .saturating_add(SLICE_PARTITION_BYTES)
             .saturating_add(usize::try_from(audit_len).expect("invariant: u32 fits usize"))
             .saturating_add(usize::try_from(data_len).expect("invariant: u32 fits usize"));
         Ok(payload_len)
@@ -705,17 +699,8 @@ fn append_prepared_borrowed(
                 detail: "WAL table FQN exceeds v3 payload limits".to_owned(),
             })?
             .to_le_bytes();
-        let mut day = FixedText::<16>::new();
-        write!(day, "{}", seal_key.day.as_date().format("%Y-%m-%d")).map_err(|_| {
-            ScribeError::Internal {
-                detail: "WAL partition day exceeds v3 payload limits".to_owned(),
-            }
-        })?;
-        let day_len = [
-            u8::try_from(day.as_bytes().len()).map_err(|_| ScribeError::Internal {
-                detail: "WAL partition day exceeds v3 payload limits".to_owned(),
-            })?,
-        ];
+        let granularity_tag = [seal_key.partition.granularity_tag()];
+        let partition_start = seal_key.partition.start_unix_micros().to_be_bytes();
         let audit_len = u32::try_from(prepared.audit.len())
             .map_err(|_| ScribeError::Internal {
                 detail: "WAL audit payload exceeds v3 payload limits".to_owned(),
@@ -733,8 +718,8 @@ fn append_prepared_borrowed(
             namespace,
             b".",
             name,
-            &day_len,
-            day.as_bytes(),
+            &granularity_tag,
+            &partition_start,
             &prepared.schema_fingerprint,
             &audit_len,
             &prepared.audit,
@@ -746,60 +731,10 @@ fn append_prepared_borrowed(
     Ok((payload_digest, payload_len))
 }
 
-const SLICE_PAYLOAD_MAGIC: [u8; 4] = *b"S3SL";
-
-struct CountWriter<'a>(&'a mut usize);
-
-impl FmtWrite for CountWriter<'_> {
-    /// Adds one fragment's byte length to the saturating count.
-    ///
-    /// # Errors
-    ///
-    /// This counting implementation is infallible and saturates at
-    /// [`usize::MAX`].
-    fn write_str(&mut self, value: &str) -> std::fmt::Result {
-        *self.0 = self.0.saturating_add(value.len());
-        Ok(())
-    }
-}
-
-/// Stack-backed formatter for the fixed-width partition-day field.
-struct FixedText<const N: usize> {
-    /// Inline bytes written so far.
-    bytes: [u8; N],
-    /// Live prefix length within `bytes`.
-    len: usize,
-}
-
-impl<const N: usize> FixedText<N> {
-    /// Constructs an empty inline formatter.
-    const fn new() -> Self {
-        Self {
-            bytes: [0; N],
-            len: 0,
-        }
-    }
-
-    /// Returns the initialized inline prefix.
-    fn as_bytes(&self) -> &[u8] {
-        &self.bytes[..self.len]
-    }
-}
-
-impl<const N: usize> FmtWrite for FixedText<N> {
-    /// Copies one formatted fragment into the fixed inline capacity.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`std::fmt::Error`] when the fragment exceeds remaining space.
-    fn write_str(&mut self, value: &str) -> std::fmt::Result {
-        let end = self.len.checked_add(value.len()).ok_or(std::fmt::Error)?;
-        let destination = self.bytes.get_mut(self.len..end).ok_or(std::fmt::Error)?;
-        destination.copy_from_slice(value.as_bytes());
-        self.len = end;
-        Ok(())
-    }
-}
+const SLICE_PAYLOAD_MAGIC: [u8; 4] = *b"S5SL";
+/// Fixed encoded width of the typed partition field: one granularity tag plus
+/// a signed big-endian epoch-microsecond start.
+const SLICE_PARTITION_BYTES: usize = 9;
 
 #[cfg(test)]
 fn encode_slice_payload(
@@ -811,7 +746,7 @@ fn encode_slice_payload(
     encode_slice_payload_parts(
         seal_key.tenant.as_uuid().as_bytes(),
         &seal_key.table.fqn(),
-        &seal_key.day.as_string(),
+        seal_key.partition,
         &schema_fingerprint,
         audit,
         data,
@@ -822,16 +757,13 @@ fn encode_slice_payload(
 fn encode_slice_payload_parts(
     tenant: &[u8; 16],
     table_fqn: &str,
-    partition_day: &str,
+    partition: TimePartition,
     schema_fingerprint: &[u8; 32],
     audit: &[u8],
     data: &[u8],
 ) -> Result<Vec<u8>, ScribeError> {
     let table_len = u16::try_from(table_fqn.len()).map_err(|_| ScribeError::Internal {
-        detail: "WAL table FQN exceeds v3 payload limits".to_owned(),
-    })?;
-    let day_len = u8::try_from(partition_day.len()).map_err(|_| ScribeError::Internal {
-        detail: "WAL partition day exceeds v3 payload limits".to_owned(),
+        detail: "WAL table FQN exceeds v5 payload limits".to_owned(),
     })?;
     let audit_len = u32::try_from(audit.len()).map_err(|_| ScribeError::Internal {
         detail: "WAL audit payload exceeds v3 payload limits".to_owned(),
@@ -843,8 +775,7 @@ fn encode_slice_payload_parts(
         .saturating_add(16)
         .saturating_add(2)
         .saturating_add(table_fqn.len())
-        .saturating_add(1)
-        .saturating_add(partition_day.len())
+        .saturating_add(SLICE_PARTITION_BYTES)
         .saturating_add(32)
         .saturating_add(4)
         .saturating_add(audit.len())
@@ -855,8 +786,8 @@ fn encode_slice_payload_parts(
     payload.extend_from_slice(tenant);
     payload.extend_from_slice(&table_len.to_le_bytes());
     payload.extend_from_slice(table_fqn.as_bytes());
-    payload.push(day_len);
-    payload.extend_from_slice(partition_day.as_bytes());
+    payload.push(partition.granularity_tag());
+    payload.extend_from_slice(&partition.start_unix_micros().to_be_bytes());
     payload.extend_from_slice(schema_fingerprint);
     payload.extend_from_slice(&audit_len.to_le_bytes());
     payload.extend_from_slice(audit);
@@ -973,14 +904,28 @@ fn decode_slice_table(table_fqn: &str) -> Result<TableRef, ScribeError> {
     })
 }
 
-/// Decode and validate the partition day encoded as `YYYY-MM-DD`.
-fn decode_slice_day(day: &str) -> Result<EventDay, ScribeError> {
-    let day = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").map_err(|error| {
-        ScribeError::Internal {
-            detail: format!("WAL partition day is invalid: {error}"),
-        }
+/// Decode and validate the typed partition encoded as a one-byte granularity
+/// tag followed by a signed big-endian epoch-microsecond start.
+///
+/// A slice that does not name a known granularity, or whose start is not the
+/// exact boundary of that granularity, is unrestorable: replay refuses it
+/// rather than re-bucketing rows into a partition the writer never chose.
+///
+/// # Errors
+/// Returns [`ScribeError::Internal`] when the tag is unknown or the start is
+/// out of range or non-canonical.
+fn decode_slice_partition(encoded: &[u8]) -> Result<TimePartition, ScribeError> {
+    let (tag, start) = encoded.split_first().ok_or_else(|| ScribeError::Internal {
+        detail: "WAL v5 slice partition field is truncated".to_owned(),
     })?;
-    Ok(EventDay::new(day))
+    let start: [u8; 8] = start.try_into().map_err(|_| ScribeError::Internal {
+        detail: "WAL v5 slice partition start is truncated".to_owned(),
+    })?;
+    TimePartition::from_durable(*tag, i64::from_be_bytes(start)).map_err(|error| {
+        ScribeError::Internal {
+            detail: format!("WAL v5 slice partition is invalid: {error}"),
+        }
+    })
 }
 
 /// Metadata decoded before the variable-size audit and Arrow fields.
@@ -989,25 +934,24 @@ struct DecodedSliceMetadata {
     schema_fingerprint: [u8; 32],
 }
 
-/// Validate the v3 marker and decode the tenant/table/day/schema identity.
+/// Validate the v5 marker and decode the tenant/table/partition/schema identity.
 fn decode_slice_metadata(
     reader: &mut SlicePayloadReader<'_>,
 ) -> Result<DecodedSliceMetadata, ScribeError> {
     if reader.take(SLICE_PAYLOAD_MAGIC.len())? != SLICE_PAYLOAD_MAGIC {
         return Err(ScribeError::Internal {
-            detail: "WAL v3 slice magic mismatch".to_owned(),
+            detail: "WAL v5 slice magic mismatch".to_owned(),
         });
     }
     let tenant = decode_slice_tenant(reader.take(16)?)?;
     let table_len = reader.read_u16("WAL table length decode failed")?;
     let table_fqn = reader.read_utf8(table_len, "table FQN")?;
     let table = decode_slice_table(&table_fqn)?;
-    let day_len = usize::from(reader.take(1)?[0]);
-    let day = decode_slice_day(&reader.read_utf8(day_len, "partition day")?)?;
+    let partition = decode_slice_partition(reader.take(SLICE_PARTITION_BYTES)?)?;
     let mut schema_fingerprint = [0_u8; 32];
     schema_fingerprint.copy_from_slice(reader.take(32)?);
     Ok(DecodedSliceMetadata {
-        seal_key: SealKey::new(tenant, table, day),
+        seal_key: SealKey::new(tenant, table, partition),
         schema_fingerprint,
     })
 }
@@ -1268,7 +1212,7 @@ impl WalRecord {
         let payload_len =
             usize::try_from(header.payload_len).expect("u32 fits usize on supported targets");
         #[cfg(test)]
-        WAL_REPLAY_PAYLOAD_ALLOCATIONS.fetch_add(1, Ordering::AcqRel);
+        WAL_REPLAY_PAYLOAD_ALLOCATIONS.with(|count| count.set(count.get() + 1));
         let mut payload = vec![0u8; payload_len];
         reader
             .read_exact(&mut payload)
@@ -3800,22 +3744,22 @@ fn crc32c_hash(data: &[u8]) -> u32 {
     crc32c::crc32c(data)
 }
 
-/// Resets the test-only count of replay payload allocations.
+/// Resets this thread's test-only count of replay payload allocations.
 #[cfg(test)]
 pub(crate) fn reset_replay_payload_allocations_for_test() {
-    WAL_REPLAY_PAYLOAD_ALLOCATIONS.store(0, Ordering::Release);
+    WAL_REPLAY_PAYLOAD_ALLOCATIONS.with(|count| count.set(0));
 }
 
-/// Returns the test-only count of replay payload allocations.
+/// Returns this thread's test-only count of replay payload allocations.
 #[cfg(test)]
 pub(crate) fn replay_payload_allocations_for_test() -> u64 {
-    WAL_REPLAY_PAYLOAD_ALLOCATIONS.load(Ordering::Acquire)
+    WAL_REPLAY_PAYLOAD_ALLOCATIONS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scribe::seal_key::EventDay;
+
     use tempfile::TempDir;
     use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
     use wyrd_spec::request_id::RequestId;
@@ -3825,7 +3769,7 @@ mod tests {
         SealKey::new(
             tenant,
             TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "wal-test"),
-            EventDay::new(chrono::NaiveDate::from_ymd_opt(2026, 1, 1).expect("test date")),
+            crate::test_support::day_partition(2026, 1, 1),
         )
     }
 
@@ -4141,13 +4085,13 @@ mod tests {
         assert_eq!(decoded.payload, b"test data");
     }
 
-    /// Proves a v4 commit has the exact fixed header fields and digest payload.
+    /// Proves a v5 commit has the exact fixed header fields and digest payload.
     #[test]
     fn wal_commit_record_uses_the_terminal_slice_identity() {
         let record = WalRecord::commit(WalLsn::new(9), [7; 16], [8; 16], 3, [9; 32]);
         let encoded = record.encode();
 
-        assert_eq!(&encoded[..8], b"WYRDWAL4");
+        assert_eq!(&encoded[..8], b"WYRDWAL5");
         assert_eq!(encoded.len(), RECORD_HEADER_SIZE + 32 + 4);
         let decoded = WalRecord::decode_from(&mut std::io::Cursor::new(encoded))
             .expect("decode terminal record")
@@ -4175,7 +4119,7 @@ mod tests {
         let mut payload = encode_slice_payload_parts(
             tenant.as_uuid().as_bytes(),
             "vala.bifrost.invalid/table",
-            "2026-01-01",
+            crate::test_support::day_partition(2026, 1, 1),
             &[0_u8; 32],
             b"audit",
             b"data",
@@ -4274,12 +4218,12 @@ mod tests {
         let first = SealKey::new(
             crate::test_support::tenant(),
             table.clone(),
-            EventDay::new(chrono::NaiveDate::from_ymd_opt(2026, 1, 1).expect("date")),
+            crate::test_support::day_partition(2026, 1, 1),
         );
         let second = SealKey::new(
             crate::test_support::tenant(),
             table,
-            EventDay::new(chrono::NaiveDate::from_ymd_opt(2026, 1, 2).expect("date")),
+            crate::test_support::day_partition(2026, 1, 2),
         );
         let frame = encode_append_frame([1u8; 16], b"audit", b"data").expect("frame");
 
@@ -4543,6 +4487,39 @@ mod tests {
         assert!(!first.path.exists());
     }
 
+    /// Finds two batch ids that route to the same fixed shard.
+    ///
+    /// Segment-pin behavior is only observable when two replay groups land in
+    /// one segment, which requires both batches to route to the same shard.
+    /// Search from `first + 1` upward so the pair is deterministic for a given
+    /// seal key rather than depending on hash luck.
+    ///
+    /// Returns both batch ids and the shard they share.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no later batch id routes to the same shard, which would mean
+    /// the fixed shard count or routing function changed underneath this test.
+    fn co_sharded_batch_pair(seal_key: &SealKey, first: u8) -> ([u8; 16], [u8; 16], usize) {
+        let first_batch = [first; 16];
+        let shard = crate::scribe::routing::shard_for(
+            seal_key.tenant,
+            &seal_key.table,
+            uuid::Uuid::from_bytes(first_batch),
+        );
+        let second_batch = (first.saturating_add(1)..=u8::MAX)
+            .map(|value| [value; 16])
+            .find(|batch_id| {
+                crate::scribe::routing::shard_for(
+                    seal_key.tenant,
+                    &seal_key.table,
+                    uuid::Uuid::from_bytes(*batch_id),
+                ) == shard
+            })
+            .expect("a second batch routes to the same fixed shard");
+        (first_batch, second_batch, shard)
+    }
+
     /// A cancelled replay keeps a shared segment until a restart publishes its final group.
     #[test]
     fn replay_segment_pin_preserves_unread_group_across_restart() {
@@ -4556,22 +4533,7 @@ mod tests {
             WalConfig::new(16 * 1024 * 1024).expect("single-segment config"),
         )
         .expect("first writer");
-        let first_batch = [1_u8; 16];
-        let shard = crate::scribe::routing::shard_for(
-            seal_key.tenant,
-            &seal_key.table,
-            uuid::Uuid::from_bytes(first_batch),
-        );
-        let second_batch = (2_u8..=u8::MAX)
-            .map(|value| [value; 16])
-            .find(|batch_id| {
-                crate::scribe::routing::shard_for(
-                    seal_key.tenant,
-                    &seal_key.table,
-                    uuid::Uuid::from_bytes(*batch_id),
-                ) == shard
-            })
-            .expect("a second batch routes to the same fixed shard");
+        let (first_batch, second_batch, shard) = co_sharded_batch_pair(&seal_key, 1);
         for batch_id in [first_batch, second_batch] {
             writer
                 .append_and_commit_for_replay_test(&seal_key, batch_id, b"audit", b"payload")
@@ -4668,22 +4630,7 @@ mod tests {
             WalConfig::new(16 * 1024 * 1024).expect("single-segment config"),
         )
         .expect("first writer");
-        let first_batch = [3_u8; 16];
-        let shard = crate::scribe::routing::shard_for(
-            seal_key.tenant,
-            &seal_key.table,
-            uuid::Uuid::from_bytes(first_batch),
-        );
-        let second_batch = (4_u8..=u8::MAX)
-            .map(|value| [value; 16])
-            .find(|batch_id| {
-                crate::scribe::routing::shard_for(
-                    seal_key.tenant,
-                    &seal_key.table,
-                    uuid::Uuid::from_bytes(*batch_id),
-                ) == shard
-            })
-            .expect("a second batch routes to the same fixed shard");
+        let (first_batch, second_batch, _shard) = co_sharded_batch_pair(&seal_key, 3);
         let audit = replay_audit();
         for batch_id in [first_batch, second_batch] {
             writer

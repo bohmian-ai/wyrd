@@ -144,6 +144,7 @@ mod pg_tests {
                 Field::new("value", DataType::Utf8, false),
             ],
             tenant,
+            physical_layout: None,
             audit: None,
         })
         .await

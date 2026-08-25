@@ -2,7 +2,9 @@
 
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit as ArrowTimeUnit};
 use vala_sql::row_types::olap_catalog::BifrostTableRow;
-use wyrd_spec::vala::api::{BifrostTableEntry, DataTypeSpec, FieldSpec, TableStatus, TimeUnit};
+use wyrd_spec::vala::api::{
+    BifrostTableEntry, DataTypeSpec, FieldSpec, PhysicalLayoutWire, TableStatus, TimeUnit,
+};
 use wyrd_spec::vala::{is_reserved_correlation_column, is_reserved_managed_column};
 
 use crate::catalog::BifrostCatalogError;
@@ -35,9 +37,28 @@ pub fn entry_from_row(row: &BifrostTableRow) -> Result<BifrostTableEntry, Bifros
         table_uid: to_hex(&row.table_uid),
         status: status_from_db(&row.status)?,
         fingerprint: to_hex(&row.fingerprint),
-        partition_columns: row.partition_columns.clone(),
         registered_at: row.registered_at,
         updated_at: row.updated_at,
+    })
+}
+
+/// Decode the persisted canonical physical layout from one catalog row.
+///
+/// The `physical_layout` column is written only by the catalog from
+/// [`crate::catalog::PhysicalLayout::to_wire`], so anything that fails to
+/// deserialize is control-plane corruption, not caller input.
+///
+/// # Errors
+/// Returns [`BifrostCatalogError::MetadataMismatch`] when the stored JSON is
+/// not a physical-layout declaration.
+pub fn layout_wire_from_row(
+    row: &BifrostTableRow,
+) -> Result<PhysicalLayoutWire, BifrostCatalogError> {
+    serde_json::from_value(row.physical_layout.clone()).map_err(|error| {
+        BifrostCatalogError::MetadataMismatch(format!(
+            "stored physical_layout for {} is not decodable: {error}",
+            row.fqn
+        ))
     })
 }
 

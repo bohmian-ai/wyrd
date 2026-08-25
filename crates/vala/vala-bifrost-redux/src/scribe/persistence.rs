@@ -1966,6 +1966,18 @@ impl PersistenceWorker {
         context: PersistenceCandidate<'_>,
         parquet_owner: &mut Option<ScribeMemoryLease>,
     ) -> Result<ParquetEncoded, ScribeError> {
+        let layout = crate::scribe::write_recipe::resolve_write_recipe(
+            self.operator_pool
+                .as_ref()
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "writer-v2 encoding requires the operator control capability"
+                        .to_owned(),
+                })?
+                .pool(),
+            context.binding,
+            &context.frozen.schema,
+        )
+        .await?;
         let (scratch, object_base, footer_reservation) = self.prepare_encoding(
             context.generation,
             context.binding,
@@ -1984,6 +1996,7 @@ impl PersistenceWorker {
                 tenant: context.binding.tenant,
                 candidate: Some(context.candidate),
                 first_ordinal: context.first_ordinal,
+                layout,
                 scratch_dir: scratch.path().to_path_buf(),
                 object_base,
                 footer_reservation,
@@ -2322,7 +2335,7 @@ impl PersistenceWorker {
             })?;
         let object_base = ScribeArtifactIdentity::new(
             binding,
-            generation.seal_key.day,
+            generation.seal_key.partition,
             &generation.stream.node_id.to_string(),
             generation.stream.writer_epoch.as_i64(),
             generation.shard_id,
@@ -2578,7 +2591,7 @@ impl PersistenceWorker {
         let mover = ScribeStageMover::new(Arc::clone(&self.wal), (*self.operator).clone());
         let object_base = ScribeArtifactIdentity::new(
             binding,
-            generation.seal_key.day,
+            generation.seal_key.partition,
             &generation.stream.node_id.to_string(),
             generation.stream.writer_epoch.as_i64(),
             generation.shard_id,
@@ -2660,7 +2673,7 @@ impl PersistenceWorker {
         if let Some(publisher) = &self.staging_file_publisher {
             let event = crate::maintenance::StagingFileCommitted::new(
                 binding.clone(),
-                generation.seal_key.day.as_naive_date(),
+                generation.seal_key.partition,
             );
             let _ = publisher.try_publish(event);
         }
@@ -2702,7 +2715,7 @@ impl PersistenceWorker {
         if let Some(publisher) = &self.staging_file_publisher {
             let _ = publisher.try_publish(crate::maintenance::StagingFileCommitted::new(
                 binding.clone(),
-                generation.seal_key.day.as_naive_date(),
+                generation.seal_key.partition,
             ));
         }
         if !defer_manifest_advance {
@@ -2792,8 +2805,8 @@ mod tests {
     use std::task::{Context, Poll};
 
     use crate::catalog::TableRef;
+
     use crate::namespaces::BifrostNamespace;
-    use crate::scribe::seal_key::EventDay;
     use crate::scribe::telemetry::producer_lifecycle_tests::{EventCaptureSubscriber, field};
     use crate::test_support::{SpanCaptureSubscriber, has_span_outcome};
 
@@ -2803,9 +2816,7 @@ mod tests {
             seal_key: SealKey::new(
                 crate::test_support::tenant(),
                 TableRef::new(BifrostNamespace::Bifrost, "producer_lifecycle"),
-                EventDay::new(
-                    chrono::NaiveDate::from_ymd_opt(2026, 8, 19).expect("valid event day"),
-                ),
+                crate::test_support::day_partition(2026, 8, 19),
             ),
             shard_id: 3,
             writer_epoch: 41,
@@ -3112,8 +3123,9 @@ mod tests {
         stream: StreamIdentity,
         /// Tenant that owns the representative generation.
         tenant: wyrd_spec::DataTenantId,
-        /// Database retained until worker shutdown completes.
-        _database: wyrd_dev_fixtures::pg::PgFixture,
+        /// Database retained until worker shutdown completes, and the source of
+        /// the tenant connection the fixture registers its control row through.
+        database: wyrd_dev_fixtures::pg::PgFixture,
         /// WAL directory retained until worker shutdown completes.
         _wal_root: tempfile::TempDir,
         /// Scratch namespace roots retained until worker shutdown completes.
@@ -3122,6 +3134,55 @@ mod tests {
 
     #[cfg(feature = "test-support")]
     impl IdlePersistenceFixture {
+        /// Builds Scribe-only runtime resources over the fixture's real volume roots.
+        ///
+        /// The snapshot is injected rather than probed so the fixture's capacity
+        /// is deterministic across machines, and only the Scribe role is
+        /// composed so the test exercises a single role's floor. The volume
+        /// roots are the fixture's real directories, so the WAL, output, and
+        /// scratch accounting under test is measured against actual files.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the injected snapshot and policy cannot produce valid
+        /// Bifrost runtime resources.
+        fn scribe_only_runtime_resources(
+            scratch_root: &std::path::Path,
+            wal_root: &std::path::Path,
+            scribe_output: std::path::PathBuf,
+            forge_scratch: std::path::PathBuf,
+            oracle_scratch: std::path::PathBuf,
+        ) -> crate::resources::BifrostRuntimeResources {
+            crate::resources::BifrostRuntimeResources::from_snapshot(
+                crate::resources::SystemResourceSnapshot {
+                    memory_limit_bytes: 1024 * 1024 * 1024,
+                    effective_cpu: 2,
+                    scratch_capacity_bytes: 2 * 1024 * 1024 * 1024,
+                    scratch_available_bytes: 2 * 1024 * 1024 * 1024,
+                    memory_source: crate::resources::ResourceSource::Injected,
+                    cpu_source: crate::resources::ResourceSource::Injected,
+                },
+                crate::resources::BifrostResourcePolicy {
+                    roles: std::collections::BTreeSet::from([
+                        crate::resources::BifrostRole::Scribe,
+                    ]),
+                    memory_limit_bytes: None,
+                    unmanaged_reserve_bytes: None,
+                    scratch_limit_bytes: None,
+                    effective_cpu: None,
+                    oracle_query_slot_limit: None,
+                    scratch_root: scratch_root.to_owned(),
+                    volume_roots: Some(crate::resources::BifrostVolumeRoots {
+                        wal: wal_root.to_owned(),
+                        scribe_output_scratch: scribe_output,
+                        forge_scratch,
+                        oracle_scratch,
+                    }),
+                },
+            )
+            .expect("test Bifrost resources")
+        }
+
         /// Starts one real persistence runtime before it accepts work.
         async fn start() -> Self {
             let database = wyrd_dev_fixtures::pg::PgFixture::start()
@@ -3163,33 +3224,13 @@ mod tests {
                 stream,
             ))
             .expect("WAL stream directory");
-            let runtime_resources = crate::resources::BifrostRuntimeResources::from_snapshot(
-                crate::resources::SystemResourceSnapshot {
-                    memory_limit_bytes: 1024 * 1024 * 1024,
-                    effective_cpu: 2,
-                    scratch_capacity_bytes: 2 * 1024 * 1024 * 1024,
-                    scratch_available_bytes: 2 * 1024 * 1024 * 1024,
-                    memory_source: crate::resources::ResourceSource::Injected,
-                    cpu_source: crate::resources::ResourceSource::Injected,
-                },
-                crate::resources::BifrostResourcePolicy {
-                    roles: std::collections::BTreeSet::from([
-                        crate::resources::BifrostRole::Scribe,
-                    ]),
-                    memory_limit_bytes: None,
-                    unmanaged_reserve_bytes: None,
-                    scratch_limit_bytes: None,
-                    effective_cpu: None,
-                    scratch_root: scratch_root.path().to_owned(),
-                    volume_roots: Some(crate::resources::BifrostVolumeRoots {
-                        wal: wal_root.path().to_owned(),
-                        scribe_output_scratch: scribe_output,
-                        forge_scratch,
-                        oracle_scratch,
-                    }),
-                },
-            )
-            .expect("test Bifrost resources");
+            let runtime_resources = Self::scribe_only_runtime_resources(
+                scratch_root.path(),
+                wal_root.path(),
+                scribe_output,
+                forge_scratch,
+                oracle_scratch,
+            );
             let roles = runtime_resources
                 .compose_roles()
                 .expect("test role resources");
@@ -3220,29 +3261,87 @@ mod tests {
                 wal,
                 stream,
                 tenant,
-                _database: database,
+                database,
                 _wal_root: wal_root,
                 _scratch_root: scratch_root,
             }
         }
 
-        /// Submits one bounded generation and waits for its real worker completion.
-        async fn submit_and_drain(&self) {
-            let table = crate::catalog::TableRef::new(
-                crate::namespaces::BifrostNamespace::Bifrost,
-                "idle_queue",
-            );
-            let seal_key = SealKey::new(
-                self.tenant,
-                table.clone(),
-                crate::scribe::seal_key::EventDay::new(
-                    chrono::NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid test day"),
-                ),
-            );
-            let binding =
-                TenantTableBinding::resolve((self.tenant, table.clone())).expect("binding");
-            let batch_id = uuid::Uuid::now_v7();
-            let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+        /// Builds the one bounded generation this fixture submits.
+        ///
+        /// Every field is fixed — one row, one audit event, one append meta,
+        /// LSN 1, shard 0 — so the queue gauges the caller asserts on move by a
+        /// known amount rather than by whatever a randomized fixture produced.
+        /// The WAL handle is taken from the fixture's real writer so the
+        /// persistence worker exercises a genuine durable path.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the fixture's WAL writer has no shard-0 handle.
+        fn fixture_generation(
+            &self,
+            table: crate::catalog::TableRef,
+            seal_key: &SealKey,
+            rows: Vec<arrow::record_batch::RecordBatch>,
+            schema: Arc<arrow::datatypes::Schema>,
+            batch_id: uuid::Uuid,
+        ) -> Arc<ImmutableGeneration> {
+            Arc::new(ImmutableGeneration {
+                table_key: (self.tenant, table),
+                seal_key: seal_key.clone(),
+                generation_id: GenerationId(1),
+                stream: self.stream,
+                wal_lsn_min: WalLsn::new(1),
+                wal_lsn_max: WalLsn::new(1),
+                wal_segments: Vec::new(),
+                wal: self.wal.handle_for_shard(0).expect("WAL handle"),
+                rows,
+                schema,
+                audit_events: vec![wyrd_spec::vala::api::AuditEvent {
+                    request_id: wyrd_spec::request_id::RequestId::now_v7(),
+                    trace_id: None,
+                    operation: "test".to_owned(),
+                    resource: "bifrost.idle_queue".to_owned(),
+                    card_ref: None,
+                    principal_id: wyrd_spec::auth::PrincipalId::new(uuid::Uuid::new_v4()),
+                    principal_kind: wyrd_spec::auth::PrincipalKindTag::User,
+                    auth_method: wyrd_spec::vala::api::AuthMethod::Jwt,
+                    permission: "bifrost.write".to_owned(),
+                    decision: wyrd_spec::vala::api::AuditDecision::Allow,
+                    result: wyrd_spec::vala::api::AuditResult::Success,
+                    payload_summary: "idle persistence fixture".to_owned(),
+                    detail: None,
+                }],
+                append_metas: vec![crate::scribe::wal::ScribeAppendMeta {
+                    batch_id: *batch_id.as_bytes(),
+                    schema_fingerprint: [0; 32],
+                    data_digest: [0; 32],
+                    data_len: 0,
+                    payload_digest: [0; 32],
+                    payload_len: 0,
+                    slice_index: 0,
+                    slice_count: 1,
+                    rows_accepted: 1,
+                    wal_lsn_min: WalLsn::new(1),
+                    wal_lsn_max: WalLsn::new(1),
+                    seal_key: seal_key.to_string(),
+                }],
+                row_count: 1,
+                arrow_bytes: 1,
+                replay_identity: Mutex::new(None),
+                opened_at: std::time::Instant::now(),
+                closed_at: std::time::Instant::now(),
+                shard_id: 0,
+            })
+        }
+
+        /// Returns the physical Arrow schema every fixture generation writes.
+        ///
+        /// Registration and submission must agree exactly: the write recipe is
+        /// re-canonicalized against the sealed schema, so a column present in
+        /// one and absent from the other fails the seal closed.
+        fn fixture_schema() -> Arc<arrow::datatypes::Schema> {
+            Arc::new(arrow::datatypes::Schema::new(vec![
                 arrow::datatypes::Field::new(
                     wyrd_spec::vala::managed_columns::DATA_TENANT_ID,
                     arrow::datatypes::DataType::Utf8,
@@ -3257,7 +3356,57 @@ mod tests {
                     false,
                 ),
                 arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
-            ]));
+            ]))
+        }
+
+        /// Registers the control row the seal path resolves its write recipe from.
+        ///
+        /// The fixture drives the persistence worker directly rather than through
+        /// the catalog, so it owns the one registration the worker requires. The
+        /// layout is the canonical omission default, matching a table registered
+        /// without a declaration.
+        async fn register_control_row(&self, table: &crate::catalog::TableRef) {
+            let fqn = table.fqn();
+            let layout = crate::catalog::layout::PhysicalLayout::canonicalize(
+                &fqn,
+                &Self::fixture_schema(),
+                None,
+            )
+            .expect("the fixture schema canonicalizes");
+            let mut conn = self
+                .database
+                .vala_postgres()
+                .tenant_conn(self.tenant)
+                .await
+                .expect("fixture tenant connection");
+            vala_sql::queries::olap_catalog::upsert_table(
+                &mut conn,
+                uuid::Uuid::now_v7().as_bytes(),
+                &fqn,
+                &[0_u8; 32],
+                &serde_json::to_value(layout.to_wire()).expect("canonical layout encodes"),
+            )
+            .await
+            .expect("register the fixture control row");
+            conn.commit().await.expect("commit the fixture control row");
+        }
+
+        /// Submits one bounded generation and waits for its real worker completion.
+        async fn submit_and_drain(&self) {
+            let table = crate::catalog::TableRef::new(
+                crate::namespaces::BifrostNamespace::Bifrost,
+                "idle_queue",
+            );
+            let seal_key = SealKey::new(
+                self.tenant,
+                table.clone(),
+                crate::test_support::day_partition(2026, 1, 1),
+            );
+            let binding =
+                TenantTableBinding::resolve((self.tenant, table.clone())).expect("binding");
+            let batch_id = uuid::Uuid::now_v7();
+            self.register_control_row(&table).await;
+            let schema = Self::fixture_schema();
             let rows = vec![
                 arrow::record_batch::RecordBatch::try_new(
                     Arc::clone(&schema),
@@ -3276,53 +3425,7 @@ mod tests {
             let (completion_tx, mut completion_rx) = mpsc::channel(1);
             self.runtime
                 .try_submit(PersistenceJob {
-                    generation: Arc::new(ImmutableGeneration {
-                        table_key: (self.tenant, table),
-                        seal_key: seal_key.clone(),
-                        generation_id: GenerationId(1),
-                        stream: self.stream,
-                        wal_lsn_min: WalLsn::new(1),
-                        wal_lsn_max: WalLsn::new(1),
-                        wal_segments: Vec::new(),
-                        wal: self.wal.handle_for_shard(0).expect("WAL handle"),
-                        rows,
-                        schema,
-                        audit_events: vec![wyrd_spec::vala::api::AuditEvent {
-                            request_id: wyrd_spec::request_id::RequestId::now_v7(),
-                            trace_id: None,
-                            operation: "test".to_owned(),
-                            resource: "bifrost.idle_queue".to_owned(),
-                            card_ref: None,
-                            principal_id: wyrd_spec::auth::PrincipalId::new(uuid::Uuid::new_v4()),
-                            principal_kind: wyrd_spec::auth::PrincipalKindTag::User,
-                            auth_method: wyrd_spec::vala::api::AuthMethod::Jwt,
-                            permission: "bifrost.write".to_owned(),
-                            decision: wyrd_spec::vala::api::AuditDecision::Allow,
-                            result: wyrd_spec::vala::api::AuditResult::Success,
-                            payload_summary: "idle persistence fixture".to_owned(),
-                            detail: None,
-                        }],
-                        append_metas: vec![crate::scribe::wal::ScribeAppendMeta {
-                            batch_id: *batch_id.as_bytes(),
-                            schema_fingerprint: [0; 32],
-                            data_digest: [0; 32],
-                            data_len: 0,
-                            payload_digest: [0; 32],
-                            payload_len: 0,
-                            slice_index: 0,
-                            slice_count: 1,
-                            rows_accepted: 1,
-                            wal_lsn_min: WalLsn::new(1),
-                            wal_lsn_max: WalLsn::new(1),
-                            seal_key: seal_key.to_string(),
-                        }],
-                        row_count: 1,
-                        arrow_bytes: 1,
-                        replay_identity: Mutex::new(None),
-                        opened_at: std::time::Instant::now(),
-                        closed_at: std::time::Instant::now(),
-                        shard_id: 0,
-                    }),
+                    generation: self.fixture_generation(table, &seal_key, rows, schema, batch_id),
                     binding,
                     completion_tx,
                     completion_waiter: None,

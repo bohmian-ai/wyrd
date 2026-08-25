@@ -3,32 +3,43 @@
 //! This module is pure: callers provide a stable live-file view and apply the
 //! resulting groups through Forge's existing fenced commit workflow.
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Utc};
 use iceberg::spec::{NullOrder, PartitionSpec, Schema, SortDirection, SortOrder, Transform};
 
 use super::error::ForgeError;
+use crate::catalog::TimeGranularity;
+use crate::catalog::layout::TimePartition;
 use crate::parquet::writer_properties::BIFROST_WRITER_RECIPE_VERSION;
 
 /// Iceberg's unsorted order identifier used when a data file omits the field.
 pub const ICEBERG_UNSORTED_ORDER_ID: i64 = 0;
 
-/// Validate the physical Iceberg layout that Forge's rewrite pipeline emits.
+/// Validate the physical Iceberg layout that Forge's rewrite pipeline emits and
+/// recover the table's registered partition granularity.
 ///
-/// Forge rewrites are sorted by `(data_tenant_id, wyrd_event_time)` and are
-/// partitioned by `day(wyrd_event_time)`. Rejecting any other current layout
-/// before policy construction prevents files from being written with a false
-/// partition or sort identity.
+/// The Iceberg table metadata is the projection of the registered
+/// [`PhysicalLayout`](crate::catalog::layout::PhysicalLayout), so Forge reads
+/// the granularity back out of the default partition spec instead of carrying a
+/// second copy of the declaration. Two invariants remain fixed for every
+/// registered layout and are re-checked here because a rewrite that violated
+/// either would write files with a false physical identity: the table is
+/// partitioned by exactly one `hour`/`day` transform over `wyrd_event_time`,
+/// and the default sort order is prefixed by ascending nulls-last
+/// `data_tenant_id`. Declared trailing sort keys are table-specific and are not
+/// constrained here; Forge reproduces the current sort order by identity.
 ///
 /// # Errors
 ///
-/// Returns [`ForgeError::InvalidConfig`] when the partition spec or sort order
-/// differs from the fixed Bifrost physical recipe, or when either source field
-/// is absent from the current schema.
+/// Returns [`ForgeError::InvalidConfig`] when `data_tenant_id` or
+/// `wyrd_event_time` is absent from the current schema, when the partition spec
+/// is not a single supported time transform over `wyrd_event_time` under its
+/// canonical field name, or when the default sort order does not begin with the
+/// tenant prefix.
 pub(crate) fn validate_supported_layout(
     schema: &Schema,
     partition_spec: &PartitionSpec,
     sort_order: &SortOrder,
-) -> Result<(), ForgeError> {
+) -> Result<TimeGranularity, ForgeError> {
     let tenant_field =
         schema
             .field_by_name("data_tenant_id")
@@ -42,31 +53,43 @@ pub(crate) fn validate_supported_layout(
                 detail: "Forge physical recipe requires wyrd_event_time".to_owned(),
             })?;
     let partition_fields = partition_spec.fields();
+    let granularity = match partition_fields.first().map(|field| field.transform) {
+        Some(Transform::Hour) => TimeGranularity::Hour,
+        Some(Transform::Day) => TimeGranularity::Day,
+        _ => {
+            return Err(ForgeError::InvalidConfig {
+                detail: "Forge supports only hour(wyrd_event_time) or day(wyrd_event_time) \
+                         partitioning"
+                    .to_owned(),
+            });
+        }
+    };
     if partition_fields.len() != 1
         || partition_fields[0].source_id != event_time_field.id
-        || partition_fields[0].name != "wyrd_event_time_day"
-        || partition_fields[0].transform != Transform::Day
+        || partition_fields[0].name != format!("wyrd_event_time_{}", granularity.as_str())
     {
         return Err(ForgeError::InvalidConfig {
-            detail: "Forge supports only day(wyrd_event_time) partitioning".to_owned(),
-        });
-    }
-    let sort_fields = &sort_order.fields;
-    let expected = [tenant_field.id, event_time_field.id];
-    if sort_fields.len() != expected.len()
-        || sort_fields.iter().zip(expected).any(|(field, source_id)| {
-            field.source_id != source_id
-                || field.transform != Transform::Identity
-                || field.direction != SortDirection::Ascending
-                || field.null_order != NullOrder::Last
-        })
-    {
-        return Err(ForgeError::InvalidConfig {
-            detail: "Forge supports only ascending (data_tenant_id, wyrd_event_time) sort order"
+            detail: "Forge supports only a single canonically named wyrd_event_time partition \
+                     field"
                 .to_owned(),
         });
     }
-    Ok(())
+    let Some(tenant_sort) = sort_order.fields.first() else {
+        return Err(ForgeError::InvalidConfig {
+            detail: "Forge requires a data_tenant_id-prefixed sort order".to_owned(),
+        });
+    };
+    if tenant_sort.source_id != tenant_field.id
+        || tenant_sort.transform != Transform::Identity
+        || tenant_sort.direction != SortDirection::Ascending
+        || tenant_sort.null_order != NullOrder::Last
+    {
+        return Err(ForgeError::InvalidConfig {
+            detail: "Forge requires ascending nulls-last data_tenant_id as the first sort key"
+                .to_owned(),
+        });
+    }
+    Ok(granularity)
 }
 
 /// Current table identity and file-size bounds for a Forge operation.
@@ -205,7 +228,7 @@ impl ForgeRightSizePolicy {
         for file in files {
             if !pending.is_empty()
                 && (pending[0].partition_spec_id != file.partition_spec_id
-                    || pending[0].partition_day != file.partition_day)
+                    || pending[0].partition != file.partition)
             {
                 Self::finish_undersized(
                     &mut pending,
@@ -322,8 +345,8 @@ pub struct IcebergCandidateFile {
     pub(crate) schema_id: i32,
     /// Partition specification that produced the file.
     pub(crate) partition_spec_id: i32,
-    /// Day partition; files never cross it.
-    pub(crate) partition_day: NaiveDate,
+    /// Exact time partition; files never cross it.
+    pub(crate) partition: TimePartition,
     /// Optional Iceberg sort-order identity.
     pub(crate) sort_order_id: Option<i64>,
     /// Physical writer-recipe marker, absent when unknown.
@@ -354,10 +377,10 @@ impl IcebergCandidateFile {
     }
 
     /// Return the canonical planner order for this file.
-    pub(crate) fn sort_key(&self) -> (i32, NaiveDate, DateTime<Utc>, DateTime<Utc>, &str) {
+    pub(crate) fn sort_key(&self) -> (i32, TimePartition, DateTime<Utc>, DateTime<Utc>, &str) {
         (
             self.partition_spec_id,
-            self.partition_day,
+            self.partition,
             self.min_event_time,
             self.max_event_time,
             &self.catalog_path,
@@ -395,7 +418,7 @@ impl IcebergCandidateFile {
     /// Return the complete planner key used to order test-support inputs.
     #[cfg(feature = "test-support")]
     #[must_use]
-    pub fn sort_key_for_test(&self) -> (i32, NaiveDate, DateTime<Utc>, DateTime<Utc>, &str) {
+    pub fn sort_key_for_test(&self) -> (i32, TimePartition, DateTime<Utc>, DateTime<Utc>, &str) {
         self.sort_key()
     }
 }
@@ -410,7 +433,11 @@ pub(crate) fn candidate_file_for_test(path: &str, bytes: u64) -> IcebergCandidat
         record_count: 1,
         schema_id: 1,
         partition_spec_id: 1,
-        partition_day: NaiveDate::from_ymd_opt(2026, 1, 1).expect("fixed date is valid"),
+        partition: TimePartition::new(
+            crate::catalog::TimeGranularity::Hour,
+            DateTime::from_timestamp(1_767_312_000, 0).expect("fixed instant is representable"),
+        )
+        .expect("fixed instant is an exact hour boundary"),
         sort_order_id: Some(1),
         writer_recipe_version: Some(BIFROST_WRITER_RECIPE_VERSION.to_owned()),
         min_event_time: DateTime::from_timestamp(1, 0).expect("fixed timestamp is valid"),
@@ -556,13 +583,21 @@ mod tests {
             .expect("physical test schema builds")
     }
 
-    /// Build the supported day partition and ascending physical sort order.
-    fn physical_layout(schema: &Schema) -> (PartitionSpec, SortOrder) {
+    /// Build one supported partition spec at `granularity` plus the tenant-prefixed
+    /// physical sort order that every registered layout carries.
+    fn physical_layout(
+        schema: &Schema,
+        granularity: TimeGranularity,
+    ) -> (PartitionSpec, SortOrder) {
+        let (name, transform) = match granularity {
+            TimeGranularity::Hour => ("wyrd_event_time_hour", Transform::Hour),
+            TimeGranularity::Day => ("wyrd_event_time_day", Transform::Day),
+        };
         let partition_spec = PartitionSpec::builder(std::sync::Arc::new(schema.clone()))
-            .add_partition_field("wyrd_event_time", "wyrd_event_time_day", Transform::Day)
-            .expect("day partition field builds")
+            .add_partition_field("wyrd_event_time", name, transform)
+            .expect("partition field builds")
             .build()
-            .expect("day partition spec binds");
+            .expect("partition spec binds");
         let tenant_id = schema
             .field_by_name("data_tenant_id")
             .expect("tenant field")
@@ -590,11 +625,26 @@ mod tests {
         (partition_spec, sort_order)
     }
 
-    /// Reject a table whose default partition transform is not day on event time.
+    /// Accept both registered granularities and recover the declared one, so a
+    /// table registered as hourly is never planned against day boundaries.
+    #[test]
+    fn supported_layout_recovers_the_registered_granularity() {
+        let schema = physical_schema();
+        for granularity in [TimeGranularity::Hour, TimeGranularity::Day] {
+            let (partition_spec, sort_order) = physical_layout(&schema, granularity);
+            assert_eq!(
+                validate_supported_layout(&schema, &partition_spec, &sort_order)
+                    .expect("registered granularity is supported"),
+                granularity
+            );
+        }
+    }
+
+    /// Reject a table whose default partition transform is neither hour nor day.
     #[test]
     fn unsupported_partition_layout_fails_before_policy_construction() {
         let schema = physical_schema();
-        let (supported, sort_order) = physical_layout(&schema);
+        let (supported, sort_order) = physical_layout(&schema, TimeGranularity::Day);
         let unsupported = PartitionSpec::builder(std::sync::Arc::new(schema.clone()))
             .add_partition_field("wyrd_event_time", "wyrd_event_time_month", Transform::Month)
             .expect("month partition field builds")
@@ -606,19 +656,43 @@ mod tests {
         assert!(matches!(error, ForgeError::InvalidConfig { .. }));
     }
 
-    /// Reject a table whose default sort order differs from Forge's row recipe.
+    /// Reject a table whose sort order loses the mandatory tenant prefix.
     #[test]
     fn unsupported_sort_layout_fails_before_policy_construction() {
         let schema = physical_schema();
-        let (partition_spec, mut sort_order) = physical_layout(&schema);
+        let (partition_spec, mut sort_order) = physical_layout(&schema, TimeGranularity::Day);
         sort_order.fields[0].direction = SortDirection::Descending;
         let error = validate_supported_layout(&schema, &partition_spec, &sort_order)
-            .expect_err("descending sort must be rejected");
+            .expect_err("a non-ascending tenant prefix must be rejected");
         assert!(matches!(error, ForgeError::InvalidConfig { .. }));
     }
 
+    /// A declared trailing sort key is table-specific, so Forge accepts a
+    /// descending non-tenant key rather than forcing one fixed row recipe.
+    #[test]
+    fn declared_trailing_sort_key_is_accepted() {
+        let schema = physical_schema();
+        let (partition_spec, mut sort_order) = physical_layout(&schema, TimeGranularity::Hour);
+        sort_order.fields[1].direction = SortDirection::Descending;
+        sort_order.fields[1].null_order = NullOrder::First;
+        assert_eq!(
+            validate_supported_layout(&schema, &partition_spec, &sort_order)
+                .expect("declared trailing keys are unconstrained"),
+            TimeGranularity::Hour
+        );
+    }
+
+    /// Builds the fixture hour partition shared by the planner regressions.
+    fn hour(epoch_hour: i64) -> TimePartition {
+        TimePartition::new(
+            crate::catalog::TimeGranularity::Hour,
+            DateTime::from_timestamp(epoch_hour * 3_600, 0).expect("fixture hour is representable"),
+        )
+        .expect("fixture hour is an exact hour boundary")
+    }
+
     /// Build one current-identity file with a stable ordering key.
-    fn file(path: &str, bytes: u64, day: NaiveDate) -> IcebergCandidateFile {
+    fn file(path: &str, bytes: u64, partition: TimePartition) -> IcebergCandidateFile {
         IcebergCandidateFile {
             catalog_path: path.to_owned(),
             object_path: path.to_owned(),
@@ -626,7 +700,7 @@ mod tests {
             record_count: 1,
             schema_id: 1,
             partition_spec_id: 1,
-            partition_day: day,
+            partition,
             sort_order_id: Some(1),
             writer_recipe_version: Some(BIFROST_WRITER_RECIPE_VERSION.to_owned()),
             min_event_time: DateTime::from_timestamp(1, 0).expect("fixed timestamp is valid"),
@@ -641,7 +715,7 @@ mod tests {
     #[test]
     fn right_size_band_is_seventy_five_to_one_eighty_percent() {
         let policy = ForgeRightSizePolicy::new(100, 1, 1, 1).expect("valid target");
-        let day = NaiveDate::from_ymd_opt(2026, 1, 1).expect("fixed day is valid");
+        let day = hour(400_000);
         assert_eq!(policy.target_file_size_bytes(), 100);
         assert_eq!(
             policy.plan(vec![file("healthy", 75, day)]).convergence,
@@ -674,7 +748,7 @@ mod tests {
     #[test]
     fn planner_combines_compatible_undersized_files() {
         let policy = ForgeRightSizePolicy::new(100, 1, 1, 1).expect("valid target");
-        let day = NaiveDate::from_ymd_opt(2026, 1, 1).expect("fixed day is valid");
+        let day = hour(400_000);
         let plan = policy.plan(vec![
             file("a", 20, day),
             file("b", 20, day),
@@ -689,7 +763,7 @@ mod tests {
     #[test]
     fn planner_accepts_one_current_undersized_tail() {
         let policy = ForgeRightSizePolicy::new(100, 1, 1, 1).expect("valid target");
-        let day = NaiveDate::from_ymd_opt(2026, 1, 1).expect("fixed day is valid");
+        let day = hour(400_000);
         let plan = policy.plan(vec![file("tail", 20, day)]);
         assert!(plan.groups.is_empty());
         assert_eq!(plan.convergence, IcebergConvergence::Converged);
@@ -699,7 +773,7 @@ mod tests {
     #[test]
     fn planner_splits_oversized_singleton() {
         let policy = ForgeRightSizePolicy::new(100, 1, 1, 1).expect("valid target");
-        let day = NaiveDate::from_ymd_opt(2026, 1, 1).expect("fixed day is valid");
+        let day = hour(400_000);
         let plan = policy.plan(vec![file("large", 181, day)]);
         assert_eq!(plan.groups.len(), 1);
         assert_eq!(plan.groups[0].reason, IcebergRewriteReason::Oversized);
@@ -710,7 +784,7 @@ mod tests {
     #[test]
     fn planner_forces_obsolete_schema_spec_sort_and_recipe() {
         let policy = ForgeRightSizePolicy::new(100, 1, 1, 1).expect("valid target");
-        let day = NaiveDate::from_ymd_opt(2026, 1, 1).expect("fixed day is valid");
+        let day = hour(400_000);
         let mut obsolete_schema = file("schema", 100, day);
         obsolete_schema.catalog_path = "1-schema".to_owned();
         obsolete_schema.schema_id = 2;
@@ -747,18 +821,18 @@ mod tests {
     #[test]
     fn planner_excludes_healthy_files() {
         let policy = ForgeRightSizePolicy::new(100, 1, 1, 1).expect("valid target");
-        let day = NaiveDate::from_ymd_opt(2026, 1, 1).expect("fixed day is valid");
+        let day = hour(400_000);
         let plan = policy.plan(vec![file("healthy", 100, day), file("tail", 20, day)]);
         assert!(plan.groups.is_empty());
         assert_eq!(plan.convergence, IcebergConvergence::Converged);
     }
 
-    /// Keeps different partition days in separate rewrite groups.
+    /// Keeps different time partitions in separate rewrite groups.
     #[test]
-    fn planner_never_crosses_spec_or_day() {
+    fn planner_never_crosses_spec_or_partition() {
         let policy = ForgeRightSizePolicy::new(100, 1, 1, 1).expect("valid target");
-        let first = NaiveDate::from_ymd_opt(2026, 1, 1).expect("fixed day is valid");
-        let second = NaiveDate::from_ymd_opt(2026, 1, 2).expect("fixed day is valid");
+        let first = hour(400_000);
+        let second = hour(400_001);
         assert!(
             policy
                 .plan(vec![file("a", 20, first), file("b", 20, second)])
@@ -771,7 +845,7 @@ mod tests {
     #[test]
     fn planner_is_stable_across_input_order() {
         let policy = ForgeRightSizePolicy::new(100, 1, 1, 1).expect("valid target");
-        let day = NaiveDate::from_ymd_opt(2026, 1, 1).expect("fixed day is valid");
+        let day = hour(400_000);
         let first = vec![file("c", 20, day), file("a", 20, day), file("b", 20, day)];
         let second = vec![file("b", 20, day), file("c", 20, day), file("a", 20, day)];
         assert_eq!(policy.plan(first), policy.plan(second));
@@ -781,7 +855,7 @@ mod tests {
     #[test]
     fn planner_no_useful_group_is_converged() {
         let policy = ForgeRightSizePolicy::new(100, 1, 1, 1).expect("valid target");
-        let day = NaiveDate::from_ymd_opt(2026, 1, 1).expect("fixed day is valid");
+        let day = hour(400_000);
         let plan = policy.plan(vec![file("healthy", 100, day)]);
         assert!(plan.groups.is_empty());
         assert_eq!(plan.convergence, IcebergConvergence::Converged);

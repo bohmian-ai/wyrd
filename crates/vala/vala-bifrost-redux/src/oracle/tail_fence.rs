@@ -7,10 +7,30 @@
 use super::*;
 use futures_util::stream::FuturesUnordered;
 
+/// Decodes the exact time partition of one hot `vala.file_list` row.
+///
+/// The two durable columns are written only by Scribe from a canonical
+/// [`crate::catalog::layout::TimePartition`], so a row that does not decode is
+/// control-plane corruption and makes the query's visibility cut unusable.
+///
+/// # Errors
+/// Returns [`BifrostError::QueryVisibilityUnavailable`] when the stored
+/// granularity or start is not canonical.
+pub(crate) fn hot_row_partition(
+    row: &vala_sql::row_types::file_list::HotFileRow,
+) -> Result<wyrd_spec::vala::api::TimePartitionWire, BifrostError> {
+    crate::catalog::layout::TimePartition::from_durable_columns(
+        &row.partition_granularity,
+        row.partition_start,
+    )
+    .map(crate::catalog::layout::TimePartition::to_wire)
+    .map_err(|_| BifrostError::QueryVisibilityUnavailable)
+}
+
 /// One query-scoped live-tail route discovered from an authoritative Scribe.
 pub struct DiscoveredTailRoute {
-    /// Event day retained by the Scribe stream.
-    pub event_day: wyrd_spec::vala::api::EventDay,
+    /// Exact time partition retained by the Scribe stream.
+    pub time_partition: wyrd_spec::vala::api::TimePartitionWire,
     /// Exact node and writer epoch returned by discovery.
     pub stream: wyrd_spec::vala::api::TailStreamIdentity,
     /// Authorized transport to that exact Scribe incarnation.
@@ -59,14 +79,14 @@ fn sealed_watermark(
     manifest: &[vala_sql::row_types::file_list::HotFileRow],
     node_id: uuid::Uuid,
     writer_epoch: u64,
-    event_day: &str,
+    time_partition: wyrd_spec::vala::api::TimePartitionWire,
 ) -> Result<wyrd_spec::vala::api::TailCursor, BifrostError> {
     let wal_lsn = manifest
         .iter()
         .filter(|file| {
             file.node_id == node_id
                 && u64::try_from(file.writer_epoch).ok() == Some(writer_epoch)
-                && file.partition_day.format("%Y-%m-%d").to_string() == event_day
+                && hot_row_partition(file).is_ok_and(|partition| partition == time_partition)
         })
         .map(|file| {
             u64::try_from(file.wal_lsn_max).map_err(|_| BifrostError::QueryVisibilityUnavailable)
@@ -485,18 +505,15 @@ impl TailFenceDrainer<'_> {
         for cut in cuts {
             let table = cut.binding.table_ref.fqn();
             let mut streams = std::collections::BTreeMap::<
-                (uuid::Uuid, String, u64),
+                (uuid::Uuid, wyrd_spec::vala::api::TimePartitionWire, u64),
                 (
-                    wyrd_spec::vala::api::EventDay,
+                    wyrd_spec::vala::api::TimePartitionWire,
                     wyrd_spec::vala::api::TailCursor,
                     Arc<dyn TailReadTransport>,
                 ),
             >::new();
             for file in &cut.sealed_manifest {
-                let event_day = wyrd_spec::vala::api::EventDay::new(
-                    file.partition_day.format("%Y-%m-%d").to_string(),
-                )
-                .map_err(|_| BifrostError::QueryVisibilityUnavailable)?;
+                let time_partition = hot_row_partition(file)?;
                 let writer_epoch = u64::try_from(file.writer_epoch)
                     .map_err(|_| BifrostError::QueryVisibilityUnavailable)?;
                 let wal_lsn = u64::try_from(file.wal_lsn_max)
@@ -507,7 +524,7 @@ impl TailFenceDrainer<'_> {
                 else {
                     return Err(BifrostError::QueryVisibilityUnavailable);
                 };
-                let key = (file.node_id, event_day.as_str().to_owned(), writer_epoch);
+                let key = (file.node_id, time_partition, writer_epoch);
                 let cursor = wyrd_spec::vala::api::TailCursor {
                     writer_epoch,
                     wal_lsn,
@@ -521,7 +538,7 @@ impl TailFenceDrainer<'_> {
                             *current = cursor.clone();
                         }
                     })
-                    .or_insert((event_day, cursor, transport));
+                    .or_insert((time_partition, cursor, transport));
             }
             for route in self.tails.live_streams(&table, cut.binding.tenant) {
                 if live_nodes
@@ -530,14 +547,10 @@ impl TailFenceDrainer<'_> {
                 {
                     continue;
                 }
-                let key = (
-                    route.node_id,
-                    route.event_day.as_str().to_owned(),
-                    route.writer_epoch,
-                );
+                let key = (route.node_id, route.time_partition, route.writer_epoch);
                 streams.entry(key).or_insert_with(|| {
                     (
-                        route.event_day,
+                        route.time_partition,
                         wyrd_spec::vala::api::TailCursor {
                             writer_epoch: route.writer_epoch,
                             wal_lsn: 0,
@@ -551,10 +564,10 @@ impl TailFenceDrainer<'_> {
             if streams.is_empty() {
                 return Err(BifrostError::QueryVisibilityUnavailable);
             }
-            for ((stream_node_id, _, _), (event_day, exclusive_sealed, transport)) in streams {
+            for ((stream_node_id, _, _), (time_partition, exclusive_sealed, transport)) in streams {
                 let request = tail_fence_request(
                     cut,
-                    event_day,
+                    time_partition,
                     exclusive_sealed,
                     wire_deadline,
                     self.query_id,
@@ -630,11 +643,11 @@ impl TailFenceDrainer<'_> {
                     &cut.sealed_manifest,
                     route.stream.node_id.as_uuid(),
                     route.stream.writer_epoch,
-                    route.event_day.as_str(),
+                    route.time_partition,
                 )?;
                 let request = tail_fence_request(
                     cut,
-                    route.event_day,
+                    route.time_partition,
                     exclusive,
                     wire_deadline,
                     self.query_id,
@@ -915,7 +928,7 @@ impl Drop for AcquiredTailFence {
 /// conversion failure, or invalid private wire values.
 fn tail_fence_request(
     cut: &PinnedSealedTable,
-    event_day: wyrd_spec::vala::api::EventDay,
+    time_partition: wyrd_spec::vala::api::TimePartitionWire,
     exclusive_sealed: wyrd_spec::vala::api::TailCursor,
     deadline: chrono::DateTime<chrono::Utc>,
     query_id: uuid::Uuid,
@@ -952,7 +965,7 @@ fn tail_fence_request(
                 .to_owned(),
             table: cut.binding.table_name.clone(),
         },
-        event_day,
+        time_partition,
         exclusive_sealed,
         deadline,
         schema_fingerprint: fingerprint,
@@ -984,7 +997,8 @@ mod tests {
             file_checksum: None,
             file_size: 1,
             row_count: 1,
-            partition_day: chrono::NaiveDate::from_ymd_opt(2026, 8, 12).expect("valid event day"),
+            partition_granularity: "day".to_owned(),
+            partition_start: crate::test_support::day_partition(2026, 8, 12).start_utc(),
             compacted: true,
             committed_snapshot_id: Some(91),
             publication_operation_id: Some(operation),
@@ -995,13 +1009,121 @@ mod tests {
             created_at: chrono::Utc::now(),
         };
 
-        let cursor = sealed_watermark(&[row], node_id, 4, "2026-08-12")
-            .expect("represented sealed lineage must produce a live-tail watermark");
+        let cursor = sealed_watermark(
+            &[row],
+            node_id,
+            4,
+            crate::test_support::day_partition(2026, 8, 12).to_wire(),
+        )
+        .expect("represented sealed lineage must produce a live-tail watermark");
 
         assert_eq!(cursor.writer_epoch, 4);
         assert_eq!(cursor.wal_lsn, 20);
         assert_eq!(cursor.batch_id, uuid::Uuid::from_u128(u128::MAX));
         assert_eq!(cursor.row_ordinal, u32::MAX);
+    }
+
+    /// Hourly sealed subtraction is exact: no row is scanned twice and none is
+    /// skipped, and a partition of the wrong granularity contributes nothing.
+    ///
+    /// The live cut is `(watermark, ...]` over the sealed manifest, so the
+    /// watermark must be the maximum represented LSN of exactly the rows in
+    /// the requested partition. Three hours of sealed rows prove there is no
+    /// bleed across adjacent hours, and a same-instant `Day` partition proves
+    /// granularity participates in identity rather than only the start.
+    #[test]
+    fn hourly_tail_cut_has_no_overlap_or_omission() {
+        let node_id = uuid::Uuid::now_v7();
+        let tenant = uuid::Uuid::now_v7();
+        let sealed_row = |partition: crate::catalog::layout::TimePartition,
+                          wal_lsn_min: i64,
+                          wal_lsn_max: i64| {
+            vala_sql::row_types::file_list::HotFileRow {
+                id: uuid::Uuid::now_v7(),
+                data_tenant_id: tenant,
+                namespace: "vala.bifrost".to_owned(),
+                table_name: "events".to_owned(),
+                file_path: format!("events/sealed-{wal_lsn_max}.parquet"),
+                file_ordinal: 0,
+                file_checksum: None,
+                file_size: 1,
+                row_count: 1,
+                partition_granularity: partition.granularity_str().to_owned(),
+                partition_start: partition.start_utc(),
+                compacted: true,
+                committed_snapshot_id: Some(91),
+                publication_operation_id: Some(uuid::Uuid::now_v7()),
+                node_id,
+                writer_epoch: 4,
+                wal_lsn_min,
+                wal_lsn_max,
+                created_at: chrono::Utc::now(),
+            }
+        };
+
+        let thirteen = crate::test_support::hour_partition(2026, 8, 12, 13);
+        let fourteen = crate::test_support::hour_partition(2026, 8, 12, 14);
+        let fifteen = crate::test_support::hour_partition(2026, 8, 12, 15);
+        let manifest = vec![
+            sealed_row(thirteen, 1, 10),
+            sealed_row(fourteen, 11, 20),
+            sealed_row(fourteen, 21, 30),
+            sealed_row(fifteen, 31, 40),
+        ];
+
+        // Each hour's watermark is its own maximum represented LSN: the
+        // preceding hour does not raise it (no omission) and the following
+        // hour does not lower it (no overlap).
+        for (partition, expected_lsn) in [(thirteen, 10), (fourteen, 30), (fifteen, 40)] {
+            let cursor = sealed_watermark(&manifest, node_id, 4, partition.to_wire())
+                .expect("hourly sealed lineage produces a watermark");
+            assert_eq!(
+                cursor.wal_lsn,
+                expected_lsn,
+                "hour {} must fence exactly its own represented LSNs",
+                partition.start_utc()
+            );
+            assert_eq!(cursor.writer_epoch, 4);
+        }
+
+        // The union of the per-hour intervals covers the whole manifest
+        // exactly once: consecutive watermarks are strictly increasing and the
+        // final one represents every sealed row.
+        let watermarks = [thirteen, fourteen, fifteen]
+            .into_iter()
+            .map(|partition| {
+                sealed_watermark(&manifest, node_id, 4, partition.to_wire())
+                    .expect("hourly watermark")
+                    .wal_lsn
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            watermarks.windows(2).all(|pair| pair[0] < pair[1]),
+            "hourly watermarks must be strictly increasing"
+        );
+        assert_eq!(
+            watermarks.last().copied(),
+            manifest
+                .iter()
+                .map(|row| u64::try_from(row.wal_lsn_max).expect("fixture LSN"))
+                .max(),
+            "the final hour must represent every sealed row"
+        );
+
+        // A Day partition starting at the same instant as an Hour partition is
+        // a different identity, so it selects nothing and the live cut opens
+        // at the start of the stream rather than silently reusing hourly rows.
+        let day = crate::test_support::day_partition(2026, 8, 12);
+        let wrong_granularity = sealed_watermark(&manifest, node_id, 4, day.to_wire())
+            .expect("a granularity mismatch is empty, not an error");
+        assert_eq!(wrong_granularity.wal_lsn, 0);
+        assert_eq!(wrong_granularity.batch_id, uuid::Uuid::nil());
+        assert_eq!(wrong_granularity.row_ordinal, 0);
+
+        // A different writer epoch is likewise a different lineage.
+        let other_epoch = sealed_watermark(&manifest, node_id, 5, fourteen.to_wire())
+            .expect("an epoch mismatch is empty, not an error");
+        assert_eq!(other_epoch.wal_lsn, 0);
     }
 
     /// Deterministic remote-style transport for fence cleanup and drain lifecycle tests.
@@ -1134,8 +1256,7 @@ mod tests {
                     namespace: "vala.bifrost".to_owned(),
                     table: "spans".to_owned(),
                 },
-                event_day: wyrd_spec::vala::api::EventDay::new("2026-08-02")
-                    .expect("test event day is valid"),
+                time_partition: crate::test_support::day_partition(2026, 8, 2).to_wire(),
                 stream: wyrd_spec::vala::api::TailStreamIdentity {
                     node_id: wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7()),
                     writer_epoch: 1,

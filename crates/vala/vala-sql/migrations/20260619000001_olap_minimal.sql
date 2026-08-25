@@ -9,7 +9,9 @@ CREATE TABLE vala.bifrost_tables (
     fqn                 TEXT    NOT NULL,
     fingerprint         BYTEA   NOT NULL CHECK (octet_length(fingerprint) = 32),
     status              TEXT    NOT NULL CHECK (status IN ('active', 'deprecated', 'quarantined')) DEFAULT 'active',
-    partition_columns   TEXT[]  NOT NULL DEFAULT ARRAY[]::TEXT[],
+    -- Canonical PhysicalLayoutWire object: the exact JSON the describe route
+    -- returns, with fully populated sort_keys and bloom_columns arrays.
+    physical_layout     JSONB   NOT NULL,
     registered_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     origin              TEXT,

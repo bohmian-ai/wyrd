@@ -5,10 +5,11 @@
 //! respects both byte and file-count limits, and drops singleton bins because
 //! rewriting one file does not reduce file cardinality.
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 use wyrd_spec::DataTenantId;
 
+use crate::catalog::layout::TimePartition;
 use crate::catalog::table_ref::TableRef;
 #[cfg(test)]
 use crate::catalog::table_ref::is_safe_name;
@@ -16,14 +17,14 @@ use crate::catalog::table_ref::is_safe_name;
 use crate::namespaces::BifrostNamespace;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-/// The tenant, table, and event day that define one compaction group.
+/// The tenant, table, and exact time partition that define one compaction group.
 pub struct ForgeGroupKey {
     /// Tenant that owns the staged files.
     pub tenant: DataTenantId,
     /// Registered Bifrost table being compacted.
     pub table_ref: TableRef,
-    /// Day partition shared by every file in the group.
-    pub partition_day: NaiveDate,
+    /// Exact time partition shared by every file in the group.
+    pub partition: TimePartition,
 }
 
 impl ForgeGroupKey {
@@ -38,7 +39,7 @@ impl ForgeGroupKey {
         tenant: DataTenantId,
         namespace: &str,
         table_name: &str,
-        partition_day: NaiveDate,
+        partition: TimePartition,
     ) -> Result<Self, String> {
         let namespace = BifrostNamespace::from_wire(namespace)
             .ok_or_else(|| format!("unknown Bifrost namespace `{namespace}`"))?;
@@ -48,16 +49,27 @@ impl ForgeGroupKey {
         Ok(Self {
             tenant,
             table_ref: TableRef::new(namespace, table_name),
-            partition_day,
+            partition,
         })
     }
 
-    /// Return the stable audit resource URI for this group.
-    pub fn audit_resource(&self) -> String {
+    /// Return the stable audit resource URI for one tenant/table pair.
+    ///
+    /// The resource identifies the table, never the partition, so table-scoped
+    /// callers such as live reconciliation can address the same audit stream
+    /// without inventing a placeholder partition.
+    #[must_use]
+    pub fn table_audit_resource(tenant: DataTenantId, table_ref: &TableRef) -> String {
         format!(
             "bifrost://{}/{}/{}",
-            self.tenant, self.table_ref.namespace, self.table_ref.name
+            tenant, table_ref.namespace, table_ref.name
         )
+    }
+
+    /// Return the stable audit resource URI for this group.
+    #[must_use]
+    pub fn audit_resource(&self) -> String {
+        Self::table_audit_resource(self.tenant, &self.table_ref)
     }
 }
 
@@ -101,8 +113,8 @@ pub(crate) fn plan_incremental_bins(
     mut files: Vec<CandidateFile>,
     target_bytes: u64,
     max_files: usize,
-    partition_day: NaiveDate,
-    current_utc_day: NaiveDate,
+    partition: TimePartition,
+    now: DateTime<Utc>,
 ) -> IncrementalCompactionPlan {
     files.sort_by_key(|file| (file.min_event_time, file.max_event_time, file.id));
     if target_bytes == 0 || max_files == 0 {
@@ -111,7 +123,7 @@ pub(crate) fn plan_incremental_bins(
             retained_files: files,
         };
     }
-    let closed = partition_day < current_utc_day;
+    let closed = !partition.is_open_at(now);
     let mut rewrite_bins = Vec::new();
     let mut retained_files = Vec::new();
     let mut current = Vec::new();
@@ -155,7 +167,27 @@ pub(crate) fn plan_incremental_bins(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::TimeGranularity;
     use crate::namespaces::BifrostNamespace;
+
+    /// Builds the fixture hour partition every planner regression shares.
+    fn hour(epoch_hour: i64) -> TimePartition {
+        TimePartition::new(
+            TimeGranularity::Hour,
+            DateTime::from_timestamp(epoch_hour * 3_600, 0).expect("fixture hour is representable"),
+        )
+        .expect("fixture hour is an exact hour boundary")
+    }
+
+    /// Returns an instant inside `partition`, so the partition reads as open.
+    fn inside(partition: TimePartition) -> DateTime<Utc> {
+        partition.start_utc()
+    }
+
+    /// Returns an instant after `partition`, so the partition reads as closed.
+    fn after(partition: TimePartition) -> DateTime<Utc> {
+        partition.end_utc()
+    }
 
     fn file(id: u128, size: u64, min: i64, max: i64) -> CandidateFile {
         CandidateFile {
@@ -168,34 +200,29 @@ mod tests {
     }
 
     #[test]
-    fn group_key_is_exactly_tenant_table_day() {
+    fn group_key_is_exactly_tenant_table_partition() {
         let tenant = DataTenantId::new_v7();
-        let day = NaiveDate::from_ymd_opt(2026, 1, 2).expect("day");
-        let key = ForgeGroupKey::from_sql(tenant, "vala.traces", "spans", day).expect("key");
+        let partition = hour(400_000);
+        let key = ForgeGroupKey::from_sql(tenant, "vala.traces", "spans", partition).expect("key");
         assert_eq!(key.tenant, tenant);
         assert_eq!(
             key.table_ref,
             TableRef::new(BifrostNamespace::Traces, "spans")
         );
-        assert_eq!(key.partition_day, day);
+        assert_eq!(key.partition, partition);
     }
 
     #[test]
-    fn group_key_rejects_tenant_namespace_table_or_day_mismatch() {
+    fn group_key_rejects_tenant_namespace_table_or_partition_mismatch() {
         let tenant = DataTenantId::new_v7();
         let other = DataTenantId::new_v7();
-        let day = NaiveDate::from_ymd_opt(2026, 1, 2).expect("day");
-        let key = ForgeGroupKey::from_sql(tenant, "vala.traces", "spans", day).expect("key");
+        let partition = hour(400_000);
+        let key = ForgeGroupKey::from_sql(tenant, "vala.traces", "spans", partition).expect("key");
         for observed in [
-            (other, "vala.traces", "spans", day),
-            (tenant, "vala.logs", "spans", day),
-            (tenant, "vala.traces", "events", day),
-            (
-                tenant,
-                "vala.traces",
-                "spans",
-                day.succ_opt().expect("next day"),
-            ),
+            (other, "vala.traces", "spans", partition),
+            (tenant, "vala.logs", "spans", partition),
+            (tenant, "vala.traces", "events", partition),
+            (tenant, "vala.traces", "spans", hour(400_001)),
         ] {
             assert_ne!(
                 ForgeGroupKey::from_sql(observed.0, observed.1, observed.2, observed.3),
@@ -204,17 +231,21 @@ mod tests {
         }
     }
 
+    /// A same-granularity partition at a different instant is a distinct group,
+    /// which is what keeps hourly compaction from merging across hours.
+    #[test]
+    fn group_key_separates_adjacent_hours() {
+        let tenant = DataTenantId::new_v7();
+        let first = ForgeGroupKey::from_sql(tenant, "vala.traces", "spans", hour(400_000));
+        let second = ForgeGroupKey::from_sql(tenant, "vala.traces", "spans", hour(400_001));
+        assert_ne!(first, second);
+    }
+
     #[test]
     fn binpack_is_stable_and_never_exceeds_target() {
         let files = vec![file(3, 4, 2, 3), file(1, 4, 0, 1), file(2, 4, 1, 2)];
-        let bins = plan_incremental_bins(
-            files,
-            8,
-            10,
-            NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
-            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
-        )
-        .rewrite_bins;
+        let partition = hour(400_000);
+        let bins = plan_incremental_bins(files, 8, 10, partition, after(partition)).rewrite_bins;
         assert_eq!(bins.len(), 1);
         assert_eq!(
             bins[0].files.iter().map(|f| f.id).collect::<Vec<_>>(),
@@ -226,14 +257,8 @@ mod tests {
     #[test]
     fn binpack_skips_singletons_and_preserves_interval_order() {
         let files = vec![file(1, 9, 0, 1), file(2, 4, 2, 3), file(3, 4, 4, 5)];
-        let bins = plan_incremental_bins(
-            files,
-            8,
-            2,
-            NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
-            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
-        )
-        .rewrite_bins;
+        let partition = hour(400_000);
+        let bins = plan_incremental_bins(files, 8, 2, partition, after(partition)).rewrite_bins;
         assert_eq!(bins.len(), 1);
         assert_eq!(
             bins[0].files.iter().map(|f| f.id).collect::<Vec<_>>(),
@@ -244,10 +269,15 @@ mod tests {
     /// An open partition retains a trailing bin that is below both planner
     /// thresholds so the next hint can add more files before rewriting it.
     #[test]
-    fn active_day_retains_incomplete_trailing_bin() {
-        let day = NaiveDate::from_ymd_opt(2026, 1, 2).expect("day");
-        let plan =
-            plan_incremental_bins(vec![file(1, 3, 0, 1), file(2, 3, 2, 3)], 10, 10, day, day);
+    fn open_partition_retains_incomplete_trailing_bin() {
+        let partition = hour(400_000);
+        let plan = plan_incremental_bins(
+            vec![file(1, 3, 0, 1), file(2, 3, 2, 3)],
+            10,
+            10,
+            partition,
+            inside(partition),
+        );
         assert!(plan.rewrite_bins.is_empty());
         assert_eq!(plan.retained_files.len(), 2);
     }
@@ -255,21 +285,30 @@ mod tests {
     /// An open partition rewrites a trailing bin as soon as it reaches the
     /// byte target, even though the partition has not closed yet.
     #[test]
-    fn active_day_emits_exact_target_trailing_bin() {
-        let day = NaiveDate::from_ymd_opt(2026, 1, 2).expect("day");
-        let plan =
-            plan_incremental_bins(vec![file(1, 5, 0, 1), file(2, 5, 2, 3)], 10, 10, day, day);
+    fn open_partition_emits_exact_target_trailing_bin() {
+        let partition = hour(400_000);
+        let plan = plan_incremental_bins(
+            vec![file(1, 5, 0, 1), file(2, 5, 2, 3)],
+            10,
+            10,
+            partition,
+            inside(partition),
+        );
         assert_eq!(plan.rewrite_bins.len(), 1);
     }
 
     /// A closed partition rewrites a multi-file trailing remainder even when
     /// it remains below the byte and file-count targets.
     #[test]
-    fn closed_day_emits_multi_file_remainder() {
-        let day = NaiveDate::from_ymd_opt(2026, 1, 1).expect("day");
-        let now = day.succ_opt().expect("next");
-        let plan =
-            plan_incremental_bins(vec![file(1, 3, 0, 1), file(2, 3, 2, 3)], 10, 10, day, now);
+    fn closed_partition_emits_multi_file_remainder() {
+        let partition = hour(400_000);
+        let plan = plan_incremental_bins(
+            vec![file(1, 3, 0, 1), file(2, 3, 2, 3)],
+            10,
+            10,
+            partition,
+            after(partition),
+        );
         assert_eq!(plan.rewrite_bins.len(), 1);
     }
 
@@ -277,9 +316,14 @@ mod tests {
     /// preserving every file for a future eligible compaction.
     #[test]
     fn planner_never_rewrites_singleton_or_drops_oversized_file() {
-        let day = NaiveDate::from_ymd_opt(2026, 1, 2).expect("day");
-        let plan =
-            plan_incremental_bins(vec![file(1, 11, 0, 1), file(2, 3, 2, 3)], 10, 10, day, day);
+        let partition = hour(400_000);
+        let plan = plan_incremental_bins(
+            vec![file(1, 11, 0, 1), file(2, 3, 2, 3)],
+            10,
+            10,
+            partition,
+            inside(partition),
+        );
         assert!(plan.rewrite_bins.is_empty());
         assert_eq!(plan.retained_files.len(), 2);
     }
@@ -288,12 +332,12 @@ mod tests {
     /// of the order in which candidates were discovered.
     #[test]
     fn planner_is_stable_across_input_order() {
-        let day = NaiveDate::from_ymd_opt(2026, 1, 2).expect("day");
+        let partition = hour(400_000);
         let a = vec![file(2, 5, 2, 3), file(1, 5, 0, 1)];
         let b = vec![a[1].clone(), a[0].clone()];
         assert_eq!(
-            plan_incremental_bins(a, 10, 10, day, day),
-            plan_incremental_bins(b, 10, 10, day, day)
+            plan_incremental_bins(a, 10, 10, partition, inside(partition)),
+            plan_incremental_bins(b, 10, 10, partition, inside(partition))
         );
     }
 }

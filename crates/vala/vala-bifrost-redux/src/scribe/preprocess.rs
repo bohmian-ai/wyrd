@@ -15,6 +15,8 @@ use wyrd_spec::vala::api::AuditEvent;
 use wyrd_spec::vala::managed_columns::{WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_REQUEST_ID};
 
 use crate::catalog::TableRef;
+use crate::catalog::TimeGranularity;
+use crate::catalog::layout::TimePartition;
 use crate::contracts::ScribeError;
 use crate::resources::ScribeMemoryLease;
 use crate::schema::SchemaFingerprint;
@@ -23,7 +25,9 @@ use crate::scribe::admission::InflightFrameReservation;
 use crate::scribe::admission::REQUEST_OVERHEAD_BYTES;
 use crate::scribe::audit_envelope::encode_audit_event_bounded;
 use crate::scribe::memory::MemoryCategory;
-use crate::scribe::seal_key::{EventDayPlan, SealKey, plan_event_days, split_batch_by_event_day};
+use crate::scribe::seal_key::{
+    SealKey, TimePartitionPlan, plan_time_partitions, split_batch_by_time_partition,
+};
 use crate::scribe::wal::PreparedWalAppend;
 use wyrd_spec::ids::DataTenantId;
 
@@ -43,6 +47,8 @@ pub(crate) struct AdmittedAppend {
     pub memory: ScribeMemoryLease,
     pub tenant: DataTenantId,
     pub table: TableRef,
+    /// Registered partition granularity every slice of this append is bucketed to.
+    pub partition_granularity: TimeGranularity,
     pub queued_at: Instant,
     pub durable_ack: Option<oneshot::Sender<Result<u64, ScribeError>>>,
     /// Move-only lifecycle observation retained beside the admitted root.
@@ -164,7 +170,7 @@ pub(crate) struct ExactMaterialFacts {
 pub(crate) struct OtlpSliceProducer {
     /// Retained request and immutable stamping context.
     source: OtlpAdmittedRows,
-    /// Whether the sole receipt-day slice has been produced.
+    /// Whether the sole receipt-partition slice has been produced.
     produced: bool,
     /// Canonical batch audit moved only into the current durable slice.
     audit_event: AuditEvent,
@@ -172,6 +178,8 @@ pub(crate) struct OtlpSliceProducer {
     tenant: DataTenantId,
     /// Logical table used by the slice seal key.
     table: TableRef,
+    /// Registered partition granularity used to bucket the produced slice.
+    partition_granularity: TimeGranularity,
     /// Exact-capacity audit JSON ceiling.
     wal_workspace_bytes: usize,
 }
@@ -184,6 +192,7 @@ impl OtlpSliceProducer {
         audit_event: AuditEvent,
         tenant: DataTenantId,
         table: TableRef,
+        partition_granularity: TimeGranularity,
         wal_workspace_bytes: usize,
     ) -> Self {
         Self {
@@ -192,6 +201,7 @@ impl OtlpSliceProducer {
             audit_event,
             tenant,
             table,
+            partition_granularity,
             wal_workspace_bytes,
         }
     }
@@ -254,7 +264,12 @@ impl OtlpSliceProducer {
         let crate::scribe::otlp_managed::OtlpManagedBatch { rows, ipc_plan } = batch;
         let receipt = chrono::DateTime::from_timestamp_micros(self.source.receipt_micros)
             .ok_or(ScribeError::InvalidFrame)?;
-        let event_day = crate::scribe::seal_key::EventDay::from_timestamp(receipt);
+        let partition = self
+            .partition_granularity
+            .bucket(receipt)
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("OTLP receipt time has no partition: {error}"),
+            })?;
         let current_bytes = rows
             .get_array_memory_size()
             .checked_add(ipc_plan.encoded_bytes())
@@ -276,7 +291,7 @@ impl OtlpSliceProducer {
                 table: &self.table,
                 wal_workspace_bytes: self.wal_workspace_bytes,
             },
-            event_day,
+            partition,
             rows,
             Some(ipc_plan),
         )?;
@@ -295,7 +310,7 @@ pub(crate) struct NativeSliceProducer {
     decoder: arrow::ipc::reader::StreamDecoder,
     /// Index of the next preflighted source descriptor.
     source_index: usize,
-    /// Current decoded source retained only across its day slices.
+    /// Current decoded source retained only across its partition slices.
     current: Option<NativeCurrentSource>,
     /// Zero-based ordinal assigned to the next slice.
     slice_index: u32,
@@ -307,19 +322,21 @@ pub(crate) struct NativeSliceProducer {
     tenant: DataTenantId,
     /// Logical table used by every produced seal key.
     table: TableRef,
+    /// Registered partition granularity used to bucket every produced slice.
+    partition_granularity: TimeGranularity,
     /// Exact-capacity audit JSON ceiling retained from the root plan.
     wal_workspace_bytes: usize,
 }
 
-/// One decoded native source and its fixed event-day cursor.
+/// One decoded native source and its fixed time-partition cursor.
 #[derive(Debug)]
 struct NativeCurrentSource {
     /// Stamped current source rows.
     rows: RecordBatch,
-    /// Immutable current-source day descriptors.
-    days: EventDayPlan,
-    /// Next day descriptor to materialize.
-    next_day: usize,
+    /// Immutable current-source partition descriptors.
+    partitions: TimePartitionPlan,
+    /// Next partition descriptor to materialize.
+    next_partition: usize,
 }
 
 impl NativeSliceProducer {
@@ -334,6 +351,7 @@ impl NativeSliceProducer {
         audit_event: AuditEvent,
         tenant: DataTenantId,
         table: TableRef,
+        partition_granularity: TimeGranularity,
         wal_workspace_bytes: usize,
     ) -> Result<Self, ScribeError> {
         let mut decoder = arrow::ipc::reader::StreamDecoder::new().with_require_alignment(true);
@@ -348,6 +366,7 @@ impl NativeSliceProducer {
             audit_event,
             tenant,
             table,
+            partition_granularity,
             wal_workspace_bytes,
         })
     }
@@ -361,10 +380,11 @@ impl NativeSliceProducer {
     pub(crate) fn next_slice(&mut self) -> Result<Option<PreparedSlice>, ScribeError> {
         loop {
             if let Some(current) = self.current.as_mut() {
-                if current.next_day < current.days.len() {
-                    let (event_day, rows) =
-                        current.days.materialize(&current.rows, current.next_day)?;
-                    current.next_day += 1;
+                if current.next_partition < current.partitions.len() {
+                    let (partition, rows) = current
+                        .partitions
+                        .materialize(&current.rows, current.next_partition)?;
+                    current.next_partition += 1;
                     let mut slice = prepare_slice(
                         SliceContext {
                             batch_id: self.source.batch_id,
@@ -373,7 +393,7 @@ impl NativeSliceProducer {
                             table: &self.table,
                             wal_workspace_bytes: self.wal_workspace_bytes,
                         },
-                        event_day,
+                        partition,
                         rows,
                         None,
                     )?;
@@ -398,11 +418,11 @@ impl NativeSliceProducer {
             };
             self.source_index += 1;
             let rows = stamp_native_source(&rows, &self.source)?;
-            let days = plan_event_days(&rows)?;
+            let partitions = plan_time_partitions(&rows, self.partition_granularity)?;
             self.current = Some(NativeCurrentSource {
                 rows,
-                days,
-                next_day: 0,
+                partitions,
+                next_partition: 0,
             });
         }
     }
@@ -618,6 +638,8 @@ struct PreparedRowsContext {
     tenant: DataTenantId,
     /// Logical table used by every seal key.
     table: TableRef,
+    /// Registered partition granularity used to bucket every slice.
+    partition_granularity: TimeGranularity,
     /// Exact-capacity audit JSON ceiling.
     wal_workspace_bytes: usize,
     /// Root bytes retained while the prepared source is live.
@@ -642,6 +664,7 @@ fn prepare_rows(
         audit_event,
         tenant,
         table,
+        partition_granularity,
         wal_workspace_bytes,
         memory_bytes,
     } = context;
@@ -650,12 +673,15 @@ fn prepare_rows(
             let mut slices = Vec::new();
             append_prepared_slices(
                 &mut slices,
-                batch_id,
-                &audit_event,
-                tenant,
-                &table,
+                SliceContext {
+                    batch_id,
+                    audit_event: &audit_event,
+                    tenant,
+                    table: &table,
+                    wal_workspace_bytes,
+                },
+                partition_granularity,
                 &rows,
-                wal_workspace_bytes,
             )?;
             let slice_count = u32::try_from(slices.len()).map_err(|_| ScribeError::Internal {
                 detail: "Scribe batch exceeds the v4 WAL slice-count bound".to_owned(),
@@ -674,8 +700,14 @@ fn prepare_rows(
             Ok((PreparedSliceSet::Materialized(slices), prepared_bytes))
         }
         AdmittedRows::Native(native) => {
-            let mut producer =
-                NativeSliceProducer::new(*native, audit_event, tenant, table, wal_workspace_bytes)?;
+            let mut producer = NativeSliceProducer::new(
+                *native,
+                audit_event,
+                tenant,
+                table,
+                partition_granularity,
+                wal_workspace_bytes,
+            )?;
             let mut slices = Vec::new();
             while let Some(slice) = producer.next_slice()? {
                 slices.push(slice);
@@ -685,8 +717,14 @@ fn prepare_rows(
             Ok((PreparedSliceSet::Materialized(slices), prepared_bytes))
         }
         AdmittedRows::Otlp(otlp) => {
-            let mut producer =
-                OtlpSliceProducer::new(*otlp, audit_event, tenant, table, wal_workspace_bytes);
+            let mut producer = OtlpSliceProducer::new(
+                *otlp,
+                audit_event,
+                tenant,
+                table,
+                partition_granularity,
+                wal_workspace_bytes,
+            );
             let slices = producer.next_slice()?.into_iter().collect::<Vec<_>>();
             let prepared_bytes = prepared_slice_bytes(&slices, memory_bytes)?;
             Ok((PreparedSliceSet::Materialized(slices), prepared_bytes))
@@ -732,6 +770,7 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
         mut memory,
         tenant,
         table,
+        partition_granularity,
         queued_at,
         mut durable_ack,
         mut lifecycle,
@@ -747,6 +786,7 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
             audit_event,
             tenant,
             table: table.clone(),
+            partition_granularity,
             wal_workspace_bytes,
             memory_bytes: memory.bytes(),
         },
@@ -883,28 +923,19 @@ fn prepared_slice_bytes(slices: &[PreparedSlice], limit: usize) -> Result<usize,
 ///
 /// # Errors
 ///
-/// Returns [`ScribeError`] when event-day validation, audit encoding, Arrow IPC
-/// serialization, or checked slice construction fails. Completed earlier
-/// slices remain owned by `slices` and are dropped by the caller on refusal.
+/// Returns [`ScribeError`] when time-partition validation, audit encoding,
+/// Arrow IPC serialization, or checked slice construction fails. Completed
+/// earlier slices remain owned by `slices` and are dropped by the caller on
+/// refusal.
 fn append_prepared_slices(
     slices: &mut Vec<PreparedSlice>,
-    batch_id: Uuid,
-    audit_event: &AuditEvent,
-    tenant: DataTenantId,
-    table: &TableRef,
+    context: SliceContext<'_>,
+    partition_granularity: TimeGranularity,
     rows: &RecordBatch,
-    wal_workspace_bytes: usize,
 ) -> Result<(), ScribeError> {
-    let context = SliceContext {
-        batch_id,
-        audit_event,
-        tenant,
-        table,
-        wal_workspace_bytes,
-    };
-    for slice in split_batch_by_event_day(rows)? {
-        let (event_day, day_rows) = slice?;
-        slices.push(prepare_slice(context, event_day, day_rows, None)?);
+    for slice in split_batch_by_time_partition(rows, partition_granularity)? {
+        let (partition, partition_rows) = slice?;
+        slices.push(prepare_slice(context, partition, partition_rows, None)?);
     }
     Ok(())
 }
@@ -931,14 +962,14 @@ struct SliceContext<'a> {
 /// Returns [`ScribeError`] when audit encoding or fixed IPC encoding fails.
 fn prepare_slice(
     context: SliceContext<'_>,
-    event_day: crate::scribe::seal_key::EventDay,
+    partition: TimePartition,
     rows: RecordBatch,
     ipc_plan: Option<crate::scribe::fixed_ipc::FixedIpcPlan>,
 ) -> Result<PreparedSlice, ScribeError> {
-    let seal_key = SealKey::new(context.tenant, context.table.clone(), event_day);
-    let mut day_audit = context.audit_event.clone();
-    day_audit.payload_summary = format!("{} rows", rows.num_rows());
-    let audit_payload = encode_audit_event_bounded(&day_audit, context.wal_workspace_bytes)?;
+    let seal_key = SealKey::new(context.tenant, context.table.clone(), partition);
+    let mut slice_audit = context.audit_event.clone();
+    slice_audit.payload_summary = format!("{} rows", rows.num_rows());
+    let audit_payload = encode_audit_event_bounded(&slice_audit, context.wal_workspace_bytes)?;
     let data_payload = encode_ipc_fixed(&rows, ipc_plan)?;
     let (logical_data_digest, logical_data_len) = logical_data_identity(&rows)?;
     let wal_append = PreparedWalAppend::new(
@@ -960,7 +991,7 @@ fn prepare_slice(
             slice_index: 0,
         },
         seal_key,
-        audit_event: day_audit,
+        audit_event: slice_audit,
         rows,
         wal_append,
         memtable_bytes,

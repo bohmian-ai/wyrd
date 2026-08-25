@@ -987,7 +987,10 @@ pub(crate) async fn provision_named_tables(
     tables: &[String],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let server = cluster.server(0).ok_or("reference cluster has no Server")?;
-    let catalog = server.state().bifrost_catalog();
+    let catalog = server
+        .state()
+        .bifrost_catalog()
+        .expect("reference cluster server exposes its Bifrost catalog");
     let fields = vec![Field::new("row_id", DataType::Int64, false)];
     for tenant in tenants {
         for table in tables {
@@ -996,6 +999,7 @@ pub(crate) async fn provision_named_tables(
                     table: TableRef::new(BifrostNamespace::Bifrost, table),
                     user_fields: fields.clone(),
                     tenant: *tenant,
+                    physical_layout: None,
                     audit: None,
                 })
                 .await?;

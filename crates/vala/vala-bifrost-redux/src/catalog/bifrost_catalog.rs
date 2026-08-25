@@ -614,7 +614,7 @@ impl BifrostCatalog {
                 physical_layout: Some((definition.physical_layout)()),
                 audit: None,
             },
-            Some((definition.schema)()),
+            Some(definition),
         )
         .await
     }
@@ -630,6 +630,14 @@ impl BifrostCatalog {
     /// repeat of a prior registration is a no-op returning the same
     /// [`TableUid`].
     ///
+    /// `builtin` names the engine-owned definition when this registration comes
+    /// from [`Self::ensure_builtin`]. It supplies the canonical physical schema
+    /// and selects [`PhysicalLayout::builtin`] as the resolver, because a
+    /// built-in legitimately sorts and Blooms on its own managed columns —
+    /// every built-in defaults to `wyrd_event_time DESC` — which the untrusted
+    /// [`PhysicalLayout::canonicalize`] path rejects as a reserved managed
+    /// column. Caller registrations pass `None` and keep that rejection.
+    ///
     /// # Errors
     /// Returns [`BifrostCatalogError::Layout`] for an invalid or conflicting
     /// declaration, [`BifrostCatalogError::FingerprintMismatch`] for a schema
@@ -637,7 +645,7 @@ impl BifrostCatalog {
     async fn create_table_locked(
         &self,
         request: CreateTableRequest,
-        canonical_schema: Option<arrow::datatypes::SchemaRef>,
+        builtin: Option<&'static BuiltinTableDefinition>,
     ) -> Result<TableUid, BifrostCatalogError> {
         reject_reserved_field_names(&request.user_fields)?;
         let binding = TenantTableBinding::resolve((request.tenant, request.table))
@@ -645,13 +653,15 @@ impl BifrostCatalog {
         let fqn = binding.table_ref.fqn();
         let fingerprint =
             SchemaFingerprint::from_arrow_schema(&Schema::new(request.user_fields.clone()));
-        let arrow_schema = canonical_schema
-            .as_deref()
-            .cloned()
-            .unwrap_or_else(|| Schema::new(with_managed_columns(request.user_fields.clone())));
-        let layout =
-            PhysicalLayout::canonicalize(&fqn, &arrow_schema, request.physical_layout.as_ref())
-                .map_err(BifrostCatalogError::Layout)?;
+        let arrow_schema = builtin.map_or_else(
+            || Schema::new(with_managed_columns(request.user_fields.clone())),
+            |definition| (*(definition.schema)()).clone(),
+        );
+        let layout = match (builtin, request.physical_layout.as_ref()) {
+            (Some(_), Some(declared)) => PhysicalLayout::builtin(&fqn, &arrow_schema, declared),
+            (_, declared) => PhysicalLayout::canonicalize(&fqn, &arrow_schema, declared),
+        }
+        .map_err(BifrostCatalogError::Layout)?;
         let layout_wire = layout.to_wire();
         let layout_json = serde_json::to_value(&layout_wire).map_err(|error| {
             BifrostCatalogError::MetadataMismatch(format!(

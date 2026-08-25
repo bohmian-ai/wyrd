@@ -118,8 +118,6 @@ pub struct OracleBuildInputs {
     pub registered_role: RegisteredRole,
     /// Shared current-ready cluster registry.
     pub cluster: Arc<ClusterRegistry>,
-    /// Optional runtime keeping server-created coordination consumers alive.
-    pub coordination_runtime: Option<Arc<tokio::runtime::Runtime>>,
     /// Audit publisher for query lifecycle transitions.
     pub audit: Arc<crate::oracle::OracleAuditPublisher>,
     /// Transport carrying lifecycle control to peer participants.
@@ -156,10 +154,71 @@ pub struct ScribeBuildInputs {
     /// Whether this role owns `fragment_query_audit`'s shutdown, which it does
     /// only when no local Oracle role shares the publisher.
     pub owns_fragment_query_audit: bool,
-    /// Optional runtime keeping server-created coordination consumers alive.
-    pub coordination_runtime: Option<Arc<tokio::runtime::Runtime>>,
     /// Role-scoped cancellation signal.
     pub role_shutdown: CancellationToken,
+}
+
+/// Sole owner of the dedicated Tokio runtime that hosts Scribe coordination tasks.
+///
+/// The coordination runtime executes the sixteen `ShardOwner::run` lanes plus
+/// the Scribe reconciliation and persistence loops. Every consumer of that
+/// executor holds a [`tokio::runtime::Handle`], never the [`Runtime`] value, so
+/// this owner is the only place in the process where the runtime itself is
+/// reachable. It is deliberately **not** `Clone` and is never stored on
+/// [`AppState`], [`Bifrost`], [`Scribe`], or [`Oracle`]: a runtime reachable
+/// from a per-request-cloned graph would be dropped on whichever clone happened
+/// to die last, and [`Runtime::drop`] blocks to join its workers, which panics
+/// when it runs on an async frame.
+///
+/// [`Runtime`]: tokio::runtime::Runtime
+/// [`Runtime::drop`]: tokio::runtime::Runtime
+pub struct ScribeCoordinationRuntime {
+    /// The dedicated executor, present only when this process selected Scribe.
+    runtime: Option<tokio::runtime::Runtime>,
+}
+
+impl ScribeCoordinationRuntime {
+    /// Takes sole ownership of a composed coordination runtime.
+    ///
+    /// `runtime` is `None` for every process that did not select the Scribe
+    /// role; those targets never build a dedicated executor and their owner is
+    /// an inert value whose drop does nothing.
+    pub(crate) const fn new(runtime: Option<tokio::runtime::Runtime>) -> Self {
+        Self { runtime }
+    }
+}
+
+impl Drop for ScribeCoordinationRuntime {
+    /// Releases the coordination runtime without blocking the dropping thread.
+    ///
+    /// [`tokio::runtime::Runtime::shutdown_background`] detaches the worker
+    /// threads instead of joining them, so it is legal from any context —
+    /// including the async frame that `async fn main` forces on the final drop
+    /// of the composed server. Because it does not wait, drop ordering is
+    /// load-bearing: this owner must outlive Scribe role drain, otherwise a
+    /// shard owner still holding WAL segments or post-`COMMIT` memtable state is
+    /// abandoned mid-flight. Both production (`app::run` drops it after
+    /// `BoundServer::run` returns) and the test harness (which drops it after
+    /// the serve task joins) satisfy that ordering.
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
+/// One composed Bifrost graph paired with the coordination runtime that hosts it.
+///
+/// `compose_bifrost` produces two values with different ownership rules: the
+/// shareable [`Bifrost`] graph, and the single non-`Clone`
+/// [`ScribeCoordinationRuntime`] owner. They travel together as one named value
+/// so callers cannot silently drop the owner and leave the shard lanes running
+/// on a runtime nothing holds.
+pub struct ComposedBifrost {
+    /// Shareable composition root published into [`AppState`].
+    pub bifrost: Arc<Bifrost>,
+    /// Sole owner of the executor backing the composed Scribe role.
+    pub coordination_runtime: ScribeCoordinationRuntime,
 }
 
 /// Existing concrete production controls injected by server journeys.
@@ -502,8 +561,6 @@ pub struct Scribe {
     fragment_query_audit: Arc<crate::oracle::OracleAuditPublisher>,
     /// Retains audit shutdown ownership only when this process has no Oracle owner.
     owns_fragment_query_audit: bool,
-    /// Optional dedicated runtime that owns Scribe coordination tasks in production.
-    coordination_runtime: Option<Arc<tokio::runtime::Runtime>>,
     /// Cancels the recurring heartbeat and snapshot tasks before role removal.
     role_shutdown: CancellationToken,
     /// Retains the heartbeat task so teardown can prove it stopped before unregister.
@@ -555,8 +612,6 @@ pub struct Oracle {
     continuity_monitor_abort: AbortHandle,
     /// Readiness value preserved by heartbeats during transport drain.
     advertise_ready: Arc<AtomicBool>,
-    /// Optional server-owned executor retained for Oracle coordination tasks.
-    coordination_runtime: Option<Arc<tokio::runtime::Runtime>>,
     /// Local WAL publisher retained for the complete Oracle lifecycle.
     audit: Arc<crate::oracle::OracleAuditPublisher>,
     /// Canonical authenticated transport for owner-local lifecycle fanout.
@@ -604,7 +659,6 @@ impl Oracle {
             catalog,
             registered_role,
             cluster,
-            coordination_runtime,
             audit,
             lifecycle_transport,
             resources,
@@ -659,7 +713,6 @@ impl Oracle {
             continuity_monitor_abort,
             lifecycle,
             advertise_ready,
-            coordination_runtime,
             audit,
             running_queries,
             lifecycle_transport,
@@ -849,12 +902,6 @@ impl Oracle {
             })
         }
     }
-
-    /// Returns whether the runtime retains a dedicated coordination executor.
-    #[must_use]
-    pub fn has_dedicated_coordination_runtime(&self) -> bool {
-        self.coordination_runtime.is_some()
-    }
 }
 
 /// Consumes the sole delegated-admission continuity signal for one Oracle fence.
@@ -969,7 +1016,6 @@ impl Scribe {
             fragment_security_audit,
             fragment_query_audit,
             owns_fragment_query_audit,
-            coordination_runtime,
             role_shutdown,
         } = inputs;
         let tail_service = Arc::new(
@@ -1014,7 +1060,6 @@ impl Scribe {
             fragment_security_audit,
             fragment_query_audit,
             owns_fragment_query_audit,
-            coordination_runtime,
             role_shutdown,
             heartbeat: Arc::new(Mutex::new(Some(heartbeat))),
             heartbeat_abort,
@@ -1212,12 +1257,6 @@ impl Scribe {
                 detail: "Scribe role registry shutdown exceeded its deadline".to_owned(),
             })
         }
-    }
-
-    /// Returns whether this runtime retains a dedicated coordination executor.
-    #[must_use]
-    pub fn has_dedicated_coordination_runtime(&self) -> bool {
-        self.coordination_runtime.is_some()
     }
 }
 
@@ -2028,6 +2067,23 @@ pub struct BifrostShutdownReport {
     pub forge_drained: bool,
     /// A selected Oracle owner completed its bounded shutdown path.
     pub oracle_drained: bool,
+}
+
+impl BifrostShutdownReport {
+    /// Returns the report describing a teardown that aborted instead of draining.
+    ///
+    /// [`Bifrost::abort`] closes admission and cancels role owners without
+    /// claiming a flush, so no subsystem drained. This constructor exists so
+    /// that path reports that fact explicitly rather than open-coding an
+    /// all-`false` literal whose meaning depends on the reader.
+    #[must_use]
+    pub(crate) const fn aborted() -> Self {
+        Self {
+            scribe_drained: false,
+            forge_drained: false,
+            oracle_drained: false,
+        }
+    }
 }
 
 /// Process-wide handle registry. One instance is shared by all HTTP handlers.

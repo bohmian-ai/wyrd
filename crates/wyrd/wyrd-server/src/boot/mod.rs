@@ -62,7 +62,9 @@ use crate::oracle::{
     ServerOraclePeerCredentials,
 };
 use crate::postgres::ServerPostgres;
-use crate::state::{AppState, Forge, Oracle, ProductionValidationError, Scribe};
+use crate::state::{
+    AppState, Forge, Oracle, ProductionValidationError, Scribe, ScribeCoordinationRuntime,
+};
 
 const DEFAULT_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 const DEFAULT_HINT_CAPACITY: usize = 1_024;
@@ -205,9 +207,8 @@ struct BifrostExternalDependencies {
 struct ScribeBootParts {
     /// Recovered Scribe allocation that Gate wraps for ingest.
     scribe: Arc<ScribeImpl>,
-    /// Dedicated runtime that owns Scribe coordination tasks.
-    coordination_runtime: Option<Arc<tokio::runtime::Runtime>>,
     /// Independently fenced Scribe role registered during this boot.
+
     scribe_role: RegisteredRole,
 }
 
@@ -497,7 +498,7 @@ async fn build_bifrost_external_dependencies(
 /// request-boundary construction fails before publication.
 pub async fn compose_bifrost(
     inputs: crate::state::BifrostBuildInputs,
-) -> Result<Arc<crate::state::Bifrost>, ServerBootError> {
+) -> Result<crate::state::ComposedBifrost, ServerBootError> {
     let crate::state::BifrostBuildInputs {
         target,
         deployment_profile,
@@ -556,6 +557,11 @@ pub async fn compose_bifrost(
     }
     let (staging_file_publisher, staging_file_inbox) = staging_file_channel(DEFAULT_HINT_CAPACITY)
         .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
+    // Declared outside the Scribe block because the composed graph must never
+    // reach the `Runtime` value: `ScribeBootParts` and the role structs carry a
+    // `Handle` only, and this slot hands the executor straight to the single
+    // `ScribeCoordinationRuntime` owner returned from this function.
+    let mut coordination_runtime: Option<tokio::runtime::Runtime> = None;
     let scribe = if roles.contains(&BifrostRuntimeRole::Scribe) {
         let scribe_role = cluster_registry
             .reserve_scribe(
@@ -606,23 +612,33 @@ pub async fn compose_bifrost(
             )
             .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
         );
-        let coordination_runtime = Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(scribe_config.coordination_threads)
-                .thread_name_fn(|| {
-                    static THREAD_INDEX: std::sync::atomic::AtomicUsize =
-                        std::sync::atomic::AtomicUsize::new(0);
-                    format!(
-                        "wyrd-scribe-coordination-{}",
-                        THREAD_INDEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    )
-                })
-                .enable_all()
-                .build()
-                .map_err(|error| {
-                    ServerBootError::Scribe(format!("coordination runtime failed: {error}"))
-                })?,
-        );
+        // The dedicated coordination runtime hosts every long-lived Scribe
+        // coordination task: the `SCRIBE_SHARD_COUNT` shard-owner lanes plus the
+        // reconciliation and persistence loops. It is deliberately separate from
+        // the request runtime so a saturated ingest path cannot starve shard
+        // progress, and its thread count derives from
+        // `default_scribe_coordination_threads` (available parallelism, capped at
+        // the lane count, floored at two). Only the `Handle` is handed to
+        // consumers; the `Runtime` value itself is moved into the single
+        // non-`Clone` `ScribeCoordinationRuntime` owner returned below, which must
+        // outlive Scribe role drain and releases the executor without blocking.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(scribe_config.coordination_threads)
+            .thread_name_fn(|| {
+                static THREAD_INDEX: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                format!(
+                    "wyrd-scribe-coordination-{}",
+                    THREAD_INDEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                )
+            })
+            .enable_all()
+            .build()
+            .map_err(|error| {
+                ServerBootError::Scribe(format!("coordination runtime failed: {error}"))
+            })?;
+        let coordination_handle = runtime.handle().clone();
+        coordination_runtime = Some(runtime);
         #[cfg(feature = "test-support")]
         let wal_sync_delay = test_controls
             .as_ref()
@@ -729,7 +745,7 @@ pub async fn compose_bifrost(
             wal,
             stream,
             admission,
-            coordination_runtime: coordination_runtime.handle().clone(),
+            coordination_runtime: coordination_handle,
             execution_pools,
             persistence: Some(persistence),
             resources: bifrost_resources.scribe().ok_or_else(|| {
@@ -771,11 +787,7 @@ pub async fn compose_bifrost(
             }
             return Err(ServerBootError::Scribe(error.to_string()));
         }
-        Some(ScribeBootParts {
-            scribe,
-            coordination_runtime: Some(coordination_runtime),
-            scribe_role,
-        })
+        Some(ScribeBootParts { scribe, scribe_role })
     } else {
         None
     };
@@ -946,7 +958,6 @@ pub async fn compose_bifrost(
                     )
                 })?,
                 owns_fragment_query_audit: !roles.contains(&BifrostRuntimeRole::Oracle),
-                coordination_runtime: parts.coordination_runtime,
                 role_shutdown: shutdown.clone(),
             })
             .with_tail_authority(Arc::new(
@@ -1009,9 +1020,10 @@ pub async fn compose_bifrost(
     .with_query_forwarder(query_forwarder);
     #[cfg(feature = "test-support")]
     let gate = gate.with_test_resources(bifrost_resources.clone());
-    Ok(crate::state::Bifrost::assembled(
-        gate, scribe, forge, oracle,
-    ))
+    Ok(crate::state::ComposedBifrost {
+        bifrost: crate::state::Bifrost::assembled(gate, scribe, forge, oracle),
+        coordination_runtime: crate::state::ScribeCoordinationRuntime::new(coordination_runtime),
+    })
 }
 
 /// Build the bounded Forge worker future shared by embedded and worker roles.
@@ -1047,6 +1059,23 @@ pub fn spawn_forge_worker(
     Ok(async move { worker.as_ref().clone().run(shutdown).await })
 }
 
+/// One booted server state paired with the coordination-runtime owner it needs.
+///
+/// [`build_state`] produces two values with different ownership rules: the
+/// cloneable [`AppState`] handed to every route, and the single non-`Clone`
+/// [`ScribeCoordinationRuntime`]. Returning them as one named value keeps the
+/// caller from publishing the state while silently dropping the executor that
+/// runs the Scribe shard lanes behind it.
+pub struct BootedServer {
+    /// Process-wide handle registry published to routes and lifecycle owners.
+    pub state: AppState,
+    /// Sole owner of the dedicated Scribe coordination runtime.
+    ///
+    /// Must be dropped only after the Bifrost graph has drained — in the server
+    /// process that is after `BoundServer::run` returns.
+    pub coordination_runtime: ScribeCoordinationRuntime,
+}
+
 /// Emit pre-telemetry warnings for relaxed config that is still safe to run.
 ///
 /// Production-profile rejection lives in `WyrdServerConfig::validate()` and runs
@@ -1074,6 +1103,11 @@ pub fn production_guards(config: &crate::config::WyrdServerConfig) {
 /// default; `WyrdServer::new` replaces it with the reporter paired to the
 /// health service it mounts.
 ///
+/// Returns the composed [`AppState`] together with the single
+/// [`ScribeCoordinationRuntime`] owner produced by [`compose_bifrost`]. The
+/// caller must retain that owner for at least as long as it runs the server:
+/// dropping it early releases the executor hosting the live Scribe shard lanes.
+///
 /// # Errors
 /// Returns [`ServerBootError`] on database/storage/bifrost boot, auth handle
 /// construction, federation seeding, or production validation failure.
@@ -1081,7 +1115,7 @@ pub async fn build_state(
     config: &crate::config::WyrdServerConfig,
     telemetry: Arc<wyrd_telemetry::TelemetryGuard>,
     overrides: StateOverrides,
-) -> Result<AppState, ServerBootError> {
+) -> Result<BootedServer, ServerBootError> {
     let shutdown = CancellationToken::new();
     let boot = PostgresBoot::from_env().await?;
     let external = build_bifrost_external_dependencies(&boot, &config.bifrost, config.role).await?;
@@ -1120,7 +1154,10 @@ pub async fn build_state(
         }
         _ => None,
     };
-    let bifrost = compose_bifrost(crate::state::BifrostBuildInputs {
+    let crate::state::ComposedBifrost {
+        bifrost,
+        coordination_runtime,
+    } = compose_bifrost(crate::state::BifrostBuildInputs {
         target: config.role,
         deployment_profile: config.deployment_profile,
         postgres: external.postgres.as_ref().clone(),
@@ -1174,7 +1211,10 @@ pub async fn build_state(
         rollback_state_roles(&state).await;
         return Err(ServerBootError::ProductionValidation(error));
     }
-    Ok(state)
+    Ok(BootedServer {
+        state,
+        coordination_runtime,
+    })
 }
 
 /// Tear down role-owned state after server-only boot stages fail.
@@ -1790,7 +1830,6 @@ impl BuiltOracleRole {
             catalog,
             registered_role: role.clone(),
             cluster: Arc::clone(&cluster),
-            coordination_runtime: None,
             audit,
             lifecycle_transport,
             resources,

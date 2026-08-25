@@ -1203,8 +1203,26 @@ pub struct BifrostResourceConfig {
     pub oracle_query_slot_limit: Option<usize>,
 }
 
+/// Derives the dedicated Scribe coordination-runtime worker count.
+///
+/// The coordination runtime hosts one long-lived task per Scribe shard lane
+/// (`SCRIBE_SHARD_COUNT` of them) plus the reconciliation and persistence
+/// loops. Those shard owners are not pure channel-awaiters: each performs
+/// synchronous Arrow memtable insertion inline and awaits a Postgres `COMMIT`,
+/// so a thread count well below the lane count serializes independent lanes.
+///
+/// The derivation therefore starts from detected parallelism — matching the
+/// sibling ingress and persistence derivations, including their `map_or(4, ..)`
+/// fallback for platforms that cannot report it — then applies two bounds.
+/// `min(SCRIBE_SHARD_COUNT)` caps threads at the number of lanes there are to
+/// run, so a large host does not spawn coordination threads that can never own
+/// a lane. `max(2)` preserves the historical floor so a single-core box still
+/// gets a second thread to make progress on while one lane blocks in `COMMIT`.
 fn default_scribe_coordination_threads() -> usize {
-    2
+    std::thread::available_parallelism()
+        .map_or(4, std::num::NonZeroUsize::get)
+        .min(vala_bifrost_redux::scribe::routing::SCRIBE_SHARD_COUNT)
+        .max(2)
 }
 
 fn default_scribe_ingress_cpu_threads() -> usize {
@@ -3230,7 +3248,17 @@ minimum_slots = 2
     #[test]
     fn scribe_runtime_defaults_match_configured_ingest_contract() {
         let cfg = ScribeRuntimeConfig::default();
-        assert_eq!(cfg.coordination_threads, 2);
+        // Asserted as bounds rather than by restating the derivation: an
+        // assertion that recomputes the implementation expression can never
+        // fail, while these bounds are exactly the properties a wrong formula
+        // violates — never below the two-thread floor, never above the number
+        // of shard lanes the runtime has to host.
+        assert!(
+            (2..=vala_bifrost_redux::scribe::routing::SCRIBE_SHARD_COUNT)
+                .contains(&cfg.coordination_threads),
+            "coordination threads {} must stay within the shard-lane bounds",
+            cfg.coordination_threads
+        );
         assert_eq!(cfg.wal_disk_limit_bytes, None);
         assert_eq!(cfg.ingest_request_bytes, 200 * 1024 * 1024);
         assert_eq!(cfg.wal_rotation_bytes, 512 * 1024 * 1024);

@@ -7067,7 +7067,7 @@ mod pg_tests {
             base_snapshot_id,
             committed_snapshot_id: None,
             partition_spec_id,
-            time_partition: fixture_seed_partition(&fixture).await.to_wire(),
+            time_partition: fixture_seed_partition(fixture).await.to_wire(),
             target_file_size_bytes: 3_000_000,
             input_paths,
             output_paths: vec![

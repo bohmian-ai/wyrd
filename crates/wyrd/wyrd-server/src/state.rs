@@ -245,8 +245,7 @@ pub struct BifrostTestControls {
 /// [`WyrdTokenVerifier`] already fixes both resolver parameters, so the alias
 /// keeps [`Bifrost`] and [`AppState`] non-generic while the Gate itself stays
 /// generic for other embedders.
-pub type ServerGate =
-    vala_bifrost_redux::gate::Gate<SqlPermissionResolver, PgIssuerResolver>;
+pub type ServerGate = vala_bifrost_redux::gate::Gate<SqlPermissionResolver, PgIssuerResolver>;
 
 /// Ordered local lifecycle states for one independently fenced role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2081,6 +2080,33 @@ mod tests {
         .await;
 
         assert!(settled.load(Ordering::Acquire));
+    }
+
+    /// The process composition retains exactly one Gate and its shared owners.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a migrated owner is unreachable from [`super::Bifrost`], or
+    /// when lifecycle shutdown leaves query admission open — which would let a
+    /// draining replica keep admitting reads.
+    #[tokio::test]
+    async fn bifrost_holds_exactly_one_gate_owner() {
+        let state = test_state().await;
+        let bifrost = &state.bifrost;
+
+        assert!(bifrost.gate().ensure_query_open().is_ok());
+        let _transport = bifrost.transport_admission();
+        let _verifier = bifrost.token_verifier();
+        assert!(
+            bifrost.query_forwarder().is_none(),
+            "an ownerless shell composes no forwarder"
+        );
+
+        bifrost.begin_shutdown();
+        assert!(matches!(
+            bifrost.gate().ensure_query_open(),
+            Err(wyrd_spec::vala::error::BifrostError::OracleRoleUnavailable)
+        ));
     }
 
     #[tokio::test]

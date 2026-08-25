@@ -867,17 +867,17 @@ mod tests {
 
     use super::limits::IngestLimits;
     use super::{AuthContext, Gate, IngestError};
-    use futures_util::StreamExt as _;
-    use wyrd_spec::vala::api::QueryStreamFrame;
-    use wyrd_spec::vala::error::BifrostError;
     use crate::contracts::{DecodedOtlp, IngressPayload, ScribeOtlpOutcome};
     use async_trait::async_trait;
+    use futures_util::StreamExt as _;
     use wyrd_auth_oidc::IssuerConfigResolver;
     use wyrd_auth_verify::PermissionResolver;
     use wyrd_runtime::{Permission, PermissionSet, Principal, PrincipalKind};
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::ids::DataTenantId;
     use wyrd_spec::request_id::RequestId;
+    use wyrd_spec::vala::api::QueryStreamFrame;
+    use wyrd_spec::vala::error::BifrostError;
     use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
 
     /// One exact Gate family description captured during owner initialization.
@@ -1471,9 +1471,9 @@ mod tests {
             Some(&1)
         );
         assert_eq!(
-            snapshot
-                .counters
-                .get("bifrost_gate_rejections_total{operation=\"query\",reason=\"role_unavailable\"}"),
+            snapshot.counters.get(
+                "bifrost_gate_rejections_total{operation=\"query\",reason=\"role_unavailable\"}"
+            ),
             Some(&1)
         );
         assert_eq!(
@@ -1577,10 +1577,7 @@ mod tests {
             },
             IngestError::RequestValidation("bad batch id".to_owned()),
             IngestError::Decode("truncated frame".to_owned()),
-            IngestError::PayloadTooLarge {
-                bytes: 2,
-                limit: 1,
-            },
+            IngestError::PayloadTooLarge { bytes: 2, limit: 1 },
             IngestError::TableNotFound {
                 table: "vala.traces.absent".to_owned(),
             },
@@ -1699,7 +1696,7 @@ mod tests {
         assert!(matches!(
             super::validate_batch(&frame(uuid_v4.as_bytes().to_vec()), &limits),
             Err(IngestError::RequestValidation(_)),
-            ));
+        ));
         assert!(matches!(
             super::validate_batch(&frame(vec![0_u8; 15]), &limits),
             Err(IngestError::RequestValidation(_))

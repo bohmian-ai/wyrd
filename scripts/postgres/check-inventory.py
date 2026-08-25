@@ -21,7 +21,7 @@ if "docker ps" in (root / "mise.toml").read_text() or "docker rm" in (root / "mi
     raise SystemExit("global Docker enumeration/deletion remains")
 empty = {
     "db:migrate", "db:migrate:all", "test:sql", "test:sql:forge-scale",
-    "test:vala:integration", "test:wyrd",
+    "test:bifrost", "test:wyrd",
 }
 migrated = {"test:vala"}
 pre = {
@@ -30,13 +30,11 @@ pre = {
     "test:storage:e2e", "test:storage:s3:cloud", "test:storage:gcs:cloud", "test:storage:azure:cloud",
     "bench:bifrost:smoke",
 }
-aggregates = {"test:unit", "pre-pr", "test:storage:matrix", "test:storage:cloud:matrix"}
+aggregates = {"test:unit", "gate", "test:storage:matrix", "test:storage:cloud:matrix"}
 for name in empty | migrated | pre:
     task = tasks.get(name)
     if task is None or "with-test-postgres.sh" not in str(task.get("run", "")):
         raise SystemExit(f"{name} is not routed through the lifecycle wrapper")
-    if f"{name}:inner" not in tasks:
-        raise SystemExit(f"{name} has no hidden inner task")
     deps = set(task.get("depends", []))
     if deps & {"setup:postgres", "db:migrate"}:
         raise SystemExit(f"{name} still has setup-only Postgres dependencies")

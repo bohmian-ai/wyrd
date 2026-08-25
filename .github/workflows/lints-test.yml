@@ -57,7 +57,7 @@ jobs:
           cat "$GITHUB_OUTPUT"
 
   # Authoritative Rust gate: format, lint, all boundary checks, tests, codegen,
-  # and Python on ubuntu/3.12. This is mise run pre-pr — the same gate as local.
+  # and Python on ubuntu/3.12. This is mise run gate.
   # Cross-platform compatibility (macOS/Windows) is handled by the rust-compat job.
   ci:
     name: ci
@@ -103,8 +103,8 @@ jobs:
       - name: Add wasm target
         run: rustup target add wasm32-unknown-unknown
 
-      - name: Run pre-pr gate
-        run: mise run pre-pr
+      - name: Run CI gate
+        run: mise run gate
 
   forge-sql-scale:
     name: Forge SQL scale

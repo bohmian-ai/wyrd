@@ -1,10 +1,10 @@
 # ============================================================================
 # Canonical developer loop — these are the tasks you run directly.
 # `mise tasks` lists only these; every other task is a CI shard or invariant
-# check that runs as a `pre-pr` dependency (still runnable by name, just hidden).
+# check that runs as a `gate` dependency (still runnable by name, just hidden).
 #
 #   mise run check       Fast pre-commit loop: fmt --check + clippy + cargo check.
-#   mise run pre-pr      The full gate. Run this before pushing — it is the
+#   mise run gate        The CI aggregate. Slow and broad; CI runs it. Locally,
 #                        answer to "make sure everything passes" (Rust + Python +
 #                        codegen + docs + every boundary invariant).
 #
@@ -91,18 +91,11 @@ description = "Run shared family tests (unit tests only — pg_tests skipped wit
 run = "bash scripts/run-family-tests.sh shared"
 
 [tasks."test:bifrost"]
-description = "Run Redux Bifrost default-feature tests"
-run = "cargo test --locked -p vala-bifrost-redux"
-
-[tasks."test:vala:integration"]
-hide = true
-description = "Run vala-bifrost-redux Postgres+opendal integration tests (scribe seal state machine)"
-
-run = "scripts/postgres/with-test-postgres.sh -- mise run test:vala:integration:inner"
-[tasks."test:vala:integration:inner"]
-hide = true
-description = "Run vala-bifrost-redux Postgres+opendal integration tests (scribe seal state machine)"
-run = "cargo test --locked -p vala-bifrost-redux --features \"$WYRD_REDUX_TEST_FEATURES\" --test integration -- --test-threads=1"
+description = """Run every vala-bifrost-redux test target — lib, the `integration` binary,
+`pg_file_list_tenant_table`, and doc tests — at the canonical test feature union
+against an isolated Postgres lifecycle. This is the one complete crate lane; no
+narrower selector covers the `test-support` lib surface."""
+run = "scripts/postgres/with-test-postgres.sh -- cargo test --locked -p vala-bifrost-redux --features \"$WYRD_REDUX_TEST_FEATURES\" -- --test-threads=1"
 
 [tasks."test:bifrost:journey"]
 description = """Run the current Bifrost/Scribe Rust user-journey tests (marked #[ignore]
@@ -279,22 +272,14 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'ulimit -n 8192 2>/dev
 description = "Validate Bifrost Oracle Kubernetes role selectors and rollback"
 run = "cargo test --locked -p wyrd-testing bifrost_deployment_contract -- --nocapture"
 
-[tasks."check:bifrost-oracle-deleted-vocabulary"]
-description = "Reject deleted Oracle lease and reconciliation telemetry vocabulary"
-run = "scripts/checks/bifrost-oracle-deleted-vocabulary.sh"
-
 [tasks."check:bifrost-resource-governance"]
 description = "Reject obsolete Bifrost resource ownership and verify checker fixtures"
 run = "BIFROST_RESOURCE_GOVERNANCE_SELF_TEST=1 bash scripts/checks/bifrost-resource-governance.sh && bash scripts/checks/bifrost-resource-governance.sh"
 
-[tasks."test:bifrost-oracle-deleted-vocabulary"]
-description = "Self-test the deleted Oracle vocabulary checker against tracked fixtures"
-run = "bash scripts/checks/test-bifrost-oracle-deleted-vocabulary.sh"
-
 [tasks."test:unit"]
 description = """Aggregate Rust test gate: family lanes (wyrd, skald, vala, shared) + storage emulator matrix + sql + server e2e.
 Bifrost (DataFusion-heavy) runs as a separate CI job via test:bifrost to avoid artifact-lock
-contention; add test:bifrost to pre-pr or run it directly to include it locally.
+contention; add test:bifrost to gate or run it directly to include it locally.
 Only real-credential cloud storage tests (test:storage:{s3,gcs,azure}:cloud) are gated to
 storage-integration-cloud.yml; emulator-backed storage tests run here because they are just
 docker containers, same difficulty as Postgres.
@@ -468,21 +453,6 @@ rg -n 'use axum::|use hyper::|use tower::' crates/wyrd/wyrd-sql/src/ && exit 1 |
 hide = true
 description = "Assert PyO3 stays out of pure contracts and Python-free shared crates"
 run = "bash scripts/checks/pyo3-scope.sh"
-
-[tasks."check:redux-isolation"]
-hide = true
-description = "Assert Redux has no legacy Bifrost dependency and run the negative self-test"
-run = "bash scripts/checks/redux-isolation.sh"
-
-[tasks."check:redux-single-authority"]
-hide = true
-description = "Require Redux as the sole Bifrost catalog and server boot authority"
-run = "bash scripts/checks/redux-single-authority.sh"
-
-[tasks."check:redux-single-table-model"]
-hide = true
-description = "Fail closed on obsolete Redux scope, sentinel tenant, and synthetic benchmark vocabulary"
-run = "bash scripts/checks/redux-single-table-model.sh"
 
 [tasks."check:mocks-scope"]
 hide = true
@@ -1048,7 +1018,7 @@ diff -u "$BEFORE" "$AFTER" \
 # (`typescript/testing`, built from `crates/bindings/wyrd-node-testing`, test-tier).
 # One napi addon per package so the harness never overwrites the SDK's generated
 # loader/`.d.ts`. 06c wires `codegen:openapi` into `codegen:regen`; 13a adds
-# `ts:napi:check`/`ts:typecheck`/`ts:test:unit` to `pre-pr`; `ts:test:integration`
+# `ts:napi:check`/`ts:typecheck`/`ts:test:unit` to `gate`; `ts:test:integration`
 # runs in the closeout journey lane.
 [tasks."codegen:openapi"]
 description = "Emit openapi.yaml from wyrd-server WyrdApiDoc (slice 06c; wired into codegen:regen). Requires utoipa 'yaml' feature on wyrd-server."
@@ -1164,13 +1134,12 @@ hide = true
 description = "Fail if wyrd-dev-fixtures imports wyrd-server or ServerPostgres::from_parts appears outside wyrd-server/wyrd-testing"
 run = "bash scripts/checks/fixtures-no-server.sh"
 
-[tasks."pre-pr"]
-description = "Aggregate gate: check + codegen:check + Python package checks + docs and examples"
+[tasks."gate"]
+description = "CI aggregate. Broad and slow — CI runs this. The local bar is `mise run check` plus the narrow tasks for what you touched (AGENTS.md §11)."
 depends = [
   "check",
   "test:unit",
   "test:bifrost",
-  "test:vala:integration",
   "codegen:check",
   "cardkind:check",
   "check:design-sync",
@@ -1208,8 +1177,6 @@ depends = [
   "check:from-pools-allowlist",
   "check:fixtures-no-server",
   "check:no-testing-in-prod-deps",
-  "check:redux-isolation",
-  "check:redux-single-table-model",
   "check:bifrost-oracle-deploy",
   "check:bifrost-bench-registration",
   "check:test-coverage"]

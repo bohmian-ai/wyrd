@@ -114,7 +114,7 @@ After all tasks are integrated:
 2. run final integration and journey tasks;
 3. run affected language, codegen, docs, migration, and boundary gates;
 4. run the all-feature workspace closeout once;
-5. run `mise run pre-pr` only when the plan requires it, shared CI/build/test
+5. run `mise run gate` only when the plan requires it, shared CI/build/test
    infrastructure changed, a release is being prepared, or the user requested
    it;
 6. inspect the complete diff and produce final requirement traceability.
@@ -145,7 +145,7 @@ Run sequentially:
 Do not run:
 
 - `mise run check`
-- `mise run pre-pr`
+- `mise run gate`
 - unrelated language suites
 - concurrent Cargo commands
 ```
@@ -177,7 +177,7 @@ Run sequentially:
 8. `mise run py:lints`
 9. `mise run check:default`
 
-Do not run `pre-pr`; the parent plan owns integrated closeout.
+Do not run `gate`; the parent plan owns integrated closeout.
 ```
 
 ### Requirement traceability

@@ -37,10 +37,8 @@ pub struct ForgeTaskEnvelope {
     pub footer_encoded_bytes: u64,
     /// Decoder workspace joined only after execution children are released.
     pub footer_decode_workspace_bytes: u64,
-    /// Scratch bytes reserved for sort spill.
+    /// Scratch bytes reserved for sort spill, the only scratch a rewrite owns.
     pub sort_spill_bytes: u64,
-    /// Scratch bytes reserved for pending output.
-    pub output_scratch_bytes: u64,
 }
 
 impl ForgeTaskEnvelope {
@@ -70,15 +68,14 @@ impl ForgeTaskEnvelope {
 
     /// Validates the executable envelope and returns its scratch total.
     ///
+    /// Rewrite output streams straight to the object store, so `DataFusion`
+    /// sort spill is the whole scratch demand.
+    ///
     /// # Errors
-    /// Returns a conflict for caller-supplied malformed or overflowing terms.
+    /// Returns a conflict for caller-supplied malformed terms.
     pub fn scratch_bytes(self) -> Result<u64, SqlError> {
         self.validate()?;
-        self.sort_spill_bytes
-            .checked_add(self.output_scratch_bytes)
-            .ok_or_else(|| SqlError::Conflict {
-                detail: "Forge envelope scratch total overflows".to_owned(),
-            })
+        Ok(self.sort_spill_bytes)
     }
 
     /// Validates version, positivity, and the two derived resident invariants.
@@ -102,7 +99,6 @@ impl ForgeTaskEnvelope {
             || self.footer_encoded_bytes == 0
             || self.footer_decode_workspace_bytes == 0
             || self.sort_spill_bytes == 0
-            || self.output_scratch_bytes == 0
             || decoded != Some(self.decoded_input_bytes)
             || sort != Some(self.sort_working_bytes)
         {
@@ -1274,7 +1270,6 @@ pub(crate) struct ForgeTaskSqlRow {
     footer_encoded_bytes: Option<i64>,
     footer_decode_workspace_bytes: Option<i64>,
     sort_spill_bytes: Option<i64>,
-    output_scratch_bytes: Option<i64>,
     state: String,
     attempt_id: Option<Uuid>,
     claimed_by: Option<Uuid>,
@@ -1453,7 +1448,6 @@ impl TryFrom<ForgeTaskSqlRow> for ForgeTask {
                     "footer_decode_workspace_bytes",
                 )?,
                 sort_spill_bytes: sql_u64(row.sort_spill_bytes, "sort_spill_bytes")?,
-                output_scratch_bytes: sql_u64(row.output_scratch_bytes, "output_scratch_bytes")?,
             }),
             _ => {
                 return Err(SqlError::InvariantViolation {

@@ -69,6 +69,46 @@ mod pg_tests {
         setup_with_faults_at_memory_limit_and_identity(faults, memory_limit_bytes, 1, None).await
     }
 
+    /// Builds the injected Scribe-only resource snapshot the seal fixtures share.
+    ///
+    /// Seal tests pin memory and scratch explicitly so admission decisions are
+    /// deterministic rather than host-dependent, and they compose only the
+    /// `Scribe` role so role budgeting matches a Scribe-target deployment.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the pinned snapshot and policy do not compose into a valid
+    /// Bifrost resource budget, which is a fixture defect.
+    fn seal_runtime_resources(
+        memory_limit_bytes: usize,
+        scratch_root: &std::path::Path,
+        volume_roots: vala_bifrost_redux::resources::BifrostVolumeRoots,
+    ) -> vala_bifrost_redux::resources::BifrostRuntimeResources {
+        vala_bifrost_redux::resources::BifrostRuntimeResources::from_snapshot(
+            vala_bifrost_redux::resources::SystemResourceSnapshot {
+                memory_limit_bytes,
+                effective_cpu: 4,
+                scratch_capacity_bytes: 1024 * 1024 * 1024,
+                scratch_available_bytes: 1024 * 1024 * 1024,
+                memory_source: vala_bifrost_redux::resources::ResourceSource::Injected,
+                cpu_source: vala_bifrost_redux::resources::ResourceSource::Injected,
+            },
+            vala_bifrost_redux::resources::BifrostResourcePolicy {
+                roles: std::collections::BTreeSet::from([
+                    vala_bifrost_redux::resources::BifrostRole::Scribe,
+                ]),
+                memory_limit_bytes: None,
+                unmanaged_reserve_bytes: None,
+                scratch_limit_bytes: None,
+                effective_cpu: None,
+                oracle_query_slot_limit: None,
+                scratch_root: scratch_root.to_owned(),
+                volume_roots: Some(volume_roots),
+            },
+        )
+        .expect("test Bifrost resources")
+    }
+
     /// Starts a direct-seal fixture with a caller-selected durable stream identity.
     async fn setup_with_faults_at_memory_limit_and_identity(
         faults: PersistenceFaults,
@@ -112,29 +152,7 @@ mod pg_tests {
         );
 
         let runtime_resources =
-            vala_bifrost_redux::resources::BifrostRuntimeResources::from_snapshot(
-                vala_bifrost_redux::resources::SystemResourceSnapshot {
-                    memory_limit_bytes,
-                    effective_cpu: 4,
-                    scratch_capacity_bytes: 1024 * 1024 * 1024,
-                    scratch_available_bytes: 1024 * 1024 * 1024,
-                    memory_source: vala_bifrost_redux::resources::ResourceSource::Injected,
-                    cpu_source: vala_bifrost_redux::resources::ResourceSource::Injected,
-                },
-                vala_bifrost_redux::resources::BifrostResourcePolicy {
-                    roles: std::collections::BTreeSet::from([
-                        vala_bifrost_redux::resources::BifrostRole::Scribe,
-                    ]),
-                    memory_limit_bytes: None,
-                    unmanaged_reserve_bytes: None,
-                    scratch_limit_bytes: None,
-                    effective_cpu: None,
-                    oracle_query_slot_limit: None,
-                    scratch_root: scratch_dir.path().to_owned(),
-                    volume_roots: Some(volume_roots),
-                },
-            )
-            .expect("test Bifrost resources");
+            seal_runtime_resources(memory_limit_bytes, scratch_dir.path(), volume_roots);
         let resources = runtime_resources
             .compose_roles()
             .expect("test role resources");
@@ -187,9 +205,10 @@ mod pg_tests {
         // the fixture publishes the same control row registration would have.
         // The canonical layout names only managed columns, so the fixture user
         // projection is enough to canonicalize it.
-        let registered_schema = Schema::new(vala_bifrost_redux::schema::with_managed_columns(
-            vec![Field::new("value", DataType::UInt64, false)],
-        ));
+        let registered_schema =
+            Schema::new(vala_bifrost_redux::schema::with_managed_columns(vec![
+                Field::new("value", DataType::UInt64, false),
+            ]));
         crate::control_row_fixture::register_control_row(
             fixture.vala_postgres(),
             tenant,
@@ -787,23 +806,18 @@ mod pg_tests {
         }
     }
 
-    #[tokio::test]
-    async fn pg_scribe_cross_day_batch_produces_two_files() {
-        let (fixture, tenant, scribe, operator) = setup().await;
-
-        let day1 = Utc::now().date_naive();
-        let day2 = day1.succ_opt().expect("current date has a successor");
-        let day1_instant = day1
-            .and_hms_opt(23, 59, 50)
-            .expect("current day accepts boundary time")
-            .and_utc();
-        let day2_instant = day2
-            .and_hms_opt(0, 0, 10)
-            .expect("next day accepts boundary time")
-            .and_utc();
-        let day1_time = day1_instant.timestamp_micros();
-        let day2_time = day2_instant.timestamp_micros();
-
+    /// Builds one 100-row append that straddles a UTC day boundary.
+    ///
+    /// Sixty rows land 100ms apart from `day1_time` and forty from `day2_time`,
+    /// so a single logical append must fan out across two daily partitions.
+    /// The seal path then has to emit one file per partition rather than one
+    /// file per append, which is what the caller asserts.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the row index does not fit `u64` or the columns do not match
+    /// the declared schema, both of which are fixture defects.
+    fn cross_day_batch(day1_time: i64, day2_time: i64) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new(
                 "wyrd_event_time",
@@ -827,14 +841,34 @@ mod pg_tests {
             timestamps.push(day2_time + ((i - 60) * 100_000));
             values.push(u64::try_from(i).expect("bounded row index"));
         }
-        let batch = RecordBatch::try_new(
-            schema.clone(),
+        RecordBatch::try_new(
+            schema,
             vec![
                 Arc::new(TimestampMicrosecondArray::from(timestamps).with_timezone("UTC")),
                 Arc::new(UInt64Array::from(values)),
             ],
         )
-        .expect("batch");
+        .expect("batch")
+    }
+
+    #[tokio::test]
+    async fn pg_scribe_cross_day_batch_produces_two_files() {
+        let (fixture, tenant, scribe, operator) = setup().await;
+
+        let day1 = Utc::now().date_naive();
+        let day2 = day1.succ_opt().expect("current date has a successor");
+        let day1_instant = day1
+            .and_hms_opt(23, 59, 50)
+            .expect("current day accepts boundary time")
+            .and_utc();
+        let day2_instant = day2
+            .and_hms_opt(0, 0, 10)
+            .expect("next day accepts boundary time")
+            .and_utc();
+        let day1_time = day1_instant.timestamp_micros();
+        let day2_time = day2_instant.timestamp_micros();
+
+        let batch = cross_day_batch(day1_time, day2_time);
 
         let principal = principal_for_tenant(tenant);
         let fingerprint = schema_fingerprint(&batch);

@@ -137,7 +137,7 @@ impl ForgeEnvelopeSizer {
             .min(capacity.max_spill_bytes / 2);
         if scratch_term < MIB || (file_count == 1 && total_input_bytes > scratch_term) {
             return Err(ForgeError::Capacity {
-                detail: "Forge input cannot fit one bounded scratch sibling".to_owned(),
+                detail: "Forge input cannot fit the bounded sort-spill reservation".to_owned(),
             });
         }
         for decoded_batch_bytes in [32 * MIB, 16 * MIB, 8 * MIB, 4 * MIB, 2 * MIB, MIB] {
@@ -192,7 +192,6 @@ impl ForgeEnvelopeSizer {
                 footer_encoded_bytes: FOOTER_ENCODED_BYTES,
                 footer_decode_workspace_bytes: FOOTER_DECODE_WORKSPACE_BYTES,
                 sort_spill_bytes: scratch_term,
-                output_scratch_bytes: scratch_term,
             };
             envelope.validate().map_err(|error| ForgeError::Invariant {
                 detail: error.to_string(),
@@ -605,7 +604,7 @@ mod tests {
         assert!(matches!(result, Err(ForgeError::Capacity { .. })));
     }
 
-    /// Scratch siblings are equal, capacity-bounded, and refuse incomplete topology.
+    /// Sort spill is the sole scratch term, capacity-bounded, and refuses incomplete topology.
     #[test]
     fn envelope_scratch_terms_are_capacity_bounded() {
         let mib = 1024 * 1024;
@@ -619,8 +618,7 @@ mod tests {
         };
         let envelope = ForgeEnvelopeSizer::size(1, 4, 4, capacity).expect("bounded scratch");
         assert_eq!(envelope.sort_spill_bytes, 512 * mib);
-        assert_eq!(envelope.output_scratch_bytes, 512 * mib);
-        assert_eq!(envelope.scratch_bytes().expect("scratch total"), 1024 * mib);
+        assert_eq!(envelope.scratch_bytes().expect("scratch total"), 512 * mib);
         assert!(
             ForgeEnvelopeSizer::size(
                 1,

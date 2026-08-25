@@ -56,7 +56,7 @@ mod pg_tests {
                 bytes: 100,
                 parallelism: 1,
                 memory_bytes: 40 * 1024 * 1024,
-                spill_bytes: 100,
+                spill_bytes: 50,
                 large_ceiling_bytes: 64 * 1024 * 1024,
                 envelope: Some(vala_sql::row_types::forge_tasks::ForgeTaskEnvelope {
                     version: vala_sql::row_types::forge_tasks::FORGE_ENVELOPE_VERSION,

@@ -13,21 +13,20 @@ ALTER TABLE vala.forge_tasks
     ADD COLUMN encoder_buffer_bytes bigint,
     ADD COLUMN upload_chunk_bytes bigint,
     ADD COLUMN sort_spill_bytes bigint,
-    ADD COLUMN output_scratch_bytes bigint,
     ADD CONSTRAINT forge_task_envelope_shape CHECK (
         (envelope_version = 0 AND decoded_batch_bytes IS NULL AND decoded_input_bytes IS NULL
             AND sort_working_bytes IS NULL AND sort_merge_reservation_bytes IS NULL
             AND encoder_buffer_bytes IS NULL AND upload_chunk_bytes IS NULL
-            AND sort_spill_bytes IS NULL AND output_scratch_bytes IS NULL)
+            AND sort_spill_bytes IS NULL)
         OR
         (envelope_version = 1 AND decoded_batch_bytes > 0 AND decoded_input_bytes > 0
             AND sort_working_bytes > 0 AND sort_merge_reservation_bytes > 0
             AND encoder_buffer_bytes > 0 AND upload_chunk_bytes > 0
-            AND sort_spill_bytes > 0 AND output_scratch_bytes > 0
+            AND sort_spill_bytes > 0
             AND decoded_input_bytes = estimated_parallelism * decoded_batch_bytes
             AND sort_working_bytes = 2 * decoded_batch_bytes + sort_merge_reservation_bytes
             AND estimated_memory_bytes = decoded_input_bytes + sort_working_bytes + encoder_buffer_bytes + upload_chunk_bytes
-            AND estimated_spill_bytes = sort_spill_bytes + output_scratch_bytes)
+            AND estimated_spill_bytes = sort_spill_bytes)
     );
 
 CREATE TABLE vala.forge_worker_registry (

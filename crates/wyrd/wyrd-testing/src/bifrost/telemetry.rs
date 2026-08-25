@@ -6830,7 +6830,7 @@ mod tests {
                         output_scratch_bytes: 1,
                     },
                     memory_bytes: 5,
-                    scratch_bytes: 2,
+                    scratch_bytes: 1,
                     reader_permits: 1,
                 })
                 .expect("real Forge rewrite acquisition");

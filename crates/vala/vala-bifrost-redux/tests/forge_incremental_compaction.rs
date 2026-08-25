@@ -722,6 +722,8 @@ mod pg_tests {
                 snapshot_retention: Duration::from_nanos(1),
                 orphan_gc_ttl: Duration::from_nanos(1),
                 iceberg_total_retry_timeout: retry_timeout,
+                manifest_rewrite_enabled: true,
+                manifest_rewrite_min_count: 2,
                 ..ForgeConfig::default()
             })
         }
@@ -896,7 +898,7 @@ mod pg_tests {
                     bytes: 1,
                     parallelism: 1,
                     memory_bytes: 106 * 1024 * 1024,
-                    spill_bytes: 1024 * 1024 * 1024,
+                    spill_bytes: 512 * 1024 * 1024,
                     large_ceiling_bytes: 2 * 1024 * 1024 * 1024,
                 },
                 ready_at: chrono::Utc::now() - chrono::Duration::seconds(1),
@@ -1929,12 +1931,22 @@ mod pg_tests {
         .expect("fixture lease")
     }
 
-    /// Proves terminal file-list history neither grants nor suppresses GC eligibility.
+    /// Proves terminal file-list history neither protects an expired object nor
+    /// is required to reclaim it.
+    ///
+    /// Physical reclamation of a never-published Forge generation belongs to
+    /// `orphan_gc` alone, gated on refreshed catalog, non-terminal `file_list`,
+    /// and open-operation protection plus the TTL floor under the exact table
+    /// lease. A terminal `file_list` row is none of those, so it must neither
+    /// suppress the delete nor stand in for the protection set: one pass
+    /// reclaims the aged, unreferenced generation without any terminal operation
+    /// evidence naming it, which is what makes an attempt that died before its
+    /// `Prepared` transition reclaimable at all.
     ///
     /// # Panics
     ///
     /// Panics when the real catalog roster, tenant row, object store, or Forge
-    /// GC workflow violates exact Reset provenance.
+    /// GC workflow violates exact orphan provenance.
     #[tokio::test]
     async fn terminal_file_list_history_does_not_protect_expired_object() {
         let fixture = Fixture::new_with_config(
@@ -1991,42 +2003,15 @@ mod pg_tests {
         .expect("terminal staging history");
         tokio::time::sleep(Duration::from_millis(5)).await;
 
-        let protected = fixture
-            .forge
-            .run_orphan_gc_for_test(&fixture.binding)
-            .await
-            .expect("Forge GC pass");
-        assert_eq!(protected, 0);
-        assert!(fixture.staging.stat(&path).await.is_ok());
-
-        let resource = format!(
-            "bifrost://{}/{}/{}",
-            fixture.tenant, fixture.binding.table_ref.namespace, fixture.binding.table_ref.name
-        );
-        let operation_id = uuid::Uuid::now_v7();
-        let prepared = operation_event(
-            "forge.file_compact.prepared",
-            &resource,
-            reset_detail_for_output(
-                operation_id,
-                &resource,
-                ForgeCompactionPhase::Prepared,
-                &path,
-            ),
-        );
-        append_operation(&fixture, ForgeOperationFamily::StagingFold, &prepared, true).await;
-        let reset = operation_event(
-            "forge.file_compact.reset",
-            &resource,
-            reset_detail_for_output(operation_id, &resource, ForgeCompactionPhase::Reset, &path),
-        );
-        append_operation(&fixture, ForgeOperationFamily::StagingFold, &reset, false).await;
         let deleted = fixture
             .forge
             .run_orphan_gc_for_test(&fixture.binding)
             .await
-            .expect("proven Forge GC pass");
-        assert_eq!(deleted, 1);
+            .expect("Forge GC pass");
+        assert_eq!(
+            deleted, 1,
+            "terminal file-list history must not suppress orphan reclamation"
+        );
         assert!(fixture.staging.stat(&path).await.is_err());
     }
 
@@ -3623,6 +3608,8 @@ mod pg_tests {
             ForgeConfig {
                 maintenance_trigger_interval: Duration::from_nanos(1),
                 snapshot_retention: Duration::from_nanos(1),
+                manifest_rewrite_enabled: true,
+                manifest_rewrite_min_count: 2,
                 ..ForgeConfig::default()
             },
             true,
@@ -3765,6 +3752,8 @@ mod pg_tests {
             ForgeConfig {
                 maintenance_trigger_interval: Duration::from_nanos(1),
                 snapshot_retention: Duration::from_nanos(1),
+                manifest_rewrite_enabled: true,
+                manifest_rewrite_min_count: 2,
                 ..ForgeConfig::default()
             },
             true,
@@ -3874,6 +3863,8 @@ mod pg_tests {
                 maintenance_trigger_interval: Duration::from_nanos(1),
                 snapshot_retention: Duration::from_nanos(1),
                 orphan_gc_ttl: Duration::from_nanos(1),
+                manifest_rewrite_enabled: true,
+                manifest_rewrite_min_count: 2,
                 ..ForgeConfig::default()
             },
             true,
@@ -5544,7 +5535,7 @@ mod pg_tests {
                     bytes: 200,
                     parallelism: 1,
                     memory_bytes: 106 * 1024 * 1024,
-                    spill_bytes: 1024 * 1024 * 1024,
+                    spill_bytes: 512 * 1024 * 1024,
                     large_ceiling_bytes: 2 * 1024 * 1024 * 1024,
                 },
                 ready_at: chrono::Utc::now(),
@@ -5735,6 +5726,8 @@ mod pg_tests {
                 maintenance_trigger_interval: Duration::from_nanos(1),
                 snapshot_retention: Duration::from_nanos(1),
                 orphan_gc_ttl: Duration::from_nanos(1),
+                manifest_rewrite_enabled: true,
+                manifest_rewrite_min_count: 2,
                 ..ForgeConfig::default()
             },
             true,
@@ -6940,9 +6933,17 @@ mod pg_tests {
         );
     }
 
-    /// Aged abandoned live outputs are rechecked, deleted, and reset exactly once.
+    /// Aged abandoned live outputs are terminally reset exactly once and left
+    /// intact for delayed orphan GC.
+    ///
+    /// Reconciliation is the logical-enqueue side of the deletion boundary: it
+    /// records the exact output generation as `Reset` and never touches object
+    /// storage, so `orphan_gc` alone owns TTL, refreshed protection, physical
+    /// deletion, and the deletion audit. The surviving object is the observable
+    /// proof of that split, and the replay proves the closed reset is not
+    /// reopened.
     #[tokio::test]
-    async fn live_reconciliation_deletes_abandoned_output_and_replays_reset() {
+    async fn live_reconciliation_resets_abandoned_output_and_replays_reset() {
         let fixture = Fixture::new_with_config(
             ForgeConfig {
                 max_concurrent_reads: 2,
@@ -6969,11 +6970,12 @@ mod pg_tests {
         assert_eq!(outcome.reset, 1);
         assert!(!outcome.blocked);
         assert!(
-            !fixture
+            fixture
                 .staging
                 .exists(&output_key)
                 .await
-                .expect("reset output existence check")
+                .expect("reset output existence check"),
+            "a logical reset must leave its output generation for orphan GC"
         );
         let replay = fixture
             .forge

@@ -2301,6 +2301,8 @@ mod pg_tests {
                     .bind(1_000_i64)
                     .bind(1_000_i64)
                     .bind(2_000_i64)
+                    .bind(Option::<Vec<String>>::None)
+                    .bind(Option::<String>::None)
                     .fetch_all(&superuser)
                     .await
                     .expect("explain production fair claim")

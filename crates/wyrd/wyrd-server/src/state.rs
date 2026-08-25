@@ -2082,6 +2082,33 @@ mod tests {
         assert!(settled.load(Ordering::Acquire));
     }
 
+    /// Builds one verifier with a real decoding key for shell composition.
+    ///
+    /// [`super::Bifrost::test_shell`] hands the verifier straight to the Gate
+    /// auth interceptor, and `TokenVerifier::new` requires at least one key, so
+    /// the shell cannot be composed from an empty key map.
+    fn shell_token_verifier() -> Arc<super::WyrdTokenVerifier> {
+        let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
+        let mut keys = std::collections::HashMap::new();
+        keys.insert(
+            wyrd_auth_verify::Kid::new("test").expect("static kid is valid"),
+            Arc::new(
+                wyrd_auth_verify::public_key_from_pem(
+                    b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n",
+                )
+                .expect("static test key is valid"),
+            ),
+        );
+        Arc::new(wyrd_auth_verify::TokenVerifier::new(
+            keys,
+            "wyrd",
+            Arc::new(
+                crate::auth::permission_resolver::SqlPermissionResolver::new(Arc::new(app_pool)),
+            ),
+            wyrd_auth_verify::WyrdAuthVerifySettings::default(),
+        ))
+    }
+
     /// The process composition retains exactly one Gate and its shared owners.
     ///
     /// # Panics
@@ -2091,8 +2118,7 @@ mod tests {
     /// draining replica keep admitting reads.
     #[tokio::test]
     async fn bifrost_holds_exactly_one_gate_owner() {
-        let state = test_state().await;
-        let bifrost = &state.bifrost;
+        let bifrost = super::Bifrost::test_shell(shell_token_verifier());
 
         assert!(bifrost.gate().ensure_query_open().is_ok());
         let _transport = bifrost.transport_admission();

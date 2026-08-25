@@ -372,6 +372,10 @@ impl GateRequestLifecycle {
             "bifrost_gate_active_requests",
             "Current in-flight Bifrost Gate requests by closed operation."
         );
+        metrics::describe_counter!(
+            "bifrost_gate_rejections_total",
+            "Total rejected Bifrost Gate requests by closed operation and refusal reason."
+        );
         for operation in Self::OPERATIONS {
             metrics::gauge!("bifrost_gate_active_requests", "operation" => operation).set(0.0);
             for outcome in Self::OUTCOMES {
@@ -379,6 +383,14 @@ impl GateRequestLifecycle {
                     "bifrost_gate_requests_total",
                     "operation" => operation,
                     "outcome" => outcome
+                )
+                .increment(0);
+            }
+            for reason in vala_bifrost_redux::gate::error::GATE_REJECTION_REASONS {
+                metrics::counter!(
+                    "bifrost_gate_rejections_total",
+                    "operation" => operation,
+                    "reason" => reason
                 )
                 .increment(0);
             }
@@ -398,6 +410,27 @@ impl GateRequestLifecycle {
             completed: false,
             active,
         }
+    }
+
+    /// Records one typed refusal against this request's closed operation.
+    ///
+    /// Callers pass a reason projected by the owning error type — Gate's
+    /// [`vala_bifrost_redux::gate::IngestError::rejection_reason`] for writes —
+    /// so the taxonomy is never restated at a transport call site. This is
+    /// paired with, not a replacement for, the terminal outcome: the same
+    /// request also settles `outcome="rejected"` through
+    /// [`GateRequestLifecycle::complete`], which is what makes a rejection rate
+    /// out of the two families reconcilable.
+    ///
+    /// Emitting here rather than at the refusal site keeps the operation label
+    /// owned by the one lifecycle that already knows it.
+    pub(crate) fn reject(&self, reason: &'static str) {
+        metrics::counter!(
+            "bifrost_gate_rejections_total",
+            "operation" => self.operation,
+            "reason" => reason
+        )
+        .increment(1);
     }
 
     /// Records the normal terminal outcome and disarms cancellation-on-drop.
@@ -537,6 +570,70 @@ mod tests {
                 "missing sum for {family}"
             );
         }
+    }
+
+    /// The rejection family renders its whole closed contract before any refusal.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a seeded `operation` x `reason` series is absent from the
+    /// render, which would make an absent series and a zero series
+    /// indistinguishable to a scrape.
+    #[test]
+    fn gate_rejection_family_seeds_every_closed_label_pair() {
+        let handle = get_handle();
+        let output = handle.render();
+        for operation in GateRequestLifecycle::OPERATIONS {
+            for reason in vala_bifrost_redux::gate::error::GATE_REJECTION_REASONS {
+                assert!(
+                    output.contains(&format!(
+                        "bifrost_gate_rejections_total{{operation=\"{operation}\",reason=\"{reason}\"}}"
+                    )),
+                    "missing seeded rejection series for {operation}/{reason}"
+                );
+            }
+        }
+    }
+
+    /// A typed refusal increments its own reason without touching the others.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the refused series does not advance by exactly one, which
+    /// would break the reconciliation between the rejection family and the
+    /// `outcome="rejected"` terminal.
+    #[test]
+    fn gate_rejection_increments_only_the_projected_reason() {
+        /// Reads one absolute counter sample out of a rendered exposition.
+        fn sample(rendered: &str, series: &str) -> f64 {
+            rendered
+                .lines()
+                .find_map(|line| line.strip_prefix(series)?.trim().parse::<f64>().ok())
+                .unwrap_or_else(|| panic!("series {series} must render"))
+        }
+        let handle = get_handle();
+        let series = "bifrost_gate_rejections_total{operation=\"write\",reason=\"catalog\"}";
+        let untouched = "bifrost_gate_rejections_total{operation=\"write\",reason=\"auth\"}";
+        let before = sample(&handle.render(), series);
+        let before_untouched = sample(&handle.render(), untouched);
+
+        let error = vala_bifrost_redux::gate::IngestError::TableNotFound {
+            table: "vala.bifrost/absent".to_owned(),
+        };
+        let reason = error
+            .rejection_reason()
+            .expect("a table-not-found refusal is a caller-attributed rejection");
+        GateRequestLifecycle::begin("write").reject(reason);
+
+        let rendered = handle.render();
+        assert!(
+            (sample(&rendered, series) - before - 1.0).abs() < f64::EPSILON,
+            "the projected reason must advance by exactly one"
+        );
+        assert!(
+            (sample(&rendered, untouched) - before_untouched).abs() < f64::EPSILON,
+            "an unrelated reason must not move"
+        );
     }
 
     #[tokio::test]

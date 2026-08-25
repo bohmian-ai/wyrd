@@ -142,6 +142,23 @@ impl BifrostIngestGrpc {
     }
 }
 
+/// Counts one refused native write against the closed Gate rejection taxonomy.
+///
+/// Gate owns the projection, so this only forwards it: a refusal that
+/// [`vala_bifrost_redux::gate::IngestError::rejection_reason`] declines to
+/// classify is a Wyrd internal failure, and it is deliberately left out of the
+/// rejection family so a server defect cannot inflate the caller-attributed
+/// rejection rate. That request still settles its terminal outcome as
+/// `failed` through the lifecycle owner.
+fn reject_write(
+    lifecycle: &crate::app::metrics::GateRequestLifecycle,
+    error: &vala_bifrost_redux::gate::IngestError,
+) {
+    if let Some(reason) = error.rejection_reason() {
+        lifecycle.reject(reason);
+    }
+}
+
 #[wyrd_tonic::tonic::async_trait]
 impl BifrostIngestService for BifrostIngestGrpc {
     async fn insert_batch(
@@ -155,12 +172,14 @@ impl BifrostIngestService for BifrostIngestGrpc {
                 .gate()
                 .authenticate_ingest(request.metadata())
                 .await
+                .inspect_err(|error| reject_write(&lifecycle, error))
                 .map_err(Status::from)?;
             let frame = request.into_inner();
             let batch_id = frame.wyrd_batch_id.clone();
             self.bifrost
                 .ingest_native_frame(&auth, frame)
                 .await
+                .inspect_err(|error| reject_write(&lifecycle, error))
                 .map_err(Status::from)?;
             let mut response = wyrd_tonic::tonic::Response::new(InsertBatchResponse {
                 wyrd_batch_id: batch_id,

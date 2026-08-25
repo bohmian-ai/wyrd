@@ -27,8 +27,9 @@ and `Sol` in a task packet are risk tiers, not model names.
 ## When dispatched by $wyrd-implement-plan
 
 The orchestrator supplies the worktree path, execution branch, active task, and
-diff base. Work only inside that worktree and commit nothing — the orchestrator
-owns every commit, task-status change, and acceptance decision.
+diff base. Work only inside that worktree. The orchestrator owns task-status
+changes, acceptance decisions, and the final published history; you own keeping
+your own work durable while you produce it (see Checkpoint your work).
 
 Return a terminal `COMPLETE` or `BLOCKED` report. If you return a nonterminal
 progress report, the orchestrator will resume **this same agent** with your
@@ -194,6 +195,27 @@ Do not edit requirements, public or persisted contracts, security semantics,
 material architecture, data-loss behavior, or acceptance outcomes. A required
 change to those fields is `BLOCKED`, not a task rewrite.
 
+## Checkpoint your work
+
+Uncommitted work in a worktree is unrecoverable. A stray `git checkout`, `git
+restore`, `git stash`, `git clean`, or `git reset --hard` destroys it with no
+undo, and a "backup" produced by piping a command through an unverified shell
+wrapper is not a backup. Commit early and often.
+
+- Commit to the execution branch as soon as a coherent slice compiles, and
+  again before any long verification run. Small `wip(<scope>): ...` commits are
+  correct; the orchestrator squashes or rewrites them at integration.
+- Commit **before** running any command that can discard working-tree state,
+  and before running a command whose purpose is to move the tree to a different
+  revision. There is no exception for "I saved a patch first."
+- Never run `git checkout -- .`, `git restore`, `git stash`, `git clean -f`, or
+  `git reset --hard` while uncommitted work exists. To compare against another
+  revision, read it with `git show <rev>:<path>` instead of moving the tree.
+- If you must verify a baseline, do it from a committed state: commit your
+  work, then compare, then return to your commit.
+- Use your configured Git identity and add no co-author trailers, per
+  `AGENTS.md` §13.
+
 ## Protect test integrity
 
 Never pass a gate by weakening assertions, adding sleeps for synchronization,
@@ -211,7 +233,8 @@ are not terminal.
 - `BLOCKED`: no in-scope solution remains without a material change or
   genuinely unavailable authority.
 
-Before reporting, inspect tracked and untracked changes, map every changed file
-to acceptance, remove accidental artifacts, and run `git diff --check`.
+Before reporting, commit all remaining work, inspect tracked and untracked
+changes, map every changed file to acceptance, remove accidental artifacts, and
+run `git diff --check`.
 Use the structured completion report in
 `architecture/references/languages/implementation-execution.md`.

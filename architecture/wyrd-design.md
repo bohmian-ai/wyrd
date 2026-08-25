@@ -1463,6 +1463,27 @@ not be treated as a correctness requirement. The tail-merge `AppendSliceId`
 dedup named in D81 is the tracked prerequisite for any future multi-pod
 ingest topology; until it ships, multi-pod ingest is out of scope.
 
+**Scribe execution-lane topology.** The sixteen shard lanes, plus the Scribe
+reconciliation and persistence loops, run on a dedicated Tokio runtime that is
+separate from the request runtime, so a saturated API path cannot starve shard
+progress and a shard lane blocked in Arrow memtable insertion or a Postgres
+`COMMIT` cannot stall request serving. Its worker count derives from detected
+parallelism, capped at the shard-lane count — a host cannot usefully run more
+coordination threads than there are lanes to own — and floored at two so a
+single-core deployment still makes progress while one lane blocks.
+
+That runtime has exactly one owner. It is never reachable from `AppState`, the
+composed Bifrost graph, or any other cloneable type: every consumer holds a
+`Handle`. Dropping a Tokio runtime blocks to join its workers, which panics on
+an async frame, and `wyrd-server` runs entirely under `#[tokio::main]` — a
+runtime reachable from per-request-cloned state would therefore be torn down by
+whichever clone happened to die last, on a stack where that teardown is illegal.
+The single owner instead releases the executor without blocking, and is dropped
+only after the bounded Bifrost drain reports that the Scribe role completed:
+because a non-blocking release does not wait, that ordering — not the release
+mechanism — is what guarantees no shard lane is abandoned while it still holds
+WAL segments or post-`COMMIT` memtable state.
+
 Control operations (seal-key freeze, live-tail snapshot, pressure flush, WAL
 pressure flush) that were previously addressed to the one shard computed by
 `shard_for(tenant, table)` are now broadcast to all sixteen shards. Shards that

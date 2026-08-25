@@ -2497,3 +2497,98 @@ fn encode(rows: RecordBatch, schema: Arc<Schema>) -> Vec<u8> {
     writer.finish().expect("IPC stream");
     bytes
 }
+
+/// Proves the sole coordination-runtime owner is released without panicking on
+/// an async frame, and only after the Scribe role has drained.
+///
+/// Reproduces the production teardown shape rather than the convenient harness
+/// one. In production `BoundServer::run(mut self)` consumes the only `AppState`
+/// and returns into `async fn main`, so the final drop of the composed graph
+/// lands on an async frame. `WyrdTestServer::shutdown` cannot reproduce that: it
+/// routes its own last clone through `spawn_blocking`, a legal blocking context.
+/// So this journey uses the in-place seam — cancel, join the serve task, keep
+/// the harness — and then drops the harness inside the test's own async frame,
+/// which is where a blocking `Runtime::drop` would panic.
+///
+/// `scribe_drained` comes from the report `BoundServer::run` produced during the
+/// real production drain, so the assertion is that the Scribe shutdown path
+/// completed before the drop statement below releases the executor. Owner
+/// liveness at that point is not asserted; it is a borrow-scope fact.
+///
+/// # Panics
+///
+/// Panics when boot, table creation, ingest, or the in-place teardown fails, or
+/// when the Scribe role did not report a completed drain.
+#[tokio::test]
+#[ignore = "requires the real Postgres-backed Bifrost journey lane"]
+async fn coordination_runtime_owner_drops_without_panic() {
+    let mut server = wyrd_testing::WyrdTestServer::start_bound()
+        .await
+        .expect("bound Bifrost server with a live Scribe role");
+    let tenant = server.data_tenant_id();
+    server
+        .create_bifrost_table_for_test(CreateTableRequest {
+            table: TableRef::new(BifrostNamespace::Bifrost, TABLE_NAME),
+            user_fields: vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("value", DataType::Utf8, false),
+            ],
+            tenant,
+            physical_layout: None,
+            audit: None,
+        })
+        .await
+        .expect("coordination-runtime journey table");
+    let transport = bootstrap_transport(&server, "coordination-runtime-writer", &["admin"])
+        .await
+        .expect("coordination-runtime journey writer");
+    transport
+        .insert_batch(TABLE_FQN, uuid::Uuid::now_v7().into_bytes(), ipc(&[1, 2, 3]))
+        .await
+        .expect("real ingest through the composed Scribe shard lanes");
+    drop(transport);
+
+    let report = server
+        .cancel_and_join_for_test()
+        .await
+        .expect("production serve task joins after cancellation");
+    assert!(
+        report.scribe_drained,
+        "the composed Scribe role must complete its bounded drain before teardown"
+    );
+
+    // The harness now holds the last `AppState` and the sole coordination-runtime
+    // owner. Dropping it here — on this async frame, not through
+    // `spawn_blocking` — is the production shape; a `Runtime` reachable from the
+    // cloned state graph would abort the test process at this statement.
+    drop(server);
+}
+
+/// Proves a panicking serve task fails `shutdown()` instead of finishing green.
+///
+/// The panic unwinds on a `tokio-runtime-worker` thread that libtest never
+/// attributes to a test, so a discarded join result lets the run pass while the
+/// process printed a panic. This journey forces that exact stack and requires
+/// the teardown seam to surface it.
+///
+/// # Panics
+///
+/// Panics when the bound server cannot start or when `shutdown()` reports
+/// success despite a panicking serve task.
+#[tokio::test]
+#[ignore = "requires the real Postgres-backed Bifrost journey lane"]
+async fn serve_task_panic_fails_shutdown() {
+    let server = wyrd_testing::WyrdTestServer::builder()
+        .with_serve_task_panic_for_test()
+        .start_bound()
+        .await
+        .expect("bound server with an injected serve-task panic");
+    let error = server
+        .shutdown()
+        .await
+        .expect_err("a panicking serve task must fail shutdown");
+    assert!(
+        error.to_string().contains("join failed"),
+        "serve-task panic must surface as a join failure, got: {error}"
+    );
+}

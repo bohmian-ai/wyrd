@@ -2803,6 +2803,66 @@ fn conjoin_physical_predicates(
         .reduce(|left, right| Arc::new(BinaryExpr::new(left, Operator::And, right)))
 }
 
+/// Compiled conjunction of one assignment's signed closed predicates,
+/// evaluated directly over Arrow batches that never pass through a
+/// `DataFusion` plan.
+///
+/// Persisted follower scans get their predicates enforced by the physical
+/// plan itself, but the Scribe live-tail snapshot is assembled inside the
+/// Scribe pod and shipped back as ready Arrow. Compiling the closure once
+/// here lets that path apply the same signed filter to every hot batch
+/// before it is returned, so a selective query sends only matching rows
+/// into follower attempt encoding instead of the whole tail.
+#[derive(Debug)]
+pub(crate) struct ScanPredicateFilter {
+    /// The conjunction, or `None` when the assignment carries no predicates
+    /// and every row is retained unchanged.
+    predicate: Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>,
+}
+
+impl ScanPredicateFilter {
+    /// Compiles the signed predicate list against the batch schema it will
+    /// be evaluated over.
+    ///
+    /// # Errors
+    /// Returns a `DataFusion` error when a predicate names a column absent
+    /// from `schema` or compares it against an incompatible literal.
+    pub(crate) fn compile(
+        schema: &SchemaRef,
+        predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
+    ) -> DataFusionResult<Self> {
+        let compiled = predicates
+            .iter()
+            .map(|predicate| scan_predicate_physical_expr(predicate, schema))
+            .collect::<DataFusionResult<Vec<_>>>()?;
+        Ok(Self {
+            predicate: conjoin_physical_predicates(compiled),
+        })
+    }
+
+    /// Returns only the rows of `batch` satisfying the conjunction.
+    ///
+    /// Rows whose predicate evaluates to `NULL` are dropped, matching SQL
+    /// `WHERE` semantics and the `FilterExec` the leader would otherwise
+    /// have applied above the provider.
+    ///
+    /// # Errors
+    /// Returns a `DataFusion` error when the conjunction cannot be evaluated
+    /// against `batch` or does not produce a boolean mask.
+    pub(crate) fn retain(
+        &self,
+        batch: arrow::record_batch::RecordBatch,
+    ) -> DataFusionResult<arrow::record_batch::RecordBatch> {
+        let Some(predicate) = &self.predicate else {
+            return Ok(batch);
+        };
+        let rows = batch.num_rows();
+        let evaluated = predicate.evaluate(&batch)?.into_array(rows)?;
+        let mask = datafusion::common::cast::as_boolean_array(&evaluated)?;
+        arrow::compute::filter_record_batch(&batch, mask).map_err(Into::into)
+    }
+}
+
 /// One statistic bound value in the closed subset this pruning path
 /// understands. Two bounds are only ever compared after both are derived
 /// from the same predicate literal's type, so the derived ordering is exact.

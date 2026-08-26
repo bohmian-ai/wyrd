@@ -58,7 +58,7 @@ mod admission;
 pub mod attempt;
 pub mod codec;
 pub mod dispatcher;
-mod exec;
+pub(crate) mod exec;
 #[cfg(feature = "test-support")]
 pub use exec::{remote_partition_attempts_for_test, reset_remote_partition_attempts_for_test};
 pub mod follower;
@@ -3397,7 +3397,7 @@ impl Oracle {
         let DistributedScanAssignments {
             mut oracle_assignments,
             source_groups,
-            scribe_assignments,
+            mut scribe_assignments,
         } = assignments;
         let dispatcher = self
             .fragment_dispatcher
@@ -3414,19 +3414,23 @@ impl Oracle {
         // recovered closure keeps its existing safe default rather than being
         // narrowed to an empty (tenant-dropping) projection.
         //
-        // Scribe assignments are deliberately excluded. A Scribe assignment's
-        // projection is not a pruning hint: `scribe_follower_sources` derives
-        // both the top-level closure and the `ScribeProviderCut` copy from the
-        // pinned physical schema, the follower refuses any assignment whose cut
-        // does not reproduce the top-level closure byte-for-byte, and the
-        // hot-tail memory provider streams its WAL rows against that exact
-        // shape. Narrowing it does not prune object reads — there are none —
-        // and starves the tail stream instead.
+        // Scribe assignments share the live scan's identity, so they recover
+        // the same closure from the same placeholder. A Scribe follower's
+        // projection is not a file-pruning hint — there are no object reads —
+        // but the signed predicates are enforced against the assembled tail
+        // before it is returned, so narrowing here is what keeps a selective
+        // query from shipping the whole live tail into attempt encoding.
         let remote_scan_closures = splitter::collect_remote_scan_closures(&split);
         for (scan_id, (required_columns, predicates)) in &remote_scan_closures {
             if let Some(assignment) = oracle_assignments.get_mut(scan_id) {
                 assignment.required_columns.clone_from(required_columns);
                 assignment.predicates.clone_from(predicates);
+            }
+            for assignments in scribe_assignments.values_mut() {
+                if let Some(assignment) = assignments.get_mut(scan_id) {
+                    assignment.required_columns.clone_from(required_columns);
+                    assignment.predicates.clone_from(predicates);
+                }
             }
         }
         for assignment in oracle_assignments.values() {
@@ -4689,12 +4693,6 @@ fn build_scribe_follower_sources(
                         writer_epoch,
                         start_partition,
                         end_partition,
-                        required_columns: table
-                            .physical_schema
-                            .fields()
-                            .iter()
-                            .map(|field| field.name().clone())
-                            .collect(),
                         persisted_cursor: cursor,
                         persisted_ranges,
                         maximum_batch_count: 1_024,
@@ -5101,7 +5099,10 @@ mod tests {
                 .expect("every pinned Scribe assignment carries the mandatory hot cut");
             assert_eq!(provider.writer_epoch, participant.fencing_token);
             assert_eq!(provider.persisted_cursor, 0);
-            assert_eq!(provider.required_columns, vec!["event_id".to_owned()]);
+            assert_eq!(
+                source.assignment.required_columns,
+                vec!["event_id".to_owned()]
+            );
         }
         assert_eq!(scan_ids.len(), tables.len() * scribes.len());
         for table in &tables {
@@ -5166,7 +5167,6 @@ mod tests {
             writer_epoch: 7,
             start_partition: crate::test_support::day_partition(2026, 8, 20).to_wire(),
             end_partition: crate::test_support::day_partition(2026, 8, 20).to_wire(),
-            required_columns: vec!["event_id".to_owned()],
             persisted_cursor: 0,
             persisted_ranges: Vec::new(),
             maximum_batch_count: 1,
@@ -5255,7 +5255,6 @@ mod tests {
             writer_epoch: 7,
             start_partition: crate::test_support::day_partition(2026, 8, 20).to_wire(),
             end_partition: crate::test_support::day_partition(2026, 8, 20).to_wire(),
-            required_columns: vec!["event_id".to_owned()],
             persisted_cursor: 0,
             persisted_ranges: Vec::new(),
             maximum_batch_count: 1,
@@ -5816,7 +5815,6 @@ mod tests {
             writer_epoch: 1,
             start_partition: crate::test_support::day_partition(2026, 8, 19).to_wire(),
             end_partition: crate::test_support::day_partition(2026, 8, 19).to_wire(),
-            required_columns: vec!["wyrd_event_time".to_owned()],
             persisted_cursor: 7,
             persisted_ranges: vec![PersistedWalRange {
                 start_lsn: 9,

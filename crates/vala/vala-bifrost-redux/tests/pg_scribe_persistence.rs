@@ -952,6 +952,7 @@ async fn hot_values_for_cut(
             after_lsn: WalLsn::ZERO,
             persisted_lsn_ranges: persisted_ranges,
             required_columns: vec!["value".to_owned()],
+            predicates: Vec::new(),
             max_batches: 16,
             max_retained_bytes: 16 * 1024 * 1024,
         })

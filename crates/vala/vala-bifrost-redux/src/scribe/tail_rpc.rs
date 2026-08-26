@@ -1860,6 +1860,7 @@ impl ScribeTailReader {
                 after_lsn: WalLsn::ZERO,
                 persisted_lsn_ranges: Vec::new(),
                 required_columns: Vec::new(),
+                predicates: Vec::new(),
                 max_batches: self.config.max_page_rows as usize,
                 max_retained_bytes: pending.payload_limit,
             })
@@ -2336,6 +2337,12 @@ pub struct FetchLiveTailRequest {
     pub persisted_lsn_ranges: Vec<(WalLsn, WalLsn)>,
     /// Columns required by Oracle filters, ordering, tripwire, and projection.
     pub required_columns: Vec<String>,
+    /// Signed closed predicates the assignment authorized for this scan.
+    ///
+    /// Scribe applies this conjunction to the assembled snapshot before
+    /// returning it, so a selective query ships only matching rows back to
+    /// the follower instead of the whole live tail.
+    pub predicates: Vec<wyrd_spec::vala::assignment_authority::ScanPredicate>,
     /// Maximum shallow Arrow batches materialized by the snapshot.
     pub max_batches: usize,
     /// Maximum source-derived Arrow bytes retained by the snapshot.
@@ -2532,34 +2539,84 @@ impl FetchLiveTailService {
                 detail: "live-tail start day is after end day".to_owned(),
             });
         }
-        if let Some(shards) = &self.shards {
-            return shards.snapshot(request).await;
+        let predicates = request.predicates.clone();
+        let assembled = if let Some(shards) = &self.shards {
+            shards.snapshot(request).await?
+        } else {
+            self.memtable
+                .as_ref()
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "direct tail memtable is not configured".to_owned(),
+                })?
+                .readable_batches_for_range(
+                    request.binding.tenant,
+                    &request.binding.table_ref,
+                    request.start_partition,
+                    request.end_partition,
+                    &request.required_columns,
+                    ReadableBatchLimits {
+                        max_batches: request.max_batches,
+                        max_retained_bytes: request.max_retained_bytes,
+                    },
+                )?
+                .into_iter()
+                .map(|readable| HotBatch {
+                    partition_day: readable.partition_day,
+                    wal_lsn: readable.meta.wal_lsn_max,
+                    batch_id: readable.meta.batch_id,
+                    rows: readable.batch,
+                })
+                .collect()
+        };
+        Self::retain_signed_rows(assembled, &predicates)
+    }
+
+    /// Applies the assignment's signed predicate conjunction to an assembled
+    /// snapshot, dropping batches that retain no rows.
+    ///
+    /// This is the live tail's equivalent of the `FilterExec` the leader
+    /// keeps above a persisted provider: the caller receives exactly the
+    /// rows the signed closure authorizes, so nothing further is shipped
+    /// into follower attempt encoding.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError::Internal`] when a signed predicate cannot be
+    /// compiled against, or evaluated over, the snapshot's own schema.
+    fn retain_signed_rows(
+        batches: Vec<HotBatch>,
+        predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
+    ) -> Result<Vec<HotBatch>, ScribeError> {
+        if predicates.is_empty() {
+            return Ok(batches);
         }
-        Ok(self
-            .memtable
-            .as_ref()
-            .ok_or_else(|| ScribeError::Internal {
-                detail: "direct tail memtable is not configured".to_owned(),
-            })?
-            .readable_batches_for_range(
-                request.binding.tenant,
-                &request.binding.table_ref,
-                request.start_partition,
-                request.end_partition,
-                &request.required_columns,
-                ReadableBatchLimits {
-                    max_batches: request.max_batches,
-                    max_retained_bytes: request.max_retained_bytes,
-                },
-            )?
-            .into_iter()
-            .map(|readable| HotBatch {
-                partition_day: readable.partition_day,
-                wal_lsn: readable.meta.wal_lsn_max,
-                batch_id: readable.meta.batch_id,
-                rows: readable.batch,
-            })
-            .collect())
+        let mut retained = Vec::with_capacity(batches.len());
+        for batch in batches {
+            let HotBatch {
+                partition_day,
+                wal_lsn,
+                batch_id,
+                rows,
+            } = batch;
+            let filter =
+                crate::oracle::exec::ScanPredicateFilter::compile(&rows.schema(), predicates)
+                    .map_err(|error| ScribeError::Internal {
+                        detail: format!("live-tail predicate is invalid for this snapshot: {error}"),
+                    })?;
+            let rows = filter
+                .retain(rows)
+                .map_err(|error| ScribeError::Internal {
+                    detail: format!("live-tail predicate evaluation failed: {error}"),
+                })?;
+            if rows.num_rows() > 0 {
+                retained.push(HotBatch {
+                    partition_day,
+                    wal_lsn,
+                    batch_id,
+                    rows,
+                });
+            }
+        }
+        Ok(retained)
     }
 }
 

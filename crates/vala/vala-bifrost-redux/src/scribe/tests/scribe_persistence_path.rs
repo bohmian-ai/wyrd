@@ -149,6 +149,7 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
         after_lsn: WalLsn::ZERO,
         persisted_lsn_ranges: Vec::new(),
         required_columns: vec!["value".to_owned()],
+        predicates: Vec::new(),
         max_batches: 64,
         max_retained_bytes: 64 * 1024 * 1024,
     };
@@ -257,6 +258,7 @@ async fn assert_pointer_identity(
             after_lsn: WalLsn::ZERO,
             persisted_lsn_ranges: Vec::new(),
             required_columns: vec!["value".to_owned()],
+            predicates: Vec::new(),
             max_batches: 64,
             max_retained_bytes: 64 * 1024 * 1024,
         })
@@ -308,6 +310,7 @@ async fn assert_cross_day_materialization(
         after_lsn: WalLsn::ZERO,
         persisted_lsn_ranges: Vec::new(),
         required_columns: vec!["value".to_owned()],
+        predicates: Vec::new(),
         max_batches: 64,
         max_retained_bytes: 64 * 1024 * 1024,
     };
@@ -362,6 +365,7 @@ async fn assert_other_tenant_isolated(
             after_lsn: WalLsn::ZERO,
             persisted_lsn_ranges: Vec::new(),
             required_columns: vec!["value".to_owned()],
+            predicates: Vec::new(),
             max_batches: 64,
             max_retained_bytes: 64 * 1024 * 1024,
         })

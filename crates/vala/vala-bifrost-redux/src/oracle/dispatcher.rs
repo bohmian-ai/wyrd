@@ -3019,7 +3019,6 @@ mod tests {
             writer_epoch,
             start_partition: fixture_partition(TimeGranularityWire::Hour, 1_787_493_600_000_000),
             end_partition: fixture_partition(TimeGranularityWire::Hour, 1_787_497_200_000_000),
-            required_columns: vec!["data_tenant_id".to_owned()],
             persisted_cursor: 41,
             persisted_ranges: vec![PersistedWalRange {
                 start_lsn: 1,

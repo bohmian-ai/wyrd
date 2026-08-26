@@ -644,7 +644,8 @@ where
                 end_partition,
                 after_lsn: checked_wal_lsn(cut.persisted_cursor)?,
                 persisted_lsn_ranges,
-                required_columns: cut.required_columns.clone(),
+                required_columns: assignment.required_columns.clone(),
+                predicates: assignment.predicates.clone(),
                 max_batches,
                 max_retained_bytes,
             })
@@ -1083,24 +1084,12 @@ where
         }
         if let Some(cut) = &assignment.scribe_provider_cut
             && (cut.writer_epoch != target_fence
-                || cut.required_columns.is_empty()
                 || cut.maximum_batch_count == 0
                 || cut.maximum_retained_bytes == 0
                 || !cut.is_valid())
         {
             return Err(PhysicalPlanFollowerError::Preflight(
                 "invalid Scribe provider cut".to_owned(),
-            ));
-        }
-        // The top-level assignment projection is authoritative; a Scribe
-        // cut carries its own `required_columns` for the memory-provider
-        // wire shape, but it must copy the signed top-level closure
-        // byte-for-byte rather than union or narrow it independently.
-        if let Some(cut) = &assignment.scribe_provider_cut
-            && cut.required_columns != assignment.required_columns
-        {
-            return Err(PhysicalPlanFollowerError::Preflight(
-                "Scribe provider cut projection differs from the assignment closure".to_owned(),
             ));
         }
         Ok(())
@@ -1469,7 +1458,6 @@ pub(crate) mod tests {
             writer_epoch: 2,
             start_partition: crate::test_support::day_partition(2026, 8, 19).to_wire(),
             end_partition: crate::test_support::day_partition(2026, 8, 19).to_wire(),
-            required_columns: vec!["wyrd_event_time".to_owned()],
             persisted_cursor: 7,
             persisted_ranges: ranges,
             maximum_batch_count: 8,

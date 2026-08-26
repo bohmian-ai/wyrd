@@ -1001,7 +1001,6 @@ impl TryFrom<proto::ScribeProviderCut> for domain::ScribeProviderCut {
             writer_epoch: value.writer_epoch,
             start_partition: time_partition(value.start_partition, "start_partition")?,
             end_partition: time_partition(value.end_partition, "end_partition")?,
-            required_columns: value.required_columns,
             persisted_cursor: value.persisted_cursor,
             persisted_ranges: value
                 .persisted_ranges
@@ -1036,7 +1035,6 @@ impl From<domain::ScribeProviderCut> for proto::ScribeProviderCut {
             writer_epoch: value.writer_epoch,
             start_partition: Some(time_partition_proto(value.start_partition)),
             end_partition: Some(time_partition_proto(value.end_partition)),
-            required_columns: value.required_columns,
             persisted_cursor: value.persisted_cursor,
             persisted_ranges: value
                 .persisted_ranges
@@ -1505,7 +1503,6 @@ mod tests {
             writer_epoch: 7,
             start_partition: hour_partition(1_787_493_600_000_000),
             end_partition: hour_partition(1_787_497_200_000_000),
-            required_columns: vec!["service_name".to_owned()],
             persisted_cursor: 41,
             persisted_ranges: vec![domain::PersistedWalRange {
                 start_lsn: 1,

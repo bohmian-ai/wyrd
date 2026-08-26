@@ -133,7 +133,9 @@ message PersistedFileAssignment { repeated string files = 1; }
 message PersistedWalRange { optional uint64 start_lsn = 1; optional uint64 end_lsn = 2; }
 message ScribeProviderCut {
   uint64 writer_epoch = 1; TimePartition start_partition = 2; TimePartition end_partition = 3;
-  repeated string required_columns = 4; uint64 persisted_cursor = 5;
+  reserved 4;
+  reserved "required_columns";
+  uint64 persisted_cursor = 5;
   repeated PersistedWalRange persisted_ranges = 6; uint32 maximum_batch_count = 7;
   uint64 maximum_retained_bytes = 8;
 }

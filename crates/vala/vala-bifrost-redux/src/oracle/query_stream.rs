@@ -826,13 +826,16 @@ pub struct QueryIpcDecoder {
 }
 
 /// Closed reason one query IPC fragment could not be consumed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum QueryIpcDecodeError {
     /// The fragment was not valid Arrow IPC, or violated its expected shape.
+    #[error("query IPC fragment is not exactly one well-formed Arrow message")]
     Malformed,
     /// A fragment arrived out of order relative to the stream's state.
+    #[error("query IPC fragment arrived out of order for this stream")]
     OutOfOrder,
     /// A batch's schema did not match the stream's initial schema.
+    #[error("query IPC batch schema does not match the stream schema")]
     SchemaMismatch,
 }
 

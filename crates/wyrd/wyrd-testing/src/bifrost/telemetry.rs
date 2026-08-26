@@ -9,7 +9,7 @@ use std::time::Instant;
 #[cfg(test)]
 use metrics_exporter_prometheus::PrometheusBuilder;
 use metrics_exporter_prometheus::PrometheusHandle;
-use wyrd_telemetry::{CapturedSpan, TestTraceCapture};
+use wyrd_telemetry::{CapturedSpan, CapturedSpanStatus, TestTraceCapture};
 
 use crate::bifrost::BifrostTopology;
 #[cfg(test)]
@@ -1497,6 +1497,72 @@ impl BifrostTelemetryCapture {
         checkpoint: &BifrostTelemetryCheckpoint,
     ) -> Result<BifrostTelemetryDelta, BifrostTelemetryReportError> {
         self.delta_without_sampler(checkpoint.clone())
+    }
+
+    /// Render what the installed production telemetry knows, for a failure report.
+    ///
+    /// A panicking journey has the whole production span tree and metric
+    /// exposition in memory at the moment it asserts, and without this it
+    /// discards all of it — leaving a bare `assert_eq!` on a number as the only
+    /// evidence. This renders the part a reader needs to place the failure:
+    /// every span the tracer marked failed, with its scrubbed attributes and
+    /// trace id; then the span names that did finish, in order; then the
+    /// non-zero production metric series.
+    ///
+    /// This is diagnostic output only. It parses nothing and asserts nothing,
+    /// and it degrades to a partial report rather than failing, because its one
+    /// caller is a panic hook where a second failure would abort the process.
+    #[must_use]
+    pub fn failure_diagnostics(&self) -> String {
+        use std::fmt::Write as _;
+
+        let mut report = String::new();
+        let spans = self.traces.finished_since(0);
+
+        let errored: Vec<&CapturedSpan> = spans
+            .iter()
+            .filter(|span| matches!(span.status, CapturedSpanStatus::Error(_)))
+            .collect();
+        if errored.is_empty() {
+            report.push_str("failed spans: none\n");
+        } else {
+            let _ = writeln!(report, "failed spans ({}):", errored.len());
+            for span in errored {
+                let description = match &span.status {
+                    CapturedSpanStatus::Error(description) => description.as_str(),
+                    CapturedSpanStatus::Ok | CapturedSpanStatus::Unset => "",
+                };
+                let _ = writeln!(
+                    report,
+                    "  {} trace={} {}us: {description}",
+                    span.name,
+                    span.trace_id,
+                    span.duration_nanos / 1_000
+                );
+                for (field, value) in &span.attributes {
+                    let _ = writeln!(report, "      {field} = {value}");
+                }
+            }
+        }
+
+        let _ = writeln!(report, "finished spans ({}):", spans.len());
+        for span in &spans {
+            let _ = writeln!(report, "  {}", span.name);
+        }
+
+        let rendered = self.metrics.render();
+        let types = rendered_types(&rendered).unwrap_or_default();
+        let values = rendered_values(&rendered).unwrap_or_default();
+        let nonzero: Vec<(String, f64)> = values
+            .into_iter()
+            .filter(|(series, value)| *value != 0.0 && supported_series(series, &types))
+            .collect();
+        let _ = writeln!(report, "non-zero production series ({}):", nonzero.len());
+        for (series, value) in nonzero {
+            let _ = writeln!(report, "  {series} = {value}");
+        }
+
+        report
     }
 
     /// Return the names of all finished spans in the shared production capture.

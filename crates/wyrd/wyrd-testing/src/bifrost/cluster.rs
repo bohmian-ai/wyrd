@@ -602,6 +602,7 @@ fn process_telemetry() -> Result<&'static ProcessTelemetry, ClusterError> {
     .map_err(|error| ClusterError::Telemetry(error.to_string()))?;
     let metrics = install_recorder().map_err(|error| ClusterError::Telemetry(error.to_string()))?;
     let forge_capture = BifrostTelemetryCapture::new(metrics.clone(), traces.clone());
+    install_failure_diagnostics_hook(forge_capture.clone());
     let _ = PROCESS_TELEMETRY.set(ProcessTelemetry {
         guard: Arc::new(guard),
         forge_capture,
@@ -609,6 +610,36 @@ fn process_telemetry() -> Result<&'static ProcessTelemetry, ClusterError> {
     PROCESS_TELEMETRY
         .get()
         .ok_or_else(|| ClusterError::Telemetry("process telemetry installation raced".to_owned()))
+}
+
+/// Print the installed telemetry's view of the world whenever a test panics.
+///
+/// The production span tree and metric exposition live in memory for the whole
+/// process, and a panicking journey would otherwise discard them — leaving the
+/// bare assertion message as the only evidence for a distributed failure. This
+/// chains ahead of the existing hook, so the normal panic message and backtrace
+/// still print; libtest captures the whole thing and shows it for the failing
+/// test only.
+///
+/// Rendering runs inside `catch_unwind` because a panic raised by a panic hook
+/// aborts the process, which would replace a readable test failure with a
+/// signal. A diagnostic that cannot be produced is simply omitted.
+///
+/// # Panics
+///
+/// Does not panic. Called once, under the process telemetry installation lock.
+fn install_failure_diagnostics_hook(capture: BifrostTelemetryCapture) {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        previous(info);
+        let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            capture.failure_diagnostics()
+        }));
+        match rendered {
+            Ok(report) => eprintln!("\n--- bifrost telemetry at panic ---\n{report}"),
+            Err(_) => eprintln!("\n--- bifrost telemetry at panic: unavailable ---"),
+        }
+    }));
 }
 
 /// Borrow the one process-installed production telemetry runtime for Forge tests.

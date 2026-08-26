@@ -36,7 +36,11 @@ jobs = 1
 UI_DIR = "crates/wyrd/wyrd-server/wyrd-ui"
 PY_DIR = "python/py-wyrd"
 WYRD_DEV_PG_CACHE = "${HOME}/.cache/wyrd/pg"
-# Canonical vala-bifrost-redux test feature union (T54). wyrd-testing depends on
+# A panicking test should say where it panicked. Every lane below runs under
+# this, so a failure report never costs a second run to reproduce with
+# backtraces enabled.
+RUST_BACKTRACE = "1"
+# Canonical vala-bifrost-redux test feature union. wyrd-testing depends on
 # vala-bifrost-redux with `test-support` + `bench-support` (a default-feature
 # wyrd-testing unit test uses `vala_bifrost_redux::bench_support`), so every
 # wyrd-testing test lane already compiles the crate at that union. The direct
@@ -99,7 +103,7 @@ complete; no narrower selector covers the `test-support` lib surface.
 `--include-ignored` is required: redux marks a journey-flavored test `#[ignore]`
 to keep it out of the family lanes, and this is the lane that must still run it.
 Tier-1 user journeys live in wyrd-testing and run under test:bifrost:journey."""
-run = "scripts/postgres/with-test-postgres.sh -- cargo test --locked -p vala-bifrost-redux --features \"$WYRD_REDUX_TEST_FEATURES\" -- --include-ignored --test-threads=1"
+run = "scripts/postgres/with-test-postgres.sh -- cargo test --locked -p vala-bifrost-redux --features \"$WYRD_REDUX_TEST_FEATURES\" --no-fail-fast -- --include-ignored --test-threads=1"
 
 [tasks."test:bifrost:journey"]
 description = """Run the current Bifrost/Scribe Rust user-journey tests (marked #[ignore]
@@ -110,21 +114,26 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:i
 hide = true
 description = """Run every Bifrost tier-1 capability binary, one after another, against
 the live Postgres this lane's parent already stood up. Each capability has a
-`test:bifrost:journey:<capability>` lane of its own; this task calls their
-`:inner` halves in sequence so every binary is defined in exactly one place and
-runs under one database lifecycle rather than standing up eight."""
-run = """
-mise run test:bifrost:journey:sdk:inner
-mise run test:bifrost:journey:forge:inner
-mise run test:bifrost:journey:scribe:inner
-mise run test:bifrost:journey:oracle:inner
-mise run test:bifrost:journey:otlp:inner
-mise run test:bifrost:journey:server:inner
-mise run test:bifrost:journey:interleavings:inner
-mise run test:bifrost:journey:mcp:inner
-"""
+`test:bifrost:journey:<capability>` lane of its own; the script calls their
+`:inner` halves so every binary is defined in exactly one place and runs under
+one database lifecycle rather than standing up eight.
+
+The script exists because this cannot be a multiline `run`: mise aborts such a
+run at its first failing line, which would hide every capability behind the
+first broken one. The script runs all eight and reports them together."""
+run = "bash scripts/run-bifrost-journeys.sh"
 
 # --- Per-capability tier-1 lanes -------------------------------------------
+#
+# `--test-threads=1` on every lane below is forced, not conservative. The
+# harness installs the production telemetry stack once per process — a global
+# metrics recorder and tracing subscriber, borrowed by every cluster — and the
+# capabilities share one Postgres lifecycle. Raising the thread count produces
+# failures that are artifacts of that sharing rather than real defects. Do not
+# remove it to make a lane faster.
+#
+# `--no-fail-fast` is equally deliberate: cargo otherwise stops after the first
+# failing target, so one broken lib test hides an entire integration binary.
 #
 # Every lane below selects a Cargo *target* and runs it whole. Cargo resolves a
 # target against the manifest and fails loudly when it is missing, while a
@@ -145,7 +154,7 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:i
 [tasks."test:bifrost:journey:sdk:inner"]
 hide = true
 description = "vala-sdk pg_bifrost_e2e binary, whole"
-run = "cargo test --locked -p vala-sdk --test pg_bifrost_e2e -- --include-ignored --test-threads=1"
+run = "cargo test --locked -p vala-sdk --test pg_bifrost_e2e --no-fail-fast -- --include-ignored --test-threads=1"
 
 [tasks."test:bifrost:journey:forge"]
 description = "Tier-1 journeys: compaction, maintenance, publication recovery, lease reclaim"
@@ -153,7 +162,7 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:i
 [tasks."test:bifrost:journey:forge:inner"]
 hide = true
 description = "wyrd-testing `forge` binary, whole"
-run = "cargo test --locked -p wyrd-testing --test forge -- --include-ignored --test-threads=1"
+run = "cargo test --locked -p wyrd-testing --test forge --no-fail-fast -- --include-ignored --test-threads=1"
 
 [tasks."test:bifrost:journey:scribe"]
 description = "Tier-1 journeys: write, ack, seal, WAL replay, admission window, source boundary"
@@ -161,7 +170,7 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:i
 [tasks."test:bifrost:journey:scribe:inner"]
 hide = true
 description = "wyrd-testing `scribe` binary, whole"
-run = "cargo test --locked -p wyrd-testing --test scribe -- --include-ignored --test-threads=1"
+run = "cargo test --locked -p wyrd-testing --test scribe --no-fail-fast -- --include-ignored --test-threads=1"
 
 [tasks."test:bifrost:journey:oracle"]
 description = "Tier-1 journeys: query execution, distributed dispatch, peer security, tail fencing, spill, telemetry"
@@ -169,7 +178,7 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:i
 [tasks."test:bifrost:journey:oracle:inner"]
 hide = true
 description = "wyrd-testing `oracle` binary, whole"
-run = "cargo test --locked -p wyrd-testing --test oracle -- --include-ignored --test-threads=1"
+run = "cargo test --locked -p wyrd-testing --test oracle --no-fail-fast -- --include-ignored --test-threads=1"
 
 [tasks."test:bifrost:journey:otlp"]
 description = "Tier-1 journeys: OTLP logs, metrics, traces, mixed batch, negative protocol surface"
@@ -177,7 +186,7 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:i
 [tasks."test:bifrost:journey:otlp:inner"]
 hide = true
 description = "wyrd-testing `otlp` binary, whole"
-run = "cargo test --locked -p wyrd-testing --test otlp -- --include-ignored --test-threads=1"
+run = "cargo test --locked -p wyrd-testing --test otlp --no-fail-fast -- --include-ignored --test-threads=1"
 
 [tasks."test:bifrost:journey:server"]
 description = "Tier-1 journeys: gRPC mount, server boot, owner lifecycle and inspection"
@@ -185,15 +194,15 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:i
 [tasks."test:bifrost:journey:server:inner"]
 hide = true
 description = "wyrd-testing `server` binary, whole"
-run = "cargo test --locked -p wyrd-testing --test server -- --include-ignored --test-threads=1"
+run = "cargo test --locked -p wyrd-testing --test server --no-fail-fast -- --include-ignored --test-threads=1"
 
 [tasks."test:bifrost:journey:interleavings"]
 description = "Tier-1 journeys: deterministic scheduler permutation checks (no database)"
-run = "cargo test --locked -p wyrd-testing --test interleavings -- --include-ignored --test-threads=1"
+run = "cargo test --locked -p wyrd-testing --test interleavings --no-fail-fast -- --include-ignored --test-threads=1"
 [tasks."test:bifrost:journey:interleavings:inner"]
 hide = true
 description = "wyrd-testing `interleavings` binary, whole; identical to the public lane, which needs no database"
-run = "cargo test --locked -p wyrd-testing --test interleavings -- --include-ignored --test-threads=1"
+run = "cargo test --locked -p wyrd-testing --test interleavings --no-fail-fast -- --include-ignored --test-threads=1"
 
 [tasks."test:bifrost:journey:mcp"]
 description = "Tier-1 journeys: Bifrost MCP surface and its RBAC"
@@ -201,7 +210,7 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:i
 [tasks."test:bifrost:journey:mcp:inner"]
 hide = true
 description = "wyrd-mcp `mcp` binary, whole"
-run = "cargo test --locked -p wyrd-mcp --test mcp -- --include-ignored --test-threads=1"
+run = "cargo test --locked -p wyrd-mcp --test mcp --no-fail-fast -- --include-ignored --test-threads=1"
 
 [tasks."test:bifrost:cluster"]
 description = "Run the deterministic public-Gate Bifrost cluster matrix"
@@ -212,7 +221,7 @@ hide = true
 description = """Run the deterministic public-Gate cluster matrix binary whole.
 Selects the `cluster` target rather than naming its journeys, so a matrix case
 added to that binary runs here without an edit."""
-run = "cargo test --locked -p wyrd-testing --test cluster -- --include-ignored --test-threads=1"
+run = "cargo test --locked -p wyrd-testing --test cluster --no-fail-fast -- --include-ignored --test-threads=1"
 
 [tasks."test:bifrost:bench-cluster"]
 description = "Run the Bifrost bench shared-resource cross-cluster visibility test against Postgres"
@@ -333,7 +342,7 @@ cargo test --locked -p wyrd-auth -- --test-threads=1
 cargo test --locked -p wyrd-server -- --test-threads=1
 cargo test --locked -p wyrd-testing -- --test-threads=1
 cargo test --locked -p wyrd-client --test pg_auth_e2e_against_fixture --test pg_discovery_against_fixture -- --test-threads=1
-cargo test --locked -p vala-sdk --test pg_bifrost_e2e -- --include-ignored --test-threads=1
+cargo test --locked -p vala-sdk --test pg_bifrost_e2e --no-fail-fast -- --include-ignored --test-threads=1
 """
 
 [tasks."identity:e2e"]

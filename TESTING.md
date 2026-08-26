@@ -114,6 +114,29 @@ Bifrost's own lanes pass `--include-ignored`, so an ignored test still runs
 there. Marking a test `#[ignore]` excludes it from the fast lane, not from
 Bifrost.
 
+## When a test fails
+
+Every lane runs with `RUST_BACKTRACE=1` and `--no-fail-fast`, and the journey
+lanes run all eight capabilities before reporting. You should get the complete
+set of failures from one invocation — if you find yourself rerunning a lane to
+discover the next failure, something has regressed in the harness.
+
+On a panic inside a journey, the harness also prints what the installed
+production telemetry saw: every span the tracer marked failed with its scrubbed
+attributes and trace id, the span names that finished, and the non-zero metric
+series. This is why an assertion on a number is diagnosable — the span tree that
+explains it prints alongside it.
+
+Two things the lanes deliberately do **not** do:
+
+- **Run in parallel.** `--test-threads=1` is forced. The telemetry recorder and
+  subscriber are process-global singletons and the capabilities share one
+  Postgres lifecycle; more threads produce failures that are artifacts of that
+  sharing. Run a lane in the background rather than widening it.
+- **Keep the database.** The Postgres fixture is a temp instance torn down at
+  the end of the lane, so there is no post-mortem SQL. Anything you need after
+  the fact has to be asserted or printed during the run.
+
 ## Benchmarks
 
 Benchmarks are separate from tests and are never a correctness gate.

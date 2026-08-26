@@ -971,3 +971,255 @@ pub enum TimePartitionError {
         start_utc: DateTime<Utc>,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        LayoutSortKey, MANAGED_BLOOM_FLOOR, MAX_SORT_KEYS, NullOrder, PhysicalLayout, SortDirection,
+        TimeGranularity,
+    };
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use wyrd_spec::vala::api::{
+        NullOrderWire, PhysicalLayoutWire, SortDirectionWire, SortKeyWire, TimeGranularityWire,
+    };
+    use wyrd_spec::vala::managed_columns::{
+        CARD_UID, DATA_TENANT_ID, PRINCIPAL_ID, RUN_ID, WYRD_EVENT_TIME,
+    };
+    use wyrd_spec::vala::{BifrostError, PhysicalLayoutField, PhysicalLayoutViolation};
+
+    /// Canonical fully-qualified name every case in this module resolves under.
+    const TABLE: &str = "vala.datasets.layout";
+
+    /// Builds the fixture physical schema: the full managed floor, the tenant
+    /// column, and two user columns to declare against.
+    fn fixture_schema() -> Schema {
+        Schema::new(vec![
+            Field::new(
+                WYRD_EVENT_TIME,
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+            Field::new(DATA_TENANT_ID, DataType::Utf8, false),
+            Field::new(RUN_ID, DataType::Utf8, true),
+            Field::new(CARD_UID, DataType::Utf8, true),
+            Field::new(PRINCIPAL_ID, DataType::Utf8, true),
+            Field::new("customer", DataType::Utf8, true),
+            Field::new("region", DataType::Utf8, true),
+        ])
+    }
+
+    /// Builds one ascending nulls-last declared sort key.
+    fn asc(column: &str) -> SortKeyWire {
+        SortKeyWire {
+            column: column.to_owned(),
+            direction: SortDirectionWire::Asc,
+            null_order: NullOrderWire::Last,
+        }
+    }
+
+    /// Builds one hourly declaration over the supplied sort and Bloom intent.
+    fn declaration(sort_keys: Vec<SortKeyWire>, bloom_columns: Vec<String>) -> PhysicalLayoutWire {
+        PhysicalLayoutWire {
+            partition_granularity: TimeGranularityWire::Hour,
+            sort_keys,
+            bloom_columns,
+        }
+    }
+
+    /// Projects a resolved layout's sort order onto its column names.
+    fn sort_columns(layout: &PhysicalLayout) -> Vec<String> {
+        layout
+            .sort_keys()
+            .iter()
+            .map(|key| key.column().to_owned())
+            .collect()
+    }
+
+    /// Asserts one declaration is refused with the exact public triple.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the declaration resolves, or fails with a different field or
+    /// violation than the one named.
+    fn assert_refused(
+        schema: &Schema,
+        declared: &PhysicalLayoutWire,
+        expected_field: PhysicalLayoutField,
+        expected_violation: PhysicalLayoutViolation,
+    ) {
+        let error = PhysicalLayout::resolve(TABLE, schema, Some(declared))
+            .expect_err("declaration must be refused");
+        let BifrostError::InvalidPhysicalLayout {
+            field, violation, ..
+        } = error
+        else {
+            panic!("expected an invalid physical layout, got {error:?}");
+        };
+        assert_eq!(field, expected_field);
+        assert_eq!(violation, expected_violation);
+    }
+
+    /// The one canonical-layout contract of the single resolution entry point.
+    ///
+    /// Covers the shapes the public rules name: an omitted declaration, an
+    /// explicit-empty declaration, `wyrd_event_time` declared explicitly, the
+    /// sort-key cap, an unknown column, a duplicate, floor-union dedupe, and the
+    /// absence of `data_tenant_id` from both canonical lists.
+    #[test]
+    fn canonical_layout_contract() {
+        let schema = fixture_schema();
+
+        // An omitted declaration resolves to hourly, one event-time key, and
+        // the schema-present managed floor — with no tenant column anywhere.
+        let omitted =
+            PhysicalLayout::resolve(TABLE, &schema, None).expect("an omitted declaration resolves");
+        assert_eq!(omitted.granularity(), TimeGranularity::Hour);
+        assert_eq!(sort_columns(&omitted), vec![WYRD_EVENT_TIME.to_owned()]);
+        assert!(omitted.sort_keys()[0].is_descending());
+        assert!(!omitted.sort_keys()[0].nulls_first());
+        assert_eq!(
+            omitted.bloom_columns(),
+            MANAGED_BLOOM_FLOOR
+                .iter()
+                .map(|column| (*column).to_owned())
+                .collect::<Vec<_>>()
+                .as_slice()
+        );
+        assert!(!omitted.bloom_columns().contains(&DATA_TENANT_ID.to_owned()));
+        assert!(!sort_columns(&omitted).contains(&DATA_TENANT_ID.to_owned()));
+
+        // An explicit empty declaration means exactly what omission means,
+        // because the system injects nothing of its own.
+        let explicit_empty = PhysicalLayout::resolve(
+            TABLE,
+            &schema,
+            Some(&declaration(Vec::new(), Vec::new())),
+        )
+        .expect("an explicit empty declaration resolves");
+        assert_eq!(explicit_empty.sort_keys(), omitted.sort_keys());
+        assert_eq!(explicit_empty.bloom_columns(), omitted.bloom_columns());
+
+        // Naming wyrd_event_time is legal and replaces the default rather than
+        // duplicating or erroring.
+        let named = PhysicalLayout::resolve(
+            TABLE,
+            &schema,
+            Some(&declaration(vec![asc(WYRD_EVENT_TIME)], Vec::new())),
+        )
+        .expect("wyrd_event_time is a legal declared sort key");
+        assert_eq!(sort_columns(&named), vec![WYRD_EVENT_TIME.to_owned()]);
+        assert_eq!(
+            named.sort_keys()[0],
+            LayoutSortKey::new(WYRD_EVENT_TIME, SortDirection::Asc, NullOrder::Last),
+            "the declaration replaces the descending default"
+        );
+
+        // Every other managed column is legal too, including data_tenant_id if
+        // a caller insists: nothing is stripped, and nothing is prepended.
+        let managed = PhysicalLayout::resolve(
+            TABLE,
+            &schema,
+            Some(&declaration(
+                vec![asc(RUN_ID), asc("customer")],
+                vec![CARD_UID.to_owned(), "region".to_owned()],
+            )),
+        )
+        .expect("managed columns are legal sort and Bloom columns");
+        assert_eq!(
+            sort_columns(&managed),
+            vec![RUN_ID.to_owned(), "customer".to_owned()]
+        );
+
+        // Floor columns dedupe by union rather than erroring, and the declared
+        // additions keep their request order behind the floor.
+        assert_eq!(
+            managed.bloom_columns(),
+            [RUN_ID, CARD_UID, PRINCIPAL_ID, "region"]
+                .iter()
+                .map(|column| (*column).to_owned())
+                .collect::<Vec<_>>()
+                .as_slice()
+        );
+
+        // The cap admits exactly MAX_SORT_KEYS and refuses the next one before
+        // any per-key validation, so the shape fault wins over a column fault.
+        let four = vec![
+            asc(WYRD_EVENT_TIME),
+            asc(RUN_ID),
+            asc(CARD_UID),
+            asc("customer"),
+        ];
+        assert_eq!(four.len(), MAX_SORT_KEYS);
+        assert!(
+            PhysicalLayout::resolve(TABLE, &schema, Some(&declaration(four.clone(), Vec::new())))
+                .is_ok(),
+            "four declared keys are admitted"
+        );
+        let mut five = four;
+        five.push(asc("absent"));
+        assert_refused(
+            &schema,
+            &declaration(five, Vec::new()),
+            PhysicalLayoutField::SortKey,
+            PhysicalLayoutViolation::TooManyKeys,
+        );
+
+        // Unknown and duplicate columns stay refused on both lists.
+        assert_refused(
+            &schema,
+            &declaration(vec![asc("absent")], Vec::new()),
+            PhysicalLayoutField::SortKey,
+            PhysicalLayoutViolation::UnknownColumn,
+        );
+        assert_refused(
+            &schema,
+            &declaration(vec![asc("customer"), asc("customer")], Vec::new()),
+            PhysicalLayoutField::SortKey,
+            PhysicalLayoutViolation::Duplicate,
+        );
+        assert_refused(
+            &schema,
+            &declaration(Vec::new(), vec!["absent".to_owned()]),
+            PhysicalLayoutField::BloomColumn,
+            PhysicalLayoutViolation::UnknownColumn,
+        );
+        assert_refused(
+            &schema,
+            &declaration(
+                Vec::new(),
+                vec!["customer".to_owned(), "customer".to_owned()],
+            ),
+            PhysicalLayoutField::BloomColumn,
+            PhysicalLayoutViolation::Duplicate,
+        );
+
+        // The canonical form is a fixed point, and the wire it projects carries
+        // the granularity directly.
+        let stored = managed.to_wire();
+        assert_eq!(stored.partition_granularity, TimeGranularityWire::Hour);
+        assert_eq!(
+            PhysicalLayout::from_stored_wire(TABLE, &schema, &stored)
+                .expect("a canonical layout re-resolves to itself")
+                .to_wire(),
+            stored
+        );
+    }
+
+    /// A schema missing a floor column claims no Bloom it cannot write, and the
+    /// floor's stable order survives the filter.
+    #[test]
+    fn managed_bloom_floor_is_filtered_to_schema_present_columns() {
+        let schema = Schema::new(vec![
+            Field::new(
+                WYRD_EVENT_TIME,
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+            Field::new(DATA_TENANT_ID, DataType::Utf8, false),
+            Field::new(PRINCIPAL_ID, DataType::Utf8, true),
+        ]);
+        let resolved = PhysicalLayout::resolve(TABLE, &schema, None)
+            .expect("a narrow schema resolves under the default");
+        assert_eq!(resolved.bloom_columns(), [PRINCIPAL_ID.to_owned()]);
+    }
+}

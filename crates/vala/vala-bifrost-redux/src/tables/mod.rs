@@ -406,10 +406,20 @@ mod tests {
                 crate::catalog::layout::TimeGranularity::Hour,
                 "{fqn} partitions hourly"
             );
+            // Nothing is injected: the canonical order is exactly what the
+            // built-in declared, in its declared order.
             assert_eq!(
-                canonical.sort_keys()[0].column(),
-                WYRD_EVENT_TIME,
-                "{fqn} sorts on the declared event-time key first"
+                canonical
+                    .sort_keys()
+                    .iter()
+                    .map(|key| key.column().to_owned())
+                    .collect::<Vec<_>>(),
+                declared
+                    .sort_keys
+                    .iter()
+                    .map(|key| key.column.clone())
+                    .collect::<Vec<_>>(),
+                "{fqn} canonical sort order must equal its declaration"
             );
             for column in crate::catalog::layout::MANAGED_BLOOM_FLOOR {
                 if schema.field_with_name(column).is_ok() {

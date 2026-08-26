@@ -1104,6 +1104,11 @@ mod tests {
     /// built-in hourly layout, then let `PhysicalLayout::resolve` union the
     /// managed Bloom floor.
     ///
+    /// The fixture schema carries none of the floor columns, so the Bloom
+    /// intent is declared explicitly. `wyrd_event_time` is a legal declared
+    /// Bloom column and, unlike `data_tenant_id`, is not constant within a
+    /// file.
+    ///
     /// # Panics
     /// Panics when the schema cannot carry the built-in declaration.
     fn test_layout(schema: &Schema) -> PhysicalLayout {
@@ -1112,7 +1117,7 @@ mod tests {
             schema,
             Some(&crate::tables::hourly_layout(
                 vec![crate::tables::sort_asc("wyrd_event_time")],
-                &[],
+                &["wyrd_event_time"],
             )),
         )
         .expect("test schema carries the built-in hourly layout")
@@ -1491,8 +1496,8 @@ mod tests {
             .find(|column| column.column_descr().name() == DATA_TENANT_ID)
             .unwrap();
         assert!(
-            tenant_col.bloom_filter_offset().is_some(),
-            "allowlisted tenant column must have a bloom filter"
+            tenant_col.bloom_filter_offset().is_none(),
+            "the tenant column is constant within a file and must not be Bloomed"
         );
 
         let col = rg
@@ -1500,6 +1505,10 @@ mod tests {
             .iter()
             .find(|column| column.column_descr().name() == "wyrd_event_time")
             .unwrap();
+        assert!(
+            col.bloom_filter_offset().is_some(),
+            "a declared Bloom column must have a bloom filter"
+        );
 
         // Page index presence is indicated by offset_index_offset being set
         assert!(

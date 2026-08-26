@@ -3405,9 +3405,11 @@ mod bifrost_wire_tests {
         };
         let json = serde_json::to_value(&layout).expect("serialize");
         let object = json.as_object().expect("layout is a JSON object");
+        let mut keys = object.keys().map(String::as_str).collect::<Vec<_>>();
+        keys.sort_unstable();
         assert_eq!(
-            object.keys().map(String::as_str).collect::<Vec<_>>(),
-            vec!["partition_granularity", "sort_keys", "bloom_columns"]
+            keys,
+            vec!["bloom_columns", "partition_granularity", "sort_keys"]
         );
     }
 

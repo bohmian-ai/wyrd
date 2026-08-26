@@ -633,8 +633,18 @@ impl FollowerSourceResolver for OracleCatalogResolver {
                 .map(|plan| plan as Arc<dyn ExecutionPlan>)
                 .map_err(|_| "authenticated Oracle empty provider failed".to_owned());
         }
+        // Rebuild the leaf from the closure the leader signed. The follower
+        // resolves its own provider, so `assignment.predicates` is the only
+        // description of what this cut may skip; handing it back as logical
+        // filters is what lets the Iceberg source prune files and row groups.
+        // Projection stays `None` on purpose: the caller verifies the resolved
+        // provider's schema fingerprint against the assignment immediately
+        // after this returns, so the leaf must keep the full physical schema
+        // and let the projection above it do the narrowing.
+        let pushdown =
+            super::exec::scan_predicate_logical_exprs(&assignment.predicates, &provider.schema());
         let plan = provider
-            .scan(session, None, &[], None)
+            .scan(session, None, &pushdown, None)
             .await
             .map_err(|_| "authenticated Oracle physical scan failed".to_owned())?;
         let catalog_binding =

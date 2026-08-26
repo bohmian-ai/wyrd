@@ -3407,7 +3407,7 @@ impl Oracle {
         let DistributedScanAssignments {
             mut oracle_assignments,
             source_groups,
-            mut scribe_assignments,
+            scribe_assignments,
         } = assignments;
         let dispatcher = self
             .fragment_dispatcher

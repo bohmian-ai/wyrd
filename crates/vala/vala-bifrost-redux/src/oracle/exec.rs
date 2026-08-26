@@ -2494,7 +2494,6 @@ fn scan_predicate_physical_expr(
     use datafusion::logical_expr::Operator;
     use datafusion::physical_expr::PhysicalExpr;
     use datafusion::physical_expr::expressions::{BinaryExpr, IsNotNullExpr, IsNullExpr, Literal};
-    use datafusion::scalar::ScalarValue;
     use wyrd_spec::vala::assignment_authority::{ScanLiteral, ScanPredicate};
 
     let column_expr = |name: &str| -> DataFusionResult<Arc<dyn PhysicalExpr>> {
@@ -2506,18 +2505,7 @@ fn scan_predicate_physical_expr(
     // against a timezone-carrying column — `wyrd_event_time` among them — an
     // Arrow type error at execution rather than a filter.
     let literal_expr = |column: &str, literal: &ScanLiteral| -> Arc<dyn PhysicalExpr> {
-        let scalar = match literal {
-            ScanLiteral::Bool(inner) => ScalarValue::Boolean(Some(*inner)),
-            ScanLiteral::I64(inner) => ScalarValue::Int64(Some(*inner)),
-            ScanLiteral::U64(inner) => ScalarValue::UInt64(Some(*inner)),
-            ScanLiteral::F64Bits(inner) => ScalarValue::Float64(Some(f64::from_bits(*inner))),
-            ScanLiteral::Utf8(inner) => ScalarValue::Utf8(Some(inner.clone())),
-            ScanLiteral::TimestampMicros(inner) => ScalarValue::TimestampMicrosecond(
-                Some(*inner),
-                timestamp_timezone_of(schema, column),
-            ),
-        };
-        Arc::new(Literal::new(scalar))
+        Arc::new(Literal::new(scan_literal_scalar(schema, column, literal)))
     };
     let comparison = |column: &str, op: Operator, literal: &ScanLiteral| {
         Ok(Arc::new(BinaryExpr::new(
@@ -2536,6 +2524,77 @@ fn scan_predicate_physical_expr(
         ScanPredicate::IsNull(column) => Ok(Arc::new(IsNullExpr::new(column_expr(column)?))),
         ScanPredicate::IsNotNull(column) => Ok(Arc::new(IsNotNullExpr::new(column_expr(column)?))),
     }
+}
+
+/// Materializes one closed [`ScanLiteral`](wyrd_spec::vala::assignment_authority::ScanLiteral)
+/// as the Arrow scalar the compared column expects.
+///
+/// This is the single authority for turning a durable literal into a value,
+/// shared by the physical and logical predicate builders so a leaf rebuilt on
+/// a follower compares exactly what the leader planned. A timestamp bound is
+/// stored as bare microseconds, so the column's own type supplies the
+/// timezone; materializing it naive would make every comparison against a
+/// timezone-carrying column an Arrow type error instead of a filter.
+fn scan_literal_scalar(
+    schema: &SchemaRef,
+    column: &str,
+    literal: &wyrd_spec::vala::assignment_authority::ScanLiteral,
+) -> datafusion::scalar::ScalarValue {
+    use datafusion::scalar::ScalarValue;
+    use wyrd_spec::vala::assignment_authority::ScanLiteral;
+
+    match literal {
+        ScanLiteral::Bool(inner) => ScalarValue::Boolean(Some(*inner)),
+        ScanLiteral::I64(inner) => ScalarValue::Int64(Some(*inner)),
+        ScanLiteral::U64(inner) => ScalarValue::UInt64(Some(*inner)),
+        ScanLiteral::F64Bits(inner) => ScalarValue::Float64(Some(f64::from_bits(*inner))),
+        ScanLiteral::Utf8(inner) => ScalarValue::Utf8(Some(inner.clone())),
+        ScanLiteral::TimestampMicros(inner) => {
+            ScalarValue::TimestampMicrosecond(Some(*inner), timestamp_timezone_of(schema, column))
+        }
+    }
+}
+
+/// Rebuilds the logical filter conjunction a signed assignment closure
+/// authorizes, against the full physical `schema`.
+///
+/// A follower resolves its own leaf rather than receiving one, so the closed
+/// predicates the leader classified and signed are the only description of
+/// what that leaf may skip. Handing them back to a
+/// [`TableProvider`](datafusion::datasource::TableProvider) as logical filters
+/// is what lets the underlying source prune files and row groups; without it a
+/// follower reads its whole assigned cut and leans on the residual filter
+/// above the leaf for correctness alone.
+///
+/// A predicate whose column is absent from `schema` is skipped rather than
+/// failing the scan: pushdown is a pruning aid, and the residual filter stays
+/// authoritative for correctness.
+pub(super) fn scan_predicate_logical_exprs(
+    predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
+    schema: &SchemaRef,
+) -> Vec<Expr> {
+    use datafusion::logical_expr::{col, lit};
+    use wyrd_spec::vala::assignment_authority::ScanPredicate;
+
+    predicates
+        .iter()
+        .filter(|predicate| schema.field_with_name(predicate.column()).is_ok())
+        .map(|predicate| {
+            let scalar = |column: &str, literal| lit(scan_literal_scalar(schema, column, literal));
+            match predicate {
+                ScanPredicate::Eq(column, literal) => col(column).eq(scalar(column, literal)),
+                ScanPredicate::NotEq(column, literal) => {
+                    col(column).not_eq(scalar(column, literal))
+                }
+                ScanPredicate::Lt(column, literal) => col(column).lt(scalar(column, literal)),
+                ScanPredicate::LtEq(column, literal) => col(column).lt_eq(scalar(column, literal)),
+                ScanPredicate::Gt(column, literal) => col(column).gt(scalar(column, literal)),
+                ScanPredicate::GtEq(column, literal) => col(column).gt_eq(scalar(column, literal)),
+                ScanPredicate::IsNull(column) => col(column).is_null(),
+                ScanPredicate::IsNotNull(column) => col(column).is_not_null(),
+            }
+        })
+        .collect()
 }
 
 /// Returns the timezone of one microsecond-timestamp column, or `None` when

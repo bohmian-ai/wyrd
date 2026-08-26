@@ -1632,9 +1632,30 @@ impl WyrdTestServer {
         tenant: DataTenantId,
         table: &str,
     ) -> Result<ForgeTableInspection, WyrdTestServerError> {
-        let binding =
-            TenantTableBinding::resolve((tenant, TableRef::new(BifrostNamespace::Bifrost, table)))
-                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        self.inspect_forge_table_ref_for_test(
+            tenant,
+            &TableRef::new(BifrostNamespace::Bifrost, table),
+        )
+        .await
+    }
+
+    /// Inspect one namespace-qualified table through the same production Forge
+    /// discovery and durable state owners.
+    ///
+    /// Journeys that register through the caller-owned HTTP route land in
+    /// `vala.datasets`, so the namespace cannot be assumed. This is the
+    /// authoritative body; the `&str` form above is the `vala.bifrost` shorthand.
+    ///
+    /// # Errors
+    ///
+    /// Returns binding, catalog, manifest, metadata, or SQL inspection errors.
+    pub async fn inspect_forge_table_ref_for_test(
+        &self,
+        tenant: DataTenantId,
+        table: &TableRef,
+    ) -> Result<ForgeTableInspection, WyrdTestServerError> {
+        let binding = TenantTableBinding::resolve((tenant, table.clone()))
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         let physical = self
             .inner
             .bifrost_catalog
@@ -1658,7 +1679,7 @@ impl WyrdTestServer {
                 bytes: file.file_size_bytes_for_test(),
             })
             .collect();
-        let workflow = self.inspect_forge_workflow_for_test(tenant, table).await?;
+        let workflow = self.inspect_forge_workflow_ref_for_test(tenant, table).await?;
         Ok(ForgeTableInspection {
             snapshot_id,
             live_data_files,
@@ -1682,35 +1703,62 @@ impl WyrdTestServer {
         tenant: DataTenantId,
         table: &str,
     ) -> Result<ForgeWorkflowInspection, WyrdTestServerError> {
+        self.inspect_forge_workflow_ref_for_test(
+            tenant,
+            &TableRef::new(BifrostNamespace::Bifrost, table),
+        )
+        .await
+    }
+
+    /// Inspect durable Forge demand and task state for one namespace-qualified
+    /// table without requiring an Iceberg snapshot.
+    ///
+    /// This is the authoritative body; the `&str` form above is the
+    /// `vala.bifrost` shorthand every built-in journey uses.
+    ///
+    /// # Errors
+    ///
+    /// Returns fixture-pool, SQL, or negative-count invariant errors.
+    pub async fn inspect_forge_workflow_ref_for_test(
+        &self,
+        tenant: DataTenantId,
+        table: &TableRef,
+    ) -> Result<ForgeWorkflowInspection, WyrdTestServerError> {
+        let namespace = table.namespace.as_str();
+        let table = table.name.as_str();
         let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
         let has_demand = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM vala.forge_planning_demands WHERE data_tenant_id=$1 AND catalog_name='wyrd-redux' AND namespace_name='vala.bifrost' AND table_name=$2)",
+            "SELECT EXISTS(SELECT 1 FROM vala.forge_planning_demands WHERE data_tenant_id=$1 AND catalog_name='wyrd-redux' AND namespace_name=$2 AND table_name=$3)",
         )
         .bind(tenant.as_uuid())
+        .bind(namespace)
         .bind(table)
         .fetch_one(&pool)
         .await
         .map_err(sql)?;
         let tasks = sqlx::query_as::<_, (String, String)>(
-            "SELECT strategy,state FROM vala.forge_tasks WHERE data_tenant_id=$1 AND catalog_name='wyrd-redux' AND namespace_name='vala.bifrost' AND table_name=$2 ORDER BY created_at,task_id",
+            "SELECT strategy,state FROM vala.forge_tasks WHERE data_tenant_id=$1 AND catalog_name='wyrd-redux' AND namespace_name=$2 AND table_name=$3 ORDER BY created_at,task_id",
         )
         .bind(tenant.as_uuid())
+        .bind(namespace)
         .bind(table)
         .fetch_all(&pool)
         .await
         .map_err(sql)?;
         let (active_claims, active_attempts) = sqlx::query_as::<_, (i64, i64)>(
-            "SELECT count(*) FILTER (WHERE claimed_by IS NOT NULL AND state IN ('claimed','running','prepared')),count(DISTINCT attempt_id) FILTER (WHERE attempt_id IS NOT NULL AND state IN ('claimed','running','prepared')) FROM vala.forge_tasks WHERE data_tenant_id=$1 AND catalog_name='wyrd-redux' AND namespace_name='vala.bifrost' AND table_name=$2",
+            "SELECT count(*) FILTER (WHERE claimed_by IS NOT NULL AND state IN ('claimed','running','prepared')),count(DISTINCT attempt_id) FILTER (WHERE attempt_id IS NOT NULL AND state IN ('claimed','running','prepared')) FROM vala.forge_tasks WHERE data_tenant_id=$1 AND catalog_name='wyrd-redux' AND namespace_name=$2 AND table_name=$3",
         )
         .bind(tenant.as_uuid())
+        .bind(namespace)
         .bind(table)
         .fetch_one(&pool)
         .await
         .map_err(sql)?;
         let uncompacted_staging_files = sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM vala.file_list WHERE data_tenant_id=$1 AND namespace='vala.bifrost' AND table_name=$2 AND NOT compacted",
+            "SELECT count(*) FROM vala.file_list WHERE data_tenant_id=$1 AND namespace=$2 AND table_name=$3 AND NOT compacted",
         )
         .bind(tenant.as_uuid())
+        .bind(namespace)
         .bind(table)
         .fetch_one(&pool)
         .await

@@ -42,7 +42,7 @@ use prost::Message;
 use thiserror::Error;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
-    ClusterRole, FollowerScanAssignment, OracleRoleFence, PhysicalExecuteFragmentRequest,
+    ClusterRole, FollowerScanAssignment, OracleRoleFence, ExecuteFragmentRequest,
     ReservationId, TenantTableBinding,
 };
 use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
@@ -1229,7 +1229,7 @@ where
     /// or post-resolution native `DataFusion` decode failure.
     pub async fn decode(
         &self,
-        request: &PhysicalExecuteFragmentRequest,
+        request: &ExecuteFragmentRequest,
         authenticated: AuthenticatedFollowerContext<'_>,
         session: &SessionState,
         context: &TaskContext,
@@ -1284,7 +1284,7 @@ where
     /// provider consumption, or physical execution fails.
     pub async fn execute(
         &self,
-        request: &PhysicalExecuteFragmentRequest,
+        request: &ExecuteFragmentRequest,
         authenticated: AuthenticatedFollowerContext<'_>,
         sessions: &FollowerSessionFactory,
     ) -> Result<FollowerExecution, PhysicalPlanFollowerError> {
@@ -1434,7 +1434,7 @@ where
 
     fn preflight(
         &self,
-        request: &PhysicalExecuteFragmentRequest,
+        request: &ExecuteFragmentRequest,
         authenticated: &AuthenticatedFollowerContext<'_>,
     ) -> Result<PreflightRequest, PhysicalPlanFollowerError> {
         self.effects.preflight.fetch_add(1, Ordering::SeqCst);
@@ -1604,7 +1604,7 @@ where
 /// # Errors
 /// Returns [`PhysicalPlanFollowerError::Preflight`] for any malformed or contradictory binding.
 pub fn authenticated_preflight(
-    request: &PhysicalExecuteFragmentRequest,
+    request: &ExecuteFragmentRequest,
     authenticated: &AuthenticatedFollowerContext<'_>,
 ) -> Result<(), PhysicalPlanFollowerError> {
     /// Resolver that proves the public preflight entry point performs no IO.
@@ -1876,7 +1876,7 @@ pub(crate) mod tests {
     /// # Errors
     /// Returns a plan error if the extension leaf cannot be serialized.
     fn oracle_request()
-    -> datafusion::common::Result<(PhysicalExecuteFragmentRequest, TenantTableBinding)> {
+    -> datafusion::common::Result<(ExecuteFragmentRequest, TenantTableBinding)> {
         let tenant_id = DataTenantId::new_v7();
         let binding = TenantTableBinding {
             tenant_id,
@@ -1909,7 +1909,7 @@ pub(crate) mod tests {
             fencing_token: 12,
         };
         Ok((
-            PhysicalExecuteFragmentRequest {
+            ExecuteFragmentRequest {
                 ticket: SignedPeerTicket {
                     key_id: "test".to_owned(),
                     claims_bytes: vec![1],
@@ -1938,7 +1938,7 @@ pub(crate) mod tests {
 
     /// Builds the authenticated context tied exactly to a request.
     fn authenticated<'a>(
-        request: &'a PhysicalExecuteFragmentRequest,
+        request: &'a ExecuteFragmentRequest,
         binding: &'a TenantTableBinding,
     ) -> AuthenticatedFollowerContext<'a> {
         AuthenticatedFollowerContext {
@@ -2273,9 +2273,9 @@ pub(crate) mod tests {
     ///
     /// Panics if the fixture request has no assignments to mutate.
     fn malformed_follower_requests(
-        request: &PhysicalExecuteFragmentRequest,
+        request: &ExecuteFragmentRequest,
         first: &PhysicalPlanNode,
-    ) -> Vec<PhysicalExecuteFragmentRequest> {
+    ) -> Vec<ExecuteFragmentRequest> {
         let mut malformed = Vec::new();
         let mut case = request.clone();
         case.physical_plan_bytes = PhysicalPlanNode {

@@ -1052,7 +1052,7 @@ impl From<domain::ScribeProviderCut> for proto::ScribeProviderCut {
     }
 }
 
-impl TryFrom<proto::ExecuteFragmentRequest> for domain::PhysicalExecuteFragmentRequest {
+impl TryFrom<proto::ExecuteFragmentRequest> for domain::ExecuteFragmentRequest {
     type Error = PrivateConversionError;
 
     /// Decodes one authenticated worker-fragment execution request.
@@ -1095,9 +1095,9 @@ impl TryFrom<proto::ExecuteFragmentRequest> for domain::PhysicalExecuteFragmentR
     }
 }
 
-impl From<domain::PhysicalExecuteFragmentRequest> for proto::ExecuteFragmentRequest {
+impl From<domain::ExecuteFragmentRequest> for proto::ExecuteFragmentRequest {
     /// Encodes an authenticated worker-fragment execution request.
-    fn from(value: domain::PhysicalExecuteFragmentRequest) -> Self {
+    fn from(value: domain::ExecuteFragmentRequest) -> Self {
         Self {
             ticket: Some(value.ticket.into()),
             physical_plan_bytes: value.physical_plan_bytes,
@@ -1713,7 +1713,7 @@ mod tests {
             .expect("reservation release round-trips"),
             release
         );
-        let execute = domain::PhysicalExecuteFragmentRequest {
+        let execute = domain::ExecuteFragmentRequest {
             ticket: domain::SignedPeerTicket {
                 key_id: "key-1".into(),
                 claims_bytes: vec![1, 2],
@@ -1735,7 +1735,7 @@ mod tests {
             plan_fingerprint: "sha256:physical-plan".to_owned(),
         };
         assert_eq!(
-            domain::PhysicalExecuteFragmentRequest::try_from(proto::ExecuteFragmentRequest::from(
+            domain::ExecuteFragmentRequest::try_from(proto::ExecuteFragmentRequest::from(
                 execute.clone(),
             ))
             .expect("execute request round-trips"),

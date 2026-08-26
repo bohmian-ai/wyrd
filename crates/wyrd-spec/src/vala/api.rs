@@ -2560,22 +2560,17 @@ pub struct FollowerScanAssignment {
     pub predicates: Vec<crate::vala::assignment_authority::ScanPredicate>,
 }
 
-/// Ticket-bound worker fragment execution request.
+/// Ticket-bound worker request carrying one serialized physical subtree.
+///
+/// This is the sole domain projection of the private
+/// `wyrd.v1.ExecuteFragmentRequest` peer message. The leader mints it per
+/// follower after splitting the admitted plan; the follower verifies the
+/// ticket, both fences, and the assignment-authority digest before it
+/// deserializes `physical_plan_bytes` and substitutes each remote placeholder
+/// with its role-local source.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct ExecuteFragmentRequest {
-    /// Opaque signed ticket.
-    pub ticket: SignedPeerTicket,
-    /// Runtime-bounded fragment bytes.
-    pub fragment_bytes: Vec<u8>,
-    /// Pending reservation identity.
-    pub reservation_id: ReservationId,
-}
-
-/// Independent physical-plan request foundation for a later atomic wire cutover.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct PhysicalExecuteFragmentRequest {
     /// Opaque signed ticket.
     pub ticket: SignedPeerTicket,
     /// Runtime-bounded physical-plan bytes.

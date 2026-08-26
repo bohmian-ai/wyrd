@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
     BifrostSecurityViolationKind, FencingToken, NodeId, OracleRoleFence, PendingNodeReservation,
-    PhysicalExecuteFragmentRequest, QueryAuditDigest, QueryClass, QueryId, ReleaseNodeSlotsRequest,
+    ExecuteFragmentRequest, QueryAuditDigest, QueryClass, QueryId, ReleaseNodeSlotsRequest,
     ReservationId, ReservationRejected, ReserveNodeSlotsRequest, ReserveNodeSlotsResponse,
     WorkerAttemptFrame, WorkerFooter, WorkerScanStats,
 };
@@ -746,7 +746,7 @@ impl OraclePeerWorker {
     /// Returns terminal security/contract failures or retryable capacity/storage failures.
     pub async fn execute(
         &self,
-        request: PhysicalExecuteFragmentRequest,
+        request: ExecuteFragmentRequest,
     ) -> Result<WorkerExecution, DispatchError> {
         self.execute_with_capacity(request, WorkerCapacity::ReserveRunning, None)
             .await
@@ -762,7 +762,7 @@ impl OraclePeerWorker {
     /// Returns terminal security/contract failures or retryable storage failures.
     async fn execute_local(
         &self,
-        request: PhysicalExecuteFragmentRequest,
+        request: ExecuteFragmentRequest,
         admitted_grant: LeaderAdmittedGrant,
     ) -> Result<WorkerExecution, DispatchError> {
         self.execute_with_capacity(
@@ -797,7 +797,7 @@ impl OraclePeerWorker {
     /// refusal, so the worker fails closed rather than serving unattributably.
     async fn admit_verified_fragment(
         &self,
-        request: &PhysicalExecuteFragmentRequest,
+        request: &ExecuteFragmentRequest,
         claims: &PeerTicketClaims,
         tenant_id: DataTenantId,
         running: &RunningReservation,
@@ -867,7 +867,7 @@ impl OraclePeerWorker {
 
     async fn execute_with_capacity(
         &self,
-        request: PhysicalExecuteFragmentRequest,
+        request: ExecuteFragmentRequest,
         capacity: WorkerCapacity,
         admitted_grant: Option<LeaderAdmittedGrant>,
     ) -> Result<WorkerExecution, DispatchError> {
@@ -983,7 +983,7 @@ impl OraclePeerWorker {
     /// failures propagate unchanged.
     async fn claim_running_reservation(
         &self,
-        request: &PhysicalExecuteFragmentRequest,
+        request: &ExecuteFragmentRequest,
         capacity: WorkerCapacity,
         claims: &PeerTicketClaims,
         tenant_id: DataTenantId,
@@ -1035,7 +1035,7 @@ impl OraclePeerWorker {
     /// fail validation. Audit-append failures propagate unchanged.
     async fn verify_fragment_authority(
         &self,
-        request: &PhysicalExecuteFragmentRequest,
+        request: &ExecuteFragmentRequest,
     ) -> Result<(PeerTicketClaims, DataTenantId), DispatchError> {
         if request.target_fence.role != wyrd_spec::vala::api::ClusterRole::Oracle {
             tracing::error!(role = ?request.target_fence.role, "Oracle peer received a non-Oracle target role");
@@ -1568,7 +1568,7 @@ fn uuid_from(bytes: &[u8]) -> Result<uuid::Uuid, DispatchError> {
 /// Returns terminal rejection for any tenant binding, plan digest, or fence mismatch.
 fn validate_physical_claims(
     claims: &PeerTicketClaims,
-    request: &PhysicalExecuteFragmentRequest,
+    request: &ExecuteFragmentRequest,
 ) -> Result<(), BifrostSecurityViolationKind> {
     if request.leader_fence.node_id.as_uuid().as_bytes() != claims.leader_node_id.as_slice()
         || request.leader_fence.fencing_token != claims.leader_fence
@@ -1624,7 +1624,7 @@ pub trait OraclePeerTransport: Send + Sync {
     async fn execute(
         &self,
         worker: NodeId,
-        request: PhysicalExecuteFragmentRequest,
+        request: ExecuteFragmentRequest,
         admitted_grant: Option<LeaderAdmittedGrant>,
     ) -> Result<WorkerAttemptStream, DispatchError>;
 }
@@ -1687,7 +1687,7 @@ impl OraclePeerTransport for LocalOraclePeerTransport {
     async fn execute(
         &self,
         _worker: NodeId,
-        request: PhysicalExecuteFragmentRequest,
+        request: ExecuteFragmentRequest,
         admitted_grant: Option<LeaderAdmittedGrant>,
     ) -> Result<WorkerAttemptStream, DispatchError> {
         let admitted_grant = admitted_grant.ok_or(DispatchError::Capacity)?;
@@ -2105,7 +2105,7 @@ impl TonicOraclePeerTransport {
     async fn execute_candidate(
         &self,
         candidate: &DispatchCandidate,
-        request: PhysicalExecuteFragmentRequest,
+        request: ExecuteFragmentRequest,
     ) -> Result<WorkerAttemptStream, DispatchError> {
         let mut client = self.client(candidate).await?;
         let wire: wyrd_tonic::wyrd::v1::ExecuteFragmentRequest = request.into();
@@ -2190,7 +2190,7 @@ impl OraclePeerTransport for TonicOraclePeerTransport {
     async fn execute(
         &self,
         worker: NodeId,
-        request: PhysicalExecuteFragmentRequest,
+        request: ExecuteFragmentRequest,
         _admitted_grant: Option<LeaderAdmittedGrant>,
     ) -> Result<WorkerAttemptStream, DispatchError> {
         let candidate = self.current_candidate(worker)?;
@@ -2315,7 +2315,7 @@ impl OraclePeerTransportDirectory {
     async fn execute(
         &self,
         candidate: &DispatchCandidate,
-        request: PhysicalExecuteFragmentRequest,
+        request: ExecuteFragmentRequest,
         admitted_grant: LeaderAdmittedGrant,
     ) -> Result<WorkerAttemptStream, DispatchError> {
         if self.is_local(candidate.node_id)
@@ -2606,7 +2606,7 @@ impl FragmentDispatcher {
                     reason: DispatchPartialReason::Setup,
                 });
             };
-            let request = PhysicalExecuteFragmentRequest {
+            let request = ExecuteFragmentRequest {
                 ticket,
                 physical_plan_bytes: fragment.physical_plan_bytes.clone(),
                 reservation_id: pending.reservation_id,
@@ -2704,7 +2704,7 @@ impl FragmentDispatcher {
     async fn open_attempt_frames(
         &self,
         candidate: &DispatchCandidate,
-        request: PhysicalExecuteFragmentRequest,
+        request: ExecuteFragmentRequest,
         context: &DispatchContext,
     ) -> Result<WorkerAttemptStream, DispatchError> {
         let remaining = context
@@ -2762,7 +2762,7 @@ impl FragmentDispatcher {
     async fn execute_attempt(
         &self,
         candidate: &DispatchCandidate,
-        request: PhysicalExecuteFragmentRequest,
+        request: ExecuteFragmentRequest,
         context: &DispatchContext,
         fragment: &PhysicalDispatchFragment,
     ) -> Result<ValidatedAttempt, DispatchError> {
@@ -3054,7 +3054,7 @@ mod tests {
         fence: FencingToken,
         query_id: QueryId,
         tenant: DataTenantId,
-    ) -> PhysicalExecuteFragmentRequest {
+    ) -> ExecuteFragmentRequest {
         worker_request_with_cut(
             fragment,
             reservation_id,
@@ -3087,7 +3087,7 @@ mod tests {
         query_id: QueryId,
         tenant: DataTenantId,
         scribe_provider_cut: Option<ScribeProviderCut>,
-    ) -> PhysicalExecuteFragmentRequest {
+    ) -> ExecuteFragmentRequest {
         let target_role = if scribe_provider_cut.is_some() {
             ClusterRole::Scribe
         } else {
@@ -3158,7 +3158,7 @@ mod tests {
         }
         .mint_peer_ticket(&claims)
         .expect("deterministic ticket");
-        PhysicalExecuteFragmentRequest {
+        ExecuteFragmentRequest {
             ticket,
             physical_plan_bytes,
             reservation_id,
@@ -3441,7 +3441,7 @@ mod tests {
         async fn execute(
             &self,
             _worker: NodeId,
-            _request: PhysicalExecuteFragmentRequest,
+            _request: ExecuteFragmentRequest,
             _admitted_grant: Option<LeaderAdmittedGrant>,
         ) -> Result<WorkerAttemptStream, DispatchError> {
             Ok(Box::pin(futures_util::stream::pending()))
@@ -3488,7 +3488,7 @@ mod tests {
         async fn execute(
             &self,
             _worker: NodeId,
-            _request: PhysicalExecuteFragmentRequest,
+            _request: ExecuteFragmentRequest,
             _admitted_grant: Option<LeaderAdmittedGrant>,
         ) -> Result<WorkerAttemptStream, DispatchError> {
             self.execute_calls.fetch_add(1, Ordering::SeqCst);
@@ -3538,7 +3538,7 @@ mod tests {
         async fn execute(
             &self,
             _worker: NodeId,
-            _request: PhysicalExecuteFragmentRequest,
+            _request: ExecuteFragmentRequest,
             _admitted_grant: Option<LeaderAdmittedGrant>,
         ) -> Result<WorkerAttemptStream, DispatchError> {
             Err(DispatchError::Terminal)
@@ -3933,7 +3933,7 @@ mod tests {
     ///
     /// Named so the tamper table stays readable; the boxed closure is what
     /// lets each case mutate a different field of the same fixture request.
-    type TamperCase = Box<dyn Fn(&mut PhysicalExecuteFragmentRequest)>;
+    type TamperCase = Box<dyn Fn(&mut ExecuteFragmentRequest)>;
 
     /// Counts resolver invocations so a test can prove a rejected request
     /// never reaches provider resolution or object I/O.
@@ -3974,7 +3974,7 @@ mod tests {
     ) -> (
         OraclePeerWorker,
         Arc<CountingFollowerResolver>,
-        PhysicalExecuteFragmentRequest,
+        ExecuteFragmentRequest,
     ) {
         let node = NodeId::new(uuid::Uuid::now_v7());
         let query_id = QueryId::new(uuid::Uuid::now_v7());

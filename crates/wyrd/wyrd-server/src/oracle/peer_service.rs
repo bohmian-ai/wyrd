@@ -4,16 +4,16 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use futures_util::{Stream, StreamExt};
-use vala_bifrost_redux::oracle::dispatcher::PEER_PROTOCOL_VERSION;
-use vala_bifrost_redux::oracle::dispatcher::{DispatchError, WorkerExecution};
-use vala_bifrost_redux::oracle::dispatcher::AttemptEncoder;
+use vala_bifrost_redux::oracle::dispatcher::{
+    AttemptEncoder, DispatchError, PEER_PROTOCOL_VERSION, WorkerExecution,
+};
 use vala_bifrost_redux::oracle::follower::{
     AuthenticatedFollowerContext, PhysicalPlanFollowerError, authenticated_preflight,
 };
 use vala_bifrost_redux::oracle::peer::{PeerSecurityAudit, PeerTicketClaims, PeerTicketVerifier};
 use wyrd_runtime::{Permission, Principal, PrincipalKind};
 use wyrd_spec::vala::api::BifrostSecurityViolationKind;
-use wyrd_spec::vala::api::{ClusterRole, PhysicalExecuteFragmentRequest};
+use wyrd_spec::vala::api::{ClusterRole, ExecuteFragmentRequest};
 use wyrd_tonic::private_conversion::PrivateConversionError;
 use wyrd_tonic::prost::Message;
 use wyrd_tonic::tonic::{Request, Response, Status};
@@ -21,8 +21,7 @@ use wyrd_tonic::wyrd::v1::oracle_peer_service_server::{
     OraclePeerService, OraclePeerServiceServer,
 };
 use wyrd_tonic::wyrd::v1::{
-    self as proto, ExecuteFragmentRequest, ForwardQueryRequest, ReleaseNodeSlotsRequest,
-    ReserveNodeSlotsRequest,
+    self as proto, ForwardQueryRequest, ReleaseNodeSlotsRequest, ReserveNodeSlotsRequest,
 };
 
 use crate::state::Bifrost;
@@ -105,7 +104,7 @@ impl OraclePeerGrpc {
     /// Executes one Scribe-targeted physical fragment under Scribe's own fence and resources.
     async fn execute_scribe_fragment(
         &self,
-        request: PhysicalExecuteFragmentRequest,
+        request: ExecuteFragmentRequest,
     ) -> Result<WorkerExecution, DispatchError> {
         let scribe = self.bifrost.scribe().ok_or_else(|| {
             tracing::error!("Scribe fragment reached a process without the Scribe owner");
@@ -355,12 +354,11 @@ impl OraclePeerService for OraclePeerGrpc {
     /// Returns an authentication, conversion, security, or execution status.
     async fn execute_fragment(
         &self,
-        request: Request<ExecuteFragmentRequest>,
+        request: Request<proto::ExecuteFragmentRequest>,
     ) -> Result<Response<Self::ExecuteFragmentStream>, Status> {
         self.authenticate(request.metadata()).await?;
         let request =
-            wyrd_spec::vala::api::PhysicalExecuteFragmentRequest::try_from(request.into_inner())
-                .map_err(conversion_status)?;
+            ExecuteFragmentRequest::try_from(request.into_inner()).map_err(conversion_status)?;
         let WorkerExecution { mut stream } = match request.target_fence.role {
             ClusterRole::Oracle => match self.bifrost.oracle_peer_service() {
                 Some(peer) => peer.worker().execute(request).await,

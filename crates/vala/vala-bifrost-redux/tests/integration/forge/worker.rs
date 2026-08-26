@@ -148,7 +148,7 @@ mod pg_tests {
     /// # Panics
     ///
     /// Panics when SQL admission, worker validation, or before-effect evidence
-    /// differs from the closed T13 task contract.
+    /// differs from the closed task contract.
     #[tokio::test]
     async fn worker_rejects_reserved_and_malformed_tasks_before_effect() {
         let fixture =

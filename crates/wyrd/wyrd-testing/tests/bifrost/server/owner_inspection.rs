@@ -19,7 +19,7 @@ use wyrd_testing::bifrost::BifrostHarness;
 /// Finds a table name whose shard-routing probe (using `Uuid::nil` as the stable
 /// batch-id sentinel) lands on `target_shard`.
 ///
-/// After T35 (batch-spread routing), the actual runtime shard depends on both
+/// Under batch-spread routing, the actual runtime shard depends on both
 /// the table and the per-request `batch_id`; this helper uses a nil UUID as a
 /// deterministic probe so the fixture can construct a predictable topology for
 /// inspection purposes.  Real appends use per-request UUIDs and will spread
@@ -99,7 +99,7 @@ async fn scribe_owner_fixed_topology_and_memory_reconciliation() {
     harness.shutdown().await.expect("harness shutdown");
 }
 
-/// Exercises the T35 batch-spread routing contract end to end through the
+/// Exercises the batch-spread routing contract end to end through the
 /// Scribe append path and pod-local shard inspection.
 ///
 /// The shard key is `(tenant, table, batch_id)`, so this journey proves two

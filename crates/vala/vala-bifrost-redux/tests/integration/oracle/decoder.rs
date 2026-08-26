@@ -11,7 +11,6 @@ use wyrd_spec::vala::api::{
     BifrostQueryRequest, FreshnessPolicy, QueryStreamFrame, QueryTerminalOutcome, VisibilityMode,
 };
 
-use super::semantics::oracle_fused_live_only_real_scribe_and_degraded_policy;
 use super::support::*;
 use futures_util::StreamExt;
 
@@ -167,13 +166,4 @@ async fn stateful_query_decoder_contract() {
         .await;
 
     shutdown_oracle(&oracle).await;
-}
-
-/// Exercises partial delivery and retained output through the real query stream.
-#[test]
-fn decoder_partial_retains_prior_batches() {
-    oracle_fused_live_only_real_scribe_and_degraded_policy();
-    for case in ["P24", "P25", "P26"] {
-        println!("BIFROST_PARITY_CASE={case}:PASS");
-    }
 }

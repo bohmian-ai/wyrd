@@ -23,7 +23,7 @@ use futures_util::StreamExt;
 
 /// Partial concurrent fence acquisition releases every successful sibling.
 #[tokio::test]
-pub(crate) async fn pg_bifrost_oracle_recovery_terminal_journey_partial_fence_cleanup() {
+async fn pg_bifrost_oracle_recovery_terminal_journey_partial_fence_cleanup() {
     let fixture = OracleFixture::new("oracle_partial_fence").await;
     let tails = Arc::new(TailTransportDirectory::default());
     let releases = Arc::new(AtomicUsize::new(0));
@@ -74,7 +74,7 @@ pub(crate) async fn pg_bifrost_oracle_recovery_terminal_journey_partial_fence_cl
 
 /// A synchronized post-acquisition deadline releases the complete cut before return.
 #[tokio::test]
-pub(crate) async fn fused_post_acquisition_timeout_releases_before_return() {
+async fn fused_post_acquisition_timeout_releases_before_return() {
     let fixture = OracleFixture::new("oracle_audit_fence_timeout").await;
     let tails = Arc::new(TailTransportDirectory::default());
     let release_polls = Arc::new(AtomicUsize::new(0));

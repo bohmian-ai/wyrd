@@ -19,7 +19,7 @@ use wyrd_spec::vala::api::{
 
 use super::support::*;
 
-/// Creates one valid locked T1 read decision for SQL-audit integration.
+/// Creates one valid locked read decision for SQL-audit integration.
 fn locked_decision() -> BifrostQueryReadDecision {
     let digest = |value: &str| QueryAuditDigest::new(value).expect("valid audit digest");
     BifrostQueryReadDecision::try_new(AuditDetail::BifrostQueryReadDecision {
@@ -38,10 +38,10 @@ fn locked_decision() -> BifrostQueryReadDecision {
         retry_ordinal: 0,
         deadline_ms: 1_000,
     })
-    .expect("locked T1 decision")
+    .expect("locked decision")
 }
 
-/// Real tenant SQL audit appends the exact locked T1 detail and commits it.
+/// Real tenant SQL audit appends the exact locked detail and commits it.
 #[tokio::test]
 async fn oracle_postgres_audit_commits_locked_read_decision() {
     let fixture = OracleFixture::new("oracle_audit").await;
@@ -192,7 +192,7 @@ async fn fused_audit_failure_releases_every_fence_before_return() {
 
 /// Typed Fused acquisition failure records no success decision or provider read.
 #[tokio::test]
-pub(crate) async fn typed_fused_acquisition_failure_precedes_audit_and_read() {
+async fn typed_fused_acquisition_failure_precedes_audit_and_read() {
     let fixture = OracleFixture::new("oracle_typed_acquire_failure").await;
     let tails = Arc::new(TailTransportDirectory::default());
     let releases = Arc::new(AtomicUsize::new(0));

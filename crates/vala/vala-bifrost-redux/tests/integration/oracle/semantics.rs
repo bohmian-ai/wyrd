@@ -304,7 +304,7 @@ async fn assert_sql_matrix_classes(fixture: &OracleFixture) {
 
 /// Fused discovers and drains a real Scribe stream before the first seal.
 #[tokio::test]
-pub(crate) async fn oracle_fused_live_only_real_scribe_and_degraded_policy() {
+async fn oracle_fused_live_only_real_scribe_and_degraded_policy() {
     let fixture = OracleFixture::new("oracle_live").await;
     let tails = live_only_tail_directory(&fixture);
     let oracle = fixture

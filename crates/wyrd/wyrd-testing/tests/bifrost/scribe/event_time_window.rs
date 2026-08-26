@@ -1,4 +1,4 @@
-//! Negative public-ingest journey for the D85/T42 event-time acceptance window.
+//! Negative public-ingest journey for the event-time acceptance window.
 //!
 //! Proves that a caller-supplied `wyrd_event_time` outside the server
 //! acceptance window is REJECTED end-to-end through the public native Arrow IPC
@@ -71,7 +71,7 @@ mod pg_tests {
     ///
     /// The schema fingerprint excludes `wyrd_*` columns, so a batch presenting
     /// an explicit `wyrd_event_time` still resolves against a `[id, value]`
-    /// table. The column uses the T38-validated physical type
+    /// table. The column uses the validated physical type
     /// `Timestamp(Microsecond, Some("UTC"))` so it passes native type
     /// validation and reaches the acceptance-window check at the decode/stamp
     /// seam.

@@ -366,7 +366,7 @@ mod pg_tests {
 
         assert!(
             order_keys.windows(2).all(|pair| pair[0] <= pair[1]),
-            "groups preserve the discovery and T2 input order"
+            "groups preserve the discovery and rewrite-stage input order"
         );
         assert_eq!(
             schema_ids
@@ -386,7 +386,7 @@ mod pg_tests {
                 files
                     .windows(2)
                     .all(|pair| pair[0].sort_key_for_test() <= pair[1].sort_key_for_test()),
-                "T2 receives each group in candidate order"
+                "the rewrite stage receives each group in candidate order"
             );
             for file in files {
                 assert_eq!(

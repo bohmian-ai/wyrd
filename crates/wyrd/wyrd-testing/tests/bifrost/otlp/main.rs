@@ -1,7 +1,7 @@
 //! OTLP export journey binary.
 //!
 //! Surface-scoped test target carved out of the former monolithic `integration`
-//! binary (T54). It aggregates the OTLP trace/metrics/logs export journeys, the
+//! binary. It aggregates the OTLP trace/metrics/logs export journeys, the
 //! mixed-batch and negative journeys, and the Bifrost ingest-runtime journey that
 //! shares the OTLP trace fixtures. `support` stays in this binary because
 //! the sibling OTLP modules reference it via `crate::support`; keeping them

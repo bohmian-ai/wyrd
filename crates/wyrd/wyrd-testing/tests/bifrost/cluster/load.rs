@@ -251,14 +251,14 @@ async fn cluster_load_cancellation_and_shutdown_release_all_owners() {
     assert!(summary.cleanup.servers_stopped);
 }
 
-/// Runs the immutable Task 3B R0 topology and workload through public Gate.
+/// Runs the immutable R0 topology and workload through public Gate.
 ///
 /// # Panics
 ///
 /// Panics unless all eight dynamic tenants complete exact writes and reads on
 /// three Server pods plus three dedicated ForgeWorker pods with zero owners.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "requires managed Postgres and the immutable Task 3B R0 lane"]
+#[ignore = "requires managed Postgres and the immutable R0 lane"]
 async fn pg_oracle_resource_ladder_r0_distributed_execution() {
     let mut profile = ClusterLoadProfile::multi_tenant_three_server_three_worker();
     profile.minimum_reads_per_tenant = 16;

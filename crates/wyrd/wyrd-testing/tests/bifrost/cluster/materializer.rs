@@ -132,7 +132,7 @@ mod pg_tests {
         };
         // AC7 assertion split. Anchor-invariant facts (per-day row counts) are
         // asserted against the checked-in canonical-anchor manifest; the
-        // anchor-dependent recorded run anchor is asserted against the live D85
+        // anchor-dependent recorded run anchor is asserted against the live
         // admission window, never against a checked-in absolute event time. The
         // generator-at-run-anchor equivalence (uniform event-time shift, unchanged
         // Q2/Q3/Q4 selections) is proven at the unit tier in `bench_dataset`.
@@ -240,8 +240,8 @@ mod pg_tests {
         cluster.shutdown().await.expect("cluster stops");
     }
 
-    /// Prove the H1 pressure seal drains ingress occupancy during ingest with no
-    /// manual flush — the write-path falsifier of the pre-H1 livelock (D83).
+    /// Prove the pressure seal drains ingress occupancy during ingest with no
+    /// manual flush — the write-path falsifier of the historical livelock.
     ///
     /// The full smoke `pg_bifrost_materializer_smoke_shape` reads each day back
     /// through the Oracle query path to assert the materialized layout; that
@@ -252,9 +252,9 @@ mod pg_tests {
     /// mark — the coordinated pressure seal freeing capacity — while the client
     /// issues no manual flush (the materializer flushes only at a day boundary,
     /// after this test has already observed the drain and cancelled). It never
-    /// reaches the day-boundary read-back, so it isolates the H1 write-path drain
-    /// from the Oracle read path. Before H1 occupancy pinned at the ingress
-    /// ceiling and never fell (the livelock); after H1 it must oscillate within
+    /// reaches the day-boundary read-back, so it isolates the write-path drain
+    /// from the Oracle read path. Before the pressure seal, occupancy pinned at the ingress
+    /// ceiling and never fell (the livelock); with it, occupancy must oscillate within
     /// the hysteresis band.
     #[tokio::test]
     #[ignore = "requires managed Postgres and the real public Gate cluster"]

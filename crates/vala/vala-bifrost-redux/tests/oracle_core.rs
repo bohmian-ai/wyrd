@@ -1504,6 +1504,7 @@ async fn decoded_query(mut query: vala_bifrost_redux::oracle::OracleQueryStream)
         match frame.expect("query frame") {
             QueryStreamFrame::Schema(frame) => {
                 assert!(schema.is_none(), "query emitted duplicate schema");
+                largest_fragment = largest_fragment.max(frame.arrow_ipc_schema.len());
                 schema = Some(
                     ipc.accept_schema(&frame.arrow_ipc_schema)
                         .expect("schema IPC"),
@@ -1522,6 +1523,7 @@ async fn decoded_query(mut query: vala_bifrost_redux::oracle::OracleQueryStream)
             QueryStreamFrame::Terminal(frame) => {
                 assert!(terminal.is_none(), "query emitted duplicate terminal");
                 if frame.outcome != QueryTerminalOutcome::Failed {
+                    largest_fragment = largest_fragment.max(frame.arrow_ipc_eos.len());
                     ipc.accept_eos(&frame.arrow_ipc_eos)
                         .expect("terminal closes the query IPC stream");
                 }
@@ -1540,6 +1542,7 @@ async fn decoded_query(mut query: vala_bifrost_redux::oracle::OracleQueryStream)
         ipc.peak_pending_frame_bytes() <= largest_fragment,
         "the decoder retains at most one fragment at a time"
     );
+
     DecodedQuery {
         schema: schema.expect("query schema"),
         batches,

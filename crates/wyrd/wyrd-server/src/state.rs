@@ -1423,7 +1423,7 @@ impl Bifrost {
             scribe: None,
             forge: None,
             oracle: None,
-            transport: vala_bifrost_redux::gate::limits::BifrostTransportAdmission::default(),
+            transport: vala_bifrost_redux::gate::limits::BifrostTransportAdmission::for_tests(),
             token_verifier,
             query_forwarder: None,
             test_resources: None,

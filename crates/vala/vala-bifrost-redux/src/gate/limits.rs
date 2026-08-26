@@ -6,8 +6,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::resources::BifrostResourceError;
 use num_traits::ToPrimitive;
 
-/// Process-wide live encoded-body budget retained inside unmanaged memory.
-pub const BIFROST_TRANSPORT_LIMIT_BYTES: usize = 400 * 1024 * 1024;
 /// Smallest accounting unit used for transport body ownership.
 pub const BIFROST_TRANSPORT_QUANTUM_BYTES: usize = 64 * 1024;
 /// Largest encoded body any Bifrost transport surface admits before parsing.
@@ -79,16 +77,6 @@ pub struct BifrostTransportAdmission {
     message_limit: usize,
 }
 
-impl Default for BifrostTransportAdmission {
-    fn default() -> Self {
-        Self::new(
-            BIFROST_TRANSPORT_LIMIT_BYTES,
-            BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES,
-        )
-        .expect("default transport message limit fits aggregate capacity")
-    }
-}
-
 impl BifrostTransportAdmission {
     /// Constructs transport admission under independently selected message and aggregate bounds.
     ///
@@ -117,6 +105,27 @@ impl BifrostTransportAdmission {
             capacity: limit_bytes,
             message_limit: message_limit_bytes,
         })
+    }
+
+    /// Builds a live admission object for tests that need one without a plan.
+    ///
+    /// Every serving path derives both bounds from the resource plan, so this
+    /// exists only so unit tests and test shells can exercise byte-weighted
+    /// admission without a resource observation. The aggregate is sized to hold
+    /// exactly two maximum messages, which is what the boundary tests assert
+    /// against; it is not a production budget and must not be read as one.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixed test bounds stop satisfying [`Self::new`], which
+    /// can only happen if the constants below are edited inconsistently.
+    #[must_use]
+    pub fn for_tests() -> Self {
+        Self::new(
+            2 * BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES,
+            BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES,
+        )
+        .expect("fixed test transport bounds are internally consistent")
     }
     /// Acquires the rounded declared or frame length before body allocation.
     ///
@@ -284,7 +293,7 @@ mod tests {
     /// Panics when an exact-boundary acquisition unexpectedly fails.
     #[test]
     fn bifrost_transport_admission_is_byte_weighted_and_exact_at_boundaries() {
-        let admission = BifrostTransportAdmission::default();
+        let admission = BifrostTransportAdmission::for_tests();
         let first = admission
             .try_acquire(BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES)
             .expect("first maximum body");

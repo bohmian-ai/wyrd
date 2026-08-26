@@ -290,7 +290,7 @@ mod tests {
     /// Panics when the in-memory service unexpectedly errors or assertions fail.
     #[tokio::test]
     async fn bifrost_transport_admission_precedes_tonic_decode_at_frame_boundary() {
-        let admission = BifrostTransportAdmission::default();
+        let admission = BifrostTransportAdmission::for_tests();
         let invoked = Arc::new(AtomicBool::new(false));
         let observed_bytes = Arc::new(AtomicUsize::new(0));
         let probe = AdmissionProbe {

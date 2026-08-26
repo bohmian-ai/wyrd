@@ -213,7 +213,7 @@ mod tests {
     /// Panics when exact-boundary admission unexpectedly fails.
     #[test]
     fn bifrost_transport_admission_is_process_wide_at_server_edge() {
-        let admission = BifrostTransportAdmission::default();
+        let admission = BifrostTransportAdmission::for_tests();
         let layer = wyrd_body_limit(
             1024,
             Some(BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES),
@@ -238,7 +238,7 @@ mod tests {
     /// Panics when the in-memory request service unexpectedly errors.
     #[tokio::test]
     async fn bifrost_transport_admission_pessimistically_rejects_unknown_http2_body() {
-        let admission = BifrostTransportAdmission::default();
+        let admission = BifrostTransportAdmission::for_tests();
         let first = admission
             .try_acquire(BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES)
             .expect("first maximum message");
@@ -279,7 +279,7 @@ mod tests {
     /// request limit; unrelated protected routes retain the general 413 floor.
     #[tokio::test]
     async fn scribe_body_limit_is_route_local() {
-        let admission = BifrostTransportAdmission::default();
+        let admission = BifrostTransportAdmission::for_tests();
         let invoked = Arc::new(AtomicBool::new(false));
         let observed = Arc::clone(&invoked);
         let service = ServiceBuilder::new()

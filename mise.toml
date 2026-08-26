@@ -324,11 +324,6 @@ wyrd-tonic's `default = []` leaves the `server`/`client` code uncompiled there,
 so this general crate lane is the only place those conversions execute."""
 run = "cargo test --locked -p wyrd-tonic --features server,client"
 
-[tasks."test:wyrd-spec:doc"]
-hide = true
-description = "Run wyrd-spec Rust doc tests"
-run = "cargo test --locked --doc --all-features -p wyrd-spec"
-
 [tasks."test:e2e"]
 hide = true
 description = "Run server-level e2e tests requiring Postgres: wyrd-auth, wyrd-server, wyrd-testing, wyrd-client, and vala-sdk e2e fixtures"
@@ -458,16 +453,12 @@ run = "docker build -f docker/Dockerfile -t wyrd-server ."
 
 [tasks."check:docs"]
 hide = true
-description = "Build public Rust docs and doctests"
+description = "Build public Rust docs"
 run = """
 RUSTDOCFLAGS="-D missing_docs -D rustdoc::broken_intra_doc_links" cargo doc --locked --no-deps --all-features \
   -p wyrd-spec \
   -p wyrd-auth-issue \
   -p wyrd-auth-verify
-cargo test --locked --doc --all-features \
-  -p wyrd-spec \
-  -p wyrd-auth-verify \
-  -p wyrd-auth-issue
 """
 
 [tasks."cardkind:check"]

@@ -77,6 +77,13 @@ export WYRD_MIGRATOR_DSN="$DATABASE_URL"
 export BIFROST_TEST_DB_URL="$DATABASE_URL"
 export WYRD_BENCH_PG_URL="$DATABASE_URL"
 
+# Journey and e2e lanes boot one WyrdTestServer per test, each retaining an
+# app pool sized for a production server (PoolConfig::app_defaults, 32). A test
+# fixture never needs that, and the per-server cost is what caps how many tests
+# can run at once against one Postgres. Cap the app pool here; the migrator and
+# platform-admin pools are already 2 and read their own suffixed vars.
+export WYRD_DB_MAX_CONNECTIONS="${WYRD_DB_MAX_CONNECTIONS:-8}"
+
 PGPASSWORD="$admin_password" psql "$admin_dsn" \
   --set=migrator_password="$migrator_password" \
   --set=app_password="$app_password" \

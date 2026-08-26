@@ -1,6 +1,12 @@
 services:
   postgres:
     image: postgres:16
+    command:
+      - postgres
+      - "-c"
+      - "max_connections=400"
+      - "-c"
+      - "shared_buffers=512MB"
     environment:
       POSTGRES_DB: wyrd
       POSTGRES_USER: wyrd_test_admin

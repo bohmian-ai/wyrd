@@ -123,8 +123,7 @@ impl ReduxTableProvider {
             .inner
             .scan(state, tenant_projection.scan.as_ref(), filters, None)
             .await?;
-        let projected =
-            self.project_filtered_plan(published, tenant_projection.output.as_ref())?;
+        let projected = self.project_filtered_plan(published, tenant_projection.output.as_ref())?;
 
         match limit {
             Some(limit) => Ok(Arc::new(GlobalLimitExec::new(projected, 0, Some(limit)))),

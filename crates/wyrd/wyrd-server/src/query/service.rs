@@ -685,10 +685,7 @@ mod tests {
                 .split("#[cfg(test)]")
                 .next()
                 .expect("query adapter has a production section");
-            for forbidden in [
-                "application/vnd.apache.arrow.stream",
-                ".collect().await",
-            ] {
+            for forbidden in ["application/vnd.apache.arrow.stream", ".collect().await"] {
                 assert!(
                     !source.contains(forbidden),
                     "{path} retains forbidden query escape hatch {forbidden}"

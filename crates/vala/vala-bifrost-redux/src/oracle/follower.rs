@@ -25,8 +25,8 @@ use prost::Message;
 use thiserror::Error;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
-    ClusterRole, FollowerScanAssignment, OracleRoleFence, ExecuteFragmentRequest,
-    ReservationId, TenantTableBinding,
+    ClusterRole, ExecuteFragmentRequest, FollowerScanAssignment, OracleRoleFence, ReservationId,
+    TenantTableBinding,
 };
 use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
 
@@ -1537,8 +1537,8 @@ pub(crate) mod tests {
     ///
     /// # Errors
     /// Returns a plan error if the extension leaf cannot be serialized.
-    fn oracle_request()
-    -> datafusion::common::Result<(ExecuteFragmentRequest, TenantTableBinding)> {
+    fn oracle_request() -> datafusion::common::Result<(ExecuteFragmentRequest, TenantTableBinding)>
+    {
         let tenant_id = DataTenantId::new_v7();
         let binding = TenantTableBinding {
             tenant_id,

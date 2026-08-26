@@ -17,8 +17,8 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
-    BifrostSecurityViolationKind, FencingToken, NodeId, OracleRoleFence, PendingNodeReservation,
-    ExecuteFragmentRequest, QueryAuditDigest, QueryClass, QueryId, ReleaseNodeSlotsRequest,
+    BifrostSecurityViolationKind, ExecuteFragmentRequest, FencingToken, NodeId, OracleRoleFence,
+    PendingNodeReservation, QueryAuditDigest, QueryClass, QueryId, ReleaseNodeSlotsRequest,
     ReservationId, ReservationRejected, ReserveNodeSlotsRequest, ReserveNodeSlotsResponse,
     WorkerAttemptFrame, WorkerFooter, WorkerScanStats,
 };
@@ -4766,13 +4766,13 @@ mod tests {
             DataType::Int64,
             true,
         )]));
-        let widened_batch = RecordBatch::try_new(
-            widened,
-            vec![Arc::new(Int64Array::from(vec![Some(4_i64)]))],
-        )
-        .expect("widened batch");
+        let widened_batch =
+            RecordBatch::try_new(widened, vec![Arc::new(Int64Array::from(vec![Some(4_i64)]))])
+                .expect("widened batch");
         assert_eq!(
-            encoder.encode(&widened_batch).expect_err("schema is immutable"),
+            encoder
+                .encode(&widened_batch)
+                .expect_err("schema is immutable"),
             AttemptEncodeError::Schema
         );
 

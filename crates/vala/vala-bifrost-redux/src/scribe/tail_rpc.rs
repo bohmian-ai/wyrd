@@ -2600,13 +2600,13 @@ impl FetchLiveTailService {
             let filter =
                 crate::oracle::exec::ScanPredicateFilter::compile(&rows.schema(), predicates)
                     .map_err(|error| ScribeError::Internal {
-                        detail: format!("live-tail predicate is invalid for this snapshot: {error}"),
+                        detail: format!(
+                            "live-tail predicate is invalid for this snapshot: {error}"
+                        ),
                     })?;
-            let rows = filter
-                .retain(rows)
-                .map_err(|error| ScribeError::Internal {
-                    detail: format!("live-tail predicate evaluation failed: {error}"),
-                })?;
+            let rows = filter.retain(rows).map_err(|error| ScribeError::Internal {
+                detail: format!("live-tail predicate evaluation failed: {error}"),
+            })?;
             if rows.num_rows() > 0 {
                 retained.push(HotBatch {
                     partition_day,
@@ -2799,8 +2799,8 @@ mod tests {
         memtable
             .insert(&key, event(), meta(2, 2), batch(vec![4, 5]))
             .expect("second fixture batch inserts");
-        let binding = super::TenantTableBinding::resolve((tenant, table))
-            .expect("fixture binding resolves");
+        let binding =
+            super::TenantTableBinding::resolve((tenant, table)).expect("fixture binding resolves");
         (
             FetchLiveTailService::new(stream, memtable, tail_resources()),
             binding,

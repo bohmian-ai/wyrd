@@ -4561,11 +4561,9 @@ mod tests {
 
         assert!(error_chain_contains_not_found(&stale));
         assert!(!error_chain_contains_not_found(&outage));
-        assert!(error_chain_contains_not_found(
-            &OracleIcebergStaleObject {
-                source: Box::new(std::io::Error::from(std::io::ErrorKind::NotFound)),
-            }
-        ));
+        assert!(error_chain_contains_not_found(&OracleIcebergStaleObject {
+            source: Box::new(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        }));
     }
 
     /// Rows written into one governed hot fixture for batch-shaping proofs.
@@ -4587,8 +4585,9 @@ mod tests {
         )]));
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
-            vec![Arc::new(Int64Array::from((0..HOT_BATCH_FIXTURE_ROWS).collect::<Vec<_>>()))
-                as ArrayRef],
+            vec![Arc::new(Int64Array::from(
+                (0..HOT_BATCH_FIXTURE_ROWS).collect::<Vec<_>>(),
+            )) as ArrayRef],
         )
         .expect("hot batch fixture batch");
         let mut writer = parquet::arrow::ArrowWriter::try_new(
@@ -4813,7 +4812,10 @@ mod tests {
         )
         .await;
         assert_eq!(retry_counts, counts);
-        assert_eq!(retry_metrics.terminal_values(), success_metrics.terminal_values());
+        assert_eq!(
+            retry_metrics.terminal_values(),
+            success_metrics.terminal_values()
+        );
         assert_eq!(pool.reserved(), 0);
         assert_eq!(
             governor

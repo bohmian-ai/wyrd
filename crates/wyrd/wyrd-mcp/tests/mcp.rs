@@ -14,7 +14,7 @@
 //! Out of scope: the server-side behavior the tools call into, which the
 //! `wyrd-testing` capability binaries own.
 
-#[path = "bifrost_rbac.rs"]
-mod bifrost_rbac;
 #[path = "bifrost_layout.rs"]
 mod bifrost_layout;
+#[path = "bifrost_rbac.rs"]
+mod bifrost_rbac;

@@ -975,8 +975,8 @@ pub enum TimePartitionError {
 #[cfg(test)]
 mod tests {
     use super::{
-        LayoutSortKey, MANAGED_BLOOM_FLOOR, MAX_SORT_KEYS, NullOrder, PhysicalLayout, SortDirection,
-        TimeGranularity,
+        LayoutSortKey, MANAGED_BLOOM_FLOOR, MAX_SORT_KEYS, NullOrder, PhysicalLayout,
+        SortDirection, TimeGranularity,
     };
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use wyrd_spec::vala::api::{
@@ -1090,12 +1090,9 @@ mod tests {
 
         // An explicit empty declaration means exactly what omission means,
         // because the system injects nothing of its own.
-        let explicit_empty = PhysicalLayout::resolve(
-            TABLE,
-            &schema,
-            Some(&declaration(Vec::new(), Vec::new())),
-        )
-        .expect("an explicit empty declaration resolves");
+        let explicit_empty =
+            PhysicalLayout::resolve(TABLE, &schema, Some(&declaration(Vec::new(), Vec::new())))
+                .expect("an explicit empty declaration resolves");
         assert_eq!(explicit_empty.sort_keys(), omitted.sort_keys());
         assert_eq!(explicit_empty.bloom_columns(), omitted.bloom_columns());
 

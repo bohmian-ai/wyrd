@@ -16,9 +16,9 @@ mod pg_tests {
     use reqwest::Method;
     use serde_json::json;
     use skald_tool::ToolRegistry;
+    use wyrd_client::WyrdClient;
     use wyrd_client::config::ClientConfig;
     use wyrd_client::transport::HttpConfig;
-    use wyrd_client::WyrdClient;
     use wyrd_mcp::bifrost::register_bifrost_tools;
     use wyrd_spec::vala::api::{
         BifrostTableDescription, DataTypeSpec, FieldSpec, NullOrderWire, PhysicalLayoutWire,
@@ -88,7 +88,10 @@ mod pg_tests {
             .expect("public HTTP client assembles"),
         );
 
-        let name = format!("mcp_layout_{}", bootstrap.id().to_string().replace('-', "_"));
+        let name = format!(
+            "mcp_layout_{}",
+            bootstrap.id().to_string().replace('-', "_")
+        );
         let request = RegisterTableRequest {
             namespace: NAMESPACE.to_owned(),
             name: name.clone(),
@@ -147,7 +150,10 @@ mod pg_tests {
             "the per-file-constant tenant column is never a canonical sort key"
         );
         assert!(
-            !layout.bloom_columns.iter().any(|column| column == "data_tenant_id"),
+            !layout
+                .bloom_columns
+                .iter()
+                .any(|column| column == "data_tenant_id"),
             "the per-file-constant tenant column is never a canonical Bloom column"
         );
 

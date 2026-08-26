@@ -839,7 +839,10 @@ fn predicate_scalar(
         // The literal adopts the column's timezone: a bare microsecond bound
         // compared against a timezone-carrying column is an Arrow type error,
         // not a filter, so the column type is the authority here.
-        (LeafScalar::TimestampMicros(value), DataType::Timestamp(TimeUnit::Microsecond, timezone)) => {
+        (
+            LeafScalar::TimestampMicros(value),
+            DataType::Timestamp(TimeUnit::Microsecond, timezone),
+        ) => {
             let array = TimestampMicrosecondArray::from(vec![*value]);
             match timezone {
                 Some(timezone) => Arc::new(array.with_timezone(Arc::clone(timezone))),

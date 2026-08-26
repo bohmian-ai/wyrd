@@ -81,10 +81,8 @@ impl Forge {
                 .ok_or_else(|| ForgeError::Invariant {
                     detail: "current snapshot schema is absent from metadata".to_owned(),
                 })?;
-        let granularity = validate_supported_layout(
-            schema,
-            table.metadata().default_partition_spec(),
-        )?;
+        let granularity =
+            validate_supported_layout(schema, table.metadata().default_partition_spec())?;
         let target = u64::try_from(
             table
                 .metadata()
@@ -145,10 +143,8 @@ impl Forge {
                         "current snapshot schema {schema_id} is absent from table metadata"
                     ),
                 })?;
-        let granularity = validate_supported_layout(
-            policy_schema,
-            table.metadata().default_partition_spec(),
-        )?;
+        let granularity =
+            validate_supported_layout(policy_schema, table.metadata().default_partition_spec())?;
         let target = u64::try_from(
             table
                 .metadata()
@@ -210,10 +206,8 @@ impl Forge {
                 .ok_or_else(|| ForgeError::Invariant {
                     detail: "exact live rewrite schema is absent from table metadata".to_owned(),
                 })?;
-        let granularity = validate_supported_layout(
-            schema,
-            table.metadata().default_partition_spec(),
-        )?;
+        let granularity =
+            validate_supported_layout(schema, table.metadata().default_partition_spec())?;
         let candidates = self
             .live_candidates(binding, table, snapshot, granularity)
             .await?;

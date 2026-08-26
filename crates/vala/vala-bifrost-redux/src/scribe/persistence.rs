@@ -3367,9 +3367,12 @@ mod tests {
         /// without a declaration.
         async fn register_control_row(&self, table: &crate::catalog::TableRef) {
             let fqn = table.fqn();
-            let layout =
-                crate::catalog::layout::PhysicalLayout::resolve(&fqn, &Self::fixture_schema(), None)
-                    .expect("the fixture schema resolves");
+            let layout = crate::catalog::layout::PhysicalLayout::resolve(
+                &fqn,
+                &Self::fixture_schema(),
+                None,
+            )
+            .expect("the fixture schema resolves");
             let mut conn = self
                 .database
                 .vala_postgres()

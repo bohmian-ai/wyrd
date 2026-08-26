@@ -394,12 +394,9 @@ mod tests {
             let fqn = format!("vala.{}.{}", definition.namespace, definition.name);
             let schema = (definition.schema)();
             let declared = (definition.physical_layout)();
-            let canonical = crate::catalog::layout::PhysicalLayout::resolve(
-                &fqn,
-                &schema,
-                Some(&declared),
-            )
-            .unwrap_or_else(|error| panic!("{fqn} declares a canonical layout: {error}"));
+            let canonical =
+                crate::catalog::layout::PhysicalLayout::resolve(&fqn, &schema, Some(&declared))
+                    .unwrap_or_else(|error| panic!("{fqn} declares a canonical layout: {error}"));
 
             assert_eq!(
                 canonical.granularity(),
@@ -430,7 +427,9 @@ mod tests {
                 }
             }
             assert!(
-                !canonical.bloom_columns().contains(&DATA_TENANT_ID.to_owned()),
+                !canonical
+                    .bloom_columns()
+                    .contains(&DATA_TENANT_ID.to_owned()),
                 "{fqn} Blooms a per-file constant"
             );
             for column in canonical.bloom_columns() {

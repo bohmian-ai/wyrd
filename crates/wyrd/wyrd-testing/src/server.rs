@@ -1679,7 +1679,9 @@ impl WyrdTestServer {
                 bytes: file.file_size_bytes_for_test(),
             })
             .collect();
-        let workflow = self.inspect_forge_workflow_ref_for_test(tenant, table).await?;
+        let workflow = self
+            .inspect_forge_workflow_ref_for_test(tenant, table)
+            .await?;
         Ok(ForgeTableInspection {
             snapshot_id,
             live_data_files,

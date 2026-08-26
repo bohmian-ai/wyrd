@@ -5106,9 +5106,7 @@ fn declared_layout_ipc(id: i64, value: &str, card_ref: &str, event_micros: i64) 
             Arc::new(Int64Array::from(vec![id])),
             Arc::new(StringArray::from(vec![value])),
             Arc::new(StringArray::from(vec![card_ref])),
-            Arc::new(
-                TimestampMicrosecondArray::from(vec![event_micros]).with_timezone("UTC"),
-            ),
+            Arc::new(TimestampMicrosecondArray::from(vec![event_micros]).with_timezone("UTC")),
         ],
     )
     .expect("fixed declared-layout arrays share a length");
@@ -5205,7 +5203,9 @@ async fn prove_declared_layout_round_trip() -> Result<(), JourneyError> {
         .collect::<Vec<_>>();
     wire_keys.sort_unstable();
     if wire_keys != vec!["bloom_columns", "partition_granularity", "sort_keys"] {
-        return Err(format!("physical layout wire carries unexpected fields: {wire_keys:?}").into());
+        return Err(
+            format!("physical layout wire carries unexpected fields: {wire_keys:?}").into(),
+        );
     }
 
     let name = unique_table("declared_layout");
@@ -5255,9 +5255,7 @@ async fn prove_declared_layout_round_trip() -> Result<(), JourneyError> {
     if refusal_status != reqwest::StatusCode::BAD_REQUEST {
         return Err(format!("a fifth sort key must be a 400, saw {refusal_status}").into());
     }
-    if refusal_body
-        .get("code")
-        .and_then(serde_json::Value::as_str)
+    if refusal_body.get("code").and_then(serde_json::Value::as_str)
         != Some("WYRD_VALA_400_BIFROST_INVALID_PHYSICAL_LAYOUT")
     {
         return Err(format!("unexpected layout refusal body: {refusal_body}").into());
@@ -5390,10 +5388,9 @@ async fn prove_declared_layout_round_trip() -> Result<(), JourneyError> {
                 let column_name = column.column_descr().name();
                 if column_name == "data_tenant_id" {
                     if column.bloom_filter_offset().is_some() {
-                        return Err(format!(
-                            "{path} Bloomed the per-file-constant tenant column"
-                        )
-                        .into());
+                        return Err(
+                            format!("{path} Bloomed the per-file-constant tenant column").into(),
+                        );
                     }
                     continue;
                 }
@@ -5545,7 +5542,9 @@ async fn prove_declared_layout_forge_rewrite(
         {
             break;
         }
-        server.forge_clock().advance(chrono::Duration::minutes(15))?;
+        server
+            .forge_clock()
+            .advance(chrono::Duration::minutes(15))?;
         let expected_attempts = observer.attempts().saturating_add(1);
         let completed_passes = server.completed_forge_scheduler_passes_for_test();
         cluster.request_forge_scheduler_pass_for_test();

@@ -4,9 +4,14 @@
 //! `../../README.md` for the rule that decides whether a test belongs
 //! here or in `wyrd-testing`.
 
+mod atomicity;
+mod bounds;
+mod commit_hints;
 mod governor_gauges;
 mod idempotent;
-mod persistence;
+mod ordering;
+mod persistence_support;
 mod registry;
+mod replay;
 mod seal;
 mod tail_rpc;

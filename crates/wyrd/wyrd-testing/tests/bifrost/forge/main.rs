@@ -16,6 +16,15 @@
 //! OTLP ingest (`otlp`), multi-pod topology (`cluster`), server boot and mount
 //! (`server`), and the Postgres-free scheduler permutations (`interleavings`).
 
-mod compaction_interleaving;
-mod journeys;
+mod commit_windows;
+mod convergence;
+mod dedicated_roles;
+mod expiry;
+mod interleaving_support;
+mod lease_theft;
+mod live_replacement;
+mod live_rewrite;
 mod maintenance_interleaving;
+mod orphan_gc;
+mod ownership;
+mod support;

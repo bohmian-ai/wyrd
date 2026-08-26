@@ -82,27 +82,6 @@ pub struct ScribeIngressFrame {
     pub payload: IngressPayload,
 }
 
-/// In-process projected-frame adapter retained for engine-only tests and
-/// benchmark fixtures. Gate alone constructs `ScribeIngressFrame` for public
-/// transport traffic.
-#[derive(Debug, Clone)]
-pub struct ScribeAppend {
-    /// Server-verified principal.
-    pub principal: Principal,
-    /// Server-resolved logical table.
-    pub table: TableRef,
-    /// Already projected Arrow rows.
-    pub rows: RecordBatch,
-    /// Source schema fingerprint.
-    pub schema_fingerprint: SchemaFingerprint,
-    /// Correlation identifier.
-    pub request_id: RequestId,
-    /// Frame identity batch identifier.
-    pub batch_id: uuid::Uuid,
-    /// Server-measured source bytes.
-    pub measured_wire_bytes: usize,
-}
-
 /// Payload forms accepted by the transport-neutral Scribe boundary.
 ///
 /// Public OTLP adapters transfer typed, fixed-capacity requests and their

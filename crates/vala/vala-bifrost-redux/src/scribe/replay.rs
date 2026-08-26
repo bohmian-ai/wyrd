@@ -150,8 +150,13 @@ pub struct ReplayedAppendMeta {
 /// - Record CRC validation fails (after truncating the torn tail)
 /// - Audit envelope decoding fails
 ///
+/// Gated to `cfg(test)` and the `test-support` feature: it collects an entire
+/// WAL without the governor, stream filter, WAL pinning, or cancellation that
+/// production recovery holds, so it must not exist in a default build.
+///
 /// # Panics
 /// May panic if internal invariants are violated (e.g., `HashMap` consistency).
+#[cfg(any(test, feature = "test-support"))]
 pub fn replay_wal_directory(
     wal_dir: impl AsRef<Path>,
 ) -> Result<HashMap<String, ReplayedSealKey>, ScribeError> {
@@ -177,6 +182,11 @@ pub fn replay_wal_directory(
 ///
 /// Returns [`ScribeError`] when WAL discovery, validation, decoding, replay
 /// assembly, or the synchronous settlement callback fails.
+///
+/// Gated with [`replay_wal_directory`] for the same reason: it omits the
+/// governor, stream filter, and cancellation that the production replay lane
+/// supplies through `replay_wal_directory_stream_accounted`.
+#[cfg(any(test, feature = "test-support"))]
 pub fn replay_wal_directory_stream(
     wal_dir: impl AsRef<Path>,
     emit: impl FnMut(ReplayChunk) -> Result<(), ScribeError>,
@@ -1072,6 +1082,7 @@ fn count_rows(data: &[u8]) -> usize {
         })
 }
 
+#[cfg(any(test, feature = "test-support"))]
 /// Merge an incoming per-shard replay state for the same seal key into the
 /// accumulated result map.
 ///

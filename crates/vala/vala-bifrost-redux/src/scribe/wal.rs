@@ -3513,10 +3513,16 @@ impl WalReader {
 
     /// Read all records from all segments.
     ///
+    /// Every caller lives in this module's own test suite: production recovery
+    /// reads through the accounted replay visitor, which never materializes a
+    /// whole WAL. The `cfg(test)` gate keeps the unbounded collector out of any
+    /// build a server or SDK can link.
+    ///
     /// # Errors
     ///
     /// Returns [`ScribeError`] when segment framing, CRC, ordering, identity,
     /// payload decoding, or torn-tail recovery validation fails.
+    #[cfg(test)]
     pub fn read_all_records(&self) -> Result<Vec<WalRecord>, ScribeError> {
         let mut all_records = Vec::new();
         self.for_each_stream_record(|_stream, _shard_id, _path, record| {
@@ -3538,6 +3544,7 @@ impl WalReader {
     /// # Errors
     /// Returns [`ScribeError`] when a segment cannot be read or its records
     /// fail WAL validation.
+    #[cfg(test)]
     pub(crate) fn for_each_stream_record<F>(&self, visit: F) -> Result<(), ScribeError>
     where
         F: FnMut(StreamIdentity, u8, PathBuf, WalRecord) -> Result<(), ScribeError>,

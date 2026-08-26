@@ -49,10 +49,8 @@ mod tests;
 #[path = "tests/wal_closeout.rs"]
 mod wal_closeout;
 use crate::catalog::{BifrostCatalog, TenantTableBinding};
-pub use crate::contracts::ScribeAppend;
 use crate::contracts::{
-    FrameAdmission, IngressPayload, Scribe, ScribeError, ScribeIngressFrame,
-    projected_source_schema_fingerprint,
+    FrameAdmission, Scribe, ScribeError, ScribeIngressFrame,
 };
 use crate::maintenance::StagingFilePublisher;
 use crate::scribe::admission::{AdmissionConfig, AdmissionController};
@@ -771,7 +769,7 @@ impl ScribeImpl {
                 batch_id: frame.batch_id,
                 audit_event: frame.audit_event,
                 measured_wire_bytes,
-                payload: IngressPayload::ArrowIpc(frame.payload),
+                payload: crate::contracts::IngressPayload::ArrowIpc(frame.payload),
             },
         )
         .await
@@ -1825,78 +1823,6 @@ impl Default for ScribeImpl {
     }
 }
 
-impl ScribeImpl {
-    /// Adapts an engine-only projected append into the private ingress seam.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError`] when the projected schema is incomplete or
-    /// inconsistent, or when private ingress rejects or cannot persist it.
-    pub async fn append_durable(&self, req: ScribeAppend) -> Result<FrameAdmission, ScribeError> {
-        if req
-            .rows
-            .schema()
-            .index_of(wyrd_spec::vala::WYRD_EVENT_TIME)
-            .is_err()
-        {
-            return Err(ScribeError::Internal {
-                detail: "projected append is missing wyrd_event_time".to_owned(),
-            });
-        }
-        if req.schema_fingerprint
-            != crate::schema::fingerprint::SchemaFingerprint::from_arrow_schema(
-                req.rows.schema().as_ref(),
-            )
-        {
-            return Err(ScribeError::FingerprintMismatch {
-                table: req.table.fqn(),
-            });
-        }
-        let audit_event = wyrd_spec::vala::api::AuditEvent {
-            request_id: req.request_id.clone(),
-            trace_id: None,
-            operation: "bifrost.append".to_owned(),
-            resource: req.table.fqn(),
-            card_ref: req.principal.card_ref().cloned(),
-            principal_id: req.principal.id,
-            principal_kind: req.principal.kind.tag(),
-            auth_method: wyrd_spec::vala::api::AuthMethod::Jwt,
-            permission: "bifrost:append".to_owned(),
-            decision: wyrd_spec::vala::api::AuditDecision::Allow,
-            result: wyrd_spec::vala::api::AuditResult::Success,
-            payload_summary: format!("{} rows", req.rows.num_rows()),
-            detail: None,
-        };
-        Scribe::ingest_frame(
-            self,
-            ScribeIngressFrame {
-                authenticated_tenant: req.principal.tenant_id,
-                principal: req.principal,
-                table: req.table,
-                expected_schema_fingerprint: Some(projected_source_schema_fingerprint(
-                    req.rows.schema().as_ref(),
-                )),
-                request_id: req.request_id,
-                batch_id: req.batch_id,
-                audit_event,
-                measured_wire_bytes: req.measured_wire_bytes,
-                payload: IngressPayload::ProjectedArrow(vec![req.rows]),
-            },
-        )
-        .await
-    }
-
-    /// Adapts an engine-only projected append into the private ingress seam.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError`] for the same validation, admission, and durable
-    /// acknowledgment failures as [`Self::append_durable`].
-    pub async fn append(&self, req: ScribeAppend) -> Result<(), ScribeError> {
-        self.append_durable(req).await.map(|_| ())
-    }
-}
-
 #[async_trait]
 impl Scribe for ScribeImpl {
     /// Acquires the adapter-decode child from Scribe's ingress resources.
@@ -2860,21 +2786,6 @@ impl ScribeImpl {
                 Err(error)
             }
         }
-    }
-
-    /// Replay every complete, unretired WAL frame into pending immutable state.
-    ///
-    /// This is the boot recovery boundary: replay validates complete
-    /// audit-plus-data records and `(batch_id, seal_key)` deduplication before the restored
-    /// Arrow batches become visible to the normal seal/reconciliation path.
-    ///
-    /// # Errors
-    /// Returns [`ScribeError`] when the WAL cannot be read or a frame cannot be
-    /// reconstructed as Arrow state.
-    pub fn replay_wal(&self) -> Result<usize, ScribeError> {
-        Err(ScribeError::Internal {
-            detail: "synchronous WAL replay is not supported; use replay_wal_async".to_owned(),
-        })
     }
 
     /// Replays eligible WAL sequentially through the bounded filesystem lane.

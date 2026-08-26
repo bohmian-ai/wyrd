@@ -524,6 +524,20 @@ impl FollowerWorkerResources {
             Self::Oracle(resources) => resources.memory_pool(),
         }
     }
+
+    /// Returns the trusted grant this role lease was charged for.
+    fn granted_memory_bytes(&self) -> usize {
+        match self {
+            Self::Oracle(resources) => resources.granted_memory_bytes(),
+        }
+    }
+
+    /// Returns the partition ceiling admitted alongside that grant.
+    fn admitted_target_partitions(&self) -> usize {
+        match self {
+            Self::Oracle(resources) => resources.admitted_target_partitions(),
+        }
+    }
 }
 
 /// Worker-side owner for verify, reservation transition, fragment validation, and IO.
@@ -590,8 +604,6 @@ pub struct OraclePeerWorkerConfig {
     pub resolver: Arc<dyn FollowerSourceResolver>,
     /// Sink for Oracle query audit records.
     pub audit: Arc<dyn super::OracleAudit>,
-    /// Follower session partition width.
-    pub target_partitions: usize,
 }
 
 impl OraclePeerWorker {
@@ -607,11 +619,8 @@ impl OraclePeerWorker {
             oracle_resources,
             resolver,
             audit,
-            target_partitions,
         } = config;
-        let follower = PhysicalPlanFollower::new(resolver)
-            .with_audit(audit)
-            .with_session_factory(FollowerSessionFactory::new(target_partitions));
+        let follower = PhysicalPlanFollower::new(resolver).with_audit(audit);
         Self {
             worker_node_id,
             oracle_fence,
@@ -751,9 +760,9 @@ impl OraclePeerWorker {
     async fn execute_local(
         &self,
         request: PhysicalExecuteFragmentRequest,
-        admitted_pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+        admitted_grant: LeaderAdmittedGrant,
     ) -> Result<WorkerExecution, DispatchError> {
-        self.execute_with_capacity(request, WorkerCapacity::LeaderAdmitted, Some(admitted_pool))
+        self.execute_with_capacity(request, WorkerCapacity::LeaderAdmitted, Some(admitted_grant))
             .await
     }
 
@@ -818,7 +827,7 @@ impl OraclePeerWorker {
         &self,
         request: PhysicalExecuteFragmentRequest,
         capacity: WorkerCapacity,
-        admitted_pool: Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>>,
+        admitted_grant: Option<LeaderAdmittedGrant>,
     ) -> Result<WorkerExecution, DispatchError> {
         let (claims, tenant_id) = self.verify_fragment_authority(&request).await?;
         let follower_deadline = tokio::time::Instant::now()
@@ -839,11 +848,25 @@ impl OraclePeerWorker {
         self.admit_verified_fragment(&request, &claims, tenant_id, &running)
             .await?;
         let follower = &self.physical_follower;
-        let memory_pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> = match capacity {
-            WorkerCapacity::LeaderAdmitted => admitted_pool.ok_or(DispatchError::Capacity)?,
+        // Both capacities shape the session from a grant this process admitted:
+        // the leader's own envelope in-process, or the worker quantum this node
+        // charged for the remote fragment. Neither reads a caller-supplied hint.
+        let sessions = match capacity {
+            WorkerCapacity::LeaderAdmitted => {
+                let grant = admitted_grant.ok_or(DispatchError::Capacity)?;
+                FollowerSessionFactory::for_grant(
+                    grant.memory_pool,
+                    grant.granted_memory_bytes,
+                    grant.admitted_target_partitions,
+                )
+            }
             WorkerCapacity::ReserveRunning => {
                 let resources = worker_resources.as_ref().ok_or(DispatchError::Capacity)?;
-                resources.memory_pool()
+                FollowerSessionFactory::for_grant(
+                    resources.memory_pool(),
+                    resources.granted_memory_bytes(),
+                    resources.admitted_target_partitions(),
+                )
             }
         };
         let binding = request
@@ -861,7 +884,7 @@ impl OraclePeerWorker {
                     leader_fence: request.leader_fence.clone(),
                     local_fence: request.target_fence.clone(),
                 },
-                memory_pool,
+                &sessions,
             )
             .await;
         let stream = match stream {
@@ -1440,7 +1463,7 @@ pub trait OraclePeerTransport: Send + Sync {
         &self,
         worker: NodeId,
         request: PhysicalExecuteFragmentRequest,
-        admitted_pool: Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>>,
+        admitted_grant: Option<LeaderAdmittedGrant>,
     ) -> Result<WorkerAttemptStream, DispatchError>;
 }
 
@@ -1503,12 +1526,12 @@ impl OraclePeerTransport for LocalOraclePeerTransport {
         &self,
         _worker: NodeId,
         request: PhysicalExecuteFragmentRequest,
-        admitted_pool: Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>>,
+        admitted_grant: Option<LeaderAdmittedGrant>,
     ) -> Result<WorkerAttemptStream, DispatchError> {
-        let admitted_pool = admitted_pool.ok_or(DispatchError::Capacity)?;
+        let admitted_grant = admitted_grant.ok_or(DispatchError::Capacity)?;
         Ok(self
             .worker
-            .execute_local(request, admitted_pool)
+            .execute_local(request, admitted_grant)
             .await?
             .stream)
     }
@@ -2006,7 +2029,7 @@ impl OraclePeerTransport for TonicOraclePeerTransport {
         &self,
         worker: NodeId,
         request: PhysicalExecuteFragmentRequest,
-        _admitted_pool: Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>>,
+        _admitted_grant: Option<LeaderAdmittedGrant>,
     ) -> Result<WorkerAttemptStream, DispatchError> {
         let candidate = self.current_candidate(worker)?;
         self.execute_candidate(&candidate, request).await
@@ -2131,13 +2154,13 @@ impl OraclePeerTransportDirectory {
         &self,
         candidate: &DispatchCandidate,
         request: PhysicalExecuteFragmentRequest,
-        query_memory_pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+        admitted_grant: LeaderAdmittedGrant,
     ) -> Result<WorkerAttemptStream, DispatchError> {
         if self.is_local(candidate.node_id)
             && candidate.role == wyrd_spec::vala::api::ClusterRole::Oracle
         {
             self.local
-                .execute(candidate.node_id, request, Some(query_memory_pool))
+                .execute(candidate.node_id, request, Some(admitted_grant))
                 .await
         } else {
             match &self.remote {
@@ -2221,6 +2244,36 @@ pub struct DispatchCandidate {
     pub endpoint: Option<String>,
 }
 
+/// Leader-admitted execution grant handed to a leader-local fragment.
+///
+/// A leader-local fragment runs inside the leader's own admitted envelope, so
+/// it must be shaped by that admission rather than by a fresh worker quantum.
+/// Carrying the grant with the pool keeps the three session knobs derived from
+/// one admission decision.
+#[derive(Clone)]
+pub struct LeaderAdmittedGrant {
+    /// Shared pool from the leader's complete admitted query envelope.
+    pub memory_pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+    /// Trusted grant bytes backing that pool.
+    pub granted_memory_bytes: usize,
+    /// Partition ceiling admitted for the leader's query.
+    pub admitted_target_partitions: usize,
+}
+
+impl std::fmt::Debug for LeaderAdmittedGrant {
+    /// Formats only the non-sensitive admitted execution bounds.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LeaderAdmittedGrant")
+            .field("granted_memory_bytes", &self.granted_memory_bytes)
+            .field(
+                "admitted_target_partitions",
+                &self.admitted_target_partitions,
+            )
+            .finish()
+    }
+}
+
 /// Immutable query and authorization bindings used for all fragment attempts.
 #[derive(Debug, Clone)]
 pub struct DispatchContext {
@@ -2244,6 +2297,10 @@ pub struct DispatchContext {
     pub attempt_memory_bytes: usize,
     /// Shared pool from the leader's complete admitted query envelope.
     pub query_memory_pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+    /// Trusted grant bytes backing `query_memory_pool`.
+    pub granted_memory_bytes: usize,
+    /// Partition ceiling admitted for this query by that same grant.
+    pub admitted_target_partitions: usize,
     /// Admission-owned cancellation propagated to every attempt await.
     pub cancellation: CancellationToken,
     /// Absolute deadline shared by reserve, execute, reads, and cleanup.
@@ -2499,7 +2556,11 @@ impl FragmentDispatcher {
                 self.transports.execute(
                     candidate,
                     request,
-                    Arc::clone(&context.query_memory_pool),
+                    LeaderAdmittedGrant {
+                        memory_pool: Arc::clone(&context.query_memory_pool),
+                        granted_memory_bytes: context.granted_memory_bytes,
+                        admitted_target_partitions: context.admitted_target_partitions,
+                    },
                 ),
             ) =>
                 result.map_err(|_| DispatchError::Unavailable).and_then(std::convert::identity),
@@ -2642,6 +2703,20 @@ impl From<PeerSecurityError> for DispatchError {
 
 #[cfg(test)]
 mod tests {
+
+    /// Builds one leader-admitted grant for in-process worker tests.
+    ///
+    /// Mirrors what the leader hands a local fragment: the admitted pool plus
+    /// the grant bytes and partition ceiling that admission produced.
+    fn test_admitted_grant(granted_memory_bytes: usize) -> LeaderAdmittedGrant {
+        LeaderAdmittedGrant {
+            memory_pool: Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
+                granted_memory_bytes,
+            )),
+            granted_memory_bytes,
+            admitted_target_partitions: 1,
+        }
+    }
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3213,7 +3288,7 @@ mod tests {
             &self,
             _worker: NodeId,
             _request: PhysicalExecuteFragmentRequest,
-            _admitted_pool: Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>>,
+            _admitted_grant: Option<LeaderAdmittedGrant>,
         ) -> Result<WorkerAttemptStream, DispatchError> {
             Ok(Box::pin(futures_util::stream::pending()))
         }
@@ -3260,7 +3335,7 @@ mod tests {
             &self,
             _worker: NodeId,
             _request: PhysicalExecuteFragmentRequest,
-            _admitted_pool: Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>>,
+            _admitted_grant: Option<LeaderAdmittedGrant>,
         ) -> Result<WorkerAttemptStream, DispatchError> {
             self.execute_calls.fetch_add(1, Ordering::SeqCst);
             Err(DispatchError::Terminal)
@@ -3310,7 +3385,7 @@ mod tests {
             &self,
             _worker: NodeId,
             _request: PhysicalExecuteFragmentRequest,
-            _admitted_pool: Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>>,
+            _admitted_grant: Option<LeaderAdmittedGrant>,
         ) -> Result<WorkerAttemptStream, DispatchError> {
             Err(DispatchError::Terminal)
         }
@@ -3670,7 +3745,6 @@ mod tests {
             oracle_resources: oracle.clone(),
             resolver: Arc::new(TestFollowerResolver),
             audit: Arc::new(TestOracleAudit),
-            target_partitions: 1,
         });
         let now = Utc::now();
         let pending = reservations
@@ -3695,9 +3769,7 @@ mod tests {
         let result = worker
             .execute_local(
                 request,
-                Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
-                    2 * 1024 * 1024,
-                )),
+                test_admitted_grant(2 * 1024 * 1024),
             )
             .await;
         let Err(error) = result else {
@@ -3771,7 +3843,6 @@ mod tests {
             oracle_resources: oracle.clone(),
             resolver: Arc::clone(&resolver) as Arc<dyn FollowerSourceResolver>,
             audit: Arc::new(TestOracleAudit),
-            target_partitions: 1,
         });
         let now = Utc::now();
         let pending = reservations
@@ -3887,9 +3958,7 @@ mod tests {
             worker
                 .execute_local(
                     request,
-                    Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
-                        2 * 1024 * 1024,
-                    )),
+                    test_admitted_grant(2 * 1024 * 1024),
                 )
                 .await
                 .expect("valid v3 assignment authority digest executes");
@@ -3918,9 +3987,7 @@ mod tests {
             let result = worker
                 .execute_local(
                     request,
-                    Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
-                        2 * 1024 * 1024,
-                    )),
+                    test_admitted_grant(2 * 1024 * 1024),
                 )
                 .await;
             assert!(matches!(result, Err(DispatchError::Terminal)));
@@ -3949,9 +4016,7 @@ mod tests {
             let result = worker
                 .execute_local(
                     request,
-                    Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
-                        2 * 1024 * 1024,
-                    )),
+                    test_admitted_grant(2 * 1024 * 1024),
                 )
                 .await;
             assert!(matches!(result, Err(DispatchError::Terminal)));
@@ -3996,7 +4061,6 @@ mod tests {
             oracle_resources: oracle.clone(),
             resolver: Arc::new(TestFollowerResolver),
             audit: Arc::new(TestOracleAudit),
-            target_partitions: 1,
         });
         let now = Utc::now();
         let pending = reservations
@@ -4017,9 +4081,7 @@ mod tests {
         let mut execution = worker
             .execute_local(
                 request,
-                Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
-                    2 * 1024 * 1024,
-                )),
+                test_admitted_grant(2 * 1024 * 1024),
             )
             .await
             .expect("leader-admitted execution");
@@ -4068,7 +4130,6 @@ mod tests {
             oracle_resources: oracle.clone(),
             resolver: Arc::new(TestFollowerResolver),
             audit: Arc::new(TestOracleAudit),
-            target_partitions: 1,
         });
         let now = Utc::now();
         // Drive the production reservation path: the worker quantum is charged
@@ -4327,6 +4388,8 @@ mod tests {
             attempt_bytes: 1_024,
             attempt_memory_bytes: 1_024,
             query_memory_pool: Arc::new(GreedyMemoryPool::new(1_024)),
+            granted_memory_bytes: 1_024,
+            admitted_target_partitions: 1,
             cancellation: CancellationToken::new(),
             deadline: Instant::now() + std::time::Duration::from_secs(5),
         };
@@ -4383,6 +4446,8 @@ mod tests {
             attempt_bytes: 1_024,
             attempt_memory_bytes: 1_024,
             query_memory_pool: Arc::new(GreedyMemoryPool::new(1_024)),
+            granted_memory_bytes: 1_024,
+            admitted_target_partitions: 1,
             cancellation: CancellationToken::new(),
             deadline: Instant::now() + std::time::Duration::from_secs(5),
         };
@@ -4449,6 +4514,8 @@ mod tests {
             attempt_bytes: 1_024,
             attempt_memory_bytes: 1_024,
             query_memory_pool: Arc::new(GreedyMemoryPool::new(1_024)),
+            granted_memory_bytes: 1_024,
+            admitted_target_partitions: 1,
             cancellation: CancellationToken::new(),
             deadline: Instant::now() + std::time::Duration::from_millis(10),
         };

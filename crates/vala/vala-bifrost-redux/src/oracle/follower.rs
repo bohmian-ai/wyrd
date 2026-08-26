@@ -19,7 +19,6 @@ use datafusion::datasource::physical_plan::{FileGroup, FileScanConfig, FileScanC
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::TaskContext;
-use datafusion::execution::context::SessionConfig;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
@@ -111,55 +110,82 @@ where
     }
 }
 
-/// Process-injected policy used to create one governed follower context per request.
+/// Request-local session policy derived from one trusted admitted grant.
+///
+/// Every follower session — leader-local Oracle, remote Oracle peer, or Scribe
+/// hot-tail peer — is shaped by the grant its own admission produced, never by
+/// a process-wide constant and never by a value the requesting peer supplied.
+/// The three knobs come from one
+/// [`OracleSessionShape`](crate::resources::OracleSessionShape), the same type
+/// the leader's session uses, so a follower cannot end up with a partition
+/// count sized for one ceiling and a batch size sized for another.
 #[derive(Clone)]
 pub struct FollowerSessionFactory {
-    /// Maximum number of physical partitions admitted by the receiving worker.
-    target_partitions: usize,
+    /// Bounded pool nested under the admission that granted this execution.
+    memory_pool: Arc<dyn MemoryPool>,
+    /// Trusted grant bytes backing `memory_pool`.
+    granted_memory_bytes: usize,
+    /// Partition ceiling admitted alongside that grant.
+    admitted_target_partitions: usize,
 }
 
 impl std::fmt::Debug for FollowerSessionFactory {
-    /// Formats only the non-sensitive execution bound.
+    /// Formats only the non-sensitive admitted execution bounds.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("FollowerSessionFactory")
-            .field("target_partitions", &self.target_partitions)
+            .field("granted_memory_bytes", &self.granted_memory_bytes)
+            .field(
+                "admitted_target_partitions",
+                &self.admitted_target_partitions,
+            )
             .finish()
     }
 }
 
 impl FollowerSessionFactory {
-    /// Creates the process policy retained by the physical follower owner.
+    /// Binds one admitted grant to the session it is allowed to shape.
     #[must_use]
-    pub fn new(target_partitions: usize) -> Self {
+    pub fn for_grant(
+        memory_pool: Arc<dyn MemoryPool>,
+        granted_memory_bytes: usize,
+        admitted_target_partitions: usize,
+    ) -> Self {
         Self {
-            target_partitions: target_partitions.max(1),
+            memory_pool,
+            granted_memory_bytes,
+            admitted_target_partitions: admitted_target_partitions.max(1),
         }
+    }
+
+    /// Returns the session shape this grant produces for `work_units`.
+    ///
+    /// Partitions narrow to the work this fragment was actually assigned, so a
+    /// one-file fragment does not open a wide plan it cannot fill.
+    #[must_use]
+    pub fn shape(&self, work_units: usize) -> crate::resources::OracleSessionShape {
+        crate::resources::OracleSessionShape::for_grant(
+            self.granted_memory_bytes,
+            self.admitted_target_partitions,
+            work_units,
+        )
     }
 
     /// Creates one request-local runtime, session state, and task context.
     ///
     /// # Errors
     /// Returns a redacted error when `DataFusion` cannot construct the bounded runtime.
-    fn create(
-        &self,
-        memory_pool: Arc<dyn MemoryPool>,
-    ) -> Result<(SessionState, Arc<TaskContext>), String> {
+    fn create(&self, work_units: usize) -> Result<(SessionState, Arc<TaskContext>), String> {
         let runtime = Arc::new(
             RuntimeEnvBuilder::new()
-                .with_memory_pool(memory_pool)
+                .with_memory_pool(Arc::clone(&self.memory_pool))
                 .build()
                 .map_err(|_| "governed follower runtime construction failed".to_owned())?,
         );
-        let mut config = SessionConfig::new()
-            .with_target_partitions(self.target_partitions)
-            .with_batch_size(1_024);
-        // Applies the same `OracleSessionShape` the leader's session uses
-        // (see `Oracle::execution_session`): Parquet-level predicate and
-        // index pushdown must also be enabled on the follower, since this is
-        // the session that actually opens the dispatched files and prunes
-        // their row groups/pages.
-        crate::resources::OracleSessionShape::apply(&mut config);
+        // `session_config` applies the same fixed Parquet pushdown and indexing
+        // options the leader's session uses: this is the session that actually
+        // opens the dispatched files and prunes their row groups and pages.
+        let config = self.shape(work_units).session_config();
         let state = SessionStateBuilder::new()
             .with_default_features()
             .with_config(config)
@@ -168,6 +194,34 @@ impl FollowerSessionFactory {
         let task = Arc::new(TaskContext::from(&state));
         Ok((state, task))
     }
+}
+
+/// Counts the independently scannable units one follower fragment was assigned.
+///
+/// This is the follower's half of the leader's `scannable_work_units`: each
+/// dispatched persisted file and each assigned Scribe cut is one independently
+/// openable scan target, and `DataFusion` cannot usefully spread a fragment
+/// across more partitions than it has targets to read.
+///
+/// # Errors
+///
+/// Returns [`PhysicalPlanFollowerError::Preflight`] when the assignments carry
+/// no scannable work at all, which is a contract failure rather than an empty
+/// result: a fragment with nothing to scan should never have been dispatched.
+pub fn oracle_assigned_work_units(
+    assignments: &[FollowerScanAssignment],
+) -> Result<usize, PhysicalPlanFollowerError> {
+    let units = assignments.iter().fold(0_usize, |total, assignment| {
+        total
+            .saturating_add(assignment.persisted.files.len())
+            .saturating_add(usize::from(assignment.scribe_provider_cut.is_some()))
+    });
+    if units == 0 {
+        return Err(PhysicalPlanFollowerError::Preflight(
+            "dispatched fragment carries no scannable work".to_owned(),
+        ));
+    }
+    Ok(units)
 }
 
 /// Validated IO-free request projection passed into provider resolution.
@@ -338,13 +392,16 @@ impl ExecutionPlan for FollowerHotParquetExec {
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         if partition != 0 {
             return Err(DataFusionError::Execution(format!(
                 "FollowerHotParquetExec has no partition {partition}"
             )));
         }
+        // The hot leaf reads at the admitted session's batch size, so this path
+        // is shaped by the same grant as every other follower operator.
+        let batch_size = context.session_config().batch_size();
         let files = self.files.clone();
         let file_io = self.file_io.clone();
         let schema = Arc::clone(&self.schema);
@@ -383,7 +440,7 @@ impl ExecutionPlan for FollowerHotParquetExec {
                 }
                 let mut batches = builder
                     .with_row_groups(selection.retained)
-                    .with_batch_size(1_024)
+                    .with_batch_size(batch_size)
                     .build()
                     .map_err(|error| DataFusionError::External(Box::new(error)))?;
                 while let Some(batch) = batches.next().await {
@@ -1082,8 +1139,6 @@ fn checked_wal_lsn(value: u64) -> Result<WalLsn, String> {
 pub struct PhysicalPlanFollower<R> {
     /// Authenticated role-local provider constructor.
     resolver: R,
-    /// Process-injected request-local execution policy.
-    sessions: FollowerSessionFactory,
     /// Exact process-owned audit capability reconstructed into tenant tripwires.
     audit: Option<Arc<dyn super::OracleAudit>>,
     /// Maximum accepted protobuf size.
@@ -1101,7 +1156,6 @@ where
         formatter
             .debug_struct("PhysicalPlanFollower")
             .field("resolver", &self.resolver)
-            .field("sessions", &self.sessions)
             .field("audit", &self.audit.is_some())
             .field("maximum_plan_bytes", &self.maximum_plan_bytes)
             .field("effects", &self.effects)
@@ -1133,7 +1187,6 @@ where
     pub fn new(resolver: R) -> Self {
         Self {
             resolver,
-            sessions: FollowerSessionFactory::new(1),
             audit: None,
             maximum_plan_bytes: DEFAULT_MAX_PHYSICAL_PLAN_BYTES,
             effects: FollowerEffects {
@@ -1144,13 +1197,6 @@ where
                 output: AtomicUsize::new(0),
             },
         }
-    }
-
-    /// Installs the process-owned request-local session policy.
-    #[must_use]
-    pub fn with_session_factory(mut self, sessions: FollowerSessionFactory) -> Self {
-        self.sessions = sessions;
-        self
     }
 
     /// Installs the process-owned audit capability required by tenant tripwires.
@@ -1230,11 +1276,11 @@ where
         &self,
         request: &PhysicalExecuteFragmentRequest,
         authenticated: AuthenticatedFollowerContext<'_>,
-        memory_pool: Arc<dyn MemoryPool>,
+        sessions: &FollowerSessionFactory,
     ) -> Result<FollowerExecution, PhysicalPlanFollowerError> {
-        let (session, context) = self
-            .sessions
-            .create(memory_pool)
+        let work_units = oracle_assigned_work_units(&request.assignments)?;
+        let (session, context) = sessions
+            .create(work_units)
             .map_err(PhysicalPlanFollowerError::Execution)?;
         let plan = self
             .decode(request, authenticated, &session, &context)
@@ -1577,6 +1623,17 @@ pub fn authenticated_preflight(
 pub(crate) mod tests {
     //! Authenticated preflight and role-local provider behavior proofs.
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Builds one admitted follower session grant for in-process tests.
+    fn test_sessions(granted_memory_bytes: usize) -> FollowerSessionFactory {
+        FollowerSessionFactory::for_grant(
+            Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
+                granted_memory_bytes,
+            )),
+            granted_memory_bytes,
+            1,
+        )
+    }
 
     use crate::scribe::memtable::Memtable;
     use crate::scribe::seal_key::SealKey;
@@ -2053,9 +2110,7 @@ pub(crate) mod tests {
             .execute(
                 &request,
                 authenticated(&request, &binding),
-                Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
-                    1024 * 1024,
-                )),
+                &test_sessions(1024 * 1024),
             )
             .await
             .expect("validated provider decodes and executes");
@@ -2070,10 +2125,8 @@ pub(crate) mod tests {
     /// residual `FilterExec` `DataFusion` keeps above the provider.
     #[tokio::test]
     async fn oracle_reader_session_options_contract() {
-        let (state, _context) = FollowerSessionFactory::new(1)
-            .create(Arc::new(
-                datafusion::execution::memory_pool::GreedyMemoryPool::new(1024),
-            ))
+        let (state, _context) = test_sessions(1024)
+            .create(1)
             .expect("governed follower session context");
         let parquet_options = &state.config().options().execution.parquet;
         assert!(parquet_options.pushdown_filters);
@@ -2089,16 +2142,12 @@ pub(crate) mod tests {
     /// decode, unsupported-operator preflight, or stream construction.
     #[tokio::test]
     async fn oracle_resolver_builds_fresh_request_local_context() {
-        let sessions = FollowerSessionFactory::new(2);
+        let sessions = test_sessions(1024);
         let (first_state, first_context) = sessions
-            .create(Arc::new(
-                datafusion::execution::memory_pool::GreedyMemoryPool::new(1024),
-            ))
+            .create(2)
             .expect("first governed request context");
         let (second_state, second_context) = sessions
-            .create(Arc::new(
-                datafusion::execution::memory_pool::GreedyMemoryPool::new(1024),
-            ))
+            .create(2)
             .expect("second governed request context");
         assert_ne!(first_state.session_id(), second_state.session_id());
         assert!(!Arc::ptr_eq(&first_context, &second_context));

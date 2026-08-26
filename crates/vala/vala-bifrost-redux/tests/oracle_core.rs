@@ -581,7 +581,6 @@ impl OracleFixture {
                     )),
                 ),
                 audit: Arc::clone(&audit),
-                target_partitions: 16,
             },
         ));
         let transports = OraclePeerTransportDirectory::new(

@@ -3458,6 +3458,8 @@ impl Oracle {
             query_memory_pool: admitted
                 .memory_pool()
                 .ok_or(BifrostError::QueryAdmissionRejected)?,
+            granted_memory_bytes: admitted.granted_memory_bytes(),
+            admitted_target_partitions: admitted.target_partitions(),
             cancellation: admitted.cancellation.clone(),
             deadline: deadline.into(),
         };

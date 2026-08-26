@@ -1667,7 +1667,6 @@ impl<'a> OracleRoleBuilder<'a> {
                 oracle_resources: oracle_resources.clone(),
                 resolver: follower_resolver,
                 audit: audit.clone(),
-                target_partitions: running_slots,
             },
         ));
         let peer = Arc::new(crate::oracle::OraclePeerRuntime::new(

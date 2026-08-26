@@ -210,9 +210,17 @@ impl OraclePeerGrpc {
                 vala_bifrost_redux::resources::ORACLE_PARTITION_MEMORY_BYTES,
             )
             .map_err(|_| DispatchError::Capacity)?;
+        // The Scribe follower is shaped by the lease this node just charged:
+        // one partition, because a hot-tail fragment is a single sequential
+        // cut, and the batch size the granted bytes support.
+        let sessions = vala_bifrost_redux::oracle::follower::FollowerSessionFactory::for_grant(
+            lease.memory_pool(),
+            lease.memory_bytes(),
+            1,
+        );
         let execution = scribe
             .fragment_follower()
-            .execute(&request, authenticated, lease.memory_pool())
+            .execute(&request, authenticated, &sessions)
             .await
             .map_err(|error| match error {
                 PhysicalPlanFollowerError::Preflight(_)

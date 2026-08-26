@@ -2096,7 +2096,17 @@ impl OracleResources {
             running_slot_units.saturating_add(class.slot_units()),
         );
         let memory_pool = bounded_memory_pool(granted_memory_bytes);
-        Ok(OracleWorkerResources { lease, memory_pool })
+        // Locality is zero here: a remote worker reads the files the leader
+        // dispatched to it, so its partition ceiling comes from the grant it
+        // was admitted with rather than from any caller-supplied hint.
+        let admitted_target_partitions =
+            oracle_target_partitions(plan.effective_cpu, 0.0, granted_memory_bytes)?;
+        Ok(OracleWorkerResources {
+            lease,
+            memory_pool,
+            granted_memory_bytes,
+            admitted_target_partitions,
+        })
     }
 
     /// Returns the fixed-purpose Oracle metadata admission capability.
@@ -3696,6 +3706,10 @@ pub struct OracleWorkerResources {
     lease: OracleMemoryLease,
     /// Exact bounded `DataFusion` pool nested under the retained root lease.
     memory_pool: Arc<dyn MemoryPool>,
+    /// Trusted grant the bounded pool was sized from.
+    granted_memory_bytes: usize,
+    /// Partition ceiling admitted for this worker by that same grant.
+    admitted_target_partitions: usize,
 }
 
 /// Move-only root-backed owner for one Scribe physical follower quantum.
@@ -3742,6 +3756,22 @@ impl OracleWorkerResources {
     #[must_use]
     pub fn memory_pool(&self) -> Arc<dyn MemoryPool> {
         Arc::clone(&self.memory_pool)
+    }
+
+    /// Returns the trusted grant this worker's execution session is shaped by.
+    ///
+    /// This is the admitted grant, not the caller's request: a follower derives
+    /// its session shape from it so a peer cannot tune the execution it is
+    /// served by asking for one.
+    #[must_use]
+    pub const fn granted_memory_bytes(&self) -> usize {
+        self.granted_memory_bytes
+    }
+
+    /// Returns the partition ceiling admitted alongside this worker's grant.
+    #[must_use]
+    pub const fn admitted_target_partitions(&self) -> usize {
+        self.admitted_target_partitions
     }
 }
 

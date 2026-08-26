@@ -1,8 +1,14 @@
-//! OTLP source-span durability journey through the Gate-owned Scribe path.
+//! Scribe source-boundary slice: OTLP source-span durability.
+//!
+//! Covers the Gate-owned Scribe write path for spans arriving over OTLP, not
+//! GenAI derivation — the file was named `genai_derivation_journey.rs` for a
+//! derivation surface it never tested.
 //!
 //! Scribe intentionally publishes Parquet and `vala.file_list` without an
 //! Iceberg snapshot; derivation/Oracle consumption is a later task. This
 //! journey therefore verifies the durable source boundary and replay row count.
+//!
+//! Compiled into the `scribe` binary; see `tests/README.md`.
 
 mod pg_tests {
     use std::time::{Duration, Instant};

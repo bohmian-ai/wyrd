@@ -13,37 +13,40 @@ default = []
 bench = ["dep:wyrd-bench"]
 python = ["dep:pyo3", "dep:wyrd-utils"]
 
-# Surface-scoped Bifrost test binaries (T54): the former monolithic
-# `integration` target was split so a single test edit relinks only its surface
-# instead of every Bifrost test. `autotests = false` keeps the individual test
-# files (referenced via `#[path]` from these roots) from also becoming targets.
+# Capability-scoped Bifrost test binaries: each target is named for the
+# capability it proves, and every test source is a `#[path]` module of exactly
+# one of them. `autotests = false` keeps those sources from also becoming
+# targets on their own — without it a `#[path]`-included file compiles into two
+# binaries. Lanes select a whole target and never an individual test name, so
+# adding a test to an existing binary needs no `mise.toml` edit. See
+# `tests/README.md`.
 [[test]]
-name = "journeys"
-path = "tests/journeys.rs"
+name = "forge"
+path = "tests/forge.rs"
+
+[[test]]
+name = "scribe"
+path = "tests/scribe.rs"
 
 [[test]]
 name = "oracle"
 path = "tests/oracle.rs"
 
 [[test]]
-name = "oracle_edge_journeys"
-path = "tests/oracle_edge_journeys.rs"
-
-[[test]]
 name = "otlp"
 path = "tests/otlp.rs"
-
-[[test]]
-name = "fuzz"
-path = "tests/fuzz.rs"
 
 [[test]]
 name = "cluster"
 path = "tests/cluster.rs"
 
 [[test]]
-name = "oracle_peer"
-path = "tests/oracle_peer.rs"
+name = "server"
+path = "tests/server.rs"
+
+[[test]]
+name = "interleavings"
+path = "tests/interleavings.rs"
 
 [dependencies]
 async-trait = { workspace = true }

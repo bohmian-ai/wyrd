@@ -1,4 +1,8 @@
-//! Crash-gap/restart journey for the GenAI source boundary.
+//! Scribe source-boundary slice: crash-gap and restart recovery.
+//!
+//! Covers repeated source recovery and flush across restart on the Scribe
+//! write path, not GenAI derivation — the file was named
+//! `genai_derivation_recovery.rs` for a derivation surface it never tested.
 //!
 //! Scribe intentionally publishes the source Parquet and `vala.file_list`
 //! bookkeeping without writing an Iceberg snapshot. Forge and downstream

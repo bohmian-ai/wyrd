@@ -3417,23 +3417,26 @@ impl Oracle {
             plan_distributed_split(session, sql, source_groups, participant_cut).await?;
         // The optimized physical plan is the first point at which the real
         // predicate/projection closure for each distributed leaf is known
-        // (`oracle_assignments`/`scribe_assignments` are built before SQL
-        // planning as a safe, unpruned full-schema placeholder). Overwrite
-        // each assignment's closure with what the provider actually attached
-        // to its `RemoteScanExec` placeholder during `scan()`; a scan id with
-        // no recovered closure keeps its existing safe default rather than
-        // being narrowed to an empty (tenant-dropping) projection.
+        // (`oracle_assignments` is built before SQL planning as a safe,
+        // unpruned full-schema placeholder). Overwrite each persisted-file
+        // assignment's closure with what the provider actually attached to its
+        // `RemoteScanExec` placeholder during `scan()`; a scan id with no
+        // recovered closure keeps its existing safe default rather than being
+        // narrowed to an empty (tenant-dropping) projection.
+        //
+        // Scribe assignments are deliberately excluded. A Scribe assignment's
+        // projection is not a pruning hint: `scribe_follower_sources` derives
+        // both the top-level closure and the `ScribeProviderCut` copy from the
+        // pinned physical schema, the follower refuses any assignment whose cut
+        // does not reproduce the top-level closure byte-for-byte, and the
+        // hot-tail memory provider streams its WAL rows against that exact
+        // shape. Narrowing it does not prune object reads — there are none —
+        // and starves the tail stream instead.
         let remote_scan_closures = splitter::collect_remote_scan_closures(&split);
         for (scan_id, (required_columns, predicates)) in &remote_scan_closures {
             if let Some(assignment) = oracle_assignments.get_mut(scan_id) {
                 assignment.required_columns.clone_from(required_columns);
                 assignment.predicates.clone_from(predicates);
-            }
-            for assignments in scribe_assignments.values_mut() {
-                if let Some(assignment) = assignments.get_mut(scan_id) {
-                    assignment.required_columns.clone_from(required_columns);
-                    assignment.predicates.clone_from(predicates);
-                }
             }
         }
         for assignment in oracle_assignments.values() {

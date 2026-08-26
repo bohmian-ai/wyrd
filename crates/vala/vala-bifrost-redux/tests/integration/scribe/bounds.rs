@@ -9,7 +9,7 @@ use arrow::ipc::writer::StreamWriter;
 use std::sync::Arc;
 use std::time::Duration;
 use vala_bifrost_redux::catalog::TableRef;
-use vala_bifrost_redux::contracts::{ScribeAppend, ScribeError};
+use vala_bifrost_redux::contracts::ScribeError;
 use vala_bifrost_redux::resources::OracleWorkerClass;
 use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
 use vala_bifrost_redux::scribe::NativeIngressTestFrame;
@@ -331,22 +331,20 @@ async fn near_full_root_immutable_owner_still_allows_incremental_candidate_progr
     )
     .expect("near-target persistence batch");
     register_control_row(&fixture, "persistence_range_overlap", &rows).await;
-    let request_id = RequestId::now_v7();
     let measured_wire_bytes =
         vala_bifrost_redux::gate::limits::BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES;
-    fixture
-        .scribe
-        .append(ScribeAppend {
-            principal: principal(fixture.tenant),
-            table: table("persistence_range_overlap"),
-            schema_fingerprint: SchemaFingerprint::from_arrow_schema(schema.as_ref()),
-            request_id,
-            batch_id: uuid::Uuid::now_v7(),
-            measured_wire_bytes,
-            rows,
-        })
-        .await
-        .expect("near-target generation admits under Oracle overlap");
+    let batch_id = uuid::Uuid::now_v7();
+    let admission = ingest_projected_rows(
+        &fixture.scribe,
+        fixture.tenant,
+        table("persistence_range_overlap"),
+        rows,
+        batch_id,
+        measured_wire_bytes,
+    )
+    .await
+    .expect("near-target generation admits under Oracle overlap");
+    assert_eq!(admission.batch_id, batch_id);
     fixture
         .scribe
         .flush_writable_for_test()

@@ -9,9 +9,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
-use vala_bifrost_redux::contracts::ScribeAppend;
 use vala_bifrost_redux::maintenance::staging_file_channel;
-use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
 use vala_bifrost_redux::scribe::ScribePersistenceConfig;
 use vala_bifrost_redux::scribe::file_list_writer::PublicationFenceBarrier;
 use vala_bifrost_redux::scribe::memory::MemoryCategory;
@@ -19,7 +17,6 @@ use vala_bifrost_redux::scribe::persistence::PersistenceFaults;
 use vala_bifrost_redux::scribe::tail_rpc::FetchLiveTailRequest;
 use vala_bifrost_redux::scribe::wal::{WalConfig, WalLsn, WalWriter};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::request_id::RequestId;
 
 use super::persistence_support::*;
 
@@ -298,19 +295,17 @@ async fn pg_later_candidate_failure_and_cancellation_leave_no_partial_generation
         )
         .expect("whole candidate batch");
         register_control_row(&fixture, table_name, &rows).await;
-        fixture
-            .scribe
-            .append(ScribeAppend {
-                principal: principal(fixture.tenant),
-                table: table(table_name),
-                schema_fingerprint: SchemaFingerprint::from_arrow_schema(rows.schema().as_ref()),
-                request_id: RequestId::now_v7(),
-                batch_id,
-                measured_wire_bytes: 0,
-                rows,
-            })
-            .await
-            .expect("candidate append");
+        let admission = ingest_projected_rows(
+            &fixture.scribe,
+            fixture.tenant,
+            table(table_name),
+            rows,
+            batch_id,
+            0,
+        )
+        .await
+        .expect("candidate append");
+        assert_eq!(admission.batch_id, batch_id);
     }
     fixture
         .scribe

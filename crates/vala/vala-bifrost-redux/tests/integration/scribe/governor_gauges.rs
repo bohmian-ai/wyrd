@@ -19,13 +19,13 @@ mod pg_tests {
     use sqlx::types::Uuid;
     use std::sync::Arc;
     use vala_bifrost_redux::catalog::TableRef;
-    use vala_bifrost_redux::contracts::ScribeAppend;
+    use crate::scribe::persistence_support::{frame_audit_event, source_schema_fingerprint};
+    use vala_bifrost_redux::contracts::{IngressPayload, Scribe, ScribeIngressFrame};
     use vala_bifrost_redux::namespaces::BifrostNamespace;
     use vala_bifrost_redux::resources::{
         BifrostResourcePolicy, BifrostRole, BifrostRoleResources, BifrostRuntimeResources,
         ResourceSource, SystemResourceSnapshot,
     };
-    use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
     use vala_bifrost_redux::scribe::admission::AdmissionConfig;
     use vala_bifrost_redux::scribe::{ScribeEmbeddedConfig, ScribeImpl, ScribeLaneConfig};
     use wyrd_dev_fixtures::pg::PgFixture;
@@ -178,17 +178,29 @@ mod pg_tests {
         // so the ingress reservation and memtable bytes remain charged when the
         // age-scan tick reads them.
         let batch = make_batch(5_000, base_time);
-        let fingerprint = SchemaFingerprint::from_arrow_schema(batch.schema().as_ref());
-        let req = ScribeAppend {
-            principal: principal_for_tenant(tenant),
-            table: TableRef::new(BifrostNamespace::Bifrost, "events"),
-            rows: batch,
-            schema_fingerprint: fingerprint,
-            request_id: RequestId::now_v7(),
-            batch_id: uuid::Uuid::now_v7(),
-            measured_wire_bytes: 0,
-        };
-        scribe.append(req).await.expect("append");
+        let fingerprint = source_schema_fingerprint(batch.schema().as_ref());
+        let principal = principal_for_tenant(tenant);
+        let table = TableRef::new(BifrostNamespace::Bifrost, "events");
+        let request_id = RequestId::now_v7();
+        let batch_id = uuid::Uuid::now_v7();
+        let rows = batch.num_rows();
+        let admission = Scribe::ingest_frame(
+            &scribe,
+            ScribeIngressFrame {
+                authenticated_tenant: tenant,
+                audit_event: frame_audit_event(&principal, &table, &request_id, rows),
+                principal,
+                table,
+                expected_schema_fingerprint: Some(fingerprint),
+                request_id,
+                batch_id,
+                measured_wire_bytes: 0,
+                payload: IngressPayload::ProjectedArrow(vec![batch]),
+            },
+        )
+        .await
+        .expect("append");
+        assert_eq!(admission.batch_id, batch_id);
 
         // `check_age` emits the governor and memtable gauges before it requests any
         // flush, so the snapshot reflects the still-buffered ingest.

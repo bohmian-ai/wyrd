@@ -18,7 +18,10 @@ mod pg_tests {
     use std::sync::Arc;
     use vala_bifrost_redux::catalog::layout::TimePartition;
     use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
-    use vala_bifrost_redux::contracts::ScribeAppend;
+    use crate::scribe::persistence_support::{frame_audit_event, source_schema_fingerprint};
+    use vala_bifrost_redux::contracts::{
+        FrameAdmission, IngressPayload, Scribe, ScribeIngressFrame,
+    };
     use vala_bifrost_redux::namespaces::BifrostNamespace;
     use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
     use vala_bifrost_redux::scribe::persistence::PersistenceFaults;
@@ -270,7 +273,48 @@ mod pg_tests {
     }
 
     fn schema_fingerprint(batch: &RecordBatch) -> SchemaFingerprint {
-        SchemaFingerprint::from_arrow_schema(batch.schema().as_ref())
+        source_schema_fingerprint(batch.schema().as_ref())
+    }
+
+    /// Ingests one already-projected seal fixture batch as `principal`.
+    ///
+    /// The seal journeys assert on the principal an audit row preserves, so each
+    /// caller supplies its own authenticated identity rather than sharing one.
+    /// The frame states the tenant, the Gate-owned allow/success audit event,
+    /// the projected source fingerprint, and the measured wire size explicitly,
+    /// which is exactly what a transport frame carries into
+    /// `Scribe::ingest_frame`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when Scribe refuses the frame or its durable completion fails.
+    async fn ingest_events(
+        scribe: &ScribeImpl,
+        tenant: DataTenantId,
+        principal: Principal,
+        batch: RecordBatch,
+        batch_id: uuid::Uuid,
+    ) -> FrameAdmission {
+        let table = events_table();
+        let request_id = RequestId::now_v7();
+        let fingerprint = schema_fingerprint(&batch);
+        let rows = batch.num_rows();
+        Scribe::ingest_frame(
+            scribe,
+            ScribeIngressFrame {
+                authenticated_tenant: tenant,
+                audit_event: frame_audit_event(&principal, &table, &request_id, rows),
+                principal,
+                table,
+                expected_schema_fingerprint: Some(fingerprint),
+                request_id,
+                batch_id,
+                measured_wire_bytes: 0,
+                payload: IngressPayload::ProjectedArrow(vec![batch]),
+            },
+        )
+        .await
+        .expect("seal fixture frame is durably admitted")
     }
 
     fn events_table() -> TableRef {
@@ -297,18 +341,15 @@ mod pg_tests {
                 .and_utc()
                 .timestamp_micros(),
         );
-        scribe
-            .append(ScribeAppend {
-                principal: principal_for_tenant(tenant),
-                table: events_table(),
-                schema_fingerprint: schema_fingerprint(&batch),
-                rows: batch,
-                request_id: RequestId::now_v7(),
-                batch_id: Uuid::from_u128(1),
-                measured_wire_bytes: 0,
-            })
-            .await
-            .expect("direct epoch append");
+        let admission = ingest_events(
+            &scribe,
+            tenant,
+            principal_for_tenant(tenant),
+            batch,
+            uuid::Uuid::from_u128(1),
+        )
+        .await;
+        assert_eq!(admission.batch_id, uuid::Uuid::from_u128(1));
         let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
             .await
             .expect("tenant connection");
@@ -369,18 +410,15 @@ mod pg_tests {
                 .and_utc()
                 .timestamp_micros(),
         );
-        scribe
-            .append(ScribeAppend {
-                principal: principal_for_tenant(tenant),
-                table: events_table(),
-                schema_fingerprint: schema_fingerprint(&batch),
-                rows: batch,
-                request_id: RequestId::now_v7(),
-                batch_id: Uuid::now_v7(),
-                measured_wire_bytes: 0,
-            })
-            .await
-            .expect("append before ambiguous seal");
+        let admission = ingest_events(
+            &scribe,
+            tenant,
+            principal_for_tenant(tenant),
+            batch,
+            uuid::Uuid::now_v7(),
+        )
+        .await;
+        assert_eq!(admission.rows_accepted, 1);
         let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
             .await
             .expect("tenant connection");
@@ -431,18 +469,15 @@ mod pg_tests {
                 .and_utc()
                 .timestamp_micros(),
         );
-        scribe
-            .append(ScribeAppend {
-                principal: principal_for_tenant(tenant),
-                table: events_table(),
-                schema_fingerprint: schema_fingerprint(&batch),
-                rows: batch,
-                request_id: RequestId::now_v7(),
-                batch_id: Uuid::now_v7(),
-                measured_wire_bytes: 0,
-            })
-            .await
-            .expect("append before cancellation");
+        let admission = ingest_events(
+            &scribe,
+            tenant,
+            principal_for_tenant(tenant),
+            batch,
+            uuid::Uuid::now_v7(),
+        )
+        .await;
+        assert_eq!(admission.rows_accepted, 1);
         let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
             .await
             .expect("tenant connection");
@@ -500,18 +535,15 @@ mod pg_tests {
             .and_utc();
         let base_time = expected_event_time.timestamp_micros();
         let batch = make_batch(50_000, base_time);
-        scribe
-            .append(ScribeAppend {
-                principal: principal_for_tenant(tenant),
-                table: events_table(),
-                schema_fingerprint: schema_fingerprint(&batch),
-                rows: batch,
-                request_id: RequestId::now_v7(),
-                batch_id: uuid::Uuid::now_v7(),
-                measured_wire_bytes: 0,
-            })
-            .await
-            .expect("append");
+        let admission = ingest_events(
+            &scribe,
+            tenant,
+            principal_for_tenant(tenant),
+            batch,
+            uuid::Uuid::now_v7(),
+        )
+        .await;
+        assert_eq!(admission.rows_accepted, 1);
         let pool = fixture.app_pool();
         let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
             .await
@@ -712,17 +744,9 @@ mod pg_tests {
             let batch = make_batch(100, base_time + (i * 1_000_000));
             let mut principal = principal_for_tenant(tenant);
             principal.id = PrincipalId::new(Uuid::now_v7());
-            let fingerprint = schema_fingerprint(&batch);
-            let req = ScribeAppend {
-                principal,
-                table: events_table(),
-                rows: batch,
-                schema_fingerprint: fingerprint,
-                request_id: RequestId::now_v7(),
-                batch_id: uuid::Uuid::now_v7(),
-                measured_wire_bytes: 0,
-            };
-            scribe.append(req).await.expect("append");
+            let admission =
+                ingest_events(&scribe, tenant, principal, batch, uuid::Uuid::now_v7()).await;
+            assert_eq!(admission.rows_accepted, 100);
         }
         let pool = fixture.app_pool();
         let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
@@ -871,19 +895,10 @@ mod pg_tests {
         let batch = cross_day_batch(day1_time, day2_time);
 
         let principal = principal_for_tenant(tenant);
-        let fingerprint = schema_fingerprint(&batch);
-
-        let req = ScribeAppend {
-            principal,
-            table: events_table(),
-            rows: batch,
-            schema_fingerprint: fingerprint,
-            request_id: RequestId::now_v7(),
-            batch_id: uuid::Uuid::now_v7(),
-            measured_wire_bytes: 0,
-        };
-
-        scribe.append(req).await.expect("append");
+        let expected_rows = u64::try_from(batch.num_rows()).expect("bounded fixture row count");
+        let admission =
+            ingest_events(&scribe, tenant, principal, batch, uuid::Uuid::now_v7()).await;
+        assert_eq!(admission.rows_accepted, expected_rows);
 
         // Force seal
         let vala = vala_sql::ValaPostgres::from_pool(fixture.app_pool().clone());
@@ -961,18 +976,15 @@ mod pg_tests {
     async fn pg_scribe_seal_tx_failure_leaves_no_file_list_or_audit() {
         let (fixture, tenant, scribe, _operator) = setup().await;
         let batch = make_batch(2, Utc::now().timestamp_micros());
-        scribe
-            .append(ScribeAppend {
-                principal: principal_for_tenant(tenant),
-                table: events_table(),
-                schema_fingerprint: schema_fingerprint(&batch),
-                request_id: RequestId::now_v7(),
-                batch_id: uuid::Uuid::now_v7(),
-                measured_wire_bytes: 0,
-                rows: batch,
-            })
-            .await
-            .expect("append");
+        let admission = ingest_events(
+            &scribe,
+            tenant,
+            principal_for_tenant(tenant),
+            batch,
+            uuid::Uuid::now_v7(),
+        )
+        .await;
+        assert_eq!(admission.rows_accepted, 1);
 
         let pool = fixture.app_pool();
         let mut conn = vala_sql::TenantConn::acquire(pool, tenant)

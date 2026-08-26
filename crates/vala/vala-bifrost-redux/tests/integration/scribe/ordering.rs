@@ -7,9 +7,6 @@ use arrow::array::{Int64Array, RecordBatch, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use vala_bifrost_redux::contracts::ScribeAppend;
-use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
-use wyrd_spec::request_id::RequestId;
 
 use super::persistence_support::*;
 
@@ -80,7 +77,6 @@ async fn multi_candidate_generation_publishes_one_fenced_set_with_deterministic_
     let first_id = uuid::Uuid::now_v7();
     let second_id = colocated_distinct_batch_id(fixture.tenant, &table(table_name), first_id);
     for (value, batch_id) in [(1_i64, first_id), (2_i64, second_id)] {
-        let request_id = RequestId::now_v7();
         let schema = Arc::new(Schema::new(vec![
             Field::new(
                 "wyrd_event_time",
@@ -104,19 +100,17 @@ async fn multi_candidate_generation_publishes_one_fenced_set_with_deterministic_
         )
         .expect("whole candidate batch");
         register_control_row(&fixture, table_name, &rows).await;
-        fixture
-            .scribe
-            .append(ScribeAppend {
-                principal: principal(fixture.tenant),
-                table: table(table_name),
-                schema_fingerprint: SchemaFingerprint::from_arrow_schema(rows.schema().as_ref()),
-                request_id,
-                batch_id,
-                measured_wire_bytes: 0,
-                rows,
-            })
-            .await
-            .expect("candidate append");
+        let admission = ingest_projected_rows(
+            &fixture.scribe,
+            fixture.tenant,
+            table(table_name),
+            rows,
+            batch_id,
+            0,
+        )
+        .await
+        .expect("candidate append");
+        assert_eq!(admission.batch_id, batch_id);
     }
     fixture
         .scribe

@@ -17,7 +17,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use vala_bifrost_redux::catalog::{BifrostCatalog, CreateTableRequest, TableRef};
-use vala_bifrost_redux::contracts::{ScribeAppend, ScribeError};
+use vala_bifrost_redux::contracts::{
+    FrameAdmission, IngressPayload, Scribe, ScribeError, ScribeIngressFrame,
+};
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::resources::{
@@ -821,6 +823,96 @@ pub(crate) async fn register_control_row(
     .await;
 }
 
+/// Fingerprints the user-visible half of a projected fixture schema.
+///
+/// Scribe identifies a table by the schema its client owns: server-managed
+/// `wyrd_*` columns and the correlation columns Scribe stamps never take part
+/// in schema identity. A fixture handing Scribe already-projected Arrow must
+/// therefore declare the same projected identity a real client's IPC stream
+/// would carry, which is what `expected_schema_fingerprint` on
+/// [`ScribeIngressFrame`] states.
+pub(crate) fn source_schema_fingerprint(schema: &Schema) -> SchemaFingerprint {
+    let fields = schema
+        .fields()
+        .iter()
+        .filter(|field| {
+            !matches!(
+                field.name().as_str(),
+                "card_ref" | "card_uid" | "principal_id" | "run_id" | "data_tenant_id"
+            ) && !field.name().starts_with("wyrd_")
+        })
+        .map(|field| field.as_ref().clone())
+        .collect::<Vec<_>>();
+    SchemaFingerprint::from_arrow_schema(&Schema::new(fields))
+}
+
+/// Builds the server-created audit event Gate owns for one authenticated frame.
+///
+/// `Scribe::ingest_frame` never mints an audit record of its own, so a fixture
+/// driving that boundary directly supplies the allow/success event a real
+/// authenticated write would have carried out of the transport layer.
+pub(crate) fn frame_audit_event(
+    principal: &Principal,
+    table: &TableRef,
+    request_id: &RequestId,
+    rows: usize,
+) -> AuditEvent {
+    AuditEvent {
+        request_id: request_id.clone(),
+        trace_id: None,
+        operation: "bifrost.append".to_owned(),
+        resource: table.fqn(),
+        card_ref: principal.card_ref().cloned(),
+        principal_id: principal.id,
+        principal_kind: principal.kind.tag(),
+        auth_method: AuthMethod::Jwt,
+        permission: "bifrost:append".to_owned(),
+        decision: AuditDecision::Allow,
+        result: AuditResult::Success,
+        payload_summary: format!("{rows} rows"),
+        detail: None,
+    }
+}
+
+/// Ingests one already-projected fixture batch through the production boundary.
+///
+/// This is the canonical shape every scribe fixture uses: an explicit
+/// authenticated tenant, an explicit Gate-owned audit event, the projected
+/// source fingerprint, and the measured wire size, handed to
+/// `Scribe::ingest_frame` so the fixture exercises the same admission path a
+/// transport frame does.
+///
+/// # Errors
+///
+/// Returns the exact Scribe ingress error from the durable owner.
+pub(crate) async fn ingest_projected_rows(
+    scribe: &ScribeImpl,
+    tenant: DataTenantId,
+    table: TableRef,
+    rows: RecordBatch,
+    batch_id: uuid::Uuid,
+    measured_wire_bytes: usize,
+) -> Result<FrameAdmission, ScribeError> {
+    let principal = principal(tenant);
+    let request_id = RequestId::now_v7();
+    let row_count = rows.num_rows();
+    Scribe::ingest_frame(
+        scribe,
+        ScribeIngressFrame {
+            authenticated_tenant: tenant,
+            audit_event: frame_audit_event(&principal, &table, &request_id, row_count),
+            principal,
+            table,
+            expected_schema_fingerprint: Some(source_schema_fingerprint(rows.schema().as_ref())),
+            request_id,
+            batch_id,
+            measured_wire_bytes,
+            payload: IngressPayload::ProjectedArrow(vec![rows]),
+        },
+    )
+    .await
+}
+
 /// Append one generation carrying a caller-chosen `batch_id`.
 ///
 /// [`append_one`] mints a fresh `now_v7` id per call, which spreads generations
@@ -835,19 +927,17 @@ pub(crate) async fn append_with_batch_id(
 ) {
     let rows = batch(value);
     register_control_row(fixture, table_name, &rows).await;
-    fixture
-        .scribe
-        .append(ScribeAppend {
-            principal: principal(fixture.tenant),
-            table: table(table_name),
-            schema_fingerprint: SchemaFingerprint::from_arrow_schema(rows.schema().as_ref()),
-            request_id: RequestId::now_v7(),
-            batch_id,
-            measured_wire_bytes: 0,
-            rows,
-        })
-        .await
-        .expect("append to Scribe");
+    let admission = ingest_projected_rows(
+        &fixture.scribe,
+        fixture.tenant,
+        table(table_name),
+        rows,
+        batch_id,
+        0,
+    )
+    .await
+    .expect("append to Scribe");
+    assert_eq!(admission.batch_id, batch_id);
 }
 
 /// Deterministically choose a second, distinct `batch_id` that Scribe routes to

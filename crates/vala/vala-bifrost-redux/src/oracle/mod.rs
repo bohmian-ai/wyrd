@@ -3423,7 +3423,7 @@ impl Oracle {
         // to its `RemoteScanExec` placeholder during `scan()`; a scan id with
         // no recovered closure keeps its existing safe default rather than
         // being narrowed to an empty (tenant-dropping) projection.
-        let remote_scan_closures = splitter::collect_remote_scan_closures(split.leader.as_ref());
+        let remote_scan_closures = splitter::collect_remote_scan_closures(&split);
         for (scan_id, (required_columns, predicates)) in &remote_scan_closures {
             if let Some(assignment) = oracle_assignments.get_mut(scan_id) {
                 assignment.required_columns.clone_from(required_columns);

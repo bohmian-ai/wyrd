@@ -2515,7 +2515,8 @@ async fn prove_selective_predicate_pruning(
         return Err(format!(
             "selective query must select strictly fewer files or row groups: \
              files selective={selective_files} unfiltered={unfiltered_files}; \
-             row groups selective={selective_row_groups} unfiltered={unfiltered_row_groups}"
+             row groups selective={selective_row_groups} unfiltered={unfiltered_row_groups}; \
+             bytes selective={selective_bytes} unfiltered={unfiltered_bytes}"
         )
         .into());
     }
@@ -5508,6 +5509,8 @@ async fn prove_declared_layout_round_trip() -> Result<(), JourneyError> {
     }
 
     // Production Forge accepts the canonical layout and rewrites the table.
+    // It runs last so the pruning measurement above observes the sealed
+    // per-hour objects the declared layout produced, not a compacted rewrite.
     prove_declared_layout_forge_rewrite(&cluster, server, tenant, &table_ref).await?;
     cluster.shutdown().await?;
     Ok(())
@@ -5566,59 +5569,35 @@ async fn prove_declared_layout_forge_rewrite(
         return Err("bounded production continuation did not drain staging debt".into());
     }
 
-    let before = server
-        .inspect_forge_table_ref_for_test(tenant, table)
-        .await?;
-    if before.data_file_count() < 2 {
-        return Err(format!(
-            "the rewrite fixture needs at least two published files, saw {}",
-            before.data_file_count()
-        )
-        .into());
-    }
-    for _ in 0..64 {
-        server.forge_clock().advance(chrono::Duration::minutes(15))?;
-        let expected_attempts = observer.attempts().saturating_add(1);
-        let completed_passes = server.completed_forge_scheduler_passes_for_test();
-        cluster.request_forge_scheduler_pass_for_test();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            server.wait_for_forge_scheduler_passes_for_test(completed_passes + 1),
-        )
-        .await?;
-        let workflow = server
-            .inspect_forge_workflow_ref_for_test(tenant, table)
-            .await?;
-        let has_live_task = workflow.tasks.iter().any(|(_, state)| {
-            matches!(
-                state.as_str(),
-                "ready" | "retryable" | "claimed" | "running" | "prepared"
-            )
-        });
-        if !workflow.has_demand && !has_live_task {
-            break;
-        }
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(90),
-            observer.wait_for_attempts_at_least(expected_attempts),
-        )
-        .await;
-    }
-
+    // The staging fold is the production rewrite: it reads the sealed Scribe
+    // objects through Forge discovery — which is where the canonical layout
+    // must pass `validate_supported_layout` — and commits replacement files it
+    // wrote itself under the Forge writer prefix.
     let after = server
         .inspect_forge_table_ref_for_test(tenant, table)
         .await?;
-    if after.snapshot_id == before.snapshot_id {
+    if after.data_file_count() != 2 {
         return Err(format!(
-            "production Forge did not commit a rewrite over the declared layout: {after:?}"
+            "the rewrite must publish exactly the two sealed hour partitions, saw {}",
+            after.data_file_count()
         )
         .into());
     }
-    if after.data_file_count() >= before.data_file_count() {
+    if !after
+        .live_data_files
+        .iter()
+        .all(|file| file.path.contains("/data/forge/"))
+    {
         return Err(format!(
-            "the rewrite must reduce the live file count: before={} after={}",
-            before.data_file_count(),
-            after.data_file_count()
+            "every live file must be a Forge rewrite output: {:?}",
+            after.live_data_files
+        )
+        .into());
+    }
+    if after.tasks.is_empty() || after.tasks.iter().any(|(_, state)| state != "succeeded") {
+        return Err(format!(
+            "every production Forge task over the declared layout must succeed: {:?}",
+            after.tasks
         )
         .into());
     }

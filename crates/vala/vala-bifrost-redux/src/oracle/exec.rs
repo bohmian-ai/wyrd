@@ -2500,16 +2500,22 @@ fn scan_predicate_physical_expr(
     let column_expr = |name: &str| -> DataFusionResult<Arc<dyn PhysicalExpr>> {
         Ok(Arc::new(Column::new_with_schema(name, schema)?))
     };
-    let literal_expr = |literal: &ScanLiteral| -> Arc<dyn PhysicalExpr> {
+    // A timestamp literal adopts the compared column's own timezone. The
+    // durable `ScanLiteral` carries microseconds since the epoch and nothing
+    // else, so materializing it as a naive instant would make every comparison
+    // against a timezone-carrying column — `wyrd_event_time` among them — an
+    // Arrow type error at execution rather than a filter.
+    let literal_expr = |column: &str, literal: &ScanLiteral| -> Arc<dyn PhysicalExpr> {
         let scalar = match literal {
             ScanLiteral::Bool(inner) => ScalarValue::Boolean(Some(*inner)),
             ScanLiteral::I64(inner) => ScalarValue::Int64(Some(*inner)),
             ScanLiteral::U64(inner) => ScalarValue::UInt64(Some(*inner)),
             ScanLiteral::F64Bits(inner) => ScalarValue::Float64(Some(f64::from_bits(*inner))),
             ScanLiteral::Utf8(inner) => ScalarValue::Utf8(Some(inner.clone())),
-            ScanLiteral::TimestampMicros(inner) => {
-                ScalarValue::TimestampMicrosecond(Some(*inner), None)
-            }
+            ScanLiteral::TimestampMicros(inner) => ScalarValue::TimestampMicrosecond(
+                Some(*inner),
+                timestamp_timezone_of(schema, column),
+            ),
         };
         Arc::new(Literal::new(scalar))
     };
@@ -2517,7 +2523,7 @@ fn scan_predicate_physical_expr(
         Ok(Arc::new(BinaryExpr::new(
             column_expr(column)?,
             op,
-            literal_expr(literal),
+            literal_expr(column, literal),
         )) as Arc<dyn PhysicalExpr>)
     };
     match predicate {
@@ -2529,6 +2535,19 @@ fn scan_predicate_physical_expr(
         ScanPredicate::GtEq(column, literal) => comparison(column, Operator::GtEq, literal),
         ScanPredicate::IsNull(column) => Ok(Arc::new(IsNullExpr::new(column_expr(column)?))),
         ScanPredicate::IsNotNull(column) => Ok(Arc::new(IsNotNullExpr::new(column_expr(column)?))),
+    }
+}
+
+/// Returns the timezone of one microsecond-timestamp column, or `None` when
+/// the column is absent or is not a timezone-carrying timestamp.
+///
+/// The closed predicate vocabulary stores a timestamp bound as bare
+/// microseconds, so the compared column is the only authority on whether that
+/// instant is timezone-aware.
+fn timestamp_timezone_of(schema: &SchemaRef, column: &str) -> Option<Arc<str>> {
+    match schema.field_with_name(column).ok()?.data_type() {
+        arrow::datatypes::DataType::Timestamp(_, timezone) => timezone.clone(),
+        _ => None,
     }
 }
 

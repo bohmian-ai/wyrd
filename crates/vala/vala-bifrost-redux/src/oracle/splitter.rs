@@ -516,8 +516,16 @@ fn collect_scans(plan: &dyn ExecutionPlan, seen: &mut HashSet<String>, scans: &m
 /// entry here means the placeholder was pruned out of the final plan or
 /// never received a closure; the caller must keep that assignment's existing
 /// safe default rather than treat the absence as "empty projection".
+///
+/// Both halves of the split are walked. A source placeholder survives in the
+/// leader only when the split boundary landed above it; for an ordinary
+/// projection/filter scan the whole leaf is pushed below the exchange, so the
+/// placeholder that carries the closure lives in a follower subtree. Walking
+/// the leader alone would silently leave every such assignment on its
+/// unpruned default and lose closed-predicate pruning for the dispatched
+/// leaf.
 pub(super) fn collect_remote_scan_closures(
-    plan: &dyn ExecutionPlan,
+    split: &SplitPhysicalPlan,
 ) -> HashMap<
     String,
     (
@@ -526,7 +534,10 @@ pub(super) fn collect_remote_scan_closures(
     ),
 > {
     let mut closures = HashMap::new();
-    collect_closures(plan, &mut closures);
+    collect_closures(split.leader.as_ref(), &mut closures);
+    for follower in &split.followers {
+        collect_closures(follower.plan.as_ref(), &mut closures);
+    }
     closures
 }
 

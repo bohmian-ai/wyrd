@@ -2382,8 +2382,18 @@ mod pg_tests {
         );
     }
 
-    /// Journey: an evidenced, aged orphan is deleted while young and unevidenced
-    /// objects survive one bounded orphan-GC run.
+    /// Journey: every unreferenced attempt generation aged past the TTL floor
+    /// is deleted in one bounded orphan-GC run, whether or not it left terminal
+    /// Reset evidence, while an object inside the floor survives.
+    ///
+    /// The eligibility predicate
+    /// (`forge::orphan_gc::ProtectionSnapshot::gc_eligibility`) protects an
+    /// object by the live set and the TTL floor alone. It deliberately does not
+    /// require a terminal operation row: an output whose rewrite died before it
+    /// could persist its `Prepared` transition leaves no evidence at all, and
+    /// requiring evidence would strand that object forever. Reset evidence is
+    /// therefore seeded on one of the two aged orphans purely to prove it makes
+    /// no difference to the outcome.
     ///
     /// Gated out of the fast lane because it sleeps past a real TTL boundary.
     ///
@@ -2392,7 +2402,7 @@ mod pg_tests {
     /// Panics when fixture setup, seeding, or the GC pass fails.
     #[tokio::test]
     #[ignore = "journey: real-time TTL boundary, run in the gated lane"]
-    async fn orphan_gc_deletes_evidenced_past_ttl_and_preserves_young() {
+    async fn orphan_gc_deletes_aged_attempt_generations_and_preserves_young() {
         let fixture = Fixture::new_with_config(
             ForgeConfig {
                 orphan_gc_ttl: Duration::from_secs(1),
@@ -2403,10 +2413,10 @@ mod pg_tests {
             fixture_snapshot(),
         )
         .await;
-        // Evidenced and aged past the TTL: eligible for deletion.
+        // Aged past the TTL and carrying terminal Reset evidence.
         let evidenced = seed_evidenced_orphan(&fixture, 0).await;
-        // Aged past the TTL but carries no Reset evidence: the evidence gate
-        // must keep it.
+        // Aged past the TTL with no evidence of any kind: the abandoned-rewrite
+        // shape the TTL floor exists to reclaim.
         let unevidenced = deterministic_output_path_for_test(
             &fixture.binding.object_prefix,
             uuid::Uuid::now_v7(),
@@ -2436,16 +2446,16 @@ mod pg_tests {
             .await
             .expect("journey orphan pass");
         assert_eq!(
-            report.deleted, 1,
-            "only the evidenced aged orphan is deleted"
+            report.deleted, 2,
+            "both aged attempt generations are reclaimed regardless of evidence"
         );
         assert!(
             fixture.staging.stat(&evidenced).await.is_err(),
             "the evidenced aged orphan is removed"
         );
         assert!(
-            fixture.staging.stat(&unevidenced).await.is_ok(),
-            "the unevidenced object survives the evidence gate"
+            fixture.staging.stat(&unevidenced).await.is_err(),
+            "the unevidenced aged orphan is removed by the TTL floor alone"
         );
         assert!(
             fixture.staging.stat(&young).await.is_ok(),

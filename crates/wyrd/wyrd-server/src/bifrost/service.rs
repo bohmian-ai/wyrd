@@ -486,10 +486,14 @@ mod pg_tests {
                 "registered table is listed"
             );
 
-            let described =
-                describe_table(&state, caller.clone(), "vala.datasets".to_owned(), name.clone())
-                    .await
-                    .expect("describe");
+            let described = describe_table(
+                &state,
+                caller.clone(),
+                "vala.datasets".to_owned(),
+                name.clone(),
+            )
+            .await
+            .expect("describe");
             assert_eq!(described.entry.name, name);
             assert!(
                 described
@@ -505,7 +509,8 @@ mod pg_tests {
                     .is_empty(),
                 "a permitted list records no durable audit transition"
             );
-            let table_rows = audit_rows_for(&state, &caller, &format!("vala.datasets.{name}")).await;
+            let table_rows =
+                audit_rows_for(&state, &caller, &format!("vala.datasets.{name}")).await;
             assert_eq!(
                 table_rows.len(),
                 1,

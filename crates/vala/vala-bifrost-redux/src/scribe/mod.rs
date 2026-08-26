@@ -49,9 +49,7 @@ mod tests;
 #[path = "tests/wal_closeout.rs"]
 mod wal_closeout;
 use crate::catalog::{BifrostCatalog, TenantTableBinding};
-use crate::contracts::{
-    FrameAdmission, Scribe, ScribeError, ScribeIngressFrame,
-};
+use crate::contracts::{FrameAdmission, Scribe, ScribeError, ScribeIngressFrame};
 use crate::maintenance::StagingFilePublisher;
 use crate::scribe::admission::{AdmissionConfig, AdmissionController};
 pub use crate::scribe::execution_lanes::{

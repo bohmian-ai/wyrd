@@ -35,7 +35,6 @@ use wyrd_server::auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_server::grpc::{GrpcRouterConfig, build_app_grpc, serve_grpc};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PLATFORM_AUDIT_PRINCIPAL, PrincipalKindTag};
-use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::{CardRef, CardRefScope};
@@ -45,6 +44,7 @@ use wyrd_spec::vala::api::{
     SchemaFingerprint as WireSchemaFingerprint, TailCursor,
     TailPageRequest as DomainTailPageRequest, TenantTableBinding,
 };
+use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 use wyrd_testing::WyrdTestServer;
 use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue, any_value};
 use wyrd_tonic::otlp::logs::v1::ResourceLogs;

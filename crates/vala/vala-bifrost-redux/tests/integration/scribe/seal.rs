@@ -9,6 +9,7 @@ mod pg_tests {
     //!
     //! Skipped when `WYRD_DATABASE_URL` is unset (credential-free default suite).
 
+    use crate::scribe::persistence_support::{frame_audit_event, source_schema_fingerprint};
     use arrow::array::{RecordBatch, TimestampMicrosecondArray, UInt64Array};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use chrono::{DateTime, Utc};
@@ -18,7 +19,6 @@ mod pg_tests {
     use std::sync::Arc;
     use vala_bifrost_redux::catalog::layout::TimePartition;
     use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
-    use crate::scribe::persistence_support::{frame_audit_event, source_schema_fingerprint};
     use vala_bifrost_redux::contracts::{
         FrameAdmission, IngressPayload, Scribe, ScribeIngressFrame,
     };

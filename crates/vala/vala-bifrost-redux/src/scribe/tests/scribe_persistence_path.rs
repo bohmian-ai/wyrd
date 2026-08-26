@@ -22,13 +22,16 @@ use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
-
 /// Build the server-created audit event Gate owns for one production frame.
 ///
 /// These fixtures call `Scribe::ingest_frame` directly, which never mints an
 /// audit record of its own, so each frame carries the allow/success event an
 /// authenticated write would have produced at the transport boundary.
-fn frame_audit_event(principal: &Principal, table: &TableRef, request_id: &RequestId) -> AuditEvent {
+fn frame_audit_event(
+    principal: &Principal,
+    table: &TableRef,
+    request_id: &RequestId,
+) -> AuditEvent {
     AuditEvent {
         request_id: request_id.clone(),
         trace_id: None,
@@ -234,11 +237,7 @@ async fn oracle_hot_snapshot_preserves_pointer_identity_and_day_isolation() {
         &scribe,
         ScribeIngressFrame {
             authenticated_tenant: tenant,
-            audit_event: frame_audit_event(
-                &pointer_principal,
-                &pointer_table,
-                &pointer_request_id,
-            ),
+            audit_event: frame_audit_event(&pointer_principal, &pointer_table, &pointer_request_id),
             principal: pointer_principal,
             table: pointer_table.clone(),
             expected_schema_fingerprint: Some(projected_source_schema_fingerprint(
@@ -271,11 +270,7 @@ async fn oracle_hot_snapshot_preserves_pointer_identity_and_day_isolation() {
         &scribe,
         ScribeIngressFrame {
             authenticated_tenant: tenant,
-            audit_event: frame_audit_event(
-                &cross_day_principal,
-                &day_table,
-                &cross_day_request_id,
-            ),
+            audit_event: frame_audit_event(&cross_day_principal, &day_table, &cross_day_request_id),
             principal: cross_day_principal,
             table: day_table.clone(),
             expected_schema_fingerprint: Some(projected_source_schema_fingerprint(

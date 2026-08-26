@@ -1159,6 +1159,60 @@ mod tests {
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
+    /// Every ungoverned WAL collector stays behind the test boundary.
+    ///
+    /// Production recovery reads through
+    /// [`replay_wal_directory_stream_accounted`], which holds the resource
+    /// governor, the current-stream filter, WAL segment pins, and cancellation.
+    /// The three helpers checked here hold none of those and materialize whole
+    /// WALs, so a default build must not be able to resolve them. This asserts
+    /// the source shape rather than a symbol name: it reads each declaration and
+    /// requires the gate attribute to sit directly above it, which fails the
+    /// moment someone removes a gate or reintroduces an ungated collector.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a source file cannot be read, a declaration is missing, or a
+    /// declaration is not immediately preceded by its expected gate.
+    #[test]
+    fn ungoverned_wal_collectors_stay_behind_the_test_boundary() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let gated: [(&str, &str, &str); 3] = [
+            (
+                "src/scribe/replay.rs",
+                "pub fn replay_wal_directory(",
+                r#"#[cfg(any(test, feature = "test-support"))]"#,
+            ),
+            (
+                "src/scribe/replay.rs",
+                "pub fn replay_wal_directory_stream(",
+                r#"#[cfg(any(test, feature = "test-support"))]"#,
+            ),
+            (
+                "src/scribe/wal.rs",
+                "pub fn read_all_records(",
+                "#[cfg(test)]",
+            ),
+        ];
+        for (relative_path, declaration, gate) in gated {
+            let source = std::fs::read_to_string(manifest_dir.join(relative_path))
+                .unwrap_or_else(|error| panic!("{relative_path} is readable: {error}"));
+            let lines = source.lines().collect::<Vec<_>>();
+            let declared = lines
+                .iter()
+                .position(|line| line.trim_start().starts_with(declaration))
+                .unwrap_or_else(|| panic!("{relative_path} still declares `{declaration}`"));
+            let preceding = declared
+                .checked_sub(1)
+                .map(|index| lines[index].trim())
+                .unwrap_or_default();
+            assert_eq!(
+                preceding, gate,
+                "`{declaration}` in {relative_path} must be gated by `{gate}`",
+            );
+        }
+    }
+
     fn replay_key(tenant: DataTenantId) -> SealKey {
         SealKey::new(
             tenant,

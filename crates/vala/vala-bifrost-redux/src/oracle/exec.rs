@@ -4507,4 +4507,260 @@ mod tests {
             }
         ));
     }
+
+    /// Rows written into one governed hot fixture for batch-shaping proofs.
+    ///
+    /// Large enough that a floor-shaped session batch size yields many batches
+    /// and a maximum-shaped one yields a single batch, which is what separates
+    /// "reads at the admitted size" from "reads at a fixed constant".
+    const HOT_BATCH_FIXTURE_ROWS: i64 = 64;
+
+    /// Writes one Parquet source of [`HOT_BATCH_FIXTURE_ROWS`] rows in a single
+    /// row group, so batch counts depend only on the configured batch size.
+    fn build_hot_batch_fixture() -> HotCausalFixture {
+        let directory = tempfile::tempdir().expect("hot batch fixture directory");
+        let path = directory.path().join("hot-batch.parquet");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from((0..HOT_BATCH_FIXTURE_ROWS).collect::<Vec<_>>()))
+                as ArrayRef],
+        )
+        .expect("hot batch fixture batch");
+        let mut writer = parquet::arrow::ArrowWriter::try_new(
+            File::create(&path).expect("hot batch fixture file"),
+            Arc::clone(&schema),
+            None,
+        )
+        .expect("hot batch fixture writer");
+        writer.write(&batch).expect("hot batch fixture write");
+        writer.close().expect("hot batch fixture close");
+        let bytes = bytes::Bytes::from(std::fs::read(&path).expect("hot batch fixture bytes"));
+        HotCausalFixture {
+            _directory: directory,
+            path,
+            schema,
+            bytes,
+        }
+    }
+
+    /// Builds one hot leaf over `fixture` under an explicit governance mode.
+    ///
+    /// `size_bytes` is the manifest size the leaf trusts, so a caller can
+    /// deliberately mis-state it to drive the storage-failure branch.
+    fn hot_exec_for(
+        fixture: &HotCausalFixture,
+        governance: HotParquetGovernance,
+        metrics: &Arc<OracleScanMetricsHandle>,
+        size_bytes: usize,
+    ) -> HotParquetExec {
+        HotParquetExec::new(
+            vec![HotFileSource {
+                location: fixture.path.to_string_lossy().into_owned(),
+                size_bytes,
+            }],
+            FileIO::new_with_fs(),
+            Arc::clone(&fixture.schema),
+            governance,
+            Arc::clone(metrics),
+            Vec::new(),
+        )
+    }
+
+    /// Builds one task context whose admitted session batch size is `batch_size`.
+    fn task_context_with_batch_size(batch_size: usize) -> Arc<TaskContext> {
+        datafusion::execution::context::SessionContext::new_with_config(
+            datafusion::prelude::SessionConfig::new().with_batch_size(batch_size),
+        )
+        .task_ctx()
+    }
+
+    /// Drains one hot stream into its per-batch row counts.
+    async fn drain_hot_row_counts(
+        mut stream: datafusion::execution::SendableRecordBatchStream,
+    ) -> Vec<usize> {
+        let mut counts = Vec::new();
+        while let Some(batch) = stream.next().await {
+            counts.push(batch.expect("hot batch decodes").num_rows());
+        }
+        counts
+    }
+
+    /// Both governance modes decode at the admitted session batch size and
+    /// produce identical rows and scan evidence.
+    ///
+    /// A floor-shaped grant must split the same file into many small batches
+    /// and a maximum-shaped grant must return it as one, through the leader's
+    /// governor-backed mode and a follower's request-local pool alike. This is
+    /// the proof that the hot leaf no longer carries a batch size of its own.
+    #[tokio::test]
+    async fn hot_parquet_decodes_at_the_admitted_batch_size_in_both_modes() {
+        let fixture = build_hot_batch_fixture();
+        let size = fixture.bytes.len();
+        let rows = usize::try_from(HOT_BATCH_FIXTURE_ROWS).expect("fixture rows fit usize");
+        let governor = oracle_test_roles(4 * 1024 * 1024 * 1024);
+        let telemetry = Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1))));
+
+        for (batch_size, expected_batches) in [(8_usize, 8_usize), (8_192, 1)] {
+            let leader_pool = crate::resources::bounded_memory_pool(1024 * 1024 * 1024);
+            let leader_metrics = Arc::new(OracleScanMetricsHandle::default());
+            let leader = hot_exec_for(
+                &fixture,
+                HotParquetGovernance::Leader {
+                    memory: oracle_memory_resources(&governor, 1024 * 1024),
+                    memory_pool: Arc::clone(&leader_pool),
+                    telemetry: Arc::clone(&telemetry),
+                    query_class: QueryClass::Interactive,
+                },
+                &leader_metrics,
+                size,
+            );
+            let leader_counts = drain_hot_row_counts(
+                leader
+                    .execute(0, task_context_with_batch_size(batch_size))
+                    .expect("leader hot stream"),
+            )
+            .await;
+
+            let follower_pool = crate::resources::bounded_memory_pool(1024 * 1024 * 1024);
+            let follower_metrics = Arc::new(OracleScanMetricsHandle::default());
+            let follower = hot_exec_for(
+                &fixture,
+                HotParquetGovernance::Follower {
+                    memory_pool: Arc::clone(&follower_pool),
+                },
+                &follower_metrics,
+                size,
+            );
+            let follower_counts = drain_hot_row_counts(
+                follower
+                    .execute(0, task_context_with_batch_size(batch_size))
+                    .expect("follower hot stream"),
+            )
+            .await;
+
+            assert_eq!(leader_counts, follower_counts);
+            assert_eq!(leader_counts.len(), expected_batches);
+            assert_eq!(leader_counts.iter().sum::<usize>(), rows);
+            assert!(leader_counts.iter().all(|count| *count <= batch_size));
+            assert_eq!(
+                leader_metrics.terminal_values(),
+                follower_metrics.terminal_values()
+            );
+            assert_hot_scan_baselines(&governor, &leader_pool, &telemetry);
+            assert_eq!(follower_pool.reserved(), 0);
+        }
+    }
+
+    /// Follower governance returns every retained byte to its request-local
+    /// pool on success, storage failure, cancellation, and retry.
+    ///
+    /// A follower holds no leader gauges, so the request-local pool and the
+    /// root governor are the only balances that can leak; each attempt is
+    /// checked back to zero and the retry reproduces the successful attempt's
+    /// scan evidence exactly.
+    #[tokio::test]
+    async fn hot_parquet_follower_mode_balances_its_request_local_pool() {
+        let fixture = build_hot_batch_fixture();
+        let size = fixture.bytes.len();
+        let rows = usize::try_from(HOT_BATCH_FIXTURE_ROWS).expect("fixture rows fit usize");
+        let governor = oracle_test_roles(4 * 1024 * 1024 * 1024);
+        let pool = crate::resources::bounded_memory_pool(1024 * 1024 * 1024);
+
+        let success_metrics = Arc::new(OracleScanMetricsHandle::default());
+        let success = hot_exec_for(
+            &fixture,
+            HotParquetGovernance::Follower {
+                memory_pool: Arc::clone(&pool),
+            },
+            &success_metrics,
+            size,
+        );
+        let counts = drain_hot_row_counts(
+            success
+                .execute(0, task_context_with_batch_size(8))
+                .expect("follower success stream"),
+        )
+        .await;
+        assert_eq!(counts.iter().sum::<usize>(), rows);
+        assert_eq!(pool.reserved(), 0);
+
+        // A mis-stated manifest size drives the storage-failure branch, which
+        // must still return its pre-IO range reservation.
+        let failed_metrics = Arc::new(OracleScanMetricsHandle::default());
+        let failed = hot_exec_for(
+            &fixture,
+            HotParquetGovernance::Follower {
+                memory_pool: Arc::clone(&pool),
+            },
+            &failed_metrics,
+            size.saturating_add(1),
+        );
+        let mut failed_stream = failed
+            .execute(0, task_context_with_batch_size(8))
+            .expect("follower failure stream");
+        assert!(
+            failed_stream
+                .next()
+                .await
+                .expect("follower failure frame")
+                .is_err()
+        );
+        drop(failed_stream);
+        assert_eq!(pool.reserved(), 0);
+
+        // Dropping mid-stream releases the decoded batch reservation the
+        // yielded batch was still holding.
+        let cancelled_metrics = Arc::new(OracleScanMetricsHandle::default());
+        let cancelled = hot_exec_for(
+            &fixture,
+            HotParquetGovernance::Follower {
+                memory_pool: Arc::clone(&pool),
+            },
+            &cancelled_metrics,
+            size,
+        );
+        let mut cancelled_stream = cancelled
+            .execute(0, task_context_with_batch_size(8))
+            .expect("follower cancellation stream");
+        let retained = cancelled_stream
+            .next()
+            .await
+            .expect("follower first frame")
+            .expect("follower first batch");
+        assert!(pool.reserved() > 0);
+        drop(cancelled_stream);
+        drop(retained);
+        assert_eq!(pool.reserved(), 0);
+
+        let retry_metrics = Arc::new(OracleScanMetricsHandle::default());
+        let retry = hot_exec_for(
+            &fixture,
+            HotParquetGovernance::Follower {
+                memory_pool: Arc::clone(&pool),
+            },
+            &retry_metrics,
+            size,
+        );
+        let retry_counts = drain_hot_row_counts(
+            retry
+                .execute(0, task_context_with_batch_size(8))
+                .expect("follower retry stream"),
+        )
+        .await;
+        assert_eq!(retry_counts, counts);
+        assert_eq!(retry_metrics.terminal_values(), success_metrics.terminal_values());
+        assert_eq!(pool.reserved(), 0);
+        assert_eq!(
+            governor
+                .snapshot()
+                .expect("root snapshot")
+                .oracle_memory_used_bytes,
+            0
+        );
+    }
 }

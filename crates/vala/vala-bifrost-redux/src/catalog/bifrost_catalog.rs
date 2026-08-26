@@ -961,21 +961,17 @@ impl BifrostCatalog {
     /// The control-plane lookup and physical Iceberg binding both use the
     /// authenticated tenant. The returned provider adds an execution-time
     /// tenant predicate as a second fail-closed boundary.
+    /// # Errors
+    /// Returns [`BifrostCatalogError::TableNotFound`] when the control-plane row
+    /// is absent for this tenant, [`BifrostCatalogError::InvalidBinding`] when
+    /// the tenant-qualified physical binding cannot be resolved, a catalog error
+    /// when the Iceberg table cannot be loaded, and
+    /// [`BifrostCatalogError::DataFusion`] when the scan provider cannot be
+    /// constructed.
     pub async fn provider(
         &self,
         table: &TableRef,
         tenant: DataTenantId,
-    ) -> Result<ReduxTableProvider, BifrostCatalogError> {
-        self.provider_with_hot_batches(table, tenant, Vec::new())
-            .await
-    }
-
-    /// Build a tenant-qualified provider with shallow Scribe hot batches.
-    pub async fn provider_with_hot_batches(
-        &self,
-        table: &TableRef,
-        tenant: DataTenantId,
-        hot_batches: Vec<arrow::record_batch::RecordBatch>,
     ) -> Result<ReduxTableProvider, BifrostCatalogError> {
         let fqn = table.fqn();
         let Some(_row) = self.lookup_table_row(&fqn, tenant).await? else {
@@ -984,7 +980,7 @@ impl BifrostCatalog {
         let binding = TenantTableBinding::resolve((tenant, table.clone()))
             .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
         let iceberg_table = self.catalog.load_table(&binding.table_ident()).await?;
-        ReduxTableProvider::try_new_with_hot_batches(iceberg_table, tenant, hot_batches)
+        ReduxTableProvider::try_new(iceberg_table, tenant)
             .await
             .map_err(BifrostCatalogError::DataFusion)
     }
@@ -1102,8 +1098,9 @@ async fn acquire_table_advisory_lock(
 #[cfg(test)]
 mod schema_shape_tests {
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use wyrd_spec::DataTenantId;
 
-    use super::schema_shape_matches;
+    use super::{BifrostCatalog, ReduxTableProvider, TableRef, schema_shape_matches};
 
     /// UTC and Iceberg's equivalent offset spelling have the same physical shape.
     #[test]
@@ -1138,5 +1135,32 @@ mod schema_shape_tests {
         )]);
 
         assert!(!schema_shape_matches(&utc, &other));
+    }
+
+    /// Table providers are constructed directly from one pinned Iceberg table
+    /// and its authenticated tenant, with no hot-batch source to union in.
+    ///
+    /// Both constructors are checked as values against an exact argument shape,
+    /// so reintroducing a hot-batch parameter, or restoring a wrapper that
+    /// forwards an empty batch vector, fails to compile here rather than
+    /// silently returning a union plan at execution time.
+    #[test]
+    fn table_providers_are_constructed_from_one_tenant_qualified_table() {
+        /// Accepts only a constructor taking exactly a table and its tenant.
+        fn accepts_direct_provider_constructor<T, F>(_constructor: F)
+        where
+            F: Fn(iceberg::table::Table, DataTenantId) -> T,
+        {
+        }
+
+        /// Accepts only a catalog lookup taking exactly a table reference and tenant.
+        fn accepts_direct_catalog_provider<T, F>(_provider: F)
+        where
+            F: Fn(&'static BifrostCatalog, &'static TableRef, DataTenantId) -> T,
+        {
+        }
+
+        accepts_direct_provider_constructor(ReduxTableProvider::try_new);
+        accepts_direct_catalog_provider(BifrostCatalog::provider);
     }
 }

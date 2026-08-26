@@ -686,8 +686,6 @@ mod tests {
                 .next()
                 .expect("query adapter has a production section");
             for forbidden in [
-                "run_plan_query",
-                "provider_with_hot_batches",
                 "application/vnd.apache.arrow.stream",
                 ".collect().await",
             ] {

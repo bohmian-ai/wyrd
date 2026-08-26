@@ -2,13 +2,9 @@
 
 use std::sync::Arc;
 
-use arrow::array::new_null_array;
-use arrow::compute::cast;
 use arrow::datatypes::SchemaRef;
-use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
@@ -17,7 +13,6 @@ use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::limit::GlobalLimitExec;
 use datafusion::physical_plan::projection::ProjectionExec;
-use datafusion::physical_plan::union::UnionExec;
 use iceberg::table::Table;
 use iceberg_datafusion::IcebergStaticTableProvider;
 use wyrd_spec::DataTenantId;
@@ -32,9 +27,10 @@ use super::tenant_filter::attach_tenant_filter;
 /// fails closed instead of relying on catalog isolation alone.
 #[derive(Debug)]
 pub struct ReduxTableProvider {
+    /// Published Iceberg scan provider for the tenant-qualified table.
     inner: IcebergStaticTableProvider,
+    /// Tenant whose predicate is re-applied above every produced scan.
     tenant: DataTenantId,
-    hot_batches: Vec<arrow::record_batch::RecordBatch>,
 }
 
 #[derive(Debug)]
@@ -50,33 +46,10 @@ impl ReduxTableProvider {
     /// Returns the `DataFusion` error produced while constructing the Iceberg
     /// scan provider.
     pub async fn try_new(table: Table, tenant: DataTenantId) -> DfResult<Self> {
-        Self::try_new_with_hot_batches(table, tenant, Vec::new()).await
-    }
-
-    /// Build a provider over an Iceberg table plus the current Scribe hot tail.
-    ///
-    /// Hot batches are shallow Arrow handles returned by the owning Scribe
-    /// shard. The provider unions them with the published scan at execution
-    /// time, so a durable ACK is immediately queryable without waiting for
-    /// Parquet publication.
-    pub async fn try_new_with_hot_batches(
-        table: Table,
-        tenant: DataTenantId,
-        hot_batches: Vec<arrow::record_batch::RecordBatch>,
-    ) -> DfResult<Self> {
         let inner = IcebergStaticTableProvider::try_new_from_table(table)
             .await
             .map_err(|error| DataFusionError::External(Box::new(error)))?;
-        let schema = inner.schema();
-        let hot_batches = hot_batches
-            .into_iter()
-            .map(|batch| project_hot_batch(&batch, &schema))
-            .collect::<DfResult<Vec<_>>>()?;
-        Ok(Self {
-            inner,
-            tenant,
-            hot_batches,
-        })
+        Ok(Self { inner, tenant })
     }
 
     /// Remove the temporary tenant column after the physical filter.
@@ -126,6 +99,17 @@ impl ReduxTableProvider {
         })
     }
 
+    /// Scans the published table with the tenant predicate re-applied above it.
+    ///
+    /// The tenant column is added to the pushed scan projection when the caller
+    /// did not request it, filtered physically, and then projected back out, so
+    /// a mixed or malformed file fails closed rather than relying on catalog
+    /// isolation. An explicit `limit` is applied above the filter because the
+    /// filter can remove rows the pushed limit would have already counted.
+    ///
+    /// # Errors
+    /// Returns the `DataFusion` error produced by the inner Iceberg scan,
+    /// projection resolution, or physical filter construction.
     async fn scan_with_tenant_filter(
         &self,
         state: &dyn Session,
@@ -139,63 +123,14 @@ impl ReduxTableProvider {
             .inner
             .scan(state, tenant_projection.scan.as_ref(), filters, None)
             .await?;
-        let mut inputs =
-            vec![self.project_filtered_plan(published, tenant_projection.output.as_ref())?];
-
-        if !self.hot_batches.is_empty() {
-            let hot = MemorySourceConfig::try_new_exec(
-                std::slice::from_ref(&self.hot_batches),
-                self.schema(),
-                tenant_projection.scan.clone(),
-            )?;
-            inputs.push(self.project_filtered_plan(hot, tenant_projection.output.as_ref())?);
-        }
-
-        let projected = UnionExec::try_new(inputs)?;
+        let projected =
+            self.project_filtered_plan(published, tenant_projection.output.as_ref())?;
 
         match limit {
             Some(limit) => Ok(Arc::new(GlobalLimitExec::new(projected, 0, Some(limit)))),
             None => Ok(projected),
         }
     }
-}
-
-/// Align a Scribe snapshot to the published table schema by field name.
-///
-/// Scribe may carry server-owned columns that are not part of an older
-/// published table definition. Name-based projection drops those columns and
-/// preserves the exact Arrow order expected by the Iceberg scan; compatible
-/// type changes are cast explicitly instead of relying on positional arrays.
-fn project_hot_batch(batch: &RecordBatch, target: &SchemaRef) -> DfResult<RecordBatch> {
-    let columns = target
-        .fields()
-        .iter()
-        .map(|field| {
-            let Some(index) = batch.schema().index_of(field.name()).ok() else {
-                if field.is_nullable() {
-                    return Ok(new_null_array(field.data_type(), batch.num_rows()));
-                }
-                return Err(DataFusionError::Plan(format!(
-                    "Scribe hot batch is missing table column `{}`",
-                    field.name()
-                )));
-            };
-            let column = batch.column(index);
-            if column.data_type() == field.data_type() {
-                Ok(Arc::clone(column))
-            } else {
-                cast(column, field.data_type()).map_err(|error| {
-                    DataFusionError::Plan(format!(
-                        "Scribe hot column `{}` cannot be cast to {:?}: {error}",
-                        field.name(),
-                        field.data_type()
-                    ))
-                })
-            }
-        })
-        .collect::<DfResult<Vec<_>>>()?;
-    RecordBatch::try_new(Arc::clone(target), columns)
-        .map_err(|error| DataFusionError::Plan(error.to_string()))
 }
 
 #[async_trait]
@@ -216,13 +151,7 @@ impl TableProvider for ReduxTableProvider {
         &self,
         filters: &[&Expr],
     ) -> DfResult<Vec<TableProviderFilterPushDown>> {
-        if self.hot_batches.is_empty() {
-            return self.inner.supports_filters_pushdown(filters);
-        }
-        Ok(filters
-            .iter()
-            .map(|_| TableProviderFilterPushDown::Inexact)
-            .collect())
+        self.inner.supports_filters_pushdown(filters)
     }
 
     async fn scan(

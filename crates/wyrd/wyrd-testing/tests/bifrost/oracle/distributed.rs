@@ -158,8 +158,7 @@ async fn prove_selective_predicate_pruning(
         // how the fixture's three published files were laid out, so requiring
         // both would assert a fixture detail rather than the pruning contract.
         PruningExpectation::FilesOrRowGroups => {
-            if !(selective_files < unfiltered_files
-                || selective_row_groups < unfiltered_row_groups)
+            if !(selective_files < unfiltered_files || selective_row_groups < unfiltered_row_groups)
             {
                 return Err(format!(
                     "selective query must select strictly fewer files or row groups: \

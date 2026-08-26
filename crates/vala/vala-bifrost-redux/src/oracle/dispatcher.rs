@@ -2916,6 +2916,73 @@ impl From<PeerSecurityError> for DispatchError {
 #[cfg(test)]
 mod tests {
 
+    /// Builds one empty attempt buffer for classification-only proofs.
+    ///
+    /// No frame is ever pushed, so `finish_partial` reports a missing schema
+    /// and the partial carries `None`. That is deliberate: this fixture exists
+    /// to observe which [`DispatchError`] variant is selected, not to prove
+    /// what a partial retains.
+    fn classification_buffer() -> AttemptBuffer {
+        let pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> =
+            Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
+                1 << 20,
+            ));
+        AttemptBuffer::with_memory_pool(1 << 20, 1 << 20, &pool)
+            .expect("a fresh buffer reserves inside a 1 MiB pool")
+    }
+
+    /// A frame stream that dies mid-attempt must not soften a refusal.
+    ///
+    /// `Terminal`, `TenantInvariant`, and `StaleObject` each make the leader
+    /// fail the partition outright, so each must reach it unchanged; folding
+    /// one into a partial turns a refusal into a degraded success, which for
+    /// the tenant tripwire is a silent isolation breach. Every other failure
+    /// only degrades the partition and so becomes a timeout partial.
+    #[test]
+    fn mid_stream_failure_preserves_partition_failing_refusals() {
+        assert!(matches!(
+            mid_stream_failure(DispatchError::Terminal, classification_buffer()),
+            DispatchError::Terminal
+        ));
+        assert!(matches!(
+            mid_stream_failure(DispatchError::TenantInvariant, classification_buffer()),
+            DispatchError::TenantInvariant
+        ));
+        assert!(matches!(
+            mid_stream_failure(DispatchError::StaleObject, classification_buffer()),
+            DispatchError::StaleObject
+        ));
+    }
+
+    /// Failures the leader is allowed to degrade become timeout partials.
+    #[test]
+    fn mid_stream_failure_degrades_recoverable_losses() {
+        for error in [
+            DispatchError::Unavailable,
+            DispatchError::Capacity,
+            DispatchError::FileNotFound,
+            DispatchError::EligibleSourceLoss {
+                cause: EligibleSourceLossCause::ProviderResolution,
+            },
+            DispatchError::Partial {
+                attempt: None,
+                reason: DispatchPartialReason::Setup,
+            },
+        ] {
+            let label = format!("{error:?}");
+            assert!(
+                matches!(
+                    mid_stream_failure(error, classification_buffer()),
+                    DispatchError::Partial {
+                        reason: DispatchPartialReason::Timeout,
+                        ..
+                    }
+                ),
+                "{label} must degrade to a timeout partial"
+            );
+        }
+    }
+
     /// Builds one leader-admitted grant for in-process worker tests.
     ///
     /// Mirrors what the leader hands a local fragment: the admitted pool plus

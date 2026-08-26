@@ -17,6 +17,22 @@ required-features = ["test-support"]
 name = "pg_file_list_tenant_table"
 path = "tests/pg_file_list_tenant_table.rs"
 
+# Narrow, manifest-verified slices of the `integration` aggregate. A lane that
+# needs less than the whole aggregate selects one of these targets, which Cargo
+# resolves against this manifest and fails loudly when it is missing; a
+# positional test-name filter is unverified and exits 0 after selecting nothing.
+# Both sources stay `#[path]` modules of `integration` as well, preserving the
+# existing duplicate compile rather than multiplying it.
+[[test]]
+name = "oracle_core"
+path = "tests/oracle_core.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "forge_incremental_compaction"
+path = "tests/forge_incremental_compaction.rs"
+required-features = ["test-support"]
+
 [features]
 default = []
 bench-support = []

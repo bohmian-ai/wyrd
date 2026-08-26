@@ -341,18 +341,6 @@ impl PhysicalLayout {
         })
     }
 
-    /// Rebuilds a layout from its persisted control JSON and re-validates it
-    /// against the stored schema.
-    ///
-    /// Persisted JSON is always the fully populated canonical form written by
-    /// the catalog itself, so it is resolved through [`Self::resolve`] and then
-    /// required to canonicalize to itself. A row that does not is the
-    /// physical-drift signal for a hand-edited or corrupted control row.
-    ///
-    /// # Errors
-    /// Returns [`BifrostError::InvalidPhysicalLayout`] when the stored JSON is
-    /// not a valid declaration, and [`BifrostError::PhysicalDrift`] when it is
-    /// valid but not canonical.
     /// Re-resolves a stored declaration against the physical schema of one
     /// artifact about to be written.
     ///
@@ -382,6 +370,18 @@ impl PhysicalLayout {
         Self::resolve(table, schema, Some(stored))
     }
 
+    /// Rebuilds a layout from its persisted control JSON and re-validates it
+    /// against the stored schema.
+    ///
+    /// Persisted JSON is always the fully populated canonical form written by
+    /// the catalog itself, so it is resolved through [`Self::resolve`] and then
+    /// required to canonicalize to itself. A row that does not is the
+    /// physical-drift signal for a hand-edited or corrupted control row.
+    ///
+    /// # Errors
+    /// Returns [`BifrostError::InvalidPhysicalLayout`] when the stored JSON is
+    /// not a valid declaration, and [`BifrostError::PhysicalDrift`] when it is
+    /// valid but not canonical.
     pub fn from_stored_wire(
         table: &str,
         schema: &Schema,

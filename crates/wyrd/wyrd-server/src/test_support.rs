@@ -129,7 +129,7 @@ fn shell_decoding_keys()
 pub fn test_app_state(
     postgres: Arc<ServerPostgres>,
     storage: Arc<StorageHandle>,
-    _catalog: Arc<BifrostCatalog>,
+    catalog: Arc<BifrostCatalog>,
 ) -> AppState {
     let verifier = Arc::new(TokenVerifier::new(
         shell_decoding_keys(),
@@ -140,7 +140,12 @@ pub fn test_app_state(
         WyrdAuthVerifySettings::default(),
     ));
     let shutdown = tokio_util::sync::CancellationToken::new();
-    AppState::new(postgres, storage, Bifrost::test_shell(verifier), shutdown)
+    AppState::new(
+        postgres,
+        storage,
+        Bifrost::test_shell_with_catalog(verifier, catalog),
+        shutdown,
+    )
 }
 
 /// Return the shared Vala Postgres handle used by the Redux catalog.

@@ -410,15 +410,16 @@ mod pg_tests {
                 .and_utc()
                 .timestamp_micros(),
         );
+        let batch_id = uuid::Uuid::now_v7();
         let admission = ingest_events(
             &scribe,
             tenant,
             principal_for_tenant(tenant),
             batch,
-            uuid::Uuid::now_v7(),
+            batch_id,
         )
         .await;
-        assert_eq!(admission.rows_accepted, 1);
+        assert_eq!(admission.batch_id, batch_id);
         let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
             .await
             .expect("tenant connection");
@@ -469,15 +470,16 @@ mod pg_tests {
                 .and_utc()
                 .timestamp_micros(),
         );
+        let batch_id = uuid::Uuid::now_v7();
         let admission = ingest_events(
             &scribe,
             tenant,
             principal_for_tenant(tenant),
             batch,
-            uuid::Uuid::now_v7(),
+            batch_id,
         )
         .await;
-        assert_eq!(admission.rows_accepted, 1);
+        assert_eq!(admission.batch_id, batch_id);
         let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
             .await
             .expect("tenant connection");
@@ -535,15 +537,16 @@ mod pg_tests {
             .and_utc();
         let base_time = expected_event_time.timestamp_micros();
         let batch = make_batch(50_000, base_time);
+        let batch_id = uuid::Uuid::now_v7();
         let admission = ingest_events(
             &scribe,
             tenant,
             principal_for_tenant(tenant),
             batch,
-            uuid::Uuid::now_v7(),
+            batch_id,
         )
         .await;
-        assert_eq!(admission.rows_accepted, 1);
+        assert_eq!(admission.batch_id, batch_id);
         let pool = fixture.app_pool();
         let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
             .await
@@ -744,9 +747,9 @@ mod pg_tests {
             let batch = make_batch(100, base_time + (i * 1_000_000));
             let mut principal = principal_for_tenant(tenant);
             principal.id = PrincipalId::new(Uuid::now_v7());
-            let admission =
-                ingest_events(&scribe, tenant, principal, batch, uuid::Uuid::now_v7()).await;
-            assert_eq!(admission.rows_accepted, 100);
+            let batch_id = uuid::Uuid::now_v7();
+            let admission = ingest_events(&scribe, tenant, principal, batch, batch_id).await;
+            assert_eq!(admission.batch_id, batch_id);
         }
         let pool = fixture.app_pool();
         let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
@@ -895,10 +898,9 @@ mod pg_tests {
         let batch = cross_day_batch(day1_time, day2_time);
 
         let principal = principal_for_tenant(tenant);
-        let expected_rows = u64::try_from(batch.num_rows()).expect("bounded fixture row count");
-        let admission =
-            ingest_events(&scribe, tenant, principal, batch, uuid::Uuid::now_v7()).await;
-        assert_eq!(admission.rows_accepted, expected_rows);
+        let batch_id = uuid::Uuid::now_v7();
+        let admission = ingest_events(&scribe, tenant, principal, batch, batch_id).await;
+        assert_eq!(admission.batch_id, batch_id);
 
         // Force seal
         let vala = vala_sql::ValaPostgres::from_pool(fixture.app_pool().clone());
@@ -976,15 +978,16 @@ mod pg_tests {
     async fn pg_scribe_seal_tx_failure_leaves_no_file_list_or_audit() {
         let (fixture, tenant, scribe, _operator) = setup().await;
         let batch = make_batch(2, Utc::now().timestamp_micros());
+        let batch_id = uuid::Uuid::now_v7();
         let admission = ingest_events(
             &scribe,
             tenant,
             principal_for_tenant(tenant),
             batch,
-            uuid::Uuid::now_v7(),
+            batch_id,
         )
         .await;
-        assert_eq!(admission.rows_accepted, 1);
+        assert_eq!(admission.batch_id, batch_id);
 
         let pool = fixture.app_pool();
         let mut conn = vala_sql::TenantConn::acquire(pool, tenant)

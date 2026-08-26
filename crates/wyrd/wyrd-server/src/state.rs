@@ -1355,6 +1355,15 @@ pub struct Bifrost {
     /// Read-only proof handle for test-tier inspection of the production graph.
     #[cfg(feature = "test-support")]
     test_resources: Option<BifrostRoleResources>,
+    /// Catalog reachable by an ownerless unit-test shell that selects no role.
+    ///
+    /// A production process only ever reaches the catalog through its selected
+    /// Scribe or Oracle runtime. An in-crate unit test exercises the catalog
+    /// service functions without composing either role, so the shell retains the
+    /// already-built test catalog here and [`Bifrost::catalog`] falls back to it
+    /// when no role owns one.
+    #[cfg(feature = "test-support")]
+    test_catalog: Option<Arc<BifrostCatalog>>,
 }
 
 /// Complete immutable composition retained by one published [`Bifrost`].
@@ -1406,6 +1415,8 @@ impl Bifrost {
             query_forwarder,
             #[cfg(feature = "test-support")]
             test_resources: resources,
+            #[cfg(feature = "test-support")]
+            test_catalog: None,
         })
     }
 
@@ -1427,6 +1438,38 @@ impl Bifrost {
             token_verifier,
             query_forwarder: None,
             test_resources: None,
+            test_catalog: None,
+        })
+    }
+
+    /// Builds an ownerless unit-test shell that can still reach one catalog.
+    ///
+    /// The in-crate `bifrost::service` tests call the catalog service functions
+    /// directly against the shared embedded-Postgres catalog. They compose no
+    /// Scribe or Oracle runtime, so the shell retains the catalog itself and
+    /// [`Self::catalog`] resolves to it. Everything else matches
+    /// [`Self::test_shell`].
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn test_shell_with_catalog(
+        token_verifier: Arc<WyrdTokenVerifier>,
+        catalog: Arc<BifrostCatalog>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            gate: ServerGate::without_scribe(
+                vala_bifrost_redux::gate::auth::ingest_auth_interceptor(Arc::clone(
+                    &token_verifier,
+                )),
+                IngestLimits::default(),
+            ),
+            scribe: None,
+            forge: None,
+            oracle: None,
+            transport: vala_bifrost_redux::gate::limits::BifrostTransportAdmission::for_tests(),
+            token_verifier,
+            query_forwarder: None,
+            test_resources: None,
+            test_catalog: Some(catalog),
         })
     }
 
@@ -1491,10 +1534,19 @@ impl Bifrost {
     /// Borrows the shared catalog retained by the selected data owners.
     #[must_use]
     pub(crate) fn catalog(&self) -> Option<&Arc<BifrostCatalog>> {
-        self.scribe
+        let selected = self
+            .scribe
             .as_ref()
             .map(|scribe| &scribe.catalog)
-            .or_else(|| self.oracle.as_ref().map(|oracle| &oracle.catalog))
+            .or_else(|| self.oracle.as_ref().map(|oracle| &oracle.catalog));
+        #[cfg(feature = "test-support")]
+        {
+            selected.or(self.test_catalog.as_ref())
+        }
+        #[cfg(not(feature = "test-support"))]
+        {
+            selected
+        }
     }
 
     /// Borrows the shared role-resource graph retained by the selected owners.

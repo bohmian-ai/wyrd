@@ -2966,6 +2966,16 @@ mod tests {
             .expect("native physical plan encoding")
             .to_vec();
         let plan_fingerprint = super::super::codec::physical_plan_fingerprint(&physical_plan_bytes);
+        // An Oracle fragment always carries at least one dispatched file: the
+        // leader marks a file-less Oracle partition empty instead of sending
+        // it, and the follower refuses a fragment with no scannable work.
+        let persisted = if scribe_provider_cut.is_some() {
+            PersistedFileAssignment { files: Vec::new() }
+        } else {
+            PersistedFileAssignment {
+                files: vec!["dispatcher-test-file-0.parquet".to_owned()],
+            }
+        };
         let assignments = vec![FollowerScanAssignment {
             scan_id: "dispatcher-test-scan".to_owned(),
             binding: TenantTableBinding {
@@ -2973,7 +2983,7 @@ mod tests {
                 namespace: "vala.bifrost".to_owned(),
                 table: "events".to_owned(),
             },
-            persisted: PersistedFileAssignment { files: Vec::new() },
+            persisted,
             scribe_provider_cut,
             schema_fingerprint: fragment.schema_fingerprint.clone(),
             required_columns: vec!["data_tenant_id".to_owned()],

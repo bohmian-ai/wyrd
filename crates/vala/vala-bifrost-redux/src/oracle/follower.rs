@@ -2119,6 +2119,92 @@ pub(crate) mod tests {
         assert_eq!(stream.split().0.schema().fields().len(), 1);
     }
 
+    /// Follower sessions are shaped only by the admitted grant and assigned work.
+    ///
+    /// This is the follower half of the resource-parity contract: the session's
+    /// partition count, batch size, and join preference all come from one
+    /// [`OracleSessionShape`](crate::resources::OracleSessionShape) derived from
+    /// the grant this node admitted, never from a fixed process constant and
+    /// never from a value the requesting peer supplied.
+    #[test]
+    fn admitted_session_shape_contract() {
+        let assignment = |files: usize, cut: bool| FollowerScanAssignment {
+            scan_id: "shape-contract-scan".to_owned(),
+            binding: TenantTableBinding {
+                tenant_id: DataTenantId::new_v7(),
+                namespace: "vala.bifrost".to_owned(),
+                table: "events".to_owned(),
+            },
+            persisted: PersistedFileAssignment {
+                files: (0..files).map(|index| format!("file-{index}.parquet")).collect(),
+            },
+            scribe_provider_cut: cut.then(|| self::cut(Vec::new())),
+            schema_fingerprint: "shape".to_owned(),
+            required_columns: vec!["data_tenant_id".to_owned()],
+            predicates: Vec::new(),
+        };
+
+        assert_eq!(
+            oracle_assigned_work_units(&[assignment(3, false)]).expect("three files"),
+            3
+        );
+        assert_eq!(
+            oracle_assigned_work_units(&[assignment(0, true)]).expect("one cut"),
+            1
+        );
+        assert_eq!(
+            oracle_assigned_work_units(&[assignment(2, false), assignment(0, true)])
+                .expect("files and a cut"),
+            3
+        );
+        assert!(
+            oracle_assigned_work_units(&[assignment(0, false)]).is_err(),
+            "a fragment with no scannable work is a contract failure"
+        );
+        assert!(
+            oracle_assigned_work_units(&[]).is_err(),
+            "an empty assignment set is a contract failure"
+        );
+
+        let granted = crate::resources::ORACLE_PARTITION_MEMORY_BYTES;
+        let sessions = FollowerSessionFactory::for_grant(
+            Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
+                granted,
+            )),
+            granted,
+            8,
+        );
+        let expected = crate::resources::OracleSessionShape::for_grant(granted, 8, 3);
+        assert_eq!(sessions.shape(3), expected);
+        let (state, _context) = sessions.create(3).expect("admitted follower session");
+        let options = state.config().options();
+        assert_eq!(options.execution.target_partitions, expected.target_partitions);
+        assert_eq!(options.execution.batch_size, expected.batch_size);
+        assert_eq!(options.optimizer.prefer_hash_join, expected.prefer_hash_join);
+        assert_eq!(
+            expected.target_partitions, 3,
+            "partitions narrow to the work this fragment was assigned"
+        );
+        assert_ne!(
+            options.execution.batch_size, 1_024,
+            "the removed fixed batch size is not the admitted shape"
+        );
+
+        let narrow = crate::resources::ORACLE_PARTITION_WORKING_MEMORY_BYTES;
+        let small = FollowerSessionFactory::for_grant(
+            Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
+                narrow,
+            )),
+            narrow,
+            8,
+        );
+        assert_ne!(
+            small.shape(3).batch_size,
+            sessions.shape(3).batch_size,
+            "a smaller grant produces a smaller batch size"
+        );
+    }
+
     /// Every follower session enables Parquet-level predicate and index
     /// pushdown, so a closed leaf predicate actually prunes row groups and
     /// pages at the reader rather than only being re-applied by the

@@ -446,6 +446,51 @@ mod tests {
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::{CardRef, CardRefScope};
 
+    /// The Scribe follower session is shaped by the lease this node charged.
+    ///
+    /// A hot-tail fragment runs under the Scribe follower lease acquired above,
+    /// so its session comes from that lease's granted bytes and the single
+    /// partition a sequential cut offers — never from a fixed batch size or a
+    /// value the leader supplied in the request.
+    #[test]
+    fn scribe_follower_session_shape_contract() {
+        let granted = vala_bifrost_redux::resources::ORACLE_PARTITION_MEMORY_BYTES;
+        let sessions = vala_bifrost_redux::oracle::follower::FollowerSessionFactory::for_grant(
+            std::sync::Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
+                granted,
+            )),
+            granted,
+            1,
+        );
+        let expected =
+            vala_bifrost_redux::resources::OracleSessionShape::for_grant(granted, 1, 1);
+
+        assert_eq!(sessions.shape(1), expected);
+        assert_eq!(
+            expected.target_partitions,
+            vala_bifrost_redux::resources::oracle_partitions_for_work(1, 1),
+            "a hot-tail cut is one sequential scan target under the shared floor"
+        );
+        assert_ne!(
+            expected.batch_size, 1_024,
+            "the removed fixed batch size is not the admitted shape"
+        );
+
+        let narrow = vala_bifrost_redux::resources::ORACLE_PARTITION_WORKING_MEMORY_BYTES;
+        let smaller = vala_bifrost_redux::oracle::follower::FollowerSessionFactory::for_grant(
+            std::sync::Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
+                narrow,
+            )),
+            narrow,
+            1,
+        );
+        assert_ne!(
+            smaller.shape(1).batch_size,
+            expected.batch_size,
+            "a smaller lease produces a smaller batch size"
+        );
+    }
+
     /// Proves the private tonic boundary preserves only stale-object failures as not-found.
     #[test]
     fn stale_object_dispatch_status_is_not_found() {

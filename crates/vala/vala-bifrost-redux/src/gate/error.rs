@@ -282,13 +282,12 @@ impl IngestError {
     pub fn from_scribe(error: crate::contracts::ScribeError) -> Self {
         match error {
             crate::contracts::ScribeError::IngestBusy { table } => Self::IngestBusy { table },
-            crate::contracts::ScribeError::PayloadTooLarge { bytes, limit } => {
-                Self::PayloadTooLarge {
-                    bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
-                    limit: u64::try_from(limit).unwrap_or(u64::MAX),
-                }
-            }
-            crate::contracts::ScribeError::DecodedPayloadTooLarge { bytes, limit } => {
+            // Both bounds project onto one Gate identity: a caller cannot act
+            // differently on "the frame was too large" than on "the frame
+            // decoded to something too large", and the byte/limit pair already
+            // says which bound was exceeded.
+            crate::contracts::ScribeError::PayloadTooLarge { bytes, limit }
+            | crate::contracts::ScribeError::DecodedPayloadTooLarge { bytes, limit } => {
                 Self::PayloadTooLarge {
                     bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
                     limit: u64::try_from(limit).unwrap_or(u64::MAX),

@@ -2923,10 +2923,9 @@ mod tests {
     /// to observe which [`DispatchError`] variant is selected, not to prove
     /// what a partial retains.
     fn classification_buffer() -> AttemptBuffer {
-        let pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> =
-            Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
-                1 << 20,
-            ));
+        let pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool> = Arc::new(
+            datafusion::execution::memory_pool::GreedyMemoryPool::new(1 << 20),
+        );
         AttemptBuffer::with_memory_pool(1 << 20, 1 << 20, &pool)
             .expect("a fresh buffer reserves inside a 1 MiB pool")
     }

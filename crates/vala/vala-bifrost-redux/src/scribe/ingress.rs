@@ -843,6 +843,67 @@ mod tests {
             .await;
     }
 
+    /// Builds one already-projected ingest frame whose single `value` cell is
+    /// exactly `value`.
+    ///
+    /// The decoded-size gate measures the projected Arrow payload rather than
+    /// the wire frame, so the caller controls the measured size purely through
+    /// the string it passes; `measured_wire_bytes` stays zero to keep the wire
+    /// bound out of the proof. The fingerprint is computed from the same schema
+    /// the batch carries, so the frame clears schema validation and reaches the
+    /// size gate.
+    fn decoded_size_frame(
+        tenant: DataTenantId,
+        principal: &Principal,
+        value: String,
+    ) -> ScribeIngressFrame {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "wyrd_event_time",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let rows = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![chrono::Utc::now().timestamp_micros()])
+                        .with_timezone("UTC"),
+                ),
+                Arc::new(StringArray::from(vec![value])),
+            ],
+        )
+        .expect("decoded-size fixture batch");
+        let request_id = RequestId::now_v7();
+        ScribeIngressFrame {
+            authenticated_tenant: tenant,
+            principal: principal.clone(),
+            table: TableRef::new(BifrostNamespace::Bifrost, "decoded_size_bound"),
+            expected_schema_fingerprint: Some(projected_source_schema_fingerprint(schema.as_ref())),
+            request_id: request_id.clone(),
+            batch_id: uuid::Uuid::now_v7(),
+            audit_event: wyrd_spec::vala::api::AuditEvent {
+                request_id,
+                trace_id: None,
+                operation: "bifrost.append".to_owned(),
+                resource: "vala.bifrost.decoded_size_bound".to_owned(),
+                card_ref: None,
+                principal_id: principal.id,
+                principal_kind: principal.kind.tag(),
+                auth_method: wyrd_spec::vala::api::AuthMethod::Jwt,
+                permission: "bifrost:append".to_owned(),
+                decision: wyrd_spec::vala::api::AuditDecision::Allow,
+                result: wyrd_spec::vala::api::AuditResult::Success,
+                payload_summary: "one projected decoded-size fixture row".to_owned(),
+                detail: None,
+            },
+            measured_wire_bytes: 0,
+            payload: IngressPayload::ProjectedArrow(vec![rows]),
+        }
+    }
+
     /// An oversized decoded request is refused at the pre-WAL size gate while
     /// the exact ceiling remains available to a subsequent bounded request.
     #[tokio::test]
@@ -877,57 +938,7 @@ mod tests {
             roles: Vec::new(),
             effective_permissions: PermissionSet::new(),
         };
-        let make_frame = |value: String| {
-            let schema = Arc::new(Schema::new(vec![
-                Field::new(
-                    "wyrd_event_time",
-                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-                    false,
-                ),
-                Field::new("value", DataType::Utf8, false),
-            ]));
-            let rows = RecordBatch::try_new(
-                Arc::clone(&schema),
-                vec![
-                    Arc::new(
-                        TimestampMicrosecondArray::from(vec![
-                            chrono::Utc::now().timestamp_micros(),
-                        ])
-                        .with_timezone("UTC"),
-                    ),
-                    Arc::new(StringArray::from(vec![value])),
-                ],
-            )
-            .expect("decoded-size fixture batch");
-            let request_id = RequestId::now_v7();
-            ScribeIngressFrame {
-                authenticated_tenant: tenant,
-                principal: principal.clone(),
-                table: TableRef::new(BifrostNamespace::Bifrost, "decoded_size_bound"),
-                expected_schema_fingerprint: Some(projected_source_schema_fingerprint(
-                    schema.as_ref(),
-                )),
-                request_id: request_id.clone(),
-                batch_id: uuid::Uuid::now_v7(),
-                audit_event: wyrd_spec::vala::api::AuditEvent {
-                    request_id,
-                    trace_id: None,
-                    operation: "bifrost.append".to_owned(),
-                    resource: "vala.bifrost.decoded_size_bound".to_owned(),
-                    card_ref: None,
-                    principal_id: principal.id,
-                    principal_kind: principal.kind.tag(),
-                    auth_method: wyrd_spec::vala::api::AuthMethod::Jwt,
-                    permission: "bifrost:append".to_owned(),
-                    decision: wyrd_spec::vala::api::AuditDecision::Allow,
-                    result: wyrd_spec::vala::api::AuditResult::Success,
-                    payload_summary: "one projected decoded-size fixture row".to_owned(),
-                    detail: None,
-                },
-                measured_wire_bytes: 0,
-                payload: IngressPayload::ProjectedArrow(vec![rows]),
-            }
-        };
+        let make_frame = |value: String| decoded_size_frame(tenant, &principal, value);
         let admission_before = scribe.admission_snapshot();
         let memory_before = scribe.memory_snapshot();
         let wal_before = scribe.wal_bytes_on_disk();

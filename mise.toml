@@ -1267,5 +1267,6 @@ cargo test --locked -p vala-bifrost-redux --features test-support,bench-support 
 cargo test --locked -p vala-bifrost-redux --features test-support,bench-support --test integration -- oracle_core::terminal_paths_release_all_distributed_owners --exact --nocapture --test-threads=1;
 cargo test --locked -p wyrd-testing --test oracle -- --include-ignored --test-threads=1;
 cargo test --locked -p wyrd-testing --test oracle -- oracle_edge_journeys::pg_bifrost_oracle_heterogeneous_distributed_query_journey --exact --ignored --nocapture --test-threads=1;
+cargo test --locked -p wyrd-testing --test oracle -- oracle_edge_journeys::pg_bifrost_selective_tail_backed_distributed_parity --exact --ignored --nocapture --test-threads=1;
 cargo test --locked -p wyrd-testing --test cluster -- pg_bifrost_cluster_load::pg_oracle_resource_ladder_r0_distributed_execution --exact --ignored --nocapture --test-threads=1'
 """

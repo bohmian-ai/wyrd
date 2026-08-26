@@ -2408,6 +2408,153 @@ async fn pg_bifrost_oracle_heterogeneous_distributed_query_journey() {
         .expect("distributed cluster shutdown");
 }
 
+/// Sums the rows every peer worker in the cluster handed to attempt encoding.
+///
+/// Followers count rows as they enter the attempt encoder, so this is the
+/// row volume that actually crosses the distributed wire — the quantity a
+/// source-applied signed predicate is supposed to reduce.
+fn cluster_rows_encoded(cluster: &WyrdTestCluster) -> u64 {
+    cluster
+        .servers()
+        .filter_map(|server| {
+            Some(
+                server
+                    .state()
+                    .oracle_peer()?
+                    .worker()
+                    .physical_inspection()
+                    .rows_encoded,
+            )
+        })
+        .sum()
+}
+
+/// Runs one fused read-only statement and returns its rows plus terminal.
+///
+/// # Errors
+/// Returns a journey error when the query cannot be issued, a frame fails to
+/// decode, or the stream ends without a terminal.
+async fn fused_query_rows(
+    client: &WyrdClient,
+    sql: String,
+) -> Result<(u64, QueryTerminalOutcome), JourneyError> {
+    let mut stream = QueryClient::new(client)
+        .query(&BifrostQueryRequest {
+            sql,
+            visibility: VisibilityMode::Fused,
+            freshness: FreshnessPolicy::Strict,
+            deadline_ms: Some(20_000),
+        })
+        .await?;
+    let mut rows = 0_u64;
+    while let Some(batch) = stream.next_batch().await? {
+        rows = rows.saturating_add(u64::try_from(batch.num_rows())?);
+    }
+    let terminal = stream.terminal().ok_or("fused query terminal missing")?;
+    if terminal.row_count != rows {
+        return Err("terminal row count differs from Arrow frames".into());
+    }
+    Ok((rows, terminal.outcome))
+}
+
+/// A Scribe assignment now carries the same closed predicates as every other
+/// assignment, and the live-tail fetch applies them before returning batches.
+///
+/// The proof is a parity comparison against the same tail-backed data: a
+/// selective fused query returns exactly the rows the predicate admits, while
+/// sending strictly fewer rows into follower attempt encoding than the
+/// unfiltered query over the identical live tail.
+///
+/// # Panics
+/// Panics when the cluster, table registration, ingest, live-tail discovery,
+/// or either query violates its journey invariant.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn pg_bifrost_selective_tail_backed_distributed_parity() {
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::three_mixed())
+        .await
+        .expect("tail parity cluster");
+    let tenant = cluster.data_tenant_id();
+    let writer = cluster.server(2).expect("remote Scribe writer");
+    let table = unique_table("oracle_tail_parity");
+    register_table(writer, tenant, &table)
+        .await
+        .expect("tail parity table");
+    let table_fqn = format!("vala.bifrost.{table}");
+    let writer_client = client(writer, "tail-parity-writer")
+        .await
+        .expect("writer client");
+    // Every row stays in the live tail: no flush runs, so the whole result
+    // must be served by Scribe follower assignments.
+    for (id, value) in [
+        (1_i64, "alpha"),
+        (2_i64, "target"),
+        (3_i64, "zulu"),
+        (4_i64, "omega"),
+    ] {
+        ingest_marked(&writer_client, &table_fqn, id, value)
+            .await
+            .expect("live tail row");
+    }
+    let day = current_hour_partition();
+    cluster
+        .observe_live_tail(&table_fqn, day)
+        .await
+        .expect("live-tail discovery");
+    cluster
+        .refresh_oracle_snapshots()
+        .await
+        .expect("immutable membership input");
+
+    let leader = cluster.server(0).expect("query leader");
+    let reader = client(leader, "tail-parity-reader")
+        .await
+        .expect("reader client");
+
+    let before_unfiltered = cluster_rows_encoded(&cluster);
+    let (unfiltered_rows, unfiltered_outcome) = fused_query_rows(
+        &reader,
+        format!("SELECT id, value FROM {table_fqn} ORDER BY id"),
+    )
+    .await
+    .expect("unfiltered tail query");
+    let unfiltered_encoded = cluster_rows_encoded(&cluster) - before_unfiltered;
+    assert_eq!(unfiltered_outcome, QueryTerminalOutcome::Success);
+    assert_eq!(unfiltered_rows, 4, "the whole live tail is visible");
+    assert!(
+        unfiltered_encoded >= 4,
+        "an unfiltered tail-backed query must encode at least the tail it returns, \
+         saw {unfiltered_encoded}"
+    );
+
+    let before_selective = cluster_rows_encoded(&cluster);
+    let (selective_rows, selective_outcome) = fused_query_rows(
+        &reader,
+        format!("SELECT id, value FROM {table_fqn} WHERE value = 'target' ORDER BY id"),
+    )
+    .await
+    .expect("selective tail query");
+    let selective_encoded = cluster_rows_encoded(&cluster) - before_selective;
+    assert_eq!(selective_outcome, QueryTerminalOutcome::Success);
+    assert_eq!(
+        selective_rows, 1,
+        "the signed predicate admits exactly the matching tail row"
+    );
+    assert!(
+        selective_encoded < unfiltered_encoded,
+        "a signed predicate must be applied inside the live-tail fetch: \
+         selective={selective_encoded} unfiltered={unfiltered_encoded}"
+    );
+
+    let inspection = cluster
+        .oracle_inspection()
+        .await
+        .expect("clean tail parity settlement");
+    assert_eq!(inspection.active_queries, 0);
+    assert_eq!(inspection.reserved_memory_bytes, 0);
+    cluster.shutdown().await.expect("tail parity shutdown");
+}
+
 /// S3 proves a selective predicate prunes physical local and distributed
 /// Oracle reads while preserving exact residual rows, and that the tenant
 /// tripwire still fails closed once closed predicate/projection pushdown is

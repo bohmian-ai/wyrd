@@ -61,9 +61,7 @@ pub mod dispatcher;
 mod exec;
 #[cfg(feature = "test-support")]
 pub use exec::{remote_partition_attempts_for_test, reset_remote_partition_attempts_for_test};
-pub mod executor;
 pub mod follower;
-pub mod fragment;
 mod ownership;
 mod participant_cut;
 pub mod peer;
@@ -139,14 +137,6 @@ fn test_query_stream_from_physical(
     query_stream::OracleQueryStream::test_from_physical(telemetry, schema, batches, scan_stats)
 }
 
-/// Converts validated batches through the leader's production memory-source helper.
-#[cfg(test)]
-fn test_validated_memory_source(
-    batches: &Vec<RecordBatch>,
-    schema: SchemaRef,
-) -> datafusion::common::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
-    exec::OracleTableProvider::validated_memory_source(batches, schema)
-}
 pub use tail_fence::{DiscoveredTailRoute, TailStreamDiscovery};
 use tail_fence::{DrainedTails, ScribeFollowerSource, TailFenceDrainer, TailFenceDrainerConfig};
 

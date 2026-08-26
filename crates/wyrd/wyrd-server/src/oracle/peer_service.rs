@@ -6,7 +6,7 @@ use std::sync::Arc;
 use futures_util::{Stream, StreamExt};
 use vala_bifrost_redux::oracle::dispatcher::PEER_PROTOCOL_VERSION;
 use vala_bifrost_redux::oracle::dispatcher::{DispatchError, WorkerExecution};
-use vala_bifrost_redux::oracle::executor::AttemptEncoder;
+use vala_bifrost_redux::oracle::dispatcher::AttemptEncoder;
 use vala_bifrost_redux::oracle::follower::{
     AuthenticatedFollowerContext, PhysicalPlanFollowerError, authenticated_preflight,
 };

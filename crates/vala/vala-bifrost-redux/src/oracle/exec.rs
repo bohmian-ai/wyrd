@@ -925,12 +925,36 @@ struct OracleIcebergStaleObject {
     source: Box<dyn std::error::Error + Send + Sync>,
 }
 
+/// Returns whether an error chain contains an exact filesystem or `OpenDAL` not-found cause.
+///
+/// Object-store backends report a vanished object through their own typed
+/// error, wrapped an arbitrary number of times by Iceberg, Parquet, and
+/// DataFusion. Walking the whole chain and downcasting is the only way to
+/// separate a pinned object that disappeared after cut selection from a
+/// genuine storage outage, which the caller must classify differently.
+pub(super) fn error_chain_contains_not_found(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(source) = current {
+        if source
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            || source
+                .downcast_ref::<opendal::Error>()
+                .is_some_and(|error| error.kind() == opendal::ErrorKind::NotFound)
+        {
+            return true;
+        }
+        current = source.source();
+    }
+    false
+}
+
 /// Preserves a typed Iceberg-only stale marker without classifying adjacent IO.
 pub(super) fn iceberg_datafusion_error<E>(error: E) -> DataFusionError
 where
     E: std::error::Error + Send + Sync + 'static,
 {
-    if super::executor::error_chain_contains_not_found(&error) {
+    if error_chain_contains_not_found(&error) {
         DataFusionError::External(Box::new(OracleIcebergStaleObject {
             source: Box::new(error),
         }))
@@ -4298,6 +4322,27 @@ mod tests {
         assert!(matches!(
             classify_filter_for_schema(&physical_schema, &col("other_column").eq(lit("api"))),
             FilterClassification::Unsupported
+        ));
+    }
+
+    /// Only a missing pinned object is classified as a stale-object race; any
+    /// other storage failure keeps its outage classification.
+    ///
+    /// This is the seam `iceberg_datafusion_error` uses to decide whether a
+    /// vanished Iceberg object is retryable state or a genuine backend failure,
+    /// so both the positive filesystem cause and a negative sibling cause are
+    /// pinned here.
+    #[test]
+    fn oracle_exec_detects_only_not_found_causes_in_an_error_chain() {
+        let stale = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let outage = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+
+        assert!(error_chain_contains_not_found(&stale));
+        assert!(!error_chain_contains_not_found(&outage));
+        assert!(error_chain_contains_not_found(
+            &OracleIcebergStaleObject {
+                source: Box::new(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            }
         ));
     }
 }

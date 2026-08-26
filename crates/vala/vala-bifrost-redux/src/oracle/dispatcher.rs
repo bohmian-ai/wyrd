@@ -5,9 +5,12 @@ use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
+use arrow::ipc::writer::StreamWriter;
+use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures_util::{Stream, StreamExt};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::Instant;
@@ -15,8 +18,9 @@ use tokio_util::sync::CancellationToken;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
     BifrostSecurityViolationKind, FencingToken, NodeId, OracleRoleFence, PendingNodeReservation,
-    PhysicalExecuteFragmentRequest, QueryClass, QueryId, ReleaseNodeSlotsRequest, ReservationId,
-    ReservationRejected, ReserveNodeSlotsRequest, ReserveNodeSlotsResponse, WorkerAttemptFrame,
+    PhysicalExecuteFragmentRequest, QueryAuditDigest, QueryClass, QueryId, ReleaseNodeSlotsRequest,
+    ReservationId, ReservationRejected, ReserveNodeSlotsRequest, ReserveNodeSlotsResponse,
+    WorkerAttemptFrame, WorkerFooter, WorkerScanStats,
 };
 use wyrd_tonic::prost::Message;
 use wyrd_tonic::tonic::metadata::MetadataValue;
@@ -26,7 +30,6 @@ use wyrd_tonic::wyrd::v1::oracle_peer_service_client::OraclePeerServiceClient;
 
 use super::OracleSlotManager;
 use super::attempt::{AttemptBuffer, AttemptError, PartialAttempt, ValidatedAttempt};
-use super::executor::AttemptEncoder;
 use super::follower::{
     AuthenticatedFollowerContext, FollowerSessionFactory, FollowerSourceResolver,
     PhysicalPlanFollower, PhysicalPlanFollowerError,
@@ -1191,6 +1194,145 @@ fn peer_ticket_claims(
         )
         .map_err(|_| DispatchError::Terminal)?,
     })
+}
+
+/// Attempt-encoding failure raised while framing one follower batch stream.
+///
+/// The encoder owns only the Arrow IPC framing boundary, so its closed set is
+/// narrower than a scan failure: every variant means the worker could not turn
+/// already-decoded rows into the peer attempt protocol. Callers map the whole
+/// enum onto [`DispatchError::Terminal`] because none of them is retryable on
+/// another candidate.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum AttemptEncodeError {
+    /// The attempt produced no schema frame, so it has no footer to finalize.
+    #[error("attempt produced no schema frame")]
+    Empty,
+    /// A later batch changed the immutable attempt schema.
+    #[error("attempt batch schema changed mid-stream")]
+    Schema,
+    /// Arrow IPC encoding or a checked counter failed.
+    #[error("attempt batch encoding failed")]
+    Encode,
+    /// A footer digest could not be constructed from its hex preimage.
+    #[error("attempt footer digest is malformed")]
+    Digest,
+}
+
+/// Stateful footer encoder for one incremental worker attempt.
+///
+/// The encoder is driven once per attempt: [`AttemptEncoder::start`] emits the
+/// immutable schema frame, [`AttemptEncoder::encode`] emits one frame per
+/// decoded batch while hashing the payload in stream order, and
+/// [`AttemptEncoder::finish_physical`] seals the running row, byte, and payload
+/// counters into the footer the leader validates. It holds no IO and no
+/// reservation; the surrounding stream owns both.
+#[derive(Debug, Default)]
+pub struct AttemptEncoder {
+    /// Schema emitted exactly once before the first batch.
+    schema: Option<arrow::datatypes::SchemaRef>,
+    /// Incremental hash over encoded batch payloads in stream order.
+    payload_hash: Sha256,
+    /// Total encoded schema and batch bytes.
+    encoded_bytes: usize,
+    /// Total rows emitted across batch frames.
+    row_count: u64,
+}
+
+impl AttemptEncoder {
+    /// Starts an attempt with its immutable output schema, including empty results.
+    ///
+    /// # Errors
+    /// Returns [`AttemptEncodeError::Encode`] when Arrow IPC schema encoding fails.
+    pub fn start(
+        &mut self,
+        schema: arrow::datatypes::SchemaRef,
+    ) -> Result<WorkerAttemptFrame, AttemptEncodeError> {
+        let mut bytes = Vec::new();
+        StreamWriter::try_new(&mut bytes, &schema)
+            .and_then(|mut writer| writer.finish())
+            .map_err(|_| AttemptEncodeError::Encode)?;
+        self.encoded_bytes = bytes.len();
+        self.schema = Some(schema);
+        Ok(WorkerAttemptFrame::Schema(bytes))
+    }
+
+    /// Encodes one batch and returns its optional first-schema frame plus batch frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttemptEncodeError::Encode`] when Arrow IPC encoding or checked
+    /// counters fail, and [`AttemptEncodeError::Schema`] if later batches change
+    /// schema.
+    pub fn encode(
+        &mut self,
+        batch: &RecordBatch,
+    ) -> Result<(Option<WorkerAttemptFrame>, WorkerAttemptFrame), AttemptEncodeError> {
+        let schema_frame = if let Some(schema) = &self.schema {
+            if schema.as_ref() != batch.schema().as_ref() {
+                return Err(AttemptEncodeError::Schema);
+            }
+            None
+        } else {
+            let schema = batch.schema();
+            let mut bytes = Vec::new();
+            StreamWriter::try_new(&mut bytes, &schema)
+                .and_then(|mut writer| writer.finish())
+                .map_err(|_| AttemptEncodeError::Encode)?;
+            self.encoded_bytes = bytes.len();
+            self.schema = Some(schema);
+            Some(WorkerAttemptFrame::Schema(bytes))
+        };
+        let mut bytes = Vec::new();
+        StreamWriter::try_new(&mut bytes, &batch.schema())
+            .and_then(|mut writer| {
+                writer.write(batch)?;
+                writer.finish()
+            })
+            .map_err(|_| AttemptEncodeError::Encode)?;
+        self.payload_hash.update(&bytes);
+        self.encoded_bytes = self
+            .encoded_bytes
+            .checked_add(bytes.len())
+            .ok_or(AttemptEncodeError::Encode)?;
+        self.row_count = self
+            .row_count
+            .checked_add(u64::try_from(batch.num_rows()).map_err(|_| AttemptEncodeError::Encode)?)
+            .ok_or(AttemptEncodeError::Encode)?;
+        Ok((schema_frame, WorkerAttemptFrame::Batch(bytes)))
+    }
+
+    /// Finalizes a native physical-plan attempt under its immutable fingerprint.
+    ///
+    /// `scan_stats` is the follower's finalized physical read volume, which the
+    /// leader sums across the participant cut because its own plan scans no
+    /// storage.
+    ///
+    /// # Errors
+    /// Returns a closed empty, digest, or checked byte-conversion failure.
+    pub fn finish_physical(
+        self,
+        plan_fingerprint: &str,
+        scan_stats: WorkerScanStats,
+    ) -> Result<WorkerAttemptFrame, AttemptEncodeError> {
+        if self.schema.is_none() {
+            return Err(AttemptEncodeError::Empty);
+        }
+        let digest = QueryAuditDigest::new(plan_fingerprint.to_owned())
+            .map_err(|_| AttemptEncodeError::Digest)?;
+        let payload_digest = QueryAuditDigest::new(hex::encode(self.payload_hash.finalize()))
+            .map_err(|_| AttemptEncodeError::Digest)?;
+        Ok(WorkerAttemptFrame::Footer(WorkerFooter {
+            fragment_id: plan_fingerprint.to_owned(),
+            manifest_digest: digest,
+            row_count: self.row_count,
+            encoded_bytes: u64::try_from(self.encoded_bytes)
+                .map_err(|_| AttemptEncodeError::Encode)?,
+            payload_digest,
+            completed: true,
+            scan_stats,
+        }))
+    }
 }
 
 /// Encodes one follower record-batch stream into the peer attempt frame protocol.
@@ -2737,16 +2879,12 @@ mod tests {
             admitted_target_partitions: 1,
         }
     }
-    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use parquet::arrow::ArrowWriter;
-    use tempfile::NamedTempFile;
 
-    use super::super::fragment::{SealedScanFile, SealedScanFragment, SealedSourceTier};
     use super::super::peer::{
         DeterministicTestSigner, NoopPeerSecurityAudit, VerifiedClaimsBytes, projection_digest,
     };
@@ -2836,49 +2974,35 @@ mod tests {
         }
     }
 
-    /// Writes one real Parquet file and plans its immutable sealed fragment.
-    fn dispatcher_parquet_fragment() -> (NamedTempFile, SealedScanFragment) {
-        let mut file = NamedTempFile::new().expect("temporary Parquet file");
+    /// Immutable scan closure every dispatcher physical-plan fixture shares.
+    ///
+    /// The dispatcher tests exercise ticket minting, reservation accounting,
+    /// role fencing, and attempt framing over a serialized physical plan, so
+    /// the only per-request source facts they need are the pinned schema
+    /// fingerprint the placeholder leaf and assignment both carry, the
+    /// projection the ticket digests, and the absolute deadline the ticket
+    /// expires at. No object is opened, so no Parquet file is written.
+    struct DispatcherFixture {
+        /// Pinned fingerprint shared by the placeholder leaf and the assignment.
+        schema_fingerprint: String,
+        /// Authorized projection covered by the ticket's projection digest.
+        projection: Vec<String>,
+        /// Absolute ticket expiry expressed as Unix milliseconds.
+        deadline_unix_ms: i64,
+    }
+
+    /// Builds the deterministic closure shared by every dispatcher request fixture.
+    fn dispatcher_fixture() -> DispatcherFixture {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
             DataType::Int64,
             false,
         )]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
-        )
-        .expect("fixture batch");
-        let mut writer = ArrowWriter::try_new(file.as_file_mut(), Arc::clone(&schema), None)
-            .expect("Parquet writer");
-        writer.write(&batch).expect("Parquet batch");
-        writer.close().expect("Parquet close");
-        let size_bytes = file.as_file().metadata().expect("file metadata").len();
-        let location = file.path().to_string_lossy().into_owned();
-        let mut fragment = SealedScanFragment {
-            fragment_id: String::new(),
-            binding: Path::new(&location)
-                .parent()
-                .expect("fixture parent")
-                .to_string_lossy()
-                .into_owned(),
-            tier: SealedSourceTier::Iceberg,
-            pinned_digest: "dispatcher-test-digest".to_owned(),
-            files: vec![SealedScanFile {
-                location,
-                row_groups: vec![0],
-                size_bytes,
-                estimated_rows: 3,
-            }],
-            projection: vec!["value".to_owned()],
-            predicates: Vec::new(),
+        DispatcherFixture {
             schema_fingerprint: crate::oracle::assignment_schema_fingerprint(&schema),
-            estimated_rows: 3,
-            estimated_bytes: size_bytes,
+            projection: vec!["value".to_owned()],
             deadline_unix_ms: Utc::now().timestamp_millis() + 60_000,
-        };
-        fragment.fragment_id = fragment.digest();
-        (file, fragment)
+        }
     }
 
     /// Encodes one matching worker request for a retained reservation.
@@ -2924,7 +3048,7 @@ mod tests {
     }
 
     fn worker_request(
-        fragment: &SealedScanFragment,
+        fragment: &DispatcherFixture,
         reservation_id: ReservationId,
         node: NodeId,
         fence: FencingToken,
@@ -2956,7 +3080,7 @@ mod tests {
     /// Panics when plan encoding, digest computation, or ticket minting fails,
     /// all of which are deterministic for these fixtures.
     fn worker_request_with_cut(
-        fragment: &SealedScanFragment,
+        fragment: &DispatcherFixture,
         reservation_id: ReservationId,
         node: NodeId,
         fence: FencingToken,
@@ -3765,7 +3889,7 @@ mod tests {
             Arc::new(OracleSlotManager::new(1, 1)),
             1,
         ));
-        let (_file, fragment) = dispatcher_parquet_fragment();
+        let fragment = dispatcher_fixture();
         let worker = OraclePeerWorker::new_physical_with_resources(OraclePeerWorkerConfig {
             worker_node_id: node,
             oracle_fence: fence,
@@ -3844,7 +3968,7 @@ mod tests {
     /// on how many times provider resolution was reached.
     fn counting_worker_request(
         oracle: &crate::resources::OracleResources,
-        fragment: &SealedScanFragment,
+        fragment: &DispatcherFixture,
         tenant: DataTenantId,
         fence: FencingToken,
     ) -> (
@@ -3905,7 +4029,7 @@ mod tests {
     /// the digest unchanged, or when an identical cut fails to reproduce it.
     fn assert_partition_components_are_digest_covered(
         tenant: DataTenantId,
-        fragment: &SealedScanFragment,
+        fragment: &DispatcherFixture,
     ) {
         let cut_assignment = |cut: ScribeProviderCut| FollowerScanAssignment {
             scan_id: "dispatcher-test-scan".to_owned(),
@@ -3975,7 +4099,7 @@ mod tests {
             [crate::resources::BifrostRole::Oracle],
         );
         let oracle = roles.oracle().expect("Oracle capability");
-        let (_file, fragment) = dispatcher_parquet_fragment();
+        let fragment = dispatcher_fixture();
         let tenant = DataTenantId::new_v7();
 
         // A valid v3 request executes and reaches the resolver exactly once.
@@ -4069,7 +4193,7 @@ mod tests {
             Arc::new(OracleSlotManager::new(1, 1)),
             1,
         ));
-        let (_file, fragment) = dispatcher_parquet_fragment();
+        let fragment = dispatcher_fixture();
         let worker = OraclePeerWorker::new_physical_with_resources(OraclePeerWorkerConfig {
             worker_node_id: node,
             oracle_fence: fence,
@@ -4135,7 +4259,7 @@ mod tests {
             Arc::new(OracleSlotManager::new(1, 1)),
             1,
         ));
-        let (_file, fragment) = dispatcher_parquet_fragment();
+        let fragment = dispatcher_fixture();
         let worker = OraclePeerWorker::new_physical_with_resources(OraclePeerWorkerConfig {
             worker_node_id: node,
             oracle_fence: fence,
@@ -4591,5 +4715,73 @@ mod tests {
             attempt_error(AttemptError::Capacity),
             DispatchError::Unavailable
         ));
+    }
+
+    /// The attempt encoder emits one schema frame, hashes batch payloads in
+    /// stream order, and seals its running counters into the physical footer.
+    ///
+    /// The footer's row and byte counters are what the leader validates against
+    /// the delivered frames, and a mid-stream schema change is the contract
+    /// violation the leader cannot reconcile, so both are pinned here.
+    #[test]
+    fn dispatcher_attempt_encoder_frames_one_schema_then_a_counted_footer() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .expect("fixture batch");
+
+        let mut encoder = AttemptEncoder::default();
+        assert!(matches!(
+            encoder.start(Arc::clone(&schema)).expect("schema frame"),
+            WorkerAttemptFrame::Schema(_)
+        ));
+        let (repeated_schema, first) = encoder.encode(&batch).expect("first batch encodes");
+        assert!(repeated_schema.is_none());
+        assert!(matches!(first, WorkerAttemptFrame::Batch(_)));
+        encoder.encode(&batch).expect("second batch encodes");
+
+        let widened = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            true,
+        )]));
+        let widened_batch = RecordBatch::try_new(
+            widened,
+            vec![Arc::new(Int64Array::from(vec![Some(4_i64)]))],
+        )
+        .expect("widened batch");
+        assert_eq!(
+            encoder.encode(&widened_batch).expect_err("schema is immutable"),
+            AttemptEncodeError::Schema
+        );
+
+        let footer = encoder
+            .finish_physical("plan-fingerprint", WorkerScanStats::default())
+            .expect("physical footer");
+        let WorkerAttemptFrame::Footer(footer) = footer else {
+            panic!("finish_physical yields a footer frame");
+        };
+        assert_eq!(footer.fragment_id, "plan-fingerprint");
+        assert_eq!(footer.manifest_digest.as_str(), "plan-fingerprint");
+        assert_eq!(footer.row_count, 6);
+        assert!(footer.encoded_bytes > 0);
+        assert!(footer.completed);
+    }
+
+    /// An attempt that never produced a schema frame has no footer to finalize.
+    #[test]
+    fn dispatcher_attempt_encoder_refuses_a_footer_without_a_schema() {
+        assert_eq!(
+            AttemptEncoder::default()
+                .finish_physical("plan-fingerprint", WorkerScanStats::default())
+                .expect_err("an unstarted attempt has no footer"),
+            AttemptEncodeError::Empty
+        );
     }
 }

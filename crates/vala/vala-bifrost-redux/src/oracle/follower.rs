@@ -2112,7 +2112,10 @@ pub(crate) mod tests {
                     schema_fingerprint: super::super::assignment_schema_fingerprint(
                         schema.as_ref(),
                     ),
-                    required_columns: vec!["data_tenant_id".to_owned()],
+                    // The resolver now projects the assignment's own closure,
+                    // so this fixture names the single column its memtable
+                    // schema actually carries.
+                    required_columns: vec!["wyrd_event_time".to_owned()],
                     predicates: Vec::new(),
                 },
                 &session,

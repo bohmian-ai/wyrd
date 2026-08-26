@@ -2733,6 +2733,138 @@ mod tests {
         }
     }
 
+    /// Builds one direct live-tail service over a memtable holding two
+    /// appended batches of `value` rows, so a selective fetch can be compared
+    /// against the unfiltered one.
+    ///
+    /// # Panics
+    /// Panics when the fixture batches, seal key, or memtable inserts violate
+    /// their construction invariants.
+    fn selective_tail_fixture(
+        tenant: DataTenantId,
+        day: crate::catalog::layout::TimePartition,
+        stream: StreamIdentity,
+    ) -> (FetchLiveTailService, super::TenantTableBinding) {
+        use crate::catalog::TableRef;
+        use crate::scribe::seal_key::SealKey;
+        use crate::scribe::wal::ScribeAppendMeta;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = |values: Vec<i64>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(values))],
+            )
+            .expect("valid fixture batch")
+        };
+        let table = TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "events");
+        let key = SealKey::new(tenant, table.clone(), day);
+        let memtable = Arc::new(Memtable::new());
+        let event = || wyrd_spec::vala::api::AuditEvent {
+            request_id: wyrd_spec::request_id::RequestId::now_v7(),
+            trace_id: None,
+            operation: "test".to_owned(),
+            resource: "vala.bifrost.events".to_owned(),
+            card_ref: None,
+            principal_id: wyrd_spec::auth::PrincipalId::new(uuid::Uuid::now_v7()),
+            principal_kind: wyrd_spec::auth::PrincipalKindTag::User,
+            auth_method: wyrd_spec::vala::api::AuthMethod::Jwt,
+            permission: "test".to_owned(),
+            decision: wyrd_spec::vala::api::AuditDecision::Allow,
+            result: wyrd_spec::vala::api::AuditResult::Success,
+            payload_summary: "test".to_owned(),
+            detail: None,
+        };
+        let meta = |lsn: u64, rows: usize| ScribeAppendMeta {
+            batch_id: *uuid::Uuid::now_v7().as_bytes(),
+            schema_fingerprint: [0; 32],
+            data_digest: [0; 32],
+            data_len: 0,
+            payload_digest: [0; 32],
+            payload_len: 0,
+            slice_index: 0,
+            slice_count: 1,
+            rows_accepted: rows,
+            wal_lsn_min: WalLsn::new(lsn),
+            wal_lsn_max: WalLsn::new(lsn),
+            seal_key: key.to_string(),
+        };
+        memtable
+            .insert(&key, event(), meta(1, 3), batch(vec![1, 2, 3]))
+            .expect("first fixture batch inserts");
+        memtable
+            .insert(&key, event(), meta(2, 2), batch(vec![4, 5]))
+            .expect("second fixture batch inserts");
+        let binding = super::TenantTableBinding::resolve((tenant, table))
+            .expect("fixture binding resolves");
+        (
+            FetchLiveTailService::new(stream, memtable, tail_resources()),
+            binding,
+        )
+    }
+
+    /// A signed predicate is applied inside Scribe, so a selective live-tail
+    /// fetch returns the same rows the leader would have kept but ships
+    /// strictly fewer of them into follower attempt encoding.
+    ///
+    /// # Panics
+    /// Panics when the fixture cannot be built or either snapshot fails.
+    #[tokio::test]
+    async fn selective_live_tail_fetch_returns_only_signed_rows() {
+        use wyrd_spec::vala::assignment_authority::{ScanLiteral, ScanPredicate};
+
+        let tenant = DataTenantId::new_v7();
+        let day = crate::test_support::day_partition(2026, 7, 14);
+        let stream = StreamIdentity::new(NodeId::generate(), WriterEpoch::new(1));
+        let (service, binding) = selective_tail_fixture(tenant, day, stream);
+        let request = |predicates: Vec<ScanPredicate>| super::FetchLiveTailRequest {
+            binding: binding.clone(),
+            target_stream: stream,
+            start_partition: day,
+            end_partition: day,
+            after_lsn: WalLsn::ZERO,
+            persisted_lsn_ranges: Vec::new(),
+            required_columns: vec!["value".to_owned()],
+            predicates,
+            max_batches: 64,
+            max_retained_bytes: 64 * 1024 * 1024,
+        };
+
+        let unfiltered = service
+            .fetch_hot_batches(request(Vec::new()))
+            .await
+            .expect("unfiltered snapshot");
+        let unfiltered_rows: usize = unfiltered.iter().map(|batch| batch.rows.num_rows()).sum();
+        assert_eq!(unfiltered.len(), 2);
+        assert_eq!(unfiltered_rows, 5);
+
+        let selective = service
+            .fetch_hot_batches(request(vec![ScanPredicate::Eq(
+                "value".to_owned(),
+                ScanLiteral::I64(2),
+            )]))
+            .await
+            .expect("selective snapshot");
+        // The batch holding no matching row is dropped entirely rather than
+        // returned empty, and the surviving batch carries only row `2`.
+        assert_eq!(selective.len(), 1);
+        let selective_rows: usize = selective.iter().map(|batch| batch.rows.num_rows()).sum();
+        assert_eq!(selective_rows, 1);
+        assert!(selective_rows < unfiltered_rows);
+        let retained = selective[0]
+            .rows
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 value column")
+            .value(0);
+        assert_eq!(retained, 2);
+    }
+
     /// Local acquire rejects query-B against a query-A ticket before allocation.
     #[tokio::test]
     async fn local_acquire_query_binding_rejects_without_allocation() {

@@ -31,6 +31,38 @@ def test_bifrost_query_yields_pyarrow_and_terminal(wyrd_server: WyrdTestServer) 
 
 
 @pytest.mark.integration
+def test_query_stream_schema_once_eos(wyrd_server: WyrdTestServer) -> None:
+    """The Python journey sees one schema and an explicitly closed IPC stream.
+
+    The server emits one Arrow IPC stream split across Wyrd frames, so every
+    batch this client decodes carries the query's single schema and the
+    successful terminal carries the end-of-stream delta that closes it. An empty
+    end-of-stream would mean a truncated result rather than a complete one.
+    """
+    table_fqn, token = wyrd_server.prepare_oracle_query_fixture()
+
+    async def query() -> tuple[list[pyarrow.RecordBatch], dict[str, object] | None]:
+        stream = await BifrostQueryClient(wyrd_server.base_url, token).query(
+            f"SELECT id, value FROM {table_fqn} ORDER BY id",
+            visibility="published_only",
+            freshness="strict",
+        )
+        batches = [batch async for batch in stream]
+        return batches, stream.terminal
+
+    batches, terminal = asyncio.run(query())
+    assert batches
+    schemas = {batch.schema for batch in batches}
+    assert len(schemas) == 1
+    assert [field.name for field in batches[0].schema] == ["id", "value"]
+    assert sum(batch.num_rows for batch in batches) == 2
+    assert terminal is not None
+    assert terminal["outcome"] == "success"
+    assert terminal["row_count"] == 2
+    assert bytes(terminal["arrow_ipc_eos"]) == b"\xff\xff\xff\xff\x00\x00\x00\x00"
+
+
+@pytest.mark.integration
 @pytest.mark.parametrize("fault", ["schema", "batch"])
 def test_bifrost_query_missing_terminal_fails_closed(
     wyrd_server: WyrdTestServer, fault: str

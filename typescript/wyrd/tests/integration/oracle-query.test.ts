@@ -70,6 +70,36 @@ describe("Oracle query journey", () => {
     }
   }, 15_000);
 
+  it("uses schema-once IPC with explicit EOS", async () => {
+    const server = startTestServer();
+    try {
+      server.seedBifrostRows(server.tableFqn, [51, 52, 53]);
+      const client = new WyrdClient(server.baseUrl, server.token, server.grpcUrl);
+      const stream = await client.bifrost.query({
+        sql: `SELECT value FROM ${server.tableFqn} ORDER BY value`,
+      });
+      const batches = [];
+      for await (const batch of stream) {
+        batches.push(batch);
+      }
+      expect(batches.length).toBeGreaterThan(0);
+      // One query is one Arrow IPC stream, so every decoded batch carries the
+      // query's single schema rather than one re-declared per batch.
+      const fields = batches.map((batch) =>
+        batch.schema.fields.map((field) => field.name).join(","),
+      );
+      expect(new Set(fields).size).toBe(1);
+      expect(batches.reduce((rows, batch) => rows + batch.numRows, 0)).toBe(3);
+      expect(stream.terminal?.outcome).toBe("success");
+      expect(stream.terminal?.row_count).toBe(3);
+      // The terminal closes that stream explicitly; an empty delta would mean a
+      // truncated result rather than a complete one.
+      expect(stream.terminal?.arrow_ipc_eos).toEqual([255, 255, 255, 255, 0, 0, 0, 0]);
+    } finally {
+      server.shutdown();
+    }
+  }, 15_000);
+
   it.each([
     ["schema", "failNextQueryAfterSchema"],
     ["batch", "failNextQueryAfterBatch"],

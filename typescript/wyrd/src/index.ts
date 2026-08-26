@@ -73,6 +73,15 @@ export interface QueryTerminal {
   warnings: unknown[];
   source_completion: unknown[];
   error?: unknown;
+  /**
+   * Arrow IPC end-of-stream delta closing the query's single IPC stream.
+   *
+   * Present and non-empty for a successful or degraded query, and empty for a
+   * failed one, which never closes its stream. A caller distinguishing a
+   * complete result from a truncated one reads this rather than inferring
+   * completeness from an absent batch.
+   */
+  arrow_ipc_eos: number[];
 }
 
 export class WyrdError extends Error {

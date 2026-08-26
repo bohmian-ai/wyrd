@@ -164,6 +164,7 @@ pub(crate) async fn seed_foreign_hot_row(
     table: &str,
     foreign: DataTenantId,
     path_tag: &str,
+    node_id: uuid::Uuid,
 ) -> Result<(), JourneyError> {
     let table_ref = TableRef::new(BifrostNamespace::Bifrost, table);
     let binding = TenantTableBinding::resolve((owner, table_ref))?;
@@ -229,7 +230,7 @@ pub(crate) async fn seed_foreign_hot_row(
                 vala_bifrost_redux::catalog::layout::TimeGranularity::Day,
                 chrono::DateTime::UNIX_EPOCH,
             )?,
-            node_id: uuid::Uuid::now_v7(),
+            node_id,
             writer_epoch: 1,
             wal_lsn_min: 9_001,
             wal_lsn_max: 9_001,

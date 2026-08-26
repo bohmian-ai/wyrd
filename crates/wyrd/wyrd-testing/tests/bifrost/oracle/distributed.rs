@@ -220,14 +220,22 @@ async fn prove_selective_predicate_pruning(
     // assertion that regresses if the closed predicate/projection path ever
     // loses the reason across the follower dispatch boundary.
     let foreign_tenant = cluster.add_tenant("oracle-s3-foreign").await?;
-    seed_foreign_hot_row(&cluster, tenant, &table, foreign_tenant, "s3-foreign").await?;
+    seed_foreign_hot_row(
+        &cluster,
+        tenant,
+        &table,
+        foreign_tenant,
+        "s3-foreign",
+        ingest_server.node_id().as_uuid(),
+    )
+    .await?;
     let (tripwire_rows, tripwire_outcome, tripwire_error) = query_terminal_either_surface(
         &reader,
         format!("SELECT count(*) AS total FROM {table_fqn}"),
     )
     .await?;
     if tripwire_rows != 0 {
-        return Err("foreign row reached a SQL operator under predicate pushdown".into());
+        return Err(format!("foreign row reached a SQL operator under predicate pushdown: rows={tripwire_rows} outcome={tripwire_outcome:?} error={tripwire_error:?}").into());
     }
     if tripwire_outcome != QueryTerminalOutcome::Failed
         || tripwire_error != Some(QueryTerminalErrorCode::QueryTenantInvariant)

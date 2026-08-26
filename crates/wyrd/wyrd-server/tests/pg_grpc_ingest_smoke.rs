@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::TableRef;
-use vala_bifrost_redux::contracts::ScribeAppend;
+use vala_bifrost_redux::contracts::{IngressPayload, Scribe, ScribeIngressFrame};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint as ReduxSchemaFingerprint;
 use vala_bifrost_redux::scribe::tail_rpc::{
@@ -35,6 +35,7 @@ use wyrd_server::auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_server::grpc::{GrpcRouterConfig, build_app_grpc, serve_grpc};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PLATFORM_AUDIT_PRINCIPAL, PrincipalKindTag};
+use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::{CardRef, CardRefScope};
@@ -229,23 +230,55 @@ fn test_principal(tenant: DataTenantId) -> Principal {
 }
 
 /// Seeds two logical rows through the production embedded Scribe boundary.
+///
+/// The frame is the one a transport request would carry: an authenticated
+/// tenant, the Gate-owned allow/success audit event, the projected `value`-only
+/// source fingerprint (`wyrd_event_time` is server-managed and never part of
+/// schema identity), and the measured wire size.
 async fn seed_tail_rows(state: &AppState, tenant: DataTenantId) {
     let rows = non_empty_tail_batch();
-    state
-        .bifrost_ingest()
-        .expect("embedded state retains Scribe")
-        .scribe()
-        .append_durable(ScribeAppend {
-            principal: test_principal(tenant),
-            table: TableRef::new(BifrostNamespace::Bifrost, "events"),
-            schema_fingerprint: ReduxSchemaFingerprint::from_arrow_schema(rows.schema().as_ref()),
-            request_id: RequestId::now_v7(),
+    let principal = test_principal(tenant);
+    let table = TableRef::new(BifrostNamespace::Bifrost, "events");
+    let request_id = RequestId::now_v7();
+    let measured_wire_bytes = rows.get_array_memory_size();
+    let audit_event = AuditEvent {
+        request_id: request_id.clone(),
+        trace_id: None,
+        operation: "bifrost.append".to_owned(),
+        resource: table.fqn(),
+        card_ref: principal.card_ref().cloned(),
+        principal_id: principal.id,
+        principal_kind: principal.kind.tag(),
+        auth_method: AuthMethod::Jwt,
+        permission: "bifrost:append".to_owned(),
+        decision: AuditDecision::Allow,
+        result: AuditResult::Success,
+        payload_summary: format!("{} rows", rows.num_rows()),
+        detail: None,
+    };
+    let admission = Scribe::ingest_frame(
+        state
+            .bifrost_ingest()
+            .expect("embedded state retains Scribe")
+            .scribe()
+            .as_ref(),
+        ScribeIngressFrame {
+            authenticated_tenant: tenant,
+            principal,
+            table,
+            expected_schema_fingerprint: Some(ReduxSchemaFingerprint::from_arrow_schema(
+                &Schema::new(vec![Field::new("value", DataType::Int64, false)]),
+            )),
+            request_id,
             batch_id: uuid::Uuid::now_v7(),
-            measured_wire_bytes: rows.get_array_memory_size(),
-            rows,
-        })
-        .await
-        .expect("embedded Scribe admits two logical rows");
+            audit_event,
+            measured_wire_bytes,
+            payload: IngressPayload::ProjectedArrow(vec![rows]),
+        },
+    )
+    .await
+    .expect("embedded Scribe admits two logical rows");
+    assert_eq!(admission.rows_accepted, 2);
 }
 
 fn empty_request() -> InsertBatchRequest {

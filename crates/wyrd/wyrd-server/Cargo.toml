@@ -99,6 +99,10 @@ name = "pg_grpc_smoke"
 
 [[test]]
 name = "pg_grpc_ingest_smoke"
+# Inspects recovered WAL state through `replay_wal_directory`, which exists only
+# under `vala-bifrost-redux/test-support`; this crate's `test-support` feature
+# forwards it.
+required-features = ["test-support"]
 
 [[test]]
 name = "pg_authz_check_route"

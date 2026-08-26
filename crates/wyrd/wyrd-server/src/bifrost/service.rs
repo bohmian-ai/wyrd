@@ -27,16 +27,6 @@ fn map_engine_error(error: BifrostCatalogError) -> WyrdError {
     error.into_public().into()
 }
 
-/// Authorize the caller against a required permission before execution.
-fn authorize(state: &AppState, caller: &Caller, required: &Permission) -> Result<(), WyrdError> {
-    state
-        .authz
-        .permission_check
-        .check(&caller.principal, required)
-        .into_result()
-        .map_err(permission_deny_reason_to_wyrd)
-}
-
 /// Authorize, appending a `decision = deny` audit row (own tx) on refusal.
 async fn authorize_audited(
     state: &AppState,
@@ -185,11 +175,32 @@ pub async fn register_table(
 }
 
 /// List the tables visible to the caller's tenant (schema-free entries).
+///
+/// Listing requires `bifrost_table:read`. A denial appends a canonical
+/// `decision = deny` row to the tenant audit outbox before the public 403 is
+/// returned, and is fail-closed: an audit-append failure refuses the read with
+/// `WYRD_VALA_500_AUDIT_UNAVAILABLE`. A successful list is an ordinary
+/// tenant-bound read and records no durable transition.
+///
+/// # Errors
+///
+/// Returns a permission error when the caller lacks `bifrost_table:read`,
+/// [`WyrdError::AuditUnavailable`] when the denial audit append fails,
+/// [`wyrd_spec::vala::BifrostError::ScribeRoleUnavailable`] when this server
+/// carries no catalog, or the mapped catalog error when the listing query
+/// fails.
 pub async fn list_tables(
     state: &AppState,
     caller: Caller,
 ) -> Result<Vec<BifrostTableEntry>, WyrdError> {
-    authorize(state, &caller, &Permission::bifrost_table_read())?;
+    authorize_audited(
+        state,
+        &caller,
+        &Permission::bifrost_table_read(),
+        "vala.bifrost.list",
+        "bifrost.tables",
+    )
+    .await?;
     state
         .bifrost
         .catalog()
@@ -200,13 +211,39 @@ pub async fn list_tables(
 }
 
 /// Describe a single table (entry plus its stored field list).
+///
+/// Describing requires `bifrost_table:read`. A denial appends a canonical
+/// `decision = deny` row naming the requested fully qualified table before the
+/// public 403 is returned, and is fail-closed: an audit-append failure refuses
+/// the read. The audited resource is built from the request as received —
+/// authorization is decided before namespace validation so an unauthorized
+/// caller cannot distinguish a valid namespace from an invalid one — while the
+/// audit tenant always remains `caller.data_tenant_id`, never request payload.
+/// A successful describe records no durable transition.
+///
+/// # Errors
+///
+/// Returns a permission error when the caller lacks `bifrost_table:read`,
+/// [`WyrdError::AuditUnavailable`] when the denial audit append fails,
+/// a validation error for an unknown namespace,
+/// [`wyrd_spec::vala::BifrostError::ScribeRoleUnavailable`] when this server
+/// carries no catalog, and the mapped catalog error (including table-not-found)
+/// otherwise.
 pub async fn describe_table(
     state: &AppState,
     caller: Caller,
     namespace: String,
     name: String,
 ) -> Result<BifrostTableDescription, WyrdError> {
-    authorize(state, &caller, &Permission::bifrost_table_read())?;
+    let requested_fqn = format!("{namespace}.{name}");
+    authorize_audited(
+        state,
+        &caller,
+        &Permission::bifrost_table_read(),
+        "vala.bifrost.describe",
+        &requested_fqn,
+    )
+    .await?;
     let ns = convert::namespace_from_wire(&namespace)?;
     let table = TableRef::new(ns, name);
     state
@@ -281,6 +318,52 @@ mod pg_tests {
             nullable: true,
             metadata: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// Read the caller's own audit-outbox rows for one resource.
+    ///
+    /// The rows are fetched through the canonical tenant-scoped reader, then
+    /// narrowed to the caller's request ID so an assertion sees exactly the
+    /// events the operation under test appended, independent of anything else
+    /// the shared test tenant has recorded for the same resource.
+    async fn audit_rows_for(
+        state: &AppState,
+        caller: &Caller,
+        resource: &str,
+    ) -> Vec<vala_sql::row_types::audit_outbox::AuditOutboxRow> {
+        let mut conn =
+            vala_sql::TenantConn::acquire(state.postgres.vala_pool(), caller.data_tenant_id)
+                .await
+                .expect("tenant connection");
+        let rows = vala_sql::queries::audit_outbox::list_audit_events_for_resource(
+            &mut conn, resource, 0, 100,
+        )
+        .await
+        .expect("audit page");
+        conn.commit().await.expect("audit read commits");
+        rows.into_iter()
+            .filter(|row| row.request_id == caller.request_id.as_str())
+            .collect()
+    }
+
+    /// Assert one row carries the canonical RBAC-denial attribution.
+    fn assert_read_denial_row(
+        row: &vala_sql::row_types::audit_outbox::AuditOutboxRow,
+        operation: &str,
+        resource: &str,
+        caller: &Caller,
+    ) {
+        assert_eq!(row.operation, operation);
+        assert_eq!(row.resource, resource);
+        assert_eq!(
+            row.permission,
+            Permission::bifrost_table_read().to_string(),
+            "denial attributes the required read permission"
+        );
+        assert_eq!(row.decision, "deny");
+        assert_eq!(row.result, "failure");
+        assert_eq!(row.principal_id, caller.principal.id.as_uuid());
+        assert_eq!(row.request_id, caller.request_id.as_str());
     }
 
     fn register_req(name: &str, fields: Vec<FieldSpec>) -> RegisterTableRequest {
@@ -404,7 +487,7 @@ mod pg_tests {
             );
 
             let described =
-                describe_table(&state, caller, "vala.datasets".to_owned(), name.clone())
+                describe_table(&state, caller.clone(), "vala.datasets".to_owned(), name.clone())
                     .await
                     .expect("describe");
             assert_eq!(described.entry.name, name);
@@ -415,18 +498,66 @@ mod pg_tests {
                     .any(|f| f.name == "value" && f.data_type == DataTypeSpec::Int64),
                 "describe surfaces the user field"
             );
+
+            assert!(
+                audit_rows_for(&state, &caller, "bifrost.tables")
+                    .await
+                    .is_empty(),
+                "a permitted list records no durable audit transition"
+            );
+            let table_rows = audit_rows_for(&state, &caller, &format!("vala.datasets.{name}")).await;
+            assert_eq!(
+                table_rows.len(),
+                1,
+                "only the registration is audited for this table"
+            );
+            assert_eq!(table_rows[0].operation, "vala.bifrost.register");
+            assert_eq!(table_rows[0].decision, "allow");
         });
     }
 
+    /// A denied list returns 403 and leaves one canonical deny row behind.
     #[test]
     fn bifrost_tables_list_requires_read_permission() {
         wyrd_runtime::runtime().block_on(async {
             let state = test_state().await;
             let caller = caller_with([]).await;
-            let err = list_tables(&state, caller)
+            let err = list_tables(&state, caller.clone())
                 .await
                 .expect_err("no read permission is denied");
             assert_eq!(err.status(), 403);
+
+            let rows = audit_rows_for(&state, &caller, "bifrost.tables").await;
+            assert_eq!(rows.len(), 1, "denied list appends exactly one audit row");
+            assert_read_denial_row(&rows[0], "vala.bifrost.list", "bifrost.tables", &caller);
+        });
+    }
+
+    /// A denied describe returns 403 and audits the requested table name.
+    #[test]
+    fn bifrost_tables_describe_requires_read_permission() {
+        wyrd_runtime::runtime().block_on(async {
+            let state = test_state().await;
+            let caller = caller_with([]).await;
+            let name = unique_name();
+            let err = describe_table(
+                &state,
+                caller.clone(),
+                "vala.datasets".to_owned(),
+                name.clone(),
+            )
+            .await
+            .expect_err("no read permission is denied");
+            assert_eq!(err.status(), 403);
+
+            let resource = format!("vala.datasets.{name}");
+            let rows = audit_rows_for(&state, &caller, &resource).await;
+            assert_eq!(
+                rows.len(),
+                1,
+                "denied describe appends exactly one audit row"
+            );
+            assert_read_denial_row(&rows[0], "vala.bifrost.describe", &resource, &caller);
         });
     }
 }

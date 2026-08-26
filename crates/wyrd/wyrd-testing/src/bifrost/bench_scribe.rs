@@ -14,7 +14,7 @@ use bytes::Bytes;
 use vala_bifrost_redux::bench_support::WalBenchSupport;
 use vala_bifrost_redux::catalog::TimeGranularity;
 use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
-use vala_bifrost_redux::contracts::ScribeAppend;
+use vala_bifrost_redux::contracts::{IngressPayload, Scribe, ScribeIngressFrame};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
 use vala_bifrost_redux::scribe::persistence::PersistenceFaults;
@@ -599,6 +599,47 @@ async fn run_phase(
     Ok((samples, max_in_flight))
 }
 
+/// The user-visible schema identity the benchmark batch carries.
+///
+/// `make_batch` also stamps `wyrd_event_time`, which is server-managed and
+/// therefore excluded from a table's schema identity. The benchmark hands
+/// Scribe already-projected Arrow, so it must state the same projected
+/// fingerprint a real client's IPC stream would.
+fn bench_source_fingerprint() -> SchemaFingerprint {
+    SchemaFingerprint::from_arrow_schema(&Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]))
+}
+
+/// Builds the server-created audit event Gate owns for one benchmark frame.
+///
+/// `Scribe::ingest_frame` never mints an audit record of its own, so the
+/// benchmark supplies the allow/success event an authenticated write carries.
+fn bench_audit_event(
+    principal: &Principal,
+    table: &TableRef,
+    request_id: &RequestId,
+    rows: usize,
+) -> wyrd_spec::vala::api::AuditEvent {
+    wyrd_spec::vala::api::AuditEvent {
+        request_id: request_id.clone(),
+        trace_id: None,
+        operation: "bifrost.append".to_owned(),
+        resource: table.fqn(),
+        card_ref: principal.card_ref().cloned(),
+        principal_id: principal.id,
+        principal_kind: principal.kind.tag(),
+        auth_method: wyrd_spec::vala::api::AuthMethod::Jwt,
+        permission: "bifrost:append".to_owned(),
+        decision: wyrd_spec::vala::api::AuditDecision::Allow,
+        result: wyrd_spec::vala::api::AuditResult::Success,
+        payload_summary: format!("{rows} rows"),
+        detail: None,
+    }
+}
+
 async fn append_one(
     scribe: Arc<vala_bifrost_redux::scribe::ScribeImpl>,
     tenant: wyrd_spec::ids::DataTenantId,
@@ -606,25 +647,31 @@ async fn append_one(
     rows: RecordBatch,
     batch_id: uuid::Uuid,
 ) -> Result<DurableAckSample, BenchError> {
-    let fingerprint = SchemaFingerprint::from_arrow_schema(rows.schema().as_ref());
+    let principal = Principal {
+        id: PrincipalId::new(uuid::Uuid::now_v7()),
+        kind: PrincipalKind::User,
+        tenant_id: tenant,
+        roles: Vec::new(),
+        effective_permissions: PermissionSet::new(),
+    };
+    let request_id = RequestId::now_v7();
+    let audit_event = bench_audit_event(&principal, &table, &request_id, rows.num_rows());
     let started = Instant::now();
-    let result = scribe
-        .append_durable(ScribeAppend {
-            principal: Principal {
-                id: PrincipalId::new(uuid::Uuid::now_v7()),
-                kind: PrincipalKind::User,
-                tenant_id: tenant,
-                roles: Vec::new(),
-                effective_permissions: PermissionSet::new(),
-            },
+    let result = Scribe::ingest_frame(
+        scribe.as_ref(),
+        ScribeIngressFrame {
+            authenticated_tenant: tenant,
+            principal,
             table,
-            rows,
-            schema_fingerprint: fingerprint,
-            request_id: RequestId::now_v7(),
+            expected_schema_fingerprint: Some(bench_source_fingerprint()),
+            request_id,
             batch_id,
+            audit_event,
             measured_wire_bytes: 0,
-        })
-        .await;
+            payload: IngressPayload::ProjectedArrow(vec![rows]),
+        },
+    )
+    .await;
     let latency_us = u64::try_from(started.elapsed().as_micros())?;
     match result {
         Ok(ack) => Ok(DurableAckSample {

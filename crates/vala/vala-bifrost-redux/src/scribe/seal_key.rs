@@ -2,7 +2,7 @@
 //! memtable.
 //!
 //! Every WAL segment, memtable slot, manifest entry, and Parquet file is keyed by
-//! seal-key. A `ScribeAppend` that spans multiple partitions is split into
+//! seal-key. A `ScribeIngressFrame` that spans multiple partitions is split into
 //! per-key slices before WAL writes; a seal-key never crosses a partition.
 //!
 //! The partition granularity is not a property of this module: it comes from the

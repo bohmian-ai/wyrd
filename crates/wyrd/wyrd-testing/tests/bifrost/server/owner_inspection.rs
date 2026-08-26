@@ -7,14 +7,69 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::TableRef;
-use vala_bifrost_redux::contracts::ScribeAppend;
+use vala_bifrost_redux::contracts::{FrameAdmission, IngressPayload, Scribe, ScribeIngressFrame};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::schema::SchemaFingerprint;
 use vala_bifrost_redux::scribe::routing::{SCRIBE_SHARD_COUNT, shard_for};
 use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
 use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::request_id::RequestId;
+use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 use wyrd_testing::bifrost::BifrostHarness;
+
+/// Ingests one already-projected inspection row through Scribe's production
+/// boundary.
+///
+/// The inspection journey asserts on lane and bucket ownership, which is
+/// decided by `(tenant, table, batch_id)`, so every frame states its
+/// authenticated tenant, its Gate-owned audit event, the projected source
+/// fingerprint, and the measured wire size exactly as a transport frame would.
+///
+/// # Panics
+///
+/// Panics when Scribe refuses the frame or its durable completion fails.
+async fn ingest_inspection_row(
+    scribe: &vala_bifrost_redux::scribe::ScribeImpl,
+    principal: Principal,
+    table: TableRef,
+    rows: RecordBatch,
+    batch_id: Uuid,
+    fingerprint: SchemaFingerprint,
+    expectation: &str,
+) -> FrameAdmission {
+    let request_id = RequestId::now_v7();
+    let audit_event = AuditEvent {
+        request_id: request_id.clone(),
+        trace_id: None,
+        operation: "bifrost.append".to_owned(),
+        resource: table.fqn(),
+        card_ref: principal.card_ref().cloned(),
+        principal_id: principal.id,
+        principal_kind: principal.kind.tag(),
+        auth_method: AuthMethod::Jwt,
+        permission: "bifrost:append".to_owned(),
+        decision: AuditDecision::Allow,
+        result: AuditResult::Success,
+        payload_summary: format!("{} rows", rows.num_rows()),
+        detail: None,
+    };
+    Scribe::ingest_frame(
+        scribe,
+        ScribeIngressFrame {
+            authenticated_tenant: principal.tenant_id,
+            principal,
+            table,
+            expected_schema_fingerprint: Some(fingerprint),
+            request_id,
+            batch_id,
+            audit_event,
+            measured_wire_bytes: 0,
+            payload: IngressPayload::ProjectedArrow(vec![rows]),
+        },
+    )
+    .await
+    .expect(expectation)
+}
 
 /// Finds a table name whose shard-routing probe (using `Uuid::nil` as the stable
 /// batch-id sentinel) lands on `target_shard`.
@@ -135,7 +190,15 @@ async fn scribe_owner_dynamic_keys_preserve_topology() {
         ],
     )
     .expect("inspection batch");
-    let fingerprint = SchemaFingerprint::from_arrow_schema(schema.as_ref());
+    // Scribe identifies a table by the schema its client owns: the
+    // server-managed `wyrd_event_time` column above never takes part in schema
+    // identity, so the frame declares the projected `value`-only fingerprint a
+    // real client's IPC stream would carry.
+    let fingerprint = SchemaFingerprint::from_arrow_schema(&Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
     let principals = tenants
         .iter()
         .copied()
@@ -156,18 +219,17 @@ async fn scribe_owner_dynamic_keys_preserve_topology() {
     let shared_batch = Uuid::now_v7();
     let shared_lane = shard_for(concentrated_tenant, &concentrated_table, shared_batch);
     for _ in 0..3_usize {
-        scribe
-            .append_durable(ScribeAppend {
-                principal: principals[0].clone(),
-                table: concentrated_table.clone(),
-                rows: rows.clone(),
-                schema_fingerprint: fingerprint,
-                request_id: RequestId::now_v7(),
-                batch_id: shared_batch,
-                measured_wire_bytes: 0,
-            })
-            .await
-            .expect("retried same-key durable ACK");
+        let admission = ingest_inspection_row(
+            scribe,
+            principals[0].clone(),
+            concentrated_table.clone(),
+            rows.clone(),
+            shared_batch,
+            fingerprint,
+            "retried same-key durable ACK",
+        )
+        .await;
+        assert_eq!(admission.batch_id, shared_batch);
     }
 
     // (a) Appends sharing one (tenant, table, batch_id) occupy exactly one
@@ -194,18 +256,18 @@ async fn scribe_owner_dynamic_keys_preserve_topology() {
     // across more than one lane. Re-appending `concentrated_table` under fresh
     // batch ids keeps it a single bucket while dispersing its write load.
     for _ in 0..64_usize {
-        scribe
-            .append_durable(ScribeAppend {
-                principal: principals[0].clone(),
-                table: concentrated_table.clone(),
-                rows: rows.clone(),
-                schema_fingerprint: fingerprint,
-                request_id: RequestId::now_v7(),
-                batch_id: Uuid::now_v7(),
-                measured_wire_bytes: 0,
-            })
-            .await
-            .expect("batch-spread durable ACK");
+        let batch_id = Uuid::now_v7();
+        let admission = ingest_inspection_row(
+            scribe,
+            principals[0].clone(),
+            concentrated_table.clone(),
+            rows.clone(),
+            batch_id,
+            fingerprint,
+            "batch-spread durable ACK",
+        )
+        .await;
+        assert_eq!(admission.batch_id, batch_id);
     }
 
     // Capture the spread snapshot before any non-concentrated append lands, so
@@ -235,18 +297,17 @@ async fn scribe_owner_dynamic_keys_preserve_topology() {
             BifrostNamespace::Bifrost,
             format!("bifrost_owner_concentrated_{index}"),
         );
-        scribe
-            .append_durable(ScribeAppend {
-                principal: principals[0].clone(),
-                table,
-                rows: rows.clone(),
-                schema_fingerprint: fingerprint,
-                request_id: RequestId::now_v7(),
-                batch_id: Uuid::now_v7(),
-                measured_wire_bytes: 0,
-            })
-            .await
-            .expect("concentrated fill durable ACK");
+        let admission = ingest_inspection_row(
+            scribe,
+            principals[0].clone(),
+            table,
+            rows.clone(),
+            Uuid::now_v7(),
+            fingerprint,
+            "concentrated fill durable ACK",
+        )
+        .await;
+        assert_eq!(admission.rows_accepted, 1);
     }
     let mut candidate = 0_usize;
 
@@ -259,18 +320,17 @@ async fn scribe_owner_dynamic_keys_preserve_topology() {
             "bifrost_owner_dispersed",
             &mut candidate,
         );
-        scribe
-            .append_durable(ScribeAppend {
-                principal: principals[tenant_index].clone(),
-                table,
-                rows: rows.clone(),
-                schema_fingerprint: fingerprint,
-                request_id: RequestId::now_v7(),
-                batch_id: Uuid::now_v7(),
-                measured_wire_bytes: 0,
-            })
-            .await
-            .expect("dispersed-key durable ACK");
+        let admission = ingest_inspection_row(
+            scribe,
+            principals[tenant_index].clone(),
+            table,
+            rows.clone(),
+            Uuid::now_v7(),
+            fingerprint,
+            "dispersed-key durable ACK",
+        )
+        .await;
+        assert_eq!(admission.rows_accepted, 1);
     }
 
     let snapshot = harness

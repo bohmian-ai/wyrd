@@ -738,9 +738,11 @@ fn record_accepted_frame(rows_accepted: u64, elapsed: std::time::Duration) {
 mod tests {
     use super::{ScribeImpl, take_transport_decode_owner, validate_decoded_request_size};
     use crate::catalog::TableRef;
-    use crate::contracts::{DecodedOtlp, IngressPayload, ScribeAppend, ScribeError};
+    use crate::contracts::{
+        DecodedOtlp, IngressPayload, Scribe, ScribeError, ScribeIngressFrame,
+        projected_source_schema_fingerprint,
+    };
     use crate::namespaces::BifrostNamespace;
-    use crate::schema::SchemaFingerprint;
     use crate::scribe::memory::MemoryCategory;
     use arrow::array::{StringArray, TimestampMicrosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -875,7 +877,7 @@ mod tests {
             roles: Vec::new(),
             effective_permissions: PermissionSet::new(),
         };
-        let make_append = |value: String| {
+        let make_frame = |value: String| {
             let schema = Arc::new(Schema::new(vec![
                 Field::new(
                     "wyrd_event_time",
@@ -897,14 +899,33 @@ mod tests {
                 ],
             )
             .expect("decoded-size fixture batch");
-            ScribeAppend {
+            let request_id = RequestId::now_v7();
+            ScribeIngressFrame {
+                authenticated_tenant: tenant,
                 principal: principal.clone(),
                 table: TableRef::new(BifrostNamespace::Bifrost, "decoded_size_bound"),
-                schema_fingerprint: SchemaFingerprint::from_arrow_schema(schema.as_ref()),
-                request_id: RequestId::now_v7(),
+                expected_schema_fingerprint: Some(projected_source_schema_fingerprint(
+                    schema.as_ref(),
+                )),
+                request_id: request_id.clone(),
                 batch_id: uuid::Uuid::now_v7(),
+                audit_event: wyrd_spec::vala::api::AuditEvent {
+                    request_id,
+                    trace_id: None,
+                    operation: "bifrost.append".to_owned(),
+                    resource: "vala.bifrost.decoded_size_bound".to_owned(),
+                    card_ref: None,
+                    principal_id: principal.id,
+                    principal_kind: principal.kind.tag(),
+                    auth_method: wyrd_spec::vala::api::AuthMethod::Jwt,
+                    permission: "bifrost:append".to_owned(),
+                    decision: wyrd_spec::vala::api::AuditDecision::Allow,
+                    result: wyrd_spec::vala::api::AuditResult::Success,
+                    payload_summary: "one projected decoded-size fixture row".to_owned(),
+                    detail: None,
+                },
                 measured_wire_bytes: 0,
-                rows,
+                payload: IngressPayload::ProjectedArrow(vec![rows]),
             }
         };
         let admission_before = scribe.admission_snapshot();
@@ -913,8 +934,7 @@ mod tests {
         let stats_before = scribe
             .memtable_stats()
             .expect("pre-rejection memtable stats");
-        let error = scribe
-            .append_durable(make_append("x".repeat(limit)))
+        let error = Scribe::ingest_frame(&scribe, make_frame("x".repeat(limit)))
             .await
             .expect_err("decoded request above 64 KiB must fail");
         assert!(matches!(
@@ -933,10 +953,10 @@ mod tests {
                 .expect("post-rejection memtable stats"),
             stats_before
         );
-        scribe
-            .append_durable(make_append("small".to_owned()))
+        let admission = Scribe::ingest_frame(&scribe, make_frame("small".to_owned()))
             .await
             .expect("sub-limit request remains durably admissible");
+        assert_eq!(admission.rows_accepted, 1);
         assert!(scribe.wal_bytes_on_disk() > wal_before);
         scribe
             .shutdown(Instant::now() + Duration::from_secs(1))

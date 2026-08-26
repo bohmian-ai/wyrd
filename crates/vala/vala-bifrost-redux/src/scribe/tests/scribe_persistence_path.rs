@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use crate::catalog::{TableRef, TenantTableBinding};
-use crate::contracts::ScribeError;
+use crate::contracts::{
+    IngressPayload, Scribe, ScribeError, ScribeIngressFrame, projected_source_schema_fingerprint,
+};
 use crate::namespaces::BifrostNamespace;
-use crate::schema::SchemaFingerprint;
-use crate::scribe::ScribeAppend;
 use crate::scribe::ScribeImpl;
 use crate::scribe::admission::EventTimeWindow;
 use crate::scribe::seal_key::SealKey;
@@ -20,6 +20,31 @@ use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
 use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::request_id::RequestId;
+use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
+
+
+/// Build the server-created audit event Gate owns for one production frame.
+///
+/// These fixtures call `Scribe::ingest_frame` directly, which never mints an
+/// audit record of its own, so each frame carries the allow/success event an
+/// authenticated write would have produced at the transport boundary.
+fn frame_audit_event(principal: &Principal, table: &TableRef, request_id: &RequestId) -> AuditEvent {
+    AuditEvent {
+        request_id: request_id.clone(),
+        trace_id: None,
+        operation: "bifrost.append".to_owned(),
+        resource: table.fqn(),
+        card_ref: principal.card_ref().cloned(),
+        principal_id: principal.id,
+        principal_kind: principal.kind.tag(),
+        auth_method: AuthMethod::Jwt,
+        permission: "bifrost:append".to_owned(),
+        decision: AuditDecision::Allow,
+        result: AuditResult::Success,
+        payload_summary: "projected persistence fixture rows".to_owned(),
+        detail: None,
+    }
+}
 
 /// Returns an event partition the production admission window still admits,
 /// `days_before_receipt` days below the current receipt instant.
@@ -107,18 +132,26 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
     );
     let scribe = ScribeImpl::new_for_embedded_with_deps(operator, wal, &Uuid::nil().to_string(), 1);
 
-    let admission = scribe
-        .append_durable(ScribeAppend {
-            principal: principal(tenant),
+    let principal = principal(tenant);
+    let request_id = RequestId::now_v7();
+    let admission = Scribe::ingest_frame(
+        &scribe,
+        ScribeIngressFrame {
+            authenticated_tenant: tenant,
+            audit_event: frame_audit_event(&principal, &table, &request_id),
+            principal,
             table: table.clone(),
-            schema_fingerprint: SchemaFingerprint::from_arrow_schema(rows.schema().as_ref()),
-            request_id: RequestId::now_v7(),
+            expected_schema_fingerprint: Some(projected_source_schema_fingerprint(
+                rows.schema().as_ref(),
+            )),
+            request_id,
             batch_id,
             measured_wire_bytes: 0,
-            rows,
-        })
-        .await
-        .expect("durable append");
+            payload: IngressPayload::ProjectedArrow(vec![rows]),
+        },
+    )
+    .await
+    .expect("durable append");
     assert_eq!(admission.batch_id, batch_id);
     assert_eq!(admission.rows_accepted, 1);
     let inspection = scribe
@@ -195,18 +228,31 @@ async fn oracle_hot_snapshot_preserves_pointer_identity_and_day_isolation() {
         .expect("WAL writer"),
     );
     let scribe = ScribeImpl::new_for_embedded_with_deps(operator, wal, &Uuid::nil().to_string(), 1);
-    scribe
-        .append_durable(ScribeAppend {
-            principal: principal(tenant),
+    let pointer_principal = principal(tenant);
+    let pointer_request_id = RequestId::now_v7();
+    let pointer_admission = Scribe::ingest_frame(
+        &scribe,
+        ScribeIngressFrame {
+            authenticated_tenant: tenant,
+            audit_event: frame_audit_event(
+                &pointer_principal,
+                &pointer_table,
+                &pointer_request_id,
+            ),
+            principal: pointer_principal,
             table: pointer_table.clone(),
-            schema_fingerprint: SchemaFingerprint::from_arrow_schema(source.schema().as_ref()),
-            request_id: RequestId::now_v7(),
+            expected_schema_fingerprint: Some(projected_source_schema_fingerprint(
+                source.schema().as_ref(),
+            )),
+            request_id: pointer_request_id,
             batch_id: Uuid::now_v7(),
             measured_wire_bytes: 0,
-            rows: source.clone(),
-        })
-        .await
-        .expect("pointer identity append");
+            payload: IngressPayload::ProjectedArrow(vec![source.clone()]),
+        },
+    )
+    .await
+    .expect("pointer identity append");
+    assert_eq!(pointer_admission.rows_accepted, 1);
     let stream = StreamIdentity::new(NodeId::new(Uuid::nil()), WriterEpoch::new(1));
     assert_pointer_identity(
         &scribe,
@@ -219,18 +265,31 @@ async fn oracle_hot_snapshot_preserves_pointer_identity_and_day_isolation() {
     .await;
 
     let cross_day = cross_day_batch(source.schema(), day_one, day_two);
-    scribe
-        .append_durable(ScribeAppend {
-            principal: principal(tenant),
+    let cross_day_principal = principal(tenant);
+    let cross_day_request_id = RequestId::now_v7();
+    let cross_day_admission = Scribe::ingest_frame(
+        &scribe,
+        ScribeIngressFrame {
+            authenticated_tenant: tenant,
+            audit_event: frame_audit_event(
+                &cross_day_principal,
+                &day_table,
+                &cross_day_request_id,
+            ),
+            principal: cross_day_principal,
             table: day_table.clone(),
-            schema_fingerprint: SchemaFingerprint::from_arrow_schema(cross_day.schema().as_ref()),
-            request_id: RequestId::now_v7(),
+            expected_schema_fingerprint: Some(projected_source_schema_fingerprint(
+                cross_day.schema().as_ref(),
+            )),
+            request_id: cross_day_request_id,
             batch_id: Uuid::now_v7(),
             measured_wire_bytes: 0,
-            rows: cross_day,
-        })
-        .await
-        .expect("cross-day append");
+            payload: IngressPayload::ProjectedArrow(vec![cross_day]),
+        },
+    )
+    .await
+    .expect("cross-day append");
+    assert_eq!(cross_day_admission.rows_accepted, 2);
     assert_cross_day_materialization(&scribe, tenant, &day_table, day_one, day_two, stream).await;
     assert_other_tenant_isolated(&scribe, &pointer_table, day_one, stream).await;
     scribe
@@ -428,18 +487,26 @@ async fn shard_wal_failure_reaches_the_durable_completion() {
         1,
     );
     let rows = batch(day);
-    let error = scribe
-        .append_durable(ScribeAppend {
-            principal: principal(tenant),
+    let principal = principal(tenant);
+    let request_id = RequestId::now_v7();
+    let error = Scribe::ingest_frame(
+        &scribe,
+        ScribeIngressFrame {
+            authenticated_tenant: tenant,
+            audit_event: frame_audit_event(&principal, &table, &request_id),
+            principal,
             table,
-            schema_fingerprint: SchemaFingerprint::from_arrow_schema(rows.schema().as_ref()),
-            request_id: RequestId::now_v7(),
+            expected_schema_fingerprint: Some(projected_source_schema_fingerprint(
+                rows.schema().as_ref(),
+            )),
+            request_id,
             batch_id: Uuid::now_v7(),
             measured_wire_bytes: 0,
-            rows,
-        })
-        .await
-        .expect_err("WAL failure must fail the durable completion");
+            payload: IngressPayload::ProjectedArrow(vec![rows]),
+        },
+    )
+    .await
+    .expect_err("WAL failure must fail the durable completion");
     assert!(matches!(error, ScribeError::WalDiskFull));
     scribe
         .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))

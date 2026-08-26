@@ -3,9 +3,11 @@
 use std::sync::Arc;
 
 use crate::catalog::TableRef;
-use crate::contracts::{ScribeAppend, ScribeError};
+use crate::contracts::{
+    FrameAdmission, IngressPayload, Scribe, ScribeError, ScribeIngressFrame,
+    projected_source_schema_fingerprint,
+};
 use crate::namespaces::BifrostNamespace;
-use crate::schema::fingerprint::SchemaFingerprint;
 use crate::scribe::admission::EventTimeWindow;
 use crate::scribe::audit_envelope::encode_audit_event;
 use crate::scribe::memory::MemoryCategory;
@@ -84,6 +86,29 @@ fn audit() -> Vec<u8> {
     .expect("audit")
 }
 
+/// Build the server-created audit event that Gate owns for a production frame.
+///
+/// Closeout fixtures pass through `Scribe::ingest_frame`, which never mints its
+/// own audit record, so each fixture supplies the allow/success event a real
+/// authenticated write would carry.
+fn frame_audit_event(principal: &Principal, table: &str, request_id: &RequestId) -> AuditEvent {
+    AuditEvent {
+        request_id: request_id.clone(),
+        trace_id: None,
+        operation: "bifrost.append".to_owned(),
+        resource: format!("vala.bifrost.{table}"),
+        card_ref: principal.card_ref().cloned(),
+        principal_id: principal.id,
+        principal_kind: principal.kind.tag(),
+        auth_method: AuthMethod::Jwt,
+        permission: "bifrost:append".to_owned(),
+        decision: AuditDecision::Allow,
+        result: AuditResult::Success,
+        payload_summary: "1 rows".to_owned(),
+        detail: None,
+    }
+}
+
 /// Build the fixed one-row closeout batch.
 ///
 /// # Panics
@@ -148,88 +173,114 @@ fn scribe(wal_root: &TempDir, node: NodeId) -> (Arc<WalWriter>, crate::scribe::S
     (wal, scribe)
 }
 
-/// Append one fixed batch through Scribe's durable production seam.
+/// Ingest one fixed batch through Scribe's durable production seam.
 ///
 /// # Errors
-/// Returns the exact Scribe append error from the durable owner.
-async fn append(
+/// Returns the exact Scribe ingress error from the durable owner.
+async fn ingest(
     scribe: &crate::scribe::ScribeImpl,
     tenant: DataTenantId,
     table: &str,
     batch_id: Uuid,
-) -> Result<(), ScribeError> {
-    append_as(scribe, principal(tenant), table, batch_id).await
+) -> Result<FrameAdmission, ScribeError> {
+    ingest_as(scribe, principal(tenant), table, batch_id).await
 }
 
-/// Append one fixed batch as a retained authenticated principal.
-async fn append_as(
+/// Ingest one fixed batch as a retained authenticated principal.
+///
+/// # Errors
+/// Returns the exact Scribe ingress error from the durable owner.
+async fn ingest_as(
     scribe: &crate::scribe::ScribeImpl,
     principal: Principal,
     table: &str,
     batch_id: Uuid,
-) -> Result<(), ScribeError> {
+) -> Result<FrameAdmission, ScribeError> {
     let rows = batch();
-    scribe
-        .append_durable(ScribeAppend {
+    let request_id = RequestId::now_v7();
+    Scribe::ingest_frame(
+        scribe,
+        ScribeIngressFrame {
+            authenticated_tenant: principal.tenant_id,
+            audit_event: frame_audit_event(&principal, table, &request_id),
             principal,
             table: TableRef::new(BifrostNamespace::Bifrost, table),
-            schema_fingerprint: SchemaFingerprint::from_arrow_schema(rows.schema().as_ref()),
-            request_id: RequestId::now_v7(),
+            expected_schema_fingerprint: Some(projected_source_schema_fingerprint(
+                rows.schema().as_ref(),
+            )),
+            request_id,
             batch_id,
             measured_wire_bytes: 0,
-            rows,
-        })
-        .await
-        .map(|_| ())
+            payload: IngressPayload::ProjectedArrow(vec![rows]),
+        },
+    )
+    .await
 }
 
-/// Append a payload variant through the production durable seam.
-async fn append_value(
+/// Ingest a payload variant through the production durable seam.
+///
+/// # Errors
+/// Returns the exact Scribe ingress error from the durable owner.
+async fn ingest_value(
     scribe: &crate::scribe::ScribeImpl,
     tenant: DataTenantId,
     table: &str,
     batch_id: Uuid,
     value: i64,
-) -> Result<(), ScribeError> {
+) -> Result<FrameAdmission, ScribeError> {
     let rows = batch_with_value(value);
-    scribe
-        .append_durable(ScribeAppend {
-            principal: principal(tenant),
+    let principal = principal(tenant);
+    let request_id = RequestId::now_v7();
+    Scribe::ingest_frame(
+        scribe,
+        ScribeIngressFrame {
+            authenticated_tenant: tenant,
+            audit_event: frame_audit_event(&principal, table, &request_id),
+            principal,
             table: TableRef::new(BifrostNamespace::Bifrost, table),
-            schema_fingerprint: SchemaFingerprint::from_arrow_schema(rows.schema().as_ref()),
-            request_id: RequestId::now_v7(),
+            expected_schema_fingerprint: Some(projected_source_schema_fingerprint(
+                rows.schema().as_ref(),
+            )),
+            request_id,
             batch_id,
             measured_wire_bytes: 0,
-            rows,
-        })
-        .await
-        .map(|_| ())
+            payload: IngressPayload::ProjectedArrow(vec![rows]),
+        },
+    )
+    .await
 }
 
-/// Append one fixed batch while reporting an explicit measured wire size.
+/// Ingest one fixed batch while reporting an explicit measured wire size.
 ///
 /// # Errors
-/// Returns the exact Scribe append error from the durable owner.
-async fn append_measured(
+/// Returns the exact Scribe ingress error from the durable owner.
+async fn ingest_measured(
     scribe: &crate::scribe::ScribeImpl,
     tenant: DataTenantId,
     table: &str,
     batch_id: Uuid,
     measured_wire_bytes: usize,
-) -> Result<(), ScribeError> {
+) -> Result<FrameAdmission, ScribeError> {
     let rows = batch();
-    scribe
-        .append_durable(ScribeAppend {
-            principal: principal(tenant),
+    let principal = principal(tenant);
+    let request_id = RequestId::now_v7();
+    Scribe::ingest_frame(
+        scribe,
+        ScribeIngressFrame {
+            authenticated_tenant: tenant,
+            audit_event: frame_audit_event(&principal, table, &request_id),
+            principal,
             table: TableRef::new(BifrostNamespace::Bifrost, table),
-            schema_fingerprint: SchemaFingerprint::from_arrow_schema(rows.schema().as_ref()),
-            request_id: RequestId::now_v7(),
+            expected_schema_fingerprint: Some(projected_source_schema_fingerprint(
+                rows.schema().as_ref(),
+            )),
+            request_id,
             batch_id,
             measured_wire_bytes,
-            rows,
-        })
-        .await
-        .map(|_| ())
+            payload: IngressPayload::ProjectedArrow(vec![rows]),
+        },
+    )
+    .await
 }
 
 /// Assert one exact Scribe rejection counter and no identity-bearing variant.
@@ -309,7 +360,7 @@ async fn scribe_memory_rejection_emits_exact_owner_reason() {
         .try_reserve_ingress(MemoryCategory::Raw, scribe.memory.ingress_limit_bytes())
         .expect("reserve Scribe ingress breaker capacity");
 
-    let error = append(&scribe, DataTenantId::new_v7(), "memory", Uuid::now_v7())
+    let error = ingest(&scribe, DataTenantId::new_v7(), "memory", Uuid::now_v7())
         .await
         .expect_err("memory breaker rejects append");
     assert!(matches!(error, ScribeError::IngestBusy { .. }));
@@ -329,7 +380,7 @@ async fn scribe_queue_rejection_emits_exact_owner_reason() {
     let (_wal, scribe) = scribe(&wal_root, NodeId::new(Uuid::now_v7()));
     scribe.shards.close();
 
-    append(&scribe, DataTenantId::new_v7(), "queue", Uuid::now_v7())
+    ingest(&scribe, DataTenantId::new_v7(), "queue", Uuid::now_v7())
         .await
         .expect_err("closed shard mailbox rejects append");
     assert_rejection(&recorder, "queue", 1);
@@ -349,7 +400,7 @@ async fn scribe_closed_rejection_emits_exact_owner_reason() {
         .closed
         .store(true, std::sync::atomic::Ordering::Release);
 
-    let error = append(&scribe, DataTenantId::new_v7(), "closed", Uuid::now_v7())
+    let error = ingest(&scribe, DataTenantId::new_v7(), "closed", Uuid::now_v7())
         .await
         .expect_err("closed lifecycle rejects append");
     assert!(matches!(error, ScribeError::IngressClosed));
@@ -367,7 +418,7 @@ async fn scribe_invalid_rejection_emits_exact_owner_reason() {
     let wal_root = tempfile::tempdir().expect("WAL directory");
     let (_wal, scribe) = scribe(&wal_root, NodeId::new(Uuid::now_v7()));
 
-    let error = append_measured(
+    let error = ingest_measured(
         &scribe,
         DataTenantId::new_v7(),
         "invalid",
@@ -391,7 +442,7 @@ async fn duplicate_shutdown_is_idempotent_and_closes_owners() {
     let node = NodeId::new(Uuid::now_v7());
     let (_wal, scribe) = scribe(&wal_root, node);
     let scribe = Arc::new(scribe);
-    append(
+    ingest(
         &scribe,
         DataTenantId::new(Uuid::now_v7()).expect("tenant ID"),
         "shutdown_owner",
@@ -500,7 +551,7 @@ async fn sync_failure_has_no_ack_or_memtable_visibility() {
     let tenant = DataTenantId::new_v7();
     wal.trip_sync_failure_for_test();
 
-    let error = append(&scribe, tenant, "sync_failure", Uuid::now_v7())
+    let error = ingest(&scribe, tenant, "sync_failure", Uuid::now_v7())
         .await
         .expect_err("sync failure must not acknowledge");
     // Assert the variant, not the wording. A non-disk-full fsync failure is
@@ -534,7 +585,7 @@ async fn failure_after_fsync_before_ack_reuses_stable_batch_once() {
     let retry_principal = principal(tenant);
     wal.trip_post_sync_failure_for_test();
 
-    let first = append_as(
+    let first = ingest_as(
         &scribe,
         retry_principal.clone(),
         "post_sync_failure",
@@ -553,7 +604,7 @@ async fn failure_after_fsync_before_ack_reuses_stable_batch_once() {
     assert_eq!(retained.active_attempts, 1);
     assert!(retained.active_reserved_bytes > 0);
 
-    let retry = append_as(&scribe, retry_principal, "post_sync_failure", batch_id);
+    let retry = ingest_as(&scribe, retry_principal, "post_sync_failure", batch_id);
     let (first_result, retry_result) = tokio::join!(first, retry);
     first_result.expect("original ACK follows visible insertion");
     retry_result.expect("stable batch retry");
@@ -590,11 +641,11 @@ async fn contradictory_batch_retry_is_rejected_before_second_wal_append() {
     let tenant = DataTenantId::new_v7();
     let batch_id = Uuid::now_v7();
 
-    append_value(&scribe, tenant, "contradictory_retry", batch_id, 7)
+    ingest_value(&scribe, tenant, "contradictory_retry", batch_id, 7)
         .await
         .expect("first append");
     let wal_bytes_before = wal.bytes_on_disk();
-    let error = append_value(&scribe, tenant, "contradictory_retry", batch_id, 8)
+    let error = ingest_value(&scribe, tenant, "contradictory_retry", batch_id, 8)
         .await
         .expect_err("contradictory retry must not acknowledge");
     assert!(error.to_string().contains("contradictory payload identity"));

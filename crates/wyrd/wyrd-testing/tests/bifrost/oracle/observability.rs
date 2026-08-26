@@ -89,27 +89,27 @@ const ORACLE_SPANS: &[&str] = &[
     "bifrost.oracle.stream",
 ];
 
-/// J6 proves durable-before-read acceptance, bounded relay backlog, and replay windows.
+/// Proves durable-before-read acceptance, bounded relay backlog, and replay windows.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn pg_bifrost_oracle_audit_relay_journey() {
     let mut cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed())
         .await
-        .expect("J6 cluster");
-    let server = cluster.server(0).expect("J6 server");
+        .expect("cluster");
+    let server = cluster.server(0).expect("server");
     let node_id = server.node_id();
     let table = unique_table("oracle_audit_relay");
     register_table(server, cluster.data_tenant_id(), &table)
         .await
-        .expect("J6 table");
+        .expect("table");
     let primary_bootstrap = server
         .bootstrap_service_in_tenant(cluster.data_tenant_id(), "oracle-audit-relay", &["admin"])
         .await
-        .expect("J6 primary bootstrap");
+        .expect("primary bootstrap");
     let primary_principal = primary_bootstrap.id().as_uuid();
     let query_client = client_from_bootstrap(server, primary_bootstrap)
         .await
-        .expect("J6 client");
+        .expect("client");
     let secondary_bootstrap = server
         .bootstrap_service_in_tenant(
             cluster.data_tenant_id(),
@@ -117,32 +117,32 @@ async fn pg_bifrost_oracle_audit_relay_journey() {
             &["admin"],
         )
         .await
-        .expect("J6 secondary bootstrap");
+        .expect("secondary bootstrap");
     let secondary_principal = secondary_bootstrap.id().as_uuid();
     let secondary_client = client_from_bootstrap(server, secondary_bootstrap)
         .await
-        .expect("J6 second client");
+        .expect("second client");
     ingest(&query_client, &format!("vala.bifrost.{table}"), &[1])
         .await
-        .expect("J6 ingest");
-    server.flush_bifrost().await.expect("J6 flush");
-    let pause = server.pause_audit_relay_for_test().expect("J6 pause relay");
+        .expect("ingest");
+    server.flush_bifrost().await.expect("flush");
+    let pause = server.pause_audit_relay_for_test().expect("pause relay");
     let audit_pool = cluster
         .pg_fixture()
         .superuser_pool()
         .await
-        .expect("J6 audit owner");
+        .expect("audit owner");
     let primary_boundary: i64 = sqlx::query_scalar(
         "SELECT COALESCE(MAX(seq), 0) FROM vala.audit_outbox WHERE data_tenant_id = $1",
     )
     .bind(cluster.data_tenant_id().as_uuid())
     .fetch_one(&audit_pool)
     .await
-    .expect("J6 primary sequence boundary");
+    .expect("primary sequence boundary");
     assert_eq!(
         query_rows(&query_client, &table, VisibilityMode::PublishedOnly)
             .await
-            .expect("J6 query"),
+            .expect("query"),
         1
     );
     let secondary_boundary: i64 = sqlx::query_scalar(
@@ -151,14 +151,14 @@ async fn pg_bifrost_oracle_audit_relay_journey() {
     .bind(cluster.data_tenant_id().as_uuid())
     .fetch_one(&audit_pool)
     .await
-    .expect("J6 secondary sequence boundary");
+    .expect("secondary sequence boundary");
     assert_eq!(
         query_rows(&secondary_client, &table, VisibilityMode::PublishedOnly,)
             .await
-            .expect("J6 second query"),
+            .expect("second query"),
         1
     );
-    let blocked = server.oracle_runtime_inspection().expect("J6 inspection");
+    let blocked = server.oracle_runtime_inspection().expect("inspection");
     assert!(
         blocked.audit_wal_records >= 1,
         "accepted audit must be durable before relay"
@@ -168,7 +168,7 @@ async fn pg_bifrost_oracle_audit_relay_journey() {
     loop {
         if server
             .oracle_runtime_inspection()
-            .expect("J6 relay inspection")
+            .expect("relay inspection")
             .audit_wal_records
             == 0
         {
@@ -192,7 +192,7 @@ async fn pg_bifrost_oracle_audit_relay_journey() {
     .bind(primary_boundary)
     .fetch_all(&audit_pool)
     .await
-    .expect("J6 primary correlated audit row");
+    .expect("primary correlated audit row");
     let secondary_rows: Vec<(uuid::Uuid, String, String, uuid::Uuid, String)> = sqlx::query_as(
         "SELECT data_tenant_id, request_id, resource, principal_id, operation FROM vala.audit_outbox \
          WHERE data_tenant_id = $1 AND resource = $2 AND principal_id = $3 \
@@ -205,7 +205,7 @@ async fn pg_bifrost_oracle_audit_relay_journey() {
     .bind(secondary_boundary)
     .fetch_all(&audit_pool)
     .await
-    .expect("J6 secondary correlated audit row");
+    .expect("secondary correlated audit row");
     assert_eq!(primary_rows.len(), 1);
     assert_eq!(secondary_rows.len(), 1);
     assert_ne!(primary_rows[0].1, secondary_rows[0].1);
@@ -225,20 +225,20 @@ async fn pg_bifrost_oracle_audit_relay_journey() {
             .pg_fixture()
             .superuser_pool()
             .await
-            .expect("J6 exact tuple owner"),
+            .expect("exact tuple owner"),
     )
     .await
-    .expect("J6 exact tuple count");
+    .expect("exact tuple count");
     assert_eq!(primary_count, 1);
     let roots = cluster
         .terminate_node_abruptly_for_test(node_id)
         .await
-        .expect("J6 terminate");
+        .expect("terminate");
     cluster
         .restart_terminated_node_at_new_address(node_id, roots)
         .await
-        .expect("J6 restart");
-    let restarted = cluster.server(0).expect("J6 restarted");
+        .expect("restart");
+    let restarted = cluster.server(0).expect("restarted");
     let current: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM vala.audit_outbox \
          WHERE data_tenant_id = $1 AND request_id = $2 AND resource = $3 \
@@ -254,40 +254,40 @@ async fn pg_bifrost_oracle_audit_relay_journey() {
             .pg_fixture()
             .superuser_pool()
             .await
-            .expect("J6 owner restart"),
+            .expect("owner restart"),
     )
     .await
-    .expect("J6 restart count");
+    .expect("restart count");
     assert_eq!(current, 1, "checkpointed relay must not replay on restart");
     let replay_bootstrap = restarted
         .bootstrap_service_in_tenant(cluster.data_tenant_id(), "oracle-audit-replay", &["admin"])
         .await
-        .expect("J6 replay bootstrap");
+        .expect("replay bootstrap");
     let replay_principal = replay_bootstrap.id().as_uuid();
     let replay_client = client_from_bootstrap(restarted, replay_bootstrap)
         .await
-        .expect("J6 replay client");
+        .expect("replay client");
     let replay_boundary: i64 = sqlx::query_scalar(
         "SELECT COALESCE(MAX(seq), 0) FROM vala.audit_outbox WHERE data_tenant_id = $1",
     )
     .bind(cluster.data_tenant_id().as_uuid())
     .fetch_one(&audit_pool)
     .await
-    .expect("J6 replay sequence boundary");
+    .expect("replay sequence boundary");
     restarted
         .fail_audit_after_commit_for_test()
-        .expect("J6 crash seam");
+        .expect("crash seam");
     assert_eq!(
         query_rows(&replay_client, &table, VisibilityMode::PublishedOnly)
             .await
-            .expect("J6 replay query"),
+            .expect("replay query"),
         1
     );
     let replay_owner = cluster
         .pg_fixture()
         .superuser_pool()
         .await
-        .expect("J6 replay owner");
+        .expect("replay owner");
     let replay_tuple: (uuid::Uuid, String, String, uuid::Uuid, String) = loop {
         let tuples: Vec<(uuid::Uuid, String, String, uuid::Uuid, String)> = sqlx::query_as(
             "SELECT data_tenant_id, request_id, resource, principal_id, operation \
@@ -301,10 +301,10 @@ async fn pg_bifrost_oracle_audit_relay_journey() {
         .bind(replay_boundary)
         .fetch_all(&replay_owner)
         .await
-        .expect("J6 replay tuple");
+        .expect("replay tuple");
         if !tuples.is_empty() {
-            assert_eq!(tuples.len(), 1, "J6 replay initial tuple must be unique");
-            break tuples.into_iter().next().expect("J6 replay tuple exists");
+            assert_eq!(tuples.len(), 1, "replay initial tuple must be unique");
+            break tuples.into_iter().next().expect("replay tuple exists");
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     };
@@ -322,10 +322,10 @@ async fn pg_bifrost_oracle_audit_relay_journey() {
         .bind(&replay_tuple.4)
         .fetch_one(&replay_owner)
         .await
-        .expect("J6 committed replay count");
+        .expect("committed replay count");
         let inspection = restarted
             .oracle_runtime_inspection()
-            .expect("J6 replay inspection");
+            .expect("replay inspection");
         if committed == 1 && inspection.audit_wal_records >= 1 {
             break;
         }
@@ -338,11 +338,11 @@ async fn pg_bifrost_oracle_audit_relay_journey() {
     let replay_roots = cluster
         .terminate_node_abruptly_for_test(node_id)
         .await
-        .expect("J6 replay terminate");
+        .expect("replay terminate");
     cluster
         .restart_terminated_node_at_new_address(node_id, replay_roots)
         .await
-        .expect("J6 replay restart");
+        .expect("replay restart");
     let replay_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     let replayed: i64 = loop {
         let count: i64 = sqlx::query_scalar(
@@ -357,7 +357,7 @@ async fn pg_bifrost_oracle_audit_relay_journey() {
         .bind(&replay_tuple.4)
         .fetch_one(&replay_owner)
         .await
-        .expect("J6 replay count");
+        .expect("replay count");
         if count >= 2 || tokio::time::Instant::now() >= replay_deadline {
             break count;
         }
@@ -379,14 +379,14 @@ async fn pg_bifrost_oracle_audit_relay_journey() {
             .pg_fixture()
             .superuser_pool()
             .await
-            .expect("J6 chain owner"),
+            .expect("chain owner"),
     )
     .await
-    .expect("J6 chain rows");
+    .expect("chain rows");
     assert_eq!(chain.len(), 2);
     assert_eq!(chain[0].0, chain[1].0 + 1);
     assert_eq!(chain[0].1, chain[1].2);
-    cluster.shutdown().await.expect("J6 shutdown");
+    cluster.shutdown().await.expect("shutdown");
 }
 
 /// J-typed proves Vala's typed route enters the same Oracle cut as SQL.

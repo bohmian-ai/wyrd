@@ -670,17 +670,6 @@ mod pg_tests {
         assert!(second.is_closed());
     }
 
-    /// Oracle journeys retain assertion-pool clones only for their local
-    /// mutation windows and release them without closing the shared pool.
-    #[test]
-    fn oracle_journeys_drop_assertion_pool_clones_without_closing() {
-        let journeys = include_str!("../../../wyrd/wyrd-testing/tests/oracle_edge_journeys.rs");
-
-        assert_eq!(journeys.matches(".superuser_pool()").count(), 4);
-        assert_eq!(journeys.matches("drop(owner);").count(), 2);
-        assert!(!journeys.contains("owner.close().await"));
-    }
-
     async fn assert_required_schemas(fixture: &PgFixture) {
         for schema in ["platform", "wyrd", "vala"] {
             let exists: (bool,) =

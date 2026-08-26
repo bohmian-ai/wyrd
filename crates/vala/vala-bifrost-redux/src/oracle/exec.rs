@@ -191,7 +191,7 @@ pub(crate) struct RemoteScanConfig {
     /// Signed dispatch facts replayed identically to every participant.
     pub(crate) context: super::dispatcher::DispatchContext,
     /// Query-scoped settlement registry joined at cancellation.
-    pub(crate) settlement: Arc<super::admission::DistributedQuerySettlement>,
+    pub(super) settlement: Arc<super::admission::DistributedQuerySettlement>,
     /// Fragment plan serialized exactly once for byte-identical delivery.
     pub(crate) physical_plan_bytes: Vec<u8>,
     /// Tenant and table this scan is authorized against.
@@ -923,7 +923,7 @@ struct OracleIcebergStaleObject {
 ///
 /// Object-store backends report a vanished object through their own typed
 /// error, wrapped an arbitrary number of times by Iceberg, Parquet, and
-/// DataFusion. Walking the whole chain and downcasting is the only way to
+/// `DataFusion`. Walking the whole chain and downcasting is the only way to
 /// separate a pinned object that disappeared after cut selection from a
 /// genuine storage outage, which the caller must classify differently.
 pub(super) fn error_chain_contains_not_found(error: &(dyn std::error::Error + 'static)) -> bool {
@@ -1225,7 +1225,7 @@ pub(crate) struct OracleTableInputs {
     /// Query-local pool shared by `DataFusion` and Wyrd-owned source buffers.
     pub(crate) query_pool: Arc<dyn MemoryPool>,
     /// Production memory telemetry owner.
-    pub(crate) telemetry: Arc<OracleTelemetry>,
+    pub(super) telemetry: Arc<OracleTelemetry>,
     /// Admission class charged by this provider.
     pub(crate) query_class: QueryClass,
 }

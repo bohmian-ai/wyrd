@@ -22,7 +22,7 @@ use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 
 use crate::support::*;
 
-/// J4 enters the final mixed node so its frozen membership includes remote workers.
+/// The journey enters the final mixed node so its frozen membership includes remote workers.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn pg_bifrost_oracle_distributed_journey() {
@@ -35,7 +35,7 @@ async fn pg_bifrost_oracle_distributed_journey() {
         true,
     )
     .await
-    .expect("J4 distributed journey");
+    .expect("distributed journey");
 }
 
 /// Proves the native physical-plan cut executes persisted and live subtrees on

@@ -8,7 +8,7 @@ use wyrd_testing::bifrost::BifrostClusterSpec;
 
 use crate::support::*;
 
-/// J1 proves exact PublishedOnly rows and a validated terminal through the public SDK.
+/// Proves exact PublishedOnly rows and a validated terminal through the public SDK.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn pg_bifrost_oracle_published_journey() {
@@ -21,10 +21,10 @@ async fn pg_bifrost_oracle_published_journey() {
         false,
     )
     .await
-    .expect("J1 PublishedOnly journey");
+    .expect("PublishedOnly journey");
 }
 
-/// J2 proves a Fused query drains a live tonic tail without a Scribe flush.
+/// Proves a Fused query drains a live tonic tail without a Scribe flush.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn pg_bifrost_oracle_fused_reconcile_journey() {
@@ -37,10 +37,10 @@ async fn pg_bifrost_oracle_fused_reconcile_journey() {
         false,
     )
     .await
-    .expect("J2 Fused journey");
+    .expect("Fused journey");
 }
 
-/// J3 proves ingest-only gRPC write and query-only HTTP/Arrow read routing.
+/// Proves ingest-only gRPC write and query-only HTTP/Arrow read routing.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn pg_bifrost_oracle_role_separated_journey() {
@@ -53,5 +53,5 @@ async fn pg_bifrost_oracle_role_separated_journey() {
         false,
     )
     .await
-    .expect("J3 role-separated journey");
+    .expect("role-separated journey");
 }

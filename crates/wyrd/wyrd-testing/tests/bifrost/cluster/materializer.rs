@@ -137,7 +137,7 @@ mod pg_tests {
         // generator-at-run-anchor equivalence (uniform event-time shift, unchanged
         // Q2/Q3/Q4 selections) is proven at the unit tier in `bench_dataset`.
         let manifest: DatasetManifestFixture = serde_json::from_slice(include_bytes!(
-            "../fixtures/bifrost/qualification/dataset-manifest.json"
+            "../../../fixtures/bifrost/qualification/dataset-manifest.json"
         ))
         .expect("checked-in dataset manifest");
         let shape = manifest.smoke.shape;

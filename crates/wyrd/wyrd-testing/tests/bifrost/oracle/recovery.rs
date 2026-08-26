@@ -277,22 +277,22 @@ async fn pg_bifrost_oracle_two_server_scribe_tail_boundary_journey() {
     cluster.shutdown().await.expect("two-server shutdown");
 }
 
-/// J7 proves stale replan, audit refusal, stale fence, SDK terminal rejection, and recovery.
+/// Proves stale replan, audit refusal, stale fence, SDK terminal rejection, and recovery.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn pg_bifrost_oracle_recovery_terminal_journey() {
     let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed())
         .await
-        .expect("J7 cluster");
-    let server = cluster.server(0).expect("J7 server");
+        .expect("cluster");
+    let server = cluster.server(0).expect("server");
     let table = unique_table("oracle_j7");
     register_table(server, cluster.data_tenant_id(), &table)
         .await
-        .expect("J7 table");
-    let client = client(server, "oracle-j7").await.expect("J7 client");
+        .expect("table");
+    let client = client(server, "oracle-j7").await.expect("client");
     let missing_path = seed_missing_hot_row(&cluster, cluster.data_tenant_id(), &table)
         .await
-        .expect("J7 missing hot row");
+        .expect("missing hot row");
     let stale = QueryClient::new(&client)
         .query(&BifrostQueryRequest {
             sql: format!("SELECT * FROM vala.bifrost.{table}"),
@@ -309,7 +309,7 @@ async fn pg_bifrost_oracle_recovery_terminal_journey() {
         .pg_fixture()
         .superuser_pool()
         .await
-        .expect("J7 owner pool");
+        .expect("owner pool");
     let audit_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     let retry_details: Vec<String> = loop {
         let details: Vec<String> = sqlx::query_scalar(
@@ -321,7 +321,7 @@ async fn pg_bifrost_oracle_recovery_terminal_journey() {
         .bind(cluster.data_tenant_id().as_uuid())
         .fetch_all(&owner)
         .await
-        .expect("J7 retry audits");
+        .expect("retry audits");
         if details.len() >= 2 || tokio::time::Instant::now() >= audit_deadline {
             break details;
         }
@@ -339,18 +339,18 @@ async fn pg_bifrost_oracle_recovery_terminal_journey() {
     prove_sdk_missing_terminal_rejected().await;
     ingest(&client, &format!("vala.bifrost.{table}"), &[7])
         .await
-        .expect("J7 ingest");
-    server.flush_bifrost().await.expect("J7 flush");
+        .expect("ingest");
+    server.flush_bifrost().await.expect("flush");
     assert_eq!(
         query_rows(&client, &table, VisibilityMode::PublishedOnly)
             .await
-            .expect("J7 recovered query"),
+            .expect("recovered query"),
         1
     );
     let residual = cluster
         .oracle_inspection()
         .await
-        .expect("J7 residual inspection");
+        .expect("residual inspection");
     assert_eq!(residual.active_queries, 0);
     assert_eq!(residual.queued_queries, 0);
     assert_eq!(residual.reserved_memory_bytes, 0);
@@ -358,7 +358,7 @@ async fn pg_bifrost_oracle_recovery_terminal_journey() {
     assert_eq!(residual.peer_pending, 0);
     assert_eq!(residual.peer_running, 0);
     drop(owner);
-    cluster.shutdown().await.expect("J7 shutdown");
+    cluster.shutdown().await.expect("shutdown");
 }
 
 /// Persist one manifest identity whose pinned object is intentionally absent.

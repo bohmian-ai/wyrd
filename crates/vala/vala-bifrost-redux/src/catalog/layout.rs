@@ -1059,14 +1059,14 @@ mod tests {
         assert_eq!(violation, expected_violation);
     }
 
-    /// The one canonical-layout contract of the single resolution entry point.
+    /// The declarations the single resolution entry point accepts.
     ///
-    /// Covers the shapes the public rules name: an omitted declaration, an
-    /// explicit-empty declaration, `wyrd_event_time` declared explicitly, the
-    /// sort-key cap, an unknown column, a duplicate, floor-union dedupe, and the
-    /// absence of `data_tenant_id` from both canonical lists.
+    /// Covers an omitted declaration, an explicit-empty declaration,
+    /// `wyrd_event_time` declared explicitly, managed columns on both lists,
+    /// floor-union dedupe, the absence of `data_tenant_id` from both canonical
+    /// lists, and the canonical form's fixed point through the stored wire.
     #[test]
-    fn canonical_layout_contract() {
+    fn canonical_layout_accepts_declared_shapes() {
         let schema = fixture_schema();
 
         // An omitted declaration resolves to hourly, one event-time key, and
@@ -1138,6 +1138,26 @@ mod tests {
                 .as_slice()
         );
 
+        // The canonical form is a fixed point, and the wire it projects carries
+        // the granularity directly.
+        let stored = managed.to_wire();
+        assert_eq!(stored.partition_granularity, TimeGranularityWire::Hour);
+        assert_eq!(
+            PhysicalLayout::from_stored_wire(TABLE, &schema, &stored)
+                .expect("a canonical layout re-resolves to itself")
+                .to_wire(),
+            stored
+        );
+    }
+
+    /// The shape and column faults the resolution entry point refuses.
+    ///
+    /// Covers the sort-key cap winning over a per-key column fault, and unknown
+    /// and duplicate columns on both the sort-key and Bloom lists.
+    #[test]
+    fn canonical_layout_refuses_shape_and_column_faults() {
+        let schema = fixture_schema();
+
         // The cap admits exactly MAX_SORT_KEYS and refuses the next one before
         // any per-key validation, so the shape fault wins over a column fault.
         let four = vec![
@@ -1188,17 +1208,6 @@ mod tests {
             ),
             PhysicalLayoutField::BloomColumn,
             PhysicalLayoutViolation::Duplicate,
-        );
-
-        // The canonical form is a fixed point, and the wire it projects carries
-        // the granularity directly.
-        let stored = managed.to_wire();
-        assert_eq!(stored.partition_granularity, TimeGranularityWire::Hour);
-        assert_eq!(
-            PhysicalLayout::from_stored_wire(TABLE, &schema, &stored)
-                .expect("a canonical layout re-resolves to itself")
-                .to_wire(),
-            stored
         );
     }
 

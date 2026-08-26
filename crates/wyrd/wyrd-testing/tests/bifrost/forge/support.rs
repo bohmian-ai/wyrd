@@ -526,7 +526,14 @@ pub(crate) async fn start_maintenance_journey_server() -> WyrdTestServer {
 ///
 /// # Panics
 ///
-/// Panics when the process-global recorder or isolated server cannot start.
+/// Panics when the process-global recorder or isolated server cannot start, or
+/// when the server unexpectedly exposes a bound endpoint that would imply a
+/// background Forge worker role.
+///
+/// Both consumers supervise their own worker, so the server must not run one:
+/// a `BifrostTarget::All` server polls the durable queue regardless of its
+/// scheduler interval and races the test-owned worker for the same task. This
+/// mirrors `start_maintenance_journey_server` and `start_engine_fixture_server`.
 pub(crate) async fn start_telemetry_maintenance_server() -> (
     WyrdTestServer,
     wyrd_testing::bifrost::BifrostTelemetryCapture,
@@ -536,10 +543,14 @@ pub(crate) async fn start_telemetry_maintenance_server() -> (
     let server = WyrdTestServer::builder()
         .with_telemetry_for_test(telemetry_guard)
         .with_forge_interval(Duration::from_secs(3600))
-        .with_forge_process_role_for_test(BifrostTarget::All)
-        .start_bound()
+        .with_forge_process_role_for_test(BifrostTarget::Server)
+        .start_in_process()
         .await
-        .expect("bound telemetry maintenance server");
+        .expect("in-process telemetry maintenance server");
+    assert!(
+        server.base_url().is_none(),
+        "telemetry maintenance fixture must not start a background Forge worker role"
+    );
     (server, telemetry)
 }
 

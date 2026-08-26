@@ -1,13 +1,9 @@
 //! Three-stage authenticated physical-plan follower lifecycle.
 
-use std::any::Any;
 use std::collections::HashMap;
-use std::fmt;
-use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use arrow::compute::cast;
 #[cfg(any(test, feature = "test-support"))]
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -17,27 +13,14 @@ use datafusion::datasource::TableProvider;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::physical_plan::{FileGroup, FileScanConfig, FileScanConfigBuilder};
 use datafusion::datasource::source::DataSourceExec;
-use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::TaskContext;
-use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
+use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
-use datafusion::physical_expr::EquivalenceProperties;
-use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, PlanProperties};
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
-    execute_stream,
-};
+use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream, execute_stream};
 use datafusion_proto::bytes::physical_plan_from_bytes_with_extension_codec;
 use datafusion_proto::protobuf::{PhysicalPlanNode, physical_plan_node::PhysicalPlanType};
-use futures_util::StreamExt;
-use iceberg::io::FileRead;
 use iceberg_datafusion::physical_plan::IcebergTableScan;
-use parquet::arrow::arrow_reader::ArrowReaderOptions;
-use parquet::arrow::async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuilder};
-use parquet::errors::ParquetError;
-use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 use prost::Message;
 use thiserror::Error;
 use wyrd_spec::DataTenantId;
@@ -273,324 +256,6 @@ impl OracleCatalogResolver {
     }
 }
 
-/// One canonical hot object admitted to a follower's lazy ranged reader.
-#[derive(Debug, Clone)]
-struct FollowerHotFile {
-    /// Exact storage-qualified object identity derived from the tenant binding.
-    location: String,
-    /// Storage metadata size used to reject invalid ranges before IO.
-    size: u64,
-}
-
-/// Bounded lazy Parquet leaf for an authenticated Oracle hot-file assignment.
-///
-/// Visible to sibling `oracle` submodules so [`super::exec::OracleQueryScanStats`]
-/// can fold this follower-local leaf into the same closed physical
-/// scan-evidence counters produced for a local `HotParquetExec` read.
-#[derive(Debug)]
-pub(super) struct FollowerHotParquetExec {
-    /// Canonical assigned objects in deterministic assignment order.
-    files: Vec<FollowerHotFile>,
-    /// Shared tenant-qualified Iceberg storage reader.
-    file_io: iceberg::io::FileIO,
-    /// Exact physical table schema expected from every assigned object.
-    schema: arrow::datatypes::SchemaRef,
-    /// Request-local pool backed by the retained Oracle worker lease.
-    memory_pool: Arc<dyn MemoryPool>,
-    /// Shared terminal metric owner retained by query telemetry.
-    metrics: Arc<super::exec::OracleScanMetricsHandle>,
-    /// Closed predicate conjunction bound to this assignment, used to skip a
-    /// file whose footer statistics prove no row group can satisfy every leaf.
-    predicates: Vec<wyrd_spec::vala::assignment_authority::ScanPredicate>,
-    /// Cached bounded single-partition leaf properties.
-    properties: Arc<PlanProperties>,
-}
-
-impl FollowerHotParquetExec {
-    /// Creates one lazy follower leaf after every object identity and size is validated.
-    fn new(
-        files: Vec<FollowerHotFile>,
-        file_io: iceberg::io::FileIO,
-        schema: arrow::datatypes::SchemaRef,
-        memory_pool: Arc<dyn MemoryPool>,
-        predicates: Vec<wyrd_spec::vala::assignment_authority::ScanPredicate>,
-    ) -> Self {
-        let properties = Arc::new(PlanProperties::new(
-            EquivalenceProperties::new(Arc::clone(&schema)),
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        ));
-        Self {
-            files,
-            file_io,
-            schema,
-            memory_pool,
-            predicates,
-            metrics: Arc::new(super::exec::OracleScanMetricsHandle::default()),
-            properties,
-        }
-    }
-
-    /// Returns the shared terminal metric owner for this follower leaf.
-    pub(super) fn metrics(&self) -> &Arc<super::exec::OracleScanMetricsHandle> {
-        &self.metrics
-    }
-}
-
-impl DisplayAs for FollowerHotParquetExec {
-    /// Renders only the authenticated object count, never tenant storage paths.
-    fn fmt_as(
-        &self,
-        _format: DisplayFormatType,
-        formatter: &mut fmt::Formatter<'_>,
-    ) -> fmt::Result {
-        write!(
-            formatter,
-            "FollowerHotParquetExec files={}",
-            self.files.len()
-        )
-    }
-}
-
-impl ExecutionPlan for FollowerHotParquetExec {
-    /// Returns the stable native follower leaf name.
-    fn name(&self) -> &'static str {
-        "FollowerHotParquetExec"
-    }
-
-    /// Exposes this concrete leaf for native plan inspection.
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    /// Returns the cached single-partition bounded properties.
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
-    }
-
-    /// This source has no child plans.
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        Vec::new()
-    }
-
-    /// Reuses this source only when no children are supplied.
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        if children.is_empty() {
-            Ok(self)
-        } else {
-            Err(DataFusionError::Plan(
-                "FollowerHotParquetExec is a leaf plan".to_owned(),
-            ))
-        }
-    }
-
-    /// Starts lazy sequential ranged reads within the request-local worker pool.
-    fn execute(
-        &self,
-        partition: usize,
-        context: Arc<TaskContext>,
-    ) -> DataFusionResult<SendableRecordBatchStream> {
-        if partition != 0 {
-            return Err(DataFusionError::Execution(format!(
-                "FollowerHotParquetExec has no partition {partition}"
-            )));
-        }
-        // The hot leaf reads at the admitted session's batch size, so this path
-        // is shaped by the same grant as every other follower operator.
-        let batch_size = context.session_config().batch_size();
-        let files = self.files.clone();
-        let file_io = self.file_io.clone();
-        let schema = Arc::clone(&self.schema);
-        let output_schema = Arc::clone(&schema);
-        let memory_pool = Arc::clone(&self.memory_pool);
-        let metrics = Arc::clone(&self.metrics);
-        let predicates = self.predicates.clone();
-        let stream = async_stream::try_stream! {
-            for file in files {
-                let input = file_io
-                    .new_input(&file.location)
-                    .map_err(|error| DataFusionError::External(Box::new(error)))?;
-                let reader = input
-                    .reader()
-                    .await
-                    .map_err(|error| DataFusionError::External(Box::new(error)))?;
-                let reader = FollowerParquetReader::new(
-                    reader,
-                    file.size,
-                    Arc::clone(&memory_pool),
-                    Arc::clone(&metrics),
-                );
-                // Recorded before the footer is read, matching the leader's
-                // hot path: every attempt on this file publishes one file
-                // observation even when the reader fails mid-open, and
-                // row-group pruning is reported separately.
-                metrics.record_hot_file();
-                let builder = ParquetRecordBatchStreamBuilder::new(reader)
-                    .await
-                    .map_err(|error| DataFusionError::External(Box::new(error)))?;
-                let selection =
-                    super::exec::select_row_groups_for_predicates(builder.metadata(), &predicates);
-                metrics.record_row_groups(&selection);
-                if selection.excludes_file() {
-                    continue;
-                }
-                let mut batches = builder
-                    .with_row_groups(selection.retained)
-                    .with_batch_size(batch_size)
-                    .build()
-                    .map_err(|error| DataFusionError::External(Box::new(error)))?;
-                while let Some(batch) = batches.next().await {
-                    let batch = batch.map_err(|error| DataFusionError::External(Box::new(error)))?;
-                    let batch = project_follower_batch(&batch, Arc::clone(&schema))?;
-                    let decoded = MemoryConsumer::new("oracle-follower-hot-decoded")
-                        .register(&memory_pool);
-                    decoded
-                        .try_grow(batch.get_array_memory_size())
-                        .map_err(|error| DataFusionError::ResourcesExhausted(error.to_string()))?;
-                    yield batch;
-                    drop(decoded);
-                }
-            }
-        };
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            output_schema,
-            stream,
-        )))
-    }
-}
-
-/// Projects one decoded hot batch to the authenticated provider schema by field name.
-///
-/// # Errors
-/// Returns a closed execution failure when a required field is absent, cannot be cast, or the
-/// projected Arrow batch is invalid.
-fn project_follower_batch(
-    batch: &RecordBatch,
-    schema: arrow::datatypes::SchemaRef,
-) -> DataFusionResult<RecordBatch> {
-    let columns = schema
-        .fields()
-        .iter()
-        .map(|field| {
-            let index = batch.schema().index_of(field.name()).map_err(|_| {
-                DataFusionError::Execution(
-                    "authenticated Oracle hot provider omitted a required field".to_owned(),
-                )
-            })?;
-            let column = batch.column(index);
-            if column.data_type() == field.data_type() {
-                Ok(Arc::clone(column))
-            } else {
-                cast(column, field.data_type()).map_err(DataFusionError::from)
-            }
-        })
-        .collect::<DataFusionResult<Vec<_>>>()?;
-    RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
-}
-
-/// Exact range bytes coupled to their request-local pool reservation.
-struct FollowerRangeOwner {
-    /// Immutable bytes returned by the storage range read.
-    bytes: bytes::Bytes,
-    /// Capacity retained until the final bytes clone or slice drops.
-    _reservation: MemoryReservation,
-}
-
-impl AsRef<[u8]> for FollowerRangeOwner {
-    /// Borrows the retained storage bytes without copying them.
-    fn as_ref(&self) -> &[u8] {
-        self.bytes.as_ref()
-    }
-}
-
-/// Parquet adapter that reserves every storage range before performing IO.
-struct FollowerParquetReader {
-    /// Pinned Iceberg ranged reader for one canonical object.
-    reader: Box<dyn FileRead>,
-    /// Metadata size used to reject out-of-bounds requests.
-    size: u64,
-    /// Request-local worker pool backing every range reservation.
-    memory_pool: Arc<dyn MemoryPool>,
-    /// Shared terminal metric owner recording each accepted range read.
-    metrics: Arc<super::exec::OracleScanMetricsHandle>,
-}
-
-impl FollowerParquetReader {
-    /// Creates one bounded reader for a metadata-validated object.
-    fn new(
-        reader: Box<dyn FileRead>,
-        size: u64,
-        memory_pool: Arc<dyn MemoryPool>,
-        metrics: Arc<super::exec::OracleScanMetricsHandle>,
-    ) -> Self {
-        Self {
-            reader,
-            size,
-            memory_pool,
-            metrics,
-        }
-    }
-}
-
-impl AsyncFileReader for FollowerParquetReader {
-    /// Reserves an exact range before IO and retains the charge with returned bytes.
-    fn get_bytes(
-        &mut self,
-        range: Range<u64>,
-    ) -> futures_util::future::BoxFuture<'_, parquet::errors::Result<bytes::Bytes>> {
-        Box::pin(async move {
-            let requested = range.end.checked_sub(range.start).ok_or_else(|| {
-                ParquetError::General("hot Parquet range start exceeds end".to_owned())
-            })?;
-            if range.end > self.size {
-                return Err(ParquetError::General(
-                    "hot Parquet range exceeds authenticated object size".to_owned(),
-                ));
-            }
-            let requested = usize::try_from(requested)
-                .map_err(|_| ParquetError::General("hot Parquet range exceeds usize".to_owned()))?;
-            let reservation =
-                MemoryConsumer::new("oracle-follower-hot-range").register(&self.memory_pool);
-            reservation
-                .try_grow(requested)
-                .map_err(|error| ParquetError::General(error.to_string()))?;
-            let bytes = self
-                .reader
-                .read(range)
-                .await
-                .map_err(|error| ParquetError::General(error.to_string()))?;
-            self.metrics.record_hot_range(bytes.len());
-            if bytes.len() != requested {
-                return Err(ParquetError::General(
-                    "hot Parquet range returned a short read".to_owned(),
-                ));
-            }
-            Ok(bytes::Bytes::from_owner(FollowerRangeOwner {
-                bytes,
-                _reservation: reservation,
-            }))
-        })
-    }
-
-    /// Loads footer/page metadata through the same pre-reserved range path.
-    fn get_metadata<'a>(
-        &'a mut self,
-        _options: Option<&'a ArrowReaderOptions>,
-    ) -> futures_util::future::BoxFuture<'a, parquet::errors::Result<Arc<ParquetMetaData>>> {
-        Box::pin(async move {
-            let size = self.size;
-            ParquetMetaDataReader::new()
-                .load_and_finish(self, size)
-                .await
-                .map(Arc::new)
-        })
-    }
-}
-
 #[async_trait]
 impl FollowerSourceResolver for OracleCatalogResolver {
     /// Builds one tenant-qualified catalog/Iceberg scan and rejects Scribe assignments.
@@ -678,16 +343,25 @@ impl FollowerSourceResolver for OracleCatalogResolver {
                     .metadata()
                     .await
                     .map_err(|_| "authenticated Oracle hot provider failed".to_owned())?;
-                files.push(FollowerHotFile {
+                let size_bytes = usize::try_from(metadata.size)
+                    .map_err(|_| "authenticated Oracle hot provider failed".to_owned())?;
+                files.push(super::exec::HotFileSource {
                     location: location.clone(),
-                    size: metadata.size,
+                    size_bytes,
                 });
             }
-            return Ok(Arc::new(FollowerHotParquetExec::new(
+            // Every object identity, size, and assignment fence has been
+            // validated above, so the shared hot leaf is constructed in
+            // follower governance: its reservations are charged to the
+            // request-local pool backed by the retained worker lease.
+            return Ok(Arc::new(super::exec::HotParquetExec::new(
                 files,
                 self.catalog.file_io().clone(),
                 provider.schema(),
-                session.runtime_env().memory_pool.clone(),
+                super::exec::HotParquetGovernance::Follower {
+                    memory_pool: session.runtime_env().memory_pool.clone(),
+                },
+                Arc::new(super::exec::OracleScanMetricsHandle::default()),
                 assignment.predicates.clone(),
             )));
         }

@@ -30,7 +30,7 @@ use datafusion::datasource::source::DataSourceExec;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::TaskContext;
-use datafusion::execution::memory_pool::MemoryPool;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_expr::expressions::Column;
@@ -68,8 +68,8 @@ use wyrd_spec::vala::api::{
 use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
 
 use super::{
-    AuthorizedQueryContext, BifrostSecurityViolation, OracleAudit, OracleMemoryKind,
-    OracleMemoryResources, OracleTelemetry, VerifiedSecurityContext,
+    AccountedMemoryReservation, AuthorizedQueryContext, BifrostSecurityViolation, OracleAudit,
+    OracleMemoryKind, OracleMemoryResources, OracleTelemetry, VerifiedSecurityContext,
 };
 
 #[cfg(feature = "test-support")]
@@ -878,16 +878,10 @@ impl OracleQueryScanStats {
             stats.scan_handles.push(Arc::clone(&source.metrics));
         }
         if let Some(source) = plan.as_any().downcast_ref::<HotParquetExec>() {
-            stats.scan_handles.push(Arc::clone(&source.metrics));
+            stats.scan_handles.push(Arc::clone(source.metrics()));
         }
         if let Some(source) = plan.as_any().downcast_ref::<RemoteScanExec>() {
             stats.remote_handles.push(Arc::clone(&source.scan_metrics));
-        }
-        if let Some(source) = plan
-            .as_any()
-            .downcast_ref::<super::follower::FollowerHotParquetExec>()
-        {
-            stats.scan_handles.push(Arc::clone(source.metrics()));
         }
         for child in plan.children() {
             Self::visit(child.as_ref(), stats);
@@ -1198,9 +1192,6 @@ impl ExecutionPlan for OracleIcebergScanExec {
         )))
     }
 }
-
-/// Record-batch target used while decoding one bounded hot Parquet file.
-const HOT_BATCH_ROWS: usize = 8_192;
 
 /// One validated immutable hot-file source selected by the pinned cut.
 #[derive(Debug, Clone)]
@@ -1589,14 +1580,14 @@ impl TableProvider for OracleTableProvider {
                 self.hot_files.clone(),
                 self.file_io.clone(),
                 Arc::clone(&self.physical_schema),
-                HotParquetRuntime {
+                HotParquetGovernance::Leader {
                     memory: self.memory.clone(),
                     memory_pool: Arc::clone(&self.query_pool),
                     telemetry: Arc::clone(&self.telemetry),
                     query_class: self.query_class,
-                    metrics: Arc::new(OracleScanMetricsHandle::default()),
-                    predicates: supported_predicates.clone(),
                 },
+                Arc::new(OracleScanMetricsHandle::default()),
+                supported_predicates.clone(),
             ));
             inputs.push(hot);
         }
@@ -1876,22 +1867,210 @@ impl Drop for AccountedRangeOwner {
     }
 }
 
+/// Closed memory-governance mode owning one hot-Parquet leaf's reservations.
+///
+/// Both Oracle roles read the same pinned objects with the same reader, pruning
+/// and projection; they differ only in which budget the range and decoded-batch
+/// bytes are charged to. The leader couples every byte to the Oracle governor
+/// and the canonical memory telemetry for its admitted query class; a follower
+/// charges the request-local worker pool retained by its lease and publishes no
+/// leader-side gauges. Keeping that difference in one closed enum is what lets
+/// a single [`HotParquetExec`] serve both roles.
+pub(super) enum HotParquetGovernance {
+    /// Leader-local execution charged against the Oracle governor and telemetry.
+    Leader {
+        /// Pod allocator and compatibility handles used by every range owner.
+        memory: OracleMemoryResources,
+        /// Query-local pool shared with `DataFusion` operators.
+        memory_pool: Arc<dyn MemoryPool>,
+        /// Canonical Oracle memory telemetry owner.
+        telemetry: Arc<OracleTelemetry>,
+        /// Immutable admission class charged by source buffers.
+        query_class: QueryClass,
+    },
+    /// Follower execution charged against the retained request-local worker pool.
+    Follower {
+        /// Request-local pool backed by the retained Oracle worker lease.
+        memory_pool: Arc<dyn MemoryPool>,
+    },
+}
+
+impl Clone for HotParquetGovernance {
+    /// Clones the governance handles so each per-file reader owns its own.
+    ///
+    /// Every field is a shared handle (`Arc`, a narrow capability, or a `Copy`
+    /// class label), so a clone shares one budget rather than duplicating it.
+    fn clone(&self) -> Self {
+        match self {
+            Self::Leader {
+                memory,
+                memory_pool,
+                telemetry,
+                query_class,
+            } => Self::Leader {
+                memory: memory.clone(),
+                memory_pool: Arc::clone(memory_pool),
+                telemetry: Arc::clone(telemetry),
+                query_class: *query_class,
+            },
+            Self::Follower { memory_pool } => Self::Follower {
+                memory_pool: Arc::clone(memory_pool),
+            },
+        }
+    }
+}
+
+/// Pre-IO range capacity held by whichever governance mode admitted it.
+enum HotRangeReservation {
+    /// Governor reservation awaiting its telemetry charge on a successful read.
+    Leader(crate::resources::OracleQueryMemoryReservation),
+    /// Request-local pool reservation released with the returned bytes.
+    Follower(MemoryReservation),
+}
+
+/// Decoded-batch capacity released once the yielded batch is consumed.
+enum HotDecodedReservation {
+    /// Governor reservation with its coupled leader gauge charge.
+    Leader {
+        /// Capacity and gauge charge released when this value drops.
+        _reservation: AccountedMemoryReservation,
+    },
+    /// Request-local pool reservation held for one yielded batch.
+    Follower {
+        /// Pool capacity released when this value drops.
+        _reservation: MemoryReservation,
+    },
+}
+
+/// Retained range bytes coupled to a request-local pool reservation.
+struct PooledRangeOwner {
+    /// Immutable bytes returned by the storage range read.
+    bytes: bytes::Bytes,
+    /// Capacity retained until the final bytes clone or slice drops.
+    _reservation: MemoryReservation,
+}
+
+impl AsRef<[u8]> for PooledRangeOwner {
+    /// Borrows the retained storage bytes without copying them.
+    fn as_ref(&self) -> &[u8] {
+        self.bytes.as_ref()
+    }
+}
+
+impl HotParquetGovernance {
+    /// Reserves exactly `requested` range bytes before any storage IO runs.
+    ///
+    /// Pre-reserving the exact length is what makes a refusal happen before the
+    /// object is touched rather than after its bytes are already resident.
+    ///
+    /// # Errors
+    /// Returns a Parquet error when the owning budget refuses the request.
+    fn reserve_range(&self, requested: usize) -> parquet::errors::Result<HotRangeReservation> {
+        match self {
+            Self::Leader {
+                memory,
+                memory_pool,
+                ..
+            } => memory
+                .resources
+                .try_split_query_memory(memory_pool, "oracle-hot-range", requested)
+                .map(HotRangeReservation::Leader)
+                .map_err(|error| ParquetError::External(Box::new(error))),
+            Self::Follower { memory_pool } => {
+                let reservation =
+                    MemoryConsumer::new("oracle-follower-hot-range").register(memory_pool);
+                reservation
+                    .try_grow(requested)
+                    .map_err(|error| ParquetError::General(error.to_string()))?;
+                Ok(HotRangeReservation::Follower(reservation))
+            }
+        }
+    }
+
+    /// Couples read range bytes to their reservation for the whole byte lifetime.
+    ///
+    /// The leader's gauge charge is applied here, after the exact-length read
+    /// succeeded, so a failed or abandoned range releases its governor
+    /// reservation without ever publishing leader memory.
+    fn own_range(
+        &self,
+        bytes: bytes::Bytes,
+        reservation: HotRangeReservation,
+    ) -> parquet::errors::Result<bytes::Bytes> {
+        match (self, reservation) {
+            (
+                Self::Leader {
+                    telemetry,
+                    query_class,
+                    ..
+                },
+                HotRangeReservation::Leader(reservation),
+            ) => Ok(bytes::Bytes::from_owner(AccountedRangeOwner::new(
+                bytes,
+                reservation,
+                Arc::clone(telemetry),
+                *query_class,
+            ))),
+            (Self::Follower { .. }, HotRangeReservation::Follower(reservation)) => {
+                Ok(bytes::Bytes::from_owner(PooledRangeOwner {
+                    bytes,
+                    _reservation: reservation,
+                }))
+            }
+            _ => Err(ParquetError::General(
+                "hot Parquet range reservation does not match its governance mode".to_owned(),
+            )),
+        }
+    }
+
+    /// Reserves one decoded batch for exactly as long as it is yielded.
+    ///
+    /// # Errors
+    /// Returns a `DataFusion` error when the owning budget refuses the batch.
+    fn reserve_decoded(&self, bytes: usize) -> DataFusionResult<HotDecodedReservation> {
+        match self {
+            Self::Leader {
+                memory,
+                memory_pool,
+                telemetry,
+                query_class,
+            } => {
+                let reservation = memory
+                    .resources
+                    .try_split_query_memory(memory_pool, "oracle-hot-decoded-batch", bytes)
+                    .map_err(|error| DataFusionError::External(Box::new(error)))?;
+                Ok(HotDecodedReservation::Leader {
+                    _reservation: telemetry.account_query_memory(
+                        reservation,
+                        *query_class,
+                        OracleMemoryKind::Source,
+                    ),
+                })
+            }
+            Self::Follower { memory_pool } => {
+                let reservation =
+                    MemoryConsumer::new("oracle-follower-hot-decoded").register(memory_pool);
+                reservation
+                    .try_grow(bytes)
+                    .map_err(|error| DataFusionError::ResourcesExhausted(error.to_string()))?;
+                Ok(HotDecodedReservation::Follower {
+                    _reservation: reservation,
+                })
+            }
+        }
+    }
+}
+
 /// Iceberg ranged storage adapted to Parquet with pre-IO Oracle accounting.
 struct IcebergParquetReader {
     /// Pinned ranged reader for one immutable hot object.
     reader: Box<dyn FileRead>,
     /// Pinned manifest size used to reject invalid ranges.
     size: u64,
-    /// Shared Oracle child capability used for every metadata and data range.
-    memory_pool: Arc<dyn MemoryPool>,
-    /// Narrow Oracle capability that attributes query-local range ownership.
-    resources: crate::resources::OracleResources,
+    /// Closed governance mode owning every range reservation this reader takes.
+    governance: HotParquetGovernance,
     /// Shared physical scan counters retained to terminal query emission.
     metrics: Arc<OracleScanMetricsHandle>,
-    /// Canonical Oracle memory telemetry coupled to range ownership.
-    telemetry: Arc<OracleTelemetry>,
-    /// Immutable query class used for range accounting.
-    query_class: QueryClass,
     /// Deterministic range reader injected only by focused tests.
     #[cfg(test)]
     reader_override: Option<(String, HotReadOverride)>,
@@ -1902,20 +2081,14 @@ impl IcebergParquetReader {
     fn new(
         reader: Box<dyn FileRead>,
         size: u64,
-        memory_pool: Arc<dyn MemoryPool>,
-        resources: crate::resources::OracleResources,
+        governance: HotParquetGovernance,
         metrics: Arc<OracleScanMetricsHandle>,
-        telemetry: Arc<OracleTelemetry>,
-        query_class: QueryClass,
     ) -> Self {
         Self {
             reader,
             size,
-            memory_pool,
-            resources,
+            governance,
             metrics,
-            telemetry,
-            query_class,
             #[cfg(test)]
             reader_override: None,
         }
@@ -1952,10 +2125,10 @@ impl AsyncFileReader for IcebergParquetReader {
             let requested = usize::try_from(requested_u64).map_err(|_| {
                 ParquetError::General("hot Parquet range length exceeds usize".to_owned())
             })?;
-            let reservation = self
-                .resources
-                .try_split_query_memory(&self.memory_pool, "oracle-hot-range", requested)
-                .map_err(|error| ParquetError::External(Box::new(error)))?;
+            let reservation = self.governance.reserve_range(requested)?;
+            // Recorded before IO, matching `record_hot_file`: every admitted
+            // range publishes one observation even when the read then fails or
+            // is abandoned, so scan evidence never silently loses an attempt.
             self.metrics.record_hot_range(requested);
             #[cfg(test)]
             let bytes = if let Some((location, reader)) = self.reader_override.as_ref() {
@@ -1980,12 +2153,7 @@ impl AsyncFileReader for IcebergParquetReader {
                     bytes.len()
                 )));
             }
-            Ok(bytes::Bytes::from_owner(AccountedRangeOwner::new(
-                bytes,
-                reservation,
-                Arc::clone(&self.telemetry),
-                self.query_class,
-            )))
+            self.governance.own_range(bytes, reservation)
         }
         .boxed()
     }
@@ -2012,21 +2180,22 @@ impl AsyncFileReader for IcebergParquetReader {
 }
 
 /// Bounded lazy source for pinned hot sealed Parquet files.
-struct HotParquetExec {
+///
+/// This is the only hot-Parquet `ExecutionPlan` in Oracle. Leader-local reads
+/// and follower reads of an authenticated hot assignment share its reader,
+/// row-group pruning, projection, and scan evidence; the two roles differ only
+/// through [`HotParquetGovernance`], which owns where every reserved byte is
+/// charged. Visible to sibling `oracle` submodules so the follower resolver can
+/// build the follower mode and [`OracleQueryScanStats`] can fold its counters.
+pub(super) struct HotParquetExec {
     /// Validated immutable manifest entries.
     files: Vec<HotFileSource>,
     /// Pinned Iceberg storage reader.
     file_io: FileIO,
     /// Complete physical table schema.
     schema: SchemaRef,
-    /// Shared governor used for each range and decoded source batch.
-    memory: OracleMemoryResources,
-    /// Query-local pool shared with `DataFusion` operators.
-    memory_pool: Arc<dyn MemoryPool>,
-    /// Production memory accounting shared with the retained Oracle.
-    telemetry: Arc<OracleTelemetry>,
-    /// Immutable admission class charged by source buffers.
-    query_class: QueryClass,
+    /// Closed governance mode owning every reservation this leaf takes.
+    governance: HotParquetGovernance,
     /// Shared terminal metric owner retained by query telemetry.
     metrics: Arc<OracleScanMetricsHandle>,
     /// Closed predicate conjunction used to skip a file whose footer
@@ -2037,22 +2206,6 @@ struct HotParquetExec {
     reader_override: Option<HotReadOverride>,
     /// Cached bounded leaf properties.
     properties: Arc<PlanProperties>,
-}
-
-/// Query-scoped dependencies shared by every hot Parquet source owner.
-struct HotParquetRuntime {
-    /// Pod allocator and compatibility memory handles used by range owners.
-    memory: OracleMemoryResources,
-    /// Shared query-local pool used by operators and source buffers.
-    memory_pool: Arc<dyn MemoryPool>,
-    /// Canonical Oracle memory telemetry owner.
-    telemetry: Arc<OracleTelemetry>,
-    /// Immutable scheduling class used only for telemetry labels.
-    query_class: QueryClass,
-    /// Terminal scan metrics retained through stream completion.
-    metrics: Arc<OracleScanMetricsHandle>,
-    /// Closed predicate conjunction pushed down to this hot leaf's readers.
-    predicates: Vec<wyrd_spec::vala::assignment_authority::ScanPredicate>,
 }
 
 impl fmt::Debug for HotParquetExec {
@@ -2067,26 +2220,34 @@ impl fmt::Debug for HotParquetExec {
 
 impl HotParquetExec {
     /// Creates a single-partition hot-file leaf from validated manifests.
-    fn new(
+    ///
+    /// Callers must have already authenticated the assignment, validated every
+    /// object identity and size, and chosen the governance mode that matches
+    /// their role; this constructor performs no IO and no authorization.
+    pub(super) fn new(
         files: Vec<HotFileSource>,
         file_io: FileIO,
         schema: SchemaRef,
-        runtime: HotParquetRuntime,
+        governance: HotParquetGovernance,
+        metrics: Arc<OracleScanMetricsHandle>,
+        predicates: Vec<wyrd_spec::vala::assignment_authority::ScanPredicate>,
     ) -> Self {
         Self {
             files,
             file_io,
-            memory: runtime.memory,
-            memory_pool: runtime.memory_pool,
-            telemetry: runtime.telemetry,
-            query_class: runtime.query_class,
-            metrics: runtime.metrics,
-            predicates: runtime.predicates,
+            governance,
+            metrics,
+            predicates,
             #[cfg(test)]
             reader_override: None,
             properties: plan_properties(Arc::clone(&schema)),
             schema,
         }
+    }
+
+    /// Returns the shared terminal metric owner for this hot leaf.
+    pub(super) fn metrics(&self) -> &Arc<OracleScanMetricsHandle> {
+        &self.metrics
     }
 
     /// Injects an existing-interface reader only for deterministic unit tests.
@@ -2156,7 +2317,7 @@ impl ExecutionPlan for HotParquetExec {
     fn execute(
         &self,
         partition: usize,
-        _task: Arc<TaskContext>,
+        task: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
         if partition != 0 {
             return Err(DataFusionError::Execution(format!(
@@ -2164,22 +2325,30 @@ impl ExecutionPlan for HotParquetExec {
             )));
         }
         let schema = Arc::clone(&self.schema);
-        let stream = hot_stream(self);
+        // The hot leaf decodes at the admitted session's batch size, so this
+        // path is shaped by the same grant as every other operator in the plan
+        // rather than by a fixed constant of its own.
+        let stream = hot_stream(self, task.session_config().batch_size());
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 }
 
 /// Builds the hot-file stream after partition validation has completed.
+///
+/// Files are read sequentially. Each one publishes a file observation before
+/// its footer is touched, prunes row groups against the closed predicates,
+/// decodes at the admitted `batch_size`, projects to the authenticated physical
+/// schema, and holds one governed reservation for exactly the lifetime of the
+/// yielded batch. Dropping the stream releases every retained reservation,
+/// which is what makes cancellation return the query's memory.
 fn hot_stream(
     exec: &HotParquetExec,
+    batch_size: usize,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> + Send + 'static {
     let files = exec.files.clone();
     let file_io = exec.file_io.clone();
     let schema = Arc::clone(&exec.schema);
-    let memory = exec.memory.clone();
-    let memory_pool = Arc::clone(&exec.memory_pool);
-    let telemetry = Arc::clone(&exec.telemetry);
-    let query_class = exec.query_class;
+    let governance = exec.governance.clone();
     let metrics = Arc::clone(&exec.metrics);
     let predicates = exec.predicates.clone();
     #[cfg(test)]
@@ -2199,11 +2368,8 @@ fn hot_stream(
             let reader = IcebergParquetReader::new(
                 reader,
                 size,
-                Arc::clone(&memory_pool),
-                memory.resources.clone(),
+                governance.clone(),
                 Arc::clone(&metrics),
-                Arc::clone(&telemetry),
-                query_class,
             );
             #[cfg(test)]
             let reader = if let Some(override_reader) = reader_override.as_ref() {
@@ -2227,24 +2393,15 @@ fn hot_stream(
             }
             let mut batches = builder
                 .with_row_groups(selection.retained)
-                .with_batch_size(HOT_BATCH_ROWS)
+                .with_batch_size(batch_size)
                 .build()
                 .map_err(|error| DataFusionError::External(Box::new(error)))?;
             while let Some(decoded) = batches.next().await {
                 let batch = decoded
                     .map_err(|error| DataFusionError::External(Box::new(error)))?;
                 let batch = project_batch(&batch, Arc::clone(&schema))?;
-                let decoded_reservation = memory.resources.try_split_query_memory(
-                    &memory_pool,
-                    "oracle-hot-decoded-batch",
-                    batch.get_array_memory_size(),
-                )
-                    .map_err(|error| DataFusionError::External(Box::new(error)))?;
-                let decoded_reservation = telemetry.account_query_memory(
-                    decoded_reservation,
-                    query_class,
-                    OracleMemoryKind::Source,
-                );
+                let decoded_reservation =
+                    governance.reserve_decoded(batch.get_array_memory_size())?;
                 yield batch;
                 drop(decoded_reservation);
             }
@@ -3540,14 +3697,14 @@ mod tests {
                 }],
                 FileIO::new_with_fs(),
                 Arc::clone(&schema),
-                HotParquetRuntime {
+                HotParquetGovernance::Leader {
                     memory: memory.clone(),
                     memory_pool: crate::resources::bounded_memory_pool(1024 * 1024 * 1024),
                     telemetry: Arc::clone(&telemetry),
                     query_class: QueryClass::Interactive,
-                    metrics: Arc::clone(&metrics),
-                    predicates: Vec::new(),
                 },
+                Arc::clone(&metrics),
+                Vec::new(),
             );
             (exec, metrics)
         };
@@ -3677,11 +3834,16 @@ mod tests {
                 short,
             }),
             u64::try_from(fixture.bytes.len()).expect("fixture size fits u64"),
-            Arc::clone(&pool),
-            resources,
+            HotParquetGovernance::Leader {
+                memory: OracleMemoryResources {
+                    resources,
+                    reconciliation_limit_bytes: 1024 * 1024,
+                },
+                memory_pool: Arc::clone(&pool),
+                telemetry: Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1)))),
+                query_class: QueryClass::Interactive,
+            },
             Arc::new(OracleScanMetricsHandle::default()),
-            Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1)))),
-            QueryClass::Interactive,
         );
         (reader, pool)
     }
@@ -3697,7 +3859,7 @@ mod tests {
         let mut batches = ParquetRecordBatchStreamBuilder::new(reader)
             .await
             .expect("ranged metadata")
-            .with_batch_size(HOT_BATCH_ROWS)
+            .with_batch_size(datafusion::prelude::SessionConfig::default().batch_size())
             .build()
             .expect("ranged batches");
         let mut rows = 0;
@@ -3751,14 +3913,14 @@ mod tests {
             }],
             FileIO::new_with_fs(),
             Arc::clone(&projected),
-            HotParquetRuntime {
+            HotParquetGovernance::Leader {
                 memory: oracle_memory_resources(&governor, 1024),
                 memory_pool: Arc::clone(&query_pool),
                 telemetry: Arc::clone(&telemetry),
                 query_class: QueryClass::Interactive,
-                predicates: Vec::new(),
-                metrics: Arc::clone(&metrics),
             },
+            Arc::clone(&metrics),
+            Vec::new(),
         )
         .with_test_reader(Arc::new(move |_, range| {
             range_peak_pool.fetch_max(observed_pool.reserved() as u64, Ordering::AcqRel);
@@ -3938,14 +4100,14 @@ mod tests {
             }],
             FileIO::new_with_fs(),
             Arc::clone(&fixture.schema),
-            HotParquetRuntime {
+            HotParquetGovernance::Leader {
                 memory: oracle_memory_resources(&governor, 1024),
                 memory_pool: Arc::clone(&query_pool),
                 telemetry: Arc::clone(&telemetry),
                 query_class: QueryClass::Interactive,
-                metrics: Arc::new(OracleScanMetricsHandle::default()),
-                predicates: Vec::new(),
             },
+            Arc::new(OracleScanMetricsHandle::default()),
+            Vec::new(),
         )
         .with_test_reader(Arc::new(move |_, range| {
             observed.fetch_add(1, Ordering::AcqRel);
@@ -4034,14 +4196,14 @@ mod tests {
                 }],
                 FileIO::new_with_fs(),
                 Arc::clone(&fixture.schema),
-                HotParquetRuntime {
+                HotParquetGovernance::Leader {
                     memory: memory.clone(),
                     memory_pool: crate::resources::bounded_memory_pool(1024 * 1024 * 1024),
                     telemetry: Arc::clone(&telemetry),
                     query_class: QueryClass::Interactive,
-                    metrics: Arc::clone(&metrics),
-                    predicates: Vec::new(),
                 },
+                Arc::clone(&metrics),
+                Vec::new(),
             )
             .with_test_reader(reader);
             (exec, metrics)

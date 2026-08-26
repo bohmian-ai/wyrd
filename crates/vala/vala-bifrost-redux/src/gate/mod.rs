@@ -1400,6 +1400,7 @@ mod tests {
                     warnings: Vec::new(),
                     source_completion: Vec::new(),
                     error: None,
+                    arrow_ipc_eos: vec![0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0],
                 },
             ))]);
             Ok(crate::oracle::OracleQueryStream::test_new(

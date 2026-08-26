@@ -845,6 +845,17 @@ impl QueryIpcDecoder {
 
     /// Consumes the initial schema fragment and returns the stream schema.
     ///
+    /// The schema is read with a throwaway [`StreamReader`] rather than from
+    /// the push decoder. Arrow's push decoder only completes a zero-body
+    /// message once the *next* fragment arrives, so its own `schema()` is still
+    /// empty at this point; reading the prefix here both hands the caller a
+    /// schema immediately and rejects a fragment that smuggles a record batch
+    /// in alongside it. The same bytes are still pushed through the decoder,
+    /// which is what carries the schema and dictionary state into later
+    /// fragments.
+    ///
+    /// [`StreamReader`]: arrow::ipc::reader::StreamReader
+    ///
     /// # Errors
     ///
     /// Returns [`QueryIpcDecodeError::OutOfOrder`] for a duplicate schema or a
@@ -854,13 +865,20 @@ impl QueryIpcDecoder {
         if self.schema.is_some() || self.eos_accepted {
             return Err(QueryIpcDecodeError::OutOfOrder);
         }
+        let mut prefix = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
+            .map_err(|_| QueryIpcDecodeError::Malformed)?;
+        let schema = prefix.schema();
+        if prefix
+            .next()
+            .transpose()
+            .map_err(|_| QueryIpcDecodeError::Malformed)?
+            .is_some()
+        {
+            return Err(QueryIpcDecodeError::Malformed);
+        }
         if self.feed(bytes)?.is_some() {
             return Err(QueryIpcDecodeError::Malformed);
         }
-        let schema = self
-            .decoder
-            .schema()
-            .ok_or(QueryIpcDecodeError::Malformed)?;
         self.schema = Some(SchemaRef::clone(&schema));
         Ok(schema)
     }
@@ -1113,8 +1131,10 @@ impl OracleQueryStream {
     ) -> Self {
         let (admitted, _shared, _request_cancellation) =
             super::admission::admitted_guard_for_test();
+        let (ipc, schema_frame) = QueryIpcEncoder::new(schema).expect("test schema frame");
         Self::new(QueryStreamInput {
-            schema_frame: encode_schema_frame(schema).expect("test schema frame"),
+            schema_frame,
+            ipc,
             batches,
             first: None,
             admitted,
@@ -1267,13 +1287,29 @@ mod tests {
 
     use super::{OracleQueryStream, QueryStreamInput, QueryStreamLifecycle, successful_terminal};
     use crate::oracle::admission::{active_queries_for_test, admitted_guard_for_test};
+    use crate::oracle::failed_terminal_for_visibility;
     use crate::oracle::exec::OracleQueryScanStats;
     use crate::oracle::{
         BifrostError, OracleSlotManager, OracleTelemetry, QueryClass, QueryFreshness,
         QuerySchemaFrame, QuerySource, QueryStreamFrame, QueryTerminalErrorCode,
-        QueryTerminalOutcome, VisibilityMode,
+        QueryTerminalFrame, QueryTerminalOutcome, VisibilityMode,
     };
     use crate::test_support::{SpanCaptureSubscriber, has_span_outcome};
+
+    /// Closes a pre-terminal candidate the way the production stream does.
+    ///
+    /// [`successful_terminal`] builds the candidate before the stream's IPC
+    /// writer is finished, so a success or degraded candidate legitimately
+    /// carries no end-of-stream yet; `close_ipc_stream` attaches it. Validating
+    /// the candidate directly would therefore assert on a state the wire never
+    /// carries, so these tests close it first.
+    fn closed(candidate: QueryTerminalFrame) -> QueryTerminalFrame {
+        let schema: arrow::datatypes::SchemaRef = Arc::new(Schema::empty());
+        let (mut ipc, _schema_frame) =
+            super::QueryIpcEncoder::new(&schema).expect("empty schema opens an IPC stream");
+        let row_count = candidate.row_count;
+        super::close_ipc_stream(&mut ipc, candidate, VisibilityMode::Fused, row_count)
+    }
 
     /// Terminal construction scopes every source loss to the requested
     /// visibility and freshness policy.
@@ -1292,7 +1328,7 @@ mod tests {
             3,
         );
         assert_eq!(complete.outcome, QueryTerminalOutcome::Success);
-        complete
+        closed(complete)
             .validate(VisibilityMode::Fused)
             .expect("complete terminal validates");
 
@@ -1327,7 +1363,7 @@ mod tests {
             allowed_live.warnings,
             vec![QueryWarning::LiveTailUnavailable]
         );
-        allowed_live
+        closed(allowed_live)
             .validate(VisibilityMode::Fused)
             .expect("eligible live-tail degradation validates");
 
@@ -1366,10 +1402,164 @@ mod tests {
             assert_eq!(unaffected.outcome, QueryTerminalOutcome::Success);
             assert_eq!(unaffected.freshness, QueryFreshness::Complete);
             assert!(unaffected.warnings.is_empty());
-            unaffected
+            closed(unaffected)
                 .validate(VisibilityMode::PublishedOnly)
                 .expect("unrequested live-tail loss does not affect a published-only terminal");
         }
+    }
+
+    /// Opens a real per-query IPC encoder over the empty schema these tests use.
+    ///
+    /// The tests exercise terminal ownership rather than payload shape, but they
+    /// must still travel through the production encoder: a hand-written schema
+    /// frame would leave the stream with no writer to close, which is exactly
+    /// the state the terminal end-of-stream contract now forbids.
+    fn empty_schema_ipc(fingerprint: &str) -> (super::QueryIpcEncoder, QuerySchemaFrame) {
+        let schema: arrow::datatypes::SchemaRef = Arc::new(Schema::empty());
+        let (encoder, mut frame) =
+            super::QueryIpcEncoder::new(&schema).expect("empty schema opens an IPC stream");
+        frame.schema_fingerprint = fingerprint.to_owned();
+        (encoder, frame)
+    }
+
+    /// Builds one dictionary-encoded batch so encoded fragments carry dictionaries.
+    ///
+    /// A dictionary-typed column is what separates a genuinely stateful stream
+    /// from a sequence of standalone ones: Arrow writes the dictionary message
+    /// only once, so a decoder that restarts per frame cannot read the later
+    /// batches at all.
+    fn dictionary_batch(values: &[&str]) -> arrow::record_batch::RecordBatch {
+        let dictionary: arrow::array::DictionaryArray<arrow::datatypes::Int32Type> =
+            values.iter().copied().collect();
+        arrow::record_batch::RecordBatch::try_from_iter(vec![(
+            "label",
+            Arc::new(dictionary) as arrow::array::ArrayRef,
+        )])
+        .expect("dictionary batch builds")
+    }
+
+    /// The split query stream is exactly one Arrow IPC stream, closed once.
+    ///
+    /// This pins the whole encoder/decoder state machine in the shape the wire
+    /// carries it: one schema prefix, one continuation fragment per batch with
+    /// its dictionaries adjacent, exactly one end-of-stream delta, and an empty
+    /// result that is schema-then-terminal. It also pins the two negative
+    /// halves — a stream that never closes has no end-of-stream to hand out,
+    /// and bytes after the end-of-stream are rejected — plus the bounded-memory
+    /// claim that neither side ever retains more than one fragment.
+    #[test]
+    fn stateful_ipc_protocol_contract() {
+        let first = dictionary_batch(&["alpha", "beta", "alpha"]);
+        let second = dictionary_batch(&["beta", "gamma"]);
+        let schema = first.schema();
+
+        let (mut encoder, schema_frame) =
+            super::QueryIpcEncoder::new(&schema).expect("schema opens the stream");
+        let first_frame = encoder.write(&first).expect("first batch encodes");
+        let second_frame = encoder.write(&second).expect("second batch encodes");
+        let eos = encoder.finish().expect("stream closes once");
+        assert!(
+            encoder.finish().is_err(),
+            "a query stream may only be closed once"
+        );
+
+        // Schema-once: the second batch's fragment carries no schema message, so
+        // it is strictly smaller than a standalone per-batch IPC stream of the
+        // same rows would be.
+        let standalone = {
+            let (mut throwaway, standalone_schema) =
+                super::QueryIpcEncoder::new(&schema).expect("standalone schema");
+            let batch = throwaway.write(&second).expect("standalone batch");
+            let eos = throwaway.finish().expect("standalone close");
+            standalone_schema.arrow_ipc_schema.len() + batch.arrow_ipc_batch.len() + eos.len()
+        };
+        assert!(
+            second_frame.arrow_ipc_batch.len() < standalone,
+            "a continuation fragment must cost less than a standalone stream"
+        );
+
+        let mut decoder = super::QueryIpcDecoder::new();
+        assert_eq!(
+            decoder
+                .accept_schema(&schema_frame.arrow_ipc_schema)
+                .expect("schema fragment decodes"),
+            schema
+        );
+        assert!(!decoder.eos_accepted());
+        assert_eq!(
+            decoder
+                .accept_batch(&first_frame.arrow_ipc_batch)
+                .expect("first fragment decodes"),
+            first
+        );
+        assert_eq!(
+            decoder
+                .accept_batch(&second_frame.arrow_ipc_batch)
+                .expect("second fragment reuses the retained dictionary"),
+            second
+        );
+        decoder.accept_eos(&eos).expect("end-of-stream closes");
+        assert!(decoder.eos_accepted());
+        assert!(
+            decoder.accept_batch(&second_frame.arrow_ipc_batch).is_err(),
+            "no fragment may follow the end-of-stream"
+        );
+        assert!(
+            decoder.accept_eos(&eos).is_err(),
+            "the end-of-stream arrives exactly once"
+        );
+
+        // Bounded memory: neither owner ever retained more than one fragment
+        // plus the documented fixed framing scratch.
+        let largest = schema_frame
+            .arrow_ipc_schema
+            .len()
+            .max(first_frame.arrow_ipc_batch.len())
+            .max(second_frame.arrow_ipc_batch.len())
+            .max(eos.len());
+        let ceiling = largest + super::ORACLE_IPC_FRAMING_SCRATCH_BYTES;
+        assert!(encoder.peak_retained_ipc_bytes() <= ceiling);
+        assert!(decoder.peak_pending_frame_bytes() <= ceiling);
+
+        // Empty success: schema then terminal, with the terminal carrying the
+        // only end-of-stream the stream ever produces.
+        let (mut empty_encoder, empty_schema) =
+            super::QueryIpcEncoder::new(&schema).expect("empty schema opens the stream");
+        let empty_eos = empty_encoder.finish().expect("empty stream closes");
+        let mut empty_decoder = super::QueryIpcDecoder::new();
+        empty_decoder
+            .accept_schema(&empty_schema.arrow_ipc_schema)
+            .expect("empty schema decodes");
+        empty_decoder
+            .accept_eos(&empty_eos)
+            .expect("empty stream is proven complete by its end-of-stream");
+        assert!(empty_decoder.eos_accepted());
+
+        // Ordering and malformed fragments are refused before Arrow sees them.
+        let mut fresh = super::QueryIpcDecoder::new();
+        assert!(fresh.accept_batch(&first_frame.arrow_ipc_batch).is_err());
+        assert!(fresh.accept_eos(&eos).is_err());
+        fresh
+            .accept_schema(&schema_frame.arrow_ipc_schema)
+            .expect("schema fragment decodes");
+        assert!(fresh.accept_schema(&schema_frame.arrow_ipc_schema).is_err());
+        assert!(fresh.accept_eos(&[]).is_err(), "an absent EOS is not an EOS");
+        assert!(fresh.accept_batch(&[0xAA, 0xBB, 0xCC]).is_err());
+
+        // A failed or cancelled stream is dropped without `finish`, so its
+        // terminal legitimately carries no end-of-stream.
+        let (dropped, _dropped_schema) =
+            super::QueryIpcEncoder::new(&schema).expect("failed stream opens");
+        drop(dropped);
+        let failed = failed_terminal_for_visibility(
+            QueryTerminalErrorCode::QueryExecutionFailed,
+            0,
+            VisibilityMode::PublishedOnly,
+        );
+        assert!(failed.arrow_ipc_eos.is_empty());
+        failed
+            .validate(VisibilityMode::PublishedOnly)
+            .expect("a failed terminal validates without an end-of-stream");
     }
 
     /// Synthetic owner state used to exercise stream cancellation ordering.
@@ -1423,11 +1613,10 @@ mod tests {
             Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1))));
         let telemetry =
             telemetry_owner.start_query(VisibilityMode::PublishedOnly, QueryClass::Interactive);
+        let (ipc, schema_frame) = empty_schema_ipc("production");
         let mut stream = OracleQueryStream::new(QueryStreamInput {
-            schema_frame: QuerySchemaFrame {
-                schema_fingerprint: "production".to_owned(),
-                arrow_ipc_schema: Vec::new(),
-            },
+            schema_frame,
+            ipc,
             batches: Box::pin(RecordBatchStreamAdapter::new(
                 Arc::new(Schema::empty()),
                 futures_util::stream::empty(),
@@ -1464,11 +1653,10 @@ mod tests {
         let stale = crate::oracle::exec::iceberg_datafusion_error(std::io::Error::from(
             std::io::ErrorKind::NotFound,
         ));
+        let (ipc, schema_frame) = empty_schema_ipc("post-output-stale");
         let mut stream = OracleQueryStream::new(QueryStreamInput {
-            schema_frame: QuerySchemaFrame {
-                schema_fingerprint: "post-output-stale".to_owned(),
-                arrow_ipc_schema: Vec::new(),
-            },
+            schema_frame,
+            ipc,
             batches: Box::pin(RecordBatchStreamAdapter::new(
                 Arc::new(Schema::empty()),
                 futures_util::stream::once(std::future::ready(Err(stale))),
@@ -1505,11 +1693,10 @@ mod tests {
         let (admitted, shared, request_cancellation) = admitted_guard_for_test();
         let telemetry_owner =
             Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1))));
+        let (ipc, schema_frame) = empty_schema_ipc("request-cancel");
         let mut stream = OracleQueryStream::new(QueryStreamInput {
-            schema_frame: QuerySchemaFrame {
-                schema_fingerprint: "request-cancel".to_owned(),
-                arrow_ipc_schema: Vec::new(),
-            },
+            schema_frame,
+            ipc,
             batches: Box::pin(RecordBatchStreamAdapter::new(
                 Arc::new(Schema::empty()),
                 futures_util::stream::pending(),

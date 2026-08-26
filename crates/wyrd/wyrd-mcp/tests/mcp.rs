@@ -16,3 +16,5 @@
 
 #[path = "bifrost_rbac.rs"]
 mod bifrost_rbac;
+#[path = "bifrost_layout.rs"]
+mod bifrost_layout;

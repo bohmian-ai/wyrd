@@ -1,11 +1,9 @@
 //! Authenticated ready-Oracle selection and private query forwarding.
 
 use std::future::Future;
-use std::io::Cursor;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow::ipc::reader::StreamReader;
 use futures_util::StreamExt;
 use rand::RngCore as _;
 use vala_bifrost_redux::catalog::BifrostCatalog;
@@ -13,7 +11,7 @@ use vala_bifrost_redux::cluster::{ClusterRegistry, ClusterSnapshot};
 use vala_bifrost_redux::oracle::dispatcher::{OraclePeerCredentials, OraclePeerTls};
 use vala_bifrost_redux::oracle::{
     AuthorizedQueryContext, Oracle, OracleConfig, OraclePlanner, OracleQueryAttemptCut,
-    OracleQueryStream,
+    OracleQueryStream, QueryIpcDecoder,
 };
 use wyrd_runtime::Permission;
 use wyrd_spec::vala::api::{BifrostQueryRequest, NodeId, QueryClass, QueryId, SignedPeerTicket};
@@ -325,6 +323,7 @@ impl ReadyOracleForwarder {
         let mut wire = response.into_inner();
         let frames = async_stream::stream! {
             let mut converter = QueryStreamConverter::new(visibility);
+            let mut ipc = ForwardedQueryIpc::new();
             while let Some(frame) = wire.next().await {
                 let frame = match frame {
                     Ok(frame) => frame,
@@ -333,17 +332,26 @@ impl ReadyOracleForwarder {
                         break;
                     }
                 };
-                let batch_rows = match frame.frame.as_ref() {
-                    Some(wyrd_tonic::wyrd::v1::query_stream_frame::Frame::Batch(batch)) => {
-                        match forwarded_batch_rows(&batch.arrow_ipc_batch) {
-                            Ok(rows) => Some(rows),
-                            Err(error) => {
-                                yield Err(error);
-                                break;
-                            }
-                        }
+                let counted = match frame.frame.as_ref() {
+                    Some(wyrd_tonic::wyrd::v1::query_stream_frame::Frame::Schema(schema)) => {
+                        ipc.accept_schema(&schema.arrow_ipc_schema).map(|()| None)
                     }
-                    _ => None,
+                    Some(wyrd_tonic::wyrd::v1::query_stream_frame::Frame::Batch(batch)) => {
+                        ipc.batch_rows(&batch.arrow_ipc_batch).map(Some)
+                    }
+                    Some(wyrd_tonic::wyrd::v1::query_stream_frame::Frame::Terminal(terminal)) => {
+                        // An empty end-of-stream is the converter's contract to
+                        // judge; a present one must be a valid stream close.
+                        ipc.close(&terminal.arrow_ipc_eos).map(|()| None)
+                    }
+                    None => Ok(None),
+                };
+                let batch_rows = match counted {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        yield Err(error);
+                        break;
+                    }
                 };
                 match converter.convert(frame, batch_rows) {
                     Ok(frame) => yield Ok(frame),
@@ -556,20 +564,86 @@ impl ForwardingAttempt {
     }
 }
 
-/// Counts rows in one bounded Arrow IPC batch frame before protocol conversion.
-fn forwarded_batch_rows(bytes: &[u8]) -> Result<u64, BifrostError> {
-    if bytes.len() > MAX_FORWARDED_BATCH_BYTES {
-        return Err(BifrostError::QueryExecutionFailed);
+/// Stateful Arrow IPC reader for one forwarded query stream.
+///
+/// A forwarded stream carries the leader's single split IPC stream: one schema
+/// prefix, one bare delta per batch, and one end-of-stream delta on the
+/// terminal. Row counts therefore cannot be recovered from a batch fragment in
+/// isolation, so the forwarder retains one decoder for the whole stream and
+/// charges the per-fragment byte ceiling before feeding it.
+struct ForwardedQueryIpc {
+    /// Decoder retaining schema and dictionary state across fragments.
+    decoder: QueryIpcDecoder,
+}
+
+impl ForwardedQueryIpc {
+    /// Creates a reader positioned before the required schema fragment.
+    fn new() -> Self {
+        Self {
+            decoder: QueryIpcDecoder::new(),
+        }
     }
-    let mut reader = StreamReader::try_new(Cursor::new(bytes), None)
-        .map_err(|_| BifrostError::QueryExecutionFailed)?;
-    reader.try_fold(0_u64, |rows, batch| {
-        let batch = batch.map_err(|_| BifrostError::QueryExecutionFailed)?;
-        rows.checked_add(
-            u64::try_from(batch.num_rows()).map_err(|_| BifrostError::QueryExecutionFailed)?,
-        )
-        .ok_or(BifrostError::QueryExecutionFailed)
-    })
+
+    /// Consumes the stream's single schema fragment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::QueryExecutionFailed`] when the fragment exceeds
+    /// the forwarded ceiling, is not exactly one schema message, or repeats.
+    fn accept_schema(&mut self, bytes: &[u8]) -> Result<(), BifrostError> {
+        Self::check_bounds(bytes)?;
+        self.decoder
+            .accept_schema(bytes)
+            .map(|_schema| ())
+            .map_err(|_| BifrostError::QueryExecutionFailed)
+    }
+
+    /// Counts rows in one bounded batch fragment before protocol conversion.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::QueryExecutionFailed`] when the fragment exceeds
+    /// the forwarded ceiling, does not decode to exactly one batch of the
+    /// stream schema, or its row count overflows `u64`.
+    fn batch_rows(&mut self, bytes: &[u8]) -> Result<u64, BifrostError> {
+        Self::check_bounds(bytes)?;
+        let batch = self
+            .decoder
+            .accept_batch(bytes)
+            .map_err(|_| BifrostError::QueryExecutionFailed)?;
+        u64::try_from(batch.num_rows()).map_err(|_| BifrostError::QueryExecutionFailed)
+    }
+
+    /// Consumes the terminal's end-of-stream delta when it carries one.
+    ///
+    /// An empty delta is left to the shared converter, which owns the rule that
+    /// a successful terminal must close its stream and a failed one must not.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::QueryExecutionFailed`] when a present delta is
+    /// not a valid close for this stream.
+    fn close(&mut self, bytes: &[u8]) -> Result<(), BifrostError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        Self::check_bounds(bytes)?;
+        self.decoder
+            .accept_eos(bytes)
+            .map_err(|_| BifrostError::QueryExecutionFailed)
+    }
+
+    /// Refuses any fragment larger than the forwarded per-fragment ceiling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::QueryExecutionFailed`] for an oversized fragment.
+    fn check_bounds(bytes: &[u8]) -> Result<(), BifrostError> {
+        if bytes.len() > MAX_FORWARDED_BATCH_BYTES {
+            return Err(BifrostError::QueryExecutionFailed);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -585,6 +659,82 @@ mod tests {
         AuthMethod, ClusterCapabilities, ClusterNodeKey, ClusterRole, ClusterRoleLease,
         FreshnessPolicy, OracleCapabilitiesV1, VisibilityMode,
     };
+
+    /// Encodes one split query IPC stream exactly as the leader emits it.
+    ///
+    /// Returns the schema fragment, one bare fragment per written batch, and
+    /// the end-of-stream fragment carried by the terminal frame.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture batches cannot be encoded.
+    fn split_ipc_stream(batches: &[&[i64]]) -> (Vec<u8>, Vec<Vec<u8>>, Vec<u8>) {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new(Vec::new(), schema.as_ref())
+            .expect("schema writer starts");
+        let prefix = std::mem::take(writer.get_mut());
+        let fragments = batches
+            .iter()
+            .map(|values| {
+                let batch = RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int64Array::from(values.to_vec()))],
+                )
+                .expect("fixture batch is valid");
+                writer.write(&batch).expect("fixture batch writes");
+                std::mem::take(writer.get_mut())
+            })
+            .collect();
+        writer.finish().expect("fixture writer finishes");
+        (prefix, fragments, std::mem::take(writer.get_mut()))
+    }
+
+    /// Forwarding counts rows through one stateful decoder for the whole stream.
+    ///
+    /// A forwarded batch fragment carries no schema of its own, so the
+    /// forwarder must retain the leader's stream state, refuse fragments that
+    /// arrive out of order or oversized, and accept the terminal close.
+    #[test]
+    fn stateful_ipc_decoder_contract() {
+        let (prefix, fragments, eos) = split_ipc_stream(&[&[1, 2], &[3]]);
+
+        let mut ipc = ForwardedQueryIpc::new();
+        assert!(
+            ipc.batch_rows(&fragments[0]).is_err(),
+            "a batch fragment before the schema is refused"
+        );
+
+        let mut ipc = ForwardedQueryIpc::new();
+        ipc.accept_schema(&prefix).expect("schema fragment accepted");
+        assert!(
+            ipc.accept_schema(&prefix).is_err(),
+            "a forwarded stream carries exactly one schema"
+        );
+        assert_eq!(ipc.batch_rows(&fragments[0]).expect("first fragment"), 2);
+        assert_eq!(ipc.batch_rows(&fragments[1]).expect("second fragment"), 1);
+        ipc.close(&eos).expect("terminal end-of-stream accepted");
+        assert!(
+            ipc.close(&eos).is_err(),
+            "a forwarded stream closes exactly once"
+        );
+
+        let mut ipc = ForwardedQueryIpc::new();
+        ipc.accept_schema(&prefix).expect("schema fragment accepted");
+        assert!(
+            ipc.batch_rows(&vec![0; MAX_FORWARDED_BATCH_BYTES + 1])
+                .is_err(),
+            "an oversized fragment is refused before decoding"
+        );
+
+        let mut ipc = ForwardedQueryIpc::new();
+        ipc.accept_schema(&prefix).expect("schema fragment accepted");
+        ipc.close(&Vec::new())
+            .expect("an absent end-of-stream is left to the converter");
+    }
 
     /// Builds one ready Oracle lease with deterministic snapshot ordering.
     fn oracle_lease(ordinal: u128, fencing_token: u64) -> ClusterRoleLease {

@@ -48,7 +48,7 @@ tenant identity from an object-store path.
 ## Stable Wyrd anchors
 
 - Analytical schema and reserved columns: `crates/wyrd-spec/src/vala/`.
-- Arrow/Parquet conversion and providers: `crates/vala/vala-bifrost/src/`.
+- Arrow/Parquet conversion and providers: `crates/vala/vala-bifrost-redux/src/`.
 - Python analytical surface: `crates/vala/vala-sdk/` and
   `python/py-wyrd/` registration.
 - Schema fingerprint and query contracts: `crates/wyrd-spec/src/vala/api/`.
@@ -60,5 +60,5 @@ tenant identity from an object-store path.
 - [Arrow C Data Interface](https://arrow.apache.org/docs/format/CDataInterface.html)
 - [Apache Parquet documentation](https://parquet.apache.org/docs/)
 - [PyArrow documentation](https://arrow.apache.org/docs/python/)
-- Wyrd anchors: `crates/wyrd-spec/src/vala/`; `crates/vala/vala-bifrost/src/`;
+- Wyrd anchors: `crates/wyrd-spec/src/vala/`; `crates/vala/vala-bifrost-redux/src/`;
   `crates/vala/vala-sdk/`.

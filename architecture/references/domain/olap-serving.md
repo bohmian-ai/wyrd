@@ -65,7 +65,7 @@ listeners in Vala crates.
 - Bifrost contract and serving rule: `architecture/wyrd-design.md` §Bifrost.
 - Query and table contracts: `crates/wyrd-spec/src/vala/api/`.
 - Query admission and server routes: `crates/wyrd/wyrd-server/`.
-- Engine implementation: `crates/vala/vala-bifrost/`.
+- Engine implementation: `crates/vala/vala-bifrost-redux/`.
 
 ## Primary grounding
 
@@ -74,4 +74,4 @@ listeners in Vala crates.
 - [Apache Arrow columnar format](https://arrow.apache.org/docs/format/Columnar.html)
 - [NIST AI RMF 1.0](https://nvlpubs.nist.gov/nistpubs/ai/NIST.AI.100-1.pdf)
 - Wyrd anchors: `architecture/wyrd-design.md` §Bifrost;
-  `crates/wyrd/wyrd-server/`; `crates/vala/vala-bifrost/`.
+  `crates/wyrd/wyrd-server/`; `crates/vala/vala-bifrost-redux/`.

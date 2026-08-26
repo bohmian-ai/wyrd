@@ -58,7 +58,7 @@ audit checks.
 ## Stable Wyrd anchors
 
 - Bifrost lifecycle and system columns: `architecture/wyrd-design.md` §Bifrost.
-- Ingest and storage engines: `crates/vala/vala-bifrost/` and
+- Ingest and storage engines: `crates/vala/vala-bifrost-redux/` and
   `crates/vala/vala-ingest/`.
 - Catalog/control records: `crates/vala/vala-sql/`.
 - Server lifecycle and audit: `crates/wyrd/wyrd-server/`.
@@ -71,4 +71,4 @@ audit checks.
 - [OpenTelemetry metrics](https://opentelemetry.io/docs/concepts/signals/#metrics)
 - [NIST AI RMF 1.0](https://nvlpubs.nist.gov/nistpubs/ai/NIST.AI.100-1.pdf)
 - Wyrd anchors: `architecture/wyrd-design.md` §Bifrost;
-  `crates/vala/vala-bifrost/`; `crates/vala/vala-sql/`.
+  `crates/vala/vala-bifrost-redux/`; `crates/vala/vala-sql/`.

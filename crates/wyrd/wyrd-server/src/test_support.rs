@@ -103,6 +103,28 @@ pub async fn test_catalog() -> Arc<BifrostCatalog> {
     Arc::clone(&shared().catalog)
 }
 
+/// One static, local-only decoding key for a unit-test [`TokenVerifier`].
+///
+/// [`TokenVerifier::new`] asserts at least one decoding key, so an `AppState`
+/// shell cannot be composed from an empty map. The unit tests reach the service
+/// functions with an already-resolved `Caller` and never verify a token, so any
+/// well-formed public key satisfies the invariant; this is the same static key
+/// the `state` module's shell tests use.
+fn shell_decoding_keys()
+-> std::collections::HashMap<wyrd_auth_verify::Kid, Arc<jsonwebtoken::DecodingKey>> {
+    let mut keys = std::collections::HashMap::new();
+    keys.insert(
+        wyrd_auth_verify::Kid::new("test").expect("static kid is valid"),
+        Arc::new(
+            wyrd_auth_verify::public_key_from_pem(
+                b"-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAWhCX9H41EwSjJJI1E6X3z5fTKyCZ3v2DsJluJ+DZ8Vw=\n-----END PUBLIC KEY-----\n",
+            )
+            .expect("static test key is valid"),
+        ),
+    );
+    keys
+}
+
 /// Constructs a non-Bifrost unit-test application shell around shared dependencies.
 pub fn test_app_state(
     postgres: Arc<ServerPostgres>,
@@ -110,7 +132,7 @@ pub fn test_app_state(
     _catalog: Arc<BifrostCatalog>,
 ) -> AppState {
     let verifier = Arc::new(TokenVerifier::new(
-        std::collections::HashMap::new(),
+        shell_decoding_keys(),
         "wyrd",
         Arc::new(SqlPermissionResolver::new(Arc::new(
             shared()._fixture.app_pool().clone(),

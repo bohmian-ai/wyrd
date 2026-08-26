@@ -50,7 +50,7 @@ as a new public Card kind or client-owned catalog contract.
 ## Stable Wyrd anchors
 
 - Physical identity and Bifrost rules: `architecture/wyrd-design.md` §Bifrost.
-- Catalog and table adapters: `crates/vala/vala-bifrost/src/catalog/`.
+- Catalog and table adapters: `crates/vala/vala-bifrost-redux/src/catalog/`.
 - Postgres catalog/control boundary: `crates/vala/vala-sql/`.
 - Object-store integration: `crates/wyrd/wyrd-storage/` and Vala adapters.
 
@@ -61,4 +61,4 @@ as a new public Card kind or client-owned catalog contract.
 - [Iceberg API overview](https://iceberg.apache.org/docs/latest/api/)
 - [Apache Parquet documentation](https://parquet.apache.org/docs/)
 - Wyrd anchors: `architecture/wyrd-design.md` §Bifrost;
-  `crates/vala/vala-bifrost/src/catalog/`; `crates/vala/vala-sql/`.
+  `crates/vala/vala-bifrost-redux/src/catalog/`; `crates/vala/vala-sql/`.

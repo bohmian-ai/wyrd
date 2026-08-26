@@ -54,7 +54,7 @@ provider and execution abstractions are sufficient.
 
 - Query contract and tenant tripwire: `architecture/wyrd-design.md` §Bifrost.
 - Wyrd query service: `crates/wyrd/wyrd-server/`.
-- Providers and execution: `crates/vala/vala-bifrost/src/`.
+- Providers and execution: `crates/vala/vala-bifrost-redux/src/`.
 - Pure query types: `crates/wyrd-spec/src/vala/api/`.
 
 ## Primary grounding
@@ -64,4 +64,4 @@ provider and execution abstractions are sufficient.
 - [DataFusion TableProvider API](https://docs.rs/datafusion/latest/datafusion/catalog/trait.TableProvider.html)
 - [Apache Arrow columnar format](https://arrow.apache.org/docs/format/Columnar.html)
 - Wyrd anchors: `architecture/wyrd-design.md` §Bifrost;
-  `crates/wyrd/wyrd-server/`; `crates/vala/vala-bifrost/src/`.
+  `crates/wyrd/wyrd-server/`; `crates/vala/vala-bifrost-redux/src/`.

@@ -716,7 +716,10 @@ impl ScribeIngressPlanner {
         name_bytes: usize,
     ) -> Result<IngestMaterialPlan, ScribeError> {
         if bytes.len() > self.limits.max_frame_bytes {
-            return Err(ScribeError::PayloadTooLarge { bytes: bytes.len() });
+            return Err(ScribeError::PayloadTooLarge {
+                bytes: bytes.len(),
+                limit: self.limits.max_frame_bytes,
+            });
         }
         let mut scan = NativeScan::new(self.limits);
         scan.scan(bytes)?;
@@ -1392,6 +1395,7 @@ impl OtlpCounts {
         if request_bytes > self.limits.otlp.request_bytes {
             return Err(ScribeError::PayloadTooLarge {
                 bytes: request_bytes,
+                limit: self.limits.otlp.request_bytes,
             });
         }
         let current_material_bytes = request_bytes

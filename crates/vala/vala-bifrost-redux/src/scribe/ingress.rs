@@ -58,6 +58,7 @@ fn validate_logical_transport_frame(
     if frame.measured_wire_bytes > request_limit_bytes {
         return Err(ScribeError::PayloadTooLarge {
             bytes: frame.measured_wire_bytes,
+            limit: request_limit_bytes,
         });
     }
     Ok(())

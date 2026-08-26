@@ -63,7 +63,7 @@ pub const OTLP_WIRE_LIMITS: OtlpWireLimits = OtlpWireLimits {
     scopes: 8_192,
     records: 131_072,
     attributes: 1_048_576,
-    value_bytes: BIFROST_INGEST_REQUEST_LIMIT_BYTES,
+    value_bytes: 32 * 1024 * 1024,
     value_depth: 8,
     time_partitions: 32,
 };

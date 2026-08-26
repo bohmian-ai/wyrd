@@ -244,8 +244,15 @@ pub enum ScribeError {
     #[error("unsupported WAL version: {version}")]
     UnsupportedWalVersion { version: u16 },
 
-    #[error("ingest payload too large: {bytes} bytes")]
-    PayloadTooLarge { bytes: usize },
+    /// The measured wire frame exceeds the configured request ceiling, so the
+    /// request was refused before any decode or durable work began.
+    #[error("ingest payload too large: {bytes} > {limit} bytes")]
+    PayloadTooLarge {
+        /// Measured wire bytes offered by the caller.
+        bytes: usize,
+        /// Configured request ceiling applied to this request.
+        limit: usize,
+    },
 
     /// The decoded Arrow ownership plus its measured wire frame cannot fit in
     /// one active persistence bucket, so no WAL or memtable work was started.
@@ -327,7 +334,10 @@ impl ScribeError {
             Self::UnsupportedWalVersion { version } => {
                 Self::UnsupportedWalVersion { version: *version }
             }
-            Self::PayloadTooLarge { bytes } => Self::PayloadTooLarge { bytes: *bytes },
+            Self::PayloadTooLarge { bytes, limit } => Self::PayloadTooLarge {
+                bytes: *bytes,
+                limit: *limit,
+            },
             Self::DecodedPayloadTooLarge { bytes, limit } => Self::DecodedPayloadTooLarge {
                 bytes: *bytes,
                 limit: *limit,

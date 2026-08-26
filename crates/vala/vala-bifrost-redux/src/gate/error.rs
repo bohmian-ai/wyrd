@@ -282,11 +282,12 @@ impl IngestError {
     pub fn from_scribe(error: crate::contracts::ScribeError) -> Self {
         match error {
             crate::contracts::ScribeError::IngestBusy { table } => Self::IngestBusy { table },
-            crate::contracts::ScribeError::PayloadTooLarge { bytes } => Self::PayloadTooLarge {
-                bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
-                limit: u64::try_from(crate::gate::limits::BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES)
-                    .unwrap_or(u64::MAX),
-            },
+            crate::contracts::ScribeError::PayloadTooLarge { bytes, limit } => {
+                Self::PayloadTooLarge {
+                    bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
+                    limit: u64::try_from(limit).unwrap_or(u64::MAX),
+                }
+            }
             crate::contracts::ScribeError::DecodedPayloadTooLarge { bytes, limit } => {
                 Self::PayloadTooLarge {
                     bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
@@ -673,7 +674,7 @@ mod tests {
                 "vala.metrics.points",
             ),
             (
-                ScribeError::PayloadTooLarge { bytes: 2 },
+                ScribeError::PayloadTooLarge { bytes: 2, limit: 1 },
                 "WYRD_VALA_413_PAYLOAD_TOO_LARGE",
                 "vala.traces.spans",
             ),

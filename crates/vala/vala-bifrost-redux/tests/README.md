@@ -27,26 +27,28 @@ still ships a journey even when its internals are covered here.
 
 ## One target, one compile
 
-`integration` is this crate's only `[[test]]` target. Every source in this
-directory is a `#[path]` module of `tests/integration.rs`, so each file is
-compiled once and each test runs once.
+`integration` is this crate's only `[[test]]` target. Its root is
+`tests/integration/main.rs`, and every source lives in a subsystem directory
+beneath it — `catalog/`, `forge/`, `oracle/`, `scribe/` — as an ordinary
+directory module. Each file compiles once and each test runs once.
 
-`autotests = false` in `Cargo.toml` is what makes that hold. Without it Cargo
-would also promote every `tests/*.rs` file to a target of its own, and each
-module would compile and execute **twice** — once inside `integration`, once
-standalone. That is not hypothetical: `oracle_core`, `pg_file_list_tenant_table`,
-and `forge_incremental_compaction` were declared that way and ran 109 tests
-twice per lane invocation until the duplicate targets were removed.
+Two things hold it: `autotests = false` in `Cargo.toml`, and the fact that
+nothing sits at the top of `tests/` for Cargo to auto-discover. Without both, a
+`tests/*.rs` file becomes a target of its own and its tests compile and execute
+**twice** — once inside `integration`, once standalone. That is not
+hypothetical: `oracle_core`, `pg_file_list_tenant_table`, and
+`forge_incremental_compaction` were declared that way and ran 109 tests twice
+per lane invocation until the duplicate targets were removed.
 
-So: **do not add a `[[test]]` entry for a file `integration.rs` already
+So: **do not add a `[[test]]` entry for a file the `integration` tree already
 includes.** Add a new target only for a genuinely separate binary that shares no
 sources with `integration`, and give it a `//!` doc naming its tier, setup, and
 owning lane.
 
 ## Adding a test
 
-1. Add it to an existing module here, or add a new source file plus one
-   `#[path]` line in `tests/integration.rs`.
+1. Add it to the module that owns its theme, or add a new file plus one `mod`
+   line in that subsystem's `mod.rs`.
 2. Do not touch `Cargo.toml`.
 3. Do not touch `mise.toml` — `test:bifrost` runs the binary whole.
 4. Add `#[ignore]` only for a test that must stay out of the fast lane. Note
@@ -62,7 +64,7 @@ mise run test:bifrost                  # lib + integration + doc tests, whole
 # One test while iterating:
 mise exec -- cargo test --locked -p vala-bifrost-redux \
   --features test-support,bench-support --test integration \
-  -- oracle_core::participant_cut_is_selected_sorted_and_read_once \
+  -- oracle::distributed::file_count_size_and_hash_partition_assignments_are_exact \
   --exact --nocapture --test-threads=1
 ```
 
@@ -72,6 +74,16 @@ test:bifrost` wraps the run in `scripts/postgres/with-test-postgres.sh` for you.
 ## File size
 
 Keep a module under roughly 40 KB. Splitting is cheap by construction — a new
-file plus one `#[path]` line, with no `Cargo.toml` or `mise.toml` change — so
+file plus one `mod` line, with no `Cargo.toml` or `mise.toml` change — so
 there is no reason for a module to grow past the point where a reader can find
 things in it.
+
+## What a test may not do
+
+- **A test must assert.** Eleven tests in the `oracle` group asserted nothing:
+  each called another test and printed a plan-case marker, paying that test's
+  full Postgres and DataFusion cost again so a human reading `--nocapture`
+  could tick off a list. They were deleted. Do not reintroduce the pattern.
+- **A test must not name a plan.** Task, case, and hypothesis identifiers are
+  meaningless once the plan closes and force a reader to find a document that
+  may be private. Describe the behavior instead.

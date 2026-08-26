@@ -320,6 +320,10 @@ then run codegen.
 
 ## 11. Testing Workflow
 
+This section is normative. `TESTING.md` is its practical map: tier homes,
+directory layout, every `mise` lane, benches, and the two prohibitions on what a
+test may not do.
+
 ### Test Taxonomy (priority order)
 
 Wyrd has three test tiers. They are ranked — higher tiers prove the product

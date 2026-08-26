@@ -484,18 +484,18 @@ mod pg_tests {
             assert_eq!(partition_fields[0].transform, Transform::Hour);
 
             let sort_fields = &table.metadata().default_sort_order().fields;
-            assert_eq!(sort_fields.len(), 2);
-            // The canonical layout leads with the ascending tenant prefix and
-            // then orders newest-first on event time.
-            for (field, (source_id, direction)) in sort_fields.iter().zip([
-                (tenant_id, SortDirection::Ascending),
-                (event_time_id, SortDirection::Descending),
-            ]) {
-                assert_eq!(field.source_id, source_id);
-                assert_eq!(field.transform, Transform::Identity);
-                assert_eq!(field.direction, direction);
-                assert_eq!(field.null_order, NullOrder::Last);
-            }
+            // The canonical layout injects nothing: the single key is the
+            // built-in's own newest-first event-time declaration, and the
+            // per-file-constant tenant column appears nowhere in it.
+            assert_eq!(sort_fields.len(), 1);
+            assert_eq!(sort_fields[0].source_id, event_time_id);
+            assert_eq!(sort_fields[0].transform, Transform::Identity);
+            assert_eq!(sort_fields[0].direction, SortDirection::Descending);
+            assert_eq!(sort_fields[0].null_order, NullOrder::Last);
+            assert!(
+                sort_fields.iter().all(|field| field.source_id != tenant_id),
+                "the canonical sort order must not carry data_tenant_id"
+            );
         }
 
         /// Build a real catalog, staging store, and Forge owner.

@@ -1876,10 +1876,7 @@ fn day_partition_start(day: chrono::NaiveDate) -> chrono::DateTime<chrono::Utc> 
 /// letting the default disagree with the rows they insert.
 fn daily_layout_declaration() -> wyrd_spec::vala::api::PhysicalLayoutWire {
     wyrd_spec::vala::api::PhysicalLayoutWire {
-        partition: wyrd_spec::vala::api::TimePartitionSpecWire {
-            column: "wyrd_event_time".to_owned(),
-            granularity: wyrd_spec::vala::api::TimeGranularityWire::Day,
-        },
+        partition_granularity: wyrd_spec::vala::api::TimeGranularityWire::Day,
         sort_keys: Vec::new(),
         bloom_columns: Vec::new(),
     }

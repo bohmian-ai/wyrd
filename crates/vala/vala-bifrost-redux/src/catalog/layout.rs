@@ -7,9 +7,11 @@
 //! catalog is its owner — nothing else resolves or defaults a layout.
 //!
 //! Callers declare intent with the Arrow-free
-//! [`PhysicalLayoutWire`]; [`PhysicalLayout::canonicalize`] turns that intent
-//! plus the complete physical schema into the one canonical form, or fails with
-//! a public [`BifrostError`] before any durable mutation.
+//! [`PhysicalLayoutWire`]; [`PhysicalLayout::resolve`] is the one entry point
+//! that turns that intent plus the complete physical schema into the canonical
+//! form, or fails with a public [`BifrostError`] before any durable mutation.
+//! Built-in and caller declarations run the identical code path, so identical
+//! declarations produce byte-identical canonical layouts.
 
 use std::collections::BTreeSet;
 
@@ -21,11 +23,9 @@ use iceberg::spec::{
 };
 use wyrd_spec::vala::api::{
     NullOrderWire, PhysicalLayoutWire, SortDirectionWire, SortKeyWire, TimeGranularityWire,
-    TimePartitionSpecWire, TimePartitionWire,
+    TimePartitionWire,
 };
-use wyrd_spec::vala::managed_columns::{
-    CARD_UID, DATA_TENANT_ID, PRINCIPAL_ID, RUN_ID, WYRD_EVENT_TIME, is_reserved_managed_column,
-};
+use wyrd_spec::vala::managed_columns::{CARD_UID, PRINCIPAL_ID, RUN_ID, WYRD_EVENT_TIME};
 use wyrd_spec::vala::{BifrostError, PhysicalLayoutField, PhysicalLayoutViolation};
 
 /// Managed Bloom floor, in the stable order every writer must emit it.
@@ -33,7 +33,18 @@ use wyrd_spec::vala::{BifrostError, PhysicalLayoutField, PhysicalLayoutViolation
 /// A name is included only when the table's physical schema actually has the
 /// column, so a table without a correlation policy does not claim Blooms it
 /// cannot write.
-pub const MANAGED_BLOOM_FLOOR: [&str; 4] = [DATA_TENANT_ID, RUN_ID, CARD_UID, PRINCIPAL_ID];
+///
+/// `data_tenant_id` is deliberately absent. Every tenant owns its own Iceberg
+/// namespace and object prefix, so the column is constant within any single
+/// file and a Bloom filter over it can never prune one.
+pub const MANAGED_BLOOM_FLOOR: [&str; 3] = [RUN_ID, CARD_UID, PRINCIPAL_ID];
+
+/// Largest number of sort keys one declaration may carry.
+///
+/// Each additional key costs write-side sort time and buys progressively less
+/// clustering, so the contract caps the declaration rather than accepting an
+/// unbounded list and silently truncating it.
+pub const MAX_SORT_KEYS: usize = 4;
 
 /// Time-partition granularity owned by the engine.
 ///
@@ -235,17 +246,6 @@ impl LayoutSortKey {
         }
     }
 
-    /// Returns the canonical tenant-prefix key injected ahead of every declared
-    /// key.
-    ///
-    /// Tenant isolation is the one pruning benefit the physical order is claimed
-    /// to provide; the direction of the remaining keys is preserved as declared
-    /// but is not itself a pruning guarantee.
-    #[must_use]
-    pub fn tenant_prefix() -> Self {
-        Self::new(DATA_TENANT_ID, SortDirection::Asc, NullOrder::Last)
-    }
-
     /// Returns the sorted column name.
     #[must_use]
     pub fn column(&self) -> &str {
@@ -264,36 +264,27 @@ impl LayoutSortKey {
         matches!(self.null_order, NullOrder::First)
     }
 
-    /// Returns the default post-tenant key used when a caller declares no sort.
+    /// Returns the sole key a layout resolves to when no sort key is declared.
+    ///
+    /// Ordering on `wyrd_event_time` is retained for encoding, not pruning:
+    /// `DELTA_BINARY_PACKED` is near-free on a sorted timestamp column and
+    /// expensive on an unsorted one.
     #[must_use]
     pub fn default_event_time() -> Self {
         Self::new(WYRD_EVENT_TIME, SortDirection::Desc, NullOrder::Last)
     }
 }
 
-/// Who authored a layout declaration.
-///
-/// The canonical form is identical either way; only the reserved-managed-column
-/// rejection distinguishes untrusted caller input from an engine-owned built-in
-/// declaration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LayoutAuthor {
-    /// An untrusted `physical_layout` declaration from a register request.
-    Caller,
-    /// An engine-owned built-in table declaration.
-    Builtin,
-}
-
 /// The canonical, fully resolved physical layout of one table.
 ///
-/// Construct it only through [`PhysicalLayout::canonicalize`] or
-/// [`PhysicalLayout::from_stored_wire`]; both guarantee the tenant sort prefix,
+/// Construct it only through [`PhysicalLayout::resolve`] or
+/// [`PhysicalLayout::from_stored_wire`]; both guarantee a non-empty sort order,
 /// the managed Bloom floor, and schema-validated columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhysicalLayout {
     /// Resolved time partition.
     partition: TimePartitionSpec,
-    /// Canonical sort order, always beginning with the tenant prefix.
+    /// Canonical sort order, carrying at least one key.
     sort_keys: Vec<LayoutSortKey>,
     /// Canonical Bloom columns, always beginning with the schema-present managed
     /// floor.
@@ -301,64 +292,47 @@ pub struct PhysicalLayout {
 }
 
 impl PhysicalLayout {
-    /// Resolves the caller's declaration into the one canonical layout.
+    /// Resolves one declaration into the one canonical layout.
+    ///
+    /// This is the single resolution entry point. A built-in definition and an
+    /// untrusted register request run this identical code path, so identical
+    /// declarations produce byte-identical canonical layouts and the engine can
+    /// never refuse to provision a table a caller could have registered.
     ///
     /// `table` is the already-validated canonical `<namespace>.<name>` used only
     /// as public error context. `schema` is the complete physical schema,
     /// including managed and correlation columns.
     ///
-    /// Validation precedence matches the public contract: the required
-    /// partition, then the partition column and granularity, then sort keys in
-    /// request order, then Bloom columns in request order. The first fault wins
-    /// and nothing is mutated.
+    /// An omitted declaration resolves to hourly `wyrd_event_time`
+    /// partitioning, `wyrd_event_time` descending nulls-last as the sole sort
+    /// key, and the schema-present managed Bloom floor. An explicit declaration
+    /// whose `sort_keys` is empty resolves to the same sort order, because the
+    /// system injects nothing of its own.
+    ///
+    /// Validation precedence matches the public contract: the sort-key count,
+    /// then sort keys in request order, then Bloom columns in request order.
+    /// The first fault wins and nothing is mutated.
     ///
     /// # Errors
     /// Returns [`BifrostError::InvalidPhysicalLayout`] naming the exact field,
     /// violation, and offending column.
-    pub fn canonicalize(
+    pub fn resolve(
         table: &str,
         schema: &Schema,
         declared: Option<&PhysicalLayoutWire>,
-    ) -> Result<Self, BifrostError> {
-        Self::resolve(table, schema, declared, LayoutAuthor::Caller)
-    }
-
-    /// Shared canonical resolution for both declaration authors.
-    ///
-    /// # Errors
-    /// Returns [`BifrostError::InvalidPhysicalLayout`] naming the exact field,
-    /// violation, and offending column.
-    fn resolve(
-        table: &str,
-        schema: &Schema,
-        declared: Option<&PhysicalLayoutWire>,
-        author: LayoutAuthor,
     ) -> Result<Self, BifrostError> {
         let Some(declared) = declared else {
             return Ok(Self {
                 partition: TimePartitionSpec::new(TimeGranularity::Hour),
-                sort_keys: vec![
-                    LayoutSortKey::tenant_prefix(),
-                    LayoutSortKey::default_event_time(),
-                ],
+                sort_keys: vec![LayoutSortKey::default_event_time()],
                 bloom_columns: managed_bloom_floor(schema),
             });
         };
 
-        if declared.partition.column != WYRD_EVENT_TIME {
-            return Err(invalid(
-                table,
-                PhysicalLayoutField::Partition,
-                PhysicalLayoutViolation::UnsupportedColumn,
-                Some(declared.partition.column.clone()),
-            ));
-        }
         let partition =
-            TimePartitionSpec::new(TimeGranularity::from_wire(declared.partition.granularity));
-
-        let sort_keys = canonical_sort_keys(table, schema, &declared.sort_keys, author)?;
-        let bloom_columns =
-            canonical_bloom_columns(table, schema, &declared.bloom_columns, author)?;
+            TimePartitionSpec::new(TimeGranularity::from_wire(declared.partition_granularity));
+        let sort_keys = canonical_sort_keys(table, schema, &declared.sort_keys)?;
+        let bloom_columns = canonical_bloom_columns(table, schema, &declared.bloom_columns)?;
 
         Ok(Self {
             partition,
@@ -367,32 +341,12 @@ impl PhysicalLayout {
         })
     }
 
-    /// Canonicalizes one engine-owned built-in declaration.
-    ///
-    /// Built-ins run the same resolution as caller declarations — tenant
-    /// prefix, schema validation, duplicate rejection, managed Bloom floor
-    /// union — so a built-in and a dynamic table with the same declaration
-    /// produce byte-identical canonical layouts. The only relaxation is that a
-    /// built-in may sort and Bloom on its own managed columns.
-    ///
-    /// # Errors
-    /// Returns [`BifrostError::InvalidPhysicalLayout`] when the built-in
-    /// declaration names a column absent from its own physical schema or
-    /// repeats one.
-    pub fn builtin(
-        table: &str,
-        schema: &Schema,
-        declared: &PhysicalLayoutWire,
-    ) -> Result<Self, BifrostError> {
-        Self::resolve(table, schema, Some(declared), LayoutAuthor::Builtin)
-    }
-
     /// Rebuilds a layout from its persisted control JSON and re-validates it
     /// against the stored schema.
     ///
     /// Persisted JSON is always the fully populated canonical form written by
-    /// the catalog itself, so it is resolved as an engine-owned declaration and
-    /// then required to canonicalize to itself. A row that does not is the
+    /// the catalog itself, so it is resolved through [`Self::resolve`] and then
+    /// required to canonicalize to itself. A row that does not is the
     /// physical-drift signal for a hand-edited or corrupted control row.
     ///
     /// # Errors
@@ -425,7 +379,7 @@ impl PhysicalLayout {
         schema: &Schema,
         stored: &PhysicalLayoutWire,
     ) -> Result<Self, BifrostError> {
-        Self::resolve(table, schema, Some(stored), LayoutAuthor::Builtin)
+        Self::resolve(table, schema, Some(stored))
     }
 
     pub fn from_stored_wire(
@@ -433,7 +387,7 @@ impl PhysicalLayout {
         schema: &Schema,
         stored: &PhysicalLayoutWire,
     ) -> Result<Self, BifrostError> {
-        let resolved = Self::resolve(table, schema, Some(stored), LayoutAuthor::Builtin)?;
+        let resolved = Self::resolve(table, schema, Some(stored))?;
         if &resolved.to_wire() != stored {
             return Err(BifrostError::PhysicalDrift {
                 detail: format!("stored physical layout for {table} is not canonical"),
@@ -517,10 +471,7 @@ impl PhysicalLayout {
     #[must_use]
     pub fn to_wire(&self) -> PhysicalLayoutWire {
         PhysicalLayoutWire {
-            partition: TimePartitionSpecWire {
-                column: WYRD_EVENT_TIME.to_owned(),
-                granularity: self.granularity().to_wire(),
-            },
+            partition_granularity: self.granularity().to_wire(),
             sort_keys: self
                 .sort_keys
                 .iter()
@@ -590,9 +541,9 @@ impl PhysicalLayout {
     /// Builds the Forge sort order for this layout, bound to the physical
     /// Iceberg schema.
     ///
-    /// The order is exactly [`PhysicalLayout::sort_keys`] — the tenant prefix
-    /// followed by the declared keys — so Forge rewrites reproduce the same
-    /// physical order the writers emit.
+    /// The order is exactly [`PhysicalLayout::sort_keys`] — the declared keys,
+    /// or the event-time default when none were declared — so Forge rewrites
+    /// reproduce the same physical order the writers emit.
     ///
     /// # Errors
     /// Returns a message when a sort column is absent from the Iceberg schema
@@ -643,37 +594,36 @@ fn invalid(
 
 /// Canonicalizes declared sort keys in request order.
 ///
-/// `data_tenant_id` is the one reserved column a caller may name: it is removed
-/// before duplicate checking because the canonical tenant prefix is injected
-/// exactly once. Every other reserved managed column is rejected, an unknown
-/// column is rejected, and a repeated column is rejected.
+/// The sort order is entirely user-owned: nothing is injected ahead of a
+/// declared key, and any column present in the physical schema is legal,
+/// including `wyrd_event_time` and every other managed column. Naming
+/// `wyrd_event_time` therefore replaces the default rather than duplicating it.
 ///
-/// `author` decides whether the remaining managed columns are admissible.
-/// `ReservedManagedColumn` is an input-validation rule for untrusted caller
-/// declarations; a built-in authored inside the engine may order on its own
-/// managed columns (notably `wyrd_event_time`), which is why
-/// [`LayoutAuthor::Builtin`] skips only that check and keeps every schema,
-/// duplicate, and canonical-form rule identical.
+/// The count cap is checked before per-key validation so a caller that declared
+/// too many keys learns the shape fault first rather than a fault in the fifth
+/// key. An unknown column is rejected and a repeated column is rejected. An
+/// empty declaration resolves to the event-time default, which is what makes an
+/// explicit empty `sort_keys` mean exactly what an omitted one means.
+///
+/// # Errors
+/// Returns [`BifrostError::InvalidPhysicalLayout`] with
+/// [`PhysicalLayoutViolation::TooManyKeys`], `UnknownColumn`, or `Duplicate`.
 fn canonical_sort_keys(
     table: &str,
     schema: &Schema,
     declared: &[SortKeyWire],
-    author: LayoutAuthor,
 ) -> Result<Vec<LayoutSortKey>, BifrostError> {
+    if declared.len() > MAX_SORT_KEYS {
+        return Err(invalid(
+            table,
+            PhysicalLayoutField::SortKey,
+            PhysicalLayoutViolation::TooManyKeys,
+            None,
+        ));
+    }
     let mut seen = BTreeSet::new();
-    let mut keys = vec![LayoutSortKey::tenant_prefix()];
+    let mut keys = Vec::with_capacity(declared.len().max(1));
     for key in declared {
-        if key.column == DATA_TENANT_ID {
-            continue;
-        }
-        if author == LayoutAuthor::Caller && is_reserved_managed_column(&key.column) {
-            return Err(invalid(
-                table,
-                PhysicalLayoutField::SortKey,
-                PhysicalLayoutViolation::ReservedManagedColumn,
-                Some(key.column.clone()),
-            ));
-        }
         if schema.field_with_name(&key.column).is_err() {
             return Err(invalid(
                 table,
@@ -702,34 +652,33 @@ fn canonical_sort_keys(
             },
         ));
     }
+    if keys.is_empty() {
+        keys.push(LayoutSortKey::default_event_time());
+    }
     Ok(keys)
 }
 
 /// Canonicalizes declared Bloom columns in request order.
 ///
 /// The schema-present managed floor always comes first; a caller naming a floor
-/// column is deduplicated by union rather than rejected. Every other reserved
-/// managed column is rejected, an unknown column is rejected, and a repeated
-/// non-floor column is rejected.
+/// column is deduplicated by union rather than rejected. Any other
+/// schema-present column may be added, including a managed column outside the
+/// floor. An unknown column is rejected and a repeated non-floor column is
+/// rejected.
+///
+/// # Errors
+/// Returns [`BifrostError::InvalidPhysicalLayout`] with `UnknownColumn` or
+/// `Duplicate`.
 fn canonical_bloom_columns(
     table: &str,
     schema: &Schema,
     declared: &[String],
-    author: LayoutAuthor,
 ) -> Result<Vec<String>, BifrostError> {
     let mut columns = managed_bloom_floor(schema);
     let mut seen: BTreeSet<String> = columns.iter().cloned().collect();
     for column in declared {
         if MANAGED_BLOOM_FLOOR.contains(&column.as_str()) {
             continue;
-        }
-        if author == LayoutAuthor::Caller && is_reserved_managed_column(column) {
-            return Err(invalid(
-                table,
-                PhysicalLayoutField::BloomColumn,
-                PhysicalLayoutViolation::ReservedManagedColumn,
-                Some(column.clone()),
-            ));
         }
         if schema.field_with_name(column).is_err() {
             return Err(invalid(

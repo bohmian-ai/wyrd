@@ -287,20 +287,6 @@ pub enum NullOrderWire {
     Last,
 }
 
-/// The single time-partition declaration of a Bifrost table.
-///
-/// `column` must be `wyrd_event_time`; it is carried explicitly so the wire
-/// contract stays self-describing and generated SDKs do not have to assume the
-/// invariant.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct TimePartitionSpecWire {
-    /// Partitioned column; only `wyrd_event_time` is accepted.
-    pub column: String,
-    /// Partition granularity.
-    pub granularity: TimeGranularityWire,
-}
-
 /// One declared physical sort key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
@@ -318,18 +304,23 @@ pub struct SortKeyWire {
 /// The same shape is used three ways: as the optional declaration on
 /// [`RegisterTableRequest`], as the canonical server-resolved layout returned by
 /// [`BifrostTableDescription`], and as the exact JSON persisted in the control
-/// row. In the latter two it is always fully populated: the canonical sort order
-/// begins with the injected `data_tenant_id` prefix and the Bloom list begins
-/// with the schema-present managed floor.
+/// row. In the latter two it is always fully populated: the sort order carries
+/// at least one key and the Bloom list begins with the schema-present managed
+/// floor.
 ///
-/// On the request path, an omitted `sort_keys` and an explicit empty
-/// `sort_keys` mean different things — see [`RegisterTableRequest`].
+/// The partition itself is system-owned. Every table is partitioned on
+/// `wyrd_event_time`, so the declaration carries only the granularity and no
+/// wire field names a partition column.
+///
+/// On the request path an omitted `sort_keys` and an explicit empty `sort_keys`
+/// resolve identically, because the server injects nothing ahead of a declared
+/// key and defaults an empty order to `wyrd_event_time` descending.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct PhysicalLayoutWire {
-    /// Required time partition.
-    pub partition: TimePartitionSpecWire,
-    /// Ordered sort keys.
+    /// Required partition granularity on the managed `wyrd_event_time` column.
+    pub partition_granularity: TimeGranularityWire,
+    /// Ordered sort keys; at most four may be declared.
     #[serde(default)]
     pub sort_keys: Vec<SortKeyWire>,
     /// Ordered Bloom-filtered columns.
@@ -349,10 +340,11 @@ pub struct RegisterTableRequest {
     pub fields: Vec<FieldSpec>,
     /// Optional physical layout declaration.
     ///
-    /// Omitting the field entirely resolves to `hour(wyrd_event_time)`, the
-    /// default sort, and the managed Bloom floor. Supplying the object requires
-    /// `partition`; within it, an explicit empty `sort_keys` means "tenant prefix
-    /// only" and an explicit empty `bloom_columns` means "managed floor only".
+    /// Omitting the field entirely resolves to `hour(wyrd_event_time)`,
+    /// `wyrd_event_time` descending nulls-last, and the managed Bloom floor.
+    /// Supplying the object requires `partition_granularity`; within it, an
+    /// explicit empty `sort_keys` resolves exactly as an omitted one does, and
+    /// an explicit empty `bloom_columns` means "managed floor only".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub physical_layout: Option<PhysicalLayoutWire>,
 }
@@ -3293,7 +3285,7 @@ mod bifrost_wire_tests {
         BifrostTableDescription, BifrostTableEntry, DataTypeSpec, FieldSpec, NullOrderWire,
         PhysicalLayoutWire, QueryParam, RegisterOutcome, RegisterTableRequest,
         RegisterTableResponse, SortDirectionWire, SortKeyWire, SyncQueryRequest, TableStatus,
-        TimeGranularityWire, TimePartitionSpecWire, TimeUnit,
+        TimeGranularityWire, TimeUnit,
     };
     use schemars::schema_for;
 
@@ -3381,21 +3373,42 @@ mod bifrost_wire_tests {
         assert!(!json.contains("physical_layout"), "{json}");
     }
 
-    /// An explicit object with empty lists is distinct from omission and keeps
-    /// its empty `sort_keys`/`bloom_columns` through a round trip.
+    /// An explicit object carrying only `partition_granularity` decodes with
+    /// empty lists and keeps them through a round trip.
+    ///
+    /// The wire distinction between `None` and an explicit object survives; what
+    /// the server no longer distinguishes is an empty `sort_keys` from an
+    /// omitted one, which both resolve to the canonical event-time default.
     #[test]
     fn bifrost_wire_register_request_keeps_explicit_empty_layout_lists() {
         let req: RegisterTableRequest = serde_json::from_str(
             r#"{"namespace":"vala.bifrost","name":"events","fields":[],
-                "physical_layout":{"partition":{"column":"wyrd_event_time","granularity":"hour"},
+                "physical_layout":{"partition_granularity":"hour",
                 "sort_keys":[],"bloom_columns":[]}}"#,
         )
         .expect("deserialize");
         let layout = req.physical_layout.as_ref().expect("explicit layout");
-        assert_eq!(layout.partition.granularity, TimeGranularityWire::Hour);
+        assert_eq!(layout.partition_granularity, TimeGranularityWire::Hour);
         assert!(layout.sort_keys.is_empty());
         assert!(layout.bloom_columns.is_empty());
         bifrost_wire_round_trip(&req);
+    }
+
+    /// No wire field names a partition column any more, so a declaration that
+    /// carries one is rejected rather than silently ignored.
+    #[test]
+    fn bifrost_wire_physical_layout_has_no_partition_column_field() {
+        let layout = PhysicalLayoutWire {
+            partition_granularity: TimeGranularityWire::Hour,
+            sort_keys: Vec::new(),
+            bloom_columns: Vec::new(),
+        };
+        let json = serde_json::to_value(&layout).expect("serialize");
+        let object = json.as_object().expect("layout is a JSON object");
+        assert_eq!(
+            object.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["partition_granularity", "sort_keys", "bloom_columns"]
+        );
     }
 
     #[test]
@@ -3445,16 +3458,13 @@ mod bifrost_wire_tests {
                 metadata: Default::default(),
             }],
             physical_layout: PhysicalLayoutWire {
-                partition: TimePartitionSpecWire {
-                    column: "wyrd_event_time".to_string(),
-                    granularity: TimeGranularityWire::Hour,
-                },
+                partition_granularity: TimeGranularityWire::Hour,
                 sort_keys: vec![SortKeyWire {
-                    column: "data_tenant_id".to_string(),
-                    direction: SortDirectionWire::Asc,
+                    column: "wyrd_event_time".to_string(),
+                    direction: SortDirectionWire::Desc,
                     null_order: NullOrderWire::Last,
                 }],
-                bloom_columns: vec!["data_tenant_id".to_string()],
+                bloom_columns: vec!["run_id".to_string()],
             },
         };
         bifrost_wire_round_trip(&entry);
@@ -3483,10 +3493,7 @@ mod bifrost_wire_tests {
             fingerprint: "01".repeat(32),
         });
         bifrost_wire_round_trip(&PhysicalLayoutWire {
-            partition: TimePartitionSpecWire {
-                column: "wyrd_event_time".to_string(),
-                granularity: TimeGranularityWire::Day,
-            },
+            partition_granularity: TimeGranularityWire::Day,
             sort_keys: vec![SortKeyWire {
                 column: "wyrd_event_time".to_string(),
                 direction: SortDirectionWire::Desc,

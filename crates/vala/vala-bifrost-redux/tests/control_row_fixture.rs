@@ -20,7 +20,7 @@ use wyrd_spec::DataTenantId;
 ///
 /// # Panics
 ///
-/// Panics when the tenant connection, the layout canonicalization, or the
+/// Panics when the tenant connection, the layout resolution, or the
 /// control-row write fails, each of which is required to establish the fixture.
 pub(crate) async fn register_control_row(
     postgres: &vala_sql::ValaPostgres,
@@ -30,12 +30,10 @@ pub(crate) async fn register_control_row(
     schema: &Schema,
 ) {
     let fqn = format!("{namespace}.{table_name}");
-    let layout = match vala_bifrost_redux::tables::builtin_table(namespace, table_name) {
-        Some(definition) => PhysicalLayout::builtin(&fqn, schema, &(definition.physical_layout)())
-            .expect("a built-in declaration always canonicalizes against its own schema"),
-        None => PhysicalLayout::canonicalize(&fqn, schema, None)
-            .expect("the fixture schema canonicalizes under the omitted-declaration default"),
-    };
+    let declared = vala_bifrost_redux::tables::builtin_table(namespace, table_name)
+        .map(|definition| (definition.physical_layout)());
+    let layout = PhysicalLayout::resolve(&fqn, schema, declared.as_ref())
+        .expect("the fixture layout resolves against the fixture schema");
     let mut conn = postgres
         .tenant_conn(tenant)
         .await

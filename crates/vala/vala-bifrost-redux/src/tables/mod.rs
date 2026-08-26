@@ -5,7 +5,6 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use wyrd_spec::vala::api::{
     NullOrderWire, PhysicalLayoutWire, SortDirectionWire, SortKeyWire, TimeGranularityWire,
-    TimePartitionSpecWire,
 };
 use wyrd_spec::vala::managed_columns::{
     DATA_TENANT_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_ROW_ORDINAL,
@@ -113,17 +112,14 @@ pub fn sort_desc(column: &str) -> SortKeyWire {
 /// `wyrd_event_time`.
 ///
 /// Every built-in partitions hourly; only its sort keys and Bloom columns
-/// differ. The catalog canonicalizes the result through
-/// [`crate::catalog::PhysicalLayout::builtin`], which injects the tenant sort
-/// prefix and the managed Bloom floor, so a built-in declares only what is
-/// specific to it.
+/// differ. The catalog resolves the result through the one
+/// [`crate::catalog::PhysicalLayout::resolve`] entry point a caller
+/// registration uses, which unions the managed Bloom floor, so a built-in
+/// declares only what is specific to it.
 #[must_use]
 pub fn hourly_layout(sort_keys: Vec<SortKeyWire>, bloom_columns: &[&str]) -> PhysicalLayoutWire {
     PhysicalLayoutWire {
-        partition: TimePartitionSpecWire {
-            column: WYRD_EVENT_TIME.to_owned(),
-            granularity: TimeGranularityWire::Hour,
-        },
+        partition_granularity: TimeGranularityWire::Hour,
         sort_keys,
         bloom_columns: bloom_columns.iter().map(|c| (*c).to_owned()).collect(),
     }
@@ -160,7 +156,7 @@ pub struct BuiltinTableDefinition {
     /// Engine-owned physical-layout declaration.
     ///
     /// This is the built-in's single statement of partition granularity, sort
-    /// intent, and Bloom intent. The catalog canonicalizes it once and every
+    /// intent, and Bloom intent. The catalog resolves it once and every
     /// downstream representation — Iceberg spec and sort order, the control
     /// row, the Parquet Bloom recipe, and every partition identity — is derived
     /// from that one canonical layout.
@@ -200,9 +196,9 @@ pub trait DomainTable: Send + Sync + 'static {
 
     /// Engine-owned physical-layout declaration.
     ///
-    /// Defaults to hourly `wyrd_event_time` with no additional sort or Bloom
-    /// intent, which canonicalizes to the tenant prefix plus
-    /// `wyrd_event_time DESC NULLS LAST` and the managed Bloom floor.
+    /// Defaults to hourly `wyrd_event_time` with no additional Bloom intent,
+    /// which resolves to `wyrd_event_time DESC NULLS LAST` and the managed
+    /// Bloom floor.
     fn physical_layout() -> PhysicalLayoutWire {
         hourly_layout(vec![sort_desc(WYRD_EVENT_TIME)], &[])
     }
@@ -342,7 +338,7 @@ mod tests {
             assert!(schema.field_with_name(WYRD_EVENT_TIME).is_ok());
             assert!(schema.field_with_name(DATA_TENANT_ID).is_ok());
             assert_eq!(
-                (definition.physical_layout)().partition.granularity,
+                (definition.physical_layout)().partition_granularity,
                 TimeGranularityWire::Hour
             );
         }
@@ -351,12 +347,13 @@ mod tests {
     /// The one authoritative physical-layout contract for every registration
     /// path: all fourteen built-ins plus each dynamic declaration class.
     ///
-    /// Built-ins and dynamic tables run the same canonicalization, so this
-    /// proves in one place that the tenant sort prefix is always first, the
-    /// managed Bloom floor is always present for schema-present columns, the
-    /// declared order is otherwise preserved, omission resolves to the hourly
-    /// default, an explicit empty list is not the same as omission, and every
-    /// invalid class is refused without mutating anything.
+    /// Built-ins and dynamic tables run the same single resolution entry point,
+    /// so this proves in one place that the system injects no sort key, that
+    /// `data_tenant_id` appears in neither canonical list, that the managed
+    /// Bloom floor is always present for schema-present columns, that the
+    /// declared order is otherwise preserved, that omission and an explicit
+    /// empty declaration resolve identically, and that every invalid class is
+    /// refused without mutating anything.
     #[test]
     fn physical_layout_contract_all_builtins() {
         let dynamic_schema = Schema::new(vec![
@@ -378,14 +375,16 @@ mod tests {
         assert_invalid_declarations_are_refused(&dynamic_schema, table);
     }
 
-    /// Proves every built-in table declares a layout that canonicalizes and is
-    /// a fixed point of canonicalization.
+    /// Proves every built-in table declares a layout that resolves and is a
+    /// fixed point of resolution.
     ///
-    /// Each built-in must partition hourly, sort on the tenant prefix first,
-    /// carry the managed Bloom floor for every column its schema actually has,
-    /// and reference only columns that exist. Re-resolving the stored wire form
-    /// must reproduce it byte for byte, which is what proves the prefix and
-    /// floor are unioned once rather than accreted on every load.
+    /// Each built-in must partition hourly, resolve through the same
+    /// [`crate::catalog::layout::PhysicalLayout::resolve`] entry point a caller
+    /// uses, carry the managed Bloom floor for every column its schema actually
+    /// has, name only columns that exist, and name `data_tenant_id` in neither
+    /// canonical list. Re-resolving the stored wire form must reproduce it byte
+    /// for byte, which is what proves the floor is unioned once rather than
+    /// accreted on every load.
     ///
     /// # Panics
     ///
@@ -395,9 +394,12 @@ mod tests {
             let fqn = format!("vala.{}.{}", definition.namespace, definition.name);
             let schema = (definition.schema)();
             let declared = (definition.physical_layout)();
-            let canonical =
-                crate::catalog::layout::PhysicalLayout::builtin(&fqn, &schema, &declared)
-                    .unwrap_or_else(|error| panic!("{fqn} declares a canonical layout: {error}"));
+            let canonical = crate::catalog::layout::PhysicalLayout::resolve(
+                &fqn,
+                &schema,
+                Some(&declared),
+            )
+            .unwrap_or_else(|error| panic!("{fqn} declares a canonical layout: {error}"));
 
             assert_eq!(
                 canonical.granularity(),
@@ -406,8 +408,8 @@ mod tests {
             );
             assert_eq!(
                 canonical.sort_keys()[0].column(),
-                DATA_TENANT_ID,
-                "{fqn} sorts on the tenant prefix first"
+                WYRD_EVENT_TIME,
+                "{fqn} sorts on the declared event-time key first"
             );
             for column in crate::catalog::layout::MANAGED_BLOOM_FLOOR {
                 if schema.field_with_name(column).is_ok() {
@@ -417,6 +419,10 @@ mod tests {
                     );
                 }
             }
+            assert!(
+                !canonical.bloom_columns().contains(&DATA_TENANT_ID.to_owned()),
+                "{fqn} Blooms a per-file constant"
+            );
             for column in canonical.bloom_columns() {
                 assert!(
                     schema.field_with_name(column).is_ok(),
@@ -424,14 +430,19 @@ mod tests {
                 );
             }
             for key in canonical.sort_keys() {
+                assert_ne!(
+                    key.column(),
+                    DATA_TENANT_ID,
+                    "{fqn} sorts on a per-file constant"
+                );
                 assert!(
                     schema.field_with_name(key.column()).is_ok(),
                     "{fqn} sort column {} is absent from its schema",
                     key.column()
                 );
             }
-            // Canonicalization is a fixed point: the stored form of a canonical
-            // layout re-resolves to itself rather than accreting the prefix or
+            // Resolution is a fixed point: the stored form of a canonical
+            // layout re-resolves to itself rather than accreting the Bloom
             // floor a second time.
             let stored = canonical.to_wire();
             let round_tripped =
@@ -441,13 +452,14 @@ mod tests {
         }
     }
 
-    /// Proves dynamic declarations resolve through the same canonicalization
-    /// path as built-ins.
+    /// Proves dynamic declarations resolve through the same entry point
+    /// built-ins use.
     ///
-    /// Covers the three legal shapes: omission resolving to the hourly default
-    /// with the managed floor, an explicit empty declaration meaning "tenant
-    /// prefix only" rather than omission, and a custom declaration keeping its
-    /// order behind the tenant prefix while unioning the managed floor.
+    /// Covers the three legal shapes: omission resolving to the hourly
+    /// event-time default with the managed floor, an explicit empty declaration
+    /// resolving to the same sort order as omission because the system injects
+    /// nothing, and a custom declaration keeping its own order while unioning
+    /// the managed floor.
     ///
     /// # Panics
     ///
@@ -456,13 +468,21 @@ mod tests {
         // Dynamic declarations share the same resolution. The fixture schema
         // carries the full managed floor plus one user column.
 
-        // Omission resolves to the hourly default with the managed floor.
-        let omitted =
-            crate::catalog::layout::PhysicalLayout::canonicalize(table, dynamic_schema, None)
-                .expect("omitted layout resolves to the default");
+        // Omission resolves to the hourly event-time default with the managed
+        // floor and nothing else.
+        let omitted = crate::catalog::layout::PhysicalLayout::resolve(table, dynamic_schema, None)
+            .expect("omitted layout resolves to the default");
         assert_eq!(
             omitted.granularity(),
             crate::catalog::layout::TimeGranularity::Hour
+        );
+        assert_eq!(
+            omitted
+                .sort_keys()
+                .iter()
+                .map(|key| key.column().to_owned())
+                .collect::<Vec<_>>(),
+            vec![WYRD_EVENT_TIME.to_owned()]
         );
         assert_eq!(
             omitted.bloom_columns(),
@@ -473,18 +493,14 @@ mod tests {
                 .as_slice()
         );
 
-        // An explicit empty declaration is not omission: it means "tenant
-        // prefix only" and "managed floor only", so the default event-time
-        // sort key is absent.
+        // An explicit empty declaration means exactly what omission means for
+        // the sort order, because nothing is injected ahead of a declared key.
         let explicit_empty = PhysicalLayoutWire {
-            partition: TimePartitionSpecWire {
-                column: WYRD_EVENT_TIME.to_owned(),
-                granularity: TimeGranularityWire::Day,
-            },
+            partition_granularity: TimeGranularityWire::Day,
             sort_keys: Vec::new(),
             bloom_columns: Vec::new(),
         };
-        let empty = crate::catalog::layout::PhysicalLayout::canonicalize(
+        let empty = crate::catalog::layout::PhysicalLayout::resolve(
             table,
             dynamic_schema,
             Some(&explicit_empty),
@@ -494,25 +510,19 @@ mod tests {
             empty.granularity(),
             crate::catalog::layout::TimeGranularity::Day
         );
-        assert_eq!(empty.sort_keys().len(), 1, "tenant prefix only");
-        assert_ne!(empty.to_wire(), omitted.to_wire());
+        assert_eq!(empty.sort_keys(), omitted.sort_keys());
+        assert_eq!(empty.bloom_columns(), omitted.bloom_columns());
 
-        // A custom declaration keeps its order behind the tenant prefix and
+        // A custom declaration keeps its own order with nothing prepended and
         // unions rather than replaces the managed Bloom floor.
         let custom = PhysicalLayoutWire {
-            partition: TimePartitionSpecWire {
-                column: WYRD_EVENT_TIME.to_owned(),
-                granularity: TimeGranularityWire::Hour,
-            },
-            sort_keys: vec![sort_desc("customer")],
+            partition_granularity: TimeGranularityWire::Hour,
+            sort_keys: vec![sort_desc("customer"), sort_asc(WYRD_EVENT_TIME)],
             bloom_columns: vec!["customer".to_owned()],
         };
-        let resolved = crate::catalog::layout::PhysicalLayout::canonicalize(
-            table,
-            dynamic_schema,
-            Some(&custom),
-        )
-        .expect("custom layout resolves");
+        let resolved =
+            crate::catalog::layout::PhysicalLayout::resolve(table, dynamic_schema, Some(&custom))
+                .expect("custom layout resolves");
         let sort_columns = resolved
             .sort_keys()
             .iter()
@@ -520,9 +530,14 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             sort_columns,
-            vec![DATA_TENANT_ID.to_owned(), "customer".to_owned()]
+            vec!["customer".to_owned(), WYRD_EVENT_TIME.to_owned()]
         );
         assert!(resolved.bloom_columns().contains(&"customer".to_owned()));
+        assert!(
+            !resolved
+                .bloom_columns()
+                .contains(&DATA_TENANT_ID.to_owned())
+        );
         for column in crate::catalog::layout::MANAGED_BLOOM_FLOOR {
             assert!(resolved.bloom_columns().contains(&column.to_owned()));
         }
@@ -544,23 +559,9 @@ mod tests {
         // declaration never yields a partially applied layout.
         let invalid_cases: Vec<(&str, PhysicalLayoutWire)> = vec![
             (
-                "unsupported partition column",
-                PhysicalLayoutWire {
-                    partition: TimePartitionSpecWire {
-                        column: "customer".to_owned(),
-                        granularity: TimeGranularityWire::Hour,
-                    },
-                    sort_keys: Vec::new(),
-                    bloom_columns: Vec::new(),
-                },
-            ),
-            (
                 "unknown sort column",
                 PhysicalLayoutWire {
-                    partition: TimePartitionSpecWire {
-                        column: WYRD_EVENT_TIME.to_owned(),
-                        granularity: TimeGranularityWire::Hour,
-                    },
+                    partition_granularity: TimeGranularityWire::Hour,
                     sort_keys: vec![sort_asc("absent")],
                     bloom_columns: Vec::new(),
                 },
@@ -568,21 +569,29 @@ mod tests {
             (
                 "duplicate sort column",
                 PhysicalLayoutWire {
-                    partition: TimePartitionSpecWire {
-                        column: WYRD_EVENT_TIME.to_owned(),
-                        granularity: TimeGranularityWire::Hour,
-                    },
+                    partition_granularity: TimeGranularityWire::Hour,
                     sort_keys: vec![sort_asc("customer"), sort_desc("customer")],
+                    bloom_columns: Vec::new(),
+                },
+            ),
+            (
+                "a fifth declared sort key",
+                PhysicalLayoutWire {
+                    partition_granularity: TimeGranularityWire::Hour,
+                    sort_keys: vec![
+                        sort_asc(WYRD_EVENT_TIME),
+                        sort_asc(DATA_TENANT_ID),
+                        sort_asc(RUN_ID),
+                        sort_asc(CARD_UID),
+                        sort_asc(PRINCIPAL_ID),
+                    ],
                     bloom_columns: Vec::new(),
                 },
             ),
             (
                 "unknown bloom column",
                 PhysicalLayoutWire {
-                    partition: TimePartitionSpecWire {
-                        column: WYRD_EVENT_TIME.to_owned(),
-                        granularity: TimeGranularityWire::Hour,
-                    },
+                    partition_granularity: TimeGranularityWire::Hour,
                     sort_keys: Vec::new(),
                     bloom_columns: vec!["absent".to_owned()],
                 },
@@ -590,28 +599,14 @@ mod tests {
             (
                 "duplicate bloom column",
                 PhysicalLayoutWire {
-                    partition: TimePartitionSpecWire {
-                        column: WYRD_EVENT_TIME.to_owned(),
-                        granularity: TimeGranularityWire::Hour,
-                    },
+                    partition_granularity: TimeGranularityWire::Hour,
                     sort_keys: Vec::new(),
                     bloom_columns: vec!["customer".to_owned(), "customer".to_owned()],
                 },
             ),
-            (
-                "caller sorts on a reserved managed column",
-                PhysicalLayoutWire {
-                    partition: TimePartitionSpecWire {
-                        column: WYRD_EVENT_TIME.to_owned(),
-                        granularity: TimeGranularityWire::Hour,
-                    },
-                    sort_keys: vec![sort_asc(WYRD_EVENT_TIME)],
-                    bloom_columns: Vec::new(),
-                },
-            ),
         ];
         for (label, declared) in invalid_cases {
-            let error = crate::catalog::layout::PhysicalLayout::canonicalize(
+            let error = crate::catalog::layout::PhysicalLayout::resolve(
                 table,
                 dynamic_schema,
                 Some(&declared),

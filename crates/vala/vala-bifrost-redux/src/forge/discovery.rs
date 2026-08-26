@@ -84,7 +84,6 @@ impl Forge {
         let granularity = validate_supported_layout(
             schema,
             table.metadata().default_partition_spec(),
-            table.metadata().default_sort_order(),
         )?;
         let target = u64::try_from(
             table
@@ -149,7 +148,6 @@ impl Forge {
         let granularity = validate_supported_layout(
             policy_schema,
             table.metadata().default_partition_spec(),
-            table.metadata().default_sort_order(),
         )?;
         let target = u64::try_from(
             table
@@ -215,7 +213,6 @@ impl Forge {
         let granularity = validate_supported_layout(
             schema,
             table.metadata().default_partition_spec(),
-            table.metadata().default_sort_order(),
         )?;
         let candidates = self
             .live_candidates(binding, table, snapshot, granularity)

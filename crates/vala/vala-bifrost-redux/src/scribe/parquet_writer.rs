@@ -1101,16 +1101,19 @@ mod tests {
     /// Builds the canonical hourly write recipe for a test schema.
     ///
     /// Tests exercise the same resolution path production uses: declare the
-    /// built-in hourly layout, then let `PhysicalLayout` inject the tenant sort
-    /// prefix and the managed Bloom floor.
+    /// built-in hourly layout, then let `PhysicalLayout::resolve` union the
+    /// managed Bloom floor.
     ///
     /// # Panics
     /// Panics when the schema cannot carry the built-in declaration.
     fn test_layout(schema: &Schema) -> PhysicalLayout {
-        PhysicalLayout::builtin(
+        PhysicalLayout::resolve(
             "vala.bifrost.test",
             schema,
-            &crate::tables::hourly_layout(vec![crate::tables::sort_asc("wyrd_event_time")], &[]),
+            Some(&crate::tables::hourly_layout(
+                vec![crate::tables::sort_asc("wyrd_event_time")],
+                &[],
+            )),
         )
         .expect("test schema carries the built-in hourly layout")
     }

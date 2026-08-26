@@ -71,10 +71,10 @@ async fn authorize_audited(
 /// table was created with.
 ///
 /// A retry of the same registration must be idempotent, so the incoming
-/// declaration is canonicalized against the table's stored physical schema and
+/// declaration is resolved against the table's stored physical schema and
 /// compared with the stored canonical layout. Comparing canonical forms means
-/// an equivalent-but-differently-spelled declaration (an omitted default, a
-/// duplicate tenant sort key) still retries cleanly, while a genuinely
+/// an equivalent-but-differently-spelled declaration (an omitted declaration
+/// versus an explicit empty one) still retries cleanly, while a genuinely
 /// different physical layout conflicts.
 ///
 /// # Errors
@@ -95,12 +95,9 @@ fn assert_registered_layout_matches(
             .map(convert::field_to_arrow)
             .collect::<Vec<_>>(),
     );
-    let canonical = vala_bifrost_redux::catalog::layout::PhysicalLayout::canonicalize(
-        fqn,
-        &stored_schema,
-        declared,
-    )
-    .map_err(WyrdError::from)?;
+    let canonical =
+        vala_bifrost_redux::catalog::layout::PhysicalLayout::resolve(fqn, &stored_schema, declared)
+            .map_err(WyrdError::from)?;
     if canonical.to_wire() == existing.physical_layout {
         return Ok(());
     }

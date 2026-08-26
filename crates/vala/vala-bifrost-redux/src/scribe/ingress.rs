@@ -209,7 +209,7 @@ impl ScribeImpl {
                 .expected_schema_fingerprint
                 .unwrap_or(registered_fingerprint),
             partition_granularity: crate::catalog::TimeGranularity::from_wire(
-                layout.partition.granularity,
+                layout.partition_granularity,
             ),
         })
     }

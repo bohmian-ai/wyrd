@@ -825,7 +825,6 @@ impl Forge {
         validate_supported_layout(
             table.metadata().current_schema(),
             table.metadata().default_partition_spec(),
-            table.metadata().default_sort_order(),
         )?;
         ForgeRightSizePolicy::from_table_threshold(
             target,

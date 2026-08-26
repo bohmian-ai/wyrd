@@ -708,7 +708,7 @@ column to let the server stamp receipt time."
         code = "WYRD_VALA_400_BIFROST_INVALID_PHYSICAL_LAYOUT",
         status = 400,
         title = "Invalid Bifrost physical layout",
-        remediation = "Use wyrd_event_time with hour or day, unique schema columns, and supported sort/null values."
+        remediation = "Declare hour or day granularity, at most four unique schema columns as sort keys, and supported sort/null values."
     )]
     InvalidPhysicalLayout {
         /// Canonical `<namespace>.<name>` of the table being registered.
@@ -775,8 +775,8 @@ pub enum PhysicalLayoutViolation {
     Missing,
     /// The same identifier was declared more than once in one list.
     Duplicate,
-    /// The declaration referenced a server-owned managed column.
-    ReservedManagedColumn,
+    /// More sort keys were declared than the layout contract admits.
+    TooManyKeys,
     /// The declaration referenced a name absent from the physical schema.
     UnknownColumn,
     /// The column exists but cannot serve this declaration slot.
@@ -803,7 +803,7 @@ mod tests {
     const ALL_VIOLATIONS: [PhysicalLayoutViolation; 6] = [
         PhysicalLayoutViolation::Missing,
         PhysicalLayoutViolation::Duplicate,
-        PhysicalLayoutViolation::ReservedManagedColumn,
+        PhysicalLayoutViolation::TooManyKeys,
         PhysicalLayoutViolation::UnknownColumn,
         PhysicalLayoutViolation::UnsupportedColumn,
         PhysicalLayoutViolation::UnsupportedValue,
@@ -853,9 +853,9 @@ mod tests {
     #[test]
     fn physical_layout_tokens_are_snake_case() {
         assert_eq!(
-            serde_json::to_string(&PhysicalLayoutViolation::ReservedManagedColumn)
+            serde_json::to_string(&PhysicalLayoutViolation::TooManyKeys)
                 .expect("violation serializes"),
-            "\"reserved_managed_column\""
+            "\"too_many_keys\""
         );
         assert_eq!(
             serde_json::to_string(&PhysicalLayoutField::SortDirection).expect("field serializes"),

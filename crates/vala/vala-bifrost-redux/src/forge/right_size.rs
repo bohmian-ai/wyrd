@@ -4,7 +4,7 @@
 //! resulting groups through Forge's existing fenced commit workflow.
 
 use chrono::{DateTime, Utc};
-use iceberg::spec::{NullOrder, PartitionSpec, Schema, SortDirection, SortOrder, Transform};
+use iceberg::spec::{PartitionSpec, Schema, Transform};
 
 use super::error::ForgeError;
 use crate::catalog::TimeGranularity;
@@ -14,38 +14,30 @@ use crate::parquet::writer_properties::BIFROST_WRITER_RECIPE_VERSION;
 /// Iceberg's unsorted order identifier used when a data file omits the field.
 pub const ICEBERG_UNSORTED_ORDER_ID: i64 = 0;
 
-/// Validate the physical Iceberg layout that Forge's rewrite pipeline emits and
-/// recover the table's registered partition granularity.
+/// Validate the physical Iceberg partition layout that Forge's rewrite pipeline
+/// emits and recover the table's registered partition granularity.
 ///
 /// The Iceberg table metadata is the projection of the registered
 /// [`PhysicalLayout`](crate::catalog::layout::PhysicalLayout), so Forge reads
 /// the granularity back out of the default partition spec instead of carrying a
-/// second copy of the declaration. Two invariants remain fixed for every
-/// registered layout and are re-checked here because a rewrite that violated
-/// either would write files with a false physical identity: the table is
-/// partitioned by exactly one `hour`/`day` transform over `wyrd_event_time`,
-/// and the default sort order is prefixed by ascending nulls-last
-/// `data_tenant_id`. Declared trailing sort keys are table-specific and are not
-/// constrained here; Forge reproduces the current sort order by identity.
+/// second copy of the declaration. One invariant is fixed for every registered
+/// layout and is re-checked here because a rewrite that violated it would write
+/// files with a false physical identity: the table is partitioned by exactly
+/// one `hour`/`day` transform over `wyrd_event_time` under its canonical field
+/// name.
+///
+/// The sort order is entirely user-owned and is therefore not constrained here;
+/// Forge reproduces whatever order the table declares by identity.
 ///
 /// # Errors
 ///
-/// Returns [`ForgeError::InvalidConfig`] when `data_tenant_id` or
-/// `wyrd_event_time` is absent from the current schema, when the partition spec
-/// is not a single supported time transform over `wyrd_event_time` under its
-/// canonical field name, or when the default sort order does not begin with the
-/// tenant prefix.
+/// Returns [`ForgeError::InvalidConfig`] when `wyrd_event_time` is absent from
+/// the current schema, or when the partition spec is not a single supported
+/// time transform over `wyrd_event_time` under its canonical field name.
 pub(crate) fn validate_supported_layout(
     schema: &Schema,
     partition_spec: &PartitionSpec,
-    sort_order: &SortOrder,
 ) -> Result<TimeGranularity, ForgeError> {
-    let tenant_field =
-        schema
-            .field_by_name("data_tenant_id")
-            .ok_or_else(|| ForgeError::InvalidConfig {
-                detail: "Forge physical recipe requires data_tenant_id".to_owned(),
-            })?;
     let event_time_field =
         schema
             .field_by_name("wyrd_event_time")
@@ -71,21 +63,6 @@ pub(crate) fn validate_supported_layout(
         return Err(ForgeError::InvalidConfig {
             detail: "Forge supports only a single canonically named wyrd_event_time partition \
                      field"
-                .to_owned(),
-        });
-    }
-    let Some(tenant_sort) = sort_order.fields.first() else {
-        return Err(ForgeError::InvalidConfig {
-            detail: "Forge requires a data_tenant_id-prefixed sort order".to_owned(),
-        });
-    };
-    if tenant_sort.source_id != tenant_field.id
-        || tenant_sort.transform != Transform::Identity
-        || tenant_sort.direction != SortDirection::Ascending
-        || tenant_sort.null_order != NullOrder::Last
-    {
-        return Err(ForgeError::InvalidConfig {
-            detail: "Forge requires ascending nulls-last data_tenant_id as the first sort key"
                 .to_owned(),
         });
     }
@@ -583,46 +560,20 @@ mod tests {
             .expect("physical test schema builds")
     }
 
-    /// Build one supported partition spec at `granularity` plus the tenant-prefixed
-    /// physical sort order that every registered layout carries.
-    fn physical_layout(
-        schema: &Schema,
-        granularity: TimeGranularity,
-    ) -> (PartitionSpec, SortOrder) {
+    /// Build one supported partition spec at `granularity`.
+    ///
+    /// The sort order is user-owned and no longer participates in validation,
+    /// so the fixture builds the partition half only.
+    fn physical_layout(schema: &Schema, granularity: TimeGranularity) -> PartitionSpec {
         let (name, transform) = match granularity {
             TimeGranularity::Hour => ("wyrd_event_time_hour", Transform::Hour),
             TimeGranularity::Day => ("wyrd_event_time_day", Transform::Day),
         };
-        let partition_spec = PartitionSpec::builder(std::sync::Arc::new(schema.clone()))
+        PartitionSpec::builder(std::sync::Arc::new(schema.clone()))
             .add_partition_field("wyrd_event_time", name, transform)
             .expect("partition field builds")
             .build()
-            .expect("partition spec binds");
-        let tenant_id = schema
-            .field_by_name("data_tenant_id")
-            .expect("tenant field")
-            .id;
-        let event_time_id = schema
-            .field_by_name("wyrd_event_time")
-            .expect("event time field")
-            .id;
-        let sort_order = SortOrder::builder()
-            .with_order_id(1)
-            .with_sort_field(iceberg::spec::SortField {
-                source_id: tenant_id,
-                transform: Transform::Identity,
-                direction: SortDirection::Ascending,
-                null_order: NullOrder::Last,
-            })
-            .with_sort_field(iceberg::spec::SortField {
-                source_id: event_time_id,
-                transform: Transform::Identity,
-                direction: SortDirection::Ascending,
-                null_order: NullOrder::Last,
-            })
-            .build(schema)
-            .expect("physical sort order binds");
-        (partition_spec, sort_order)
+            .expect("partition spec binds")
     }
 
     /// Accept both registered granularities and recover the declared one, so a
@@ -631,9 +582,9 @@ mod tests {
     fn supported_layout_recovers_the_registered_granularity() {
         let schema = physical_schema();
         for granularity in [TimeGranularity::Hour, TimeGranularity::Day] {
-            let (partition_spec, sort_order) = physical_layout(&schema, granularity);
+            let partition_spec = physical_layout(&schema, granularity);
             assert_eq!(
-                validate_supported_layout(&schema, &partition_spec, &sort_order)
+                validate_supported_layout(&schema, &partition_spec)
                     .expect("registered granularity is supported"),
                 granularity
             );
@@ -644,42 +595,16 @@ mod tests {
     #[test]
     fn unsupported_partition_layout_fails_before_policy_construction() {
         let schema = physical_schema();
-        let (supported, sort_order) = physical_layout(&schema, TimeGranularity::Day);
+        let supported = physical_layout(&schema, TimeGranularity::Day);
         let unsupported = PartitionSpec::builder(std::sync::Arc::new(schema.clone()))
             .add_partition_field("wyrd_event_time", "wyrd_event_time_month", Transform::Month)
             .expect("month partition field builds")
             .build()
             .expect("month partition spec binds");
-        assert!(validate_supported_layout(&schema, &supported, &sort_order).is_ok());
-        let error = validate_supported_layout(&schema, &unsupported, &sort_order)
+        assert!(validate_supported_layout(&schema, &supported).is_ok());
+        let error = validate_supported_layout(&schema, &unsupported)
             .expect_err("month partition must be rejected");
         assert!(matches!(error, ForgeError::InvalidConfig { .. }));
-    }
-
-    /// Reject a table whose sort order loses the mandatory tenant prefix.
-    #[test]
-    fn unsupported_sort_layout_fails_before_policy_construction() {
-        let schema = physical_schema();
-        let (partition_spec, mut sort_order) = physical_layout(&schema, TimeGranularity::Day);
-        sort_order.fields[0].direction = SortDirection::Descending;
-        let error = validate_supported_layout(&schema, &partition_spec, &sort_order)
-            .expect_err("a non-ascending tenant prefix must be rejected");
-        assert!(matches!(error, ForgeError::InvalidConfig { .. }));
-    }
-
-    /// A declared trailing sort key is table-specific, so Forge accepts a
-    /// descending non-tenant key rather than forcing one fixed row recipe.
-    #[test]
-    fn declared_trailing_sort_key_is_accepted() {
-        let schema = physical_schema();
-        let (partition_spec, mut sort_order) = physical_layout(&schema, TimeGranularity::Hour);
-        sort_order.fields[1].direction = SortDirection::Descending;
-        sort_order.fields[1].null_order = NullOrder::First;
-        assert_eq!(
-            validate_supported_layout(&schema, &partition_spec, &sort_order)
-                .expect("declared trailing keys are unconstrained"),
-            TimeGranularity::Hour
-        );
     }
 
     /// Builds the fixture hour partition shared by the planner regressions.

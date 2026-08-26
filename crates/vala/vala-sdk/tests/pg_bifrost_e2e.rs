@@ -943,7 +943,10 @@ mod pg_tests {
         );
         assert!(stream.arrow_ipc_closed(), "the IPC stream is closed");
 
-        let standalone: usize = batches
+        // Re-encoding each decoded batch as its own stream reproduces exactly
+        // what the wire carried before this task: schema, batch, and terminator
+        // per batch.
+        let per_batch: Vec<usize> = batches
             .iter()
             .map(|batch| {
                 let mut bytes = Vec::new();
@@ -954,22 +957,23 @@ mod pg_tests {
                 drop(writer);
                 bytes.len()
             })
-            .sum();
+            .collect();
+        let standalone: usize = per_batch.iter().sum();
         assert!(
             stream.arrow_ipc_bytes() < standalone,
             "one shared stream must carry fewer Arrow bytes than per-batch streams: {} vs {standalone}",
             stream.arrow_ipc_bytes()
         );
-        let largest_batch = batches
-            .iter()
-            .map(RecordBatch::get_array_memory_size)
-            .max()
-            .expect("result has batches");
+        // A continuation fragment is strictly smaller than the standalone
+        // stream carrying the same batch, so the widest standalone encoding is
+        // a real ceiling on anything the client may retain at once. A client
+        // that accumulated even two fragments would exceed it.
+        let widest_batch_stream = per_batch.iter().copied().max().expect("result has batches");
         assert!(
-            stream.peak_pending_frame_bytes() <= stream.arrow_ipc_bytes(),
-            "the client retains one fragment, never the whole stream"
+            stream.peak_pending_frame_bytes() <= widest_batch_stream,
+            "the client retains one fragment at a time: {} vs {widest_batch_stream}",
+            stream.peak_pending_frame_bytes()
         );
-        assert!(largest_batch > 0);
         srv.shutdown().await.expect("server shutdown");
     }
 

@@ -22,6 +22,7 @@ mod pg_tests {
     use tokio::sync::Notify;
     use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
     use vala_bifrost_redux::namespaces::BifrostNamespace;
+    use vala_bifrost_redux::resources::ORACLE_MAX_BATCH_SIZE;
     use vala_sdk::{
         Bifrost, BifrostGrpcTransport, BifrostIngestSink, BifrostTransportConfig, ClientScope,
         IngestTransport, QueryClient, SinkKind, observe,
@@ -810,17 +811,22 @@ mod pg_tests {
         srv.shutdown().await.expect("server shutdown");
     }
 
-    /// Builds one Arrow IPC ingest payload with the journey's two-column schema.
-    fn native_ipc_rows(ids: &[i64], values: &[&str]) -> Vec<u8> {
+    /// Encodes one native Arrow IPC ingest payload for the multi-batch journey.
+    ///
+    /// Each row's `value` is derived from its `id` so one call describes a whole
+    /// chunk, letting the journey seed more rows than the widest admitted
+    /// `DataFusion` batch size across several requests.
+    fn native_ipc_ids(ids: &[i64]) -> Vec<u8> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("value", DataType::Utf8, false),
         ]));
+        let values: Vec<String> = ids.iter().map(|id| format!("row-{id}")).collect();
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
                 Arc::new(Int64Array::from(ids.to_vec())),
-                Arc::new(StringArray::from(values.to_vec())),
+                Arc::new(StringArray::from(values)),
             ],
         )
         .expect("valid native SDK batch");
@@ -881,19 +887,24 @@ mod pg_tests {
         };
         config.grpc.max_message_bytes = 32 * 1024 * 1024;
         let client = WyrdClient::with_config(config).expect("public SDK client");
-        // Two independently sealed ingests become two scan targets, so the
-        // query returns more than one batch on one shared IPC stream.
-        for (ids, values) in [
-            (vec![1_i64, 2], vec!["one", "two"]),
-            (vec![3_i64, 4], vec!["three", "four"]),
-        ] {
+        // One ingest larger than the widest admitted DataFusion batch size
+        // guarantees the result spans several batches on one shared IPC stream,
+        // independent of how many files or partitions the scan happens to use.
+        let row_count = ORACLE_MAX_BATCH_SIZE + 1;
+        let ids: Vec<i64> = (0..row_count)
+            .map(|id| i64::try_from(id).expect("row id fits i64"))
+            .collect();
+        // The rows arrive in several requests so each stays well under the
+        // server's canonical ingest ceiling; one flush seals them all before the
+        // query runs.
+        for chunk in ids.chunks(512) {
             BifrostGrpcTransport::connect(&client)
                 .await
                 .expect("connect ingest")
                 .insert_batch(
                     &table_fqn,
                     uuid::Uuid::now_v7().into_bytes(),
-                    native_ipc_rows(&ids, &values),
+                    native_ipc_ids(chunk),
                 )
                 .await
                 .expect("durable ingest ACK");
@@ -920,9 +931,12 @@ mod pg_tests {
             "the journey needs a multi-batch result to prove schema reuse"
         );
         let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        assert_eq!(rows, 4);
+        assert_eq!(rows, row_count);
         let terminal = stream.terminal().expect("validated terminal");
-        assert_eq!(terminal.row_count, 4);
+        assert_eq!(
+            terminal.row_count,
+            u64::try_from(row_count).expect("row count fits u64")
+        );
         assert!(
             !terminal.arrow_ipc_eos.is_empty(),
             "a successful terminal carries its end-of-stream delta"

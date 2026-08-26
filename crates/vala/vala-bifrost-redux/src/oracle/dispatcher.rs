@@ -573,6 +573,13 @@ pub struct PhysicalWorkerInspection {
     pub oracle_executions: u64,
     /// Footer frames emitted after complete physical execution.
     pub footers_emitted: u64,
+    /// Rows handed to attempt encoding across every executed fragment.
+    ///
+    /// This is the row count that actually crosses the follower wire, so a
+    /// signed predicate applied inside the source — the Scribe live tail
+    /// among them — is observable here as strictly fewer encoded rows for
+    /// the same final result.
+    pub rows_encoded: u64,
 }
 
 /// Shared counters retained across the worker and its emitted streams.
@@ -582,6 +589,8 @@ struct PhysicalWorkerObserver {
     oracle_executions: std::sync::atomic::AtomicU64,
     /// Footer frames emitted after complete physical execution.
     footers_emitted: std::sync::atomic::AtomicU64,
+    /// Rows handed to attempt encoding across every executed fragment.
+    rows_encoded: std::sync::atomic::AtomicU64,
 }
 
 /// Complete construction inputs for one production [`OraclePeerWorker`].
@@ -650,6 +659,7 @@ impl OraclePeerWorker {
                 .physical_observer
                 .footers_emitted
                 .load(Ordering::Acquire),
+            rows_encoded: self.physical_observer.rows_encoded.load(Ordering::Acquire),
         }
     }
 
@@ -1396,6 +1406,12 @@ fn encode_attempt_frames(
                     return;
                 }
             };
+            physical_observer
+                .rows_encoded
+                .fetch_add(
+                    u64::try_from(batch.num_rows()).unwrap_or(u64::MAX),
+                    Ordering::AcqRel,
+                );
             match encoder.encode(&batch) {
                 Ok((schema, batch)) => {
                     if let Some(schema) = schema {

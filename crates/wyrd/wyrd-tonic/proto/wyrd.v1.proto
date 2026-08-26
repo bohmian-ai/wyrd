@@ -44,6 +44,9 @@ message QueryTerminalFrame {
   QueryTerminalOutcome outcome = 1; QueryFreshness freshness = 2;
   uint64 row_count = 3; repeated QueryWarning warnings = 4;
   repeated SourceCompletion source_completion = 5; optional QueryTerminalError error = 6;
+  // Arrow IPC end-of-stream delta closing the query's single IPC stream.
+  // Required on success/degraded, and empty on failure.
+  bytes arrow_ipc_eos = 7;
 }
 message QueryStreamFrame {
   oneof frame { QuerySchemaFrame schema = 1; QueryBatchFrame batch = 2; QueryTerminalFrame terminal = 3; }

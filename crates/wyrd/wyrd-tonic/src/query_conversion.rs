@@ -296,6 +296,7 @@ impl From<domain::QueryStreamFrame> for proto::QueryStreamFrame {
                         .map(proto_source_completion)
                         .collect(),
                     error: value.error.map(proto_terminal_error),
+                    arrow_ipc_eos: value.arrow_ipc_eos,
                 })
             }
         };
@@ -499,6 +500,7 @@ fn terminal(
             .map(source_completion)
             .collect::<Result<_, _>>()?,
         error: value.error.map(terminal_error).transpose()?,
+        arrow_ipc_eos: value.arrow_ipc_eos,
     };
     terminal.validate(visibility)?;
     terminal.validate_emitted_rows(emitted_rows)?;
@@ -661,6 +663,70 @@ fn freshness(value: i32) -> Result<domain::FreshnessPolicy, QueryConversionError
 mod tests {
     use super::*;
 
+    /// Exact `StreamWriter::finish` delta: continuation token, zero length.
+    const EOS: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0];
+
+    /// The terminal's Arrow IPC end-of-stream survives the wire and stays closed.
+    ///
+    /// Field 7 is new and every other terminal tag is unchanged, so this pins
+    /// both halves of the contract: the bytes round-trip through the protobuf
+    /// oneof unmodified, and the converter — which is the only decoder Wyrd's
+    /// own transports use — refuses a success terminal that omits them and a
+    /// failure that supplies them, rather than deferring that to a later
+    /// Arrow-level decode.
+    #[test]
+    fn query_stream_eos_contract() {
+        let mut converter = QueryStreamConverter::new(domain::VisibilityMode::PublishedOnly);
+        prime_schema(&mut converter);
+        let domain::QueryStreamFrame::Terminal(decoded) = converter
+            .convert(valid_terminal(false, 0), None)
+            .expect("a success terminal with its end-of-stream converts")
+        else {
+            panic!("terminal frame must decode as a terminal");
+        };
+        assert_eq!(decoded.arrow_ipc_eos, EOS.to_vec());
+
+        // Field numbers are the contract: re-encoding the decoded terminal and
+        // decoding it again must reproduce it byte for byte.
+        let reencoded = proto::QueryStreamFrame::from(domain::QueryStreamFrame::Terminal(
+            decoded.clone(),
+        ));
+        let mut roundtrip = QueryStreamConverter::new(domain::VisibilityMode::PublishedOnly);
+        prime_schema(&mut roundtrip);
+        assert_eq!(
+            roundtrip.convert(reencoded, None).expect("round trip"),
+            domain::QueryStreamFrame::Terminal(decoded)
+        );
+
+        let mut missing = valid_terminal(false, 0);
+        if let Some(proto::query_stream_frame::Frame::Terminal(terminal)) = missing.frame.as_mut() {
+            terminal.arrow_ipc_eos.clear();
+        }
+        let mut converter = QueryStreamConverter::new(domain::VisibilityMode::PublishedOnly);
+        prime_schema(&mut converter);
+        assert!(matches!(
+            converter.convert(missing, None),
+            Err(QueryConversionError::Contract(_))
+        ));
+
+        let mut failed_with_eos = valid_terminal(false, 0);
+        if let Some(proto::query_stream_frame::Frame::Terminal(terminal)) =
+            failed_with_eos.frame.as_mut()
+        {
+            terminal.outcome = proto::QueryTerminalOutcome::Failed as i32;
+            terminal.error = Some(proto::QueryTerminalError {
+                code: proto::QueryTerminalErrorCode::QueryExecutionFailed as i32,
+                detail: None,
+            });
+        }
+        let mut converter = QueryStreamConverter::new(domain::VisibilityMode::PublishedOnly);
+        prime_schema(&mut converter);
+        assert!(matches!(
+            converter.convert(failed_with_eos, None),
+            Err(QueryConversionError::Contract(_))
+        ));
+    }
+
     /// Required enum zero values fail before reaching a runtime owner.
     #[test]
     fn unspecified_request_enum_is_rejected() {
@@ -698,6 +764,7 @@ mod tests {
                     warnings: vec![],
                     source_completion: vec![],
                     error: None,
+                    arrow_ipc_eos: EOS.to_vec(),
                 },
             )),
         };
@@ -759,6 +826,7 @@ mod tests {
                 warnings: vec![],
                 source_completion: sealed.clone(),
                 error: None,
+                arrow_ipc_eos: Vec::new(),
             },
             proto::QueryTerminalFrame {
                 outcome: proto::QueryTerminalOutcome::Success as i32,
@@ -767,6 +835,7 @@ mod tests {
                 warnings: vec![],
                 source_completion: sealed.clone(),
                 error: None,
+                arrow_ipc_eos: Vec::new(),
             },
             proto::QueryTerminalFrame {
                 outcome: proto::QueryTerminalOutcome::Success as i32,
@@ -775,6 +844,7 @@ mod tests {
                 warnings: vec![proto::QueryWarning::LiveTailUnavailable as i32],
                 source_completion: sealed.clone(),
                 error: None,
+                arrow_ipc_eos: Vec::new(),
             },
         ] {
             let frame = proto::QueryStreamFrame {
@@ -859,6 +929,7 @@ mod tests {
                     warnings: vec![],
                     source_completion,
                     error: None,
+                    arrow_ipc_eos: EOS.to_vec(),
                 },
             )),
         }

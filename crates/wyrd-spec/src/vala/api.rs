@@ -1464,14 +1464,33 @@ pub struct QueryTerminalFrame {
     pub source_completion: Vec<SourceCompletion>,
     /// Required only for failed terminals.
     pub error: Option<QueryTerminalError>,
+    /// Arrow IPC end-of-stream delta closing the query's single IPC stream.
+    ///
+    /// The public query stream is one Arrow IPC stream split across Wyrd
+    /// frames: the schema frame carries the stream prefix through exactly one
+    /// schema message, each batch frame carries that write's exact delta, and
+    /// this field carries the writer's `finish` delta. It is required for
+    /// [`QueryTerminalOutcome::Success`] and [`QueryTerminalOutcome::Degraded`]
+    /// and must be empty for [`QueryTerminalOutcome::Failed`], because a failed
+    /// or cancelled stream never calls `finish` and therefore has no valid EOS
+    /// to report. Arrow's own `StreamDecoder::finish` cannot prove an explicit
+    /// EOS was received, so carrying the delta here is what makes an empty
+    /// successful result (`Schema` then `Terminal`) unambiguous on the wire.
+    pub arrow_ipc_eos: Vec<u8>,
 }
 
 impl QueryTerminalFrame {
     /// Validates closed terminal combinations for the selected visibility.
     ///
+    /// The end-of-stream rule is part of this matrix rather than a separate
+    /// check: a terminal that claims success without closing its Arrow IPC
+    /// stream, or a failure that claims to have closed one it never finished,
+    /// is as invalid as a mismatched source set.
+    ///
     /// # Errors
     /// Returns [`QueryContractError`] for invalid cardinality, duplicate or
-    /// missing sources, or inconsistent outcome/freshness/error fields.
+    /// missing sources, inconsistent outcome/freshness/error fields, or an
+    /// Arrow IPC end-of-stream whose presence contradicts the outcome.
     pub fn validate(&self, visibility: VisibilityMode) -> Result<(), QueryContractError> {
         if self.warnings.len() > MAX_QUERY_TERMINAL_WARNINGS {
             return Err(QueryContractError::TooMany {
@@ -1542,6 +1561,15 @@ impl QueryTerminalFrame {
                 reason: "live-tail warning must match unavailable source",
             });
         }
+        if failed == !self.arrow_ipc_eos.is_empty() {
+            return Err(QueryContractError::InvalidTerminal {
+                reason: if failed {
+                    "failed terminal must not carry an Arrow IPC end-of-stream"
+                } else {
+                    "successful terminal must carry its Arrow IPC end-of-stream"
+                },
+            });
+        }
         Ok(())
     }
 
@@ -1563,6 +1591,10 @@ impl QueryTerminalFrame {
 #[cfg(test)]
 mod query_terminal_tests {
     use super::*;
+
+    /// Exact Arrow IPC end-of-stream marker: one continuation token followed by
+    /// a zero-length message, which is what `StreamWriter::finish` appends.
+    const EOS: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0];
 
     /// Builds the required closed source set for one visibility mode.
     fn complete_sources(visibility: VisibilityMode) -> Vec<SourceCompletion> {
@@ -1595,6 +1627,7 @@ mod query_terminal_tests {
             warnings: vec![],
             source_completion: complete_sources(VisibilityMode::PublishedOnly),
             error: None,
+            arrow_ipc_eos: EOS.to_vec(),
         };
         success
             .validate(VisibilityMode::PublishedOnly)
@@ -1612,6 +1645,7 @@ mod query_terminal_tests {
             warnings: vec![QueryWarning::LiveTailUnavailable],
             source_completion: degraded_sources.clone(),
             error: None,
+            arrow_ipc_eos: EOS.to_vec(),
         };
         degraded
             .validate(VisibilityMode::Fused)
@@ -1627,6 +1661,7 @@ mod query_terminal_tests {
                 code: QueryTerminalErrorCode::QueryExecutionFailed,
                 detail: None,
             }),
+            arrow_ipc_eos: Vec::new(),
         };
         failed
             .validate(VisibilityMode::Fused)
@@ -1646,6 +1681,7 @@ mod query_terminal_tests {
             warnings: vec![],
             source_completion: complete_sources(VisibilityMode::PublishedOnly),
             error: None,
+            arrow_ipc_eos: Vec::new(),
         };
         assert!(
             failed_without_error
@@ -1749,6 +1785,7 @@ mod query_terminal_tests {
                 code: QueryTerminalErrorCode::QueryExecutionFailed,
                 detail: None,
             }),
+            arrow_ipc_eos: Vec::new(),
         };
         let degraded_without_live = failed(
             QueryFreshness::Degraded,
@@ -2637,6 +2674,109 @@ mod tests {
     use chrono::Utc;
 
     use super::*;
+
+    /// Terminal Arrow IPC end-of-stream presence is closed over the outcome.
+    ///
+    /// The public query stream is one Arrow IPC stream split across frames, so
+    /// the terminal is the only place its `finish` delta can travel. This pins
+    /// the whole matrix: `Success` and `Degraded` must carry it — including the
+    /// empty result, whose stream is `Schema` then `Terminal` and would
+    /// otherwise be indistinguishable from a truncated one — and `Failed` must
+    /// not, because a failed or cancelled stream never calls `finish`.
+    #[test]
+    fn query_terminal_eos_contract() {
+        /// Exact `StreamWriter::finish` delta: continuation token, zero length.
+        const EOS: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0];
+
+        let sources = vec![
+            SourceCompletion {
+                source: QuerySource::Iceberg,
+                outcome: SourceCompletionOutcome::Complete,
+            },
+            SourceCompletion {
+                source: QuerySource::HotSealed,
+                outcome: SourceCompletionOutcome::Complete,
+            },
+        ];
+        let base = QueryTerminalFrame {
+            outcome: QueryTerminalOutcome::Success,
+            freshness: QueryFreshness::Complete,
+            row_count: 0,
+            warnings: vec![],
+            source_completion: sources,
+            error: None,
+            arrow_ipc_eos: EOS.to_vec(),
+        };
+
+        // Empty success is the case the previous byteless terminal could not
+        // express: no batch frame ever carried an EOS, so the terminal must.
+        base.validate(VisibilityMode::PublishedOnly)
+            .expect("empty success carries its end-of-stream");
+        base.validate_emitted_rows(0)
+            .expect("empty success emitted no rows");
+        assert!(
+            QueryTerminalFrame {
+                arrow_ipc_eos: Vec::new(),
+                ..base.clone()
+            }
+            .validate(VisibilityMode::PublishedOnly)
+            .is_err(),
+            "success without an end-of-stream must be rejected"
+        );
+
+        let mut degraded_sources = base.source_completion.clone();
+        degraded_sources.push(SourceCompletion {
+            source: QuerySource::LiveTail,
+            outcome: SourceCompletionOutcome::Unavailable,
+        });
+        let degraded = QueryTerminalFrame {
+            outcome: QueryTerminalOutcome::Degraded,
+            freshness: QueryFreshness::Degraded,
+            warnings: vec![QueryWarning::LiveTailUnavailable],
+            source_completion: degraded_sources,
+            ..base.clone()
+        };
+        degraded
+            .validate(VisibilityMode::Fused)
+            .expect("degraded still finishes its Arrow stream");
+        assert!(
+            QueryTerminalFrame {
+                arrow_ipc_eos: Vec::new(),
+                ..degraded
+            }
+            .validate(VisibilityMode::Fused)
+            .is_err(),
+            "degraded without an end-of-stream must be rejected"
+        );
+
+        let failed = QueryTerminalFrame {
+            outcome: QueryTerminalOutcome::Failed,
+            error: Some(QueryTerminalError {
+                code: QueryTerminalErrorCode::QueryExecutionFailed,
+                detail: None,
+            }),
+            arrow_ipc_eos: Vec::new(),
+            ..base.clone()
+        };
+        failed
+            .validate(VisibilityMode::PublishedOnly)
+            .expect("a failed terminal closes nothing");
+        assert!(
+            QueryTerminalFrame {
+                arrow_ipc_eos: EOS.to_vec(),
+                ..failed
+            }
+            .validate(VisibilityMode::PublishedOnly)
+            .is_err(),
+            "a failed terminal must not claim an end-of-stream"
+        );
+
+        let encoded = serde_json::to_value(&base).expect("terminal serializes");
+        assert_eq!(
+            serde_json::from_value::<QueryTerminalFrame>(encoded).expect("terminal deserializes"),
+            base
+        );
+    }
 
     #[test]
     fn query_contracts_roundtrip() {

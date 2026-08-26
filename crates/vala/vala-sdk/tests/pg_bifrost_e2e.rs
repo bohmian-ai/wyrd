@@ -964,10 +964,13 @@ mod pg_tests {
             "one shared stream must carry fewer Arrow bytes than per-batch streams: {} vs {standalone}",
             stream.arrow_ipc_bytes()
         );
-        // A continuation fragment is strictly smaller than the standalone
-        // stream carrying the same batch, so the widest standalone encoding is
-        // a real ceiling on anything the client may retain at once. A client
-        // that accumulated even two fragments would exceed it.
+        // Every fragment kind is strictly smaller than the standalone stream
+        // carrying the widest batch: a continuation fragment is that batch's
+        // message without the schema prefix and terminator a standalone adds,
+        // the schema fragment is embedded in every standalone, and the
+        // end-of-stream is eight bytes. The widest standalone encoding is
+        // therefore a real ceiling on whatever the client retains at once,
+        // whatever this fixture's schema happens to cost.
         let widest_batch_stream = per_batch.iter().copied().max().expect("result has batches");
         assert!(
             stream.peak_pending_frame_bytes() <= widest_batch_stream,

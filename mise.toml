@@ -131,37 +131,6 @@ Selects the `cluster` target rather than naming its journeys, so a matrix case
 added to that binary runs here without an edit."""
 run = "cargo test --locked -p wyrd-testing --test cluster -- --include-ignored --test-threads=1"
 
-[tasks."test:bifrost:s3-predicate-pushdown"]
-depends = ["codegen:check"]
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'set -euo pipefail; mise run db:migrate:inner; mise run test:bifrost:s3-predicate-pushdown:inner'"
-
-[tasks."test:bifrost:s3-predicate-pushdown:inner"]
-hide = true
-run = '''
-run_exact_cargo() {
-  selector="$1"
-  mode="$2"
-  shift 2
-  listing=$("$@" -- --list)
-  count=$(printf '%s\n' "$listing" | awk -v expected="$selector: test" '$0 == expected { n += 1 } END { print n + 0 }')
-  if [ "$count" -ne 1 ]; then
-    printf 'expected exactly one Cargo test named %s, discovered %s\n' "$selector" "$count" >&2
-    return 1
-  fi
-  if [ "$mode" = ignored ]; then
-    "$@" -- "$selector" --exact --ignored --nocapture --test-threads=1
-  else
-    "$@" -- "$selector" --exact --nocapture --test-threads=1
-  fi
-}
-run_exact_cargo oracle::exec::tests::closed_predicate_projection_contract normal cargo test --locked -p vala-bifrost-redux --features "$WYRD_REDUX_TEST_FEATURES" --lib
-run_exact_cargo oracle::exec::tests::qualified_column_references_push_down_only_for_owned_columns normal cargo test --locked -p vala-bifrost-redux --features "$WYRD_REDUX_TEST_FEATURES" --lib
-run_exact_cargo oracle::dispatcher::tests::follower_assignment_v2_authority_contract normal cargo test --locked -p vala-bifrost-redux --features "$WYRD_REDUX_TEST_FEATURES" --lib
-run_exact_cargo private_conversion::tests::follower_assignment_v2_contract normal cargo test --locked -p wyrd-tonic --features server,client --lib
-run_exact_cargo resources::tests::oracle_reader_session_options_contract normal cargo test --locked -p vala-bifrost-redux --features "$WYRD_REDUX_TEST_FEATURES" --lib
-run_exact_cargo oracle_edge_journeys::pg_bifrost_selective_predicate_prunes_distributed_reads ignored cargo test --locked -p wyrd-testing --test oracle
-'''
-
 [tasks."test:bifrost:bench-cluster"]
 description = "Run the Bifrost bench shared-resource cross-cluster visibility test against Postgres"
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'ulimit -n 8192 2>/dev/null || true; mise run db:migrate:inner && mise run test:bifrost:bench-cluster:inner'"
@@ -254,7 +223,14 @@ Only real-credential cloud storage tests (test:storage:{s3,gcs,azure}:cloud) are
 storage-integration-cloud.yml; emulator-backed storage tests run here because they are just
 docker containers, same difficulty as Postgres.
 """
-depends = ["test:wyrd", "test:skald", "test:vala", "test:shared", "test:storage:matrix", "test:sql", "test:e2e"]
+depends = ["test:wyrd", "test:skald", "test:vala", "test:shared", "test:storage:matrix", "test:sql", "test:tonic", "test:e2e"]
+
+[tasks."test:tonic"]
+description = """Run every wyrd-tonic test at the feature union its private-conversion
+contracts require. The family lanes invoke Cargo with default features, and
+wyrd-tonic's `default = []` leaves the `server`/`client` code uncompiled there,
+so this general crate lane is the only place those conversions execute."""
+run = "cargo test --locked -p wyrd-tonic --features server,client"
 
 [tasks."test:wyrd-spec:doc"]
 hide = true

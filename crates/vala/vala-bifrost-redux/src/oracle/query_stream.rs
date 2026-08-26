@@ -178,8 +178,10 @@ impl OracleQueryStream {
 
 /// Complete owned inputs for one terminal-aware query stream.
 pub(super) struct QueryStreamInput {
-    /// Public output schema encoded before admission ownership transfers.
+    /// Public output schema drained from the query's own IPC encoder.
     pub(super) schema_frame: QuerySchemaFrame,
+    /// The one IPC encoder every batch frame and the terminal EOS come from.
+    pub(super) ipc: QueryIpcEncoder,
     /// Lazy physical batch stream.
     pub(super) batches: SendableRecordBatchStream,
     /// Pre-byte lookahead result.
@@ -264,6 +266,8 @@ enum QueryStreamEvent {
 struct FrameBuildInput {
     /// Encoded public schema frame.
     schema_frame: QuerySchemaFrame,
+    /// The one IPC encoder retained for this stream's batches and terminal.
+    ipc: QueryIpcEncoder,
     /// Physical batch stream.
     batches: SendableRecordBatchStream,
     /// Optional pre-read batch.
@@ -298,6 +302,7 @@ struct FrameBuildInput {
 fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameStream>> {
     let FrameBuildInput {
         schema_frame,
+        mut ipc,
         mut batches,
         first,
         admitted,
@@ -338,7 +343,7 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
                     query_telemetry.first_batch();
                     let batch_rows = batch.num_rows() as u64;
                     row_count = row_count.saturating_add(batch_rows);
-                    let Ok(frame) = encode_batch_frame(&batch) else {
+                    let Ok(frame) = ipc.write(&batch) else {
                         break failed_terminal_for_visibility(
                             QueryTerminalErrorCode::QueryExecutionFailed,
                             row_count,
@@ -376,6 +381,7 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
         drop(next);
         drop(batches);
         settle_distributed(&distributed_settlement, candidate.outcome, &stream_cancellation).await;
+        let candidate = close_ipc_stream(&mut ipc, candidate, visibility, row_count);
         let terminal = release_and_finish_terminal(
             &mut admitted,
             &mut query_telemetry,
@@ -644,43 +650,308 @@ fn successful_terminal(
         warnings,
         source_completion,
         error: None,
+        // The candidate is built before the stream is closed; `close_ipc_stream`
+        // attaches the writer's finish delta once, on this exact terminal.
+        arrow_ipc_eos: Vec::new(),
     }
 }
 
-/// Encodes one Arrow schema frame and its stable fingerprint.
+/// Fixed framing scratch a query-stream IPC owner may retain beyond the one
+/// fragment it is currently holding.
 ///
-/// # Errors
+/// Arrow's writer and push decoder each keep a small internal buffer for a
+/// message that straddles a write boundary. Neither grows with the result, so
+/// the bounded-memory proof for a query stream is "one schema fragment plus one
+/// batch fragment plus this constant" rather than a fraction of the result.
+pub const ORACLE_IPC_FRAMING_SCRATCH_BYTES: usize = 64 * 1024;
+
+/// One query's Arrow IPC encoder, owning the single stream the frames carry.
 ///
-/// Returns query execution failure when Arrow IPC rejects the schema.
-pub(super) fn encode_schema_frame(schema: &SchemaRef) -> Result<QuerySchemaFrame, BifrostError> {
-    let mut bytes = Vec::new();
-    let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut bytes, schema)
-        .map_err(|_| BifrostError::QueryExecutionFailed)?;
-    writer
-        .finish()
-        .map_err(|_| BifrostError::QueryExecutionFailed)?;
-    Ok(QuerySchemaFrame {
-        schema_fingerprint: hex::encode(SchemaFingerprint::from_arrow_schema(schema).0),
-        arrow_ipc_schema: bytes,
-    })
+/// The public query stream is *one* Arrow IPC stream split across Wyrd frames,
+/// not one standalone stream per batch. This owner is what makes that true: it
+/// holds a single [`arrow::ipc::writer::StreamWriter`] over a drainable byte
+/// sink for the whole query, so the schema and its dictionaries are written
+/// once and every batch frame carries only the bytes that write appended.
+/// Draining after each operation is what keeps retained state bounded — the
+/// sink never holds more than the fragment being handed out.
+///
+/// Because the writer is shared across batches, [`Self::finish`] must run
+/// exactly once on a successful or degraded terminal, and must not run at all
+/// on a failed or cancelled one; the terminal contract in
+/// [`QueryTerminalFrame::validate`] enforces the same rule from the other side.
+pub struct QueryIpcEncoder {
+    /// Single per-query writer over a drainable in-memory sink.
+    writer: arrow::ipc::writer::StreamWriter<Vec<u8>>,
+    /// Whether the writer already emitted its end-of-stream delta.
+    finished: bool,
+    /// Largest single fragment this encoder has retained before handing it out.
+    peak_retained_ipc_bytes: usize,
 }
 
-/// Encodes one bounded Arrow record batch frame.
+impl std::fmt::Debug for QueryIpcEncoder {
+    /// Formats only the bounded-memory evidence, never buffered query bytes.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("QueryIpcEncoder")
+            .field("finished", &self.finished)
+            .field("peak_retained_ipc_bytes", &self.peak_retained_ipc_bytes)
+            .finish()
+    }
+}
+
+impl QueryIpcEncoder {
+    /// Opens the query's IPC stream and drains its schema prefix into a frame.
+    ///
+    /// Creating the writer is what writes the stream prefix through exactly one
+    /// schema message, so the schema frame is produced here rather than by a
+    /// separate encoder: there is no point at which a caller could observe the
+    /// stream without its schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::QueryExecutionFailed`] when Arrow IPC rejects
+    /// the output schema.
+    pub fn new(schema: &SchemaRef) -> Result<(Self, QuerySchemaFrame), BifrostError> {
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new(Vec::new(), schema)
+            .map_err(|_| BifrostError::QueryExecutionFailed)?;
+        let arrow_ipc_schema = std::mem::take(writer.get_mut());
+        let mut encoder = Self {
+            writer,
+            finished: false,
+            peak_retained_ipc_bytes: 0,
+        };
+        encoder.observe_retained(arrow_ipc_schema.len());
+        Ok((
+            encoder,
+            QuerySchemaFrame {
+                schema_fingerprint: hex::encode(SchemaFingerprint::from_arrow_schema(schema).0),
+                arrow_ipc_schema,
+            },
+        ))
+    }
+
+    /// Appends one record batch and drains exactly that write's delta.
+    ///
+    /// The delta is whatever the writer appended for this call: zero or more
+    /// dictionary messages followed by exactly one record-batch message. Keeping
+    /// dictionaries adjacent to the batch that first needs them is what lets a
+    /// stateful decoder consume fragments in order without buffering the result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::QueryExecutionFailed`] when the stream is already
+    /// finished or Arrow IPC rejects the batch.
+    pub fn write(&mut self, batch: &RecordBatch) -> Result<QueryBatchFrame, BifrostError> {
+        if self.finished {
+            return Err(BifrostError::QueryExecutionFailed);
+        }
+        self.writer
+            .write(batch)
+            .map_err(|_| BifrostError::QueryExecutionFailed)?;
+        let arrow_ipc_batch = std::mem::take(self.writer.get_mut());
+        self.observe_retained(arrow_ipc_batch.len());
+        Ok(QueryBatchFrame { arrow_ipc_batch })
+    }
+
+    /// Closes the query's IPC stream once and returns its end-of-stream delta.
+    ///
+    /// Only a successful or degraded terminal calls this. A failed or cancelled
+    /// stream drops the encoder instead, which is why the terminal contract
+    /// requires empty end-of-stream bytes for a failure: there is no valid EOS
+    /// for a stream that never completed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::QueryExecutionFailed`] when called twice or when
+    /// Arrow IPC cannot write the end-of-stream marker.
+    pub fn finish(&mut self) -> Result<Vec<u8>, BifrostError> {
+        if self.finished {
+            return Err(BifrostError::QueryExecutionFailed);
+        }
+        self.writer
+            .finish()
+            .map_err(|_| BifrostError::QueryExecutionFailed)?;
+        self.finished = true;
+        let eos = std::mem::take(self.writer.get_mut());
+        self.observe_retained(eos.len());
+        if eos.is_empty() {
+            return Err(BifrostError::QueryExecutionFailed);
+        }
+        Ok(eos)
+    }
+
+    /// Returns the largest single fragment this encoder ever retained.
+    ///
+    /// This is the encoder's half of the bounded-memory proof: it must never
+    /// exceed the largest individual fragment, because the sink is drained after
+    /// every operation rather than accumulating the result.
+    #[must_use]
+    pub const fn peak_retained_ipc_bytes(&self) -> usize {
+        self.peak_retained_ipc_bytes
+    }
+
+    /// Records one drained fragment against the retained-bytes high-water mark.
+    fn observe_retained(&mut self, bytes: usize) {
+        self.peak_retained_ipc_bytes = self.peak_retained_ipc_bytes.max(bytes);
+    }
+}
+
+/// Stateful decoder for one query's Arrow IPC stream, fragment by fragment.
 ///
-/// # Errors
+/// Wyrd's server-tier consumers — bounded collection, cross-node forwarding,
+/// and the `oracle_core` journeys — all read the same split stream, so they
+/// share this owner instead of constructing a throwaway `StreamReader` per
+/// frame. A per-frame reader cannot work once the stream is one IPC stream:
+/// the schema and its dictionaries arrive in earlier fragments and a fresh
+/// reader has no record of them.
 ///
-/// Returns query execution failure when Arrow IPC rejects the batch.
-fn encode_batch_frame(batch: &RecordBatch) -> Result<QueryBatchFrame, BifrostError> {
-    let mut bytes = Vec::new();
-    let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut bytes, &batch.schema())
-        .map_err(|_| BifrostError::QueryExecutionFailed)?;
-    writer
-        .write(batch)
-        .and_then(|()| writer.finish())
-        .map_err(|_| BifrostError::QueryExecutionFailed)?;
-    Ok(QueryBatchFrame {
-        arrow_ipc_batch: bytes,
-    })
+/// The decoder tracks end-of-stream receipt itself.
+/// [`arrow::ipc::reader::StreamDecoder::finish`] reports success both for a
+/// stream that ended cleanly and for one that never began, so it cannot prove
+/// an explicit EOS arrived; only the terminal's carried delta can.
+///
+/// The client tier has its own copy of this state machine in `vala-sdk`,
+/// because client-tier crates may not depend on the Bifrost server engine. The
+/// wire contract, not shared code, is what keeps the two honest.
+#[derive(Debug, Default)]
+pub struct QueryIpcDecoder {
+    /// Arrow's push decoder, retaining schema and dictionary state.
+    decoder: arrow::ipc::reader::StreamDecoder,
+    /// Schema recovered from the required initial schema fragment.
+    schema: Option<SchemaRef>,
+    /// Whether the terminal's explicit end-of-stream delta was accepted.
+    eos_accepted: bool,
+    /// Largest single fragment this decoder has held while decoding.
+    peak_pending_frame_bytes: usize,
+}
+
+/// Closed reason one query IPC fragment could not be consumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryIpcDecodeError {
+    /// The fragment was not valid Arrow IPC, or violated its expected shape.
+    Malformed,
+    /// A fragment arrived out of order relative to the stream's state.
+    OutOfOrder,
+    /// A batch's schema did not match the stream's initial schema.
+    SchemaMismatch,
+}
+
+impl QueryIpcDecoder {
+    /// Creates a decoder positioned before the required schema fragment.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Consumes the initial schema fragment and returns the stream schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QueryIpcDecodeError::OutOfOrder`] for a duplicate schema or a
+    /// schema after end-of-stream, and [`QueryIpcDecodeError::Malformed`] when
+    /// the fragment is not exactly one schema message.
+    pub fn accept_schema(&mut self, bytes: &[u8]) -> Result<SchemaRef, QueryIpcDecodeError> {
+        if self.schema.is_some() || self.eos_accepted {
+            return Err(QueryIpcDecodeError::OutOfOrder);
+        }
+        if self.feed(bytes)?.is_some() {
+            return Err(QueryIpcDecodeError::Malformed);
+        }
+        let schema = self
+            .decoder
+            .schema()
+            .ok_or(QueryIpcDecodeError::Malformed)?;
+        self.schema = Some(SchemaRef::clone(&schema));
+        Ok(schema)
+    }
+
+    /// Consumes one batch fragment and returns its decoded record batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QueryIpcDecodeError::OutOfOrder`] before the schema or after
+    /// end-of-stream, [`QueryIpcDecodeError::Malformed`] when the fragment does
+    /// not decode to exactly one record batch, and
+    /// [`QueryIpcDecodeError::SchemaMismatch`] when the batch contradicts the
+    /// stream schema.
+    pub fn accept_batch(&mut self, bytes: &[u8]) -> Result<RecordBatch, QueryIpcDecodeError> {
+        let expected = self
+            .schema
+            .as_ref()
+            .ok_or(QueryIpcDecodeError::OutOfOrder)?;
+        if self.eos_accepted {
+            return Err(QueryIpcDecodeError::OutOfOrder);
+        }
+        let expected = SchemaRef::clone(expected);
+        let batch = self.feed(bytes)?.ok_or(QueryIpcDecodeError::Malformed)?;
+        if batch.schema().as_ref() != expected.as_ref() {
+            return Err(QueryIpcDecodeError::SchemaMismatch);
+        }
+        Ok(batch)
+    }
+
+    /// Consumes the terminal's end-of-stream delta and closes the stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QueryIpcDecodeError::OutOfOrder`] before the schema or on a
+    /// second end-of-stream, and [`QueryIpcDecodeError::Malformed`] when the
+    /// delta carries a record batch or leaves a partial message behind.
+    pub fn accept_eos(&mut self, bytes: &[u8]) -> Result<(), QueryIpcDecodeError> {
+        if self.schema.is_none() || self.eos_accepted {
+            return Err(QueryIpcDecodeError::OutOfOrder);
+        }
+        if bytes.is_empty() || self.feed(bytes)?.is_some() {
+            return Err(QueryIpcDecodeError::Malformed);
+        }
+        self.decoder
+            .finish()
+            .map_err(|_| QueryIpcDecodeError::Malformed)?;
+        self.eos_accepted = true;
+        Ok(())
+    }
+
+    /// Returns the stream schema once its initial fragment was accepted.
+    #[must_use]
+    pub fn schema(&self) -> Option<&SchemaRef> {
+        self.schema.as_ref()
+    }
+
+    /// Reports whether the explicit end-of-stream delta was accepted.
+    #[must_use]
+    pub const fn eos_accepted(&self) -> bool {
+        self.eos_accepted
+    }
+
+    /// Returns the largest single fragment this decoder held while decoding.
+    #[must_use]
+    pub const fn peak_pending_frame_bytes(&self) -> usize {
+        self.peak_pending_frame_bytes
+    }
+
+    /// Pushes one fragment through Arrow's decoder, allowing at most one batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QueryIpcDecodeError::Malformed`] when Arrow rejects the bytes
+    /// or the fragment yields more than one record batch.
+    fn feed(&mut self, bytes: &[u8]) -> Result<Option<RecordBatch>, QueryIpcDecodeError> {
+        self.peak_pending_frame_bytes = self.peak_pending_frame_bytes.max(bytes.len());
+        let mut buffer = arrow::buffer::Buffer::from_vec(bytes.to_vec());
+        let mut decoded = None;
+        while !buffer.is_empty() {
+            match self
+                .decoder
+                .decode(&mut buffer)
+                .map_err(|_| QueryIpcDecodeError::Malformed)?
+            {
+                Some(batch) if decoded.is_none() => decoded = Some(batch),
+                Some(_) => return Err(QueryIpcDecodeError::Malformed),
+                None => {}
+            }
+        }
+        Ok(decoded)
+    }
 }
 
 /// Maps a late `DataFusion` failure to the closed terminal-code catalog.
@@ -716,6 +987,43 @@ fn finish_stream(
     telemetry.finish(outcome, status);
     if let Some(lifecycle) = lifecycle {
         lifecycle.finish(outcome);
+    }
+}
+
+/// Closes the query's IPC stream and attaches its end-of-stream to the terminal.
+///
+/// This is the only place `finish` runs, and it runs only for an outcome the
+/// terminal contract requires an end-of-stream for. A failed or cancelled
+/// candidate is returned untouched, so the encoder is dropped without a
+/// `finish` and the terminal carries no end-of-stream — which is exactly the
+/// pairing [`QueryTerminalFrame::validate`] enforces on the reading side.
+///
+/// Because the terminal is the last frame, a failure to close the stream cannot
+/// be reported by emitting one more frame; it degrades the candidate into the
+/// failed terminal for the requested visibility instead, which is also the only
+/// representation that legitimately carries no end-of-stream.
+fn close_ipc_stream(
+    ipc: &mut QueryIpcEncoder,
+    candidate: QueryTerminalFrame,
+    visibility: VisibilityMode,
+    row_count: u64,
+) -> QueryTerminalFrame {
+    if candidate.outcome == QueryTerminalOutcome::Failed {
+        return candidate;
+    }
+    match ipc.finish() {
+        Ok(arrow_ipc_eos) => QueryTerminalFrame {
+            arrow_ipc_eos,
+            ..candidate
+        },
+        Err(error) => {
+            tracing::error!(%error, "Oracle query stream could not close its Arrow IPC stream");
+            failed_terminal_for_visibility(
+                QueryTerminalErrorCode::QueryExecutionFailed,
+                row_count,
+                visibility,
+            )
+        }
     }
 }
 
@@ -833,6 +1141,7 @@ impl OracleQueryStream {
         let _stream_span = tracing::info_span!("bifrost.oracle.stream").entered();
         let QueryStreamInput {
             schema_frame,
+            ipc,
             batches,
             first,
             admitted,
@@ -860,6 +1169,7 @@ impl OracleQueryStream {
         query_telemetry.start_stream();
         let frames = build_frames(FrameBuildInput {
             schema_frame,
+            ipc,
             batches,
             first,
             admitted,

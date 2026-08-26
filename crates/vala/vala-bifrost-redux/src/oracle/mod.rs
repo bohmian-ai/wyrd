@@ -122,7 +122,10 @@ use planner::OracleClassification;
 pub use planner::OraclePlanner;
 pub use query_stream::OracleQueryStream;
 pub use query_stream::QueryStreamLifecycle;
-use query_stream::{QueryStreamInput, RunningQueryTerminalOwner, encode_schema_frame};
+pub use query_stream::{
+    ORACLE_IPC_FRAMING_SCRATCH_BYTES, QueryIpcDecodeError, QueryIpcDecoder, QueryIpcEncoder,
+};
+use query_stream::{QueryStreamInput, RunningQueryTerminalOwner};
 pub use running::{RunningQueryEntry, RunningQueryRegistry, RunningQuerySettlement};
 
 /// Builds one test stream through the production telemetry terminal owner.
@@ -2876,9 +2879,10 @@ impl Oracle {
                 "typed first-batch rejection",
             );
         }
-        let schema_frame = encode_schema_frame(&schema)?;
+        let (ipc, schema_frame) = QueryIpcEncoder::new(&schema)?;
         Ok(OracleQueryStream::new(QueryStreamInput {
             schema_frame,
+            ipc,
             batches,
             first,
             admitted,
@@ -3887,6 +3891,9 @@ fn failed_terminal_for_visibility(
         warnings: Vec::new(),
         source_completion,
         error: Some(wyrd_spec::vala::api::QueryTerminalError { code, detail: None }),
+        // A failed stream never finished its Arrow IPC stream, so there is no
+        // end-of-stream delta to report.
+        arrow_ipc_eos: Vec::new(),
     }
 }
 
@@ -4294,8 +4301,8 @@ async fn settle_attempt_output(
         return settle_distributed_failure(deadline, batches, admitted, error, "missing telemetry")
             .await;
     };
-    let schema_frame = match encode_schema_frame(&schema) {
-        Ok(frame) => frame,
+    let (ipc, schema_frame) = match QueryIpcEncoder::new(&schema) {
+        Ok(opened) => opened,
         Err(error) => {
             return settle_distributed_failure(
                 deadline,
@@ -4309,6 +4316,7 @@ async fn settle_attempt_output(
     };
     Ok(Some(OracleQueryStream::new(QueryStreamInput {
         schema_frame,
+        ipc,
         batches,
         first,
         admitted,

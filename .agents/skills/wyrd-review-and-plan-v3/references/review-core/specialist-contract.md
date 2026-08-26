@@ -27,9 +27,10 @@ Never assign `REV-NNN`; those IDs belong to validated final findings.
 
 ## Required sections
 
-The immutable packet and `coverage.json` carry assignment identity, model,
-prompt digest, target SHA, and trigger metadata. Do not repeat them in the
-specialist report. Use these sections exactly once and in order:
+The immutable packet and `coverage.json` carry assignment identity, required
+capability, prompt digest, target SHA, and trigger metadata. Do not repeat them in the
+specialist report. The root persists their validated binding separately in the
+dispatch attestation. Use these sections exactly once and in order:
 
 1. `## Scope`
 2. `## Adversarial probe`

@@ -106,9 +106,9 @@ mechanical repairs need no user approval.
    migrations, recovery, destructive writes, async lifecycle, cancellation,
    locks, retries, drain, Python/PyO3/native bindings, Vala/query/admission,
    public wire contracts, cross-owner contracts, or UI behavior, first dispatch
-   exactly one focused Terra-high companion review and persist its immutable
-   addendum. Then dispatch an independent Sol-medium `$wyrd-review-v3` for
-   every candidate generation, supplying that addendum when present. The
+   exactly one focused independent companion review and persist its immutable
+   addendum. Then dispatch an independent `$wyrd-review-v3` for every candidate
+   generation, supplying that addendum when present. The
    primary reviewer examines actual code/diff and tests against every AC,
    validates proof and companion claims from source, and may run targeted
    checks only when evidence is missing or suspicious. Review—not successful
@@ -120,7 +120,7 @@ mechanical repairs need no user approval.
 5. On reversible findings, route the reviewer's bounded remediation contract
    unchanged to an implementer. The controller does not redesign or replan
    ordinary findings. The replacement starts from the original/current bound
-   parent, fully implements the task plus assigned findings, reruns all task and
+   parent, fully implements the task plus bound findings, reruns all task and
    finding checks, supersedes the rejected generation, and receives fresh
    independent review.
 6. A mechanically defective packet enters bounded task-contract repair and
@@ -139,7 +139,7 @@ mechanical repairs need no user approval.
 Implementation, review, resource-heavy commands, and serial integration are
 distinct resources. Default to one heavy Cargo/database command at a time;
 allow independent lighter work when measured capacity permits. A waiting worker
-need not reserve a model slot.
+need not reserve execution capacity.
 
 ## Terminal acceptance
 

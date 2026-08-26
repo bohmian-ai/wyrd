@@ -8,7 +8,7 @@ handoff. Stop without implementation.
 
 Read `orchestration-contract.md`, `artifact-contract.md`, `packet.md`,
 `specialist-contract.md`, `adversarial-contract.md`, `evidence-contract.md`,
-`runner-contract.md`, and `validation/maintainer-gate.md` completely before
+`dispatch-contract.md`, and `validation/maintainer-gate.md` completely before
 acting.
 
 ## Phase 1: Resolve the immutable execution result
@@ -32,19 +32,21 @@ assignments, and static-analysis limits.
 Create the review directory and required evidence tree from
 `evidence-contract.md`. Write the stable packet and input digests. Build
 `coverage.json` before dispatch so every changed production file, requirement,
-task criterion, and high-risk boundary has an explicit assignment. Preflight
-every required capability against `role-map.json`; persist and return
-`REVIEW_BLOCKED` if the required independent roster cannot run.
+task criterion, and high-risk boundary has an explicit assignment. Confirm the
+active harness can provide every required capability with distinct reviewer
+identities; persist and return `REVIEW_BLOCKED` if the required independent
+roster cannot run.
 
 ## Phase 2: Dispatch independent specialists
 
-Build the immutable external-runner packet defined in `runner-contract.md` and
-dispatch all seven baseline domains to separate Terra-high Codex sessions using
-the exact prompts and roles in `orchestration-contract.md` and `role-map.json`.
+Build the immutable assignment packet defined in `dispatch-contract.md` and
+dispatch all seven baseline domains to separate review contexts using the exact
+prompts and capabilities in `orchestration-contract.md`.
 Dispatch every triggered persistence, async, PyO3, Vala, UI, or other required
-specialist in addition to the baseline roster. The runner enforces bounded
-parallelism, timeouts, retries, identity validation, and atomic report
-publication. Concurrency limits never justify combining or omitting roles.
+specialist in addition to the baseline roster. Respect the active harness's
+capacity and stopping behavior. The root validates result identity and publishes
+accepted reports atomically. Capacity limits never justify combining or omitting
+domains.
 
 Apply the coverage floors in `evidence-contract.md`. Auth, tenancy, destructive
 persistence, migration, concurrency, recovery, and public wire-contract
@@ -58,18 +60,17 @@ and assigned report path. Require the report schema from
 `adversarial-contract.md`.
 
 Specialists inspect code independently and return only their structured result.
-The runner writes accepted evidence reports. Specialists do not run project
+The root writes accepted evidence reports. Specialists do not run project
 commands, assign final IDs, plan, remediate, launch agents, inspect
 working-tree-only content, or modify source.
 
-If external Codex sessions are unavailable, use the collaboration fallback in
-`runner-contract.md`, preserve the same Terra-high assignment policy and
-artifact contract, and dispatch in capacity-bounded waves. Record the selected
-backend in `coverage.json`.
+Use the active harness's native delegation mechanism. When capacity is lower
+than the roster size, dispatch in capacity-bounded waves. Harness choice never
+changes the artifact contract, coverage floor, or reviewer-independence rule.
 
 ## Phase 3: Validate, deduplicate, and ground
 
-Validate roster completeness, roles, capabilities, trigger coverage, report
+Validate roster completeness, capabilities, trigger coverage, report
 identity, prompt digests, target SHA, and independent reviewer IDs. Create the
 preliminary `ledger.json` with every namespaced candidate visible.
 
@@ -97,11 +98,10 @@ Before accepting a clean conclusion, challenge the three most dangerous changed
 invariants across the integrated impact cone. Record whether each survived,
 became a candidate, or remains a static limit.
 
-Dispatch the Sol-high final independent adjudicator required by
-`evidence-contract.md` when its floor triggers. The adjudicator must have
-produced no candidate report and receives no desired verdict. Sol high is not
-used for any other review role. Reconcile its challenges in `validation.md` and
-`ledger.json`.
+Dispatch the final independent adjudicator required by `evidence-contract.md`
+when its floor triggers. The adjudicator must have produced no candidate report
+and receives no desired verdict. Reconcile its challenges in `validation.md`
+and `ledger.json`.
 
 ## Phase 4: Write and validate the terminal review
 

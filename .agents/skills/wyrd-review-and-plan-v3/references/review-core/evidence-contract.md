@@ -14,7 +14,8 @@ the only authoritative verdict and remediation source.
     ├── ledger.json
     ├── validation.md
     └── specialists/
-        └── <lens>.md
+        ├── <assignment>.md
+        └── <assignment>.attestation.json
 ```
 
 No evidence artifact may be required to understand a final finding or execute
@@ -30,7 +31,7 @@ Record immutable review inputs and digests:
   digests;
 - target-snapshot authority paths and digests;
 - risk and change profiles;
-- baseline and triggered assignments, reviewer questions, roles, and digests;
+- baseline and triggered assignments, reviewer questions, capabilities, and digests;
 - static-analysis boundary.
 
 Do not require a second stored copy of a large diff when its commit range and
@@ -42,11 +43,9 @@ Use this shape:
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "review_id": "",
   "mode": "full",
-  "engine": "codex|claude",
-  "backend": "codex-exec|collaboration",
   "risk": "low|standard|high",
   "roster": [
     {
@@ -55,12 +54,12 @@ Use this shape:
       "requirement": "baseline|triggered",
       "trigger_ids": [],
       "required_capability": "security-specialist",
-      "actual_agent_role": "security-auditor",
       "reviewer_id": "security-review-task",
       "prompt_path": "review-security/review-security.md",
       "prompt_digest": "sha256:...",
       "target_sha": "",
       "report_path": "evidence/specialists/baseline-security.md",
+      "attestation_path": "evidence/specialists/baseline-security.attestation.json",
       "status": "completed|blocked"
     }
   ],
@@ -134,8 +133,8 @@ Coverage floors:
 
 - every baseline domain in `orchestration-contract.md` has one completed
   assignment;
-- every full-mode baseline assignment has the required role and a distinct
-  reviewer identity;
+- every full-mode baseline assignment has the required capability and a
+  distinct reviewer identity;
 - every matched trigger has one completed additional assignment;
 - every changed production file has one primary assignment;
 - every reference requirement and acceptance criterion maps to source and
@@ -149,6 +148,8 @@ Coverage floors:
 - every full-mode specialist report records its inspected scope, at least one
   material adversarial probe, and, when clean, why its strongest realistic
   counterexample survived;
+- every completed specialist has a compact dispatch attestation binding its
+  assignment, reviewer, target, prompt, and published report digest;
 - a clean full review challenges the three most dangerous changed invariants;
 
 Record representative downstream inspection as `sampled`; never imply an

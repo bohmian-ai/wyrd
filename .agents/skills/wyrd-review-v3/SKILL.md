@@ -64,9 +64,9 @@ terminal review's full roster or three-invariant burden.
 
 ## High-risk companion review
 
-Default to one independent Sol-medium primary reviewer. The controller adds
-exactly one independent Terra-high companion before primary adjudication only
-when the packet or actual candidate diff crosses one of these boundaries:
+Default to one independent primary reviewer. The controller adds exactly one
+independent companion before primary adjudication only when the packet or
+actual candidate diff crosses one of these boundaries:
 
 | Candidate impact | Companion lens |
 |---|---|

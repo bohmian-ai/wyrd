@@ -31,8 +31,8 @@ planning blockers.
 ## Use bounded evidence scouts when breadth earns them
 
 For an unfamiliar or multi-owner evidence gap that direct tracing cannot
-efficiently close, the planner may dispatch one through three read-only
-evidence scouts using `.agents/model-routing.md`. Give each scout one bounded
+efficiently close, the planner may use one through three read-only evidence
+scouts when the active environment supports them. Give each scout one bounded
 question and explicit repository or source scope. Require an evidence-only
 report containing verified facts with paths, symbols, or primary links,
 relevant tests or commands, counterevidence, and unresolved uncertainty.
@@ -106,12 +106,13 @@ contracts, actual dependencies, acceptance criteria, and proof obligations.
 Then package that understood work into cohesive, decision-ready execution tasks
 for the shortest expected time to accepted integration. Full decomposition is
 about decision and dependency completeness, not packet count. Do not create a
-worker dispatch or serial dependency merely because touched paths have different
+separate task or serial dependency merely because touched paths have different
 repository owners.
 
-Each task has one primary outcome and integration owner, but it may include
-inseparable consumer, test, journey, generated, or wiring closure in other owned
-surfaces. Create a separate packet when it gives a substantial independent
+Each task has one primary outcome and names the repository owners of the
+behavior it changes, but it may include inseparable consumer, test, journey,
+generated, or wiring closure in other owned surfaces. The controller owns
+candidate integration. Create a separate packet when it gives a substantial independent
 implementation outcome or is required to preserve authority and review
 integrity; separation does not itself imply ordering. Add a dependency only
 when the successor genuinely requires the predecessor's integrated artifact or
@@ -130,7 +131,7 @@ setup and proof lane, would collide in composition files, or one side is too
 small to amortize orchestration. Do not make each journey, test selector,
 wiring edit, or matrix row its own packet. Group related journeys by runtime
 and shared fixture unless they can perform substantial implementation work in
-parallel. Prefer a few concurrent end-to-end owner tracks over dozens of tiny
+parallel. Prefer a few concurrent end-to-end outcome tracks over dozens of tiny
 packets and serial joins.
 
 Use a dependency only when a task requires a predecessor's committed contract
@@ -143,11 +144,11 @@ several consumers need a new shared contract, isolate the smallest coherent
 foundation and release every independent consumer directly from it.
 
 Expose substantial independent work when doing so is expected to shorten the
-critical path, but never target worker utilization or DAG width independently
+critical path, but never target executor utilization or DAG width independently
 of total acceptance time. Do not add packets, dependencies, or integration
-stages solely to occupy slots. Do not manufacture parallelism across a
+stages solely to occupy capacity. Do not manufacture parallelism across a
 genuinely shared mutable contract, fixture, migration, or test seam; keep that
-inseparable seam cohesive and allow unrelated owner tracks to continue around
+inseparable seam cohesive and allow unrelated outcome tracks to continue around
 it. Prefer lower critical-path depth and fewer reconciliation points when two
 decompositions expose similar useful concurrency.
 
@@ -163,8 +164,8 @@ every possible touched file or incidental repair before implementation.
 Each `tasks/<NN>-<slug>.md` packet must contain these sections:
 
 1. **Task contract** — a YAML block containing `id`, `depends_on`, `write_set`,
-   `execution_tier`, `acceptance_criteria`, and
-   `verification`. This is the machine-readable coordination contract; the prose below explains
+   `acceptance_criteria`, and `verification`. This is the machine-readable
+   coordination contract; the prose below explains
    it. Use repository-relative paths, stable `AC<N>` IDs, and the narrowest
    exact `mise` command.
 2. **Outcome** — the observable result and user/operator value.
@@ -187,7 +188,7 @@ Each `tasks/<NN>-<slug>.md` packet must contain these sections:
    and explain evidence mapping without restating their text.
 9. **Tests and verification** — name the smallest test that directly proves
    each AC, then add a broader module/package or journey check only when it
-   covers a distinct cross-boundary risk. Define `verification.worker` as one
+   covers a distinct cross-boundary risk. Define `verification.diagnostic` as one
    optional, fast diagnostic command and `verification.candidate` as the
    narrowest authoritative exact `mise` command. Do not prescribe broad
    workspace checks per task or multiple overlapping tests merely because they
@@ -212,16 +213,11 @@ Use this task-contract verification shape:
 
 ```yaml
 verification:
-  worker: <optional fastest safe diagnostic mise command, or null>
+  diagnostic: <optional fastest safe diagnostic mise command, or null>
   candidate: <one narrow authoritative mise command>
 ```
 
-Set `execution_tier: fast` only for mechanical, localized, low-risk work whose
-material decisions are fixed. Use `general` for work requiring normal
-engineering judgment. The controller maps the tier through
-`.agents/model-routing.md` and escalates unexpected ambiguity separately.
-
-`worker` is optional and must not duplicate a costly candidate command. It is
+`diagnostic` is optional and must not duplicate a costly candidate command. It is
 for one narrow post-implementation signal, not a test-after-every-edit loop.
 It may be a filtered Cargo check/test when that is the fastest useful type or
 compile signal, but the controller must run it in the shared heavy-resource
@@ -235,8 +231,8 @@ integration closeout.
 Before returning the plan, verify that:
 
 - every requested outcome maps to one or more tasks;
-- every task has bounded responsibility, a useful write forecast, an owner,
-  non-goals, and concrete ACs;
+- every task has bounded responsibility, a useful write forecast, named
+  repository owners, non-goals, and concrete ACs;
 - every cross-task contract has one producer and named consumers;
 - dependencies are necessary and task order is executable;
 - every user-facing behavior has the journey coverage required by `AGENTS.md`;

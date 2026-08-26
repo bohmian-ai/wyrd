@@ -11,8 +11,7 @@ independent work, use a broad or invalid test, or make an unsafe integration.
 Judge concurrency by expected time-to-integrated-acceptance, not packet count or
 theoretical DAG width.
 Remain read-only; do not edit, run verification, create artifacts, invoke a
-workflow, or spawn children. Use the plan-review route in
-`.agents/model-routing.md`.
+workflow, or spawn children.
 
 ## Required input
 
@@ -60,8 +59,9 @@ forecasts, shared test/generated/migration surfaces, and cross-task
 contracts. Require full decomposition of outcomes, owners, producer/consumer
 obligations, actual dependencies, acceptance criteria, and proof without
 requiring one packet per repository owner. A task must have one primary outcome
-and integration owner, but may include inseparable cross-owner consumer, test,
-journey, generated, or wiring closure. A separate authority or review packet
+and name the repository owners of changed behavior, but may include inseparable
+cross-owner consumer, test, journey, generated, or wiring closure. Candidate
+integration belongs to the controller. A separate authority or review packet
 does not imply ordering.
 
 Apply the wall-time test to scheduling and any optional packetization beyond
@@ -91,17 +91,16 @@ implementation can overlap and that removed serial work is likely to exceed
 context, dispatch, proof, review, reconciliation, invalidation, and integration
 cost. Reject journey-per-packet, selector-per-packet, wiring-only, or tiny
 mechanical splits that add DAG depth without shortening the critical path.
-Reject a higher-width plan when a smaller set of end-to-end owner tracks is
+Reject a higher-width plan when a smaller set of end-to-end outcome tracks is
 likely to ship sooner. Full decomposition must cover every outcome, decision,
 owner, dependency, acceptance criterion, and proof obligation; it does not
 require a separate packet for every owner or separable edit. Concurrency is
 subordinate to wall time: expose ready work only when separate execution is
 likely to improve time to accepted integration.
 
-For every task, verify bounded responsibility, real non-goals, exact owner/context,
-concrete ACs, an appropriate implementation skill, an evidence-backed
-`execution_tier`, and an escalation boundary limited to material authority
-gaps. Do not demand private helper names,
+For every task, verify bounded responsibility, real non-goals, exact repository
+owner/context, concrete ACs, an appropriate implementation skill, and an
+escalation boundary limited to material authority gaps. Do not demand private helper names,
 incidental mechanics, or an exhaustive file list where repository-native local
 adaptation can satisfy the approved outcome.
 
@@ -120,7 +119,7 @@ outputs, or diagnostics-discovered repairs.
 
 Map every AC to its smallest direct proof. Require:
 
-- `verification.worker` to be `null` or one narrow safe diagnostic; a filtered
+- `verification.diagnostic` to be `null` or one narrow safe diagnostic; a filtered
   Cargo compile/test signal is permitted when routed through the controller's
   heavy lane;
 - `verification.candidate` to be one exact narrow `mise` command that exists

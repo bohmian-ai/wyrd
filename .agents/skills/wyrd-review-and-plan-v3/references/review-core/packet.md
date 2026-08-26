@@ -29,7 +29,7 @@ Record:
 - every required authority, plan, task, lineage, and proof path and digest;
 - mode, review ID, risk, change profile, and reviewer assignments;
 - the complete baseline roster, trigger matches, assignment IDs, required
-  capabilities, concrete roles, and prompt digests;
+  capabilities, reviewer identities, and prompt digests;
 - applicable repository authorities and hard gates.
 
 If any SHA, required artifact, digest, or lineage binding cannot be resolved,

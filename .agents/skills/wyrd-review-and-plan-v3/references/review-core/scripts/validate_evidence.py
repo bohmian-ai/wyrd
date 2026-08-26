@@ -52,9 +52,6 @@ BASELINE_CAPABILITIES = {
     "developer-experience": "dx-specialist",
     "architecture-contracts": "architecture-specialist",
 }
-ROLE_MAP = json.loads(
-    Path(__file__).parents[1].joinpath("role-map.json").read_text(encoding="utf-8")
-)["engines"]
 PROMPT_BY_DOMAIN = {
     "correctness": "review-bugs/review-bugs.md",
     "security": "review-security/review-security.md",
@@ -151,6 +148,11 @@ def validate_specialists(
     """Validate reports and map candidate IDs to assignment and reviewer IDs."""
     candidate_sources: dict[str, tuple[str, str]] = {}
     reports = {path.stem: path for path in directory.glob("*.md")}
+    attestation_suffix = ".attestation.json"
+    attestations = {
+        path.name[: -len(attestation_suffix)]: path
+        for path in directory.glob(f"*{attestation_suffix}")
+    }
     expected = {
         assignment_id
         for assignment_id, assignment in roster.items()
@@ -158,10 +160,20 @@ def validate_specialists(
     }
     missing = sorted(expected - reports.keys())
     unexpected = sorted(reports.keys() - expected)
+    missing_attestations = sorted(expected - attestations.keys())
+    unexpected_attestations = sorted(attestations.keys() - expected)
     for assignment_id in missing:
         errors.append(f"completed assignment has no specialist report: {assignment_id}")
     for assignment_id in unexpected:
         errors.append(f"specialist report has no completed assignment: {assignment_id}")
+    for assignment_id in missing_attestations:
+        errors.append(
+            f"completed assignment has no dispatch attestation: {assignment_id}"
+        )
+    for assignment_id in unexpected_attestations:
+        errors.append(
+            f"dispatch attestation has no completed assignment: {assignment_id}"
+        )
 
     for assignment_id, path in reports.items():
         text = path.read_text(encoding="utf-8")
@@ -169,6 +181,37 @@ def validate_specialists(
         expected_report = assignment.get("report_path")
         if expected_report and not str(expected_report).endswith(f"/{path.name}"):
             errors.append(f"{assignment_id} report path does not match roster")
+        attestation_path = attestations.get(assignment_id)
+        if attestation_path is not None:
+            attestation = load_json(attestation_path, errors)
+            expected_attestation = assignment.get("attestation_path")
+            if expected_attestation and not str(expected_attestation).endswith(
+                f"/{attestation_path.name}"
+            ):
+                errors.append(f"{assignment_id} attestation path does not match roster")
+            if isinstance(attestation, dict):
+                expected_values = {
+                    "schema_version": 1,
+                    "assignment_id": assignment_id,
+                    "domain": assignment.get("domain"),
+                    "reviewer_id": assignment.get("reviewer_id"),
+                    "target_sha": assignment.get("target_sha"),
+                    "prompt_sha256": str(
+                        assignment.get("prompt_digest", "")
+                    ).removeprefix("sha256:"),
+                    "report_path": assignment.get("report_path"),
+                    "report_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    "status": "completed",
+                }
+                if set(attestation) != set(expected_values):
+                    errors.append(
+                        f"{assignment_id} attestation has unexpected or missing fields"
+                    )
+                for field, expected_value in expected_values.items():
+                    if attestation.get(field) != expected_value:
+                        errors.append(
+                            f"{assignment_id} attestation has invalid {field}"
+                        )
         domain = assignment.get("domain")
         positions: list[int] = []
         for section in REPORT_SECTIONS:
@@ -222,16 +265,11 @@ def validate_coverage(
     if not isinstance(data, dict):
         errors.append("coverage.json must contain an object")
         return {}
-    if data.get("schema_version") != 2:
-        errors.append("coverage.json must use schema_version 2")
+    if data.get("schema_version") != 3:
+        errors.append("coverage.json must use schema_version 3")
     mode = data.get("mode")
     if mode != "full":
         errors.append("coverage.json has invalid mode")
-    if data.get("engine") not in {"codex", "claude"}:
-        errors.append("coverage.json has invalid engine")
-    if data.get("backend") not in {"codex-exec", "collaboration"}:
-        errors.append("coverage.json has invalid backend")
-
     adversarial = data.get("adversarial_review")
     if not isinstance(adversarial, dict):
         errors.append("coverage.json `adversarial_review` must be an object")
@@ -257,7 +295,7 @@ def validate_coverage(
         roster_entries = []
     roster: dict[str, dict[str, Any]] = {}
     baseline_domains: set[str] = set()
-    baseline_reviewers: set[str] = set()
+    completed_reviewers: set[str] = set()
     for assignment in roster_entries:
         if not isinstance(assignment, dict):
             errors.append("coverage roster entries must be objects")
@@ -278,11 +316,12 @@ def validate_coverage(
             errors.append(f"{assignment_id} has invalid status")
         for field in (
             "required_capability",
-            "actual_agent_role",
             "reviewer_id",
             "prompt_path",
             "prompt_digest",
             "target_sha",
+            "report_path",
+            "attestation_path",
         ):
             if (
                 not isinstance(assignment.get(field), str)
@@ -309,28 +348,16 @@ def validate_coverage(
             expected_capability = BASELINE_CAPABILITIES.get(domain)
             if expected_capability is None:
                 errors.append(f"unknown baseline domain: {domain}")
-            else:
-                expected_role = ROLE_MAP.get(str(data.get("engine")), {}).get(
-                    expected_capability
-                )
-                if (
-                    assignment.get("required_capability") != expected_capability
-                    or assignment.get("actual_agent_role") != expected_role
-                ):
-                    errors.append(f"baseline role/capability mismatch: {domain}")
+            elif assignment.get("required_capability") != expected_capability:
+                errors.append(f"baseline capability mismatch: {domain}")
             if status != "completed" and verdict != "REVIEW_BLOCKED":
                 errors.append(f"baseline assignment is not completed: {domain}")
-            reviewer_id = assignment.get("reviewer_id")
-            if (
-                mode == "full"
-                and status == "completed"
-                and reviewer_id in baseline_reviewers
-            ):
-                errors.append(
-                    f"full baseline assignments share reviewer: {reviewer_id}"
-                )
-            if status == "completed" and isinstance(reviewer_id, str):
-                baseline_reviewers.add(reviewer_id)
+        reviewer_id = assignment.get("reviewer_id")
+        if mode == "full" and status == "completed":
+            if reviewer_id in completed_reviewers:
+                errors.append(f"completed assignments share reviewer: {reviewer_id}")
+            if isinstance(reviewer_id, str):
+                completed_reviewers.add(reviewer_id)
     for domain in sorted(set(BASELINE_CAPABILITIES) - baseline_domains):
         errors.append(f"missing baseline domain: {domain}")
 

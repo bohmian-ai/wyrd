@@ -16,11 +16,11 @@ spawn children, or mutate controller state.
 Accept `request_id`, repository root, immutable task-packet path and digest,
 `parent_sha`, dedicated clean `worktree_path`, controller generation, and an
 optional remediation binding. The packet is immutable authority for task ID,
-dependencies, forecast `write_set`, explicit non-goals, execution tier,
-acceptance criteria, and complete verification.
+dependencies, forecast `write_set`, explicit non-goals, acceptance criteria,
+and complete verification.
 
 A remediation binding contains the prior review artifact path/digest,
-superseded candidate, and assigned finding IDs. Terminal remediation also binds
+superseded candidate, and bound finding IDs. Terminal remediation also binds
 the reviewed integrated target. Verify all bindings before editing. Findings
 add only their bounded outcomes, assertions, owners, and checks; they do not
 authorize a new material decision.

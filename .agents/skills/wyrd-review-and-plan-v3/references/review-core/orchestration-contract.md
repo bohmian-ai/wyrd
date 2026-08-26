@@ -1,7 +1,7 @@
 # Review Orchestration Contract
 
 Use this contract for the full Wyrd v3 terminal review. It separates the
-question being reviewed from the capability and concrete agent that performs
+question being reviewed from whatever concrete execution environment performs
 it.
 
 ## Assignment identity
@@ -11,15 +11,14 @@ Every review assignment records:
 - `assignment_id`: stable ID such as `baseline-security`;
 - `domain`: the review question;
 - `requirement`: `baseline` or `triggered`;
-- `required_capability`: engine-neutral specialist capability;
-- `actual_agent_role`: concrete platform role;
+- `required_capability`: provider-neutral specialist capability;
 - `reviewer_id`: unique agent/task identity;
 - prompt path and SHA-256 digest;
 - resolved target SHA;
 - assigned paths, symbols, boundaries, requirements, and trigger IDs;
 - report path and completion status.
 
-A domain, capability, role, and reviewer instance are different concepts. Two
+A domain, capability, and reviewer instance are different concepts. Two
 lenses performed by one reviewer are not independent. A report filename does
 not prove specialist dispatch.
 
@@ -27,25 +26,22 @@ not prove specialist dispatch.
 
 The terminal review always covers all seven domains:
 
-Resolve the concrete role through `role-map.json`; the table below is the
-human-readable contract and must remain synchronized with that file.
-
-| Domain | Required capability | Required role |
-|---|---|---|
-| `correctness` | `correctness-specialist` | `code-reviewer` |
-| `security` | `security-specialist` | `security-auditor` |
-| `code-quality` | `quality-specialist` | `code-reviewer` |
-| `maintainability` | `maintainability-specialist` | `pedantic-maintainer` |
-| `tests` | `test-specialist` | `test-engineer` |
-| `developer-experience` | `dx-specialist` | `code-reviewer` |
-| `architecture-contracts` | `architecture-specialist` | `code-reviewer` |
+| Domain | Required capability |
+|---|---|
+| `correctness` | `correctness-specialist` |
+| `security` | `security-specialist` |
+| `code-quality` | `quality-specialist` |
+| `maintainability` | `maintainability-specialist` |
+| `tests` | `test-specialist` |
+| `developer-experience` | `dx-specialist` |
+| `architecture-contracts` | `architecture-specialist` |
 
 Dispatch each row to a separate agent instance. Never combine
 baseline domains. A narrow assignment may return clean or not-applicable
-evidence after inspection; it may not be skipped. If a required role cannot be
-dispatched, return `REVIEW_BLOCKED` without a merge-readiness verdict. If a role
-override conflicts with full-history forking, use a context-light fork with the
-complete immutable packet. Never silently remove the role.
+evidence after inspection; it may not be skipped. If a required capability
+cannot be dispatched, return `REVIEW_BLOCKED` without a merge-readiness verdict.
+The active harness chooses the concrete reviewer, model, effort, context
+strategy, and scheduling. Never persist those choices as repository policy.
 
 Reviewer independence does not require simultaneous execution. When the root
 orchestrator plus reviewers exceed the harness's active-agent capacity, dispatch
@@ -71,8 +67,9 @@ Triggered assignments add coverage and never replace a baseline assignment:
   by target-snapshot review policy.
 
 Record every trigger with matched paths or symbols. Unknown production scope
-is a coverage gap. Triggered assignments use `code-reviewer` unless the
-engine's installed role map declares a narrower supported role.
+is a coverage gap. Triggered assignments declare only their domain and required
+capability; the active harness selects a reviewer capable of applying the bound
+prompt.
 
 Repository integration skills that assign verdicts or invoke planning are
 orchestrator policy. They never satisfy baseline or triggered assignments.
@@ -84,7 +81,7 @@ require multiple assignments, but different domain names or prompt files from
 one reviewer do not satisfy that floor.
 
 Independent validation uses a reviewer that produced no candidate report. It
-audits source decisions, deduplication, baseline roster completeness, role and
+audits source decisions, deduplication, baseline roster completeness,
 capability compliance, trigger completeness, and reviewer independence.
 
 ## Finding information contract

@@ -24,7 +24,7 @@ acting, read these ported full-review contracts completely and follow them:
 4. `${REVIEW_ROOT}/specialist-contract.md`
 5. `${REVIEW_ROOT}/evidence-contract.md`
 6. `${REVIEW_ROOT}/adversarial-contract.md`
-7. `${REVIEW_ROOT}/runner-contract.md`
+7. `${REVIEW_ROOT}/dispatch-contract.md`
 8. `${REVIEW_ROOT}/pipeline.md`
 
 The ported contracts are authoritative for review mechanics and artifact
@@ -38,10 +38,10 @@ repository gates. Integrated verification belongs to the v3 controller and
 task candidates. State in every report:
 `Static analysis: no runtime verification performed.`
 
-Use `.agents/model-routing.md`: the terminal root is Sol medium, every baseline
-and triggered specialist is Terra high, and the final independent adjudicator
-is Sol high. Sol high is reserved for adjudication. Never invoke v1 or v2
-implementation, review, or planning workflows.
+Concrete agents, models, effort, roles, and concurrency belong to the active
+harness. This skill defines review questions, capability and independence
+requirements, immutable identities, and evidence contracts only. Never invoke
+v1 or v2 implementation, review, or planning workflows.
 
 ## Required input
 
@@ -88,7 +88,8 @@ Create a review ID and persist this tree under the supplied output directory:
     ├── ledger.json
     ├── validation.md
     └── specialists/
-        └── <assignment>.md
+        ├── <assignment>.md
+        └── <assignment>.attestation.json
 ```
 
 `review.md` is the only authoritative verdict and remediation handoff. Evidence
@@ -116,8 +117,8 @@ not mechanically replay every accepted leaf review.
 
 ## Dispatch the full review roster
 
-Dispatch seven independent baseline specialists through the external Codex
-runner in `${REVIEW_ROOT}/runner-contract.md`. Each has a distinct reviewer
+Dispatch seven independent baseline specialists through the active harness as
+defined by `${REVIEW_ROOT}/dispatch-contract.md`. Each has a distinct reviewer
 identity and one primary domain:
 
 1. `correctness` — behavior, lifecycle, performance, state transitions,
@@ -173,17 +174,18 @@ public wire contracts require two distinct reviewers. A changed user-facing
 capability must be covered by the tests/user-journey specialist.
 
 If required capability or reviewer independence is unavailable, persist the
-coverage gap and return `REVIEW_BLOCKED`. Never combine or omit a baseline role
-to fit capacity. When external sessions are unavailable, use the collaboration
-fallback and dispatch in waves.
+coverage gap and return `REVIEW_BLOCKED`. Never combine or omit a baseline
+domain to fit capacity. Use the active harness's native delegation mechanism
+and dispatch in waves when capacity requires it.
 
 Every specialist receives the same immutable review tuple and only its scoped
 impact slice. Specialists remain read-only and return a schema-constrained
-report to the runner, which validates identity and publishes the evidence
+report. The root validates identity and publishes the evidence
 atomically. Specialists do not assign final IDs, plan, remediate, launch other
 reviewers, or communicate with the user.
 
-The immutable packet and runner record assignment identity. Each specialist
+The immutable packet and per-assignment dispatch attestation record assignment
+identity. Each specialist
 report records inspected and sampled scope, applicable requirements and task
 criteria, at least one material adversarial probe, candidate findings, clean
 rationale, and static limits. A clean report must name the most dangerous
@@ -268,7 +270,7 @@ files, requirements, high-risk boundaries, user-facing capabilities, and any
 gaps. `ledger.json` records every candidate and its final disposition.
 `validation.md` records the root source-validation decision for every
 candidate. The root may perform only immutable Git-object inspection,
-`run_specialists.py`, and the ported artifact validators. It must not run
+harness-native review dispatch, and the ported artifact validators. It must not run
 project tests, builds, formatters, linters, generators, migrations, servers,
 or arbitrary shell workflows. Validate the artifact structure with:
 

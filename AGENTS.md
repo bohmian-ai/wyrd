@@ -544,24 +544,22 @@ task packets, or documentation.
   tenancy, audit, migrations, cross-owner expansion, or suspicious evidence.
   Passing isolated leaves do not require a reviewer. The controller reconciles
   and integrates each eligible candidate as soon as its
-  actual dependencies and conflicts permit. V3 uses deep-reasoning
-  capability for planning and review, general-engineering capability for
-  orchestration and integration, and fast-execution capability for bounded
-  evidence retrieval and mechanical work. Harness-specific model and effort
-  mappings live in `.agents/model-routing.md`, not in this architecture
-  authority. Evidence scouts retrieve bounded evidence only and do not plan,
+  actual dependencies and conflicts permit. Concrete agents, models, effort,
+  roles, and concurrency are execution-environment concerns; plans, task
+  packets, review contracts, and repository skills must not assign or require
+  them. Evidence scouts retrieve bounded evidence only and do not plan,
   decide, edit, or execute. V3 plans require
   bounded task scope, declared dependencies, focused proof, progressive
   verification, optimistic scope discovery, autonomous reconciliation, and
   serial root integration; they do not require an external readiness workflow.
   Planning optimizes expected wall-clock time to accepted integrated code, not
-  packet count, theoretical DAG width, or worker utilization. Full decomposition
+  packet count, theoretical DAG width, or executor utilization. Full decomposition
   makes every outcome, owner, contract, dependency, acceptance criterion, and
-  proof obligation explicit; it does not require one worker dispatch per
+  proof obligation explicit; it does not require one execution task per
   boundary or make an ownership boundary a serial dependency. Package that
   decomposed work into coherent, decision-ready tasks for the shortest expected
   wall time. A task may include inseparable consumer, test, journey, or wiring
-  closure across owned surfaces under one primary outcome owner. Add a direct
+  closure across owned surfaces under one primary outcome. Add a direct
   dependency only when the successor genuinely requires the predecessor's
   integrated artifact or behavior; when planning fixes the shared contract,
   independent producers and consumers should fan out. Split further only when

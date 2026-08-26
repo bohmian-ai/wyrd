@@ -9,8 +9,8 @@ approved intent, active authority, `adversarial-contract.md`, and
 the orchestrator's proposed decision as evidence.
 
 Use a reviewer identity that produced no specialist candidate report. Before
-challenging candidates, audit the seven-domain baseline roster, required role
-and capability matches, trigger completeness, prompt and target digests, and
+challenging candidates, audit the seven-domain baseline roster, required
+capability matches, trigger completeness, prompt and target digests, and
 distinct reviewer identities. Any gap blocks merge-readiness.
 
 For every candidate selected by the independent-validation floor, challenge:

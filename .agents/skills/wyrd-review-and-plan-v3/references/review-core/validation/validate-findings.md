@@ -23,7 +23,7 @@ Candidate reports are durable supporting evidence and follow
 Build one candidate list containing:
 
 - immutable namespaced candidate ID;
-- assignment IDs, reviewer IDs, required capabilities, and actual roles;
+- assignment IDs, reviewer IDs, and required capabilities;
 - source reviewer and proposed category;
 - proposed severity and confidence;
 - locations and symbols;

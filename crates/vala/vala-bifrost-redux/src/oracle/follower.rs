@@ -258,13 +258,25 @@ impl OracleCatalogResolver {
 
 #[async_trait]
 impl FollowerSourceResolver for OracleCatalogResolver {
-    /// Builds one tenant-qualified catalog/Iceberg scan and rejects Scribe assignments.
+    /// Builds one tenant-qualified leaf for an Oracle assignment and rejects
+    /// Scribe assignments.
+    ///
+    /// Which leaf depends on the assignment's own scan id. A `:hot` assignment
+    /// reads sealed Scribe output directly through [`super::exec::HotParquetExec`],
+    /// which takes `assignment.predicates` as its own filter; every other
+    /// assignment reads compacted output through the catalog provider's scan,
+    /// which takes the same predicates as logical filters. Both leaves therefore
+    /// prune from the closure the leader signed, but only one of them is built
+    /// per call — the hot branch returns before the provider scan, so a hot
+    /// assignment never plans a catalog scan it would discard.
+    ///
     /// Cancellation during catalog or scan IO drops all locally acquired state
     /// and exposes no provider; retry restarts the complete resolution.
     ///
     /// # Errors
     /// Returns a redacted resolution error for a role mismatch, invalid table binding,
-    /// catalog lookup failure, or physical scan construction failure.
+    /// catalog lookup failure, hot-file metadata failure, or physical scan
+    /// construction failure.
     async fn resolve(
         &self,
         target_role: ClusterRole,
@@ -298,20 +310,6 @@ impl FollowerSourceResolver for OracleCatalogResolver {
                 .map(|plan| plan as Arc<dyn ExecutionPlan>)
                 .map_err(|_| "authenticated Oracle empty provider failed".to_owned());
         }
-        // Rebuild the leaf from the closure the leader signed. The follower
-        // resolves its own provider, so `assignment.predicates` is the only
-        // description of what this cut may skip; handing it back as logical
-        // filters is what lets the Iceberg source prune files and row groups.
-        // Projection stays `None` on purpose: the caller verifies the resolved
-        // provider's schema fingerprint against the assignment immediately
-        // after this returns, so the leaf must keep the full physical schema
-        // and let the projection above it do the narrowing.
-        let pushdown =
-            super::exec::scan_predicate_logical_exprs(&assignment.predicates, &provider.schema());
-        let plan = provider
-            .scan(session, None, &pushdown, None)
-            .await
-            .map_err(|_| "authenticated Oracle physical scan failed".to_owned())?;
         let catalog_binding =
             CatalogTableBinding::resolve((assignment.binding.tenant_id, table))
                 .map_err(|_| "authenticated Oracle assignment binding failed".to_owned())?;
@@ -365,6 +363,21 @@ impl FollowerSourceResolver for OracleCatalogResolver {
                 assignment.predicates.clone(),
             )));
         }
+        // Compacted assignments keep the catalog's own scan. Rebuild the leaf
+        // from the closure the leader signed: the follower resolves its own
+        // provider, so `assignment.predicates` is the only description of what
+        // this cut may skip, and handing it back as logical filters is what
+        // lets the Iceberg source prune files and row groups. Projection stays
+        // `None` on purpose — the caller verifies the resolved provider's
+        // schema fingerprint against the assignment immediately after this
+        // returns, so the leaf must keep the full physical schema and let the
+        // projection above it do the narrowing.
+        let pushdown =
+            super::exec::scan_predicate_logical_exprs(&assignment.predicates, &provider.schema());
+        let plan = provider
+            .scan(session, None, &pushdown, None)
+            .await
+            .map_err(|_| "authenticated Oracle physical scan failed".to_owned())?;
         restrict_plan_to_assigned_files(plan, &assigned_locations)
     }
 }

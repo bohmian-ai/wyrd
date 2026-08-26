@@ -2808,14 +2808,10 @@ impl FragmentDispatcher {
         } {
             let frame = match frame {
                 Ok(frame) => frame,
-                Err(DispatchError::Terminal) => return Err(DispatchError::Terminal),
                 Err(error) => {
                     tracing::warn!(?error, "Oracle follower frame stream completed partially");
                     record_peer_attempt(FragmentOutcome::Failed, dispatch_error_label(&error));
-                    return Err(DispatchError::Partial {
-                        attempt: buffer.finish_partial().ok(),
-                        reason: DispatchPartialReason::Timeout,
-                    });
+                    return Err(mid_stream_failure(error, buffer));
                 }
             };
             if let Err(error) = buffer.push(frame) {
@@ -2846,6 +2842,44 @@ impl FragmentDispatcher {
         record_peer_attempt(FragmentOutcome::Success, PeerErrorClass::None);
         telemetry.finish(FragmentOutcome::Success, attempt.footer.encoded_bytes);
         Ok(attempt)
+    }
+}
+
+/// Maps one mid-stream frame failure to the outcome the leader must classify.
+///
+/// A frame stream can die after the attempt opened, and what the leader is
+/// allowed to do about it depends entirely on *which* failure it was. Three of
+/// them make [`classify_partition_attempt`](super::exec) fail the partition
+/// outright, so they must arrive unchanged: [`DispatchError::Terminal`] is a
+/// contract or peer-security violation, [`DispatchError::TenantInvariant`] is a
+/// physically scanned foreign-tenant row, and [`DispatchError::StaleObject`]
+/// means the pinned cut moved and the query owes a replan. Softening any of
+/// them into a partial converts a refusal into a degraded success — for the
+/// tenant tripwire that is a silent tenant-isolation breach, because the leader
+/// would return the surviving participants' rows and report a timeout.
+///
+/// Every remaining failure only degrades the partition, so each becomes a
+/// [`DispatchPartialReason::Timeout`] partial carrying whatever `buffer`
+/// already decoded. Keeping those batches is the point of the partial: the
+/// leader folds them into the degraded result instead of discarding delivered
+/// rows.
+///
+/// The match is exhaustive on purpose. A new [`DispatchError`] variant must not
+/// be able to inherit "soften into a partial" by falling through a wildcard,
+/// which is how the tenant refusal previously lost its reason here.
+fn mid_stream_failure(error: DispatchError, buffer: AttemptBuffer) -> DispatchError {
+    match error {
+        error @ (DispatchError::Terminal
+        | DispatchError::TenantInvariant
+        | DispatchError::StaleObject) => error,
+        DispatchError::Partial { .. }
+        | DispatchError::Unavailable
+        | DispatchError::EligibleSourceLoss { .. }
+        | DispatchError::Capacity
+        | DispatchError::FileNotFound => DispatchError::Partial {
+            attempt: buffer.finish_partial().ok(),
+            reason: DispatchPartialReason::Timeout,
+        },
     }
 }
 

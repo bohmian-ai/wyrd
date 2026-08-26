@@ -21,4 +21,4 @@ for pkg in "${packages[@]}"; do
   cargo_args+=("-p" "$pkg")
 done
 
-exec cargo test --locked "${cargo_args[@]}" -- --skip pg_tests
+exec cargo nextest run --locked "${cargo_args[@]}" -E 'not test(pg_tests)'

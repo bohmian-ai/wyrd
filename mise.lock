@@ -4,6 +4,10 @@
 version = "0.19.8"
 backend = "cargo:cargo-deny"
 
+[[tools."cargo:cargo-nextest"]]
+version = "0.9.143"
+backend = "cargo:cargo-nextest"
+
 [[tools.cmake]]
 version = "3.26.4"
 backend = "aqua:Kitware/CMake"

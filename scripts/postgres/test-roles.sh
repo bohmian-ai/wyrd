@@ -54,10 +54,10 @@ docker info >/dev/null 2>&1 || { echo "Docker daemon is unavailable" >&2; exit 1
   fi
   PGPASSWORD="$admin_password" psql "$WYRD_TEST_DATABASE_ADMIN_URL" -v ON_ERROR_STOP=1 -c "REVOKE wyrd_operator_fixture FROM wyrd_app; REVOKE ALL PRIVILEGES ON DATABASE wyrd FROM wyrd_operator_fixture; DROP ROLE wyrd_operator_fixture;"
 '
-mise exec -- cargo test --locked -p wyrd-sql --features embedded-postgres \
+mise exec -- cargo nextest run --locked -p wyrd-sql --features embedded-postgres \
   postgres_boot::tests::fresh_embedded_and_external_catalog_snapshots_match \
-  -- --nocapture --test-threads=1
-mise exec -- cargo test --locked -p wyrd-sql --features embedded-postgres \
+  --test-threads=1
+mise exec -- cargo nextest run --locked -p wyrd-sql --features embedded-postgres \
   postgres_boot::role_bootstrap::tests::embedded_bootstrap_converges_real_catalog \
-  -- --nocapture --test-threads=1
+  --test-threads=1
 echo "postgres role audit: PASS"

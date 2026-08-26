@@ -36,9 +36,8 @@ use vala_bifrost_redux::oracle::peer::{
 use vala_bifrost_redux::oracle::{
     AuthorizedQueryContext, BifrostQueryReadDecision, BifrostSecurityViolation,
     DelegatedOracleAdmissionConfig, Oracle, OracleAudit, OracleBuildConfig, OracleConfig,
-    OracleMemoryResources, OracleSlotManager, QueryIpcDecoder, QueryOptions,
-    QueryResourceSnapshot, TailTransportDirectory, TestPostgresOracleAudit,
-    VerifiedSecurityContext,
+    OracleMemoryResources, OracleSlotManager, QueryIpcDecoder, QueryOptions, QueryResourceSnapshot,
+    TailTransportDirectory, TestPostgresOracleAudit, VerifiedSecurityContext,
 };
 use vala_bifrost_redux::schema::with_managed_columns;
 use vala_bifrost_redux::scribe::file_list_writer::{FileListInsert, insert_and_audit};
@@ -1505,7 +1504,10 @@ async fn decoded_query(mut query: vala_bifrost_redux::oracle::OracleQueryStream)
         match frame.expect("query frame") {
             QueryStreamFrame::Schema(frame) => {
                 assert!(schema.is_none(), "query emitted duplicate schema");
-                schema = Some(ipc.accept_schema(&frame.arrow_ipc_schema).expect("schema IPC"));
+                schema = Some(
+                    ipc.accept_schema(&frame.arrow_ipc_schema)
+                        .expect("schema IPC"),
+                );
             }
             QueryStreamFrame::Batch(frame) => {
                 assert!(schema.is_some(), "batch preceded schema");
@@ -1875,6 +1877,63 @@ async fn oracle_reads_both_automatic_cross_epoch_artifacts() {
     shutdown_oracle(&oracle).await;
 }
 
+/// Proves an empty successful result is a schema frame and a closing terminal.
+///
+/// An empty result has no batch frame at all, so the terminal's end-of-stream
+/// delta is the only evidence the stream completed rather than being truncated.
+///
+/// # Panics
+///
+/// Panics when the query fails, emits a batch, or does not close its stream.
+async fn assert_empty_success_is_schema_then_close(
+    oracle: &Oracle,
+    context: AuthorizedQueryContext,
+    table: &str,
+) {
+    let mut empty = oracle
+        .query_sql(
+            context,
+            BifrostQueryRequest {
+                sql: format!("SELECT value FROM {table} WHERE false"),
+                visibility: VisibilityMode::PublishedOnly,
+                freshness: FreshnessPolicy::Strict,
+                deadline_ms: Some(5_000),
+            },
+        )
+        .await
+        .expect("empty Oracle SQL");
+    let mut empty_ipc = QueryIpcDecoder::new();
+    let mut empty_rows = 0_usize;
+    let mut empty_terminal = None;
+    while let Some(frame) = empty.frames.next().await {
+        match frame.expect("query frame") {
+            QueryStreamFrame::Schema(frame) => {
+                empty_ipc
+                    .accept_schema(&frame.arrow_ipc_schema)
+                    .expect("schema prefix decodes");
+            }
+            QueryStreamFrame::Batch(frame) => {
+                empty_rows += empty_ipc
+                    .accept_batch(&frame.arrow_ipc_batch)
+                    .expect("batch delta decodes")
+                    .num_rows();
+            }
+            QueryStreamFrame::Terminal(frame) => {
+                empty_ipc
+                    .accept_eos(&frame.arrow_ipc_eos)
+                    .expect("empty success still closes the stream");
+                empty_terminal = Some(frame);
+            }
+        }
+    }
+    assert_eq!(empty_rows, 0);
+    assert_eq!(
+        empty_terminal.expect("empty terminal").row_count,
+        0,
+        "an empty success is schema then a closing terminal"
+    );
+}
+
 /// One Oracle query stream is one split Arrow IPC stream closed by its terminal.
 ///
 /// Proves the wire contract end to end against a real query: exactly one schema
@@ -1906,10 +1965,7 @@ async fn stateful_query_decoder_contract() {
         .query_sql(
             fixture.context(),
             BifrostQueryRequest {
-                sql: format!(
-                    "SELECT value FROM {} ORDER BY value",
-                    fixture.table.fqn()
-                ),
+                sql: format!("SELECT value FROM {} ORDER BY value", fixture.table.fqn()),
                 visibility: VisibilityMode::PublishedOnly,
                 freshness: FreshnessPolicy::Strict,
                 deadline_ms: Some(5_000),
@@ -1969,48 +2025,8 @@ async fn stateful_query_decoder_contract() {
         "the decoder retains at most one fragment at a time"
     );
 
-    let mut empty = oracle
-        .query_sql(
-            fixture.context(),
-            BifrostQueryRequest {
-                sql: format!("SELECT value FROM {} WHERE false", fixture.table.fqn()),
-                visibility: VisibilityMode::PublishedOnly,
-                freshness: FreshnessPolicy::Strict,
-                deadline_ms: Some(5_000),
-            },
-        )
-        .await
-        .expect("empty Oracle SQL");
-    let mut empty_ipc = QueryIpcDecoder::new();
-    let mut empty_rows = 0_usize;
-    let mut empty_terminal = None;
-    while let Some(frame) = empty.frames.next().await {
-        match frame.expect("query frame") {
-            QueryStreamFrame::Schema(frame) => {
-                empty_ipc
-                    .accept_schema(&frame.arrow_ipc_schema)
-                    .expect("schema prefix decodes");
-            }
-            QueryStreamFrame::Batch(frame) => {
-                empty_rows += empty_ipc
-                    .accept_batch(&frame.arrow_ipc_batch)
-                    .expect("batch delta decodes")
-                    .num_rows();
-            }
-            QueryStreamFrame::Terminal(frame) => {
-                empty_ipc
-                    .accept_eos(&frame.arrow_ipc_eos)
-                    .expect("empty success still closes the stream");
-                empty_terminal = Some(frame);
-            }
-        }
-    }
-    assert_eq!(empty_rows, 0);
-    assert_eq!(
-        empty_terminal.expect("empty terminal").row_count,
-        0,
-        "an empty success is schema then a closing terminal"
-    );
+    assert_empty_success_is_schema_then_close(&oracle, fixture.context(), &fixture.table.fqn())
+        .await;
 
     shutdown_oracle(&oracle).await;
 }

@@ -695,7 +695,7 @@ impl std::fmt::Debug for QueryIpcEncoder {
             .debug_struct("QueryIpcEncoder")
             .field("finished", &self.finished)
             .field("peak_retained_ipc_bytes", &self.peak_retained_ipc_bytes)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -868,8 +868,9 @@ impl QueryIpcDecoder {
         if self.schema.is_some() || self.eos_accepted {
             return Err(QueryIpcDecodeError::OutOfOrder);
         }
-        let mut prefix = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
-            .map_err(|_| QueryIpcDecodeError::Malformed)?;
+        let mut prefix =
+            arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
+                .map_err(|_| QueryIpcDecodeError::Malformed)?;
         let schema = prefix.schema();
         if prefix
             .next()
@@ -1290,8 +1291,8 @@ mod tests {
 
     use super::{OracleQueryStream, QueryStreamInput, QueryStreamLifecycle, successful_terminal};
     use crate::oracle::admission::{active_queries_for_test, admitted_guard_for_test};
-    use crate::oracle::failed_terminal_for_visibility;
     use crate::oracle::exec::OracleQueryScanStats;
+    use crate::oracle::failed_terminal_for_visibility;
     use crate::oracle::{
         BifrostError, OracleSlotManager, OracleTelemetry, QueryClass, QueryFreshness,
         QuerySchemaFrame, QuerySource, QueryStreamFrame, QueryTerminalErrorCode,
@@ -1546,7 +1547,10 @@ mod tests {
             .accept_schema(&schema_frame.arrow_ipc_schema)
             .expect("schema fragment decodes");
         assert!(fresh.accept_schema(&schema_frame.arrow_ipc_schema).is_err());
-        assert!(fresh.accept_eos(&[]).is_err(), "an absent EOS is not an EOS");
+        assert!(
+            fresh.accept_eos(&[]).is_err(),
+            "an absent EOS is not an EOS"
+        );
         assert!(fresh.accept_batch(&[0xAA, 0xBB, 0xCC]).is_err());
 
         // A failed or cancelled stream is dropped without `finish`, so its

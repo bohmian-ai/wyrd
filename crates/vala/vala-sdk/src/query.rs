@@ -336,7 +336,10 @@ impl RawQueryStream {
     /// Cancelling this operation preserves decoder state. Dropping the stream
     /// drops the HTTP response body and stops further reads.
     pub async fn next_frame(&mut self) -> Result<Option<QueryStreamFrame>, ValaSdkError> {
-        Ok(self.next_decoded_frame().await?.map(|(frame, _batch)| frame))
+        Ok(self
+            .next_decoded_frame()
+            .await?
+            .map(|(frame, _batch)| frame))
     }
 
     /// Returns the next validated frame with the batch its fragment decoded to.
@@ -397,9 +400,7 @@ impl RawQueryStream {
                             .as_ref()
                             .map(|batch| {
                                 u64::try_from(batch.num_rows()).map_err(|_| {
-                                    ValaSdkError::Protocol(
-                                        "row count does not fit u64".to_owned(),
-                                    )
+                                    ValaSdkError::Protocol("row count does not fit u64".to_owned())
                                 })
                             })
                             .transpose()?;
@@ -798,9 +799,10 @@ impl QueryIpcDecoder {
     /// end-of-stream, and [`ValaSdkError::Arrow`] when the fragment does not
     /// decode to exactly one record batch matching the stream schema.
     fn accept_batch(&mut self, bytes: &[u8]) -> Result<RecordBatch, ValaSdkError> {
-        let expected = self.schema.as_ref().ok_or_else(|| {
-            ValaSdkError::Protocol("batch arrived before schema".to_owned())
-        })?;
+        let expected = self
+            .schema
+            .as_ref()
+            .ok_or_else(|| ValaSdkError::Protocol("batch arrived before schema".to_owned()))?;
         if self.eos_accepted {
             return Err(ValaSdkError::Protocol(
                 "query stream frame arrived after its end-of-stream".to_owned(),
@@ -1378,8 +1380,11 @@ mod tests {
             .expect("standalone writer starts");
         writer
             .write(
-                &RecordBatch::try_new(Arc::clone(&other), vec![Arc::new(Int64Array::from(vec![1]))])
-                    .expect("standalone batch is valid"),
+                &RecordBatch::try_new(
+                    Arc::clone(&other),
+                    vec![Arc::new(Int64Array::from(vec![1]))],
+                )
+                .expect("standalone batch is valid"),
             )
             .expect("standalone batch writes");
         writer.finish().expect("standalone writer finishes");
@@ -1410,7 +1415,7 @@ mod tests {
     async fn stateful_ipc_decoder_contract() {
         let schema = test_schema();
         let (mut ipc, prefix) = TestQueryIpc::open(&schema);
-        let batches = vec![
+        let batches = [
             ipc.batch(&schema, &[1, 2]),
             ipc.batch(&schema, &[3]),
             ipc.batch(&schema, &[4, 5, 6]),
@@ -1464,7 +1469,10 @@ mod tests {
         }
         assert_eq!(rows, vec![1, 2, 3, 4, 5, 6]);
         assert_eq!(result.terminal().expect("terminal retained").row_count, 6);
-        assert!(result.raw.arrow_ipc_closed(), "terminal EOS closes the stream");
+        assert!(
+            result.raw.arrow_ipc_closed(),
+            "terminal EOS closes the stream"
+        );
         let largest = batches
             .iter()
             .map(Vec::len)
@@ -1510,7 +1518,9 @@ mod tests {
             decoder.accept_schema(&prefix).is_err(),
             "a stream carries exactly one schema"
         );
-        decoder.accept_eos(&closing).expect("end-of-stream accepted");
+        decoder
+            .accept_eos(&closing)
+            .expect("end-of-stream accepted");
         assert!(decoder.eos_accepted());
         assert!(
             decoder.accept_batch(&batches[0]).is_err(),

@@ -688,9 +688,8 @@ mod tests {
 
         // Field numbers are the contract: re-encoding the decoded terminal and
         // decoding it again must reproduce it byte for byte.
-        let reencoded = proto::QueryStreamFrame::from(domain::QueryStreamFrame::Terminal(
-            decoded.clone(),
-        ));
+        let reencoded =
+            proto::QueryStreamFrame::from(domain::QueryStreamFrame::Terminal(decoded.clone()));
         let mut roundtrip = QueryStreamConverter::new(domain::VisibilityMode::PublishedOnly);
         prime_schema(&mut roundtrip);
         assert_eq!(

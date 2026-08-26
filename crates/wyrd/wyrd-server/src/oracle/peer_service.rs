@@ -462,8 +462,7 @@ mod tests {
             granted,
             1,
         );
-        let expected =
-            vala_bifrost_redux::resources::OracleSessionShape::for_grant(granted, 1, 1);
+        let expected = vala_bifrost_redux::resources::OracleSessionShape::for_grant(granted, 1, 1);
 
         assert_eq!(sessions.shape(1), expected);
         assert_eq!(

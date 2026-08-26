@@ -1561,7 +1561,7 @@ impl QueryTerminalFrame {
                 reason: "live-tail warning must match unavailable source",
             });
         }
-        if failed == !self.arrow_ipc_eos.is_empty() {
+        if failed != self.arrow_ipc_eos.is_empty() {
             return Err(QueryContractError::InvalidTerminal {
                 reason: if failed {
                     "failed terminal must not carry an Arrow IPC end-of-stream"

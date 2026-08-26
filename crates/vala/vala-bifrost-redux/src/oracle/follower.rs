@@ -139,7 +139,7 @@ impl std::fmt::Debug for FollowerSessionFactory {
                 "admitted_target_partitions",
                 &self.admitted_target_partitions,
             )
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -2136,7 +2136,9 @@ pub(crate) mod tests {
                 table: "events".to_owned(),
             },
             persisted: PersistedFileAssignment {
-                files: (0..files).map(|index| format!("file-{index}.parquet")).collect(),
+                files: (0..files)
+                    .map(|index| format!("file-{index}.parquet"))
+                    .collect(),
             },
             scribe_provider_cut: cut.then(|| self::cut(Vec::new())),
             schema_fingerprint: "shape".to_owned(),
@@ -2178,9 +2180,15 @@ pub(crate) mod tests {
         assert_eq!(sessions.shape(3), expected);
         let (state, _context) = sessions.create(3).expect("admitted follower session");
         let options = state.config().options();
-        assert_eq!(options.execution.target_partitions, expected.target_partitions);
+        assert_eq!(
+            options.execution.target_partitions,
+            expected.target_partitions
+        );
         assert_eq!(options.execution.batch_size, expected.batch_size);
-        assert_eq!(options.optimizer.prefer_hash_join, expected.prefer_hash_join);
+        assert_eq!(
+            options.optimizer.prefer_hash_join,
+            expected.prefer_hash_join
+        );
         assert_eq!(
             expected.target_partitions, 3,
             "partitions narrow to the work this fragment was assigned"
@@ -2229,12 +2237,10 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn oracle_resolver_builds_fresh_request_local_context() {
         let sessions = test_sessions(1024);
-        let (first_state, first_context) = sessions
-            .create(2)
-            .expect("first governed request context");
-        let (second_state, second_context) = sessions
-            .create(2)
-            .expect("second governed request context");
+        let (first_state, first_context) =
+            sessions.create(2).expect("first governed request context");
+        let (second_state, second_context) =
+            sessions.create(2).expect("second governed request context");
         assert_ne!(first_state.session_id(), second_state.session_id());
         assert!(!Arc::ptr_eq(&first_context, &second_context));
         prove_role_local_providers_are_isolated_and_consumed_once().await;

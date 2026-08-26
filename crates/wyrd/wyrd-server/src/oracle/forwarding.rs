@@ -709,7 +709,8 @@ mod tests {
         );
 
         let mut ipc = ForwardedQueryIpc::new();
-        ipc.accept_schema(&prefix).expect("schema fragment accepted");
+        ipc.accept_schema(&prefix)
+            .expect("schema fragment accepted");
         assert!(
             ipc.accept_schema(&prefix).is_err(),
             "a forwarded stream carries exactly one schema"
@@ -723,7 +724,8 @@ mod tests {
         );
 
         let mut ipc = ForwardedQueryIpc::new();
-        ipc.accept_schema(&prefix).expect("schema fragment accepted");
+        ipc.accept_schema(&prefix)
+            .expect("schema fragment accepted");
         assert!(
             ipc.batch_rows(&vec![0; MAX_FORWARDED_BATCH_BYTES + 1])
                 .is_err(),
@@ -731,7 +733,8 @@ mod tests {
         );
 
         let mut ipc = ForwardedQueryIpc::new();
-        ipc.accept_schema(&prefix).expect("schema fragment accepted");
+        ipc.accept_schema(&prefix)
+            .expect("schema fragment accepted");
         ipc.close(&Vec::new())
             .expect("an absent end-of-stream is left to the converter");
     }

@@ -762,8 +762,12 @@ impl OraclePeerWorker {
         request: PhysicalExecuteFragmentRequest,
         admitted_grant: LeaderAdmittedGrant,
     ) -> Result<WorkerExecution, DispatchError> {
-        self.execute_with_capacity(request, WorkerCapacity::LeaderAdmitted, Some(admitted_grant))
-            .await
+        self.execute_with_capacity(
+            request,
+            WorkerCapacity::LeaderAdmitted,
+            Some(admitted_grant),
+        )
+        .await
     }
 
     /// Executes the shared verification and fragment workflow with explicit capacity ownership.
@@ -823,6 +827,41 @@ impl OraclePeerWorker {
         Ok(())
     }
 
+    /// Selects the follower session grant for one fragment's admitted capacity.
+    ///
+    /// Both capacities shape the session from a grant this process admitted:
+    /// the leader's own envelope in-process, or the worker quantum this node
+    /// charged for the remote fragment. Neither reads a caller-supplied hint.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DispatchError::Capacity`] when the capacity this fragment
+    /// claims has no retained grant to shape its session from.
+    fn admitted_sessions(
+        capacity: WorkerCapacity,
+        admitted_grant: Option<LeaderAdmittedGrant>,
+        worker_resources: Option<&FollowerWorkerResources>,
+    ) -> Result<FollowerSessionFactory, DispatchError> {
+        Ok(match capacity {
+            WorkerCapacity::LeaderAdmitted => {
+                let grant = admitted_grant.ok_or(DispatchError::Capacity)?;
+                FollowerSessionFactory::for_grant(
+                    grant.memory_pool,
+                    grant.granted_memory_bytes,
+                    grant.admitted_target_partitions,
+                )
+            }
+            WorkerCapacity::ReserveRunning => {
+                let resources = worker_resources.ok_or(DispatchError::Capacity)?;
+                FollowerSessionFactory::for_grant(
+                    resources.memory_pool(),
+                    resources.granted_memory_bytes(),
+                    resources.admitted_target_partitions(),
+                )
+            }
+        })
+    }
+
     async fn execute_with_capacity(
         &self,
         request: PhysicalExecuteFragmentRequest,
@@ -848,27 +887,8 @@ impl OraclePeerWorker {
         self.admit_verified_fragment(&request, &claims, tenant_id, &running)
             .await?;
         let follower = &self.physical_follower;
-        // Both capacities shape the session from a grant this process admitted:
-        // the leader's own envelope in-process, or the worker quantum this node
-        // charged for the remote fragment. Neither reads a caller-supplied hint.
-        let sessions = match capacity {
-            WorkerCapacity::LeaderAdmitted => {
-                let grant = admitted_grant.ok_or(DispatchError::Capacity)?;
-                FollowerSessionFactory::for_grant(
-                    grant.memory_pool,
-                    grant.granted_memory_bytes,
-                    grant.admitted_target_partitions,
-                )
-            }
-            WorkerCapacity::ReserveRunning => {
-                let resources = worker_resources.as_ref().ok_or(DispatchError::Capacity)?;
-                FollowerSessionFactory::for_grant(
-                    resources.memory_pool(),
-                    resources.granted_memory_bytes(),
-                    resources.admitted_target_partitions(),
-                )
-            }
-        };
+        let sessions =
+            Self::admitted_sessions(capacity, admitted_grant, worker_resources.as_ref())?;
         let binding = request
             .assignments
             .first()
@@ -2270,7 +2290,7 @@ impl std::fmt::Debug for LeaderAdmittedGrant {
                 "admitted_target_partitions",
                 &self.admitted_target_partitions,
             )
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -3777,10 +3797,7 @@ mod tests {
         request.assignments[0].required_columns = vec!["tampered_column".to_owned()];
 
         let result = worker
-            .execute_local(
-                request,
-                test_admitted_grant(2 * 1024 * 1024),
-            )
+            .execute_local(request, test_admitted_grant(2 * 1024 * 1024))
             .await;
         let Err(error) = result else {
             panic!("tampered assignment closure must be rejected before execution");
@@ -3966,10 +3983,7 @@ mod tests {
             let (worker, resolver, request) =
                 counting_worker_request(&oracle, &fragment, tenant, 51);
             worker
-                .execute_local(
-                    request,
-                    test_admitted_grant(2 * 1024 * 1024),
-                )
+                .execute_local(request, test_admitted_grant(2 * 1024 * 1024))
                 .await
                 .expect("valid v3 assignment authority digest executes");
             assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
@@ -3995,10 +4009,7 @@ mod tests {
                 counting_worker_request(&oracle, &fragment, tenant, 52);
             tamper(&mut request);
             let result = worker
-                .execute_local(
-                    request,
-                    test_admitted_grant(2 * 1024 * 1024),
-                )
+                .execute_local(request, test_admitted_grant(2 * 1024 * 1024))
                 .await;
             assert!(matches!(result, Err(DispatchError::Terminal)));
             assert_eq!(
@@ -4024,10 +4035,7 @@ mod tests {
             request.ticket.claims_bytes = bytes.clone();
             request.ticket.signature = bytes;
             let result = worker
-                .execute_local(
-                    request,
-                    test_admitted_grant(2 * 1024 * 1024),
-                )
+                .execute_local(request, test_admitted_grant(2 * 1024 * 1024))
                 .await;
             assert!(matches!(result, Err(DispatchError::Terminal)));
             assert_eq!(
@@ -4089,10 +4097,7 @@ mod tests {
         );
 
         let mut execution = worker
-            .execute_local(
-                request,
-                test_admitted_grant(2 * 1024 * 1024),
-            )
+            .execute_local(request, test_admitted_grant(2 * 1024 * 1024))
             .await
             .expect("leader-admitted execution");
         let frame = execution

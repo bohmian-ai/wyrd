@@ -533,8 +533,9 @@ mod tests {
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{
-        FreshnessPolicy, QueryBatchFrame, QueryFreshness, QuerySchemaFrame, QueryStreamFrame,
-        QueryTerminalFrame, QuerySource, SourceCompletion, SourceCompletionOutcome, VisibilityMode,
+        FreshnessPolicy, QueryBatchFrame, QueryFreshness, QuerySchemaFrame, QuerySource,
+        QueryStreamFrame, QueryTerminalFrame, SourceCompletion, SourceCompletionOutcome,
+        VisibilityMode,
     };
 
     use super::*;
@@ -771,11 +772,12 @@ mod tests {
             let (batches, has_more) = collect_bounded(stream(frames(eos.clone())), 100)
                 .await
                 .expect("split stream collects");
-            assert_eq!(batches.len(), 3, "each fragment decodes to exactly one batch");
             assert_eq!(
-                batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
-                5
+                batches.len(),
+                3,
+                "each fragment decodes to exactly one batch"
             );
+            assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 5);
             assert!(!has_more);
 
             let (bounded, has_more) = collect_bounded(stream(frames(eos)), 2)

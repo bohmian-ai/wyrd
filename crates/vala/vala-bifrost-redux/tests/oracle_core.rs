@@ -1,7 +1,6 @@
 //! Real T3 Oracle integration proofs selected by the recorded `oracle` filter.
 
 use std::collections::HashMap;
-use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -11,7 +10,6 @@ use arrow::array::{
     TimestampMicrosecondArray, UInt64Array,
 };
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow::ipc::reader::StreamReader;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use chrono::Utc;
@@ -38,8 +36,9 @@ use vala_bifrost_redux::oracle::peer::{
 use vala_bifrost_redux::oracle::{
     AuthorizedQueryContext, BifrostQueryReadDecision, BifrostSecurityViolation,
     DelegatedOracleAdmissionConfig, Oracle, OracleAudit, OracleBuildConfig, OracleConfig,
-    OracleMemoryResources, OracleSlotManager, QueryOptions, QueryResourceSnapshot,
-    TailTransportDirectory, TestPostgresOracleAudit, VerifiedSecurityContext,
+    OracleMemoryResources, OracleSlotManager, QueryIpcDecoder, QueryOptions,
+    QueryResourceSnapshot, TailTransportDirectory, TestPostgresOracleAudit,
+    VerifiedSecurityContext,
 };
 use vala_bifrost_redux::schema::with_managed_columns;
 use vala_bifrost_redux::scribe::file_list_writer::{FileListInsert, insert_and_audit};
@@ -1488,41 +1487,58 @@ struct DecodedQuery {
 
 /// Decodes and validates every schema, batch, and terminal frame.
 ///
+/// The stream is one Arrow IPC stream split across Wyrd frames, so a single
+/// decoder consumes the schema prefix, each batch delta, and the terminal
+/// end-of-stream delta. A non-failed terminal must close the stream.
+///
 /// # Panics
 ///
 /// Panics when IPC is malformed, schema frames are missing or duplicated,
-/// batch schemas diverge, frame ordering is invalid, or no terminal arrives.
+/// batch schemas diverge, frame ordering is invalid, the stream is not closed
+/// by a successful terminal, or no terminal arrives.
 async fn decoded_query(mut query: vala_bifrost_redux::oracle::OracleQueryStream) -> DecodedQuery {
+    let mut ipc = QueryIpcDecoder::new();
     let mut schema = None;
     let mut batches = Vec::new();
     let mut terminal = None;
+    let mut largest_fragment = 0_usize;
     while let Some(frame) = query.frames.next().await {
         match frame.expect("query frame") {
             QueryStreamFrame::Schema(frame) => {
                 assert!(schema.is_none(), "query emitted duplicate schema");
-                let reader = StreamReader::try_new(Cursor::new(frame.arrow_ipc_schema), None)
-                    .expect("schema IPC");
-                schema = Some(reader.schema());
+                schema = Some(ipc.accept_schema(&frame.arrow_ipc_schema).expect("schema IPC"));
             }
             QueryStreamFrame::Batch(frame) => {
                 assert!(schema.is_some(), "batch preceded schema");
-                let reader = StreamReader::try_new(Cursor::new(frame.arrow_ipc_batch), None)
-                    .expect("batch IPC");
-                for batch in reader {
-                    let batch = batch.expect("record batch IPC");
-                    assert_eq!(
-                        batch.schema().as_ref(),
-                        schema.as_ref().expect("schema").as_ref()
-                    );
-                    batches.push(batch);
-                }
+                largest_fragment = largest_fragment.max(frame.arrow_ipc_batch.len());
+                let batch = ipc.accept_batch(&frame.arrow_ipc_batch).expect("batch IPC");
+                assert_eq!(
+                    batch.schema().as_ref(),
+                    schema.as_ref().expect("schema").as_ref()
+                );
+                batches.push(batch);
             }
             QueryStreamFrame::Terminal(frame) => {
                 assert!(terminal.is_none(), "query emitted duplicate terminal");
+                if frame.outcome != QueryTerminalOutcome::Failed {
+                    ipc.accept_eos(&frame.arrow_ipc_eos)
+                        .expect("terminal closes the query IPC stream");
+                }
                 terminal = Some(frame);
             }
         }
     }
+    assert!(
+        terminal
+            .as_ref()
+            .is_some_and(|frame| frame.outcome == QueryTerminalOutcome::Failed)
+            || ipc.eos_accepted(),
+        "a non-failed query stream must be explicitly closed"
+    );
+    assert!(
+        ipc.peak_pending_frame_bytes() <= largest_fragment,
+        "the decoder retains at most one fragment at a time"
+    );
     DecodedQuery {
         schema: schema.expect("query schema"),
         batches,
@@ -1857,6 +1873,146 @@ async fn oracle_reads_both_automatic_cross_epoch_artifacts() {
     .await;
     assert_eq!(int64_values(&result, "value"), [11, 22]);
     assert_query_succeeded(&result);
+    shutdown_oracle(&oracle).await;
+}
+
+/// One Oracle query stream is one split Arrow IPC stream closed by its terminal.
+///
+/// Proves the wire contract end to end against a real query: exactly one schema
+/// prefix, one bare continuation delta per batch that is strictly smaller than
+/// a standalone re-encode of the same batch, and exactly one end-of-stream
+/// delta carried by the terminal. It also proves an empty successful result is
+/// schema-then-terminal, with no batch frame and a real close.
+#[tokio::test]
+async fn stateful_query_decoder_contract() {
+    let fixture = OracleFixture::new("oracle_stateful_ipc").await;
+    let _seeded = fixture
+        .seed_hot_rows_at_epoch(
+            "scribe-018f7ca27a4d7cc198a797fdd1f15101-epoch-1-shard-0-wal-1-1-00000.parquet",
+            &[(11, fixture.tenant), (22, fixture.tenant)],
+            1,
+        )
+        .await;
+    let oracle = fixture
+        .oracle(
+            Arc::new(TestPostgresOracleAudit::new(
+                fixture.pg.vala_postgres().clone(),
+            )),
+            Arc::new(TailTransportDirectory::default()),
+            OracleConfig::default(),
+        )
+        .await;
+
+    let mut stream = oracle
+        .query_sql(
+            fixture.context(),
+            BifrostQueryRequest {
+                sql: format!(
+                    "SELECT value FROM {} ORDER BY value",
+                    fixture.table.fqn()
+                ),
+                visibility: VisibilityMode::PublishedOnly,
+                freshness: FreshnessPolicy::Strict,
+                deadline_ms: Some(5_000),
+            },
+        )
+        .await
+        .expect("Oracle SQL");
+    let mut ipc = QueryIpcDecoder::new();
+    let mut schema_frames = 0_usize;
+    let mut fragments = Vec::new();
+    let mut rows = 0_u64;
+    let mut terminal = None;
+    while let Some(frame) = stream.frames.next().await {
+        match frame.expect("query frame") {
+            QueryStreamFrame::Schema(frame) => {
+                schema_frames += 1;
+                ipc.accept_schema(&frame.arrow_ipc_schema)
+                    .expect("schema prefix decodes");
+            }
+            QueryStreamFrame::Batch(frame) => {
+                let decoded = ipc
+                    .accept_batch(&frame.arrow_ipc_batch)
+                    .expect("batch delta decodes");
+                let mut standalone = Vec::new();
+                let mut writer = arrow::ipc::writer::StreamWriter::try_new(
+                    &mut standalone,
+                    decoded.schema().as_ref(),
+                )
+                .expect("standalone writer starts");
+                writer.write(&decoded).expect("standalone batch writes");
+                writer.finish().expect("standalone writer finishes");
+                drop(writer);
+                assert!(
+                    frame.arrow_ipc_batch.len() < standalone.len(),
+                    "a continuation delta must be smaller than a standalone stream"
+                );
+                rows += u64::try_from(decoded.num_rows()).expect("row count fits u64");
+                fragments.push(frame.arrow_ipc_batch.len());
+            }
+            QueryStreamFrame::Terminal(frame) => {
+                assert!(terminal.is_none(), "query emitted duplicate terminal");
+                assert_eq!(frame.outcome, QueryTerminalOutcome::Success);
+                ipc.accept_eos(&frame.arrow_ipc_eos)
+                    .expect("terminal closes the stream");
+                terminal = Some(frame);
+            }
+        }
+    }
+    assert_eq!(schema_frames, 1, "the stream carries exactly one schema");
+    assert!(ipc.eos_accepted(), "the stream is explicitly closed");
+    let terminal = terminal.expect("query terminal");
+    assert_eq!(terminal.row_count, rows);
+    assert_eq!(rows, 2);
+    let largest = fragments.into_iter().max().expect("query returned batches");
+    assert!(
+        ipc.peak_pending_frame_bytes() <= largest,
+        "the decoder retains at most one fragment at a time"
+    );
+
+    let mut empty = oracle
+        .query_sql(
+            fixture.context(),
+            BifrostQueryRequest {
+                sql: format!("SELECT value FROM {} WHERE false", fixture.table.fqn()),
+                visibility: VisibilityMode::PublishedOnly,
+                freshness: FreshnessPolicy::Strict,
+                deadline_ms: Some(5_000),
+            },
+        )
+        .await
+        .expect("empty Oracle SQL");
+    let mut empty_ipc = QueryIpcDecoder::new();
+    let mut empty_rows = 0_usize;
+    let mut empty_terminal = None;
+    while let Some(frame) = empty.frames.next().await {
+        match frame.expect("query frame") {
+            QueryStreamFrame::Schema(frame) => {
+                empty_ipc
+                    .accept_schema(&frame.arrow_ipc_schema)
+                    .expect("schema prefix decodes");
+            }
+            QueryStreamFrame::Batch(frame) => {
+                empty_rows += empty_ipc
+                    .accept_batch(&frame.arrow_ipc_batch)
+                    .expect("batch delta decodes")
+                    .num_rows();
+            }
+            QueryStreamFrame::Terminal(frame) => {
+                empty_ipc
+                    .accept_eos(&frame.arrow_ipc_eos)
+                    .expect("empty success still closes the stream");
+                empty_terminal = Some(frame);
+            }
+        }
+    }
+    assert_eq!(empty_rows, 0);
+    assert_eq!(
+        empty_terminal.expect("empty terminal").row_count,
+        0,
+        "an empty success is schema then a closing terminal"
+    );
+
     shutdown_oracle(&oracle).await;
 }
 

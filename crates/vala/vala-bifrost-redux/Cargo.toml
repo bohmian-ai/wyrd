@@ -16,7 +16,7 @@ autotests = false
 # includes.
 [[test]]
 name = "integration"
-path = "tests/integration.rs"
+path = "tests/integration/main.rs"
 required-features = ["test-support"]
 
 [features]

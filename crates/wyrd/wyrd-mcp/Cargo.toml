@@ -22,7 +22,7 @@ path = "src/lib.rs"
 # `tests/mcp.rs`, not a `mise.toml` line.
 [[test]]
 name = "mcp"
-path = "tests/mcp.rs"
+path = "tests/bifrost/mcp/main.rs"
 
 [dependencies]
 arrow = { workspace = true }

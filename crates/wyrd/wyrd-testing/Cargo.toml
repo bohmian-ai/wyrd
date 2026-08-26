@@ -13,40 +13,45 @@ default = []
 bench = ["dep:wyrd-bench"]
 python = ["dep:pyo3", "dep:wyrd-utils"]
 
-# Capability-scoped Bifrost test binaries: each target is named for the
-# capability it proves, and every test source is a `#[path]` module of exactly
-# one of them. `autotests = false` keeps those sources from also becoming
-# targets on their own — without it a `#[path]`-included file compiles into two
-# binaries. Lanes select a whole target and never an individual test name, so
-# adding a test to an existing binary needs no `mise.toml` edit. See
-# `tests/README.md`.
+# Capability-scoped Bifrost test binaries. Each target is named for the
+# capability it proves and lives in `tests/bifrost/<capability>/`, where
+# `main.rs` is the binary root and every sibling file is one of its modules —
+# an ordinary directory module tree, so no `#[path]` attributes are needed.
+#
+# `autotests = false` is what keeps a module from also becoming a target of its
+# own; without it, Cargo would promote every `tests/*.rs` file and each module
+# would compile and run twice. Keeping the sources one directory down makes
+# that structural rather than a rule to remember.
+#
+# Lanes select a whole target and never an individual test name, so adding a
+# test to an existing binary needs no `mise.toml` edit. See `tests/README.md`.
 [[test]]
 name = "forge"
-path = "tests/forge.rs"
+path = "tests/bifrost/forge/main.rs"
 
 [[test]]
 name = "scribe"
-path = "tests/scribe.rs"
+path = "tests/bifrost/scribe/main.rs"
 
 [[test]]
 name = "oracle"
-path = "tests/oracle.rs"
+path = "tests/bifrost/oracle/main.rs"
 
 [[test]]
 name = "otlp"
-path = "tests/otlp.rs"
+path = "tests/bifrost/otlp/main.rs"
 
 [[test]]
 name = "cluster"
-path = "tests/cluster.rs"
+path = "tests/bifrost/cluster/main.rs"
 
 [[test]]
 name = "server"
-path = "tests/server.rs"
+path = "tests/bifrost/server/main.rs"
 
 [[test]]
 name = "interleavings"
-path = "tests/interleavings.rs"
+path = "tests/bifrost/interleavings/main.rs"
 
 [dependencies]
 async-trait = { workspace = true }

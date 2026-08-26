@@ -91,11 +91,15 @@ description = "Run shared family tests (unit tests only — pg_tests skipped wit
 run = "bash scripts/run-family-tests.sh shared"
 
 [tasks."test:bifrost"]
-description = """Run every vala-bifrost-redux test target — lib, the `integration` binary,
-`pg_file_list_tenant_table`, and doc tests — at the canonical test feature union
-against an isolated Postgres lifecycle. This is the one complete crate lane; no
-narrower selector covers the `test-support` lib surface."""
-run = "scripts/postgres/with-test-postgres.sh -- cargo test --locked -p vala-bifrost-redux --features \"$WYRD_REDUX_TEST_FEATURES\" -- --test-threads=1"
+description = """Tier-2 lane: every vala-bifrost-redux test — lib, the `integration`
+binary, and doc tests — at the canonical test feature union against an isolated
+Postgres lifecycle. `integration` is the crate's only test target and every
+source under its `tests/` directory is a module of it, so this one command is
+complete; no narrower selector covers the `test-support` lib surface.
+`--include-ignored` is required: redux marks a journey-flavored test `#[ignore]`
+to keep it out of the family lanes, and this is the lane that must still run it.
+Tier-1 user journeys live in wyrd-testing and run under test:bifrost:journey."""
+run = "scripts/postgres/with-test-postgres.sh -- cargo test --locked -p vala-bifrost-redux --features \"$WYRD_REDUX_TEST_FEATURES\" -- --include-ignored --test-threads=1"
 
 [tasks."test:bifrost:journey"]
 description = """Run the current Bifrost/Scribe Rust user-journey tests (marked #[ignore]
@@ -104,21 +108,100 @@ so they stay out of the fast lane) against live Postgres."""
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:bifrost:journey:inner'"
 [tasks."test:bifrost:journey:inner"]
 hide = true
-description = """Run every Bifrost capability test binary whole against live Postgres.
-Each line selects a Cargo target, never an individual test name: Cargo resolves a
-target against the manifest and fails loudly when it is missing, while a
-positional test-name filter is unverified and exits 0 after selecting nothing.
-Adding a journey to an existing binary therefore needs no edit here."""
+description = """Run every Bifrost tier-1 capability binary, one after another, against
+the live Postgres this lane's parent already stood up. Each capability has a
+`test:bifrost:journey:<capability>` lane of its own; this task calls their
+`:inner` halves in sequence so every binary is defined in exactly one place and
+runs under one database lifecycle rather than standing up eight."""
 run = """
-cargo test --locked -p vala-sdk --test pg_bifrost_e2e -- --include-ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test forge -- --include-ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test scribe -- --include-ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test oracle -- --include-ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test otlp -- --include-ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test server -- --include-ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test interleavings -- --include-ignored --test-threads=1
-cargo test --locked -p wyrd-mcp --test mcp -- --include-ignored --test-threads=1
+mise run test:bifrost:journey:sdk:inner
+mise run test:bifrost:journey:forge:inner
+mise run test:bifrost:journey:scribe:inner
+mise run test:bifrost:journey:oracle:inner
+mise run test:bifrost:journey:otlp:inner
+mise run test:bifrost:journey:server:inner
+mise run test:bifrost:journey:interleavings:inner
+mise run test:bifrost:journey:mcp:inner
 """
+
+# --- Per-capability tier-1 lanes -------------------------------------------
+#
+# Every lane below selects a Cargo *target* and runs it whole. Cargo resolves a
+# target against the manifest and fails loudly when it is missing, while a
+# positional test-name filter is unverified and exits 0 after selecting nothing.
+# Adding a journey to an existing binary therefore needs no edit in this file.
+#
+# Each capability is a pair: a public lane that stands up Postgres and migrates,
+# and a hidden `:inner` that is just the cargo line. `test:bifrost:journey`
+# composes the inners; a developer iterating on one capability runs the public
+# lane. There is one definition of each binary's command, in the `:inner`.
+#
+# `crates/wyrd/wyrd-testing/tests/README.md` maps binaries to the sources they
+# aggregate and is the place to look before adding a journey.
+
+[tasks."test:bifrost:journey:sdk"]
+description = "Tier-1 journeys: the vala-sdk public Bifrost client path"
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:bifrost:journey:sdk:inner'"
+[tasks."test:bifrost:journey:sdk:inner"]
+hide = true
+description = "vala-sdk pg_bifrost_e2e binary, whole"
+run = "cargo test --locked -p vala-sdk --test pg_bifrost_e2e -- --include-ignored --test-threads=1"
+
+[tasks."test:bifrost:journey:forge"]
+description = "Tier-1 journeys: compaction, maintenance, publication recovery, lease reclaim"
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:bifrost:journey:forge:inner'"
+[tasks."test:bifrost:journey:forge:inner"]
+hide = true
+description = "wyrd-testing `forge` binary, whole"
+run = "cargo test --locked -p wyrd-testing --test forge -- --include-ignored --test-threads=1"
+
+[tasks."test:bifrost:journey:scribe"]
+description = "Tier-1 journeys: write, ack, seal, WAL replay, admission window, source boundary"
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:bifrost:journey:scribe:inner'"
+[tasks."test:bifrost:journey:scribe:inner"]
+hide = true
+description = "wyrd-testing `scribe` binary, whole"
+run = "cargo test --locked -p wyrd-testing --test scribe -- --include-ignored --test-threads=1"
+
+[tasks."test:bifrost:journey:oracle"]
+description = "Tier-1 journeys: query execution, distributed dispatch, peer security, tail fencing, spill, telemetry"
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:bifrost:journey:oracle:inner'"
+[tasks."test:bifrost:journey:oracle:inner"]
+hide = true
+description = "wyrd-testing `oracle` binary, whole"
+run = "cargo test --locked -p wyrd-testing --test oracle -- --include-ignored --test-threads=1"
+
+[tasks."test:bifrost:journey:otlp"]
+description = "Tier-1 journeys: OTLP logs, metrics, traces, mixed batch, negative protocol surface"
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:bifrost:journey:otlp:inner'"
+[tasks."test:bifrost:journey:otlp:inner"]
+hide = true
+description = "wyrd-testing `otlp` binary, whole"
+run = "cargo test --locked -p wyrd-testing --test otlp -- --include-ignored --test-threads=1"
+
+[tasks."test:bifrost:journey:server"]
+description = "Tier-1 journeys: gRPC mount, server boot, owner lifecycle and inspection"
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:bifrost:journey:server:inner'"
+[tasks."test:bifrost:journey:server:inner"]
+hide = true
+description = "wyrd-testing `server` binary, whole"
+run = "cargo test --locked -p wyrd-testing --test server -- --include-ignored --test-threads=1"
+
+[tasks."test:bifrost:journey:interleavings"]
+description = "Tier-1 journeys: deterministic scheduler permutation checks (no database)"
+run = "cargo test --locked -p wyrd-testing --test interleavings -- --include-ignored --test-threads=1"
+[tasks."test:bifrost:journey:interleavings:inner"]
+hide = true
+description = "wyrd-testing `interleavings` binary, whole; identical to the public lane, which needs no database"
+run = "cargo test --locked -p wyrd-testing --test interleavings -- --include-ignored --test-threads=1"
+
+[tasks."test:bifrost:journey:mcp"]
+description = "Tier-1 journeys: Bifrost MCP surface and its RBAC"
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:bifrost:journey:mcp:inner'"
+[tasks."test:bifrost:journey:mcp:inner"]
+hide = true
+description = "wyrd-mcp `mcp` binary, whole"
+run = "cargo test --locked -p wyrd-mcp --test mcp -- --include-ignored --test-threads=1"
 
 [tasks."test:bifrost:cluster"]
 description = "Run the deterministic public-Gate Bifrost cluster matrix"
@@ -1244,29 +1327,3 @@ hide = true
 description = "Validate the TOML-aware database task lifecycle inventory and regression fixture"
 run = "python3 scripts/postgres/check-inventory.py && python3 scripts/postgres/check-inventory.py --negative-test"
 
-[tasks."test:bifrost:oracle-distributed-parity"]
-description = "Run exact distributed Oracle execution parity tests."
-run = """
-scripts/postgres/with-test-postgres.sh -- bash -lc 'set -euo pipefail;
-mise run db:migrate:inner;
-cargo check --locked -p vala-bifrost-redux --features test-support,bench-support;
-cargo check --locked -p wyrd-server;
-cargo check --locked -p wyrd-testing;
-cargo test --locked -p vala-bifrost-redux --features test-support,bench-support --test integration -- oracle_core::remote_scan_rule_matches_expected_plan_shapes --exact --nocapture --test-threads=1;
-cargo test --locked -p vala-bifrost-redux --features test-support,bench-support --test integration -- oracle_core::participant_cut_is_selected_sorted_and_read_once --exact --nocapture --test-threads=1;
-cargo test --locked -p vala-bifrost-redux --features test-support,bench-support --test integration -- oracle_core::file_count_size_and_hash_partition_assignments_are_exact --exact --nocapture --test-threads=1;
-cargo test --locked -p vala-bifrost-redux --features test-support,bench-support --test integration -- oracle_core::later_partition_opens_while_first_is_barriered --exact --nocapture --test-threads=1;
-cargo test --locked -p vala-bifrost-redux --features test-support,bench-support --test integration -- oracle_core::completion_inversion_preserves_leader_plan_output --exact --nocapture --test-threads=1;
-cargo test --locked -p vala-bifrost-redux --features test-support,bench-support --test integration -- oracle_core::empty_oracle_skips_rpc_but_empty_scribe_executes --exact --nocapture --test-threads=1;
-cargo test --locked -p vala-bifrost-redux --features test-support,bench-support --test integration -- oracle_core::client_setup_matrix_is_partial --exact --nocapture --test-threads=1;
-cargo test --locked -p vala-bifrost-redux --features test-support,bench-support --test integration -- oracle_core::do_get_status_matrix_is_exact --exact --nocapture --test-threads=1;
-cargo test --locked -p vala-bifrost-redux --features test-support,bench-support --test integration -- oracle_core::decoder_partial_retains_prior_batches --exact --nocapture --test-threads=1;
-cargo test --locked -p vala-bifrost-redux --features test-support,bench-support --test integration -- oracle_core::post_delivery_failure_has_one_attempt --exact --nocapture --test-threads=1;
-cargo test --locked -p vala-bifrost-redux --features test-support,bench-support --test integration -- oracle_core::deadline_is_captured_once_and_never_refreshed --exact --nocapture --test-threads=1;
-cargo test --locked -p vala-bifrost-redux --features test-support,bench-support --test integration -- oracle_core::cancel_joins_every_started_partition --exact --nocapture --test-threads=1;
-cargo test --locked -p vala-bifrost-redux --features test-support,bench-support --test integration -- oracle_core::terminal_paths_release_all_distributed_owners --exact --nocapture --test-threads=1;
-cargo test --locked -p wyrd-testing --test oracle -- --include-ignored --test-threads=1;
-cargo test --locked -p wyrd-testing --test oracle -- oracle_edge_journeys::pg_bifrost_oracle_heterogeneous_distributed_query_journey --exact --ignored --nocapture --test-threads=1;
-cargo test --locked -p wyrd-testing --test oracle -- oracle_edge_journeys::pg_bifrost_selective_tail_backed_distributed_parity --exact --ignored --nocapture --test-threads=1;
-cargo test --locked -p wyrd-testing --test cluster -- pg_bifrost_cluster_load::pg_oracle_resource_ladder_r0_distributed_execution --exact --ignored --nocapture --test-threads=1'
-"""

@@ -8,29 +8,15 @@ authors.workspace = true
 rust-version.workspace = true
 autotests = false
 
+# `integration` is the crate's only test target. Every source under `tests/` is a
+# `#[path]` module of it, so a source is compiled and run exactly once.
+# `autotests = false` above is what makes that hold: without it Cargo would also
+# promote each `tests/*.rs` file to a target of its own and every module would
+# execute twice. Do not add a second `[[test]]` for a file this binary already
+# includes.
 [[test]]
 name = "integration"
 path = "tests/integration.rs"
-required-features = ["test-support"]
-
-[[test]]
-name = "pg_file_list_tenant_table"
-path = "tests/pg_file_list_tenant_table.rs"
-
-# Narrow, manifest-verified slices of the `integration` aggregate. A lane that
-# needs less than the whole aggregate selects one of these targets, which Cargo
-# resolves against this manifest and fails loudly when it is missing; a
-# positional test-name filter is unverified and exits 0 after selecting nothing.
-# Both sources stay `#[path]` modules of `integration` as well, preserving the
-# existing duplicate compile rather than multiplying it.
-[[test]]
-name = "oracle_core"
-path = "tests/oracle_core.rs"
-required-features = ["test-support"]
-
-[[test]]
-name = "forge_incremental_compaction"
-path = "tests/forge_incremental_compaction.rs"
 required-features = ["test-support"]
 
 [features]

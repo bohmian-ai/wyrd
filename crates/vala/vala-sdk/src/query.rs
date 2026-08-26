@@ -468,6 +468,12 @@ impl RawQueryStream {
     pub const fn peak_pending_frame_bytes(&self) -> usize {
         self.ipc.peak_pending_frame_bytes()
     }
+
+    /// Returns total Arrow IPC bytes consumed across every fragment.
+    #[must_use]
+    pub const fn arrow_ipc_bytes(&self) -> usize {
+        self.ipc.total_fragment_bytes()
+    }
 }
 
 /// Maps a Reqwest body failure without confusing transport with framing.
@@ -650,6 +656,34 @@ impl QueryResultStream {
     pub fn encoded_bytes(&self) -> usize {
         self.encoded_bytes
     }
+
+    /// Reports whether the query's Arrow IPC stream was explicitly closed.
+    ///
+    /// A successful or degraded query closes its single IPC stream with the
+    /// end-of-stream delta carried by the terminal frame. A caller that must
+    /// distinguish a complete result from a truncated one reads this rather
+    /// than inferring completeness from an absent batch.
+    #[must_use]
+    pub const fn arrow_ipc_closed(&self) -> bool {
+        self.raw.arrow_ipc_closed()
+    }
+
+    /// Returns the largest single Arrow fragment this stream held while decoding.
+    #[must_use]
+    pub const fn peak_pending_frame_bytes(&self) -> usize {
+        self.raw.peak_pending_frame_bytes()
+    }
+
+    /// Returns total Arrow IPC bytes this query carried across every fragment.
+    ///
+    /// The query is one split IPC stream, so this counts one schema prefix,
+    /// each batch's bare delta, and the single end-of-stream delta — strictly
+    /// less than re-encoding each batch as its own standalone stream once the
+    /// query returns more than one batch.
+    #[must_use]
+    pub const fn arrow_ipc_bytes(&self) -> usize {
+        self.raw.arrow_ipc_bytes()
+    }
 }
 
 /// Explicit collection ceilings used by CLI, MCP, and tests.
@@ -700,6 +734,8 @@ struct QueryIpcDecoder {
     eos_accepted: bool,
     /// Largest single fragment this decoder has held while decoding.
     peak_pending_frame_bytes: usize,
+    /// Total Arrow IPC bytes this decoder consumed across every fragment.
+    total_fragment_bytes: usize,
 }
 
 impl QueryIpcDecoder {
@@ -710,6 +746,7 @@ impl QueryIpcDecoder {
             schema: None,
             eos_accepted: false,
             peak_pending_frame_bytes: 0,
+            total_fragment_bytes: 0,
         }
     }
 
@@ -821,6 +858,11 @@ impl QueryIpcDecoder {
         self.peak_pending_frame_bytes
     }
 
+    /// Returns the total Arrow IPC bytes consumed across every fragment.
+    const fn total_fragment_bytes(&self) -> usize {
+        self.total_fragment_bytes
+    }
+
     /// Pushes one fragment through Arrow's decoder, allowing at most one batch.
     ///
     /// # Errors
@@ -829,6 +871,7 @@ impl QueryIpcDecoder {
     /// fragment yields more than one record batch.
     fn feed(&mut self, bytes: &[u8]) -> Result<Option<RecordBatch>, ValaSdkError> {
         self.peak_pending_frame_bytes = self.peak_pending_frame_bytes.max(bytes.len());
+        self.total_fragment_bytes = self.total_fragment_bytes.saturating_add(bytes.len());
         let mut buffer = arrow::buffer::Buffer::from_vec(bytes.to_vec());
         let mut decoded = None;
         while !buffer.is_empty() {

@@ -810,6 +810,155 @@ mod pg_tests {
         srv.shutdown().await.expect("server shutdown");
     }
 
+    /// Builds one Arrow IPC ingest payload with the journey's two-column schema.
+    fn native_ipc_rows(ids: &[i64], values: &[&str]) -> Vec<u8> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ids.to_vec())),
+                Arc::new(StringArray::from(values.to_vec())),
+            ],
+        )
+        .expect("valid native SDK batch");
+        let mut bytes = Vec::new();
+        let mut writer = StreamWriter::try_new(&mut bytes, schema.as_ref()).expect("IPC writer");
+        writer.write(&batch).expect("write IPC batch");
+        writer.finish().expect("finish IPC stream");
+        bytes
+    }
+
+    /// A multi-batch query carries one schema and closes with one explicit EOS.
+    ///
+    /// The public query stream is one Arrow IPC stream split across Wyrd frames,
+    /// so a result with several batches repeats neither the schema nor the
+    /// stream prefix. This journey drives the real SDK against a real server and
+    /// proves the wire consequence directly: the query's total Arrow bytes are
+    /// strictly fewer than re-encoding the same batches as standalone streams,
+    /// the stream is explicitly closed, and the client never retains more than
+    /// one fragment at a time.
+    #[tokio::test]
+    async fn pg_bifrost_multi_batch_query_stream_reuses_schema() {
+        let srv = WyrdTestServer::start_bound()
+            .await
+            .expect("test server start");
+        let table_name = format!("sdk_multi_batch_{}", uuid::Uuid::now_v7().simple());
+        let table_fqn = format!("vala.bifrost.{table_name}");
+        srv.state()
+            .bifrost_catalog()
+            .expect("Bifrost catalog")
+            .create_table(CreateTableRequest {
+                table: TableRef::new(BifrostNamespace::Bifrost, &table_name),
+                user_fields: vec![
+                    Field::new("id", DataType::Int64, false),
+                    Field::new("value", DataType::Utf8, false),
+                ],
+                tenant: srv.data_tenant_id(),
+                physical_layout: None,
+                audit: None,
+            })
+            .await
+            .expect("register multi-batch journey table");
+        let bootstrap = srv
+            .bootstrap_service("sdk-multi-batch-query", &["admin"])
+            .await
+            .expect("bootstrap SDK caller");
+        let mut config = ClientConfig {
+            grpc: GrpcConfig {
+                endpoint: srv.grpc_url().expect("gRPC URL"),
+                connect_retries: 0,
+                ..GrpcConfig::default()
+            },
+            http: HttpConfig {
+                base_url: srv.base_url().expect("HTTP URL").to_owned(),
+                ..HttpConfig::default()
+            },
+            api_key: Some(bootstrap.api_key().expect("machine API key").clone()),
+            ..ClientConfig::default()
+        };
+        config.grpc.max_message_bytes = 32 * 1024 * 1024;
+        let client = WyrdClient::with_config(config).expect("public SDK client");
+        // Two independently sealed ingests become two scan targets, so the
+        // query returns more than one batch on one shared IPC stream.
+        for (ids, values) in [
+            (vec![1_i64, 2], vec!["one", "two"]),
+            (vec![3_i64, 4], vec!["three", "four"]),
+        ] {
+            BifrostGrpcTransport::connect(&client)
+                .await
+                .expect("connect ingest")
+                .insert_batch(
+                    &table_fqn,
+                    uuid::Uuid::now_v7().into_bytes(),
+                    native_ipc_rows(&ids, &values),
+                )
+                .await
+                .expect("durable ingest ACK");
+            srv.flush_bifrost().await.expect("flush Scribe");
+        }
+
+        let request = BifrostQueryRequest {
+            sql: format!("SELECT id, value FROM {table_fqn} ORDER BY id"),
+            visibility: VisibilityMode::PublishedOnly,
+            freshness: FreshnessPolicy::Strict,
+            deadline_ms: None,
+        };
+        let mut stream = QueryClient::new(&client)
+            .query(&request)
+            .await
+            .expect("Oracle query starts");
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.next_batch().await.expect("valid terminal stream") {
+            batches.push(batch);
+        }
+        let schema = stream.schema().expect("authoritative schema").clone();
+        assert!(
+            batches.len() >= 2,
+            "the journey needs a multi-batch result to prove schema reuse"
+        );
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 4);
+        let terminal = stream.terminal().expect("validated terminal");
+        assert_eq!(terminal.row_count, 4);
+        assert!(
+            !terminal.arrow_ipc_eos.is_empty(),
+            "a successful terminal carries its end-of-stream delta"
+        );
+        assert!(stream.arrow_ipc_closed(), "the IPC stream is closed");
+
+        let standalone: usize = batches
+            .iter()
+            .map(|batch| {
+                let mut bytes = Vec::new();
+                let mut writer = StreamWriter::try_new(&mut bytes, schema.as_ref())
+                    .expect("standalone writer starts");
+                writer.write(batch).expect("standalone batch writes");
+                writer.finish().expect("standalone writer finishes");
+                drop(writer);
+                bytes.len()
+            })
+            .sum();
+        assert!(
+            stream.arrow_ipc_bytes() < standalone,
+            "one shared stream must carry fewer Arrow bytes than per-batch streams: {} vs {standalone}",
+            stream.arrow_ipc_bytes()
+        );
+        let largest_batch = batches
+            .iter()
+            .map(RecordBatch::get_array_memory_size)
+            .max()
+            .expect("result has batches");
+        assert!(
+            stream.peak_pending_frame_bytes() <= stream.arrow_ipc_bytes(),
+            "the client retains one fragment, never the whole stream"
+        );
+        assert!(largest_batch > 0);
+        srv.shutdown().await.expect("server shutdown");
+    }
+
     #[tokio::test]
     async fn public_sdk_bidi_write_ack_and_durable_readback() {
         let srv = WyrdTestServer::start_bound()

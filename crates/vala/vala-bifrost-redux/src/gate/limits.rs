@@ -10,8 +10,18 @@ use num_traits::ToPrimitive;
 pub const BIFROST_TRANSPORT_LIMIT_BYTES: usize = 400 * 1024 * 1024;
 /// Smallest accounting unit used for transport body ownership.
 pub const BIFROST_TRANSPORT_QUANTUM_BYTES: usize = 64 * 1024;
-/// Default individual encoded HTTP or tonic message selected for Bifrost.
+/// Largest encoded body any Bifrost transport surface admits before parsing.
+///
+/// An abuse ceiling only. It bounds nothing else and is never a memory-sizing
+/// input; Scribe plans against [`BIFROST_INGEST_REQUEST_LIMIT_BYTES`].
 pub const BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES: usize = 200 * 1024 * 1024;
+/// Default largest single ingest request Scribe plans and reserves for.
+///
+/// Scribe reserves a crash-replayable envelope for one request of this size and
+/// refuses to boot when the node cannot cover it, so raising it raises the
+/// memory a node needs to start. Operators override it with
+/// `scribe.ingest_request_bytes`.
+pub const BIFROST_INGEST_REQUEST_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 /// Largest canonical native schema accepted by V1.
 pub const BIFROST_NATIVE_FIELD_LIMIT: usize = 256;
 /// Largest canonical native record-batch count accepted by V1.
@@ -48,12 +58,12 @@ pub struct OtlpWireLimits {
 
 /// Canonical OTLP V1 defaults used to initialize decode and projection limits.
 pub const OTLP_WIRE_LIMITS: OtlpWireLimits = OtlpWireLimits {
-    request_bytes: BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES,
+    request_bytes: BIFROST_INGEST_REQUEST_LIMIT_BYTES,
     resources: 4_096,
     scopes: 8_192,
     records: 131_072,
     attributes: 1_048_576,
-    value_bytes: 32 * 1024 * 1024,
+    value_bytes: BIFROST_INGEST_REQUEST_LIMIT_BYTES,
     value_depth: 8,
     time_partitions: 32,
 };
@@ -252,8 +262,8 @@ pub struct IngestLimits {
 impl Default for IngestLimits {
     fn default() -> Self {
         Self {
-            max_frame_bytes: BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES,
-            max_decoding_message_size: BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES + 64 * 1024,
+            max_frame_bytes: BIFROST_INGEST_REQUEST_LIMIT_BYTES,
+            max_decoding_message_size: BIFROST_INGEST_REQUEST_LIMIT_BYTES + 64 * 1024,
             otlp: OTLP_WIRE_LIMITS,
             native_fields: BIFROST_NATIVE_FIELD_LIMIT,
             native_sources: BIFROST_NATIVE_SOURCE_LIMIT,

@@ -397,12 +397,19 @@ fn validate_scribe_replay_envelope(
     config: crate::config::ScribeRuntimeConfig,
     maximum_envelope_bytes: usize,
 ) -> Result<(), ServerBootError> {
-    let required =
-        vala_bifrost_redux::scribe::configured_maximum_envelope_bytes(config.ingest_limits())
-            .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
+    let limits = config.ingest_limits();
+    let required = vala_bifrost_redux::scribe::configured_maximum_envelope_bytes(limits)
+        .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
     if required > maximum_envelope_bytes {
+        let shortfall = required.saturating_sub(maximum_envelope_bytes);
         return Err(ServerBootError::Scribe(format!(
-            "scribe configured replay envelope requires {required} bytes but the detected root provides {maximum_envelope_bytes} bytes"
+            "scribe configured replay envelope requires {required} bytes but the detected root \
+             provides {maximum_envelope_bytes} bytes ({shortfall} bytes short). The requirement \
+             scales from scribe.ingest_request_bytes = {request_bytes}, which Scribe must be able \
+             to hold, persist, and replay after a crash. Lower scribe.ingest_request_bytes to fit \
+             this node, or raise the node's memory limit \
+             (WYRD_BIFROST_MEMORY_LIMIT_BYTES / the container memory limit)",
+            request_bytes = limits.max_frame_bytes
         )));
     }
     Ok(())

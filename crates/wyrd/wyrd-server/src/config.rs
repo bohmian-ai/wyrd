@@ -326,6 +326,10 @@ pub struct ScribeRuntimeConfig {
     #[serde(default)]
     pub event_time_future_window_secs: Option<u64>,
     /// Maximum encoded bytes accepted for one native or OTLP request.
+    ///
+    /// Scribe reserves a replayable envelope for one request of this size at
+    /// boot and refuses to start when the node cannot cover it, so this is a
+    /// capacity decision rather than only a validation bound.
     #[serde(default = "default_ingest_request_bytes")]
     pub ingest_request_bytes: usize,
     /// Target bytes for one non-empty Scribe WAL segment before rotation.
@@ -1242,9 +1246,9 @@ fn default_scribe_wal_io_threads() -> usize {
     4
 }
 
-/// Returns the operator-configurable transport-request default.
+/// Returns the default for [`ScribeRuntimeConfig::ingest_request_bytes`].
 fn default_ingest_request_bytes() -> usize {
-    vala_bifrost_redux::gate::limits::BIFROST_TRANSPORT_MESSAGE_LIMIT_BYTES
+    vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES
 }
 
 /// Returns the WAL rotation target.
@@ -3260,7 +3264,10 @@ minimum_slots = 2
             cfg.coordination_threads
         );
         assert_eq!(cfg.wal_disk_limit_bytes, None);
-        assert_eq!(cfg.ingest_request_bytes, 200 * 1024 * 1024);
+        assert_eq!(
+            cfg.ingest_request_bytes,
+            vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES
+        );
         assert_eq!(cfg.wal_rotation_bytes, 512 * 1024 * 1024);
         assert_eq!(cfg.memtable_rotation_bytes, 512 * 1024 * 1024);
         assert_eq!(cfg.memtable_max_age_secs, 600);

@@ -882,9 +882,19 @@ run = "cargo build -p skald-workflow --examples --features otel"
 
 [tasks."dev:backend"]
 description = "Build and run wyrd-server on :8080"
+# Bifrost detects the node memory limit from cgroups or /proc/meminfo, both of
+# which are Linux-only. On macOS that probe has no source and the server refuses
+# to start rather than guess, so supply the limit here from `hw.memsize`. Linux
+# leaves the variable unset and keeps the real detection path.
 run = [
   "cargo build -p wyrd-server",
-  "WYRD_SERVER_PORT=${WYRD_SERVER_PORT:-8080} ./target/debug/wyrd-server",
+  """
+  if [ -z "${WYRD_BIFROST_MEMORY_LIMIT_BYTES:-}" ] && [ "$(uname -s)" = "Darwin" ]; then
+    WYRD_BIFROST_MEMORY_LIMIT_BYTES="$(sysctl -n hw.memsize)"
+    export WYRD_BIFROST_MEMORY_LIMIT_BYTES
+  fi
+  WYRD_SERVER_PORT=${WYRD_SERVER_PORT:-8080} ./target/debug/wyrd-server
+  """,
 ]
 
 [tasks."cli:dev-bootstrap"]

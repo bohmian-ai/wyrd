@@ -334,7 +334,7 @@ async fn seed_reset_generations(
     let outputs = (0..output_count)
         .map(|ordinal| {
             format!(
-                "{}/data/forge/bifrost-writer-v1/{}-{ordinal:05}.parquet",
+                "{}/data/forge/bifrost-writer-v2/{}-{ordinal:05}.parquet",
                 fixture.binding.object_prefix,
                 uuid::Uuid::now_v7(),
             )
@@ -366,7 +366,7 @@ async fn seed_reset_generations(
             .map(|path| StoragePath::new(path.clone()).expect("reset output storage path"))
             .collect(),
         snapshot_id: None,
-        writer_recipe_version: "bifrost-writer-v1".to_owned(),
+        writer_recipe_version: "bifrost-writer-v2".to_owned(),
     };
     let lease_key = forge_lease_key(
         fixture.tenant,
@@ -706,7 +706,7 @@ async fn forge_gc_deletes_evidenced_orphan_and_preserves_unevidenced() {
     commit_live_rewrite(&fixture).await;
     let evidenced = reset_outputs[0].clone();
     let unevidenced = format!(
-        "{}/data/forge/bifrost-writer-v1/{}-unevidenced.parquet",
+        "{}/data/forge/bifrost-writer-v2/{}-unevidenced.parquet",
         fixture.binding.object_prefix,
         uuid::Uuid::now_v7(),
     );

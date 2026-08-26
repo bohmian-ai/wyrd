@@ -1709,15 +1709,18 @@ impl ForgeFixture {
             ],
         )
         .expect("Forge fixture append batch");
-        let mut bytes = Vec::new();
-        let mut writer =
-            ArrowWriter::try_new(&mut bytes, batch.schema(), None).expect("Parquet writer");
-        writer.write(&batch).expect("Parquet batch");
-        writer.close().expect("Parquet close");
         let path = format!(
             "{}/sustained-{sequence}.parquet",
             self.binding.object_prefix
         );
+        let metadata = BifrostParquetMemoryEnvelope::metadata_for_batch(&batch, &path)
+            .expect("Forge fixture writer-v2 metadata");
+        let mut bytes = Vec::new();
+        let properties = bifrost_writer_properties_with_metadata(batch.num_rows(), metadata, &[]);
+        let mut writer = ArrowWriter::try_new(&mut bytes, batch.schema(), Some(properties))
+            .expect("Parquet writer");
+        writer.write(&batch).expect("Parquet batch");
+        writer.close().expect("Parquet close");
         let file_size = i64::try_from(bytes.len()).expect("Forge fixture file size");
         self.staging
             .write(&path, Buffer::from(bytes))

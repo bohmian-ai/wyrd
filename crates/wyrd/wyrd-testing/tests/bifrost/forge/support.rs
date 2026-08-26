@@ -499,14 +499,27 @@ pub(crate) async fn supervised_temporary_pressure_defers_without_ownership() {
 /// # Panics
 ///
 /// Panics when the local Postgres, catalog, storage, or server fixture cannot
-/// start with its background Forge interval disabled for deterministic control.
+/// start with its background Forge interval disabled for deterministic control,
+/// or when it unexpectedly exposes a bound endpoint that would imply a
+/// background Forge worker role.
+///
+/// The journey's own [`JourneyMaintenance`] must be the only Forge scheduler and
+/// worker lifecycle. A `BifrostTarget::All` server keeps polling the durable
+/// queue regardless of its scheduler interval, so it claims the task before the
+/// test-owned worker ever sees it and the journey times out with work still
+/// pending. This mirrors `start_engine_fixture_server`'s rule.
 pub(crate) async fn start_maintenance_journey_server() -> WyrdTestServer {
-    WyrdTestServer::builder()
+    let server = WyrdTestServer::builder()
         .with_forge_interval(Duration::from_secs(3600))
-        .with_forge_process_role_for_test(BifrostTarget::All)
-        .start_bound()
+        .with_forge_process_role_for_test(BifrostTarget::Server)
+        .start_in_process()
         .await
-        .expect("bound maintenance journey server")
+        .expect("in-process maintenance journey server");
+    assert!(
+        server.base_url().is_none(),
+        "maintenance journey fixture must not start a background Forge worker role"
+    );
+    server
 }
 
 /// Start an isolated maintenance server attached to the shared production telemetry capture.

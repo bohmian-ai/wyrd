@@ -94,7 +94,7 @@ fn authoritative_forge_violations(
         .map(|name| {
             local_functions
                 .iter()
-                .find(|(source, function)| *source == 0 && function.name == *name)
+                .find(|(_, function)| function.name == *name)
                 .cloned()
                 .expect("authoritative root has an owner-qualified definition")
         })

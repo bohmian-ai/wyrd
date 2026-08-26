@@ -2491,8 +2491,6 @@ pub struct ScribeProviderCut {
     pub start_partition: TimePartitionWire,
     /// Inclusive final partition in the provider projection.
     pub end_partition: TimePartitionWire,
-    /// Required columns in stable projection order.
-    pub required_columns: Vec<String>,
     /// Highest persisted stream cursor visible to this cut.
     pub persisted_cursor: u64,
     /// Ordered, disjoint persisted WAL intervals excluded from memory.
@@ -2510,7 +2508,6 @@ impl ScribeProviderCut {
         self.writer_epoch > 0
             && self.start_partition.granularity() == self.end_partition.granularity()
             && self.start_partition <= self.end_partition
-            && !self.required_columns.is_empty()
             && self.maximum_batch_count > 0
             && self.maximum_retained_bytes > 0
             && persisted_wal_ranges_are_valid(self.persisted_cursor, &self.persisted_ranges)

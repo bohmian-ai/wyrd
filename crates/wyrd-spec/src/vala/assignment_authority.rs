@@ -179,11 +179,12 @@ pub enum AssignmentDigestError {
 
 /// Domain separator for the v3 assignment-authority digest.
 ///
-/// v3 differs from v2 only in the Scribe-cut encoding: the two length-prefixed
-/// event-day strings are replaced by two fixed-width typed partitions. Every
-/// other count, length, option, predicate, file, projection, cursor, range, and
-/// numeric rule is unchanged. The domain is bumped so a v2 signature can never
-/// validate against v3 bytes.
+/// v3 replaced v2's two length-prefixed event-day strings with two fixed-width
+/// typed partitions, and carries the projection closure exactly once, on the
+/// assignment itself: the Scribe cut contributes only its epoch, partitions,
+/// cursor, ranges, and retention bounds. Every other count, length, option,
+/// predicate, file, projection, and numeric rule is unchanged from v2, and the
+/// domain differs so a v2 signature can never validate against v3 bytes.
 const ASSIGNMENT_AUTHORITY_DOMAIN: &[u8] = b"wyrd.oracle.assignment-authority.v3\0";
 
 /// Appends a length-prefixed UTF-8 string: a big-endian `u32` byte length
@@ -267,14 +268,6 @@ fn push_scribe_cut(
     buffer.extend_from_slice(&cut.writer_epoch.to_be_bytes());
     push_time_partition(buffer, cut.start_partition);
     push_time_partition(buffer, cut.end_partition);
-    push_count(
-        buffer,
-        cut.required_columns.len(),
-        "scribe_cut.required_columns",
-    )?;
-    for column in &cut.required_columns {
-        push_string(buffer, column)?;
-    }
     buffer.extend_from_slice(&cut.persisted_cursor.to_be_bytes());
     push_count(
         buffer,
@@ -401,15 +394,15 @@ mod tests {
     use crate::vala::api::{ScribeProviderCut, TimeGranularityWire, TimePartitionWire};
 
     /// Builds the normative v3 Scribe cut: writer epoch 7, the two hourly
-    /// partitions `2026-08-23T14:00:00Z` and `2026-08-23T15:00:00Z`, the three
-    /// standard required columns, persisted cursor 41 with the single range
-    /// `[1, 40]`, 16 maximum batches, and 1 MiB maximum retained bytes.
-    fn normative_scribe_cut(required_columns: &[String]) -> ScribeProviderCut {
+    /// partitions `2026-08-23T14:00:00Z` and `2026-08-23T15:00:00Z`, persisted
+    /// cursor 41 with the single range `[1, 40]`, 16 maximum batches, and 1 MiB
+    /// maximum retained bytes. The projection closure lives on the enclosing
+    /// assignment, never on the cut.
+    fn normative_scribe_cut() -> ScribeProviderCut {
         ScribeProviderCut {
             writer_epoch: 7,
             start_partition: hour_partition(1_787_493_600_000_000),
             end_partition: hour_partition(1_787_497_200_000_000),
-            required_columns: required_columns.to_vec(),
             persisted_cursor: 41,
             persisted_ranges: vec![crate::vala::api::PersistedWalRange {
                 start_lsn: 1,
@@ -430,11 +423,11 @@ mod tests {
 
     /// Normative v3 vector from the task packet: one assignment for tenant
     /// `00112233-4455-6677-8899-aabbccddeeff`, table `logs.records`, fingerprint
-    /// `00..1f`, one file, three required columns, a single
-    /// `Eq(service_name, "api")` predicate, and the normative Scribe cut must
-    /// encode to exactly 362 bytes and hash to the fixed digest below. Asserting
-    /// both the byte length and the hash prevents a compensating pair of layout
-    /// mistakes from passing.
+    /// `00..1f`, one file, three required columns carried once on the
+    /// assignment, a single `Eq(service_name, "api")` predicate, and the
+    /// normative Scribe cut must encode to exactly 305 bytes and hash to the
+    /// fixed digest below. Asserting both the byte length and the hash prevents
+    /// a compensating pair of layout mistakes from passing.
     #[test]
     fn normative_vector_encodes_to_fixed_length_and_digest() {
         let fingerprint: String = (0u8..32).map(|byte| format!("{byte:02x}")).collect();
@@ -449,7 +442,7 @@ mod tests {
             "service_name".to_string(),
             ScanLiteral::Utf8("api".to_string()),
         )];
-        let cut = normative_scribe_cut(&required_columns);
+        let cut = normative_scribe_cut();
         let assignment = AssignmentDigestInput {
             scan_id: "scan-1",
             tenant_uuid,
@@ -465,14 +458,14 @@ mod tests {
         let bytes = encode_assignment_authority_bytes(std::slice::from_ref(&assignment)).unwrap();
         assert_eq!(
             bytes.len(),
-            362,
-            "normative vector must encode to exactly 362 bytes"
+            305,
+            "normative vector must encode to exactly 305 bytes"
         );
 
         let digest = assignment_authority_digest(std::slice::from_ref(&assignment)).unwrap();
         assert_eq!(
             digest,
-            "60dfb9453fa65f0752431b3feaf8ca5f9a9f7dfa0bab7c87b8724e209bbbe579"
+            "a8ec167a1925681edb74bee14a50a3c9e682bc3c0f62f3bead333e5156711250"
         );
     }
 
@@ -482,7 +475,7 @@ mod tests {
     #[test]
     fn every_partition_bound_component_changes_the_digest() {
         let (fingerprint, tenant_uuid, files, required_columns, predicates) = base_vector();
-        let baseline_cut = normative_scribe_cut(&required_columns);
+        let baseline_cut = normative_scribe_cut();
         let digest_with = |cut: &ScribeProviderCut| {
             digest_of(&AssignmentDigestInput {
                 scan_id: "scan-1",
@@ -745,7 +738,7 @@ mod tests {
             required_columns: &required_columns,
             predicates: &predicates,
         });
-        let cut = normative_scribe_cut(&required_columns);
+        let cut = normative_scribe_cut();
         let with_cut = digest_of(&AssignmentDigestInput {
             scan_id: "scan-1",
             tenant_uuid,
@@ -773,6 +766,49 @@ mod tests {
             predicates: &predicates,
         });
         assert_ne!(with_cut, with_mutated_cut);
+
+        // The projection closure is carried once, on the assignment. With a cut
+        // present it must still be signed there, so a peer cannot widen a
+        // Scribe follower's projection while replaying the same cut.
+        let reordered_columns = vec![
+            "wyrd_event_time".to_string(),
+            "service_name".to_string(),
+            "data_tenant_id".to_string(),
+        ];
+        assert_ne!(
+            with_cut,
+            digest_of(&AssignmentDigestInput {
+                scan_id: "scan-1",
+                tenant_uuid,
+                namespace: "logs",
+                table: "records",
+                schema_fingerprint_hex: &fingerprint,
+                files: &files,
+                scribe_cut: Some(&cut),
+                required_columns: &reordered_columns,
+                predicates: &predicates,
+            })
+        );
+
+        // Predicates stay signed alongside a cut for the same reason.
+        let widened_predicates = vec![ScanPredicate::NotEq(
+            "service_name".to_string(),
+            ScanLiteral::Utf8("api".to_string()),
+        )];
+        assert_ne!(
+            with_cut,
+            digest_of(&AssignmentDigestInput {
+                scan_id: "scan-1",
+                tenant_uuid,
+                namespace: "logs",
+                table: "records",
+                schema_fingerprint_hex: &fingerprint,
+                files: &files,
+                scribe_cut: Some(&cut),
+                required_columns: &required_columns,
+                predicates: &widened_predicates,
+            })
+        );
     }
 
     #[test]

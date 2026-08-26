@@ -889,6 +889,8 @@ mod tests {
                 code: QueryTerminalErrorCode::QueryExecutionFailed,
                 detail: Some(QueryErrorDetail::new("native sentinel failure").expect("detail")),
             }),
+            // A failed stream never calls `finish`, so it has no end-of-stream.
+            arrow_ipc_eos: Vec::new(),
         };
         let owner = NativeBifrostQueryStream::new_for_test(TestStreamOwner::new(
             std::collections::VecDeque::from([Err(ValaSdkError::FailedTerminal {
@@ -1037,6 +1039,7 @@ mod tests {
                     },
                 ],
                 error: None,
+                arrow_ipc_eos: vec![0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0],
             }),
             Arc::clone(&dropped),
             Arc::clone(&polls),

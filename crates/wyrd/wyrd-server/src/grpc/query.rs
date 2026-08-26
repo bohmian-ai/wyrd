@@ -366,6 +366,9 @@ mod tests {
         ]
     }
 
+    /// Arrow IPC end-of-stream delta carried by every non-failed terminal.
+    const EOS: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0];
+
     /// Builds one canonical schema frame used by both public transports.
     fn schema_frame() -> QueryStreamFrame {
         QueryStreamFrame::Schema(QuerySchemaFrame {
@@ -485,6 +488,7 @@ mod tests {
                 warnings: Vec::new(),
                 source_completion: complete_sources(),
                 error: None,
+                arrow_ipc_eos: EOS.to_vec(),
             }),
         ];
         let response = query_stream_response(oracle_stream(expected.clone()));
@@ -526,6 +530,7 @@ mod tests {
                 warnings: vec![QueryWarning::LiveTailUnavailable],
                 source_completion: degraded_sources,
                 error: None,
+                arrow_ipc_eos: EOS.to_vec(),
             }),
         ];
         let failed = vec![
@@ -543,6 +548,8 @@ mod tests {
                     code: QueryTerminalErrorCode::QueryExecutionFailed,
                     detail: Some(QueryErrorDetail::new("worker failed").expect("scrubbed detail")),
                 }),
+                // A failed stream never calls `finish`, so it has no end-of-stream.
+                arrow_ipc_eos: Vec::new(),
             }),
         ];
 

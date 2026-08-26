@@ -388,6 +388,9 @@ mod tests {
 
     use super::*;
 
+    /// Arrow IPC end-of-stream delta carried by every non-failed terminal.
+    const EOS: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0];
+
     /// HTTP lifecycle contracts expose only the owner tenant and idempotent cancellation.
     #[test]
     fn running_query_controls_are_tenant_scoped() {
@@ -525,6 +528,7 @@ mod tests {
                 warnings: Vec::new(),
                 source_completion: Vec::new(),
                 error: None,
+                arrow_ipc_eos: EOS.to_vec(),
             }),
         ];
         let frames = futures_util::stream::iter(expected.clone().into_iter().map(Ok));
@@ -604,6 +608,7 @@ mod tests {
                 warnings: Vec::new(),
                 source_completion: complete_sources(),
                 error: None,
+                arrow_ipc_eos: EOS.to_vec(),
             }),
         ];
         let bytes = query_stream_response(OracleQueryStream::test_new(
@@ -675,6 +680,8 @@ mod tests {
                 code: QueryTerminalErrorCode::QueryExecutionFailed,
                 detail: Some(QueryErrorDetail::new("worker failed").expect("scrubbed detail")),
             }),
+            // A failed stream never calls `finish`, so it has no end-of-stream.
+            arrow_ipc_eos: Vec::new(),
         });
         let frames = futures_util::stream::iter([
             Ok(QueryStreamFrame::Schema(QuerySchemaFrame {

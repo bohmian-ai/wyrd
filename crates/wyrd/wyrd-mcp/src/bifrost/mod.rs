@@ -985,6 +985,8 @@ mod bifrost_tools {
                 code: QueryTerminalErrorCode::QueryExecutionFailed,
                 detail: Some(QueryErrorDetail::new("safe terminal detail").expect("detail valid")),
             }),
+            // A failed stream never calls `finish`, so it has no end-of-stream.
+            arrow_ipc_eos: Vec::new(),
         };
         let expected = serde_json::to_value(&terminal).expect("terminal serializes");
         assert_structured_error(
@@ -1021,6 +1023,7 @@ mod bifrost_tools {
                 },
             ],
             error: None,
+            arrow_ipc_eos: vec![0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0],
         };
         let value = serde_json::to_value(terminal).expect("degraded terminal serializes");
         assert_eq!(value["outcome"], "degraded");

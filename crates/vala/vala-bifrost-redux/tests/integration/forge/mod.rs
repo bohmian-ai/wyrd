@@ -5,5 +5,13 @@
 //! here or in `wyrd-testing`.
 
 mod immutable_tier_retention;
-mod incremental_compaction;
+mod maintenance;
 mod mitari_rewrite_api;
+mod replay;
+mod retention;
+mod scheduler;
+mod staging;
+mod streaming_rewrite;
+mod support;
+mod worker;
+mod worker_lifecycle;

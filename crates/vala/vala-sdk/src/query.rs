@@ -293,10 +293,13 @@ pub struct RawQueryStream {
     body: ResponseBytes,
     /// Bounded protobuf length-delimited decoder.
     decoder: FrameDecoder,
-    /// Complete frames decoded from the most recent body chunk.
-    pending: VecDeque<QueryStreamFrame>,
+    /// Complete frames decoded from the most recent body chunk, each paired
+    /// with the record batch its Arrow fragment produced, if any.
+    pending: VecDeque<(QueryStreamFrame, Option<RecordBatch>)>,
     /// Shared wire-to-domain ordering and terminal validator.
     converter: QueryStreamConverter,
+    /// The one Arrow IPC decoder for this query's single split stream.
+    ipc: QueryIpcDecoder,
     /// Validated terminal retained after it is yielded.
     terminal: Option<QueryTerminalFrame>,
     /// Exact length-delimited response bytes received from the HTTP body.
@@ -314,6 +317,7 @@ impl RawQueryStream {
             decoder: FrameDecoder::new(MAX_FRAME_BYTES),
             pending: VecDeque::new(),
             converter: QueryStreamConverter::new(visibility),
+            ipc: QueryIpcDecoder::new(),
             terminal: None,
             received_bytes: 0,
         }
@@ -332,12 +336,30 @@ impl RawQueryStream {
     /// Cancelling this operation preserves decoder state. Dropping the stream
     /// drops the HTTP response body and stops further reads.
     pub async fn next_frame(&mut self) -> Result<Option<QueryStreamFrame>, ValaSdkError> {
+        Ok(self.next_decoded_frame().await?.map(|(frame, _batch)| frame))
+    }
+
+    /// Returns the next validated frame with the batch its fragment decoded to.
+    ///
+    /// Each Arrow fragment is decoded exactly once, here, because the stream is
+    /// stateful: a batch consumed twice would advance the shared decoder twice
+    /// and desynchronise every later fragment. The Arrow projection therefore
+    /// takes the already-decoded batch rather than re-reading the bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed protocol or Arrow error for malformed, truncated,
+    /// out-of-order, duplicate, post-terminal, or invalid-terminal streams.
+    /// EOF before terminal returns [`ValaSdkError::IncompleteQueryStream`].
+    async fn next_decoded_frame(
+        &mut self,
+    ) -> Result<Option<(QueryStreamFrame, Option<RecordBatch>)>, ValaSdkError> {
         loop {
-            if let Some(frame) = self.pending.pop_front() {
+            if let Some((frame, batch)) = self.pending.pop_front() {
                 if let QueryStreamFrame::Terminal(terminal) = &frame {
                     self.terminal = Some(terminal.clone());
                 }
-                return Ok(Some(frame));
+                return Ok(Some((frame, batch)));
             }
             match self.body.next().await {
                 Some(Ok(bytes)) => {
@@ -354,21 +376,47 @@ impl RawQueryStream {
                         .push::<wyrd_tonic::wyrd::v1::QueryStreamFrame>(&bytes)
                         .map_err(|error| ValaSdkError::Protocol(error.to_string()))?;
                     for frame in frames {
-                        let batch_rows = match frame.frame.as_ref() {
+                        // The Arrow fragment is consumed before conversion so
+                        // the converter's row accounting and the decoder's
+                        // stream position advance from the same bytes exactly
+                        // once.
+                        let decoded = match frame.frame.as_ref() {
                             Some(wyrd_tonic::wyrd::v1::query_stream_frame::Frame::Batch(batch)) => {
-                                Some(decode_batch_rows(&batch.arrow_ipc_batch)?)
+                                Some(self.ipc.accept_batch(&batch.arrow_ipc_batch)?)
                             }
-                            Some(
-                                wyrd_tonic::wyrd::v1::query_stream_frame::Frame::Schema(_)
-                                | wyrd_tonic::wyrd::v1::query_stream_frame::Frame::Terminal(_),
-                            )
+                            Some(wyrd_tonic::wyrd::v1::query_stream_frame::Frame::Schema(
+                                schema,
+                            )) => {
+                                self.ipc.accept_schema(&schema.arrow_ipc_schema)?;
+                                None
+                            }
+                            Some(wyrd_tonic::wyrd::v1::query_stream_frame::Frame::Terminal(_))
                             | None => None,
                         };
+                        let batch_rows = decoded
+                            .as_ref()
+                            .map(|batch| {
+                                u64::try_from(batch.num_rows()).map_err(|_| {
+                                    ValaSdkError::Protocol(
+                                        "row count does not fit u64".to_owned(),
+                                    )
+                                })
+                            })
+                            .transpose()?;
                         let frame = self
                             .converter
                             .convert(frame, batch_rows)
                             .map_err(|error| ValaSdkError::Protocol(error.to_string()))?;
-                        self.pending.push_back(frame);
+                        // The terminal's own validation already refused a
+                        // success that omits its end-of-stream; closing the
+                        // Arrow stream here proves the bytes it carries are the
+                        // real end of this decoder's stream.
+                        if let QueryStreamFrame::Terminal(terminal) = &frame
+                            && terminal.outcome != QueryTerminalOutcome::Failed
+                        {
+                            self.ipc.accept_eos(&terminal.arrow_ipc_eos)?;
+                        }
+                        self.pending.push_back((frame, decoded));
                     }
                 }
                 Some(Err(error)) => {
@@ -397,6 +445,28 @@ impl RawQueryStream {
     #[must_use]
     fn received_bytes(&self) -> usize {
         self.received_bytes
+    }
+
+    /// Returns the stream schema once its initial fragment was accepted.
+    #[must_use]
+    pub fn arrow_schema(&self) -> Option<&SchemaRef> {
+        self.ipc.schema.as_ref()
+    }
+
+    /// Reports whether the stream's Arrow IPC end-of-stream was accepted.
+    #[must_use]
+    pub const fn arrow_ipc_closed(&self) -> bool {
+        self.ipc.eos_accepted()
+    }
+
+    /// Returns the largest single Arrow fragment this stream held while decoding.
+    ///
+    /// This is the client half of the bounded-memory contract: it must never
+    /// exceed the largest individual fragment, because fragments are decoded
+    /// and released one at a time rather than accumulated.
+    #[must_use]
+    pub const fn peak_pending_frame_bytes(&self) -> usize {
+        self.ipc.peak_pending_frame_bytes()
     }
 }
 
@@ -480,25 +550,19 @@ impl QueryResultStream {
     /// cancels response-body consumption.
     pub async fn next_batch(&mut self) -> Result<Option<RecordBatch>, ValaSdkError> {
         loop {
-            let frame = self.raw.next_frame().await;
+            let frame = self.raw.next_decoded_frame().await;
             self.encoded_bytes = self.raw.received_bytes();
-            let Some(frame) = frame? else {
+            let Some((frame, decoded)) = frame? else {
                 return Ok(None);
             };
             match frame {
-                QueryStreamFrame::Schema(schema) => {
-                    self.schema = Some(decode_schema(&schema.arrow_ipc_schema)?);
+                QueryStreamFrame::Schema(_) => {
+                    self.schema = self.raw.arrow_schema().cloned();
                 }
-                QueryStreamFrame::Batch(batch) => {
-                    let decoded = decode_one_batch(&batch.arrow_ipc_batch)?;
-                    let expected = self.schema.as_ref().ok_or_else(|| {
-                        ValaSdkError::Protocol("batch arrived before schema".to_owned())
+                QueryStreamFrame::Batch(_) => {
+                    let decoded = decoded.ok_or_else(|| {
+                        ValaSdkError::Arrow("batch frame contains no record batch".to_owned())
                     })?;
-                    if decoded.schema().as_ref() != expected.as_ref() {
-                        return Err(ValaSdkError::Arrow(
-                            "batch schema does not match the initial schema".to_owned(),
-                        ));
-                    }
                     self.emitted_rows = self
                         .emitted_rows
                         .checked_add(u64::try_from(decoded.num_rows()).map_err(|_| {
@@ -612,73 +676,178 @@ pub struct CollectedQueryResult {
     pub encoded_bytes: usize,
 }
 
-/// Decodes and counts every record batch in one Arrow IPC batch frame.
+/// Stateful Arrow IPC decoder for one public query stream.
 ///
-/// # Errors
+/// The public stream is a single Arrow IPC stream split across Wyrd frames, so
+/// the schema and every dictionary arrive once, in earlier fragments. A decoder
+/// constructed per frame cannot read that stream at all; this owner is
+/// constructed once per query and consumes fragments in order.
 ///
-/// Returns [`ValaSdkError::Arrow`] when the IPC payload is malformed or its row
-/// count cannot fit the public `u64` terminal counter.
-fn decode_batch_rows(bytes: &[u8]) -> Result<u64, ValaSdkError> {
-    let mut reader = StreamReader::try_new(Cursor::new(bytes), None)
-        .map_err(|error| ValaSdkError::Arrow(error.to_string()))?;
-    reader.try_fold(0_u64, |rows, batch| {
-        let batch = batch.map_err(|error| ValaSdkError::Arrow(error.to_string()))?;
-        rows.checked_add(
-            u64::try_from(batch.num_rows())
-                .map_err(|_| ValaSdkError::Protocol("row count does not fit u64".to_owned()))?,
-        )
-        .ok_or_else(|| ValaSdkError::Protocol("row count overflow".to_owned()))
-    })
+/// The server tier has its own copy of this state machine in
+/// `vala-bifrost-redux`. Client-tier crates may not depend on the Bifrost
+/// server engine, so the wire contract — not shared code — is what keeps the
+/// two honest, and the journeys in `tests/pg_bifrost_e2e.rs` are what prove it.
+///
+/// End-of-stream receipt is tracked here rather than delegated to
+/// [`arrow::ipc::reader::StreamDecoder::finish`], which reports success both
+/// for a stream that closed cleanly and for one that never started.
+struct QueryIpcDecoder {
+    /// Arrow's push decoder, retaining schema and dictionary state.
+    decoder: arrow::ipc::reader::StreamDecoder,
+    /// Schema recovered from the required initial schema fragment.
+    schema: Option<SchemaRef>,
+    /// Whether the terminal's explicit end-of-stream delta was accepted.
+    eos_accepted: bool,
+    /// Largest single fragment this decoder has held while decoding.
+    peak_pending_frame_bytes: usize,
 }
 
-/// Decodes the schema-only Arrow IPC stream from the initial frame.
-///
-/// # Errors
-///
-/// Returns [`ValaSdkError::Arrow`] when the schema stream is malformed or
-/// unexpectedly contains a record batch.
-fn decode_schema(bytes: &[u8]) -> Result<SchemaRef, ValaSdkError> {
-    let mut reader = StreamReader::try_new(Cursor::new(bytes), None)
-        .map_err(|error| ValaSdkError::Arrow(error.to_string()))?;
-    let schema = reader.schema();
-    if reader
-        .next()
-        .transpose()
-        .map_err(|error| ValaSdkError::Arrow(error.to_string()))?
-        .is_some()
-    {
-        return Err(ValaSdkError::Arrow(
-            "schema frame unexpectedly contains a record batch".to_owned(),
-        ));
+impl QueryIpcDecoder {
+    /// Creates a decoder positioned before the required schema fragment.
+    fn new() -> Self {
+        Self {
+            decoder: arrow::ipc::reader::StreamDecoder::new(),
+            schema: None,
+            eos_accepted: false,
+            peak_pending_frame_bytes: 0,
+        }
     }
-    Ok(schema)
-}
 
-/// Decodes exactly one record batch from one Arrow IPC batch frame.
-///
-/// # Errors
-///
-/// Returns [`ValaSdkError::Arrow`] when the payload is malformed, empty, or
-/// contains more than one record batch.
-fn decode_one_batch(bytes: &[u8]) -> Result<RecordBatch, ValaSdkError> {
-    let mut reader = StreamReader::try_new(Cursor::new(bytes), None)
-        .map_err(|error| ValaSdkError::Arrow(error.to_string()))?;
-    let batch = reader
-        .next()
-        .transpose()
-        .map_err(|error| ValaSdkError::Arrow(error.to_string()))?
-        .ok_or_else(|| ValaSdkError::Arrow("batch frame contains no record batch".to_owned()))?;
-    if reader
-        .next()
-        .transpose()
-        .map_err(|error| ValaSdkError::Arrow(error.to_string()))?
-        .is_some()
-    {
-        return Err(ValaSdkError::Arrow(
-            "batch frame contains more than one record batch".to_owned(),
-        ));
+    /// Consumes the initial schema fragment and returns the stream schema.
+    ///
+    /// The schema is read with a throwaway [`StreamReader`] because Arrow's
+    /// push decoder only completes a zero-body message once the next fragment
+    /// arrives; the same bytes are still pushed through the push decoder, which
+    /// is what carries schema and dictionary state into later fragments.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValaSdkError::Protocol`] for a duplicate or post-terminal
+    /// schema, and [`ValaSdkError::Arrow`] when the fragment is not exactly one
+    /// schema message.
+    fn accept_schema(&mut self, bytes: &[u8]) -> Result<SchemaRef, ValaSdkError> {
+        if self.schema.is_some() || self.eos_accepted {
+            return Err(ValaSdkError::Protocol(
+                "query stream carries more than one schema frame".to_owned(),
+            ));
+        }
+        let mut prefix = StreamReader::try_new(Cursor::new(bytes), None)
+            .map_err(|error| ValaSdkError::Arrow(error.to_string()))?;
+        let schema = prefix.schema();
+        if prefix
+            .next()
+            .transpose()
+            .map_err(|error| ValaSdkError::Arrow(error.to_string()))?
+            .is_some()
+        {
+            return Err(ValaSdkError::Arrow(
+                "schema frame unexpectedly contains a record batch".to_owned(),
+            ));
+        }
+        if self.feed(bytes)?.is_some() {
+            return Err(ValaSdkError::Arrow(
+                "schema frame unexpectedly contains a record batch".to_owned(),
+            ));
+        }
+        self.schema = Some(SchemaRef::clone(&schema));
+        Ok(schema)
     }
-    Ok(batch)
+
+    /// Consumes one batch fragment and returns its decoded record batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValaSdkError::Protocol`] before the schema or after
+    /// end-of-stream, and [`ValaSdkError::Arrow`] when the fragment does not
+    /// decode to exactly one record batch matching the stream schema.
+    fn accept_batch(&mut self, bytes: &[u8]) -> Result<RecordBatch, ValaSdkError> {
+        let expected = self.schema.as_ref().ok_or_else(|| {
+            ValaSdkError::Protocol("batch arrived before schema".to_owned())
+        })?;
+        if self.eos_accepted {
+            return Err(ValaSdkError::Protocol(
+                "query stream frame arrived after its end-of-stream".to_owned(),
+            ));
+        }
+        let expected = SchemaRef::clone(expected);
+        let batch = self.feed(bytes)?.ok_or_else(|| {
+            ValaSdkError::Arrow("batch frame contains no record batch".to_owned())
+        })?;
+        if batch.schema().as_ref() != expected.as_ref() {
+            return Err(ValaSdkError::Arrow(
+                "batch schema does not match the initial schema".to_owned(),
+            ));
+        }
+        Ok(batch)
+    }
+
+    /// Consumes the terminal's end-of-stream delta and closes the stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValaSdkError::Protocol`] before the schema or on a second
+    /// end-of-stream, and [`ValaSdkError::Arrow`] when the delta is absent,
+    /// carries a record batch, or leaves a partial message behind.
+    fn accept_eos(&mut self, bytes: &[u8]) -> Result<(), ValaSdkError> {
+        if self.schema.is_none() || self.eos_accepted {
+            return Err(ValaSdkError::Protocol(
+                "query stream end-of-stream is out of order".to_owned(),
+            ));
+        }
+        if bytes.is_empty() {
+            return Err(ValaSdkError::Arrow(
+                "successful query terminal carries no Arrow IPC end-of-stream".to_owned(),
+            ));
+        }
+        if self.feed(bytes)?.is_some() {
+            return Err(ValaSdkError::Arrow(
+                "query end-of-stream unexpectedly contains a record batch".to_owned(),
+            ));
+        }
+        self.decoder
+            .finish()
+            .map_err(|error| ValaSdkError::Arrow(error.to_string()))?;
+        self.eos_accepted = true;
+        Ok(())
+    }
+
+    /// Reports whether the explicit end-of-stream delta was accepted.
+    const fn eos_accepted(&self) -> bool {
+        self.eos_accepted
+    }
+
+    /// Returns the largest single fragment this decoder held while decoding.
+    const fn peak_pending_frame_bytes(&self) -> usize {
+        self.peak_pending_frame_bytes
+    }
+
+    /// Pushes one fragment through Arrow's decoder, allowing at most one batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValaSdkError::Arrow`] when Arrow rejects the bytes or the
+    /// fragment yields more than one record batch.
+    fn feed(&mut self, bytes: &[u8]) -> Result<Option<RecordBatch>, ValaSdkError> {
+        self.peak_pending_frame_bytes = self.peak_pending_frame_bytes.max(bytes.len());
+        let mut buffer = arrow::buffer::Buffer::from_vec(bytes.to_vec());
+        let mut decoded = None;
+        while !buffer.is_empty() {
+            match self
+                .decoder
+                .decode(&mut buffer)
+                .map_err(|error| ValaSdkError::Arrow(error.to_string()))?
+            {
+                Some(batch) if decoded.is_none() => decoded = Some(batch),
+                Some(_) => {
+                    return Err(ValaSdkError::Arrow(
+                        "batch frame contains more than one record batch".to_owned(),
+                    ));
+                }
+                None => {}
+            }
+        }
+        Ok(decoded)
+    }
 }
 
 #[cfg(test)]
@@ -801,28 +970,61 @@ mod tests {
         Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
     }
 
-    /// Encodes a schema-only Arrow IPC stream.
-    fn schema_ipc(schema: &SchemaRef) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        let mut writer =
-            StreamWriter::try_new(&mut bytes, schema.as_ref()).expect("schema writer starts");
-        writer.finish().expect("schema writer finishes");
-        bytes
+    /// Test-owned encoder that emits the same split IPC stream the server emits.
+    ///
+    /// One writer opens the stream, each batch contributes only its own write
+    /// delta, and [`TestQueryIpc::close`] yields the end-of-stream delta the
+    /// terminal frame carries. Fixtures built this way exercise the stateful
+    /// decoder exactly as a real query stream does.
+    struct TestQueryIpc {
+        /// Writer whose sink is drained once per emitted fragment.
+        writer: StreamWriter<Vec<u8>>,
     }
 
-    /// Encodes one Arrow record batch as a complete IPC stream.
-    fn batch_ipc(schema: &SchemaRef, values: &[i64]) -> Vec<u8> {
-        let batch = RecordBatch::try_new(
-            Arc::clone(schema),
-            vec![Arc::new(Int64Array::from(values.to_vec()))],
-        )
-        .expect("test batch is valid");
-        let mut bytes = Vec::new();
-        let mut writer =
-            StreamWriter::try_new(&mut bytes, schema.as_ref()).expect("batch writer starts");
-        writer.write(&batch).expect("batch writes");
-        writer.finish().expect("batch writer finishes");
-        bytes
+    impl TestQueryIpc {
+        /// Opens a stream over `schema` and returns its schema fragment.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the test schema cannot start an Arrow IPC stream.
+        fn open(schema: &SchemaRef) -> (Self, Vec<u8>) {
+            let mut writer =
+                StreamWriter::try_new(Vec::new(), schema.as_ref()).expect("schema writer starts");
+            let prefix = std::mem::take(writer.get_mut());
+            (Self { writer }, prefix)
+        }
+
+        /// Writes one `Int64` batch and returns only that write's fragment.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the batch is invalid for `schema` or cannot be written.
+        fn batch(&mut self, schema: &SchemaRef, values: &[i64]) -> Vec<u8> {
+            let batch = RecordBatch::try_new(
+                Arc::clone(schema),
+                vec![Arc::new(Int64Array::from(values.to_vec()))],
+            )
+            .expect("test batch is valid");
+            self.writer.write(&batch).expect("batch writes");
+            std::mem::take(self.writer.get_mut())
+        }
+
+        /// Finishes the stream and returns its end-of-stream fragment.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the writer cannot finish the stream.
+        fn close(&mut self) -> Vec<u8> {
+            self.writer.finish().expect("writer finishes");
+            std::mem::take(self.writer.get_mut())
+        }
+    }
+
+    /// Opens and immediately closes a stream, yielding its schema and EOS fragments.
+    fn empty_ipc(schema: &SchemaRef) -> (Vec<u8>, Vec<u8>) {
+        let (mut ipc, prefix) = TestQueryIpc::open(schema);
+        let eos = ipc.close();
+        (prefix, eos)
     }
 
     /// Builds the exact complete source set required by the visibility mode.
@@ -846,8 +1048,12 @@ mod tests {
         values
     }
 
-    /// Builds a successful terminal for the supplied visibility and row count.
-    fn success_terminal(visibility: VisibilityMode, rows: u64) -> QueryTerminalFrame {
+    /// Builds a successful terminal for the supplied visibility, rows, and EOS.
+    fn success_terminal(
+        visibility: VisibilityMode,
+        rows: u64,
+        arrow_ipc_eos: Vec<u8>,
+    ) -> QueryTerminalFrame {
         QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Success,
             freshness: QueryFreshness::Complete,
@@ -855,11 +1061,12 @@ mod tests {
             warnings: Vec::new(),
             source_completion: sources(visibility),
             error: None,
+            arrow_ipc_eos,
         }
     }
 
     /// Builds a degraded Fused terminal with the required warning and source state.
-    fn degraded_terminal(rows: u64) -> QueryTerminalFrame {
+    fn degraded_terminal(rows: u64, arrow_ipc_eos: Vec<u8>) -> QueryTerminalFrame {
         QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Degraded,
             freshness: QueryFreshness::Degraded,
@@ -880,6 +1087,7 @@ mod tests {
                 },
             ],
             error: None,
+            arrow_ipc_eos,
         }
     }
 
@@ -895,6 +1103,8 @@ mod tests {
                 code: QueryTerminalErrorCode::QueryExecutionFailed,
                 detail: None,
             }),
+            // A failed stream never calls `finish`, so it has no end-of-stream.
+            arrow_ipc_eos: Vec::new(),
         }
     }
 
@@ -912,9 +1122,10 @@ mod tests {
     /// The converter rejects a second schema before any terminal can be accepted.
     #[test]
     fn bifrost_query_rejects_duplicate_schema() {
+        let (prefix, _eos) = empty_ipc(&test_schema());
         let schema = QueryStreamFrame::Schema(QuerySchemaFrame {
             schema_fingerprint: "test".to_owned(),
-            arrow_ipc_schema: schema_ipc(&test_schema()),
+            arrow_ipc_schema: prefix,
         });
         let proto = proto::QueryStreamFrame::from(schema);
         let mut converter = QueryStreamConverter::new(VisibilityMode::PublishedOnly);
@@ -927,9 +1138,10 @@ mod tests {
     /// Every byte boundary is accepted by the incremental protobuf decoder.
     #[test]
     fn bifrost_query_frame_decoder_accepts_arbitrary_chunk_splits() {
+        let (prefix, _eos) = empty_ipc(&test_schema());
         let frame = QueryStreamFrame::Schema(QuerySchemaFrame {
             schema_fingerprint: "test".to_owned(),
-            arrow_ipc_schema: schema_ipc(&test_schema()),
+            arrow_ipc_schema: prefix,
         });
         let encoded = encoded(frame);
         let mut decoder = FrameDecoder::new(MAX_FRAME_BYTES);
@@ -960,17 +1172,21 @@ mod tests {
     #[tokio::test]
     async fn bifrost_query_decodes_arrow_and_terminal() {
         let schema = test_schema();
+        let (mut ipc, prefix) = TestQueryIpc::open(&schema);
+        let batch = ipc.batch(&schema, &[1, 2]);
+        let eos = ipc.close();
         let chunks = vec![
             encoded(QueryStreamFrame::Schema(QuerySchemaFrame {
                 schema_fingerprint: "fingerprint".to_owned(),
-                arrow_ipc_schema: schema_ipc(&schema),
+                arrow_ipc_schema: prefix,
             })),
             encoded(QueryStreamFrame::Batch(QueryBatchFrame {
-                arrow_ipc_batch: batch_ipc(&schema, &[1, 2]),
+                arrow_ipc_batch: batch,
             })),
             encoded(QueryStreamFrame::Terminal(success_terminal(
                 VisibilityMode::PublishedOnly,
                 2,
+                eos,
             ))),
         ];
         let mut result = result_stream(chunks, VisibilityMode::PublishedOnly);
@@ -993,13 +1209,13 @@ mod tests {
     /// Degraded is a successful completion with explicit retained terminal state.
     #[tokio::test]
     async fn bifrost_query_degraded_terminal_completes() {
-        let schema = test_schema();
+        let (prefix, eos) = empty_ipc(&test_schema());
         let chunks = vec![
             encoded(QueryStreamFrame::Schema(QuerySchemaFrame {
                 schema_fingerprint: "fingerprint".to_owned(),
-                arrow_ipc_schema: schema_ipc(&schema),
+                arrow_ipc_schema: prefix,
             })),
-            encoded(QueryStreamFrame::Terminal(degraded_terminal(0))),
+            encoded(QueryStreamFrame::Terminal(degraded_terminal(0, eos))),
         ];
         let mut result = result_stream(chunks, VisibilityMode::Fused);
         assert!(
@@ -1022,14 +1238,16 @@ mod tests {
             Field::new("id", DataType::Int64, false),
             Field::new("optional_value", DataType::Utf8, true),
         ]));
+        let (prefix, eos) = empty_ipc(&schema);
         let chunks = vec![
             encoded(QueryStreamFrame::Schema(QuerySchemaFrame {
                 schema_fingerprint: "zero-row-fingerprint".to_owned(),
-                arrow_ipc_schema: schema_ipc(&schema),
+                arrow_ipc_schema: prefix,
             })),
             encoded(QueryStreamFrame::Terminal(success_terminal(
                 VisibilityMode::PublishedOnly,
                 0,
+                eos,
             ))),
         ];
 
@@ -1056,9 +1274,11 @@ mod tests {
     /// A successful terminal without the required schema never becomes a result.
     #[tokio::test]
     async fn bifrost_query_collection_rejects_missing_schema() {
+        let (_prefix, eos) = empty_ipc(&test_schema());
         let chunks = vec![encoded(QueryStreamFrame::Terminal(success_terminal(
             VisibilityMode::PublishedOnly,
             0,
+            eos,
         )))];
 
         assert!(
@@ -1075,11 +1295,11 @@ mod tests {
     /// A failed terminal errors after retaining exact diagnostic metadata.
     #[tokio::test]
     async fn bifrost_query_failed_terminal_is_retained_and_rejected() {
-        let schema = test_schema();
+        let (prefix, _eos) = empty_ipc(&test_schema());
         let chunks = vec![
             encoded(QueryStreamFrame::Schema(QuerySchemaFrame {
                 schema_fingerprint: "fingerprint".to_owned(),
-                arrow_ipc_schema: schema_ipc(&schema),
+                arrow_ipc_schema: prefix,
             })),
             encoded(QueryStreamFrame::Terminal(failed_terminal(0))),
         ];
@@ -1095,22 +1315,39 @@ mod tests {
         );
     }
 
-    /// A batch encoded with a different schema cannot cross the initial schema frame.
+    /// A standalone per-batch stream is refused; there is no compatibility mode.
+    ///
+    /// The public protocol is one split IPC stream, so a batch frame carries a
+    /// bare write delta. A legacy frame that re-encodes its own schema message
+    /// is a second schema on the same stream and must be rejected rather than
+    /// silently reinterpreted under the initial schema.
     #[tokio::test]
-    async fn bifrost_query_rejects_batch_schema_mismatch() {
+    async fn bifrost_query_rejects_standalone_batch_stream() {
         let initial = test_schema();
         let other = Arc::new(Schema::new(vec![Field::new(
             "other",
             DataType::Int64,
             false,
         )]));
+        let (_initial_ipc, prefix) = TestQueryIpc::open(&initial);
+        let mut standalone = Vec::new();
+        let mut writer = StreamWriter::try_new(&mut standalone, other.as_ref())
+            .expect("standalone writer starts");
+        writer
+            .write(
+                &RecordBatch::try_new(Arc::clone(&other), vec![Arc::new(Int64Array::from(vec![1]))])
+                    .expect("standalone batch is valid"),
+            )
+            .expect("standalone batch writes");
+        writer.finish().expect("standalone writer finishes");
+        drop(writer);
         let chunks = vec![
             encoded(QueryStreamFrame::Schema(QuerySchemaFrame {
                 schema_fingerprint: "fingerprint".to_owned(),
-                arrow_ipc_schema: schema_ipc(&initial),
+                arrow_ipc_schema: prefix,
             })),
             encoded(QueryStreamFrame::Batch(QueryBatchFrame {
-                arrow_ipc_batch: batch_ipc(&other, &[1]),
+                arrow_ipc_batch: standalone,
             })),
         ];
         let mut result = result_stream(chunks, VisibilityMode::PublishedOnly);
@@ -1120,15 +1357,139 @@ mod tests {
         ));
     }
 
+    /// The client decodes one split IPC stream per query with an explicit close.
+    ///
+    /// This is the client half of the stateful protocol: one schema fragment,
+    /// one bare delta per batch, and one end-of-stream delta carried by the
+    /// terminal. It proves ordering, closure, per-fragment bounded retention,
+    /// and that the fragments are strictly smaller than standalone re-encodes.
+    #[tokio::test]
+    async fn stateful_ipc_decoder_contract() {
+        let schema = test_schema();
+        let (mut ipc, prefix) = TestQueryIpc::open(&schema);
+        let batches = vec![
+            ipc.batch(&schema, &[1, 2]),
+            ipc.batch(&schema, &[3]),
+            ipc.batch(&schema, &[4, 5, 6]),
+        ];
+        let eos = ipc.close();
+
+        let mut standalone = Vec::new();
+        let mut writer =
+            StreamWriter::try_new(&mut standalone, schema.as_ref()).expect("standalone starts");
+        writer
+            .write(
+                &RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int64Array::from(vec![1, 2]))],
+                )
+                .expect("standalone batch is valid"),
+            )
+            .expect("standalone batch writes");
+        writer.finish().expect("standalone finishes");
+        drop(writer);
+        assert!(
+            batches[0].len() < standalone.len(),
+            "a continuation fragment must be smaller than a standalone stream"
+        );
+
+        let mut chunks = vec![encoded(QueryStreamFrame::Schema(QuerySchemaFrame {
+            schema_fingerprint: "fingerprint".to_owned(),
+            arrow_ipc_schema: prefix,
+        }))];
+        chunks.extend(batches.iter().map(|fragment| {
+            encoded(QueryStreamFrame::Batch(QueryBatchFrame {
+                arrow_ipc_batch: fragment.clone(),
+            }))
+        }));
+        chunks.push(encoded(QueryStreamFrame::Terminal(success_terminal(
+            VisibilityMode::PublishedOnly,
+            6,
+            eos.clone(),
+        ))));
+
+        let mut result = result_stream(chunks, VisibilityMode::PublishedOnly);
+        let mut rows = Vec::new();
+        while let Some(batch) = result.next_batch().await.expect("split stream decodes") {
+            assert_eq!(batch.schema().as_ref(), schema.as_ref());
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("int64 column");
+            rows.extend(column.values().iter().copied());
+        }
+        assert_eq!(rows, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(result.terminal().expect("terminal retained").row_count, 6);
+        assert!(result.raw.arrow_ipc_closed(), "terminal EOS closes the stream");
+        let largest = batches
+            .iter()
+            .map(Vec::len)
+            .max()
+            .expect("fixture has batches");
+        assert!(
+            result.raw.peak_pending_frame_bytes() <= largest,
+            "the decoder retains at most one fragment at a time"
+        );
+
+        let (prefix, _unused) = empty_ipc(&schema);
+        let missing_eos = vec![
+            encoded(QueryStreamFrame::Schema(QuerySchemaFrame {
+                schema_fingerprint: "fingerprint".to_owned(),
+                arrow_ipc_schema: prefix,
+            })),
+            encoded(QueryStreamFrame::Terminal(QueryTerminalFrame {
+                arrow_ipc_eos: Vec::new(),
+                ..success_terminal(VisibilityMode::PublishedOnly, 0, eos.clone())
+            })),
+        ];
+        assert!(matches!(
+            result_stream(missing_eos, VisibilityMode::PublishedOnly)
+                .next_batch()
+                .await,
+            Err(ValaSdkError::Protocol(_)),
+        ));
+
+        let orphan_batch = vec![encoded(QueryStreamFrame::Batch(QueryBatchFrame {
+            arrow_ipc_batch: batches[0].clone(),
+        }))];
+        assert!(matches!(
+            result_stream(orphan_batch, VisibilityMode::PublishedOnly)
+                .next_batch()
+                .await,
+            Err(ValaSdkError::Protocol(_))
+        ));
+
+        let (prefix, closing) = empty_ipc(&schema);
+        let mut decoder = QueryIpcDecoder::new();
+        decoder.accept_schema(&prefix).expect("schema accepted");
+        assert!(
+            decoder.accept_schema(&prefix).is_err(),
+            "a stream carries exactly one schema"
+        );
+        decoder.accept_eos(&closing).expect("end-of-stream accepted");
+        assert!(decoder.eos_accepted());
+        assert!(
+            decoder.accept_batch(&batches[0]).is_err(),
+            "no fragment may follow the end-of-stream"
+        );
+        assert!(
+            decoder.accept_eos(&closing).is_err(),
+            "a stream closes exactly once"
+        );
+    }
+
     /// Row and encoded-byte bounds reject the whole collection without truncation.
     #[tokio::test]
     async fn bifrost_query_bounded_collection_rejects_rows_and_bytes() {
         let schema = test_schema();
-        let batch = batch_ipc(&schema, &[1, 2]);
+        let (mut ipc, prefix) = TestQueryIpc::open(&schema);
+        let batch = ipc.batch(&schema, &[1, 2]);
+        let eos = ipc.close();
         let chunks = vec![
             encoded(QueryStreamFrame::Schema(QuerySchemaFrame {
                 schema_fingerprint: "fingerprint".to_owned(),
-                arrow_ipc_schema: schema_ipc(&schema),
+                arrow_ipc_schema: prefix,
             })),
             encoded(QueryStreamFrame::Batch(QueryBatchFrame {
                 arrow_ipc_batch: batch.clone(),
@@ -1136,6 +1497,7 @@ mod tests {
             encoded(QueryStreamFrame::Terminal(success_terminal(
                 VisibilityMode::PublishedOnly,
                 2,
+                eos,
             ))),
         ];
         let rows = result_stream(chunks.clone(), VisibilityMode::PublishedOnly)
@@ -1168,13 +1530,15 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let schema = Arc::new(Schema::new(fields));
+        let (prefix, eos) = empty_ipc(&schema);
         let schema_frame = encoded(QueryStreamFrame::Schema(QuerySchemaFrame {
             schema_fingerprint: "wide-schema".to_owned(),
-            arrow_ipc_schema: schema_ipc(&schema),
+            arrow_ipc_schema: prefix,
         }));
         let terminal_frame = encoded(QueryStreamFrame::Terminal(success_terminal(
             VisibilityMode::PublishedOnly,
             0,
+            eos,
         )));
         let encoded_bytes = schema_frame
             .len()

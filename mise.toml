@@ -104,54 +104,20 @@ so they stay out of the fast lane) against live Postgres."""
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:bifrost:journey:inner'"
 [tasks."test:bifrost:journey:inner"]
 hide = true
-description = """Run the current Bifrost/Scribe Rust user-journey tests (marked #[ignore]
-so they stay out of the fast lane) against live Postgres."""
+description = """Run every Bifrost capability test binary whole against live Postgres.
+Each line selects a Cargo target, never an individual test name: Cargo resolves a
+target against the manifest and fails loudly when it is missing, while a
+positional test-name filter is unverified and exits 0 after selecting nothing.
+Adding a journey to an existing binary therefore needs no edit here."""
 run = """
 cargo test --locked -p vala-sdk --test pg_bifrost_e2e -- --include-ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test journeys -- public_write_read_journey --ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test journeys -- production_recorder_exposes_bifrost_owner_families --ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test journeys -- public_write_compact_read_journey --ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test journeys -- public_multitenant_write_compact_read_journey --ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test journeys -- distributed_write_compact_read_journey --ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test journeys -- unhealthy_scratch_volume_defers_peer_and_healthy_worker_takes_over --ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test journeys -- pg_bifrost_forge_small_files_converges_without_query_dependency --ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test journeys -- supervised_forge_panic_fails_stop_and_recovers_exactly_once --ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test journeys -- public_ack_restart_read_exact_once_journey --ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test journeys -- coordination_runtime_owner_drops_without_panic --ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test journeys -- serve_task_panic_fails_shutdown --ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test otlp -- --test-threads=1
-cargo test --locked -p wyrd-testing --test oracle -- pg_bifrost_oracle_published_journey --ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test oracle -- pg_bifrost_oracle_fused_reconcile_journey --ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test oracle -- pg_bifrost_oracle_role_separated_journey --ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test oracle -- pg_bifrost_oracle_distributed_journey --ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test oracle -- pg_bifrost_oracle_multitenant_isolation_and_fairness_journey --ignored --test-threads=1
-cargo test --locked -p vala-bifrost-redux --features "$WYRD_REDUX_TEST_FEATURES" --test integration -- pg_bifrost_oracle_multitenant_isolation_and_fairness_journey --test-threads=1
-cargo test --locked -p wyrd-testing --test oracle -- pg_bifrost_oracle_peer_security_journey --ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test oracle -- pg_bifrost_oracle_recovery_terminal_journey --ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test oracle -- pg_bifrost_oracle_audit_relay_journey --ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test oracle -- public_grpc_matches_http_frames --ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test oracle -- public_grpc_without_oracle_is_unavailable --ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test oracle -- public_grpc_drop_releases_query_resources --ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test oracle -- typed_vala_route_uses_oracle_cut --ignored --test-threads=1
-cargo test --locked -p wyrd-mcp --test bifrost_rbac -- bifrost_query_zero_rows_returns_authoritative_schema --ignored --test-threads=1
-cargo test --locked -p vala-bifrost-redux --features "$WYRD_REDUX_TEST_FEATURES" --test integration -- pg_bifrost_oracle_recovery_terminal_journey --test-threads=1
-cargo test --locked -p wyrd-testing --test oracle -- oracle_production_telemetry_contract --ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test oracle -- pg_bifrost_oracle_two_server_scribe_tail_boundary_journey --ignored --test-threads=1
-cargo test --locked -p vala-bifrost-redux --features "$WYRD_REDUX_TEST_FEATURES" --test integration -- pg_bifrost_oracle_multitenant_isolation_and_fairness_journey_stale_file_replan --test-threads=1
-"""
-
-[tasks."test:fuzz:bifrost"]
-description = "Run the Postgres-backed Bifrost interleaving replay tests"
-
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:fuzz:bifrost:inner'"
-[tasks."test:fuzz:bifrost:inner"]
-hide = true
-description = "Run the Postgres-backed Bifrost interleaving replay tests"
-run = """
-cargo test --locked -p wyrd-testing --test fuzz -- interleaving_smoke --test-threads=1
-cargo test --locked -p wyrd-testing --test fuzz -- bifrost_interleavings --test-threads=1
-cargo test --locked -p wyrd-testing --test fuzz -- forge_compaction_interleaving --ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test fuzz -- forge_maintenance_interleaving --ignored --test-threads=1
+cargo test --locked -p wyrd-testing --test forge -- --include-ignored --test-threads=1
+cargo test --locked -p wyrd-testing --test scribe -- --include-ignored --test-threads=1
+cargo test --locked -p wyrd-testing --test oracle -- --include-ignored --test-threads=1
+cargo test --locked -p wyrd-testing --test otlp -- --include-ignored --test-threads=1
+cargo test --locked -p wyrd-testing --test server -- --include-ignored --test-threads=1
+cargo test --locked -p wyrd-testing --test interleavings -- --include-ignored --test-threads=1
+cargo test --locked -p wyrd-mcp --test mcp -- --include-ignored --test-threads=1
 """
 
 [tasks."test:bifrost:cluster"]
@@ -160,8 +126,10 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:i
 
 [tasks."test:bifrost:cluster:inner"]
 hide = true
-description = "Run only the named deterministic Rust cluster matrix journeys"
-run = "cargo test --locked -p wyrd-testing --test cluster -- single_tenant_single_pod_mixed_gate_load --ignored --test-threads=1 && cargo test --locked -p wyrd-testing --test cluster -- multi_tenant_single_pod_mixed_gate_load --ignored --test-threads=1 && cargo test --locked -p wyrd-testing --test cluster -- multi_tenant_three_server_three_worker_mixed_gate_load --ignored --test-threads=1 && cargo test --locked -p wyrd-testing --test cluster -- pressured_tenant_does_not_starve_peers --ignored --test-threads=1 && cargo test --locked -p wyrd-testing --test cluster -- cluster_load_cancellation_and_shutdown_release_all_owners --ignored --test-threads=1 && cargo test --locked -p wyrd-testing --test cluster -- three_server_cluster_reconciles_production_telemetry --ignored --test-threads=1"
+description = """Run the deterministic public-Gate cluster matrix binary whole.
+Selects the `cluster` target rather than naming its journeys, so a matrix case
+added to that binary runs here without an edit."""
+run = "cargo test --locked -p wyrd-testing --test cluster -- --include-ignored --test-threads=1"
 
 [tasks."test:bifrost:s3-predicate-pushdown"]
 depends = ["codegen:check"]
@@ -1321,7 +1289,7 @@ cargo test --locked -p vala-bifrost-redux --features test-support,bench-support 
 cargo test --locked -p vala-bifrost-redux --features test-support,bench-support --test integration -- oracle_core::deadline_is_captured_once_and_never_refreshed --exact --nocapture --test-threads=1;
 cargo test --locked -p vala-bifrost-redux --features test-support,bench-support --test integration -- oracle_core::cancel_joins_every_started_partition --exact --nocapture --test-threads=1;
 cargo test --locked -p vala-bifrost-redux --features test-support,bench-support --test integration -- oracle_core::terminal_paths_release_all_distributed_owners --exact --nocapture --test-threads=1;
-cargo test --locked -p wyrd-testing --test oracle_peer -- follower_ticket_source_stream_and_cleanup_are_exact --exact --nocapture --test-threads=1;
+cargo test --locked -p wyrd-testing --test oracle -- --include-ignored --test-threads=1;
 cargo test --locked -p wyrd-testing --test oracle -- oracle_edge_journeys::pg_bifrost_oracle_heterogeneous_distributed_query_journey --exact --ignored --nocapture --test-threads=1;
 cargo test --locked -p wyrd-testing --test cluster -- pg_bifrost_cluster_load::pg_oracle_resource_ladder_r0_distributed_execution --exact --ignored --nocapture --test-threads=1'
 """

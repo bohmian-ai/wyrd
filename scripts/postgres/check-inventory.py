@@ -25,7 +25,7 @@ empty = {
 }
 migrated = {"test:vala"}
 pre = {
-    "test:bifrost:journey", "test:fuzz:bifrost",
+    "test:bifrost:journey",
     "test:e2e", "py:test:integration", "ts:test:integration", "identity:e2e",
     "test:storage:e2e", "test:storage:s3:cloud", "test:storage:gcs:cloud", "test:storage:azure:cloud",
     "bench:bifrost:smoke",

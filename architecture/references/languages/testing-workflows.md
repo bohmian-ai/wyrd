@@ -78,6 +78,8 @@ mise run test:shared          # shared/* family (no DB)
 mise run test:sql             # live Postgres SQL integration tests
 mise run test:bifrost         # vala-bifrost integration tests
 mise run test:bifrost:journey # Rust bifrost user-journey tests/multi-pod distributed tests
+                              # (capability binaries + registration rule:
+                              #  crates/wyrd/wyrd-testing/tests/README.md)
 mise run test:e2e             # server-level e2e (wyrd-auth, wyrd-server, wyrd-testing, wyrd-client, vala-sdk)
 mise run test:storage:matrix  # storage emulator matrix (S3/GCS/Azure)
 

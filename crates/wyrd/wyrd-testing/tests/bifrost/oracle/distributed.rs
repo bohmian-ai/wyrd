@@ -33,10 +33,9 @@ enum PruningExpectation {
     RowGroupsOnly,
 }
 
-/// S3 proves a selective predicate prunes physical local and distributed
-/// Oracle reads while preserving exact residual rows, and that the tenant
-/// tripwire still fails closed once closed predicate/projection pushdown is
-/// in effect.
+/// A selective predicate prunes physical local and distributed Oracle reads
+/// while preserving exact residual rows, and the tenant tripwire still fails
+/// closed once predicate and projection pushdown are in effect.
 ///
 /// The two legs prove different halves. The `one_mixed` leg plans and scans on
 /// one node, so either physical granularity may move and the assertion accepts
@@ -54,14 +53,14 @@ async fn pg_bifrost_selective_predicate_prunes_distributed_reads() {
         PruningExpectation::FilesOrRowGroups,
     )
     .await
-    .expect("S3 local pruning journey");
+    .expect("local pruning journey");
     prove_selective_predicate_pruning(
         BifrostClusterSpec::three_mixed(),
         2,
         PruningExpectation::RowGroupsOnly,
     )
     .await
-    .expect("S3 distributed pruning journey");
+    .expect("distributed pruning journey");
 }
 
 /// Drives one topology through a three-file selective-predicate fixture,
@@ -82,19 +81,19 @@ async fn prove_selective_predicate_pruning(
     let ingest_server = cluster
         .servers()
         .find(|server| server.bifrost_scribe().is_some())
-        .ok_or("missing S3 ingest node")?;
+        .ok_or("missing ingest node")?;
     let tenant = cluster.data_tenant_id();
-    let table = unique_table("oracle_s3_predicate");
+    let table = unique_table("oracle_predicate");
     register_table(ingest_server, tenant, &table).await?;
-    let writer = client(ingest_server, "s3-predicate-writer").await?;
+    let writer = client(ingest_server, "predicate-writer").await?;
     for (id, value) in [(1_i64, "alpha"), (2_i64, "target"), (3_i64, "zulu")] {
         ingest_marked(&writer, &format!("vala.bifrost.{table}"), id, value).await?;
         ingest_server.flush_bifrost().await?;
     }
     cluster.refresh_oracle_snapshots().await?;
 
-    let query_server = cluster.server(query_index).ok_or("missing S3 query node")?;
-    let reader = client(query_server, "s3-predicate-reader").await?;
+    let query_server = cluster.server(query_index).ok_or("missing query node")?;
+    let reader = client(query_server, "predicate-reader").await?;
     let table_fqn = format!("vala.bifrost.{table}");
 
     let unfiltered_checkpoint = cluster
@@ -218,13 +217,13 @@ async fn prove_selective_predicate_pruning(
     // `QueryTenantInvariant` specifically — not merely "some failure" — is the
     // assertion that regresses if the closed predicate/projection path ever
     // loses the reason across the follower dispatch boundary.
-    let foreign_tenant = cluster.add_tenant("oracle-s3-foreign").await?;
+    let foreign_tenant = cluster.add_tenant("oracle-predicate-foreign").await?;
     seed_foreign_hot_row(
         &cluster,
         tenant,
         &table,
         foreign_tenant,
-        "s3-foreign",
+        "predicate-foreign",
         ingest_server.node_id().as_uuid(),
     )
     .await?;
@@ -381,6 +380,12 @@ fn ipc_marked(id: i64, value: &str) -> Vec<u8> {
     bytes
 }
 
+/// Bound on how many Forge planning passes the fixture will drive before it
+/// gives up on compacting its first batch. Generous, because a pass may claim
+/// nothing, retry, or lose a lease race; finite, because a stalled Forge must
+/// fail the journey rather than hang it.
+const COMPACTION_PASS_BUDGET: usize = 32;
+
 /// Number of rows written before compaction. Every one of them is sealed as
 /// its own Parquet file, so the Forge pass has `min_files` worth of real
 /// inputs to rewrite into a single published data file.
@@ -397,9 +402,9 @@ const MARKER_STRIDE: i64 = 4;
 /// which physical tier it could only have come from.
 const HOT_BATCH_ID_BASE: i64 = 101;
 
-/// S3 proves one selective distributed query reads a cut that spans both
-/// follower read leaves at once — the compacted `:iceberg` leaf and the sealed
-/// `:hot` leaf — and prunes physically on both.
+/// One selective distributed query reads a cut that spans both follower read
+/// leaves at once — the compacted `:iceberg` leaf and the sealed `:hot` leaf —
+/// and prunes physically on both.
 ///
 /// The two leaves are otherwise untestable together. A table that has never
 /// compacted records an `:iceberg` assignment with an empty file set, which
@@ -426,7 +431,7 @@ const HOT_BATCH_ID_BASE: i64 = 101;
 async fn pg_bifrost_selective_predicate_spans_hot_and_compacted_reads() {
     prove_hot_and_compacted_pruning()
         .await
-        .expect("S3 hot+compacted pruning journey");
+        .expect("hot and compacted pruning journey");
 }
 
 /// Builds the two-tier fixture and proves the span-and-prune contract on it.
@@ -439,16 +444,15 @@ async fn pg_bifrost_selective_predicate_spans_hot_and_compacted_reads() {
 /// requires.
 async fn prove_hot_and_compacted_pruning() -> Result<(), JourneyError> {
     let cluster =
-        WyrdTestCluster::start_spec_with_forge_completion_observer(BifrostClusterSpec::three_mixed())
-            .await?;
+        WyrdTestCluster::start_spec(BifrostClusterSpec::three_mixed()).await?;
     let ingest_server = cluster
         .servers()
         .find(|server| server.bifrost_scribe().is_some())
-        .ok_or("missing S3 ingest node")?;
+        .ok_or("missing ingest node")?;
     let tenant = cluster.data_tenant_id();
-    let table = unique_table("oracle_s3_two_tier");
+    let table = unique_table("oracle_two_tier");
     register_table(ingest_server, tenant, &table).await?;
-    let writer = client(ingest_server, "s3-two-tier-writer").await?;
+    let writer = client(ingest_server, "two-tier-writer").await?;
     let table_fqn = format!("vala.bifrost.{table}");
 
     for id in 1..=COMPACTED_BATCH_ROWS {
@@ -476,8 +480,8 @@ async fn prove_hot_and_compacted_pruning() -> Result<(), JourneyError> {
         .into());
     }
 
-    let query_server = cluster.server(2).ok_or("missing S3 query node")?;
-    let reader = client(query_server, "s3-two-tier-reader").await?;
+    let query_server = cluster.server(2).ok_or("missing query node")?;
+    let reader = client(query_server, "two-tier-reader").await?;
     let total_rows = COMPACTED_BATCH_ROWS + HOT_BATCH_ROWS;
 
     let unfiltered_checkpoint = cluster
@@ -597,45 +601,96 @@ fn expected_marked_ids() -> Vec<i64> {
         .collect()
 }
 
-/// Drives one Forge planning pass to completion and requires every sealed
-/// input for `table` to be marked compacted.
+/// Compacts every sealed file already written for `table`, so that a later
+/// query reads them through the Iceberg snapshot rather than the hot manifest.
 ///
-/// Waits on the production completion observer rather than on elapsed time:
-/// the observer counts worker completions the supervisor actually published,
-/// so a pass that claimed nothing cannot be mistaken for a pass that rewrote
-/// the batch. The durable `compacted` flag is then read back as the real
-/// postcondition, because the observer proves a task finished and not that
-/// this table's files moved tiers.
+/// Three things have to happen for that, and none of them are automatic:
+///
+/// * The event-day partition holding the batch has to close. Forge does not
+///   rewrite a partition it may still receive writes for, so the test clock is
+///   advanced past it first.
+/// * A planning pass has to run. The supervisor's own ticker is a minute long,
+///   so passes are requested explicitly and awaited by count.
+/// * A task that lands in `retryable` has to become eligible again. Real
+///   backoff is minutes; `release_forge_retries` moves the durable
+///   `next_eligible_at` back instead of sleeping, leaving the failure
+///   classification untouched.
+///
+/// The loop is bounded and its exit condition is the durable `compacted` flag,
+/// not a pass count: a pass that claimed nothing must not be mistaken for a
+/// pass that rewrote the batch.
 ///
 /// # Errors
 ///
-/// Returns an error when the observer is absent, when no pass completes within
-/// the bound, when the Postgres probe fails, or when fewer than `expected`
-/// inputs end up compacted.
+/// Returns an error when the clock cannot be advanced, when a scheduler pass
+/// does not complete within its bound, when a Postgres probe fails, or when
+/// fewer than `expected` inputs are compacted before the loop's budget runs
+/// out.
 async fn compact_sealed_batch(
     cluster: &WyrdTestCluster,
     tenant: wyrd_spec::DataTenantId,
     table: &str,
     expected: i64,
 ) -> Result<(), JourneyError> {
-    let observer = cluster
-        .forge_completion_observer()
-        .ok_or("cluster was started without a Forge completion observer")?;
-    let target = observer.completed().saturating_add(1);
-    cluster.request_forge_scheduler_pass_for_test();
-    tokio::time::timeout(
-        std::time::Duration::from_secs(90),
-        observer.wait_for_at_least(target),
-    )
-    .await
-    .map_err(|_| "Forge worker did not complete a pass for the sealed batch")?;
-    let (compacted, _) = file_tier_counts(cluster, tenant, table).await?;
-    if compacted < expected {
-        return Err(format!(
-            "Forge pass compacted {compacted} of {expected} sealed inputs"
-        )
-        .into());
+    for server in cluster.servers() {
+        server
+            .forge_clock()
+            .advance(chrono::Duration::days(1))
+            .map_err(|error| format!("close the written partition: {error}"))?;
     }
+    for _ in 0..COMPACTION_PASS_BUDGET {
+        let (compacted, _) = file_tier_counts(cluster, tenant, table).await?;
+        if compacted >= expected {
+            return Ok(());
+        }
+        release_forge_retries(cluster, tenant, table).await?;
+        let mut awaited = Vec::new();
+        for server in cluster.servers() {
+            awaited.push((server, server.completed_forge_scheduler_passes_for_test()));
+        }
+        cluster.request_forge_scheduler_pass_for_test();
+        for (server, before) in awaited {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                server.wait_for_forge_scheduler_passes_for_test(before.saturating_add(1)),
+            )
+            .await
+            .map_err(|_| "Forge scheduler pass did not complete")?;
+        }
+    }
+    let (compacted, hot) = file_tier_counts(cluster, tenant, table).await?;
+    Err(format!(
+        "Forge compacted {compacted} of {expected} sealed inputs within \
+         {COMPACTION_PASS_BUDGET} passes ({hot} still hot)"
+    )
+    .into())
+}
+
+/// Makes every `retryable` Forge task for one table immediately eligible.
+///
+/// Backoff between attempts is real production time, which a bounded journey
+/// cannot wait out. Only `next_eligible_at` and `ready_at` move; the attempt
+/// count and failure classification are left alone, so a task that is failing
+/// for a real reason still exhausts its attempts and still reports why.
+///
+/// # Errors
+///
+/// Returns the SQLx error when the eligibility update cannot be applied.
+async fn release_forge_retries(
+    cluster: &WyrdTestCluster,
+    tenant: wyrd_spec::DataTenantId,
+    table: &str,
+) -> Result<(), JourneyError> {
+    sqlx::query(
+        "UPDATE vala.forge_tasks \
+         SET ready_at = statement_timestamp(), \
+             next_eligible_at = statement_timestamp() - interval '15 minutes' \
+         WHERE data_tenant_id = $1 AND table_name = $2 AND state = 'retryable'",
+    )
+    .bind(tenant.as_uuid())
+    .bind(table)
+    .execute(cluster.pg_fixture().operator_pool().pool())
+    .await?;
     Ok(())
 }
 

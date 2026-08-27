@@ -694,8 +694,15 @@ pub async fn compose_bifrost(
         // server. One initializer makes that divergence unrepresentable.
         let admission_defaults = AdmissionConfig {
             memory_limit_bytes: pod_memory_limit,
-            scribe_memory_limit_bytes: (resource_plan.scribe_floor_bytes > 0)
-                .then_some(resource_plan.scribe_floor_bytes),
+            // Scribe's real ceiling is its guaranteed floor plus the shared
+            // elastic allowance it may borrow, which is what the role governor
+            // enforces. Validating against the floor alone would understate the
+            // memory Scribe actually owns and refuse pods that can serve.
+            scribe_memory_limit_bytes: (resource_plan.scribe_floor_bytes > 0).then(|| {
+                resource_plan
+                    .scribe_floor_bytes
+                    .saturating_add(resource_plan.elastic_memory_bytes)
+            }),
             policy: vala_bifrost_redux::scribe::geometry::ScribeArtifactPolicy::new(geometry),
             event_time_window: EventTimeWindow {
                 past: scribe_config

@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::contracts::ScribeError;
 use crate::resources::ScribeResources;
-use crate::scribe::contention::{ContentionKey, ScribeContentionLedger};
+use crate::scribe::contention::{ActivationOutcome, ContentionKey, ScribeContentionLedger};
 use crate::scribe::geometry::{ContentionCategory, ScribeArtifactPolicy, ScribeGeometryError};
 
 /// Fixed request overhead charged to every accepted append.
@@ -598,19 +598,44 @@ impl AdmissionController {
 
     /// Activates a table's cell if needed and charges one admitted request.
     ///
-    /// Activation and the two admission charges happen together because a cell
-    /// that held an item without its bytes, or the reverse, would let a table
-    /// pass admission it cannot actually own.
+    /// Activation and the two admission charges are one reversible transition.
+    ///
+    /// A cell that held an item without its bytes, or the reverse, would let a
+    /// table pass admission it cannot actually own. A cell created here and then
+    /// refused is removed again, so a rejected first request leaves no trace of
+    /// the table at all -- an empty cell would otherwise occupy one of the pod's
+    /// derived ownership slots forever while serving nothing. Only a cell *this
+    /// call* created is rolled back: a table that was already active keeps its
+    /// cell and everything it owns, because the refusal says nothing about the
+    /// work it is already carrying.
     ///
     /// # Errors
     ///
     /// Returns the [`ScribeError`] projection of the contention refusal.
     fn charge_cell(&self, key: &ContentionKey, bytes: usize) -> Result<(), ScribeError> {
         let ledger = &self.inner.contention;
-        ledger.activate(key)?;
-        ledger.charge(key, ContentionCategory::AdmissionItems, 1)?;
+        let outcome = ledger.activate(key)?;
+        let rollback = |controller: &Self| {
+            if outcome == ActivationOutcome::Created {
+                // Every charge has been returned by this point, so the cell is
+                // empty and deactivation cannot refuse.
+                if let Err(error) = controller.inner.contention.deactivate(key) {
+                    tracing::error!(
+                        error = %error,
+                        "failed admission could not release the cell it created"
+                    );
+                }
+            }
+        };
+        if let Err(refusal) = ledger.charge(key, ContentionCategory::AdmissionItems, 1) {
+            rollback(self);
+            return Err(refusal.into());
+        }
         if let Err(refusal) = ledger.charge(key, ContentionCategory::AdmissionBytes, bytes) {
-            let _ = ledger.release(key, ContentionCategory::AdmissionItems, 1);
+            if let Err(error) = ledger.release(key, ContentionCategory::AdmissionItems, 1) {
+                tracing::error!(error = %error, "admission item rollback failed");
+            }
+            rollback(self);
             return Err(refusal.into());
         }
         Ok(())
@@ -677,17 +702,27 @@ impl InflightFrameReservation {
         })?;
         if bytes >= self.bytes {
             let extra = bytes - self.bytes;
-            state.bytes =
+            let next_bytes =
                 state
                     .bytes
                     .checked_add(extra)
                     .ok_or_else(|| ScribeError::IngestBusy {
                         table: "vala.bifrost".to_owned(),
                     })?;
+            state.bytes = next_bytes;
             if let Some(key) = &self.cell {
-                inner
-                    .contention
-                    .charge(key, ContentionCategory::AdmissionBytes, extra)?;
+                // The global counter moved first, so a contention refusal must
+                // put it back. Leaving it raised would charge the pod for bytes
+                // no table owns, and every later admission would be measured
+                // against that phantom.
+                if let Err(refusal) =
+                    inner
+                        .contention
+                        .charge(key, ContentionCategory::AdmissionBytes, extra)
+                {
+                    state.bytes -= extra;
+                    return Err(refusal.into());
+                }
             }
         } else {
             let released = self.bytes - bytes;
@@ -777,6 +812,182 @@ pub struct AdmissionSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builds a contention cell identity for one tenant ordinal and table name.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the synthetic tenant identifier is not accepted.
+    fn cell_key(tenant: u8, table: &str) -> ContentionKey {
+        let mut bytes = [tenant; 16];
+        bytes[6] = 0x70 | (bytes[6] & 0x0f);
+        bytes[8] = 0x80 | (bytes[8] & 0x3f);
+        ContentionKey::new(
+            wyrd_spec::ids::DataTenantId::new(uuid::Uuid::from_bytes(bytes))
+                .expect("UUIDv7 test tenant"),
+            crate::catalog::TableRef::new(crate::namespaces::BifrostNamespace::Datasets, table),
+        )
+    }
+
+    /// Returns the pod capacity the default admission configuration derives.
+    fn default_pod_capacity() -> crate::scribe::geometry::ScribeGlobalCapacity {
+        let config = AdmissionConfig::default();
+        let memory = super::super::embedded_scribe_resources(&config);
+        let staging = memory
+            .snapshot()
+            .map_or(0, |snapshot| snapshot.plan.scratch_limit_bytes);
+        config.policy.pod_capacity(
+            config.memory_limit_bytes,
+            usize::try_from(staging).unwrap_or(usize::MAX),
+            GLOBAL_INFLIGHT_ITEMS,
+        )
+    }
+
+    /// A first request refused on admission items installs no cell at all.
+    ///
+    /// Activation and the first charges are one reversible transition, so the
+    /// arriving table must leave no trace: an empty cell would hold one of the
+    /// pod's derived ownership slots while serving nothing.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the refused arrival keeps a cell, or when the saturating
+    /// owner loses anything.
+    #[test]
+    fn a_first_request_refused_on_items_installs_no_cell() {
+        let admission = AdmissionController::with_config(AdmissionConfig::default())
+            .expect("the default geometry fits the default budget");
+        let ledger = admission.contention();
+        let filler = cell_key(7, "filler");
+        let capacity = default_pod_capacity();
+        ledger.activate(&filler).expect("filler activates");
+        ledger
+            .charge(
+                &filler,
+                ContentionCategory::AdmissionItems,
+                capacity.admission_items,
+            )
+            .expect("an idle pod lets one owner hold every admitted item");
+
+        let arrival = cell_key(8, "arrival");
+        admission
+            .try_reserve_for_cell(&arrival, "wyrd.arrival", 0)
+            .expect_err("the arrival cannot reserve an item the pod does not have");
+        assert!(matches!(
+            ledger.usage(&arrival, ContentionCategory::AdmissionItems),
+            Err(crate::scribe::contention::ContentionRefusal::Inactive)
+        ));
+        assert_eq!(admission.snapshot().items, 0);
+        assert_eq!(admission.snapshot().bytes, 0);
+        assert_eq!(
+            ledger
+                .usage(&filler, ContentionCategory::AdmissionItems)
+                .expect("the saturating owner keeps its cell"),
+            capacity.admission_items
+        );
+    }
+
+    /// A first request refused on admission bytes installs no cell at all.
+    ///
+    /// The item charge succeeds and the byte charge does not, so this proves the
+    /// rollback returns the item as well as the cell.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the refused arrival keeps a cell or leaves an item charged.
+    #[test]
+    fn a_first_request_refused_on_bytes_installs_no_cell() {
+        let admission = AdmissionController::with_config(AdmissionConfig::default())
+            .expect("the default geometry fits the default budget");
+        let ledger = admission.contention();
+        let filler = cell_key(7, "filler");
+        let capacity = default_pod_capacity();
+        ledger.activate(&filler).expect("filler activates");
+        ledger
+            .charge(
+                &filler,
+                ContentionCategory::AdmissionBytes,
+                capacity.admission_bytes,
+            )
+            .expect("an idle pod lets one owner hold every admitted byte");
+
+        let arrival = cell_key(8, "arrival");
+        admission
+            .try_reserve_for_cell(&arrival, "wyrd.arrival", 4_096)
+            .expect_err("the arrival cannot reserve bytes the pod does not have");
+        assert!(matches!(
+            ledger.usage(&arrival, ContentionCategory::AdmissionBytes),
+            Err(crate::scribe::contention::ContentionRefusal::Inactive)
+        ));
+        assert_eq!(
+            ledger
+                .committed(ContentionCategory::AdmissionItems)
+                .expect("pod items"),
+            0,
+            "the rolled-back arrival must return the item it charged first"
+        );
+        assert_eq!(admission.snapshot().items, 0);
+        assert_eq!(admission.snapshot().bytes, 0);
+    }
+
+    /// A rejected resize leaves the global and cell counters exactly as they were.
+    ///
+    /// The global byte counter moves before contention is consulted, so a
+    /// refusal must put it back; leaving it raised would charge the pod for
+    /// bytes no table owns.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a refused resize changes any counter, or when dropping the
+    /// reservation afterwards does not balance every level back to zero.
+    #[test]
+    fn a_rejected_resize_changes_no_counter_and_still_balances_on_drop() {
+        let admission = AdmissionController::with_config(AdmissionConfig::default())
+            .expect("the default geometry fits the default budget");
+        let ledger = admission.contention();
+        let capacity = default_pod_capacity();
+        let owner = cell_key(9, "events");
+        let mut reservation = admission
+            .try_reserve_for_cell(&owner, "wyrd.events", 4_096)
+            .expect("a first request activates the cell and reserves inside it");
+
+        // Saturate the remaining admitted bytes from another owner so the resize
+        // is refused by contention rather than by the pod-global breaker.
+        let filler = cell_key(10, "filler");
+        ledger.activate(&filler).expect("filler activates");
+        ledger
+            .charge(
+                &filler,
+                ContentionCategory::AdmissionBytes,
+                capacity.admission_bytes - 4_096,
+            )
+            .expect("the rest of the admitted bytes are taken");
+
+        let before = admission.snapshot();
+        reservation
+            .resize(4_096 + 1_024)
+            .expect_err("a saturated pod refuses the growth");
+        assert_eq!(admission.snapshot().bytes, before.bytes);
+        assert_eq!(admission.snapshot().items, before.items);
+        assert_eq!(
+            ledger
+                .usage(&owner, ContentionCategory::AdmissionBytes)
+                .expect("the cell survives a refused resize"),
+            4_096
+        );
+        assert_eq!(reservation.bytes(), 4_096);
+
+        drop(reservation);
+        assert_eq!(admission.snapshot().items, 0);
+        assert_eq!(admission.snapshot().bytes, 0);
+        assert_eq!(
+            ledger
+                .committed(ContentionCategory::AdmissionBytes)
+                .expect("pod bytes"),
+            capacity.admission_bytes - 4_096,
+            "only the filler's charge remains"
+        );
+    }
 
     /// A per-table reservation charges and returns its own contention cell.
     ///

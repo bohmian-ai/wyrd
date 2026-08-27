@@ -94,16 +94,52 @@ impl ContentionKey {
 
 /// One bounded, expiring record that a real table is waiting for capacity.
 ///
-/// Holds identity and an expiry and nothing else. It exists so a contender that
-/// was refused is served before an incumbent can reborrow the capacity it
-/// releases, and it is removed the moment that contender is admitted, cancels,
-/// or expires.
+/// Holds identity, what it is waiting for, and an expiry, and nothing else. It
+/// exists so a contender that was refused is served before an incumbent can
+/// reborrow the capacity it releases, and it is removed the moment that
+/// contender succeeds, cancels, or expires.
+///
+/// The two kinds of waiting are distinct and both are needed. A record with no
+/// category is waiting to *activate*: it wants a whole lifecycle vector and
+/// stops mattering the moment its table becomes active. A record with a
+/// category belongs to a table that is already active and was refused capacity
+/// in that one category; it must survive precisely because its table is active,
+/// since that is the case an over-share incumbent would otherwise reacquire
+/// past.
 #[derive(Debug, Clone)]
 struct DemandRecord {
     /// Which registered canonical table is waiting.
     key: ContentionKey,
+    /// The category it was refused in, or `None` when it is waiting to activate.
+    category: Option<ContentionCategory>,
     /// When this record stops conferring ordering priority.
     expires_at: Instant,
+}
+
+impl DemandRecord {
+    /// Returns whether this record competes for capacity in one category.
+    ///
+    /// An activation record competes in every category, because the table it
+    /// speaks for needs a complete lifecycle vector before it can serve.
+    const fn competes_in(&self, category: ContentionCategory) -> bool {
+        match self.category {
+            None => true,
+            Some(waiting) => waiting as usize == category as usize,
+        }
+    }
+}
+
+/// What one call to [`ScribeContentionLedger::activate`] actually did.
+///
+/// The caller needs this to undo a failed admission: only a cell this call
+/// created may be rolled back, because rolling back a cell that was already
+/// serving would revoke another caller's acknowledged work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationOutcome {
+    /// This call installed the table's cell.
+    Created,
+    /// The table already held a cell; nothing was installed.
+    AlreadyActive,
 }
 
 /// Live usage of one active canonical table across every governed category.
@@ -191,52 +227,105 @@ impl LedgerState {
     /// Drops every demand record that expired or was overtaken by admission.
     ///
     /// Called at the head of every operation that reads demand so an abandoned
-    /// contender cannot hold ordering priority, and so a record left behind by a
-    /// racing admission is never counted twice.
+    /// contender cannot hold ordering priority. Only *activation* records are
+    /// retired by their table becoming active; a category record belongs to an
+    /// already-active table by definition, and pruning it on that basis is
+    /// exactly what would let an over-share incumbent reacquire past it.
     fn prune_demand(&mut self, now: Instant) {
-        let active: Vec<ContentionKey> = self
+        let admitted: Vec<ContentionKey> = self
             .demand
             .iter()
-            .filter(|record| self.is_active(&record.key))
+            .filter(|record| record.category.is_none() && self.is_active(&record.key))
             .map(|record| record.key.clone())
             .collect();
-        self.demand
-            .retain(|record| record.expires_at > now && !active.contains(&record.key));
+        self.demand.retain(|record| {
+            record.expires_at > now
+                && !(record.category.is_none() && admitted.contains(&record.key))
+        });
     }
 
-    /// Returns the distinct waiting tables registered before `key`.
+    /// Returns the distinct tables waiting to activate ahead of `key`.
     ///
     /// A contender that already holds a record counts only the records ahead of
     /// its own; one that holds none counts every live record, because it is
     /// arriving behind all of them.
     fn waiting_ahead(&self, key: &ContentionKey) -> usize {
+        self.distinct_ahead(key, |record| record.category.is_none())
+    }
+
+    /// Returns the distinct unserved contenders holding capacity back from `key`.
+    ///
+    /// A contender is *unserved* while its table holds less than one lifecycle
+    /// quantum in the category it is waiting on: it has been refused and has not
+    /// yet received enough to carry a table through. Only those reserve.
+    ///
+    /// Who counts as "ahead" depends on the caller. An unserved caller is a
+    /// contender itself, so it only yields to the contenders queued before it
+    /// and receives released capacity in queue order. A caller that is already
+    /// served -- the over-share incumbent -- yields to *every* unserved
+    /// contender regardless of when it queued, which is what makes reacquisition
+    /// impossible while anyone is still waiting.
+    fn reserved_ahead(
+        &self,
+        key: &ContentionKey,
+        category: ContentionCategory,
+        quantum: usize,
+    ) -> usize {
+        let caller_is_contender = self.unserved(key, category, quantum);
         let mut seen: Vec<&ContentionKey> = Vec::new();
         for record in &self.demand {
             if &record.key == key {
-                break;
+                if caller_is_contender {
+                    break;
+                }
+                continue;
             }
-            if !seen.contains(&&record.key) {
+            if record.competes_in(category)
+                && self.unserved(&record.key, category, quantum)
+                && !seen.contains(&&record.key)
+            {
                 seen.push(&record.key);
             }
         }
         seen.len()
     }
 
-    /// Returns the extra tables each tenant is waiting to activate.
-    ///
-    /// Keyed by tenant so a waiting contender's lifecycle quantum can enter the
-    /// fairness computation as demand without owning anything yet.
-    fn pending_by_tenant(&self) -> HashMap<DataTenantId, usize> {
-        let mut pending: HashMap<DataTenantId, usize> = HashMap::new();
+    /// Returns whether one table still holds less than a lifecycle quantum.
+    fn unserved(&self, key: &ContentionKey, category: ContentionCategory, quantum: usize) -> bool {
+        self.held(key, category) < quantum
+    }
+
+    /// Returns one table's committed amount, or zero when it holds no cell.
+    fn held(&self, key: &ContentionKey, category: ContentionCategory) -> usize {
+        self.tenants
+            .get(&key.tenant)
+            .and_then(|tenant| tenant.tables.get(&key.table))
+            .map_or(0, |cell| cell.get(category))
+    }
+
+    /// Returns whether one table is queued for capacity in one category.
+    fn has_demand(&self, key: &ContentionKey, category: ContentionCategory) -> bool {
+        self.demand
+            .iter()
+            .any(|record| &record.key == key && record.competes_in(category))
+    }
+
+    /// Counts distinct matching demand keys registered before `key`'s own record.
+    fn distinct_ahead(
+        &self,
+        key: &ContentionKey,
+        matches: impl Fn(&DemandRecord) -> bool,
+    ) -> usize {
         let mut seen: Vec<&ContentionKey> = Vec::new();
         for record in &self.demand {
-            if seen.contains(&&record.key) {
-                continue;
+            if &record.key == key {
+                break;
             }
-            seen.push(&record.key);
-            *pending.entry(record.key.tenant).or_insert(0) += 1;
+            if matches(record) && !seen.contains(&&record.key) {
+                seen.push(&record.key);
+            }
         }
-        pending
+        seen.len()
     }
 }
 
@@ -308,6 +397,26 @@ pub enum ContentionRefusal {
     /// A charge referenced a tenant or table that holds no installed cell.
     #[error("Scribe contention charge for an inactive table")]
     Inactive,
+    /// A release asked for more than the table's cell actually holds.
+    #[error(
+        "Scribe contention over-release of `{category}`: the cell holds {held} and {requested} was returned"
+    )]
+    OverRelease {
+        /// Fixed-cardinality category label the release named.
+        category: &'static str,
+        /// What the cell actually holds in that category.
+        held: usize,
+        /// What the caller tried to return.
+        requested: usize,
+    },
+    /// A table was deactivated while it still holds capacity.
+    #[error("Scribe cannot deactivate a table still holding {held} in `{category}`")]
+    NonEmpty {
+        /// Fixed-cardinality category label still holding capacity.
+        category: &'static str,
+        /// What the cell still holds in that category.
+        held: usize,
+    },
     /// The ledger lock was poisoned by a panicking holder.
     #[error("Scribe contention ledger lock poisoned: {detail}")]
     Poisoned {
@@ -329,7 +438,10 @@ impl From<ContentionRefusal> for ScribeError {
                     table: refusal.to_string(),
                 }
             }
-            ContentionRefusal::Inactive | ContentionRefusal::Poisoned { .. } => Self::Internal {
+            ContentionRefusal::Inactive
+            | ContentionRefusal::OverRelease { .. }
+            | ContentionRefusal::NonEmpty { .. }
+            | ContentionRefusal::Poisoned { .. } => Self::Internal {
                 detail: refusal.to_string(),
             },
         }
@@ -429,16 +541,16 @@ impl ScribeContentionLedger {
     /// Returns [`ContentionRefusal::OwnershipCeiling`] when the pod cannot carry
     /// another table, or cannot carry it before the contenders already waiting,
     /// and [`ContentionRefusal::Poisoned`] when the ledger lock is poisoned.
-    pub fn activate(&self, key: &ContentionKey) -> Result<(), ContentionRefusal> {
+    pub fn activate(&self, key: &ContentionKey) -> Result<ActivationOutcome, ContentionRefusal> {
         let mut state = self.lock()?;
         state.prune_demand(Instant::now());
         if state.is_active(key) {
-            return Ok(());
+            return Ok(ActivationOutcome::AlreadyActive);
         }
         let active = state.active_tables();
         let waiting = state.waiting_ahead(key);
         if active.saturating_add(waiting) >= self.ownership_ceiling {
-            self.enqueue_demand(&mut state, key);
+            self.enqueue_demand(&mut state, key, None);
             return Err(ContentionRefusal::OwnershipCeiling {
                 ceiling: self.ownership_ceiling,
                 active,
@@ -451,8 +563,10 @@ impl ScribeContentionLedger {
             .or_default()
             .tables
             .insert(key.table.clone(), TenantTableLedger::default());
-        state.demand.retain(|record| &record.key != key);
-        Ok(())
+        state
+            .demand
+            .retain(|record| &record.key != key || record.category.is_some());
+        Ok(ActivationOutcome::Created)
     }
 
     /// Records that one registered canonical table is waiting for capacity.
@@ -461,9 +575,21 @@ impl ScribeContentionLedger {
     /// duplicate record is refreshed rather than appended so one caller cannot
     /// buy priority by retrying, and a full queue drops the request instead of
     /// growing without bound.
-    fn enqueue_demand(&self, state: &mut LedgerState, key: &ContentionKey) {
+    fn enqueue_demand(
+        &self,
+        state: &mut LedgerState,
+        key: &ContentionKey,
+        category: Option<ContentionCategory>,
+    ) {
         let expires_at = Instant::now() + self.demand_ttl;
-        if let Some(record) = state.demand.iter_mut().find(|record| &record.key == key) {
+        if let Some(record) = state.demand.iter_mut().find(|record| {
+            &record.key == key
+                && record.category.map(|held| held as usize)
+                    == category.map(|wanted| wanted as usize)
+        }) {
+            // Refreshed in place, never re-appended: a caller that retries must
+            // keep the queue position it earned rather than losing it to a
+            // rival that has been waiting less time.
             record.expires_at = expires_at;
             return;
         }
@@ -472,14 +598,17 @@ impl ScribeContentionLedger {
         }
         state.demand.push_back(DemandRecord {
             key: key.clone(),
+            category,
             expires_at,
         });
     }
 
-    /// Withdraws one table's demand record.
+    /// Withdraws every demand record one table holds.
     ///
     /// Called when a contender gives up or is invalidated, so it stops holding
-    /// ordering priority ahead of callers that are still waiting.
+    /// ordering priority ahead of callers that are still waiting. Both the
+    /// activation record and any per-category records go together, because a
+    /// caller that has given up is not waiting for any of them.
     ///
     /// # Errors
     ///
@@ -501,14 +630,26 @@ impl ScribeContentionLedger {
     pub fn waiting_demand(&self) -> Result<usize, ContentionRefusal> {
         let mut state = self.lock()?;
         state.prune_demand(Instant::now());
-        Ok(state.pending_by_tenant().values().sum())
+        let mut seen: Vec<&ContentionKey> = Vec::new();
+        for record in &state.demand {
+            if !seen.contains(&&record.key) {
+                seen.push(&record.key);
+            }
+        }
+        Ok(seen.len())
     }
 
-    /// Releases one table's cell and everything it still held.
+    /// Releases one table's cell once it holds nothing.
     ///
-    /// Nothing survives the release: the table's committed amounts go back to
-    /// the pod, and a tenant whose last table is gone leaves no cell behind. The
-    /// capacity freed here is what a queued contender takes next.
+    /// Deactivation is refused while any category still carries a balance. A
+    /// cell that vanished mid-flight would strand exactly that balance: the pod
+    /// total would keep counting capacity no owner can ever return, and the
+    /// table would have to reactivate into a pod that believes it is fuller than
+    /// it is. Releasing everything first is the caller's job, and this refusal
+    /// is how that obligation is enforced rather than assumed.
+    ///
+    /// A tenant whose last table is gone leaves no cell behind. The capacity
+    /// freed here is what a queued contender takes next.
     ///
     /// Deactivating a table that is not active is a no-op rather than an error:
     /// the shard and admission owners may both reach the same conclusion about
@@ -516,15 +657,29 @@ impl ScribeContentionLedger {
     ///
     /// # Errors
     ///
-    /// Returns [`ContentionRefusal::Poisoned`] when the ledger lock is poisoned.
+    /// Returns [`ContentionRefusal::NonEmpty`] naming the first category that
+    /// still holds capacity, leaving the ledger untouched, and
+    /// [`ContentionRefusal::Poisoned`] when the ledger lock is poisoned.
     pub fn deactivate(&self, key: &ContentionKey) -> Result<(), ContentionRefusal> {
         let mut state = self.lock()?;
         let Some(tenant) = state.tenants.get_mut(&key.tenant) else {
             return Ok(());
         };
-        if tenant.tables.remove(&key.table).is_none() {
+        let Some(cell) = tenant.tables.get(&key.table) else {
             return Ok(());
+        };
+        // Checked before anything is removed, so a refusal leaves the cell and
+        // every total exactly as it found them.
+        for category in ContentionCategory::ALL {
+            let held = cell.get(category);
+            if held > 0 {
+                return Err(ContentionRefusal::NonEmpty {
+                    category: category.label(),
+                    held,
+                });
+            }
         }
+        tenant.tables.remove(&key.table);
         if tenant.tables.is_empty() {
             state.tenants.remove(&key.tenant);
         }
@@ -534,21 +689,31 @@ impl ScribeContentionLedger {
     /// Charges `amount` in one category to an active table.
     ///
     /// The ceiling is recomputed here, on every charge, from the live owners and
-    /// the live contenders — never cached and never derived from a configured
-    /// cardinality. Two max-min levels are computed independently in this one
-    /// category: a tenant level over the pod's capacity, then a table level over
-    /// the charging tenant's own level. A waiting contender enters both
-    /// computations as one lifecycle vector of demand, which is exactly what
-    /// stops an over-share incumbent from acquiring more while someone waits.
+    /// the live contenders -- never cached and never derived from a configured
+    /// cardinality. Three bounds apply in this one category, and nothing is
+    /// summed across categories:
+    ///
+    /// 1. **Contender reservation.** Every distinct contender queued for this
+    ///    category *ahead of the caller* holds back one lifecycle quantum. An
+    ///    incumbent that has just released capacity is behind all of them, which
+    ///    is what makes reacquisition impossible while someone waits; the
+    ///    contender at the head of the queue reserves nothing against itself and
+    ///    so receives that capacity.
+    /// 2. **Tenant level.** Max-min fair share of what is left, over the live
+    ///    tenants.
+    /// 3. **Table level.** Max-min fair share of the charging tenant's own
+    ///    level, over its live tables.
     ///
     /// An owner already above a level it used to be under keeps what it holds;
-    /// only this growth is refused.
+    /// only this growth is refused. Every refusal registers the caller's own
+    /// bounded, expiring, identity-only demand record, so a retry inherits the
+    /// queue position this attempt earned.
     ///
     /// # Errors
     ///
     /// Returns [`ContentionRefusal::Inactive`] when the table holds no cell,
-    /// [`ContentionRefusal::Exhausted`] naming the level the owner reached, and
-    /// [`ContentionRefusal::Poisoned`] when the ledger lock is poisoned.
+    /// [`ContentionRefusal::Exhausted`] naming the bound the charge ran into,
+    /// and [`ContentionRefusal::Poisoned`] when the ledger lock is poisoned.
     pub fn charge(
         &self,
         key: &ContentionKey,
@@ -562,98 +727,112 @@ impl ScribeContentionLedger {
         if !state.is_active(key) {
             return Err(ContentionRefusal::Inactive);
         }
-        let pending = state.pending_by_tenant();
+
+        // Capacity the queue is holding for contenders ahead of this caller.
+        let reserved = state
+            .reserved_ahead(key, category, quantum)
+            .saturating_mul(quantum)
+            .min(capacity);
+        let available = capacity - reserved;
 
         // Hard pod bound first. A fair level says what an owner *should* hold;
-        // this says what the pod physically has. They differ exactly when an
-        // incumbent is above its level, and because acknowledged work is never
-        // revoked the incumbent keeps it and every other owner waits for it to
-        // drain rather than over-committing the pod.
+        // this says what the pod physically has left once the queue is honoured.
+        // The two differ exactly when an incumbent is above its level, and
+        // because acknowledged work is never revoked the incumbent keeps it and
+        // everyone else waits for it to drain rather than over-committing.
         let pod_committed: usize = state
             .tenants
             .values()
             .map(|tenant| tenant.committed(category))
             .sum();
-        if pod_committed.saturating_add(amount) > capacity {
-            return Err(ContentionRefusal::Exhausted {
-                scope: "pod",
-                category: category.label(),
-                ceiling: capacity,
-                held: pod_committed,
-                requested: amount,
-            });
+        if pod_committed.saturating_add(amount) > available {
+            return Err(self.refuse(
+                &mut state,
+                key,
+                category,
+                "pod",
+                available,
+                pod_committed,
+                amount,
+            ));
         }
 
-        // Tenant level: every active tenant demands what it holds, every waiting
-        // contender demands one lifecycle vector, and the charging tenant
-        // demands what it holds plus this request.
-        let mut tenant_demands: Vec<usize> =
-            Vec::with_capacity(state.tenants.len() + pending.len());
+        // Tenant level. A table's demand is what it holds, plus this request if
+        // it is the caller, plus the rest of a lifecycle quantum if it is queued
+        // and still unserved. That last term is what makes a refused contender
+        // visible to the fairness computation at all: without it a contender
+        // that holds nothing reads as wanting nothing, and every incumbent would
+        // be levelled against zero.
+        let effective = |owner: &ContentionKey, cell: &TenantTableLedger| -> usize {
+            let held = cell.get(category);
+            if owner == key {
+                return held.saturating_add(amount);
+            }
+            if state.has_demand(owner, category) {
+                return held.max(quantum);
+            }
+            held
+        };
+        let mut tenant_demands: Vec<usize> = Vec::with_capacity(state.tenants.len());
         let mut charging_tenant_demand = 0;
         for (tenant, cell) in &state.tenants {
-            let waiting = pending.get(tenant).copied().unwrap_or(0);
-            let mut demand = cell
-                .committed(category)
-                .saturating_add(waiting.saturating_mul(quantum));
+            let demand: usize = cell
+                .tables
+                .iter()
+                .map(|(table, usage)| effective(&ContentionKey::new(*tenant, table.clone()), usage))
+                .sum();
             if tenant == &key.tenant {
-                demand = demand.saturating_add(amount);
                 charging_tenant_demand = demand;
             }
             tenant_demands.push(demand);
         }
-        for (tenant, waiting) in &pending {
-            if !state.tenants.contains_key(tenant) {
-                tenant_demands.push(waiting.saturating_mul(quantum));
-            }
-        }
-        let tenant_level = max_min_level(capacity, &mut tenant_demands);
+        let tenant_level = max_min_level(available, &mut tenant_demands);
         let tenant_held = state
             .tenants
             .get(&key.tenant)
             .map_or(0, |cell| cell.committed(category));
         if charging_tenant_demand > tenant_level {
-            return Err(ContentionRefusal::Exhausted {
-                scope: "tenant",
-                category: category.label(),
-                ceiling: tenant_level,
-                held: tenant_held,
-                requested: amount,
-            });
+            return Err(self.refuse(
+                &mut state,
+                key,
+                category,
+                "tenant",
+                tenant_level,
+                tenant_held,
+                amount,
+            ));
         }
 
         // Table level: the charging tenant's own allowance, divided max-min
-        // across its live tables and its own waiting contenders.
-        let tenant_allowance = tenant_level.min(capacity);
-        let waiting_here = pending.get(&key.tenant).copied().unwrap_or(0);
+        // across its live tables.
+        let tenant_allowance = tenant_level.min(available);
         let tenant_cell = state
             .tenants
             .get(&key.tenant)
             .ok_or(ContentionRefusal::Inactive)?;
-        let mut table_demands: Vec<usize> =
-            Vec::with_capacity(tenant_cell.tables.len() + waiting_here);
+        let mut table_demands: Vec<usize> = Vec::with_capacity(tenant_cell.tables.len());
         let mut charging_table_demand = 0;
         let mut table_held = 0;
         for (table, cell) in &tenant_cell.tables {
-            let mut demand = cell.get(category);
+            let owner = ContentionKey::new(key.tenant, table.clone());
+            let demand = effective(&owner, cell);
             if table == &key.table {
-                table_held = demand;
-                demand = demand.saturating_add(amount);
+                table_held = cell.get(category);
                 charging_table_demand = demand;
             }
             table_demands.push(demand);
         }
-        for _ in 0..waiting_here {
-            table_demands.push(quantum);
-        }
         let table_level = max_min_level(tenant_allowance, &mut table_demands);
         if charging_table_demand > table_level {
-            return Err(ContentionRefusal::Exhausted {
-                scope: "table",
-                category: category.label(),
-                ceiling: table_level,
-                held: table_held,
-                requested: amount,
-            });
+            return Err(self.refuse(
+                &mut state,
+                key,
+                category,
+                "table",
+                table_level,
+                table_held,
+                amount,
+            ));
         }
 
         if let Some(cell) = state
@@ -663,21 +842,55 @@ impl ScribeContentionLedger {
         {
             cell.set(category, charging_table_demand);
         }
+        // The caller got what it asked for, so it stops holding the queue.
+        state
+            .demand
+            .retain(|record| &record.key != key || !record.competes_in(category));
         Ok(())
+    }
+
+    /// Records the caller's demand and builds the refusal describing the bound.
+    ///
+    /// Every refusal path goes through here so that no bound can be added later
+    /// which refuses a caller without also queueing it; a caller refused without
+    /// a record would lose its place to whoever retries next.
+    fn refuse(
+        &self,
+        state: &mut LedgerState,
+        key: &ContentionKey,
+        category: ContentionCategory,
+        scope: &'static str,
+        ceiling: usize,
+        held: usize,
+        requested: usize,
+    ) -> ContentionRefusal {
+        self.enqueue_demand(state, key, Some(category));
+        ContentionRefusal::Exhausted {
+            scope,
+            category: category.label(),
+            ceiling,
+            held,
+            requested,
+        }
     }
 
     /// Returns `amount` in one category to an active table's cell.
     ///
-    /// Releasing more than the cell holds is an accounting bug rather than a
-    /// caller error, so it saturates at zero instead of wrapping into an
-    /// enormous usage that would lock the table out permanently. Pod and tenant
-    /// totals are derived from the cell, so returning it here is the whole
-    /// release, and the freed amount is immediately visible to every other
-    /// owner's next fair-level computation.
+    /// Releasing more than the cell holds is an accounting bug, and it fails
+    /// closed: the subtraction is checked, the refusal is typed, and nothing at
+    /// the table, tenant or pod level moves. Saturating here instead would
+    /// silently reconcile the caller's bad arithmetic against the ledger's good
+    /// arithmetic and hide the bug that produced it.
+    ///
+    /// Pod and tenant totals are derived from the cell, so returning it here is
+    /// the whole release, and the freed amount is immediately visible to every
+    /// other owner's next fair-level computation.
     ///
     /// # Errors
     ///
-    /// Returns [`ContentionRefusal::Inactive`] when the table holds no cell, and
+    /// Returns [`ContentionRefusal::Inactive`] when the table holds no cell,
+    /// [`ContentionRefusal::OverRelease`] when the cell holds less than
+    /// `amount`, leaving every total untouched, and
     /// [`ContentionRefusal::Poisoned`] when the ledger lock is poisoned.
     pub fn release(
         &self,
@@ -691,7 +904,14 @@ impl ScribeContentionLedger {
             .get_mut(&key.tenant)
             .and_then(|tenant| tenant.tables.get_mut(&key.table))
             .ok_or(ContentionRefusal::Inactive)?;
-        let next_usage = cell.get(category).saturating_sub(amount);
+        let held = cell.get(category);
+        let next_usage = held
+            .checked_sub(amount)
+            .ok_or(ContentionRefusal::OverRelease {
+                category: category.label(),
+                held,
+                requested: amount,
+            })?;
         cell.set(category, next_usage);
         Ok(())
     }
@@ -1206,6 +1426,314 @@ mod tests {
                 .usage(&only, ContentionCategory::Active)
                 .expect("usage"),
             1
+        );
+    }
+
+    /// A refused first charge leaves no cell behind for a brand new table.
+    ///
+    /// Activation and the first admission charges are one transition. A cell
+    /// that survived a refused first request would hold one of the pod's
+    /// derived ownership slots forever while serving nothing.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the rolled-back table or its tenant still holds a cell, or
+    /// when the pre-existing owner loses anything.
+    #[test]
+    fn a_refused_first_charge_leaves_no_new_cell() {
+        let ledger = ledger_for(4);
+        let incumbent = key(1, "hot");
+        let arrival = key(2, "cold");
+        let whole = capacity_of(4, ContentionCategory::Active);
+        ledger.activate(&incumbent).expect("incumbent activates");
+        ledger
+            .charge(&incumbent, ContentionCategory::Active, whole)
+            .expect("the idle pod lets the first owner take everything");
+
+        assert_eq!(
+            ledger
+                .activate(&arrival)
+                .expect("the pod can still carry it"),
+            ActivationOutcome::Created
+        );
+        ledger
+            .charge(&arrival, ContentionCategory::Active, 1)
+            .expect_err("a full pod refuses the arrival's first charge");
+        // The admission path rolls the created cell back on that refusal.
+        ledger
+            .deactivate(&arrival)
+            .expect("an empty cell rolls back");
+
+        assert_eq!(ledger.active_cells().expect("cells"), 1);
+        assert_eq!(ledger.active_tenants().expect("tenants"), 1);
+        assert_eq!(
+            ledger
+                .usage(&incumbent, ContentionCategory::Active)
+                .expect("usage"),
+            whole,
+            "rolling back an arrival must not touch a pre-existing owner"
+        );
+    }
+
+    /// Deactivation is refused while a table still holds capacity.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a non-empty cell is removed, when the refusal does not name
+    /// the category still held, or when the refusal mutates anything.
+    #[test]
+    fn deactivating_a_nonempty_table_is_refused_without_mutation() {
+        let ledger = ledger_for(4);
+        let owner = key(1, "events");
+        ledger.activate(&owner).expect("activate");
+        ledger
+            .charge(&owner, ContentionCategory::Active, 64)
+            .expect("charge");
+
+        let refusal = ledger
+            .deactivate(&owner)
+            .expect_err("a table holding capacity must not vanish");
+        assert!(matches!(
+            refusal,
+            ContentionRefusal::NonEmpty {
+                category: "active",
+                held: 64,
+            }
+        ));
+        assert_eq!(ledger.active_cells().expect("cells"), 1);
+        assert_eq!(
+            ledger.committed(ContentionCategory::Active).expect("pod"),
+            64
+        );
+
+        ledger
+            .release(&owner, ContentionCategory::Active, 64)
+            .expect("release");
+        ledger
+            .deactivate(&owner)
+            .expect("an empty table deactivates");
+        assert_eq!(ledger.active_tenants().expect("tenants"), 0);
+    }
+
+    /// Over-release fails closed and moves no counter at any level.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a release larger than the cell holds is accepted, or when the
+    /// refusal changes table, tenant or pod accounting.
+    #[test]
+    fn over_release_is_refused_without_mutation() {
+        let ledger = ledger_for(4);
+        let owner = key(1, "events");
+        ledger.activate(&owner).expect("activate");
+        ledger
+            .charge(&owner, ContentionCategory::Active, 100)
+            .expect("charge");
+
+        let refusal = ledger
+            .release(&owner, ContentionCategory::Active, 101)
+            .expect_err("returning more than the cell holds is an accounting bug");
+        assert!(matches!(
+            refusal,
+            ContentionRefusal::OverRelease {
+                category: "active",
+                held: 100,
+                requested: 101,
+            }
+        ));
+        assert_eq!(
+            ledger
+                .usage(&owner, ContentionCategory::Active)
+                .expect("usage"),
+            100
+        );
+        assert_eq!(
+            ledger
+                .tenant_usage(&tenant_id(1), ContentionCategory::Active)
+                .expect("tenant"),
+            100
+        );
+        assert_eq!(
+            ledger.committed(ContentionCategory::Active).expect("pod"),
+            100
+        );
+    }
+
+    /// A refused charge by an already-active table keeps its cell and ownership.
+    ///
+    /// The refusal says nothing about the work the table is already carrying, so
+    /// nothing it owns may be revoked or rolled back.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the refusal disturbs the table's cell or its committed bytes.
+    #[test]
+    fn a_refused_charge_preserves_an_active_table() {
+        let ledger = ledger_for(4);
+        let owner = key(1, "events");
+        let whole = capacity_of(4, ContentionCategory::Active);
+        ledger.activate(&owner).expect("activate");
+        ledger
+            .charge(&owner, ContentionCategory::Active, whole)
+            .expect("charge");
+
+        ledger
+            .charge(&owner, ContentionCategory::Active, 1)
+            .expect_err("one unit past measured capacity refuses");
+        assert_eq!(ledger.active_cells().expect("cells"), 1);
+        assert_eq!(
+            ledger
+                .usage(&owner, ContentionCategory::Active)
+                .expect("usage"),
+            whole
+        );
+        // Its own demand record does not lock it out of what it already holds.
+        ledger
+            .release(&owner, ContentionCategory::Active, whole)
+            .expect("release");
+        ledger
+            .charge(&owner, ContentionCategory::Active, whole)
+            .expect("an unblocked owner reacquires when nobody else waits");
+    }
+
+    /// An active contender receives released capacity before reacquisition.
+    ///
+    /// The incumbent queued first and is already served, so it yields to the
+    /// contender regardless of queue order; the contender is unserved and takes
+    /// what the incumbent drops.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the incumbent reacquires ahead of the contender, or when the
+    /// contender never receives the released capacity.
+    #[test]
+    fn an_active_contender_is_served_before_incumbent_reacquisition() {
+        let ledger = ledger_for(4);
+        let incumbent = key(1, "hot");
+        let contender = key(2, "cold");
+        let whole = capacity_of(4, ContentionCategory::Active);
+        let quantum = capacity_of(1, ContentionCategory::Active);
+        ledger.activate(&incumbent).expect("incumbent activates");
+        ledger
+            .charge(&incumbent, ContentionCategory::Active, whole)
+            .expect("the idle pod lets the first owner take everything");
+        ledger.activate(&contender).expect("contender activates");
+
+        // The incumbent queues first, then the contender. Queue order must not
+        // let a served incumbent outrank an unserved contender.
+        ledger
+            .charge(&incumbent, ContentionCategory::Active, quantum)
+            .expect_err("a full pod refuses the incumbent");
+        ledger
+            .charge(&contender, ContentionCategory::Active, quantum)
+            .expect_err("a full pod refuses the contender too");
+
+        ledger
+            .release(&incumbent, ContentionCategory::Active, quantum)
+            .expect("the incumbent drains through the normal lifecycle route");
+        ledger
+            .charge(&incumbent, ContentionCategory::Active, quantum)
+            .expect_err("a served incumbent may not reacquire while a contender waits");
+        ledger
+            .charge(&contender, ContentionCategory::Active, quantum)
+            .expect("the waiting contender receives the released capacity");
+        assert_eq!(
+            ledger
+                .usage(&contender, ContentionCategory::Active)
+                .expect("usage"),
+            quantum
+        );
+    }
+
+    /// The last table activates once a vector turns over, and cannot be jumped.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the queued contender loses its place to an incumbent's new
+    /// table or to a tenant that arrived after it.
+    #[test]
+    fn a_queued_table_activates_on_turnover_and_cannot_be_bypassed() {
+        let ledger = ledger_for(16);
+        for table in 0..16 {
+            ledger
+                .activate(&key(1, &format!("table_{table}")))
+                .expect("every table the resources complete activates");
+        }
+        let queued = key(1, "table_16");
+        ledger
+            .activate(&queued)
+            .expect_err("the seventeenth table waits for a vector to turn over");
+
+        ledger
+            .deactivate(&key(1, "table_0"))
+            .expect("an empty table turns its vector over");
+
+        ledger
+            .activate(&key(1, "incumbent_extra"))
+            .expect_err("an incumbent tenant may not jump the queue with a new table");
+        ledger
+            .activate(&key(2, "new_arrival"))
+            .expect_err("a newly arriving tenant may not jump the queue either");
+        ledger
+            .activate(&queued)
+            .expect("the queued table takes the vector that turned over");
+        assert_eq!(ledger.active_cells().expect("cells"), 16);
+    }
+
+    /// An initial borrower is throttled as real contenders arrive.
+    ///
+    /// Every continuously retrying tenant makes progress: the borrower drains,
+    /// each contender is served in the order it queued, and the borrower cannot
+    /// reacquire while any of them is still unserved.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a contender is starved, when the borrower reacquires ahead of
+    /// one, or when a served contender keeps holding the queue.
+    #[test]
+    fn an_initial_borrower_is_throttled_as_contenders_arrive() {
+        const TENANTS: u8 = 10;
+        let ledger = ledger_for(16);
+        let borrower = key(0, "greedy");
+        let whole = capacity_of(16, ContentionCategory::Active);
+        let quantum = capacity_of(1, ContentionCategory::Active);
+        ledger.activate(&borrower).expect("borrower activates");
+        ledger
+            .charge(&borrower, ContentionCategory::Active, whole)
+            .expect("an idle pod lets the first owner take everything");
+
+        let contenders: Vec<ContentionKey> =
+            (1..TENANTS).map(|tenant| key(tenant, "events")).collect();
+        for contender in &contenders {
+            ledger
+                .activate(contender)
+                .expect("each contender activates");
+            ledger
+                .charge(contender, ContentionCategory::Active, quantum)
+                .expect_err("a saturated pod refuses every contender");
+        }
+
+        for contender in &contenders {
+            ledger
+                .release(&borrower, ContentionCategory::Active, quantum)
+                .expect("the borrower drains one quantum");
+            ledger
+                .charge(&borrower, ContentionCategory::Active, quantum)
+                .expect_err("the borrower may not reacquire while contenders wait");
+            ledger
+                .charge(contender, ContentionCategory::Active, quantum)
+                .expect("each retrying contender progresses in queue order");
+            assert_eq!(
+                ledger
+                    .usage(contender, ContentionCategory::Active)
+                    .expect("usage"),
+                quantum
+            );
+        }
+        assert_eq!(
+            ledger.committed(ContentionCategory::Active).expect("pod"),
+            whole,
+            "every quantum the borrower released reached a contender"
         );
     }
 

@@ -176,6 +176,10 @@ mod tests {
     }
 
     /// A query runtime rejects spill growth beyond its exact admitted share.
+    ///
+    /// DataFusion 55 enforces the temp-directory quota inside the spill
+    /// writer's `Write::write`, so growth past the admitted share surfaces as a
+    /// write error naming the limit rather than a post-hoc usage refresh.
     #[test]
     fn oracle_query_runtime_enforces_exact_disk_share() {
         let root = tempfile::tempdir().expect("test spill root must exist");
@@ -184,24 +188,32 @@ mod tests {
         let query = runtime
             .build_query_runtime(Arc::new(GreedyMemoryPool::new(1_024)), 8)
             .expect("bounded query runtime must be created");
-        let mut file = query
+        let file = query
             .disk_manager
             .create_tmp_file("quota")
             .expect("first temporary file must be created");
-        file.inner()
-            .as_file()
+        let mut writer = file
+            .open_writer()
+            .expect("admitted spill file must open a writer");
+        writer
             .write_all(&[0; 8])
-            .expect("exact-quota bytes must be written");
-        file.update_disk_usage()
             .expect("write at the exact quota must succeed");
-        file.inner()
-            .as_file()
-            .write_all(&[0])
-            .expect("over-quota byte must reach disk before accounting");
-        assert!(matches!(
-            file.update_disk_usage(),
-            Err(datafusion::error::DataFusionError::ResourcesExhausted(_))
-        ));
+        assert_eq!(file.size(), Some(8));
+        let over_quota = writer
+            .write(&[0])
+            .expect_err("write past the admitted share must be refused");
+        assert!(
+            over_quota
+                .to_string()
+                .contains("exceeded the allowable limit"),
+            "refusal must name the exceeded disk limit, got: {over_quota}"
+        );
+        assert_eq!(
+            file.size(),
+            Some(8),
+            "a refused write must not grow the accounted file"
+        );
+        drop(writer);
         drop(file);
         drop(query);
         assert_eq!(

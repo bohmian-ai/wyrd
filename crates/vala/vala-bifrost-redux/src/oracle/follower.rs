@@ -735,7 +735,6 @@ fn restrict_plan_to_assigned_files(
     let transformed = plan
         .transform_up(|node| {
             if let Some(exec) = node
-                .as_any()
                 .downcast_ref::<super::exec::OracleIcebergScanExec>()
             {
                 file_leaves = file_leaves.saturating_add(1);
@@ -744,7 +743,7 @@ fn restrict_plan_to_assigned_files(
                     exec.clone().with_assigned_files(assigned.clone()),
                 )));
             }
-            if node.as_any().is::<IcebergTableScan>() {
+            if node.is::<IcebergTableScan>() {
                 let restricted = super::exec::OracleIcebergScanExec::from_plan(node.as_ref())
                     .map_err(|_| {
                         datafusion::common::DataFusionError::Plan(
@@ -756,7 +755,7 @@ fn restrict_plan_to_assigned_files(
                 observed.extend(assigned.iter().cloned());
                 return Ok(Transformed::yes(Arc::new(restricted)));
             }
-            let Some(exec) = node.as_any().downcast_ref::<DataSourceExec>() else {
+            let Some(exec) = node.downcast_ref::<DataSourceExec>() else {
                 return Ok(Transformed::no(node));
             };
             let Some(config) = exec.data_source().as_any().downcast_ref::<FileScanConfig>() else {
@@ -1372,7 +1371,6 @@ pub(crate) mod tests {
     /// [`file_plan`] or if that source does not contain a [`FileScanConfig`].
     fn plan_files(plan: &Arc<dyn ExecutionPlan>) -> Vec<String> {
         let exec = plan
-            .as_any()
             .downcast_ref::<DataSourceExec>()
             .expect("file source");
         let config = exec

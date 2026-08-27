@@ -1,5 +1,8 @@
 //! Bounded, spillable staging-to-Iceberg rewrite execution.
 
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::error::Result as DataFusionResult;
+use datafusion::physical_expr::PhysicalExpr;
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -79,7 +82,19 @@ impl ForgeAttemptMemoryPool {
     }
 }
 
+impl std::fmt::Display for ForgeAttemptMemoryPool {
+    /// Renders the pool name DataFusion reports in resource-exhaustion errors.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("forge_attempt")
+    }
+}
+
 impl MemoryPool for ForgeAttemptMemoryPool {
+    /// Returns the stable pool name DataFusion attributes reservations to.
+    fn name(&self) -> &str {
+        "forge_attempt"
+    }
+
     /// Delegates registration to the aggregate pool.
     fn register(&self, consumer: &MemoryConsumer) {
         self.inner.register(consumer);
@@ -2785,14 +2800,23 @@ impl AsyncFileReader for ForgeParquetReader {
 }
 
 impl ExecutionPlan for StagingParquetExec {
+    /// Visits every physical expression this plan owns.
+    ///
+    /// This plan owns no `PhysicalExpr`, so the traversal reports
+    /// [`TreeNodeRecursion::Continue`] without invoking `f`.
+    ///
+    /// # Errors
+    /// Never returns an error; the signature is fixed by the trait.
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     /// Return the stable physical-plan node name.
     fn name(&self) -> &'static str {
         "StagingParquetExec"
-    }
-
-    /// Expose this concrete plan for `DataFusion` downcasts.
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     /// Return the cached schema, partitioning, and boundedness properties.
@@ -2973,7 +2997,19 @@ impl ForgeSortMemoryPool {
     }
 }
 
+impl std::fmt::Display for ForgeSortMemoryPool {
+    /// Renders the pool name DataFusion reports in resource-exhaustion errors.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("forge_sort")
+    }
+}
+
 impl MemoryPool for ForgeSortMemoryPool {
+    /// Returns the stable pool name DataFusion attributes reservations to.
+    fn name(&self) -> &str {
+        "forge_sort"
+    }
+
     /// Delegates registration to the aggregate attempt pool.
     fn register(&self, consumer: &MemoryConsumer) {
         self.inner.register(consumer);

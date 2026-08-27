@@ -4,6 +4,7 @@
 //! validation surrounds that union so a foreign row cannot influence a filter,
 //! join, aggregate, or limit.
 
+use datafusion::common::tree_node::TreeNodeRecursion;
 use std::any::Any;
 use std::fmt;
 #[cfg(test)]
@@ -444,14 +445,23 @@ impl DisplayAs for RemoteScanExec {
 }
 
 impl ExecutionPlan for RemoteScanExec {
+    /// Visits every physical expression this plan owns.
+    ///
+    /// This plan owns no `PhysicalExpr`, so the traversal reports
+    /// [`TreeNodeRecursion::Continue`] without invoking `f`.
+    ///
+    /// # Errors
+    /// Never returns an error; the signature is fixed by the trait.
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn datafusion::physical_expr::PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     /// Returns the stable physical operator name.
     fn name(&self) -> &'static str {
         "RemoteScanExec"
-    }
-
-    /// Exposes the concrete network node to optimizers and proof tests.
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     /// Returns exact output partitioning for the immutable participant cut.
@@ -854,7 +864,7 @@ impl OracleQueryScanStats {
 
     /// Visits each physical node exactly once, accumulating leaf scan evidence.
     fn visit(plan: &dyn ExecutionPlan, stats: &mut Self) {
-        if let Some(source) = plan.as_any().downcast_ref::<DataSourceExec>()
+        if let Some(source) = plan.downcast_ref::<DataSourceExec>()
             && let Some(config) = source
                 .data_source()
                 .as_any()
@@ -874,13 +884,13 @@ impl OracleQueryScanStats {
                 .physical_metrics
                 .push(config.file_source.metrics().clone());
         }
-        if let Some(source) = plan.as_any().downcast_ref::<OracleIcebergScanExec>() {
+        if let Some(source) = plan.downcast_ref::<OracleIcebergScanExec>() {
             stats.scan_handles.push(Arc::clone(&source.metrics));
         }
-        if let Some(source) = plan.as_any().downcast_ref::<HotParquetExec>() {
+        if let Some(source) = plan.downcast_ref::<HotParquetExec>() {
             stats.scan_handles.push(Arc::clone(source.metrics()));
         }
-        if let Some(source) = plan.as_any().downcast_ref::<RemoteScanExec>() {
+        if let Some(source) = plan.downcast_ref::<RemoteScanExec>() {
             stats.remote_handles.push(Arc::clone(&source.scan_metrics));
         }
         for child in plan.children() {
@@ -1013,7 +1023,6 @@ impl OracleIcebergScanExec {
     /// its public projection cannot be represented by the adapter.
     pub(crate) fn from_plan(plan: &dyn ExecutionPlan) -> DataFusionResult<Self> {
         let scan = plan
-            .as_any()
             .downcast_ref::<IcebergTableScan>()
             .ok_or_else(|| {
                 DataFusionError::Plan(
@@ -1199,14 +1208,23 @@ impl DisplayAs for OracleIcebergScanExec {
 }
 
 impl ExecutionPlan for OracleIcebergScanExec {
+    /// Visits every physical expression this plan owns.
+    ///
+    /// This plan owns no `PhysicalExpr`, so the traversal reports
+    /// [`TreeNodeRecursion::Continue`] without invoking `f`.
+    ///
+    /// # Errors
+    /// Never returns an error; the signature is fixed by the trait.
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn datafusion::physical_expr::PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     /// Returns the stable physical source name.
     fn name(&self) -> &'static str {
         "OracleIcebergScanExec"
-    }
-
-    /// Exposes this concrete adapter for terminal metric collection.
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     /// This source has no child plans.
@@ -1554,11 +1572,6 @@ fn classify_filter_for_schema(physical_schema: &Schema, filter: &Expr) -> Filter
 
 #[async_trait]
 impl TableProvider for OracleTableProvider {
-    /// Exposes this provider for `DataFusion` downcasts.
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     /// Returns the caller-visible schema with no tenant selector column.
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.public_schema)
@@ -1775,14 +1788,23 @@ impl DisplayAs for TenantTripwireExec {
 }
 
 impl ExecutionPlan for TenantTripwireExec {
+    /// Visits every physical expression this plan owns.
+    ///
+    /// This plan owns no `PhysicalExpr`, so the traversal reports
+    /// [`TreeNodeRecursion::Continue`] without invoking `f`.
+    ///
+    /// # Errors
+    /// Never returns an error; the signature is fixed by the trait.
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn datafusion::physical_expr::PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     /// Returns the stable physical operator name.
     fn name(&self) -> &'static str {
         "TenantTripwireExec"
-    }
-
-    /// Exposes this concrete invariant node for downcasts.
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     /// Returns cached bounded plan properties.
@@ -2336,14 +2358,23 @@ impl DisplayAs for HotParquetExec {
 }
 
 impl ExecutionPlan for HotParquetExec {
+    /// Visits every physical expression this plan owns.
+    ///
+    /// This plan owns no `PhysicalExpr`, so the traversal reports
+    /// [`TreeNodeRecursion::Continue`] without invoking `f`.
+    ///
+    /// # Errors
+    /// Never returns an error; the signature is fixed by the trait.
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn datafusion::physical_expr::PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     /// Returns the stable physical leaf name.
     fn name(&self) -> &'static str {
         "HotParquetExec"
-    }
-
-    /// Exposes this concrete source for downcasts.
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     /// Returns cached bounded plan properties.
@@ -3378,10 +3409,9 @@ mod tests {
         );
         assert_eq!(tripwire.name(), "TenantTripwireExec");
         assert_eq!(tripwire.children()[0].name(), "UnionExec");
-        assert!(tripwire.as_any().downcast_ref::<SortExec>().is_none());
+        assert!(tripwire.downcast_ref::<SortExec>().is_none());
         assert!(
             tripwire.children()[0]
-                .as_any()
                 .downcast_ref::<SortExec>()
                 .is_none()
         );

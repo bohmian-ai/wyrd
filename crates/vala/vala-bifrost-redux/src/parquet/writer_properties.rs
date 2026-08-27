@@ -184,8 +184,8 @@ mod tests {
             let properties_for_column = properties
                 .bloom_filter_properties(&ColumnPath::from(column.as_str()))
                 .expect("allowlisted column has a bloom filter");
-            assert!((properties_for_column.fpp - BLOOM_FPP).abs() < f64::EPSILON);
-            assert_eq!(properties_for_column.ndv, 1_000);
+            assert!((properties_for_column.fpp() - BLOOM_FPP).abs() < f64::EPSILON);
+            assert_eq!(properties_for_column.ndv(), 1_000);
         }
 
         for column in ["message", "payload", "value"] {

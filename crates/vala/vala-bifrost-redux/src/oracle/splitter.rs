@@ -256,10 +256,10 @@ fn rewrite_node(
     source_groups: &HashMap<String, String>,
     followers: &mut Vec<FollowerSubtree>,
 ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-    if plan.as_any().is::<RepartitionExec>() || plan.as_any().is::<CoalescePartitionsExec>() {
+    if plan.is::<RepartitionExec>() || plan.is::<CoalescePartitionsExec>() {
         return rewrite_exchange(plan, source_groups, followers);
     }
-    if plan.as_any().is::<SortPreservingMergeExec>() {
+    if plan.is::<SortPreservingMergeExec>() {
         if contains_remote_result(plan.as_ref()) {
             return Ok(plan);
         }
@@ -294,7 +294,7 @@ fn rewrite_node(
                 continue;
             }
             let follower_plan: Arc<dyn ExecutionPlan> =
-                if let Some(sort) = child.as_any().downcast_ref::<SortExec>() {
+                if let Some(sort) = child.downcast_ref::<SortExec>() {
                     Arc::new(
                         SortPreservingMergeExec::new(sort.expr().clone(), Arc::clone(child))
                             .with_fetch(sort.fetch()),
@@ -407,8 +407,7 @@ fn capture_follower(
 
 /// Stops rewrites below a leader placeholder already produced by this rule.
 fn contains_remote_result(plan: &dyn ExecutionPlan) -> bool {
-    plan.as_any()
-        .downcast_ref::<RemoteSourcePlaceholderExec>()
+    plan.downcast_ref::<RemoteSourcePlaceholderExec>()
         .is_some_and(|scan| scan.scan_id().starts_with("oracle-result-"))
         || plan
             .children()
@@ -429,7 +428,7 @@ fn wrap_partial_reduce(
     if !enabled {
         return Ok(input);
     }
-    let Some(aggregate) = input.as_any().downcast_ref::<AggregateExec>() else {
+    let Some(aggregate) = input.downcast_ref::<AggregateExec>() else {
         return Ok(input);
     };
     if !matches!(
@@ -492,7 +491,7 @@ fn collect_source_scan_ids(plan: &dyn ExecutionPlan) -> Vec<String> {
 
 /// Depth-first placeholder collection preserves deterministic physical-plan order.
 fn collect_scans(plan: &dyn ExecutionPlan, seen: &mut HashSet<String>, scans: &mut Vec<String>) {
-    if let Some(scan) = plan.as_any().downcast_ref::<RemoteSourcePlaceholderExec>()
+    if let Some(scan) = plan.downcast_ref::<RemoteSourcePlaceholderExec>()
         && !scan.scan_id().starts_with("oracle-result-")
         && seen.insert(scan.scan_id().to_owned())
     {
@@ -552,7 +551,7 @@ fn collect_closures(
         ),
     >,
 ) {
-    if let Some(scan) = plan.as_any().downcast_ref::<RemoteSourcePlaceholderExec>()
+    if let Some(scan) = plan.downcast_ref::<RemoteSourcePlaceholderExec>()
         && !scan.scan_id().starts_with("oracle-result-")
         && !scan.required_columns().is_empty()
     {
@@ -631,7 +630,7 @@ fn substitute_plan_node(
     plan: Arc<dyn ExecutionPlan>,
     replacements: &mut HashMap<String, Arc<dyn ExecutionPlan>>,
 ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-    if let Some(scan) = plan.as_any().downcast_ref::<RemoteSourcePlaceholderExec>()
+    if let Some(scan) = plan.downcast_ref::<RemoteSourcePlaceholderExec>()
         && scan.scan_id().starts_with("oracle-result-")
     {
         return replacements.remove(scan.scan_id()).ok_or_else(|| {
@@ -655,7 +654,7 @@ fn substitute_node(
     plan: Arc<dyn ExecutionPlan>,
     results: &mut HashMap<String, Vec<RecordBatch>>,
 ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-    if let Some(scan) = plan.as_any().downcast_ref::<RemoteSourcePlaceholderExec>()
+    if let Some(scan) = plan.downcast_ref::<RemoteSourcePlaceholderExec>()
         && scan.scan_id().starts_with("oracle-result-")
     {
         let mut batches = results.remove(scan.scan_id()).ok_or_else(|| {
@@ -704,11 +703,6 @@ mod tests {
 
     #[async_trait]
     impl TableProvider for RemoteTable {
-        /// Exposes the concrete fixture for `DataFusion` downcasts.
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-
         /// Returns the immutable fixture schema.
         fn schema(&self) -> SchemaRef {
             Arc::clone(&self.schema)
@@ -916,7 +910,7 @@ mod tests {
         let groups = HashMap::from([("scan".to_owned(), "events".to_owned())]);
         let split = split_physical_plan(plan, &groups).expect("whole-plan fallback");
         assert_eq!(split.followers.len(), 1);
-        assert!(split.followers[0].plan.as_any().is::<GlobalLimitExec>());
-        assert!(split.leader.as_any().is::<RemoteSourcePlaceholderExec>());
+        assert!(split.followers[0].plan.is::<GlobalLimitExec>());
+        assert!(split.leader.is::<RemoteSourcePlaceholderExec>());
     }
 }

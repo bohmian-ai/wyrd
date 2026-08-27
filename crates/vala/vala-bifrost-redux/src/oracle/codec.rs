@@ -1,5 +1,8 @@
 //! Authenticated `DataFusion` physical-plan extension codec for Oracle followers.
 
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::error::Result as DataFusionResult;
+use datafusion::physical_expr::PhysicalExpr;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -215,13 +218,23 @@ impl DisplayAs for RemoteSourcePlaceholderExec {
 }
 
 impl ExecutionPlan for RemoteSourcePlaceholderExec {
+    /// Visits every physical expression this plan owns.
+    ///
+    /// This plan owns no `PhysicalExpr`, so the traversal reports
+    /// [`TreeNodeRecursion::Continue`] without invoking `f`.
+    ///
+    /// # Errors
+    /// Never returns an error; the signature is fixed by the trait.
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     /// Returns the stable diagnostic operator name.
     fn name(&self) -> &'static str {
         "RemoteSourcePlaceholderExec"
-    }
-    /// Enables extension-codec downcasting.
-    fn as_any(&self) -> &dyn Any {
-        self
     }
     /// Returns the placeholder's cached physical properties.
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -434,6 +447,7 @@ impl PhysicalExtensionCodec for OraclePhysicalExtensionCodec {
         buf: &[u8],
         inputs: &[Arc<dyn ExecutionPlan>],
         _ctx: &TaskContext,
+        _proto_converter: &dyn datafusion_proto::physical_plan::PhysicalProtoConverterExtension,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let envelope = Self::decode_envelope(buf)?;
         match envelope.type_tag.as_str() {
@@ -490,9 +504,14 @@ impl PhysicalExtensionCodec for OraclePhysicalExtensionCodec {
     ///
     /// # Errors
     /// Returns a plan error for any other extension type or protobuf failure.
-    fn try_encode(&self, node: Arc<dyn ExecutionPlan>, buf: &mut Vec<u8>) -> Result<()> {
+    fn try_encode(
+        &self,
+        node: Arc<dyn ExecutionPlan>,
+        buf: &mut Vec<u8>,
+        _proto_converter: &dyn datafusion_proto::physical_plan::PhysicalProtoConverterExtension,
+    ) -> Result<()> {
         let (type_tag, payload) = if let Some(scan) =
-            node.as_any().downcast_ref::<RemoteSourcePlaceholderExec>()
+            node.downcast_ref::<RemoteSourcePlaceholderExec>()
         {
             (
                 ORACLE_REMOTE_SCAN_TAG,
@@ -503,7 +522,6 @@ impl PhysicalExtensionCodec for OraclePhysicalExtensionCodec {
                 .encode_to_vec(),
             )
         } else if let Some(tripwire) = node
-            .as_any()
             .downcast_ref::<super::exec::TenantTripwireExec>()
         {
             (
@@ -597,13 +615,23 @@ mod tests {
     }
 
     impl ExecutionPlan for DropObservedExec {
+        /// Visits every physical expression this plan owns.
+        ///
+        /// This plan owns no `PhysicalExpr`, so the traversal reports
+        /// [`TreeNodeRecursion::Continue`] without invoking `f`.
+        ///
+        /// # Errors
+        /// Never returns an error; the signature is fixed by the trait.
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+        ) -> DataFusionResult<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
+        }
+
         /// Returns the stable test operator name.
         fn name(&self) -> &'static str {
             "DropObservedExec"
-        }
-        /// Enables downcasting.
-        fn as_any(&self) -> &dyn Any {
-            self
         }
         /// Delegates cached properties.
         fn properties(&self) -> &Arc<PlanProperties> {

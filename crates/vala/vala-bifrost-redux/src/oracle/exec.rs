@@ -3645,6 +3645,125 @@ mod tests {
         .expect("service block")
     }
 
+    /// Assert every row group's `service_name` chunk carries both halves of
+    /// the recipe an equality leaf depends on: a dictionary page and a Bloom
+    /// filter.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a group lacks the column, its dictionary, or its filter.
+    fn assert_dictionary_bloom_groups(metadata: &parquet::file::metadata::ParquetMetaData) {
+        for group in metadata.row_groups() {
+            let column = group
+                .columns()
+                .iter()
+                .find(|column| column.column_path().string() == "service_name")
+                .expect("service_name chunk");
+            let encodings = column.encodings().collect::<Vec<_>>();
+            assert!(
+                encodings.contains(&parquet::basic::Encoding::RLE_DICTIONARY)
+                    || encodings.contains(&parquet::basic::Encoding::PLAIN_DICTIONARY),
+                "service_name must be dictionary-encoded, saw {encodings:?}"
+            );
+            assert!(
+                column.bloom_filter_offset().is_some(),
+                "an allowlisted column must carry a Bloom filter"
+            );
+        }
+    }
+
+    /// Decode `groups` of `published` and return the `value` column, asserting
+    /// every decoded row carries `service`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the object cannot be decoded, a column is missing or of an
+    /// unexpected type, or a decoded row carries a different service.
+    fn decoded_values_for_service(
+        published: &bytes::Bytes,
+        groups: Vec<usize>,
+        service: &str,
+    ) -> Vec<i64> {
+        let decoded = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            published.clone(),
+        )
+        .expect("decode builder")
+        .with_row_groups(groups)
+        .build()
+        .expect("decode reader")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("decode rows");
+        let mut decoded_values = Vec::new();
+        for batch in &decoded {
+            let services = batch
+                .column_by_name("service_name")
+                .expect("service column")
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("service column is Utf8");
+            let values = batch
+                .column_by_name("value")
+                .expect("value column")
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("value column is Int64");
+            for row in 0..batch.num_rows() {
+                assert_eq!(services.value(row), service);
+                decoded_values.push(values.value(row));
+            }
+        }
+        decoded_values
+    }
+
+    /// Prove the same recipe stays lossless once parquet-rs falls back off its
+    /// dictionary, by writing `rows` all-distinct strings and reading them back.
+    ///
+    /// This is the other half of the dictionary decision: enabling dictionaries
+    /// by default is only safe because overflow degrades to `PLAIN` rather than
+    /// truncating or corrupting the column.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the batch cannot be built, encoded, or decoded, or when any
+    /// value does not survive the round trip.
+    fn assert_high_cardinality_round_trips(schema: &SchemaRef, rows: i64) {
+        let unique = (0..rows)
+            .map(|row| format!("service-{row}"))
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from_iter_values(unique.iter())) as ArrayRef,
+                Arc::new(Int64Array::from_iter_values(0..rows)) as ArrayRef,
+            ],
+        )
+        .expect("high-cardinality batch");
+        let wide = write_grouped_fixture(schema, std::slice::from_ref(&batch));
+        let wide_rows =
+            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(wide)
+                .expect("wide decode builder")
+                .build()
+                .expect("wide decode reader")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("wide decode rows");
+        let mut wide_services = Vec::with_capacity(unique.len());
+        for batch in &wide_rows {
+            let services = batch
+                .column_by_name("service_name")
+                .expect("service column")
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("service column is Utf8");
+            for row in 0..batch.num_rows() {
+                wide_services.push(services.value(row).to_owned());
+            }
+        }
+        assert_eq!(
+            wide_services, unique,
+            "dictionary overflow must fall back to PLAIN without losing a row"
+        );
+    }
+
     /// Closed-predicate pruning measured on a real two-row-group file written
     /// by the production recipe: the file's low-cardinality `service_name`
     /// column is dictionary-encoded and Bloom-filtered, an equality leaf
@@ -3674,23 +3793,7 @@ mod tests {
             .expect("valid Parquet footer");
 
         assert_eq!(metadata.num_row_groups(), 2, "fixture must have two groups");
-        for group in metadata.row_groups() {
-            let column = group
-                .columns()
-                .iter()
-                .find(|column| column.column_path().string() == "service_name")
-                .expect("service_name chunk");
-            let encodings = column.encodings().collect::<Vec<_>>();
-            assert!(
-                encodings.contains(&parquet::basic::Encoding::RLE_DICTIONARY)
-                    || encodings.contains(&parquet::basic::Encoding::PLAIN_DICTIONARY),
-                "service_name must be dictionary-encoded, saw {encodings:?}"
-            );
-            assert!(
-                column.bloom_filter_offset().is_some(),
-                "an allowlisted column must carry a Bloom filter"
-            );
-        }
+        assert_dictionary_bloom_groups(&metadata);
 
         let predicates = vec![ScanPredicate::Eq(
             "service_name".to_owned(),
@@ -3713,71 +3816,11 @@ mod tests {
             "pruning must scan strictly fewer bytes: {scanned} vs {whole_file}"
         );
 
-        let decoded = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
-            published.clone(),
-        )
-        .expect("decode builder")
-        .with_row_groups(selection.retained.clone())
-        .build()
-        .expect("decode reader")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("decode rows");
-        let mut decoded_values = Vec::new();
-        for batch in &decoded {
-            let services = batch
-                .column_by_name("service_name")
-                .expect("service column")
-                .as_any()
-                .downcast_ref::<arrow::array::StringArray>()
-                .expect("service column is Utf8");
-            let values = batch
-                .column_by_name("value")
-                .expect("value column")
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .expect("value column is Int64");
-            for row in 0..batch.num_rows() {
-                assert_eq!(services.value(row), "checkout");
-                decoded_values.push(values.value(row));
-            }
-        }
+        let decoded_values =
+            decoded_values_for_service(&published, selection.retained.clone(), "checkout");
         assert_eq!(decoded_values, (0..BLOCK_ROWS).collect::<Vec<_>>());
 
-        let unique = (0..BLOCK_ROWS)
-            .map(|row| format!("service-{row}"))
-            .collect::<Vec<_>>();
-        let high_cardinality = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(arrow::array::StringArray::from_iter_values(unique.iter())) as ArrayRef,
-                Arc::new(Int64Array::from_iter_values(0..BLOCK_ROWS)) as ArrayRef,
-            ],
-        )
-        .expect("high-cardinality batch");
-        let wide = write_grouped_fixture(&schema, std::slice::from_ref(&high_cardinality));
-        let wide_rows =
-            parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(wide)
-                .expect("wide decode builder")
-                .build()
-                .expect("wide decode reader")
-                .collect::<Result<Vec<_>, _>>()
-                .expect("wide decode rows");
-        let mut wide_services = Vec::with_capacity(unique.len());
-        for batch in &wide_rows {
-            let services = batch
-                .column_by_name("service_name")
-                .expect("service column")
-                .as_any()
-                .downcast_ref::<arrow::array::StringArray>()
-                .expect("service column is Utf8");
-            for row in 0..batch.num_rows() {
-                wide_services.push(services.value(row).to_owned());
-            }
-        }
-        assert_eq!(
-            wide_services, unique,
-            "dictionary overflow must fall back to PLAIN without losing a row"
-        );
+        assert_high_cardinality_round_trips(&schema, BLOCK_ROWS);
     }
 
     /// Owns temporary files and metadata for the position-delete adapter proof.

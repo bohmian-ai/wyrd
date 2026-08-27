@@ -4140,16 +4140,21 @@ mod tests {
         assert_eq!(durable.file_metadata().num_rows(), 8192);
     }
 
-    /// A file a real Forge rewrite wrote proves the same footer recipe Scribe
-    /// seals under: a low-cardinality string column encodes through a
-    /// dictionary, `wyrd_event_time` encodes as `DELTA_BINARY_PACKED` with no
-    /// dictionary page, and every decoded row equals the row written. The
-    /// assertion reads the published object's own footer, so a second property
-    /// builder anywhere in the rewrite path would fail it.
-    #[tokio::test]
-    async fn rewritten_file_footer_encoding_contract() {
-        const ROWS: i64 = 4_096;
-
+    /// Build the two-column Arrow/Iceberg pair and batch the footer-recipe
+    /// proof rewrites.
+    ///
+    /// `service_name` repeats four values so a dictionary is unambiguously the
+    /// right encoding for it, and `wyrd_event_time` is strictly increasing so
+    /// `DELTA_BINARY_PACKED` is unambiguously right for that one. The returned
+    /// event times are the exact values the decode assertion compares against.
+    fn footer_contract_fixture(
+        rows: i64,
+    ) -> (
+        Arc<Schema>,
+        Arc<iceberg::spec::Schema>,
+        RecordBatch,
+        Vec<i64>,
+    ) {
         let field_id = |id: &str| HashMap::from([("PARQUET:field_id".to_owned(), id.to_owned())]);
         let schema = Arc::new(Schema::new(vec![
             Field::new("service_name", DataType::Utf8, false).with_metadata(field_id("1")),
@@ -4177,12 +4182,12 @@ mod tests {
                 .build()
                 .expect("Iceberg schema"),
         );
-        let times: Vec<i64> = (0..ROWS).map(|row| 1_767_312_000_000_000 + row).collect();
+        let times: Vec<i64> = (0..rows).map(|row| 1_767_312_000_000_000 + row).collect();
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
                 Arc::new(arrow::array::StringArray::from_iter_values(
-                    (0..ROWS).map(|row| format!("service-{}", row % 4)),
+                    (0..rows).map(|row| format!("service-{}", row % 4)),
                 )),
                 Arc::new(arrow::array::TimestampMicrosecondArray::from_iter_values(
                     times.iter().copied(),
@@ -4190,7 +4195,102 @@ mod tests {
             ],
         )
         .expect("rewrite fixture batch");
+        (schema, iceberg_schema, batch, times)
+    }
 
+    /// Assert the writer recipe's per-column encodings in a real footer.
+    ///
+    /// Both columns must be observed: a footer that simply omitted one would
+    /// otherwise satisfy every per-column check vacuously.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either column is missing or carries the wrong encoding set.
+    fn assert_recipe_encodings(durable: &parquet::file::metadata::ParquetMetaData) {
+        let mut saw_dictionary = false;
+        let mut saw_event_time = false;
+        for group in durable.row_groups() {
+            for column in group.columns() {
+                let name = column.column_path().string();
+                let encodings = column.encodings().collect::<Vec<_>>();
+                if name == "service_name" {
+                    saw_dictionary = true;
+                    assert!(
+                        encodings.contains(&parquet::basic::Encoding::RLE_DICTIONARY)
+                            || encodings.contains(&parquet::basic::Encoding::PLAIN_DICTIONARY),
+                        "low-cardinality {name} must be dictionary-encoded, saw {encodings:?}"
+                    );
+                }
+                if name == "wyrd_event_time" {
+                    saw_event_time = true;
+                    assert!(
+                        encodings.contains(&parquet::basic::Encoding::DELTA_BINARY_PACKED),
+                        "wyrd_event_time must be DELTA_BINARY_PACKED, saw {encodings:?}"
+                    );
+                    assert!(
+                        !encodings.contains(&parquet::basic::Encoding::RLE_DICTIONARY)
+                            && !encodings.contains(&parquet::basic::Encoding::PLAIN_DICTIONARY),
+                        "wyrd_event_time must not carry a dictionary page, saw {encodings:?}"
+                    );
+                }
+            }
+        }
+        assert!(saw_dictionary && saw_event_time);
+    }
+
+    /// Decode a published footer-recipe object back into its logical rows.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the object cannot be decoded or its columns are absent or
+    /// of an unexpected type.
+    fn decoded_service_and_time_rows(published: &bytes::Bytes) -> (Vec<String>, Vec<i64>) {
+        let decoded = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            published.clone(),
+        )
+        .expect("decode builder")
+        .build()
+        .expect("decode reader")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("decode rows");
+        let mut decoded_times = Vec::new();
+        let mut decoded_services = Vec::new();
+        for decoded_batch in &decoded {
+            decoded_times.extend(
+                decoded_batch
+                    .column_by_name("wyrd_event_time")
+                    .expect("decoded event-time column")
+                    .as_any()
+                    .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+                    .expect("decoded event-time is microsecond timestamps")
+                    .values()
+                    .iter()
+                    .copied(),
+            );
+            let services = decoded_batch
+                .column_by_name("service_name")
+                .expect("decoded service column")
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("decoded service column is Utf8");
+            for row in 0..decoded_batch.num_rows() {
+                decoded_services.push(services.value(row).to_owned());
+            }
+        }
+        (decoded_services, decoded_times)
+    }
+
+    /// A file a real Forge rewrite wrote proves the same footer recipe Scribe
+    /// seals under: a low-cardinality string column encodes through a
+    /// dictionary, `wyrd_event_time` encodes as `DELTA_BINARY_PACKED` with no
+    /// dictionary page, and every decoded row equals the row written. The
+    /// assertion reads the published object's own footer, so a second property
+    /// builder anywhere in the rewrite path would fail it.
+    #[tokio::test]
+    async fn rewritten_file_footer_encoding_contract() {
+        const ROWS: i64 = 4_096;
+
+        let (schema, iceberg_schema, batch, times) = footer_contract_fixture(ROWS);
         let staging = Arc::new(
             opendal::Operator::new(opendal::services::Memory::default())
                 .expect("in-memory staging operator")
@@ -4245,69 +4345,9 @@ mod tests {
         let durable = parquet::file::metadata::ParquetMetaDataReader::new()
             .parse_and_finish(&published)
             .expect("valid Parquet footer");
+        assert_recipe_encodings(&durable);
 
-        let mut saw_dictionary = false;
-        let mut saw_event_time = false;
-        for group in durable.row_groups() {
-            for column in group.columns() {
-                let name = column.column_path().string();
-                let encodings = column.encodings().collect::<Vec<_>>();
-                if name == "service_name" {
-                    saw_dictionary = true;
-                    assert!(
-                        encodings.contains(&parquet::basic::Encoding::RLE_DICTIONARY)
-                            || encodings.contains(&parquet::basic::Encoding::PLAIN_DICTIONARY),
-                        "low-cardinality {name} must be dictionary-encoded, saw {encodings:?}"
-                    );
-                }
-                if name == "wyrd_event_time" {
-                    saw_event_time = true;
-                    assert!(
-                        encodings.contains(&parquet::basic::Encoding::DELTA_BINARY_PACKED),
-                        "wyrd_event_time must be DELTA_BINARY_PACKED, saw {encodings:?}"
-                    );
-                    assert!(
-                        !encodings.contains(&parquet::basic::Encoding::RLE_DICTIONARY)
-                            && !encodings.contains(&parquet::basic::Encoding::PLAIN_DICTIONARY),
-                        "wyrd_event_time must not carry a dictionary page, saw {encodings:?}"
-                    );
-                }
-            }
-        }
-        assert!(saw_dictionary && saw_event_time);
-
-        let decoded = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
-            published.clone(),
-        )
-        .expect("decode builder")
-        .build()
-        .expect("decode reader")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("decode rows");
-        let mut decoded_times = Vec::with_capacity(times.len());
-        let mut decoded_services = Vec::with_capacity(times.len());
-        for decoded_batch in &decoded {
-            decoded_times.extend(
-                decoded_batch
-                    .column_by_name("wyrd_event_time")
-                    .expect("decoded event-time column")
-                    .as_any()
-                    .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
-                    .expect("decoded event-time is microsecond timestamps")
-                    .values()
-                    .iter()
-                    .copied(),
-            );
-            let services = decoded_batch
-                .column_by_name("service_name")
-                .expect("decoded service column")
-                .as_any()
-                .downcast_ref::<arrow::array::StringArray>()
-                .expect("decoded service column is Utf8");
-            for row in 0..decoded_batch.num_rows() {
-                decoded_services.push(services.value(row).to_owned());
-            }
-        }
+        let (decoded_services, decoded_times) = decoded_service_and_time_rows(&published);
         assert_eq!(decoded_times, times);
         assert_eq!(
             decoded_services,

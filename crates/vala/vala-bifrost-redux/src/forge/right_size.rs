@@ -308,6 +308,11 @@ impl ForgeRightSizePolicy {
 /// Immutable data-file facts consumed by the right-size planner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IcebergCandidateFile {
+    /// Live Iceberg manifest entry backing this candidate.
+    ///
+    /// Managed Iceberg deletes by `DataFile`, so a live candidate carries the
+    /// exact discovered entry. Staging-fold candidates carry `None`.
+    pub data_file: Option<iceberg::spec::DataFile>,
     /// Stable catalog path used as the final ordering tie-breaker.
     pub(crate) catalog_path: String,
     /// Binding-validated relative object key used for rewrite reads.
@@ -400,6 +405,7 @@ impl IcebergCandidateFile {
 #[cfg(test)]
 pub(crate) fn candidate_file_for_test(path: &str, bytes: u64) -> IcebergCandidateFile {
     IcebergCandidateFile {
+        data_file: None,
         catalog_path: path.to_owned(),
         object_path: path.to_owned(),
         file_size_bytes: bytes,
@@ -612,6 +618,7 @@ mod tests {
     /// Build one current-identity file with a stable ordering key.
     fn file(path: &str, bytes: u64, partition: TimePartition) -> IcebergCandidateFile {
         IcebergCandidateFile {
+            data_file: None,
             catalog_path: path.to_owned(),
             object_path: path.to_owned(),
             file_size_bytes: bytes,

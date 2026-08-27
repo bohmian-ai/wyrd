@@ -758,7 +758,7 @@ fn restrict_plan_to_assigned_files(
             let Some(exec) = node.downcast_ref::<DataSourceExec>() else {
                 return Ok(Transformed::no(node));
             };
-            let Some(config) = exec.data_source().as_any().downcast_ref::<FileScanConfig>() else {
+            let Some(config) = exec.data_source().downcast_ref::<FileScanConfig>() else {
                 return Err(datafusion::common::DataFusionError::Plan(
                     "Oracle assignment encountered a non-file data source".to_owned(),
                 ));
@@ -1375,7 +1375,6 @@ pub(crate) mod tests {
             .expect("file source");
         let config = exec
             .data_source()
-            .as_any()
             .downcast_ref::<FileScanConfig>()
             .expect("file scan config");
         config
@@ -1876,7 +1875,7 @@ pub(crate) mod tests {
             options.execution.target_partitions,
             expected.target_partitions
         );
-        assert_eq!(options.execution.batch_size, expected.batch_size);
+        assert_eq!(options.execution.batch_size.get(), expected.batch_size);
         assert_eq!(
             options.optimizer.prefer_hash_join,
             expected.prefer_hash_join
@@ -1886,7 +1885,7 @@ pub(crate) mod tests {
             "partitions narrow to the work this fragment was assigned"
         );
         assert_ne!(
-            options.execution.batch_size, 1_024,
+            options.execution.batch_size.get(), 1_024,
             "the removed fixed batch size is not the admitted shape"
         );
 

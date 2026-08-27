@@ -3,7 +3,6 @@
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::physical_expr::PhysicalExpr;
-use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::ops::Range;
@@ -666,6 +665,12 @@ impl fmt::Display for ForgeAttemptGeneration {
 /// Immutable source identity consumed by one bounded rewrite.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RewriteSourceFile {
+    /// Live Iceberg manifest entry backing this source.
+    ///
+    /// Managed Iceberg deletes by `DataFile` rather than by path, so live
+    /// replacement carries the exact entry it discovered. Staging-fold sources
+    /// are not yet in the catalog and therefore carry `None`.
+    pub(crate) data_file: Option<iceberg::spec::DataFile>,
     /// Catalog-owned path used by live replacement's exact delete set.
     pub(crate) catalog_path: String,
     /// Binding-validated object path used for bounded Parquet reads.
@@ -3847,6 +3852,7 @@ mod tests {
     #[cfg(feature = "test-support")]
     fn parity_file(path: &str, bytes: u64) -> super::super::right_size::IcebergCandidateFile {
         super::super::right_size::IcebergCandidateFile {
+            data_file: None,
             catalog_path: path.to_owned(),
             object_path: path.to_owned(),
             file_size_bytes: bytes,

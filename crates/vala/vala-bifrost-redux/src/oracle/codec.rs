@@ -3,7 +3,6 @@
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::physical_expr::PhysicalExpr;
-use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -555,6 +554,7 @@ impl PhysicalExtensionCodec for OraclePhysicalExtensionCodec {
 mod tests {
     //! Behavioral proof for physical-plan encoding and provider ownership.
     use super::*;
+    use datafusion::physical_plan::execution_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -711,7 +711,7 @@ mod tests {
             .into_iter()
             .map(|child| replace_source(Arc::clone(child), source))
             .collect::<Result<Vec<_>>>()?;
-        plan.with_new_children(replaced)
+        plan.replace_children(replaced, ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute))
     }
 
     /// A real native aggregate/sort/limit tree round-trips and executes identically.

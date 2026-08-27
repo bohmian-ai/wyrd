@@ -1381,6 +1381,7 @@ fn plan_staging_bins(
         .map(|file| {
             by_path.insert(file.path.clone(), file.clone());
             IcebergCandidateFile {
+                data_file: None,
                 catalog_path: file.path.clone(),
                 object_path: file.path.clone(),
                 file_size_bytes: file.size,
@@ -1517,6 +1518,7 @@ impl Forge {
             .files
             .iter()
             .map(|file| RewriteSourceFile {
+                data_file: None,
                 catalog_path: file.path.clone(),
                 object_path: file.path.clone(),
                 file_size_bytes: file.size,
@@ -1685,12 +1687,12 @@ impl Forge {
             properties.insert("forge.task_attempt".to_owned(), attempt_id.to_string());
         }
         let tx = Transaction::new(&table);
-        let action = tx
+        let mut action = tx
             .rewrite_files()
-            .delete_files(Vec::<String>::new())
-            .add_data_files(rewrite.files.iter().cloned())
-            .set_commit_uuid(operation_id)
-            .set_snapshot_properties(properties);
+            .delete_files(Vec::<iceberg::spec::DataFile>::new())
+            .add_data_files(rewrite.files.iter().cloned());
+        action.set_commit_uuid(operation_id);
+        action.set_snapshot_properties(properties);
         let transaction = ApplyTransactionAction::apply(action, tx).map_err(ForgeError::Catalog)?;
         lease.require_fence(&self.core.operator_pool).await?;
         if !lease.commit_window_fits(self.core.config.commit_window()) {

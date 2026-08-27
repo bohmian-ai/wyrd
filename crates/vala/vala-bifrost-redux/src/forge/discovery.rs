@@ -377,6 +377,7 @@ impl Forge {
                     event_time_bound(data_file.upper_bounds(), event_time_field_id)?;
                 validate_event_time_range(min_event_time, max_event_time, &catalog_path)?;
                 candidates.push(IcebergCandidateFile {
+                    data_file: Some(data_file.clone()),
                     object_path: catalog_path_to_object_key(
                         table.metadata().location(),
                         binding,
@@ -585,6 +586,7 @@ mod tests {
     /// Build a complete candidate so equality proves every manifest identity field.
     fn candidate(path: &str, partition: TimePartition, schema_id: i32) -> IcebergCandidateFile {
         IcebergCandidateFile {
+            data_file: None,
             catalog_path: path.to_owned(),
             object_path: path.to_owned(),
             file_size_bytes: 10,

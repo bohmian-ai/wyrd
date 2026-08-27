@@ -196,11 +196,11 @@ opendal = { version = "0.57", default-features = false, features = [
 datafusion = "=55.0.0"
 datafusion-proto = "=55.0.0"
 parquet = "59.2"
-iceberg = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "e11f66f3158a585d09c73702b1b708df3c5b8835" }
+iceberg = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "57772676f85b138648c2f4e7f95e6dc3850d62fe" }
 # sqlx 0.8.1 is a hard dep in this crate — there is no sqlx feature flag to add.
-iceberg-catalog-sql = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "e11f66f3158a585d09c73702b1b708df3c5b8835" }
-iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "e11f66f3158a585d09c73702b1b708df3c5b8835" }
-iceberg-storage-opendal = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "e11f66f3158a585d09c73702b1b708df3c5b8835", features = ["opendal-s3", "opendal-gcs", "opendal-azdls", "opendal-fs", "opendal-memory"] }
+iceberg-catalog-sql = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "57772676f85b138648c2f4e7f95e6dc3850d62fe" }
+iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "57772676f85b138648c2f4e7f95e6dc3850d62fe" }
+iceberg-storage-opendal = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "57772676f85b138648c2f4e7f95e6dc3850d62fe", features = ["opendal-s3", "opendal-gcs", "opendal-azdls", "opendal-fs", "opendal-memory"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

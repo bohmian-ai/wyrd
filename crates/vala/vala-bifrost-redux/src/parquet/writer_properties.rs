@@ -93,7 +93,7 @@ pub fn bifrost_writer_properties_with_metadata(
         builder = builder
             .set_column_bloom_filter_enabled(path.clone(), true)
             .set_column_bloom_filter_fpp(path.clone(), BLOOM_FPP)
-            .set_column_bloom_filter_ndv(path, bloom_ndv);
+            .set_column_bloom_filter_max_ndv(path, bloom_ndv);
     }
 
     builder.build()

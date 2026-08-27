@@ -339,6 +339,7 @@ impl Forge {
             .files
             .iter()
             .map(|file| RewriteSourceFile {
+                data_file: file.data_file.clone(),
                 catalog_path: file.catalog_path.clone(),
                 object_path: file.object_path.clone(),
                 file_size_bytes: file.file_size_bytes,
@@ -445,18 +446,29 @@ impl Forge {
             properties.insert("forge.task_attempt".to_owned(), attempt_id.to_string());
         }
         let tx = Transaction::new(&current);
-        let action = tx
+        // Managed Iceberg deletes by the exact discovered `DataFile`, so a live
+        // source that lost its catalog entry is an invariant violation rather
+        // than a silently skipped delete.
+        let removed = operation
+            .source_files
+            .iter()
+            .map(|file| {
+                file.data_file
+                    .clone()
+                    .ok_or_else(|| ForgeError::Invariant {
+                        detail: format!(
+                            "live replacement source has no catalog data file: {}",
+                            file.catalog_path
+                        ),
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut action = tx
             .rewrite_files()
-            .delete_files(
-                operation
-                    .source_files
-                    .iter()
-                    .map(|file| file.catalog_path.clone())
-                    .collect::<Vec<_>>(),
-            )
-            .add_data_files(operation.rewrite.files.iter().cloned())
-            .set_commit_uuid(operation.operation_id)
-            .set_snapshot_properties(properties);
+            .delete_files(removed)
+            .add_data_files(operation.rewrite.files.iter().cloned());
+        action.set_commit_uuid(operation.operation_id);
+        action.set_snapshot_properties(properties);
         let transaction = ApplyTransactionAction::apply(action, tx).map_err(ForgeError::Catalog)?;
         lease.require_fence(&self.core.operator_pool).await?;
         if stop.is_cancelled() {
@@ -766,6 +778,7 @@ mod tests {
     fn length_framed_operation_identity_distinguishes_ambiguous_inputs() {
         let day = fixture_partition();
         let left = [RewriteSourceFile {
+            data_file: None,
             catalog_path: "a|bc".to_owned(),
             object_path: "a|bc".to_owned(),
             file_size_bytes: 1,
@@ -773,12 +786,14 @@ mod tests {
         }];
         let right = [
             RewriteSourceFile {
+                data_file: None,
                 catalog_path: "a".to_owned(),
                 object_path: "a".to_owned(),
                 file_size_bytes: 1,
                 record_count: 1,
             },
             RewriteSourceFile {
+                data_file: None,
                 catalog_path: "bc".to_owned(),
                 object_path: "bc".to_owned(),
                 file_size_bytes: 1,
@@ -796,6 +811,7 @@ mod tests {
     fn operation_identity_uses_explicit_plan_base() {
         let day = fixture_partition();
         let files = [RewriteSourceFile {
+            data_file: None,
             catalog_path: "live/é.parquet".to_owned(),
             object_path: "live/é.parquet".to_owned(),
             file_size_bytes: 1,

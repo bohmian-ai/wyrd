@@ -5,7 +5,6 @@
 //! join, aggregate, or limit.
 
 use datafusion::common::tree_node::TreeNodeRecursion;
-use std::any::Any;
 use std::fmt;
 #[cfg(test)]
 use std::fs::File;
@@ -867,7 +866,6 @@ impl OracleQueryScanStats {
         if let Some(source) = plan.downcast_ref::<DataSourceExec>()
             && let Some(config) = source
                 .data_source()
-                .as_any()
                 .downcast_ref::<FileScanConfig>()
         {
             stats.partitions_scanned = stats
@@ -3409,7 +3407,8 @@ mod tests {
         );
         assert_eq!(tripwire.name(), "TenantTripwireExec");
         assert_eq!(tripwire.children()[0].name(), "UnionExec");
-        assert!(tripwire.downcast_ref::<SortExec>().is_none());
+        let tripwire_plan: Arc<dyn ExecutionPlan> = Arc::clone(&tripwire) as Arc<dyn ExecutionPlan>;
+        assert!(tripwire_plan.downcast_ref::<SortExec>().is_none());
         assert!(
             tripwire.children()[0]
                 .downcast_ref::<SortExec>()

@@ -26,7 +26,6 @@ use super::rewrite::{
 use super::right_size::IcebergRewriteGroup;
 use crate::catalog::TenantTableBinding;
 use crate::catalog::layout::TimePartition;
-use crate::parquet::writer_properties::BIFROST_WRITER_RECIPE_VERSION;
 
 #[cfg(feature = "test-support")]
 /// Injects one pre-`Prepared` audit failure for the real catalog integration seam.
@@ -745,7 +744,6 @@ fn live_detail(
         target_file_size_bytes: operation.target_file_size_bytes,
         input_paths,
         output_paths,
-        writer_recipe_version: BIFROST_WRITER_RECIPE_VERSION.to_owned(),
     })
 }
 

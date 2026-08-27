@@ -835,7 +835,6 @@ fn iceberg_terminal_detail(
         target_file_size_bytes,
         input_paths,
         output_paths,
-        writer_recipe_version,
         ..
     } = prepared
     else {
@@ -862,7 +861,6 @@ fn iceberg_terminal_detail(
         target_file_size_bytes: *target_file_size_bytes,
         input_paths: input_paths.clone(),
         output_paths: output_paths.clone(),
-        writer_recipe_version: writer_recipe_version.clone(),
     })
 }
 
@@ -888,7 +886,6 @@ mod tests {
             target_file_size_bytes: 1024,
             input_paths: vec![StoragePath::new("table/input.parquet").expect("valid input")],
             output_paths: vec![StoragePath::new("table/output.parquet").expect("valid output")],
-            writer_recipe_version: "recipe-v1".to_owned(),
         }
     }
 

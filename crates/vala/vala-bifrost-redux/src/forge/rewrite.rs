@@ -399,9 +399,7 @@ use crate::parquet::memory::{
     BifrostArrowLogicalSizer, BifrostParquetMemoryEnvelope, BoundedRowSlice, MAX_FILE_BYTES,
     MAX_FILE_ROW_GROUPS, MAX_LOGICAL_ROW_GROUP_BYTES, MAX_ROW_GROUP_ROWS,
 };
-use crate::parquet::writer_properties::{
-    BIFROST_WRITER_RECIPE_VERSION, bifrost_writer_properties_with_metadata,
-};
+use crate::parquet::writer_properties::bifrost_writer_properties_with_metadata;
 use crate::resources::ForgeRewriteRequest;
 use vala_sql::OperatorPool;
 use vala_sql::row_types::forge_tasks::ForgeTaskEstimates;
@@ -2426,7 +2424,7 @@ fn deterministic_output_path(
     ordinal: usize,
 ) -> String {
     format!(
-        "{}/data/forge/{BIFROST_WRITER_RECIPE_VERSION}/{generation}-{ordinal:05}.parquet",
+        "{}/data/forge/{generation}-{ordinal:05}.parquet",
         prefix.trim_end_matches('/')
     )
 }
@@ -2439,7 +2437,7 @@ fn forge_table_output_path(
     ordinal: usize,
 ) -> String {
     format!(
-        "{}/data/forge/{BIFROST_WRITER_RECIPE_VERSION}/{}-{ordinal:05}.parquet",
+        "{}/data/forge/{}-{ordinal:05}.parquet",
         table_location.trim_end_matches('/'),
         generation.0
     )
@@ -3826,7 +3824,6 @@ mod tests {
             )
             .expect("fixed parity instant is an exact hour boundary"),
             sort_order_id: Some(1),
-            writer_recipe_version: Some(BIFROST_WRITER_RECIPE_VERSION.to_owned()),
             min_event_time: chrono::DateTime::from_timestamp(1, 0)
                 .expect("fixed parity timestamp is valid"),
             max_event_time: chrono::DateTime::from_timestamp(2, 0)
@@ -4165,17 +4162,16 @@ mod tests {
         assert!(retry.ends_with("-00000.parquet"));
     }
 
-    /// A writer recipe change produces a distinct deterministic storage path.
+    /// The rewrite output path carries generation and ordinal alone, with no
+    /// recipe segment that a value change could strand the orphan collector on.
     #[test]
-    fn writer_recipe_version_changes_deterministic_path() {
+    fn deterministic_path_carries_no_recipe_segment() {
         let operation_id = Uuid::from_u128(42);
         let generation = ForgeAttemptGeneration::for_test(operation_id);
         let path = deterministic_output_path("tenants/a/table", generation, 0);
         assert_eq!(
             path,
-            format!(
-                "tenants/a/table/data/forge/{BIFROST_WRITER_RECIPE_VERSION}/{operation_id}-00000.parquet"
-            )
+            format!("tenants/a/table/data/forge/{operation_id}-00000.parquet")
         );
     }
 

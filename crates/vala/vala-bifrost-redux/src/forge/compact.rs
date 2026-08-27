@@ -48,7 +48,6 @@ use super::right_size::{
 };
 use crate::catalog::TenantTableBinding;
 use crate::catalog::layout::TimePartition;
-use crate::parquet::writer_properties::BIFROST_WRITER_RECIPE_VERSION;
 
 const DEFAULT_MAX_CONCURRENT_READS: usize = 4;
 const DEFAULT_SPILL_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -1390,7 +1389,6 @@ fn plan_staging_bins(
                 partition_spec_id: policy.partition_spec_id(),
                 partition,
                 sort_order_id: Some(policy.sort_order_id()),
-                writer_recipe_version: Some(BIFROST_WRITER_RECIPE_VERSION.to_owned()),
                 min_event_time: file.min_event_time,
                 max_event_time: file.max_event_time,
                 source_snapshot_id: 0,
@@ -2291,7 +2289,6 @@ impl Forge {
                 input_file_ids,
                 input_paths,
                 output_paths,
-                writer_recipe_version,
                 ..
             } => AuditDetail::ForgeCompaction {
                 operation_id: *operation_id,
@@ -2301,7 +2298,6 @@ impl Forge {
                 input_paths: input_paths.clone(),
                 output_paths: output_paths.clone(),
                 snapshot_id,
-                writer_recipe_version: writer_recipe_version.clone(),
             },
             _ => detail.clone(),
         }
@@ -2365,11 +2361,6 @@ pub(super) fn forge_transition_event(
 
 /// Build the canonical audit detail for one compaction operation.
 ///
-/// `writer_recipe_version` is read from [`BIFROST_WRITER_RECIPE_VERSION`]
-/// rather than a hard-coded literal so the durable audit stream's recorded
-/// recipe identity cannot silently desynchronize from the physical writer
-/// recipe on a future bump (mirrors the constant read at `compact.rs:937`).
-///
 /// # Errors
 ///
 /// Returns [`ForgeError::Group`] when the group storage path (built from
@@ -2421,7 +2412,6 @@ fn forge_detail(
         input_paths,
         output_paths,
         snapshot_id,
-        writer_recipe_version: BIFROST_WRITER_RECIPE_VERSION.to_owned(),
     })
 }
 

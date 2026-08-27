@@ -381,8 +381,6 @@ pub enum AuditDetail {
         input_paths: Vec<StoragePath>,
         /// Exact ordered rewritten object paths added by the Iceberg action.
         output_paths: Vec<StoragePath>,
-        /// Physical recipe used to produce the outputs.
-        writer_recipe_version: String,
     },
     /// A Forge compaction operation and its external Iceberg boundary.
     ///
@@ -408,8 +406,6 @@ pub enum AuditDetail {
         output_paths: Vec<StoragePath>,
         /// Iceberg snapshot returned by a committed operation, when known.
         snapshot_id: Option<i64>,
-        /// Writer recipe identifier used to create the output.
-        writer_recipe_version: String,
     },
     /// A Forge snapshot-expiry operation and its Iceberg metadata boundary.
     ForgeSnapshotExpire {
@@ -763,7 +759,6 @@ mod tests {
             target_file_size_bytes: 1024,
             input_paths: vec![StoragePath::new("table/live-a.parquet").expect("valid input")],
             output_paths: vec![StoragePath::new("table/rewrite-a.parquet").expect("valid output")],
-            writer_recipe_version: "bifrost-writer-v1".to_owned(),
         };
         let json = serde_json::to_value(&detail).expect("serialize detail");
         assert_eq!(json["kind"], "forge_iceberg_rewrite");

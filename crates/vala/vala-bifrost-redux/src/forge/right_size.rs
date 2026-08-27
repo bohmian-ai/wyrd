@@ -9,7 +9,6 @@ use iceberg::spec::{PartitionSpec, Schema, Transform};
 use super::error::ForgeError;
 use crate::catalog::TimeGranularity;
 use crate::catalog::layout::TimePartition;
-use crate::parquet::writer_properties::BIFROST_WRITER_RECIPE_VERSION;
 
 /// Iceberg's unsorted order identifier used when a data file omits the field.
 pub const ICEBERG_UNSORTED_ORDER_ID: i64 = 0;
@@ -302,8 +301,7 @@ impl ForgeRightSizePolicy {
         if file.sort_order_id.unwrap_or(ICEBERG_UNSORTED_ORDER_ID) != self.sort_order_id {
             return Some(IcebergRewriteReason::ObsoleteSortOrder);
         }
-        (file.writer_recipe_version.as_deref() != Some(BIFROST_WRITER_RECIPE_VERSION))
-            .then_some(IcebergRewriteReason::ObsoleteWriterRecipe)
+        None
     }
 }
 
@@ -326,8 +324,6 @@ pub struct IcebergCandidateFile {
     pub(crate) partition: TimePartition,
     /// Optional Iceberg sort-order identity.
     pub(crate) sort_order_id: Option<i64>,
-    /// Physical writer-recipe marker, absent when unknown.
-    pub(crate) writer_recipe_version: Option<String>,
     /// Earliest event timestamp in the file.
     pub(crate) min_event_time: DateTime<Utc>,
     /// Latest event timestamp in the file.
@@ -416,7 +412,6 @@ pub(crate) fn candidate_file_for_test(path: &str, bytes: u64) -> IcebergCandidat
         )
         .expect("fixed instant is an exact hour boundary"),
         sort_order_id: Some(1),
-        writer_recipe_version: Some(BIFROST_WRITER_RECIPE_VERSION.to_owned()),
         min_event_time: DateTime::from_timestamp(1, 0).expect("fixed timestamp is valid"),
         max_event_time: DateTime::from_timestamp(2, 0).expect("fixed timestamp is valid"),
         source_snapshot_id: 1,
@@ -438,8 +433,6 @@ pub enum IcebergRewriteReason {
     ObsoletePartitionSpec,
     /// The file has an obsolete sort order.
     ObsoleteSortOrder,
-    /// The file has an unknown or obsolete physical writer recipe.
-    ObsoleteWriterRecipe,
 }
 
 /// One ordered, same-spec/day rewrite operation.
@@ -627,7 +620,6 @@ mod tests {
             partition_spec_id: 1,
             partition,
             sort_order_id: Some(1),
-            writer_recipe_version: Some(BIFROST_WRITER_RECIPE_VERSION.to_owned()),
             min_event_time: DateTime::from_timestamp(1, 0).expect("fixed timestamp is valid"),
             max_event_time: DateTime::from_timestamp(2, 0).expect("fixed timestamp is valid"),
             source_snapshot_id: 1,
@@ -705,9 +697,13 @@ mod tests {
         assert_eq!(plan.groups[0].files.len(), 1);
     }
 
-    /// Forces identity repair even when a file's size is healthy.
+    /// Identity repair is forced by exactly the three Iceberg-native
+    /// identities and nothing else. A physical writer recipe is not an
+    /// identity: two healthy, current files that differ only in the
+    /// compression or encoding settings they were written under stay
+    /// untouched, and compacting them together is well defined.
     #[test]
-    fn planner_forces_obsolete_schema_spec_sort_and_recipe() {
+    fn rewrite_identity_reason_contract() {
         let policy = ForgeRightSizePolicy::new(100, 1, 1, 1).expect("valid target");
         let day = hour(400_000);
         let mut obsolete_schema = file("schema", 100, day);
@@ -719,15 +715,7 @@ mod tests {
         let mut obsolete_sort = file("sort", 100, day);
         obsolete_sort.catalog_path = "3-sort".to_owned();
         obsolete_sort.sort_order_id = None;
-        let mut obsolete_recipe = file("recipe", 100, day);
-        obsolete_recipe.catalog_path = "4-recipe".to_owned();
-        obsolete_recipe.writer_recipe_version = None;
-        let plan = policy.plan(vec![
-            obsolete_schema,
-            obsolete_spec,
-            obsolete_sort,
-            obsolete_recipe,
-        ]);
+        let plan = policy.plan(vec![obsolete_schema, obsolete_spec, obsolete_sort]);
         assert_eq!(
             plan.groups
                 .iter()
@@ -736,9 +724,14 @@ mod tests {
             vec![
                 IcebergRewriteReason::ObsoleteSchema,
                 IcebergRewriteReason::ObsoleteSortOrder,
-                IcebergRewriteReason::ObsoleteWriterRecipe,
                 IcebergRewriteReason::ObsoletePartitionSpec,
             ]
+        );
+
+        let healthy = policy.plan(vec![file("mixed-a", 100, day), file("mixed-b", 100, day)]);
+        assert!(
+            healthy.groups.is_empty(),
+            "current files differing only in physical encoding are not rewrite candidates"
         );
     }
 

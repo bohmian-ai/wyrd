@@ -4,9 +4,8 @@ use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::metadata::KeyValue;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::schema::types::ColumnPath;
+use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
-/// Complete version marker for the Bifrost physical Parquet writer recipe.
-pub(crate) const BIFROST_WRITER_RECIPE_VERSION: &str = "bifrost-writer-v2";
 /// Number of rows handed to parquet-rs for one internal column write batch.
 pub(crate) const PARQUET_WRITE_BATCH_ROWS: usize = 8_192;
 
@@ -29,6 +28,13 @@ fn bloom_filter_ndv(row_count: usize) -> u64 {
 /// scan-bound, so the extra compression over SNAPPY is worth it). Row groups are capped at 131,072
 /// rows because parquet-58 has no byte-based row-group flush.
 ///
+/// Dictionary encoding is on by default so low-cardinality string and
+/// identifier columns encode as `RLE_DICTIONARY`; parquet-rs owns dictionary
+/// page overflow and the fallback to `PLAIN`, so no sampler or cardinality
+/// estimate is computed here. `wyrd_event_time` is the one column that opts
+/// out: it is monotonic microsecond data that `DELTA_BINARY_PACKED` encodes
+/// strictly better than a dictionary would.
+///
 /// Bloom filters are enabled only for `bloom_columns`, the canonical union the
 /// registered physical layout resolved from the managed floor and the table's
 /// declarations. Every other column stays unallowlisted so payload and message
@@ -41,6 +47,12 @@ pub fn bifrost_writer_properties(row_count: usize, bloom_columns: &[String]) -> 
 }
 
 /// Parquet properties carrying the exact writer-v2 footer metadata.
+///
+/// Dictionary encoding is enabled globally and disabled for
+/// [`WYRD_EVENT_TIME`], which keeps `DELTA_BINARY_PACKED` as its actual
+/// encoding. Both calls are required: parquet-rs treats a per-column encoding
+/// request as a *fallback* used only after a dictionary overflows, so
+/// `set_column_encoding` alone would leave the column dictionary-encoded.
 ///
 /// The caller must construct metadata through the common memory-contract
 /// owner so producer paths cannot invent alternate field spellings, and must
@@ -63,9 +75,10 @@ pub fn bifrost_writer_properties_with_metadata(
         ))
         .set_write_batch_size(PARQUET_WRITE_BATCH_ROWS)
         .set_max_row_group_row_count(Some(MAX_ROW_GROUP_ROWS))
-        .set_dictionary_enabled(false)
+        .set_dictionary_enabled(true)
+        .set_column_dictionary_enabled(ColumnPath::from(WYRD_EVENT_TIME), false)
         .set_column_encoding(
-            ColumnPath::from("wyrd_event_time"),
+            ColumnPath::from(WYRD_EVENT_TIME),
             Encoding::DELTA_BINARY_PACKED,
         )
         .set_statistics_enabled(EnabledStatistics::Page)
@@ -103,6 +116,42 @@ mod tests {
         .into_iter()
         .map(str::to_owned)
         .collect()
+    }
+
+    /// The one writer recipe every Bifrost producer builds: dictionary
+    /// encoding on by default so low-cardinality columns compress, off for
+    /// `wyrd_event_time` so `DELTA_BINARY_PACKED` is its real encoding rather
+    /// than a post-overflow fallback, and one deterministic footer recipe
+    /// marker stamped by the memory-contract owner.
+    #[test]
+    fn writer_recipe_encoding_contract() {
+        let bloom_columns = declared_recipe();
+        let properties = bifrost_writer_properties(50_000, &bloom_columns);
+
+        for column in ["service_name", "run_id", "message", "data_tenant_id"] {
+            let path = ColumnPath::from(column);
+            assert!(
+                properties.dictionary_enabled(&path),
+                "{column} must be dictionary-eligible by default"
+            );
+            assert_eq!(
+                properties.encoding(&path),
+                None,
+                "{column} must leave encoding selection to parquet-rs"
+            );
+        }
+
+        let event_time = ColumnPath::from(WYRD_EVENT_TIME);
+        assert!(
+            !properties.dictionary_enabled(&event_time),
+            "wyrd_event_time must opt out of dictionary encoding"
+        );
+        assert_eq!(
+            properties.encoding(&event_time),
+            Some(Encoding::DELTA_BINARY_PACKED)
+        );
+
+        assert_eq!(super::super::memory::WRITER_RECIPE, "bifrost-writer-v2");
     }
 
     #[test]

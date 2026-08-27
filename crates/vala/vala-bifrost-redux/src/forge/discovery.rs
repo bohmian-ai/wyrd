@@ -234,7 +234,6 @@ impl Forge {
                 || file.partition_spec_id != first.partition_spec_id
                 || file.partition != first.partition
                 || file.sort_order_id != first.sort_order_id
-                || file.writer_recipe_version != first.writer_recipe_version
         }) {
             return Err(ForgeError::Reconciliation {
                 detail: "exact live rewrite inputs no longer share one physical group".to_owned(),
@@ -391,7 +390,6 @@ impl Forge {
                     partition_spec_id: manifest.metadata().partition_spec().spec_id(),
                     partition,
                     sort_order_id: data_file.sort_order_id().map(i64::from),
-                    writer_recipe_version: writer_recipe_version(data_file.file_path()),
                     min_event_time,
                     max_event_time,
                     source_snapshot_id: entry.snapshot_id().ok_or_else(|| {
@@ -569,19 +567,11 @@ fn validate_event_time_range(
     Ok(())
 }
 
-/// Extract the Forge recipe only from the established rewrite object layout.
-fn writer_recipe_version(path: &str) -> Option<String> {
-    let (_, recipe_and_file) = path.split_once("/data/forge/")?;
-    let (recipe, file) = recipe_and_file.split_once('/')?;
-    (!recipe.is_empty() && file.ends_with(".parquet")).then(|| recipe.to_owned())
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::parquet::writer_properties::BIFROST_WRITER_RECIPE_VERSION;
 
     /// Builds the fixture hour partition shared by the discovery regressions.
     fn hour(epoch_hour: i64) -> TimePartition {
@@ -603,7 +593,6 @@ mod tests {
             partition_spec_id: 1,
             partition,
             sort_order_id: Some(1),
-            writer_recipe_version: Some("bifrost-writer-v1".to_owned()),
             min_event_time: DateTime::from_timestamp(1, 0).expect("fixed timestamp is valid"),
             max_event_time: DateTime::from_timestamp(2, 0).expect("fixed timestamp is valid"),
             source_snapshot_id: 42,
@@ -654,11 +643,7 @@ mod tests {
         let policy = ForgeRightSizePolicy::new(100, 1, 1, 1).expect("policy is valid");
         let previous = hour(399_999);
         let next = hour(400_001);
-        let current = |path: &str, partition| {
-            let mut file = candidate(path, partition, 1);
-            file.writer_recipe_version = Some(BIFROST_WRITER_RECIPE_VERSION.to_owned());
-            file
-        };
+        let current = |path: &str, partition| candidate(path, partition, 1);
 
         assert_eq!(
             plan_candidates(

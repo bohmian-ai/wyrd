@@ -214,11 +214,7 @@ impl MaintenanceProtection {
 /// Scribe pod/ULID names and generic Iceberg metadata paths deliberately fail
 /// this predicate and can be reclaimed only from committed expiry evidence.
 fn is_forge_attempt_generation(path: &str) -> bool {
-    let marker = format!(
-        "/data/forge/{}/",
-        crate::parquet::writer_properties::BIFROST_WRITER_RECIPE_VERSION
-    );
-    let Some((_, file_name)) = path.rsplit_once(&marker) else {
+    let Some((_, file_name)) = path.rsplit_once("/data/forge/") else {
         return false;
     };
     let Some(stem) = file_name.strip_suffix(".parquet") else {
@@ -1544,9 +1540,8 @@ mod tests {
         .expect("binding");
         let forge_path = |generation: Uuid| {
             format!(
-                "{}/data/forge/{}/{generation}-00000.parquet",
-                binding.object_prefix,
-                crate::parquet::writer_properties::BIFROST_WRITER_RECIPE_VERSION
+                "{}/data/forge/{generation}-00000.parquet",
+                binding.object_prefix
             )
         };
         let old_path = forge_path(Uuid::now_v7());
@@ -1628,13 +1623,18 @@ mod tests {
         assert_eq!(protection.now.timestamp_millis(), 48 * 60 * 60 * 1_000);
     }
 
-    /// Generic orphan collection excludes Scribe pod/ULID and Iceberg-owned paths.
+    /// A Forge attempt generation is recognized by the `/data/forge/` segment
+    /// alone, so no recipe or other path-smuggled value can strand a
+    /// generation outside the collector's reach. Scribe pod/ULID and
+    /// Iceberg-owned paths still fail the predicate.
     #[test]
-    fn generic_gc_accepts_only_forge_attempt_generations() {
+    fn forge_attempt_generation_recognition_contract() {
         let generation = Uuid::now_v7();
         assert!(is_forge_attempt_generation(&format!(
-            "tenant/table/data/forge/{}/{generation}-00000.parquet",
-            crate::parquet::writer_properties::BIFROST_WRITER_RECIPE_VERSION
+            "tenant/table/data/forge/{generation}-00000.parquet"
+        )));
+        assert!(!is_forge_attempt_generation(&format!(
+            "tenant/table/data/forge/bifrost-writer-v2/{generation}-00000.parquet"
         )));
         assert!(!is_forge_attempt_generation(
             "tenant/table/data/pod-a-01JABC.parquet"

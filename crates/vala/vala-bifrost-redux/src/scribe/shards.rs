@@ -416,6 +416,13 @@ pub(crate) struct PressureSignal {
 pub trait ShardItem {
     /// Authenticated tenant owning the item.
     fn tenant(&self) -> DataTenantId;
+    /// Logical table owning the item within its tenant.
+    ///
+    /// Scheduling is hierarchical, so an item must name its table as well as
+    /// its tenant: a tenant-only view cannot tell one tenant's hot table from
+    /// its quiet sibling, and would let the hot one consume the tenant's whole
+    /// turn indefinitely.
+    fn table(&self) -> &TableRef;
     /// In-flight bytes charged to the item.
     fn bytes(&self) -> usize;
 }
@@ -509,14 +516,45 @@ impl<T> Default for ScribeShardSet<T> {
     }
 }
 
-/// Tenant-fair pending scheduler owned by one shard task.
+/// Hierarchical tenant-then-table-fair pending scheduler owned by one shard.
+///
+/// Scheduling walks three levels, outermost first: tenants in round-robin
+/// order, that tenant's tables in round-robin order, and one table's requests
+/// in arrival order. Each turn takes exactly one complete request, so neither a
+/// hot tenant nor a hot table inside a fair tenant can fill an fsync group
+/// while a peer waits behind it, and ordering within any one table is still
+/// strictly the order its requests arrived.
 #[derive(Debug)]
-pub struct TenantRoundRobin<T> {
-    pending_by_tenant: HashMap<DataTenantId, VecDeque<T>>,
+pub struct TenantTableRoundRobin<T> {
+    /// Per-tenant table queues and that tenant's own table rotation.
+    pending_by_tenant: HashMap<DataTenantId, TenantTableQueues<T>>,
+    /// Tenants with at least one pending request, in service order.
     active_tenants: VecDeque<DataTenantId>,
 }
 
-impl<T> Default for TenantRoundRobin<T> {
+/// One tenant's table queues and its table-level rotation.
+///
+/// Kept as its own struct rather than a bare map so the rotation and the queues
+/// it names can only be updated together; a rotation that outlived its queue
+/// would hand a turn to a table with nothing to send.
+#[derive(Debug)]
+struct TenantTableQueues<T> {
+    /// Arrival-ordered requests per table.
+    by_table: HashMap<TableRef, VecDeque<T>>,
+    /// Tables with at least one pending request, in service order.
+    active_tables: VecDeque<TableRef>,
+}
+
+impl<T> Default for TenantTableQueues<T> {
+    fn default() -> Self {
+        Self {
+            by_table: HashMap::new(),
+            active_tables: VecDeque::new(),
+        }
+    }
+}
+
+impl<T> Default for TenantTableRoundRobin<T> {
     fn default() -> Self {
         Self {
             pending_by_tenant: HashMap::new(),
@@ -525,60 +563,81 @@ impl<T> Default for TenantRoundRobin<T> {
     }
 }
 
-impl<T: ShardItem> TenantRoundRobin<T> {
-    /// Enqueue an item and activate its tenant once.
+impl<T: ShardItem> TenantTableRoundRobin<T> {
+    /// Enqueues one request, activating its tenant and table exactly once.
+    ///
+    /// A tenant or table already in its rotation is not re-added: appending it
+    /// again would give it two turns per cycle for as long as it stayed busy,
+    /// which is precisely the unfairness the rotation exists to prevent.
     pub fn push(&mut self, item: T) {
         let tenant = item.tenant();
-        let queue = self.pending_by_tenant.entry(tenant).or_default();
-        let was_empty = queue.is_empty();
+        let table = item.table().clone();
+        let queues = self.pending_by_tenant.entry(tenant).or_default();
+        let tenant_was_idle = queues.active_tables.is_empty();
+        let queue = queues.by_table.entry(table.clone()).or_default();
+        let table_was_idle = queue.is_empty();
         queue.push_back(item);
-        if was_empty {
+        if table_was_idle {
+            queues.active_tables.push_back(table);
+        }
+        if tenant_was_idle {
             self.active_tenants.push_back(tenant);
         }
     }
 
-    /// Drain one bounded group in tenant round-robin order.
+    /// Drains one bounded group in tenant-then-table round-robin order.
     ///
-    /// Each turn takes one complete request from the next active tenant. A
-    /// tenant with more pending work is requeued at the back, so a hot tenant
-    /// cannot fill an entire fsync group while another tenant waits behind it.
+    /// Each iteration serves one request from the next tenant's next table and
+    /// requeues both levels behind their peers when either still has work.
+    /// Tenants and tables whose queues emptied are dropped from the rotation
+    /// entirely rather than left as empty entries a later turn would waste.
     pub fn pop_group(&mut self) -> Vec<T> {
         let mut result = Vec::new();
         while result.len() < MAX_GROUP_ITEMS {
             let Some(tenant) = self.active_tenants.pop_front() else {
                 break;
             };
-            if self
-                .pending_by_tenant
-                .get(&tenant)
-                .and_then(|queue| queue.front())
-                .is_none()
-            {
-                self.pending_by_tenant.remove(&tenant);
+            let Some(queues) = self.pending_by_tenant.get_mut(&tenant) else {
                 continue;
-            }
-            let item = self
-                .pending_by_tenant
-                .get_mut(&tenant)
-                .and_then(VecDeque::pop_front);
-            let Some(item) = item else {
+            };
+            let Some(item) = Self::pop_next_table_item(queues) else {
+                self.pending_by_tenant.remove(&tenant);
                 continue;
             };
             result.push(item);
-            if self
-                .pending_by_tenant
-                .get(&tenant)
-                .is_some_and(|queue| !queue.is_empty())
-            {
-                self.active_tenants.push_back(tenant);
-            } else {
+            if queues.active_tables.is_empty() {
                 self.pending_by_tenant.remove(&tenant);
+            } else {
+                self.active_tenants.push_back(tenant);
             }
         }
         result
     }
 
-    /// Whether the shard has no queued requests.
+    /// Takes one request from the tenant's next table, rotating that table.
+    ///
+    /// Returns `None` only when the tenant has no table with pending work, in
+    /// which case the caller drops the tenant from the rotation.
+    fn pop_next_table_item(queues: &mut TenantTableQueues<T>) -> Option<T> {
+        while let Some(table) = queues.active_tables.pop_front() {
+            let Some(queue) = queues.by_table.get_mut(&table) else {
+                continue;
+            };
+            let Some(item) = queue.pop_front() else {
+                queues.by_table.remove(&table);
+                continue;
+            };
+            if queue.is_empty() {
+                queues.by_table.remove(&table);
+            } else {
+                queues.active_tables.push_back(table);
+            }
+            return Some(item);
+        }
+        None
+    }
+
+    /// Reports whether the shard has no queued requests at any level.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.active_tenants.is_empty()
@@ -588,6 +647,10 @@ impl<T: ShardItem> TenantRoundRobin<T> {
 impl ShardItem for PreparedAppend {
     fn tenant(&self) -> DataTenantId {
         self.tenant
+    }
+
+    fn table(&self) -> &TableRef {
+        &self.table
     }
 
     fn bytes(&self) -> usize {
@@ -692,7 +755,7 @@ struct ShardOwner {
     /// Coalescing memory/WAL pressure mailbox for this shard.
     pressure_receiver: watch::Receiver<Option<PressureSignal>>,
     /// Tenant-fair scheduler for admitted prepared appends.
-    scheduler: TenantRoundRobin<PreparedAppend>,
+    scheduler: TenantTableRoundRobin<PreparedAppend>,
     /// Whether this owner has received its shutdown command.
     shutting_down: bool,
     /// WAL segments currently associated with writable seal keys.
@@ -973,7 +1036,7 @@ impl ScribeShardRuntime {
                 id,
                 receiver,
                 pressure_receiver: pressure_receiver.clone(),
-                scheduler: TenantRoundRobin::default(),
+                scheduler: TenantTableRoundRobin::default(),
                 shutting_down: false,
                 wal_segments: WalSegmentsByKey::new(),
                 synced_not_inserted: HashMap::new(),
@@ -6121,6 +6184,7 @@ mod tests {
     #[derive(Debug)]
     struct Item {
         tenant: DataTenantId,
+        table: TableRef,
         bytes: usize,
         sequence: usize,
     }
@@ -6128,6 +6192,10 @@ mod tests {
     impl ShardItem for Item {
         fn tenant(&self) -> DataTenantId {
             self.tenant
+        }
+
+        fn table(&self) -> &TableRef {
+            &self.table
         }
 
         fn bytes(&self) -> usize {
@@ -6493,7 +6561,7 @@ mod tests {
             id: 0,
             receiver,
             pressure_receiver,
-            scheduler: TenantRoundRobin::default(),
+            scheduler: TenantTableRoundRobin::default(),
             shutting_down: false,
             wal_segments: WalSegmentsByKey::new(),
             synced_not_inserted: HashMap::new(),
@@ -7448,26 +7516,30 @@ mod tests {
         );
     }
 
+    /// Builds one scheduler item for a tenant, table, and arrival sequence.
+    fn scheduled(tenant: DataTenantId, table: &str, sequence: usize) -> Item {
+        Item {
+            tenant,
+            table: TableRef::new(BifrostNamespace::Bifrost, table),
+            bytes: 1,
+            sequence,
+        }
+    }
+
+    /// A group rotates tenants first and never starves the second tenant.
+    ///
+    /// # Panics
+    ///
+    /// Panics when one tenant takes two consecutive turns while another has
+    /// pending work, or when a tenant's own arrival order is not preserved.
     #[test]
     fn scheduler_rotates_between_tenants() {
         let first = DataTenantId::new_v7();
         let second = DataTenantId::new_v7();
-        let mut scheduler = TenantRoundRobin::default();
-        scheduler.push(Item {
-            tenant: first,
-            bytes: 1,
-            sequence: 1,
-        });
-        scheduler.push(Item {
-            tenant: first,
-            bytes: 1,
-            sequence: 2,
-        });
-        scheduler.push(Item {
-            tenant: second,
-            bytes: 1,
-            sequence: 3,
-        });
+        let mut scheduler = TenantTableRoundRobin::default();
+        scheduler.push(scheduled(first, "events", 1));
+        scheduler.push(scheduled(first, "events", 2));
+        scheduler.push(scheduled(second, "events", 3));
         let first_group = scheduler.pop_group();
         assert_eq!(first_group.len(), 3);
         assert_eq!(first_group[0].tenant(), first);
@@ -7477,6 +7549,66 @@ mod tests {
         let second_group = scheduler.pop_group();
         assert!(second_group.is_empty());
         assert!(scheduler.pop_group().is_empty());
+    }
+
+    /// One tenant's hot table cannot consume that tenant's whole turn.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a tenant's tables are not rotated inside its turn, when
+    /// arrival order within one table is not preserved, or when a quiet table
+    /// waits behind more than one request of its busy sibling.
+    #[test]
+    fn scheduler_rotates_tables_inside_one_tenant() {
+        let tenant = DataTenantId::new_v7();
+        let mut scheduler = TenantTableRoundRobin::default();
+        // Four requests for the hot table arrive before the quiet table's one.
+        for sequence in 1..=4 {
+            scheduler.push(scheduled(tenant, "hot", sequence));
+        }
+        scheduler.push(scheduled(tenant, "quiet", 5));
+
+        let group = scheduler.pop_group();
+        assert_eq!(group.len(), 5);
+        let served: Vec<(&str, usize)> = group
+            .iter()
+            .map(|item| (item.table().name.as_str(), item.sequence))
+            .collect();
+        assert_eq!(
+            served,
+            vec![("hot", 1), ("quiet", 5), ("hot", 2), ("hot", 3), ("hot", 4),],
+            "the quiet table takes its turn after one hot request, not after four"
+        );
+        assert!(scheduler.is_empty());
+    }
+
+    /// Two tenants with uneven table counts still alternate at the tenant level.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a tenant that owns more tables receives more turns than a
+    /// tenant that owns one, which would make table count a fairness lever.
+    #[test]
+    fn scheduler_tenant_fairness_is_independent_of_table_count() {
+        let wide = DataTenantId::new_v7();
+        let narrow = DataTenantId::new_v7();
+        let mut scheduler = TenantTableRoundRobin::default();
+        for (index, table) in ["a", "b", "c"].into_iter().enumerate() {
+            scheduler.push(scheduled(wide, table, index));
+        }
+        for sequence in 100..103 {
+            scheduler.push(scheduled(narrow, "only", sequence));
+        }
+
+        let group = scheduler.pop_group();
+        assert_eq!(group.len(), 6);
+        let wide_turns = group.iter().filter(|item| item.tenant() == wide).count();
+        assert_eq!(
+            wide_turns, 3,
+            "owning three tables buys no extra tenant-level turns"
+        );
+        let alternating: Vec<bool> = group.iter().map(|item| item.tenant() == wide).collect();
+        assert_eq!(alternating, vec![true, false, true, false, true, false]);
     }
 
     /// Verify that shard lookup is bounded within the fixed topology for any batch.

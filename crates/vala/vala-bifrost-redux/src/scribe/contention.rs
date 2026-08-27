@@ -302,30 +302,71 @@ impl ScribeContentionLedger {
         self.policy.geometry().guaranteed_width()
     }
 
+    /// Returns the tenants whose whole table width the pod permanently holds.
+    #[must_use]
+    pub const fn guaranteed_tenants(&self) -> usize {
+        self.policy.geometry().guaranteed_active_tenants()
+    }
+
+    /// Returns the vectors active owners hold beyond what they are entitled to.
+    ///
+    /// Entitlement is `min(active_tenants, guaranteed_tenants)` whole table
+    /// widths: an active tenant inside the guaranteed count is entitled to its
+    /// configured width and nothing more, and a tenant beyond that count is
+    /// entitled to nothing. Everything an owner reserves past its entitlement is
+    /// borrowed from real surplus.
+    ///
+    /// Counting it this way is what stops one tenant from spreading into the
+    /// slots of guaranteed tenants that have not arrived yet. Those slots are
+    /// inside the permanent reservation, so they are never free capacity, and
+    /// a widening that would consume them shows up here as extra the pod cannot
+    /// back.
+    fn extra_vectors(
+        state: &LedgerState,
+        tenants: usize,
+        width: usize,
+        guaranteed: usize,
+    ) -> usize {
+        state
+            .reserved_vectors()
+            .saturating_sub(tenants.min(guaranteed).saturating_mul(width))
+    }
+
+    /// Returns the complete vectors the pod must currently back.
+    ///
+    /// The permanent startup reservation plus every vector owners borrowed past
+    /// their entitlement. The reservation is a floor and never shrinks, so an
+    /// unclaimed guaranteed slot stays paid for rather than becoming surplus.
+    fn held_vectors(&self, state: &LedgerState) -> usize {
+        self.guaranteed_vectors()
+            .saturating_add(Self::extra_vectors(
+                state,
+                state.active_tenants(),
+                self.tenant_table_width(),
+                self.guaranteed_tenants(),
+            ))
+    }
+
     /// Returns the elastic surplus in one category.
     ///
-    /// Capacity beyond the startup reservation and beyond any extra vectors
-    /// owners have installed past their configured width. Everything below that
-    /// line is a protected cell and is never borrowable.
+    /// Capacity beyond every vector the pod must back. Everything below that
+    /// line is a protected cell — including the cells of guaranteed tenants that
+    /// have not arrived — and is never borrowable.
     fn surplus(&self, state: &LedgerState, category: ContentionCategory) -> usize {
-        let component = self.reserve_vector().component(category);
         let held = self
-            .guaranteed_vectors()
-            .max(state.reserved_vectors())
-            .saturating_mul(component);
+            .held_vectors(state)
+            .saturating_mul(self.reserve_vector().component(category));
         self.capacity.component(category).saturating_sub(held)
     }
 
     /// Returns the pod-wide committed amount in one category.
     ///
-    /// The permanently held reservation plus everything borrowed beyond it, so
-    /// the value a widening or a borrow is checked against is always the same
+    /// Everything the pod must back plus everything borrowed beyond it, so the
+    /// value a widening or a borrow is checked against is always the same
     /// quantity the capacity bound describes.
     fn pod_committed(&self, state: &LedgerState, category: ContentionCategory) -> usize {
-        let component = self.reserve_vector().component(category);
-        self.guaranteed_vectors()
-            .max(state.reserved_vectors())
-            .saturating_mul(component)
+        self.held_vectors(state)
+            .saturating_mul(self.reserve_vector().component(category))
             .saturating_add(state.borrowed(&self.reserve_vector(), category))
     }
 
@@ -356,7 +397,9 @@ impl ScribeContentionLedger {
 
         let Some(tenant) = state.tenants.get(&key.tenant) else {
             // A brand new tenant takes its whole table width in one step.
-            self.check_widening(&state, width, "tenant")?;
+            let tenants = state.active_tenants() + 1;
+            let reserved = state.reserved_vectors() + width;
+            self.check_reservation(&state, tenants, reserved, "tenant")?;
             let mut tenant = TenantScribeLedger {
                 tables: HashMap::new(),
                 reserved_vectors: width,
@@ -373,8 +416,11 @@ impl ScribeContentionLedger {
         }
         let widen = tenant.tables.len() >= tenant.reserved_vectors;
         if widen {
-            // Beyond the configured width: one complete extra vector or nothing.
-            self.check_widening(&state, 1, "table")?;
+            // Beyond the configured width: one complete extra vector, and it may
+            // only come from surplus above the permanent guarantee.
+            let tenants = state.active_tenants();
+            let reserved = state.reserved_vectors() + 1;
+            self.check_reservation(&state, tenants, reserved, "table")?;
         }
         let Some(tenant) = state.tenants.get_mut(&key.tenant) else {
             return Err(ContentionRefusal::Inactive);
@@ -388,35 +434,43 @@ impl ScribeContentionLedger {
         Ok(())
     }
 
-    /// Verifies that `vectors` more complete reserve vectors fit every category.
+    /// Verifies that a prospective reservation fits every category.
     ///
-    /// Checked against the pod total before anything is mutated, so a widening
-    /// that fails in the last category leaves the tenant map untouched. Extra
-    /// vectors come out of surplus: they can never displace the permanently held
-    /// startup reservation.
+    /// `tenants` and `reserved` describe the state *after* the activation, so
+    /// the check is made against what the pod would owe rather than what it owes
+    /// now. Extra vectors are measured against entitlement, which means a tenant
+    /// widening past its configured table width must find real surplus: it can
+    /// never spend a slot the permanent reservation is holding for a guaranteed
+    /// tenant that has not arrived.
+    ///
+    /// Checked before anything is mutated, so a widening that fails in the last
+    /// category leaves the tenant map untouched.
     ///
     /// # Errors
     ///
     /// Returns [`ContentionRefusal::ActivationWidth`] naming `scope` and the
-    /// first category that cannot hold the additional vectors.
-    fn check_widening(
+    /// first category that cannot hold the prospective reservation.
+    fn check_reservation(
         &self,
         state: &LedgerState,
-        vectors: usize,
+        tenants: usize,
+        reserved: usize,
         scope: &'static str,
     ) -> Result<(), ContentionRefusal> {
         let vector = self.reserve_vector();
-        let held = state.reserved_vectors();
-        let guaranteed = self.guaranteed_vectors();
+        let width = self.tenant_table_width();
+        let guaranteed = self.guaranteed_tenants();
+        let entitled = tenants.min(guaranteed).saturating_mul(width);
+        let next_held = self
+            .guaranteed_vectors()
+            .saturating_add(reserved.saturating_sub(entitled));
         for category in ContentionCategory::ALL {
-            let component = vector.component(category);
             let capacity = self.capacity.component(category);
             let committed = self.pod_committed(state, category);
-            let next_held = guaranteed
-                .max(held.saturating_add(vectors))
-                .checked_mul(component)
+            let required = next_held
+                .checked_mul(vector.component(category))
                 .and_then(|held| held.checked_add(state.borrowed(&vector, category)));
-            if next_held.is_none_or(|next| next > capacity) {
+            if required.is_none_or(|required| required > capacity) {
                 return Err(ContentionRefusal::ActivationWidth {
                     scope,
                     category: category.label(),
@@ -796,6 +850,72 @@ mod tests {
         ledger
             .charge(&late, ContentionCategory::Active, reserve)
             .expect("a protected cell is untouched by an earlier hot tenant");
+    }
+
+    /// An early tenant cannot spread into slots later guaranteed tenants own.
+    ///
+    /// The bug this pins is arithmetic, not policy: counting an unclaimed
+    /// guaranteed tenant slot as free capacity let the first tenant to arrive
+    /// widen through every vector on the pod, and the guaranteed tenants behind
+    /// it were then refused the width startup had already reserved for them.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a tenant widens past its configured table width without real
+    /// surplus, when a later guaranteed tenant is refused, or when one surplus
+    /// vector admits anything other than exactly one extra table.
+    #[test]
+    fn an_early_tenant_cannot_widen_into_unclaimed_guaranteed_tenant_slots() {
+        // Exact-minimum four tenants of two tables: every vector is spoken for.
+        let ledger = ledger_for(4, 2, 0);
+        ledger.activate(&key(1, "a")).expect("first table");
+        ledger
+            .activate(&key(1, "b"))
+            .expect("second reserved table");
+        let refusal = ledger
+            .activate(&key(1, "c"))
+            .expect_err("a third table has no surplus to come from");
+        let ContentionRefusal::ActivationWidth { scope, .. } = refusal else {
+            panic!("an over-wide table activation must report the diagnostic");
+        };
+        assert_eq!(scope, "table");
+
+        // Every other guaranteed tenant still gets its complete configured width.
+        for tenant in 2..=4_u8 {
+            for table in ["a", "b"] {
+                ledger
+                    .activate(&key(tenant, table))
+                    .unwrap_or_else(|error| {
+                        panic!("guaranteed tenant {tenant} table {table} must activate: {error}")
+                    });
+            }
+        }
+        assert_eq!(ledger.active_cells().expect("cell count"), 8);
+        assert_eq!(ledger.active_tenants().expect("tenant count"), 4);
+
+        // One spare vector admits exactly one extra table, pod-wide, and no more.
+        let elastic = ledger_for(4, 2, 1);
+        elastic.activate(&key(1, "a")).expect("first table");
+        elastic
+            .activate(&key(1, "b"))
+            .expect("second reserved table");
+        elastic
+            .activate(&key(1, "c"))
+            .expect("the one surplus vector admits a third table");
+        assert!(
+            elastic.activate(&key(1, "d")).is_err(),
+            "the surplus is spent; a fourth table has nothing to come from"
+        );
+        for tenant in 2..=4_u8 {
+            for table in ["a", "b"] {
+                elastic
+                    .activate(&key(tenant, table))
+                    .unwrap_or_else(|error| {
+                        panic!("guaranteed tenant {tenant} table {table} must activate: {error}")
+                    });
+            }
+        }
+        assert_eq!(elastic.active_cells().expect("cell count"), 9);
     }
 
     /// A hot table drains rather than keeps its sibling's share when it arrives.

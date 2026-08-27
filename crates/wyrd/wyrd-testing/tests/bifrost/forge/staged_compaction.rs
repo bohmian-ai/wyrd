@@ -20,11 +20,15 @@ struct SealedFile {
     rows: i64,
 }
 
-/// Read every `file_list` row of the fixture table in a stable order.
+/// Read the fixture table's staging `file_list` rows in a stable order.
+///
+/// Scoped to rows Forge would still consider: a committed staged fold retires
+/// its inputs by marking them compacted rather than deleting them, so the
+/// `NOT compacted` filter is the same one production discovery applies.
 async fn sealed_files(fixture: &wyrd_testing::bifrost::ForgeFixture) -> Vec<SealedFile> {
     sqlx::query_as::<_, (String, i64, i64)>(
         "SELECT file_path, file_size, row_count FROM vala.file_list \
-         WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 \
+         WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 AND NOT compacted \
          ORDER BY file_path",
     )
     .bind(fixture.tenant.as_uuid())
@@ -119,7 +123,22 @@ async fn staged_compaction_folds_scribe_sealed_files() {
     );
     assert!(
         sealed_files(&fixture).await.is_empty(),
-        "a committed staged compaction consumes its file-list inputs"
+        "a committed staged compaction retires every file-list input it folded"
+    );
+    let retired: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.file_list \
+         WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 AND compacted",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(&fixture.binding.logical_namespace)
+    .bind(&fixture.binding.table_name)
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("retired file-list rows");
+    assert_eq!(
+        retired,
+        i64::try_from(before.len()).expect("input count"),
+        "every sealed input is retired, not dropped"
     );
 
     let table = fixture

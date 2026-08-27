@@ -1820,16 +1820,24 @@ pub async fn seed_forge_group_for_tenant_with_schema(
     .await
 }
 
-/// Default partition day every Forge fixture seeds rows into.
+/// Default partition day every Forge fixture seeds rows into: yesterday, UTC.
 ///
-/// Derived from the current UTC date rather than a frozen calendar literal
-/// because these fixtures now drive a real Scribe append, and Scribe enforces
-/// an event-time acceptance window measured against wall clock (30 days past,
-/// 24 hours future). A fixed day silently falls out of that window as time
-/// passes and would start rejecting every fixture write.
+/// Two live constraints pin this to a relative day rather than a frozen
+/// calendar literal, and both are load-bearing.
+///
+/// Scribe sets the floor. These fixtures now drive a real append, and Scribe
+/// enforces an event-time acceptance window measured against wall clock (30
+/// days past, 24 hours future). A fixed literal silently falls out of that
+/// window as time passes and would begin rejecting every fixture write.
+///
+/// Forge sets the ceiling. Its right-size planner refuses to merge undersized
+/// files in a partition that is still open, because more writes are expected
+/// to land there. Seeding into today would therefore produce a table Forge
+/// correctly declines to compact. Yesterday is the most recent closed day, so
+/// it satisfies both bounds with the widest margin.
 #[must_use]
 pub fn default_fixture_day() -> chrono::NaiveDate {
-    chrono::Utc::now().date_naive()
+    chrono::Utc::now().date_naive() - chrono::Duration::days(1)
 }
 
 /// Exact UTC start of `day`, the durable partition-start column value.

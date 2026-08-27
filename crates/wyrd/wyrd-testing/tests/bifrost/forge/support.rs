@@ -153,8 +153,26 @@ impl SupervisedForge {
             .fetch_all(self.operator_pool.pool())
             .await
             .expect("Forge task timeout diagnostics");
+            let tables: Vec<(String, String)> =
+                sqlx::query_as("SELECT fqn, status FROM vala.bifrost_tables ORDER BY fqn")
+                    .fetch_all(self.operator_pool.pool())
+                    .await
+                    .expect("Forge table diagnostics");
+            let demands: Vec<(String, String, i64)> = sqlx::query_as(
+                "SELECT table_name, last_source, generation FROM vala.forge_planning_demands \
+                 ORDER BY table_name",
+            )
+            .fetch_all(self.operator_pool.pool())
+            .await
+            .expect("Forge demand diagnostics");
+            let files: Vec<(String, i64, bool)> = sqlx::query_as(
+                "SELECT file_path, file_size, compacted FROM vala.file_list ORDER BY file_path",
+            )
+            .fetch_all(self.operator_pool.pool())
+            .await
+            .expect("Forge file diagnostics");
             panic!(
-                "production Forge worker completion bound: completed={}, attempts={}, errors={:?}, tasks={tasks:?}",
+                "production Forge worker completion bound: completed={}, attempts={}, errors={:?}, tasks={tasks:?}, tables={tables:?}, demands={demands:?}, files={files:?}",
                 self.worker_observer.completed(),
                 self.worker_observer.attempts(),
                 self.worker_observer.returned_errors(),

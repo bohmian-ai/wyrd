@@ -11,6 +11,7 @@ pub mod file_list_writer;
 pub mod filename;
 mod fixed_ipc;
 pub mod geometry;
+pub mod hot_source;
 mod ingress;
 pub mod manifest;
 mod material_plan;

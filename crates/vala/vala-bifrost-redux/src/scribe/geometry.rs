@@ -708,23 +708,19 @@ impl ScribeArtifactPolicy {
     /// place a table count comes from, and it is derived from measured
     /// resources rather than configured.
     ///
-    /// # Panics
-    ///
-    /// Does not panic: [`Self::validate_capacity`] rejects a zero component
-    /// before a capacity reaches here, and a zero component would otherwise be
-    /// reported as an unbounded ceiling rather than dividing by zero.
+    /// A zero component yields a zero ceiling rather than an unbounded one:
+    /// [`Self::validate_capacity`] already refuses such a policy before serving,
+    /// and reporting "no tables" is the safe reading if one ever reached here.
     #[must_use]
     pub fn max_active_tables(&self, capacity: &ScribeGlobalCapacity) -> usize {
         let vector = self.reserve_vector();
         ContentionCategory::ALL
             .into_iter()
             .map(|category| {
-                let component = vector.component(category);
-                if component == 0 {
-                    0
-                } else {
-                    capacity.component(category) / component
-                }
+                capacity
+                    .component(category)
+                    .checked_div(vector.component(category))
+                    .unwrap_or(0)
             })
             .min()
             .unwrap_or(0)

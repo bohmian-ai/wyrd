@@ -1073,7 +1073,9 @@ impl OracleIcebergScanExec {
         let Some(snapshot) = snapshot else {
             return Ok(None);
         };
-        let schema = snapshot.schema(metadata).map_err(iceberg_datafusion_error)?;
+        let schema = snapshot
+            .schema(metadata)
+            .map_err(iceberg_datafusion_error)?;
         predicate
             .bind(schema, true)
             .map(Some)

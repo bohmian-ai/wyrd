@@ -451,9 +451,10 @@ async fn pg_bifrost_selective_predicate_spans_hot_and_compacted_reads() {
 /// error when the fixture fails to reach the two-tier state the assertion
 /// requires.
 async fn prove_hot_and_compacted_pruning() -> Result<(), JourneyError> {
-    let cluster =
-        WyrdTestCluster::start_spec_with_forge_completion_observer(BifrostClusterSpec::three_mixed())
-            .await?;
+    let cluster = WyrdTestCluster::start_spec_with_forge_completion_observer(
+        BifrostClusterSpec::three_mixed(),
+    )
+    .await?;
     let ingest_server = cluster
         .servers()
         .find(|server| server.bifrost_scribe().is_some())
@@ -544,10 +545,7 @@ async fn prove_hot_and_compacted_pruning() -> Result<(), JourneyError> {
     // compacted leaf and the hot leaf each contributed rows to one query.
     // Their id ranges are disjoint and each range lives in exactly one tier.
     if !selective_ids.iter().any(|id| *id < HOT_BATCH_ID_BASE) {
-        return Err(format!(
-            "no compacted-tier row reached the client: {selective_ids:?}"
-        )
-        .into());
+        return Err(format!("no compacted-tier row reached the client: {selective_ids:?}").into());
     }
     if !selective_ids.iter().any(|id| *id >= HOT_BATCH_ID_BASE) {
         return Err(format!("no hot-tier row reached the client: {selective_ids:?}").into());

@@ -343,8 +343,7 @@
             "partition_spec_id",
             "phase",
             "target_file_size_bytes",
-            "time_partition",
-            "writer_recipe_version"
+            "time_partition"
           ],
           "properties": {
             "base_snapshot_id": {
@@ -415,10 +414,6 @@
                   "$ref": "#/definitions/TimePartitionWire"
                 }
               ]
-            },
-            "writer_recipe_version": {
-              "description": "Physical recipe used to produce the outputs.",
-              "type": "string"
             }
           }
         },
@@ -432,8 +427,7 @@
             "kind",
             "operation_id",
             "output_paths",
-            "phase",
-            "writer_recipe_version"
+            "phase"
           ],
           "properties": {
             "group": {
@@ -488,10 +482,6 @@
                 "null"
               ],
               "format": "int64"
-            },
-            "writer_recipe_version": {
-              "description": "Writer recipe identifier used to create the output.",
-              "type": "string"
             }
           }
         },

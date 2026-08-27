@@ -97,7 +97,6 @@ mod pg_tests {
                 ],
                 output_paths: vec![StoragePath::new("table/c.parquet").expect("valid path")],
                 snapshot_id: None,
-                writer_recipe_version: "bifrost-writer-v1".to_owned(),
             }
         }
 
@@ -145,7 +144,6 @@ mod pg_tests {
                     input_file_ids,
                     input_paths,
                     output_paths,
-                    writer_recipe_version,
                     ..
                 } => AuditDetail::ForgeCompaction {
                     operation_id: *operation_id,
@@ -155,7 +153,6 @@ mod pg_tests {
                     input_paths: input_paths.clone(),
                     output_paths: output_paths.clone(),
                     snapshot_id: Some(42),
-                    writer_recipe_version: writer_recipe_version.clone(),
                 },
                 _ => panic!("expected ForgeCompaction"),
             };
@@ -174,7 +171,6 @@ mod pg_tests {
                     input_file_ids,
                     input_paths,
                     output_paths,
-                    writer_recipe_version,
                     ..
                 } => AuditDetail::ForgeCompaction {
                     operation_id: *operation_id,
@@ -184,7 +180,6 @@ mod pg_tests {
                     input_paths: input_paths.clone(),
                     output_paths: output_paths.clone(),
                     snapshot_id: Some(42),
-                    writer_recipe_version: writer_recipe_version.clone(),
                 },
                 _ => panic!("expected ForgeCompaction"),
             };
@@ -203,7 +198,6 @@ mod pg_tests {
                     input_file_ids,
                     input_paths,
                     output_paths,
-                    writer_recipe_version,
                     ..
                 } => AuditDetail::ForgeCompaction {
                     operation_id: *operation_id,
@@ -213,7 +207,6 @@ mod pg_tests {
                     input_paths: input_paths.clone(),
                     output_paths: output_paths.clone(),
                     snapshot_id: Some(42),
-                    writer_recipe_version: writer_recipe_version.clone(),
                 },
                 _ => panic!("expected ForgeCompaction"),
             };
@@ -1117,7 +1110,6 @@ mod pg_tests {
                     StoragePath::new("table/changed-output.parquet").expect("valid path"),
                 ],
                 snapshot_id: None,
-                writer_recipe_version: "bifrost-writer-v1".to_owned(),
             };
             let collision = event("forge.file_compact.prepared", resource(), Some(changed));
 
@@ -1530,7 +1522,6 @@ mod pg_tests {
                 input_paths: vec![StoragePath::new("table/a.parquet").expect("valid path")],
                 output_paths: vec![StoragePath::new("table/c.parquet").expect("valid path")],
                 snapshot_id: None,
-                writer_recipe_version: "bifrost-writer-v1".to_owned(),
             };
             let changed_event = event(
                 "forge.file_compact.prepared",
@@ -2164,7 +2155,6 @@ mod pg_tests {
                     ],
                     output_paths: vec![StoragePath::new("table/c.parquet").expect("valid path")],
                     snapshot_id: None,
-                    writer_recipe_version: "bifrost-writer-v1".to_owned(),
                 };
                 let event = event("forge.file_compact.prepared", resource(), Some(detail));
                 let result = append_prepared(
@@ -2544,7 +2534,6 @@ mod pg_tests {
                 output_paths: vec![
                     StoragePath::new("table/rewrite-a.parquet").expect("valid path"),
                 ],
-                writer_recipe_version: "bifrost-writer-v1".to_owned(),
             };
             let prepared_event = event("forge.iceberg_rewrite.prepared", resource(), Some(detail));
 
@@ -2566,7 +2555,6 @@ mod pg_tests {
                     target_file_size_bytes,
                     input_paths,
                     output_paths,
-                    writer_recipe_version,
                     ..
                 } => AuditDetail::ForgeIcebergRewrite {
                     operation_id,
@@ -2579,7 +2567,6 @@ mod pg_tests {
                     target_file_size_bytes: *target_file_size_bytes,
                     input_paths: input_paths.clone(),
                     output_paths: output_paths.clone(),
-                    writer_recipe_version: writer_recipe_version.clone(),
                 },
                 _ => panic!("expected Iceberg rewrite detail"),
             };
@@ -2863,7 +2850,6 @@ mod pg_tests {
                 input_paths: vec![],
                 output_paths: vec![],
                 snapshot_id: None,
-                writer_recipe_version: "v1".to_owned(),
             };
             // Wrong operation prefix for StagingFold
             let bad_event = event("forge.iceberg_rewrite.prepared", resource(), Some(detail));
@@ -2959,7 +2945,6 @@ mod pg_tests {
                     input_file_ids,
                     input_paths,
                     output_paths,
-                    writer_recipe_version,
                     ..
                 } => AuditDetail::ForgeCompaction {
                     operation_id: *operation_id,
@@ -2969,7 +2954,6 @@ mod pg_tests {
                     input_paths: input_paths.clone(),
                     output_paths: output_paths.clone(),
                     snapshot_id: Some(42),
-                    writer_recipe_version: writer_recipe_version.clone(),
                 },
                 _ => unreachable!(),
             };

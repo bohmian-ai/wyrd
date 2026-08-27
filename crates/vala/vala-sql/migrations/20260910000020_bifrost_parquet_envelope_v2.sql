@@ -43,31 +43,3 @@ CREATE UNIQUE INDEX file_list_stream_range_ordinal_uniq
     ON vala.file_list (
         data_tenant_id, node_id, writer_epoch, wal_lsn_min, wal_lsn_max, file_ordinal
     );
-
-CREATE TABLE vala.bifrost_layout_inventory (
-    data_tenant_id uuid NOT NULL REFERENCES platform.tenants(data_tenant_id),
-    table_uid uuid NOT NULL,
-    current_snapshot_id bigint,
-    current_schema_id integer NOT NULL,
-    metadata_location text NOT NULL,
-    unresolved_hot_manifest_digest bytea NOT NULL CHECK (octet_length(unresolved_hot_manifest_digest) = 32),
-    table_identity_digest bytea NOT NULL CHECK (octet_length(table_identity_digest) = 32),
-    unmarked_file_count bigint NOT NULL CHECK (unmarked_file_count >= 0),
-    writer_v1_file_count bigint NOT NULL CHECK (writer_v1_file_count >= 0),
-    writer_v2_file_count bigint NOT NULL CHECK (writer_v2_file_count >= 0),
-    complete boolean NOT NULL,
-    observed_at timestamptz NOT NULL,
-    attestation_state text NOT NULL CHECK (attestation_state IN ('unverified', 'verified', 'blocked_legacy')),
-    PRIMARY KEY (data_tenant_id, table_uid)
-);
-
-CREATE TABLE vala.bifrost_layout_inventory_state (
-    inventory_name text PRIMARY KEY CHECK (inventory_name = 'oracle_activation'),
-    global_cut_digest bytea NOT NULL CHECK (octet_length(global_cut_digest) = 32),
-    roster_count bigint NOT NULL CHECK (roster_count >= 0),
-    complete boolean NOT NULL,
-    observed_at timestamptz NOT NULL
-);
-
-GRANT SELECT, INSERT, UPDATE, DELETE ON vala.bifrost_layout_inventory TO wyrd_platform_admin;
-GRANT SELECT, INSERT, UPDATE, DELETE ON vala.bifrost_layout_inventory_state TO wyrd_platform_admin;

@@ -4054,8 +4054,7 @@ mod tests {
                 .expect("in-memory staging operator")
                 .finish(),
         );
-        let object_path =
-            "s3://bucket/table/data/forge/test-00000.parquet".to_owned();
+        let object_path = "s3://bucket/table/data/forge/test-00000.parquet".to_owned();
         let sink = ForgeOutputSink::open(
             Arc::new(MemoryOutputStore),
             Arc::clone(&staging),
@@ -4185,9 +4184,9 @@ mod tests {
                 Arc::new(arrow::array::StringArray::from_iter_values(
                     (0..ROWS).map(|row| format!("service-{}", row % 4)),
                 )),
-                Arc::new(
-                    arrow::array::TimestampMicrosecondArray::from_iter_values(times.iter().copied()),
-                ),
+                Arc::new(arrow::array::TimestampMicrosecondArray::from_iter_values(
+                    times.iter().copied(),
+                )),
             ],
         )
         .expect("rewrite fixture batch");
@@ -4206,11 +4205,8 @@ mod tests {
         )
         .await
         .expect("streaming output sink");
-        let mut state = RewriteBatchState::with_reservation(
-            None,
-            None,
-            Arc::from(["service_name".to_owned()]),
-        );
+        let mut state =
+            RewriteBatchState::with_reservation(None, None, Arc::from(["service_name".to_owned()]));
         let phase = Arc::new(ForgeFooterPhase::new(8, 32).expect("footer phase"));
         let guard = ForgeFooterPhaseGuard {
             owner: Arc::clone(&phase),

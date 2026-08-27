@@ -1,0 +1,204 @@
+//! Shared production Forge supervisor lifecycle for the `forge` journey group.
+//!
+//! Contains no tests. Every item is the smallest real lifecycle a journey needs
+//! to make one production scheduler pass and one production worker attempt
+//! observable without polling or sleeping.
+
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+use vala_bifrost_redux::forge::{
+    Forge, ForgeError, ForgeSchedulerTrigger, ForgeWorker, ForgeWorkerCompletionObserver,
+    ForgeWorkerConfig,
+};
+use wyrd_server::BifrostTarget;
+use wyrd_testing::WyrdTestServer;
+use wyrd_testing::bifrost::ForgeFixture;
+
+/// Start the real dependency server without a background Forge role supervisor.
+///
+/// The test-owned [`SupervisedForge`] is then the only scheduler and worker
+/// lifecycle able to plan or claim this fixture's durable tasks, which is what
+/// makes a single pass observable rather than racing an ambient loop.
+///
+/// # Panics
+///
+/// Panics when the in-process server resources cannot start, or when it
+/// unexpectedly exposes a bound endpoint that would imply a background server
+/// role supervisor.
+pub(crate) async fn start_engine_fixture_server() -> WyrdTestServer {
+    let server = WyrdTestServer::builder()
+        .with_forge_interval(Duration::from_secs(3600))
+        .with_forge_process_role_for_test(BifrostTarget::Server)
+        .start_in_process()
+        .await
+        .expect("in-process Forge dependency server");
+    assert!(
+        server.base_url().is_none(),
+        "engine fixture must not start a background server role supervisor"
+    );
+    server
+}
+
+/// Production scheduler and worker supervisors retained for one journey.
+pub(crate) struct SupervisedForge {
+    /// Privileged SQL pool used only for bounded lifecycle diagnostics.
+    operator_pool: vala_sql::OperatorPool,
+    /// Passive wake-up for deterministic production scheduler passes.
+    scheduler_trigger: ForgeSchedulerTrigger,
+    /// Passive observation of returned and successful worker attempts.
+    worker_observer: ForgeWorkerCompletionObserver,
+    /// Cancellation boundary for the production scheduler loop.
+    scheduler_stop: CancellationToken,
+    /// Cancellation boundary observed by active worker execution.
+    worker_stop: CancellationToken,
+    /// Running production scheduler supervisor.
+    scheduler_task: JoinHandle<Result<(), ForgeError>>,
+    /// Running production worker supervisor.
+    worker_task: Option<JoinHandle<Result<(), ForgeError>>>,
+    /// Forge graph kept alive for the supervised lifetime.
+    _forge: Arc<Forge>,
+}
+
+impl SupervisedForge {
+    /// Start one production scheduler and one production worker over the
+    /// fixture's own catalog and object store.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot construct its validated worker graph.
+    pub(crate) fn start_default(
+        fixture: &ForgeFixture,
+        config: vala_bifrost_redux::forge::ForgeConfig,
+    ) -> Self {
+        let scheduler_trigger = ForgeSchedulerTrigger::with_owner_for_test(uuid::Uuid::now_v7());
+        let worker_observer = ForgeWorkerCompletionObserver::new();
+        let (forge, _publisher) = fixture.context_with_worker_supervision(
+            config,
+            Arc::clone(&fixture.catalog),
+            Arc::clone(&fixture.object_store),
+            worker_observer.clone(),
+            scheduler_trigger.clone(),
+        );
+        let worker = ForgeWorker::new(
+            Arc::clone(&forge),
+            ForgeWorkerConfig::default(),
+            uuid::Uuid::now_v7(),
+        )
+        .expect("validated journey worker");
+        let scheduler_stop = CancellationToken::new();
+        let worker_stop = CancellationToken::new();
+        let scheduler_task = tokio::spawn({
+            let forge = Arc::clone(&forge);
+            let stop = scheduler_stop.clone();
+            async move { forge.run(stop).await }
+        });
+        let worker_task = tokio::spawn({
+            let stop = worker_stop.clone();
+            async move { worker.run(stop).await }
+        });
+        Self {
+            operator_pool: fixture.operator_pool.clone(),
+            scheduler_trigger,
+            worker_observer,
+            scheduler_stop,
+            worker_stop,
+            scheduler_task,
+            worker_task: Some(worker_task),
+            _forge: forge,
+        }
+    }
+
+    /// Request and await one pass from the running production scheduler.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the scheduler does not return within the deterministic bound.
+    async fn schedule_once(&self) {
+        let expected = self.scheduler_trigger.completed_passes().saturating_add(1);
+        self.scheduler_trigger.request_pass();
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            self.scheduler_trigger.wait_for_passes_at_least(expected),
+        )
+        .await
+        .expect("production Forge scheduler pass bound");
+    }
+
+    /// Schedule one pass and await exactly one successful production worker
+    /// attempt, holding the attempt so no retry can race the assertions.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the scheduler or worker misses its deterministic bound, or
+    /// when the attempt returned an error.
+    pub(crate) async fn run_one_success(&mut self) {
+        let expected = self.worker_observer.completed().saturating_add(1);
+        let expected_attempt = self.worker_observer.attempts().saturating_add(1);
+        let expected_errors = self.worker_observer.returned_errors().len();
+        self.worker_observer.hold_after_next_attempt_for_test();
+        self.schedule_once().await;
+        if tokio::time::timeout(
+            Duration::from_secs(30),
+            self.worker_observer.wait_for_held_attempt_for_test(),
+        )
+        .await
+        .is_err()
+        {
+            let tasks: Vec<(String, String, i64, i64)> = sqlx::query_as(
+                "SELECT state, strategy, estimated_files, estimated_bytes \
+                 FROM vala.forge_tasks ORDER BY created_at, task_id",
+            )
+            .fetch_all(self.operator_pool.pool())
+            .await
+            .expect("Forge task timeout diagnostics");
+            panic!(
+                "production Forge worker completion bound: completed={}, attempts={}, errors={:?}, tasks={tasks:?}",
+                self.worker_observer.completed(),
+                self.worker_observer.attempts(),
+                self.worker_observer.returned_errors(),
+            );
+        }
+        assert_eq!(self.worker_observer.attempts(), expected_attempt);
+        assert_eq!(
+            self.worker_observer.returned_errors().len(),
+            expected_errors
+        );
+        self.stop_worker().await;
+        assert_eq!(self.worker_observer.completed(), expected);
+    }
+
+    /// Cancel and join the worker before it can retry a returned attempt.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the worker misses its bounded shutdown or exits unexpectedly.
+    async fn stop_worker(&mut self) {
+        self.worker_stop.cancel();
+        self.worker_observer.release_held_attempt_for_test();
+        let task = self.worker_task.take().expect("worker is stopped once");
+        tokio::time::timeout(Duration::from_secs(30), task)
+            .await
+            .expect("production Forge worker shutdown bound")
+            .expect("production Forge worker task")
+            .expect("production Forge worker shutdown");
+    }
+
+    /// Cancel and join both production supervisors.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either production loop misses its bounded shutdown.
+    pub(crate) async fn shutdown(mut self) {
+        self.scheduler_stop.cancel();
+        if self.worker_task.is_some() {
+            self.stop_worker().await;
+        }
+        tokio::time::timeout(Duration::from_secs(30), self.scheduler_task)
+            .await
+            .expect("production Forge scheduler shutdown bound")
+            .expect("production Forge scheduler task")
+            .expect("production Forge scheduler shutdown");
+    }
+}

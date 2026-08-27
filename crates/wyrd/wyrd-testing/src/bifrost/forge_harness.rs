@@ -36,6 +36,7 @@ use vala_bifrost_redux::resources::{
     SystemResourceSnapshot,
 };
 use vala_bifrost_redux::schema::with_managed_columns;
+use vala_bifrost_redux::scribe::{NativeIngressTestFrame, ScribeImpl};
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_spec::DataTenantId;
 use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
@@ -102,9 +103,23 @@ pub struct ForgeFixture {
     pub binding: TenantTableBinding,
     /// The tenant that owns the table and file-list rows.
     pub tenant: DataTenantId,
+    /// Real Scribe owner every durable fixture append and seal runs through.
+    ///
+    /// `None` only for the benchmark-only synthetic fixture built by
+    /// [`StandaloneForgeFixture`], which stands up no Scribe at all. Every
+    /// correctness fixture carries one, and [`ForgeFixture::scribe`] refuses
+    /// rather than silently falling back to a fabricated durable row.
+    scribe: Option<Arc<ScribeImpl>>,
+    /// Catalog owner retained so incremental appends can resolve the live
+    /// schema fingerprint Scribe ingress requires.
+    bifrost_catalog: Arc<BifrostCatalog>,
 }
 
-/// Real dependency graph used to seed a Forge fixture without an HTTP server.
+/// Real dependency graph shared by both Forge fixture seeders.
+///
+/// Deliberately carries no Scribe handle: the Scribe-backed seeder takes one as
+/// an explicit argument so a correctness caller cannot reach the benchmark-only
+/// synthetic seeder by leaving an option unset.
 #[derive(Clone)]
 struct ForgeFixtureResources {
     /// The production-shaped Forge owner that consumes seeded work.
@@ -238,12 +253,11 @@ impl StandaloneForgeFixture {
                     .await?,
             );
         }
-        let partition_day =
-            chrono::NaiveDate::from_ymd_opt(2026, 7, 14).ok_or("invalid standalone fixture day")?;
+        let partition_day = default_fixture_day();
         let mut fixtures = Vec::with_capacity(tenants.len());
         for tenant in tenants {
             fixtures.push(
-                seed_forge_group_with_resources(
+                seed_synthetic_forge_group_for_bench(
                     resources.clone(),
                     tenant,
                     table_name,
@@ -1264,6 +1278,20 @@ impl ForgeObjectStore for ForgeObjectStoreControl {
 }
 
 impl ForgeFixture {
+    /// The real Scribe owner this fixture appends and seals through.
+    ///
+    /// # Panics
+    ///
+    /// Panics for the benchmark-only synthetic fixture, which stands up no
+    /// Scribe. Refusing here is deliberate: a silent fallback to a fabricated
+    /// durable row is exactly the failure mode the Scribe-backed seeder exists
+    /// to remove.
+    fn scribe(&self) -> &Arc<ScribeImpl> {
+        self.scribe.as_ref().expect(
+            "this Forge fixture was built by seed_synthetic_forge_group_for_bench, which has no Scribe",
+        )
+    }
+
     /// Clone the server-owned context with a test-specific validated config.
     #[must_use]
     pub fn context_with_config(&self, config: ForgeConfig) -> Arc<Forge> {
@@ -1607,12 +1635,8 @@ impl ForgeFixture {
 
     /// Append one aged Scribe-shaped Parquet file and its durable file-list row.
     pub async fn append_forge_file(&self, sequence: i64) {
-        self.append_forge_file_for_day(
-            sequence,
-            chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("partition day"),
-            true,
-        )
-        .await;
+        self.append_forge_file_for_day(sequence, default_fixture_day(), true)
+            .await;
     }
 
     /// Append a large aged file for spill-focused sustained journeys.
@@ -1622,13 +1646,8 @@ impl ForgeFixture {
     /// Panics when the requested row count cannot be represented in the
     /// durable fixture metadata or the test object cannot be encoded.
     pub async fn append_forge_file_with_rows(&self, sequence: i64, rows: usize) {
-        self.append_forge_file_for_day_with_rows(
-            sequence,
-            chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("partition day"),
-            true,
-            rows,
-        )
-        .await;
+        self.append_forge_file_for_day_with_rows(sequence, default_fixture_day(), true, rows)
+            .await;
     }
 
     /// Append one Scribe-shaped file for an explicit partition day.
@@ -1642,11 +1661,18 @@ impl ForgeFixture {
             .await;
     }
 
-    /// Append a Scribe-shaped file with an explicit row count and partition.
+    /// Append one file by driving a real Scribe append and seal.
+    ///
+    /// Every durable value of the resulting `vala.file_list` row — path, size,
+    /// row count, event-time bounds, LSN range, partition — is produced by
+    /// Scribe from the batch it actually encoded. The fixture chooses only the
+    /// ingress rows; `sequence` separates one appended file from the next so a
+    /// sustained journey builds a genuine multi-file group.
     ///
     /// # Panics
     ///
-    /// Panics when `rows` is zero or the test object cannot be encoded.
+    /// Panics when `rows` is zero, when this fixture carries no Scribe owner
+    /// (the benchmark-only synthetic fixture), or when ingest or seal fails.
     async fn append_forge_file_for_day_with_rows(
         &self,
         sequence: i64,
@@ -1655,107 +1681,23 @@ impl ForgeFixture {
         rows: usize,
     ) {
         assert!(rows > 0, "Forge fixture files must contain rows");
-        let schema = ArrowSchema::new(with_managed_columns(vec![Field::new(
-            "value",
-            DataType::Int64,
-            false,
-        )]));
-        let base = partition_day
-            .and_hms_opt(12, 0, 0)
-            .expect("Forge fixture timestamp")
-            .and_utc()
-            .timestamp_micros()
-            + sequence * 1_000_000;
-        let values = (0..rows)
-            .map(|offset| {
-                sequence.saturating_mul(1_000_000)
-                    + i64::try_from(offset).expect("Forge fixture row offset")
-            })
-            .collect::<Vec<_>>();
-        let times = (0..rows)
-            .map(|offset| base + i64::try_from(offset).expect("row offset") * 1_000)
-            .collect::<Vec<_>>();
-        let tenants = vec![self.tenant.to_string(); rows];
-        let mut batch_ids = FixedSizeBinaryBuilder::with_capacity(rows, 16);
-        for _ in 0..rows {
-            batch_ids
-                .append_value([0_u8; 16])
-                .expect("fixed batch identifier");
-        }
-        let batch = RecordBatch::try_new(
-            Arc::new(schema.clone()),
-            vec![
-                Arc::new(Int64Array::from(values)),
-                Arc::new(StringArray::from(vec![None::<&str>; rows])),
-                Arc::new(StringArray::from(vec![None::<&str>; rows])),
-                Arc::new(StringArray::from(vec!["principal"; rows])),
-                Arc::new(StringArray::from(vec!["request"; rows])),
-                Arc::new(TimestampMicrosecondArray::from(times).with_timezone("UTC")),
-                Arc::new(
-                    TimestampMicrosecondArray::from(
-                        (0..rows)
-                            .map(|offset| base + i64::try_from(offset).expect("row offset") * 1_000)
-                            .collect::<Vec<_>>(),
-                    )
-                    .with_timezone("UTC"),
-                ),
-                Arc::new(batch_ids.finish()),
-                Arc::new(Int32Array::from(
-                    (0..rows)
-                        .map(|offset| i32::try_from(offset).expect("row ordinal"))
-                        .collect::<Vec<_>>(),
-                )),
-                Arc::new(StringArray::from(tenants)),
-            ],
-        )
-        .expect("Forge fixture append batch");
-        let path = format!(
-            "{}/sustained-{sequence}.parquet",
-            self.binding.object_prefix
-        );
-        let metadata = BifrostParquetMemoryEnvelope::metadata_for_batch(&batch, &path)
-            .expect("Forge fixture writer-v2 metadata");
-        let mut bytes = Vec::new();
-        let properties = bifrost_writer_properties_with_metadata(batch.num_rows(), metadata, &[]);
-        let mut writer = ArrowWriter::try_new(&mut bytes, batch.schema(), Some(properties))
-            .expect("Parquet writer");
-        writer.write(&batch).expect("Parquet batch");
-        writer.close().expect("Parquet close");
-        let file_size = i64::try_from(bytes.len()).expect("Forge fixture file size");
-        self.staging
-            .write(&path, Buffer::from(bytes))
+        let seeded_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT now()")
+            .fetch_one(self.operator_pool.pool())
             .await
-            .expect("Forge fixture append object");
-        let file_id = uuid::Uuid::now_v7();
-        sqlx::query(
-            "INSERT INTO vala.file_list (id, data_tenant_id, namespace, table_name, file_path, file_size, row_count, min_event_time, max_event_time, partition_granularity, partition_start, node_id, writer_epoch, wal_lsn_min, wal_lsn_max) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+            .expect("Forge fixture append marker");
+        let ingress_schema = fixture_ingress_schema(false);
+        let batch = fixture_ingress_batch(&ingress_schema, false, partition_day, sequence, rows);
+        scribe_append_and_seal(
+            self.scribe().as_ref(),
+            &self.vala,
+            &self.bifrost_catalog,
+            self.tenant,
+            &self.binding,
+            &batch,
         )
-        .bind(file_id)
-        .bind(self.tenant.as_uuid())
-        .bind(&self.binding.logical_namespace)
-        .bind(&self.binding.table_name)
-        .bind(&path)
-        .bind(file_size)
-        .bind(i64::try_from(rows).expect("Forge fixture row count"))
-        .bind(chrono::DateTime::from_timestamp_micros(base).expect("timestamp"))
-        .bind(chrono::DateTime::from_timestamp_micros(base + 1_000_000).expect("timestamp"))
-        .bind("day")
-        .bind(day_partition_start(partition_day))
-        .bind(uuid::Uuid::now_v7())
-        .bind(1_i64)
-        .bind(sequence * 2 + 1)
-        .bind(sequence * 2 + 2)
-        .execute(self.operator_pool.pool())
-        .await
-        .expect("Forge fixture file-list append");
+        .await;
         if aged {
-            sqlx::query(
-                "UPDATE vala.file_list SET created_at = now() - interval '3 minutes' WHERE id = $1",
-            )
-            .bind(file_id)
-            .execute(self.operator_pool.pool())
-            .await
-            .expect("Forge fixture append aging");
+            age_fixture_files(&self.operator_pool, self.tenant, &self.binding, seeded_at).await;
         }
     }
 
@@ -1764,6 +1706,21 @@ impl ForgeFixture {
     /// GC race tests call this after the real object listing has paused. The
     /// next production live-set rebuild must therefore protect the path and
     /// skip deletion even though it was absent from the initial live set.
+    ///
+    /// **Documented raw-insert exemption.** Every other `file_list` row this
+    /// harness creates comes from a real Scribe seal, because a fabricated row
+    /// could describe a file Scribe would never produce. This one cannot: the
+    /// property under test is that a reference appearing *after* the live-set
+    /// listing snapshot still protects an object, and Scribe has no API for
+    /// publishing a reference to an object it did not just write. Routing it
+    /// through a seal would create a different object at a Scribe-chosen path
+    /// and stop exercising the race at all. The row is deliberately minimal —
+    /// it stands for a reference, not for a file — and no assertion reads its
+    /// size, row count, or LSN range.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the durable reference insert fails.
     pub async fn protect_path(&self, path: &str) {
         sqlx::query(
             "INSERT INTO vala.file_list (id, data_tenant_id, namespace, table_name, file_path, file_size, row_count, min_event_time, max_event_time, partition_granularity, partition_start, node_id, writer_epoch, wal_lsn_min, wal_lsn_max) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
@@ -1775,12 +1732,14 @@ impl ForgeFixture {
         .bind(path)
         .bind(1_i64)
         .bind(1_i64)
-        .bind(chrono::DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z").expect("timestamp"))
-        .bind(chrono::DateTime::parse_from_rfc3339("2026-07-14T12:00:01Z").expect("timestamp"))
+        .bind(day_partition_start(default_fixture_day()) + chrono::Duration::hours(12))
+        .bind(
+            day_partition_start(default_fixture_day())
+                + chrono::Duration::hours(12)
+                + chrono::Duration::seconds(1),
+        )
         .bind("day")
-        .bind(day_partition_start(
-            chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("partition day"),
-        ))
+        .bind(day_partition_start(default_fixture_day()))
         .bind(uuid::Uuid::now_v7())
         .bind(1_i64)
         .bind(1_i64)
@@ -1823,8 +1782,8 @@ fn directory_tree_is_empty(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Create an Iceberg table, staging Parquet files, and aged `vala.file_list`
-/// rows in the real Wyrd test server.
+/// Create an Iceberg table, drive a real Scribe append and seal, and age the
+/// `vala.file_list` rows Scribe produced.
 pub async fn seed_forge_group(server: &WyrdTestServer, table_name: &str) -> ForgeFixture {
     seed_forge_group_for_tenant(server, server.data_tenant_id(), table_name).await
 }
@@ -1856,9 +1815,21 @@ pub async fn seed_forge_group_for_tenant_with_schema(
         tenant,
         table_name,
         schema_variant,
-        &[chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("partition day")],
+        &[default_fixture_day()],
     )
     .await
+}
+
+/// Default partition day every Forge fixture seeds rows into.
+///
+/// Derived from the current UTC date rather than a frozen calendar literal
+/// because these fixtures now drive a real Scribe append, and Scribe enforces
+/// an event-time acceptance window measured against wall clock (30 days past,
+/// 24 hours future). A fixed day silently falls out of that window as time
+/// passes and would start rejecting every fixture write.
+#[must_use]
+pub fn default_fixture_day() -> chrono::NaiveDate {
+    chrono::Utc::now().date_naive()
 }
 
 /// Exact UTC start of `day`, the durable partition-start column value.
@@ -1875,14 +1846,198 @@ fn day_partition_start(day: chrono::NaiveDate) -> chrono::DateTime<chrono::Utc> 
 /// Daily layout declaration every Forge fixture table registers with.
 ///
 /// Bifrost's default is `hour(wyrd_event_time)`; these fixtures seed day-granular
-/// file-list rows, so they declare the matching daily partition rather than
-/// letting the default disagree with the rows they insert.
+/// rows, so they declare the matching daily partition rather than letting the
+/// default disagree with the rows Scribe writes.
 fn daily_layout_declaration() -> wyrd_spec::vala::api::PhysicalLayoutWire {
     wyrd_spec::vala::api::PhysicalLayoutWire {
         partition_granularity: wyrd_spec::vala::api::TimeGranularityWire::Day,
         sort_keys: Vec::new(),
         bloom_columns: Vec::new(),
     }
+}
+
+/// User-visible ingress schema for one Forge fixture table.
+///
+/// Carries `wyrd_event_time` explicitly so the fixture selects its own event
+/// day; Scribe lifts that column into the managed slot verbatim and stamps
+/// every other managed column itself.
+fn fixture_ingress_schema(schema_variant: bool) -> Arc<ArrowSchema> {
+    let mut fields = vec![Field::new("value", DataType::Int64, false)];
+    if schema_variant {
+        fields.push(Field::new("schema_variant", DataType::Int64, false));
+    }
+    fields.push(Field::new(
+        wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME,
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+        false,
+    ));
+    Arc::new(ArrowSchema::new(fields))
+}
+
+/// Build one two-row ingress batch whose event times land inside `day`.
+///
+/// `file_number` separates the batches of one day so each sealed file carries a
+/// distinct value and event-time range, which is what makes the seeded group a
+/// real multi-file compaction candidate.
+fn fixture_ingress_batch(
+    schema: &Arc<ArrowSchema>,
+    schema_variant: bool,
+    day: chrono::NaiveDate,
+    file_number: i64,
+    rows: usize,
+) -> RecordBatch {
+    let base = day
+        .and_hms_opt(12, 0, 0)
+        .expect("Forge fixture timestamp")
+        .and_utc()
+        .timestamp_micros()
+        + file_number * 1_000_000;
+    let mut columns: Vec<Arc<dyn arrow::array::Array>> = vec![Arc::new(Int64Array::from(
+        (0..rows)
+            .map(|offset| {
+                file_number + i64::try_from(offset).expect("Forge fixture row offset") * 10
+            })
+            .collect::<Vec<_>>(),
+    ))];
+    if schema_variant {
+        columns.push(Arc::new(Int64Array::from(vec![1_i64; rows])));
+    }
+    columns.push(Arc::new(
+        TimestampMicrosecondArray::from(
+            (0..rows)
+                .map(|offset| {
+                    base + i64::try_from(offset).expect("Forge fixture row offset") * 1_000
+                })
+                .collect::<Vec<_>>(),
+        )
+        .with_timezone("UTC"),
+    ));
+    RecordBatch::try_new(Arc::clone(schema), columns).expect("Forge fixture ingress batch")
+}
+
+/// Encode one batch as the native Arrow IPC stream Scribe ingress accepts.
+fn fixture_ingress_ipc(batch: &RecordBatch) -> bytes::Bytes {
+    let mut ipc = Vec::new();
+    {
+        let mut writer =
+            arrow::ipc::writer::StreamWriter::try_new(&mut ipc, batch.schema().as_ref())
+                .expect("Forge fixture IPC writer");
+        writer.write(batch).expect("Forge fixture IPC batch");
+        writer.finish().expect("Forge fixture IPC finish");
+    }
+    bytes::Bytes::from(ipc)
+}
+
+/// Build the server-shaped audit event committed with one fixture ingest.
+fn fixture_ingest_audit_event(
+    tenant: DataTenantId,
+    principal: &wyrd_runtime::principal::Principal,
+    binding: &TenantTableBinding,
+) -> wyrd_spec::vala::api::AuditEvent {
+    let _ = tenant;
+    wyrd_spec::vala::api::AuditEvent::new(
+        wyrd_spec::request_id::RequestId::now_v7(),
+        None,
+        "bifrost.write".to_owned(),
+        format!(
+            "bifrost://{}/{}",
+            binding.logical_namespace, binding.table_name
+        ),
+        None,
+        principal.id,
+        wyrd_spec::auth::PrincipalKindTag::User,
+        wyrd_spec::vala::api::AuthMethod::Internal,
+        "bifrost_write:write".to_owned(),
+        wyrd_spec::vala::api::AuditDecision::Allow,
+        wyrd_spec::vala::api::AuditResult::Success,
+        "Forge fixture ingest".to_owned(),
+    )
+}
+
+/// Drive one real Scribe append and seal, committing the `file_list` rows
+/// Scribe's own file-list writer produced.
+///
+/// This is the only way a correctness Forge fixture creates durable state. The
+/// row count, file size, LSN range, event-time bounds, and partition are all
+/// derived by Scribe from the batch it actually encoded, so no fixture can
+/// describe a file production would never produce.
+///
+/// # Panics
+///
+/// Panics when ingest, seal, the tenant transaction, or post-commit settlement
+/// fails, since every one of those is a fixture-setup invariant.
+async fn scribe_append_and_seal(
+    scribe: &ScribeImpl,
+    vala: &vala_sql::ValaPostgres,
+    bifrost_catalog: &BifrostCatalog,
+    tenant: DataTenantId,
+    binding: &TenantTableBinding,
+    batch: &RecordBatch,
+) {
+    let (fingerprint, _) = bifrost_catalog
+        .table_registration(&binding.table_ref, tenant)
+        .await
+        .expect("Forge fixture table registration");
+    let principal = wyrd_runtime::principal::Principal {
+        id: wyrd_spec::auth::PrincipalId::new(uuid::Uuid::now_v7()),
+        kind: wyrd_runtime::principal::PrincipalKind::User,
+        tenant_id: tenant,
+        roles: Vec::new(),
+        effective_permissions: wyrd_runtime::PermissionSet::new(),
+    };
+    let audit_event = fixture_ingest_audit_event(tenant, &principal, binding);
+    scribe
+        .ingest_native_for_test(NativeIngressTestFrame {
+            principal,
+            table: binding.table_ref.clone(),
+            expected_schema_fingerprint: fingerprint,
+            request_id: wyrd_spec::request_id::RequestId::now_v7(),
+            batch_id: uuid::Uuid::now_v7(),
+            audit_event,
+            payload: fixture_ingress_ipc(batch),
+        })
+        .await
+        .expect("Forge fixture Scribe ingest");
+
+    let mut conn = vala
+        .tenant_conn(tenant)
+        .await
+        .expect("Forge fixture seal tenant connection");
+    let attempts = match scribe.force_seal(&mut conn).await {
+        Ok(attempts) => attempts,
+        Err(error) => panic!("Forge fixture Scribe seal: {error}"),
+    };
+    let commit_result = conn.commit().await;
+    scribe
+        .settle_commit_attempts(attempts, &commit_result)
+        .await
+        .expect("Forge fixture seal settlement");
+    commit_result.expect("Forge fixture seal commit");
+}
+
+/// Age every `file_list` row of one fixture table created at or after `since`.
+///
+/// Forge's staging discovery ignores rows younger than its settle floor, so a
+/// fixture that wants its files considered on the next scheduler pass has to
+/// backdate them. Scoping by `since` keeps an incremental append from aging
+/// rows an earlier step deliberately left young.
+async fn age_fixture_files(
+    operator_pool: &vala_sql::OperatorPool,
+    tenant: DataTenantId,
+    binding: &TenantTableBinding,
+    since: chrono::DateTime<chrono::Utc>,
+) {
+    sqlx::query(
+        "UPDATE vala.file_list SET created_at = now() - interval '3 minutes' \
+         WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 AND created_at >= $4",
+    )
+    .bind(tenant.as_uuid())
+    .bind(&binding.logical_namespace)
+    .bind(&binding.table_name)
+    .bind(since)
+    .execute(operator_pool.pool())
+    .await
+    .expect("Forge fixture aging");
 }
 
 /// Create a durable Forge fixture with explicit partition days and an optional
@@ -1924,8 +2079,12 @@ pub async fn seed_forge_group_for_tenant_with_schema_and_days(
             .expect("Bifrost memory governor"),
         config: ForgeConfig::default(),
     };
-    seed_forge_group_with_resources(
+    let scribe = server
+        .bifrost_scribe()
+        .expect("production server has a Scribe owner");
+    seed_forge_group_with_scribe(
         resources,
+        scribe,
         tenant,
         table_name,
         schema_variant,
@@ -1934,21 +2093,13 @@ pub async fn seed_forge_group_for_tenant_with_schema_and_days(
     .await
 }
 
-/// Seed a real Forge fixture from explicit non-server dependencies.
-async fn seed_forge_group_with_resources(
-    resources: ForgeFixtureResources,
+/// Register the fixture table and return its binding and ingress schema.
+async fn create_fixture_table(
+    bifrost_catalog: &BifrostCatalog,
     tenant: DataTenantId,
     table_name: &str,
     schema_variant: bool,
-    partition_days: &[chrono::NaiveDate],
-) -> ForgeFixture {
-    assert!(
-        !partition_days.is_empty(),
-        "Forge fixture needs one partition day"
-    );
-    let forge = resources.forge.clone();
-    let bifrost_catalog = &resources.bifrost_catalog;
-    let staging = Arc::clone(&resources.staging);
+) -> TenantTableBinding {
     let binding =
         TenantTableBinding::resolve((tenant, TableRef::new(BifrostNamespace::Bifrost, table_name)))
             .expect("Forge fixture table binding");
@@ -1966,7 +2117,147 @@ async fn seed_forge_group_with_resources(
         })
         .await
         .expect("production Forge fixture table");
-    let catalog = bifrost_catalog.iceberg_catalog();
+    binding
+}
+
+/// Seed a real Forge fixture by driving a real Scribe append and seal per file.
+///
+/// Two files are sealed per requested partition day, which is the smallest
+/// group Forge will compact. Every durable value in the resulting
+/// `vala.file_list` rows is Scribe's, read back from the rows it wrote rather
+/// than chosen here; the fixture no longer selects a partition at all, which is
+/// what removes the class of failure where a fixture built a multi-partition
+/// input set for a task enqueued as single-partition.
+///
+/// # Panics
+///
+/// Panics when `partition_days` is empty, when table creation, ingest, or seal
+/// fails, or when Scribe produced no `file_list` row for the seeded table.
+async fn seed_forge_group_with_scribe(
+    resources: ForgeFixtureResources,
+    scribe: Arc<ScribeImpl>,
+    tenant: DataTenantId,
+    table_name: &str,
+    schema_variant: bool,
+    partition_days: &[chrono::NaiveDate],
+) -> ForgeFixture {
+    assert!(
+        !partition_days.is_empty(),
+        "Forge fixture needs one partition day"
+    );
+    let binding = create_fixture_table(
+        &resources.bifrost_catalog,
+        tenant,
+        table_name,
+        schema_variant,
+    )
+    .await;
+    let ingress_schema = fixture_ingress_schema(schema_variant);
+    let seeded_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT now()")
+        .fetch_one(resources.operator_pool.pool())
+        .await
+        .expect("Forge fixture seed marker");
+
+    for (day_index, partition_day) in partition_days.iter().enumerate() {
+        for file_number in 0..2_i64 {
+            let file_number =
+                i64::try_from(day_index).expect("partition day index") * 2 + file_number;
+            let batch = fixture_ingress_batch(
+                &ingress_schema,
+                schema_variant,
+                *partition_day,
+                file_number,
+                2,
+            );
+            scribe_append_and_seal(
+                scribe.as_ref(),
+                &resources.vala,
+                &resources.bifrost_catalog,
+                tenant,
+                &binding,
+                &batch,
+            )
+            .await;
+        }
+    }
+    age_fixture_files(&resources.operator_pool, tenant, &binding, seeded_at).await;
+
+    let sealed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.file_list \
+         WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3",
+    )
+    .bind(tenant.as_uuid())
+    .bind(&binding.logical_namespace)
+    .bind(&binding.table_name)
+    .fetch_one(resources.operator_pool.pool())
+    .await
+    .expect("Forge fixture sealed file count");
+    assert!(
+        sealed >= 2,
+        "a real Scribe seal must publish at least two files for {table_name}, saw {sealed}"
+    );
+
+    let catalog = resources.bifrost_catalog.iceberg_catalog();
+    ForgeFixture {
+        forge: resources.forge,
+        vala: resources.vala,
+        operator_pool: resources.operator_pool,
+        catalog,
+        staging: resources.staging,
+        object_store: resources.object_store,
+        spill_root: resources.spill_root,
+        memory: resources.memory,
+        config: resources.config,
+        binding,
+        tenant,
+        scribe: Some(scribe),
+        bifrost_catalog: resources.bifrost_catalog,
+    }
+}
+
+/// Seed a synthetic Forge group for the Forge benchmark harness only.
+///
+/// **Third documented raw-insert exemption.** [`StandaloneForgeFixture`] stands
+/// up Postgres, storage, a catalog, and Forge without an HTTP server,
+/// `AppState`, or [`WyrdTestServer`], and therefore has no Scribe to append
+/// through. Reaching a real seal from there would mean assembling a full
+/// `ScribeImpl` — WAL directories, execution pools, persistence config, and
+/// tenant setup — inside a fixture whose entire purpose is to exclude that
+/// stack.
+///
+/// That is the right split rather than a concession. Its only consumer is
+/// `bench_forge`, which measures Forge compaction throughput; routing its setup
+/// through a real Scribe would make the benchmark measure Scribe ingest as well
+/// and couple a performance number to an unrelated subsystem. And the property
+/// the Scribe-backed seeder protects — a fixture cannot describe a file
+/// production would never produce — exists to stop a *correctness* test passing
+/// against impossible state. A benchmark asserts nothing, so a synthetic seed
+/// here cannot manufacture a false green.
+///
+/// # Panics
+///
+/// Panics when `partition_days` is empty or when table creation, object
+/// encoding, or the durable fixture insert fails.
+async fn seed_synthetic_forge_group_for_bench(
+    resources: ForgeFixtureResources,
+    tenant: DataTenantId,
+    table_name: &str,
+    schema_variant: bool,
+    partition_days: &[chrono::NaiveDate],
+) -> ForgeFixture {
+    assert!(
+        !partition_days.is_empty(),
+        "Forge fixture needs one partition day"
+    );
+    let staging = Arc::clone(&resources.staging);
+    let binding = create_fixture_table(
+        &resources.bifrost_catalog,
+        tenant,
+        table_name,
+        schema_variant,
+    )
+    .await;
+    let catalog = resources.bifrost_catalog.iceberg_catalog();
     let schema = ArrowSchema::new(with_managed_columns(if schema_variant {
         vec![
             Field::new("value", DataType::Int64, false),
@@ -2083,17 +2374,19 @@ async fn seed_forge_group_with_resources(
     .expect("Forge fixture aging");
 
     ForgeFixture {
-        forge,
+        forge: resources.forge,
         vala: resources.vala,
         operator_pool: resources.operator_pool,
         catalog,
-        staging: Arc::clone(&staging),
+        staging,
         object_store: resources.object_store,
         spill_root: resources.spill_root,
         memory: resources.memory,
         config: resources.config,
         binding,
         tenant,
+        scribe: None,
+        bifrost_catalog: resources.bifrost_catalog,
     }
 }
 

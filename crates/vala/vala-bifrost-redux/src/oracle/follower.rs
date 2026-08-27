@@ -804,7 +804,16 @@ fn restrict_plan_to_assigned_files(
         .map_err(|_| "authenticated Oracle file projection failed".to_owned())?
         .data;
     if file_leaves == 0 || observed != assigned {
-        return Err("authenticated Oracle assignment differs from planned files".to_owned());
+        // Counts only: which files a tenant owns is not safe to name in an
+        // error that crosses the dispatch boundary, but the shape of the
+        // mismatch is what a maintainer needs to tell "no file leaf in this
+        // plan" apart from "the leaf lost files the leader signed for".
+        return Err(format!(
+            "authenticated Oracle assignment differs from planned files: \
+             file_leaves={file_leaves} observed={} assigned={}",
+            observed.len(),
+            assigned.len()
+        ));
     }
     Ok(transformed)
 }

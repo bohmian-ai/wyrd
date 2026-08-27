@@ -444,7 +444,8 @@ async fn pg_bifrost_selective_predicate_spans_hot_and_compacted_reads() {
 /// requires.
 async fn prove_hot_and_compacted_pruning() -> Result<(), JourneyError> {
     let cluster =
-        WyrdTestCluster::start_spec(BifrostClusterSpec::three_mixed()).await?;
+        WyrdTestCluster::start_spec_with_forge_completion_observer(BifrostClusterSpec::three_mixed())
+            .await?;
     let ingest_server = cluster
         .servers()
         .find(|server| server.bifrost_scribe().is_some())
@@ -609,29 +610,34 @@ fn expected_marked_ids() -> Vec<i64> {
 /// * The event-day partition holding the batch has to close. Forge does not
 ///   rewrite a partition it may still receive writes for, so the test clock is
 ///   advanced past it first.
-/// * A planning pass has to run. The supervisor's own ticker is a minute long,
-///   so passes are requested explicitly and awaited by count.
+/// * A planning pass has to run, and the worker it hands the task to has to
+///   finish. The supervisor's own ticker is a minute long, so passes are
+///   requested explicitly; the wait is on the worker completion observer,
+///   because a planning pass returns as soon as the task is claimed.
 /// * A task that lands in `retryable` has to become eligible again. Real
 ///   backoff is minutes; `release_forge_retries` moves the durable
 ///   `next_eligible_at` back instead of sleeping, leaving the failure
 ///   classification untouched.
 ///
 /// The loop is bounded and its exit condition is the durable `compacted` flag,
-/// not a pass count: a pass that claimed nothing must not be mistaken for a
-/// pass that rewrote the batch.
+/// not a pass or completion count: a pass that claimed nothing, and a
+/// completion that rewrote some other table, must not be mistaken for this
+/// batch having moved tiers.
 ///
 /// # Errors
 ///
-/// Returns an error when the clock cannot be advanced, when a scheduler pass
-/// does not complete within its bound, when a Postgres probe fails, or when
-/// fewer than `expected` inputs are compacted before the loop's budget runs
-/// out.
+/// Returns an error when the observer is absent, when the clock cannot be
+/// advanced, when a Postgres probe fails, or when fewer than `expected` inputs
+/// are compacted before the loop's budget runs out.
 async fn compact_sealed_batch(
     cluster: &WyrdTestCluster,
     tenant: wyrd_spec::DataTenantId,
     table: &str,
     expected: i64,
 ) -> Result<(), JourneyError> {
+    let observer = cluster
+        .forge_completion_observer()
+        .ok_or("cluster was started without a Forge completion observer")?;
     for server in cluster.servers() {
         server
             .forge_clock()
@@ -644,19 +650,16 @@ async fn compact_sealed_batch(
             return Ok(());
         }
         release_forge_retries(cluster, tenant, table).await?;
-        let mut awaited = Vec::new();
-        for server in cluster.servers() {
-            awaited.push((server, server.completed_forge_scheduler_passes_for_test()));
-        }
+        let target = observer.completed().saturating_add(1);
         cluster.request_forge_scheduler_pass_for_test();
-        for (server, before) in awaited {
-            tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                server.wait_for_forge_scheduler_passes_for_test(before.saturating_add(1)),
-            )
-            .await
-            .map_err(|_| "Forge scheduler pass did not complete")?;
-        }
+        // A lapsed wait is not a failure on its own: the pass may legitimately
+        // have found nothing to claim on this iteration. The durable flag
+        // checked at the top of the next iteration is the real verdict.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            observer.wait_for_at_least(target),
+        )
+        .await;
     }
     let (compacted, hot) = file_tier_counts(cluster, tenant, table).await?;
     Err(format!(

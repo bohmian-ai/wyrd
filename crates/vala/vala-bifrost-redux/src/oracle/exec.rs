@@ -49,7 +49,7 @@ use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
 use futures_util::{Stream, StreamExt, TryStreamExt};
 use iceberg::arrow::ScanMetrics;
-use iceberg::expr::Predicate;
+use iceberg::expr::{Bind, BoundPredicate, Predicate};
 use iceberg::io::{FileIO, FileRead};
 use iceberg::scan::FileScanTask;
 use iceberg_datafusion::IcebergStaticTableProvider;
@@ -1041,12 +1041,71 @@ impl OracleIcebergScanExec {
         self
     }
 
+    /// Binds this scan's predicate to the pinned snapshot's schema, for use as
+    /// a per-task row filter on a follower assignment.
+    ///
+    /// The scan builder does this binding itself when it is given a filter;
+    /// a follower withholds the filter from the builder (see
+    /// [`Self::start_stream`]) and so has to bind it here against the same
+    /// schema the builder would have used — the snapshot's, not the table's
+    /// current one, so a scan pinned to an older snapshot binds against the
+    /// schema that snapshot was written under.
+    ///
+    /// Returns `None` when there is no predicate to push, and when the table
+    /// has no snapshot to bind against — the latter can only happen on an empty
+    /// table, where there are no tasks to attach a filter to.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed `DataFusion` error when the snapshot's schema cannot be
+    /// resolved, or when the predicate does not bind to it — a predicate naming
+    /// a column the snapshot does not have is a contract failure, not an empty
+    /// result.
+    fn assignment_row_filter(&self) -> DataFusionResult<Option<BoundPredicate>> {
+        let Some(predicate) = &self.predicates else {
+            return Ok(None);
+        };
+        let metadata = self.table.metadata();
+        let snapshot = match self.snapshot_id {
+            Some(snapshot_id) => metadata.snapshot_by_id(snapshot_id),
+            None => metadata.current_snapshot(),
+        };
+        let Some(snapshot) = snapshot else {
+            return Ok(None);
+        };
+        let schema = snapshot.schema(metadata).map_err(iceberg_datafusion_error)?;
+        predicate
+            .bind(schema, true)
+            .map(Some)
+            .map_err(iceberg_datafusion_error)
+    }
+
     /// Rebuilds the exact pinned Iceberg scan and starts its reader stream.
+    ///
+    /// Where the predicate is applied depends on who selected the files.
+    ///
+    /// A leader-local scan owns its own file selection, so the predicate goes
+    /// into the scan builder and prunes manifest entries as usual. A follower
+    /// assignment does not: the leader already chose this fragment's files and
+    /// signed them, and [`Self::with_assigned_files`] is the authorization
+    /// boundary for what this process may read. Handing the predicate to
+    /// manifest planning there would prune files *out of* the planned set, and
+    /// the assignment check below cannot tell a file the predicate excluded
+    /// from a file the follower's snapshot no longer has — so a stale plan
+    /// would silently return fewer rows instead of failing and replanning.
+    ///
+    /// The follower therefore plans against the pinned snapshot unfiltered,
+    /// which keeps `assigned ⊆ planned` an exact drift check, and attaches the
+    /// bound predicate to each retained task instead. Nothing is lost by that:
+    /// row-group and page pruning are driven by `FileScanTask::predicate` at
+    /// read time, not by manifest planning, and the file-level pruning given up
+    /// here was discarded by `with_assigned_files` anyway.
     ///
     /// # Errors
     ///
     /// Returns a typed `DataFusion` error when scan planning, task planning,
-    /// reader construction, or object-store reads fail.
+    /// predicate binding, reader construction, or object-store reads fail, and
+    /// a plan error when an assigned file is absent from the pinned snapshot.
     async fn start_stream(&self) -> DataFusionResult<SendableRecordBatchStream> {
         let mut builder = self.table.scan();
         if let Some(snapshot_id) = self.snapshot_id {
@@ -1056,8 +1115,10 @@ impl OracleIcebergScanExec {
             Some(columns) => builder.select(columns.iter().cloned()),
             None => builder.select_all(),
         };
-        if let Some(predicate) = &self.predicates {
-            builder = builder.with_filter(predicate.clone());
+        if self.assigned_files.is_none() {
+            if let Some(predicate) = &self.predicates {
+                builder = builder.with_filter(predicate.clone());
+            }
         }
         let scan = builder.build().map_err(iceberg_datafusion_error)?;
         let tasks = scan.plan_files().await.map_err(iceberg_datafusion_error)?;
@@ -1075,9 +1136,14 @@ impl OracleIcebergScanExec {
                     "authenticated Oracle assignment differs from planned files".to_owned(),
                 ));
             }
+            let row_filter = self.assignment_row_filter()?;
             tasks
                 .into_iter()
                 .filter(|task| assigned.contains(&task.data_file_path))
+                .map(|mut task| {
+                    task.predicate = row_filter.clone();
+                    task
+                })
                 .collect::<Vec<_>>()
         } else {
             tasks

@@ -687,31 +687,16 @@ pub async fn compose_bifrost(
             })
             .map_err(|error| ServerBootError::Scribe(format!("WAL IO pool failed: {error}")))?,
         );
-        #[cfg(feature = "test-support")]
-        let admission = test_controls
-            .as_ref()
-            .and_then(|controls| controls.scribe_admission)
-            .unwrap_or(AdmissionConfig {
-                memory_limit_bytes: pod_memory_limit,
-                scribe_memory_limit_bytes: (resource_plan.scribe_floor_bytes > 0)
-                    .then_some(resource_plan.scribe_floor_bytes),
-                policy: vala_bifrost_redux::scribe::geometry::ScribeArtifactPolicy::new(geometry),
-                event_time_window: EventTimeWindow {
-                    past: scribe_config
-                        .event_time_past_window_secs
-                        .map(std::time::Duration::from_secs)
-                        .unwrap_or_else(|| std::time::Duration::from_secs(30 * 24 * 60 * 60)),
-                    future: scribe_config
-                        .event_time_future_window_secs
-                        .map(std::time::Duration::from_secs)
-                        .unwrap_or_else(|| std::time::Duration::from_secs(24 * 60 * 60)),
-                },
-            });
-        #[cfg(not(feature = "test-support"))]
-        let admission = AdmissionConfig {
+        // Built once, not once per feature branch. The previous shape
+        // duplicated every field under `test-support` and `not(test-support)`,
+        // and a field added to only one of them compiles cleanly on the
+        // all-features route while breaking the default-feature production
+        // server. One initializer makes that divergence unrepresentable.
+        let admission_defaults = AdmissionConfig {
             memory_limit_bytes: pod_memory_limit,
             scribe_memory_limit_bytes: (resource_plan.scribe_floor_bytes > 0)
                 .then_some(resource_plan.scribe_floor_bytes),
+            policy: vala_bifrost_redux::scribe::geometry::ScribeArtifactPolicy::new(geometry),
             event_time_window: EventTimeWindow {
                 past: scribe_config
                     .event_time_past_window_secs
@@ -723,6 +708,13 @@ pub async fn compose_bifrost(
                     .unwrap_or_else(|| std::time::Duration::from_secs(24 * 60 * 60)),
             },
         };
+        #[cfg(feature = "test-support")]
+        let admission = test_controls
+            .as_ref()
+            .and_then(|controls| controls.scribe_admission)
+            .unwrap_or(admission_defaults);
+        #[cfg(not(feature = "test-support"))]
+        let admission = admission_defaults;
         let persistence = ScribePersistenceConfig::new(
             Arc::new(postgres.vala().clone()),
             64,
@@ -759,7 +751,12 @@ pub async fn compose_bifrost(
             ingest_limits: scribe_config.ingest_limits(),
             geometry,
             staging_file_publisher: Some(staging_file_publisher),
-        }));
+        })
+        .map_err(|error| {
+            ServerBootError::Scribe(format!(
+                "Scribe cannot serve its configured contention width on this node: {error}"
+            ))
+        })?);
         if let Err(error) = scribe.replay_wal_async().await {
             if let Err(cleanup_error) = cluster_registry.shutdown_role(scribe_role.clone()).await {
                 tracing::warn!(%cleanup_error, "failed to release reserved Scribe fence after recovery failure");

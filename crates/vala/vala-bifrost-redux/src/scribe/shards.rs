@@ -6579,7 +6579,8 @@ mod tests {
             admission: AdmissionController::with_config_and_memory(
                 crate::scribe::admission::AdmissionConfig::default(),
                 budget.clone(),
-            ),
+            )
+            .expect("the default Scribe geometry fits the default test budget"),
             memtable,
             persistence_cpu: ScribePersistenceCpuPool::new(1),
             wal_io: ScribeWalIoPool::new(1),

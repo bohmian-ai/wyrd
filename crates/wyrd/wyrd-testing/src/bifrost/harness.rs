@@ -225,7 +225,8 @@ impl BifrostHarness {
                     )
                     .map_err(|error| HarnessError::Scribe(error.to_string()))?,
                 staging_file_publisher: None,
-            });
+            })
+            .map_err(|error| HarnessError::Scribe(error.to_string()))?;
             scribes.push(Arc::new(scribe));
         }
 

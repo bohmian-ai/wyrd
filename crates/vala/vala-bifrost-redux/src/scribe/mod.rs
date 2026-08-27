@@ -942,7 +942,7 @@ impl ScribeImpl {
             ),
             stream_identity::WriterEpoch::new(writer_epoch),
         );
-        Ok(Self::new_with_execution_pools(ScribeBuildConfig {
+        Self::new_with_execution_pools(ScribeBuildConfig {
             catalog: config.catalog,
             operator,
             wal,
@@ -955,7 +955,8 @@ impl ScribeImpl {
             ingest_limits: crate::gate::limits::IngestLimits::default(),
             geometry,
             staging_file_publisher: None,
-        }))
+        })
+        .map_err(|error| error.to_string())
     }
 
     /// Construct a Scribe using an explicitly owned Tokio coordination runtime.
@@ -1049,8 +1050,12 @@ impl ScribeImpl {
     ///
     /// # Panics
     ///
-    /// Panics when `node_id` is not a UUID accepted by the WAL stream identity
-    /// or the fixed Scribe ownership graph cannot be initialized.
+    /// Panics when `node_id` is not a UUID accepted by the WAL stream identity,
+    /// when the fixed Scribe ownership graph cannot be initialized, or when the
+    /// supplied admission budget cannot hold its own configured guaranteed
+    /// contention width. Server deployments take the fallible
+    /// [`Self::new_with_execution_pools`] instead so that last case becomes a
+    /// typed boot refusal rather than a panic.
     pub fn new_for_embedded_with_runtime_config_and_admission_and_memory(
         operator: Arc<opendal::Operator>,
         wal: Arc<wal::WalWriter>,
@@ -1089,10 +1094,20 @@ impl ScribeImpl {
             geometry,
             staging_file_publisher: config.staging_file_publisher,
         })
+        .expect("embedded Scribe admission must hold its configured guaranteed width")
     }
 
     /// Construct Scribe from execution lanes provisioned by server boot.
-    pub fn new_with_execution_pools(config: ScribeBuildConfig) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`geometry::ScribeGeometryError`] when the node's Scribe memory
+    /// budget and staging volume cannot hold the configured guaranteed
+    /// contention width, so boot fails with the shortfall named instead of
+    /// reporting ready.
+    pub fn new_with_execution_pools(
+        config: ScribeBuildConfig,
+    ) -> Result<Self, geometry::ScribeGeometryError> {
         Self::build(config)
     }
 
@@ -1121,16 +1136,23 @@ impl ScribeImpl {
     /// owners so every child receives the same lanes, WAL identity, memory
     /// ledger, and coordination runtime.
     ///
+    /// # Errors
+    ///
+    /// Returns [`geometry::ScribeGeometryError`] when the pod cannot hold every
+    /// guaranteed contention reserve vector. Scribe refuses to exist on a node
+    /// it cannot serve its configured width on, so this check happens here,
+    /// before any owner is built.
+    ///
     /// # Panics
     ///
     /// Panics only if the configured fallback memory governor cannot represent
     /// the fixed one-gibibyte invariant or a shard WAL handle cannot be built.
-    fn build(config: ScribeBuildConfig) -> Self {
+    fn build(config: ScribeBuildConfig) -> Result<Self, geometry::ScribeGeometryError> {
         let memory = config.resources.clone();
         let memory_ownership =
             memory::ScribeOwnership::new(&memory).expect("zero-sized root ownership must be valid");
         let admission =
-            AdmissionController::with_config_and_memory(config.admission, memory.clone());
+            AdmissionController::with_config_and_memory(config.admission, memory.clone())?;
         let ScribeBuildConfig {
             catalog,
             operator,
@@ -1191,7 +1213,7 @@ impl ScribeImpl {
         );
         let pressure_config = ScribePressureConfig::new(75, 50, seal_max_age);
         Self::install_boot_metrics(wal.bytes_on_disk());
-        Self {
+        Ok(Self {
             catalog,
             operator,
             wal,
@@ -1223,7 +1245,7 @@ impl ScribeImpl {
             decoded_request_limit_for_test: AtomicUsize::new(0),
             #[cfg(feature = "test-support")]
             publication_observer: ScribePublicationObserver::default(),
-        }
+        })
     }
 
     /// Publish the zero-initialized Scribe boot telemetry.
@@ -1316,6 +1338,7 @@ impl ScribeImpl {
             geometry,
             staging_file_publisher: None,
         })
+        .expect("the fixed test Scribe geometry fits its embedded governor")
     }
 
     /// Stop accepting new shard work and drain execution lanes until `deadline`.

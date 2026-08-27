@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use crate::contracts::ScribeError;
 use crate::resources::ScribeResources;
 use crate::scribe::contention::{ContentionKey, ScribeContentionLedger};
-use crate::scribe::geometry::{ContentionCategory, ScribeArtifactPolicy, ScribeGlobalCapacity};
+use crate::scribe::geometry::{ContentionCategory, ScribeArtifactPolicy, ScribeGeometryError};
 
 /// Fixed request overhead charged to every accepted append.
 pub const REQUEST_OVERHEAD_BYTES: usize = 4 * 1024;
@@ -134,10 +134,21 @@ pub struct AdmissionConfig {
     pub event_time_window: EventTimeWindow,
 }
 
+/// Smallest pod memory budget the default Scribe geometry can be installed on.
+///
+/// [`ScribeArtifactPolicy::pod_capacity`] splits the Scribe memory ceiling into
+/// four equal category shares, and the largest guaranteed total is merge scratch
+/// at `guaranteed_width` lanes of `minimum_merge_lane_scratch_bytes` — one
+/// gibibyte for the default four tenants of two tables. Four times that is the
+/// smallest budget on which every category clears its guarantee, so it is the
+/// default rather than a round number: a smaller default would make every
+/// embedded and test controller fail the same startup gate production must pass.
+pub const DEFAULT_POD_MEMORY_LIMIT_BYTES: usize = 4 * 1024 * 1024 * 1024;
+
 impl Default for AdmissionConfig {
     fn default() -> Self {
         Self {
-            memory_limit_bytes: 1024 * 1024 * 1024,
+            memory_limit_bytes: DEFAULT_POD_MEMORY_LIMIT_BYTES,
             scribe_memory_limit_bytes: None,
             policy: ScribeArtifactPolicy::default(),
             event_time_window: EventTimeWindow::default(),
@@ -170,60 +181,77 @@ pub struct AdmissionController {
 
 impl AdmissionController {
     /// Construct an admission controller with the production defaults.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the default geometry does not fit the default governor,
+    /// which is a fixed-constant invariant this crate proves in its own tests
+    /// rather than a condition a caller can provoke.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn new() -> Self {
         Self::with_config(AdmissionConfig::default())
+            .expect("the default Scribe geometry must fit the default embedded governor")
     }
 
     /// Construct an admission controller with explicit limits.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics only if the fixed one-gibibyte test governor violates the
-    /// governor constructor invariant.
+    /// Returns [`ScribeGeometryError`] when the resolved pod capacity cannot
+    /// hold every guaranteed reserve vector, exactly as production startup does.
     #[cfg(any(test, feature = "test-support"))]
-    #[must_use]
-    pub fn with_config(config: AdmissionConfig) -> Self {
+    pub fn with_config(config: AdmissionConfig) -> Result<Self, ScribeGeometryError> {
         let memory = super::embedded_scribe_resources(&config);
         Self::with_config_and_memory(config, memory)
     }
 
     /// Construct admission with the already-resolved process-wide governor.
-    #[must_use]
-    pub fn with_config_and_memory(config: AdmissionConfig, memory: ScribeResources) -> Self {
+    ///
+    /// This is the startup capacity gate. It derives the pod's real capacity in
+    /// every governed category from the memory Scribe actually owns and the
+    /// staging volume actually present, then refuses to build the ledger unless
+    /// the configured policy's complete guaranteed reserve vectors fit. A pod
+    /// that cannot install the promised
+    /// `guaranteed_active_tenants × guaranteed_active_tables_per_tenant` vectors
+    /// must fail here, before it reports ready, rather than accept appends it
+    /// cannot stage, merge, or publish and discover the shortfall as runtime
+    /// pressure.
+    ///
+    /// The Scribe-owned child budget wins over the whole-pod budget whenever it
+    /// is configured and smaller, because that child budget is what Scribe may
+    /// actually own; validating against the larger pod figure would prove a
+    /// capacity Scribe never has.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeGeometryError::Capacity`] naming the category, required
+    /// total, actual total, and guaranteed width of the first shortfall,
+    /// [`ScribeGeometryError::EmptyReserve`] when the policy derives a zero
+    /// component, and [`ScribeGeometryError::Incoherent`] when the configured
+    /// width and per-table components cannot be represented together.
+    pub fn with_config_and_memory(
+        config: AdmissionConfig,
+        memory: ScribeResources,
+    ) -> Result<Self, ScribeGeometryError> {
         // The staging volume is disk the ledger only ever compares against, so
         // an absent volume yields zero rather than a fabricated allowance: a pod
-        // with no staging volume must refuse to activate a table, not pretend.
+        // with no staging volume must fail startup, not pretend.
         let staging_bytes = memory
             .snapshot()
             .map_or(0, |snapshot| snapshot.plan.scratch_limit_bytes);
-        let capacity = config
-            .policy
-            .pod_capacity(
-                config.memory_limit_bytes,
-                usize::try_from(staging_bytes).unwrap_or(usize::MAX),
-                GLOBAL_INFLIGHT_ITEMS,
-            )
-            .unwrap_or_else(|_| {
-                // `pod_capacity` only fails on an unrepresentable width, which a
-                // validated policy cannot have; fall back to the policy's own
-                // minimum so the ledger stays coherent rather than panicking in
-                // a construction path the server calls during boot.
-                ScribeArtifactPolicy::default()
-                    .minimum_capacity()
-                    .unwrap_or(ScribeGlobalCapacity {
-                        admission_items: 0,
-                        admission_bytes: 0,
-                        active_bytes: 0,
-                        immutable_bytes: 0,
-                        durable_stage_bytes: 0,
-                        merge_scratch_bytes: 0,
-                        staging_claim_items: 0,
-                        upload_claim_items: 0,
-                    })
+        let scribe_memory_bytes = config
+            .scribe_memory_limit_bytes
+            .map_or(config.memory_limit_bytes, |scribe| {
+                scribe.min(config.memory_limit_bytes)
             });
-        Self {
+        let capacity = config.policy.pod_capacity(
+            scribe_memory_bytes,
+            usize::try_from(staging_bytes).unwrap_or(usize::MAX),
+            GLOBAL_INFLIGHT_ITEMS,
+        )?;
+        config.policy.validate_capacity(&capacity)?;
+        Ok(Self {
             inner: Arc::new(AdmissionInner {
                 config,
                 state: Mutex::new(AdmissionState::default()),
@@ -231,7 +259,7 @@ impl AdmissionController {
                 memory,
                 contention: ScribeContentionLedger::new(config.policy, capacity),
             }),
-        }
+        })
     }
 
     /// Borrows the per-table contention ledger this controller owns.
@@ -759,12 +787,8 @@ mod tests {
     /// a refused per-table charge leaves the pod counting an unowned request.
     #[test]
     fn per_table_reservations_charge_and_return_their_own_cell() {
-        let admission = AdmissionController::with_config(AdmissionConfig {
-            memory_limit_bytes: 1024 * 1024 * 1024,
-            scribe_memory_limit_bytes: None,
-            policy: ScribeArtifactPolicy::default(),
-            event_time_window: EventTimeWindow::default(),
-        });
+        let admission = AdmissionController::with_config(AdmissionConfig::default())
+            .expect("the default geometry fits the default budget");
         let mut bytes = [7_u8; 16];
         bytes[6] = 0x70 | (bytes[6] & 0x0f);
         bytes[8] = 0x80 | (bytes[8] & 0x3f);
@@ -812,11 +836,12 @@ mod tests {
     #[test]
     fn reservations_release_global_items_and_bytes() {
         let admission = AdmissionController::with_config(AdmissionConfig {
-            memory_limit_bytes: 100,
+            memory_limit_bytes: DEFAULT_POD_MEMORY_LIMIT_BYTES,
             scribe_memory_limit_bytes: None,
             policy: ScribeArtifactPolicy::default(),
             event_time_window: EventTimeWindow::default(),
-        });
+        })
+        .expect("the default geometry fits the default budget");
         let reservation = admission
             .try_reserve("vala.bifrost.events", 10)
             .expect("reserve");
@@ -834,7 +859,8 @@ mod tests {
             scribe_memory_limit_bytes: None,
             policy: ScribeArtifactPolicy::default(),
             event_time_window: EventTimeWindow::default(),
-        });
+        })
+        .expect("the default geometry fits the default budget");
         let mut reservations = Vec::with_capacity(GLOBAL_INFLIGHT_ITEMS);
         for _ in 0..GLOBAL_INFLIGHT_ITEMS {
             reservations.push(admission.try_reserve("events", 1).expect("reserve"));
@@ -889,11 +915,12 @@ mod tests {
     #[test]
     fn active_and_immutable_bytes_are_non_reserving_counters() {
         let admission = AdmissionController::with_config(AdmissionConfig {
-            memory_limit_bytes: 100,
+            memory_limit_bytes: DEFAULT_POD_MEMORY_LIMIT_BYTES,
             scribe_memory_limit_bytes: None,
             policy: ScribeArtifactPolicy::default(),
             event_time_window: EventTimeWindow::default(),
-        });
+        })
+        .expect("the default geometry fits the default budget");
         admission
             .try_reserve_active("events", 90)
             .expect("record active bytes");
@@ -921,12 +948,91 @@ mod tests {
         assert_eq!(admission.snapshot().bytes, 0);
     }
 
+    /// Startup refuses a pod whose Scribe memory cannot hold the guaranteed width.
+    ///
+    /// The controller is the only place the derived pod capacity and the
+    /// configured policy meet, so this is where the AC2 refusal must happen. A
+    /// pod one share short used to silently substitute a default or zero
+    /// capacity and report ready.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an undersized pod builds a controller, or when the refusal
+    /// does not name the category, requirement, and width an operator must fix.
+    #[test]
+    fn startup_refuses_a_pod_that_cannot_hold_the_guaranteed_width() {
+        let config = AdmissionConfig::default();
+        let memory = super::super::embedded_scribe_resources(&config);
+        AdmissionController::with_config_and_memory(config, memory.clone())
+            .expect("the default budget holds the default guaranteed width");
+
+        let short = AdmissionConfig {
+            memory_limit_bytes: DEFAULT_POD_MEMORY_LIMIT_BYTES - 4,
+            ..AdmissionConfig::default()
+        };
+        let error = AdmissionController::with_config_and_memory(short, memory)
+            .expect_err("one share below the requirement must refuse before serving");
+        let crate::scribe::geometry::ScribeGeometryError::Capacity {
+            category,
+            required,
+            actual,
+            width,
+        } = error
+        else {
+            panic!("a startup shortfall must report the capacity diagnostic");
+        };
+        assert_eq!(
+            width,
+            AdmissionConfig::default()
+                .policy
+                .geometry()
+                .guaranteed_width()
+        );
+        assert!(actual < required, "the refusal must name the real shortfall");
+        assert!(
+            ContentionCategory::ALL
+                .iter()
+                .any(|known| known.label() == category),
+            "the refusal must name a governed category"
+        );
+    }
+
+    /// The Scribe child budget bounds startup even when the pod budget is ample.
+    ///
+    /// Validating against the whole-pod figure would prove a capacity Scribe
+    /// never owns, which is precisely how a pod could report ready and then fail
+    /// to install the vectors it promised.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the larger pod budget is used in place of the smaller
+    /// Scribe-owned child limit.
+    #[test]
+    fn startup_validates_against_the_smaller_scribe_child_budget() {
+        let config = AdmissionConfig {
+            memory_limit_bytes: DEFAULT_POD_MEMORY_LIMIT_BYTES * 4,
+            scribe_memory_limit_bytes: Some(DEFAULT_POD_MEMORY_LIMIT_BYTES / 2),
+            ..AdmissionConfig::default()
+        };
+        let memory = super::super::embedded_scribe_resources(&config);
+        let error = AdmissionController::with_config_and_memory(config, memory)
+            .expect_err("the child budget, not the pod budget, bounds Scribe");
+        assert!(
+            matches!(
+                error,
+                crate::scribe::geometry::ScribeGeometryError::Capacity { .. }
+            ),
+            "an undersized child budget must refuse with the capacity diagnostic"
+        );
+    }
+
     /// Admission observes the same governor poison bit as memory reservations.
     #[test]
     fn admission_uses_shared_governor_poison() {
         let memory = super::super::embedded_scribe_resources(&AdmissionConfig::default());
         let admission =
-            AdmissionController::with_config_and_memory(AdmissionConfig::default(), memory.clone());
+            AdmissionController::with_config_and_memory(AdmissionConfig::default(), memory.clone())
+                .expect("the default geometry fits the default budget");
         memory.poison();
         assert!(matches!(
             admission.try_reserve("events", 1),
@@ -939,7 +1045,8 @@ mod tests {
     fn authoritative_memtable_sync_does_not_poison() {
         let memory = super::super::embedded_scribe_resources(&AdmissionConfig::default());
         let admission =
-            AdmissionController::with_config_and_memory(AdmissionConfig::default(), memory.clone());
+            AdmissionController::with_config_and_memory(AdmissionConfig::default(), memory.clone())
+                .expect("the default geometry fits the default budget");
         admission.sync_memtable_bytes(64, 32);
         assert_eq!(admission.snapshot().active_bytes, 64);
         assert_eq!(admission.snapshot().immutable_bytes, 32);

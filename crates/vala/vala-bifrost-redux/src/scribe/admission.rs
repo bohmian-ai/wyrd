@@ -10,6 +10,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::contracts::ScribeError;
 use crate::resources::ScribeResources;
+use crate::scribe::contention::{ContentionKey, ScribeContentionLedger};
+use crate::scribe::geometry::{ContentionCategory, ScribeArtifactPolicy, ScribeGlobalCapacity};
 
 /// Fixed request overhead charged to every accepted append.
 pub const REQUEST_OVERHEAD_BYTES: usize = 4 * 1024;
@@ -117,6 +119,12 @@ pub struct AdmissionConfig {
     pub memory_limit_bytes: usize,
     /// Optional explicit Scribe child budget under the detected pod budget.
     pub scribe_memory_limit_bytes: Option<usize>,
+    /// Per-table contention policy every admitted table reserves against.
+    ///
+    /// Held here rather than derived per request so the reserve vector one
+    /// table installs is by construction the vector startup proved the pod can
+    /// hold, and so a configuration change cannot move the two apart.
+    pub policy: ScribeArtifactPolicy,
     /// Acceptance window for caller-supplied `wyrd_event_time` values.
     ///
     /// Applied uniformly to both the native Arrow IPC and projected OTLP
@@ -131,6 +139,7 @@ impl Default for AdmissionConfig {
         Self {
             memory_limit_bytes: 1024 * 1024 * 1024,
             scribe_memory_limit_bytes: None,
+            policy: ScribeArtifactPolicy::default(),
             event_time_window: EventTimeWindow::default(),
         }
     }
@@ -150,6 +159,7 @@ struct AdmissionInner {
     state: Mutex<AdmissionState>,
     wal_available: AtomicBool,
     memory: ScribeResources,
+    contention: ScribeContentionLedger,
 }
 
 /// Pod-global admission controller.
@@ -182,14 +192,55 @@ impl AdmissionController {
     /// Construct admission with the already-resolved process-wide governor.
     #[must_use]
     pub fn with_config_and_memory(config: AdmissionConfig, memory: ScribeResources) -> Self {
+        // The staging volume is disk the ledger only ever compares against, so
+        // an absent volume yields zero rather than a fabricated allowance: a pod
+        // with no staging volume must refuse to activate a table, not pretend.
+        let staging_bytes = memory
+            .snapshot()
+            .map_or(0, |snapshot| snapshot.plan.scratch_limit_bytes);
+        let capacity = config
+            .policy
+            .pod_capacity(
+                config.memory_limit_bytes,
+                usize::try_from(staging_bytes).unwrap_or(usize::MAX),
+                GLOBAL_INFLIGHT_ITEMS,
+            )
+            .unwrap_or_else(|_| {
+                // `pod_capacity` only fails on an unrepresentable width, which a
+                // validated policy cannot have; fall back to the policy's own
+                // minimum so the ledger stays coherent rather than panicking in
+                // a construction path the server calls during boot.
+                ScribeArtifactPolicy::default()
+                    .minimum_capacity()
+                    .unwrap_or(ScribeGlobalCapacity {
+                        admission_items: 0,
+                        admission_bytes: 0,
+                        active_bytes: 0,
+                        immutable_bytes: 0,
+                        durable_stage_bytes: 0,
+                        merge_scratch_bytes: 0,
+                        staging_claim_items: 0,
+                        upload_claim_items: 0,
+                    })
+            });
         Self {
             inner: Arc::new(AdmissionInner {
                 config,
                 state: Mutex::new(AdmissionState::default()),
                 wal_available: AtomicBool::new(true),
                 memory,
+                contention: ScribeContentionLedger::new(config.policy, capacity),
             }),
         }
+    }
+
+    /// Borrows the per-table contention ledger this controller owns.
+    ///
+    /// Exposed so shard and staging owners charge the same ledger admission
+    /// does rather than keeping a second, divergent view of who owns what.
+    #[must_use]
+    pub fn contention(&self) -> &ScribeContentionLedger {
+        &self.inner.contention
     }
 
     /// Reserve one request item and its byte charge without waiting.
@@ -202,12 +253,38 @@ impl AdmissionController {
         table: impl Into<String>,
         bytes: usize,
     ) -> Result<InflightFrameReservation, ScribeError> {
-        self.try_reserve_kind(table, bytes)
+        self.try_reserve_kind(table, None, bytes)
+    }
+
+    /// Reserve one request item and its byte charge against a table's own cell.
+    ///
+    /// This is the production path. The pod-global counters still bound the node
+    /// as a whole, but the request is additionally charged to the caller's own
+    /// contention cell, so a tenant that saturates the node is refused on its own
+    /// account instead of pushing that refusal onto a quiet neighbour. The cell
+    /// is installed on first use and its whole reserve vector is committed at
+    /// that moment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::IngestBusy`] when a pod-global limit, the pod's
+    /// activation width, or the table's own reserve plus available surplus
+    /// cannot cover the request, [`ScribeError::WalDiskFull`] when the WAL
+    /// breaker is tripped, and [`ScribeError::Internal`] when memory accounting
+    /// is poisoned or a lock failed.
+    pub fn try_reserve_for_cell(
+        &self,
+        key: &ContentionKey,
+        table: impl Into<String>,
+        bytes: usize,
+    ) -> Result<InflightFrameReservation, ScribeError> {
+        self.try_reserve_kind(table, Some(key), bytes)
     }
 
     fn try_reserve_kind(
         &self,
         table: impl Into<String>,
+        cell: Option<&ContentionKey>,
         bytes: usize,
     ) -> Result<InflightFrameReservation, ScribeError> {
         let table = table.into();
@@ -253,9 +330,21 @@ impl AdmissionController {
         state.bytes = next_bytes;
         drop(state);
 
+        if let Some(key) = cell {
+            // Charge the cell only after the pod-global counters accepted, and
+            // hand back the global charge if the cell refuses, so a per-table
+            // refusal never leaves the pod counting a request nobody owns.
+            if let Err(refusal) = self.charge_cell(key, bytes) {
+                let _ = self.release_request(bytes);
+                super::record_scribe_rejection("contention");
+                return Err(refusal);
+            }
+        }
+
         Ok(InflightFrameReservation {
             inner: Some(Arc::clone(&self.inner)),
             bytes,
+            cell: cell.cloned(),
         })
     }
 
@@ -479,6 +568,26 @@ impl AdmissionController {
         self.inner.config
     }
 
+    /// Activates a table's cell if needed and charges one admitted request.
+    ///
+    /// Activation and the two admission charges happen together because a cell
+    /// that held an item without its bytes, or the reverse, would let a table
+    /// pass admission it cannot actually own.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`ScribeError`] projection of the contention refusal.
+    fn charge_cell(&self, key: &ContentionKey, bytes: usize) -> Result<(), ScribeError> {
+        let ledger = &self.inner.contention;
+        ledger.activate(key)?;
+        ledger.charge(key, ContentionCategory::AdmissionItems, 1)?;
+        if let Err(refusal) = ledger.charge(key, ContentionCategory::AdmissionBytes, bytes) {
+            let _ = ledger.release(key, ContentionCategory::AdmissionItems, 1);
+            return Err(refusal.into());
+        }
+        Ok(())
+    }
+
     fn memory_breaker_bytes(&self) -> usize {
         self.inner.config.memory_limit_bytes.saturating_mul(90) / 100
     }
@@ -516,6 +625,9 @@ impl Default for AdmissionController {
 pub struct InflightFrameReservation {
     inner: Option<Arc<AdmissionInner>>,
     bytes: usize,
+    /// Contention cell charged alongside the pod-global counters, when the
+    /// caller reserved through the per-table path.
+    cell: Option<ContentionKey>,
 }
 
 impl InflightFrameReservation {
@@ -544,6 +656,11 @@ impl InflightFrameReservation {
                     .ok_or_else(|| ScribeError::IngestBusy {
                         table: "vala.bifrost".to_owned(),
                     })?;
+            if let Some(key) = &self.cell {
+                inner
+                    .contention
+                    .charge(key, ContentionCategory::AdmissionBytes, extra)?;
+            }
         } else {
             let released = self.bytes - bytes;
             let Some(next_bytes) = state.bytes.checked_sub(released) else {
@@ -555,6 +672,11 @@ impl InflightFrameReservation {
                 });
             };
             state.bytes = next_bytes;
+            if let Some(key) = &self.cell {
+                inner
+                    .contention
+                    .release(key, ContentionCategory::AdmissionBytes, released)?;
+            }
         }
         self.bytes = bytes;
         Ok(())
@@ -565,12 +687,35 @@ impl InflightFrameReservation {
         self.release_inner()
     }
 
+    /// Returns both the pod-global charge and the contention cell's share.
+    ///
+    /// The cell is released first and unconditionally: leaking a cell charge
+    /// would permanently shrink one table's usable reserve, which is a worse
+    /// failure than double-counting a global byte that the governor's own
+    /// reconciliation can still correct.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when either counter underflows or its
+    /// lock is poisoned.
     fn release_inner(&mut self) -> Result<(), ScribeError> {
-        if let Some(inner) = self.inner.take() {
-            AdmissionController { inner }.release_request(self.bytes)
-        } else {
-            Ok(())
-        }
+        let Some(inner) = self.inner.take() else {
+            return Ok(());
+        };
+        let cell_result = match self.cell.take() {
+            Some(key) => inner
+                .contention
+                .release(&key, ContentionCategory::AdmissionBytes, self.bytes)
+                .and_then(|()| {
+                    inner
+                        .contention
+                        .release(&key, ContentionCategory::AdmissionItems, 1)
+                })
+                .map_err(ScribeError::from),
+            None => Ok(()),
+        };
+        let global_result = AdmissionController { inner }.release_request(self.bytes);
+        cell_result.and(global_result)
     }
 }
 
@@ -605,11 +750,71 @@ pub struct AdmissionSnapshot {
 mod tests {
     use super::*;
 
+    /// A per-table reservation charges and returns its own contention cell.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the cell is not charged alongside the pod-global counters,
+    /// when releasing the reservation leaves the cell holding anything, or when
+    /// a refused per-table charge leaves the pod counting an unowned request.
+    #[test]
+    fn per_table_reservations_charge_and_return_their_own_cell() {
+        let admission = AdmissionController::with_config(AdmissionConfig {
+            memory_limit_bytes: 1024 * 1024 * 1024,
+            scribe_memory_limit_bytes: None,
+            policy: ScribeArtifactPolicy::default(),
+            event_time_window: EventTimeWindow::default(),
+        });
+        let mut bytes = [7_u8; 16];
+        bytes[6] = 0x70 | (bytes[6] & 0x0f);
+        bytes[8] = 0x80 | (bytes[8] & 0x3f);
+        let key = ContentionKey::new(
+            wyrd_spec::ids::DataTenantId::new(uuid::Uuid::from_bytes(bytes))
+                .expect("UUIDv7 test tenant"),
+            crate::catalog::TableRef::new(crate::namespaces::BifrostNamespace::Datasets, "events"),
+        );
+
+        let reservation = admission
+            .try_reserve_for_cell(&key, "wyrd.events", 4_096)
+            .expect("a first request activates the cell and reserves inside it");
+        let ledger = admission.contention();
+        assert_eq!(
+            ledger
+                .usage(&key, ContentionCategory::AdmissionItems)
+                .expect("cell is active"),
+            1
+        );
+        assert_eq!(
+            ledger
+                .usage(&key, ContentionCategory::AdmissionBytes)
+                .expect("cell is active"),
+            4_096
+        );
+        assert_eq!(admission.snapshot().items, 1);
+
+        reservation.release().expect("release succeeds");
+        assert_eq!(
+            ledger
+                .usage(&key, ContentionCategory::AdmissionItems)
+                .expect("cell stays installed"),
+            0
+        );
+        assert_eq!(
+            ledger
+                .usage(&key, ContentionCategory::AdmissionBytes)
+                .expect("cell stays installed"),
+            0
+        );
+        assert_eq!(admission.snapshot().items, 0);
+        assert_eq!(admission.snapshot().bytes, 0);
+    }
+
     #[test]
     fn reservations_release_global_items_and_bytes() {
         let admission = AdmissionController::with_config(AdmissionConfig {
             memory_limit_bytes: 100,
             scribe_memory_limit_bytes: None,
+            policy: ScribeArtifactPolicy::default(),
             event_time_window: EventTimeWindow::default(),
         });
         let reservation = admission
@@ -627,6 +832,7 @@ mod tests {
         let admission = AdmissionController::with_config(AdmissionConfig {
             memory_limit_bytes: usize::MAX,
             scribe_memory_limit_bytes: None,
+            policy: ScribeArtifactPolicy::default(),
             event_time_window: EventTimeWindow::default(),
         });
         let mut reservations = Vec::with_capacity(GLOBAL_INFLIGHT_ITEMS);
@@ -685,6 +891,7 @@ mod tests {
         let admission = AdmissionController::with_config(AdmissionConfig {
             memory_limit_bytes: 100,
             scribe_memory_limit_bytes: None,
+            policy: ScribeArtifactPolicy::default(),
             event_time_window: EventTimeWindow::default(),
         });
         admission

@@ -2,6 +2,7 @@
 
 pub mod admission;
 pub mod audit_envelope;
+pub mod contention;
 mod direct_logs;
 mod direct_metrics;
 mod direct_traces;

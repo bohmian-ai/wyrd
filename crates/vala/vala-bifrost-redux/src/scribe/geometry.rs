@@ -773,6 +773,48 @@ impl ScribeArtifactPolicy {
         Ok(())
     }
 
+    /// Derives the pod capacity this policy is checked against.
+    ///
+    /// The three inputs are the only ones the node actually measures: the Scribe
+    /// memory ceiling the resource governor granted, the local staging volume,
+    /// and the fixed pod-global in-flight item ceiling. Everything else is a
+    /// split of those, and each split is named rather than implied:
+    ///
+    /// - Admitted request bytes, active generations, immutable generations, and
+    ///   merge scratch all come out of the one memory ceiling, so each gets an
+    ///   equal quarter. An equal split is deliberate: any weighting would encode
+    ///   a guess about which phase dominates, and the phases genuinely trade off
+    ///   against each other over a pod's lifetime.
+    /// - Durable staging comes from the staging volume, which is disk and shares
+    ///   nothing with memory.
+    /// - Claim items are counted, not sized. One outstanding staging claim and
+    ///   one outstanding upload claim per guaranteed table is the whole point of
+    ///   those categories, so their capacity is the guaranteed width itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeGeometryError::Incoherent`] when the guaranteed width and
+    /// per-table components cannot be represented together.
+    pub fn pod_capacity(
+        &self,
+        scribe_memory_bytes: usize,
+        staging_volume_bytes: usize,
+        global_inflight_items: usize,
+    ) -> Result<ScribeGlobalCapacity, ScribeGeometryError> {
+        let memory_share = scribe_memory_bytes / 4;
+        let width = self.geometry.guaranteed_width();
+        Ok(ScribeGlobalCapacity {
+            admission_items: global_inflight_items,
+            admission_bytes: memory_share,
+            active_bytes: memory_share,
+            immutable_bytes: memory_share,
+            durable_stage_bytes: staging_volume_bytes,
+            merge_scratch_bytes: memory_share,
+            staging_claim_items: width,
+            upload_claim_items: width,
+        })
+    }
+
     /// Returns the smallest pod capacity that satisfies this policy exactly.
     ///
     /// Used by startup diagnostics and by the minimum-geometry configuration

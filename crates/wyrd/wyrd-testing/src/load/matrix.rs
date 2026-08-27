@@ -436,6 +436,7 @@ impl BifrostClusterLoad {
                 AdmissionConfig {
                     memory_limit_bytes: 1024 * 1024 * 1024,
                     scribe_memory_limit_bytes: Some(256 * 1024),
+                    policy: vala_bifrost_redux::scribe::geometry::ScribeArtifactPolicy::default(),
                     event_time_window: EventTimeWindow::default(),
                 },
             )

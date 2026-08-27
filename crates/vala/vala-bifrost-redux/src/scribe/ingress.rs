@@ -444,9 +444,16 @@ impl ScribeImpl {
             &binding.table_ref,
             frame.batch_id,
         );
-        let reservation = self
-            .admission
-            .try_reserve(table, material_plan.root_bytes)?;
+        // The cell key is the tenant/table pair, not the shard: a table's
+        // protected reserve must survive routing, and blake3 routing puts the
+        // same table on different shards for different batches.
+        let cell = crate::scribe::contention::ContentionKey::new(
+            frame.principal.tenant_id,
+            binding.table_ref.clone(),
+        );
+        let reservation =
+            self.admission
+                .try_reserve_for_cell(&cell, table, material_plan.root_bytes)?;
         memory.attach_shard(shard)?;
         #[cfg(any(test, feature = "test-support"))]
         self.pause_admitted_ingest_for_test().await;

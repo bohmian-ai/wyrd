@@ -695,6 +695,7 @@ pub async fn compose_bifrost(
                 memory_limit_bytes: pod_memory_limit,
                 scribe_memory_limit_bytes: (resource_plan.scribe_floor_bytes > 0)
                     .then_some(resource_plan.scribe_floor_bytes),
+                policy: vala_bifrost_redux::scribe::geometry::ScribeArtifactPolicy::new(geometry),
                 event_time_window: EventTimeWindow {
                     past: scribe_config
                         .event_time_past_window_secs

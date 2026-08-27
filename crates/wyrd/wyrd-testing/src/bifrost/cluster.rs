@@ -2968,8 +2968,12 @@ mod tests {
         let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::role_separated())
             .await
             .expect("role-separated cluster starts");
-        assert_eq!(cluster.ready_ingest_nodes().len(), 3);
-        assert_eq!(cluster.ready_query_nodes().len(), 3);
+        // The spec binds two Oracle-only nodes and one Scribe-only node, so the
+        // two endpoint sets are disjoint. Asserting the configured node count on
+        // both sides would pass only if every node ran every role, which is the
+        // opposite of what role separation means.
+        assert_eq!(cluster.ready_ingest_nodes().len(), 1);
+        assert_eq!(cluster.ready_query_nodes().len(), 2);
         assert!(cluster.ready_ingest_nodes().iter().all(|node| {
             cluster
                 .server_by_node(*node)
@@ -2979,7 +2983,7 @@ mod tests {
         assert!(cluster.ready_query_nodes().iter().all(|node| {
             cluster
                 .server_by_node(*node)
-                .is_some_and(|server| server.bifrost_scribe().is_some())
+                .is_some_and(|server| server.bifrost_scribe().is_none())
         }));
         cluster.shutdown().await.expect("cluster shuts down");
     }

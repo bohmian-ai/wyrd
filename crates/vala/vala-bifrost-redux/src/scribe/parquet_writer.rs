@@ -1702,6 +1702,91 @@ mod tests {
                 && detail.contains(&observed.to_string())));
     }
 
+    /// A real sealed file proves the writer recipe on its own footer rather
+    /// than on the builder that produced it: the low-cardinality
+    /// `data_tenant_id` column encodes through a dictionary, `wyrd_event_time`
+    /// encodes as `DELTA_BINARY_PACKED` with no dictionary page, and every row
+    /// decodes back exactly as written.
+    #[test]
+    fn sealed_file_footer_encoding_contract() {
+        let tenant = DataTenantId::new_v7();
+        let tenant_text = tenant.to_string();
+        let rows = 4_096;
+        let timestamps: Vec<i64> = (0..rows).map(|row| 1_767_312_000_000_000 + row).collect();
+        let frozen = build_test_frozen(
+            crate::test_support::day_partition(2026, 7, 14),
+            tenant,
+            vec![tenant_text.as_str(); usize::try_from(rows).expect("row count fits usize")],
+            timestamps.clone(),
+        );
+        let binding =
+            TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone())).expect("binding");
+        let (_scratch, encoded) = encode_for_test(&frozen, &binding, tenant);
+
+        let artifact = encoded
+            .artifacts
+            .as_slice()
+            .first()
+            .expect("seal produced one artifact");
+        let file = std::fs::File::open(&artifact.scratch_path).expect("open sealed artifact");
+        let reader = SerializedFileReader::new(file).expect("read sealed footer");
+        let metadata = reader.metadata();
+
+        let mut saw_dictionary = false;
+        let mut saw_event_time = false;
+        for group in metadata.row_groups() {
+            for column in group.columns() {
+                let name = column.column_path().string();
+                let encodings = column.encodings().collect::<Vec<_>>();
+                if name == DATA_TENANT_ID {
+                    saw_dictionary = true;
+                    assert!(
+                        encodings.contains(&parquet::basic::Encoding::RLE_DICTIONARY)
+                            || encodings.contains(&parquet::basic::Encoding::PLAIN_DICTIONARY),
+                        "low-cardinality {name} must be dictionary-encoded, saw {encodings:?}"
+                    );
+                }
+                if name == "wyrd_event_time" {
+                    saw_event_time = true;
+                    assert!(
+                        encodings.contains(&parquet::basic::Encoding::DELTA_BINARY_PACKED),
+                        "wyrd_event_time must be DELTA_BINARY_PACKED, saw {encodings:?}"
+                    );
+                    assert!(
+                        !encodings.contains(&parquet::basic::Encoding::RLE_DICTIONARY)
+                            && !encodings.contains(&parquet::basic::Encoding::PLAIN_DICTIONARY),
+                        "wyrd_event_time must not carry a dictionary page, saw {encodings:?}"
+                    );
+                }
+            }
+        }
+        assert!(saw_dictionary && saw_event_time);
+
+        let decoded_file = std::fs::File::open(&artifact.scratch_path).expect("reopen artifact");
+        let batches = ParquetRecordBatchReaderBuilder::try_new(decoded_file)
+            .expect("decode builder")
+            .build()
+            .expect("decode reader")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("decode rows");
+        let decoded_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(
+            decoded_rows,
+            usize::try_from(rows).expect("row count fits usize")
+        );
+        let mut decoded_times = Vec::with_capacity(decoded_rows);
+        for batch in &batches {
+            let column = batch
+                .column_by_name("wyrd_event_time")
+                .expect("decoded event-time column")
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .expect("decoded event-time is microsecond timestamps");
+            decoded_times.extend(column.values().iter().copied());
+        }
+        assert_eq!(decoded_times, timestamps);
+    }
+
     #[test]
     fn tenant_binding_mismatch_fails_before_encoding() {
         let seal_tenant = DataTenantId::new_v7();

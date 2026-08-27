@@ -17,6 +17,7 @@ use parquet::arrow::ArrowWriter;
 use std::sync::Arc;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef, TenantTableBinding};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_bifrost_redux::parquet::writer_properties::bifrost_writer_properties;
 use vala_bifrost_redux::schema::with_managed_columns;
 use vala_bifrost_redux::scribe::file_list_writer::{FileListInsert, insert_and_audit};
 use vala_sdk::QueryClient;
@@ -191,7 +192,8 @@ pub(crate) async fn seed_foreign_hot_row(
         ],
     )?;
     let mut parquet = Vec::new();
-    let mut writer = ArrowWriter::try_new(&mut parquet, schema, None)?;
+    let properties = bifrost_writer_properties(batch.num_rows(), &[]);
+    let mut writer = ArrowWriter::try_new(&mut parquet, schema, Some(properties))?;
     writer.write(&batch)?;
     writer.close()?;
     let path = format!("{}/{path_tag}.parquet", binding.object_prefix);

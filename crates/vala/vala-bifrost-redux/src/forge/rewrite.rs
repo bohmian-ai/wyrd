@@ -4055,7 +4055,7 @@ mod tests {
                 .finish(),
         );
         let object_path =
-            "s3://bucket/table/data/forge/bifrost-writer-v2/test-00000.parquet".to_owned();
+            "s3://bucket/table/data/forge/test-00000.parquet".to_owned();
         let sink = ForgeOutputSink::open(
             Arc::new(MemoryOutputStore),
             Arc::clone(&staging),
@@ -4139,6 +4139,186 @@ mod tests {
             .parse_and_finish(&published)
             .expect("valid Parquet footer");
         assert_eq!(durable.file_metadata().num_rows(), 8192);
+    }
+
+    /// A file a real Forge rewrite wrote proves the same footer recipe Scribe
+    /// seals under: a low-cardinality string column encodes through a
+    /// dictionary, `wyrd_event_time` encodes as `DELTA_BINARY_PACKED` with no
+    /// dictionary page, and every decoded row equals the row written. The
+    /// assertion reads the published object's own footer, so a second property
+    /// builder anywhere in the rewrite path would fail it.
+    #[tokio::test]
+    async fn rewritten_file_footer_encoding_contract() {
+        const ROWS: i64 = 4_096;
+
+        let field_id = |id: &str| HashMap::from([("PARQUET:field_id".to_owned(), id.to_owned())]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("service_name", DataType::Utf8, false).with_metadata(field_id("1")),
+            Field::new(
+                "wyrd_event_time",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+                false,
+            )
+            .with_metadata(field_id("2")),
+        ]));
+        let iceberg_schema = Arc::new(
+            iceberg::spec::Schema::builder()
+                .with_fields(vec![
+                    Arc::new(iceberg::spec::NestedField::required(
+                        1,
+                        "service_name",
+                        iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::String),
+                    )),
+                    Arc::new(iceberg::spec::NestedField::required(
+                        2,
+                        "wyrd_event_time",
+                        iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::Timestamp),
+                    )),
+                ])
+                .build()
+                .expect("Iceberg schema"),
+        );
+        let times: Vec<i64> = (0..ROWS).map(|row| 1_767_312_000_000_000 + row).collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from_iter_values(
+                    (0..ROWS).map(|row| format!("service-{}", row % 4)),
+                )),
+                Arc::new(
+                    arrow::array::TimestampMicrosecondArray::from_iter_values(times.iter().copied()),
+                ),
+            ],
+        )
+        .expect("rewrite fixture batch");
+
+        let staging = Arc::new(
+            opendal::Operator::new(opendal::services::Memory::default())
+                .expect("in-memory staging operator")
+                .finish(),
+        );
+        let object_path = "s3://bucket/table/data/forge/footer-00000.parquet".to_owned();
+        let sink = ForgeOutputSink::open(
+            Arc::new(MemoryOutputStore),
+            Arc::clone(&staging),
+            object_path.clone(),
+            8 * 1024 * 1024,
+        )
+        .await
+        .expect("streaming output sink");
+        let mut state = RewriteBatchState::with_reservation(
+            None,
+            None,
+            Arc::from(["service_name".to_owned()]),
+        );
+        let phase = Arc::new(ForgeFooterPhase::new(8, 32).expect("footer phase"));
+        let guard = ForgeFooterPhaseGuard {
+            owner: Arc::clone(&phase),
+            _permit: Arc::clone(&phase.gate)
+                .try_acquire_owned()
+                .expect("execution phase"),
+            metadata: false,
+        };
+        state
+            .open_writer(
+                &schema,
+                &batch,
+                sink,
+                object_path.clone(),
+                object_path.clone(),
+                guard,
+            )
+            .expect("streaming writer opens before the first byte");
+        let slices = [BoundedRowSlice {
+            offset: 0,
+            len: batch.num_rows(),
+            logical_bytes: 32_768,
+        }];
+        state
+            .write_batch(&iceberg_schema, &batch, &slices, ROW_GROUP_FLUSH_BYTES)
+            .await
+            .expect("streamed encode");
+        let mut active = state.take_writer().expect("active writer");
+        active.writer.finish().await.expect("streamed footer");
+
+        let published = staging
+            .read(&object_path)
+            .await
+            .expect("published object")
+            .to_bytes();
+        let durable = parquet::file::metadata::ParquetMetaDataReader::new()
+            .parse_and_finish(&published)
+            .expect("valid Parquet footer");
+
+        let mut saw_dictionary = false;
+        let mut saw_event_time = false;
+        for group in durable.row_groups() {
+            for column in group.columns() {
+                let name = column.column_path().string();
+                let encodings = column.encodings().collect::<Vec<_>>();
+                if name == "service_name" {
+                    saw_dictionary = true;
+                    assert!(
+                        encodings.contains(&parquet::basic::Encoding::RLE_DICTIONARY)
+                            || encodings.contains(&parquet::basic::Encoding::PLAIN_DICTIONARY),
+                        "low-cardinality {name} must be dictionary-encoded, saw {encodings:?}"
+                    );
+                }
+                if name == "wyrd_event_time" {
+                    saw_event_time = true;
+                    assert!(
+                        encodings.contains(&parquet::basic::Encoding::DELTA_BINARY_PACKED),
+                        "wyrd_event_time must be DELTA_BINARY_PACKED, saw {encodings:?}"
+                    );
+                    assert!(
+                        !encodings.contains(&parquet::basic::Encoding::RLE_DICTIONARY)
+                            && !encodings.contains(&parquet::basic::Encoding::PLAIN_DICTIONARY),
+                        "wyrd_event_time must not carry a dictionary page, saw {encodings:?}"
+                    );
+                }
+            }
+        }
+        assert!(saw_dictionary && saw_event_time);
+
+        let decoded = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            published.clone(),
+        )
+        .expect("decode builder")
+        .build()
+        .expect("decode reader")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("decode rows");
+        let mut decoded_times = Vec::with_capacity(times.len());
+        let mut decoded_services = Vec::with_capacity(times.len());
+        for decoded_batch in &decoded {
+            decoded_times.extend(
+                decoded_batch
+                    .column_by_name("wyrd_event_time")
+                    .expect("decoded event-time column")
+                    .as_any()
+                    .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+                    .expect("decoded event-time is microsecond timestamps")
+                    .values()
+                    .iter()
+                    .copied(),
+            );
+            let services = decoded_batch
+                .column_by_name("service_name")
+                .expect("decoded service column")
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("decoded service column is Utf8");
+            for row in 0..decoded_batch.num_rows() {
+                decoded_services.push(services.value(row).to_owned());
+            }
+        }
+        assert_eq!(decoded_times, times);
+        assert_eq!(
+            decoded_services,
+            (0..ROWS)
+                .map(|row| format!("service-{}", row % 4))
+                .collect::<Vec<_>>()
+        );
     }
 
     /// Rotated names preserve one operation identity and ordered ordinals.

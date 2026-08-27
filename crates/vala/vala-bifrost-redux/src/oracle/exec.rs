@@ -3624,10 +3624,14 @@ mod tests {
         batch: &RecordBatch,
         context: &str,
     ) {
+        let properties = crate::parquet::writer_properties::bifrost_writer_properties(
+            batch.num_rows(),
+            &[],
+        );
         let mut writer = parquet::arrow::ArrowWriter::try_new(
             File::create(path).unwrap_or_else(|error| panic!("{context} file: {error}")),
             schema,
-            None,
+            Some(properties),
         )
         .unwrap_or_else(|error| panic!("{context} writer: {error}"));
         writer
@@ -3796,7 +3800,10 @@ mod tests {
         let mut writer = parquet::arrow::ArrowWriter::try_new(
             File::create(&path).expect("hot file"),
             Arc::clone(&schema),
-            None,
+            Some(crate::parquet::writer_properties::bifrost_writer_properties(
+                batch.num_rows(),
+                &[],
+            )),
         )
         .expect("hot writer");
         writer.write(&batch).expect("hot batch write");
@@ -3899,7 +3906,10 @@ mod tests {
         let mut writer = parquet::arrow::ArrowWriter::try_new(
             File::create(&path).expect("hot causal file"),
             Arc::clone(&schema),
-            None,
+            Some(crate::parquet::writer_properties::bifrost_writer_properties(
+                batch.num_rows(),
+                &[],
+            )),
         )
         .expect("hot causal writer");
         writer.write(&batch).expect("hot causal write");
@@ -4659,7 +4669,10 @@ mod tests {
         let mut writer = parquet::arrow::ArrowWriter::try_new(
             File::create(&path).expect("hot batch fixture file"),
             Arc::clone(&schema),
-            None,
+            Some(crate::parquet::writer_properties::bifrost_writer_properties(
+                batch.num_rows(),
+                &[],
+            )),
         )
         .expect("hot batch fixture writer");
         writer.write(&batch).expect("hot batch fixture write");

@@ -20,18 +20,27 @@ use crate::schema::SchemaFingerprint;
 pub const MAX_LOGICAL_ROW_GROUP_BYTES: u64 = 32 * 1024 * 1024;
 /// Maximum decoded workspace required by one admitted row group.
 pub const ROW_GROUP_DECODE_WORKSPACE_BYTES: u64 = 64 * 1024 * 1024;
-/// Maximum encoded bytes in one physical writer-v2 object.
-pub const MAX_FILE_BYTES: u64 = 128 * 1024 * 1024;
 /// Maximum rows in one row group, independent of its byte ceiling.
 pub const MAX_ROW_GROUP_ROWS: usize = 131_072;
-/// Maximum row groups represented by one physical writer-v2 object.
-pub const MAX_FILE_ROW_GROUPS: usize = 4;
+/// Maximum row groups one physical object's footer may describe.
+///
+/// This bounds footer decode work, not object size. A row group holds at most
+/// [`MAX_LOGICAL_ROW_GROUP_BYTES`] of canonical Arrow, so an assembled hot object
+/// at its approximately 512 MiB target needs roughly sixteen groups; the ceiling
+/// leaves a wide margin above that for indivisible overshoot and for compression
+/// putting physical bytes well under the logical estimate. It is deliberately not
+/// an object-size promise: the object target lives in Scribe's staging geometry.
+pub const MAX_FOOTER_ROW_GROUPS: usize = 1_024;
 /// Maximum normalized leaf columns represented by one physical object.
 pub const MAX_FILE_LEAF_COLUMNS: usize = 64;
 /// Maximum Parquet schema nodes, including nested group nodes.
 pub const MAX_FILE_SCHEMA_ELEMENTS: usize = 128;
 /// Maximum row-group column chunks represented by one physical object.
-pub const MAX_FILE_COLUMN_CHUNKS: usize = 256;
+///
+/// Paired with [`MAX_FOOTER_ROW_GROUPS`] and [`MAX_FILE_LEAF_COLUMNS`]: a footer
+/// cannot describe more chunks than groups times leaf columns, so this is the
+/// product of the two rather than an independent judgement.
+pub const MAX_FILE_COLUMN_CHUNKS: usize = MAX_FOOTER_ROW_GROUPS * MAX_FILE_LEAF_COLUMNS;
 /// Maximum encoded footer bytes reserved before writer creation.
 pub const MAX_FOOTER_ENCODED_BYTES: u64 = 8 * 1024 * 1024;
 /// Exact footer decoder workspace paired with the encoded footer child.
@@ -39,7 +48,7 @@ pub const FOOTER_DECODE_WORKSPACE_BYTES: u64 = 32 * 1024 * 1024;
 /// Closed writer recipe stamped into every new data file.
 pub const WRITER_RECIPE: &str = "bifrost-writer-v2";
 /// Version of the footer memory-envelope metadata contract.
-pub const PARQUET_MEMORY_ENVELOPE_VERSION: &str = "1";
+pub const PARQUET_MEMORY_ENVELOPE_VERSION: &str = "2";
 
 /// Validates the encoded footer against the child reserved before writer creation.
 ///
@@ -56,7 +65,6 @@ const KEY_RECIPE: &str = "wyrd.bifrost.writer_recipe";
 const KEY_ENVELOPE_VERSION: &str = "wyrd.bifrost.memory_envelope_version";
 const KEY_ROW_GROUP_LOGICAL: &str = "wyrd.bifrost.row_group_logical_bytes";
 const KEY_DECODE_WORKSPACE: &str = "wyrd.bifrost.decode_workspace_bytes";
-const KEY_FILE_BYTES: &str = "wyrd.bifrost.file_bytes";
 const KEY_SCHEMA: &str = "wyrd.bifrost.schema_fingerprint";
 const KEY_OBJECT: &str = "wyrd.bifrost.object_identity";
 const KEY_MAX_ROW: &str = "wyrd.bifrost.max_logical_row_bytes";
@@ -247,7 +255,6 @@ impl BifrostParquetMemoryEnvelope {
                 KEY_DECODE_WORKSPACE,
                 ROW_GROUP_DECODE_WORKSPACE_BYTES.to_string(),
             ),
-            (KEY_FILE_BYTES, MAX_FILE_BYTES.to_string()),
             (KEY_SCHEMA, schema),
             (KEY_OBJECT, object_identity.to_owned()),
             (KEY_MAX_ROW, max_logical_row_bytes.to_string()),
@@ -280,7 +287,6 @@ impl BifrostParquetMemoryEnvelope {
             KEY_ENVELOPE_VERSION,
             KEY_ROW_GROUP_LOGICAL,
             KEY_DECODE_WORKSPACE,
-            KEY_FILE_BYTES,
             KEY_SCHEMA,
             KEY_OBJECT,
             KEY_MAX_ROW,
@@ -295,7 +301,7 @@ impl BifrostParquetMemoryEnvelope {
                 .iter()
                 .any(|entry| !expected_keys.contains(&entry.key.as_str()))
         {
-            return Err("writer-v2 footer metadata is not the exact nine-field set".to_owned());
+            return Err("writer-v2 footer metadata is not the exact eight-field set".to_owned());
         }
         let value = |key: &str| -> Result<&str, String> {
             let mut matches = metadata.iter().filter(|entry| entry.key == key);
@@ -315,10 +321,6 @@ impl BifrostParquetMemoryEnvelope {
                 != ROW_GROUP_DECODE_WORKSPACE_BYTES
         {
             return Err("writer-v2 footer carries an unsupported memory recipe".to_owned());
-        }
-        let file_bytes = parse_canonical_u64(value(KEY_FILE_BYTES)?)?;
-        if file_bytes == 0 || file_bytes > MAX_FILE_BYTES {
-            return Err("writer-v2 file byte ceiling is invalid".to_owned());
         }
         let schema = value(KEY_SCHEMA)?;
         if schema.len() != 64
@@ -1190,7 +1192,7 @@ fn validate_structural_counts(
     elements: usize,
 ) -> Result<(), String> {
     if groups == 0
-        || groups > MAX_FILE_ROW_GROUPS
+        || groups > MAX_FOOTER_ROW_GROUPS
         || leaf_columns == 0
         || leaf_columns > MAX_FILE_LEAF_COLUMNS
         || schema_elements > MAX_FILE_SCHEMA_ELEMENTS
@@ -1508,41 +1510,53 @@ mod tests {
         (directory, path, file[footer_start..file.len() - 8].to_vec())
     }
 
-    /// Joint writer-v2 structural caps accept the maximum grid and reject each excess axis.
+    /// Structural preflight bounds decode work without capping object row groups.
+    ///
+    /// A hot object assembled to its approximately 512 MiB target carries far
+    /// more than the four row groups the deleted whole-object ceiling allowed, so
+    /// a fifth group must now be admitted. What still refuses is every axis that
+    /// actually bounds footer decode: leaf columns, column chunks, schema
+    /// elements, total footer elements, an empty footer, and a row-group count
+    /// past [`MAX_FOOTER_ROW_GROUPS`].
     #[test]
     fn bifrost_parquet_joint_structural_cap_boundaries() {
-        let (_directory, maximum) = structural_footer(64, 4);
-        assert_eq!(maximum.row_groups().len(), 4);
-        assert_eq!(maximum.file_metadata().schema_descr().num_columns(), 64);
-        assert_eq!(
-            maximum
-                .row_groups()
-                .iter()
-                .map(|group| group.columns().len())
-                .sum::<usize>(),
-            256
-        );
-        validate_writer_v2_structure(&maximum).expect("4 x 64 structural grid");
+        let (_directory, wide) = structural_footer(64, 4);
+        assert_eq!(wide.row_groups().len(), 4);
+        assert_eq!(wide.file_metadata().schema_descr().num_columns(), 64);
+        validate_writer_v2_structure(&wide).expect("4 x 64 structural grid");
         assert!(
-            maximum.memory_size()
+            wide.memory_size()
                 <= usize::try_from(FOOTER_DECODE_WORKSPACE_BYTES)
                     .expect("workspace fits address space"),
             "standard-decoder metadata remains inside the 32 MiB workspace"
         );
 
         let (_directory, fifth_group) = structural_footer(64, 5);
-        assert!(validate_writer_v2_structure(&fifth_group).is_err());
+        validate_writer_v2_structure(&fifth_group)
+            .expect("a multi-row-group object is the production shape, not an excess");
+
         let (_directory, sixty_fifth_leaf) = structural_footer(65, 4);
-        assert_eq!(
-            sixty_fifth_leaf
-                .row_groups()
-                .iter()
-                .map(|group| group.columns().len())
-                .sum::<usize>(),
-            260
+        assert!(
+            validate_writer_v2_structure(&sixty_fifth_leaf).is_err(),
+            "the leaf-column ceiling still bounds footer width"
         );
-        assert!(validate_writer_v2_structure(&sixty_fifth_leaf).is_err());
-        assert!(validate_structural_counts(4, 64, 65, 257, 390).is_err());
+        assert!(validate_structural_counts(0, 64, 64, 256, 390).is_err());
+        assert!(
+            validate_structural_counts(MAX_FOOTER_ROW_GROUPS + 1, 64, 64, 256, 390).is_err(),
+            "the decode-bound row-group ceiling still refuses"
+        );
+        assert!(
+            validate_structural_counts(
+                MAX_FOOTER_ROW_GROUPS,
+                64,
+                64,
+                MAX_FILE_COLUMN_CHUNKS + 1,
+                390
+            )
+            .is_err(),
+            "the chunk ceiling still refuses"
+        );
+        assert!(validate_structural_counts(4, 64, 129, 256, 390).is_err());
         assert!(validate_structural_counts(4, 64, 65, 256, 4_097).is_err());
     }
 
@@ -1631,7 +1645,6 @@ mod tests {
             KEY_ENVELOPE_VERSION,
             KEY_ROW_GROUP_LOGICAL,
             KEY_DECODE_WORKSPACE,
-            KEY_FILE_BYTES,
             KEY_SCHEMA,
             KEY_OBJECT,
             KEY_MAX_ROW,
@@ -1690,11 +1703,9 @@ mod tests {
         let metadata = metadata.to_vec();
         for (key, malformed) in [
             (KEY_RECIPE, "bifrost-writer-v1"),
-            (KEY_ENVELOPE_VERSION, "2"),
+            (KEY_ENVELOPE_VERSION, "1"),
             (KEY_ROW_GROUP_LOGICAL, "33554433"),
             (KEY_DECODE_WORKSPACE, "33554431"),
-            (KEY_FILE_BYTES, "0"),
-            (KEY_FILE_BYTES, "134217729"),
             (KEY_SCHEMA, "A"),
             (KEY_SCHEMA, "a"),
             (KEY_OBJECT, "s3://bucket/wrong.parquet"),
@@ -1727,14 +1738,14 @@ mod tests {
         }
     }
 
-    /// Nine metadata fields round-trip and every malformed contract shape refuses.
+    /// Eight metadata fields round-trip and every malformed contract shape refuses.
     #[test]
     fn bifrost_leaf_width_profile_is_schema_bound_and_canonical() {
         let batch = batch(vec!["payload".to_owned()]);
         let object = "s3://bucket/table/day=2026-08-14/part-00000.parquet";
         let metadata = BifrostParquetMemoryEnvelope::metadata_for_batch(&batch, object)
             .expect("canonical metadata");
-        assert_eq!(metadata.len(), 9);
+        assert_eq!(metadata.len(), 8);
         let (_directory, footer) = footer_with_metadata(&batch, metadata.clone());
         let envelope = BifrostParquetMemoryEnvelope::from_footer(
             footer.file_metadata(),

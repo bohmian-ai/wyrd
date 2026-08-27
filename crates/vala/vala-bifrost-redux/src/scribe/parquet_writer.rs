@@ -5,7 +5,7 @@
 //! `(data_tenant_id, wyrd_event_time)` and takes its partition day from the
 //! seal-key (never from row min/max).
 
-use std::io::{BufReader, BufWriter, Read, Seek, Write};
+use std::io::{BufReader, BufWriter, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -28,7 +28,7 @@ use crate::catalog::layout::PhysicalLayout;
 use crate::catalog::layout::TimePartition;
 use crate::contracts::ScribeError;
 use crate::parquet::memory::{
-    BifrostArrowLogicalSizer, BifrostParquetMemoryEnvelope, BoundedRowSlice, MAX_FILE_BYTES,
+    BifrostArrowLogicalSizer, BifrostParquetMemoryEnvelope, BoundedRowSlice,
     MAX_LOGICAL_ROW_GROUP_BYTES, validate_writer_v2_structure,
 };
 use crate::parquet::writer_properties::bifrost_writer_properties_with_metadata;
@@ -283,53 +283,6 @@ pub struct BoundedParquetArtifact {
     pub row_count: usize,
     /// Footer-derived row-group statistics.
     pub row_group_stats: Vec<RowGroupStats>,
-}
-
-/// File sink that refuses before crossing the 128 MiB physical ceiling.
-struct CappedScratchWriter {
-    inner: BufWriter<std::fs::File>,
-    written: u64,
-}
-
-impl CappedScratchWriter {
-    /// Wraps one newly created generation-owned file.
-    fn new(file: std::fs::File) -> Self {
-        Self {
-            inner: BufWriter::new(file),
-            written: 0,
-        }
-    }
-}
-
-impl Write for CappedScratchWriter {
-    /// Writes only complete buffers that fit the closed physical ceiling.
-    ///
-    /// # Errors
-    /// Returns `StorageFull` before mutation when the buffer would cross the cap,
-    /// or propagates the underlying scratch-file error.
-    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        let requested = u64::try_from(buffer.len()).unwrap_or(u64::MAX);
-        if self.written.saturating_add(requested) > MAX_FILE_BYTES {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::StorageFull,
-                "Scribe writer-v2 artifact exceeds 128 MiB",
-            ));
-        }
-        let written = self.inner.write(buffer)?;
-        self.written = self
-            .written
-            .checked_add(u64::try_from(written).unwrap_or(u64::MAX))
-            .ok_or_else(|| std::io::Error::other("Scribe scratch byte count overflows"))?;
-        Ok(written)
-    }
-
-    /// Flushes admitted bytes to the generation-owned file.
-    ///
-    /// # Errors
-    /// Propagates the underlying scratch-file flush error.
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
 }
 
 /// Statistics for a single row group.
@@ -599,7 +552,7 @@ impl ParquetBatchEncoder<'_> {
             detail: format!("create writer-v2 scratch artifact: {error}"),
         })?;
         let mut writer = ArrowWriter::try_new(
-            CappedScratchWriter::new(file),
+            BufWriter::new(file),
             artifact_batch.schema(),
             Some(bifrost_writer_properties_with_metadata(
                 artifact_batch.num_rows(),
@@ -623,9 +576,9 @@ impl ParquetBatchEncoder<'_> {
                 detail: format!("stat writer-v2 scratch artifact: {error}"),
             })?
             .len();
-        if file_size == 0 || file_size > MAX_FILE_BYTES {
+        if file_size == 0 {
             return Err(ScribeError::Internal {
-                detail: "writer-v2 sealed artifact violates its file ceiling".to_owned(),
+                detail: "writer-v2 sealed artifact is empty".to_owned(),
             });
         }
         match inspect_sealed_artifact(

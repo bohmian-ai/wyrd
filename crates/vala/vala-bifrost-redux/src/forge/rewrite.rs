@@ -410,14 +410,28 @@ use super::planner::ForgePlanCandidate;
 use super::planner::{ForgeCapacity, ForgePlanner};
 use crate::catalog::TenantTableBinding;
 use crate::parquet::memory::{
-    BifrostArrowLogicalSizer, BifrostParquetMemoryEnvelope, BoundedRowSlice, MAX_FILE_BYTES,
-    MAX_FILE_ROW_GROUPS, MAX_LOGICAL_ROW_GROUP_BYTES, MAX_ROW_GROUP_ROWS,
+    BifrostArrowLogicalSizer, BifrostParquetMemoryEnvelope, BoundedRowSlice,
+    MAX_LOGICAL_ROW_GROUP_BYTES, MAX_ROW_GROUP_ROWS,
 };
 use crate::parquet::writer_properties::bifrost_writer_properties_with_metadata;
 use crate::resources::ForgeRewriteRequest;
 use vala_sql::OperatorPool;
 use vala_sql::row_types::forge_tasks::ForgeTaskEstimates;
 
+/// Maximum encoded bytes Forge writes into one rewrite output object.
+///
+/// This is Forge's own output geometry and is deliberately independent of the
+/// Scribe hot-object target: Scribe assembles approximately 512 MiB hot objects
+/// from staged runs, and Forge later rewrites those objects toward its own
+/// Iceberg-facing target. Sharing one constant between the two made a change to
+/// either geometry silently move the other, so each owner names its own bound.
+const FORGE_OUTPUT_MAX_FILE_BYTES: u64 = 128 * 1024 * 1024;
+/// Maximum row groups Forge writes into one rewrite output object.
+///
+/// Paired with [`FORGE_OUTPUT_MAX_FILE_BYTES`]: together they bound one rewrite
+/// output so a single object never grows past what a maintenance worker can
+/// re-read within its admitted memory.
+const FORGE_OUTPUT_MAX_ROW_GROUPS: usize = 4;
 /// Maximum rows decoded from one Parquet source batch.
 const REWRITE_BATCH_ROWS: usize = 8_192;
 /// Byte threshold that forces the current Parquet row group to flush.
@@ -1041,15 +1055,15 @@ impl RewriteBatchState {
     fn should_rotate(&self, output_file_bytes: u64) -> bool {
         self.writer.as_ref().is_some_and(|writer| {
             self.writer_rows > 0
-                && (self.writer_row_groups >= MAX_FILE_ROW_GROUPS
+                && (self.writer_row_groups >= FORGE_OUTPUT_MAX_ROW_GROUPS
                     || u64::try_from(writer.bytes_written() + writer.in_progress_size())
                         .unwrap_or(u64::MAX)
                         >= output_file_bytes)
         })
     }
 
-    /// Report whether appending another physical group would cross the hard
-    /// writer-v2 row-group ceiling.
+    /// Report whether appending another physical group would cross Forge's hard
+    /// output row-group ceiling.
     fn would_exceed_row_groups(&self, slices: &[BoundedRowSlice]) -> bool {
         if self.writer.is_none() {
             return false;
@@ -1072,7 +1086,7 @@ impl RewriteBatchState {
             logical_bytes = logical_bytes.saturating_add(slice.logical_bytes);
             rows = rows.saturating_add(slice.len);
         }
-        groups > MAX_FILE_ROW_GROUPS
+        groups > FORGE_OUTPUT_MAX_ROW_GROUPS
     }
 
     /// Opens the streaming writer for the next output object.
@@ -1498,8 +1512,8 @@ async fn reserve_decoded_batch_slot(
 
 /// Removes the next physical file's contiguous logical row groups.
 ///
-/// The operator target is a preferred rotation boundary, while the writer-v2
-/// row-group count and 128 MiB file ceiling are hard bounds. A first row group
+/// The operator target is a preferred rotation boundary, while Forge's own
+/// row-group count and file-byte ceiling are hard bounds. A first row group
 /// larger than a small operator target is still admitted because it already
 /// satisfies the independent 32 MiB row-group contract.
 fn take_physical_file_group(
@@ -1509,10 +1523,10 @@ fn take_physical_file_group(
     let Some(first) = pending.pop_front() else {
         return Vec::new();
     };
-    let target = operator_target_bytes.clamp(1, MAX_FILE_BYTES);
+    let target = operator_target_bytes.clamp(1, FORGE_OUTPUT_MAX_FILE_BYTES);
     let mut logical_bytes = first.logical_bytes;
     let mut group = vec![first];
-    while group.len() < MAX_FILE_ROW_GROUPS {
+    while group.len() < FORGE_OUTPUT_MAX_ROW_GROUPS {
         let Some(next) = pending.front() else {
             break;
         };
@@ -3530,7 +3544,7 @@ mod tests {
 
         let mut large_target = slices;
         let first = take_physical_file_group(&mut large_target, u64::MAX);
-        assert_eq!(first.len(), MAX_FILE_ROW_GROUPS);
+        assert_eq!(first.len(), FORGE_OUTPUT_MAX_ROW_GROUPS);
         assert_eq!(
             large_target.len(),
             2,

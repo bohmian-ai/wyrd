@@ -262,12 +262,13 @@ impl ScribeHotSourceRegistry {
         let authorities = state.get_mut(key).ok_or(HotSourceError::Unregistered {
             generation: generation.get(),
         })?;
-        let current = authorities
-            .by_generation
-            .get(&generation)
-            .ok_or(HotSourceError::Unregistered {
-                generation: generation.get(),
-            })?;
+        let current =
+            authorities
+                .by_generation
+                .get(&generation)
+                .ok_or(HotSourceError::Unregistered {
+                    generation: generation.get(),
+                })?;
         if !current.is_durable() {
             return Err(HotSourceError::NotDurable {
                 generation: generation.get(),
@@ -294,9 +295,10 @@ impl ScribeHotSourceRegistry {
         key: &SealKey,
         generation: GenerationOrdinal,
     ) -> Result<Option<HotAuthority>, HotSourceError> {
-        Ok(self.lock()?.get(key).and_then(|authorities| {
-            authorities.by_generation.get(&generation).cloned()
-        }))
+        Ok(self
+            .lock()?
+            .get(key)
+            .and_then(|authorities| authorities.by_generation.get(&generation).cloned()))
     }
 
     /// Returns one key's live generations, oldest first, with their authorities.
@@ -478,7 +480,9 @@ mod tests {
             .advance(&key, generation, staged())
             .expect("staging succeeds");
         assert!(registry.is_fully_durable(&key).expect("locked"));
-        let released = registry.release(&key, generation).expect("release succeeds");
+        let released = registry
+            .release(&key, generation)
+            .expect("release succeeds");
         assert!(released.is_durable());
         assert_eq!(registry.authority(&key, generation).expect("locked"), None);
     }

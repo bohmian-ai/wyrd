@@ -988,7 +988,10 @@ mod tests {
                 .geometry()
                 .guaranteed_width()
         );
-        assert!(actual < required, "the refusal must name the real shortfall");
+        assert!(
+            actual < required,
+            "the refusal must name the real shortfall"
+        );
         assert!(
             ContentionCategory::ALL
                 .iter()

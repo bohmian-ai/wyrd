@@ -734,29 +734,31 @@ pub async fn compose_bifrost(
                     controls.scribe_persistence_faults.clone()
                 }),
         );
-        let scribe = Arc::new(ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
-            catalog: Some(Arc::clone(&bifrost)),
-            operator: Arc::new(storage.operator().clone()),
-            wal,
-            stream,
-            admission,
-            coordination_runtime: coordination_handle,
-            execution_pools,
-            persistence: Some(persistence),
-            resources: bifrost_resources.scribe().ok_or_else(|| {
-                ServerBootError::Scribe(
-                    "Scribe role selected without a composed Scribe capability".to_owned(),
-                )
+        let scribe = Arc::new(
+            ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
+                catalog: Some(Arc::clone(&bifrost)),
+                operator: Arc::new(storage.operator().clone()),
+                wal,
+                stream,
+                admission,
+                coordination_runtime: coordination_handle,
+                execution_pools,
+                persistence: Some(persistence),
+                resources: bifrost_resources.scribe().ok_or_else(|| {
+                    ServerBootError::Scribe(
+                        "Scribe role selected without a composed Scribe capability".to_owned(),
+                    )
+                })?,
+                ingest_limits: scribe_config.ingest_limits(),
+                geometry,
+                staging_file_publisher: Some(staging_file_publisher),
+            })
+            .map_err(|error| {
+                ServerBootError::Scribe(format!(
+                    "Scribe cannot serve its configured contention width on this node: {error}"
+                ))
             })?,
-            ingest_limits: scribe_config.ingest_limits(),
-            geometry,
-            staging_file_publisher: Some(staging_file_publisher),
-        })
-        .map_err(|error| {
-            ServerBootError::Scribe(format!(
-                "Scribe cannot serve its configured contention width on this node: {error}"
-            ))
-        })?);
+        );
         if let Err(error) = scribe.replay_wal_async().await {
             if let Err(cleanup_error) = cluster_registry.shutdown_role(scribe_role.clone()).await {
                 tracing::warn!(%cleanup_error, "failed to release reserved Scribe fence after recovery failure");

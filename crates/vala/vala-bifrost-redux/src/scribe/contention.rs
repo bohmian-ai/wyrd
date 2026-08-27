@@ -364,7 +364,7 @@ impl ScribeContentionLedger {
             tenant
                 .tables
                 .insert(key.table.clone(), TenantTableLedger::default());
-            state.tenants.insert(key.tenant.clone(), tenant);
+            state.tenants.insert(key.tenant, tenant);
             return Ok(());
         };
 
@@ -515,15 +515,14 @@ impl ScribeContentionLedger {
         let tenant_ceiling = tenant_protected.saturating_add(tenant_surplus_share);
         let table_ceiling = reserve.saturating_add(tenant_surplus_share / active_tables);
 
-        let exhausted = |scope: &'static str, protected: usize, ceiling: usize| {
-            ContentionRefusal::Exhausted {
+        let exhausted =
+            |scope: &'static str, protected: usize, ceiling: usize| ContentionRefusal::Exhausted {
                 scope,
                 category: category.label(),
                 protected,
                 ceiling,
                 requested: amount,
-            }
-        };
+            };
         let current = usage.get(category);
         let next_usage = current
             .checked_add(amount)
@@ -681,8 +680,7 @@ mod tests {
     use crate::namespaces::BifrostNamespace;
     use crate::scribe::geometry::{
         DEFAULT_ACTIVE_GENERATION_BUDGET_BYTES, DEFAULT_GENERATION_MAX_AGE,
-        DEFAULT_GENERATION_ROTATION_CEILING_BYTES,
-        DEFAULT_MAXIMUM_ACTIVE_REQUEST_OWNERSHIP_BYTES,
+        DEFAULT_GENERATION_ROTATION_CEILING_BYTES, DEFAULT_MAXIMUM_ACTIVE_REQUEST_OWNERSHIP_BYTES,
         DEFAULT_MAXIMUM_IMMUTABLE_MEMBER_OWNERSHIP_BYTES, DEFAULT_MINIMUM_MERGE_LANE_SCRATCH_BYTES,
         DEFAULT_MINIMUM_STAGE_MEMBER_BYTES, DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES,
         DEFAULT_WAL_SEGMENT_BYTES, ScribeGeometry,
@@ -705,7 +703,7 @@ mod tests {
     ///
     /// # Panics
     ///
-    /// Panics when the synthetic identifier is not a valid UUIDv7 tenant.
+    /// Panics when the synthetic identifier is not a valid `UUIDv7` tenant.
     fn tenant_id(tenant: u8) -> DataTenantId {
         let mut bytes = [tenant; 16];
         // Force the UUIDv7 version and variant nibbles the identifier requires.
@@ -789,7 +787,9 @@ mod tests {
             for table in ["system", "dynamic"] {
                 ledger
                     .activate(&key(tenant, table))
-                    .unwrap_or_else(|error| panic!("tenant {tenant}/{table} must activate: {error}"));
+                    .unwrap_or_else(|error| {
+                        panic!("tenant {tenant}/{table} must activate: {error}")
+                    });
             }
         }
         let late = key(4, "dynamic");
@@ -863,11 +863,7 @@ mod tests {
         // Alone, the tenant's share is the whole surplus, and its one table's
         // share of that is the whole thing again.
         ledger
-            .charge(
-                &first,
-                ContentionCategory::Active,
-                vector.active_bytes * 5,
-            )
+            .charge(&first, ContentionCategory::Active, vector.active_bytes * 5)
             .expect("a lone tenant may borrow the whole surplus");
         // Exhausting `active` says nothing about `immutable`.
         ledger
@@ -881,11 +877,7 @@ mod tests {
         ledger.activate(&second).expect("second tenant activates");
         assert!(
             ledger
-                .charge(
-                    &second,
-                    ContentionCategory::Active,
-                    vector.active_bytes * 4
-                )
+                .charge(&second, ContentionCategory::Active, vector.active_bytes * 4)
                 .is_err(),
             "the arriving tenant is bounded by its own equal half-share"
         );
@@ -923,7 +915,9 @@ mod tests {
         assert_eq!(category, ContentionCategory::AdmissionItems.label());
 
         // The second table inside an active tenant is already paid for.
-        ledger.activate(&key(1, "b")).expect("reserved second table");
+        ledger
+            .activate(&key(1, "b"))
+            .expect("reserved second table");
         // A third table in that tenant needs a whole extra vector the pod lacks.
         let refusal = ledger
             .activate(&key(1, "c"))

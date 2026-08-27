@@ -393,9 +393,12 @@ const COMPACTED_BATCH_ROWS: i64 = 20;
 
 /// Number of rows written after compaction. These stay in the hot manifest for
 /// the duration of the journey, so the query's cut spans both physical tiers.
+///
+/// Every one of them matches the predicate, which is what isolates the two
+/// leaves' pruning from each other — see [`marker_value`].
 const HOT_BATCH_ROWS: i64 = 8;
 
-/// Every fourth row carries the selective marker, in both batches.
+/// Every fourth row of the compacted batch carries the selective marker.
 const MARKER_STRIDE: i64 = 4;
 
 /// Ids in the second batch start here so a returned id names, unambiguously,
@@ -423,9 +426,14 @@ const HOT_BATCH_ID_BASE: i64 = 101;
 /// Id ranges are disjoint across the two batches, so the returned ids are the
 /// proof that both leaves executed: an id below `HOT_BATCH_ID_BASE` exists only
 /// inside the compacted data file, and an id at or above it exists only in the
-/// hot manifest. Row-group pruning is then required to move against the
-/// unfiltered baseline, which is what regresses if the follower stops passing
-/// `assignment.predicates` into `provider.scan` on the compacted leaf.
+/// hot manifest.
+///
+/// Pruning is then required to move bytes scanned against an unfiltered
+/// baseline of the same cut, and the fixture is shaped so that only the
+/// compacted leaf can move it: every hot row matches the predicate, so the hot
+/// leaf reads the same bytes either way. Removing `assignment.predicates` from
+/// the follower's `provider.scan` call collapses the difference to zero, which
+/// is the regression this leg exists to catch.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
 async fn pg_bifrost_selective_predicate_spans_hot_and_compacted_reads() {
@@ -505,9 +513,6 @@ async fn prove_hot_and_compacted_pruning() -> Result<(), JourneyError> {
         .telemetry()
         .delta_since(&unfiltered_checkpoint)
         .map_err(|error| error.to_string())?;
-    let unfiltered_row_groups =
-        sum_metric(&unfiltered_delta, "oracle_query_row_groups_scanned_total");
-    let unfiltered_pruned = sum_metric(&unfiltered_delta, "oracle_query_row_groups_pruned_total");
     let unfiltered_bytes = sum_metric(&unfiltered_delta, "oracle_query_bytes_scanned_total");
 
     let selective_checkpoint = cluster
@@ -537,6 +542,7 @@ async fn prove_hot_and_compacted_pruning() -> Result<(), JourneyError> {
     }
     // The span proof. These two conditions cannot both hold unless the
     // compacted leaf and the hot leaf each contributed rows to one query.
+    // Their id ranges are disjoint and each range lives in exactly one tier.
     if !selective_ids.iter().any(|id| *id < HOT_BATCH_ID_BASE) {
         return Err(format!(
             "no compacted-tier row reached the client: {selective_ids:?}"
@@ -551,22 +557,23 @@ async fn prove_hot_and_compacted_pruning() -> Result<(), JourneyError> {
         .telemetry()
         .delta_since(&selective_checkpoint)
         .map_err(|error| error.to_string())?;
-    let selective_row_groups =
-        sum_metric(&selective_delta, "oracle_query_row_groups_scanned_total");
-    let selective_pruned = sum_metric(&selective_delta, "oracle_query_row_groups_pruned_total");
     let selective_bytes = sum_metric(&selective_delta, "oracle_query_bytes_scanned_total");
-    // Required positively, as on the single-tier distributed leg: `sum_metric`
-    // reports an absent family as 0.0, so a missing series must fail here.
-    if selective_row_groups >= unfiltered_row_groups || selective_pruned - unfiltered_pruned <= 0.0
-    {
-        return Err(format!(
-            "two-tier selective query must scan strictly fewer row groups and prune strictly more: \
-             row groups selective={selective_row_groups} unfiltered={unfiltered_row_groups}; \
-             pruned selective={selective_pruned} unfiltered={unfiltered_pruned}; \
-             bytes selective={selective_bytes} unfiltered={unfiltered_bytes}"
-        )
-        .into());
-    }
+    // Bytes, not row groups, is the pruning signal for the compacted leaf, and
+    // the choice is forced rather than preferred.
+    // `oracle_query_row_groups_{scanned,pruned}_total` are fed only by
+    // `OracleScanMetricsHandle::record_row_groups`, which the hot Parquet
+    // reader calls and the Iceberg reader does not; the compacted leaf's
+    // counters come from `iceberg::arrow::ScanMetrics`, which exposes byte
+    // ranges and nothing else. Asserting on row groups here would therefore
+    // measure the hot leaf and report it as coverage of the compacted one.
+    //
+    // Attribution still holds: every hot row matches the predicate, so the hot
+    // leaf reads identical bytes filtered and unfiltered, and the whole of this
+    // difference is the compacted leaf skipping row groups inside its published
+    // data file. Removing `assignment.predicates` from the follower's
+    // `provider.scan` call collapses it to zero, which is what makes this a
+    // real assertion rather than a restatement of the fixture.
+    //
     // Strict `Less` rather than a negated `<`: an incomparable (NaN) metric
     // must fail this proof, not silently satisfy it.
     if !matches!(
@@ -574,7 +581,8 @@ async fn prove_hot_and_compacted_pruning() -> Result<(), JourneyError> {
         Some(std::cmp::Ordering::Less)
     ) {
         return Err(format!(
-            "two-tier selective query must scan strictly fewer bytes: selective={selective_bytes} unfiltered={unfiltered_bytes}"
+            "compacted leaf must scan strictly fewer bytes under the signed predicate: \
+             selective={selective_bytes} unfiltered={unfiltered_bytes}"
         )
         .into());
     }
@@ -583,10 +591,18 @@ async fn prove_hot_and_compacted_pruning() -> Result<(), JourneyError> {
     Ok(())
 }
 
-/// The marker a given id carries. Every `MARKER_STRIDE`-th id is selective, so
-/// both batches contain matching and non-matching rows.
+/// The marker a given id carries: every `MARKER_STRIDE`-th row of the
+/// compacted batch, and every row of the hot batch.
+///
+/// The asymmetry is the point. `oracle_query_row_groups_pruned_total` carries
+/// no per-source label, so a pruning delta on a two-tier query says only that
+/// *some* leaf pruned. Making every hot row match leaves the hot leaf with
+/// nothing it is allowed to skip, so a nonzero delta can only have come from
+/// the compacted leaf. Without this, the hot leaf alone satisfies the
+/// assertion and a compacted leaf that stopped pushing predicates entirely
+/// still passes.
 fn marker_value(id: i64) -> &'static str {
-    if id % MARKER_STRIDE == 0 {
+    if id >= HOT_BATCH_ID_BASE || id % MARKER_STRIDE == 0 {
         "target"
     } else {
         "other"

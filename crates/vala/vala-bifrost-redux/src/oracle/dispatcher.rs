@@ -105,6 +105,40 @@ pub enum DispatchError {
     TenantInvariant,
 }
 
+impl DispatchError {
+    /// Whether the leader's partition classification depends on this failure
+    /// keeping its own identity.
+    ///
+    /// Three failures make
+    /// [`classify_partition_attempt`](super::exec::classify_partition_attempt)
+    /// fail the partition outright: [`Self::Terminal`] is a contract or
+    /// peer-security violation, [`Self::TenantInvariant`] is a physically
+    /// scanned foreign-tenant row, and [`Self::StaleObject`] means the pinned
+    /// cut moved and the query owes a replan. Reporting any of them as a
+    /// partial converts a refusal into a degraded success — for the tenant
+    /// tripwire that is a silent isolation breach, because the leader would
+    /// return the surviving participants' rows and blame a timeout.
+    ///
+    /// Every other failure only degrades the partition, so a boundary is free
+    /// to soften it into whichever [`DispatchPartialReason`] describes where it
+    /// happened.
+    ///
+    /// This is the single authority for that split. Both dispatch boundaries —
+    /// stream open and mid-stream frame delivery — ask here rather than each
+    /// carrying its own list, because the two lists previously disagreed and
+    /// the tenant refusal fell through the gap.
+    const fn must_reach_leader_unchanged(&self) -> bool {
+        match self {
+            Self::Terminal | Self::TenantInvariant | Self::StaleObject => true,
+            Self::Partial { .. }
+            | Self::Unavailable
+            | Self::EligibleSourceLoss { .. }
+            | Self::Capacity
+            | Self::FileNotFound => false,
+        }
+    }
+}
+
 /// Longest a peer waits out a saturated running-slot pool before refusing.
 ///
 /// Sized far below the query deadline so peer backpressure never becomes a
@@ -2753,24 +2787,7 @@ impl FragmentDispatcher {
                     "oracle peer remote execute open failed"
                 );
                 record_peer_attempt(FragmentOutcome::Failed, dispatch_error_label(&error));
-                Err(match error {
-                    DispatchError::Terminal => DispatchError::Terminal,
-                    DispatchError::StaleObject => DispatchError::StaleObject,
-                    DispatchError::FileNotFound => DispatchError::FileNotFound,
-                    // A foreign-tenant refusal is a property of the data, not
-                    // of this candidate, so it must never soften into a setup
-                    // partial that another participant's rows could mask.
-                    DispatchError::TenantInvariant => DispatchError::TenantInvariant,
-                    DispatchError::Partial { attempt, reason } => {
-                        DispatchError::Partial { attempt, reason }
-                    }
-                    DispatchError::Unavailable
-                    | DispatchError::EligibleSourceLoss { .. }
-                    | DispatchError::Capacity => DispatchError::Partial {
-                        attempt: None,
-                        reason: DispatchPartialReason::Setup,
-                    },
-                })
+                Err(open_failure(error))
             }
         }
     }
@@ -2845,41 +2862,40 @@ impl FragmentDispatcher {
     }
 }
 
+/// Maps one stream-open failure to the outcome the leader must classify.
+///
+/// No frame was delivered, so a softened failure carries no attempt: the
+/// leader keeps whatever the other participants produced and records that this
+/// one never started. A failure
+/// [`DispatchError::must_reach_leader_unchanged`] identifies is returned as-is,
+/// and an already-softened [`DispatchError::Partial`] keeps the reason and
+/// payload its own boundary chose rather than being relabelled `Setup`.
+fn open_failure(error: DispatchError) -> DispatchError {
+    if error.must_reach_leader_unchanged() || matches!(error, DispatchError::Partial { .. }) {
+        return error;
+    }
+    DispatchError::Partial {
+        attempt: None,
+        reason: DispatchPartialReason::Setup,
+    }
+}
+
 /// Maps one mid-stream frame failure to the outcome the leader must classify.
 ///
-/// A frame stream can die after the attempt opened, and what the leader is
-/// allowed to do about it depends entirely on *which* failure it was. Three of
-/// them make [`classify_partition_attempt`](super::exec) fail the partition
-/// outright, so they must arrive unchanged: [`DispatchError::Terminal`] is a
-/// contract or peer-security violation, [`DispatchError::TenantInvariant`] is a
-/// physically scanned foreign-tenant row, and [`DispatchError::StaleObject`]
-/// means the pinned cut moved and the query owes a replan. Softening any of
-/// them into a partial converts a refusal into a degraded success — for the
-/// tenant tripwire that is a silent tenant-isolation breach, because the leader
-/// would return the surviving participants' rows and report a timeout.
-///
-/// Every remaining failure only degrades the partition, so each becomes a
-/// [`DispatchPartialReason::Timeout`] partial carrying whatever `buffer`
-/// already decoded. Keeping those batches is the point of the partial: the
-/// leader folds them into the degraded result instead of discarding delivered
-/// rows.
-///
-/// The match is exhaustive on purpose. A new [`DispatchError`] variant must not
-/// be able to inherit "soften into a partial" by falling through a wildcard,
-/// which is how the tenant refusal previously lost its reason here.
+/// The attempt already opened and may have delivered batches, so a softened
+/// failure carries whatever `buffer` decoded before the stream died. Keeping
+/// those batches is the point of the partial: the leader folds them into the
+/// degraded result instead of discarding delivered rows. A failure
+/// [`DispatchError::must_reach_leader_unchanged`] identifies is returned as-is,
+/// and the buffered batches are dropped with it — the leader fails that
+/// partition, so there is nothing to fold them into.
 fn mid_stream_failure(error: DispatchError, buffer: AttemptBuffer) -> DispatchError {
-    match error {
-        error @ (DispatchError::Terminal
-        | DispatchError::TenantInvariant
-        | DispatchError::StaleObject) => error,
-        DispatchError::Partial { .. }
-        | DispatchError::Unavailable
-        | DispatchError::EligibleSourceLoss { .. }
-        | DispatchError::Capacity
-        | DispatchError::FileNotFound => DispatchError::Partial {
-            attempt: buffer.finish_partial().ok(),
-            reason: DispatchPartialReason::Timeout,
-        },
+    if error.must_reach_leader_unchanged() {
+        return error;
+    }
+    DispatchError::Partial {
+        attempt: buffer.finish_partial().ok(),
+        reason: DispatchPartialReason::Timeout,
     }
 }
 
@@ -2930,13 +2946,56 @@ mod tests {
             .expect("a fresh buffer reserves inside a 1 MiB pool")
     }
 
-    /// A frame stream that dies mid-attempt must not soften a refusal.
+    /// Neither dispatch boundary may soften a partition-failing refusal.
     ///
     /// `Terminal`, `TenantInvariant`, and `StaleObject` each make the leader
-    /// fail the partition outright, so each must reach it unchanged; folding
-    /// one into a partial turns a refusal into a degraded success, which for
-    /// the tenant tripwire is a silent isolation breach. Every other failure
-    /// only degrades the partition and so becomes a timeout partial.
+    /// fail the partition outright, so each must reach it unchanged from both
+    /// the stream open and a mid-stream frame death; folding one into a partial
+    /// turns a refusal into a degraded success, which for the tenant tripwire
+    /// is a silent isolation breach.
+    #[test]
+    fn neither_boundary_softens_a_partition_failing_refusal() {
+        for error in [
+            DispatchError::Terminal,
+            DispatchError::TenantInvariant,
+            DispatchError::StaleObject,
+        ] {
+            let label = format!("{error:?}");
+            assert!(
+                error.must_reach_leader_unchanged(),
+                "{label} must be preserved"
+            );
+            assert!(
+                open_failure(error).must_reach_leader_unchanged(),
+                "{label} must survive the open boundary"
+            );
+        }
+    }
+
+    /// A stream that never opened degrades with no attempt, and an already
+    /// softened partial keeps the reason its own boundary chose.
+    #[test]
+    fn open_failure_degrades_recoverable_losses_without_an_attempt() {
+        assert!(matches!(
+            open_failure(DispatchError::Unavailable),
+            DispatchError::Partial {
+                attempt: None,
+                reason: DispatchPartialReason::Setup,
+            }
+        ));
+        assert!(matches!(
+            open_failure(DispatchError::Partial {
+                attempt: None,
+                reason: DispatchPartialReason::Decoder,
+            }),
+            DispatchError::Partial {
+                reason: DispatchPartialReason::Decoder,
+                ..
+            }
+        ));
+    }
+
+    /// A frame stream that dies mid-attempt must not soften a refusal.
     #[test]
     fn mid_stream_failure_preserves_partition_failing_refusals() {
         assert!(matches!(

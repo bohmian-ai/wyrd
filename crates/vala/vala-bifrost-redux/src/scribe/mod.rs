@@ -9,6 +9,7 @@ pub mod execution_lanes;
 pub mod file_list_writer;
 pub mod filename;
 mod fixed_ipc;
+pub mod geometry;
 mod ingress;
 pub mod manifest;
 mod material_plan;
@@ -577,12 +578,12 @@ pub struct ScribeBuildConfig {
     pub resources: crate::resources::ScribeResources,
     /// Immutable boot-selected ingest ceilings shared with Gate.
     pub ingest_limits: crate::gate::limits::IngestLimits,
-    /// Encoded and uncompressed WAL target for whole-shard rotation.
-    pub wal_rotation_bytes: u64,
-    /// Target bytes for one non-empty memtable before rotation.
-    pub memtable_rotation_bytes: usize,
-    /// Maximum age of one active memtable before rotation.
-    pub memtable_max_age: Duration,
+    /// Validated independent geometry every rotation limit derives from.
+    ///
+    /// Scribe takes the whole checked value object rather than three loose
+    /// numbers so a caller cannot pass a WAL target that disagrees with the
+    /// generation limit the same boot installed.
+    pub geometry: geometry::ScribeGeometry,
     /// Optional bounded local wake-up publisher for committed staging files.
     pub staging_file_publisher: Option<StagingFilePublisher>,
 }
@@ -636,31 +637,32 @@ pub struct ScribeEmbeddedConfig {
 }
 
 impl ScribeEmbeddedConfig {
-    /// Selects the writer's configured WAL target unless test support overrides it.
-    fn wal_rotation_bytes(&self, wal: &wal::WalWriter) -> u64 {
+    /// Derives the geometry an embedded Scribe runs under.
+    ///
+    /// The WAL segment target is read back from the already-constructed writer
+    /// rather than re-declared, so an embedded Scribe can never rotate its
+    /// shards against a segment size the writer does not actually use.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a test-support rotation override is not a coherent geometry,
+    /// which is a fixture bug rather than an operator input.
+    fn geometry(&self, wal: &wal::WalWriter) -> geometry::ScribeGeometry {
         #[cfg(any(test, feature = "test-support"))]
         if let Some(rotation) = self.rotation_for_test {
-            return rotation.wal_rotation_bytes;
+            return geometry::ScribeGeometry::for_uniform_shard_rotation(
+                rotation.wal_rotation_bytes,
+                rotation.memtable_rotation_bytes,
+                rotation.memtable_max_age,
+            )
+            .expect("a test-support rotation override must be a coherent geometry");
         }
-        wal.segment_bytes()
-    }
-
-    /// Selects the production memtable target unless test support overrides it.
-    fn memtable_rotation_bytes(&self) -> usize {
-        #[cfg(any(test, feature = "test-support"))]
-        if let Some(rotation) = self.rotation_for_test {
-            return rotation.memtable_rotation_bytes;
-        }
-        memtable::MEMTABLE_ROTATION_BYTES
-    }
-
-    /// Selects the production age target unless test support overrides it.
-    fn memtable_max_age(&self) -> Duration {
-        #[cfg(any(test, feature = "test-support"))]
-        if let Some(rotation) = self.rotation_for_test {
-            return rotation.memtable_max_age;
-        }
-        ScribePressureConfig::default().seal_max_age
+        geometry::ScribeGeometry::for_uniform_shard_rotation(
+            wal.segment_bytes(),
+            memtable::MEMTABLE_ROTATION_BYTES,
+            ScribePressureConfig::default().seal_max_age,
+        )
+        .expect("the embedded default rotation targets form a coherent geometry")
     }
 }
 
@@ -913,9 +915,7 @@ impl ScribeImpl {
         sync_delay: std::time::Duration,
         config: ScribeEmbeddedConfig,
     ) -> Result<Self, String> {
-        let wal_rotation_bytes = config.wal_rotation_bytes(&wal);
-        let memtable_rotation_bytes = config.memtable_rotation_bytes();
-        let memtable_max_age = config.memtable_max_age();
+        let geometry = config.geometry(&wal);
         let execution_pools = ScribeExecutionPools::new(
             ScribeIngressCpuPool::try_new_with_capacity(
                 config.lane_config.ingress_cpu_threads,
@@ -951,9 +951,7 @@ impl ScribeImpl {
             persistence: config.persistence,
             resources: config.resources,
             ingest_limits: crate::gate::limits::IngestLimits::default(),
-            wal_rotation_bytes,
-            memtable_rotation_bytes,
-            memtable_max_age,
+            geometry,
             staging_file_publisher: None,
         }))
     }
@@ -1058,9 +1056,7 @@ impl ScribeImpl {
         writer_epoch: i64,
         config: ScribeEmbeddedConfig,
     ) -> Self {
-        let wal_rotation_bytes = config.wal_rotation_bytes(&wal);
-        let memtable_rotation_bytes = config.memtable_rotation_bytes();
-        let memtable_max_age = config.memtable_max_age();
+        let geometry = config.geometry(&wal);
         let stream = stream_identity::StreamIdentity::new(
             stream_identity::NodeId::new(
                 uuid::Uuid::parse_str(node_id).expect("embedded Scribe node_id must be a UUID"),
@@ -1088,9 +1084,7 @@ impl ScribeImpl {
             persistence: config.persistence,
             resources: config.resources,
             ingest_limits: crate::gate::limits::IngestLimits::default(),
-            wal_rotation_bytes,
-            memtable_rotation_bytes,
-            memtable_max_age,
+            geometry,
             staging_file_publisher: config.staging_file_publisher,
         })
     }
@@ -1146,11 +1140,10 @@ impl ScribeImpl {
             admission: _,
             resources: _,
             ingest_limits,
-            wal_rotation_bytes,
-            memtable_rotation_bytes,
-            memtable_max_age,
+            geometry,
             staging_file_publisher,
         } = config;
+        let seal_max_age = geometry.generation_max_age();
         let (node_id, writer_epoch) = (stream.node_id.to_string(), stream.writer_epoch.as_i64());
         let ScribeExecutionPools {
             ingress_cpu,
@@ -1182,9 +1175,8 @@ impl ScribeImpl {
         let shards = shards::ScribeShardRuntime::start(
             shards::ScribeShardStartConfig {
                 admission: admission.clone(),
-                wal_rotation_bytes,
-                memtable_rotation_bytes,
-                seal_max_age: memtable_max_age,
+                geometry,
+                seal_max_age,
                 wal: Arc::clone(&wal),
                 persistence_cpu: persistence_cpu.clone(),
                 wal_io: wal_io.clone(),
@@ -1195,7 +1187,7 @@ impl ScribeImpl {
             },
             &coordination_runtime,
         );
-        let pressure_config = ScribePressureConfig::new(75, 50, memtable_max_age);
+        let pressure_config = ScribePressureConfig::new(75, 50, seal_max_age);
         Self::install_boot_metrics(wal.bytes_on_disk());
         Self {
             catalog,
@@ -1292,7 +1284,12 @@ impl ScribeImpl {
         std::mem::forget(temp_dir);
 
         let resources = embedded_scribe_resources(&admission_config);
-        let wal_rotation_bytes = wal.segment_bytes();
+        let geometry = geometry::ScribeGeometry::for_uniform_shard_rotation(
+            wal.segment_bytes(),
+            memtable::MEMTABLE_ROTATION_BYTES,
+            ScribePressureConfig::default().seal_max_age,
+        )
+        .expect("the static test rotation targets form a coherent geometry");
         Self::build(ScribeBuildConfig {
             catalog: None,
             operator,
@@ -1314,9 +1311,7 @@ impl ScribeImpl {
             persistence: None,
             resources,
             ingest_limits: crate::gate::limits::IngestLimits::default(),
-            wal_rotation_bytes,
-            memtable_rotation_bytes: memtable::MEMTABLE_ROTATION_BYTES,
-            memtable_max_age: ScribePressureConfig::default().seal_max_age,
+            geometry,
             staging_file_publisher: None,
         })
     }

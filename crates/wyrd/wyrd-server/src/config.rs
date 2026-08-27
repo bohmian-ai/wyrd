@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
+use vala_bifrost_redux::scribe::geometry::{ScribeGeometry, ScribeGeometryError};
 use wyrd_spec::TenantSlug;
 use wyrd_spec::auth::IssuerTokenPolicy;
 use wyrd_telemetry::TelemetryConfig;
@@ -332,15 +333,51 @@ pub struct ScribeRuntimeConfig {
     /// capacity decision rather than only a validation bound.
     #[serde(default = "default_ingest_request_bytes")]
     pub ingest_request_bytes: usize,
-    /// Target bytes for one non-empty Scribe WAL segment before rotation.
-    #[serde(default = "default_scribe_wal_rotation_bytes")]
-    pub wal_rotation_bytes: u64,
-    /// Target bytes for one non-empty Scribe memtable before rotation.
-    #[serde(default = "default_scribe_memtable_rotation_bytes")]
-    pub memtable_rotation_bytes: usize,
-    /// Maximum active memtable age before rotation.
-    #[serde(default = "default_scribe_memtable_max_age_secs")]
-    pub memtable_max_age_secs: u64,
+    /// Encoded bytes in one non-empty Scribe WAL segment before rotation.
+    ///
+    /// This governs WAL segment size only. It does not size a generation, a
+    /// row group, a hot object, or a Forge rewrite output.
+    #[serde(default = "default_scribe_wal_segment_bytes")]
+    pub wal_segment_bytes: u64,
+    /// Pod-wide Arrow budget shared by every active shard generation.
+    ///
+    /// Divided evenly across the fixed sixteen shards and then capped by
+    /// [`Self::generation_rotation_ceiling_bytes`] to derive the rotation limit
+    /// each shard applies. It is a limit rather than sixteen reservations, so
+    /// lowering it narrows every shard together instead of letting the first
+    /// shards to fill exclude the rest.
+    #[serde(default = "default_scribe_active_generation_budget_bytes")]
+    pub active_generation_budget_bytes: u64,
+    /// Absolute per-shard active-generation rotation ceiling.
+    ///
+    /// Applied after the pod-wide budget divides, so a large budget can never
+    /// turn one shard into an unbounded memory owner.
+    #[serde(default = "default_scribe_generation_rotation_ceiling_bytes")]
+    pub generation_rotation_ceiling_bytes: u64,
+    /// Maximum active shard-generation age before rotation.
+    #[serde(default = "default_scribe_generation_max_age_secs")]
+    pub generation_max_age_secs: u64,
+    /// Optional per-`SealKey` size that seals one key earlier than its shard.
+    ///
+    /// A key may seal earlier than the shard it belongs to; it may never seal
+    /// later, so a value above the derived per-shard rotation limit is refused.
+    #[serde(default)]
+    pub seal_key_early_seal_bytes: Option<usize>,
+    /// Optional per-`SealKey` age that seals one key earlier than its shard.
+    #[serde(default)]
+    pub seal_key_max_age_secs: Option<u64>,
+    /// Encoded Parquet target for one assembled Scribe hot object.
+    ///
+    /// Independent of every rotation limit: a generation rotates to bound
+    /// memory, while staging assembles across generations toward this size.
+    #[serde(default = "default_scribe_staging_target_file_size_bytes")]
+    pub staging_target_file_size_bytes: u64,
+    /// Tenants whose complete contention reserve vectors are guaranteed.
+    #[serde(default = "default_scribe_guaranteed_active_tenants")]
+    pub guaranteed_active_tenants: usize,
+    /// Tables per tenant whose contention reserve vectors are guaranteed.
+    #[serde(default = "default_scribe_guaranteed_active_tables_per_tenant")]
+    pub guaranteed_active_tables_per_tenant: usize,
     /// Maximum field count in one canonical native IPC schema.
     #[serde(default = "default_ingest_native_fields")]
     pub ingest_native_fields: usize,
@@ -1251,19 +1288,39 @@ fn default_ingest_request_bytes() -> usize {
     vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES
 }
 
-/// Returns the WAL rotation target.
-fn default_scribe_wal_rotation_bytes() -> u64 {
-    512 * 1024 * 1024
+/// Returns the default for [`ScribeRuntimeConfig::wal_segment_bytes`].
+fn default_scribe_wal_segment_bytes() -> u64 {
+    vala_bifrost_redux::scribe::geometry::DEFAULT_WAL_SEGMENT_BYTES
 }
 
-/// Returns the memtable rotation target.
-fn default_scribe_memtable_rotation_bytes() -> usize {
-    512 * 1024 * 1024
+/// Returns the default for [`ScribeRuntimeConfig::active_generation_budget_bytes`].
+fn default_scribe_active_generation_budget_bytes() -> u64 {
+    vala_bifrost_redux::scribe::geometry::DEFAULT_ACTIVE_GENERATION_BUDGET_BYTES
 }
 
-/// Returns the active memtable age target.
-fn default_scribe_memtable_max_age_secs() -> u64 {
-    600
+/// Returns the default for [`ScribeRuntimeConfig::generation_rotation_ceiling_bytes`].
+fn default_scribe_generation_rotation_ceiling_bytes() -> u64 {
+    vala_bifrost_redux::scribe::geometry::DEFAULT_GENERATION_ROTATION_CEILING_BYTES
+}
+
+/// Returns the default for [`ScribeRuntimeConfig::generation_max_age_secs`].
+fn default_scribe_generation_max_age_secs() -> u64 {
+    vala_bifrost_redux::scribe::geometry::DEFAULT_GENERATION_MAX_AGE.as_secs()
+}
+
+/// Returns the default for [`ScribeRuntimeConfig::staging_target_file_size_bytes`].
+fn default_scribe_staging_target_file_size_bytes() -> u64 {
+    vala_bifrost_redux::scribe::geometry::DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES
+}
+
+/// Returns the default for [`ScribeRuntimeConfig::guaranteed_active_tenants`].
+fn default_scribe_guaranteed_active_tenants() -> usize {
+    vala_bifrost_redux::scribe::geometry::DEFAULT_GUARANTEED_ACTIVE_TENANTS
+}
+
+/// Returns the default for [`ScribeRuntimeConfig::guaranteed_active_tables_per_tenant`].
+fn default_scribe_guaranteed_active_tables_per_tenant() -> usize {
+    vala_bifrost_redux::scribe::geometry::DEFAULT_GUARANTEED_ACTIVE_TABLES_PER_TENANT
 }
 
 /// Returns the immutable V1 native field hard maximum.
@@ -1332,9 +1389,16 @@ impl Default for ScribeRuntimeConfig {
             event_time_past_window_secs: None,
             event_time_future_window_secs: None,
             ingest_request_bytes: default_ingest_request_bytes(),
-            wal_rotation_bytes: default_scribe_wal_rotation_bytes(),
-            memtable_rotation_bytes: default_scribe_memtable_rotation_bytes(),
-            memtable_max_age_secs: default_scribe_memtable_max_age_secs(),
+            wal_segment_bytes: default_scribe_wal_segment_bytes(),
+            active_generation_budget_bytes: default_scribe_active_generation_budget_bytes(),
+            generation_rotation_ceiling_bytes: default_scribe_generation_rotation_ceiling_bytes(),
+            generation_max_age_secs: default_scribe_generation_max_age_secs(),
+            seal_key_early_seal_bytes: None,
+            seal_key_max_age_secs: None,
+            staging_target_file_size_bytes: default_scribe_staging_target_file_size_bytes(),
+            guaranteed_active_tenants: default_scribe_guaranteed_active_tenants(),
+            guaranteed_active_tables_per_tenant: default_scribe_guaranteed_active_tables_per_tenant(
+            ),
             ingest_native_fields: default_ingest_native_fields(),
             ingest_native_sources: default_ingest_native_sources(),
             ingest_rows: default_ingest_rows(),
@@ -1374,14 +1438,11 @@ impl ScribeRuntimeConfig {
         {
             return Err("scribe.wal_disk_limit_bytes must be at least 1".to_owned());
         }
-        if self.wal_rotation_bytes == 0 {
-            return Err("scribe.wal_rotation_bytes must be at least 1".to_owned());
+        if self.generation_max_age_secs == 0 {
+            return Err("scribe.generation_max_age_secs must be at least 1".to_owned());
         }
-        if self.memtable_rotation_bytes == 0 {
-            return Err("scribe.memtable_rotation_bytes must be at least 1".to_owned());
-        }
-        if self.memtable_max_age_secs == 0 {
-            return Err("scribe.memtable_max_age_secs must be at least 1".to_owned());
+        if self.seal_key_max_age_secs == Some(0) {
+            return Err("scribe.seal_key_max_age_secs must be at least 1".to_owned());
         }
         if self.ingest_request_bytes == 0 {
             return Err("scribe.ingest_request_bytes must be at least 1".to_owned());
@@ -1396,6 +1457,8 @@ impl ScribeRuntimeConfig {
                 "scribe.ingest_request_bytes exceeds WAL v4 payload representability".to_owned(),
             );
         }
+        self.scribe_geometry()
+            .map_err(|error| format!("scribe geometry configuration is invalid: {error}"))?;
         let ingest_values = [
             (
                 "ingest_native_fields",
@@ -1461,6 +1524,36 @@ impl ScribeRuntimeConfig {
             ));
         }
         Ok(())
+    }
+
+    /// Derives the validated independent Scribe geometry from this configuration.
+    ///
+    /// This is the single conversion from operator-facing seconds and byte
+    /// fields into the checked [`ScribeGeometry`] the Scribe runtime owns, so
+    /// no caller can assemble an unvalidated geometry of its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`ScribeGeometryError`] naming the geometry field that is
+    /// zero, that divides to no per-shard rotation limit at all, or that would
+    /// make a per-`SealKey` control fire after its shard has already rotated.
+    pub fn scribe_geometry(&self) -> Result<ScribeGeometry, ScribeGeometryError> {
+        ScribeGeometry::new(
+            self.wal_segment_bytes,
+            self.active_generation_budget_bytes,
+            self.generation_rotation_ceiling_bytes,
+            Duration::from_secs(self.generation_max_age_secs),
+            self.seal_key_early_seal_bytes,
+            self.seal_key_max_age_secs.map(Duration::from_secs),
+            self.staging_target_file_size_bytes,
+            self.guaranteed_active_tenants,
+            self.guaranteed_active_tables_per_tenant,
+            self.ingest_request_bytes,
+            vala_bifrost_redux::scribe::geometry::DEFAULT_MAXIMUM_ACTIVE_REQUEST_OWNERSHIP_BYTES,
+            vala_bifrost_redux::scribe::geometry::DEFAULT_MAXIMUM_IMMUTABLE_MEMBER_OWNERSHIP_BYTES,
+            vala_bifrost_redux::scribe::geometry::DEFAULT_MINIMUM_STAGE_MEMBER_BYTES,
+            vala_bifrost_redux::scribe::geometry::DEFAULT_MINIMUM_MERGE_LANE_SCRATCH_BYTES,
+        )
     }
 
     /// Freezes the validated operator-selected limits passed to Gate and Scribe.
@@ -3268,14 +3361,60 @@ minimum_slots = 2
             cfg.ingest_request_bytes,
             vala_bifrost_redux::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES
         );
-        assert_eq!(cfg.wal_rotation_bytes, 512 * 1024 * 1024);
-        assert_eq!(cfg.memtable_rotation_bytes, 512 * 1024 * 1024);
-        assert_eq!(cfg.memtable_max_age_secs, 600);
+        assert_eq!(cfg.wal_segment_bytes, 512 * 1024 * 1024);
+        assert_eq!(cfg.active_generation_budget_bytes, 8 * 1024 * 1024 * 1024);
+        assert_eq!(cfg.generation_rotation_ceiling_bytes, 512 * 1024 * 1024);
+        assert_eq!(cfg.generation_max_age_secs, 600);
+        assert_eq!(cfg.seal_key_early_seal_bytes, None);
+        assert_eq!(cfg.seal_key_max_age_secs, None);
+        assert_eq!(cfg.staging_target_file_size_bytes, 512 * 1024 * 1024);
+        assert_eq!(cfg.guaranteed_active_tenants, 4);
+        assert_eq!(cfg.guaranteed_active_tables_per_tenant, 2);
         assert_eq!(
             cfg.ingest_limits(),
             vala_bifrost_redux::gate::limits::IngestLimits::default()
         );
         cfg.validate().expect("resolved defaults must validate");
+    }
+
+    /// One pod-wide budget derives every shard's rotation limit at boot.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the derived per-shard limit is not the minimum of the
+    /// ceiling and the evenly divided budget, when a geometry that cannot serve
+    /// is accepted, or when a per-`SealKey` control is allowed to fire after
+    /// its shard would already have rotated.
+    #[test]
+    fn scribe_geometry_is_derived_from_independent_configured_fields() {
+        let mut config = ScribeRuntimeConfig::default();
+        let geometry = config
+            .scribe_geometry()
+            .expect("the defaults form a coherent geometry");
+        assert_eq!(
+            geometry.shard_generation_rotation_bytes(),
+            512 * 1024 * 1024
+        );
+        assert_eq!(geometry.wal_segment_bytes(), 512 * 1024 * 1024);
+        assert_eq!(geometry.staging_target_file_size_bytes(), 512 * 1024 * 1024);
+        assert_eq!(geometry.guaranteed_width(), 8);
+
+        // Lowering only the pod-wide budget narrows every shard together and
+        // leaves the WAL segment and hot-object targets exactly where they were.
+        config.active_generation_budget_bytes = 1024 * 1024 * 1024;
+        let narrowed = config
+            .scribe_geometry()
+            .expect("a smaller budget is still coherent");
+        assert_eq!(narrowed.shard_generation_rotation_bytes(), 64 * 1024 * 1024);
+        assert_eq!(narrowed.wal_segment_bytes(), 512 * 1024 * 1024);
+        assert_eq!(narrowed.staging_target_file_size_bytes(), 512 * 1024 * 1024);
+
+        // A per-key control may only seal earlier than the shard it belongs to.
+        config.seal_key_early_seal_bytes = Some(65 * 1024 * 1024);
+        let error = config
+            .validate()
+            .expect_err("an early seal above the derived shard limit must be refused");
+        assert!(error.contains("seal_key_early_seal_bytes"), "{error}");
     }
 
     /// Rejects every independently configurable Scribe bound before boot.
@@ -3301,9 +3440,13 @@ minimum_slots = 2
         assert_rejected!(persistence_cpu_threads, 0);
         assert_rejected!(wal_io_threads, 0);
         assert_rejected!(wal_disk_limit_bytes, Some(0));
-        assert_rejected!(wal_rotation_bytes, 0);
-        assert_rejected!(memtable_rotation_bytes, 0);
-        assert_rejected!(memtable_max_age_secs, 0);
+        assert_rejected!(wal_segment_bytes, 0);
+        assert_rejected!(active_generation_budget_bytes, 0);
+        assert_rejected!(generation_rotation_ceiling_bytes, 0);
+        assert_rejected!(generation_max_age_secs, 0);
+        assert_rejected!(staging_target_file_size_bytes, 0);
+        assert_rejected!(guaranteed_active_tenants, 0);
+        assert_rejected!(guaranteed_active_tables_per_tenant, 1);
         assert_rejected!(ingest_request_bytes, 0);
         assert_rejected!(ingest_native_fields, 0);
         assert_rejected!(ingest_native_sources, 0);

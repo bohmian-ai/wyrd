@@ -599,21 +599,30 @@ pub async fn compose_bifrost(
                     "live Scribe role requires registered WAL volume capabilities".to_owned(),
                 )
             })?;
+        let configured_geometry = scribe_config
+            .scribe_geometry()
+            .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
         #[cfg(feature = "test-support")]
-        let wal_rotation_bytes = test_controls
+        let geometry = test_controls
             .as_ref()
             .and_then(|controls| controls.scribe_rotation)
-            .map_or(scribe_config.wal_rotation_bytes, |rotation| {
-                rotation.wal_rotation_bytes
-            });
+            .map_or(Ok(configured_geometry), |rotation| {
+                vala_bifrost_redux::scribe::geometry::ScribeGeometry::for_uniform_shard_rotation(
+                    rotation.wal_rotation_bytes,
+                    rotation.memtable_rotation_bytes,
+                    rotation.memtable_max_age,
+                )
+            })
+            .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
         #[cfg(not(feature = "test-support"))]
-        let wal_rotation_bytes = scribe_config.wal_rotation_bytes;
+        let geometry = configured_geometry;
+        let wal_segment_bytes = geometry.wal_segment_bytes();
         let wal = Arc::new(
             WalWriter::new_with_volume(
                 &wal_dir,
                 *stream.node_id.as_bytes(),
                 stream.writer_epoch.as_i64(),
-                WalConfig::new(wal_rotation_bytes)
+                WalConfig::new(wal_segment_bytes)
                     .map_err(|error| ServerBootError::Scribe(error.to_string()))?
                     .with_disk_limit(scribe_config.wal_disk_limit_bytes)
                     .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
@@ -732,22 +741,6 @@ pub async fn compose_bifrost(
                     controls.scribe_persistence_faults.clone()
                 }),
         );
-        #[cfg(feature = "test-support")]
-        let (memtable_rotation_bytes, memtable_max_age) = test_controls
-            .as_ref()
-            .and_then(|controls| controls.scribe_rotation)
-            .map_or(
-                (
-                    scribe_config.memtable_rotation_bytes,
-                    std::time::Duration::from_secs(scribe_config.memtable_max_age_secs),
-                ),
-                |rotation| (rotation.memtable_rotation_bytes, rotation.memtable_max_age),
-            );
-        #[cfg(not(feature = "test-support"))]
-        let (memtable_rotation_bytes, memtable_max_age) = (
-            scribe_config.memtable_rotation_bytes,
-            std::time::Duration::from_secs(scribe_config.memtable_max_age_secs),
-        );
         let scribe = Arc::new(ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
             catalog: Some(Arc::clone(&bifrost)),
             operator: Arc::new(storage.operator().clone()),
@@ -763,9 +756,7 @@ pub async fn compose_bifrost(
                 )
             })?,
             ingest_limits: scribe_config.ingest_limits(),
-            wal_rotation_bytes,
-            memtable_rotation_bytes,
-            memtable_max_age,
+            geometry,
             staging_file_publisher: Some(staging_file_publisher),
         }));
         if let Err(error) = scribe.replay_wal_async().await {

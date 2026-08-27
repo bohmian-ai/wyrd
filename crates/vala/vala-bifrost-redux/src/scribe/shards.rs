@@ -703,10 +703,14 @@ struct ShardOwner {
     pending_generations: PendingGenerationsByKey,
     /// Whole-shard automatic rotations that solely own closed WAL retirement.
     rotation_cohorts: VecDeque<ShardRotationCohort>,
-    /// Encoded and uncompressed WAL target for this writer.
-    wal_rotation_bytes: u64,
-    /// Aggregate JSON-equivalent and Arrow memtable target for this writer.
-    memtable_rotation_bytes: usize,
+    /// Encoded and uncompressed WAL segment target for this writer.
+    wal_segment_bytes: u64,
+    /// Aggregate JSON-equivalent and Arrow generation target for this writer.
+    ///
+    /// Derived from the pod-wide active-generation budget divided across the
+    /// fixed sixteen shards and capped by the per-shard ceiling, so every shard
+    /// carries the same limit and none of them is a reservation.
+    generation_rotation_bytes: usize,
     /// Monotonic start of the complete active shard generation.
     generation_started_at: std::time::Instant,
     /// JSON-equivalent bytes inserted into the current active generation.
@@ -816,15 +820,13 @@ pub(crate) struct ScribeShardRuntime {
 pub(crate) struct ScribeShardStartConfig {
     /// Admission controller shared by all shard owners.
     pub(crate) admission: AdmissionController,
-    /// Encoded and uncompressed WAL threshold for whole-shard rotation.
-    pub(crate) wal_rotation_bytes: u64,
-    /// Aggregate JSON-equivalent and Arrow threshold for whole-shard rotation.
-    pub(crate) memtable_rotation_bytes: usize,
+    /// Validated independent geometry every shard rotation limit derives from.
+    pub(crate) geometry: crate::scribe::geometry::ScribeGeometry,
     /// Active-generation max age consulted by the age seal predicate.
     ///
     /// Threaded from [`crate::scribe::ScribePressureConfig::seal_max_age`] into
-    /// each owner's memtable the same way `memtable_rotation_bytes` is, so the age
-    /// trigger uses the configured seconds-scale value (D83 default 600 s).
+    /// each owner's memtable the same way the size limit is, so the age trigger
+    /// uses the configured seconds-scale value (D83 default 600 s).
     pub(crate) seal_max_age: std::time::Duration,
     /// Shared WAL writer used to create shard handles.
     pub(crate) wal: Arc<WalWriter>,
@@ -932,8 +934,7 @@ impl ScribeShardRuntime {
     pub(crate) fn start(config: ScribeShardStartConfig, runtime: &Handle) -> Arc<Self> {
         let ScribeShardStartConfig {
             admission,
-            wal_rotation_bytes,
-            memtable_rotation_bytes,
+            geometry,
             seal_max_age,
             wal,
             persistence_cpu,
@@ -943,6 +944,8 @@ impl ScribeShardRuntime {
             stream,
             memory_ownership,
         } = config;
+        let wal_segment_bytes = geometry.wal_segment_bytes();
+        let generation_rotation_bytes = geometry.shard_generation_rotation_usize();
         let mut set = ScribeShardSet::<ShardCommand>::new();
         let receivers = set.take_receivers().unwrap_or_default();
         let senders: Vec<ScribeShard<ShardCommand>> =
@@ -976,8 +979,8 @@ impl ScribeShardRuntime {
                 synced_not_inserted: HashMap::new(),
                 pending_generations: PendingGenerationsByKey::new(),
                 rotation_cohorts: VecDeque::new(),
-                wal_rotation_bytes,
-                memtable_rotation_bytes,
+                wal_segment_bytes,
+                generation_rotation_bytes,
                 generation_started_at: std::time::Instant::now(),
                 active_json_bytes: 0,
                 generation_max_age: seal_max_age,
@@ -986,7 +989,7 @@ impl ScribeShardRuntime {
                 retained_generations: HashMap::new(),
                 retained_commit_ambiguity: None,
                 admission: admission.clone(),
-                memtable: Memtable::new_with_config(memtable_rotation_bytes, seal_max_age),
+                memtable: Memtable::new_with_config(generation_rotation_bytes, seal_max_age),
                 persistence_cpu: persistence_cpu.clone(),
                 wal_io: wal_io.clone(),
                 persistence: persistence.clone(),
@@ -1021,7 +1024,7 @@ impl ScribeShardRuntime {
             #[cfg(any(test, feature = "test-support"))]
             shutdown_flush_completions: AtomicUsize::new(0),
             #[cfg(test)]
-            rotation_thresholds: (wal_rotation_bytes, memtable_rotation_bytes),
+            rotation_thresholds: (wal_segment_bytes, generation_rotation_bytes),
         })
     }
 
@@ -3526,16 +3529,16 @@ impl ShardOwner {
             memtable_arrow: projected_arrow,
             age_expired,
         };
-        if !projection.should_rotate(self.wal_rotation_bytes, self.memtable_rotation_bytes) {
+        if !projection.should_rotate(self.wal_segment_bytes, self.generation_rotation_bytes) {
             return Ok(());
         }
         let rotation_trigger = if projection.age_expired {
             "age"
-        } else if projection.wal_encoded > self.wal_rotation_bytes {
+        } else if projection.wal_encoded > self.wal_segment_bytes {
             "wal_encoded"
-        } else if projection.wal_uncompressed > self.wal_rotation_bytes {
+        } else if projection.wal_uncompressed > self.wal_segment_bytes {
             "wal_uncompressed"
-        } else if projection.memtable_json > self.memtable_rotation_bytes {
+        } else if projection.memtable_json > self.generation_rotation_bytes {
             "memtable_json"
         } else {
             "memtable_arrow"
@@ -4679,8 +4682,8 @@ mod tests {
             let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
             let (mut owner, _budget) =
                 owner_for_completion_test_with_budget(memtable, &wal, wal_handle, stream);
-            owner.wal_rotation_bytes = wal_target;
-            owner.memtable_rotation_bytes = memtable_target;
+            owner.wal_segment_bytes = wal_target;
+            owner.generation_rotation_bytes = memtable_target;
             owner
                 .memory_ownership
                 .reserve_active(active_bytes)
@@ -4764,8 +4767,8 @@ mod tests {
         let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
         let (mut owner, budget) =
             owner_for_completion_test_with_budget(Memtable::new(), &wal, wal_handle, stream);
-        owner.wal_rotation_bytes = 100;
-        owner.memtable_rotation_bytes = 200;
+        owner.wal_segment_bytes = 100;
+        owner.generation_rotation_bytes = 200;
         let root_ceiling = budget.ingress_limit_bytes();
         let occupied = budget
             .try_reserve_maintenance(MemoryCategory::Raw, root_ceiling)
@@ -4778,7 +4781,7 @@ mod tests {
                 memtable_arrow: 0,
                 age_expired: false,
             }
-            .should_rotate(owner.wal_rotation_bytes, owner.memtable_rotation_bytes)
+            .should_rotate(owner.wal_segment_bytes, owner.generation_rotation_bytes)
         );
         assert!(matches!(
             budget.try_reserve_maintenance(MemoryCategory::Raw, 1),
@@ -4793,7 +4796,7 @@ mod tests {
                 memtable_arrow: 0,
                 age_expired: false,
             }
-            .should_rotate(owner.wal_rotation_bytes, owner.memtable_rotation_bytes)
+            .should_rotate(owner.wal_segment_bytes, owner.generation_rotation_bytes)
         );
         drop(
             budget
@@ -6496,8 +6499,8 @@ mod tests {
             synced_not_inserted: HashMap::new(),
             pending_generations: PendingGenerationsByKey::new(),
             rotation_cohorts: VecDeque::new(),
-            wal_rotation_bytes: crate::scribe::wal::WalConfig::default().segment_bytes,
-            memtable_rotation_bytes: crate::scribe::memtable::MEMTABLE_ROTATION_BYTES,
+            wal_segment_bytes: crate::scribe::wal::WalConfig::default().segment_bytes,
+            generation_rotation_bytes: crate::scribe::memtable::MEMTABLE_ROTATION_BYTES,
             generation_started_at: std::time::Instant::now(),
             active_json_bytes: 0,
             generation_max_age: crate::scribe::memtable::ACTIVE_GENERATION_MAX_AGE,

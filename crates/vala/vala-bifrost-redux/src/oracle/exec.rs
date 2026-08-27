@@ -1117,10 +1117,8 @@ impl OracleIcebergScanExec {
             Some(columns) => builder.select(columns.iter().cloned()),
             None => builder.select_all(),
         };
-        if self.assigned_files.is_none() {
-            if let Some(predicate) = &self.predicates {
-                builder = builder.with_filter(predicate.clone());
-            }
+        if let (None, Some(predicate)) = (&self.assigned_files, &self.predicates) {
+            builder = builder.with_filter(predicate.clone());
         }
         let scan = builder.build().map_err(iceberg_datafusion_error)?;
         let tasks = scan.plan_files().await.map_err(iceberg_datafusion_error)?;
@@ -1143,7 +1141,7 @@ impl OracleIcebergScanExec {
                 .into_iter()
                 .filter(|task| assigned.contains(&task.data_file_path))
                 .map(|mut task| {
-                    task.predicate = row_filter.clone();
+                    task.predicate.clone_from(&row_filter);
                     task
                 })
                 .collect::<Vec<_>>()

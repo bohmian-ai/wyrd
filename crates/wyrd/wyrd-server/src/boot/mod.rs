@@ -755,7 +755,7 @@ pub async fn compose_bifrost(
             })
             .map_err(|error| {
                 ServerBootError::Scribe(format!(
-                    "Scribe cannot serve its configured contention width on this node: {error}"
+                    "Scribe cannot complete one table's lifecycle on this node's measured resources: {error}"
                 ))
             })?,
         );

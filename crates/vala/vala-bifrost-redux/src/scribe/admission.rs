@@ -137,13 +137,15 @@ pub struct AdmissionConfig {
 /// Smallest pod memory budget the default Scribe geometry can be installed on.
 ///
 /// [`ScribeArtifactPolicy::pod_capacity`] splits the Scribe memory ceiling into
-/// four equal category shares, and the largest guaranteed total is merge scratch
-/// at `guaranteed_width` lanes of `minimum_merge_lane_scratch_bytes` — one
-/// gibibyte for the default four tenants of two tables. Four times that is the
-/// smallest budget on which every category clears its guarantee, so it is the
-/// default rather than a round number: a smaller default would make every
-/// embedded and test controller fail the same startup gate production must pass.
-pub const DEFAULT_POD_MEMORY_LIMIT_BYTES: usize = 4 * 1024 * 1024 * 1024;
+/// four equal category shares, and the largest single-table component is merge
+/// scratch at `minimum_merge_lane_scratch_bytes`. Four times that — half a
+/// gibibyte — is the hard floor at which every category holds one complete
+/// lifecycle vector, and this default is eight times that floor so an embedded
+/// or test controller derives a useful multi-table ownership ceiling rather than
+/// a pod that can only ever carry one table. Nothing here scales with tenants or
+/// tables: a smaller budget still starts, it just completes fewer tables at once.
+pub const DEFAULT_POD_MEMORY_LIMIT_BYTES: usize =
+    32 * super::geometry::DEFAULT_MINIMUM_MERGE_LANE_SCRATCH_BYTES;
 
 impl Default for AdmissionConfig {
     fn default() -> Self {
@@ -199,7 +201,7 @@ impl AdmissionController {
     /// # Errors
     ///
     /// Returns [`ScribeGeometryError`] when the resolved pod capacity cannot
-    /// hold every guaranteed reserve vector, exactly as production startup does.
+    /// hold one complete lifecycle vector, exactly as production startup does.
     #[cfg(any(test, feature = "test-support"))]
     pub fn with_config(config: AdmissionConfig) -> Result<Self, ScribeGeometryError> {
         let memory = super::embedded_scribe_resources(&config);
@@ -210,13 +212,12 @@ impl AdmissionController {
     ///
     /// This is the startup capacity gate. It derives the pod's real capacity in
     /// every governed category from the memory Scribe actually owns and the
-    /// staging volume actually present, then refuses to build the ledger unless
-    /// the configured policy's complete guaranteed reserve vectors fit. A pod
-    /// that cannot install the promised
-    /// `guaranteed_active_tenants × guaranteed_active_tables_per_tenant` vectors
-    /// must fail here, before it reports ready, rather than accept appends it
-    /// cannot stage, merge, or publish and discover the shortfall as runtime
-    /// pressure.
+    /// staging volume actually present, then refuses to build the ledger unless every category holds at least one
+    /// complete lifecycle vector. A pod that cannot carry even one canonical
+    /// table from admission through release must fail here, before it reports
+    /// ready, rather than accept appends it cannot stage, merge or publish and
+    /// discover the shortfall as runtime pressure. How many tables the pod can
+    /// then own is derived from that capacity, not configured.
     ///
     /// The Scribe-owned child budget wins over the whole-pod budget whenever it
     /// is configured and smaller, because that child budget is what Scribe may
@@ -225,11 +226,10 @@ impl AdmissionController {
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeGeometryError::Capacity`] naming the category, required
-    /// total, actual total, and guaranteed width of the first shortfall,
+    /// Returns [`ScribeGeometryError::Capacity`] naming the category and the
+    /// required and actual totals of the first shortfall, and
     /// [`ScribeGeometryError::EmptyReserve`] when the policy derives a zero
-    /// component, and [`ScribeGeometryError::Incoherent`] when the configured
-    /// width and per-table components cannot be represented together.
+    /// component.
     pub fn with_config_and_memory(
         config: AdmissionConfig,
         memory: ScribeResources,
@@ -249,7 +249,7 @@ impl AdmissionController {
             scribe_memory_bytes,
             usize::try_from(staging_bytes).unwrap_or(usize::MAX),
             GLOBAL_INFLIGHT_ITEMS,
-        )?;
+        );
         config.policy.validate_capacity(&capacity)?;
         Ok(Self {
             inner: Arc::new(AdmissionInner {
@@ -948,7 +948,7 @@ mod tests {
         assert_eq!(admission.snapshot().bytes, 0);
     }
 
-    /// Startup refuses a pod whose Scribe memory cannot hold the guaranteed width.
+    /// Startup refuses a pod that cannot hold one complete lifecycle vector.
     ///
     /// The controller is the only place the derived pod capacity and the
     /// configured policy meet, so this is where the AC2 refusal must happen. A
@@ -958,16 +958,29 @@ mod tests {
     /// # Panics
     ///
     /// Panics when an undersized pod builds a controller, or when the refusal
-    /// does not name the category, requirement, and width an operator must fix.
+    /// does not name the category and requirement an operator must fix.
     #[test]
-    fn startup_refuses_a_pod_that_cannot_hold_the_guaranteed_width() {
+    fn startup_refuses_a_pod_that_cannot_hold_one_lifecycle_vector() {
         let config = AdmissionConfig::default();
         let memory = super::super::embedded_scribe_resources(&config);
         AdmissionController::with_config_and_memory(config, memory.clone())
-            .expect("the default budget holds the default guaranteed width");
+            .expect("the default budget holds one complete lifecycle vector");
+
+        // The hard floor is one complete lifecycle vector, which memory reaches
+        // at four times the merge-lane scratch minimum. Exactly the floor serves
+        // one table; one memory share below it serves none.
+        let floor = 4 * crate::scribe::geometry::DEFAULT_MINIMUM_MERGE_LANE_SCRATCH_BYTES;
+        AdmissionController::with_config_and_memory(
+            AdmissionConfig {
+                memory_limit_bytes: floor,
+                ..AdmissionConfig::default()
+            },
+            memory.clone(),
+        )
+        .expect("the exact one-vector floor still serves");
 
         let short = AdmissionConfig {
-            memory_limit_bytes: DEFAULT_POD_MEMORY_LIMIT_BYTES - 4,
+            memory_limit_bytes: floor - 4,
             ..AdmissionConfig::default()
         };
         let error = AdmissionController::with_config_and_memory(short, memory)
@@ -976,18 +989,10 @@ mod tests {
             category,
             required,
             actual,
-            width,
         } = error
         else {
             panic!("a startup shortfall must report the capacity diagnostic");
         };
-        assert_eq!(
-            width,
-            AdmissionConfig::default()
-                .policy
-                .geometry()
-                .guaranteed_width()
-        );
         assert!(
             actual < required,
             "the refusal must name the real shortfall"
@@ -1004,7 +1009,7 @@ mod tests {
     ///
     /// Validating against the whole-pod figure would prove a capacity Scribe
     /// never owns, which is precisely how a pod could report ready and then fail
-    /// to install the vectors it promised.
+    /// to carry the one table lifecycle it promised.
     ///
     /// # Panics
     ///
@@ -1014,7 +1019,9 @@ mod tests {
     fn startup_validates_against_the_smaller_scribe_child_budget() {
         let config = AdmissionConfig {
             memory_limit_bytes: DEFAULT_POD_MEMORY_LIMIT_BYTES * 4,
-            scribe_memory_limit_bytes: Some(DEFAULT_POD_MEMORY_LIMIT_BYTES / 2),
+            scribe_memory_limit_bytes: Some(
+                4 * crate::scribe::geometry::DEFAULT_MINIMUM_MERGE_LANE_SCRATCH_BYTES - 4,
+            ),
             ..AdmissionConfig::default()
         };
         let memory = super::super::embedded_scribe_resources(&config);

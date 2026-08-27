@@ -22,7 +22,7 @@
 //! On top of the geometries this module owns the contention reserve: the exact
 //! per-table [`ContentionReserveVector`] that admission installs before a table
 //! may serve, and the startup arithmetic that refuses to boot a pod whose global
-//! capacity cannot hold the guaranteed number of those vectors.
+//! capacity cannot hold one complete vector in every governed category.
 
 use std::time::Duration;
 
@@ -48,16 +48,6 @@ pub const DEFAULT_ACTIVE_GENERATION_BUDGET_BYTES: u64 =
 pub const DEFAULT_GENERATION_MAX_AGE: Duration = Duration::from_mins(10);
 /// Default encoded Parquet target for one assembled Scribe hot object.
 pub const DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES: u64 = 512 * 1024 * 1024;
-/// Default number of tenants whose complete reserve vectors are guaranteed.
-pub const DEFAULT_GUARANTEED_ACTIVE_TENANTS: usize = 4;
-/// Default number of tables per tenant whose reserve vectors are guaranteed.
-///
-/// Two is the floor rather than a preference: a tenant always has at least one
-/// registered system table alongside its dynamic table, and the packet's whole
-/// contention argument is that a hot dynamic table must not be able to exclude
-/// its sibling system table. One guaranteed table per tenant would make that
-/// exclusion legal.
-pub const DEFAULT_GUARANTEED_ACTIVE_TABLES_PER_TENANT: usize = 2;
 
 /// One governed Scribe resource category.
 ///
@@ -138,9 +128,9 @@ impl ContentionCategory {
 /// installation is what would let a table acknowledge an append it cannot later
 /// stage, merge, or publish, so every category is reserved together or none is.
 ///
-/// A vector's cells are protected: no other tenant or table may borrow them,
-/// however idle they look. Only capacity beyond the guaranteed vectors is
-/// elastic surplus.
+/// The vector is the resource quantum for one *actual* canonical table. It is
+/// never installed for a hypothetical tenant or table: owners are created lazily
+/// from real traffic, and capacity no live owner holds stays borrowable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContentionReserveVector {
     /// Admitted in-flight items reserved for one table. Always one.
@@ -197,8 +187,8 @@ impl ContentionReserveVector {
 ///
 /// This is what the node actually has, derived from the detected memory budget,
 /// the staging volume, and the configured lane widths. Startup compares it
-/// against the guaranteed reserve vectors and refuses to serve when it falls one
-/// byte or item short.
+/// against one complete reserve vector and refuses to serve when any category
+/// falls one byte or item short.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScribeGlobalCapacity {
     /// Total admitted in-flight items across the pod.
@@ -257,21 +247,19 @@ pub enum ScribeGeometryError {
         /// What the arithmetic could not produce.
         detail: String,
     },
-    /// Pod capacity cannot hold the guaranteed reserve vectors in one category.
+    /// Pod capacity cannot hold even one complete lifecycle vector.
     #[error(
-        "Scribe capacity for `{category}` holds {actual} but {width} guaranteed table reserves require {required}"
+        "Scribe capacity for `{category}` holds {actual} but one complete lifecycle vector requires {required}"
     )]
     Capacity {
         /// Fixed-cardinality category label.
         category: &'static str,
-        /// Total the guaranteed reserves require in this category.
+        /// Amount one complete lifecycle vector requires in this category.
         required: usize,
         /// Total the pod actually has in this category.
         actual: usize,
-        /// Guaranteed table width: tenants times tables per tenant.
-        width: usize,
     },
-    /// A reserve vector component is zero, so a table could activate
+    /// A lifecycle vector component is zero, so a table could activate
     /// without reserving something it must later own.
     #[error("Scribe reserve vector component `{category}` must be greater than zero")]
     EmptyReserve {
@@ -301,10 +289,6 @@ pub struct ScribeGeometry {
     seal_key_max_age: Option<Duration>,
     /// Encoded Parquet target for one assembled hot object.
     staging_target_file_size_bytes: u64,
-    /// Tenants whose complete reserve vectors are guaranteed.
-    guaranteed_active_tenants: usize,
-    /// Tables per tenant whose reserve vectors are guaranteed.
-    guaranteed_active_tables_per_tenant: usize,
     /// Maximum encoded bytes accepted for one ingress request.
     maximum_ingress_envelope_bytes: usize,
     /// Arrow bytes one table may own in a still-writable generation.
@@ -345,8 +329,6 @@ impl ScribeGeometry {
         seal_key_early_seal_bytes: Option<usize>,
         seal_key_max_age: Option<Duration>,
         staging_target_file_size_bytes: u64,
-        guaranteed_active_tenants: usize,
-        guaranteed_active_tables_per_tenant: usize,
         maximum_ingress_envelope_bytes: usize,
         maximum_active_request_ownership_bytes: usize,
         maximum_immutable_member_ownership_bytes: usize,
@@ -361,8 +343,6 @@ impl ScribeGeometry {
             seal_key_early_seal_bytes,
             seal_key_max_age,
             staging_target_file_size_bytes,
-            guaranteed_active_tenants,
-            guaranteed_active_tables_per_tenant,
             maximum_ingress_envelope_bytes,
             maximum_active_request_ownership_bytes,
             maximum_immutable_member_ownership_bytes,
@@ -377,14 +357,13 @@ impl ScribeGeometry {
     /// Refuses any geometry field that must be positive but was left at zero.
     ///
     /// A zero here is never a "disabled" control: it would make a rotation
-    /// limit, an ownership bound, or a guaranteed width vanish, so each is
-    /// rejected by name rather than defaulted.
+    /// limit or an ownership bound vanish, so each is rejected by name rather
+    /// than defaulted.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeGeometryError::Zero`] naming the first zero-valued
-    /// field, and [`ScribeGeometryError::Incoherent`] when the guaranteed table
-    /// width is below the system/dynamic table pair every tenant has.
+    /// field.
     fn check_positive(&self) -> Result<(), ScribeGeometryError> {
         let byte_fields = [
             ("wal_segment_bytes", self.wal_segment_bytes),
@@ -405,11 +384,6 @@ impl ScribeGeometry {
             return Err(ScribeGeometryError::Zero { field });
         }
         let width_fields = [
-            ("guaranteed_active_tenants", self.guaranteed_active_tenants),
-            (
-                "guaranteed_active_tables_per_tenant",
-                self.guaranteed_active_tables_per_tenant,
-            ),
             (
                 "maximum_ingress_envelope_bytes",
                 self.maximum_ingress_envelope_bytes,
@@ -437,16 +411,6 @@ impl ScribeGeometry {
         if self.generation_max_age.is_zero() {
             return Err(ScribeGeometryError::Zero {
                 field: "generation_max_age",
-            });
-        }
-        if self.guaranteed_active_tables_per_tenant < DEFAULT_GUARANTEED_ACTIVE_TABLES_PER_TENANT {
-            return Err(ScribeGeometryError::Incoherent {
-                field: "guaranteed_active_tables_per_tenant",
-                detail: format!(
-                    "a tenant always has a registered system table beside its dynamic table, \
-                     so the guaranteed table width is never below \
-                     {DEFAULT_GUARANTEED_ACTIVE_TABLES_PER_TENANT}"
-                ),
             });
         }
         Ok(())
@@ -530,8 +494,6 @@ impl ScribeGeometry {
             None,
             None,
             DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES,
-            DEFAULT_GUARANTEED_ACTIVE_TENANTS,
-            DEFAULT_GUARANTEED_ACTIVE_TABLES_PER_TENANT,
             crate::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES,
             DEFAULT_MAXIMUM_ACTIVE_REQUEST_OWNERSHIP_BYTES,
             DEFAULT_MAXIMUM_IMMUTABLE_MEMBER_OWNERSHIP_BYTES,
@@ -595,27 +557,6 @@ impl ScribeGeometry {
     pub const fn staging_target_file_size_bytes(&self) -> u64 {
         self.staging_target_file_size_bytes
     }
-
-    /// Returns the guaranteed contention width: tenants times tables per tenant.
-    ///
-    /// This is the number of complete reserve vectors startup must be able to
-    /// install before the pod serves anything.
-    #[must_use]
-    pub const fn guaranteed_width(&self) -> usize {
-        self.guaranteed_active_tenants * self.guaranteed_active_tables_per_tenant
-    }
-
-    /// Returns the guaranteed tenant width.
-    #[must_use]
-    pub const fn guaranteed_active_tenants(&self) -> usize {
-        self.guaranteed_active_tenants
-    }
-
-    /// Returns the guaranteed per-tenant table width.
-    #[must_use]
-    pub const fn guaranteed_active_tables_per_tenant(&self) -> usize {
-        self.guaranteed_active_tables_per_tenant
-    }
 }
 
 impl Default for ScribeGeometry {
@@ -640,8 +581,6 @@ impl Default for ScribeGeometry {
             None,
             None,
             DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES,
-            DEFAULT_GUARANTEED_ACTIVE_TENANTS,
-            DEFAULT_GUARANTEED_ACTIVE_TABLES_PER_TENANT,
             crate::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES,
             DEFAULT_MAXIMUM_ACTIVE_REQUEST_OWNERSHIP_BYTES,
             DEFAULT_MAXIMUM_IMMUTABLE_MEMBER_OWNERSHIP_BYTES,
@@ -695,9 +634,10 @@ impl ScribeArtifactPolicy {
     /// Item categories are always one: a table reserves the right to have one
     /// request in flight, one outstanding assembly claim, and one outstanding
     /// upload claim. Byte categories come straight from the geometry's declared
-    /// per-table maxima and minima. Nothing here is scaled by how many tables or
-    /// tenants happen to be active, because a protected cell must not shrink
-    /// when a neighbour appears.
+    /// per-table maxima and minima. Nothing here is scaled by a tenant count or
+    /// a table count: the vector is the resource quantum one actual canonical
+    /// table needs to travel admission, active, immutable, durable staging,
+    /// merge scratch, staging claim, upload claim, publication and release.
     #[must_use]
     pub const fn reserve_vector(&self) -> ContentionReserveVector {
         ContentionReserveVector {
@@ -712,42 +652,30 @@ impl ScribeArtifactPolicy {
         }
     }
 
-    /// Returns the total one category must hold for every guaranteed vector.
+    /// Returns what one category must hold to admit one more canonical table.
     ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeGeometryError::Incoherent`] when the multiplication
-    /// overflows, which means the configured width and per-table component
-    /// cannot coexist on any machine rather than merely not fitting this one.
-    pub fn required_for(&self, category: ContentionCategory) -> Result<usize, ScribeGeometryError> {
-        let component = self.reserve_vector().component(category);
-        self.geometry
-            .guaranteed_width()
-            .checked_mul(component)
-            .ok_or_else(|| ScribeGeometryError::Incoherent {
-                field: "guaranteed_active_tenants",
-                detail: format!(
-                    "reserving {} vectors of {component} in `{}` overflows",
-                    self.geometry.guaranteed_width(),
-                    category.label()
-                ),
-            })
+    /// This is exactly the reserve vector's component for that category. There
+    /// is no tenant or table multiplier: capacity is a measured resource, and
+    /// how many tables it supports is derived from it by
+    /// [`Self::max_active_tables`] rather than configured ahead of traffic.
+    #[must_use]
+    pub const fn required_for(&self, category: ContentionCategory) -> usize {
+        self.reserve_vector().component(category)
     }
 
-    /// Refuses to serve unless the pod holds every guaranteed reserve vector.
+    /// Refuses to serve unless every category holds one complete vector.
     ///
     /// Each category is checked independently against its own capacity
     /// component: byte and item categories are never summed, and a surplus in
     /// one category never covers a shortfall in another. A pod one byte or one
-    /// item below any component fails here, before serving, with the category,
-    /// the required total, the actual total, and the guaranteed width named.
+    /// item below any component fails here, before serving, naming the
+    /// category, the required total and the actual total.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeGeometryError::EmptyReserve`] when a vector component is
-    /// zero, [`ScribeGeometryError::Incoherent`] when the required total
-    /// overflows, and [`ScribeGeometryError::Capacity`] naming the first
-    /// category the pod cannot hold.
+    /// zero, and [`ScribeGeometryError::Capacity`] naming the first category the
+    /// pod cannot hold one complete vector in.
     pub fn validate_capacity(
         &self,
         capacity: &ScribeGlobalCapacity,
@@ -759,26 +687,55 @@ impl ScribeArtifactPolicy {
             });
         }
         for category in ContentionCategory::ALL {
-            let required = self.required_for(category)?;
+            let required = vector.component(category);
             let actual = capacity.component(category);
             if actual < required {
                 return Err(ScribeGeometryError::Capacity {
                     category: category.label(),
                     required,
                     actual,
-                    width: self.geometry.guaranteed_width(),
                 });
             }
         }
         Ok(())
     }
 
+    /// Returns how many canonical tables this pod can own simultaneously.
+    ///
+    /// Every category independently supports `capacity / component` complete
+    /// vectors, and a table needs one vector in *every* category, so the pod's
+    /// ownership ceiling is the minimum across categories. This is the only
+    /// place a table count comes from, and it is derived from measured
+    /// resources rather than configured.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic: [`Self::validate_capacity`] rejects a zero component
+    /// before a capacity reaches here, and a zero component would otherwise be
+    /// reported as an unbounded ceiling rather than dividing by zero.
+    #[must_use]
+    pub fn max_active_tables(&self, capacity: &ScribeGlobalCapacity) -> usize {
+        let vector = self.reserve_vector();
+        ContentionCategory::ALL
+            .into_iter()
+            .map(|category| {
+                let component = vector.component(category);
+                if component == 0 {
+                    0
+                } else {
+                    capacity.component(category) / component
+                }
+            })
+            .min()
+            .unwrap_or(0)
+    }
+
     /// Derives the pod capacity this policy is checked against.
     ///
     /// The three inputs are the only ones the node actually measures: the Scribe
     /// memory ceiling the resource governor granted, the local staging volume,
-    /// and the fixed pod-global in-flight item ceiling. Everything else is a
-    /// split of those, and each split is named rather than implied:
+    /// and the pod-global in-flight item ceiling. Everything else is a split of
+    /// those, and each split is named rather than implied:
     ///
     /// - Admitted request bytes, active generations, immutable generations, and
     ///   merge scratch all come out of the one memory ceiling, so each gets an
@@ -787,56 +744,50 @@ impl ScribeArtifactPolicy {
     ///   against each other over a pod's lifetime.
     /// - Durable staging comes from the staging volume, which is disk and shares
     ///   nothing with memory.
-    /// - Claim items are counted, not sized. One outstanding staging claim and
-    ///   one outstanding upload claim per guaranteed table is the whole point of
-    ///   those categories, so their capacity is the guaranteed width itself.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeGeometryError::Incoherent`] when the guaranteed width and
-    /// per-table components cannot be represented together.
-    pub fn pod_capacity(
+    /// - Claim items are counted, not sized. An outstanding staging or upload
+    ///   claim is one queued unit of persistence work, so both categories are
+    ///   bounded by the same pod-global in-flight item ceiling the admission
+    ///   category uses. Lane width governs how fast those claims drain, not how
+    ///   many may be outstanding, and the lane's own workspace is the separately
+    ///   governed merge-scratch category.
+    #[must_use]
+    pub const fn pod_capacity(
         &self,
         scribe_memory_bytes: usize,
         staging_volume_bytes: usize,
         global_inflight_items: usize,
-    ) -> Result<ScribeGlobalCapacity, ScribeGeometryError> {
+    ) -> ScribeGlobalCapacity {
         let memory_share = scribe_memory_bytes / 4;
-        let width = self.geometry.guaranteed_width();
-        Ok(ScribeGlobalCapacity {
+        ScribeGlobalCapacity {
             admission_items: global_inflight_items,
             admission_bytes: memory_share,
             active_bytes: memory_share,
             immutable_bytes: memory_share,
             durable_stage_bytes: staging_volume_bytes,
             merge_scratch_bytes: memory_share,
-            staging_claim_items: width,
-            upload_claim_items: width,
-        })
+            staging_claim_items: global_inflight_items,
+            upload_claim_items: global_inflight_items,
+        }
     }
 
     /// Returns the smallest pod capacity that satisfies this policy exactly.
     ///
-    /// Used by startup diagnostics and by the minimum-geometry configuration
-    /// test: a capacity built from this function passes
-    /// [`Self::validate_capacity`], and lowering any single component by one
-    /// makes it fail.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeGeometryError::Incoherent`] when any required total
-    /// overflows.
-    pub fn minimum_capacity(&self) -> Result<ScribeGlobalCapacity, ScribeGeometryError> {
-        Ok(ScribeGlobalCapacity {
-            admission_items: self.required_for(ContentionCategory::AdmissionItems)?,
-            admission_bytes: self.required_for(ContentionCategory::AdmissionBytes)?,
-            active_bytes: self.required_for(ContentionCategory::Active)?,
-            immutable_bytes: self.required_for(ContentionCategory::Immutable)?,
-            durable_stage_bytes: self.required_for(ContentionCategory::DurableStage)?,
-            merge_scratch_bytes: self.required_for(ContentionCategory::MergeScratch)?,
-            staging_claim_items: self.required_for(ContentionCategory::StagingClaim)?,
-            upload_claim_items: self.required_for(ContentionCategory::UploadClaim)?,
-        })
+    /// That is one complete lifecycle vector: a capacity built from this
+    /// function passes [`Self::validate_capacity`] and owns exactly one table,
+    /// and lowering any single component by one makes it fail.
+    #[must_use]
+    pub const fn minimum_capacity(&self) -> ScribeGlobalCapacity {
+        let vector = self.reserve_vector();
+        ScribeGlobalCapacity {
+            admission_items: vector.admission_items,
+            admission_bytes: vector.admission_bytes,
+            active_bytes: vector.active_bytes,
+            immutable_bytes: vector.immutable_bytes,
+            durable_stage_bytes: vector.durable_stage_bytes,
+            merge_scratch_bytes: vector.merge_scratch_bytes,
+            staging_claim_items: vector.staging_claim_items,
+            upload_claim_items: vector.upload_claim_items,
+        }
     }
 }
 
@@ -866,8 +817,6 @@ mod tests {
             None,
             None,
             DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES,
-            DEFAULT_GUARANTEED_ACTIVE_TENANTS,
-            DEFAULT_GUARANTEED_ACTIVE_TABLES_PER_TENANT,
             crate::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES,
             DEFAULT_MAXIMUM_ACTIVE_REQUEST_OWNERSHIP_BYTES,
             DEFAULT_MAXIMUM_IMMUTABLE_MEMBER_OWNERSHIP_BYTES,
@@ -942,8 +891,6 @@ mod tests {
             None,
             None,
             DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES,
-            DEFAULT_GUARANTEED_ACTIVE_TENANTS,
-            DEFAULT_GUARANTEED_ACTIVE_TABLES_PER_TENANT,
             crate::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES,
             DEFAULT_MAXIMUM_ACTIVE_REQUEST_OWNERSHIP_BYTES,
             DEFAULT_MAXIMUM_IMMUTABLE_MEMBER_OWNERSHIP_BYTES,
@@ -998,8 +945,6 @@ mod tests {
                 .map(|limit| limit + 1),
             None,
             DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES,
-            DEFAULT_GUARANTEED_ACTIVE_TENANTS,
-            DEFAULT_GUARANTEED_ACTIVE_TABLES_PER_TENANT,
             crate::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES,
             DEFAULT_MAXIMUM_ACTIVE_REQUEST_OWNERSHIP_BYTES,
             DEFAULT_MAXIMUM_IMMUTABLE_MEMBER_OWNERSHIP_BYTES,
@@ -1013,31 +958,6 @@ mod tests {
                 ..
             })
         ));
-
-        // The guaranteed table width never drops below the system/dynamic pair.
-        let narrow = ScribeGeometry::new(
-            DEFAULT_WAL_SEGMENT_BYTES,
-            DEFAULT_ACTIVE_GENERATION_BUDGET_BYTES,
-            DEFAULT_GENERATION_ROTATION_CEILING_BYTES,
-            DEFAULT_GENERATION_MAX_AGE,
-            None,
-            None,
-            DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES,
-            1,
-            1,
-            crate::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES,
-            DEFAULT_MAXIMUM_ACTIVE_REQUEST_OWNERSHIP_BYTES,
-            DEFAULT_MAXIMUM_IMMUTABLE_MEMBER_OWNERSHIP_BYTES,
-            DEFAULT_MINIMUM_STAGE_MEMBER_BYTES,
-            DEFAULT_MINIMUM_MERGE_LANE_SCRATCH_BYTES,
-        );
-        assert!(matches!(
-            narrow,
-            Err(ScribeGeometryError::Incoherent {
-                field: "guaranteed_active_tables_per_tenant",
-                ..
-            })
-        ));
     }
 
     /// Startup accepts the exact minimum capacity and refuses one unit below it.
@@ -1046,16 +966,16 @@ mod tests {
     ///
     /// Panics when the exact minimum is refused, when a one-unit shortfall in
     /// any category is admitted, or when the refusal does not name that
-    /// category, its required and actual totals, and the guaranteed width.
+    /// category and its required and actual totals.
     #[test]
     fn startup_capacity_is_checked_per_category_at_exact_minimum() {
         let policy = ScribeArtifactPolicy::default();
-        let width = policy.geometry().guaranteed_width();
-        assert_eq!(width, 8, "four tenants times two tables");
-
-        let minimum = policy
-            .minimum_capacity()
-            .expect("the default policy has a representable minimum");
+        let minimum = policy.minimum_capacity();
+        assert_eq!(
+            policy.max_active_tables(&minimum),
+            1,
+            "the exact minimum owns exactly one canonical table"
+        );
         policy
             .validate_capacity(&minimum)
             .expect("the exact minimum capacity serves");
@@ -1080,7 +1000,6 @@ mod tests {
                 category: named,
                 required,
                 actual,
-                width: reported,
             } = error
             else {
                 panic!("a capacity shortfall must report the capacity diagnostic");
@@ -1088,7 +1007,6 @@ mod tests {
             assert_eq!(named, category.label());
             assert_eq!(required, minimum.component(category));
             assert_eq!(actual, reduced);
-            assert_eq!(reported, width);
         }
     }
 
@@ -1101,9 +1019,7 @@ mod tests {
     #[test]
     fn contention_categories_are_never_summed_across_units() {
         let policy = ScribeArtifactPolicy::default();
-        let mut lopsided = policy
-            .minimum_capacity()
-            .expect("the default policy has a representable minimum");
+        let mut lopsided = policy.minimum_capacity();
         lopsided.active_bytes = lopsided.active_bytes.saturating_mul(64);
         lopsided.staging_claim_items -= 1;
         let error = policy

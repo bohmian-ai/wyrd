@@ -372,12 +372,6 @@ pub struct ScribeRuntimeConfig {
     /// memory, while staging assembles across generations toward this size.
     #[serde(default = "default_scribe_staging_target_file_size_bytes")]
     pub staging_target_file_size_bytes: u64,
-    /// Tenants whose complete contention reserve vectors are guaranteed.
-    #[serde(default = "default_scribe_guaranteed_active_tenants")]
-    pub guaranteed_active_tenants: usize,
-    /// Tables per tenant whose contention reserve vectors are guaranteed.
-    #[serde(default = "default_scribe_guaranteed_active_tables_per_tenant")]
-    pub guaranteed_active_tables_per_tenant: usize,
     /// Maximum field count in one canonical native IPC schema.
     #[serde(default = "default_ingest_native_fields")]
     pub ingest_native_fields: usize,
@@ -1313,16 +1307,6 @@ fn default_scribe_staging_target_file_size_bytes() -> u64 {
     vala_bifrost_redux::scribe::geometry::DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES
 }
 
-/// Returns the default for [`ScribeRuntimeConfig::guaranteed_active_tenants`].
-fn default_scribe_guaranteed_active_tenants() -> usize {
-    vala_bifrost_redux::scribe::geometry::DEFAULT_GUARANTEED_ACTIVE_TENANTS
-}
-
-/// Returns the default for [`ScribeRuntimeConfig::guaranteed_active_tables_per_tenant`].
-fn default_scribe_guaranteed_active_tables_per_tenant() -> usize {
-    vala_bifrost_redux::scribe::geometry::DEFAULT_GUARANTEED_ACTIVE_TABLES_PER_TENANT
-}
-
 /// Returns the immutable V1 native field hard maximum.
 fn default_ingest_native_fields() -> usize {
     vala_bifrost_redux::gate::limits::BIFROST_NATIVE_FIELD_LIMIT
@@ -1396,9 +1380,6 @@ impl Default for ScribeRuntimeConfig {
             seal_key_early_seal_bytes: None,
             seal_key_max_age_secs: None,
             staging_target_file_size_bytes: default_scribe_staging_target_file_size_bytes(),
-            guaranteed_active_tenants: default_scribe_guaranteed_active_tenants(),
-            guaranteed_active_tables_per_tenant: default_scribe_guaranteed_active_tables_per_tenant(
-            ),
             ingest_native_fields: default_ingest_native_fields(),
             ingest_native_sources: default_ingest_native_sources(),
             ingest_rows: default_ingest_rows(),
@@ -1546,8 +1527,6 @@ impl ScribeRuntimeConfig {
             self.seal_key_early_seal_bytes,
             self.seal_key_max_age_secs.map(Duration::from_secs),
             self.staging_target_file_size_bytes,
-            self.guaranteed_active_tenants,
-            self.guaranteed_active_tables_per_tenant,
             self.ingest_request_bytes,
             vala_bifrost_redux::scribe::geometry::DEFAULT_MAXIMUM_ACTIVE_REQUEST_OWNERSHIP_BYTES,
             vala_bifrost_redux::scribe::geometry::DEFAULT_MAXIMUM_IMMUTABLE_MEMBER_OWNERSHIP_BYTES,
@@ -3368,8 +3347,6 @@ minimum_slots = 2
         assert_eq!(cfg.seal_key_early_seal_bytes, None);
         assert_eq!(cfg.seal_key_max_age_secs, None);
         assert_eq!(cfg.staging_target_file_size_bytes, 512 * 1024 * 1024);
-        assert_eq!(cfg.guaranteed_active_tenants, 4);
-        assert_eq!(cfg.guaranteed_active_tables_per_tenant, 2);
         assert_eq!(
             cfg.ingest_limits(),
             vala_bifrost_redux::gate::limits::IngestLimits::default()
@@ -3397,7 +3374,6 @@ minimum_slots = 2
         );
         assert_eq!(geometry.wal_segment_bytes(), 512 * 1024 * 1024);
         assert_eq!(geometry.staging_target_file_size_bytes(), 512 * 1024 * 1024);
-        assert_eq!(geometry.guaranteed_width(), 8);
 
         // Lowering only the pod-wide budget narrows every shard together and
         // leaves the WAL segment and hot-object targets exactly where they were.
@@ -3445,8 +3421,6 @@ minimum_slots = 2
         assert_rejected!(generation_rotation_ceiling_bytes, 0);
         assert_rejected!(generation_max_age_secs, 0);
         assert_rejected!(staging_target_file_size_bytes, 0);
-        assert_rejected!(guaranteed_active_tenants, 0);
-        assert_rejected!(guaranteed_active_tables_per_tenant, 1);
         assert_rejected!(ingest_request_bytes, 0);
         assert_rejected!(ingest_native_fields, 0);
         assert_rejected!(ingest_native_sources, 0);

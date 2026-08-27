@@ -1094,7 +1094,7 @@ impl ScribeImpl {
             geometry,
             staging_file_publisher: config.staging_file_publisher,
         })
-        .expect("embedded Scribe admission must hold its configured guaranteed width")
+        .expect("the embedded Scribe budget completes at least one table lifecycle")
     }
 
     /// Construct Scribe from execution lanes provisioned by server boot.

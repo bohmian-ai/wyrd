@@ -4523,7 +4523,7 @@ impl PeakTrackingMemoryPool {
 
 #[cfg(any(test, feature = "test-support"))]
 impl std::fmt::Display for PeakTrackingMemoryPool {
-    /// Renders the pool name DataFusion reports in resource-exhaustion errors.
+    /// Renders the pool name `DataFusion` reports in resource-exhaustion errors.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("peak_tracking")
     }
@@ -4531,8 +4531,8 @@ impl std::fmt::Display for PeakTrackingMemoryPool {
 
 #[cfg(any(test, feature = "test-support"))]
 impl MemoryPool for PeakTrackingMemoryPool {
-    /// Returns the stable pool name DataFusion attributes reservations to.
-    fn name(&self) -> &str {
+    /// Returns the stable pool name `DataFusion` attributes reservations to.
+    fn name(&self) -> &'static str {
         "peak_tracking"
     }
 

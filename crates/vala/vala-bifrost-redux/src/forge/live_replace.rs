@@ -453,14 +453,12 @@ impl Forge {
             .source_files
             .iter()
             .map(|file| {
-                file.data_file
-                    .clone()
-                    .ok_or_else(|| ForgeError::Invariant {
-                        detail: format!(
-                            "live replacement source has no catalog data file: {}",
-                            file.catalog_path
-                        ),
-                    })
+                file.data_file.clone().ok_or_else(|| ForgeError::Invariant {
+                    detail: format!(
+                        "live replacement source has no catalog data file: {}",
+                        file.catalog_path
+                    ),
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
         let mut action = tx

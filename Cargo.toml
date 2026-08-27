@@ -201,6 +201,10 @@ iceberg = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "57772676f
 iceberg-catalog-sql = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "57772676f85b138648c2f4e7f95e6dc3850d62fe" }
 iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "57772676f85b138648c2f4e7f95e6dc3850d62fe" }
 iceberg-storage-opendal = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "57772676f85b138648c2f4e7f95e6dc3850d62fe", features = ["opendal-s3", "opendal-gcs", "opendal-azdls", "opendal-fs", "opendal-memory"] }
+# Test-only. Pinned to an immutable revision so the Bifrost integration target can
+# prove that Wyrd's Oracle SessionState composes with the distributed planner over
+# one shared native DataFusion 55 universe. Wyrd ships no distributed query path.
+datafusion-distributed = { git = "https://github.com/datafusion-contrib/datafusion-distributed", rev = "4cfa166d233207ee188a277a7849bee7d9dfd2de" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

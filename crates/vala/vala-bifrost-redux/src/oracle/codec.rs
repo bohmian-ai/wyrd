@@ -520,9 +520,7 @@ impl PhysicalExtensionCodec for OraclePhysicalExtensionCodec {
                 }
                 .encode_to_vec(),
             )
-        } else if let Some(tripwire) = node
-            .downcast_ref::<super::exec::TenantTripwireExec>()
-        {
+        } else if let Some(tripwire) = node.downcast_ref::<super::exec::TenantTripwireExec>() {
             (
                 ORACLE_TENANT_TRIPWIRE_TAG,
                 TenantTripwirePayload {
@@ -554,12 +552,14 @@ impl PhysicalExtensionCodec for OraclePhysicalExtensionCodec {
 mod tests {
     //! Behavioral proof for physical-plan encoding and provider ownership.
     use super::*;
-    use datafusion::physical_plan::execution_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use datafusion::datasource::MemTable;
     use datafusion::execution::context::SessionContext;
+    use datafusion::physical_plan::execution_plan::{
+        ChildrenPropertiesMode, ReplaceChildrenOptions,
+    };
     use datafusion::physical_plan::{collect, displayable};
     use datafusion_proto::bytes::{
         physical_plan_from_bytes_with_extension_codec, physical_plan_to_bytes_with_extension_codec,
@@ -711,7 +711,10 @@ mod tests {
             .into_iter()
             .map(|child| replace_source(Arc::clone(child), source))
             .collect::<Result<Vec<_>>>()?;
-        plan.replace_children(replaced, ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute))
+        plan.replace_children(
+            replaced,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
     }
 
     /// A real native aggregate/sort/limit tree round-trips and executes identically.

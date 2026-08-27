@@ -82,15 +82,15 @@ impl ForgeAttemptMemoryPool {
 }
 
 impl std::fmt::Display for ForgeAttemptMemoryPool {
-    /// Renders the pool name DataFusion reports in resource-exhaustion errors.
+    /// Renders the pool name `DataFusion` reports in resource-exhaustion errors.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("forge_attempt")
     }
 }
 
 impl MemoryPool for ForgeAttemptMemoryPool {
-    /// Returns the stable pool name DataFusion attributes reservations to.
-    fn name(&self) -> &str {
+    /// Returns the stable pool name `DataFusion` attributes reservations to.
+    fn name(&self) -> &'static str {
         "forge_attempt"
     }
 
@@ -3003,15 +3003,15 @@ impl ForgeSortMemoryPool {
 }
 
 impl std::fmt::Display for ForgeSortMemoryPool {
-    /// Renders the pool name DataFusion reports in resource-exhaustion errors.
+    /// Renders the pool name `DataFusion` reports in resource-exhaustion errors.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("forge_sort")
     }
 }
 
 impl MemoryPool for ForgeSortMemoryPool {
-    /// Returns the stable pool name DataFusion attributes reservations to.
-    fn name(&self) -> &str {
+    /// Returns the stable pool name `DataFusion` attributes reservations to.
+    fn name(&self) -> &'static str {
         "forge_sort"
     }
 

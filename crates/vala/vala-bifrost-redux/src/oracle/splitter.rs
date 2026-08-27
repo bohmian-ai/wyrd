@@ -232,7 +232,10 @@ fn split_node(
         .into_iter()
         .map(|child| split_node(Arc::clone(child), source_groups, followers))
         .collect::<Result<Vec<_>, DataFusionError>>()?;
-    let plan = plan.replace_children(rewritten, ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute))?;
+    let plan = plan.replace_children(
+        rewritten,
+        ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+    )?;
     rewrite_node(plan, source_groups, followers)
 }
 
@@ -269,7 +272,10 @@ fn rewrite_node(
             return Ok(plan);
         }
         let remote = capture_follower(Arc::clone(&plan), source_scan_ids, followers);
-        return plan.replace_children(vec![remote], ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute));
+        return plan.replace_children(
+            vec![remote],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        );
     }
     if plan.name() == "UnionExec" {
         if contains_remote_result(plan.as_ref()) {
@@ -305,7 +311,10 @@ fn rewrite_node(
                 };
             replacements.push(capture_follower(follower_plan, source_scan_ids, followers));
         }
-        return plan.replace_children(replacements, ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute));
+        return plan.replace_children(
+            replacements,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        );
     }
     if plan.name() == "HashJoinExec" {
         let mut replacements = Vec::new();
@@ -322,7 +331,10 @@ fn rewrite_node(
                 datafusion::physical_expr::Partitioning::RoundRobinBatch(partitions),
             )?) as Arc<dyn ExecutionPlan>);
         }
-        return plan.replace_children(replacements, ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute));
+        return plan.replace_children(
+            replacements,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        );
     }
     Ok(plan)
 }
@@ -383,7 +395,10 @@ fn rewrite_exchange(
         remote,
         datafusion::physical_expr::Partitioning::RoundRobinBatch(partitions),
     )?) as Arc<dyn ExecutionPlan>;
-    plan.replace_children(vec![repartition], ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute))
+    plan.replace_children(
+        vec![repartition],
+        ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+    )
 }
 
 /// Captures one follower subtree and returns its leader-side remote placeholder.
@@ -646,7 +661,10 @@ fn substitute_plan_node(
         .into_iter()
         .map(|child| substitute_plan_node(Arc::clone(child), replacements))
         .collect::<Result<Vec<_>, _>>()?;
-    plan.replace_children(children, ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute))
+    plan.replace_children(
+        children,
+        ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+    )
 }
 
 /// Recursively consumes one exact remote result per leader placeholder.
@@ -678,7 +696,10 @@ fn substitute_node(
         .into_iter()
         .map(|child| substitute_node(Arc::clone(child), results))
         .collect::<Result<Vec<_>, _>>()?;
-    plan.replace_children(replacements, ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute))
+    plan.replace_children(
+        replacements,
+        ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+    )
 }
 
 #[cfg(test)]

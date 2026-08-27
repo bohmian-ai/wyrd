@@ -453,7 +453,9 @@ impl ExecutionPlan for RemoteScanExec {
     /// Never returns an error; the signature is fixed by the trait.
     fn apply_expressions(
         &self,
-        _f: &mut dyn FnMut(&Arc<dyn datafusion::physical_expr::PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        ) -> DataFusionResult<TreeNodeRecursion>,
     ) -> DataFusionResult<TreeNodeRecursion> {
         Ok(TreeNodeRecursion::Continue)
     }
@@ -864,9 +866,7 @@ impl OracleQueryScanStats {
     /// Visits each physical node exactly once, accumulating leaf scan evidence.
     fn visit(plan: &dyn ExecutionPlan, stats: &mut Self) {
         if let Some(source) = plan.downcast_ref::<DataSourceExec>()
-            && let Some(config) = source
-                .data_source()
-                .downcast_ref::<FileScanConfig>()
+            && let Some(config) = source.data_source().downcast_ref::<FileScanConfig>()
         {
             stats.partitions_scanned = stats
                 .partitions_scanned
@@ -1020,13 +1020,11 @@ impl OracleIcebergScanExec {
     /// Returns a planning error when the dependency plan cannot be downcast or
     /// its public projection cannot be represented by the adapter.
     pub(crate) fn from_plan(plan: &dyn ExecutionPlan) -> DataFusionResult<Self> {
-        let scan = plan
-            .downcast_ref::<IcebergTableScan>()
-            .ok_or_else(|| {
-                DataFusionError::Plan(
-                    "OracleIcebergScanExec requires the pinned IcebergTableScan".to_owned(),
-                )
-            })?;
+        let scan = plan.downcast_ref::<IcebergTableScan>().ok_or_else(|| {
+            DataFusionError::Plan(
+                "OracleIcebergScanExec requires the pinned IcebergTableScan".to_owned(),
+            )
+        })?;
         Ok(Self {
             table: scan.table().clone(),
             snapshot_id: scan.snapshot_id(),
@@ -1215,7 +1213,9 @@ impl ExecutionPlan for OracleIcebergScanExec {
     /// Never returns an error; the signature is fixed by the trait.
     fn apply_expressions(
         &self,
-        _f: &mut dyn FnMut(&Arc<dyn datafusion::physical_expr::PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        ) -> DataFusionResult<TreeNodeRecursion>,
     ) -> DataFusionResult<TreeNodeRecursion> {
         Ok(TreeNodeRecursion::Continue)
     }
@@ -1795,7 +1795,9 @@ impl ExecutionPlan for TenantTripwireExec {
     /// Never returns an error; the signature is fixed by the trait.
     fn apply_expressions(
         &self,
-        _f: &mut dyn FnMut(&Arc<dyn datafusion::physical_expr::PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        ) -> DataFusionResult<TreeNodeRecursion>,
     ) -> DataFusionResult<TreeNodeRecursion> {
         Ok(TreeNodeRecursion::Continue)
     }
@@ -2365,7 +2367,9 @@ impl ExecutionPlan for HotParquetExec {
     /// Never returns an error; the signature is fixed by the trait.
     fn apply_expressions(
         &self,
-        _f: &mut dyn FnMut(&Arc<dyn datafusion::physical_expr::PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        ) -> DataFusionResult<TreeNodeRecursion>,
     ) -> DataFusionResult<TreeNodeRecursion> {
         Ok(TreeNodeRecursion::Continue)
     }
@@ -3409,11 +3413,7 @@ mod tests {
         assert_eq!(tripwire.children()[0].name(), "UnionExec");
         let tripwire_plan: Arc<dyn ExecutionPlan> = Arc::clone(&tripwire) as Arc<dyn ExecutionPlan>;
         assert!(tripwire_plan.downcast_ref::<SortExec>().is_none());
-        assert!(
-            tripwire.children()[0]
-                .downcast_ref::<SortExec>()
-                .is_none()
-        );
+        assert!(tripwire.children()[0].downcast_ref::<SortExec>().is_none());
     }
 
     /// Composes one Oracle capability for hot-read resource tests.

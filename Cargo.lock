@@ -377,6 +377,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrow-flight"
+version = "59.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bebfacc9d71f0728f6774164e4d4254b5e504d2b46812d0512d8290ec119a64"
+dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-cast",
+ "arrow-data",
+ "arrow-ipc",
+ "arrow-schema",
+ "base64 0.23.1",
+ "bytes",
+ "futures",
+ "prost",
+ "prost-types",
+ "tonic",
+ "tonic-prost",
+]
+
+[[package]]
 name = "arrow-ipc"
 version = "59.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1440,6 +1461,15 @@ name = "bimap"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "230c5f1ca6a325a32553f8640d31ac9b49f2411e901e427570154868b46da4f7"
+
+[[package]]
+name = "bincode"
+version = "1.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "bit-set"
@@ -2692,6 +2722,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "datafusion-distributed"
+version = "4.0.0"
+source = "git+https://github.com/datafusion-contrib/datafusion-distributed?rev=4cfa166d233207ee188a277a7849bee7d9dfd2de#4cfa166d233207ee188a277a7849bee7d9dfd2de"
+dependencies = [
+ "arrow-flight",
+ "arrow-ipc",
+ "arrow-select",
+ "async-trait",
+ "bincode",
+ "bytes",
+ "chrono",
+ "crossbeam-queue",
+ "dashmap 6.2.1",
+ "datafusion",
+ "datafusion-proto",
+ "delegate",
+ "futures",
+ "http 1.5.0",
+ "itertools 0.14.0",
+ "moka",
+ "num-traits",
+ "object_store",
+ "pin-project",
+ "prost",
+ "rand 0.9.5",
+ "sketches-ddsketch",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic",
+ "tonic-prost",
+ "tower",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "datafusion-doc"
 version = "55.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3190,6 +3257,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "10d60334b3b2e7c9d91ef8150abfb6fa4c1c39ebbcf4a81c2e346aad939fee3e"
 dependencies = [
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "delegate"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "780eb241654bf097afb00fc5f054a09b687dad862e485fdcf8399bb056565370"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -8564,6 +8642,9 @@ name = "sketches-ddsketch"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c6f73aeb92d671e0cc4dca167e59b2deb6387c375391bc99ee743f326994a2b"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "slab"
@@ -10011,6 +10092,7 @@ dependencies = [
  "chrono",
  "crc32c",
  "datafusion",
+ "datafusion-distributed",
  "datafusion-proto",
  "futures-util",
  "hex",
@@ -10038,6 +10120,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "ulid",
+ "url",
  "uuid",
  "vala-sql",
  "wyrd-auth-oidc",

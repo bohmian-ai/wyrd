@@ -49,6 +49,8 @@ iceberg = { workspace = true }
 iceberg-datafusion = { workspace = true }
 iceberg-catalog-sql = { workspace = true }
 iceberg-storage-opendal = { workspace = true }
+datafusion-distributed = { workspace = true }
+url = { workspace = true }
 datafusion = { workspace = true }
 datafusion-proto = { workspace = true }
 opendal = { workspace = true }
@@ -78,6 +80,8 @@ wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
 wyrd-bench = { workspace = true }
 iceberg-catalog-sql = { workspace = true }
 iceberg-storage-opendal = { workspace = true }
+datafusion-distributed = { workspace = true }
+url = { workspace = true }
 
 [lints]
 workspace = true

@@ -177,7 +177,7 @@ mod tests {
 
     /// A query runtime rejects spill growth beyond its exact admitted share.
     ///
-    /// DataFusion 55 enforces the temp-directory quota inside the spill
+    /// `DataFusion` 55 enforces the temp-directory quota inside the spill
     /// writer's `Write::write`, so growth past the admitted share surfaces as a
     /// write error naming the limit rather than a post-hoc usage refresh.
     #[test]

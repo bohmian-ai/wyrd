@@ -734,9 +734,7 @@ fn restrict_plan_to_assigned_files(
     let mut file_leaves = 0usize;
     let transformed = plan
         .transform_up(|node| {
-            if let Some(exec) = node
-                .downcast_ref::<super::exec::OracleIcebergScanExec>()
-            {
+            if let Some(exec) = node.downcast_ref::<super::exec::OracleIcebergScanExec>() {
                 file_leaves = file_leaves.saturating_add(1);
                 observed.extend(assigned.iter().cloned());
                 return Ok(Transformed::yes(Arc::new(
@@ -1370,9 +1368,7 @@ pub(crate) mod tests {
     /// Panics if the supplied plan is not the file-backed source constructed by
     /// [`file_plan`] or if that source does not contain a [`FileScanConfig`].
     fn plan_files(plan: &Arc<dyn ExecutionPlan>) -> Vec<String> {
-        let exec = plan
-            .downcast_ref::<DataSourceExec>()
-            .expect("file source");
+        let exec = plan.downcast_ref::<DataSourceExec>().expect("file source");
         let config = exec
             .data_source()
             .downcast_ref::<FileScanConfig>()
@@ -1885,7 +1881,8 @@ pub(crate) mod tests {
             "partitions narrow to the work this fragment was assigned"
         );
         assert_ne!(
-            options.execution.batch_size.get(), 1_024,
+            options.execution.batch_size.get(),
+            1_024,
             "the removed fixed batch size is not the admitted shape"
         );
 

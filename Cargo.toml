@@ -145,9 +145,9 @@ opentelemetry = "0.31"
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"] }
 opentelemetry-proto = { version = "0.31", default-features = false, features = ["gen-tonic", "gen-tonic-messages", "trace", "metrics", "logs", "with-serde"] }
-arrow = "58"
-arrow-array = "58"
-arrow-schema = "58"
+arrow = "59.2"
+arrow-array = "59.2"
+arrow-schema = "59.2"
 statrs = "0.18"
 jsonpath-rust = "0.7"
 tracing-opentelemetry = "0.32"
@@ -190,15 +190,17 @@ opendal = { version = "0.57", default-features = false, features = [
   "services-fs", "services-s3", "services-gcs", "services-azblob",
   "reqwest-rustls-tls",
 ] }
-# =53.1.0 matches the iceberg-rust arrow-58 line; git-pinned until iceberg 0.10 publishes.
-datafusion = "=53.1.0"
-datafusion-proto = "=53.1.0"
-parquet = "58"
-iceberg = { git = "https://github.com/mitari-ai/iceberg-rust", branch = "wyrd/rewrite-files-action" }
+# =55.0.0 matches the managed iceberg-rust arrow-59.2 line. The four iceberg
+# crates share one immutable SCRIBE_ICEBERG_SHA so the analytical graph stays a
+# single native universe (no moving branch, no duplicate Arrow/Parquet package).
+datafusion = "=55.0.0"
+datafusion-proto = "=55.0.0"
+parquet = "59.2"
+iceberg = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "e11f66f3158a585d09c73702b1b708df3c5b8835" }
 # sqlx 0.8.1 is a hard dep in this crate — there is no sqlx feature flag to add.
-iceberg-catalog-sql = { git = "https://github.com/mitari-ai/iceberg-rust", branch = "wyrd/rewrite-files-action" }
-iceberg-datafusion = { git = "https://github.com/mitari-ai/iceberg-rust", branch = "wyrd/rewrite-files-action" }
-iceberg-storage-opendal = { git = "https://github.com/mitari-ai/iceberg-rust", branch = "wyrd/rewrite-files-action", features = ["opendal-s3", "opendal-gcs", "opendal-azdls", "opendal-fs", "opendal-memory"] }
+iceberg-catalog-sql = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "e11f66f3158a585d09c73702b1b708df3c5b8835" }
+iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "e11f66f3158a585d09c73702b1b708df3c5b8835" }
+iceberg-storage-opendal = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "e11f66f3158a585d09c73702b1b708df3c5b8835", features = ["opendal-s3", "opendal-gcs", "opendal-azdls", "opendal-fs", "opendal-memory"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

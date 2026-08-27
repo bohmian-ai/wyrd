@@ -4,7 +4,7 @@
 //! Module of the `oracle` binary; see `main.rs` for the capability it proves
 //! and `support.rs` for the fixtures it shares.
 
-use arrow::array::{Int64Array, StringArray};
+use arrow::array::{Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
@@ -379,4 +379,341 @@ fn ipc_marked(id: i64, value: &str) -> Vec<u8> {
     writer.write(&batch).expect("in-memory IPC write");
     writer.finish().expect("in-memory IPC finish");
     bytes
+}
+
+/// Number of rows written before compaction. Every one of them is sealed as
+/// its own Parquet file, so the Forge pass has `min_files` worth of real
+/// inputs to rewrite into a single published data file.
+const COMPACTED_BATCH_ROWS: i64 = 20;
+
+/// Number of rows written after compaction. These stay in the hot manifest for
+/// the duration of the journey, so the query's cut spans both physical tiers.
+const HOT_BATCH_ROWS: i64 = 8;
+
+/// Every fourth row carries the selective marker, in both batches.
+const MARKER_STRIDE: i64 = 4;
+
+/// Ids in the second batch start here so a returned id names, unambiguously,
+/// which physical tier it could only have come from.
+const HOT_BATCH_ID_BASE: i64 = 101;
+
+/// S3 proves one selective distributed query reads a cut that spans both
+/// follower read leaves at once — the compacted `:iceberg` leaf and the sealed
+/// `:hot` leaf — and prunes physically on both.
+///
+/// The two leaves are otherwise untestable together. A table that has never
+/// compacted records an `:iceberg` assignment with an empty file set, which
+/// `OracleCatalogResolver::resolve` short-circuits before it ever calls
+/// `provider.scan`, so a fixture that only writes and flushes exercises the hot
+/// leaf and nothing else. This journey therefore compacts first and writes
+/// second:
+///
+/// 1. write `COMPACTED_BATCH_ROWS` rows, each sealed as its own file;
+/// 2. drive one Forge pass to completion and require the inputs to be marked
+///    compacted, which moves them out of the hot manifest and into the Iceberg
+///    snapshot;
+/// 3. write `HOT_BATCH_ROWS` more rows and leave them sealed-but-uncompacted;
+/// 4. query once with the selective predicate.
+///
+/// Id ranges are disjoint across the two batches, so the returned ids are the
+/// proof that both leaves executed: an id below `HOT_BATCH_ID_BASE` exists only
+/// inside the compacted data file, and an id at or above it exists only in the
+/// hot manifest. Row-group pruning is then required to move against the
+/// unfiltered baseline, which is what regresses if the follower stops passing
+/// `assignment.predicates` into `provider.scan` on the compacted leaf.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn pg_bifrost_selective_predicate_spans_hot_and_compacted_reads() {
+    prove_hot_and_compacted_pruning()
+        .await
+        .expect("S3 hot+compacted pruning journey");
+}
+
+/// Builds the two-tier fixture and proves the span-and-prune contract on it.
+///
+/// # Errors
+///
+/// Returns a client, Postgres, telemetry, Forge-scheduling, or
+/// cluster-lifecycle error surfaced by any journey step, and a descriptive
+/// error when the fixture fails to reach the two-tier state the assertion
+/// requires.
+async fn prove_hot_and_compacted_pruning() -> Result<(), JourneyError> {
+    let cluster =
+        WyrdTestCluster::start_spec_with_forge_completion_observer(BifrostClusterSpec::three_mixed())
+            .await?;
+    let ingest_server = cluster
+        .servers()
+        .find(|server| server.bifrost_scribe().is_some())
+        .ok_or("missing S3 ingest node")?;
+    let tenant = cluster.data_tenant_id();
+    let table = unique_table("oracle_s3_two_tier");
+    register_table(ingest_server, tenant, &table).await?;
+    let writer = client(ingest_server, "s3-two-tier-writer").await?;
+    let table_fqn = format!("vala.bifrost.{table}");
+
+    for id in 1..=COMPACTED_BATCH_ROWS {
+        ingest_marked(&writer, &table_fqn, id, marker_value(id)).await?;
+        ingest_server.flush_bifrost().await?;
+    }
+    compact_sealed_batch(&cluster, tenant, &table, COMPACTED_BATCH_ROWS).await?;
+
+    for offset in 0..HOT_BATCH_ROWS {
+        let id = HOT_BATCH_ID_BASE + offset;
+        ingest_marked(&writer, &table_fqn, id, marker_value(id)).await?;
+        ingest_server.flush_bifrost().await?;
+    }
+    cluster.refresh_oracle_snapshots().await?;
+
+    // Precondition, asserted immediately before the query rather than assumed:
+    // the periodic maintenance ticker could in principle sweep the second batch
+    // too, and a cut with only one physical tier in it would silently prove
+    // half of what this journey claims.
+    let (compacted_files, hot_files) = file_tier_counts(&cluster, tenant, &table).await?;
+    if compacted_files == 0 || hot_files == 0 {
+        return Err(format!(
+            "query cut must span both physical tiers: compacted={compacted_files} hot={hot_files}"
+        )
+        .into());
+    }
+
+    let query_server = cluster.server(2).ok_or("missing S3 query node")?;
+    let reader = client(query_server, "s3-two-tier-reader").await?;
+    let total_rows = COMPACTED_BATCH_ROWS + HOT_BATCH_ROWS;
+
+    let unfiltered_checkpoint = cluster
+        .telemetry()
+        .checkpoint()
+        .map_err(|error| error.to_string())?;
+    let unfiltered_ids = query_ids(
+        &reader,
+        format!("SELECT id, value FROM {table_fqn} ORDER BY id"),
+    )
+    .await?;
+    if i64::try_from(unfiltered_ids.len())? != total_rows {
+        return Err(format!(
+            "unfiltered baseline expected {total_rows} rows, saw {}",
+            unfiltered_ids.len()
+        )
+        .into());
+    }
+    let unfiltered_delta = cluster
+        .telemetry()
+        .delta_since(&unfiltered_checkpoint)
+        .map_err(|error| error.to_string())?;
+    let unfiltered_row_groups =
+        sum_metric(&unfiltered_delta, "oracle_query_row_groups_scanned_total");
+    let unfiltered_pruned = sum_metric(&unfiltered_delta, "oracle_query_row_groups_pruned_total");
+    let unfiltered_bytes = sum_metric(&unfiltered_delta, "oracle_query_bytes_scanned_total");
+
+    let selective_checkpoint = cluster
+        .telemetry()
+        .checkpoint()
+        .map_err(|error| error.to_string())?;
+    let selective_ids = query_ids(
+        &reader,
+        format!("SELECT id, value FROM {table_fqn} WHERE value = 'target' ORDER BY id"),
+    )
+    .await?;
+    let expected_ids = expected_marked_ids();
+    if selective_ids != expected_ids {
+        return Err(format!(
+            "selective predicate returned the wrong residual rows: got {selective_ids:?} want {expected_ids:?}"
+        )
+        .into());
+    }
+    // The user-visible half of the contract: the filter removed rows, it did
+    // not merely reorder them.
+    if i64::try_from(selective_ids.len())? >= total_rows {
+        return Err(format!(
+            "selective predicate returned {} of {total_rows} written rows",
+            selective_ids.len()
+        )
+        .into());
+    }
+    // The span proof. These two conditions cannot both hold unless the
+    // compacted leaf and the hot leaf each contributed rows to one query.
+    if !selective_ids.iter().any(|id| *id < HOT_BATCH_ID_BASE) {
+        return Err(format!(
+            "no compacted-tier row reached the client: {selective_ids:?}"
+        )
+        .into());
+    }
+    if !selective_ids.iter().any(|id| *id >= HOT_BATCH_ID_BASE) {
+        return Err(format!("no hot-tier row reached the client: {selective_ids:?}").into());
+    }
+
+    let selective_delta = cluster
+        .telemetry()
+        .delta_since(&selective_checkpoint)
+        .map_err(|error| error.to_string())?;
+    let selective_row_groups =
+        sum_metric(&selective_delta, "oracle_query_row_groups_scanned_total");
+    let selective_pruned = sum_metric(&selective_delta, "oracle_query_row_groups_pruned_total");
+    let selective_bytes = sum_metric(&selective_delta, "oracle_query_bytes_scanned_total");
+    // Required positively, as on the single-tier distributed leg: `sum_metric`
+    // reports an absent family as 0.0, so a missing series must fail here.
+    if selective_row_groups >= unfiltered_row_groups || selective_pruned - unfiltered_pruned <= 0.0
+    {
+        return Err(format!(
+            "two-tier selective query must scan strictly fewer row groups and prune strictly more: \
+             row groups selective={selective_row_groups} unfiltered={unfiltered_row_groups}; \
+             pruned selective={selective_pruned} unfiltered={unfiltered_pruned}; \
+             bytes selective={selective_bytes} unfiltered={unfiltered_bytes}"
+        )
+        .into());
+    }
+    // Strict `Less` rather than a negated `<`: an incomparable (NaN) metric
+    // must fail this proof, not silently satisfy it.
+    if !matches!(
+        selective_bytes.partial_cmp(&unfiltered_bytes),
+        Some(std::cmp::Ordering::Less)
+    ) {
+        return Err(format!(
+            "two-tier selective query must scan strictly fewer bytes: selective={selective_bytes} unfiltered={unfiltered_bytes}"
+        )
+        .into());
+    }
+
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// The marker a given id carries. Every `MARKER_STRIDE`-th id is selective, so
+/// both batches contain matching and non-matching rows.
+fn marker_value(id: i64) -> &'static str {
+    if id % MARKER_STRIDE == 0 {
+        "target"
+    } else {
+        "other"
+    }
+}
+
+/// The exact ascending ids the selective predicate must return, derived from
+/// the same rule that wrote them.
+fn expected_marked_ids() -> Vec<i64> {
+    (1..=COMPACTED_BATCH_ROWS)
+        .chain(HOT_BATCH_ID_BASE..HOT_BATCH_ID_BASE + HOT_BATCH_ROWS)
+        .filter(|id| marker_value(*id) == "target")
+        .collect()
+}
+
+/// Drives one Forge planning pass to completion and requires every sealed
+/// input for `table` to be marked compacted.
+///
+/// Waits on the production completion observer rather than on elapsed time:
+/// the observer counts worker completions the supervisor actually published,
+/// so a pass that claimed nothing cannot be mistaken for a pass that rewrote
+/// the batch. The durable `compacted` flag is then read back as the real
+/// postcondition, because the observer proves a task finished and not that
+/// this table's files moved tiers.
+///
+/// # Errors
+///
+/// Returns an error when the observer is absent, when no pass completes within
+/// the bound, when the Postgres probe fails, or when fewer than `expected`
+/// inputs end up compacted.
+async fn compact_sealed_batch(
+    cluster: &WyrdTestCluster,
+    tenant: wyrd_spec::DataTenantId,
+    table: &str,
+    expected: i64,
+) -> Result<(), JourneyError> {
+    let observer = cluster
+        .forge_completion_observer()
+        .ok_or("cluster was started without a Forge completion observer")?;
+    let target = observer.completed().saturating_add(1);
+    cluster.request_forge_scheduler_pass_for_test();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(90),
+        observer.wait_for_at_least(target),
+    )
+    .await
+    .map_err(|_| "Forge worker did not complete a pass for the sealed batch")?;
+    let (compacted, _) = file_tier_counts(cluster, tenant, table).await?;
+    if compacted < expected {
+        return Err(format!(
+            "Forge pass compacted {compacted} of {expected} sealed inputs"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Returns `(compacted, hot)` durable file counts for one tenant-owned table.
+///
+/// Reads `vala.file_list` through the operator pool because the split between
+/// the two tiers is durable server state the journey has no client-visible
+/// projection of; the query's own metrics report scan totals without naming
+/// which leaf produced them.
+///
+/// # Errors
+///
+/// Returns the SQLx error when either count cannot be read.
+async fn file_tier_counts(
+    cluster: &WyrdTestCluster,
+    tenant: wyrd_spec::DataTenantId,
+    table: &str,
+) -> Result<(i64, i64), JourneyError> {
+    let pool = cluster.pg_fixture().operator_pool().pool();
+    let compacted: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.file_list WHERE data_tenant_id = $1 AND table_name = $2 AND compacted",
+    )
+    .bind(tenant.as_uuid())
+    .bind(table)
+    .fetch_one(pool)
+    .await?;
+    let hot: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.file_list WHERE data_tenant_id = $1 AND table_name = $2 AND NOT compacted",
+    )
+    .bind(tenant.as_uuid())
+    .bind(table)
+    .fetch_one(pool)
+    .await?;
+    Ok((compacted, hot))
+}
+
+/// Drains one successful query stream and returns its `id` column in stream
+/// order.
+///
+/// Returning the ids rather than a count is what lets a caller name which
+/// physical tier a row could only have come from.
+///
+/// # Errors
+///
+/// Returns a client or Arrow error, and an error when the stream carries no
+/// terminal frame, does not succeed, or emits a batch whose leading column is
+/// not a non-null `Int64`.
+async fn query_ids(client: &WyrdClient, sql: String) -> Result<Vec<i64>, JourneyError> {
+    let mut stream = QueryClient::new(client)
+        .query(&BifrostQueryRequest {
+            sql,
+            visibility: VisibilityMode::PublishedOnly,
+            freshness: FreshnessPolicy::Strict,
+            deadline_ms: None,
+        })
+        .await?;
+    let mut ids = Vec::new();
+    while let Some(batch) = stream.next_batch().await? {
+        let column = batch
+            .column_by_name("id")
+            .ok_or("query result is missing its id column")?
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or("query result id column is not Int64")?;
+        for index in 0..column.len() {
+            if column.is_null(index) {
+                return Err("query result carried a null id".into());
+            }
+            ids.push(column.value(index));
+        }
+    }
+    let terminal = stream.terminal().ok_or("query terminal missing")?;
+    if terminal.outcome != QueryTerminalOutcome::Success || terminal.error.is_some() {
+        return Err(format!(
+            "query did not succeed: {:?} {:?}",
+            terminal.outcome, terminal.error
+        )
+        .into());
+    }
+    Ok(ids)
 }

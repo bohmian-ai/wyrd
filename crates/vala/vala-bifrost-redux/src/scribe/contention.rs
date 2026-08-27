@@ -5,46 +5,48 @@
 //! other tenant's append fail with the same busy error, and nothing in a global
 //! counter says whose fault that is or whose work should have been protected.
 //!
-//! This module adds the two missing dimensions, in the order they matter. The
-//! pod-wide [`ScribeContentionLedger`] is keyed by tenant; each tenant owns one
-//! [`TenantScribeLedger`] holding a whole table-width reservation and the nested
-//! canonical-table [`TenantTableLedger`] cells drawn from it. A tenant that
-//! activates therefore takes its configured table width out of pod capacity
-//! atomically, before any of its tables arrive, so the tenant that starts
-//! writing first cannot consume the vectors a later guaranteed tenant is owed.
+//! This module adds the two missing dimensions without inventing tenants or
+//! tables that do not exist. Nothing here is sized by a tenant count or a table
+//! count. Capacity is whatever the node actually measured, owners are created
+//! lazily from real traffic, and how many owners the pod can carry is derived
+//! from that capacity by [`ScribeArtifactPolicy::max_active_tables`].
 //!
-//! Three quantities govern every decision, and keeping them apart is the whole
-//! point of the module:
+//! Three rules govern every decision:
 //!
-//! - The **startup reservation** is `guaranteed_width` complete
-//!   [`crate::scribe::geometry::ContentionReserveVector`]s. Startup already
-//!   proved the pod holds it, and it is held for the pod's whole life whether or
-//!   not the guaranteed owners have arrived. It is never borrowable.
-//! - A **protected cell** is one owner's slice of that reservation: a tenant's
-//!   `reserved_vectors`, and inside it one vector per active table.
-//! - **Surplus** is whatever capacity remains beyond the reservation. Only this
-//!   is elastic, and it is not first-come: each active tenant may borrow up to
-//!   an equal share of it, and each table inside a tenant up to an equal share
-//!   of its tenant's share. Shares are computed independently per category, so a
-//!   table that has saturated the surplus in one category still competes
-//!   normally in the others.
+//! - **Lazy ownership.** A tenant cell and a table cell exist only while that
+//!   tenant and table are actually active or actually contending. No cell is
+//!   held for an identity that has never sent traffic, so one tenant with one
+//!   table may use every genuinely idle byte, item and lane the pod owns.
+//! - **Dynamic max-min shares.** A ceiling is never a fixed division of
+//!   capacity. On every charge the ledger recomputes the max-min fair level
+//!   across the live owners, so an owner below its level frees the remainder for
+//!   everyone else and a hungry owner rises only to the level fairness allows.
+//!   Levels are computed independently per category: byte, item and lane
+//!   categories are never summed or traded against one another.
+//! - **Acknowledged work is never revoked.** When a new contender shrinks
+//!   everyone's level, an owner already above it keeps what it holds and drains
+//!   it through the normal lifecycle. It is refused only *new* growth. That is
+//!   the difference between backpressure and data loss.
 //!
-//! Shares shrink as owners arrive, and shrinking never revokes what an owner
-//! already holds: an over-share owner keeps its bytes and drains them, and is
-//! only refused *new* borrowed ownership. That is the difference between
-//! backpressure and data loss.
+//! Fair *ordering* needs one more thing: a contender that was refused must get
+//! the next released capacity before an incumbent can take it back. That is what
+//! [`DemandRecord`] is for. A demand record is identity-only — a tenant and a
+//! registered canonical table — bounded by a configured queue capacity,
+//! expiring, and removed on admission, cancellation or expiry. It owns no bytes,
+//! writes no WAL, creates no durable row, and never appears in a metric label.
 //!
-//! Pod-wide totals are derived from the tenant map on every read rather than
-//! cached beside it. A cached total is one more thing that can drift from the
-//! cells it is supposed to summarize, and the map is bounded by the configured
-//! activation width, so summing it is cheap.
+//! Pod-wide and tenant-wide totals are derived from the owner map on every read
+//! rather than cached beside it. A cached total is one more thing that can drift
+//! from the cells it is supposed to summarize.
 //!
 //! The ledger owns the accounting only. It does not perform IO, does not know
 //! what a batch is, and does not decide when a table stops being active; those
 //! belong to the admission and shard owners that hold it.
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use wyrd_spec::ids::DataTenantId;
 
@@ -53,6 +55,21 @@ use crate::contracts::ScribeError;
 use crate::scribe::geometry::{
     ContentionCategory, ContentionReserveVector, ScribeArtifactPolicy, ScribeGlobalCapacity,
 };
+
+/// Live contention-demand records the pod will hold before refusing to queue.
+///
+/// The queue is an operational bound, not a tenant or table cardinality: it caps
+/// how many identity-only waiting records the pod tracks at once, and a full
+/// queue simply means a refused contender is not promised ordering, never that
+/// it is denied service once capacity frees.
+pub const DEFAULT_CONTENTION_DEMAND_CAPACITY: usize = 1_024;
+
+/// How long one identity-only contention-demand record stays live.
+///
+/// A contender that has gone away must not hold ordering priority forever, so a
+/// record expires rather than requiring an explicit cancellation from a caller
+/// that may already have failed.
+pub const DEFAULT_CONTENTION_DEMAND_TTL: Duration = Duration::from_secs(30);
 
 /// Identity of one contention cell.
 ///
@@ -75,14 +92,26 @@ impl ContentionKey {
     }
 }
 
+/// One bounded, expiring record that a real table is waiting for capacity.
+///
+/// Holds identity and an expiry and nothing else. It exists so a contender that
+/// was refused is served before an incumbent can reborrow the capacity it
+/// releases, and it is removed the moment that contender is admitted, cancels,
+/// or expires.
+#[derive(Debug, Clone)]
+struct DemandRecord {
+    /// Which registered canonical table is waiting.
+    key: ContentionKey,
+    /// When this record stops conferring ordering priority.
+    expires_at: Instant,
+}
+
 /// Live usage of one active canonical table across every governed category.
 ///
 /// This is the innermost ledger in the hierarchy. It holds only committed
-/// amounts; the protected reserve it draws from belongs to the enclosing
-/// [`TenantScribeLedger`], and the ceiling it may borrow to is recomputed from
-/// the live owner counts on every charge rather than cached, because a cached
-/// ceiling is exactly what would let an owner keep a share a newly arrived
-/// neighbour is entitled to.
+/// amounts; every ceiling it is checked against is recomputed from the live
+/// owner set on each charge, because a cached ceiling is exactly what would let
+/// an owner keep a share a newly arrived neighbour is entitled to.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct TenantTableLedger {
     /// Committed amount per category, indexed by `ContentionCategory::ALL`.
@@ -101,20 +130,15 @@ impl TenantTableLedger {
     }
 }
 
-/// One tenant's protected cell and the canonical tables nested inside it.
+/// One tenant's lazily created cell and the canonical tables nested inside it.
 ///
-/// `reserved_vectors` is the tenant's own width, not a count of its live tables.
-/// It is taken when the tenant activates and stays taken while the tenant is
-/// active, so an idle table slot inside a guaranteed tenant is still protected
-/// from a hot table in another tenant. It grows past the configured table width
-/// only when a complete extra vector fits pod capacity, and shrinks back toward
-/// that width as tables release.
+/// The cell exists only while the tenant has at least one active table. It
+/// reserves nothing on its own: a tenant that stops writing leaves no permanent
+/// claim on capacity behind it.
 #[derive(Debug, Default)]
 struct TenantScribeLedger {
     /// Nested canonical-table ledgers by table identity.
     tables: HashMap<TableRef, TenantTableLedger>,
-    /// Complete reserve vectors this tenant holds out of pod capacity.
-    reserved_vectors: usize,
 }
 
 impl TenantScribeLedger {
@@ -128,97 +152,156 @@ impl TenantScribeLedger {
             .map(|table| table.get(category))
             .sum::<usize>()
     }
-
-    /// Returns this tenant's protected amount in one category.
-    ///
-    /// This is the floor its tables draw from before any of them touches shared
-    /// surplus, and the amount no other tenant may borrow however idle it looks.
-    fn protected(&self, vector: &ContentionReserveVector, category: ContentionCategory) -> usize {
-        self.reserved_vectors
-            .saturating_mul(vector.component(category))
-    }
-
-    /// Returns the amount this tenant currently holds beyond its protected cell.
-    ///
-    /// Only this part ever competes for shared surplus; the protected part was
-    /// committed once, when the tenant activated.
-    fn borrowed(&self, vector: &ContentionReserveVector, category: ContentionCategory) -> usize {
-        self.committed(category)
-            .saturating_sub(self.protected(vector, category))
-    }
 }
 
 /// Mutable ledger state guarded by one lock.
 ///
-/// Tenants and their nested tables move together under the same lock so a
-/// concurrent activation can never observe a reservation the tenant map does not
-/// yet contain, which would let the pod over-commit by exactly one cell.
+/// Owners and waiting demand move together under the same lock so a concurrent
+/// activation can never observe a queue the owner map does not yet agree with,
+/// which would let the pod over-commit by exactly one table.
 #[derive(Debug, Default)]
 struct LedgerState {
     /// Installed tenant cells by identity.
     tenants: HashMap<DataTenantId, TenantScribeLedger>,
+    /// Identity-only waiting records in arrival order.
+    demand: VecDeque<DemandRecord>,
 }
 
 impl LedgerState {
-    /// Returns the number of active tenants sharing every category's surplus.
+    /// Returns the number of active tenants sharing every category.
     fn active_tenants(&self) -> usize {
         self.tenants.len()
     }
 
-    /// Returns the total complete vectors every active tenant has reserved.
-    fn reserved_vectors(&self) -> usize {
+    /// Returns the number of active canonical tables across every tenant.
+    fn active_tables(&self) -> usize {
         self.tenants
             .values()
-            .map(|tenant| tenant.reserved_vectors)
+            .map(|tenant| tenant.tables.len())
             .sum()
     }
 
-    /// Returns the total borrowed beyond every tenant's protected cell.
-    fn borrowed(&self, vector: &ContentionReserveVector, category: ContentionCategory) -> usize {
+    /// Returns whether one table currently holds a cell.
+    fn is_active(&self, key: &ContentionKey) -> bool {
         self.tenants
-            .values()
-            .map(|tenant| tenant.borrowed(vector, category))
-            .sum()
+            .get(&key.tenant)
+            .is_some_and(|tenant| tenant.tables.contains_key(&key.table))
     }
+
+    /// Drops every demand record that expired or was overtaken by admission.
+    ///
+    /// Called at the head of every operation that reads demand so an abandoned
+    /// contender cannot hold ordering priority, and so a record left behind by a
+    /// racing admission is never counted twice.
+    fn prune_demand(&mut self, now: Instant) {
+        let active: Vec<ContentionKey> = self
+            .demand
+            .iter()
+            .filter(|record| self.is_active(&record.key))
+            .map(|record| record.key.clone())
+            .collect();
+        self.demand
+            .retain(|record| record.expires_at > now && !active.contains(&record.key));
+    }
+
+    /// Returns the distinct waiting tables registered before `key`.
+    ///
+    /// A contender that already holds a record counts only the records ahead of
+    /// its own; one that holds none counts every live record, because it is
+    /// arriving behind all of them.
+    fn waiting_ahead(&self, key: &ContentionKey) -> usize {
+        let mut seen: Vec<&ContentionKey> = Vec::new();
+        for record in &self.demand {
+            if &record.key == key {
+                break;
+            }
+            if !seen.contains(&&record.key) {
+                seen.push(&record.key);
+            }
+        }
+        seen.len()
+    }
+
+    /// Returns the extra tables each tenant is waiting to activate.
+    ///
+    /// Keyed by tenant so a waiting contender's lifecycle quantum can enter the
+    /// fairness computation as demand without owning anything yet.
+    fn pending_by_tenant(&self) -> HashMap<DataTenantId, usize> {
+        let mut pending: HashMap<DataTenantId, usize> = HashMap::new();
+        let mut seen: Vec<&ContentionKey> = Vec::new();
+        for record in &self.demand {
+            if seen.contains(&&record.key) {
+                continue;
+            }
+            seen.push(&record.key);
+            *pending.entry(record.key.tenant).or_insert(0) += 1;
+        }
+        pending
+    }
+}
+
+/// Returns the max-min fair level for the unsatisfied owners of one category.
+///
+/// Classic progressive filling: every owner whose demand is at or below the
+/// running equal share is satisfied outright, its unused remainder returns to
+/// the pool, and the pool is redivided among those still hungry. The value
+/// returned is the level a still-hungry owner may rise to. When every owner fits
+/// inside capacity there is no binding level and [`usize::MAX`] is returned,
+/// which is what makes the ledger work-conserving: one tenant with one table
+/// faces no ceiling below the pod's real capacity.
+///
+/// `demands` is consumed as a scratch buffer and left sorted.
+fn max_min_level(capacity: usize, demands: &mut [usize]) -> usize {
+    demands.sort_unstable();
+    let mut remaining = capacity;
+    let mut hungry = demands.len();
+    for demand in demands.iter() {
+        if hungry == 0 {
+            break;
+        }
+        let level = remaining / hungry;
+        if *demand > level {
+            return level;
+        }
+        remaining -= *demand;
+        hungry -= 1;
+    }
+    usize::MAX
 }
 
 /// Why one contention charge or activation was refused.
 ///
 /// The variants distinguish the refusals a caller must handle differently: an
-/// owner that has exceeded its protected reserve and its soft share of the
-/// surplus is busy and may retry, while a pod that cannot install another cell
-/// at all is at its activation width and retrying will not help.
+/// owner that has reached its dynamic fair level is busy and may retry as soon
+/// as any owner drains, while a pod already carrying every table its measured
+/// resources can complete is at its derived ownership ceiling.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ContentionRefusal {
-    /// The pod cannot hold another complete tenant or table reservation.
+    /// The pod cannot carry another canonical table through its lifecycle.
     #[error(
-        "Scribe cannot activate another {scope}: `{category}` holds {capacity} and {active} active tenants already reserve {committed}"
+        "Scribe cannot activate another table: measured capacity completes {ceiling} tables, {active} are active and {waiting} contenders are already queued"
     )]
-    ActivationWidth {
-        /// Which level of the hierarchy could not be widened.
-        scope: &'static str,
-        /// Fixed-cardinality category label that ran out first.
-        category: &'static str,
-        /// Pod capacity in that category.
-        capacity: usize,
-        /// Already-committed total in that category.
-        committed: usize,
-        /// Number of tenants already active.
+    OwnershipCeiling {
+        /// Tables the pod's measured resources can complete simultaneously.
+        ceiling: usize,
+        /// Tables currently active.
         active: usize,
+        /// Distinct contenders queued ahead of this one.
+        waiting: usize,
     },
-    /// One owner exhausted both its protected reserve and its soft share.
+    /// One owner reached its dynamically recomputed max-min fair level.
     #[error(
-        "Scribe {scope} contention limit reached for `{category}`: protected {protected} and soft share ceiling {ceiling} cannot cover {requested}"
+        "Scribe {scope} contention limit reached for `{category}`: fair level {ceiling} cannot cover {held} plus {requested}"
     )]
     Exhausted {
-        /// Whether the tenant or the table ran out first.
+        /// Which level the charge ran into: the pod, the tenant or the table.
         scope: &'static str,
         /// Fixed-cardinality category label that ran out.
         category: &'static str,
-        /// The owner's protected amount in that category.
-        protected: usize,
-        /// The owner's protected amount plus its equal share of the surplus.
+        /// The owner's max-min fair level in that category.
         ceiling: usize,
+        /// What the owner already holds in that category.
+        held: usize,
         /// Amount the caller asked for.
         requested: usize,
     },
@@ -236,13 +319,12 @@ pub enum ContentionRefusal {
 impl From<ContentionRefusal> for ScribeError {
     /// Maps a contention refusal onto the Scribe error a caller already handles.
     ///
-    /// Exhaustion and activation width are backpressure, so they surface as
-    /// `IngestBusy` naming the owner that could not proceed. The remaining
-    /// variants are accounting invariants, not caller-visible pressure, so they
-    /// surface as `Internal`.
+    /// Reaching a fair level or the derived ownership ceiling is backpressure,
+    /// so both surface as `IngestBusy`. The remaining variants are accounting
+    /// invariants, not caller-visible pressure, so they surface as `Internal`.
     fn from(refusal: ContentionRefusal) -> Self {
         match refusal {
-            ContentionRefusal::ActivationWidth { .. } | ContentionRefusal::Exhausted { .. } => {
+            ContentionRefusal::OwnershipCeiling { .. } | ContentionRefusal::Exhausted { .. } => {
                 Self::IngestBusy {
                     table: refusal.to_string(),
                 }
@@ -257,238 +339,176 @@ impl From<ContentionRefusal> for ScribeError {
 /// Pod-wide tenant-keyed contention ledger.
 ///
 /// Constructed once from the validated [`ScribeArtifactPolicy`] and the pod
-/// capacity that startup already proved can hold the guaranteed vectors, so the
-/// ledger never has to re-derive or re-validate either.
+/// capacity that startup already proved holds at least one complete lifecycle
+/// vector, so the ledger never has to re-derive or re-validate either.
 #[derive(Debug)]
 pub struct ScribeContentionLedger {
-    /// Policy the reserve vector, widths, and required totals come from.
+    /// Policy the lifecycle reserve vector comes from.
     policy: ScribeArtifactPolicy,
     /// Pod capacity each category is checked against.
     capacity: ScribeGlobalCapacity,
-    /// Installed tenant cells.
+    /// Tables the measured capacity can carry through their whole lifecycle.
+    ownership_ceiling: usize,
+    /// Live identity-only demand records the pod will hold at once.
+    demand_capacity: usize,
+    /// How long one demand record confers ordering priority.
+    demand_ttl: Duration,
+    /// Installed owners and waiting demand.
     state: Mutex<LedgerState>,
 }
 
 impl ScribeContentionLedger {
     /// Builds a ledger over one validated policy and the pod's real capacity.
+    ///
+    /// The ownership ceiling is derived here, once, from measured capacity
+    /// divided by the lifecycle vector. It is the only table count in the
+    /// module and it is never configured.
     #[must_use]
     pub fn new(policy: ScribeArtifactPolicy, capacity: ScribeGlobalCapacity) -> Self {
+        Self::with_demand_bounds(
+            policy,
+            capacity,
+            DEFAULT_CONTENTION_DEMAND_CAPACITY,
+            DEFAULT_CONTENTION_DEMAND_TTL,
+        )
+    }
+
+    /// Builds a ledger with explicit operational bounds on the demand queue.
+    ///
+    /// Exposed so an operator profile — and the tests that prove expiry and
+    /// queue saturation — can state the bounds directly instead of waiting on
+    /// wall-clock defaults.
+    #[must_use]
+    pub fn with_demand_bounds(
+        policy: ScribeArtifactPolicy,
+        capacity: ScribeGlobalCapacity,
+        demand_capacity: usize,
+        demand_ttl: Duration,
+    ) -> Self {
+        let ownership_ceiling = policy.max_active_tables(&capacity);
         Self {
             policy,
             capacity,
+            ownership_ceiling,
+            demand_capacity,
+            demand_ttl,
             state: Mutex::new(LedgerState::default()),
         }
     }
 
-    /// Returns the reserve vector every active table installs.
+    /// Returns the lifecycle reserve vector one active table is sized against.
     #[must_use]
     pub const fn reserve_vector(&self) -> ContentionReserveVector {
         self.policy.reserve_vector()
     }
 
-    /// Returns the table width every activating tenant reserves atomically.
+    /// Returns how many canonical tables the measured capacity can carry.
+    ///
+    /// Derived from resources at construction. It is not an entitlement and it
+    /// is not divided between tenants: any tenant may hold all of it while the
+    /// rest of the pod is idle.
     #[must_use]
-    pub const fn tenant_table_width(&self) -> usize {
-        self.policy.geometry().guaranteed_active_tables_per_tenant()
+    pub const fn ownership_ceiling(&self) -> usize {
+        self.ownership_ceiling
     }
 
-    /// Returns the complete vectors held for the pod's whole life.
+    /// Installs one table's cell, creating its tenant cell lazily if needed.
     ///
-    /// This is the startup reservation, not a live count: it is held whether or
-    /// not the guaranteed owners have arrived, which is what stops an early
-    /// tenant from spending capacity a later guaranteed tenant is owed.
-    #[must_use]
-    pub const fn guaranteed_vectors(&self) -> usize {
-        self.policy.geometry().guaranteed_width()
-    }
-
-    /// Returns the tenants whose whole table width the pod permanently holds.
-    #[must_use]
-    pub const fn guaranteed_tenants(&self) -> usize {
-        self.policy.geometry().guaranteed_active_tenants()
-    }
-
-    /// Returns the vectors active owners hold beyond what they are entitled to.
+    /// Activation is allowed while the pod can still complete another table's
+    /// whole lifecycle *and* every contender that queued earlier could be
+    /// admitted first. The second condition is what stops an incumbent from
+    /// reborrowing the slot a waiting contender is owed. A refusal registers the
+    /// caller's bounded, expiring, identity-only demand record so its next
+    /// attempt is ordered ahead of arrivals behind it.
     ///
-    /// Entitlement is `min(active_tenants, guaranteed_tenants)` whole table
-    /// widths: an active tenant inside the guaranteed count is entitled to its
-    /// configured width and nothing more, and a tenant beyond that count is
-    /// entitled to nothing. Everything an owner reserves past its entitlement is
-    /// borrowed from real surplus.
-    ///
-    /// Counting it this way is what stops one tenant from spreading into the
-    /// slots of guaranteed tenants that have not arrived yet. Those slots are
-    /// inside the permanent reservation, so they are never free capacity, and
-    /// a widening that would consume them shows up here as extra the pod cannot
-    /// back.
-    fn extra_vectors(
-        state: &LedgerState,
-        tenants: usize,
-        width: usize,
-        guaranteed: usize,
-    ) -> usize {
-        state
-            .reserved_vectors()
-            .saturating_sub(tenants.min(guaranteed).saturating_mul(width))
-    }
-
-    /// Returns the complete vectors the pod must currently back.
-    ///
-    /// The permanent startup reservation plus every vector owners borrowed past
-    /// their entitlement. The reservation is a floor and never shrinks, so an
-    /// unclaimed guaranteed slot stays paid for rather than becoming surplus.
-    fn held_vectors(&self, state: &LedgerState) -> usize {
-        self.guaranteed_vectors()
-            .saturating_add(Self::extra_vectors(
-                state,
-                state.active_tenants(),
-                self.tenant_table_width(),
-                self.guaranteed_tenants(),
-            ))
-    }
-
-    /// Returns the elastic surplus in one category.
-    ///
-    /// Capacity beyond every vector the pod must back. Everything below that
-    /// line is a protected cell — including the cells of guaranteed tenants that
-    /// have not arrived — and is never borrowable.
-    fn surplus(&self, state: &LedgerState, category: ContentionCategory) -> usize {
-        let held = self
-            .held_vectors(state)
-            .saturating_mul(self.reserve_vector().component(category));
-        self.capacity.component(category).saturating_sub(held)
-    }
-
-    /// Returns the pod-wide committed amount in one category.
-    ///
-    /// Everything the pod must back plus everything borrowed beyond it, so the
-    /// value a widening or a borrow is checked against is always the same
-    /// quantity the capacity bound describes.
-    fn pod_committed(&self, state: &LedgerState, category: ContentionCategory) -> usize {
-        self.held_vectors(state)
-            .saturating_mul(self.reserve_vector().component(category))
-            .saturating_add(state.borrowed(&self.reserve_vector(), category))
-    }
-
-    /// Installs one table's cell, activating its tenant first if needed.
-    ///
-    /// Activation is hierarchical and all-or-nothing at each level. A tenant
-    /// that is not yet active reserves its whole configured table width in every
-    /// category at once, before it owns a single table, which is what keeps one
-    /// tenant's arrival order from consuming the vectors another guaranteed
-    /// tenant is entitled to. A table inside an active tenant is free while the
-    /// tenant still has an unused reserved vector, and otherwise widens the
-    /// tenant by one complete vector only when that vector fits pod capacity in
-    /// every category.
-    ///
-    /// Partial installation at either level is what would let a table
-    /// acknowledge an append it cannot later stage, merge, or publish, so every
-    /// category is checked before anything is committed. Activating an
-    /// already-active table is idempotent and reserves nothing further.
+    /// Activating an already-active table is idempotent and reserves nothing
+    /// further.
     ///
     /// # Errors
     ///
-    /// Returns [`ContentionRefusal::ActivationWidth`] naming the level and the
-    /// first category whose capacity cannot hold the required reservation, and
-    /// [`ContentionRefusal::Poisoned`] when the ledger lock is poisoned.
+    /// Returns [`ContentionRefusal::OwnershipCeiling`] when the pod cannot carry
+    /// another table, or cannot carry it before the contenders already waiting,
+    /// and [`ContentionRefusal::Poisoned`] when the ledger lock is poisoned.
     pub fn activate(&self, key: &ContentionKey) -> Result<(), ContentionRefusal> {
-        let width = self.tenant_table_width();
         let mut state = self.lock()?;
-
-        let Some(tenant) = state.tenants.get(&key.tenant) else {
-            // A brand new tenant takes its whole table width in one step.
-            let tenants = state.active_tenants() + 1;
-            let reserved = state.reserved_vectors() + width;
-            self.check_reservation(&state, tenants, reserved, "tenant")?;
-            let mut tenant = TenantScribeLedger {
-                tables: HashMap::new(),
-                reserved_vectors: width,
-            };
-            tenant
-                .tables
-                .insert(key.table.clone(), TenantTableLedger::default());
-            state.tenants.insert(key.tenant, tenant);
-            return Ok(());
-        };
-
-        if tenant.tables.contains_key(&key.table) {
+        state.prune_demand(Instant::now());
+        if state.is_active(key) {
             return Ok(());
         }
-        let widen = tenant.tables.len() >= tenant.reserved_vectors;
-        if widen {
-            // Beyond the configured width: one complete extra vector, and it may
-            // only come from surplus above the permanent guarantee.
-            let tenants = state.active_tenants();
-            let reserved = state.reserved_vectors() + 1;
-            self.check_reservation(&state, tenants, reserved, "table")?;
+        let active = state.active_tables();
+        let waiting = state.waiting_ahead(key);
+        if active.saturating_add(waiting) >= self.ownership_ceiling {
+            self.enqueue_demand(&mut state, key);
+            return Err(ContentionRefusal::OwnershipCeiling {
+                ceiling: self.ownership_ceiling,
+                active,
+                waiting,
+            });
         }
-        let Some(tenant) = state.tenants.get_mut(&key.tenant) else {
-            return Err(ContentionRefusal::Inactive);
-        };
-        if widen {
-            tenant.reserved_vectors += 1;
-        }
-        tenant
+        state
+            .tenants
+            .entry(key.tenant)
+            .or_default()
             .tables
             .insert(key.table.clone(), TenantTableLedger::default());
+        state.demand.retain(|record| &record.key != key);
         Ok(())
     }
 
-    /// Verifies that a prospective reservation fits every category.
+    /// Records that one registered canonical table is waiting for capacity.
     ///
-    /// `tenants` and `reserved` describe the state *after* the activation, so
-    /// the check is made against what the pod would owe rather than what it owes
-    /// now. Extra vectors are measured against entitlement, which means a tenant
-    /// widening past its configured table width must find real surplus: it can
-    /// never spend a slot the permanent reservation is holding for a guaranteed
-    /// tenant that has not arrived.
+    /// Identity only: no bytes, no items, no lanes, no WAL, no durable row. A
+    /// duplicate record is refreshed rather than appended so one caller cannot
+    /// buy priority by retrying, and a full queue drops the request instead of
+    /// growing without bound.
+    fn enqueue_demand(&self, state: &mut LedgerState, key: &ContentionKey) {
+        let expires_at = Instant::now() + self.demand_ttl;
+        if let Some(record) = state.demand.iter_mut().find(|record| &record.key == key) {
+            record.expires_at = expires_at;
+            return;
+        }
+        if state.demand.len() >= self.demand_capacity {
+            return;
+        }
+        state.demand.push_back(DemandRecord {
+            key: key.clone(),
+            expires_at,
+        });
+    }
+
+    /// Withdraws one table's demand record.
     ///
-    /// Checked before anything is mutated, so a widening that fails in the last
-    /// category leaves the tenant map untouched.
+    /// Called when a contender gives up or is invalidated, so it stops holding
+    /// ordering priority ahead of callers that are still waiting.
     ///
     /// # Errors
     ///
-    /// Returns [`ContentionRefusal::ActivationWidth`] naming `scope` and the
-    /// first category that cannot hold the prospective reservation.
-    fn check_reservation(
-        &self,
-        state: &LedgerState,
-        tenants: usize,
-        reserved: usize,
-        scope: &'static str,
-    ) -> Result<(), ContentionRefusal> {
-        let vector = self.reserve_vector();
-        let width = self.tenant_table_width();
-        let guaranteed = self.guaranteed_tenants();
-        let entitled = tenants.min(guaranteed).saturating_mul(width);
-        let next_held = self
-            .guaranteed_vectors()
-            .saturating_add(reserved.saturating_sub(entitled));
-        for category in ContentionCategory::ALL {
-            let capacity = self.capacity.component(category);
-            let committed = self.pod_committed(state, category);
-            let required = next_held
-                .checked_mul(vector.component(category))
-                .and_then(|held| held.checked_add(state.borrowed(&vector, category)));
-            if required.is_none_or(|required| required > capacity) {
-                return Err(ContentionRefusal::ActivationWidth {
-                    scope,
-                    category: category.label(),
-                    capacity,
-                    committed,
-                    active: state.active_tenants(),
-                });
-            }
-        }
+    /// Returns [`ContentionRefusal::Poisoned`] when the ledger lock is poisoned.
+    pub fn cancel_demand(&self, key: &ContentionKey) -> Result<(), ContentionRefusal> {
+        let mut state = self.lock()?;
+        state.demand.retain(|record| &record.key != key);
         Ok(())
     }
 
-    /// Releases one table's cell and every category it still held.
+    /// Returns how many distinct contenders are currently waiting.
     ///
-    /// The tenant keeps its configured table width so a table that goes quiet
-    /// for a moment does not surrender a protected cell to a hot neighbour; only
-    /// vectors the tenant borrowed past that width are given back. The tenant
-    /// cell itself is released once its last table is gone.
+    /// A count only. Tenant and table identities stay inside the ledger and
+    /// never reach a metric label.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContentionRefusal::Poisoned`] when the ledger lock is poisoned.
+    pub fn waiting_demand(&self) -> Result<usize, ContentionRefusal> {
+        let mut state = self.lock()?;
+        state.prune_demand(Instant::now());
+        Ok(state.pending_by_tenant().values().sum())
+    }
+
+    /// Releases one table's cell and everything it still held.
+    ///
+    /// Nothing survives the release: the table's committed amounts go back to
+    /// the pod, and a tenant whose last table is gone leaves no cell behind. The
+    /// capacity freed here is what a queued contender takes next.
     ///
     /// Deactivating a table that is not active is a no-op rather than an error:
     /// the shard and admission owners may both reach the same conclusion about
@@ -498,7 +518,6 @@ impl ScribeContentionLedger {
     ///
     /// Returns [`ContentionRefusal::Poisoned`] when the ledger lock is poisoned.
     pub fn deactivate(&self, key: &ContentionKey) -> Result<(), ContentionRefusal> {
-        let width = self.tenant_table_width();
         let mut state = self.lock()?;
         let Some(tenant) = state.tenants.get_mut(&key.tenant) else {
             return Ok(());
@@ -508,30 +527,27 @@ impl ScribeContentionLedger {
         }
         if tenant.tables.is_empty() {
             state.tenants.remove(&key.tenant);
-            return Ok(());
         }
-        // Shrink back toward the configured width, never below the tables that
-        // are still installed.
-        tenant.reserved_vectors = tenant.reserved_vectors.min(width.max(tenant.tables.len()));
         Ok(())
     }
 
     /// Charges `amount` in one category to an active table.
     ///
-    /// A charge inside the table's protected reserve always succeeds and costs
-    /// the pod nothing new, because that reserve was already committed when its
-    /// tenant activated. A charge beyond the reserve borrows from the shared
-    /// surplus and is bounded three ways: by the table's equal share of its
-    /// tenant's share, by the tenant's equal share of pod surplus, and by pod
-    /// capacity itself. Both shares are recomputed here from the live owner
-    /// counts, so a hot table cannot hold a share a newly arrived neighbour is
-    /// entitled to, and neither can reach into a protected cell.
+    /// The ceiling is recomputed here, on every charge, from the live owners and
+    /// the live contenders — never cached and never derived from a configured
+    /// cardinality. Two max-min levels are computed independently in this one
+    /// category: a tenant level over the pod's capacity, then a table level over
+    /// the charging tenant's own level. A waiting contender enters both
+    /// computations as one lifecycle vector of demand, which is exactly what
+    /// stops an over-share incumbent from acquiring more while someone waits.
+    ///
+    /// An owner already above a level it used to be under keeps what it holds;
+    /// only this growth is refused.
     ///
     /// # Errors
     ///
     /// Returns [`ContentionRefusal::Inactive`] when the table holds no cell,
-    /// [`ContentionRefusal::Exhausted`] naming the level whose protected reserve
-    /// and soft share together cannot cover the request, and
+    /// [`ContentionRefusal::Exhausted`] naming the level the owner reached, and
     /// [`ContentionRefusal::Poisoned`] when the ledger lock is poisoned.
     pub fn charge(
         &self,
@@ -539,64 +555,105 @@ impl ScribeContentionLedger {
         category: ContentionCategory,
         amount: usize,
     ) -> Result<(), ContentionRefusal> {
-        let vector = self.reserve_vector();
-        let reserve = vector.component(category);
+        let quantum = self.reserve_vector().component(category);
         let capacity = self.capacity.component(category);
         let mut state = self.lock()?;
-        let surplus = self.surplus(&state, category);
-        let pod_committed = self.pod_committed(&state, category);
-        let active_tenants = state.active_tenants().max(1);
+        state.prune_demand(Instant::now());
+        if !state.is_active(key) {
+            return Err(ContentionRefusal::Inactive);
+        }
+        let pending = state.pending_by_tenant();
 
-        let tenant = state
+        // Hard pod bound first. A fair level says what an owner *should* hold;
+        // this says what the pod physically has. They differ exactly when an
+        // incumbent is above its level, and because acknowledged work is never
+        // revoked the incumbent keeps it and every other owner waits for it to
+        // drain rather than over-committing the pod.
+        let pod_committed: usize = state
+            .tenants
+            .values()
+            .map(|tenant| tenant.committed(category))
+            .sum();
+        if pod_committed.saturating_add(amount) > capacity {
+            return Err(ContentionRefusal::Exhausted {
+                scope: "pod",
+                category: category.label(),
+                ceiling: capacity,
+                held: pod_committed,
+                requested: amount,
+            });
+        }
+
+        // Tenant level: every active tenant demands what it holds, every waiting
+        // contender demands one lifecycle vector, and the charging tenant
+        // demands what it holds plus this request.
+        let mut tenant_demands: Vec<usize> =
+            Vec::with_capacity(state.tenants.len() + pending.len());
+        let mut charging_tenant_demand = 0;
+        for (tenant, cell) in &state.tenants {
+            let waiting = pending.get(tenant).copied().unwrap_or(0);
+            let mut demand = cell
+                .committed(category)
+                .saturating_add(waiting.saturating_mul(quantum));
+            if tenant == &key.tenant {
+                demand = demand.saturating_add(amount);
+                charging_tenant_demand = demand;
+            }
+            tenant_demands.push(demand);
+        }
+        for (tenant, waiting) in &pending {
+            if !state.tenants.contains_key(tenant) {
+                tenant_demands.push(waiting.saturating_mul(quantum));
+            }
+        }
+        let tenant_level = max_min_level(capacity, &mut tenant_demands);
+        let tenant_held = state
+            .tenants
+            .get(&key.tenant)
+            .map_or(0, |cell| cell.committed(category));
+        if charging_tenant_demand > tenant_level {
+            return Err(ContentionRefusal::Exhausted {
+                scope: "tenant",
+                category: category.label(),
+                ceiling: tenant_level,
+                held: tenant_held,
+                requested: amount,
+            });
+        }
+
+        // Table level: the charging tenant's own allowance, divided max-min
+        // across its live tables and its own waiting contenders.
+        let tenant_allowance = tenant_level.min(capacity);
+        let waiting_here = pending.get(&key.tenant).copied().unwrap_or(0);
+        let tenant_cell = state
             .tenants
             .get(&key.tenant)
             .ok_or(ContentionRefusal::Inactive)?;
-        let usage = tenant
-            .tables
-            .get(&key.table)
-            .copied()
-            .ok_or(ContentionRefusal::Inactive)?;
-        let active_tables = tenant.tables.len().max(1);
-        let tenant_protected = tenant.protected(&vector, category);
-        let tenant_committed = tenant.committed(category);
-        let tenant_borrowed = tenant.borrowed(&vector, category);
-
-        // Independent equal soft shares. Surplus splits evenly across active
-        // tenants, and a tenant's share of it splits evenly across its active
-        // tables. A protected cell is a floor under the ceiling, never a cap,
-        // and is never part of anyone else's share.
-        let tenant_surplus_share = surplus / active_tenants;
-        let tenant_ceiling = tenant_protected.saturating_add(tenant_surplus_share);
-        let table_ceiling = reserve.saturating_add(tenant_surplus_share / active_tables);
-
-        let exhausted =
-            |scope: &'static str, protected: usize, ceiling: usize| ContentionRefusal::Exhausted {
-                scope,
+        let mut table_demands: Vec<usize> =
+            Vec::with_capacity(tenant_cell.tables.len() + waiting_here);
+        let mut charging_table_demand = 0;
+        let mut table_held = 0;
+        for (table, cell) in &tenant_cell.tables {
+            let mut demand = cell.get(category);
+            if table == &key.table {
+                table_held = demand;
+                demand = demand.saturating_add(amount);
+                charging_table_demand = demand;
+            }
+            table_demands.push(demand);
+        }
+        for _ in 0..waiting_here {
+            table_demands.push(quantum);
+        }
+        let table_level = max_min_level(tenant_allowance, &mut table_demands);
+        if charging_table_demand > table_level {
+            return Err(ContentionRefusal::Exhausted {
+                scope: "table",
                 category: category.label(),
-                protected,
-                ceiling,
+                ceiling: table_level,
+                held: table_held,
                 requested: amount,
-            };
-        let current = usage.get(category);
-        let next_usage = current
-            .checked_add(amount)
-            .ok_or_else(|| exhausted("table", reserve, table_ceiling))?;
-        if next_usage > table_ceiling {
-            return Err(exhausted("table", reserve, table_ceiling));
-        }
-        let next_tenant = tenant_committed
-            .checked_add(amount)
-            .ok_or_else(|| exhausted("tenant", tenant_protected, tenant_ceiling))?;
-        if next_tenant > tenant_ceiling {
-            return Err(exhausted("tenant", tenant_protected, tenant_ceiling));
-        }
-        // Only growth beyond the tenant's own protected cell touches the pod.
-        let extra = next_tenant.saturating_sub(tenant_protected) - tenant_borrowed;
-        if pod_committed
-            .checked_add(extra)
-            .is_none_or(|next| next > capacity)
-        {
-            return Err(exhausted("table", reserve, table_ceiling));
+            });
         }
 
         if let Some(cell) = state
@@ -604,7 +661,7 @@ impl ScribeContentionLedger {
             .get_mut(&key.tenant)
             .and_then(|tenant| tenant.tables.get_mut(&key.table))
         {
-            cell.set(category, next_usage);
+            cell.set(category, charging_table_demand);
         }
         Ok(())
     }
@@ -615,7 +672,8 @@ impl ScribeContentionLedger {
     /// caller error, so it saturates at zero instead of wrapping into an
     /// enormous usage that would lock the table out permanently. Pod and tenant
     /// totals are derived from the cell, so returning it here is the whole
-    /// release.
+    /// release, and the freed amount is immediately visible to every other
+    /// owner's next fair-level computation.
     ///
     /// # Errors
     ///
@@ -644,19 +702,13 @@ impl ScribeContentionLedger {
     ///
     /// Returns [`ContentionRefusal::Poisoned`] when the ledger lock is poisoned.
     pub fn active_cells(&self) -> Result<usize, ContentionRefusal> {
-        Ok(self
-            .lock()?
-            .tenants
-            .values()
-            .map(|tenant| tenant.tables.len())
-            .sum())
+        Ok(self.lock()?.active_tables())
     }
 
     /// Returns the number of currently active tenant cells.
     ///
-    /// Exposed alongside [`Self::active_cells`] because the two widths are
-    /// enforced independently: a pod can be at its tenant width with idle table
-    /// slots, or at its table width inside a single tenant.
+    /// Exposed alongside [`Self::active_cells`] because both counts are purely
+    /// observed: neither is configured, and neither bounds the other.
     ///
     /// # Errors
     ///
@@ -706,12 +758,19 @@ impl ScribeContentionLedger {
 
     /// Returns the pod-wide committed total in one category.
     ///
+    /// Summed from the live owners, so it is exactly what the pod is holding and
+    /// never includes capacity set aside for an identity that never arrived.
+    ///
     /// # Errors
     ///
     /// Returns [`ContentionRefusal::Poisoned`] when the ledger lock is poisoned.
     pub fn committed(&self, category: ContentionCategory) -> Result<usize, ContentionRefusal> {
         let state = self.lock()?;
-        Ok(self.pod_committed(&state, category))
+        Ok(state
+            .tenants
+            .values()
+            .map(|tenant| tenant.committed(category))
+            .sum())
     }
 
     /// Locks the ledger state, converting a poisoned lock into a typed refusal.
@@ -732,13 +791,6 @@ impl ScribeContentionLedger {
 mod tests {
     use super::*;
     use crate::namespaces::BifrostNamespace;
-    use crate::scribe::geometry::{
-        DEFAULT_ACTIVE_GENERATION_BUDGET_BYTES, DEFAULT_GENERATION_MAX_AGE,
-        DEFAULT_GENERATION_ROTATION_CEILING_BYTES, DEFAULT_MAXIMUM_ACTIVE_REQUEST_OWNERSHIP_BYTES,
-        DEFAULT_MAXIMUM_IMMUTABLE_MEMBER_OWNERSHIP_BYTES, DEFAULT_MINIMUM_MERGE_LANE_SCRATCH_BYTES,
-        DEFAULT_MINIMUM_STAGE_MEMBER_BYTES, DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES,
-        DEFAULT_WAL_SEGMENT_BYTES, ScribeGeometry,
-    };
 
     /// Builds a cell identity for one tenant ordinal and table name.
     ///
@@ -766,37 +818,37 @@ mod tests {
         DataTenantId::new(uuid::Uuid::from_bytes(bytes)).expect("UUIDv7 test tenant")
     }
 
-    /// Builds a ledger over an explicit guaranteed width plus surplus vectors.
+    /// Builds a ledger whose measured capacity completes exactly `vectors` tables.
     ///
-    /// Capacity is `(tenants × tables + surplus) × vector` in every category, so
-    /// a test states the exact protected width it wants and exactly how much
-    /// elastic room sits beyond it.
+    /// The capacity is stated as a multiple of the lifecycle vector because that
+    /// is what a real node's resources reduce to. No tenant or table count is
+    /// configured anywhere: `vectors` is a resource quantity, and the ownership
+    /// ceiling the ledger derives from it is what the tests then observe.
     ///
     /// # Panics
     ///
-    /// Panics when the requested widths do not form a valid geometry, which
-    /// would be a fixture bug rather than a ledger behavior.
-    fn ledger_for(tenants: usize, tables: usize, surplus: usize) -> ScribeContentionLedger {
-        let geometry = ScribeGeometry::new(
-            DEFAULT_WAL_SEGMENT_BYTES,
-            DEFAULT_ACTIVE_GENERATION_BUDGET_BYTES,
-            DEFAULT_GENERATION_ROTATION_CEILING_BYTES,
-            DEFAULT_GENERATION_MAX_AGE,
-            None,
-            None,
-            DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES,
-            tenants,
-            tables,
-            crate::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES,
-            DEFAULT_MAXIMUM_ACTIVE_REQUEST_OWNERSHIP_BYTES,
-            DEFAULT_MAXIMUM_IMMUTABLE_MEMBER_OWNERSHIP_BYTES,
-            DEFAULT_MINIMUM_STAGE_MEMBER_BYTES,
-            DEFAULT_MINIMUM_MERGE_LANE_SCRATCH_BYTES,
+    /// Panics when the default policy cannot serve the capacity it derives,
+    /// which would be a fixture bug rather than a ledger behavior.
+    fn ledger_for(vectors: usize) -> ScribeContentionLedger {
+        ledger_with_demand(
+            vectors,
+            DEFAULT_CONTENTION_DEMAND_CAPACITY,
+            DEFAULT_CONTENTION_DEMAND_TTL,
         )
-        .expect("test geometry must be valid");
-        let policy = ScribeArtifactPolicy::new(geometry);
+    }
+
+    /// Builds a ledger with explicit demand-queue bounds over `vectors` tables.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the derived capacity does not satisfy the default policy.
+    fn ledger_with_demand(
+        vectors: usize,
+        demand_capacity: usize,
+        demand_ttl: Duration,
+    ) -> ScribeContentionLedger {
+        let policy = ScribeArtifactPolicy::default();
         let vector = policy.reserve_vector();
-        let vectors = tenants * tables + surplus;
         let capacity = ScribeGlobalCapacity {
             admission_items: vector.admission_items * vectors,
             admission_bytes: vector.admission_bytes * vectors,
@@ -809,321 +861,364 @@ mod tests {
         };
         policy
             .validate_capacity(&capacity)
-            .expect("a fixture capacity must hold the guaranteed width it declares");
-        ScribeContentionLedger::new(policy, capacity)
+            .expect("a fixture capacity must hold one complete lifecycle vector");
+        ScribeContentionLedger::with_demand_bounds(policy, capacity, demand_capacity, demand_ttl)
     }
 
-    /// One tenant's arrival order cannot consume another tenant's protected width.
+    /// Returns the pod's total capacity in one category for a `vectors` fixture.
+    fn capacity_of(vectors: usize, category: ContentionCategory) -> usize {
+        ScribeArtifactPolicy::default()
+            .reserve_vector()
+            .component(category)
+            * vectors
+    }
+
+    /// One tenant with one table may use every genuinely idle byte in the pod.
+    ///
+    /// This is the work-conserving rule: capacity is never stranded behind an
+    /// identity that has not sent traffic, so a single owner faces no ceiling
+    /// below the pod's real capacity, and exactly one unit beyond it is refused.
     ///
     /// # Panics
     ///
-    /// Panics when the first tenant borrows past its own protected cell on a pod
-    /// with no surplus, or when a later guaranteed tenant is then refused the
-    /// width the pod permanently reserved for it.
+    /// Panics when a lone owner is capped below pod capacity, when it is allowed
+    /// past it, or when only one tenant cell was not created lazily.
     #[test]
-    fn a_first_tenant_cannot_consume_the_width_of_later_guaranteed_tenants() {
-        // The default guaranteed geometry with no surplus at all: every byte of
-        // capacity belongs to a protected cell.
-        let ledger = ledger_for(4, 2, 0);
-        let hot = key(1, "hot");
-        ledger.activate(&hot).expect("first tenant activates");
+    fn a_single_table_may_use_all_idle_capacity() {
+        let ledger = ledger_for(4);
+        let only = key(1, "events");
+        ledger.activate(&only).expect("the first table activates");
+        assert_eq!(ledger.active_tenants().expect("tenants"), 1);
+        assert_eq!(ledger.active_cells().expect("cells"), 1);
 
-        let reserve = ledger.reserve_vector().active_bytes;
+        let whole = capacity_of(4, ContentionCategory::Active);
         ledger
-            .charge(&hot, ContentionCategory::Active, reserve)
-            .expect("a table always gets its own protected reserve");
-        assert!(
-            ledger.charge(&hot, ContentionCategory::Active, 1).is_err(),
-            "with no surplus, one tenant may not borrow a byte it does not own"
+            .charge(&only, ContentionCategory::Active, whole)
+            .expect("a lone owner reaches the pod's whole measured capacity");
+        assert_eq!(
+            ledger
+                .usage(&only, ContentionCategory::Active)
+                .expect("usage"),
+            whole
         );
-
-        for tenant in 2..=4_u8 {
-            for table in ["system", "dynamic"] {
-                ledger
-                    .activate(&key(tenant, table))
-                    .unwrap_or_else(|error| {
-                        panic!("tenant {tenant}/{table} must activate: {error}")
-                    });
-            }
-        }
-        let late = key(4, "dynamic");
-        ledger
-            .charge(&late, ContentionCategory::Active, reserve)
-            .expect("a protected cell is untouched by an earlier hot tenant");
-    }
-
-    /// An early tenant cannot spread into slots later guaranteed tenants own.
-    ///
-    /// The bug this pins is arithmetic, not policy: counting an unclaimed
-    /// guaranteed tenant slot as free capacity let the first tenant to arrive
-    /// widen through every vector on the pod, and the guaranteed tenants behind
-    /// it were then refused the width startup had already reserved for them.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a tenant widens past its configured table width without real
-    /// surplus, when a later guaranteed tenant is refused, or when one surplus
-    /// vector admits anything other than exactly one extra table.
-    #[test]
-    fn an_early_tenant_cannot_widen_into_unclaimed_guaranteed_tenant_slots() {
-        // Exact-minimum four tenants of two tables: every vector is spoken for.
-        let ledger = ledger_for(4, 2, 0);
-        ledger.activate(&key(1, "a")).expect("first table");
-        ledger
-            .activate(&key(1, "b"))
-            .expect("second reserved table");
         let refusal = ledger
-            .activate(&key(1, "c"))
-            .expect_err("a third table has no surplus to come from");
-        let ContentionRefusal::ActivationWidth { scope, .. } = refusal else {
-            panic!("an over-wide table activation must report the diagnostic");
-        };
-        assert_eq!(scope, "table");
-
-        // Every other guaranteed tenant still gets its complete configured width.
-        for tenant in 2..=4_u8 {
-            for table in ["a", "b"] {
-                ledger
-                    .activate(&key(tenant, table))
-                    .unwrap_or_else(|error| {
-                        panic!("guaranteed tenant {tenant} table {table} must activate: {error}")
-                    });
-            }
-        }
-        assert_eq!(ledger.active_cells().expect("cell count"), 8);
-        assert_eq!(ledger.active_tenants().expect("tenant count"), 4);
-
-        // One spare vector admits exactly one extra table, pod-wide, and no more.
-        let elastic = ledger_for(4, 2, 1);
-        elastic.activate(&key(1, "a")).expect("first table");
-        elastic
-            .activate(&key(1, "b"))
-            .expect("second reserved table");
-        elastic
-            .activate(&key(1, "c"))
-            .expect("the one surplus vector admits a third table");
-        assert!(
-            elastic.activate(&key(1, "d")).is_err(),
-            "the surplus is spent; a fourth table has nothing to come from"
-        );
-        for tenant in 2..=4_u8 {
-            for table in ["a", "b"] {
-                elastic
-                    .activate(&key(tenant, table))
-                    .unwrap_or_else(|error| {
-                        panic!("guaranteed tenant {tenant} table {table} must activate: {error}")
-                    });
-            }
-        }
-        assert_eq!(elastic.active_cells().expect("cell count"), 9);
+            .charge(&only, ContentionCategory::Active, 1)
+            .expect_err("one unit past measured capacity must refuse");
+        assert!(matches!(
+            refusal,
+            ContentionRefusal::Exhausted { scope: "pod", .. }
+        ));
     }
 
-    /// A hot table drains rather than keeps its sibling's share when it arrives.
+    /// One tenant may own every table the measured capacity can complete.
+    ///
+    /// The ceiling is derived from resources divided by the lifecycle vector,
+    /// not from a configured tables-per-tenant width, so one tenant reaches all
+    /// of it and the next table is refused on resources rather than identity.
     ///
     /// # Panics
     ///
-    /// Panics when the hot table keeps borrowing after its share halves, when
-    /// share shrink revokes what it already holds, or when the sibling is then
-    /// refused its protected reserve.
+    /// Panics when a single tenant is capped below the derived ceiling, or when
+    /// the refusal past it does not name the derived ceiling.
     #[test]
-    fn a_hot_table_cannot_consume_its_sibling_system_table_vector() {
-        // One tenant of two tables, with two spare vectors of surplus.
-        let ledger = ledger_for(1, 2, 2);
-        let dynamic = key(1, "dynamic");
-        let system = key(1, "system");
+    fn one_tenant_owns_every_table_the_resources_complete() {
+        let ledger = ledger_for(16);
+        assert_eq!(ledger.ownership_ceiling(), 16);
+        for table in 0..16 {
+            ledger
+                .activate(&key(1, &format!("table_{table}")))
+                .expect("every table the resources complete activates");
+        }
+        assert_eq!(ledger.active_cells().expect("cells"), 16);
+
+        let refusal = ledger
+            .activate(&key(1, "table_16"))
+            .expect_err("the seventeenth table exceeds the measured resources");
+        assert!(matches!(
+            refusal,
+            ContentionRefusal::OwnershipCeiling {
+                ceiling: 16,
+                active: 16,
+                waiting: 0,
+            }
+        ));
+    }
+
+    /// Ten hungry tenants converge on an equal max-min share of one category.
+    ///
+    /// The share is never a configured division: it is recomputed from the live
+    /// owners, which is why nine idle tenants leave the tenth unconstrained in
+    /// the previous test and ten hungry ones divide the category here.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an equal share is refused, when a tenant is allowed past it
+    /// while its peers are hungry, or when the categories were summed.
+    #[test]
+    fn ten_hungry_tenants_receive_equal_max_min_shares() {
+        const TENANTS: usize = 10;
+        let ledger = ledger_for(16);
+        for tenant in 0..TENANTS {
+            let owner = key(u8::try_from(tenant).expect("tenant ordinal"), "events");
+            ledger.activate(&owner).expect("each tenant activates");
+        }
+        let whole = capacity_of(16, ContentionCategory::Active);
+        let share = whole / TENANTS;
+        assert!(
+            whole - share * TENANTS < TENANTS,
+            "an equal division leaves less than one unit per tenant unallocated"
+        );
+        for tenant in 0..TENANTS {
+            let owner = key(u8::try_from(tenant).expect("tenant ordinal"), "events");
+            ledger
+                .charge(&owner, ContentionCategory::Active, share)
+                .expect("an equal share is always available to a live owner");
+        }
+        for tenant in 0..TENANTS {
+            let owner = key(u8::try_from(tenant).expect("tenant ordinal"), "events");
+            let refusal = ledger
+                .charge(&owner, ContentionCategory::Active, share)
+                .expect_err("no tenant may exceed its share while its peers are hungry");
+            assert!(matches!(refusal, ContentionRefusal::Exhausted { .. }));
+            // A different category is untouched by exhaustion in this one.
+            ledger
+                .charge(&owner, ContentionCategory::Immutable, share)
+                .expect("byte categories are governed independently");
+        }
+    }
+
+    /// A hot incumbent keeps what it holds and is refused only new growth.
+    ///
+    /// Acknowledged work is never revoked. When a contender arrives and shrinks
+    /// every level, the incumbent's committed bytes stay exactly where they are
+    /// and drain through the normal lifecycle; only its next acquisition fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the incumbent's committed bytes change on contention, when it
+    /// is allowed to grow anyway, or when the contender never gets the capacity
+    /// the incumbent released.
+    #[test]
+    fn a_hot_incumbent_drains_rather_than_being_revoked() {
+        let ledger = ledger_for(4);
+        let incumbent = key(1, "hot");
+        let contender = key(2, "cold");
+        let whole = capacity_of(4, ContentionCategory::Active);
+        ledger.activate(&incumbent).expect("incumbent activates");
+        ledger
+            .charge(&incumbent, ContentionCategory::Active, whole)
+            .expect("an idle pod lets the first owner take everything");
+
+        ledger.activate(&contender).expect("contender activates");
+        assert_eq!(
+            ledger
+                .usage(&incumbent, ContentionCategory::Active)
+                .expect("usage"),
+            whole,
+            "a new contender must never revoke acknowledged work"
+        );
+        ledger
+            .charge(&incumbent, ContentionCategory::Active, 1)
+            .expect_err("an over-share incumbent may not acquire more while a peer waits");
+        ledger
+            .charge(&contender, ContentionCategory::Active, 1)
+            .expect_err("the pod is full until the incumbent drains");
+
+        ledger
+            .release(&incumbent, ContentionCategory::Active, whole / 2)
+            .expect("released through the normal lifecycle route");
+        ledger
+            .charge(&contender, ContentionCategory::Active, whole / 2)
+            .expect("released capacity reaches the waiting contender");
+    }
+
+    /// Demand records are identity-only, bounded, expiring, and ordering-fair.
+    ///
+    /// A refused contender is served before the incumbent that released the
+    /// capacity can take it back; the queue never grows past its configured
+    /// operational bound; and an expired record confers nothing.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an incumbent reborrows ahead of a waiting contender, when the
+    /// queue grows past its bound, or when an expired record still counts.
+    #[test]
+    fn contention_demand_is_bounded_expiring_and_ordering_fair() {
+        let ledger = ledger_with_demand(1, 1, Duration::from_secs(30));
+        let incumbent = key(1, "hot");
+        let contender = key(2, "cold");
+        let third = key(3, "later");
+        ledger.activate(&incumbent).expect("incumbent activates");
+
+        ledger
+            .activate(&contender)
+            .expect_err("a full pod refuses the contender and records its demand");
+        assert_eq!(ledger.waiting_demand().expect("demand"), 1);
+        ledger
+            .activate(&third)
+            .expect_err("a full pod refuses every further contender");
+        assert_eq!(
+            ledger.waiting_demand().expect("demand"),
+            1,
+            "the demand queue never grows past its configured operational bound"
+        );
+
+        ledger
+            .deactivate(&incumbent)
+            .expect("the incumbent finishes and releases its table");
+        ledger
+            .activate(&key(1, "hot_again"))
+            .expect_err("an incumbent may not reborrow ahead of a waiting contender");
+        ledger
+            .activate(&contender)
+            .expect("the waiting contender receives the next released vector");
+        assert_eq!(
+            ledger.waiting_demand().expect("demand"),
+            0,
+            "admission removes the record it was waiting on"
+        );
+
+        // An expired record confers no ordering priority at all.
+        let expiring = ledger_with_demand(1, 4, Duration::ZERO);
+        expiring.activate(&incumbent).expect("incumbent activates");
+        expiring
+            .activate(&contender)
+            .expect_err("a full pod refuses the contender");
+        assert_eq!(expiring.waiting_demand().expect("demand"), 0);
+
+        // Cancellation removes it just as admission does.
+        let cancelling = ledger_with_demand(1, 4, Duration::from_secs(30));
+        cancelling
+            .activate(&incumbent)
+            .expect("incumbent activates");
+        cancelling
+            .activate(&contender)
+            .expect_err("a full pod refuses the contender");
+        cancelling.cancel_demand(&contender).expect("cancel");
+        assert_eq!(cancelling.waiting_demand().expect("demand"), 0);
+    }
+
+    /// Charging and releasing one category balances back to zero exactly.
+    ///
+    /// Table, tenant and pod totals are all derived from the same cells, so a
+    /// complete release must leave nothing behind at any level, and deactivating
+    /// the last table must leave no tenant cell holding capacity.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any level fails to return to zero, or when a released tenant
+    /// cell survives its last table.
+    #[test]
+    fn accounting_balances_across_table_tenant_and_pod() {
+        let ledger = ledger_for(4);
+        let first = key(1, "events");
+        let second = key(1, "wyrd_system_events");
+        ledger.activate(&first).expect("first table activates");
+        ledger.activate(&second).expect("second table activates");
+
+        let amount = capacity_of(4, ContentionCategory::Active) / 4;
+        ledger
+            .charge(&first, ContentionCategory::Active, amount)
+            .expect("charge");
+        ledger
+            .charge(&second, ContentionCategory::Active, amount)
+            .expect("charge");
+        assert_eq!(
+            ledger
+                .tenant_usage(&tenant_id(1), ContentionCategory::Active)
+                .expect("tenant usage"),
+            amount * 2
+        );
+        assert_eq!(
+            ledger.committed(ContentionCategory::Active).expect("pod"),
+            amount * 2
+        );
+
+        ledger
+            .release(&first, ContentionCategory::Active, amount)
+            .expect("release");
+        ledger
+            .release(&second, ContentionCategory::Active, amount)
+            .expect("release");
+        assert_eq!(
+            ledger.committed(ContentionCategory::Active).expect("pod"),
+            0
+        );
+
+        ledger.deactivate(&first).expect("deactivate");
+        ledger.deactivate(&second).expect("deactivate");
+        assert_eq!(ledger.active_tenants().expect("tenants"), 0);
+        assert_eq!(
+            ledger.committed(ContentionCategory::Active).expect("pod"),
+            0
+        );
+    }
+
+    /// A system table and a dynamic table are governed identically.
+    ///
+    /// Neither name has a reserved cell and neither has priority: the two
+    /// siblings divide their tenant's level equally, and the system table is
+    /// refused past it on exactly the same terms as the dynamic one.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either table is given a different level from its sibling.
+    #[test]
+    fn system_and_dynamic_tables_are_governed_identically() {
+        let ledger = ledger_for(4);
+        let system = key(1, "wyrd_system_events");
+        let dynamic = key(1, "orders");
+        ledger.activate(&system).expect("system table activates");
         ledger.activate(&dynamic).expect("dynamic table activates");
 
-        let reserve = ledger.reserve_vector().active_bytes;
-        // Its own reserve plus the whole surplus: two spare vectors.
+        let half = capacity_of(4, ContentionCategory::Active) / 2;
         ledger
-            .charge(&dynamic, ContentionCategory::Active, reserve * 3)
-            .expect("the only active table may borrow the whole surplus");
-        assert!(
-            ledger
-                .charge(&dynamic, ContentionCategory::Active, 1)
-                .is_err(),
-            "surplus is finite; the next byte would come out of a protected cell"
-        );
-
-        // The sibling arrives, halving the surplus share.
-        ledger.activate(&system).expect("sibling table activates");
-        assert!(
-            ledger
-                .charge(&dynamic, ContentionCategory::Active, 1)
-                .is_err(),
-            "an over-share owner is refused new borrowing once a sibling arrives"
-        );
-        assert_eq!(
-            ledger
-                .usage(&dynamic, ContentionCategory::Active)
-                .expect("the over-share owner keeps what it holds"),
-            reserve * 3,
-            "share shrink drains borrowers, it never revokes ownership"
-        );
+            .charge(&system, ContentionCategory::Active, half)
+            .expect("the system table reaches its equal share");
         ledger
-            .charge(&system, ContentionCategory::Active, reserve)
-            .expect("a protected sibling cell is never borrowable");
+            .charge(&dynamic, ContentionCategory::Active, half)
+            .expect("the dynamic table reaches the same equal share");
+        for table in [&system, &dynamic] {
+            let refusal = ledger
+                .charge(table, ContentionCategory::Active, 1)
+                .expect_err("neither sibling may exceed the level the other shares");
+            assert!(matches!(refusal, ContentionRefusal::Exhausted { .. }));
+        }
     }
 
-    /// Surplus rebalances equally per category as tenants arrive.
+    /// Reactivating an already-active table changes nothing.
     ///
     /// # Panics
     ///
-    /// Panics when a share is not recomputed from the live tenant count, or when
-    /// one category's exhaustion leaks into another.
-    #[test]
-    fn soft_shares_rebalance_equally_and_independently_per_category() {
-        // Two guaranteed tenants of two tables, plus four surplus vectors.
-        let ledger = ledger_for(2, 2, 4);
-        let first = key(1, "t");
-        let second = key(2, "t");
-        ledger.activate(&first).expect("first tenant activates");
-
-        let vector = ledger.reserve_vector();
-        // Alone, the tenant's share is the whole surplus, and its one table's
-        // share of that is the whole thing again.
-        ledger
-            .charge(&first, ContentionCategory::Active, vector.active_bytes * 5)
-            .expect("a lone tenant may borrow the whole surplus");
-        // Exhausting `active` says nothing about `immutable`.
-        ledger
-            .charge(
-                &first,
-                ContentionCategory::Immutable,
-                vector.immutable_bytes * 5,
-            )
-            .expect("categories are governed independently");
-
-        ledger.activate(&second).expect("second tenant activates");
-        assert!(
-            ledger
-                .charge(&second, ContentionCategory::Active, vector.active_bytes * 4)
-                .is_err(),
-            "the arriving tenant is bounded by its own equal half-share"
-        );
-        ledger
-            .charge(&second, ContentionCategory::Active, vector.active_bytes)
-            .expect("its protected reserve is always available");
-    }
-
-    /// The pod refuses tenants and tables beyond the width its capacity holds.
-    ///
-    /// # Panics
-    ///
-    /// Panics when activation over-commits, when the refusal does not name the
-    /// exhausted level and category, or when releasing does not free the cell.
-    #[test]
-    fn activation_is_bounded_at_both_levels_and_returns_its_vectors_on_release() {
-        // Room for exactly two tenants of two tables and nothing more.
-        let ledger = ledger_for(2, 2, 0);
-        ledger.activate(&key(1, "a")).expect("first tenant");
-        ledger.activate(&key(2, "a")).expect("second tenant");
-        let refusal = ledger
-            .activate(&key(3, "a"))
-            .expect_err("a third tenant exceeds the pod's activation width");
-        let ContentionRefusal::ActivationWidth {
-            scope,
-            category,
-            active,
-            ..
-        } = refusal
-        else {
-            panic!("an over-wide activation must report the activation diagnostic");
-        };
-        assert_eq!(scope, "tenant");
-        assert_eq!(active, 2);
-        assert_eq!(category, ContentionCategory::AdmissionItems.label());
-
-        // The second table inside an active tenant is already paid for.
-        ledger
-            .activate(&key(1, "b"))
-            .expect("reserved second table");
-        // A third table in that tenant needs a whole extra vector the pod lacks.
-        let refusal = ledger
-            .activate(&key(1, "c"))
-            .expect_err("a third table exceeds the tenant's reserved width");
-        let ContentionRefusal::ActivationWidth { scope, .. } = refusal else {
-            panic!("an over-wide table activation must report the diagnostic");
-        };
-        assert_eq!(scope, "table");
-
-        // Releasing a tenant's last table returns its whole cell.
-        ledger.deactivate(&key(2, "a")).expect("release");
-        assert_eq!(
-            ledger.active_tenants().expect("tenant count"),
-            1,
-            "an empty tenant releases its reserved width"
-        );
-        ledger
-            .activate(&key(3, "a"))
-            .expect("the freed width is reusable");
-    }
-
-    /// Activating an already-active table reserves nothing further.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a repeated activation double-commits its tenant's width.
+    /// Panics when repeated activation installs a second cell or disturbs usage.
     #[test]
     fn repeated_activation_is_idempotent() {
-        let ledger = ledger_for(2, 2, 0);
-        let table = key(1, "a");
-        ledger.activate(&table).expect("first activation");
-        let committed = ledger
-            .committed(ContentionCategory::Active)
-            .expect("committed total");
-        ledger.activate(&table).expect("second activation");
+        let ledger = ledger_for(4);
+        let only = key(1, "events");
+        ledger.activate(&only).expect("activate");
+        ledger
+            .charge(&only, ContentionCategory::Active, 1)
+            .expect("charge");
+        ledger.activate(&only).expect("re-activate");
+        assert_eq!(ledger.active_cells().expect("cells"), 1);
         assert_eq!(
             ledger
-                .committed(ContentionCategory::Active)
-                .expect("committed total"),
-            committed,
-            "an idempotent activation must not re-reserve the tenant width"
-        );
-        assert_eq!(
-            ledger.active_cells().expect("cell count"),
-            1,
-            "an idempotent activation installs no second cell"
+                .usage(&only, ContentionCategory::Active)
+                .expect("usage"),
+            1
         );
     }
 
-    /// Released surplus returns to the pod and is borrowable again.
+    /// Progressive filling satisfies small demands before levelling the rest.
     ///
     /// # Panics
     ///
-    /// Panics when release does not return borrowed surplus to the pod total.
+    /// Panics when an unconstrained set is given a binding level, or when the
+    /// level is not the equal division of what the satisfied owners left behind.
     #[test]
-    fn released_surplus_returns_to_the_pod_total() {
-        let ledger = ledger_for(1, 2, 2);
-        let table = key(1, "a");
-        ledger.activate(&table).expect("activation");
-        let vector = ledger.reserve_vector();
-        let protected = vector.active_bytes * 2;
-        ledger
-            .charge(&table, ContentionCategory::Active, vector.active_bytes * 3)
-            .expect("borrow the whole surplus");
-        assert_eq!(
-            ledger
-                .committed(ContentionCategory::Active)
-                .expect("committed"),
-            protected + vector.active_bytes,
-            "the pod holds its protected width plus the borrowed surplus"
-        );
-        ledger
-            .release(&table, ContentionCategory::Active, vector.active_bytes * 2)
-            .expect("release the borrowed part");
-        assert_eq!(
-            ledger
-                .committed(ContentionCategory::Active)
-                .expect("committed"),
-            protected,
-            "returning borrowed surplus leaves only the protected width"
-        );
-        assert_eq!(
-            ledger
-                .usage(&table, ContentionCategory::Active)
-                .expect("usage"),
-            vector.active_bytes
-        );
+    fn max_min_level_fills_progressively() {
+        assert_eq!(max_min_level(100, &mut [10, 10]), usize::MAX);
+        assert_eq!(max_min_level(100, &mut [10, 100, 100]), 45);
+        assert_eq!(max_min_level(100, &mut []), usize::MAX);
     }
 }

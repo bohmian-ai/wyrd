@@ -1264,7 +1264,7 @@ Brings up Postgres, provisions roles, then runs the SQL migration, reset, fixtur
 env = { WYRD_REG_E2E = "1" }
 run = """
 cargo nextest run --locked -p wyrd-sql --test-threads=1
-cargo nextest run --locked -p wyrd-dev-fixtures --test-threads=1
+cargo nextest run --locked -p wyrd-dev-fixtures --features pg --test-threads=1
 cargo nextest run --locked -p vala-sql --test-threads=1 -E 'not test(open_set_scan_remains_bounded_after_terminal_growth)'
 cargo nextest run --locked -p wyrd-storage --test pg_sweeper --test-threads=1
 """

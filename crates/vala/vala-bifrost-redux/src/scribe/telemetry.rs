@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use num_traits::ToPrimitive;
 
 use crate::scribe::admission::AdmissionSnapshot;
+use crate::scribe::geometry::ContentionCategory;
 use crate::scribe::material_plan::IngestMaterialPlan;
 use crate::scribe::memory::MEMORY_CATEGORY_COUNT;
 use crate::scribe::seal_key::SealKey;
@@ -846,26 +847,37 @@ mod tests {
 
 /// Every contention and admission lifecycle effect Scribe can emit.
 ///
-/// This is the closed, compile-time enumerable registry the contention ledger
-/// and the admission controller emit through. Production code names a variant;
-/// it never invents a stage, decision, or metric label at a call site. The
-/// registry is closed on purpose: the operator vocabulary for admission
-/// fairness has to be stable enough to alert on, and a free-form log string at
-/// one call site is exactly how that vocabulary rots.
+/// This is the closed, compile-time enumerable registry that
+/// [`ScribeTelemetry`] publishes and that the contention ledger and admission
+/// controller emit through. Production code names a variant; it never invents a
+/// stage, decision, or metric label at a call site. The registry is closed on
+/// purpose: the operator vocabulary for admission fairness has to be stable
+/// enough to alert on, and a free-form log string at one call site is exactly
+/// how that vocabulary rots.
 ///
-/// [`ContentionEffect::ALL`] is the inventory. Every entry has one production
-/// emitter and every production transition maps to one entry; the registry
-/// closure test in this module proves both directions by driving the public
-/// ledger and admission surfaces and comparing what they emitted against this
-/// list.
+/// [`ContentionEffect::ALL`] is the inventory, and it is production state, not
+/// a test fixture: [`ScribeTelemetry`] indexes its per-effect counters by
+/// position in this list, so an entry missing from `ALL` cannot be counted and
+/// an entry present in it with no emitter shows a permanent zero. Every entry
+/// has one production emitter and every production transition maps to one
+/// entry; the closure test in the admission module proves both directions by
+/// driving the public surfaces and comparing what they emitted against `ALL`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ContentionEffect {
+    /// A request entered pod-global admission and holds an active transition.
+    AdmissionAttempted,
+    /// A request left pod-global admission and released its active transition.
+    AdmissionSettled,
     /// A table's lifecycle vector cell was installed.
     ActivationInstalled,
     /// Activation was refused because the pod is at its derived table ceiling.
     ActivationRefused,
     /// An installed cell was removed again because its first charge refused.
     ActivationRolledBack,
+    /// A max-min fair level was recomputed and bound the charging owner's growth.
+    ShareRecomputed,
+    /// A charge took idle capacity beyond the caller's own lifecycle quantum.
+    CapacityBorrowed,
     /// One category charge committed to a table's cell.
     ChargeCommitted,
     /// One category charge was refused by a recomputed fair level or pod bound.
@@ -882,10 +894,16 @@ pub(crate) enum ContentionEffect {
     DemandRefreshed,
     /// A demand record was dropped because the bounded queue is full.
     DemandDropped,
+    /// A queued contender advanced but still holds less than its full quantum.
+    DemandPartiallyServed,
     /// A contender received its complete category quantum and left the queue.
     DemandRetired,
     /// A contender withdrew every record it held.
     DemandCancelled,
+    /// A demand record was dropped because the identity it spoke for is gone.
+    DemandInvalidated,
+    /// A rolled-back transition returned a demand record to its earned position.
+    DemandRestored,
     /// A demand record stopped conferring priority because its TTL elapsed.
     DemandExpired,
     /// An empty table cell was retired by terminal settlement.
@@ -894,6 +912,8 @@ pub(crate) enum ContentionEffect {
     TenantSettled,
     /// Terminal settlement left a table installed because it still holds capacity.
     SettlementDeferred,
+    /// A reservation returned every resource it owned at every level.
+    ResourceSettled,
     /// An in-flight reservation grew and the delta moved at every level.
     ResizeGrown,
     /// An in-flight reservation shrank and the delta moved at every level.
@@ -907,14 +927,17 @@ pub(crate) enum ContentionEffect {
 impl ContentionEffect {
     /// The complete registry inventory, in lifecycle order.
     ///
-    /// Production code matches the enum exhaustively rather than iterating it,
-    /// so the list itself is a proof fixture: it is what the registry closure
-    /// tests compare captured production emissions against.
-    #[cfg(test)]
-    pub(crate) const ALL: [Self; 21] = [
+    /// Indexed by [`Self::index`], so the order here is the order of
+    /// [`ScribeTelemetry`]'s per-effect counters. Appending is safe; reordering
+    /// silently re-labels historical counters.
+    pub(crate) const ALL: [Self; 29] = [
+        Self::AdmissionAttempted,
+        Self::AdmissionSettled,
         Self::ActivationInstalled,
         Self::ActivationRefused,
         Self::ActivationRolledBack,
+        Self::ShareRecomputed,
+        Self::CapacityBorrowed,
         Self::ChargeCommitted,
         Self::ChargeRefused,
         Self::IncumbentBlocked,
@@ -923,17 +946,60 @@ impl ContentionEffect {
         Self::DemandEnqueued,
         Self::DemandRefreshed,
         Self::DemandDropped,
+        Self::DemandPartiallyServed,
         Self::DemandRetired,
         Self::DemandCancelled,
+        Self::DemandInvalidated,
+        Self::DemandRestored,
         Self::DemandExpired,
         Self::TableSettled,
         Self::TenantSettled,
         Self::SettlementDeferred,
+        Self::ResourceSettled,
         Self::ResizeGrown,
         Self::ResizeShrunk,
         Self::ResizeRefused,
         Self::InvariantFailure,
     ];
+
+    /// Returns this effect's position in [`Self::ALL`].
+    ///
+    /// The match is exhaustive, so a new variant cannot be added without being
+    /// given a position here, and the registry test proves the positions are a
+    /// bijection with `ALL`.
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::AdmissionAttempted => 0,
+            Self::AdmissionSettled => 1,
+            Self::ActivationInstalled => 2,
+            Self::ActivationRefused => 3,
+            Self::ActivationRolledBack => 4,
+            Self::ShareRecomputed => 5,
+            Self::CapacityBorrowed => 6,
+            Self::ChargeCommitted => 7,
+            Self::ChargeRefused => 8,
+            Self::IncumbentBlocked => 9,
+            Self::ChargeReleased => 10,
+            Self::OverReleaseRefused => 11,
+            Self::DemandEnqueued => 12,
+            Self::DemandRefreshed => 13,
+            Self::DemandDropped => 14,
+            Self::DemandPartiallyServed => 15,
+            Self::DemandRetired => 16,
+            Self::DemandCancelled => 17,
+            Self::DemandInvalidated => 18,
+            Self::DemandRestored => 19,
+            Self::DemandExpired => 20,
+            Self::TableSettled => 21,
+            Self::TenantSettled => 22,
+            Self::SettlementDeferred => 23,
+            Self::ResourceSettled => 24,
+            Self::ResizeGrown => 25,
+            Self::ResizeShrunk => 26,
+            Self::ResizeRefused => 27,
+            Self::InvariantFailure => 28,
+        }
+    }
 
     /// Returns the closed lifecycle stage this effect belongs to.
     ///
@@ -942,10 +1008,13 @@ impl ContentionEffect {
     /// without enumerating each decision.
     pub(crate) const fn stage(self) -> &'static str {
         match self {
+            Self::AdmissionAttempted | Self::AdmissionSettled => "admission",
             Self::ActivationInstalled | Self::ActivationRefused | Self::ActivationRolledBack => {
                 "activation"
             }
-            Self::ChargeCommitted
+            Self::ShareRecomputed
+            | Self::CapacityBorrowed
+            | Self::ChargeCommitted
             | Self::ChargeRefused
             | Self::IncumbentBlocked
             | Self::ChargeReleased
@@ -953,10 +1022,16 @@ impl ContentionEffect {
             Self::DemandEnqueued
             | Self::DemandRefreshed
             | Self::DemandDropped
+            | Self::DemandPartiallyServed
             | Self::DemandRetired
             | Self::DemandCancelled
+            | Self::DemandInvalidated
+            | Self::DemandRestored
             | Self::DemandExpired => "demand",
-            Self::TableSettled | Self::TenantSettled | Self::SettlementDeferred => "settlement",
+            Self::TableSettled
+            | Self::TenantSettled
+            | Self::SettlementDeferred
+            | Self::ResourceSettled => "settlement",
             Self::ResizeGrown | Self::ResizeShrunk | Self::ResizeRefused => "resize",
             Self::InvariantFailure => "invariant",
         }
@@ -965,9 +1040,13 @@ impl ContentionEffect {
     /// Returns the closed decision this effect records within its stage.
     pub(crate) const fn decision(self) -> &'static str {
         match self {
+            Self::AdmissionAttempted => "attempted",
+            Self::AdmissionSettled => "settled",
             Self::ActivationInstalled => "installed",
             Self::ActivationRefused => "ceiling_refused",
             Self::ActivationRolledBack => "rolled_back",
+            Self::ShareRecomputed => "share_recomputed",
+            Self::CapacityBorrowed => "borrowed",
             Self::ChargeCommitted => "committed",
             Self::ChargeRefused => "refused",
             Self::IncumbentBlocked => "contender_priority",
@@ -976,12 +1055,16 @@ impl ContentionEffect {
             Self::DemandEnqueued => "enqueued",
             Self::DemandRefreshed => "refreshed",
             Self::DemandDropped => "queue_full",
+            Self::DemandPartiallyServed => "partially_served",
             Self::DemandRetired => "served",
             Self::DemandCancelled => "cancelled",
+            Self::DemandInvalidated => "invalidated",
+            Self::DemandRestored => "restored",
             Self::DemandExpired => "expired",
             Self::TableSettled => "table_retired",
             Self::TenantSettled => "tenant_retired",
             Self::SettlementDeferred => "nonempty",
+            Self::ResourceSettled => "resources_returned",
             Self::ResizeGrown => "grown",
             Self::ResizeShrunk => "shrunk",
             Self::ResizeRefused => "delta_refused",
@@ -1002,19 +1085,64 @@ impl ContentionEffect {
             _ => "info",
         }
     }
+
+    /// Reports whether this effect opens an active transition.
+    ///
+    /// Starts and terminals must balance for the pod to be drained, so exactly
+    /// one effect opens a transition and exactly one closes it.
+    pub(crate) const fn is_start(self) -> bool {
+        matches!(self, Self::AdmissionAttempted)
+    }
+
+    /// Reports whether this effect closes an active transition.
+    pub(crate) const fn is_terminal(self) -> bool {
+        matches!(self, Self::AdmissionSettled)
+    }
+
+    /// Reports whether this effect installs one complete lifecycle vector.
+    pub(crate) const fn installs_vector(self) -> bool {
+        matches!(self, Self::ActivationInstalled)
+    }
+
+    /// Reports whether this effect releases one complete lifecycle vector.
+    ///
+    /// A rolled-back install releases the vector it briefly held, so it counts
+    /// here alongside the two settlement outcomes that retire a table.
+    pub(crate) const fn releases_vector(self) -> bool {
+        matches!(
+            self,
+            Self::ActivationRolledBack | Self::TableSettled | Self::TenantSettled
+        )
+    }
+
+    /// Reports whether this effect is a transition of the bounded demand queue.
+    pub(crate) const fn is_demand_transition(self) -> bool {
+        matches!(
+            self,
+            Self::DemandEnqueued
+                | Self::DemandRefreshed
+                | Self::DemandDropped
+                | Self::DemandPartiallyServed
+                | Self::DemandRetired
+                | Self::DemandCancelled
+                | Self::DemandInvalidated
+                | Self::DemandRestored
+                | Self::DemandExpired
+        )
+    }
 }
 
 /// Bounded, identity-free facts attached to one contention lifecycle effect.
 ///
-/// Every field here is a scalar the operator vocabulary already closes over.
-/// Tenant, table, request, batch, generation, path, row, SQL, credential, and
-/// token values are deliberately absent: this struct is what reaches the metric
-/// label set, and admitting one workload identity into it would make the metric
-/// cardinality track request cardinality.
+/// Every field here is a scalar or a closed enum the operator vocabulary
+/// already covers. Tenant, table, request, batch, generation, path, row, SQL,
+/// credential, and token values are deliberately absent: this struct is what
+/// reaches the metric label set, and admitting one workload identity into it
+/// would make the metric cardinality track request cardinality.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ContentionFacts {
-    /// Governed category label, or `""` when the effect spans every category.
-    pub(crate) category: &'static str,
+    /// Governed category, or `None` when the effect spans every category.
+    pub(crate) category: Option<ContentionCategory>,
     /// Bound the decision was measured against, when one applies.
     pub(crate) ceiling: usize,
     /// Amount the caller asked for.
@@ -1023,6 +1151,8 @@ pub(crate) struct ContentionFacts {
     pub(crate) held_before: usize,
     /// Amount the owner holds after the transition.
     pub(crate) held_after: usize,
+    /// Pod-wide committed amount in this category after the transition.
+    pub(crate) pod_committed: usize,
     /// Distinct unserved contenders holding capacity back from the caller.
     pub(crate) reserved_contenders: usize,
     /// Live bounded demand records after the transition.
@@ -1033,63 +1163,326 @@ pub(crate) struct ContentionFacts {
     pub(crate) active_tenants: usize,
 }
 
-/// Emits one production contention lifecycle effect as a metric and a trace event.
+impl ContentionFacts {
+    /// Returns the closed metric label naming this effect's resource category.
+    fn category_label(self) -> &'static str {
+        self.category.map_or("all", ContentionCategory::label)
+    }
+}
+
+/// Reconcilable totals one [`ScribeTelemetry`] has published since startup.
 ///
-/// The counter carries only the effect's closed stage, decision, severity, and
-/// resource-category labels. The correlated event carries the bounded numeric
-/// facts a maintainer needs to reconstruct one attempt's ordering; scrubbed
-/// tenant/table context is attached by the caller's own `tracing` span rather
-/// than lifted into a label here.
-pub(crate) fn record_contention_effect(effect: ContentionEffect, facts: ContentionFacts) {
-    metrics::counter!(
-        "bifrost_scribe_contention_effects_total",
-        "stage" => effect.stage(),
-        "decision" => effect.decision(),
-        "severity" => effect.severity(),
-        "category" => facts.category,
-    )
-    .increment(1);
-    metrics::gauge!("bifrost_scribe_contention_active_tables")
-        .set(facts.active_tables.to_f64().unwrap_or(f64::MAX));
-    metrics::gauge!("bifrost_scribe_contention_active_tenants")
-        .set(facts.active_tenants.to_f64().unwrap_or(f64::MAX));
-    metrics::gauge!("bifrost_scribe_contention_demand_records")
-        .set(facts.demand_records.to_f64().unwrap_or(f64::MAX));
-    tracing::info!(
-        stage = effect.stage(),
-        decision = effect.decision(),
-        severity = effect.severity(),
-        category = facts.category,
-        ceiling = facts.ceiling,
-        requested = facts.requested,
-        held_before = facts.held_before,
-        held_after = facts.held_after,
-        reserved_contenders = facts.reserved_contenders,
-        demand_records = facts.demand_records,
-        active_tables = facts.active_tables,
-        active_tenants = facts.active_tenants,
-        "Scribe contention lifecycle"
-    );
+/// Exposed so a caller can prove the published metrics agree with the ledger's
+/// own state rather than inferring a successful stage from a counter alone:
+/// installed minus released vectors is the active table count, the demand gauge
+/// is the live record count, and starts minus terminals is the number of
+/// admission transitions still in flight.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScribeTelemetrySnapshot {
+    /// Emission count per registry entry, indexed by [`ContentionEffect::index`].
+    counts: [u64; ContentionEffect::ALL.len()],
+    /// Admission transitions opened.
+    starts: u64,
+    /// Admission transitions closed.
+    terminals: u64,
+    /// Complete lifecycle vectors installed.
+    vectors_installed: u64,
+    /// Complete lifecycle vectors released.
+    vectors_released: u64,
+    /// Bounded demand-queue transitions of every kind.
+    demand_transitions: u64,
+}
+
+impl ScribeTelemetrySnapshot {
+    /// Returns how many times one registry entry was emitted.
+    pub(crate) const fn count(&self, effect: ContentionEffect) -> u64 {
+        self.counts[effect.index()]
+    }
+
+    /// Returns admission transitions opened since startup.
+    pub const fn starts(&self) -> u64 {
+        self.starts
+    }
+
+    /// Returns admission transitions closed since startup.
+    pub const fn terminals(&self) -> u64 {
+        self.terminals
+    }
+
+    /// Returns admission transitions still in flight.
+    ///
+    /// A drained pod publishes zero here; any other value names outstanding
+    /// work, never an accounting leak on its own.
+    pub const fn active_transitions(&self) -> u64 {
+        self.starts.saturating_sub(self.terminals)
+    }
+
+    /// Returns lifecycle vectors installed and not yet released.
+    ///
+    /// Reconciles against the ledger's own active table count.
+    pub const fn live_vectors(&self) -> u64 {
+        self.vectors_installed.saturating_sub(self.vectors_released)
+    }
+
+    /// Returns every bounded demand-queue transition published so far.
+    pub const fn demand_transitions(&self) -> u64 {
+        self.demand_transitions
+    }
+}
+
+/// The pod's single production observation owner for Scribe admission fairness.
+///
+/// One instance lives beside the contention ledger it observes, and admission,
+/// contention, and settlement code call its inherent methods rather than
+/// scattering spans, log strings, or metric descriptors of their own. It owns
+/// the reconcilable totals above, which is what lets a test prove a published
+/// metric came from a real state transition instead of accepting a counter as
+/// evidence of one.
+///
+/// Counters are `u64` under one lock rather than atomics because every emission
+/// already happens inside a ledger transition that holds a lock, and one
+/// consistent snapshot is worth more here than uncontended increments.
+#[derive(Debug)]
+pub(crate) struct ScribeTelemetry {
+    /// Reconcilable totals published since startup.
+    totals: Mutex<ScribeTelemetrySnapshot>,
+}
+
+impl Default for ScribeTelemetry {
+    /// Builds an owner whose totals start at zero.
+    fn default() -> Self {
+        Self {
+            totals: Mutex::new(ScribeTelemetrySnapshot {
+                counts: [0; ContentionEffect::ALL.len()],
+                starts: 0,
+                terminals: 0,
+                vectors_installed: 0,
+                vectors_released: 0,
+                demand_transitions: 0,
+            }),
+        }
+    }
+}
+
+impl ScribeTelemetry {
+    /// Publishes one production effect as metrics, a trace event, and totals.
+    ///
+    /// The counter and gauge label sets are built from the effect's own closed
+    /// vocabulary plus the closed resource category; nothing a caller passes can
+    /// widen them. The correlated event carries the bounded numeric facts a
+    /// maintainer needs to reconstruct one attempt's ordering, while scrubbed
+    /// tenant and table context stays on the caller's own `tracing` span.
+    ///
+    /// A poisoned totals lock is not allowed to fail a production transition:
+    /// the metrics and the event are still published and only the reconcilable
+    /// totals stop advancing, because losing observation is strictly better than
+    /// refusing admitted work.
+    pub(crate) fn record(&self, effect: ContentionEffect, facts: ContentionFacts) {
+        let category = facts.category_label();
+        metrics::counter!(
+            "bifrost_scribe_contention_effects_total",
+            "stage" => effect.stage(),
+            "decision" => effect.decision(),
+            "severity" => effect.severity(),
+            "category" => category,
+        )
+        .increment(1);
+        if effect.is_demand_transition() {
+            metrics::counter!(
+                "bifrost_scribe_contention_demand_transitions_total",
+                "decision" => effect.decision(),
+            )
+            .increment(1);
+        }
+        if effect.installs_vector() {
+            metrics::counter!("bifrost_scribe_contention_vectors_installed_total").increment(1);
+        }
+        if effect.releases_vector() {
+            metrics::counter!("bifrost_scribe_contention_vectors_released_total").increment(1);
+        }
+        if facts.category.is_some() {
+            metrics::gauge!(
+                "bifrost_scribe_contention_committed",
+                "category" => category,
+            )
+            .set(gauge_value(facts.pod_committed));
+        }
+        metrics::gauge!("bifrost_scribe_contention_active_tables")
+            .set(gauge_value(facts.active_tables));
+        metrics::gauge!("bifrost_scribe_contention_active_tenants")
+            .set(gauge_value(facts.active_tenants));
+        metrics::gauge!("bifrost_scribe_contention_demand_records")
+            .set(gauge_value(facts.demand_records));
+        let totals = self.accumulate(effect);
+        let active = totals.active_transitions();
+        metrics::gauge!("bifrost_scribe_contention_active_transitions")
+            .set(active.to_f64().unwrap_or(f64::MAX));
+        metrics::gauge!("bifrost_scribe_contention_live_vectors")
+            .set(totals.live_vectors().to_f64().unwrap_or(f64::MAX));
+        metrics::gauge!("bifrost_scribe_contention_admissions_opened")
+            .set(totals.starts().to_f64().unwrap_or(f64::MAX));
+        metrics::gauge!("bifrost_scribe_contention_admissions_closed")
+            .set(totals.terminals().to_f64().unwrap_or(f64::MAX));
+        tracing::info!(
+            stage = effect.stage(),
+            decision = effect.decision(),
+            severity = effect.severity(),
+            category,
+            ceiling = facts.ceiling,
+            requested = facts.requested,
+            held_before = facts.held_before,
+            held_after = facts.held_after,
+            pod_committed = facts.pod_committed,
+            reserved_contenders = facts.reserved_contenders,
+            demand_records = facts.demand_records,
+            active_tables = facts.active_tables,
+            active_tenants = facts.active_tenants,
+            active_transitions = active,
+            live_vectors = totals.live_vectors(),
+            demand_transitions = totals.demand_transitions(),
+            effect_total = totals.count(effect),
+            "Scribe contention lifecycle"
+        );
+    }
+
+    /// Advances the reconcilable totals and returns the view they now hold.
+    ///
+    /// The advance and the read happen under one acquisition so the published
+    /// reconciliation metrics describe one consistent moment rather than two.
+    /// A poisoned lock yields an all-zero view, which stops the totals advancing
+    /// without failing the transition that was being observed.
+    fn accumulate(&self, effect: ContentionEffect) -> ScribeTelemetrySnapshot {
+        let Ok(mut totals) = self.totals.lock() else {
+            return ScribeTelemetrySnapshot::default();
+        };
+        totals.counts[effect.index()] = totals.counts[effect.index()].saturating_add(1);
+        if effect.is_start() {
+            totals.starts = totals.starts.saturating_add(1);
+        }
+        if effect.is_terminal() {
+            totals.terminals = totals.terminals.saturating_add(1);
+        }
+        if effect.installs_vector() {
+            totals.vectors_installed = totals.vectors_installed.saturating_add(1);
+        }
+        if effect.releases_vector() {
+            totals.vectors_released = totals.vectors_released.saturating_add(1);
+        }
+        if effect.is_demand_transition() {
+            totals.demand_transitions = totals.demand_transitions.saturating_add(1);
+        }
+        *totals
+    }
+
+    /// Returns one consistent view of every reconcilable total.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the totals lock is poisoned, which can only happen if a
+    /// previous accumulation panicked inside this module.
+    pub(crate) fn snapshot(&self) -> ScribeTelemetrySnapshot {
+        *self.totals.lock().expect("Scribe telemetry totals lock")
+    }
+}
+
+/// Converts one bounded count to the `f64` a gauge takes.
+///
+/// Saturating at `f64::MAX` rather than wrapping keeps an impossible count
+/// visibly impossible instead of silently small.
+fn gauge_value(count: usize) -> f64 {
+    count.to_f64().unwrap_or(f64::MAX)
 }
 
 #[cfg(test)]
 /// Registry-shape proofs for the closed contention effect vocabulary.
 mod contention_registry_tests {
-    use super::{ContentionEffect, ContentionFacts, record_contention_effect};
+    use super::{ContentionEffect, ContentionFacts, ScribeTelemetry};
+    use crate::scribe::geometry::ContentionCategory;
 
-    /// The registry's vocabularies are closed, complete, and free of duplicates.
+    /// The registry's inventory is a bijection with its own index space.
     ///
-    /// Complements the production-emitter coverage proof in the admission
-    /// module: that test proves every entry is reachable from a real
-    /// transition, and this one proves the vocabulary those entries publish is
-    /// a closed label set an operator can aggregate on. A duplicate
-    /// stage/decision pair would silently merge two distinct decisions into one
-    /// time series.
+    /// [`ScribeTelemetry`] indexes its per-effect counters by
+    /// [`ContentionEffect::index`], so an entry missing from
+    /// [`ContentionEffect::ALL`] would be counted into a slot nothing reads and
+    /// a duplicated index would merge two decisions into one counter. The index
+    /// match is exhaustive, so this pairing is what makes adding a variant
+    /// impossible to get half-right.
     ///
     /// # Panics
     ///
-    /// Panics when an entry publishes an empty or duplicated label, or when a
-    /// severity outside the closed operator vocabulary is returned.
+    /// Panics when an index is out of range, duplicated, or unclaimed.
+    #[test]
+    fn scribe_contention_registry_inventory_is_complete() {
+        let mut claimed = [false; ContentionEffect::ALL.len()];
+        for effect in ContentionEffect::ALL {
+            let index = effect.index();
+            assert!(
+                index < ContentionEffect::ALL.len(),
+                "{effect:?} indexes past the registry"
+            );
+            assert!(!claimed[index], "{effect:?} duplicates index {index}");
+            claimed[index] = true;
+        }
+        assert!(
+            claimed.iter().all(|slot| *slot),
+            "an index in the registry's counter space has no entry"
+        );
+    }
+
+    /// The registry covers every effect this remediation is required to publish.
+    ///
+    /// Named rather than counted: a count would still pass if one required
+    /// decision were dropped and an unrelated one added. Each entry here is an
+    /// obligation from the remediation packet's telemetry contract.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a required effect is absent from the registry.
+    #[test]
+    fn scribe_contention_registry_covers_every_required_effect() {
+        for required in [
+            ContentionEffect::AdmissionAttempted,
+            ContentionEffect::AdmissionSettled,
+            ContentionEffect::ActivationInstalled,
+            ContentionEffect::ActivationRolledBack,
+            ContentionEffect::ShareRecomputed,
+            ContentionEffect::CapacityBorrowed,
+            ContentionEffect::ChargeCommitted,
+            ContentionEffect::ChargeRefused,
+            ContentionEffect::ChargeReleased,
+            ContentionEffect::IncumbentBlocked,
+            ContentionEffect::DemandEnqueued,
+            ContentionEffect::DemandRefreshed,
+            ContentionEffect::DemandPartiallyServed,
+            ContentionEffect::DemandRetired,
+            ContentionEffect::DemandExpired,
+            ContentionEffect::DemandCancelled,
+            ContentionEffect::DemandInvalidated,
+            ContentionEffect::DemandDropped,
+            ContentionEffect::TableSettled,
+            ContentionEffect::TenantSettled,
+            ContentionEffect::ResourceSettled,
+            ContentionEffect::ResizeGrown,
+            ContentionEffect::ResizeShrunk,
+            ContentionEffect::ResizeRefused,
+            ContentionEffect::InvariantFailure,
+        ] {
+            assert!(
+                ContentionEffect::ALL.contains(&required),
+                "{required:?} is required by the telemetry contract but absent"
+            );
+        }
+    }
+
+    /// The registry's vocabularies are closed, complete, and free of duplicates.
+    ///
+    /// A duplicate stage/decision pair would silently merge two distinct
+    /// decisions into one operator time series.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an entry publishes an empty or duplicated label, or a
+    /// severity outside the closed operator vocabulary.
     #[test]
     fn scribe_contention_registry_vocabularies_are_closed() {
         let mut pairs: Vec<(&'static str, &'static str)> = Vec::new();
@@ -1109,12 +1502,53 @@ mod contention_registry_tests {
         assert_eq!(pairs.len(), ContentionEffect::ALL.len());
     }
 
+    /// Exactly one effect opens an active transition and one closes it.
+    ///
+    /// Starts and terminals have to balance for a drained pod to publish zero
+    /// active transitions. Two openers or two closers would make that balance
+    /// depend on which path a request happened to take.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the start, terminal, install, or release sets are not the
+    /// single fixed entries the reconciliation depends on.
+    #[test]
+    fn scribe_contention_transitions_have_one_opener_and_one_closer() {
+        let starts: Vec<_> = ContentionEffect::ALL
+            .into_iter()
+            .filter(|effect| effect.is_start())
+            .collect();
+        let terminals: Vec<_> = ContentionEffect::ALL
+            .into_iter()
+            .filter(|effect| effect.is_terminal())
+            .collect();
+        assert_eq!(starts, vec![ContentionEffect::AdmissionAttempted]);
+        assert_eq!(terminals, vec![ContentionEffect::AdmissionSettled]);
+
+        let installs: Vec<_> = ContentionEffect::ALL
+            .into_iter()
+            .filter(|effect| effect.installs_vector())
+            .collect();
+        assert_eq!(installs, vec![ContentionEffect::ActivationInstalled]);
+        let releases: Vec<_> = ContentionEffect::ALL
+            .into_iter()
+            .filter(|effect| effect.releases_vector())
+            .collect();
+        assert_eq!(
+            releases,
+            vec![
+                ContentionEffect::ActivationRolledBack,
+                ContentionEffect::TableSettled,
+                ContentionEffect::TenantSettled,
+            ]
+        );
+    }
+
     /// Steady-state fairness decisions stay inside the bounded `info` severity.
     ///
     /// Borrowing, retryable pressure, and turnover are what a work-conserving
     /// ledger does constantly. Emitting them above `info` would make normal
-    /// operation indistinguishable from a fault and drown the two signals that
-    /// genuinely need attention.
+    /// operation indistinguishable from a fault.
     ///
     /// # Panics
     ///
@@ -1123,17 +1557,24 @@ mod contention_registry_tests {
     #[test]
     fn scribe_contention_severity_is_bounded_to_real_faults() {
         for effect in [
+            ContentionEffect::AdmissionAttempted,
+            ContentionEffect::AdmissionSettled,
             ContentionEffect::ActivationInstalled,
             ContentionEffect::ActivationRefused,
             ContentionEffect::ActivationRolledBack,
+            ContentionEffect::ShareRecomputed,
+            ContentionEffect::CapacityBorrowed,
             ContentionEffect::ChargeCommitted,
             ContentionEffect::ChargeRefused,
             ContentionEffect::IncumbentBlocked,
             ContentionEffect::ChargeReleased,
             ContentionEffect::DemandEnqueued,
+            ContentionEffect::DemandPartiallyServed,
             ContentionEffect::DemandRetired,
+            ContentionEffect::DemandRestored,
             ContentionEffect::TableSettled,
             ContentionEffect::TenantSettled,
+            ContentionEffect::ResourceSettled,
         ] {
             assert_eq!(effect.severity(), "info", "{effect:?} escalated");
         }
@@ -1142,10 +1583,49 @@ mod contention_registry_tests {
         assert_eq!(ContentionEffect::InvariantFailure.severity(), "error");
     }
 
-    /// Emitting an effect with default facts publishes only closed labels.
+    /// The owner's totals count exactly what it published, per entry.
     ///
-    /// Guards the emitter itself: the metric label set is built from the
-    /// effect's own closed vocabulary plus the resource category, and nothing a
+    /// This is what makes a reconciliation assertion meaningful elsewhere: the
+    /// totals are not a parallel bookkeeping of what the code intended, they are
+    /// a tally of the emissions that actually happened.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a published effect is not counted, or when the derived
+    /// start/terminal, vector, and demand totals disagree with the emissions.
+    #[test]
+    fn scribe_telemetry_totals_tally_what_it_published() {
+        let telemetry = ScribeTelemetry::default();
+        for effect in ContentionEffect::ALL {
+            telemetry.record(
+                effect,
+                ContentionFacts {
+                    category: Some(ContentionCategory::AdmissionBytes),
+                    ..ContentionFacts::default()
+                },
+            );
+        }
+        let snapshot = telemetry.snapshot();
+        for effect in ContentionEffect::ALL {
+            assert_eq!(snapshot.count(effect), 1, "{effect:?} was not counted");
+        }
+        assert_eq!(snapshot.starts(), 1);
+        assert_eq!(snapshot.terminals(), 1);
+        assert_eq!(snapshot.active_transitions(), 0);
+        assert_eq!(snapshot.live_vectors(), 0, "one install, three releases");
+        assert_eq!(
+            snapshot.demand_transitions(),
+            ContentionEffect::ALL
+                .into_iter()
+                .filter(|effect| effect.is_demand_transition())
+                .count() as u64
+        );
+    }
+
+    /// An effect with no category publishes the closed `all` label, not an identity.
+    ///
+    /// Guards the emitter itself: the label set is built from the effect's own
+    /// closed vocabulary plus a closed [`ContentionCategory`], and nothing a
     /// caller passes can widen it.
     ///
     /// # Panics
@@ -1154,14 +1634,21 @@ mod contention_registry_tests {
     /// call sites fallible.
     #[test]
     fn recording_an_effect_publishes_only_closed_labels() {
-        for effect in ContentionEffect::ALL {
-            record_contention_effect(
-                effect,
+        let telemetry = ScribeTelemetry::default();
+        for category in ContentionCategory::ALL.map(Some).into_iter().chain([None]) {
+            telemetry.record(
+                ContentionEffect::ChargeCommitted,
                 ContentionFacts {
-                    category: "admission_bytes",
+                    category,
                     ..ContentionFacts::default()
                 },
             );
         }
+        assert_eq!(
+            telemetry
+                .snapshot()
+                .count(ContentionEffect::ChargeCommitted),
+            u64::try_from(ContentionCategory::ALL.len() + 1).expect("small count")
+        );
     }
 }

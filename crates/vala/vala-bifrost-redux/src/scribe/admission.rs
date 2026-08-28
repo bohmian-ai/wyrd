@@ -12,7 +12,7 @@ use crate::contracts::ScribeError;
 use crate::resources::ScribeResources;
 use crate::scribe::contention::{ContentionKey, ScribeContentionLedger};
 use crate::scribe::geometry::{ContentionCategory, ScribeArtifactPolicy, ScribeGeometryError};
-use crate::scribe::telemetry::{ContentionEffect, ContentionFacts, record_contention_effect};
+use crate::scribe::telemetry::{ContentionEffect, ContentionFacts, ScribeTelemetry};
 
 /// Fixed request overhead charged to every accepted append.
 pub const REQUEST_OVERHEAD_BYTES: usize = 4 * 1024;
@@ -164,6 +164,17 @@ struct AdmissionState {
     bytes: usize,
     active_bytes: usize,
     immutable_bytes: usize,
+}
+
+impl AdmissionInner {
+    /// Returns the pod's single observation owner for admission transitions.
+    ///
+    /// Pod-global admission and per-table contention publish through the same
+    /// instance so their totals reconcile against one another rather than
+    /// against two independently drifting counters.
+    fn telemetry(&self) -> &ScribeTelemetry {
+        self.contention.telemetry()
+    }
 }
 
 #[derive(Debug)]
@@ -356,7 +367,22 @@ impl AdmissionController {
 
         state.items = next_items;
         state.bytes = next_bytes;
+        let attempt = ContentionFacts {
+            category: Some(ContentionCategory::AdmissionBytes),
+            ceiling: self.memory_breaker_bytes(),
+            requested: bytes,
+            held_before: next_bytes.saturating_sub(bytes),
+            held_after: next_bytes,
+            pod_committed: next_bytes,
+            ..ContentionFacts::default()
+        };
         drop(state);
+        // Opened here, after the pod-global counters accepted and before any
+        // per-table charge, so every admitted request holds exactly one active
+        // transition until its resources are settled.
+        self.inner
+            .telemetry()
+            .record(ContentionEffect::AdmissionAttempted, attempt);
 
         if let Some(key) = cell {
             // Charge the cell only after the pod-global counters accepted, and
@@ -364,6 +390,7 @@ impl AdmissionController {
             // refusal never leaves the pod counting a request nobody owns.
             if let Err(refusal) = self.charge_cell(key, bytes) {
                 let _ = self.release_request(bytes);
+                self.settle_admission(bytes);
                 super::record_scribe_rejection("contention");
                 return Err(refusal);
             }
@@ -614,6 +641,26 @@ impl AdmissionController {
         Ok(())
     }
 
+    /// Closes one pod-global admission transition and reports its settlement.
+    ///
+    /// Called once per opened transition on every path -- refusal, normal
+    /// release, and drop -- so starts and terminals balance and a drained pod
+    /// publishes zero active transitions.
+    fn settle_admission(&self, bytes: usize) {
+        let held = self.inner.state.lock().map_or(0, |state| state.bytes);
+        self.inner.telemetry().record(
+            ContentionEffect::AdmissionSettled,
+            ContentionFacts {
+                category: Some(ContentionCategory::AdmissionBytes),
+                requested: bytes,
+                held_before: held.saturating_add(bytes),
+                held_after: held,
+                pod_committed: held,
+                ..ContentionFacts::default()
+            },
+        );
+    }
+
     fn memory_breaker_bytes(&self) -> usize {
         self.inner.config.memory_limit_bytes.saturating_mul(90) / 100
     }
@@ -727,13 +774,13 @@ impl InflightFrameReservation {
                     .charge(key, ContentionCategory::AdmissionBytes, extra)
         {
             state.bytes -= extra;
-            record_contention_effect(
+            inner.telemetry().record(
                 ContentionEffect::ResizeRefused,
                 self.resize_facts(extra, self.bytes),
             );
             return Err(refusal.into());
         }
-        record_contention_effect(
+        inner.telemetry().record(
             ContentionEffect::ResizeGrown,
             self.resize_facts(extra, self.bytes + extra),
         );
@@ -761,7 +808,7 @@ impl InflightFrameReservation {
     ) -> Result<(), ScribeError> {
         let Some(next_bytes) = state.bytes.checked_sub(released) else {
             inner.memory.poison();
-            record_contention_effect(
+            inner.telemetry().record(
                 ContentionEffect::InvariantFailure,
                 self.resize_facts(released, self.bytes),
             );
@@ -776,14 +823,14 @@ impl InflightFrameReservation {
                     .contention
                     .release(key, ContentionCategory::AdmissionBytes, released)
         {
-            record_contention_effect(
+            inner.telemetry().record(
                 ContentionEffect::ResizeRefused,
                 self.resize_facts(released, self.bytes),
             );
             return Err(refusal.into());
         }
         state.bytes = next_bytes;
-        record_contention_effect(
+        inner.telemetry().record(
             ContentionEffect::ResizeShrunk,
             self.resize_facts(released, self.bytes - released),
         );
@@ -793,7 +840,7 @@ impl InflightFrameReservation {
     /// Builds the bounded, identity-free facts one resize transition reports.
     fn resize_facts(&self, delta: usize, held_after: usize) -> ContentionFacts {
         ContentionFacts {
-            category: ContentionCategory::AdmissionBytes.label(),
+            category: Some(ContentionCategory::AdmissionBytes),
             requested: delta,
             held_before: self.bytes,
             held_after,
@@ -839,7 +886,20 @@ impl InflightFrameReservation {
                 .map_err(ScribeError::from),
             None => Ok(()),
         };
-        let global_result = AdmissionController { inner }.release_request(self.bytes);
+        let controller = AdmissionController { inner };
+        let global_result = controller.release_request(self.bytes);
+        // Every level this reservation charged has now been returned, so the
+        // transition it opened at admission is terminal and the pod's active
+        // gauge must fall back by exactly one.
+        controller.inner.telemetry().record(
+            ContentionEffect::ResourceSettled,
+            ContentionFacts {
+                category: Some(ContentionCategory::AdmissionBytes),
+                requested: self.bytes,
+                ..ContentionFacts::default()
+            },
+        );
+        controller.settle_admission(self.bytes);
         cell_result.and(global_result)
     }
 }
@@ -1110,8 +1170,143 @@ mod tests {
         drive_single_vector_effects();
         drive_demand_expiry_effect();
         drive_contender_priority_effects();
+        drive_rollback_claim_and_partial_effects();
+        drive_share_recomputation_effect();
         drive_sibling_settlement_effect();
-        drive_resize_effects();
+        drive_reservation_lifecycle_effects();
+        drive_resize_invariant_effect();
+    }
+
+    /// Drives `demand/restored` and `demand/partially_served`.
+    ///
+    /// The restore case is the one an incomplete rollback loses: an already
+    /// active table whose item leg satisfies and retires a demand record it
+    /// earned by waiting, whose byte leg then refuses. Returning the item charge
+    /// without returning the record would leave the table at zero ownership and
+    /// behind every rival it had been ahead of.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a transition this fixture depends on does not behave as the
+    /// ledger's own focused tests already prove it does.
+    fn drive_rollback_claim_and_partial_effects() {
+        let vector = ScribeArtifactPolicy::default().reserve_vector();
+        let quantum = vector.admission_bytes;
+        let ledger = ledger_for_vectors(2);
+        let incumbent = cell_key(33, "incumbent");
+        let contender = cell_key(34, "contender");
+
+        ledger
+            .admit(&incumbent, quantum * 2)
+            .expect("a lone owner borrows every idle byte");
+        ledger
+            .activate(&contender)
+            .expect("the pod still completes a second table");
+        ledger
+            .charge(&contender, ContentionCategory::AdmissionItems, 2)
+            .expect_err("the pod cannot hold a second item beyond its capacity");
+        ledger
+            .admit(&contender, quantum)
+            .expect_err("every byte is owned, so the byte leg refuses");
+
+        ledger
+            .release(&incumbent, ContentionCategory::AdmissionBytes, quantum / 2)
+            .expect("the incumbent drains part of one vector");
+        ledger
+            .charge(&contender, ContentionCategory::AdmissionBytes, quantum / 2)
+            .expect("work-conserving: the contender keeps what turned over");
+    }
+
+    /// Drives `charge/share_recomputed` with a level that actually binds.
+    ///
+    /// A queued contender is counted twice on purpose -- once as reserved
+    /// capacity the pod will not hand out, and once as effective demand in the
+    /// fairness computation -- so a third owner's modest charge is measured
+    /// against a level below the largest incumbent's holding. That is the only
+    /// shape where the recomputed level constrains rather than resolving to no
+    /// ceiling at all.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the charge this fixture depends on is refused.
+    fn drive_share_recomputation_effect() {
+        let vector = ScribeArtifactPolicy::default().reserve_vector();
+        let quantum = vector.admission_bytes;
+        let ledger = ledger_for_vectors(4);
+        let large = cell_key(35, "large");
+        let queued = cell_key(36, "queued");
+        let modest = cell_key(37, "modest");
+
+        ledger
+            .admit(&large, quantum * 2)
+            .expect("the largest owner takes two vectors");
+        ledger
+            .activate(&queued)
+            .expect("the pod still completes another table");
+        ledger
+            .charge(&queued, ContentionCategory::AdmissionBytes, quantum * 3)
+            .expect_err("more than the pod has left");
+        ledger
+            .admit(&modest, quantum / 2)
+            .expect("a modest charge fits under the recomputed level");
+    }
+
+    /// Drives `admission/settled` and `settlement/resources_returned`.
+    ///
+    /// One reservation is opened and released normally, which is the only path
+    /// that closes the pod-global admission transition it opened. `resize` is
+    /// exercised on the same reservation so growth and shrink report against a
+    /// transition that genuinely settles.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a resize that must succeed is refused, or when the release
+    /// does not balance.
+    fn drive_reservation_lifecycle_effects() {
+        let admission = AdmissionController::with_config(AdmissionConfig::default())
+            .expect("the default geometry fits the default budget");
+        let owner = cell_key(38, "lifecycle");
+        let mut reservation = admission
+            .try_reserve_for_cell(&owner, "wyrd.lifecycle", 4_096)
+            .expect("a first request activates the cell");
+        reservation.resize(8_192).expect("growth fits");
+        reservation.resize(4_096).expect("shrink fits");
+        reservation.release().expect("the reservation balances");
+        assert_eq!(admission.snapshot().items, 0);
+        assert_eq!(admission.snapshot().bytes, 0);
+    }
+
+    /// Drives `resize/delta_refused` and `invariant/corrupt`.
+    ///
+    /// The final block makes the reservation claim more bytes than the pod
+    /// counter holds, which is the accounting contradiction the invariant entry
+    /// exists to report; the reservation is then neutralized so its drop cannot
+    /// re-enter the poisoned path. It runs on its own controller because the
+    /// forgotten reservation deliberately never settles.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a resize that must be refused succeeds.
+    fn drive_resize_invariant_effect() {
+        let admission = AdmissionController::with_config(AdmissionConfig::default())
+            .expect("the default geometry fits the default budget");
+        let owner = cell_key(29, "resize");
+        let mut reservation = admission
+            .try_reserve_for_cell(&owner, "wyrd.resize", 4_096)
+            .expect("a first request activates the cell");
+        admission
+            .contention()
+            .release(&owner, ContentionCategory::AdmissionBytes, 4_096)
+            .expect("the cell's bytes are returned out of band");
+        reservation
+            .resize(1_024)
+            .expect_err("the cell cannot return bytes it no longer holds");
+        reservation.bytes = usize::MAX;
+        reservation
+            .resize(0)
+            .expect_err("the pod counter cannot absorb an impossible shrink");
+        reservation.bytes = 0;
+        std::mem::forget(reservation);
     }
 
     /// Returns the pod capacity that completes exactly `vectors` lifecycle vectors.
@@ -1287,41 +1482,6 @@ mod tests {
             .release(&settled, ContentionCategory::AdmissionItems, 1)
             .expect("items return");
         assert!(ledger.settle(&settled).expect("readable"));
-    }
-
-    /// Drives `resize/grown`, `resize/shrunk`, `resize/refused`, and `invariant/corrupt`.
-    ///
-    /// The final block makes the reservation claim more bytes than the pod
-    /// counter holds, which is the accounting contradiction the invariant entry
-    /// exists to report; the reservation is then neutralized so its drop cannot
-    /// re-enter the poisoned path.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a resize that must succeed is refused, or when a resize that
-    /// must be refused succeeds.
-    fn drive_resize_effects() {
-        let admission = AdmissionController::with_config(AdmissionConfig::default())
-            .expect("the default geometry fits the default budget");
-        let owner = cell_key(29, "resize");
-        let mut reservation = admission
-            .try_reserve_for_cell(&owner, "wyrd.resize", 4_096)
-            .expect("a first request activates the cell");
-        reservation.resize(8_192).expect("growth fits");
-        reservation.resize(4_096).expect("shrink fits");
-        admission
-            .contention()
-            .release(&owner, ContentionCategory::AdmissionBytes, 4_096)
-            .expect("the cell's bytes are returned out of band");
-        reservation
-            .resize(1_024)
-            .expect_err("the cell cannot return bytes it no longer holds");
-        reservation.bytes = usize::MAX;
-        reservation
-            .resize(0)
-            .expect_err("the pod counter cannot absorb an impossible shrink");
-        reservation.bytes = 0;
-        std::mem::forget(reservation);
     }
 
     /// Builds a ledger whose measured capacity completes exactly `vectors` tables.

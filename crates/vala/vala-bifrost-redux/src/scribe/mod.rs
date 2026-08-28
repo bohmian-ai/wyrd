@@ -1,6 +1,7 @@
 //! Scribe implementation — WAL append, fsync, replay, and memtable (/).
 
 pub mod admission;
+pub mod assembly;
 pub mod audit_envelope;
 pub mod contention;
 mod direct_logs;

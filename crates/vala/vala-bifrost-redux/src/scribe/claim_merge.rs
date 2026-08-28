@@ -301,6 +301,19 @@ impl StagedRunMerge {
     }
 }
 
+impl Iterator for StagedRunMerge {
+    type Item = Result<RecordBatch, ScribeError>;
+
+    /// Yields the next ordered batch so the merge can drive the claim writer.
+    ///
+    /// A merge failure ends the iteration by surfacing as the item: the writer
+    /// must stop at the first unreadable run rather than seal an object that
+    /// silently drops its rows.
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_batch().transpose()
+    }
+}
+
 impl std::fmt::Debug for StagedRunMerge {
     /// Names the merge by its width rather than its decoded rows.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

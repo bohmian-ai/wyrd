@@ -379,6 +379,64 @@ pub(crate) struct CandidateEncodeRequest<'a> {
     pub(crate) layout: &'a PhysicalLayout,
 }
 
+/// Everything a rolling artifact writer needs that is not the rows themselves.
+///
+/// The plan exists so one writer serves both producers of ordered rows: the
+/// frozen-generation encoder, whose rows come from Arrow, and claim assembly,
+/// whose rows come from a bounded merge over staged runs. Neither owns the
+/// rolling rules, so neither can drift from them.
+#[derive(Debug, Clone, Copy)]
+pub struct ArtifactPlan<'a> {
+    /// Directory receiving the sealed artifacts.
+    pub scratch_dir: &'a Path,
+    /// Deterministic object identity prefix for artifact ordinals.
+    pub object_base: &'a str,
+    /// Registered physical write recipe governing Bloom columns.
+    pub layout: &'a PhysicalLayout,
+    /// First artifact ordinal this operation may assign.
+    pub first_ordinal: usize,
+    /// Approximate encoded size at which one artifact closes and the next opens.
+    pub target_object_bytes: u64,
+}
+
+/// Encodes one claim's already ordered rows into rolling hot objects.
+///
+/// This is the assembly half of the writer: the rows arrive globally ordered
+/// from the claim's bounded merge, so there is nothing to sort and nothing to
+/// concatenate. Artifacts roll strictly between completed row groups once the
+/// running encoded size reaches the plan's target, and the claim's remainder is
+/// a valid smaller final object rather than a defect.
+///
+/// Unlike a frozen generation, a claim has no candidate boundaries: sealing
+/// happens only at the target and at the end, which is what lets several
+/// members share one object.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::Internal`] when the merge fails, a batch violates the
+/// logical row-group contract, an artifact cannot be opened, written, sealed,
+/// inspected, or checksummed, or the claim produced no rows at all.
+pub fn encode_ordered_claim(
+    plan: ArtifactPlan<'_>,
+    footer_reservation: crate::scribe::memory::EncodedFooterReservation,
+    ordered: impl Iterator<Item = Result<RecordBatch, ScribeError>>,
+) -> Result<(BoundedParquetArtifactSet, Vec<RowGroupStats>), ScribeError> {
+    debug_assert_eq!(
+        footer_reservation.bytes(),
+        crate::scribe::memory::PARQUET_FOOTER_CHILD_BYTES
+    );
+    let mut roller = RollingArtifactWriter::new(plan);
+    for batch in ordered {
+        roller.append_ordered_batch(&batch?)?;
+    }
+    let (artifacts, row_group_stats) = roller.finish()?;
+    drop(footer_reservation);
+    Ok((
+        BoundedParquetArtifactSet::encoded(artifacts)?,
+        row_group_stats,
+    ))
+}
+
 /// Owns one bounded Parquet encoding workflow and its footer reservation.
 struct ParquetBatchEncoder<'a> {
     /// Immutable generation being encoded.
@@ -403,7 +461,18 @@ struct ParquetBatchEncoder<'a> {
     target_object_bytes: u64,
 }
 
-impl ParquetBatchEncoder<'_> {
+impl<'a> ParquetBatchEncoder<'a> {
+    /// Returns the rolling rules and identity this encoding writes under.
+    fn plan(&self) -> ArtifactPlan<'a> {
+        ArtifactPlan {
+            scratch_dir: self.scratch_dir,
+            object_base: self.object_base,
+            layout: self.layout,
+            first_ordinal: self.first_ordinal,
+            target_object_bytes: self.target_object_bytes,
+        }
+    }
+
     /// Executes validation, bounded materialization, and exact artifact encoding.
     ///
     /// # Errors
@@ -415,7 +484,7 @@ impl ParquetBatchEncoder<'_> {
             self.footer_reservation.bytes(),
             crate::scribe::memory::PARQUET_FOOTER_CHILD_BYTES
         );
-        let mut roller = RollingArtifactWriter::new(&self);
+        let mut roller = RollingArtifactWriter::new(self.plan());
         for candidate in &self.candidates {
             let sorted_batch = self.prepare_sorted_candidate(*candidate)?;
             roller.append_ordered_batch(&sorted_batch)?;
@@ -504,9 +573,9 @@ struct OpenArtifact {
 /// validation. Rolling is the only size decision made from encoded bytes, it is
 /// taken only between completed groups, and it never deletes, retries, or
 /// refuses a group that was already written.
-struct RollingArtifactWriter<'a, 'b> {
-    /// Encoder owning scratch, identity, layout, and the object target.
-    encoder: &'a ParquetBatchEncoder<'b>,
+struct RollingArtifactWriter<'a> {
+    /// Scratch, identity, layout, and the object target this writer obeys.
+    plan: ArtifactPlan<'a>,
     /// Next generation-global ordinal to assign.
     next_ordinal: usize,
     /// Artifact currently accepting row groups, if one is open.
@@ -517,12 +586,12 @@ struct RollingArtifactWriter<'a, 'b> {
     row_group_stats: Vec<RowGroupStats>,
 }
 
-impl<'a, 'b> RollingArtifactWriter<'a, 'b> {
-    /// Starts a rolling writer at the encoder's first generation-global ordinal.
-    fn new(encoder: &'a ParquetBatchEncoder<'b>) -> Self {
+impl<'a> RollingArtifactWriter<'a> {
+    /// Starts a rolling writer at the plan's first generation-global ordinal.
+    fn new(plan: ArtifactPlan<'a>) -> Self {
         Self {
-            encoder,
-            next_ordinal: encoder.first_ordinal,
+            plan,
+            next_ordinal: plan.first_ordinal,
             open: None,
             artifacts: Vec::new(),
             row_group_stats: Vec::new(),
@@ -587,7 +656,7 @@ impl<'a, 'b> RollingArtifactWriter<'a, 'b> {
         })?;
         open.rows = open.rows.saturating_add(group.num_rows());
         let written = u64::try_from(open.writer.bytes_written()).unwrap_or(u64::MAX);
-        if written >= self.encoder.target_object_bytes {
+        if written >= self.plan.target_object_bytes {
             self.seal_open_artifact()?;
         }
         Ok(())
@@ -609,9 +678,9 @@ impl<'a, 'b> RollingArtifactWriter<'a, 'b> {
             detail: "writer-v2 artifact ordinal exceeds u16".to_owned(),
         })?;
         self.next_ordinal = self.next_ordinal.saturating_add(1);
-        let object_identity = format!("{}-{ordinal:05}.parquet", self.encoder.object_base);
+        let object_identity = format!("{}-{ordinal:05}.parquet", self.plan.object_base);
         let scratch_path = self
-            .encoder
+            .plan
             .scratch_dir
             .join(format!("artifact-{ordinal:05}.parquet"));
         let file = std::fs::File::create(&scratch_path).map_err(|error| ScribeError::Internal {
@@ -626,7 +695,7 @@ impl<'a, 'b> RollingArtifactWriter<'a, 'b> {
             Some(bifrost_writer_properties_with_metadata(
                 group.num_rows(),
                 Vec::new(),
-                self.encoder.layout.bloom_columns(),
+                self.plan.layout.bloom_columns(),
             )),
         )
         .map_err(|error| ScribeError::Internal {

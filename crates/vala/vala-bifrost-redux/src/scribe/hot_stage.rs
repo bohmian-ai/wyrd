@@ -657,6 +657,28 @@ impl ScribeHotStage {
         Ok(())
     }
 
+    /// Loads and validates exactly one member of one assembly key.
+    ///
+    /// Assembly reads a claim's members individually rather than rescanning the
+    /// namespace, and it must read them through the same validation startup
+    /// uses: a run whose bytes no longer match its recorded digest must stop
+    /// the claim rather than reach a published object.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same refusals as [`Self::recover`] for this member, and
+    /// [`HotStageError::Io`] when the member's record is absent, which means
+    /// the caller is holding a member this stage never published.
+    pub async fn member(
+        &self,
+        key: &ScribeAssemblyKey,
+        member: StagedMemberId,
+    ) -> Result<StagedMember, HotStageError> {
+        let directory = self.member_directory(key, member);
+        let path = directory.join(RECORD_FILE_NAME);
+        self.validate(&directory, &path).await
+    }
+
     /// Scans and validates the whole staged namespace at startup.
     ///
     /// Every record is decoded, version-checked, rebuilt into its assembly key,

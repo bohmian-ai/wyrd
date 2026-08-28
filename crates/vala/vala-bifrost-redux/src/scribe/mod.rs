@@ -3,6 +3,7 @@
 pub mod admission;
 pub mod assembly;
 pub mod audit_envelope;
+pub mod claim_assembly;
 pub mod claim_merge;
 pub mod contention;
 mod direct_logs;

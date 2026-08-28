@@ -10,8 +10,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::contracts::ScribeError;
 use crate::resources::ScribeResources;
-use crate::scribe::contention::{ActivationOutcome, ContentionKey, ScribeContentionLedger};
+use crate::scribe::contention::{ContentionKey, ScribeContentionLedger};
 use crate::scribe::geometry::{ContentionCategory, ScribeArtifactPolicy, ScribeGeometryError};
+use crate::scribe::telemetry::{ContentionEffect, ContentionFacts, record_contention_effect};
 
 /// Fixed request overhead charged to every accepted append.
 pub const REQUEST_OVERHEAD_BYTES: usize = 4 * 1024;
@@ -597,46 +598,19 @@ impl AdmissionController {
 
     /// Activates a table's cell if needed and charges one admitted request.
     ///
-    /// Activation and the two admission charges are one reversible transition.
-    ///
-    /// A cell that held an item without its bytes, or the reverse, would let a
-    /// table pass admission it cannot actually own. A cell created here and then
-    /// refused is removed again, so a rejected first request leaves no trace of
-    /// the table at all -- an empty cell would otherwise occupy one of the pod's
-    /// derived ownership slots forever while serving nothing. Only a cell *this
-    /// call* created is rolled back: a table that was already active keeps its
-    /// cell and everything it owns, because the refusal says nothing about the
-    /// work it is already carrying.
+    /// Delegates to [`ScribeContentionLedger::admit`], which performs
+    /// activation, both admission charges, demand retirement, and complete
+    /// rollback as one lock-held transition. Splitting those steps across
+    /// separate ledger calls is what let an over-share incumbent reacquire the
+    /// capacity a queued contender had just been promised, so the controller
+    /// deliberately owns none of that sequencing itself.
     ///
     /// # Errors
     ///
-    /// Returns the [`ScribeError`] projection of the contention refusal.
+    /// Returns the [`ScribeError`] projection of the contention refusal. Every
+    /// refusal leaves the ledger exactly as it found it.
     fn charge_cell(&self, key: &ContentionKey, bytes: usize) -> Result<(), ScribeError> {
-        let ledger = &self.inner.contention;
-        let outcome = ledger.activate(key)?;
-        let rollback = |controller: &Self| {
-            if outcome == ActivationOutcome::Created {
-                // Every charge has been returned by this point, so the cell is
-                // empty and deactivation cannot refuse.
-                if let Err(error) = controller.inner.contention.deactivate(key) {
-                    tracing::error!(
-                        error = %error,
-                        "failed admission could not release the cell it created"
-                    );
-                }
-            }
-        };
-        if let Err(refusal) = ledger.charge(key, ContentionCategory::AdmissionItems, 1) {
-            rollback(self);
-            return Err(refusal.into());
-        }
-        if let Err(refusal) = ledger.charge(key, ContentionCategory::AdmissionBytes, bytes) {
-            if let Err(error) = ledger.release(key, ContentionCategory::AdmissionItems, 1) {
-                tracing::error!(error = %error, "admission item rollback failed");
-            }
-            rollback(self);
-            return Err(refusal.into());
-        }
+        self.inner.contention.admit(key, bytes)?;
         Ok(())
     }
 
@@ -720,25 +694,83 @@ impl InflightFrameReservation {
                         .charge(key, ContentionCategory::AdmissionBytes, extra)
                 {
                     state.bytes -= extra;
+                    record_contention_effect(
+                        ContentionEffect::ResizeRefused,
+                        ContentionFacts {
+                            category: ContentionCategory::AdmissionBytes.label(),
+                            requested: extra,
+                            held_before: self.bytes,
+                            held_after: self.bytes,
+                            ..ContentionFacts::default()
+                        },
+                    );
                     return Err(refusal.into());
                 }
             }
+            record_contention_effect(
+                ContentionEffect::ResizeGrown,
+                ContentionFacts {
+                    category: ContentionCategory::AdmissionBytes.label(),
+                    requested: extra,
+                    held_before: self.bytes,
+                    held_after: bytes,
+                    ..ContentionFacts::default()
+                },
+            );
         } else {
             let released = self.bytes - bytes;
+            // Computed but not stored yet. The cell release below is fallible,
+            // and a shrink that lowered the pod counter before that failure
+            // would leave the pod believing bytes were returned that the table
+            // still owns -- the same split accounting a growth refusal restores.
             let Some(next_bytes) = state.bytes.checked_sub(released) else {
                 inner.memory.poison();
+                record_contention_effect(
+                    ContentionEffect::InvariantFailure,
+                    ContentionFacts {
+                        category: ContentionCategory::AdmissionBytes.label(),
+                        requested: released,
+                        held_before: state.bytes,
+                        held_after: state.bytes,
+                        ..ContentionFacts::default()
+                    },
+                );
                 return Err(ScribeError::Internal {
                     detail:
                         "in-flight admission byte counter underflow while shrinking reservation"
                             .to_owned(),
                 });
             };
-            state.bytes = next_bytes;
             if let Some(key) = &self.cell {
-                inner
-                    .contention
-                    .release(key, ContentionCategory::AdmissionBytes, released)?;
+                if let Err(refusal) =
+                    inner
+                        .contention
+                        .release(key, ContentionCategory::AdmissionBytes, released)
+                {
+                    record_contention_effect(
+                        ContentionEffect::ResizeRefused,
+                        ContentionFacts {
+                            category: ContentionCategory::AdmissionBytes.label(),
+                            requested: released,
+                            held_before: state.bytes,
+                            held_after: state.bytes,
+                            ..ContentionFacts::default()
+                        },
+                    );
+                    return Err(refusal.into());
+                }
             }
+            state.bytes = next_bytes;
+            record_contention_effect(
+                ContentionEffect::ResizeShrunk,
+                ContentionFacts {
+                    category: ContentionCategory::AdmissionBytes.label(),
+                    requested: released,
+                    held_before: self.bytes,
+                    held_after: bytes,
+                    ..ContentionFacts::default()
+                },
+            );
         }
         self.bytes = bytes;
         Ok(())
@@ -773,6 +805,12 @@ impl InflightFrameReservation {
                         .contention
                         .release(&key, ContentionCategory::AdmissionItems, 1)
                 })
+                // Terminal settlement runs on the production release path, not
+                // only on failed-first-charge rollback. An empty cell that is
+                // never retired still occupies one of the pod's derived
+                // ownership slots, so sequential traffic across distinct tables
+                // would reach the ownership ceiling while owning nothing.
+                .and_then(|()| inner.contention.settle(&key).map(|_| ()))
                 .map_err(ScribeError::from),
             None => Ok(()),
         };
@@ -811,6 +849,7 @@ pub struct AdmissionSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scribe::contention::ContentionRefusal;
 
     /// Builds a contention cell identity for one tenant ordinal and table name.
     ///
@@ -993,8 +1032,9 @@ mod tests {
     /// # Panics
     ///
     /// Panics when the cell is not charged alongside the pod-global counters,
-    /// when releasing the reservation leaves the cell holding anything, or when
-    /// a refused per-table charge leaves the pod counting an unowned request.
+    /// when terminal release leaves the emptied cell occupying an ownership
+    /// slot, or when a refused per-table charge leaves the pod counting an
+    /// unowned request.
     #[test]
     fn per_table_reservations_charge_and_return_their_own_cell() {
         let admission = AdmissionController::with_config(AdmissionConfig::default())
@@ -1027,18 +1067,18 @@ mod tests {
         assert_eq!(admission.snapshot().items, 1);
 
         reservation.release().expect("release succeeds");
+        // Terminal settlement runs on the production release path: the emptied
+        // cell is retired rather than left occupying an ownership slot.
         assert_eq!(
-            ledger
-                .usage(&key, ContentionCategory::AdmissionItems)
-                .expect("cell stays installed"),
-            0
+            ledger.usage(&key, ContentionCategory::AdmissionItems),
+            Err(ContentionRefusal::Inactive)
         );
         assert_eq!(
-            ledger
-                .usage(&key, ContentionCategory::AdmissionBytes)
-                .expect("cell stays installed"),
-            0
+            ledger.usage(&key, ContentionCategory::AdmissionBytes),
+            Err(ContentionRefusal::Inactive)
         );
+        assert_eq!(ledger.active_cells().expect("ledger readable"), 0);
+        assert_eq!(ledger.active_tenants().expect("ledger readable"), 0);
         assert_eq!(admission.snapshot().items, 0);
         assert_eq!(admission.snapshot().bytes, 0);
     }

@@ -55,6 +55,7 @@ use crate::contracts::ScribeError;
 use crate::scribe::geometry::{
     ContentionCategory, ContentionReserveVector, ScribeArtifactPolicy, ScribeGlobalCapacity,
 };
+use crate::scribe::telemetry::{ContentionEffect, ContentionFacts, record_contention_effect};
 
 /// Live contention-demand records the pod will hold before refusing to queue.
 ///
@@ -248,17 +249,37 @@ impl LedgerState {
     /// retired by their table becoming active; a category record belongs to an
     /// already-active table by definition, and pruning it on that basis is
     /// exactly what would let an over-share incumbent reacquire past it.
-    fn prune_demand(&mut self, now: Instant) {
+    fn prune_demand(&mut self, now: Instant) -> usize {
         let admitted: Vec<ContentionKey> = self
             .demand
             .iter()
             .filter(|record| record.category.is_none() && self.is_active(&record.key))
             .map(|record| record.key.clone())
             .collect();
+        let expired = self
+            .demand
+            .iter()
+            .filter(|record| record.expires_at <= now)
+            .count();
         self.demand.retain(|record| {
             record.expires_at > now
                 && !(record.category.is_none() && admitted.contains(&record.key))
         });
+        expired
+    }
+
+    /// Returns how many distinct tables currently hold a demand record.
+    ///
+    /// Counted rather than tracked so the gauge one transition publishes can
+    /// never disagree with the queue it summarizes.
+    fn distinct_demand(&self) -> usize {
+        let mut seen: Vec<&ContentionKey> = Vec::new();
+        for record in &self.demand {
+            if !seen.contains(&&record.key) {
+                seen.push(&record.key);
+            }
+        }
+        seen.len()
     }
 
     /// Returns the distinct tables waiting to activate ahead of `key`.
@@ -539,6 +560,31 @@ impl From<ContentionRefusal> for ScribeError {
     }
 }
 
+/// What one terminal settlement attempt did to the owner map.
+///
+/// Distinguished so the settlement owner can report the tenant's own retirement
+/// exactly once rather than inferring it from a table count a caller would have
+/// to read back under a second lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Settlement {
+    /// The table held no cell; nothing was tracked and nothing was removed.
+    Untracked,
+    /// The empty table cell was removed and its tenant still has other tables.
+    TableRetired,
+    /// The empty table cell was removed and it was its tenant's last.
+    TenantRetired,
+}
+
+impl Settlement {
+    /// Returns the registry effect this settlement outcome is reported as.
+    const fn effect(self) -> ContentionEffect {
+        match self {
+            Self::Untracked | Self::TableRetired => ContentionEffect::TableSettled,
+            Self::TenantRetired => ContentionEffect::TenantSettled,
+        }
+    }
+}
+
 /// Pod-wide tenant-keyed contention ledger.
 ///
 /// Constructed once from the validated [`ScribeArtifactPolicy`] and the pod
@@ -634,14 +680,154 @@ impl ScribeContentionLedger {
     /// and [`ContentionRefusal::Poisoned`] when the ledger lock is poisoned.
     pub fn activate(&self, key: &ContentionKey) -> Result<ActivationOutcome, ContentionRefusal> {
         let mut state = self.lock()?;
-        state.prune_demand(Instant::now());
+        self.prune(&mut state);
+        let outcome = self.install(&mut state, key)?;
+        Self::retire_activation(&mut state, key);
+        Ok(outcome)
+    }
+
+    /// Activates a table if needed and applies its initial admission charges
+    /// as one indivisible ledger transition.
+    ///
+    /// This is the production admission entry point, and it exists because
+    /// activation and the first charge cannot be two lock acquisitions. Between
+    /// them the contender is installed, holds nothing, and -- if its ordering
+    /// record were retired at activation -- would read as zero demand to every
+    /// fairness computation. An incumbent above its recomputed share could take
+    /// the capacity the contender had just been promised, and the contender
+    /// would be refused and rolled back after waiting its whole turn. Holding
+    /// one lock across install, both charges, demand retirement, and rollback
+    /// closes that window entirely.
+    ///
+    /// The contender keeps its ordering claim for the whole transition. Demand
+    /// retires only when both charges commit; a refusal removes every effect of
+    /// this call and leaves a live demand record behind, so the next release
+    /// still belongs to the contender rather than to whoever retries first.
+    ///
+    /// A table that was already active keeps its cell and everything it owns on
+    /// refusal: the refusal describes this request, and says nothing about work
+    /// the table is already carrying.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContentionRefusal::OwnershipCeiling`] when the pod cannot carry
+    /// another table before the contenders already waiting,
+    /// [`ContentionRefusal::Exhausted`] when either initial charge exceeds a
+    /// recomputed bound, and [`ContentionRefusal::Poisoned`] when the ledger
+    /// lock is poisoned. Every refusal leaves the ledger exactly as it found it.
+    pub fn admit(
+        &self,
+        key: &ContentionKey,
+        bytes: usize,
+    ) -> Result<ActivationOutcome, ContentionRefusal> {
+        let mut state = self.lock()?;
+        self.prune(&mut state);
+        let outcome = self.install(&mut state, key)?;
+        if let Err(refusal) = self.charge_locked(
+            &mut state,
+            &self.request(key, ContentionCategory::AdmissionItems, 1),
+        ) {
+            self.roll_back_install(&mut state, key, outcome);
+            return Err(refusal);
+        }
+        if let Err(refusal) = self.charge_locked(
+            &mut state,
+            &self.request(key, ContentionCategory::AdmissionBytes, bytes),
+        ) {
+            // Returning the item charge cannot fail: this transition committed
+            // it a moment ago under the same lock. A failure here is a ledger
+            // invariant break, not a caller error, so it is reported as one and
+            // the rollback still completes.
+            if let Err(error) = Self::release_locked(
+                &mut state,
+                key,
+                ContentionCategory::AdmissionItems,
+                1,
+            ) {
+                self.emit(
+                    &state,
+                    ContentionEffect::InvariantFailure,
+                    ContentionFacts {
+                        category: ContentionCategory::AdmissionItems.label(),
+                        requested: 1,
+                        ..ContentionFacts::default()
+                    },
+                );
+                tracing::error!(error = %error, "admission item rollback broke ledger accounting");
+            }
+            self.roll_back_install(&mut state, key, outcome);
+            return Err(refusal);
+        }
+        Self::retire_activation(&mut state, key);
+        self.emit(
+            &state,
+            ContentionEffect::ActivationInstalled,
+            ContentionFacts {
+                category: ContentionCategory::AdmissionBytes.label(),
+                requested: bytes,
+                held_after: state.held(key, ContentionCategory::AdmissionBytes),
+                ..ContentionFacts::default()
+            },
+        );
+        Ok(outcome)
+    }
+
+    /// Builds one charge request against this ledger's lifecycle vector.
+    fn request<'a>(
+        &self,
+        key: &'a ContentionKey,
+        category: ContentionCategory,
+        amount: usize,
+    ) -> ChargeRequest<'a> {
+        ChargeRequest {
+            key,
+            category,
+            amount,
+            quantum: self.reserve_vector().component(category),
+        }
+    }
+
+    /// Expires stale demand under an already-held lock and reports the effect.
+    fn prune(&self, state: &mut LedgerState) {
+        if state.prune_demand(Instant::now()) > 0 {
+            self.emit(
+                state,
+                ContentionEffect::DemandExpired,
+                ContentionFacts::default(),
+            );
+        }
+    }
+
+    /// Installs one table's cell under an already-held lock.
+    ///
+    /// The caller's ordering record is deliberately left in place: it is retired
+    /// by [`Self::retire_activation`] only once the whole transition commits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContentionRefusal::OwnershipCeiling`] when the pod cannot carry
+    /// another table, or cannot carry it before the contenders already waiting.
+    fn install(
+        &self,
+        state: &mut LedgerState,
+        key: &ContentionKey,
+    ) -> Result<ActivationOutcome, ContentionRefusal> {
         if state.is_active(key) {
             return Ok(ActivationOutcome::AlreadyActive);
         }
         let active = state.active_tables();
         let waiting = state.waiting_ahead(key);
         if active.saturating_add(waiting) >= self.ownership_ceiling {
-            self.enqueue_demand(&mut state, key, None);
+            self.enqueue_demand(state, key, None);
+            self.emit(
+                state,
+                ContentionEffect::ActivationRefused,
+                ContentionFacts {
+                    ceiling: self.ownership_ceiling,
+                    reserved_contenders: waiting,
+                    ..ContentionFacts::default()
+                },
+            );
             return Err(ContentionRefusal::OwnershipCeiling {
                 ceiling: self.ownership_ceiling,
                 active,
@@ -654,10 +840,59 @@ impl ScribeContentionLedger {
             .or_default()
             .tables
             .insert(key.table.clone(), TenantTableLedger::default());
+        Ok(ActivationOutcome::Created)
+    }
+
+    /// Removes a cell this transition installed and restores its ordering claim.
+    ///
+    /// A table that was already active is left untouched: rolling it back would
+    /// revoke acknowledged work this request never owned.
+    fn roll_back_install(
+        &self,
+        state: &mut LedgerState,
+        key: &ContentionKey,
+        outcome: ActivationOutcome,
+    ) {
+        if outcome != ActivationOutcome::Created {
+            return;
+        }
+        if let Some(tenant) = state.tenants.get_mut(&key.tenant) {
+            tenant.tables.remove(&key.table);
+            if tenant.tables.is_empty() {
+                state.tenants.remove(&key.tenant);
+            }
+        }
+        // The contender is inactive again, so it needs a live activation claim
+        // to keep the place in line it just spent its turn on.
+        self.enqueue_demand(state, key, None);
+        self.emit(
+            state,
+            ContentionEffect::ActivationRolledBack,
+            ContentionFacts {
+                ceiling: self.ownership_ceiling,
+                ..ContentionFacts::default()
+            },
+        );
+    }
+
+    /// Retires one table's activation claim once it is genuinely installed.
+    fn retire_activation(state: &mut LedgerState, key: &ContentionKey) {
         state
             .demand
             .retain(|record| &record.key != key || record.category.is_some());
-        Ok(ActivationOutcome::Created)
+    }
+
+    /// Emits one registry effect with the ledger's live bounded gauges attached.
+    fn emit(&self, state: &LedgerState, effect: ContentionEffect, facts: ContentionFacts) {
+        record_contention_effect(
+            effect,
+            ContentionFacts {
+                demand_records: state.distinct_demand(),
+                active_tables: state.active_tables(),
+                active_tenants: state.active_tenants(),
+                ..facts
+            },
+        );
     }
 
     /// Records that one registered canonical table is waiting for capacity.
@@ -673,6 +908,7 @@ impl ScribeContentionLedger {
         category: Option<ContentionCategory>,
     ) {
         let expires_at = Instant::now() + self.demand_ttl;
+        let label = category.map_or("activation", ContentionCategory::label);
         if let Some(record) = state.demand.iter_mut().find(|record| {
             &record.key == key
                 && record.category.map(|held| held as usize)
@@ -682,9 +918,26 @@ impl ScribeContentionLedger {
             // keep the queue position it earned rather than losing it to a
             // rival that has been waiting less time.
             record.expires_at = expires_at;
+            self.emit(
+                state,
+                ContentionEffect::DemandRefreshed,
+                ContentionFacts {
+                    category: label,
+                    ..ContentionFacts::default()
+                },
+            );
             return;
         }
         if state.demand.len() >= self.demand_capacity {
+            self.emit(
+                state,
+                ContentionEffect::DemandDropped,
+                ContentionFacts {
+                    category: label,
+                    ceiling: self.demand_capacity,
+                    ..ContentionFacts::default()
+                },
+            );
             return;
         }
         state.demand.push_back(DemandRecord {
@@ -692,6 +945,15 @@ impl ScribeContentionLedger {
             category,
             expires_at,
         });
+        self.emit(
+            state,
+            ContentionEffect::DemandEnqueued,
+            ContentionFacts {
+                category: label,
+                ceiling: self.demand_capacity,
+                ..ContentionFacts::default()
+            },
+        );
     }
 
     /// Withdraws every demand record one table holds.
@@ -706,7 +968,15 @@ impl ScribeContentionLedger {
     /// Returns [`ContentionRefusal::Poisoned`] when the ledger lock is poisoned.
     pub fn cancel_demand(&self, key: &ContentionKey) -> Result<(), ContentionRefusal> {
         let mut state = self.lock()?;
+        let before = state.demand.len();
         state.demand.retain(|record| &record.key != key);
+        if state.demand.len() != before {
+            self.emit(
+                &state,
+                ContentionEffect::DemandCancelled,
+                ContentionFacts::default(),
+            );
+        }
         Ok(())
     }
 
@@ -720,14 +990,8 @@ impl ScribeContentionLedger {
     /// Returns [`ContentionRefusal::Poisoned`] when the ledger lock is poisoned.
     pub fn waiting_demand(&self) -> Result<usize, ContentionRefusal> {
         let mut state = self.lock()?;
-        state.prune_demand(Instant::now());
-        let mut seen: Vec<&ContentionKey> = Vec::new();
-        for record in &state.demand {
-            if !seen.contains(&&record.key) {
-                seen.push(&record.key);
-            }
-        }
-        Ok(seen.len())
+        self.prune(&mut state);
+        Ok(state.distinct_demand())
     }
 
     /// Releases one table's cell once it holds nothing.
@@ -753,14 +1017,75 @@ impl ScribeContentionLedger {
     /// [`ContentionRefusal::Poisoned`] when the ledger lock is poisoned.
     pub fn deactivate(&self, key: &ContentionKey) -> Result<(), ContentionRefusal> {
         let mut state = self.lock()?;
+        match Self::retire_if_empty(&mut state, key) {
+            Ok(Settlement::Untracked) => Ok(()),
+            Ok(settlement) => {
+                self.emit(&state, settlement.effect(), ContentionFacts::default());
+                Ok(())
+            }
+            Err(refusal) => {
+                self.emit(
+                    &state,
+                    ContentionEffect::SettlementDeferred,
+                    ContentionFacts::default(),
+                );
+                Err(refusal)
+            }
+        }
+    }
+
+    /// Settles one table at the end of its ownership and reports what it did.
+    ///
+    /// This is the production terminal-settlement owner. Normal release returns
+    /// balances but leaves the cell installed, and an installed empty cell still
+    /// occupies one of the pod's derived ownership slots. Sequential traffic
+    /// across distinct tables would therefore walk the pod up to its ownership
+    /// ceiling while owning nothing at all, and every later table would be
+    /// refused against zero real usage. Calling this after every terminal
+    /// release is what makes an idle table's slot genuinely reusable.
+    ///
+    /// Unlike [`Self::deactivate`], a table that still holds capacity is not an
+    /// error here: settlement is evaluated after every release, and most
+    /// releases legitimately leave work behind. The cell is removed exactly once
+    /// and only when every governed category is zero; the tenant goes with its
+    /// final table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContentionRefusal::Poisoned`] when the ledger lock is poisoned.
+    pub fn settle(&self, key: &ContentionKey) -> Result<bool, ContentionRefusal> {
+        let mut state = self.lock()?;
+        let settlement = Self::retire_if_empty(&mut state, key);
+        let (retired, effect) = match settlement {
+            Ok(Settlement::Untracked) => return Ok(false),
+            Ok(state_change) => (true, state_change.effect()),
+            Err(_) => (false, ContentionEffect::SettlementDeferred),
+        };
+        self.emit(&state, effect, ContentionFacts::default());
+        Ok(retired)
+    }
+
+    /// Removes one empty table cell, and its tenant when that was the last table.
+    ///
+    /// Every category is inspected before anything is removed, so a nonempty
+    /// refusal leaves the cell and every derived total exactly as it found them.
+    /// A cell that vanished while still holding a balance would strand it: the
+    /// pod total would keep counting capacity no owner can return.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContentionRefusal::NonEmpty`] naming the first category that
+    /// still holds capacity.
+    fn retire_if_empty(
+        state: &mut LedgerState,
+        key: &ContentionKey,
+    ) -> Result<Settlement, ContentionRefusal> {
         let Some(tenant) = state.tenants.get_mut(&key.tenant) else {
-            return Ok(());
+            return Ok(Settlement::Untracked);
         };
         let Some(cell) = tenant.tables.get(&key.table) else {
-            return Ok(());
+            return Ok(Settlement::Untracked);
         };
-        // Checked before anything is removed, so a refusal leaves the cell and
-        // every total exactly as it found them.
         for category in ContentionCategory::ALL {
             let held = cell.get(category);
             if held > 0 {
@@ -773,8 +1098,9 @@ impl ScribeContentionLedger {
         tenant.tables.remove(&key.table);
         if tenant.tables.is_empty() {
             state.tenants.remove(&key.tenant);
+            return Ok(Settlement::TenantRetired);
         }
-        Ok(())
+        Ok(Settlement::TableRetired)
     }
 
     /// Charges `amount` in one category to an active table.
@@ -811,22 +1137,37 @@ impl ScribeContentionLedger {
         category: ContentionCategory,
         amount: usize,
     ) -> Result<(), ContentionRefusal> {
-        let request = ChargeRequest {
-            key,
-            category,
-            amount,
-            quantum: self.reserve_vector().component(category),
-        };
-        let capacity = self.capacity.component(category);
         let mut state = self.lock()?;
-        state.prune_demand(Instant::now());
+        self.prune(&mut state);
+        self.charge_locked(&mut state, &self.request(key, category, amount))
+    }
+
+    /// Applies one category charge to already-locked ledger state.
+    ///
+    /// Split out from [`Self::charge`] so [`Self::admit`] can apply both initial
+    /// charges inside the same lock as activation. Every bound, refusal, demand
+    /// record, and commit is identical on both paths by construction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContentionRefusal::Inactive`] when the table holds no cell and
+    /// [`ContentionRefusal::Exhausted`] naming the bound the charge ran into.
+    fn charge_locked(
+        &self,
+        state: &mut LedgerState,
+        request: &ChargeRequest<'_>,
+    ) -> Result<(), ContentionRefusal> {
+        let key = request.key;
+        let category = request.category;
+        let amount = request.amount;
+        let capacity = self.capacity.component(category);
         if !state.is_active(key) {
             return Err(ContentionRefusal::Inactive);
         }
 
         // Capacity the queue is holding for contenders ahead of this caller.
-        let reserved = state
-            .reserved_ahead(key, category, request.quantum)
+        let contenders = state.reserved_ahead(key, category, request.quantum);
+        let reserved = contenders
             .saturating_mul(request.quantum)
             .min(capacity);
         let available = capacity - reserved;
@@ -842,23 +1183,30 @@ impl ScribeContentionLedger {
             .map(|tenant| tenant.committed(category))
             .sum();
         if pod_committed.saturating_add(amount) > available {
-            return Err(self.refuse(&mut state, &request, "pod", available, pod_committed));
+            return Err(self.refuse(state, request, "pod", available, pod_committed, contenders));
         }
 
-        let (mut tenant_demands, charging_tenant) = state.tenant_demands(&request);
+        let (mut tenant_demands, charging_tenant) = state.tenant_demands(request);
         let tenant_level = max_min_level(available, &mut tenant_demands);
         if charging_tenant > tenant_level {
             let held = state
                 .tenants
                 .get(&key.tenant)
                 .map_or(0, |cell| cell.committed(category));
-            return Err(self.refuse(&mut state, &request, "tenant", tenant_level, held));
+            return Err(self.refuse(state, request, "tenant", tenant_level, held, contenders));
         }
 
-        let (mut table_demands, charging_table, table_held) = state.table_demands(&request)?;
+        let (mut table_demands, charging_table, table_held) = state.table_demands(request)?;
         let table_level = max_min_level(tenant_level.min(available), &mut table_demands);
         if charging_table > table_level {
-            return Err(self.refuse(&mut state, &request, "table", table_level, table_held));
+            return Err(self.refuse(
+                state,
+                request,
+                "table",
+                table_level,
+                table_held,
+                contenders,
+            ));
         }
 
         if let Some(cell) = state
@@ -868,10 +1216,41 @@ impl ScribeContentionLedger {
         {
             cell.set(category, charging_table);
         }
-        // The caller got what it asked for, so it stops holding the queue.
-        state
-            .demand
-            .retain(|record| &record.key != key || !record.competes_in(category));
+        // The queue is released only once the caller actually holds the whole
+        // lifecycle quantum it queued for. A partial turnover is work-conserving
+        // -- the caller keeps what it just received -- but it does not end the
+        // caller's turn, because an incumbent would otherwise take the rest of
+        // the quantum the contender was still owed.
+        if charging_table >= request.quantum {
+            state
+                .demand
+                .retain(|record| &record.key != key || record.category != Some(category));
+            self.emit(
+                state,
+                ContentionEffect::DemandRetired,
+                ContentionFacts {
+                    category: category.label(),
+                    ceiling: request.quantum,
+                    requested: amount,
+                    held_before: table_held,
+                    held_after: charging_table,
+                    ..ContentionFacts::default()
+                },
+            );
+        }
+        self.emit(
+            state,
+            ContentionEffect::ChargeCommitted,
+            ContentionFacts {
+                category: category.label(),
+                ceiling: table_level,
+                requested: amount,
+                held_before: table_held,
+                held_after: charging_table,
+                reserved_contenders: contenders,
+                ..ContentionFacts::default()
+            },
+        );
         Ok(())
     }
 
@@ -887,8 +1266,30 @@ impl ScribeContentionLedger {
         scope: &'static str,
         ceiling: usize,
         held: usize,
+        contenders: usize,
     ) -> ContentionRefusal {
         self.enqueue_demand(state, request.key, Some(request.category));
+        let effect = if contenders > 0 {
+            // The bound this caller ran into exists because someone is queued
+            // ahead of it. Reported as its own decision so an operator can tell
+            // "the pod is full" apart from "a contender is being protected".
+            ContentionEffect::IncumbentBlocked
+        } else {
+            ContentionEffect::ChargeRefused
+        };
+        self.emit(
+            state,
+            effect,
+            ContentionFacts {
+                category: request.category.label(),
+                ceiling,
+                requested: request.amount,
+                held_before: held,
+                held_after: held,
+                reserved_contenders: contenders,
+                ..ContentionFacts::default()
+            },
+        );
         ContentionRefusal::Exhausted {
             scope,
             category: request.category.label(),
@@ -923,6 +1324,54 @@ impl ScribeContentionLedger {
         amount: usize,
     ) -> Result<(), ContentionRefusal> {
         let mut state = self.lock()?;
+        let held = state.held(key, category);
+        match Self::release_locked(&mut state, key, category, amount) {
+            Ok(()) => {
+                self.emit(
+                    &state,
+                    ContentionEffect::ChargeReleased,
+                    ContentionFacts {
+                        category: category.label(),
+                        requested: amount,
+                        held_before: held,
+                        held_after: held.saturating_sub(amount),
+                        ..ContentionFacts::default()
+                    },
+                );
+                Ok(())
+            }
+            Err(refusal) => {
+                if matches!(refusal, ContentionRefusal::OverRelease { .. }) {
+                    self.emit(
+                        &state,
+                        ContentionEffect::OverReleaseRefused,
+                        ContentionFacts {
+                            category: category.label(),
+                            requested: amount,
+                            held_before: held,
+                            held_after: held,
+                            ..ContentionFacts::default()
+                        },
+                    );
+                }
+                Err(refusal)
+            }
+        }
+    }
+
+    /// Returns `amount` to one cell under an already-held lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContentionRefusal::Inactive`] when the table holds no cell and
+    /// [`ContentionRefusal::OverRelease`] when the cell holds less than
+    /// `amount`, in which case nothing is mutated.
+    fn release_locked(
+        state: &mut LedgerState,
+        key: &ContentionKey,
+        category: ContentionCategory,
+        amount: usize,
+    ) -> Result<(), ContentionRefusal> {
         let cell = state
             .tenants
             .get_mut(&key.tenant)

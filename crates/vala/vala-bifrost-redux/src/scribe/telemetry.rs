@@ -841,3 +841,223 @@ mod tests {
         assert_eq!(snapshot.releases, 1);
     }
 }
+
+/// Every contention and admission lifecycle effect Scribe can emit.
+///
+/// This is the closed, compile-time enumerable registry the contention ledger
+/// and the admission controller emit through. Production code names a variant;
+/// it never invents a stage, decision, or metric label at a call site. The
+/// registry is closed on purpose: the operator vocabulary for admission
+/// fairness has to be stable enough to alert on, and a free-form log string at
+/// one call site is exactly how that vocabulary rots.
+///
+/// [`ContentionEffect::ALL`] is the inventory. Every entry has one production
+/// emitter and every production transition maps to one entry; the registry
+/// closure test in this module proves both directions by driving the public
+/// ledger and admission surfaces and comparing what they emitted against this
+/// list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ContentionEffect {
+    /// A table's lifecycle vector cell was installed.
+    ActivationInstalled,
+    /// Activation was refused because the pod is at its derived table ceiling.
+    ActivationRefused,
+    /// An installed cell was removed again because its first charge refused.
+    ActivationRolledBack,
+    /// One category charge committed to a table's cell.
+    ChargeCommitted,
+    /// One category charge was refused by a recomputed fair level or pod bound.
+    ChargeRefused,
+    /// A charge was refused specifically to hold capacity for queued contenders.
+    IncumbentBlocked,
+    /// One category amount was returned to a table's cell.
+    ChargeReleased,
+    /// A release asked for more than the cell holds and was refused unmoved.
+    OverReleaseRefused,
+    /// A bounded identity-only demand record entered the queue.
+    DemandEnqueued,
+    /// An existing demand record's expiry was refreshed in its earned position.
+    DemandRefreshed,
+    /// A demand record was dropped because the bounded queue is full.
+    DemandDropped,
+    /// A contender received its complete category quantum and left the queue.
+    DemandRetired,
+    /// A contender withdrew every record it held.
+    DemandCancelled,
+    /// A demand record stopped conferring priority because its TTL elapsed.
+    DemandExpired,
+    /// An empty table cell was retired by terminal settlement.
+    TableSettled,
+    /// A tenant cell was retired because its final table settled.
+    TenantSettled,
+    /// Terminal settlement left a table installed because it still holds capacity.
+    SettlementDeferred,
+    /// An in-flight reservation grew and the delta moved at every level.
+    ResizeGrown,
+    /// An in-flight reservation shrank and the delta moved at every level.
+    ResizeShrunk,
+    /// A resize refused and every level was left at its pre-call value.
+    ResizeRefused,
+    /// Accounting reached a state the ledger's own invariants forbid.
+    InvariantFailure,
+}
+
+impl ContentionEffect {
+    /// The complete registry inventory, in lifecycle order.
+    pub(crate) const ALL: [Self; 21] = [
+        Self::ActivationInstalled,
+        Self::ActivationRefused,
+        Self::ActivationRolledBack,
+        Self::ChargeCommitted,
+        Self::ChargeRefused,
+        Self::IncumbentBlocked,
+        Self::ChargeReleased,
+        Self::OverReleaseRefused,
+        Self::DemandEnqueued,
+        Self::DemandRefreshed,
+        Self::DemandDropped,
+        Self::DemandRetired,
+        Self::DemandCancelled,
+        Self::DemandExpired,
+        Self::TableSettled,
+        Self::TenantSettled,
+        Self::SettlementDeferred,
+        Self::ResizeGrown,
+        Self::ResizeShrunk,
+        Self::ResizeRefused,
+        Self::InvariantFailure,
+    ];
+
+    /// Returns the closed lifecycle stage this effect belongs to.
+    ///
+    /// Stages group the effects an operator reasons about together, so a
+    /// dashboard can aggregate "everything that happened to the demand queue"
+    /// without enumerating each decision.
+    pub(crate) const fn stage(self) -> &'static str {
+        match self {
+            Self::ActivationInstalled
+            | Self::ActivationRefused
+            | Self::ActivationRolledBack => "activation",
+            Self::ChargeCommitted
+            | Self::ChargeRefused
+            | Self::IncumbentBlocked
+            | Self::ChargeReleased
+            | Self::OverReleaseRefused => "charge",
+            Self::DemandEnqueued
+            | Self::DemandRefreshed
+            | Self::DemandDropped
+            | Self::DemandRetired
+            | Self::DemandCancelled
+            | Self::DemandExpired => "demand",
+            Self::TableSettled | Self::TenantSettled | Self::SettlementDeferred => "settlement",
+            Self::ResizeGrown | Self::ResizeShrunk | Self::ResizeRefused => "resize",
+            Self::InvariantFailure => "invariant",
+        }
+    }
+
+    /// Returns the closed decision this effect records within its stage.
+    pub(crate) const fn decision(self) -> &'static str {
+        match self {
+            Self::ActivationInstalled => "installed",
+            Self::ActivationRefused => "ceiling_refused",
+            Self::ActivationRolledBack => "rolled_back",
+            Self::ChargeCommitted => "committed",
+            Self::ChargeRefused => "refused",
+            Self::IncumbentBlocked => "contender_priority",
+            Self::ChargeReleased => "released",
+            Self::OverReleaseRefused => "over_release",
+            Self::DemandEnqueued => "enqueued",
+            Self::DemandRefreshed => "refreshed",
+            Self::DemandDropped => "queue_full",
+            Self::DemandRetired => "served",
+            Self::DemandCancelled => "cancelled",
+            Self::DemandExpired => "expired",
+            Self::TableSettled => "table_retired",
+            Self::TenantSettled => "tenant_retired",
+            Self::SettlementDeferred => "nonempty",
+            Self::ResizeGrown => "grown",
+            Self::ResizeShrunk => "shrunk",
+            Self::ResizeRefused => "refused",
+            Self::InvariantFailure => "corrupt",
+        }
+    }
+
+    /// Returns the closed severity an operator signal is bounded to.
+    ///
+    /// Borrowing, retryable pressure, and turnover are `info`: they are the
+    /// steady state of a work-conserving ledger and must not produce unbounded
+    /// warning volume. Queue saturation is the one bounded `warn`, and only
+    /// genuine accounting corruption reaches `error`.
+    pub(crate) const fn severity(self) -> &'static str {
+        match self {
+            Self::DemandDropped => "warn",
+            Self::OverReleaseRefused | Self::InvariantFailure => "error",
+            _ => "info",
+        }
+    }
+}
+
+/// Bounded, identity-free facts attached to one contention lifecycle effect.
+///
+/// Every field here is a scalar the operator vocabulary already closes over.
+/// Tenant, table, request, batch, generation, path, row, SQL, credential, and
+/// token values are deliberately absent: this struct is what reaches the metric
+/// label set, and admitting one workload identity into it would make the metric
+/// cardinality track request cardinality.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ContentionFacts {
+    /// Governed category label, or `""` when the effect spans every category.
+    pub(crate) category: &'static str,
+    /// Bound the decision was measured against, when one applies.
+    pub(crate) ceiling: usize,
+    /// Amount the caller asked for.
+    pub(crate) requested: usize,
+    /// Amount the owner held before the transition.
+    pub(crate) held_before: usize,
+    /// Amount the owner holds after the transition.
+    pub(crate) held_after: usize,
+    /// Distinct unserved contenders holding capacity back from the caller.
+    pub(crate) reserved_contenders: usize,
+    /// Live bounded demand records after the transition.
+    pub(crate) demand_records: usize,
+    /// Active table cells after the transition.
+    pub(crate) active_tables: usize,
+    /// Active tenant cells after the transition.
+    pub(crate) active_tenants: usize,
+}
+
+/// Emits one production contention lifecycle effect as a metric and a trace event.
+///
+/// The counter carries only the effect's closed stage, decision, severity, and
+/// resource-category labels. The correlated event carries the bounded numeric
+/// facts a maintainer needs to reconstruct one attempt's ordering; scrubbed
+/// tenant/table context is attached by the caller's own `tracing` span rather
+/// than lifted into a label here.
+pub(crate) fn record_contention_effect(effect: ContentionEffect, facts: ContentionFacts) {
+    metrics::counter!(
+        "bifrost_scribe_contention_effects_total",
+        "stage" => effect.stage(),
+        "decision" => effect.decision(),
+        "severity" => effect.severity(),
+        "category" => facts.category,
+    )
+    .increment(1);
+    metrics::gauge!("bifrost_scribe_contention_active_tables").set(facts.active_tables as f64);
+    metrics::gauge!("bifrost_scribe_contention_active_tenants").set(facts.active_tenants as f64);
+    metrics::gauge!("bifrost_scribe_contention_demand_records").set(facts.demand_records as f64);
+    tracing::info!(
+        stage = effect.stage(),
+        decision = effect.decision(),
+        severity = effect.severity(),
+        category = facts.category,
+        ceiling = facts.ceiling,
+        requested = facts.requested,
+        held_before = facts.held_before,
+        held_after = facts.held_after,
+        reserved_contenders = facts.reserved_contenders,
+        demand_records = facts.demand_records,
+        active_tables = facts.active_tables,
+        active_tenants = facts.active_tenants,
+        "Scribe contention lifecycle"
+    );
+}

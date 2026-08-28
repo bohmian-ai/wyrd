@@ -3,6 +3,8 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use num_traits::ToPrimitive;
+
 use crate::scribe::admission::AdmissionSnapshot;
 use crate::scribe::material_plan::IngestMaterialPlan;
 use crate::scribe::memory::MEMORY_CATEGORY_COUNT;
@@ -904,6 +906,11 @@ pub(crate) enum ContentionEffect {
 
 impl ContentionEffect {
     /// The complete registry inventory, in lifecycle order.
+    ///
+    /// Production code matches the enum exhaustively rather than iterating it,
+    /// so the list itself is a proof fixture: it is what the registry closure
+    /// tests compare captured production emissions against.
+    #[cfg(test)]
     pub(crate) const ALL: [Self; 21] = [
         Self::ActivationInstalled,
         Self::ActivationRefused,
@@ -977,7 +984,7 @@ impl ContentionEffect {
             Self::SettlementDeferred => "nonempty",
             Self::ResizeGrown => "grown",
             Self::ResizeShrunk => "shrunk",
-            Self::ResizeRefused => "refused",
+            Self::ResizeRefused => "delta_refused",
             Self::InvariantFailure => "corrupt",
         }
     }
@@ -1042,9 +1049,12 @@ pub(crate) fn record_contention_effect(effect: ContentionEffect, facts: Contenti
         "category" => facts.category,
     )
     .increment(1);
-    metrics::gauge!("bifrost_scribe_contention_active_tables").set(facts.active_tables as f64);
-    metrics::gauge!("bifrost_scribe_contention_active_tenants").set(facts.active_tenants as f64);
-    metrics::gauge!("bifrost_scribe_contention_demand_records").set(facts.demand_records as f64);
+    metrics::gauge!("bifrost_scribe_contention_active_tables")
+        .set(facts.active_tables.to_f64().unwrap_or(f64::MAX));
+    metrics::gauge!("bifrost_scribe_contention_active_tenants")
+        .set(facts.active_tenants.to_f64().unwrap_or(f64::MAX));
+    metrics::gauge!("bifrost_scribe_contention_demand_records")
+        .set(facts.demand_records.to_f64().unwrap_or(f64::MAX));
     tracing::info!(
         stage = effect.stage(),
         decision = effect.decision(),

@@ -664,116 +664,141 @@ impl InflightFrameReservation {
     }
 
     /// Resize the request charge while retaining the same global item.
+    ///
+    /// Growth and shrink are both transactional across the reservation, the
+    /// table cell, and the pod-global counter: the identical delta moves at
+    /// every level or no level moves. Which direction runs decides only which
+    /// level is fallible first, not whether a failure can leave them split.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::IngestBusy`] when growth exceeds a pod bound or
+    /// the table's recomputed share, and [`ScribeError::Internal`] when the
+    /// reservation was already released, a lock is poisoned, or the pod counter
+    /// cannot absorb the shrink. Every failure leaves the pre-call state.
     pub fn resize(&mut self, bytes: usize) -> Result<(), ScribeError> {
         let Some(inner) = &self.inner else {
             return Err(ScribeError::Internal {
                 detail: "in-flight admission reservation was already released".to_owned(),
             });
         };
+        let inner = Arc::clone(inner);
         let mut state = inner.state.lock().map_err(|_| ScribeError::Internal {
             detail: "admission state lock poisoned while resizing reservation".to_owned(),
         })?;
         if bytes >= self.bytes {
-            let extra = bytes - self.bytes;
-            let next_bytes =
-                state
-                    .bytes
-                    .checked_add(extra)
-                    .ok_or_else(|| ScribeError::IngestBusy {
-                        table: "vala.bifrost".to_owned(),
-                    })?;
-            state.bytes = next_bytes;
-            if let Some(key) = &self.cell {
-                // The global counter moved first, so a contention refusal must
-                // put it back. Leaving it raised would charge the pod for bytes
-                // no table owns, and every later admission would be measured
-                // against that phantom.
-                if let Err(refusal) =
-                    inner
-                        .contention
-                        .charge(key, ContentionCategory::AdmissionBytes, extra)
-                {
-                    state.bytes -= extra;
-                    record_contention_effect(
-                        ContentionEffect::ResizeRefused,
-                        ContentionFacts {
-                            category: ContentionCategory::AdmissionBytes.label(),
-                            requested: extra,
-                            held_before: self.bytes,
-                            held_after: self.bytes,
-                            ..ContentionFacts::default()
-                        },
-                    );
-                    return Err(refusal.into());
-                }
-            }
-            record_contention_effect(
-                ContentionEffect::ResizeGrown,
-                ContentionFacts {
-                    category: ContentionCategory::AdmissionBytes.label(),
-                    requested: extra,
-                    held_before: self.bytes,
-                    held_after: bytes,
-                    ..ContentionFacts::default()
-                },
-            );
+            self.grow(&inner, &mut state, bytes - self.bytes)?;
         } else {
-            let released = self.bytes - bytes;
-            // Computed but not stored yet. The cell release below is fallible,
-            // and a shrink that lowered the pod counter before that failure
-            // would leave the pod believing bytes were returned that the table
-            // still owns -- the same split accounting a growth refusal restores.
-            let Some(next_bytes) = state.bytes.checked_sub(released) else {
-                inner.memory.poison();
-                record_contention_effect(
-                    ContentionEffect::InvariantFailure,
-                    ContentionFacts {
-                        category: ContentionCategory::AdmissionBytes.label(),
-                        requested: released,
-                        held_before: state.bytes,
-                        held_after: state.bytes,
-                        ..ContentionFacts::default()
-                    },
-                );
-                return Err(ScribeError::Internal {
-                    detail:
-                        "in-flight admission byte counter underflow while shrinking reservation"
-                            .to_owned(),
-                });
-            };
-            if let Some(key) = &self.cell {
-                if let Err(refusal) =
-                    inner
-                        .contention
-                        .release(key, ContentionCategory::AdmissionBytes, released)
-                {
-                    record_contention_effect(
-                        ContentionEffect::ResizeRefused,
-                        ContentionFacts {
-                            category: ContentionCategory::AdmissionBytes.label(),
-                            requested: released,
-                            held_before: state.bytes,
-                            held_after: state.bytes,
-                            ..ContentionFacts::default()
-                        },
-                    );
-                    return Err(refusal.into());
-                }
-            }
-            state.bytes = next_bytes;
-            record_contention_effect(
-                ContentionEffect::ResizeShrunk,
-                ContentionFacts {
-                    category: ContentionCategory::AdmissionBytes.label(),
-                    requested: released,
-                    held_before: self.bytes,
-                    held_after: bytes,
-                    ..ContentionFacts::default()
-                },
-            );
+            self.shrink(&inner, &mut state, self.bytes - bytes)?;
         }
         self.bytes = bytes;
         Ok(())
+    }
+
+    /// Adds `extra` bytes at the pod, table, and reservation levels together.
+    ///
+    /// The pod counter moves first because it is the cheap bound, so a
+    /// contention refusal has to put it back. Leaving it raised would charge the
+    /// pod for bytes no table owns, and every later admission would be measured
+    /// against that phantom.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::IngestBusy`] when the pod counter would overflow
+    /// or the table's recomputed share cannot cover `extra`, leaving every level
+    /// at its pre-call value.
+    fn grow(
+        &self,
+        inner: &AdmissionInner,
+        state: &mut AdmissionState,
+        extra: usize,
+    ) -> Result<(), ScribeError> {
+        let next_bytes = state
+            .bytes
+            .checked_add(extra)
+            .ok_or_else(|| ScribeError::IngestBusy {
+                table: "vala.bifrost".to_owned(),
+            })?;
+        state.bytes = next_bytes;
+        if let Some(key) = &self.cell
+            && let Err(refusal) =
+                inner
+                    .contention
+                    .charge(key, ContentionCategory::AdmissionBytes, extra)
+        {
+            state.bytes -= extra;
+            record_contention_effect(
+                ContentionEffect::ResizeRefused,
+                self.resize_facts(extra, self.bytes),
+            );
+            return Err(refusal.into());
+        }
+        record_contention_effect(
+            ContentionEffect::ResizeGrown,
+            self.resize_facts(extra, self.bytes + extra),
+        );
+        Ok(())
+    }
+
+    /// Returns `released` bytes at the pod, table, and reservation levels together.
+    ///
+    /// The cell release runs before the pod counter is lowered because it is the
+    /// fallible half here. Lowering the pod counter first and then failing would
+    /// leave the pod believing bytes were returned that the table still owns --
+    /// the mirror of the split accounting a growth refusal restores.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the pod counter cannot absorb the
+    /// shrink, which poisons memory accounting because it is an invariant break
+    /// rather than pressure, and the [`ScribeError`] projection of a cell
+    /// release refusal. Both leave every level at its pre-call value.
+    fn shrink(
+        &self,
+        inner: &AdmissionInner,
+        state: &mut AdmissionState,
+        released: usize,
+    ) -> Result<(), ScribeError> {
+        let Some(next_bytes) = state.bytes.checked_sub(released) else {
+            inner.memory.poison();
+            record_contention_effect(
+                ContentionEffect::InvariantFailure,
+                self.resize_facts(released, self.bytes),
+            );
+            return Err(ScribeError::Internal {
+                detail: "in-flight admission byte counter underflow while shrinking reservation"
+                    .to_owned(),
+            });
+        };
+        if let Some(key) = &self.cell
+            && let Err(refusal) =
+                inner
+                    .contention
+                    .release(key, ContentionCategory::AdmissionBytes, released)
+        {
+            record_contention_effect(
+                ContentionEffect::ResizeRefused,
+                self.resize_facts(released, self.bytes),
+            );
+            return Err(refusal.into());
+        }
+        state.bytes = next_bytes;
+        record_contention_effect(
+            ContentionEffect::ResizeShrunk,
+            self.resize_facts(released, self.bytes - released),
+        );
+        Ok(())
+    }
+
+    /// Builds the bounded, identity-free facts one resize transition reports.
+    fn resize_facts(&self, delta: usize, held_after: usize) -> ContentionFacts {
+        ContentionFacts {
+            category: ContentionCategory::AdmissionBytes.label(),
+            requested: delta,
+            held_before: self.bytes,
+            held_after,
+            ..ContentionFacts::default()
+        }
     }
 
     /// Release the in-flight reservation immediately.
@@ -907,7 +932,7 @@ mod tests {
             "the fixture pod must complete at least one table"
         );
 
-        for step in 0..(ceiling * 2 + 1) {
+        for step in 0..=(ceiling * 2) {
             let owner = cell_key(11, &format!("sequential_{step}"));
             let reservation = admission
                 .try_reserve_for_cell(&owner, "wyrd.sequential", 4_096)
@@ -1055,7 +1080,7 @@ mod tests {
             .iter()
             .filter(|event| event.iter().any(|(name, _)| name == "decision"))
         {
-            for (name, _) in event.iter() {
+            for (name, _) in event {
                 assert!(
                     !matches!(
                         name.as_str(),

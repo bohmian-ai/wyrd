@@ -680,7 +680,7 @@ impl ScribeContentionLedger {
     /// and [`ContentionRefusal::Poisoned`] when the ledger lock is poisoned.
     pub fn activate(&self, key: &ContentionKey) -> Result<ActivationOutcome, ContentionRefusal> {
         let mut state = self.lock()?;
-        self.prune(&mut state);
+        Self::prune(&mut state);
         let outcome = self.install(&mut state, key)?;
         Self::retire_activation(&mut state, key);
         Ok(outcome)
@@ -721,7 +721,7 @@ impl ScribeContentionLedger {
         bytes: usize,
     ) -> Result<ActivationOutcome, ContentionRefusal> {
         let mut state = self.lock()?;
-        self.prune(&mut state);
+        Self::prune(&mut state);
         let outcome = self.install(&mut state, key)?;
         if let Err(refusal) = self.charge_locked(
             &mut state,
@@ -741,7 +741,7 @@ impl ScribeContentionLedger {
             if let Err(error) =
                 Self::release_locked(&mut state, key, ContentionCategory::AdmissionItems, 1)
             {
-                self.emit(
+                Self::emit(
                     &state,
                     ContentionEffect::InvariantFailure,
                     ContentionFacts {
@@ -756,7 +756,7 @@ impl ScribeContentionLedger {
             return Err(refusal);
         }
         Self::retire_activation(&mut state, key);
-        self.emit(
+        Self::emit(
             &state,
             ContentionEffect::ActivationInstalled,
             ContentionFacts {
@@ -785,9 +785,9 @@ impl ScribeContentionLedger {
     }
 
     /// Expires stale demand under an already-held lock and reports the effect.
-    fn prune(&self, state: &mut LedgerState) {
+    fn prune(state: &mut LedgerState) {
         if state.prune_demand(Instant::now()) > 0 {
-            self.emit(
+            Self::emit(
                 state,
                 ContentionEffect::DemandExpired,
                 ContentionFacts::default(),
@@ -816,7 +816,7 @@ impl ScribeContentionLedger {
         let waiting = state.waiting_ahead(key);
         if active.saturating_add(waiting) >= self.ownership_ceiling {
             self.enqueue_demand(state, key, None);
-            self.emit(
+            Self::emit(
                 state,
                 ContentionEffect::ActivationRefused,
                 ContentionFacts {
@@ -862,7 +862,7 @@ impl ScribeContentionLedger {
         // The contender is inactive again, so it needs a live activation claim
         // to keep the place in line it just spent its turn on.
         self.enqueue_demand(state, key, None);
-        self.emit(
+        Self::emit(
             state,
             ContentionEffect::ActivationRolledBack,
             ContentionFacts {
@@ -880,7 +880,7 @@ impl ScribeContentionLedger {
     }
 
     /// Emits one registry effect with the ledger's live bounded gauges attached.
-    fn emit(&self, state: &LedgerState, effect: ContentionEffect, facts: ContentionFacts) {
+    fn emit(state: &LedgerState, effect: ContentionEffect, facts: ContentionFacts) {
         record_contention_effect(
             effect,
             ContentionFacts {
@@ -915,7 +915,7 @@ impl ScribeContentionLedger {
             // keep the queue position it earned rather than losing it to a
             // rival that has been waiting less time.
             record.expires_at = expires_at;
-            self.emit(
+            Self::emit(
                 state,
                 ContentionEffect::DemandRefreshed,
                 ContentionFacts {
@@ -926,7 +926,7 @@ impl ScribeContentionLedger {
             return;
         }
         if state.demand.len() >= self.demand_capacity {
-            self.emit(
+            Self::emit(
                 state,
                 ContentionEffect::DemandDropped,
                 ContentionFacts {
@@ -942,7 +942,7 @@ impl ScribeContentionLedger {
             category,
             expires_at,
         });
-        self.emit(
+        Self::emit(
             state,
             ContentionEffect::DemandEnqueued,
             ContentionFacts {
@@ -968,7 +968,7 @@ impl ScribeContentionLedger {
         let before = state.demand.len();
         state.demand.retain(|record| &record.key != key);
         if state.demand.len() != before {
-            self.emit(
+            Self::emit(
                 &state,
                 ContentionEffect::DemandCancelled,
                 ContentionFacts::default(),
@@ -987,7 +987,7 @@ impl ScribeContentionLedger {
     /// Returns [`ContentionRefusal::Poisoned`] when the ledger lock is poisoned.
     pub fn waiting_demand(&self) -> Result<usize, ContentionRefusal> {
         let mut state = self.lock()?;
-        self.prune(&mut state);
+        Self::prune(&mut state);
         Ok(state.distinct_demand())
     }
 
@@ -1017,11 +1017,11 @@ impl ScribeContentionLedger {
         match Self::retire_if_empty(&mut state, key) {
             Ok(Settlement::Untracked) => Ok(()),
             Ok(settlement) => {
-                self.emit(&state, settlement.effect(), ContentionFacts::default());
+                Self::emit(&state, settlement.effect(), ContentionFacts::default());
                 Ok(())
             }
             Err(refusal) => {
-                self.emit(
+                Self::emit(
                     &state,
                     ContentionEffect::SettlementDeferred,
                     ContentionFacts::default(),
@@ -1058,7 +1058,7 @@ impl ScribeContentionLedger {
             Ok(state_change) => (true, state_change.effect()),
             Err(_) => (false, ContentionEffect::SettlementDeferred),
         };
-        self.emit(&state, effect, ContentionFacts::default());
+        Self::emit(&state, effect, ContentionFacts::default());
         Ok(retired)
     }
 
@@ -1140,7 +1140,7 @@ impl ScribeContentionLedger {
         amount: usize,
     ) -> Result<(), ContentionRefusal> {
         let mut state = self.lock()?;
-        self.prune(&mut state);
+        Self::prune(&mut state);
         self.charge_locked(&mut state, &self.request(key, category, amount))
     }
 
@@ -1218,7 +1218,7 @@ impl ScribeContentionLedger {
             state
                 .demand
                 .retain(|record| &record.key != key || record.category != Some(category));
-            self.emit(
+            Self::emit(
                 state,
                 ContentionEffect::DemandRetired,
                 ContentionFacts {
@@ -1231,7 +1231,7 @@ impl ScribeContentionLedger {
                 },
             );
         }
-        self.emit(
+        Self::emit(
             state,
             ContentionEffect::ChargeCommitted,
             ContentionFacts {
@@ -1270,7 +1270,7 @@ impl ScribeContentionLedger {
         } else {
             ContentionEffect::ChargeRefused
         };
-        self.emit(
+        Self::emit(
             state,
             effect,
             ContentionFacts {
@@ -1320,7 +1320,7 @@ impl ScribeContentionLedger {
         let held = state.held(key, category);
         match Self::release_locked(&mut state, key, category, amount) {
             Ok(()) => {
-                self.emit(
+                Self::emit(
                     &state,
                     ContentionEffect::ChargeReleased,
                     ContentionFacts {
@@ -1335,7 +1335,7 @@ impl ScribeContentionLedger {
             }
             Err(refusal) => {
                 if matches!(refusal, ContentionRefusal::OverRelease { .. }) {
-                    self.emit(
+                    Self::emit(
                         &state,
                         ContentionEffect::OverReleaseRefused,
                         ContentionFacts {

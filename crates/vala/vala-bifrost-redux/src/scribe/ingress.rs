@@ -593,9 +593,8 @@ impl ScribeImpl {
             .submit(ScribePersistenceCpuOp::Preprocess(Box::new(admitted)))
             .await?
         {
-            ScribePersistenceCpuResult::Prepared(value) => value,
-            ScribePersistenceCpuResult::ParquetEncoded(_)
-            | ScribePersistenceCpuResult::MemberStaged(_)
+            ScribePersistenceCpuResult::Prepared(value) => *value,
+            ScribePersistenceCpuResult::MemberStaged(_)
             | ScribePersistenceCpuResult::ClaimAssembled(_)
             | ScribePersistenceCpuResult::ReplayRestored(_) => {
                 return Err(ScribeError::Internal {

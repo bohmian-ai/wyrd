@@ -18,7 +18,6 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::AuditEvent;
 
 use crate::contracts::ScribeError;
-use crate::scribe::file_list_writer::FileListCommitKey;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::wal::ScribeAppendMeta;
 
@@ -1054,27 +1053,6 @@ impl Memtable {
         )
     }
 
-    /// Mark a prepared generation committed after the owning SQL transaction commits.
-    /// Repeating the operation with the same key is idempotent.
-    pub fn complete_post_commit(
-        &self,
-        seal_id: u64,
-        file_list_key: FileListCommitKey,
-    ) -> Result<(), ScribeError> {
-        let mut immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
-            detail: format!("memtable immutable lock poisoned: {e}"),
-        })?;
-        for entries in immutable.values_mut() {
-            if let Some(entry) = entries.iter_mut().find(|entry| entry.seal_id() == seal_id) {
-                entry.record_durable(DurableEvidence::Published(file_list_key));
-                return Ok(());
-            }
-        }
-        Err(ScribeError::Internal {
-            detail: format!("post-commit token references unknown seal generation {seal_id}"),
-        })
-    }
-
     /// Mark a prepared generation durable after its staged member is published.
     ///
     /// This is the boundary Scribe normally retires against: the member's runs
@@ -1104,24 +1082,6 @@ impl Memtable {
         }
         Err(ScribeError::Internal {
             detail: format!("staged token references unknown seal generation {seal_id}"),
-        })
-    }
-
-    /// Keep a prepared generation pending after a transaction rollback.
-    /// Repeating the operation is intentionally idempotent.
-    pub fn abort_post_commit(&self, seal_id: u64) -> Result<(), ScribeError> {
-        let immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
-            detail: format!("memtable immutable lock poisoned: {e}"),
-        })?;
-        if immutable
-            .values()
-            .flatten()
-            .any(|entry| entry.seal_id() == seal_id)
-        {
-            return Ok(());
-        }
-        Err(ScribeError::Internal {
-            detail: format!("abort token references unknown seal generation {seal_id}"),
         })
     }
 
@@ -1544,8 +1504,6 @@ impl MemtableBucket {
 pub enum DurableEvidence {
     /// Rows are durable and servable as a staged member on this pod's volume.
     Staged(crate::scribe::assembly::StagedMemberId),
-    /// Rows are published into the fenced file list under this commit key.
-    Published(FileListCommitKey),
 }
 
 /// The lifecycle state of one immutable generation.
@@ -2148,16 +2106,9 @@ mod tests {
         );
     }
 
-    fn make_file_list_key(min: u64, max: u64) -> FileListCommitKey {
-        FileListCommitKey {
-            data_tenant_id: crate::test_support::tenant(),
-            namespace: "vala.bifrost".to_owned(),
-            table_name: "events".to_owned(),
-            node_id: uuid::Uuid::nil(),
-            writer_epoch: 1,
-            wal_lsn_min: i64::try_from(min).expect("test lsn"),
-            wal_lsn_max: i64::try_from(max).expect("test lsn"),
-        }
+    /// Builds one staged-member identity standing for a published shard run.
+    fn staged_member(generation: u64) -> crate::scribe::assembly::StagedMemberId {
+        crate::scribe::assembly::StagedMemberId::new(0, generation)
     }
 
     /// Encodes one replay handoff carrying caller-selected persisted ordinals.
@@ -2322,7 +2273,7 @@ mod tests {
             .expect("first insert");
         let first = memtable.freeze(&seal_key).expect("first freeze");
         memtable
-            .complete_post_commit(first.seal_id, make_file_list_key(10, 10))
+            .complete_staged(first.seal_id, staged_member(10))
             .expect("first complete");
 
         memtable
@@ -2428,7 +2379,7 @@ mod tests {
             .expect("insert");
         let frozen = memtable.freeze(&seal_key).expect("freeze");
         memtable
-            .complete_post_commit(frozen.seal_id, make_file_list_key(10, 10))
+            .complete_staged(frozen.seal_id, staged_member(10))
             .expect("complete");
 
         assert_eq!(
@@ -2602,7 +2553,7 @@ mod tests {
             .expect("first insert");
         let first = memtable.freeze(&seal_key).expect("first freeze");
         memtable
-            .complete_post_commit(first.seal_id, make_file_list_key(10, 10))
+            .complete_staged(first.seal_id, staged_member(10))
             .expect("first complete");
         let first_bytes = memtable.stats().expect("first stats").immutable_bytes;
 

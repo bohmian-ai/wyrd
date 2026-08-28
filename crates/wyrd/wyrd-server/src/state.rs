@@ -1982,19 +1982,13 @@ impl AppState {
     #[cfg(feature = "test-support")]
     pub async fn flush_scribe_for_test(
         &self,
-        mut conn: vala_sql::TenantConn<'_>,
     ) -> Result<(), vala_bifrost_redux::contracts::ScribeError> {
         let Some(runtime) = self.bifrost.scribe() else {
             return Err(vala_bifrost_redux::contracts::ScribeError::Internal {
                 detail: "Scribe is not configured".to_owned(),
             });
         };
-        let attempts = runtime.scribe().force_seal(&mut conn).await?;
-        let commit_result = conn.commit().await;
-        runtime
-            .scribe()
-            .settle_commit_attempts(attempts, &commit_result)
-            .await
+        runtime.scribe().flush_staged().await.map(|_| ())
     }
 
     /// Trip the Scribe WAL breaker for a deterministic test-tier probe.

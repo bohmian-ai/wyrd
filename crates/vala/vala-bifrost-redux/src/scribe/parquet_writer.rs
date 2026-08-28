@@ -78,25 +78,9 @@ pub(crate) fn file_candidates(batches: &[RecordBatch]) -> Vec<FileCandidate> {
     candidates
 }
 
-/// Returns the largest exact Arrow footprint among whole-batch candidates.
-///
-/// Admission shares the encoder's candidate grouping, ensuring several small
-/// batches that merge into one candidate reserve their complete peak.
-///
-/// # Errors
-///
-/// Returns [`ScribeError::Internal`] when a candidate byte sum overflows.
-pub(crate) fn largest_candidate_bytes(batches: &[RecordBatch]) -> Result<usize, ScribeError> {
-    largest_candidate_bytes_from_facts(
-        batches
-            .iter()
-            .map(|batch| (batch.num_rows(), batch.get_array_memory_size())),
-    )
-}
-
 /// Returns the largest whole-batch candidate from row and Arrow-byte facts.
 ///
-/// This is the allocation-free form of [`largest_candidate_bytes`]. Ingress
+/// This form takes row and byte facts directly. Ingress
 /// and the shard owner use it before WAL mutation so their replayability check
 /// cannot drift from the encoder's grouping rule.
 ///
@@ -310,55 +294,6 @@ pub(crate) fn encode_batch(
         target_object_bytes: DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES,
     }
     .encode()
-}
-
-/// Encodes exactly one whole-batch candidate with generation-global ordinals.
-///
-/// The caller serially owns candidate workspace and scratch, so this operation
-/// never retains encoded bytes from an earlier candidate.
-///
-/// # Errors
-///
-/// Returns [`ScribeError::Internal`] for invalid identity, candidate bounds,
-/// Arrow materialization, scratch IO, or an invalid encoded artifact.
-pub(crate) fn encode_candidate(
-    request: CandidateEncodeRequest<'_>,
-    footer_reservation: crate::scribe::memory::EncodedFooterReservation,
-) -> Result<ParquetEncoded, ScribeError> {
-    ParquetBatchEncoder {
-        frozen: request.frozen,
-        binding: request.binding,
-        seal_tenant: request.seal_tenant,
-        candidates: vec![request.candidate],
-        first_ordinal: request.first_ordinal,
-        scratch_dir: request.scratch_dir,
-        object_base: request.object_base,
-        layout: request.layout,
-        footer_reservation,
-        target_object_bytes: DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES,
-    }
-    .encode()
-}
-
-/// Borrowed inputs for one candidate-local Parquet encoding operation.
-#[derive(Clone, Copy)]
-pub(crate) struct CandidateEncodeRequest<'a> {
-    /// Immutable generation containing the candidate's stored batches.
-    pub(crate) frozen: &'a FrozenMemtable,
-    /// Tenant-qualified physical table binding.
-    pub(crate) binding: &'a TenantTableBinding,
-    /// Authenticated tenant stamped into physical output.
-    pub(crate) seal_tenant: DataTenantId,
-    /// Exact whole-batch candidate encoded by this operation.
-    pub(crate) candidate: FileCandidate,
-    /// First generation-global artifact ordinal.
-    pub(crate) first_ordinal: usize,
-    /// Candidate-owned scratch directory.
-    pub(crate) scratch_dir: &'a Path,
-    /// Deterministic generation object prefix.
-    pub(crate) object_base: &'a str,
-    /// Registered physical write recipe applied to every artifact.
-    pub(crate) layout: &'a PhysicalLayout,
 }
 
 /// Everything a rolling artifact writer needs that is not the rows themselves.
@@ -1551,48 +1486,18 @@ mod tests {
         );
     }
 
-    /// Runs one production candidate encode while retaining its scratch owner.
-    fn encode_serial_candidate_for_test(
-        frozen: &FrozenMemtable,
-        binding: &TenantTableBinding,
-        tenant: DataTenantId,
-        batch_index: usize,
-        first_ordinal: usize,
-    ) -> (tempfile::TempDir, Result<ParquetEncoded, ScribeError>) {
-        let scratch = tempfile::tempdir().expect("candidate scratch");
-        let layout = test_layout(frozen.schema.as_ref());
-        let encoded = encode_candidate(
-            CandidateEncodeRequest {
-                frozen,
-                binding,
-                seal_tenant: tenant,
-                candidate: FileCandidate {
-                    start: batch_index,
-                    end: batch_index + 1,
-                    rows: frozen.batches[batch_index].num_rows(),
-                },
-                first_ordinal,
-                scratch_dir: scratch.path(),
-                object_base: "tenant/table/member",
-                layout: &layout,
-            },
-            crate::scribe::memory::EncodedFooterReservation::for_test(),
-        );
-        (scratch, encoded)
-    }
-
-    /// Reads one encoded candidate and proves its tenant and timestamp order.
-    fn assert_serial_candidate(encoded: &ParquetEncoded, tenant: &str, expected_times: &[i64]) {
+    /// Reads one encoded artifact and proves its tenant and timestamp order.
+    fn assert_encoded_rows(encoded: &ParquetEncoded, tenant: &str, expected_times: &[i64]) {
         let file =
-            std::fs::File::open(&encoded.artifacts[0].scratch_path).expect("candidate artifact");
+            std::fs::File::open(&encoded.artifacts[0].scratch_path).expect("encoded artifact");
         let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)
-            .expect("candidate parquet")
+            .expect("encoded parquet")
             .build()
-            .expect("candidate reader");
+            .expect("encoded reader");
         let batch = reader
             .next()
-            .expect("candidate row group")
-            .expect("candidate batch");
+            .expect("encoded row group")
+            .expect("encoded batch");
         let times = batch
             .column_by_name("wyrd_event_time")
             .expect("event time")
@@ -1610,11 +1515,23 @@ mod tests {
         assert!((0..tenants.len()).all(|index| tenants.value(index) == tenant));
     }
 
-    /// Candidate-local production encoding sorts every iteration, stamps the
-    /// authenticated tenant, preserves generation-global ordinals, and refuses
-    /// a mismatched tenant before materialization.
+    /// Generation encoding sorts every stored batch together, stamps the
+    /// authenticated tenant, numbers artifacts from zero, and refuses a
+    /// mismatched tenant before materialization.
+    ///
+    /// The generation is the encoding unit: its stored batches are one sorted
+    /// output, not one artifact per batch. Sorting across the whole generation
+    /// is what a claim's merge later relies on, so proving the interleaved
+    /// timestamps come back globally ordered is proving that contract, not
+    /// merely that one batch sorted.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the rows are not globally ordered, when an artifact is not
+    /// numbered from zero, or when a tenant that does not match the binding is
+    /// allowed to materialize rows.
     #[test]
-    fn serial_candidate_encoding_preserves_sort_tenant_and_global_identity() {
+    fn generation_encoding_preserves_sort_tenant_and_artifact_identity() {
         let tenant = DataTenantId::new_v7();
         let tenant_string = tenant.to_string();
         let day = crate::test_support::day_partition(2026, 7, 14);
@@ -1637,13 +1554,13 @@ mod tests {
                     Arc::new(TimestampMicrosecondArray::from(timestamps)),
                 ],
             )
-            .expect("candidate batch")
+            .expect("stored batch")
         };
         let frozen = FrozenMemtable {
             seal_id: 42,
             seal_key: SealKey::new(
                 tenant,
-                TableRef::new(BifrostNamespace::Bifrost, "serial_candidates"),
+                TableRef::new(BifrostNamespace::Bifrost, "sorted_generations"),
                 day,
             ),
             shard_id: 4,
@@ -1657,29 +1574,29 @@ mod tests {
         };
         let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
             .expect("tenant binding");
-        let (_first_scratch, first) =
-            encode_serial_candidate_for_test(&frozen, &binding, tenant, 0, 0);
-        let first = first.expect("first candidate");
-        let (_second_scratch, second) =
-            encode_serial_candidate_for_test(&frozen, &binding, tenant, 1, first.artifacts.len());
-        let second = second.expect("second candidate");
-        assert_eq!(first.artifacts[0].ordinal, 0);
-        assert_eq!(second.artifacts[0].ordinal, 1);
+
+        let (_scratch, encoded) = encode_for_test(&frozen, &binding, tenant);
+        assert_eq!(encoded.artifacts.len(), 1);
+        assert_eq!(encoded.artifacts[0].ordinal, 0);
         assert!(
-            first.artifacts[0]
+            encoded.artifacts[0]
                 .object_identity
                 .ends_with("-00000.parquet")
         );
-        assert!(
-            second.artifacts[0]
-                .object_identity
-                .ends_with("-00001.parquet")
-        );
-        assert_serial_candidate(&first, &tenant_string, &[10, 40]);
-        assert_serial_candidate(&second, &tenant_string, &[20, 30]);
-        let (_mismatch_scratch, mismatch) =
-            encode_serial_candidate_for_test(&frozen, &binding, DataTenantId::new_v7(), 0, 0);
-        let error = mismatch.expect_err("mismatched tenant must fail closed");
+        assert_encoded_rows(&encoded, &tenant_string, &[10, 20, 30, 40]);
+
+        let mismatch_scratch = tempfile::tempdir().expect("mismatch scratch");
+        let layout = test_layout(frozen.schema.as_ref());
+        let error = encode_batch(
+            &frozen,
+            &binding,
+            DataTenantId::new_v7(),
+            mismatch_scratch.path(),
+            "tenant/table/member",
+            &layout,
+            crate::scribe::memory::EncodedFooterReservation::for_test(),
+        )
+        .expect_err("mismatched tenant must fail closed");
         assert!(
             matches!(error, ScribeError::Internal { detail } if detail.contains("tenant-table binding mismatch"))
         );

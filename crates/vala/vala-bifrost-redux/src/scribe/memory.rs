@@ -478,8 +478,6 @@ pub struct ScribeGenerationLifecycleSnapshot {
     pub replay_materializations: u64,
     /// Exact Arrow bytes reconstructed during replay.
     pub replay_materialized_bytes: usize,
-    /// Immutable-to-active rollback transitions.
-    pub rollbacks: u64,
     /// Generation reservations terminally released.
     pub releases: u64,
     /// Exact active or immutable bytes terminally released.
@@ -777,63 +775,6 @@ impl ScribeOwnership {
         Ok(())
     }
 
-    /// Move Arrow ownership back to writable buckets after rollback.
-    ///
-    /// Symmetric net-zero counterpart to [`Self::move_active_to_immutable`]: the
-    /// bytes stay charged against the shared pools while their category flips
-    /// from immutable back to active, so a post-commit abort's accounting
-    /// rollback cannot fail on a ceiling and needs no compensating resize. The
-    /// lock order (active before immutable) matches the forward move so the two
-    /// methods share one lock ordering and add no deadlock surface.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError::Internal`] when the active or immutable ledger
-    /// lock is poisoned; no partial category move can have occurred because the
-    /// method mutates nothing before both locks are held.
-    pub fn move_immutable_to_active(&self, bytes: usize) -> Result<(), ScribeError> {
-        let mut active = self.active.lock().map_err(|_| ScribeError::Internal {
-            detail: "active memory ledger lock poisoned".to_owned(),
-        })?;
-        let mut immutable = self.immutable.lock().map_err(|_| ScribeError::Internal {
-            detail: "immutable memory ledger lock poisoned".to_owned(),
-        })?;
-        immutable.transfer_bytes_to(&mut active, bytes)?;
-        self.observe(|lifecycle| {
-            lifecycle.rollbacks = lifecycle.rollbacks.saturating_add(1);
-            lifecycle.immutable_bytes = lifecycle.immutable_bytes.saturating_sub(bytes);
-            lifecycle.active_bytes = lifecycle.active_bytes.saturating_add(bytes);
-        });
-        Ok(())
-    }
-
-    /// Check immutable-to-active ledger ownership before a post-commit abort.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError::Internal`] and poisons the governor when the
-    /// immutable source cannot cover `bytes`, the active target would overflow,
-    /// or either ledger lock is poisoned.
-    pub(crate) fn preflight_move_immutable_to_active(
-        &self,
-        bytes: usize,
-    ) -> Result<(), ScribeError> {
-        let active = self.active.lock().map_err(|_| ScribeError::Internal {
-            detail: "active memory ledger lock poisoned during reverse move preflight".to_owned(),
-        })?;
-        let immutable = self.immutable.lock().map_err(|_| ScribeError::Internal {
-            detail: "immutable memory ledger lock poisoned during reverse move preflight"
-                .to_owned(),
-        })?;
-        if immutable.bytes() < bytes || active.bytes().checked_add(bytes).is_none() {
-            active.poison();
-            return Err(ScribeError::Internal {
-                detail: "immutable-to-active ledger move failed preflight".to_owned(),
-            });
-        }
-        Ok(())
-    }
-
     /// Release immutable Arrow ownership after grace expiry.
     ///
     /// # Errors
@@ -1013,12 +954,6 @@ mod tests {
             .move_active_to_immutable(128)
             .expect("persistence transfer");
         ownership
-            .move_immutable_to_active(128)
-            .expect("retry rollback");
-        ownership
-            .move_active_to_immutable(128)
-            .expect("retry transfer");
-        ownership
             .release_immutable(128)
             .expect("retirement release");
         ownership
@@ -1033,11 +968,10 @@ mod tests {
         assert_eq!(lifecycle.reserved_bytes, 192);
         assert_eq!(lifecycle.materializations, 2);
         assert_eq!(lifecycle.materialized_bytes, 192);
-        assert_eq!(lifecycle.transfers, 2);
-        assert_eq!(lifecycle.transferred_bytes, 256);
+        assert_eq!(lifecycle.transfers, 1);
+        assert_eq!(lifecycle.transferred_bytes, 128);
         assert_eq!(lifecycle.replay_materializations, 1);
         assert_eq!(lifecycle.replay_materialized_bytes, 64);
-        assert_eq!(lifecycle.rollbacks, 1);
         assert_eq!(lifecycle.releases, 2);
         assert_eq!(lifecycle.released_bytes, 192);
         assert_eq!(lifecycle.active_bytes, 0);

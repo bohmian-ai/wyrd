@@ -546,12 +546,9 @@ pub struct PersistenceRuntime {
     tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     /// Lock-independent abort handles for every spawned persistence worker.
     abort_handles: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
-    /// Generation-owned output scratch authority shared by direct and queued producers.
-    output_scratch: Option<Arc<crate::resources::ScratchVolume>>,
     /// Operator-backed owner for caller-commit ambiguity reconciliation.
     reconciler: Option<ScribePublicationReconciler>,
     /// Bounded ownership-transfer seam for already-admitted ambiguous attempts.
-    reconciliation_sender: Option<mpsc::Sender<ScribeReconciliationJob>>,
     /// Arrival-ordered exact-byte producer admission shared by every worker.
     producer_admission: Option<ProducerAdmission>,
     /// WAL-root stage owner used for pre-readiness publication recovery.
@@ -574,14 +571,6 @@ pub(crate) enum PersistenceSubmitError {
     Full(Box<PersistenceJob>),
     /// The persistence runtime no longer accepts jobs.
     Closed(Box<PersistenceJob>),
-}
-
-/// Runtime-owned ambiguous caller publication and its completion waiter.
-struct ScribeReconciliationJob {
-    /// Complete move-only attempt retained across SQL retries.
-    attempt: Box<super::seal::ScribeCommitAttempt>,
-    /// Caller notification; dropping the receiver does not cancel reconciliation.
-    completion: oneshot::Sender<Result<(), String>>,
 }
 
 impl std::fmt::Debug for PersistenceRuntime {
@@ -615,9 +604,7 @@ impl PersistenceRuntime {
             drained: Arc::new(Notify::new()),
             tasks: Arc::new(Mutex::new(Vec::new())),
             abort_handles: Arc::new(Mutex::new(Vec::new())),
-            output_scratch: None,
             reconciler: None,
-            reconciliation_sender: None,
             producer_admission: None,
             recovery_wal: None,
             recovery_operator: None,
@@ -637,9 +624,7 @@ impl PersistenceRuntime {
             drained: Arc::new(Notify::new()),
             tasks: Arc::new(Mutex::new(Vec::new())),
             abort_handles: Arc::new(Mutex::new(Vec::new())),
-            output_scratch: None,
             reconciler: None,
-            reconciliation_sender: None,
             producer_admission: None,
             recovery_wal: None,
             recovery_operator: None,
@@ -655,27 +640,6 @@ impl PersistenceRuntime {
         self.queued.fetch_sub(1, Ordering::AcqRel);
         self.queued_bytes.fetch_sub(arrow_bytes, Ordering::AcqRel);
         self.drained.notify_waiters();
-    }
-
-    /// Spawns the cancellation-independent reconciliation queue owner.
-    fn spawn_reconciliation_worker(
-        runtime: &Handle,
-        mut receiver: mpsc::Receiver<ScribeReconciliationJob>,
-        reconciler: ScribePublicationReconciler,
-    ) -> tokio::task::JoinHandle<()> {
-        runtime.spawn(async move {
-            while let Some(job) = receiver.recv().await {
-                let ScribeReconciliationJob {
-                    attempt,
-                    completion,
-                } = job;
-                let result = attempt
-                    .reconcile(&reconciler)
-                    .await
-                    .map_err(|error| error.to_string());
-                let _ = completion.send(result);
-            }
-        })
     }
 
     /// Builds the pod's staged-member lifecycle owner, when it can exist.
@@ -776,7 +740,6 @@ impl PersistenceRuntime {
                 config.faults.clone(),
             )
         });
-        let (reconciliation_sender, reconciliation_receiver) = mpsc::channel(config.queue_items);
         let producer_admission = ProducerAdmission::new(context.memory.clone());
         let recovery_wal = Arc::clone(&context.wal);
         let recovery_operator = (*context.operator).clone();
@@ -788,7 +751,7 @@ impl PersistenceRuntime {
             config.operator_pool,
             Arc::clone(&failures),
             context,
-            output_scratch.clone(),
+            output_scratch,
             producer_admission.clone(),
             staging,
         ));
@@ -799,9 +762,7 @@ impl PersistenceRuntime {
             drained: Arc::new(Notify::new()),
             tasks: Arc::new(Mutex::new(Vec::new())),
             abort_handles: Arc::new(Mutex::new(Vec::new())),
-            output_scratch,
             reconciler,
-            reconciliation_sender: Some(reconciliation_sender),
             producer_admission: Some(producer_admission),
             recovery_wal: Some(recovery_wal),
             recovery_operator: Some(recovery_operator),
@@ -809,16 +770,6 @@ impl PersistenceRuntime {
             worker: Some(Arc::clone(&worker)),
         });
         let mut tasks = Vec::with_capacity(config.workers);
-        if let Some(reconciler) = runtime_state.reconciler.clone() {
-            let task =
-                Self::spawn_reconciliation_worker(runtime, reconciliation_receiver, reconciler);
-            let abort_handle = task.abort_handle();
-            match runtime_state.abort_handles.lock() {
-                Ok(mut handles) => handles.push(abort_handle),
-                Err(poisoned) => poisoned.into_inner().push(abort_handle),
-            }
-            tasks.push(task);
-        }
         for _ in 0..config.workers {
             let receiver = Arc::clone(&receiver);
             let worker = Arc::clone(&worker);
@@ -1052,18 +1003,6 @@ impl PersistenceRuntime {
         self.queued_bytes.load(Ordering::Acquire)
     }
 
-    /// Returns the generation scratch authority used by caller-owned seals.
-    #[must_use]
-    pub(crate) fn output_scratch(&self) -> Option<Arc<crate::resources::ScratchVolume>> {
-        self.output_scratch.clone()
-    }
-
-    /// Returns the concrete operator-backed publication reconciler.
-    #[must_use]
-    pub(crate) fn publication_reconciler(&self) -> Option<ScribePublicationReconciler> {
-        self.reconciler.clone()
-    }
-
     /// Rebuilds the staged ready and claim indexes from the durable volume.
     ///
     /// Runs before admission opens, so the members that survived the previous
@@ -1126,27 +1065,6 @@ impl PersistenceRuntime {
         ScribeStageMover::new(Arc::clone(wal), operator.clone())
             .recover_publications(reconciler, memory)
             .await
-    }
-
-    /// Transfers one ambiguous caller attempt into the independent retry owner.
-    ///
-    /// # Errors
-    /// Returns the attempt when shutdown has removed the reconciliation owner.
-    pub(crate) fn submit_reconciliation(
-        &self,
-        attempt: super::seal::ScribeCommitAttempt,
-    ) -> Result<oneshot::Receiver<Result<(), String>>, Box<super::seal::ScribeCommitAttempt>> {
-        let Some(sender) = &self.reconciliation_sender else {
-            return Err(Box::new(attempt));
-        };
-        let (completion, receiver) = oneshot::channel();
-        sender
-            .try_send(ScribeReconciliationJob {
-                attempt: Box::new(attempt),
-                completion,
-            })
-            .map_err(|error| error.into_inner().attempt)?;
-        Ok(receiver)
     }
 }
 
@@ -1492,6 +1410,70 @@ struct ProducerWaiter {
 struct ProducerAdmissionState {
     /// FIFO of accepted waiters.
     waiters: VecDeque<ProducerWaiter>,
+}
+
+/// Move-owned terminal guard for one durable Scribe visibility publication.
+#[derive(Debug)]
+pub(crate) struct VisibilityPublishGuard {
+    /// Production span retained until the durable lifecycle reaches one terminal.
+    span: tracing::Span,
+    /// Fallback terminal recorded when the owner is dropped before explicit completion.
+    drop_outcome: &'static str,
+    /// Whether an explicit terminal has already been recorded.
+    terminal: bool,
+}
+
+impl VisibilityPublishGuard {
+    /// Starts one production visibility publication with failure as the pre-commit fallback.
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self {
+            span: tracing::info_span!(
+                "bifrost.scribe.visibility.publish",
+                outcome = tracing::field::Empty
+            ),
+            drop_outcome: "failed",
+            terminal: false,
+        }
+    }
+
+    /// Changes abandonment after successful pre-commit into cancellation.
+    pub(crate) fn arm_cancellation(&mut self) {
+        self.drop_outcome = "cancelled";
+    }
+
+    /// Records the exact successful lifecycle terminal once.
+    pub(crate) fn succeed(&mut self) {
+        self.finish("success");
+    }
+
+    /// Records the exact failed lifecycle terminal once.
+    pub(crate) fn fail(&mut self) {
+        self.finish("failed");
+    }
+
+    /// Records the exact cancelled lifecycle terminal once.
+    pub(crate) fn cancel(&mut self) {
+        self.finish("cancelled");
+    }
+
+    /// Records one terminal outcome while preventing double terminalization.
+    fn finish(&mut self, outcome: &'static str) {
+        if !self.terminal {
+            self.span.record("outcome", outcome);
+            self.terminal = true;
+        }
+    }
+}
+
+impl Drop for VisibilityPublishGuard {
+    /// Records abandonment or task cancellation before closing the production span.
+    fn drop(&mut self) {
+        if !self.terminal {
+            self.span.record("outcome", self.drop_outcome);
+            self.terminal = true;
+        }
+    }
 }
 
 /// Dependency-owning FIFO admission for concurrent byte-weighted producers.
@@ -2028,7 +2010,7 @@ impl PersistenceWorker {
     /// Cancellation can occur after object or SQL side effects. The shard keeps
     /// the generation pending and WAL replay reconciles any partial progress.
     async fn process_job(&self, job: PersistenceJob) {
-        let mut visibility = super::seal::VisibilityPublishGuard::new();
+        let mut visibility = VisibilityPublishGuard::new();
         visibility.arm_cancellation();
         let generation = Arc::clone(&job.generation);
         tracing::info!(
@@ -2204,7 +2186,7 @@ impl PersistenceWorker {
         &self,
         job: PersistenceJob,
         completion: PersistenceCompletion,
-        visibility: super::seal::VisibilityPublishGuard,
+        visibility: VisibilityPublishGuard,
         publication_succeeded: bool,
     ) {
         let generation_id = job.generation.generation_id.0;
@@ -2443,7 +2425,6 @@ impl PersistenceWorker {
         {
             ScribePersistenceCpuResult::MemberStaged(staged) => *staged,
             ScribePersistenceCpuResult::Prepared(_)
-            | ScribePersistenceCpuResult::ParquetEncoded(_)
             | ScribePersistenceCpuResult::ClaimAssembled(_)
             | ScribePersistenceCpuResult::ReplayRestored(_) => {
                 return Err(ScribeError::Internal {
@@ -2594,7 +2575,6 @@ impl PersistenceWorker {
         {
             ScribePersistenceCpuResult::ClaimAssembled(assembled) => *assembled,
             ScribePersistenceCpuResult::Prepared(_)
-            | ScribePersistenceCpuResult::ParquetEncoded(_)
             | ScribePersistenceCpuResult::MemberStaged(_)
             | ScribePersistenceCpuResult::ReplayRestored(_) => {
                 return Err(ScribeError::Internal {
@@ -2695,7 +2675,7 @@ impl PersistenceWorker {
 /// shard acknowledgment. A dropped acknowledgment is cancellation because the
 /// shard outcome is unknown.
 async fn finish_visibility_publication(
-    mut visibility: super::seal::VisibilityPublishGuard,
+    mut visibility: VisibilityPublishGuard,
     publication_succeeded: bool,
     completion_delivered: bool,
     visibility_result: oneshot::Receiver<Result<(), String>>,
@@ -2890,9 +2870,7 @@ mod tests {
             drained: Arc::new(Notify::new()),
             tasks: Arc::new(Mutex::new(Vec::new())),
             abort_handles: Arc::new(Mutex::new(Vec::new())),
-            output_scratch: None,
             reconciler: None,
-            reconciliation_sender: None,
             producer_admission: None,
             recovery_wal: None,
             recovery_operator: None,
@@ -2916,7 +2894,7 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             let (sender, receiver) = oneshot::channel();
             let mut future = Box::pin(finish_visibility_publication(
-                super::super::seal::VisibilityPublishGuard::new(),
+                super::VisibilityPublishGuard::new(),
                 true,
                 true,
                 receiver,
@@ -2945,7 +2923,7 @@ mod tests {
                 .send(Err("publication failed".to_owned()))
                 .expect("shard failure");
             let mut future = Box::pin(finish_visibility_publication(
-                super::super::seal::VisibilityPublishGuard::new(),
+                super::VisibilityPublishGuard::new(),
                 true,
                 true,
                 receiver,
@@ -2967,7 +2945,7 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             let (_sender, receiver) = oneshot::channel();
             let mut future = Box::pin(finish_visibility_publication(
-                super::super::seal::VisibilityPublishGuard::new(),
+                super::VisibilityPublishGuard::new(),
                 true,
                 false,
                 receiver,
@@ -2990,7 +2968,7 @@ mod tests {
             let (sender, receiver) = oneshot::channel::<Result<(), String>>();
             drop(sender);
             let mut future = Box::pin(finish_visibility_publication(
-                super::super::seal::VisibilityPublishGuard::new(),
+                super::VisibilityPublishGuard::new(),
                 true,
                 true,
                 receiver,
@@ -3011,7 +2989,7 @@ mod tests {
         let records = Arc::clone(&subscriber.records);
         tracing::subscriber::with_default(subscriber, || {
             let (_sender, receiver) = oneshot::channel::<Result<(), String>>();
-            let mut visibility = super::super::seal::VisibilityPublishGuard::new();
+            let mut visibility = super::VisibilityPublishGuard::new();
             visibility.arm_cancellation();
             let mut future = Box::pin(finish_visibility_publication(
                 visibility, true, true, receiver,

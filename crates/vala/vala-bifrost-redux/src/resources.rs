@@ -1599,7 +1599,7 @@ pub struct ResourceSnapshot {
 pub(crate) type ScribeMemoryCategory = crate::scribe::memory::MemoryCategory;
 
 /// One checked Scribe memory request admitted by the process root.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct ScribeMemoryRequest {
     /// Exact bytes that become owned on successful admission.
     pub bytes: usize,
@@ -1607,8 +1607,6 @@ pub(crate) struct ScribeMemoryRequest {
     pub category: ScribeMemoryCategory,
     /// Optional bounded shard attribution.
     pub shard: Option<usize>,
-    /// Optional durable artifact-generation attribution.
-    pub generation: Option<crate::scribe::seal_key::ScribeArtifactIdentity>,
 }
 
 /// Closed Scribe attribution exported only for production-equivalent tests.
@@ -1619,8 +1617,6 @@ pub struct ResourceAttributionSnapshot {
     pub category_bytes: [usize; crate::scribe::memory::MEMORY_CATEGORY_COUNT],
     /// Exact shard totals for shards that currently own bytes.
     pub shard_bytes: BTreeMap<usize, usize>,
-    /// Number of live leases that intentionally omit generation attribution.
-    pub omitted_generation_count: usize,
 }
 
 /// One complete Oracle query request.
@@ -1712,9 +1708,6 @@ struct ResourceState {
     oracle_query_scratch_used_bytes: u64,
     scribe_category_bytes: [usize; crate::scribe::memory::MEMORY_CATEGORY_COUNT],
     scribe_shard_bytes: BTreeMap<usize, usize>,
-    scribe_generation_bytes: usize,
-    scribe_omitted_generation_bytes: usize,
-    scribe_omitted_generation_count: usize,
     memory_epoch: u64,
     poisoned: bool,
 }
@@ -2071,7 +2064,6 @@ impl ScribeResources {
                 bytes: estimated_bytes,
                 category: crate::scribe::memory::MemoryCategory::Decode,
                 shard: None,
-                generation: None,
             },
             None,
         )?;
@@ -2164,7 +2156,6 @@ impl ScribeResources {
         ResourceAttributionSnapshot {
             category_bytes: state.scribe_category_bytes,
             shard_bytes: state.scribe_shard_bytes.clone(),
-            omitted_generation_count: state.scribe_omitted_generation_count,
         }
     }
 
@@ -2268,7 +2259,6 @@ impl ScribeResources {
                     bytes,
                     category,
                     shard: None,
-                    generation: None,
                 },
                 Some(self.ingress_limit_bytes()),
             )
@@ -2306,7 +2296,6 @@ impl ScribeResources {
             bytes,
             category,
             shard: None,
-            generation: None,
         })
         .map_err(scribe_resource_error)
     }
@@ -2812,7 +2801,6 @@ impl BifrostResourceGovernor {
         Ok(ResourceAttributionSnapshot {
             category_bytes: state.scribe_category_bytes,
             shard_bytes: state.scribe_shard_bytes.clone(),
-            omitted_generation_count: state.scribe_omitted_generation_count,
         })
     }
 
@@ -2838,10 +2826,6 @@ impl BifrostResourceGovernor {
             .try_fold(0usize, |total, bytes| {
                 total.checked_add(*bytes).ok_or_else(accounting_overflow)
             })?;
-        let generation_total = state
-            .scribe_generation_bytes
-            .checked_add(state.scribe_omitted_generation_bytes)
-            .ok_or_else(accounting_overflow)?;
         let role_total = state
             .scribe_memory_used_bytes
             .checked_add(state.oracle_memory_used_bytes)
@@ -2866,16 +2850,14 @@ impl BifrostResourceGovernor {
             .ok_or_else(accounting_overflow)?;
         if category_total != state.scribe_memory_used_bytes
             || shard_total > state.scribe_memory_used_bytes
-            || generation_total != state.scribe_memory_used_bytes
             || role_total > plan.managed_memory_bytes
             || expected_elastic != state.elastic_memory_used_bytes
         {
-            // Emit the operands: which of the five identities broke is the
+            // Emit the operands: which of the four identities broke is the
             // whole diagnosis, and it is unrecoverable from the error string.
             tracing::error!(
                 category_total,
                 shard_total,
-                generation_total,
                 role_total,
                 expected_elastic,
                 scribe_memory_used_bytes = state.scribe_memory_used_bytes,
@@ -2982,18 +2964,6 @@ impl BifrostResourceGovernor {
                     .ok_or_else(accounting_overflow)
             })
             .transpose()?;
-        let next_generation = state
-            .scribe_generation_bytes
-            .checked_add(usize::from(request.generation.is_some()) * request.bytes)
-            .ok_or_else(accounting_overflow)?;
-        let next_omitted = state
-            .scribe_omitted_generation_bytes
-            .checked_add(usize::from(request.generation.is_none()) * request.bytes)
-            .ok_or_else(accounting_overflow)?;
-        let next_omitted_count = state
-            .scribe_omitted_generation_count
-            .checked_add(usize::from(request.generation.is_none()))
-            .ok_or_else(accounting_overflow)?;
         if ingress_limit_bytes.is_some_and(|limit| next > limit) {
             record_memory_transition("scribe", "refused", state.scribe_memory_used_bytes);
             return Err(BifrostResourceError::Occupied {
@@ -3013,16 +2983,12 @@ impl BifrostResourceGovernor {
         if let (Some(shard), Some(bytes)) = (request.shard, next_shard) {
             state.scribe_shard_bytes.insert(shard, bytes);
         }
-        state.scribe_generation_bytes = next_generation;
-        state.scribe_omitted_generation_bytes = next_omitted;
-        state.scribe_omitted_generation_count = next_omitted_count;
         record_memory_transition("scribe", "acquired", next);
         Ok(ScribeMemoryLease {
             root: self.clone(),
             bytes: request.bytes,
             category: request.category,
             shard: request.shard,
-            generation: request.generation,
             released: false,
         })
     }
@@ -3433,8 +3399,6 @@ pub struct ScribeMemoryLease {
     category: ScribeMemoryCategory,
     /// Optional shard attribution retained across ownership transformations.
     shard: Option<usize>,
-    /// Optional durable-generation attribution retained across transformations.
-    generation: Option<crate::scribe::seal_key::ScribeArtifactIdentity>,
     /// Whether ownership has already returned or transferred.
     released: bool,
 }
@@ -3476,20 +3440,12 @@ impl ScribeMemoryLease {
                 detail: "Scribe lease split exceeds owned bytes".to_owned(),
             });
         }
-        if self.generation.is_none() {
-            let mut state = self.root.lock_state()?;
-            state.scribe_omitted_generation_count = state
-                .scribe_omitted_generation_count
-                .checked_add(1)
-                .ok_or_else(accounting_overflow)?;
-        }
         self.bytes -= bytes;
         Ok(Self {
             root: self.root.clone(),
             bytes,
             category: self.category,
             shard: self.shard,
-            generation: self.generation.clone(),
             released: false,
         })
     }
@@ -3504,7 +3460,6 @@ impl ScribeMemoryLease {
         if !Arc::ptr_eq(&self.root.inner, &other.root.inner)
             || self.category != other.category
             || self.shard != other.shard
-            || self.generation != other.generation
         {
             return Err(BifrostResourceError::InvalidPlan {
                 detail: "only sibling Scribe leases with identical attribution may merge"
@@ -3515,16 +3470,6 @@ impl ScribeMemoryLease {
             .bytes
             .checked_add(other.bytes)
             .ok_or_else(accounting_overflow)?;
-        if self.generation.is_none() {
-            let mut state = self.root.lock_state()?;
-            if state.scribe_omitted_generation_count == 0 {
-                return Err(self.root.poison_locked(
-                    &mut state,
-                    "Scribe omitted-generation lease count underflow",
-                ));
-            }
-            state.scribe_omitted_generation_count -= 1;
-        }
         self.bytes = merged_bytes;
         other.released = true;
         other.bytes = 0;
@@ -3624,24 +3569,11 @@ impl ScribeMemoryLease {
                     .ok_or_else(accounting_overflow)
             })
             .transpose()?;
-        let generation = if self.generation.is_some() {
-            state.scribe_generation_bytes
-        } else {
-            state.scribe_omitted_generation_bytes
-        };
-        let next_generation = generation
-            .checked_add(growth)
-            .ok_or_else(accounting_overflow)?;
         state.scribe_memory_used_bytes = next_total;
         state.elastic_memory_used_bytes = next_elastic;
         state.scribe_category_bytes[category] = next_category;
         if let (Some(shard), Some(total)) = (self.shard, next_shard) {
             state.scribe_shard_bytes.insert(shard, total);
-        }
-        if self.generation.is_some() {
-            state.scribe_generation_bytes = next_generation;
-        } else {
-            state.scribe_omitted_generation_bytes = next_generation;
         }
         Ok(())
     }
@@ -3665,15 +3597,9 @@ impl ScribeMemoryLease {
                 .copied()
                 .unwrap_or_default()
         });
-        let generation_total = if self.generation.is_some() {
-            state.scribe_generation_bytes
-        } else {
-            state.scribe_omitted_generation_bytes
-        };
         if state.scribe_memory_used_bytes < shrink
             || state.scribe_category_bytes[category] < shrink
             || shard_total.is_some_and(|total| total < shrink)
-            || generation_total < shrink
         {
             return Err(self
                 .root
@@ -3700,11 +3626,6 @@ impl ScribeMemoryLease {
             } else {
                 state.scribe_shard_bytes.insert(shard, remaining);
             }
-        }
-        if self.generation.is_some() {
-            state.scribe_generation_bytes -= shrink;
-        } else {
-            state.scribe_omitted_generation_bytes -= shrink;
         }
         Ok(())
     }
@@ -3797,12 +3718,12 @@ impl ScribeMemoryLease {
         Ok(())
     }
 
-    /// Clears shard and generation identity before joining an aggregate owner.
+    /// Clears shard identity before joining an aggregate owner.
     ///
     /// # Errors
     ///
-    /// Returns a poison error when the prior identity attribution cannot cover
-    /// this lease or the omitted-generation counters overflow.
+    /// Returns a poison error when the prior shard attribution cannot cover
+    /// this lease.
     pub(crate) fn clear_identity_attribution(&mut self) -> Result<(), BifrostResourceError> {
         let mut state = self.root.lock_state()?;
         if let Some(shard) = self.shard {
@@ -3823,22 +3744,6 @@ impl ScribeMemoryLease {
                 state.scribe_shard_bytes.insert(shard, remaining);
             }
             self.shard = None;
-        }
-        if self.generation.take().is_some() {
-            if state.scribe_generation_bytes < self.bytes {
-                return Err(self
-                    .root
-                    .poison_locked(&mut state, "Scribe aggregate generation clear underflow"));
-            }
-            state.scribe_generation_bytes -= self.bytes;
-            state.scribe_omitted_generation_bytes = state
-                .scribe_omitted_generation_bytes
-                .checked_add(self.bytes)
-                .ok_or_else(accounting_overflow)?;
-            state.scribe_omitted_generation_count = state
-                .scribe_omitted_generation_count
-                .checked_add(1)
-                .ok_or_else(accounting_overflow)?;
         }
         Ok(())
     }
@@ -3946,16 +3851,9 @@ impl ScribeMemoryLease {
                 .copied()
                 .unwrap_or_default()
         });
-        let attributed_generation = if self.generation.is_some() {
-            state.scribe_generation_bytes
-        } else {
-            state.scribe_omitted_generation_bytes
-        };
         if state.scribe_memory_used_bytes < self.bytes
             || state.scribe_category_bytes[category] < self.bytes
             || shard_bytes.is_some_and(|bytes| bytes < self.bytes)
-            || attributed_generation < self.bytes
-            || (self.generation.is_none() && state.scribe_omitted_generation_count == 0)
         {
             return Err(self
                 .root
@@ -3983,12 +3881,6 @@ impl ScribeMemoryLease {
             } else {
                 state.scribe_shard_bytes.insert(shard, remaining);
             }
-        }
-        if self.generation.is_some() {
-            state.scribe_generation_bytes -= self.bytes;
-        } else {
-            state.scribe_omitted_generation_bytes -= self.bytes;
-            state.scribe_omitted_generation_count -= 1;
         }
         state.memory_epoch = state.memory_epoch.wrapping_add(1);
         record_memory_transition("scribe", "released", next);
@@ -6401,7 +6293,6 @@ mod tests {
                 bytes: 96 * MIB,
                 category: crate::scribe::memory::MemoryCategory::Active,
                 shard: Some(3),
-                generation: None,
             })
             .expect("root admission");
         let child = owner.split(32 * MIB).expect("checked split");
@@ -6419,7 +6310,6 @@ mod tests {
             128 * MIB
         );
         assert_eq!(attribution.shard_bytes.get(&3), Some(&(128 * MIB)));
-        assert_eq!(attribution.omitted_generation_count, 1);
         let before_shrink = scribe.snapshot().expect("pre-shrink snapshot");
         owner.shrink_to(64 * MIB).expect("atomic exact shrink");
         let after_shrink = scribe.snapshot().expect("post-shrink snapshot");
@@ -6453,7 +6343,6 @@ mod tests {
                 bytes: 1,
                 category: crate::scribe::memory::MemoryCategory::Raw,
                 shard: Some(0),
-                generation: None,
             })
             .expect("root admission");
         let observed = scribe.memory_epoch();
@@ -6488,7 +6377,6 @@ mod tests {
                 bytes: 8,
                 category: crate::scribe::memory::MemoryCategory::Queued,
                 shard: Some(1),
-                generation: None,
             })
             .expect("root admission");
         scribe
@@ -6918,7 +6806,6 @@ mod tests {
                     bytes: 64 * MIB,
                     category: ScribeMemoryCategory::Raw,
                     shard: Some(0),
-                    generation: None,
                 })
                 .expect("Scribe lease one"),
             scribe
@@ -6926,7 +6813,6 @@ mod tests {
                     bytes: 64 * MIB,
                     category: ScribeMemoryCategory::Queued,
                     shard: Some(1),
-                    generation: None,
                 })
                 .expect("Scribe lease two"),
         ];
@@ -7320,7 +7206,6 @@ mod tests {
                 bytes: 300 * MIB,
                 category: crate::scribe::memory::MemoryCategory::Active,
                 shard: None,
-                generation: None,
             })
             .expect("Scribe uses its floor and borrows elastic memory");
         let with_scribe = scribe.snapshot().expect("Scribe ownership snapshot");

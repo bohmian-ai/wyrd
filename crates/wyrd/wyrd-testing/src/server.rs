@@ -812,19 +812,20 @@ impl WyrdTestServer {
         usize::from(self.serve_handle.is_some())
     }
 
-    /// Flush the server-owned Scribe through its normal post-commit seal path.
+    /// Flush the server-owned Scribe through its staged and claim lifecycle.
     ///
     /// This is intentionally test-tier only: production callers use the
     /// generation and shutdown coordinators rather than reaching into Scribe.
+    /// The flush itself is the production path, so what a journey observes
+    /// afterwards is what a real pod publishes.
     ///
     /// # Errors
-    /// Returns an error when the server has no Scribe or the seal transaction
-    /// cannot be committed.
+    /// Returns an error when the server has no Scribe or a residue claim
+    /// cannot publish.
     pub async fn flush_bifrost(&self) -> Result<(), WyrdTestServerError> {
-        let conn = self.tenant_conn().await?;
         self.inner
             .state
-            .flush_scribe_for_test(conn)
+            .flush_scribe_for_test()
             .await
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))
     }
@@ -1159,18 +1160,22 @@ impl WyrdTestServer {
         Ok(probe)
     }
 
-    /// Flush the server-owned Scribe through a specific tenant's seal path.
+    /// Flush the server-owned Scribe through its staged and claim lifecycle.
+    ///
+    /// The pod flush is tenant-independent: it covers every active bucket the
+    /// pod holds, so the tenant argument is retained only because callers name
+    /// the tenant they are about to read back.
     ///
     /// # Errors
-    /// Returns an error when the tenant connection or seal transaction fails.
+    /// Returns an error when the server has no Scribe or a residue claim
+    /// cannot publish.
     pub async fn flush_bifrost_for_tenant(
         &self,
-        tenant: DataTenantId,
+        _tenant: DataTenantId,
     ) -> Result<(), WyrdTestServerError> {
-        let conn = self.tenant_conn_for(tenant).await?;
         self.inner
             .state
-            .flush_scribe_for_test(conn)
+            .flush_scribe_for_test()
             .await
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))
     }
@@ -1856,15 +1861,6 @@ impl WyrdTestServer {
     #[must_use]
     pub fn bifrost_scribe(&self) -> Option<Arc<ScribeImpl>> {
         self.inner.state.bifrost_scribe_for_test().cloned()
-    }
-
-    /// Return the passive typed lifecycle observer owned by production Scribe.
-    #[must_use]
-    pub fn scribe_publication_observer(
-        &self,
-    ) -> Option<vala_bifrost_redux::scribe::ScribePublicationObserver> {
-        self.bifrost_scribe()
-            .map(|scribe| scribe.publication_observer_for_test())
     }
 
     /// Install a deterministic barrier at the public Bifrost write seam.

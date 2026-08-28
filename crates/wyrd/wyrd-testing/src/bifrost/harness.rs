@@ -278,30 +278,24 @@ impl BifrostHarness {
             .map_err(|error| HarnessError::Database(error.to_string()))
     }
 
-    /// Seal every pod's writable and pending generations and commit file-list
-    /// transactions through the tenant-scoped fixture connection.
+    /// Flush every pod through the staged and claim lifecycle.
+    ///
+    /// The harness drives the one production flush rather than a seal path of
+    /// its own, so what a journey observes afterwards is what a real pod
+    /// produces: durable staged members whose residue claims published their
+    /// hot objects through the fenced `file_list` transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarnessError::Scribe`] when a pod cannot flush or one of its
+    /// residue claims cannot publish. Members that did not publish stay durable
+    /// and staged, so the caller may retry.
     pub async fn force_seal_all(&self) -> Result<(), HarnessError> {
-        for tenant in self.tenants.iter().copied() {
-            let mut conn = self.tenant_conn(tenant).await?;
-            let mut commits = Vec::with_capacity(self.scribes.len());
-            for scribe in &self.scribes {
-                match scribe.force_seal(&mut conn).await {
-                    Ok(batch) => commits.push((scribe.as_ref(), batch)),
-                    Err(error) => {
-                        for (completed_scribe, batch) in commits {
-                            let _ = completed_scribe.abort_commit_attempts(batch).await;
-                        }
-                        return Err(HarnessError::Scribe(error.to_string()));
-                    }
-                }
-            }
-            let commit_result = conn.commit().await;
-            for (scribe, batch) in commits {
-                scribe
-                    .settle_commit_attempts(batch, &commit_result)
-                    .await
-                    .map_err(|error| HarnessError::Scribe(error.to_string()))?;
-            }
+        for scribe in &self.scribes {
+            scribe
+                .flush_staged()
+                .await
+                .map_err(|error| HarnessError::Scribe(error.to_string()))?;
         }
         Ok(())
     }

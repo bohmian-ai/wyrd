@@ -30,7 +30,6 @@ pub mod preprocess;
 pub mod registry;
 pub mod replay;
 pub mod routing;
-pub mod seal;
 pub mod seal_key;
 pub mod shards;
 pub(crate) mod staged_tail;
@@ -59,7 +58,7 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/wal_closeout.rs"]
 mod wal_closeout;
-use crate::catalog::{BifrostCatalog, TenantTableBinding};
+use crate::catalog::BifrostCatalog;
 use crate::contracts::{FrameAdmission, Scribe, ScribeError, ScribeIngressFrame};
 use crate::maintenance::StagingFilePublisher;
 use crate::scribe::admission::{AdmissionConfig, AdmissionController};
@@ -69,7 +68,6 @@ pub use crate::scribe::execution_lanes::{
 pub use crate::scribe::memory::ScribeRejectionCeiling;
 pub use crate::scribe::memtable::SealTriggerReason;
 pub use crate::scribe::persistence::ScribePersistenceConfig;
-use crate::scribe::seal::SealDriver;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::tail_rpc::FetchLiveTailService;
 pub use crate::scribe::tail_rpc::{
@@ -105,7 +103,6 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::runtime::Handle;
-use vala_sql::TenantConn;
 
 /// Awaits one already-signalled Scribe cleanup phase within the caller deadline.
 ///
@@ -278,8 +275,6 @@ struct PersistenceDependencies {
 pub struct ScribeImpl {
     /// Catalog owner used to validate and resolve logical transport frames.
     catalog: Option<Arc<crate::catalog::BifrostCatalog>>,
-    /// Opendal operator for object store (shared across seal drivers).
-    operator: Arc<opendal::Operator>,
     /// WAL writer for durable append fsync.
     wal: Arc<wal::WalWriter>,
     /// Pod identity (`node_id`, `writer_epoch`).
@@ -332,99 +327,12 @@ pub struct ScribeImpl {
     recovery_cancelled: Arc<AtomicBool>,
     /// Optional server-provisioned immutable persistence runtime.
     persistence: Option<Arc<persistence::PersistenceRuntime>>,
-    /// Optional local wake-up publisher retained for caller-owned commits.
-    staging_file_publisher: Option<StagingFilePublisher>,
     #[cfg(any(test, feature = "test-support"))]
     ingest_stall: Arc<std::sync::Mutex<Option<Arc<IngestStall>>>>,
     /// Optional decoded-request ceiling used only by bounded regression tests;
     /// zero selects the production active-bucket target.
     #[cfg(any(test, feature = "test-support"))]
     decoded_request_limit_for_test: AtomicUsize,
-    /// Passive typed lifecycle observer populated only by production owner boundaries.
-    #[cfg(feature = "test-support")]
-    publication_observer: ScribePublicationObserver,
-}
-
-/// Typed publication evidence emitted at Scribe's production durability boundaries.
-#[cfg(feature = "test-support")]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ScribePublicationEvent {
-    /// The WAL owner returned a durable public acknowledgement.
-    Acknowledged {
-        /// Exact idempotency identity returned to the public writer.
-        batch_id: uuid::Uuid,
-        /// Number of rows accepted by the durable WAL owner.
-        rows: u64,
-    },
-    /// The seal owner produced an immutable object and pending catalog capability.
-    Sealed {
-        /// Local immutable-generation identity.
-        seal_id: u64,
-        /// Durable file-list identity reserved by the seal transaction.
-        file_list_row_id: uuid::Uuid,
-        /// Ordered public batch identities represented by the generation.
-        batch_ids: Vec<uuid::Uuid>,
-        /// First WAL position represented by the immutable generation.
-        wal_lsn_min: u64,
-        /// Last WAL position represented by the immutable generation.
-        wal_lsn_max: u64,
-    },
-    /// The post-commit owner published the exact file-list identity.
-    Published {
-        /// Local immutable-generation identity completed after commit.
-        seal_id: u64,
-        /// File-list row whose transaction committed before this event.
-        file_list_row_id: uuid::Uuid,
-        /// Ordered public batch identities represented by the published file.
-        batch_ids: Vec<uuid::Uuid>,
-        /// Fully-qualified table receiving the published immutable generation.
-        table: String,
-    },
-}
-
-/// Passive event stream for deterministic Scribe journey coordination.
-#[cfg(feature = "test-support")]
-#[derive(Debug, Clone, Default)]
-pub struct ScribePublicationObserver {
-    /// Ordered events recorded synchronously by their production owners.
-    events: Arc<std::sync::Mutex<Vec<ScribePublicationEvent>>>,
-    /// Wakeup for bounded journey waiters.
-    ready: Arc<tokio::sync::Notify>,
-}
-
-#[cfg(feature = "test-support")]
-impl ScribePublicationObserver {
-    /// Return a stable snapshot of all observed lifecycle events.
-    #[must_use]
-    pub fn events(&self) -> Vec<ScribePublicationEvent> {
-        self.events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    }
-
-    /// Wait until an event matching `predicate` has been recorded.
-    pub async fn wait_for(
-        &self,
-        predicate: impl Fn(&ScribePublicationEvent) -> bool,
-    ) -> ScribePublicationEvent {
-        loop {
-            let notified = self.ready.notified();
-            if let Some(event) = self.events().into_iter().find(&predicate) {
-                return event;
-            }
-            notified.await;
-        }
-    }
-
-    /// Record one event after its production transition completes.
-    fn record(&self, event: ScribePublicationEvent) {
-        self.events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(event);
-        self.ready.notify_waiters();
-    }
 }
 
 /// Scribe is accepting work and no shutdown owner exists.
@@ -834,14 +742,6 @@ impl ScribeImpl {
     }
 
     /// Builds the immutable-retirement owner transferred with caller COMMIT attempts.
-    fn commit_completion(&self) -> seal::ScribeCommitCompletion {
-        seal::ScribeCommitCompletion {
-            shards: Arc::clone(&self.shards),
-            staging_file_publisher: self.staging_file_publisher.clone(),
-            #[cfg(feature = "test-support")]
-            publication_observer: self.publication_observer.clone(),
-        }
-    }
     /// Return the registered writer epoch used by this production Scribe.
     #[cfg(feature = "test-support")]
     #[must_use]
@@ -1317,7 +1217,6 @@ impl ScribeImpl {
         Self::install_boot_metrics(wal.bytes_on_disk());
         Ok(Self {
             catalog,
-            operator,
             wal,
             node_id,
             stream,
@@ -1341,13 +1240,10 @@ impl ScribeImpl {
             recovery_ready: AtomicBool::new(true),
             recovery_cancelled: Arc::new(AtomicBool::new(false)),
             persistence,
-            staging_file_publisher,
             #[cfg(any(test, feature = "test-support"))]
             ingest_stall: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(any(test, feature = "test-support"))]
             decoded_request_limit_for_test: AtomicUsize::new(0),
-            #[cfg(feature = "test-support")]
-            publication_observer: ScribePublicationObserver::default(),
         })
     }
 
@@ -1887,91 +1783,6 @@ impl ScribeImpl {
             },
         }
     }
-
-    /// Execute seal pre-commit stages (Freeze → Parquet → PUT → PG tx) for a
-    /// specific seal-key on the caller's tenant-scoped transaction.
-    ///
-    /// Returns `ScribeCommitAttempt` handles whose post-commit tokens must be completed
-    /// only after the caller commits the transaction. The caller owns commit/rollback.
-    ///
-    /// Repo rule (`check:from-pools-allowlist`): this signature MUST take
-    /// `&mut vala_sql::TenantConn<'_>` and MUST NOT accept `sqlx::PgPool`.
-    ///
-    /// Under batch-spread routing a seal key may have buckets on several shards,
-    /// so `ScribeShardRuntime::freeze_key` now returns
-    /// every shard's frozen memtable. Each is pre-committed within the caller's
-    /// transaction and returned as a separate [`seal::ScribeCommitAttempt`], so no frozen
-    /// Arrow data is orphaned. If any pre-commit fails after earlier ones
-    /// succeeded, the already-committed generations are aborted back to the
-    /// active ledger before the error is returned, mirroring
-    /// [`Self::force_seal`].
-    ///
-    /// # Errors
-    /// Returns [`ScribeError`] if tenant validation, freezing, or any seal stage
-    /// fails. On a mid-batch failure the partial post-commit state is rolled
-    /// back before the error surfaces.
-    pub async fn seal_one(
-        &self,
-        seal_key: &SealKey,
-        conn: &mut TenantConn<'_>,
-    ) -> Result<Vec<seal::ScribeCommitAttempt>, ScribeError> {
-        let binding = TenantTableBinding::resolve((seal_key.tenant, seal_key.table.clone()))
-            .map_err(|error| ScribeError::Internal {
-                detail: error.to_string(),
-            })?;
-        binding
-            .validate_authenticated_tenant(conn.data_tenant_id())
-            .map_err(|error| ScribeError::Internal {
-                detail: error.to_string(),
-            })?;
-        if self
-            .persistence
-            .as_ref()
-            .and_then(|runtime| runtime.publication_reconciler())
-            .is_none()
-        {
-            return Err(ScribeError::Internal {
-                detail: "caller-owned Scribe seal requires a publication reconciler before encode"
-                    .to_owned(),
-            });
-        }
-
-        let driver = SealDriver::new_with_lane(
-            self.operator.clone(),
-            self.persistence_cpu.clone(),
-            self.persistence
-                .as_ref()
-                .and_then(|runtime| runtime.output_scratch()),
-            Some(self.memory.clone()),
-        );
-        let frozen_set = self.shards.freeze_key(seal_key.clone()).await?;
-        let mut commits = Vec::with_capacity(frozen_set.len());
-        for frozen in &frozen_set {
-            match driver
-                .pre_commit_frozen(
-                    frozen,
-                    seal_key,
-                    &binding,
-                    conn,
-                    &self.node_id,
-                    self.writer_epoch,
-                )
-                .await
-            {
-                Ok(mut commit) => {
-                    commit.attach_completion(self.commit_completion());
-                    commits.push(commit);
-                }
-                Err(error) => {
-                    // Roll back the generations already pre-committed in this
-                    // batch so no shard is left with orphaned immutable state.
-                    let _ = self.abort_commit_attempts(commits).await;
-                    return Err(error);
-                }
-            }
-        }
-        Ok(commits)
-    }
 }
 
 #[cfg(test)]
@@ -2045,12 +1856,6 @@ impl Scribe for ScribeImpl {
                     record_scribe_rejection(reason);
                 }
             })?;
-        #[cfg(feature = "test-support")]
-        self.publication_observer
-            .record(ScribePublicationEvent::Acknowledged {
-                batch_id: admission.batch_id,
-                rows: admission.rows_accepted,
-            });
         Ok(admission)
     }
 }
@@ -2403,12 +2208,6 @@ mod telemetry_tests {
 }
 
 impl ScribeImpl {
-    /// Return the passive typed publication observer owned by this Scribe.
-    #[cfg(feature = "test-support")]
-    #[must_use]
-    pub fn publication_observer_for_test(&self) -> ScribePublicationObserver {
-        self.publication_observer.clone()
-    }
     /// Install a one-shot test barrier at the public write seam.
     #[cfg(any(test, feature = "test-support"))]
     pub fn stall_next_ingest_for_test(&self) -> Arc<IngestStall> {
@@ -2589,361 +2388,35 @@ impl ScribeImpl {
             .map_or(0, |bucket| bucket.row_count)
     }
 
-    /// Force-seal every non-empty writable or pending bucket on this pod.
+    /// Flushes every active bucket through the staged and claim lifecycle.
     ///
-    /// The returned batch is only a set of post-commit capabilities. The
-    /// caller must commit its `TenantConn` first, then pass the batch to
-    /// [`Self::complete_post_commit`].
+    /// This is the one flush: it drives the same path a full pod does, so what
+    /// it produces is what production produces. Every active bucket freezes
+    /// into its shard's persistence queue, the accepted generations become
+    /// durable staged members, and the ready members that target and dwell
+    /// would still hold publish as residue claims.
+    ///
+    /// Returns the number of claims published, which is zero for a pod with
+    /// nothing staged rather than an error.
     ///
     /// # Errors
-    /// Returns `ScribeError` if any seal stage fails.
-    pub async fn force_seal(
-        &self,
-        conn: &mut TenantConn<'_>,
-    ) -> Result<Vec<seal::ScribeCommitAttempt>, ScribeError> {
-        if self
-            .persistence
-            .as_ref()
-            .and_then(|runtime| runtime.publication_reconciler())
-            .is_none()
-        {
-            return Err(ScribeError::Internal {
-                detail: "caller-owned Scribe seal requires a publication reconciler before encode"
-                    .to_owned(),
-            });
-        }
+    ///
+    /// Returns [`ScribeError`] when a shard cannot flush, or when a residue
+    /// claim cannot be taken, merged, or published. Members that did not
+    /// publish stay durable and staged and the WAL stays authoritative for
+    /// their rows, so the caller may retry.
+    pub async fn flush_staged(&self) -> Result<usize, ScribeError> {
+        self.shards.flush_all().await?;
         self.shards.drain().await;
-        // A `TenantConn` is bound to exactly one tenant. Seal only the
-        // memtable buckets whose seal-key belongs to that tenant; the harness
-        // iterates tenants and opens a fresh `TenantConn` per tenant.
-        //
-        let tenant = conn.data_tenant_id();
-        let frozen = self.shards.freeze_tenant(tenant).await?;
-        let driver = seal::SealDriver::new_with_lane(
-            self.operator.clone(),
-            self.persistence_cpu.clone(),
-            self.persistence
-                .as_ref()
-                .and_then(|runtime| runtime.output_scratch()),
-            Some(self.memory.clone()),
-        );
-
-        let mut attempts = Vec::with_capacity(frozen.len());
-        for frozen in frozen {
-            let key = frozen.seal_key.clone();
-            match driver
-                .pre_commit_frozen(
-                    &frozen,
-                    &key,
-                    &TenantTableBinding::resolve((key.tenant, key.table.clone())).map_err(
-                        |error| ScribeError::Internal {
-                            detail: error.to_string(),
-                        },
-                    )?,
-                    conn,
-                    &self.node_id,
-                    self.writer_epoch,
-                )
-                .await
-            {
-                Ok(mut handle) => {
-                    handle.attach_completion(self.commit_completion());
-                    #[cfg(feature = "test-support")]
-                    if let Some(token) = handle.token() {
-                        self.publication_observer
-                            .record(ScribePublicationEvent::Sealed {
-                                seal_id: token.seal_id,
-                                file_list_row_id: token.file_list_row_id,
-                                batch_ids: token.batch_ids.clone(),
-                                wal_lsn_min: token.wal_lsn_min.as_u64(),
-                                wal_lsn_max: token.wal_lsn_max.as_u64(),
-                            });
-                    }
-                    attempts.push(handle);
-                }
-                Err(error) => {
-                    let _ = self.abort_commit_attempts(attempts).await;
-                    return Err(error);
-                }
-            }
-        }
-
-        Ok(attempts)
-    }
-
-    /// Settles caller-owned Scribe publications from the exact COMMIT result.
-    ///
-    /// A confirmed commit completes immutable ownership normally. Every commit
-    /// error is ambiguous: the same deterministic full-set transaction is
-    /// retried through the operator capability before any object, scratch, or
-    /// WAL authority is released.
-    ///
-    /// # Errors
-    /// Returns a Scribe error when confirmed completion, exact scratch cleanup,
-    /// or full-set reconciliation fails. An unresolved attempt poisons Scribe
-    /// and retains its evidence for restart reconciliation.
-    ///
-    /// # Cancellation
-    /// Dropping this future while reconciliation owns an attempt invokes the
-    /// attempt's fail-stop drop path; it never deletes remote objects or
-    /// advances the immutable generation.
-    pub async fn settle_commit_attempts(
-        &self,
-        attempts: Vec<seal::ScribeCommitAttempt>,
-        commit_result: &Result<(), vala_sql::SqlError>,
-    ) -> Result<(), ScribeError> {
-        if commit_result.is_ok() {
-            let mut tokens = Vec::with_capacity(attempts.len());
-            let mut artifact_sets = Vec::with_capacity(attempts.len());
-            let mut parquet_owners = Vec::with_capacity(attempts.len());
-            for attempt in attempts {
-                let (token, artifacts, parquet_owner) = attempt.take_terminal();
-                tokens.push(token);
-                artifact_sets.push(artifacts);
-                parquet_owners.push(parquet_owner);
-            }
-            self.complete_post_commit(seal::PostCommitBatch(tokens))
-                .await?;
-            for artifacts in artifact_sets {
-                artifacts.cleanup()?;
-            }
-            drop(parquet_owners);
-            return Ok(());
-        }
-
-        let runtime = self
-            .persistence
-            .as_ref()
-            .ok_or_else(|| ScribeError::Internal {
-                detail: "Scribe publication reconciler disappeared after COMMIT ambiguity"
-                    .to_owned(),
-            })?;
-        let mut completions = Vec::with_capacity(attempts.len());
-        for attempt in attempts {
-            completions.push(runtime.submit_reconciliation(attempt).map_err(|attempt| {
-                drop(attempt);
-                ScribeError::Internal {
-                    detail: "Scribe publication reconciliation owner is unavailable".to_owned(),
-                }
-            })?);
-        }
-        for completion in completions {
-            completion
-                .await
-                .map_err(|_| ScribeError::Internal {
-                    detail: "Scribe publication reconciliation owner stopped".to_owned(),
-                })?
-                .map_err(|detail| ScribeError::Internal { detail })?;
-        }
-        Ok(())
-    }
-
-    /// Aborts attempts whose caller-owned transaction is known not committed.
-    ///
-    /// Remote bytes remain retained for deterministic retry before scratch and
-    /// immutable ownership return to the active tier.
-    ///
-    /// # Errors
-    /// Returns a Scribe error when scratch cleanup or immutable rollback fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics only when an unsettled commit attempt has lost its required
-    /// artifact owner, which violates the attempt state invariant.
-    pub async fn abort_commit_attempts(
-        &self,
-        attempts: Vec<seal::ScribeCommitAttempt>,
-    ) -> Result<(), ScribeError> {
-        let mut tokens = Vec::with_capacity(attempts.len());
-        let mut parquet_owners = Vec::with_capacity(attempts.len());
-        for attempt in attempts {
-            let (token, artifacts, parquet_owner) = attempt.take_terminal();
-            artifacts.cleanup()?;
-            tokens.push(token);
-            parquet_owners.push(parquet_owner);
-        }
-        let result = self.abort_post_commit(seal::PostCommitBatch(tokens)).await;
-        drop(parquet_owners);
-        result
-    }
-
-    /// Complete one or more seal generations after the caller commits SQL.
-    pub async fn complete_post_commit<T>(&self, post_commit: T) -> Result<(), ScribeError>
-    where
-        T: Into<seal::PostCommitBatch>,
-    {
-        for mut token in post_commit.into().0 {
-            let result = async {
-                let binding = TenantTableBinding::resolve((
-                    token.seal_key.tenant,
-                    token.seal_key.table.clone(),
-                ))
-                .map_err(|error| ScribeError::Internal {
-                    detail: error.to_string(),
-                })?;
-                self.shards
-                    .complete_post_commit(
-                        token.seal_id,
-                        token.shard_id,
-                        &token.seal_key,
-                        token.memtable_bytes,
-                        token.file_list_key.clone(),
-                    )
-                    .await?;
-                #[cfg(feature = "test-support")]
-                self.publication_observer
-                    .record(ScribePublicationEvent::Published {
-                        seal_id: token.seal_id,
-                        file_list_row_id: token.file_list_row_id,
-                        batch_ids: token.batch_ids.clone(),
-                        table: token.seal_key.table.fqn(),
-                    });
-                if let Some(publisher) = &self.staging_file_publisher {
-                    let _ = publisher.try_publish(crate::maintenance::StagingFileCommitted::new(
-                        binding,
-                        token.seal_key.partition,
-                    ));
-                }
-                Ok::<(), ScribeError>(())
-            }
-            .await;
-            match result {
-                Ok(()) => token.visibility.succeed(),
-                Err(error) => {
-                    token.visibility.fail();
-                    return Err(error);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Abort one or more post-commit capabilities after SQL rollback.
-    pub async fn abort_post_commit<T>(&self, post_commit: T) -> Result<(), ScribeError>
-    where
-        T: Into<seal::PostCommitBatch>,
-    {
-        for mut token in post_commit.into().0 {
-            let result = async {
-                self.admission
-                    .preflight_transfer_immutable_to_active(token.memtable_bytes)?;
-                self.memory_ownership
-                    .preflight_move_immutable_to_active(token.memtable_bytes)?;
-                self.shards
-                    .abort_post_commit(token.seal_id, token.shard_id, &token.seal_key)
-                    .await?;
-                self.admission
-                    .transfer_immutable_to_active(token.memtable_bytes)?;
-                self.memory_ownership
-                    .move_immutable_to_active(token.memtable_bytes)
-                    .map_err(|error| ScribeError::Internal {
-                        detail: error.to_string(),
-                    })?;
-                Ok::<(), ScribeError>(())
-            }
-            .await;
-            match result {
-                Ok(()) => token.visibility.cancel(),
-                Err(error) => {
-                    token.visibility.fail();
-                    return Err(error);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Reconcile a pending generation against the exact durable file-list row.
-    ///
-    /// The lookup runs through the caller's tenant-bound connection. A found
-    /// row completes the generation; a missing row deliberately leaves it
-    /// pending so WAL replay can retry the seal.
-    pub async fn reconcile_post_commit(
-        &self,
-        mut token: seal::PostCommitToken,
-        conn: &mut TenantConn<'_>,
-    ) -> Result<bool, ScribeError> {
-        let result = async {
-            let key = &token.file_list_key;
-            if conn.data_tenant_id() != key.data_tenant_id {
-                return Err(ScribeError::Internal {
-                    detail: format!(
-                        "post-commit reconciliation tenant mismatch: key={} connection={}",
-                        key.data_tenant_id,
-                        conn.data_tenant_id()
-                    ),
-                });
-            }
-            let row: Option<uuid::Uuid> = sqlx::query_scalar(
-                "SELECT id
-               FROM vala.file_list
-              WHERE data_tenant_id = $1
-                AND namespace = $2
-                AND table_name = $3
-                AND node_id = $4
-                AND writer_epoch = $5
-                AND wal_lsn_min = $6
-                AND wal_lsn_max = $7",
-            )
-            .bind(key.data_tenant_id.as_uuid())
-            .bind(&key.namespace)
-            .bind(&key.table_name)
-            .bind(key.node_id)
-            .bind(key.writer_epoch)
-            .bind(key.wal_lsn_min)
-            .bind(key.wal_lsn_max)
-            .fetch_optional(&mut **conn.transaction())
-            .await
-            .map_err(|error| ScribeError::Internal {
-                detail: format!("file-list post-commit reconciliation failed: {error}"),
-            })?;
-
-            if row.is_some() {
-                let binding = TenantTableBinding::resolve((
-                    token.seal_key.tenant,
-                    token.seal_key.table.clone(),
-                ))
-                .map_err(|error| ScribeError::Internal {
-                    detail: error.to_string(),
-                })?;
-                self.shards
-                    .complete_post_commit(
-                        token.seal_id,
-                        token.shard_id,
-                        &token.seal_key,
-                        token.memtable_bytes,
-                        key.clone(),
-                    )
-                    .await?;
-                if let Some(publisher) = &self.staging_file_publisher {
-                    let _ = publisher.try_publish(crate::maintenance::StagingFileCommitted::new(
-                        binding,
-                        token.seal_key.partition,
-                    ));
-                }
-                Ok(true)
-            } else {
-                self.shards
-                    .abort_post_commit(token.seal_id, token.shard_id, &token.seal_key)
-                    .await?;
-                Ok(false)
-            }
-        }
-        .await;
-        match result {
-            Ok(true) => {
-                token.visibility.succeed();
-                Ok(true)
-            }
-            Ok(false) => {
-                token.visibility.cancel();
-                Ok(false)
-            }
-            Err(error) => {
-                token.visibility.fail();
-                Err(error)
-            }
-        }
+        let Some(persistence) = &self.persistence else {
+            return Ok(0);
+        };
+        persistence.drain().await;
+        let published = persistence
+            .publish_residue(crate::scribe::assembly::ClaimCause::Drain)
+            .await?;
+        self.shards.drain().await;
+        Ok(published)
     }
 
     /// Replays eligible WAL sequentially through the bounded filesystem lane.

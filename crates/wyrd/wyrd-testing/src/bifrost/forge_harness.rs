@@ -1689,7 +1689,6 @@ impl ForgeFixture {
         let batch = fixture_ingress_batch(&ingress_schema, false, partition_day, sequence, rows);
         scribe_append_and_seal(
             self.scribe().as_ref(),
-            &self.vala,
             &self.bifrost_catalog,
             self.tenant,
             &self.binding,
@@ -1976,7 +1975,6 @@ fn fixture_ingest_audit_event(
 /// fails, since every one of those is a fixture-setup invariant.
 async fn scribe_append_and_seal(
     scribe: &ScribeImpl,
-    vala: &vala_sql::ValaPostgres,
     bifrost_catalog: &BifrostCatalog,
     tenant: DataTenantId,
     binding: &TenantTableBinding,
@@ -2007,20 +2005,9 @@ async fn scribe_append_and_seal(
         .await
         .expect("Forge fixture Scribe ingest");
 
-    let mut conn = vala
-        .tenant_conn(tenant)
-        .await
-        .expect("Forge fixture seal tenant connection");
-    let attempts = match scribe.force_seal(&mut conn).await {
-        Ok(attempts) => attempts,
-        Err(error) => panic!("Forge fixture Scribe seal: {error}"),
-    };
-    let commit_result = conn.commit().await;
-    scribe
-        .settle_commit_attempts(attempts, &commit_result)
-        .await
-        .expect("Forge fixture seal settlement");
-    commit_result.expect("Forge fixture seal commit");
+    if let Err(error) = scribe.flush_staged().await {
+        panic!("Forge fixture Scribe flush: {error}");
+    }
 }
 
 /// Age every `file_list` row of one fixture table created at or after `since`.
@@ -2179,7 +2166,6 @@ async fn seed_forge_group_with_scribe(
             );
             scribe_append_and_seal(
                 scribe.as_ref(),
-                &resources.vala,
                 &resources.bifrost_catalog,
                 tenant,
                 &binding,

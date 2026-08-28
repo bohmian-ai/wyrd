@@ -20,9 +20,6 @@ use crate::resources::ScribeResources;
 use crate::schema::fingerprint::SchemaFingerprint;
 use crate::scribe::admission::EventTimeWindow;
 use crate::scribe::memtable::FrozenMemtable;
-use crate::scribe::parquet_writer::{
-    CandidateEncodeRequest, FileCandidate, ParquetEncoded, encode_batch, encode_candidate,
-};
 use crate::scribe::preprocess::{AdmittedAppend, PreparedAppend, prepare_append};
 use crate::scribe::replay::ReplayedSealKey;
 use crate::scribe::seal_key::SealKey;
@@ -41,7 +38,6 @@ use wyrd_spec::vala::managed_columns::{
 
 #[cfg(test)]
 const INGRESS_QUEUE_ITEMS: usize = 256;
-pub(crate) const PERSISTENCE_QUEUE_ITEMS: usize = 64;
 #[cfg(test)]
 const WAL_IO_QUEUE_ITEMS: usize = 256;
 
@@ -1043,7 +1039,6 @@ fn append_managed_columns(
 #[derive(Debug)]
 pub(crate) enum ScribePersistenceCpuOp {
     Preprocess(Box<AdmittedAppend>),
-    EncodeParquet(Box<EncodeParquetOp>),
     /// Encode one frozen generation into durable staged runs.
     StageMember(Box<StageMemberOp>),
     /// Merge one claim's staged runs into rolling sealed objects.
@@ -1071,34 +1066,6 @@ pub(crate) struct HoldMemoryOp {
     started: std::sync::mpsc::SyncSender<()>,
     /// Deterministic release gate controlled by the cancellation test.
     release: std::sync::mpsc::Receiver<()>,
-}
-
-/// Move-only inputs for one bounded Parquet encoding lane operation.
-#[derive(Debug)]
-pub(crate) struct EncodeParquetOp {
-    /// Frozen generation encoded without retaining the shard actor.
-    pub(crate) frozen: Box<FrozenMemtable>,
-    /// Tenant-qualified physical table binding.
-    pub(crate) binding: TenantTableBinding,
-    /// Authenticated tenant checked again by the encoder.
-    pub(crate) tenant: wyrd_spec::ids::DataTenantId,
-    /// Exact whole-batch candidate encoded by this serial operation.
-    pub(crate) candidate: Option<FileCandidate>,
-    /// First generation-global artifact ordinal assigned to this candidate.
-    pub(crate) first_ordinal: usize,
-    /// Generation-owned output scratch directory.
-    pub(crate) scratch_dir: std::path::PathBuf,
-    /// Deterministic artifact basename.
-    pub(crate) object_base: String,
-    /// Exact pre-writer footer child retained through sealed inspection.
-    pub(crate) footer_reservation: crate::scribe::memory::EncodedFooterReservation,
-    /// Registered physical write recipe resolved before the lane was entered.
-    ///
-    /// The blocking CPU lane owns no catalog capability, so the seal and
-    /// persistence dispatchers resolve the table's canonical layout and hand
-    /// it down with the operation, mirroring how an Iceberg write task binds
-    /// its spec and sort order before the first row is written.
-    pub(crate) layout: std::sync::Arc<crate::catalog::layout::PhysicalLayout>,
 }
 
 /// Move-only inputs for staging one frozen generation onto the staging volume.
@@ -1145,8 +1112,7 @@ pub(crate) struct AssembleClaimOp {
 /// Results produced by [`ScribePersistenceCpuPool`].
 #[derive(Debug)]
 pub(crate) enum ScribePersistenceCpuResult {
-    Prepared(PreparedAppend),
-    ParquetEncoded(ParquetEncoded),
+    Prepared(Box<PreparedAppend>),
     ReplayRestored(Box<FrozenMemtable>),
     MemberStaged(Box<crate::scribe::member_stager::StagedRuns>),
     ClaimAssembled(Box<crate::scribe::claim_assembly::AssembledClaim>),
@@ -1171,45 +1137,8 @@ fn execute_persistence_operation(
             if !preprocess_delay.is_zero() {
                 std::thread::sleep(preprocess_delay);
             }
-            prepare_append(*append).map(ScribePersistenceCpuResult::Prepared)
-        }
-        ScribePersistenceCpuOp::EncodeParquet(operation) => {
-            let EncodeParquetOp {
-                frozen,
-                binding,
-                tenant,
-                candidate,
-                first_ordinal,
-                scratch_dir,
-                object_base,
-                footer_reservation,
-                layout,
-            } = *operation;
-            match candidate {
-                Some(candidate) => encode_candidate(
-                    CandidateEncodeRequest {
-                        frozen: &frozen,
-                        binding: &binding,
-                        seal_tenant: tenant,
-                        candidate,
-                        first_ordinal,
-                        scratch_dir: &scratch_dir,
-                        object_base: &object_base,
-                        layout: &layout,
-                    },
-                    footer_reservation,
-                ),
-                None => encode_batch(
-                    &frozen,
-                    &binding,
-                    tenant,
-                    &scratch_dir,
-                    &object_base,
-                    &layout,
-                    footer_reservation,
-                ),
-            }
-            .map(ScribePersistenceCpuResult::ParquetEncoded)
+            prepare_append(*append)
+                .map(|prepared| ScribePersistenceCpuResult::Prepared(Box::new(prepared)))
         }
         ScribePersistenceCpuOp::StageMember(operation) => stage_member(*operation),
         ScribePersistenceCpuOp::AssembleClaim(operation) => assemble_claim(*operation),
@@ -1327,9 +1256,17 @@ impl ScribePersistenceCpuPool {
     pub(crate) fn close(&self) {
         self.permits.close();
     }
-    /// Build the fixed persistence CPU lane.
+    /// Builds a persistence CPU lane with the fixed test queue bound.
+    ///
+    /// Production boot always states its own bound through
+    /// [`Self::try_new_with_capacity`]; only bounded tests want a default.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the fixed Rayon pool cannot be constructed.
+    #[cfg(test)]
     pub(crate) fn new(worker_count: usize) -> Self {
-        Self::new_with_capacity(worker_count, PERSISTENCE_QUEUE_ITEMS)
+        Self::new_with_capacity(worker_count, 64)
     }
 
     /// Build the fixed persistence CPU lane with an explicit queue bound.

@@ -25,83 +25,9 @@ use crate::catalog::layout::TimeGranularity;
 pub use crate::catalog::layout::TimePartition;
 use crate::contracts::ScribeError;
 
-/// Durable identity shared by every producer of one Scribe artifact set.
-///
-/// The identity deliberately excludes process-local generation and seal counters.
-/// Its complete tuple matches the durable file-list conflict scope while also
-/// retaining the partition and shard needed to keep object paths inspectable.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ScribeArtifactIdentity {
-    /// Tenant-qualified object prefix for the logical table.
-    object_prefix: String,
-    /// Exact partition represented by the artifact set.
-    partition: TimePartition,
-    /// Producing Scribe node without UUID punctuation.
-    node_id: String,
-    /// Producing Scribe writer epoch.
-    writer_epoch: i64,
-    /// Pod-local shard lane that produced the artifact set.
-    shard_id: usize,
-    /// Inclusive minimum WAL LSN represented by the artifact set.
-    wal_lsn_min: u64,
-    /// Inclusive maximum WAL LSN represented by the artifact set.
-    wal_lsn_max: u64,
-}
-
-impl ScribeArtifactIdentity {
-    /// Constructs the durable identity after validating its node identifier.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError`] when `node_id` is not a UUID or when the WAL
-    /// range is reversed.
-    pub(crate) fn new(
-        binding: &TenantTableBinding,
-        partition: TimePartition,
-        node_id: &str,
-        writer_epoch: i64,
-        shard_id: usize,
-        wal_lsn_min: u64,
-        wal_lsn_max: u64,
-    ) -> Result<Self, ScribeError> {
-        let node_id = uuid::Uuid::parse_str(node_id).map_err(|error| ScribeError::Internal {
-            detail: format!("node_id is not a valid UUID: {error}"),
-        })?;
-        if wal_lsn_min > wal_lsn_max {
-            return Err(ScribeError::Internal {
-                detail: "Scribe artifact WAL range is reversed".to_owned(),
-            });
-        }
-        Ok(Self {
-            object_prefix: binding.object_prefix.clone(),
-            partition,
-            node_id: node_id.simple().to_string(),
-            writer_epoch,
-            shard_id,
-            wal_lsn_min,
-            wal_lsn_max,
-        })
-    }
-
-    /// Returns the deterministic base shared by every ordinal in the set.
-    #[must_use]
-    pub(crate) fn object_base(&self) -> String {
-        format!(
-            "{}/{}/scribe-{}-epoch-{}-shard-{}-wal-{}-{}",
-            self.object_prefix,
-            self.partition.as_path_components(),
-            self.node_id,
-            self.writer_epoch,
-            self.shard_id,
-            self.wal_lsn_min,
-            self.wal_lsn_max,
-        )
-    }
-}
-
 /// Durable identity shared by every object one assembly claim publishes.
 ///
-/// A claim spans several shard lanes, so unlike [`ScribeArtifactIdentity`] it
+/// A claim spans several shard lanes, so it
 /// carries no shard: the claim digest is what distinguishes one published set
 /// from another. That digest is derived from the claim's exact members, so the
 /// base is stable across a retry of the same publication and an interrupted
@@ -472,15 +398,6 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
 
-    /// Builds one tenant-qualified binding for durable identity tests.
-    fn artifact_binding() -> TenantTableBinding {
-        TenantTableBinding::resolve((
-            crate::test_support::tenant(),
-            TableRef::new(BifrostNamespace::Bifrost, "artifact_identity"),
-        ))
-        .expect("artifact identity binding")
-    }
-
     /// Builds one exact partition from an RFC 3339 boundary.
     fn partition(granularity: TimeGranularity, rfc3339: &str) -> TimePartition {
         let start = DateTime::parse_from_rfc3339(rfc3339)
@@ -508,74 +425,6 @@ mod tests {
             ],
         )
         .expect("fixture batch builds")
-    }
-
-    /// Durable Scribe identity changes for every conflict-key dimension and
-    /// remains stable for an exact retry and its ordered artifact ordinals.
-    #[test]
-    fn scribe_artifact_identity_matrix_is_durable_and_retry_stable() {
-        let binding = artifact_binding();
-        let hour = partition(TimeGranularity::Hour, "2026-08-15T13:00:00Z");
-        let node = "018f7ca2-7a4d-7cc1-98a7-97fdd1f15101";
-        let identity = ScribeArtifactIdentity::new(&binding, hour, node, 7, 3, 101, 109)
-            .expect("durable identity");
-        let retry = ScribeArtifactIdentity::new(&binding, hour, node, 7, 3, 101, 109)
-            .expect("retry identity");
-        let base = identity.object_base();
-        assert_eq!(base, retry.object_base());
-        assert!(base.contains("partition_granularity=hour/partition_start=2026-08-15T13Z"));
-        assert_eq!(
-            format!("{base}-{:05}.parquet", 0),
-            format!("{}-{:05}.parquet", retry.object_base(), 0)
-        );
-        assert_ne!(
-            format!("{base}-{:05}.parquet", 0),
-            format!("{base}-{:05}.parquet", 1)
-        );
-
-        for changed in [
-            ScribeArtifactIdentity::new(&binding, hour, node, 8, 3, 101, 109),
-            ScribeArtifactIdentity::new(&binding, hour, node, 7, 4, 101, 109),
-            ScribeArtifactIdentity::new(&binding, hour, node, 7, 3, 100, 109),
-            ScribeArtifactIdentity::new(&binding, hour, node, 7, 3, 101, 110),
-            ScribeArtifactIdentity::new(
-                &binding,
-                partition(TimeGranularity::Hour, "2026-08-15T14:00:00Z"),
-                node,
-                7,
-                3,
-                101,
-                109,
-            ),
-            ScribeArtifactIdentity::new(
-                &binding,
-                partition(TimeGranularity::Day, "2026-08-15T00:00:00Z"),
-                node,
-                7,
-                3,
-                101,
-                109,
-            ),
-        ] {
-            assert_ne!(base, changed.expect("changed identity").object_base());
-        }
-    }
-
-    /// Reversed WAL ranges fail before an object path can be constructed.
-    #[test]
-    fn scribe_artifact_identity_rejects_reversed_wal_range() {
-        let binding = artifact_binding();
-        let error = ScribeArtifactIdentity::new(
-            &binding,
-            partition(TimeGranularity::Hour, "2026-08-15T13:00:00Z"),
-            "018f7ca2-7a4d-7cc1-98a7-97fdd1f15101",
-            7,
-            3,
-            110,
-            109,
-        )
-        .expect_err("reversed range must fail");
-        assert!(matches!(error, ScribeError::Internal { .. }));
     }
 
     /// Bucketing places an instant in the exact partition of its granularity.

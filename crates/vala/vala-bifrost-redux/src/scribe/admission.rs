@@ -542,52 +542,6 @@ impl AdmissionController {
         Ok(())
     }
 
-    /// Transfer immutable bytes back to the active generation after a seal
-    /// transaction rolls back.
-    pub fn transfer_immutable_to_active(&self, bytes: usize) -> Result<(), ScribeError> {
-        let mut state = self.inner.state.lock().map_err(|_| ScribeError::Internal {
-            detail: "admission state lock poisoned during immutable transfer".to_owned(),
-        })?;
-        if state.immutable_bytes < bytes {
-            self.inner.memory.poison();
-            return Err(ScribeError::Internal {
-                detail: "admission immutable counter underflow during transfer".to_owned(),
-            });
-        }
-        let active = state.active_bytes.checked_add(bytes).ok_or_else(|| {
-            self.inner.memory.poison();
-            ScribeError::Internal {
-                detail: "admission active counter overflow during transfer".to_owned(),
-            }
-        })?;
-        state.immutable_bytes -= bytes;
-        state.active_bytes = active;
-        Ok(())
-    }
-
-    /// Check immutable-to-active ownership before a post-commit abort mutates.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError::Internal`] and poisons the shared governor when
-    /// immutable ownership is insufficient, active ownership would overflow,
-    /// or the admission lock is poisoned.
-    pub(crate) fn preflight_transfer_immutable_to_active(
-        &self,
-        bytes: usize,
-    ) -> Result<(), ScribeError> {
-        let state = self.inner.state.lock().map_err(|_| ScribeError::Internal {
-            detail: "admission state lock poisoned during immutable transfer preflight".to_owned(),
-        })?;
-        if state.immutable_bytes < bytes || state.active_bytes.checked_add(bytes).is_none() {
-            self.inner.memory.poison();
-            return Err(ScribeError::Internal {
-                detail: "admission immutable-to-active transfer failed preflight".to_owned(),
-            });
-        }
-        Ok(())
-    }
-
     /// Reconcile the counters with the authoritative memtable statistics.
     pub fn sync_memtable_bytes(&self, active_bytes: usize, immutable_bytes: usize) {
         if let Ok(mut state) = self.inner.state.lock() {

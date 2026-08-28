@@ -1,145 +1,147 @@
 ---
 name: wyrd-review-v3
-description: Independently adjudicate every immutable Wyrd v3 candidate against its bound task packet, implementation, tests, and proof.
+description: Independently review an immutable Wyrd commit range against its task packet, implementation, tests, and verification evidence.
 ---
 
 # Wyrd Review v3
 
-Act as acceptance authority for one immutable `parent_sha..candidate_sha`.
-Review actual code and tests against every criterion, validate implementer
-proof, and approve or emit bounded remediation. Remain independent and
-read-only. Never review a mutable tree or merely check whether commands ran.
+Review the supplied `base_sha..candidate_sha` against the supplied Wyrd task or
+remediation packet. The goal is to decide whether the candidate actually
+completes the task, not to enforce workflow bookkeeping.
 
-## Input and identity
+Remain read-only with respect to the candidate implementation. Review committed
+code, not uncommitted edits. A clean checkout at the candidate is acceptable;
+otherwise use `git show`, `git diff`, or a detached read-only worktree.
 
-Accept request ID, repository root, task ID and packet path/digest, generation,
-parent/candidate SHAs, binary diff digest, candidate-manifest ref/digest,
-proof-artifact ref/digest, and optional remediation lineage. The review identity
-is exactly that tuple. Missing or contradictory identity is `REVIEW_BLOCKED`;
-never infer it from branches, chat, or controller state.
+## Required input
 
-When the controller's high-risk preflight requires a companion review, also
-accept its immutable artifact ref/digest and reviewer identity. It is
-untrusted, candidate-only evidence; the primary reviewer remains the sole
-acceptance authority and rechecks every adopted claim against source.
+A direct review needs only:
 
-Read `AGENTS.md`, `architecture/agent-rules.md`, the packet, and applicable
-design/doctrine authorities. Use CodeGraph only when indexed at the candidate;
-otherwise use `git show` or a detached read-only worktree.
+- repository root;
+- task or remediation packet, by path or supplied text; and
+- immutable base and candidate SHAs.
 
-Verify candidate existence and sole parent, diff/manifest/proof digests,
-supersession lineage, actual paths, and forecast expansions. A path outside
-`write_set` is not itself a defect; judge it against task intent, ownership,
-non-goals, and acceptance criteria.
+Confirm that both commits exist, the base is an ancestor of the candidate, and
+the candidate is not a merge unless the caller explicitly asks to review a
+merge. Treat `base_sha` as the review-range base; it need not be the candidate's
+immediate Git parent.
 
-Validate every required command's ID, cwd, timeout, timestamps, exit status,
-result, output ref/digest, and claimed ACs. Read only relevant log sections and
-never copy full logs. Required verification must pass before approval.
+Controller-supplied request IDs, generations, manifests, proof artifacts, and
+digests are optional provenance. Validate and report them when supplied. Their
+absence does not block a direct user-requested review and must never replace
+reviewing the code.
 
-## Review implementation and proof
+Use `REVIEW_BLOCKED` only when the commits or task cannot be read, the range is
+mutable or ambiguous, or the environment prevents a necessary review step. Do
+not block on missing orchestration metadata.
 
-Map every packet AC or remediation assertion to source, consumers, tests, and
-proof. Inspect enough unchanged context to challenge relevant negative,
-recovery, cancellation, concurrency, tenancy, auth, audit, durability,
-ownership, async, rustdoc, PyO3/SDK, generated-surface, and journey behavior.
-Reject duplicate truth and tests unable to detect the alleged defect.
+## Review workflow
 
-## Diff-first code review
+Read `AGENTS.md`, `architecture/agent-rules.md`, the task packet, and the
+relevant portions of `architecture/wyrd-design.md` and
+`architecture/wyrd-doctrine.mdx`. Follow CodeGraph instructions from
+`AGENTS.md`; use `git show` or a detached worktree when CodeGraph is not indexed
+at the candidate.
 
-Before judging acceptance, review `parent_sha..candidate_sha` as code. Inspect
-the changed symbols, their immediate unchanged callers, consumers, error
-mappers, and tests, plus packet-declared impact expansions. Challenge actual
-control and data flow, reachable failure paths, state transitions, cleanup and
-cancellation, public API and error ergonomics, local Wyrd patterns, duplicated
-logic, needless abstractions, structural simplicity, and assertion strength.
-When the packet declares a hot path, query path, admission or resource bound,
-or scale target, inspect the change against that criterion.
+Review the diff before mapping acceptance criteria. Inspect:
 
-AC-to-evidence mapping is necessary but never substitutes for this review of
-the implementation itself. For every clean candidate, record one concise
-adversarial probe: the most dangerous changed invariant, strongest reachable
-counterexample, source/test/proof evidence inspected, outcome, and any static
-limit. One probe is proportionate for a bounded candidate; do not import the
-terminal review's full roster or three-invariant burden.
+- every changed production symbol and test;
+- immediate callers, consumers, error paths, and cleanup paths;
+- state transitions, rollback, cancellation, concurrency, durability,
+  tenancy, audit, bounds, and telemetry where relevant;
+- whether tests can fail for the defect they claim to cover; and
+- whether the implementation stays inside the task's owners and non-goals.
 
-## High-risk companion review
+Be proportionate. Do not invent style findings, demand unrelated cleanup, or
+expand a bounded remediation into terminal integrated review. Report only
+defects that can affect task behavior, correctness, verification, or a hard
+repository rule.
 
-Default to one independent primary reviewer. The controller adds exactly one
-independent companion before primary adjudication only when the packet or
-actual candidate diff crosses one of these boundaries:
+Map each task acceptance criterion or remediation finding to source, tests, and
+verification. A concise mapping is enough; do not repeat the packet.
 
-| Candidate impact | Companion lens |
-|---|---|
-| auth, tenancy, audit, scopes, or public errors | security |
-| SQL, storage, migrations, recovery, or destructive writes | persistence |
-| async lifecycle, cancellation, locks, retries, or drain | async/reliability |
-| Python, PyO3, generated SDK, or native-binding boundary | cross-language |
-| Vala serving, OLAP/query, hot path, or admission limit | Vala/data-plane |
-| public wire/schema/API or cross-owner contract | architecture/contracts |
-| UI route, state, or accessibility behavior | UI |
+## Verification
 
-The companion returns a compact immutable candidate-review addendum: identity,
-focused impact inspected, one adversarial probe, source-grounded findings or
-clean rationale, and static limits. It assigns no acceptance verdict, plans no
-remediation, and does not replace primary review. The controller passes the
-artifact to the primary reviewer, which independently validates relevant claims
-and records how they affected its decision. Do not add code-quality,
-maintainability, developer-experience, or tests companions by default.
+Audit the implementer's claimed commands and results when evidence is
+available. Rerun the narrowest relevant checks when evidence is absent,
+contradictory, suspicious, or needed to complete the review. Do not blindly
+rerun a broad suite that valid focused proof already covers.
 
-Implementer verification is mandatory but not self-accepting. Decide whether
-the checks and assertions prove the task. Rerun only a targeted check when
-evidence is missing, contradictory, or suspicious; never blindly rerun the full
-suite. Store rerun output once using the compact proof contract.
+Required task verification must pass before approval. A failure proven to be
+unchanged from the review base may be recorded as a pre-existing static limit
+when the candidate's narrower owning-surface checks pass and the task does not
+require fixing that unrelated owner. Do not accept a candidate-caused failure,
+a weakened check, a filtered required test, or an unverified task-critical
+behavior.
 
-Classify findings as `REVERSIBLE` for ordinary bounded code/test/scope/evidence
-work, `TASK_CONTRACT_REPAIR` for a mechanically defective packet field,
-`MATERIAL` for a genuinely new product/contract/owner/security/tenancy/audit/
-migration/acceptance decision, or `REVIEW_INTEGRITY` for invalid identity.
-Ordinary defects never require replanning.
+When a task names a conditional lane or future owner that does not exist, check
+the repository and task sequencing. Treat it as not applicable only when the
+packet makes it conditional or the work is explicitly owned by a later,
+out-of-scope slice. Otherwise report a task-contract defect or missing proof.
 
-The reviewer owns each remediation contract: exact evidence refs, affected
-ACs, expected observable behavior, permitted owners, acceptance assertions,
-and required verification. The controller routes it unchanged; the implementer
-chooses the fix and fully verifies it. Every replacement candidate receives a
-fresh independent review.
+An independent companion review is optional. Use one when the caller or an
+active controller requires it, or when the primary reviewer decides a focused
+specialist pass would materially reduce risk. Lack of a companion never blocks
+an otherwise complete direct review.
+
+## Findings and verdicts
+
+Classify findings as:
+
+- `REVERSIBLE`: bounded code, test, documentation, or verification work;
+- `TASK_CONTRACT_REPAIR`: a mechanically impossible or contradictory packet
+  requirement;
+- `MATERIAL`: a genuinely new product, contract, owner, security, tenancy,
+  audit, or migration decision; or
+- `REVIEW_INTEGRITY`: the supplied commits or task do not identify a stable
+  review target.
+
+Verdicts:
+
+- `APPROVE`: all in-scope criteria are satisfied, relevant verification is
+  adequate, the code review found no defect, and one adversarial probe survived;
+- `REMEDIATION_REQUIRED`: bounded implementation or proof work remains;
+- `TASK_CONTRACT_REPAIR_REQUIRED`: the packet itself needs mechanical repair;
+- `MATERIAL_DECISION_REQUIRED`: completion needs a new material decision; or
+- `REVIEW_BLOCKED`: the review target cannot be reliably inspected.
+
+For each finding give a stable ID, class, severity, confidence, affected
+criteria, exact source location or authority, reachable scenario, observable
+consequence, expected behavior, permitted owner, acceptance assertion, and
+required focused verification. Do not produce findings for harmless preference
+differences.
 
 ## Output
 
-Return one compact artifact containing reviewed task/generation and immutable
-tuple/digests, `sole_parent`, verdict, identity/path-reconciliation status, proof
-audit, targeted-rerun refs, static limits, companion-review refs, and each AC
-exactly once:
+Lead with the verdict and findings. For approval, say explicitly that no
+findings remain. Include a compact review record:
 
 ```yaml
-acceptance_trace:
-  - {ac_id: <ID>, status: <SATISFIED|UNSATISFIED|MATERIAL_DECISION|UNREVIEWABLE>, evidence_refs: [<refs>]}
-code_review:
+review:
+  task: <task id or path>
+  range: <base_sha>..<candidate_sha>
+  verdict: <verdict>
   changed_paths: [<paths>]
-  inspected_impact: [<symbols, callers, consumers, or tests>]
-  covered_concerns: [<focused code-review concerns>]
-  adversarial_probe: {invariant: <text>, counterexample: <text>, evidence_refs: [<refs>], outcome: <SURVIVED|FINDING|STATIC_LIMIT>}
-  companion_reviews: [<artifact refs>]
+  verification: [<commands and outcomes>]
+  static_limits: [<pre-existing or untestable limits>]
+acceptance_trace:
+  - {ac_id: <ID>, status: <SATISFIED|UNSATISFIED|MATERIAL_DECISION|UNREVIEWABLE>, evidence_refs: [<source/test/proof refs>]}
+code_review:
+  inspected_impact: [<symbols, callers, consumers, tests>]
+  covered_concerns: [<focused concerns>]
+  adversarial_probe:
+    invariant: <most dangerous changed invariant>
+    counterexample: <strongest reachable counterexample>
+    evidence_refs: [<source/test/proof refs>]
+    outcome: <SURVIVED|FINDING|STATIC_LIMIT>
 ```
 
-Verdicts are `APPROVE`, `REMEDIATION_REQUIRED`,
-`TASK_CONTRACT_REPAIR_REQUIRED`, `MATERIAL_DECISION_REQUIRED`, or
-`REVIEW_BLOCKED`. Each finding records stable ID, class, severity, confidence,
-affected AC IDs, exact source location and authority, reachable scenario,
-evidence refs, observable consequence, expected behavior, owners, observable
-acceptance assertions, and required verification command IDs/assertion IDs.
+Keep the artifact concise. Do not paste logs or restate the task. A direct
+human-readable review is preferred over empty procedural fields.
 
-`APPROVE` requires valid identity, reconciled actual paths, adequate passing
-proof, every AC satisfied, a completed code-review record with a surviving
-adversarial probe or declared static limit, and no findings. Never repeat packet AC prose,
-commands, implementation evidence, nested evidence, or logs.
+## Boundary
 
-## Terminal boundary
-
-This skill owns candidate-local code correctness, task/AC/proof conformance,
-immediate consumer closure, and bounded code quality. `$wyrd-review-and-plan-v3`
-owns cross-candidate seams, aggregate intent and plan closure, accumulated
-architecture or contract drift, contradictory candidate evidence, integrated
-journey implications, and push readiness. Terminal review reopens candidate-
-local implementation only when an integrated seam or evidence inconsistency
-makes the accepted candidate review suspect; it does not mechanically repeat
-every leaf review.
+This skill owns candidate-local correctness, task conformance, immediate
+consumer closure, and focused verification. `wyrd-review-and-plan-v3` owns
+cross-candidate seams, aggregate plan closure, integrated drift, and final push
+readiness.

@@ -254,3 +254,267 @@ fn run_failure<E: std::fmt::Display>(
         detail: format!("could not {action} staged run {run}: {error}"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    use super::*;
+    use crate::catalog::{TableRef, TimeGranularity, TimePartition};
+    use crate::namespaces::BifrostNamespace;
+    use crate::scribe::assembly::StagedMemberId;
+    use crate::scribe::hot_source::GenerationOrdinal;
+    use crate::scribe::seal_key::SealKey;
+    use wyrd_spec::ids::DataTenantId;
+
+    /// Builds the two-column schema every staged fixture run is written under.
+    fn fixture_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("ordinal", DataType::Int64, false),
+            Field::new("label", DataType::Utf8, false),
+        ]))
+    }
+
+    /// Writes one staged run holding `rows` sequential ordinals and labels.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot write its own run, which would be a
+    /// fixture bug rather than reader behavior.
+    fn write_run(directory: &Path, name: &str, rows: i64) -> PathBuf {
+        let schema = fixture_schema();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..rows)),
+                Arc::new(StringArray::from_iter_values(
+                    (0..rows).map(|ordinal| format!("row-{ordinal}")),
+                )),
+            ],
+        )
+        .expect("fixture staged batch");
+        let path = directory.join(name);
+        let file = std::fs::File::create(&path).expect("fixture staged run file");
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(file, schema, None).expect("fixture run writer");
+        writer.write(&batch).expect("fixture run rows");
+        writer.close().expect("fixture run footer");
+        path
+    }
+
+    /// Builds one staged source over `runs` covering the given WAL range.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixed partition literal is not a valid day boundary.
+    fn source(generation: u64, runs: Vec<PathBuf>, wal: (u64, u64)) -> StagedSource {
+        StagedSource {
+            key: SealKey::new(
+                DataTenantId::new_v7(),
+                TableRef::new(BifrostNamespace::Bifrost, "events"),
+                TimePartition::new(
+                    TimeGranularity::Day,
+                    chrono::DateTime::from_timestamp(1_772_150_400, 0)
+                        .expect("a fixed representable instant"),
+                )
+                .expect("a fixed day boundary"),
+            ),
+            generation: GenerationOrdinal::new(0, generation),
+            member: StagedMemberId::new(0, generation),
+            runs,
+            bytes: 4_096,
+            wal: (WalLsn::new(wal.0), WalLsn::new(wal.1)),
+        }
+    }
+
+    /// Builds an unbounded read requesting `columns` under an empty cut.
+    fn unbounded(columns: &[String]) -> StagedTailRead<'_> {
+        StagedTailRead {
+            required_columns: columns,
+            limits: ReadableBatchLimits {
+                max_batches: usize::MAX,
+                max_retained_bytes: usize::MAX,
+            },
+            persisted_cursor: WalLsn::ZERO,
+            persisted_ranges: &[],
+        }
+    }
+
+    /// A staged read returns the requested columns in the caller's order.
+    ///
+    /// Oracle binds a projected batch positionally, so file order is not good
+    /// enough: a run written `(ordinal, label)` must come back `(label,
+    /// ordinal)` when that is what the caller asked for, and must carry no
+    /// column the caller did not ask for.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the projection is dropped, reordered wrongly, or widened.
+    #[test]
+    fn a_staged_read_projects_exactly_the_requested_columns_in_caller_order() {
+        let root = tempfile::tempdir().expect("staged root");
+        let run = write_run(root.path(), "run-1.parquet", 4);
+        let columns = vec!["label".to_owned(), "ordinal".to_owned()];
+        let batches = StagedTailReader::default()
+            .read(&[source(1, vec![run], (1, 9))], &unbounded(&columns))
+            .expect("the staged run reads");
+
+        assert_eq!(batches.len(), 1);
+        let rows = &batches[0].rows;
+        assert_eq!(rows.num_columns(), 2);
+        assert_eq!(rows.schema().field(0).name(), "label");
+        assert_eq!(rows.schema().field(1).name(), "ordinal");
+        assert_eq!(
+            batches[0].origin,
+            HotBatchOrigin::StagedMember {
+                member: StagedMemberId::new(0, 1)
+            }
+        );
+    }
+
+    /// A read stops at the caller's batch ceiling instead of draining a member.
+    ///
+    /// The ceiling is what keeps one large staged member from materializing
+    /// unboundedly into a query, and the oldest source is read first so the
+    /// truncated answer is a prefix rather than an arbitrary subset.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the reader returns more batches than the ceiling allows or
+    /// serves them out of source order.
+    #[test]
+    fn a_staged_read_stops_at_the_caller_batch_ceiling_oldest_first() {
+        let root = tempfile::tempdir().expect("staged root");
+        let first = write_run(root.path(), "run-1.parquet", 2);
+        let second = write_run(root.path(), "run-2.parquet", 2);
+        let columns = Vec::new();
+        let read = StagedTailRead {
+            required_columns: &columns,
+            limits: ReadableBatchLimits {
+                max_batches: 1,
+                max_retained_bytes: usize::MAX,
+            },
+            persisted_cursor: WalLsn::ZERO,
+            persisted_ranges: &[],
+        };
+        let batches = StagedTailReader::default()
+            .read(
+                &[
+                    source(1, vec![first], (1, 9)),
+                    source(2, vec![second], (10, 19)),
+                ],
+                &read,
+            )
+            .expect("the staged runs read");
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0].origin,
+            HotBatchOrigin::StagedMember {
+                member: StagedMemberId::new(0, 1)
+            },
+            "the oldest source must be the one the truncated read returns"
+        );
+    }
+
+    /// A member the pinned cut fully owns is suppressed; a partly covered one is not.
+    ///
+    /// Suppression prevents double-counting rows the published object already
+    /// serves. Partial coverage cannot suppress: a member is one indivisible
+    /// staged unit, so dropping it for a partly published range would hide the
+    /// rest of its rows entirely.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fully covered member is still served or a partly covered
+    /// one is dropped.
+    #[test]
+    fn a_pinned_cut_suppresses_only_the_members_it_fully_owns() {
+        let root = tempfile::tempdir().expect("staged root");
+        let covered = write_run(root.path(), "covered.parquet", 2);
+        let partial = write_run(root.path(), "partial.parquet", 2);
+        let columns = Vec::new();
+        let read = StagedTailRead {
+            required_columns: &columns,
+            limits: ReadableBatchLimits {
+                max_batches: usize::MAX,
+                max_retained_bytes: usize::MAX,
+            },
+            persisted_cursor: WalLsn::new(9),
+            persisted_ranges: &[],
+        };
+        let batches = StagedTailReader::default()
+            .read(
+                &[
+                    source(1, vec![covered], (1, 9)),
+                    source(2, vec![partial], (5, 19)),
+                ],
+                &read,
+            )
+            .expect("the staged runs read");
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0].origin,
+            HotBatchOrigin::StagedMember {
+                member: StagedMemberId::new(0, 2)
+            },
+            "only the member whose whole range the cut owns is suppressed"
+        );
+    }
+
+    /// A published non-prefix range suppresses the member it fully contains.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a member covered by an independently published range is
+    /// still served.
+    #[test]
+    fn a_published_range_suppresses_the_member_it_contains() {
+        let root = tempfile::tempdir().expect("staged root");
+        let run = write_run(root.path(), "run-1.parquet", 2);
+        let columns = Vec::new();
+        let ranges = [(WalLsn::new(10), WalLsn::new(30))];
+        let read = StagedTailRead {
+            required_columns: &columns,
+            limits: ReadableBatchLimits {
+                max_batches: usize::MAX,
+                max_retained_bytes: usize::MAX,
+            },
+            persisted_cursor: WalLsn::ZERO,
+            persisted_ranges: &ranges,
+        };
+        let batches = StagedTailReader::default()
+            .read(&[source(1, vec![run], (12, 20))], &read)
+            .expect("the staged run reads");
+
+        assert!(batches.is_empty());
+    }
+
+    /// A required column the run does not carry is refused, naming the run.
+    ///
+    /// A staged run written under a different schema than the reader was told
+    /// to expect is durable-evidence drift, so the read fails closed instead of
+    /// silently returning a narrower batch.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the read succeeds or refuses without naming the run.
+    #[test]
+    fn a_missing_required_column_refuses_and_names_the_run() {
+        let root = tempfile::tempdir().expect("staged root");
+        let run = write_run(root.path(), "run-1.parquet", 2);
+        let columns = vec!["absent".to_owned()];
+        let error = StagedTailReader::default()
+            .read(&[source(1, vec![run], (1, 9))], &unbounded(&columns))
+            .expect_err("a column the run does not carry is refused");
+
+        let detail = error.to_string();
+        assert!(detail.contains("absent"), "{detail}");
+        assert!(detail.contains("run-1.parquet"), "{detail}");
+    }
+}

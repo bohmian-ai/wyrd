@@ -190,6 +190,23 @@ impl TenantScribeLedger {
     }
 }
 
+/// One in-progress charge, as every bound in the ledger sees it.
+///
+/// Carried as one value rather than five parameters because the bounds are
+/// evaluated in sequence and each must see exactly the same request; threading
+/// the parts separately is how they would drift apart.
+#[derive(Debug, Clone, Copy)]
+struct ChargeRequest<'a> {
+    /// Who is charging.
+    key: &'a ContentionKey,
+    /// Which governed category the charge lands in.
+    category: ContentionCategory,
+    /// How much the caller asked for.
+    amount: usize,
+    /// The lifecycle vector's component in this category.
+    quantum: usize,
+}
+
 /// Mutable ledger state guarded by one lock.
 ///
 /// Owners and waiting demand move together under the same lock so a concurrent
@@ -308,6 +325,80 @@ impl LedgerState {
         self.demand
             .iter()
             .any(|record| &record.key == key && record.competes_in(category))
+    }
+
+    /// Returns what one table effectively wants in a category right now.
+    ///
+    /// Its committed amount, plus the caller's request when it *is* the caller,
+    /// plus the rest of a lifecycle quantum when it is queued and still
+    /// unserved. That last term is what makes a refused contender visible to the
+    /// fairness computation at all: without it a contender that holds nothing
+    /// reads as wanting nothing, and every incumbent would be levelled against
+    /// zero.
+    fn effective_demand(
+        &self,
+        owner: &ContentionKey,
+        held: usize,
+        request: &ChargeRequest<'_>,
+    ) -> usize {
+        if owner == request.key {
+            return held.saturating_add(request.amount);
+        }
+        if self.has_demand(owner, request.category) {
+            return held.max(request.quantum);
+        }
+        held
+    }
+
+    /// Returns every live tenant's effective demand, and the caller's own.
+    fn tenant_demands(&self, request: &ChargeRequest<'_>) -> (Vec<usize>, usize) {
+        let mut demands = Vec::with_capacity(self.tenants.len());
+        let mut charging = 0;
+        for (tenant, cell) in &self.tenants {
+            let demand: usize = cell
+                .tables
+                .iter()
+                .map(|(table, usage)| {
+                    let owner = ContentionKey::new(*tenant, table.clone());
+                    self.effective_demand(&owner, usage.get(request.category), request)
+                })
+                .sum();
+            if tenant == &request.key.tenant {
+                charging = demand;
+            }
+            demands.push(demand);
+        }
+        (demands, charging)
+    }
+
+    /// Returns the charging tenant's table demands, the caller's own, and its held amount.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContentionRefusal::Inactive`] when the charging tenant lost its
+    /// cell between checks, which the caller treats as an inactive table.
+    fn table_demands(
+        &self,
+        request: &ChargeRequest<'_>,
+    ) -> Result<(Vec<usize>, usize, usize), ContentionRefusal> {
+        let tenant = self
+            .tenants
+            .get(&request.key.tenant)
+            .ok_or(ContentionRefusal::Inactive)?;
+        let mut demands = Vec::with_capacity(tenant.tables.len());
+        let mut charging = 0;
+        let mut held = 0;
+        for (table, cell) in &tenant.tables {
+            let owner = ContentionKey::new(request.key.tenant, table.clone());
+            let usage = cell.get(request.category);
+            let demand = self.effective_demand(&owner, usage, request);
+            if table == &request.key.table {
+                held = usage;
+                charging = demand;
+            }
+            demands.push(demand);
+        }
+        Ok((demands, charging, held))
     }
 
     /// Counts distinct matching demand keys registered before `key`'s own record.
@@ -720,7 +811,12 @@ impl ScribeContentionLedger {
         category: ContentionCategory,
         amount: usize,
     ) -> Result<(), ContentionRefusal> {
-        let quantum = self.reserve_vector().component(category);
+        let request = ChargeRequest {
+            key,
+            category,
+            amount,
+            quantum: self.reserve_vector().component(category),
+        };
         let capacity = self.capacity.component(category);
         let mut state = self.lock()?;
         state.prune_demand(Instant::now());
@@ -730,8 +826,8 @@ impl ScribeContentionLedger {
 
         // Capacity the queue is holding for contenders ahead of this caller.
         let reserved = state
-            .reserved_ahead(key, category, quantum)
-            .saturating_mul(quantum)
+            .reserved_ahead(key, category, request.quantum)
+            .saturating_mul(request.quantum)
             .min(capacity);
         let available = capacity - reserved;
 
@@ -746,93 +842,23 @@ impl ScribeContentionLedger {
             .map(|tenant| tenant.committed(category))
             .sum();
         if pod_committed.saturating_add(amount) > available {
-            return Err(self.refuse(
-                &mut state,
-                key,
-                category,
-                "pod",
-                available,
-                pod_committed,
-                amount,
-            ));
+            return Err(self.refuse(&mut state, &request, "pod", available, pod_committed));
         }
 
-        // Tenant level. A table's demand is what it holds, plus this request if
-        // it is the caller, plus the rest of a lifecycle quantum if it is queued
-        // and still unserved. That last term is what makes a refused contender
-        // visible to the fairness computation at all: without it a contender
-        // that holds nothing reads as wanting nothing, and every incumbent would
-        // be levelled against zero.
-        let effective = |owner: &ContentionKey, cell: &TenantTableLedger| -> usize {
-            let held = cell.get(category);
-            if owner == key {
-                return held.saturating_add(amount);
-            }
-            if state.has_demand(owner, category) {
-                return held.max(quantum);
-            }
-            held
-        };
-        let mut tenant_demands: Vec<usize> = Vec::with_capacity(state.tenants.len());
-        let mut charging_tenant_demand = 0;
-        for (tenant, cell) in &state.tenants {
-            let demand: usize = cell
-                .tables
-                .iter()
-                .map(|(table, usage)| effective(&ContentionKey::new(*tenant, table.clone()), usage))
-                .sum();
-            if tenant == &key.tenant {
-                charging_tenant_demand = demand;
-            }
-            tenant_demands.push(demand);
-        }
+        let (mut tenant_demands, charging_tenant) = state.tenant_demands(&request);
         let tenant_level = max_min_level(available, &mut tenant_demands);
-        let tenant_held = state
-            .tenants
-            .get(&key.tenant)
-            .map_or(0, |cell| cell.committed(category));
-        if charging_tenant_demand > tenant_level {
-            return Err(self.refuse(
-                &mut state,
-                key,
-                category,
-                "tenant",
-                tenant_level,
-                tenant_held,
-                amount,
-            ));
+        if charging_tenant > tenant_level {
+            let held = state
+                .tenants
+                .get(&key.tenant)
+                .map_or(0, |cell| cell.committed(category));
+            return Err(self.refuse(&mut state, &request, "tenant", tenant_level, held));
         }
 
-        // Table level: the charging tenant's own allowance, divided max-min
-        // across its live tables.
-        let tenant_allowance = tenant_level.min(available);
-        let tenant_cell = state
-            .tenants
-            .get(&key.tenant)
-            .ok_or(ContentionRefusal::Inactive)?;
-        let mut table_demands: Vec<usize> = Vec::with_capacity(tenant_cell.tables.len());
-        let mut charging_table_demand = 0;
-        let mut table_held = 0;
-        for (table, cell) in &tenant_cell.tables {
-            let owner = ContentionKey::new(key.tenant, table.clone());
-            let demand = effective(&owner, cell);
-            if table == &key.table {
-                table_held = cell.get(category);
-                charging_table_demand = demand;
-            }
-            table_demands.push(demand);
-        }
-        let table_level = max_min_level(tenant_allowance, &mut table_demands);
-        if charging_table_demand > table_level {
-            return Err(self.refuse(
-                &mut state,
-                key,
-                category,
-                "table",
-                table_level,
-                table_held,
-                amount,
-            ));
+        let (mut table_demands, charging_table, table_held) = state.table_demands(&request)?;
+        let table_level = max_min_level(tenant_level.min(available), &mut table_demands);
+        if charging_table > table_level {
+            return Err(self.refuse(&mut state, &request, "table", table_level, table_held));
         }
 
         if let Some(cell) = state
@@ -840,7 +866,7 @@ impl ScribeContentionLedger {
             .get_mut(&key.tenant)
             .and_then(|tenant| tenant.tables.get_mut(&key.table))
         {
-            cell.set(category, charging_table_demand);
+            cell.set(category, charging_table);
         }
         // The caller got what it asked for, so it stops holding the queue.
         state
@@ -857,20 +883,18 @@ impl ScribeContentionLedger {
     fn refuse(
         &self,
         state: &mut LedgerState,
-        key: &ContentionKey,
-        category: ContentionCategory,
+        request: &ChargeRequest<'_>,
         scope: &'static str,
         ceiling: usize,
         held: usize,
-        requested: usize,
     ) -> ContentionRefusal {
-        self.enqueue_demand(state, key, Some(category));
+        self.enqueue_demand(state, request.key, Some(request.category));
         ContentionRefusal::Exhausted {
             scope,
-            category: category.label(),
+            category: request.category.label(),
             ceiling,
             held,
-            requested,
+            requested: request.amount,
         }
     }
 

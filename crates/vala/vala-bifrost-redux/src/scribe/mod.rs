@@ -34,6 +34,7 @@ pub mod seal;
 pub mod seal_key;
 pub mod shards;
 pub(crate) mod staging;
+pub mod staging_runtime;
 pub mod stream_identity;
 pub mod tail_rpc;
 pub mod telemetry;

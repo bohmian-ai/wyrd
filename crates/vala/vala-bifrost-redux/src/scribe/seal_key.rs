@@ -99,6 +99,83 @@ impl ScribeArtifactIdentity {
     }
 }
 
+/// Durable identity shared by every object one assembly claim publishes.
+///
+/// A claim spans several shard lanes, so unlike [`ScribeArtifactIdentity`] it
+/// carries no shard: the claim digest is what distinguishes one published set
+/// from another. That digest is derived from the claim's exact members, so the
+/// base is stable across a retry of the same publication and an interrupted
+/// upload converges on the identical object instead of leaving a second copy
+/// of the same rows behind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScribeClaimIdentity {
+    /// Tenant-qualified object prefix for the logical table.
+    object_prefix: String,
+    /// Exact partition every member of the claim represents.
+    partition: TimePartition,
+    /// Producing Scribe node without UUID punctuation.
+    node_id: String,
+    /// Producing Scribe writer epoch.
+    writer_epoch: i64,
+    /// Claim digest distinguishing this member set from any other.
+    claim: String,
+    /// Inclusive minimum WAL LSN the claim's members cover.
+    wal_lsn_min: u64,
+    /// Inclusive maximum WAL LSN the claim's members cover.
+    wal_lsn_max: u64,
+}
+
+impl ScribeClaimIdentity {
+    /// Constructs the durable claim identity after validating its node.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when `node_id` is not a UUID or when the WAL
+    /// range the claim's members union to is reversed.
+    pub(crate) fn new(
+        binding: &TenantTableBinding,
+        partition: TimePartition,
+        node_id: &str,
+        writer_epoch: i64,
+        claim: &crate::scribe::assembly::StagingClaimId,
+        wal_lsn_min: u64,
+        wal_lsn_max: u64,
+    ) -> Result<Self, ScribeError> {
+        let node_id = uuid::Uuid::parse_str(node_id).map_err(|error| ScribeError::Internal {
+            detail: format!("node_id is not a valid UUID: {error}"),
+        })?;
+        if wal_lsn_min > wal_lsn_max {
+            return Err(ScribeError::Internal {
+                detail: "Scribe claim WAL range is reversed".to_owned(),
+            });
+        }
+        Ok(Self {
+            object_prefix: binding.object_prefix.clone(),
+            partition,
+            node_id: node_id.simple().to_string(),
+            writer_epoch,
+            claim: claim.to_string(),
+            wal_lsn_min,
+            wal_lsn_max,
+        })
+    }
+
+    /// Returns the deterministic base shared by every object of the claim.
+    #[must_use]
+    pub(crate) fn object_base(&self) -> String {
+        format!(
+            "{}/{}/scribe-{}-epoch-{}-claim-{}-wal-{}-{}",
+            self.object_prefix,
+            self.partition.as_path_components(),
+            self.node_id,
+            self.writer_epoch,
+            self.claim,
+            self.wal_lsn_min,
+            self.wal_lsn_max,
+        )
+    }
+}
+
 /// Seal key — `(DataTenantId, TableRef, TimePartition)` identifying one
 /// WAL/memtable/seal scope.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

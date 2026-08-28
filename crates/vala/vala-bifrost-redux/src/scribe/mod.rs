@@ -285,6 +285,8 @@ pub struct ScribeImpl {
     writer_epoch: i64,
     /// Pod-global request and shard admission counters.
     admission: AdmissionController,
+    /// Pod-wide closed hot-path telemetry owner.
+    telemetry: Arc<telemetry::ScribeTelemetry>,
     /// Scribe-only child capability over the pod-global Bifrost governor.
     memory: crate::resources::ScribeResources,
     /// Immutable boot-selected ingest ceilings shared with Gate.
@@ -1217,6 +1219,7 @@ impl ScribeImpl {
             &coordination_runtime,
         );
         let pressure_config = ScribePressureConfig::new(75, 50, seal_max_age);
+        let telemetry = admission.contention().telemetry_handle();
         Self::install_boot_metrics(wal.bytes_on_disk());
         Ok(Self {
             catalog,
@@ -1225,6 +1228,7 @@ impl ScribeImpl {
             stream,
             writer_epoch,
             admission,
+            telemetry,
             memory,
             ingest_limits,
             pressure_config,
@@ -1372,6 +1376,15 @@ impl ScribeImpl {
         }
         #[cfg(any(test, feature = "test-support"))]
         self.shutdown_draining_notify.notify_waiters();
+        let drain = self.telemetry.start_effect(
+            telemetry::ScribeEffect::DrainStarted,
+            telemetry::ScribeEffect::DrainSettled,
+            telemetry::ScribeEffectFacts {
+                outcome: telemetry::ScribeEffectOutcome::Started,
+                reason: telemetry::ScribeEffectReason::Shutdown,
+                ..telemetry::ScribeEffectFacts::default()
+            },
+        );
         let mut cancellation_finalizer = ShutdownCancellationFinalizer {
             scribe: self,
             armed: true,
@@ -1449,6 +1462,19 @@ impl ScribeImpl {
         metrics::histogram!("bifrost_scribe_shutdown_seconds")
             .record(started.elapsed().as_secs_f64());
         cancellation_finalizer.disarm();
+        drain.settle(
+            if graceful {
+                telemetry::ScribeEffectOutcome::Success
+            } else {
+                telemetry::ScribeEffectOutcome::Failed
+            },
+            if graceful {
+                telemetry::ScribeEffectReason::Drained
+            } else {
+                telemetry::ScribeEffectReason::Deadline
+            },
+            0,
+        );
         graceful
     }
 
@@ -1477,8 +1503,24 @@ impl ScribeImpl {
             }
         }
         self.begin_shutdown();
+        self.telemetry.record_effect(
+            telemetry::ScribeEffect::CancellationStarted,
+            telemetry::ScribeEffectFacts {
+                outcome: telemetry::ScribeEffectOutcome::Started,
+                reason: telemetry::ScribeEffectReason::Deadline,
+                ..telemetry::ScribeEffectFacts::default()
+            },
+        );
         self.close_lanes();
         self.finalize_shutdown_owners();
+        self.telemetry.record_effect(
+            telemetry::ScribeEffect::CancellationSettled,
+            telemetry::ScribeEffectFacts {
+                outcome: telemetry::ScribeEffectOutcome::Success,
+                reason: telemetry::ScribeEffectReason::OwnersAborted,
+                ..telemetry::ScribeEffectFacts::default()
+            },
+        );
     }
 
     /// Abort retained async owners and publish the terminal stopped state.
@@ -1638,6 +1680,13 @@ impl ScribeImpl {
     #[cfg(any(test, feature = "test-support"))]
     pub fn inflight_items_for_test(&self) -> usize {
         self.admission.snapshot().items
+    }
+
+    /// Capture the complete top-level production telemetry registry.
+    #[must_use]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hot_path_telemetry_for_test(&self) -> telemetry::ScribeHotPathSnapshot {
+        self.telemetry.hot_path_snapshot()
     }
 
     /// Read a governor snapshot enriched with the runtime ingress watermarks.
@@ -2447,6 +2496,43 @@ impl ScribeImpl {
     /// manifest advancement failure, or WAL retirement failure.
     pub async fn replay_wal_async(&self) -> Result<usize, ScribeError> {
         let started = std::time::Instant::now();
+        let replay = self.telemetry.start_effect(
+            telemetry::ScribeEffect::WalReplayStarted,
+            telemetry::ScribeEffect::WalReplaySettled,
+            telemetry::ScribeEffectFacts {
+                outcome: telemetry::ScribeEffectOutcome::Started,
+                reason: telemetry::ScribeEffectReason::Startup,
+                ..telemetry::ScribeEffectFacts::default()
+            },
+        );
+        let result = self.replay_wal_inner().await;
+        if result.is_ok() {
+            self.recovery_ready.store(true, Ordering::Release);
+            metrics::histogram!("bifrost_scribe_replay_seconds")
+                .record(started.elapsed().as_secs_f64());
+        }
+        let (outcome, reason) = if result.is_ok() {
+            (
+                telemetry::ScribeEffectOutcome::Success,
+                telemetry::ScribeEffectReason::Recovery,
+            )
+        } else if self.recovery_cancelled.load(Ordering::Acquire) {
+            (
+                telemetry::ScribeEffectOutcome::Cancelled,
+                telemetry::ScribeEffectReason::Shutdown,
+            )
+        } else {
+            (
+                telemetry::ScribeEffectOutcome::Failed,
+                telemetry::ScribeEffectReason::Retained,
+            )
+        };
+        replay.settle(outcome, reason, 0);
+        result
+    }
+
+    /// Performs WAL recovery after the telemetry lifecycle has been acquired.
+    async fn replay_wal_inner(&self) -> Result<usize, ScribeError> {
         self.recovery_ready.store(false, Ordering::Release);
         if self.recovery_cancelled.load(Ordering::Acquire) {
             return Err(ScribeError::Internal {
@@ -2518,11 +2604,6 @@ impl ScribeImpl {
                 Err(error)
             }
         };
-        if result.is_ok() {
-            self.recovery_ready.store(true, Ordering::Release);
-            metrics::histogram!("bifrost_scribe_replay_seconds")
-                .record(started.elapsed().as_secs_f64());
-        }
         result
     }
 

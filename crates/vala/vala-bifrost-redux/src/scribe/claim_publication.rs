@@ -64,6 +64,8 @@ pub struct ClaimPublisher {
     reconciler: ScribePublicationReconciler,
     /// Pod authority registry whose leases cleanup waits on, when one is owned.
     hot_sources: Option<Arc<crate::scribe::hot_source::ScribeHotSourceRegistry>>,
+    /// Pod-wide production telemetry owner, when composed by the runtime.
+    telemetry: Option<Arc<crate::scribe::telemetry::ScribeTelemetry>>,
 }
 
 impl ClaimPublisher {
@@ -79,7 +81,18 @@ impl ClaimPublisher {
             mover,
             reconciler,
             hot_sources: None,
+            telemetry: None,
         }
+    }
+
+    /// Binds publication to the pod-wide production telemetry owner.
+    #[must_use]
+    pub(crate) fn with_telemetry(
+        mut self,
+        telemetry: Arc<crate::scribe::telemetry::ScribeTelemetry>,
+    ) -> Self {
+        self.telemetry = Some(telemetry);
+        self
     }
 
     /// Binds the authority registry whose staged leases cleanup must respect.
@@ -279,14 +292,48 @@ impl ClaimPublisher {
         )
         .await?;
         let mut chunk = vec![0_u8; PARQUET_TRANSFER_BUFFER_BYTES];
-        let (claims, verified) = self
+        let upload = self.telemetry.as_ref().map(|telemetry| {
+            telemetry.start_effect(
+                crate::scribe::telemetry::ScribeEffect::UploadStarted,
+                crate::scribe::telemetry::ScribeEffect::UploadSettled,
+                crate::scribe::telemetry::ScribeEffectFacts {
+                    bytes: request.claim.encoded_bytes(),
+                    outcome: crate::scribe::telemetry::ScribeEffectOutcome::Started,
+                    reason: crate::scribe::telemetry::ScribeEffectReason::ClaimAssembled,
+                    ..crate::scribe::telemetry::ScribeEffectFacts::default()
+                },
+            )
+        });
+        let uploaded = self
             .mover
             .stage_and_upload_candidate(
                 request.object_base,
                 &request.assembled.artifacts,
                 &mut chunk,
             )
-            .await?;
+            .await;
+        let (claims, verified) = match uploaded {
+            Ok(uploaded) => {
+                if let Some(upload) = upload {
+                    upload.settle(
+                        crate::scribe::telemetry::ScribeEffectOutcome::Success,
+                        crate::scribe::telemetry::ScribeEffectReason::Verified,
+                        u64::try_from(uploaded.1.len()).unwrap_or(u64::MAX),
+                    );
+                }
+                uploaded
+            }
+            Err(error) => {
+                if let Some(upload) = upload {
+                    upload.settle(
+                        crate::scribe::telemetry::ScribeEffectOutcome::Failed,
+                        crate::scribe::telemetry::ScribeEffectReason::UploadRefused,
+                        0,
+                    );
+                }
+                return Err(error);
+            }
+        };
         validate_promotion_records(&rows, &verified)?;
         self.mover
             .persist_publication(
@@ -297,15 +344,89 @@ impl ClaimPublisher {
                 &claims,
             )
             .await?;
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.record_effect(
+                crate::scribe::telemetry::ScribeEffect::PublicationManifestDurable,
+                crate::scribe::telemetry::ScribeEffectFacts {
+                    rows: request.assembled.rows,
+                    bytes: request.claim.encoded_bytes(),
+                    artifacts: u64::try_from(rows.len()).unwrap_or(u64::MAX),
+                    outcome: crate::scribe::telemetry::ScribeEffectOutcome::Success,
+                    reason: crate::scribe::telemetry::ScribeEffectReason::Fsynced,
+                },
+            );
+        }
+        let file_list = self.telemetry.as_ref().map(|telemetry| {
+            telemetry.start_effect(
+                crate::scribe::telemetry::ScribeEffect::FileListCommitStarted,
+                crate::scribe::telemetry::ScribeEffect::FileListCommitSettled,
+                crate::scribe::telemetry::ScribeEffectFacts {
+                    rows: request.assembled.rows,
+                    artifacts: u64::try_from(rows.len()).unwrap_or(u64::MAX),
+                    outcome: crate::scribe::telemetry::ScribeEffectOutcome::Started,
+                    reason: crate::scribe::telemetry::ScribeEffectReason::ManifestDurable,
+                    ..crate::scribe::telemetry::ScribeEffectFacts::default()
+                },
+            )
+        });
         let outcome = match self.reconciler.publish(&rows, &events).await {
-            ScribePublicationOutcome::Committed(outcome) => outcome,
+            ScribePublicationOutcome::Committed(outcome) => {
+                if let Some(file_list) = file_list {
+                    file_list.settle(
+                        crate::scribe::telemetry::ScribeEffectOutcome::Success,
+                        crate::scribe::telemetry::ScribeEffectReason::Committed,
+                        u64::try_from(rows.len()).unwrap_or(u64::MAX),
+                    );
+                }
+                outcome
+            }
             ScribePublicationOutcome::UnknownCommitOutcome(error)
-            | ScribePublicationOutcome::KnownNotCommitted(error) => return Err(error),
+            | ScribePublicationOutcome::KnownNotCommitted(error) => {
+                if let Some(file_list) = file_list {
+                    file_list.settle(
+                        crate::scribe::telemetry::ScribeEffectOutcome::Failed,
+                        crate::scribe::telemetry::ScribeEffectReason::Retained,
+                        u64::try_from(rows.len()).unwrap_or(u64::MAX),
+                    );
+                }
+                return Err(error);
+            }
         };
         let object_identities: Vec<String> = rows.iter().map(|row| row.file_path.clone()).collect();
         self.advance_published(&request, &object_identities)?;
-        self.retire_members(&request, &outcome.commit_key, &object_identities)
-            .await?;
+        let cleanup = self.telemetry.as_ref().map(|telemetry| {
+            telemetry.start_effect(
+                crate::scribe::telemetry::ScribeEffect::CleanupStarted,
+                crate::scribe::telemetry::ScribeEffect::CleanupSettled,
+                crate::scribe::telemetry::ScribeEffectFacts {
+                    bytes: request.claim.encoded_bytes(),
+                    artifacts: u64::try_from(request.claim.members().len()).unwrap_or(u64::MAX),
+                    outcome: crate::scribe::telemetry::ScribeEffectOutcome::Started,
+                    reason: crate::scribe::telemetry::ScribeEffectReason::Published,
+                    ..crate::scribe::telemetry::ScribeEffectFacts::default()
+                },
+            )
+        });
+        if let Err(error) = self
+            .retire_members(&request, &outcome.commit_key, &object_identities)
+            .await
+        {
+            if let Some(cleanup) = cleanup {
+                cleanup.settle(
+                    crate::scribe::telemetry::ScribeEffectOutcome::Failed,
+                    crate::scribe::telemetry::ScribeEffectReason::Retained,
+                    0,
+                );
+            }
+            return Err(error);
+        }
+        if let Some(cleanup) = cleanup {
+            cleanup.settle(
+                crate::scribe::telemetry::ScribeEffectOutcome::Success,
+                crate::scribe::telemetry::ScribeEffectReason::Retired,
+                u64::try_from(request.claim.members().len()).unwrap_or(u64::MAX),
+            );
+        }
         self.mover.cleanup_published(&claims).await?;
         Ok(PublishedClaim {
             commit_key: outcome.commit_key,

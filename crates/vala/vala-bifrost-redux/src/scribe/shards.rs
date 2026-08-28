@@ -718,6 +718,8 @@ pub(crate) enum ShardCommand {
 /// Keeping these values together makes FIFO, replay, memory release, and
 /// shutdown transitions occur only at the shard boundary.
 struct ShardOwner {
+    /// Pod-wide closed hot-path telemetry owner.
+    telemetry: Arc<crate::scribe::telemetry::ScribeTelemetry>,
     /// Stable pod-local shard number used for routing and diagnostics.
     id: usize,
     /// Bounded command mailbox consumed in FIFO order.
@@ -982,6 +984,7 @@ impl ScribeShardRuntime {
         } = config;
         let wal_segment_bytes = geometry.wal_segment_bytes();
         let generation_rotation_bytes = geometry.shard_generation_rotation_usize();
+        let telemetry = admission.contention().telemetry_handle();
         let mut set = ScribeShardSet::<ShardCommand>::new();
         let receivers = set.take_receivers().unwrap_or_default();
         let senders: Vec<ScribeShard<ShardCommand>> =
@@ -1006,6 +1009,7 @@ impl ScribeShardRuntime {
             });
             let (_, pressure_receiver) = &pressure_channels[id];
             let owner = ShardOwner {
+                telemetry: Arc::clone(&telemetry),
                 id,
                 receiver,
                 pressure_receiver: pressure_receiver.clone(),
@@ -1471,7 +1475,18 @@ impl ShardOwner {
     /// Applies one command and returns whether it requested owner shutdown.
     async fn handle_command(&mut self, command: ShardCommand) -> bool {
         match command {
-            ShardCommand::Append(append) => self.scheduler.push(*append),
+            ShardCommand::Append(append) => {
+                self.telemetry.record_effect(
+                    crate::scribe::telemetry::ScribeEffect::RouteDecided,
+                    crate::scribe::telemetry::ScribeEffectFacts {
+                        bytes: u64::try_from(append.prepared_bytes).unwrap_or(u64::MAX),
+                        outcome: crate::scribe::telemetry::ScribeEffectOutcome::Success,
+                        reason: crate::scribe::telemetry::ScribeEffectReason::RecordedShard,
+                        ..crate::scribe::telemetry::ScribeEffectFacts::default()
+                    },
+                );
+                self.scheduler.push(*append);
+            }
             ShardCommand::Snapshot { request, response } => {
                 let _ = response.send(self.snapshot_at(&request));
             }
@@ -2184,6 +2199,29 @@ impl ShardOwner {
                 return Err(error);
             }
             let frozen = self.memtable.freeze(&seal_key)?;
+            let reason = match trigger {
+                Some(SealTriggerReason::Size) => crate::scribe::telemetry::ScribeEffectReason::Size,
+                Some(SealTriggerReason::Age) => crate::scribe::telemetry::ScribeEffectReason::Age,
+                Some(SealTriggerReason::Pressure) => {
+                    crate::scribe::telemetry::ScribeEffectReason::Pressure
+                }
+                None => crate::scribe::telemetry::ScribeEffectReason::Explicit,
+            };
+            for effect in [
+                crate::scribe::telemetry::ScribeEffect::GenerationRotated,
+                crate::scribe::telemetry::ScribeEffect::GenerationFrozen,
+            ] {
+                self.telemetry.record_effect(
+                    effect,
+                    crate::scribe::telemetry::ScribeEffectFacts {
+                        rows: u64::try_from(frozen.row_count()).unwrap_or(u64::MAX),
+                        bytes: u64::try_from(frozen.arrow_bytes).unwrap_or(u64::MAX),
+                        outcome: crate::scribe::telemetry::ScribeEffectOutcome::Success,
+                        reason,
+                        ..crate::scribe::telemetry::ScribeEffectFacts::default()
+                    },
+                );
+            }
             if has_rows && let Some(trigger) = trigger {
                 record_seal(trigger);
             }
@@ -2481,7 +2519,8 @@ impl ShardOwner {
             let Some(retained) = self.retire_committed_generation(generation_id)? else {
                 continue;
             };
-            if let Err(error) = self
+            let retired_segments = u64::try_from(retained.wal_segments.len()).unwrap_or(u64::MAX);
+            match self
                 .wal_io
                 .submit(ScribeWalIoOp::RetireWal {
                     wal: retained.wal,
@@ -2489,7 +2528,18 @@ impl ShardOwner {
                 })
                 .await
             {
-                tracing::warn!(error = %error, generation_id, "WAL retirement submission failed");
+                Ok(_) => self.telemetry.record_effect(
+                    crate::scribe::telemetry::ScribeEffect::WalRetired,
+                    crate::scribe::telemetry::ScribeEffectFacts {
+                        artifacts: retired_segments,
+                        outcome: crate::scribe::telemetry::ScribeEffectOutcome::Success,
+                        reason: crate::scribe::telemetry::ScribeEffectReason::GenerationCommitted,
+                        ..crate::scribe::telemetry::ScribeEffectFacts::default()
+                    },
+                ),
+                Err(error) => {
+                    tracing::warn!(error = %error, generation_id, "WAL retirement submission failed");
+                }
             }
         }
         Ok(())
@@ -3086,6 +3136,52 @@ impl ShardOwner {
     /// prepared ACK waiters receive the same completion error and reservations
     /// are released before the error returns.
     async fn process_group(&mut self, group: Vec<PreparedAppend>) -> Result<(), ScribeError> {
+        let bytes = u64::try_from(
+            group
+                .iter()
+                .map(ShardItem::bytes)
+                .fold(0_usize, usize::saturating_add),
+        )
+        .unwrap_or(u64::MAX);
+        let append = self.telemetry.start_effect(
+            crate::scribe::telemetry::ScribeEffect::WalAppendStarted,
+            crate::scribe::telemetry::ScribeEffect::WalAppendSettled,
+            crate::scribe::telemetry::ScribeEffectFacts {
+                bytes,
+                outcome: crate::scribe::telemetry::ScribeEffectOutcome::Started,
+                reason: crate::scribe::telemetry::ScribeEffectReason::FairGroup,
+                ..crate::scribe::telemetry::ScribeEffectFacts::default()
+            },
+        );
+        let fsync = self.telemetry.start_effect(
+            crate::scribe::telemetry::ScribeEffect::WalFsyncStarted,
+            crate::scribe::telemetry::ScribeEffect::WalFsyncSettled,
+            crate::scribe::telemetry::ScribeEffectFacts {
+                bytes,
+                outcome: crate::scribe::telemetry::ScribeEffectOutcome::Started,
+                reason: crate::scribe::telemetry::ScribeEffectReason::FairGroup,
+                ..crate::scribe::telemetry::ScribeEffectFacts::default()
+            },
+        );
+        let result = self.process_group_inner(group).await;
+        let (outcome, reason) = if result.is_ok() {
+            (
+                crate::scribe::telemetry::ScribeEffectOutcome::Success,
+                crate::scribe::telemetry::ScribeEffectReason::Committed,
+            )
+        } else {
+            (
+                crate::scribe::telemetry::ScribeEffectOutcome::Failed,
+                crate::scribe::telemetry::ScribeEffectReason::Retained,
+            )
+        };
+        append.settle(outcome, reason, 0);
+        fsync.settle(outcome, reason, 0);
+        result
+    }
+
+    /// Executes one group beneath the balanced WAL activity guards.
+    async fn process_group_inner(&mut self, group: Vec<PreparedAppend>) -> Result<(), ScribeError> {
         self.retry_retained_post_commit()?;
         self.rotate_before_append_if_needed(&group)?;
         let mut state = self.write_group(group).await?;
@@ -6254,8 +6350,15 @@ mod tests {
         let (pressure_tx, pressure_receiver) = watch::channel(None);
         let budget =
             crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
+        let admission = AdmissionController::with_config_and_memory(
+            crate::scribe::admission::AdmissionConfig::default(),
+            budget.clone(),
+        )
+        .expect("the default Scribe geometry fits the default test budget");
+        let telemetry = admission.contention().telemetry_handle();
         let _ = wal;
         let owner = ShardOwner {
+            telemetry,
             id: 0,
             receiver,
             pressure_receiver,
@@ -6274,11 +6377,7 @@ mod tests {
             seal_retry: HashSet::new(),
             retained_generations: HashMap::new(),
             retained_commit_ambiguity: None,
-            admission: AdmissionController::with_config_and_memory(
-                crate::scribe::admission::AdmissionConfig::default(),
-                budget.clone(),
-            )
-            .expect("the default Scribe geometry fits the default test budget"),
+            admission,
             memtable,
             persistence_cpu: ScribePersistenceCpuPool::new(1),
             wal_io: ScribeWalIoPool::new(1),

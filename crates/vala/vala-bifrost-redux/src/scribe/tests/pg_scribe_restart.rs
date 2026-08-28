@@ -221,4 +221,37 @@ async fn replay_failure_keeps_scribe_unready() {
         .expect_err("invalid replay must fail");
     assert!(error.to_string().contains("Arrow") || error.to_string().contains("replayed"));
     assert!(!scribe.is_ready());
+    let telemetry = scribe.hot_path_telemetry_for_test();
+    assert_eq!(telemetry.effects["wal_replay.started"], 1);
+    assert_eq!(telemetry.effects["wal_replay.settled"], 1);
+    assert_eq!(telemetry.active, 0, "failed replay balances its RAII owner");
+}
+
+#[tokio::test]
+/// A replay cancelled before startup emits one balanced failed terminal.
+async fn replay_cancellation_balances_telemetry_and_keeps_scribe_unready() {
+    let temp_dir = TempDir::new().expect("WAL directory");
+    let node = NodeId::new(Uuid::now_v7());
+    let operator = Arc::new(
+        opendal::Operator::new(Memory::default())
+            .expect("memory operator")
+            .finish(),
+    );
+    let wal = Arc::new(
+        WalWriter::new(temp_dir.path(), *node.as_bytes(), 1, WalConfig::default())
+            .expect("WAL writer"),
+    );
+    let scribe = ScribeImpl::new_for_embedded_with_deps(operator, wal, &node.to_string(), 1);
+    scribe.abort_shutdown();
+
+    let error = scribe
+        .replay_wal_async()
+        .await
+        .expect_err("cancelled replay must fail closed");
+    assert!(error.to_string().contains("cancelled"));
+    assert!(!scribe.is_ready());
+    let telemetry = scribe.hot_path_telemetry_for_test();
+    assert_eq!(telemetry.effects["wal_replay.started"], 1);
+    assert_eq!(telemetry.effects["wal_replay.settled"], 1);
+    assert_eq!(telemetry.active, 0, "cancelled replay balances its owner");
 }

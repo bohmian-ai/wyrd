@@ -169,7 +169,7 @@ impl ScribeStagingRuntime {
                 members: claim.members().len(),
                 bytes: claim.encoded_bytes(),
                 artifacts: 0,
-                cause: Some(claim.cause().label()),
+                cause: Some(claim.cause()),
             },
         );
     }
@@ -671,6 +671,49 @@ impl ScribeStagingRuntime {
     ) -> Result<PublishedClaim, ScribeError> {
         let context = self.context_for(claim.key())?;
         let object_base = claim_object_base(claim, runs, &context)?;
+        if let Some(telemetry) = &self.telemetry {
+            for artifact in assembled.artifacts.iter() {
+                for group in &artifact.row_group_stats {
+                    telemetry.record_effect(
+                        crate::scribe::telemetry::ScribeEffect::RowGroupFlushed,
+                        crate::scribe::telemetry::ScribeEffectFacts {
+                            rows: u64::try_from(group.row_count).unwrap_or(u64::MAX),
+                            bytes: artifact.file_size,
+                            artifacts: 1,
+                            outcome: crate::scribe::telemetry::ScribeEffectOutcome::Success,
+                            reason: crate::scribe::telemetry::ScribeEffectReason::SealedFooter,
+                        },
+                    );
+                }
+                telemetry.record_effect(
+                    if artifact.file_size >= self.target_object_bytes {
+                        crate::scribe::telemetry::ScribeEffect::TargetObjectClosed
+                    } else {
+                        crate::scribe::telemetry::ScribeEffect::ResidueObjectClosed
+                    },
+                    crate::scribe::telemetry::ScribeEffectFacts {
+                        rows: u64::try_from(artifact.row_count).unwrap_or(u64::MAX),
+                        bytes: artifact.file_size,
+                        artifacts: 1,
+                        outcome: crate::scribe::telemetry::ScribeEffectOutcome::Success,
+                        reason: if artifact.file_size >= self.target_object_bytes {
+                            crate::scribe::telemetry::ScribeEffectReason::TargetReached
+                        } else {
+                            crate::scribe::telemetry::ScribeEffectReason::ClaimExhausted
+                        },
+                    },
+                );
+            }
+        }
+        self.observe(
+            crate::scribe::telemetry::StagingEffect::ClaimAssembled,
+            crate::scribe::telemetry::StagingFacts {
+                members: claim.members().len(),
+                bytes: claim.encoded_bytes(),
+                artifacts: assembled.artifacts.iter().count(),
+                cause: Some(claim.cause()),
+            },
+        );
         let published = match self
             .publisher
             .publish(PublishClaimRequest {
@@ -695,7 +738,7 @@ impl ScribeStagingRuntime {
                 members: claim.members().len(),
                 bytes: claim.encoded_bytes(),
                 artifacts: published.object_identities.len(),
-                cause: Some(claim.cause().label()),
+                cause: Some(claim.cause()),
             },
         );
         self.observe(
@@ -704,7 +747,7 @@ impl ScribeStagingRuntime {
                 members: claim.members().len(),
                 bytes: claim.encoded_bytes(),
                 artifacts: 0,
-                cause: Some(claim.cause().label()),
+                cause: Some(claim.cause()),
             },
         );
         self.settle(claim.id(), published.released_bytes)?;

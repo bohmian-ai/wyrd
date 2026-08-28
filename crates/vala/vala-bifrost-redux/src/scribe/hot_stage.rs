@@ -763,7 +763,7 @@ impl ScribeHotStage {
 }
 
 /// Name of the one durable record file inside a member directory.
-const RECORD_FILE_NAME: &str = "member.staged.json";
+pub(crate) const RECORD_FILE_NAME: &str = "member.staged.json";
 /// Name of the incomplete record a crash may leave behind.
 const TEMPORARY_RECORD_FILE_NAME: &str = "member.staged.json.tmp";
 

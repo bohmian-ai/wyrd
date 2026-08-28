@@ -66,7 +66,7 @@ pub(crate) fn parquet_candidate_incremental_bytes(
 /// sealed footer has been inspected. Dropping it restores those bytes to the
 /// remaining producer reservation without changing aggregate accounting.
 #[derive(Debug)]
-pub(crate) struct EncodedFooterReservation {
+pub struct EncodedFooterReservation {
     /// Exact checked memory reservation backing the footer child.
     reservation: Option<crate::resources::ScribeMemoryLease>,
 }

@@ -17,6 +17,7 @@ pub mod hot_stage;
 mod ingress;
 pub mod manifest;
 mod material_plan;
+pub mod member_stager;
 pub mod memory;
 pub mod memtable;
 mod otlp_managed;

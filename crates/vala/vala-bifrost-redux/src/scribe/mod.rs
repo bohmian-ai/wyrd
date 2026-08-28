@@ -301,6 +301,12 @@ pub struct ScribeImpl {
     /// Shared by the admission path and the periodic age scanner so the
     /// flush-first hysteresis is defined once.
     pressure_config: ScribePressureConfig,
+    /// Validated geometry this Scribe booted with.
+    ///
+    /// Retained so the running service can state the rotation limits and
+    /// assembled-object target it is actually enforcing; the shard owners and
+    /// persistence runtime each received a copy of this same value at start.
+    geometry: geometry::ScribeGeometry,
     /// Shared active/immutable Arrow ownership ledger.
     memory_ownership: memory::ScribeOwnership,
     /// Bounded persistence CPU lane retained for replay and seal preparation.
@@ -593,14 +599,16 @@ pub struct ScribeEmbeddedConfig {
     pub resources: crate::resources::ScribeResources,
     /// Optional bounded publisher for post-commit Forge wake-ups.
     pub staging_file_publisher: Option<StagingFilePublisher>,
-    /// Test-tier override for the existing writer-wide size rotation target.
+    /// Test-tier override for the complete production geometry.
     ///
     /// Production boot constructs [`ScribeBuildConfig`] directly from
-    /// `ScribeRuntimeConfig`; this embedded projection exists only so real
-    /// server journeys can make the already-configurable production boundary
-    /// small without adding a second rotation policy.
+    /// `ScribeRuntimeConfig`; this override exists only so real server journeys
+    /// can scale the already-configurable production controls — rotation
+    /// limits and the assembled-object target — without adding a second
+    /// geometry policy. The value is a validated [`geometry::ScribeGeometry`],
+    /// so a test cannot install a shape production could not boot with.
     #[cfg(any(test, feature = "test-support"))]
-    pub rotation_for_test: Option<ScribeRotationTestConfig>,
+    pub geometry_for_test: Option<geometry::ScribeGeometry>,
 }
 
 impl ScribeEmbeddedConfig {
@@ -612,17 +620,12 @@ impl ScribeEmbeddedConfig {
     ///
     /// # Panics
     ///
-    /// Panics when a test-support rotation override is not a coherent geometry,
-    /// which is a fixture bug rather than an operator input.
+    /// Panics when the embedded default rotation targets are not a coherent
+    /// geometry, which is a construction invariant rather than an input.
     fn geometry(&self, wal: &wal::WalWriter) -> geometry::ScribeGeometry {
         #[cfg(any(test, feature = "test-support"))]
-        if let Some(rotation) = self.rotation_for_test {
-            return geometry::ScribeGeometry::for_uniform_shard_rotation(
-                rotation.wal_rotation_bytes,
-                rotation.memtable_rotation_bytes,
-                rotation.memtable_max_age,
-            )
-            .expect("a test-support rotation override must be a coherent geometry");
+        if let Some(geometry) = self.geometry_for_test {
+            return geometry;
         }
         geometry::ScribeGeometry::for_uniform_shard_rotation(
             wal.segment_bytes(),
@@ -631,18 +634,6 @@ impl ScribeEmbeddedConfig {
         )
         .expect("the embedded default rotation targets form a coherent geometry")
     }
-}
-
-/// Test-only projection of the existing production rotation thresholds.
-#[cfg(any(test, feature = "test-support"))]
-#[derive(Debug, Clone, Copy)]
-pub struct ScribeRotationTestConfig {
-    /// Target bytes for a non-empty WAL generation before whole-shard rotation.
-    pub wal_rotation_bytes: u64,
-    /// Target bytes for one active shard memtable before whole-shard rotation.
-    pub memtable_rotation_bytes: usize,
-    /// Maximum active shard-generation age before whole-shard rotation.
-    pub memtable_max_age: Duration,
 }
 
 /// Composes the embedded Scribe capability through the production root path.
@@ -749,6 +740,17 @@ impl ScribeImpl {
     pub const fn writer_epoch_for_test(&self) -> i64 {
         self.writer_epoch
     }
+
+    /// Return the validated geometry this Scribe actually booted with.
+    ///
+    /// A scaled production test configures the geometry through the server and
+    /// then asserts against what is running, rather than assuming the override
+    /// reached the shard owners.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub const fn geometry_for_test(&self) -> geometry::ScribeGeometry {
+        self.geometry
+    }
     /// Construct a new `ScribeImpl` with empty memtable and provided dependencies.
     pub fn new_for_embedded_with_deps(
         operator: Arc<opendal::Operator>,
@@ -791,7 +793,7 @@ impl ScribeImpl {
                 resources,
                 staging_file_publisher: None,
                 #[cfg(any(test, feature = "test-support"))]
-                rotation_for_test: None,
+                geometry_for_test: None,
             },
         )
     }
@@ -854,7 +856,7 @@ impl ScribeImpl {
                 resources,
                 staging_file_publisher: None,
                 #[cfg(any(test, feature = "test-support"))]
-                rotation_for_test: None,
+                geometry_for_test: None,
             },
         )
     }
@@ -997,7 +999,7 @@ impl ScribeImpl {
                 resources,
                 staging_file_publisher: None,
                 #[cfg(any(test, feature = "test-support"))]
-                rotation_for_test: None,
+                geometry_for_test: None,
             },
         )
     }
@@ -1226,6 +1228,7 @@ impl ScribeImpl {
             memory,
             ingest_limits,
             pressure_config,
+            geometry,
             memory_ownership,
             hot_sources,
             persistence_cpu,
@@ -1986,10 +1989,11 @@ mod constructor_rotation_tests {
     /// Embedded construction applies every explicitly selected test-tier
     /// threshold to the same shard-owner graph used by production boot.
     #[tokio::test]
-    async fn embedded_constructor_applies_rotation_for_test_override() {
+    async fn embedded_constructor_applies_geometry_for_test_override() {
         let segment_bytes = 41 * 1024 * 1024;
         let memtable_bytes = 23 * 1024 * 1024;
         let max_age = Duration::from_secs(7);
+        let scaled_target_bytes = 3 * 1024 * 1024;
         let wal_root = tempfile::tempdir().expect("WAL root");
         let wal = Arc::new(
             wal::WalWriter::new(
@@ -2030,11 +2034,16 @@ mod constructor_rotation_tests {
                 persistence: None,
                 resources: embedded_scribe_resources(&admission),
                 staging_file_publisher: None,
-                rotation_for_test: Some(ScribeRotationTestConfig {
-                    wal_rotation_bytes: segment_bytes,
-                    memtable_rotation_bytes: memtable_bytes,
-                    memtable_max_age: max_age,
-                }),
+                geometry_for_test: Some(
+                    geometry::ScribeGeometry::for_uniform_shard_rotation(
+                        segment_bytes,
+                        memtable_bytes,
+                        max_age,
+                    )
+                    .expect("nondefault geometry")
+                    .with_staging_target_file_size_bytes(scaled_target_bytes)
+                    .expect("scaled assembled-object target"),
+                ),
             },
         )
         .with_ingest_limits_for_test(ingest_limits);
@@ -2044,6 +2053,11 @@ mod constructor_rotation_tests {
             (segment_bytes, memtable_bytes)
         );
         assert_eq!(scribe.pressure_config.seal_max_age, max_age);
+        assert_eq!(
+            scribe.geometry_for_test().staging_target_file_size_bytes(),
+            scaled_target_bytes,
+            "the scaled assembled-object target reaches the running Scribe"
+        );
         assert_eq!(scribe.ingest_limits, ingest_limits);
         scribe
             .shutdown(std::time::Instant::now() + Duration::from_secs(1))

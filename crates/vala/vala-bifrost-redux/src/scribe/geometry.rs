@@ -502,6 +502,37 @@ impl ScribeGeometry {
         )
     }
 
+    /// Returns this geometry with a different assembled-object target.
+    ///
+    /// The target is the one geometry control a scaled production test needs to
+    /// move: proving target roll plus residue at 512 MiB would mean writing
+    /// half a gigabyte per case, while every other control must stay exactly
+    /// what production uses for the proof to mean anything. Revalidating keeps
+    /// a scaled target from producing a geometry `new` would have refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeGeometryError::Zero`] when the target is zero.
+    pub fn with_staging_target_file_size_bytes(
+        self,
+        staging_target_file_size_bytes: u64,
+    ) -> Result<Self, ScribeGeometryError> {
+        Self::new(
+            self.wal_segment_bytes,
+            self.active_generation_budget_bytes,
+            self.generation_rotation_ceiling_bytes,
+            self.generation_max_age,
+            self.seal_key_early_seal_bytes,
+            self.seal_key_max_age,
+            staging_target_file_size_bytes,
+            self.maximum_ingress_envelope_bytes,
+            self.maximum_active_request_ownership_bytes,
+            self.maximum_immutable_member_ownership_bytes,
+            self.minimum_stage_member_bytes,
+            self.minimum_merge_lane_scratch_bytes,
+        )
+    }
+
     /// Returns the per-shard rotation limit as a `usize` byte count.
     ///
     /// Shard owners compare against in-memory sizes, so they need the limit in

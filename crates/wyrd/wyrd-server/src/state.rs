@@ -231,8 +231,12 @@ pub struct BifrostTestControls {
     pub forge_object_store: Option<Arc<dyn vala_bifrost_redux::forge::ForgeObjectStore>>,
     /// Deterministic delay in the existing Scribe WAL IO lane.
     pub scribe_wal_sync_delay: Duration,
-    /// Optional projection of the production Scribe rotation thresholds.
-    pub scribe_rotation: Option<vala_bifrost_redux::scribe::ScribeRotationTestConfig>,
+    /// Optional complete override of the production Scribe geometry.
+    ///
+    /// Scaled production journeys need the assembled-object target and the
+    /// rotation limits moved together; a validated geometry is the one value
+    /// that carries both without introducing a second policy.
+    pub scribe_geometry: Option<vala_bifrost_redux::scribe::geometry::ScribeGeometry>,
     /// Existing Scribe persistence fault controls.
     pub scribe_persistence_faults: vala_bifrost_redux::scribe::persistence::PersistenceFaults,
     /// Optional override of the existing Scribe admission configuration.

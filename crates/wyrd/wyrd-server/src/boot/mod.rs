@@ -623,15 +623,8 @@ pub async fn compose_bifrost(
         #[cfg(feature = "test-support")]
         let geometry = test_controls
             .as_ref()
-            .and_then(|controls| controls.scribe_rotation)
-            .map_or(Ok(configured_geometry), |rotation| {
-                vala_bifrost_redux::scribe::geometry::ScribeGeometry::for_uniform_shard_rotation(
-                    rotation.wal_rotation_bytes,
-                    rotation.memtable_rotation_bytes,
-                    rotation.memtable_max_age,
-                )
-            })
-            .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
+            .and_then(|controls| controls.scribe_geometry)
+            .unwrap_or(configured_geometry);
         #[cfg(not(feature = "test-support"))]
         let geometry = configured_geometry;
         let wal_segment_bytes = geometry.wal_segment_bytes();

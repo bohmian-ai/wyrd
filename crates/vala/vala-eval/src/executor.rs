@@ -50,7 +50,11 @@ use crate::store::{EvalTaskKind, TaskRegistry};
 #[derive(Debug, Clone, PartialEq)]
 pub enum TaskRunOutcome {
     /// The executor produced a result.
-    Ran(AssertionResult),
+    ///
+    /// Boxed because a result is an order of magnitude larger than a skip, and
+    /// every stage collects both in one `Vec`: inline, each skipped task would
+    /// carry a result-sized hole.
+    Ran(Box<AssertionResult>),
     /// The task did not run.
     Skipped {
         /// Skipped task id.
@@ -99,7 +103,7 @@ impl EvalReport {
     /// Iterate over the assertion results of tasks that actually ran.
     pub fn ran(&self) -> impl Iterator<Item = &AssertionResult> + '_ {
         self.outcomes.iter().filter_map(|outcome| match outcome {
-            TaskRunOutcome::Ran(result) => Some(result),
+            TaskRunOutcome::Ran(result) => Some(result.as_ref()),
             TaskRunOutcome::Skipped { .. } => None,
         })
     }
@@ -371,7 +375,7 @@ fn order_stage_outcomes(
         if let Some(skip) = skips_by_id.remove(task_id) {
             ordered.push(skip);
         } else if let Some(output) = by_id.remove(task_id) {
-            ordered.push(TaskRunOutcome::Ran(output.result().clone()));
+            ordered.push(TaskRunOutcome::Ran(Box::new(output.result().clone())));
             new_outputs.push((task_id.clone(), Arc::new(output)));
         }
     }
@@ -910,7 +914,7 @@ mod end_to_end {
         for outcome in &report.outcomes {
             match outcome {
                 TaskRunOutcome::Ran(result) => {
-                    ran.insert(result.task_id.clone(), result.clone());
+                    ran.insert(result.task_id.clone(), result.as_ref().clone());
                 }
                 TaskRunOutcome::Skipped { task_id, reason } => {
                     skipped.push((task_id.clone(), reason.clone()));

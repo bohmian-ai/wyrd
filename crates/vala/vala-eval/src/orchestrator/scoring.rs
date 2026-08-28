@@ -211,7 +211,7 @@ impl ScenarioScoring {
                 if let TaskRunOutcome::Ran(result) = outcome {
                     mechanic.push(RecordTaskResult {
                         record_id: record.record_id.clone(),
-                        result,
+                        result: *result,
                     });
                 }
             }

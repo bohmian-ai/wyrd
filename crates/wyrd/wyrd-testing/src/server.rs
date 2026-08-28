@@ -316,6 +316,52 @@ pub struct ForgeTableInspection {
     pub active_attempts: u64,
 }
 
+/// One `vala.file_list` row exactly as the publication columns store it.
+///
+/// The decoding into [`PublishedHotFileInspection`] is deliberately separate:
+/// this type is the SQL shape, and refusing a negative width or an undecodable
+/// promotion record happens once, on the way out of it.
+#[derive(sqlx::FromRow)]
+struct PublishedHotFileRow {
+    /// Durable row identity.
+    id: uuid::Uuid,
+    /// Deterministic object key.
+    file_path: String,
+    /// Recorded object bytes.
+    file_size: i64,
+    /// Recorded row count.
+    row_count: i64,
+    /// Zero-based artifact ordinal.
+    file_ordinal: i16,
+    /// Lowercase SHA-256 of the object.
+    file_checksum: Option<String>,
+    /// Stored promotion evidence.
+    promotion_record: serde_json::Value,
+}
+
+/// One committed Scribe hot object as `vala.file_list` recorded it.
+///
+/// This is the fenced row plus the promotion evidence published with it, so a
+/// production test can compare what Scribe committed against the object that
+/// exists without reconstructing either from the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedHotFileInspection {
+    /// Durable `file_list` row identity.
+    pub id: uuid::Uuid,
+    /// Deterministic object key the row names.
+    pub object_key: String,
+    /// Exact object bytes recorded at publication.
+    pub file_size: u64,
+    /// Rows the object contains.
+    pub row_count: u64,
+    /// Zero-based artifact ordinal within its publication set.
+    pub file_ordinal: i16,
+    /// Lowercase SHA-256 of the published object.
+    pub file_checksum: String,
+    /// Typed promotion evidence committed in the same transaction.
+    pub promotion_record: vala_bifrost_redux::scribe::promotion::ScribePublishedHotFileV1,
+}
+
 /// Durable pre-snapshot Forge workflow state for one tenant table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForgeWorkflowInspection {
@@ -404,7 +450,7 @@ pub struct WyrdTestServerBuilder {
     /// One immutable lowerable limits snapshot shared by the test server's ingest owners.
     scribe_ingest_limits: IngestLimits,
     /// Optional projection of production Scribe rotation limits for real-server journeys.
-    scribe_rotation_for_test: Option<vala_bifrost_redux::scribe::ScribeRotationTestConfig>,
+    scribe_geometry_for_test: Option<vala_bifrost_redux::scribe::geometry::ScribeGeometry>,
     /// Optional faults installed in the real Scribe persistence graph for journeys.
     scribe_persistence_faults_for_test:
         Option<vala_bifrost_redux::scribe::persistence::PersistenceFaults>,
@@ -480,7 +526,7 @@ impl Default for WyrdTestServerBuilder {
             wal_sync_delay: Duration::ZERO,
             scribe_admission: None,
             scribe_ingest_limits: IngestLimits::default(),
-            scribe_rotation_for_test: None,
+            scribe_geometry_for_test: None,
             scribe_persistence_faults_for_test: None,
             role_timing: None,
             node_id: None,
@@ -1223,6 +1269,65 @@ impl WyrdTestServer {
         .fetch_one(&pool)
         .await
         .map_err(sql)
+    }
+
+    /// Read every committed hot object one tenant table published, in order.
+    ///
+    /// Production Scribe tests assert against what actually became durable:
+    /// the fenced row identity, the object it names, and the typed promotion
+    /// record committed with it. Reading them here — rather than through a
+    /// Scribe-internal accessor — is what makes the assertion a statement about
+    /// published state instead of writer intent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the fixture pool cannot be acquired, the query
+    /// fails, a recorded size or row count is negative, or a stored promotion
+    /// record does not decode as the one shipped version.
+    pub async fn published_hot_files_for_test(
+        &self,
+        tenant: DataTenantId,
+        namespace: &str,
+        table_name: &str,
+    ) -> Result<Vec<PublishedHotFileInspection>, WyrdTestServerError> {
+        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
+        let rows: Vec<PublishedHotFileRow> = sqlx::query_as(
+            "SELECT id,file_path,file_size,row_count,file_ordinal,file_checksum,promotion_record \
+             FROM vala.file_list \
+             WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 \
+             ORDER BY wal_lsn_min, file_ordinal",
+        )
+        .bind(tenant.as_uuid())
+        .bind(namespace)
+        .bind(table_name)
+        .fetch_all(&pool)
+        .await
+        .map_err(sql)?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(PublishedHotFileInspection {
+                    id: row.id,
+                    object_key: row.file_path,
+                    file_size: u64::try_from(row.file_size).map_err(|_| {
+                        WyrdTestServerError::Start(
+                            "published hot file has a negative size".to_owned(),
+                        )
+                    })?,
+                    row_count: u64::try_from(row.row_count).map_err(|_| {
+                        WyrdTestServerError::Start(
+                            "published hot file has a negative row count".to_owned(),
+                        )
+                    })?,
+                    file_ordinal: row.file_ordinal,
+                    file_checksum: row.file_checksum.unwrap_or_default(),
+                    promotion_record:
+                        vala_bifrost_redux::scribe::promotion::ScribePublishedHotFileV1::from_json(
+                            &row.promotion_record,
+                        )
+                        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
+                })
+            })
+            .collect()
     }
 
     /// Count Bifrost read-decision audit rows for the fixture tenant.
@@ -2932,17 +3037,18 @@ impl WyrdTestServerBuilder {
         self
     }
 
-    /// Select low existing Scribe rotation thresholds for a real-server journey.
+    /// Select a scaled Scribe geometry for a real-server journey.
     ///
-    /// This test-only projection does not introduce a second lifecycle policy:
-    /// it supplies the same WAL bytes, memtable bytes, and age inputs that
-    /// production boot reads from `ScribeRuntimeConfig`.
+    /// This installs no second lifecycle policy: the value is the same
+    /// validated geometry production boot derives from `ScribeRuntimeConfig`,
+    /// so a journey can move the rotation limits and the assembled-object
+    /// target down to test scale and still exercise the production controls.
     #[must_use]
-    pub fn with_scribe_rotation_for_test(
+    pub fn with_scribe_geometry_for_test(
         mut self,
-        rotation: vala_bifrost_redux::scribe::ScribeRotationTestConfig,
+        geometry: vala_bifrost_redux::scribe::geometry::ScribeGeometry,
     ) -> Self {
-        self.scribe_rotation_for_test = Some(rotation);
+        self.scribe_geometry_for_test = Some(geometry);
         self
     }
 
@@ -2956,6 +3062,22 @@ impl WyrdTestServerBuilder {
         faults: vala_bifrost_redux::scribe::persistence::PersistenceFaults,
     ) -> Self {
         self.scribe_persistence_faults_for_test = Some(faults);
+        self
+    }
+
+    /// Run this server under one production Bifrost process target.
+    ///
+    /// The role set is derived by [`BifrostRoles::for_target`] — the same
+    /// derivation `WYRD_TARGET` drives in production — so a Scribe-only test
+    /// server activates exactly the subsystems a Scribe pod activates, without
+    /// a test-specific topology.
+    #[must_use]
+    pub fn with_bifrost_target_for_test(mut self, target: BifrostTarget) -> Self {
+        self.bifrost_roles = wyrd_server::config::BifrostRoles::for_target(target)
+            .iter()
+            .copied()
+            .collect();
+        self.forge_process_role = target;
         self
     }
 
@@ -3296,7 +3418,7 @@ impl WyrdTestServerBuilder {
             forge_catalog: self.forge_catalog,
             forge_object_store: composed_forge_object_store,
             scribe_wal_sync_delay: self.wal_sync_delay,
-            scribe_rotation: self.scribe_rotation_for_test,
+            scribe_geometry: self.scribe_geometry_for_test,
             scribe_persistence_faults: self
                 .scribe_persistence_faults_for_test
                 .clone()

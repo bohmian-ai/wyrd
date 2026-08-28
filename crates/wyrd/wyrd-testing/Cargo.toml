@@ -114,28 +114,3 @@ wyrd-tls = { workspace = true }
 
 [dev-dependencies]
 metrics = { workspace = true }
-
-[[bench]]
-name = "bench_bifrost_scribe"
-harness = false
-required-features = ["bench"]
-
-[[bench]]
-name = "bench_bifrost_otlp"
-harness = false
-required-features = ["bench"]
-
-[[bench]]
-name = "bench_bifrost_forge"
-harness = false
-required-features = ["bench"]
-
-[[bench]]
-name = "bench_bifrost_oracle"
-harness = false
-required-features = ["bench"]
-
-[[bench]]
-name = "bench_bifrost_qualification"
-harness = false
-required-features = ["bench"]

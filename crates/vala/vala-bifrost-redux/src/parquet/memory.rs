@@ -1209,10 +1209,17 @@ pub fn schema_fingerprint(schema: &Schema) -> SchemaFingerprint {
 
 /// Validates the conjunctive decoded writer-v2 footer ceilings.
 ///
+/// The ceilings here are structural: how much a footer describes, which is what
+/// bounds decode work. Encoded row-group bytes are deliberately not among them.
+/// [`MAX_LOGICAL_ROW_GROUP_BYTES`] bounds the canonical Arrow input admitted
+/// into one group before it is written, and compression, encoding, and
+/// dictionary behavior may put the resulting physical bytes above or below it,
+/// so a group that encodes larger is valid data rather than a defect. A
+/// producer that owns a physical output ceiling enforces it where it writes.
+///
 /// # Errors
 /// Returns a data-layout refusal when row groups, leaves, schema nodes, column
-/// chunks, aggregate structure, or encoded row-group bytes exceed the closed
-/// producer contract.
+/// chunks, or aggregate structure exceed the closed producer contract.
 pub fn validate_writer_v2_structure(metadata: &ParquetMetaData) -> Result<(), String> {
     let groups = metadata.row_groups();
     let leaf_columns = metadata.file_metadata().schema_descr().num_columns();
@@ -1235,11 +1242,6 @@ pub fn validate_writer_v2_structure(metadata: &ParquetMetaData) -> Result<(), St
         chunks,
         elements,
     )?;
-    if groups.iter().any(|group| {
-        u64::try_from(group.compressed_size()).unwrap_or(u64::MAX) > MAX_LOGICAL_ROW_GROUP_BYTES
-    }) {
-        return Err("Parquet writer-v2 structural footer ceiling exceeded".to_owned());
-    }
     Ok(())
 }
 

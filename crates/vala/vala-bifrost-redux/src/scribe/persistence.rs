@@ -538,8 +538,6 @@ pub struct PersistenceRuntime {
     queued: Arc<AtomicUsize>,
     queued_bytes: Arc<AtomicUsize>,
     drained: Arc<Notify>,
-    /// Persistence failures retained for startup recovery readiness checks.
-    failures: Arc<Mutex<Vec<String>>>,
     /// Retained worker handles aborted when the process deadline ends graceful persistence.
     tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     /// Lock-independent abort handles for every spawned persistence worker.
@@ -558,6 +556,11 @@ pub struct PersistenceRuntime {
     recovery_operator: Option<opendal::Operator>,
     /// Root owner charged before allocating recovery transfer buffers.
     recovery_memory: Option<ScribeResources>,
+    /// The shared worker retained so drain can publish residue after the queue empties.
+    ///
+    /// `None` only for the workerless test constructors, which have no staged
+    /// members to settle.
+    worker: Option<Arc<PersistenceWorker>>,
 }
 
 /// Reason a non-blocking persistence submission retained ownership of its job.
@@ -606,7 +609,6 @@ impl PersistenceRuntime {
             queued: Arc::new(AtomicUsize::new(0)),
             queued_bytes: Arc::new(AtomicUsize::new(0)),
             drained: Arc::new(Notify::new()),
-            failures: Arc::new(Mutex::new(Vec::new())),
             tasks: Arc::new(Mutex::new(Vec::new())),
             abort_handles: Arc::new(Mutex::new(Vec::new())),
             output_scratch: None,
@@ -616,6 +618,7 @@ impl PersistenceRuntime {
             recovery_wal: None,
             recovery_operator: None,
             recovery_memory: None,
+            worker: None,
         }
     }
 
@@ -628,7 +631,6 @@ impl PersistenceRuntime {
             queued: Arc::new(AtomicUsize::new(0)),
             queued_bytes: Arc::new(AtomicUsize::new(0)),
             drained: Arc::new(Notify::new()),
-            failures: Arc::new(Mutex::new(Vec::new())),
             tasks: Arc::new(Mutex::new(Vec::new())),
             abort_handles: Arc::new(Mutex::new(Vec::new())),
             output_scratch: None,
@@ -638,6 +640,7 @@ impl PersistenceRuntime {
             recovery_wal: None,
             recovery_operator: None,
             recovery_memory: None,
+            worker: None,
         };
         (runtime, receiver)
     }
@@ -772,32 +775,33 @@ impl PersistenceRuntime {
         let recovery_wal = Arc::clone(&context.wal);
         let recovery_operator = (*context.operator).clone();
         let recovery_memory = context.memory.clone();
+        let failures = Arc::new(Mutex::new(Vec::new()));
+        let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
+        let staging = Self::build_staging(&context, config.operator_pool.as_ref(), config.workers);
+        let worker = Arc::new(PersistenceWorker::new(
+            config.operator_pool,
+            Arc::clone(&failures),
+            context,
+            output_scratch.clone(),
+            producer_admission.clone(),
+            staging,
+        ));
         let runtime_state = Arc::new(Self {
             sender: Arc::new(Mutex::new(Some(sender))),
             queued: Arc::new(AtomicUsize::new(0)),
             queued_bytes: Arc::new(AtomicUsize::new(0)),
             drained: Arc::new(Notify::new()),
-            failures: Arc::new(Mutex::new(Vec::new())),
             tasks: Arc::new(Mutex::new(Vec::new())),
             abort_handles: Arc::new(Mutex::new(Vec::new())),
-            output_scratch: output_scratch.clone(),
+            output_scratch,
             reconciler,
             reconciliation_sender: Some(reconciliation_sender),
-            producer_admission: Some(producer_admission.clone()),
+            producer_admission: Some(producer_admission),
             recovery_wal: Some(recovery_wal),
             recovery_operator: Some(recovery_operator),
             recovery_memory: Some(recovery_memory),
+            worker: Some(Arc::clone(&worker)),
         });
-        let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
-        let staging = Self::build_staging(&context, config.operator_pool.as_ref(), config.workers);
-        let worker = Arc::new(PersistenceWorker::new(
-            config.operator_pool,
-            Arc::clone(&runtime_state.failures),
-            context,
-            output_scratch,
-            producer_admission,
-            staging,
-        ));
         let mut tasks = Vec::with_capacity(config.workers);
         if let Some(reconciler) = runtime_state.reconciler.clone() {
             let task =
@@ -950,6 +954,37 @@ impl PersistenceRuntime {
             }
             notified.await;
         }
+    }
+
+    /// Settles every staged member that no future arrival will complete.
+    ///
+    /// Call this after [`Self::drain`], when every accepted generation is
+    /// already durable on the staging volume: the sweep publishes the ready
+    /// members that target and dwell would otherwise keep waiting for. A pod
+    /// without staged members, or one provisioned without staging at all,
+    /// publishes nothing and reports zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when a residue claim cannot be taken, merged, or
+    /// published. Members that did not publish stay durable and staged, and the
+    /// WAL stays authoritative for their rows.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping this future stops the sweep between claims. Published claims
+    /// stay published and the rest stay staged for the next sweep or restart.
+    pub(crate) async fn publish_residue(
+        &self,
+        cause: crate::scribe::assembly::ClaimCause,
+    ) -> Result<usize, ScribeError> {
+        let Some(worker) = &self.worker else {
+            return Ok(0);
+        };
+        if worker.staging.is_none() {
+            return Ok(0);
+        }
+        worker.publish_residue(cause).await
     }
 
     /// Aborts every retained persistence worker without touching the async join registry.
@@ -1469,9 +1504,14 @@ impl ProducerAdmission {
 
     /// Acquires for a job accepted before runtime shutdown began.
     ///
+    /// Graceful drain closes admission before its residue claims publish, but
+    /// every member in those claims was admitted while the runtime was open and
+    /// is already durable. Refusing their merge workspace would strand durable
+    /// rows on the staging volume, so this admission ignores the closed flag
+    /// while still queueing behind the same fair waiter order.
+    ///
     /// # Errors
     /// Returns root admission failures or poisoned queue state.
-    #[cfg(test)]
     pub(crate) async fn acquire_accepted(
         &self,
         workspace_bytes: usize,
@@ -2293,9 +2333,7 @@ impl PersistenceWorker {
             self.advance_manifest(generation).await?;
         }
         tracing::debug!(generation_id, "generation is durable on the staging volume");
-        let published = self
-            .publish_due_claims(generation, producer_identity)
-            .await?;
+        let published = self.publish_due_claims(producer_identity).await?;
         Ok(StagedGenerationOutcome { member, published })
     }
 
@@ -2403,16 +2441,47 @@ impl PersistenceWorker {
     /// durable, so the failure retries rather than losing rows.
     async fn publish_due_claims(
         &self,
-        generation: &Arc<ImmutableGeneration>,
         producer_identity: &ProducerLifecycleIdentity,
     ) -> Result<Vec<FileListCommitKey>, ScribeError> {
         let staging = self.staging()?;
         let mut published = Vec::new();
         while let Some(claim) = staging.take_claim(chrono::Utc::now())? {
             published.push(
-                self.publish_claim(&staging, &claim, generation, producer_identity)
+                self.publish_claim(&staging, &claim, Some(producer_identity))
                     .await?,
             );
+        }
+        Ok(published)
+    }
+
+    /// Publishes every staged member that target and dwell would still hold.
+    ///
+    /// Drain is the one point where waiting costs more than publishing: no
+    /// further member will arrive to complete a partial key, and its dwell
+    /// would expire against a runtime that is gone. Sweeping every ready key as
+    /// residue therefore settles the staging volume instead of leaving durable
+    /// members for the next process to rediscover. Publication is still the
+    /// same fenced transaction, so a member that cannot publish stays durable
+    /// and staged rather than being dropped.
+    ///
+    /// Returns the number of claims published.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the staging capability is absent, when the
+    /// assembler refuses a residue claim, or when a claim fails to publish. The
+    /// remaining keys stay staged and the WAL stays authoritative for them.
+    async fn publish_residue(
+        &self,
+        cause: crate::scribe::assembly::ClaimCause,
+    ) -> Result<usize, ScribeError> {
+        let staging = self.staging()?;
+        let mut published = 0;
+        for key in staging.ready_keys()? {
+            while let Some(claim) = staging.take_residue(&key, cause)? {
+                self.publish_claim(&staging, &claim, None).await?;
+                published += 1;
+            }
         }
         Ok(published)
     }
@@ -2429,15 +2498,22 @@ impl PersistenceWorker {
         &self,
         staging: &Arc<crate::scribe::staging_runtime::ScribeStagingRuntime>,
         claim: &crate::scribe::assembly::StagingClaim,
-        generation: &Arc<ImmutableGeneration>,
-        producer_identity: &ProducerLifecycleIdentity,
+        producer_identity: Option<&ProducerLifecycleIdentity>,
     ) -> Result<FileListCommitKey, ScribeError> {
         let runs = staging.gather(claim).await?;
         let workspace_bytes = parquet_candidate_incremental_bytes(claim_merge_bytes(claim))?;
-        let mut reservation = self
-            .producer_admission
-            .acquire_with_identity(workspace_bytes, producer_identity.clone())
-            .await?;
+        let mut reservation = match producer_identity {
+            Some(identity) => {
+                self.producer_admission
+                    .acquire_with_identity(workspace_bytes, identity.clone())
+                    .await?
+            }
+            None => {
+                self.producer_admission
+                    .acquire_accepted(workspace_bytes)
+                    .await?
+            }
+        };
         let footer_reservation =
             crate::scribe::memory::EncodedFooterReservation::split_from(&mut reservation)?;
         let scratch = self
@@ -2447,7 +2523,7 @@ impl PersistenceWorker {
                 detail: "Scribe output scratch is unavailable before claim assembly".to_owned(),
             })?
             .create_scribe_claim(
-                &generation.stream.node_id.to_string(),
+                &claim.key().node_id().to_string(),
                 &claim.id().to_string(),
                 claim.encoded_bytes(),
             )
@@ -2778,7 +2854,6 @@ mod tests {
             queued: Arc::new(AtomicUsize::new(0)),
             queued_bytes: Arc::new(AtomicUsize::new(0)),
             drained: Arc::new(Notify::new()),
-            failures: Arc::new(Mutex::new(Vec::new())),
             tasks: Arc::new(Mutex::new(Vec::new())),
             abort_handles: Arc::new(Mutex::new(Vec::new())),
             output_scratch: None,
@@ -2788,6 +2863,7 @@ mod tests {
             recovery_wal: None,
             recovery_operator: None,
             recovery_memory: None,
+            worker: None,
         }
     }
 

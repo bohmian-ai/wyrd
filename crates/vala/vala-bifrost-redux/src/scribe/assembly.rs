@@ -925,6 +925,21 @@ impl StagingAssembler {
             .map_or(&[], |index| index.members.as_slice())
     }
 
+    /// Returns every key that currently holds at least one ready member.
+    ///
+    /// Drain and partition-close use this to sweep what target and dwell would
+    /// otherwise keep waiting: a member that is durable but unpublished costs
+    /// staging capacity, so at shutdown every remaining key is claimed as
+    /// residue rather than left for a dwell that will never expire.
+    #[must_use]
+    pub fn ready_keys(&self) -> Vec<ScribeAssemblyKey> {
+        self.ready
+            .iter()
+            .filter(|(_, index)| !index.members.is_empty())
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
     /// Refuses when every configured claim slot is already outstanding.
     ///
     /// # Errors

@@ -198,6 +198,19 @@ impl ScribeStagingRuntime {
             })
     }
 
+    /// Returns every key that still holds ready, unpublished members.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the ready index is unavailable.
+    pub fn ready_keys(&self) -> Result<Vec<ScribeAssemblyKey>, ScribeError> {
+        Ok(self
+            .assembly
+            .lock()
+            .map_err(|_| poisoned("staged ready index"))?
+            .ready_keys())
+    }
+
     /// Re-validates a claim's members and returns its runs in merge order.
     ///
     /// # Errors
@@ -590,6 +603,98 @@ mod tests {
                 .expect("claim object base")
                 .contains(&claim.id().to_string()),
             "objects are named after the claim that produced them"
+        );
+    }
+
+    /// Members that reach neither target nor dwell are invisible to
+    /// [`ScribeStagingRuntime::take_claim`] but are exactly what drain must
+    /// settle, so every ready key is reachable as residue and each key stops
+    /// being ready once its residue is claimed.
+    #[tokio::test]
+    async fn drain_reaches_every_ready_key_target_and_dwell_would_hold() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let stage_root = root.path().join("stage");
+        let wal_root = root.path().join("member-wal");
+        for path in [&stage_root, &wal_root] {
+            std::fs::create_dir_all(path).expect("fixture directory");
+        }
+        let node_id = NodeId::new(uuid::Uuid::from_u128(0xd2a2));
+        let stage = Arc::new(ScribeHotStage::new(stage_root.clone()));
+        let runtime = ScribeStagingRuntime::new(
+            Arc::clone(&stage),
+            staging_volume(root.path(), &stage_root),
+            publisher(stage, &wal_root, node_id),
+            StagingAssemblerConfig::new(512 * 1024 * 1024, std::time::Duration::from_mins(5), 4)
+                .expect("assembler controls"),
+        );
+
+        let schema = runtime_schema();
+        let layout = runtime_layout(schema.as_ref());
+        let staged_at = chrono::Utc::now();
+        let mut keys = Vec::new();
+        for (shard, generation) in [(1_u8, 7_u64), (2, 8)] {
+            let tenant = DataTenantId::new_v7();
+            let frozen = frozen_member(tenant, 256, shard);
+            let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
+                .expect("tenant binding");
+            let staged = runtime
+                .encode_member(
+                    StageMemberRequest {
+                        frozen: &frozen,
+                        binding: &binding,
+                        layout: &layout,
+                        origin: StagedMemberOrigin {
+                            node_id,
+                            writer_epoch: WriterEpoch::new(1),
+                            shard: shard.into(),
+                            generation,
+                            wal: StagedLsnRange {
+                                min: u64::from(shard) * 10,
+                                max: u64::from(shard) * 10 + 9,
+                            },
+                        },
+                        footer_reservation:
+                            crate::scribe::memory::EncodedFooterReservation::for_test(),
+                    },
+                    ClaimContext {
+                        schema: Arc::clone(&schema),
+                        layout: layout.clone(),
+                        binding: binding.clone(),
+                    },
+                )
+                .expect("member stages");
+            keys.push(staged.key().clone());
+            runtime
+                .register_member(staged, staged_at)
+                .await
+                .expect("member becomes durable and ready");
+        }
+
+        assert!(
+            runtime
+                .take_claim(staged_at)
+                .expect("due claim query")
+                .is_none(),
+            "neither key reached its target or its dwell"
+        );
+        let ready = runtime.ready_keys().expect("ready keys");
+        assert_eq!(ready.len(), 2, "both durable members are still unpublished");
+        for key in &keys {
+            assert!(ready.contains(key), "every ready key is reachable by drain");
+        }
+
+        let mut claimed_rows = 0;
+        for key in &ready {
+            let claim = runtime
+                .take_residue(key, ClaimCause::Drain)
+                .expect("residue claim")
+                .expect("a ready key yields its residue");
+            claimed_rows += claim.rows();
+        }
+        assert_eq!(claimed_rows, 512, "drain claims every staged row");
+        assert!(
+            runtime.ready_keys().expect("ready keys").is_empty(),
+            "a swept key is no longer ready"
         );
     }
 }

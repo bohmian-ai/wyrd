@@ -115,12 +115,26 @@ async fn await_shutdown_phase<T>(
     deadline: std::time::Instant,
     phase: impl std::future::Future<Output = T>,
 ) -> bool {
+    timed_shutdown_phase(deadline, phase).await.is_some()
+}
+
+/// Runs one bounded shutdown phase and returns what it produced, if anything.
+///
+/// `None` means the phase did not finish before the caller's deadline, either
+/// because the deadline had already passed or because the phase timed out. A
+/// phase whose own outcome decides whether shutdown stays graceful uses this
+/// directly; phases that only need to complete use
+/// [`await_shutdown_phase`].
+async fn timed_shutdown_phase<T>(
+    deadline: std::time::Instant,
+    phase: impl std::future::Future<Output = T>,
+) -> Option<T> {
     if tokio::time::Instant::now() >= tokio::time::Instant::from_std(deadline) {
-        return false;
+        return None;
     }
     tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), phase)
         .await
-        .is_ok()
+        .ok()
 }
 
 #[cfg(test)]
@@ -1408,6 +1422,13 @@ impl ScribeImpl {
         if graceful && let Some(persistence) = &self.persistence {
             graceful = await_shutdown_phase(deadline, persistence.drain()).await;
         }
+        // Every accepted generation is now durable on the staging volume, but a
+        // key that never reached its object target would sit there waiting for
+        // a dwell this process will not outlive. Publish that residue while the
+        // CPU, WAL, and object lanes are still open.
+        if graceful {
+            graceful = self.publish_staged_residue(deadline).await;
+        }
         self.close_lanes();
         if graceful {
             graceful = await_shutdown_phase(deadline, self.shards.shutdown(deadline)).await;
@@ -1501,6 +1522,36 @@ impl ScribeImpl {
         self.shutdown_state
             .store(SHUTDOWN_STOPPED, Ordering::Release);
         self.shutdown_notify.notify_waiters();
+    }
+
+    /// Publishes the staged members graceful drain would otherwise strand.
+    ///
+    /// Runs after the persistence queue is empty, so every accepted generation
+    /// is already durable and the only members left are the ones target and
+    /// dwell were still holding. Returns whether the sweep completed within the
+    /// deadline; a pod without staging publishes nothing and succeeds. A member
+    /// that fails to publish stays durable and staged, so reporting the failure
+    /// downgrades shutdown to non-graceful rather than losing rows.
+    async fn publish_staged_residue(&self, deadline: std::time::Instant) -> bool {
+        let Some(persistence) = &self.persistence else {
+            return true;
+        };
+        match timed_shutdown_phase(
+            deadline,
+            persistence.publish_residue(crate::scribe::assembly::ClaimCause::Drain),
+        )
+        .await
+        {
+            Some(Ok(published)) => {
+                tracing::info!(published, "Scribe drain published its staged residue");
+                true
+            }
+            Some(Err(error)) => {
+                tracing::warn!(%error, "Scribe drain left staged members unpublished");
+                false
+            }
+            None => false,
+        }
     }
 
     /// Closes external Scribe admission without cancelling internal flush lanes.

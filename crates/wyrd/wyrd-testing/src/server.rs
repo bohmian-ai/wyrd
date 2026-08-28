@@ -3220,11 +3220,13 @@ impl WyrdTestServerBuilder {
             None
         } else {
             let wal_volume_root = wal_root.path().to_owned();
+            let scribe_stage = wal_volume_root.join("scribe-stage");
             let scribe_output = scratch_root.join("scribe-output");
             let forge_scratch = scratch_root.join("forge");
             let oracle_scratch = scratch_root.join("oracle");
             for root in [
                 &wal_volume_root,
+                &scribe_stage,
                 &scribe_output,
                 &forge_scratch,
                 &oracle_scratch,
@@ -3234,6 +3236,7 @@ impl WyrdTestServerBuilder {
             }
             Some(BifrostVolumeRoots {
                 wal: wal_volume_root,
+                scribe_stage,
                 scribe_output_scratch: scribe_output,
                 forge_scratch,
                 oracle_scratch,

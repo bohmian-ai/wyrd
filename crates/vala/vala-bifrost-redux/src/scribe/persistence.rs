@@ -3149,6 +3149,7 @@ mod tests {
         fn scribe_only_runtime_resources(
             scratch_root: &std::path::Path,
             wal_root: &std::path::Path,
+            scribe_stage: std::path::PathBuf,
             scribe_output: std::path::PathBuf,
             forge_scratch: std::path::PathBuf,
             oracle_scratch: std::path::PathBuf,
@@ -3174,6 +3175,7 @@ mod tests {
                     scratch_root: scratch_root.to_owned(),
                     volume_roots: Some(crate::resources::BifrostVolumeRoots {
                         wal: wal_root.to_owned(),
+                        scribe_stage,
                         scribe_output_scratch: scribe_output,
                         forge_scratch,
                         oracle_scratch,
@@ -3191,10 +3193,16 @@ mod tests {
             let tenant = database.data_tenant_id();
             let wal_root = tempfile::tempdir().expect("WAL directory");
             let scratch_root = tempfile::tempdir().expect("scratch directory");
+            let scribe_stage = wal_root.path().join("scribe-stage");
             let scribe_output = scratch_root.path().join("scribe-output");
             let forge_scratch = scratch_root.path().join("forge");
             let oracle_scratch = scratch_root.path().join("oracle");
-            for root in [&scribe_output, &forge_scratch, &oracle_scratch] {
+            for root in [
+                &scribe_stage,
+                &scribe_output,
+                &forge_scratch,
+                &oracle_scratch,
+            ] {
                 std::fs::create_dir(root).expect("test volume root");
             }
             let node_id = crate::scribe::stream_identity::NodeId::generate();
@@ -3227,6 +3235,7 @@ mod tests {
             let runtime_resources = Self::scribe_only_runtime_resources(
                 scratch_root.path(),
                 wal_root.path(),
+                scribe_stage,
                 scribe_output,
                 forge_scratch,
                 oracle_scratch,

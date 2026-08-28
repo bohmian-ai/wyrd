@@ -1829,14 +1829,22 @@ mod tests {
     async fn governed_staging_restart_reconstructs_and_retires_exact_namespace_bytes() {
         let directory = tempfile::tempdir().expect("stage volume root");
         let wal_root = directory.path().join("wal");
+        let scribe_stage = directory.path().join("scribe-stage");
         let scribe_scratch = directory.path().join("scribe-scratch");
         let forge_scratch = directory.path().join("forge-scratch");
         let oracle_scratch = directory.path().join("oracle-scratch");
-        for path in [&wal_root, &scribe_scratch, &forge_scratch, &oracle_scratch] {
+        for path in [
+            &wal_root,
+            &scribe_stage,
+            &scribe_scratch,
+            &forge_scratch,
+            &oracle_scratch,
+        ] {
             std::fs::create_dir(path).expect("registered volume root");
         }
         let roots = BifrostVolumeRoots {
             wal: wal_root.clone(),
+            scribe_stage: scribe_stage.clone(),
             scribe_output_scratch: scribe_scratch.clone(),
             forge_scratch: forge_scratch.clone(),
             oracle_scratch: oracle_scratch.clone(),
@@ -1903,6 +1911,7 @@ mod tests {
         assert_restart_reconstructs_and_retires(
             BifrostVolumeRoots {
                 wal: wal_root.clone(),
+                scribe_stage,
                 scribe_output_scratch: scribe_scratch,
                 forge_scratch,
                 oracle_scratch,

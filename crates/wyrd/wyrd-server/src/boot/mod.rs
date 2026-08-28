@@ -448,8 +448,19 @@ async fn build_bifrost_external_dependencies(
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from(".wyrd/scribe-wal"));
     let oracle_scratch = prepare_oracle_spill_root(Some(wal_dir.clone()))?;
+    let scribe_stage = wal_dir.join("scribe-stage");
     let scribe_output_scratch = wal_dir.join("scribe-output-scratch");
     let forge_scratch = wal_dir.join("forge-spill");
+    for root in [
+        &wal_dir,
+        &scribe_stage,
+        &scribe_output_scratch,
+        &forge_scratch,
+    ] {
+        std::fs::create_dir_all(root).map_err(|error| {
+            ServerBootError::Scribe(format!("Bifrost volume root creation failed: {error}"))
+        })?;
+    }
     let roles = crate::config::BifrostRoles::for_target(target);
     let resource_roles = roles
         .iter()
@@ -472,6 +483,7 @@ async fn build_bifrost_external_dependencies(
             scratch_root: oracle_scratch.clone(),
             volume_roots: Some(vala_bifrost_redux::resources::BifrostVolumeRoots {
                 wal: wal_dir.clone(),
+                scribe_stage,
                 scribe_output_scratch,
                 forge_scratch,
                 oracle_scratch,
@@ -540,9 +552,15 @@ pub async fn compose_bifrost(
                 detail: "platform-admin operator pool is unavailable".to_owned(),
             })?;
     let scribe_config = bifrost_config.scribe;
+    let scribe_stage = wal_dir.join("scribe-stage");
     let scribe_output_scratch = wal_dir.join("scribe-output-scratch");
     let forge_scratch = wal_dir.join("forge-spill");
-    for root in [&wal_dir, &scribe_output_scratch, &forge_scratch] {
+    for root in [
+        &wal_dir,
+        &scribe_stage,
+        &scribe_output_scratch,
+        &forge_scratch,
+    ] {
         std::fs::create_dir_all(root).map_err(|error| {
             ServerBootError::Scribe(format!("Bifrost volume root creation failed: {error}"))
         })?;

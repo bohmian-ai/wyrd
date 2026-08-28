@@ -218,6 +218,11 @@ pub struct SystemResourceSnapshot {
 pub struct BifrostVolumeRoots {
     /// Durable Scribe WAL base.
     pub wal: PathBuf,
+    /// Durable Scribe staged-member base.
+    ///
+    /// This namespace is never cleared at boot: the records under it are what
+    /// authorized retiring the WAL segments behind their rows.
+    pub scribe_stage: PathBuf,
     /// Process-owned Scribe output scratch namespace.
     pub scribe_output_scratch: PathBuf,
     /// Forge attempt scratch root.
@@ -231,6 +236,8 @@ pub struct BifrostVolumeRoots {
 pub enum BifrostVolumeClass {
     /// Durable write-ahead log occupancy.
     Wal,
+    /// Durable Scribe staged-member occupancy.
+    ScribeStage,
     /// Disposable Scribe persistence output.
     ScribeOutput,
     /// Disposable Forge rewrite data.
@@ -244,16 +251,26 @@ impl BifrostVolumeClass {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Wal => "wal",
+            Self::ScribeStage => "scribe_stage",
             Self::ScribeOutput => "scribe_output",
             Self::Forge => "forge",
             Self::Oracle => "oracle",
         }
     }
 
+    /// Returns whether occupancy in this class survives a process restart.
+    ///
+    /// A durable class is reconciled from the filesystem at registration and
+    /// released only by an explicit retirement; a disposable class is owned by
+    /// live leases and returns its bytes when they drop.
+    const fn is_durable(self) -> bool {
+        matches!(self, Self::Wal | Self::ScribeStage)
+    }
+
     /// Returns the closed role label responsible for this volume purpose.
     const fn role(self) -> &'static str {
         match self {
-            Self::Wal | Self::ScribeOutput => "scribe",
+            Self::Wal | Self::ScribeStage | Self::ScribeOutput => "scribe",
             Self::Forge => "forge",
             Self::Oracle => "oracle",
         }
@@ -310,14 +327,66 @@ struct RegisteredVolumeRoot {
 /// Exact per-device durable and provisional ownership.
 #[derive(Debug, Default)]
 struct VolumeDeviceState {
-    /// Durable WAL bytes reconciled or committed on this device.
-    durable_wal_bytes: u64,
-    /// Provisional WAL growth admitted before mutation completes.
-    provisional_wal_bytes: u64,
+    /// Durable bytes reconciled or committed on this device, per class.
+    ///
+    /// Two classes are durable for different reasons: WAL bytes are the
+    /// acknowledged rows themselves, and staged bytes are the local runs that
+    /// let those WAL bytes retire. Both survive a restart, so both are
+    /// reconciled from the filesystem at registration rather than assumed zero.
+    durable_bytes: BTreeMap<BifrostVolumeClass, u64>,
+    /// Durable growth admitted before its mutation completes, per class.
+    provisional_bytes: BTreeMap<BifrostVolumeClass, u64>,
     /// Live disposable scratch leases.
     scratch_bytes: BTreeMap<BifrostVolumeClass, u64>,
     /// Whether accounting on this device remains trustworthy.
     poisoned: bool,
+}
+
+impl VolumeDeviceState {
+    /// Returns committed durable bytes owned by one class.
+    fn durable(&self, class: BifrostVolumeClass) -> u64 {
+        self.durable_bytes.get(&class).copied().unwrap_or_default()
+    }
+
+    /// Returns admitted but uncommitted durable bytes owned by one class.
+    fn provisional(&self, class: BifrostVolumeClass) -> u64 {
+        self.provisional_bytes
+            .get(&class)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Returns live disposable scratch bytes owned by one class.
+    fn scratch(&self, class: BifrostVolumeClass) -> u64 {
+        self.scratch_bytes.get(&class).copied().unwrap_or_default()
+    }
+
+    /// Returns the bytes one class currently owns under its own accounting.
+    ///
+    /// A durable class owns committed plus provisional growth; a disposable
+    /// class owns its live leases. This is what telemetry reports and what a
+    /// refusal diagnostic names.
+    fn owned(&self, class: BifrostVolumeClass) -> u64 {
+        if class.is_durable() {
+            self.durable(class).saturating_add(self.provisional(class))
+        } else {
+            self.scratch(class)
+        }
+    }
+
+    /// Sums every class's ownership on this device.
+    ///
+    /// # Errors
+    ///
+    /// Returns an accounting overflow when the device totals cannot be summed.
+    fn total(&self) -> Result<u64, BifrostResourceError> {
+        self.durable_bytes
+            .values()
+            .chain(self.provisional_bytes.values())
+            .chain(self.scratch_bytes.values())
+            .try_fold(0_u64, |total, bytes| total.checked_add(*bytes))
+            .ok_or_else(accounting_overflow)
+    }
 }
 
 /// Shared physical-volume authority grouped by filesystem device identity.
@@ -349,6 +418,7 @@ impl BifrostVolumeGovernor {
         reconcile_scribe_scratch_namespace(&roots.scribe_output_scratch)?;
         let entries = [
             (BifrostVolumeClass::Wal, roots.wal),
+            (BifrostVolumeClass::ScribeStage, roots.scribe_stage),
             (
                 BifrostVolumeClass::ScribeOutput,
                 roots.scribe_output_scratch,
@@ -391,7 +461,19 @@ impl BifrostVolumeGovernor {
         devices
             .get_mut(&wal.device)
             .ok_or_else(accounting_overflow)?
-            .durable_wal_bytes = retained;
+            .durable_bytes
+            .insert(BifrostVolumeClass::Wal, retained);
+        let stage_root = registered
+            .get(&BifrostVolumeClass::ScribeStage)
+            .ok_or_else(|| BifrostResourceError::InvalidPlan {
+                detail: "Scribe stage volume root was not registered".to_owned(),
+            })?;
+        let staged = retained_stage_root_bytes(&stage_root.path)?;
+        devices
+            .get_mut(&stage_root.device)
+            .ok_or_else(accounting_overflow)?
+            .durable_bytes
+            .insert(BifrostVolumeClass::ScribeStage, staged);
         let governor = Self {
             roots: Arc::new(registered),
             devices: Arc::new(Mutex::new(devices)),
@@ -400,6 +482,7 @@ impl BifrostVolumeGovernor {
         };
         for class in [
             BifrostVolumeClass::Wal,
+            BifrostVolumeClass::ScribeStage,
             BifrostVolumeClass::ScribeOutput,
             BifrostVolumeClass::Forge,
             BifrostVolumeClass::Oracle,
@@ -427,6 +510,9 @@ impl BifrostVolumeGovernor {
             wal: WalVolume {
                 governor: self.clone(),
             },
+            scribe_stage: StageVolume {
+                governor: self.clone(),
+            },
             scribe_output: ScratchVolume {
                 governor: self.clone(),
                 class: BifrostVolumeClass::ScribeOutput,
@@ -442,7 +528,11 @@ impl BifrostVolumeGovernor {
         }
     }
 
-    /// Returns exact class ownership for deterministic WAL and scratch tests.
+    /// Returns exact ownership of one class for deterministic volume tests.
+    ///
+    /// The triple is the class's committed durable bytes, its provisional
+    /// durable growth, and its disposable scratch bytes, so a test can prove a
+    /// transition moved a charge between exactly those counters.
     ///
     /// # Errors
     ///
@@ -461,9 +551,9 @@ impl BifrostVolumeGovernor {
             })?;
         let state = devices.get(&root.device).ok_or_else(accounting_overflow)?;
         Ok((
-            state.durable_wal_bytes,
-            state.provisional_wal_bytes,
-            state.scratch_bytes.get(&class).copied().unwrap_or_default(),
+            state.durable(class),
+            state.provisional(class),
+            state.scratch(class),
         ))
     }
 
@@ -485,11 +575,16 @@ impl BifrostVolumeGovernor {
     }
 
     /// Atomically charges one device after a fresh physical free-space probe.
+    ///
+    /// `durable` selects which counter receives the charge: a durable class
+    /// takes provisional growth that a later commit converts into retained
+    /// occupancy, while a disposable class takes a live scratch lease that
+    /// returns its bytes on drop.
     fn acquire(
         &self,
         class: BifrostVolumeClass,
         bytes: u64,
-        wal: bool,
+        durable: bool,
     ) -> Result<VolumeLease, BifrostResourceError> {
         if let Some(reason) = self.health.reason() {
             return Err(BifrostResourceError::Poisoned {
@@ -517,50 +612,27 @@ impl BifrostVolumeGovernor {
                 detail: "a prior physical-volume invariant failed".to_owned(),
             });
         }
-        let scratch_used = state
-            .scratch_bytes
-            .values()
-            .try_fold(0_u64, |total, bytes| total.checked_add(*bytes))
-            .ok_or_else(accounting_overflow)?;
-        let used = state
-            .durable_wal_bytes
-            .checked_add(state.provisional_wal_bytes)
-            .and_then(|value| value.checked_add(scratch_used))
-            .ok_or_else(accounting_overflow)?;
+        let used = state.total()?;
         let next = used.checked_add(bytes).ok_or_else(accounting_overflow)?;
         if next > self.configured_limit_bytes || next > available {
-            let current = if wal {
-                state
-                    .durable_wal_bytes
-                    .saturating_add(state.provisional_wal_bytes)
-            } else {
-                state.scratch_bytes.get(&class).copied().unwrap_or_default()
-            };
-            record_volume_transition(class, "refused", current);
+            record_volume_transition(class, "refused", state.owned(class));
             return Err(BifrostResourceError::Occupied {
                 detail: "physical-volume request exceeds configured or live-free capacity"
                     .to_owned(),
             });
         }
-        if wal {
-            state.provisional_wal_bytes += bytes;
+        if durable {
+            *state.provisional_bytes.entry(class).or_default() += bytes;
         } else {
             *state.scratch_bytes.entry(class).or_default() += bytes;
         }
-        let current = if wal {
-            state
-                .durable_wal_bytes
-                .saturating_add(state.provisional_wal_bytes)
-        } else {
-            state.scratch_bytes.get(&class).copied().unwrap_or_default()
-        };
-        record_volume_transition(class, "acquired", current);
+        record_volume_transition(class, "acquired", state.owned(class));
         Ok(VolumeLease {
             governor: self.clone(),
             device: root.device,
             bytes,
             class,
-            wal,
+            durable,
             retained: false,
         })
     }
@@ -600,12 +672,220 @@ fn reconcile_scribe_scratch_namespace(root: &Path) -> Result<(), BifrostResource
 pub struct BifrostVolumeCapabilities {
     /// Durable WAL growth capability.
     pub wal: WalVolume,
+    /// Durable Scribe staged-member capability.
+    pub scribe_stage: StageVolume,
     /// Scribe output-scratch capability.
     pub scribe_output: ScratchVolume,
     /// Forge scratch capability.
     pub forge: ScratchVolume,
     /// Oracle scratch capability.
     pub oracle: ScratchVolume,
+}
+
+/// Converts one class's provisional growth into retained durable occupancy.
+///
+/// # Errors
+///
+/// Returns poison when the registered device or provisional counter no longer
+/// covers this exact growth; the lease is retained rather than rolled back so
+/// the divergence cannot be hidden by returning capacity twice.
+fn commit_durable(mut lease: VolumeLease) -> Result<(), BifrostResourceError> {
+    let class = lease.class;
+    let mut devices =
+        lease
+            .governor
+            .devices
+            .lock()
+            .map_err(|_| BifrostResourceError::Poisoned {
+                detail: "volume state lock is poisoned".to_owned(),
+            })?;
+    let state = devices
+        .get_mut(&lease.device)
+        .ok_or_else(accounting_overflow)?;
+    if state.provisional(class) < lease.bytes {
+        state.poisoned = true;
+        lease
+            .governor
+            .health
+            .poison(BifrostResourcePoisonReason::Volume);
+        return Err(BifrostResourceError::Poisoned {
+            detail: "provisional durable growth diverged before commit".to_owned(),
+        });
+    }
+    *state.provisional_bytes.entry(class).or_default() -= lease.bytes;
+    let durable = state
+        .durable(class)
+        .checked_add(lease.bytes)
+        .ok_or_else(accounting_overflow)?;
+    state.durable_bytes.insert(class, durable);
+    lease.retained = true;
+    record_volume_transition(class, "committed", durable);
+    Ok(())
+}
+
+/// Releases exact committed durable occupancy after its files are gone.
+///
+/// # Errors
+///
+/// Returns poison when reconciled durable ownership cannot cover the exact
+/// retired length; no capacity is returned on mismatch.
+fn retire_durable(
+    governor: &BifrostVolumeGovernor,
+    class: BifrostVolumeClass,
+    bytes: u64,
+) -> Result<(), BifrostResourceError> {
+    let root = governor.roots.get(&class).ok_or_else(accounting_overflow)?;
+    let mut devices = governor
+        .devices
+        .lock()
+        .map_err(|_| BifrostResourceError::Poisoned {
+            detail: "volume state lock is poisoned".to_owned(),
+        })?;
+    let state = devices
+        .get_mut(&root.device)
+        .ok_or_else(accounting_overflow)?;
+    if state.durable(class) < bytes {
+        state.poisoned = true;
+        governor.health.poison(BifrostResourcePoisonReason::Volume);
+        return Err(BifrostResourceError::Poisoned {
+            detail: "durable volume retirement underflow".to_owned(),
+        });
+    }
+    let remaining = state.durable(class) - bytes;
+    state.durable_bytes.insert(class, remaining);
+    record_volume_transition(class, "released", remaining);
+    Ok(())
+}
+
+/// Non-generic durable Scribe staging capability.
+///
+/// Staged runs are the reason a WAL segment may retire, so their bytes are
+/// accounted like WAL bytes rather than like scratch: they are reconciled from
+/// the filesystem at registration, admitted before the runs are written,
+/// committed when the member's record lands, and released only when the member
+/// is retired after publication.
+#[derive(Debug)]
+pub struct StageVolume {
+    /// Shared device-grouped authority.
+    governor: BifrostVolumeGovernor,
+}
+
+impl StageVolume {
+    /// Returns the registered durable staging root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-plan error when the staging class is not registered,
+    /// which registration prevents.
+    pub fn root(&self) -> Result<&Path, BifrostResourceError> {
+        self.governor
+            .roots
+            .get(&BifrostVolumeClass::ScribeStage)
+            .map(|root| root.path.as_path())
+            .ok_or_else(|| BifrostResourceError::InvalidPlan {
+                detail: "Scribe stage volume class is not registered".to_owned(),
+            })
+    }
+
+    /// Provisionally admits exact staged growth before the runs are written.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed refusal when the shared device cannot preserve both its
+    /// configured ceiling and current physical free-space floor.
+    pub fn try_reserve_growth(&self, bytes: u64) -> Result<StageGrowth, BifrostResourceError> {
+        Ok(StageGrowth {
+            lease: Some(
+                self.governor
+                    .acquire(BifrostVolumeClass::ScribeStage, bytes, true)?,
+            ),
+        })
+    }
+
+    /// Releases exact staged occupancy after a member's files are removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns poison when reconciled staged ownership cannot cover the exact
+    /// retired length.
+    pub fn retire(&self, bytes: u64) -> Result<(), BifrostResourceError> {
+        retire_durable(&self.governor, BifrostVolumeClass::ScribeStage, bytes)
+    }
+}
+
+/// Provisional staged growth awaiting the record that makes it authoritative.
+#[derive(Debug)]
+pub struct StageGrowth {
+    /// Shared provisional owner; `None` after durable commit.
+    lease: Option<VolumeLease>,
+}
+
+impl StageGrowth {
+    /// Reconciles the admitted estimate to measured bytes, then commits them.
+    ///
+    /// Staged bytes are admitted before encoding against the frozen bucket's
+    /// retained Arrow size, which is an estimate rather than the encoded
+    /// length. Committing therefore settles the difference first: a smaller
+    /// encoding releases the unused provisional charge, and a larger one is
+    /// re-admitted through the same ceiling and free-space floor as the
+    /// original request, so a member never owns bytes the device never
+    /// approved.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed refusal when measured bytes exceed the estimate and the
+    /// device cannot admit the difference, and poison when the registered
+    /// device or provisional counter no longer covers the admitted growth. A
+    /// refusal leaves the estimate charged until this owner drops, so the
+    /// caller must remove the measured files it could not commit.
+    pub fn commit(mut self, measured_bytes: u64) -> Result<(), BifrostResourceError> {
+        let mut lease = self.lease.take().ok_or_else(accounting_overflow)?;
+        if measured_bytes > lease.bytes {
+            let mut extra =
+                lease
+                    .governor
+                    .acquire(lease.class, measured_bytes - lease.bytes, true)?;
+            extra.retained = true;
+            lease.bytes = measured_bytes;
+        } else if measured_bytes < lease.bytes {
+            release_provisional(&lease, lease.bytes - measured_bytes)?;
+            lease.bytes = measured_bytes;
+        }
+        commit_durable(lease)
+    }
+}
+
+/// Releases part of one lease's provisional durable charge before commit.
+///
+/// # Errors
+///
+/// Returns poison when the registered device or provisional counter no longer
+/// covers the released difference; capacity is not returned on mismatch.
+fn release_provisional(lease: &VolumeLease, bytes: u64) -> Result<(), BifrostResourceError> {
+    let mut devices =
+        lease
+            .governor
+            .devices
+            .lock()
+            .map_err(|_| BifrostResourceError::Poisoned {
+                detail: "volume state lock is poisoned".to_owned(),
+            })?;
+    let state = devices
+        .get_mut(&lease.device)
+        .ok_or_else(accounting_overflow)?;
+    if state.provisional(lease.class) < bytes {
+        state.poisoned = true;
+        lease
+            .governor
+            .health
+            .poison(BifrostResourcePoisonReason::Volume);
+        return Err(BifrostResourceError::Poisoned {
+            detail: "provisional durable growth diverged before reconciliation".to_owned(),
+        });
+    }
+    *state.provisional_bytes.entry(lease.class).or_default() -= bytes;
+    record_volume_transition(lease.class, "released", state.owned(lease.class));
+    Ok(())
 }
 
 /// Non-generic WAL volume capability.
@@ -638,33 +918,7 @@ impl WalVolume {
     /// Returns poison when reconciled durable ownership cannot cover the exact
     /// retired file length; no capacity is returned on mismatch.
     pub fn retire(&self, bytes: u64) -> Result<(), BifrostResourceError> {
-        let root = self
-            .governor
-            .roots
-            .get(&BifrostVolumeClass::Wal)
-            .ok_or_else(accounting_overflow)?;
-        let mut devices =
-            self.governor
-                .devices
-                .lock()
-                .map_err(|_| BifrostResourceError::Poisoned {
-                    detail: "volume state lock is poisoned".to_owned(),
-                })?;
-        let state = devices
-            .get_mut(&root.device)
-            .ok_or_else(accounting_overflow)?;
-        if state.durable_wal_bytes < bytes {
-            state.poisoned = true;
-            self.governor
-                .health
-                .poison(BifrostResourcePoisonReason::Volume);
-            return Err(BifrostResourceError::Poisoned {
-                detail: "durable WAL retirement underflow".to_owned(),
-            });
-        }
-        state.durable_wal_bytes -= bytes;
-        record_volume_transition(BifrostVolumeClass::Wal, "released", state.durable_wal_bytes);
-        Ok(())
+        retire_durable(&self.governor, BifrostVolumeClass::Wal, bytes)
     }
 
     /// Poisons shared health when failed WAL mutation cannot be reconciled.
@@ -893,40 +1147,7 @@ impl WalVolumeGrowth {
     /// Returns poison when the registered device or provisional counter no
     /// longer covers this exact growth.
     pub fn commit(mut self) -> Result<(), BifrostResourceError> {
-        let mut lease = self.lease.take().ok_or_else(accounting_overflow)?;
-        let mut devices =
-            lease
-                .governor
-                .devices
-                .lock()
-                .map_err(|_| BifrostResourceError::Poisoned {
-                    detail: "volume state lock is poisoned".to_owned(),
-                })?;
-        let state = devices
-            .get_mut(&lease.device)
-            .ok_or_else(accounting_overflow)?;
-        if state.provisional_wal_bytes < lease.bytes {
-            state.poisoned = true;
-            lease
-                .governor
-                .health
-                .poison(BifrostResourcePoisonReason::Volume);
-            return Err(BifrostResourceError::Poisoned {
-                detail: "provisional WAL growth diverged before commit".to_owned(),
-            });
-        }
-        state.provisional_wal_bytes -= lease.bytes;
-        state.durable_wal_bytes = state
-            .durable_wal_bytes
-            .checked_add(lease.bytes)
-            .ok_or_else(accounting_overflow)?;
-        lease.retained = true;
-        record_volume_transition(
-            BifrostVolumeClass::Wal,
-            "committed",
-            state.durable_wal_bytes,
-        );
-        Ok(())
+        commit_durable(self.lease.take().ok_or_else(accounting_overflow)?)
     }
 
     /// Retains provisional ownership and poisons health after mutation divergence.
@@ -967,14 +1188,14 @@ struct VolumeLease {
     bytes: u64,
     /// Closed capability class whose exact counter receives this ownership.
     class: BifrostVolumeClass,
-    /// Whether this is provisional WAL rather than disposable scratch.
-    wal: bool,
-    /// Durable WAL or failed-cleanup ownership retained after this handle drops.
+    /// Whether this is provisional durable growth rather than disposable scratch.
+    durable: bool,
+    /// Committed durable or failed-cleanup ownership retained after this drops.
     retained: bool,
 }
 
 impl Drop for VolumeLease {
-    /// Rolls back provisional WAL or releases exact disposable scratch.
+    /// Rolls back provisional durable growth or releases disposable scratch.
     fn drop(&mut self) {
         if self.retained {
             return;
@@ -991,8 +1212,8 @@ impl Drop for VolumeLease {
                 .poison(BifrostResourcePoisonReason::Volume);
             return;
         };
-        let counter = if self.wal {
-            &mut state.provisional_wal_bytes
+        let counter = if self.durable {
+            state.provisional_bytes.entry(self.class).or_default()
         } else {
             state.scratch_bytes.entry(self.class).or_default()
         };
@@ -1016,6 +1237,42 @@ impl Drop for VolumeLease {
 /// Returns unavailable when a registered path cannot be read or measured.
 fn retained_wal_root_bytes(root: &Path) -> Result<u64, BifrostResourceError> {
     retained_path_bytes(root, &root.join("staged"))
+}
+
+/// Measures retained Scribe staged bytes under the registered staging root.
+///
+/// The staging root is owned end to end by `ScribeHotStage`: every regular file
+/// beneath it is either a staged run or a staged member record, and both are
+/// durable until the member retires. Reconciliation therefore counts the whole
+/// tree rather than a filename allowlist, so an interrupted stage cannot leave
+/// bytes on the device that the governor does not own.
+///
+/// # Errors
+///
+/// Returns unavailable when the staging root cannot be read or measured.
+fn retained_stage_root_bytes(root: &Path) -> Result<u64, BifrostResourceError> {
+    let metadata =
+        fs::symlink_metadata(root).map_err(|error| BifrostResourceError::Unavailable {
+            detail: format!("cannot inspect retained stage path: {error}"),
+        })?;
+    if metadata.is_file() {
+        return Ok(metadata.len());
+    }
+    if !metadata.is_dir() {
+        return Ok(0);
+    }
+    let mut total = 0_u64;
+    for entry in fs::read_dir(root).map_err(|error| BifrostResourceError::Unavailable {
+        detail: format!("cannot enumerate retained stage path: {error}"),
+    })? {
+        let entry = entry.map_err(|error| BifrostResourceError::Unavailable {
+            detail: format!("cannot inspect retained stage entry: {error}"),
+        })?;
+        total = total
+            .checked_add(retained_stage_root_bytes(&entry.path())?)
+            .ok_or_else(accounting_overflow)?;
+    }
+    Ok(total)
 }
 
 /// Recursively measures retained WAL bytes without following symlinks.
@@ -5324,10 +5581,11 @@ mod tests {
     fn bifrost_volume_governor_groups_aliases_and_preserves_exact_capacity() {
         let temp = tempfile::tempdir().expect("temporary volume root");
         let wal = temp.path().join("wal");
+        let stage_root = temp.path().join("scribe-stage");
         let scribe = temp.path().join("scribe-output-scratch");
         let forge = temp.path().join("forge");
         let oracle = temp.path().join("oracle");
-        for path in [&wal, &scribe, &forge, &oracle] {
+        for path in [&wal, &stage_root, &scribe, &forge, &oracle] {
             fs::create_dir(path).expect("registered volume root");
         }
         fs::write(wal.join("retained.wal"), [0_u8; 16]).expect("retained WAL fixture");
@@ -5335,6 +5593,7 @@ mod tests {
         let governor = BifrostVolumeGovernor::register(
             BifrostVolumeRoots {
                 wal,
+                scribe_stage: stage_root,
                 scribe_output_scratch: scribe,
                 forge_scratch: forge,
                 oracle_scratch: oracle,
@@ -5376,15 +5635,17 @@ mod tests {
     fn bifrost_volume_governor_serializes_same_device_wal_scratch_race() {
         let temp = tempfile::tempdir().expect("temporary volume root");
         let wal = temp.path().join("wal");
+        let stage_root = temp.path().join("scribe-stage");
         let scribe = temp.path().join("scribe-output-scratch");
         let forge = temp.path().join("forge");
         let oracle = temp.path().join("oracle");
-        for path in [&wal, &scribe, &forge, &oracle] {
+        for path in [&wal, &stage_root, &scribe, &forge, &oracle] {
             fs::create_dir(path).expect("registered volume root");
         }
         let governor = BifrostVolumeGovernor::register(
             BifrostVolumeRoots {
                 wal,
+                scribe_stage: stage_root,
                 scribe_output_scratch: scribe,
                 forge_scratch: forge,
                 oracle_scratch: oracle,
@@ -5444,10 +5705,11 @@ mod tests {
     fn bifrost_volume_governor_scribe_namespace_is_exactly_scoped() {
         let temp = tempfile::tempdir().expect("temporary volume root");
         let wal = temp.path().join("wal");
+        let stage_root = wal.join("scribe-stage");
         let scribe = wal.join("scribe-output-scratch");
         let forge = wal.join("forge");
         let oracle = wal.join("oracle");
-        for path in [&wal, &scribe, &forge, &oracle] {
+        for path in [&wal, &stage_root, &scribe, &forge, &oracle] {
             fs::create_dir_all(path).expect("registered volume root");
         }
         let retained_wal = wal.join("retained.wal");
@@ -5460,6 +5722,7 @@ mod tests {
         let governor = BifrostVolumeGovernor::register(
             BifrostVolumeRoots {
                 wal,
+                scribe_stage: stage_root,
                 scribe_output_scratch: scribe.clone(),
                 forge_scratch: forge,
                 oracle_scratch: oracle,
@@ -5500,16 +5763,18 @@ mod tests {
     fn bifrost_volume_governor_cleanup_failure_retains_charge_and_poisons() {
         let temp = tempfile::tempdir().expect("temporary volume root");
         let wal = temp.path().join("wal");
+        let stage_root = wal.join("scribe-stage");
         let scribe = wal.join("scribe-output-scratch");
         let forge = wal.join("forge");
         let oracle = wal.join("oracle");
-        for path in [&wal, &scribe, &forge, &oracle] {
+        for path in [&wal, &stage_root, &scribe, &forge, &oracle] {
             fs::create_dir_all(path).expect("registered volume root");
         }
         let health = BifrostResourceHealth::default();
         let governor = BifrostVolumeGovernor::register(
             BifrostVolumeRoots {
                 wal,
+                scribe_stage: stage_root,
                 scribe_output_scratch: scribe,
                 forge_scratch: forge,
                 oracle_scratch: oracle,
@@ -5582,15 +5847,17 @@ mod tests {
 
             let temp = tempfile::tempdir().expect("temporary volume root");
             let wal = temp.path().join("wal");
+            let stage_root = temp.path().join("scribe-stage");
             let scribe = temp.path().join("scribe-output-scratch");
             let forge = temp.path().join("forge");
             let oracle_root = temp.path().join("oracle");
-            for path in [&wal, &scribe, &forge, &oracle_root] {
+            for path in [&wal, &stage_root, &scribe, &forge, &oracle_root] {
                 fs::create_dir(path).expect("registered volume root");
             }
             let volumes = BifrostVolumeGovernor::register(
                 BifrostVolumeRoots {
                     wal,
+                    scribe_stage: stage_root,
                     scribe_output_scratch: scribe,
                     forge_scratch: forge,
                     oracle_scratch: oracle_root,
@@ -5641,10 +5908,11 @@ mod tests {
             return;
         };
         let wal = disk.path().join("wal");
+        let stage_root = disk.path().join("scribe-stage");
         let scribe = disk.path().join("scribe-output-scratch");
         let forge = disk.path().join("forge");
         let oracle = memory.path().join("oracle");
-        for path in [&wal, &scribe, &forge, &oracle] {
+        for path in [&wal, &stage_root, &scribe, &forge, &oracle] {
             fs::create_dir(path).expect("registered volume root");
         }
         if fs::metadata(&forge).expect("Forge metadata").dev()
@@ -5657,6 +5925,7 @@ mod tests {
         let governor = BifrostVolumeGovernor::register(
             BifrostVolumeRoots {
                 wal,
+                scribe_stage: stage_root,
                 scribe_output_scratch: scribe,
                 forge_scratch: forge,
                 oracle_scratch: oracle,

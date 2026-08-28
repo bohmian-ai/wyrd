@@ -5112,14 +5112,16 @@ mod tests {
         let _guard = WAL_FAULT_LOCK.lock().expect("test hook lock");
         let directory = TempDir::new().expect("temporary WAL directory");
         let scribe = directory.path().join("scribe-output-scratch");
+        let stage = directory.path().join("scribe-stage");
         let forge = directory.path().join("forge");
         let oracle = directory.path().join("oracle");
-        for path in [&scribe, &forge, &oracle] {
+        for path in [&scribe, &stage, &forge, &oracle] {
             std::fs::create_dir(path).expect("registered volume root");
         }
         let governor = crate::resources::BifrostVolumeGovernor::register(
             crate::resources::BifrostVolumeRoots {
                 wal: directory.path().to_owned(),
+                scribe_stage: stage,
                 scribe_output_scratch: scribe,
                 forge_scratch: forge,
                 oracle_scratch: oracle,
@@ -5213,15 +5215,17 @@ mod tests {
         for fail_final_open in [true, false] {
             let directory = TempDir::new().expect("temporary WAL directory");
             let scribe = directory.path().join("scribe-output-scratch");
+            let stage = directory.path().join("scribe-stage");
             let forge = directory.path().join("forge");
             let oracle = directory.path().join("oracle");
-            for path in [&scribe, &forge, &oracle] {
+            for path in [&scribe, &stage, &forge, &oracle] {
                 std::fs::create_dir(path).expect("registered volume root");
             }
             let health = crate::resources::BifrostResourceHealth::default();
             let governor = crate::resources::BifrostVolumeGovernor::register(
                 crate::resources::BifrostVolumeRoots {
                     wal: directory.path().to_owned(),
+                    scribe_stage: stage,
                     scribe_output_scratch: scribe,
                     forge_scratch: forge,
                     oracle_scratch: oracle,

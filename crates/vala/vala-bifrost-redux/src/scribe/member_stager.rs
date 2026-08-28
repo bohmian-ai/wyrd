@@ -82,6 +82,8 @@ pub struct StagedRuns {
     wal: StagedLsnRange,
     /// Sorted runs in sort order, named relative to the member directory.
     runs: Vec<StagedRunFile>,
+    /// Durable staged bytes committed to the staging volume for these runs.
+    staged_bytes: u64,
 }
 
 impl StagedRuns {
@@ -99,6 +101,15 @@ impl StagedRuns {
     pub fn runs(&self) -> &[StagedRunFile] {
         &self.runs
     }
+
+    /// Returns the staged bytes charged against the durable staging volume.
+    ///
+    /// Retiring the member must release exactly this many bytes, so the value
+    /// travels with the runs rather than being re-measured from a directory
+    /// that may already be partially removed.
+    pub const fn staged_bytes(&self) -> u64 {
+        self.staged_bytes
+    }
 }
 
 /// Encodes frozen buckets into durable local runs and stages them ready.
@@ -106,12 +117,32 @@ impl StagedRuns {
 pub struct ScribeMemberStager {
     /// Durable staged namespace owning member directories and records.
     stage: Arc<ScribeHotStage>,
+    /// Governed durable capacity the staged namespace draws its bytes from.
+    volume: crate::resources::StageVolume,
 }
 
 impl ScribeMemberStager {
-    /// Binds the stager to the pod's durable staged namespace.
-    pub const fn new(stage: Arc<ScribeHotStage>) -> Self {
-        Self { stage }
+    /// Binds the stager to the pod's durable staged namespace and capacity.
+    pub const fn new(stage: Arc<ScribeHotStage>, volume: crate::resources::StageVolume) -> Self {
+        Self { stage, volume }
+    }
+
+    /// Releases the durable staged charge a retired member no longer owns.
+    ///
+    /// Call this only after the member's files are gone: the governor treats
+    /// the release as authoritative, so returning capacity for bytes still on
+    /// the device would let the next admission exceed the physical floor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when reconciled staged ownership
+    /// cannot cover the exact retired length.
+    pub fn release_staged_bytes(&self, bytes: u64) -> Result<(), ScribeError> {
+        self.volume
+            .retire(bytes)
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("release retired staged bytes: {error}"),
+            })
     }
 
     /// Sorts, encodes, fsyncs, and preflights one frozen bucket's runs.
@@ -154,6 +185,16 @@ impl ScribeMemberStager {
                 ),
             });
         }
+        let admitted =
+            u64::try_from(request.frozen.arrow_bytes).map_err(|_| ScribeError::Internal {
+                detail: "frozen generation size exceeds u64".to_owned(),
+            })?;
+        let growth =
+            self.volume
+                .try_reserve_growth(admitted)
+                .map_err(|error| ScribeError::Internal {
+                    detail: format!("admit durable staged bytes: {error}"),
+                })?;
         std::fs::create_dir_all(&directory).map_err(|error| ScribeError::Internal {
             detail: format!("create the staged member directory: {error}"),
         })?;
@@ -167,8 +208,14 @@ impl ScribeMemberStager {
             request.footer_reservation,
         )?;
         let mut runs = Vec::with_capacity(encoded.artifacts.len());
+        let mut staged_bytes = 0_u64;
         for artifact in &encoded.artifacts {
             let file_name = file_name_of(&artifact.scratch_path)?;
+            staged_bytes = staged_bytes
+                .checked_add(artifact.file_size)
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "staged member size exceeds u64".to_owned(),
+                })?;
             fsync_file(&artifact.scratch_path)?;
             preflight_run(&artifact.scratch_path)?;
             runs.push(StagedRunFile::new(
@@ -182,11 +229,18 @@ impl ScribeMemberStager {
         }
         encoded.artifacts.retain_for_reconciliation();
         fsync_directory(&directory)?;
+        if let Err(error) = growth.commit(staged_bytes) {
+            remove_member_directory(&directory);
+            return Err(ScribeError::Internal {
+                detail: format!("commit durable staged bytes: {error}"),
+            });
+        }
         Ok(StagedRuns {
             key,
             member,
             wal: request.origin.wal,
             runs,
+            staged_bytes,
         })
     }
 
@@ -223,6 +277,17 @@ impl ScribeMemberStager {
                 detail: format!("staged member is not a claimable ready member: {error}"),
             })
     }
+}
+
+/// Removes a member directory whose bytes were never admitted.
+///
+/// A member that could not commit its charge must not survive, or a restart
+/// would reconcile bytes the governor refused. The removal is best effort
+/// because the refusal is already the caller's error; residue that survives an
+/// IO failure here is removed by the staged namespace's startup cleanup, which
+/// ignores a directory holding no record.
+fn remove_member_directory(directory: &Path) {
+    let _ = std::fs::remove_dir_all(directory);
 }
 
 /// Builds the deterministic local object base stamped into a member's runs.
@@ -406,6 +471,41 @@ mod tests {
         .expect("test schema carries the built-in hourly layout")
     }
 
+    /// Registers a governed staging volume whose root is the stage's own root.
+    ///
+    /// The sibling roots are real directories because registration groups
+    /// classes by device, and the limit is generous because these tests prove
+    /// exact accounting rather than refusal.
+    fn staging_volume(
+        base: &Path,
+        stage_root: &Path,
+    ) -> (
+        crate::resources::BifrostVolumeGovernor,
+        crate::resources::StageVolume,
+    ) {
+        let wal = base.join("wal");
+        let scribe_output = base.join("scribe-output-scratch");
+        let forge = base.join("forge");
+        let oracle = base.join("oracle");
+        for path in [&wal, &scribe_output, &forge, &oracle] {
+            std::fs::create_dir_all(path).expect("registered volume root");
+        }
+        let governor = crate::resources::BifrostVolumeGovernor::register(
+            crate::resources::BifrostVolumeRoots {
+                wal,
+                scribe_stage: stage_root.to_owned(),
+                scribe_output_scratch: scribe_output,
+                forge_scratch: forge,
+                oracle_scratch: oracle,
+            },
+            1024 * 1024 * 1024,
+            crate::resources::BifrostResourceHealth::default(),
+        )
+        .expect("staging volume registration");
+        let volume = governor.capabilities().scribe_stage;
+        (governor, volume)
+    }
+
     /// Builds the origin facts a rotating shard contributes to one member.
     fn origin() -> StagedMemberOrigin {
         StagedMemberOrigin {
@@ -423,8 +523,11 @@ mod tests {
     #[tokio::test]
     async fn staged_member_recovers_ready_with_the_runs_it_named() {
         let root = tempfile::tempdir().expect("staged root");
-        let stage = Arc::new(ScribeHotStage::new(root.path().to_path_buf()));
-        let stager = ScribeMemberStager::new(Arc::clone(&stage));
+        let stage_root = root.path().join("stage");
+        std::fs::create_dir_all(&stage_root).expect("staged namespace");
+        let stage = Arc::new(ScribeHotStage::new(stage_root.clone()));
+        let (governor, volume) = staging_volume(root.path(), &stage_root);
+        let stager = ScribeMemberStager::new(Arc::clone(&stage), volume);
         let tenant = DataTenantId::new_v7();
         let frozen = frozen_member(tenant, 512);
         let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
@@ -441,6 +544,13 @@ mod tests {
             .expect("frozen member encodes into local runs");
         assert_eq!(member.member(), StagedMemberId::new(5, 9));
         assert_eq!(member.runs().len(), 1);
+        assert_eq!(
+            governor
+                .usage_for_test(crate::resources::BifrostVolumeClass::ScribeStage)
+                .expect("staged volume usage"),
+            (member.staged_bytes(), 0, 0),
+            "the committed charge is exactly the bytes the runs occupy"
+        );
 
         let recovered_before = stage.recover().await.expect("scan before publication");
         assert!(
@@ -470,6 +580,16 @@ mod tests {
         for path in members[0].run_paths() {
             assert!(path.exists(), "recovery names a run that exists: {path:?}");
         }
+
+        stager
+            .release_staged_bytes(member.staged_bytes())
+            .expect("retiring the member releases its exact charge");
+        assert_eq!(
+            governor
+                .usage_for_test(crate::resources::BifrostVolumeClass::ScribeStage)
+                .expect("retired volume usage"),
+            (0, 0, 0)
+        );
     }
 
     /// Re-encoding a member that already owns its durable directory is refused:
@@ -478,8 +598,11 @@ mod tests {
     #[tokio::test]
     async fn restaging_an_existing_member_is_refused() {
         let root = tempfile::tempdir().expect("staged root");
-        let stage = Arc::new(ScribeHotStage::new(root.path().to_path_buf()));
-        let stager = ScribeMemberStager::new(Arc::clone(&stage));
+        let stage_root = root.path().join("stage");
+        std::fs::create_dir_all(&stage_root).expect("staged namespace");
+        let stage = Arc::new(ScribeHotStage::new(stage_root.clone()));
+        let (governor, volume) = staging_volume(root.path(), &stage_root);
+        let stager = ScribeMemberStager::new(Arc::clone(&stage), volume);
         let tenant = DataTenantId::new_v7();
         let frozen = frozen_member(tenant, 64);
         let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
@@ -492,15 +615,23 @@ mod tests {
             origin: origin(),
             footer_reservation: crate::scribe::memory::EncodedFooterReservation::for_test(),
         };
-        stager
+        let charged = stager
             .encode_runs(request())
-            .expect("first staging encodes");
+            .expect("first staging encodes")
+            .staged_bytes();
         let refusal = stager
             .encode_runs(request())
             .expect_err("second staging is refused");
         assert!(
             refusal.to_string().contains("already occupies"),
             "refusal names the durable collision: {refusal}"
+        );
+        assert_eq!(
+            governor
+                .usage_for_test(crate::resources::BifrostVolumeClass::ScribeStage)
+                .expect("staged volume usage"),
+            (charged, 0, 0),
+            "a refused restage charges nothing and releases nothing"
         );
     }
 }

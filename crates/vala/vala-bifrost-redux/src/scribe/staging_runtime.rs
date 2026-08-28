@@ -124,6 +124,7 @@ impl ScribeStagingRuntime {
         mut self,
         hot_sources: Arc<crate::scribe::hot_source::ScribeHotSourceRegistry>,
     ) -> Self {
+        self.publisher.set_hot_sources(Arc::clone(&hot_sources));
         self.hot_sources = Some(hot_sources);
         self
     }

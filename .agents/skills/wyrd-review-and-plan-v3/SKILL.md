@@ -1,302 +1,140 @@
 ---
 name: wyrd-review-and-plan-v3
-description: Run the final full static review of an immutable Wyrd implementation produced by wyrd-implement-plan-v3, against its approved intent, plan, task packets, and integrated code. Use as the last merge- and push-readiness gate after integrated verification; never for working-tree or per-task candidate review.
+description: Run the terminal static review of an immutable integrated Wyrd change against its intent, plan, tasks, claims, code, and available evidence. Use after integrated verification as the final merge- or push-readiness review; no execution controller artifacts are required.
 ---
 
 # Wyrd Review And Plan v3
 
-Act as the independent terminal acceptance reviewer for one completed
-`$wyrd-implement-plan-v3` execution. Review the entire immutable integrated
-target, not merely its task reports. This is the last review gate before the
-controller may declare the implementation ready to push.
+Review one immutable integrated base-to-target range for aggregate intent and
+plan closure, cross-task correctness, architecture and contract drift,
+integrated journeys, and merge/push readiness. This is not a per-task candidate
+review and never reviews a mutable working tree.
 
-Model the workflow after the global `$review-and-plan` full review: independent
-specialist discovery, explicit coverage, adversarial probes, root source
-validation, a durable candidate ledger, and one authoritative consolidated
-review. Apply Wyrd authorities and the v3 remediation lifecycle described here.
-
-Set `REVIEW_ROOT` to this skill's `references/review-core` directory. Before
-acting, read these ported full-review contracts completely and follow them:
-
-1. `${REVIEW_ROOT}/artifact-contract.md`
-2. `${REVIEW_ROOT}/orchestration-contract.md`
-3. `${REVIEW_ROOT}/packet.md`
-4. `${REVIEW_ROOT}/specialist-contract.md`
-5. `${REVIEW_ROOT}/evidence-contract.md`
-6. `${REVIEW_ROOT}/adversarial-contract.md`
-7. `${REVIEW_ROOT}/dispatch-contract.md`
-8. `${REVIEW_ROOT}/pipeline.md`
-
-The ported contracts are authoritative for review mechanics and artifact
-schemas. This entrypoint supplies Wyrd v3 identity, lifecycle, and remediation
-routing. If prose here appears to conflict with a ported contract, follow the
-more specific v3 rule and report the inconsistency rather than improvising.
-
-Remain read-only. Never modify production source, review a working tree, or run
-project tests, builds, formatters, linters, generators, migrations, servers, or
-repository gates. Integrated verification belongs to the v3 controller and
-task candidates. State in every report:
-`Static analysis: no runtime verification performed.`
-
-Concrete agents, models, effort, roles, and concurrency belong to the active
-harness. This skill defines review questions, capability and independence
-requirements, immutable identities, and evidence contracts only. Never invoke
-v1 or v2 implementation, review, or planning workflows.
+Remain read-only. Do not implement fixes or mutate reviewed source. Runtime
+verification normally belongs to the calling execution environment; audit its
+available evidence and run only a narrowly necessary check when the caller
+explicitly authorizes runtime verification. State static and runtime limits
+plainly.
 
 ## Required input
 
-Require:
+Require only:
 
-- stable request ID and repository root;
-- immutable execution baseline, integrated target, and merge-base SHAs;
-- output directory outside the reviewed worktree;
-- approved intent, plan, plan-review, and task-packet paths and digests;
-- for every integrated task: task ID, packet digest, approved candidate SHA,
-  integration commit, candidate manifest ref/digest, proof ref/digest, and
-  `$wyrd-review-v3` artifact ref/digest;
-- integrated-verification proof refs/digests from the controller.
+- repository root;
+- immutable base and integrated target SHAs with an unambiguous range; and
+- the user intent plus available plan/task authority.
 
-Resolve every ref and digest before review. Reject a dirty or moving target,
-unreadable authority, missing task identity, contradictory lineage, candidate
-that was not approved, or integration commit that does not contribute the
-recorded candidate. Never infer missing identity from branch names, chat, or
-mutable controller state.
+Plan reviews, task reviews, command results, evidence summaries, Change IDs,
+Change revision IDs, and artifact digests are useful optional evidence. Missing
+controller request IDs, generations, candidate manifests, integration commits,
+proof artifacts, leases, or controller state never blocks review.
 
-Read completely at the target snapshot:
+When a Wyrd `ChangeRevisionId` is supplied, confirm its base/candidate identity
+matches the reviewed integrated subject and that it is not stale or superseded.
+Review acceptance remains an evidence contribution: it does not transition a
+Wyrd `Change`, finalize an `EvidenceManifest`, authorize, merge, or promote it.
 
-- `AGENTS.md` and `architecture/agent-rules.md`;
-- `architecture/wyrd-design.md` and `architecture/wyrd-doctrine.mdx`;
-- the approved intent, plan, plan review, and every task packet;
-- applicable manifests, ownership rules, generated-contract owners, and local
-  architecture authorities;
-- the complete committed diff and enough unchanged callers, consumers,
-  contracts, tests, and precedents to evaluate it.
+Read at the target snapshot:
 
-Use CodeGraph only when its index is proven to match `target_sha`; otherwise
-use `git show` or a detached read-only worktree.
+- `AGENTS.md`, `architecture/agent-rules.md`, and applicable design/doctrine;
+- intent, plan, and relevant task packets;
+- the complete committed diff;
+- enough unchanged owners, callers, consumers, contracts, tests, and generated
+  surfaces to evaluate the integrated impact; and
+- available verification and prior review evidence.
 
-## Establish terminal review coverage
+Follow CodeGraph instructions. Use `git show` or a detached read-only worktree
+when the index does not match the target.
 
-Create a review ID and persist this tree under the supplied output directory:
+## Establish proportionate coverage
 
-```text
-<review-dir>/
-├── review.md
-└── evidence/
-    ├── packet.md
-    ├── coverage.json
-    ├── ledger.json
-    ├── validation.md
-    └── specialists/
-        ├── <assignment>.md
-        └── <assignment>.attestation.json
-```
+Build a compact impact map from the integrated diff: changed behavior owners,
+public/durable contracts, state and side-effect transitions, consumers,
+generated projections, tests and journeys, deployment surfaces, and applicable
+release gates.
 
-`review.md` is the only authoritative verdict and remediation handoff. Evidence
-records how the conclusion was reached; it must not be required to understand
-a final finding.
+Always cover:
 
-Derive the impact graph from `base_sha..target_sha`: changed owners and
-symbols, callers, consumers, state transitions, public projections,
-persistence and lifecycle paths, tests and user journeys, manifests, generated
-artifacts, deployment surfaces, and release gates. Map every plan requirement,
-task acceptance criterion, changed production file, and high-risk boundary to
-an assignment before dispatch.
+1. aggregate user intent and required claim closure;
+2. cross-task producer/consumer seams and integration drift;
+3. candidate-introduced behavioral regressions;
+4. applicable Wyrd architecture, ownership, and hard repository rules;
+5. evidence adequacy, staleness, and contradiction; and
+6. user/agent journey closure for changed public behavior.
 
-Audit existing candidate, proof, review, and integrated-verification artifacts
-semantically by content-addressed reference. They are evidence, not acceptance
-authority for the integrated result. Do not copy their commands, logs, task
-prose, or nested traces into terminal artifacts.
+Add focused specialist review only when it materially reduces risk. High-risk
+auth, tenancy, audit, destructive persistence, migrations, public contracts,
+cross-language boundaries, concurrency/recovery, Vala/Bifrost data-plane, or UI
+changes may justify independent lenses. Do not require a fixed reviewer roster,
+artifact tree, dispatch schema, or reviewer count for every change. The root
+reviewer validates adopted findings against source and owns the final verdict.
 
-Use approved candidate reviews as evidence of candidate-local code review and
-proof. Spend terminal effort on cross-task seams, aggregate intent and plan
-closure, accumulated architecture or contract drift, integrated journeys, and
-contradictory evidence. Reopen a candidate-local implementation only when an
-integrated seam or evidence inconsistency makes that prior review suspect; do
-not mechanically replay every accepted leaf review.
+Use accepted candidate reviews as evidence rather than mechanically repeating
+them. Reopen candidate-local work only when an integrated seam, later change,
+stale subject, missing consumer closure, or evidence inconsistency makes the
+prior conclusion suspect.
 
-## Dispatch the full review roster
+## Review claims and evidence
 
-Dispatch seven independent baseline specialists through the active harness as
-defined by `${REVIEW_ROOT}/dispatch-contract.md`. Each has a distinct reviewer
-identity and one primary domain:
+Map required plan/task claims to the strongest applicable evidence. Preserve
+the Wyrd Change trust distinctions when present:
 
-1. `correctness` — behavior, lifecycle, performance, state transitions,
-   concurrency, cancellation, recovery, cleanup, and failure handling.
-2. `security` — authentication, authorization, tenant isolation, RLS, secrets,
-   audit boundaries, stable errors, unsafe input, and abuse paths.
-3. `code-quality` — Rust/Python/TypeScript idioms, local patterns, clarity,
-   dependency use, error handling, and needless complexity.
-4. `maintainability` — ownership, struct-centered Rust, cohesion, dependency
-   cones, duplication, extensibility actually required by the task, and YAGNI.
-5. `tests` — plan and acceptance traceability, assertion strength, negative and
-   edge flows, user journeys, lane placement, and whether recorded proof binds
-   to the reviewed commits.
-6. `developer-experience` — public SDK, HTTP, MCP, CLI, UI, generated docs,
-   errors, discoverability, and agent-facing usability.
-7. `architecture-contracts` — Wyrd doctrine, owner boundaries, durable and
-   public contracts, async/PyO3 boundaries, deployment topology, and contract
-   projection parity.
+- deterministic evidence, LLM evaluation, and human attestation remain
+  orthogonal;
+- finalized evidence completeness does not itself prove claim success;
+- failed or missing evidence is failed or indeterminate, never success;
+- evidence from a different, stale, or superseded subject does not transfer;
+  and
+- review acceptance does not imply product authorization or merge authority.
 
-Each assignment must read `${REVIEW_ROOT}/specialist-contract.md`,
-`${REVIEW_ROOT}/adversarial-contract.md`, and its exact prompt:
+Broad integrated checks support, but do not replace, inspection of whether
+their assertions prove the relevant behavior. Conversely, do not rerun broad
+suites merely to duplicate valid current evidence.
 
-- `correctness`: `review-bugs/review-bugs.md`
-- `security`: `review-security/review-security.md`
-- `code-quality`: `review-code-quality/review-code-quality.md`
-- `maintainability`: `review-maintainability/review-maintainability.md`
-- `tests`: `review-tests/review-tests.md`
-- `developer-experience`:
-  `review-developer-experience/review-developer-experience.md`
-- `architecture-contracts`:
-  `review-architecture-contracts/review-architecture-contracts.md`
+## Finding threshold
 
-Add separate triggered specialists for every applicable domain:
+Report only confirmed defects that affect integrated behavior, a required
+claim, a public/durable contract, cross-task closure, verification credibility,
+or an applicable hard repository rule. Reject speculative, preference-only,
+duplicate, stale, or unrelated findings.
 
-- persistence, SQL, storage, migrations, durability, replay, or idempotency;
-- async, queues, external calls, timeouts, retries, shutdown, flush, or drain;
-- PyO3, Python exports/stubs, Node bindings, or cross-language lifetime work;
-- Vala, Bifrost, Arrow, DataFusion, Parquet, Iceberg, ingestion, or query work;
-- Wyrd UI or browser-visible behavior;
-- another repository specialist required by the impact graph or plan.
+A finding contains:
 
-Use the corresponding ported prompts for triggered assignments:
+- stable ID, severity, and exact location;
+- affected claim, task, or hard rule;
+- current versus expected integrated behavior;
+- reachable scenario and observable consequence;
+- bounded required outcome and non-goals; and
+- focused verification that would establish closure.
 
-- `review-persistence-storage/review-persistence-storage.md`
-- `review-async-reliability/review-async-reliability.md`
-- `review-pyo3-cross-language/review-pyo3-cross-language.md`
-- `review-vala-data-plane/review-vala-data-plane.md`
-- `review-wyrd-ui/review-wyrd-ui.md`
+Classify findings as:
 
-Triggered assignments add coverage; they never replace a baseline assignment.
-Auth, tenancy, destructive persistence, migrations, concurrency, recovery, and
-public wire contracts require two distinct reviewers. A changed user-facing
-capability must be covered by the tests/user-journey specialist.
+- `REVERSIBLE` — intent already determines a bounded code, test, generated,
+  documentation, or evidence correction;
+- `TASK_REPAIR` — task authority is mechanically contradictory or unexecutable
+  without a new material decision; or
+- `MATERIAL` — correction needs new product, public/durable contract,
+  ownership, security, tenancy, migration, rollout, or acceptance authority.
 
-If required capability or reviewer independence is unavailable, persist the
-coverage gap and return `REVIEW_BLOCKED`. Never combine or omit a baseline
-domain to fit capacity. Use the active harness's native delegation mechanism
-and dispatch in waves when capacity requires it.
+## Verdict and remediation
 
-Every specialist receives the same immutable review tuple and only its scoped
-impact slice. Specialists remain read-only and return a schema-constrained
-report. The root validates identity and publishes the evidence
-atomically. Specialists do not assign final IDs, plan, remediate, launch other
-reviewers, or communicate with the user.
+Use one verdict:
 
-The immutable packet and per-assignment dispatch attestation record assignment
-identity. Each specialist
-report records inspected and sampled scope, applicable requirements and task
-criteria, at least one material adversarial probe, candidate findings, clean
-rationale, and static limits. A clean report must name the most dangerous
-relevant invariant challenged, the strongest realistic counterexample
-attempted, and why it survived inspection.
+- `CLEAN` — no confirmed findings; required integrated claims and journeys are
+  adequately supported; ready for the caller's merge/push decision;
+- `REMEDIATION_REQUIRED` — bounded reversible or task-repair work remains;
+- `MATERIAL_DECISION_REQUIRED` — new material authority is required; or
+- `REVIEW_BLOCKED` — the immutable target, essential authority, or critical
+  evidence cannot be inspected sufficiently.
 
-## Validate and consolidate
+Lead with the verdict and confirmed findings. Then summarize reviewed identity,
+impact coverage, claim/evidence closure, verification/static limits, and
+merge/push readiness. Do not require a durable review directory or exact YAML
+schema unless the caller requests an automation artifact.
 
-The root reviewer—not the specialists and not prior task approval—is final
-static-review authority. Preserve every specialist candidate in `ledger.json`.
-For each candidate:
-
-1. Re-read its cited source and complete owning symbol at `target_sha`.
-2. Inspect affected callers, consumers, contracts, tests, and local precedent.
-3. Test the claim against approved intent, plan, packet, Wyrd authority, and
-   the actual integrated flow.
-4. Attempt to disprove its reachability, consequence, and proposed closure.
-5. Reject speculative, preference-only, duplicate, stale, working-tree-only,
-   or unsupported claims with a concrete disposition.
-6. Merge only candidates with the same root cause and required outcome.
-7. Assign stable `REV-NNN` IDs only after validation and deduplication.
-
-Before returning a clean verdict, independently challenge the three most
-dangerous changed invariants across the integrated impact cone and record how
-each survived, became a finding, or remains a static limit.
-
-Classify each confirmed finding:
-
-- `REVERSIBLE`: approved intent already determines a bounded implementation,
-  test, generated-output, or evidence correction;
-- `TASK_CONTRACT_REPAIR`: a mechanical task-packet field or proof obligation is
-  defective without requiring a new material decision;
-- `MATERIAL`: correction requires a new product, public or durable contract,
-  owner, dependency, security, tenancy, audit, migration, or acceptance choice.
-
-Every confirmed finding must stand alone and contain:
-
-- severity, confidence, class, affected task IDs, owners, exact locations,
-  authorities, requirements, source reviewers, and candidate IDs;
-- a plain-language maintainer summary;
-- the current flow, expected behavior, exact divergence, and source evidence;
-- a concrete reachable failure scenario, consequence, blast radius,
-  detectability, and recovery;
-- the bounded required outcome, constraints, local precedent, and non-goals;
-- observable acceptance assertions with stable assertion IDs;
-- required verification command IDs and test tier/location;
-- when structural Rust work is required, the natural concrete owner, composed
-  state, inherent public/private methods, justified pure helpers, sync/async
-  boundary, rustdoc closure, and forbidden shapes.
-
-Do not replace these facts with a title restatement or evidence pointer.
-
-## Authoritative output
-
-Write `review.md` with:
-
-1. review metadata and immutable identities;
-2. executive assessment and explicit push-readiness conclusion;
-3. scope, intent, plan, and task closure;
-4. baseline and triggered lens coverage;
-5. requirement and acceptance traceability;
-6. confirmed findings;
-7. follow-ups, deferrals, and static limits;
-8. validation-ledger summary;
-9. remediation or material-decision handoff.
-
-Use exactly one terminal verdict:
-
-- `CLEAN`: no confirmed findings, complete required coverage, valid lineage,
-  and adequate prior proof/review bindings; the implementation is ready for
-  the controller's final push handoff.
-- `REMEDIATION_REQUIRED`: one or more `REVERSIBLE` or
-  `TASK_CONTRACT_REPAIR` findings remain; the implementation is not ready to
-  push.
-- `MATERIAL_DECISION_REQUIRED`: at least one `MATERIAL` finding requires new
-  authority; the implementation is not ready to push.
-- `REVIEW_BLOCKED`: immutable identity, mandatory authority, evidence, roster,
-  independence, or coverage is insufficient; make no push-readiness claim.
-
-`coverage.json` records the full roster, reviewer identities, triggers, changed
-files, requirements, high-risk boundaries, user-facing capabilities, and any
-gaps. `ledger.json` records every candidate and its final disposition.
-`validation.md` records the root source-validation decision for every
-candidate. The root may perform only immutable Git-object inspection,
-harness-native review dispatch, and the ported artifact validators. It must not run
-project tests, builds, formatters, linters, generators, migrations, servers,
-or arbitrary shell workflows. Validate the artifact structure with:
-
-```bash
-python "${REVIEW_ROOT}/scripts/validate_review.py" "${REVIEW_DIR}/review.md"
-python "${REVIEW_ROOT}/scripts/validate_evidence.py" "${REVIEW_DIR}"
-```
-
-## V3 remediation routing
-
-Do not create a second implementation plan for ordinary terminal findings.
-The v3 controller routes each `REVERSIBLE` remediation contract unchanged to
-`$wyrd-implement-v3`, grouped only by actual owner and write overlap. Every
-replacement candidate receives complete implementer verification,
-`$wyrd-review-v3`, serial integration, integrated checks, and a fresh terminal
-review of the new immutable target.
-
-Route `TASK_CONTRACT_REPAIR` through the bounded v3 packet-repair and reapproval
-path, then apply the same candidate lifecycle. Historical integrated task
-identities remain immutable; remediation is additive from the current target.
-
-Invoke `$wyrd-plan-v3` only for `MATERIAL` findings. Supply the consolidated
-finding and exact committed identities, then stop before implementation. Never
-invent a review-private plan or task format.
-
-The final response returns the review ID, base/target/merge-base SHAs, verdict,
-risk, `review.md` path, evidence directory, finding counts by class, and either
-the remediation contracts or the material-plan path. Always repeat:
-`Static analysis: no runtime verification performed.`
+Return reversible findings directly to the caller for bounded
+`$wyrd-implement-v3` remediation. A repaired immutable candidate receives
+focused `$wyrd-review-v3`, integration, applicable integrated checks, and a
+fresh terminal review. Route only `MATERIAL` findings to `$wyrd-plan-v3` or the
+user. No repository skill owns scheduling, leases, generations, worktrees,
+candidate refs, serial integration, or remediation-controller state.

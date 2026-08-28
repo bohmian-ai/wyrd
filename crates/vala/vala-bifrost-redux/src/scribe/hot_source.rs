@@ -203,11 +203,44 @@ pub struct StagedSource {
     pub wal: (WalLsn, WalLsn),
 }
 
+/// Staged sources one reader holds open for the length of its read.
+///
+/// The lease is what stops cleanup from deleting a member's runs between the
+/// moment a reader resolved it and the moment the reader opens its files. It
+/// releases on drop, including on an early return or a panic, so a refused read
+/// never strands a member's directory.
+#[derive(Debug)]
+pub struct StagedSourceLease {
+    /// Registry the leases are released back to.
+    registry: std::sync::Arc<ScribeHotSourceRegistry>,
+    /// One entry per lease taken, in the order they were taken.
+    held: Vec<(SealKey, GenerationOrdinal)>,
+    /// Staged sources this lease keeps readable, oldest first.
+    sources: Vec<StagedSource>,
+}
+
+impl StagedSourceLease {
+    /// Returns the leased staged sources, oldest first.
+    #[must_use]
+    pub fn sources(&self) -> &[StagedSource] {
+        &self.sources
+    }
+}
+
+impl Drop for StagedSourceLease {
+    /// Releases every lease this read held.
+    fn drop(&mut self) {
+        self.registry.release_leases(&self.held);
+    }
+}
+
 /// Live authority for one seal key's generations.
 #[derive(Debug, Default)]
 struct KeyAuthorities {
     /// Current authority per registered generation.
     by_generation: HashMap<GenerationOrdinal, HotAuthority>,
+    /// Readers currently holding each generation's staged runs open.
+    leases: HashMap<GenerationOrdinal, usize>,
 }
 
 /// Pod-wide registry of where every live generation's rows are readable.
@@ -215,6 +248,8 @@ struct KeyAuthorities {
 pub struct ScribeHotSourceRegistry {
     /// Authorities per seal key.
     state: Mutex<HashMap<SealKey, KeyAuthorities>>,
+    /// Signalled whenever a lease is released, so cleanup can wait on it.
+    released: tokio::sync::Notify,
 }
 
 impl ScribeHotSourceRegistry {
@@ -455,14 +490,15 @@ impl ScribeHotSourceRegistry {
     ///
     /// Returns [`HotSourceError::Poisoned`] on a poisoned lock.
     pub fn staged_sources(
-        &self,
+        self: &std::sync::Arc<Self>,
         tenant: wyrd_spec::ids::DataTenantId,
         table: &crate::catalog::TableRef,
         start: crate::catalog::layout::TimePartition,
         end: crate::catalog::layout::TimePartition,
-    ) -> Result<Vec<StagedSource>, HotSourceError> {
-        let state = self.lock()?;
+    ) -> Result<StagedSourceLease, HotSourceError> {
+        let mut state = self.lock()?;
         let mut sources = Vec::new();
+        let mut held = Vec::new();
         for (key, authorities) in state.iter() {
             if key.tenant != tenant || key.table != *table {
                 continue;
@@ -480,6 +516,7 @@ impl ScribeHotSourceRegistry {
                 else {
                     continue;
                 };
+                held.push((key.clone(), *generation));
                 sources.push(StagedSource {
                     key: key.clone(),
                     generation: *generation,
@@ -490,13 +527,89 @@ impl ScribeHotSourceRegistry {
                 });
             }
         }
+        for (key, generation) in &held {
+            let authorities = state.entry(key.clone()).or_default();
+            let count = authorities.leases.entry(*generation).or_default();
+            *count = count.saturating_add(1);
+        }
+        drop(state);
         sources.sort_by(|left, right| {
             left.key
                 .partition
                 .cmp(&right.key.partition)
                 .then(left.generation.cmp(&right.generation))
         });
-        Ok(sources)
+        Ok(StagedSourceLease {
+            registry: std::sync::Arc::clone(self),
+            held,
+            sources,
+        })
+    }
+
+    /// Waits until no reader still holds one generation's staged runs open.
+    ///
+    /// Cleanup calls this before deleting a member's directory. The reader
+    /// opens each run lazily, so deleting under a live lease would turn an
+    /// in-flight exact read into a refusal even though the rows are published
+    /// and correct. Publication has already advanced the generation's authority
+    /// by the time cleanup runs, so no new lease can be taken here and the wait
+    /// is bounded by the reads that were already in flight.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HotSourceError::Poisoned`] on a poisoned lock.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancelling the wait leaves the leases untouched; the member's directory
+    /// simply is not removed yet, and the next cleanup attempt waits again.
+    pub async fn drain_leases(
+        &self,
+        key: &SealKey,
+        generation: GenerationOrdinal,
+    ) -> Result<(), HotSourceError> {
+        loop {
+            let released = self.released.notified();
+            if self.leases(key, generation)? == 0 {
+                return Ok(());
+            }
+            released.await;
+        }
+    }
+
+    /// Returns how many readers currently hold one generation's runs open.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HotSourceError::Poisoned`] on a poisoned lock.
+    pub fn leases(
+        &self,
+        key: &SealKey,
+        generation: GenerationOrdinal,
+    ) -> Result<usize, HotSourceError> {
+        Ok(self
+            .lock()?
+            .get(key)
+            .and_then(|authorities| authorities.leases.get(&generation).copied())
+            .unwrap_or(0))
+    }
+
+    /// Releases one held lease per entry, waking any cleanup waiting on it.
+    fn release_leases(&self, held: &[(SealKey, GenerationOrdinal)]) {
+        if let Ok(mut state) = self.state.lock() {
+            for (key, generation) in held {
+                let Some(authorities) = state.get_mut(key) else {
+                    continue;
+                };
+                if let Some(count) = authorities.leases.get_mut(generation) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        authorities.leases.remove(generation);
+                    }
+                }
+            }
+        }
+        self.released.notify_waiters();
     }
 
     /// Reports whether every generation of a key is durably held.
@@ -736,7 +849,7 @@ mod tests {
     /// Panics when a fixture registration or transition is refused.
     #[test]
     fn staged_sources_are_scoped_ordered_and_exclude_other_authorities() {
-        let registry = ScribeHotSourceRegistry::new();
+        let registry = std::sync::Arc::new(ScribeHotSourceRegistry::new());
         let key = seal_key();
         let next_day = SealKey::new(
             key.tenant,
@@ -753,7 +866,14 @@ mod tests {
             TableRef::new(BifrostNamespace::Bifrost, "other"),
             key.partition,
         );
-        for (key, generation) in [(&key, 2_u64), (&key, 1), (&next_day, 3), (&other_table, 4)] {
+        let other_tenant = SealKey::new(DataTenantId::new_v7(), key.table.clone(), key.partition);
+        for (key, generation) in [
+            (&key, 2_u64),
+            (&key, 1),
+            (&next_day, 3),
+            (&other_table, 4),
+            (&other_tenant, 7),
+        ] {
             let generation = GenerationOrdinal::new(0, generation);
             registry
                 .register_memtable(key, generation)
@@ -787,6 +907,7 @@ mod tests {
             .staged_sources(key.tenant, &key.table, key.partition, next_day.partition)
             .expect("locked");
         let named: Vec<(TimePartition, u64)> = sources
+            .sources()
             .iter()
             .map(|source| (source.key.partition, source.generation.get()))
             .collect();
@@ -799,5 +920,73 @@ mod tests {
             ],
             "only staged generations of the requested table and range are readable, oldest first"
         );
+    }
+
+    /// A resolved staged read leases its members until the reader drops them.
+    ///
+    /// Cleanup deletes a member's runs as soon as its claim publishes, and the
+    /// reader opens those runs lazily. Without the lease a read that had already
+    /// resolved a member would refuse on a file that vanished under it, so the
+    /// lease is what makes "no deletion under a pinned reader" true rather than
+    /// merely likely.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the lease is not counted, when cleanup does not wait for it,
+    /// or when dropping the reader does not release it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cleanup_waits_for_a_pinned_reader_to_release_its_staged_lease() {
+        let registry = std::sync::Arc::new(ScribeHotSourceRegistry::new());
+        let key = seal_key();
+        let generation = GenerationOrdinal::new(0, 1);
+        registry
+            .register_memtable(&key, generation)
+            .expect("generation registers");
+        registry
+            .advance(&key, generation, staged())
+            .expect("generation stages");
+
+        let lease = registry
+            .staged_sources(key.tenant, &key.table, key.partition, key.partition)
+            .expect("locked");
+        assert_eq!(lease.sources().len(), 1);
+        assert_eq!(registry.leases(&key, generation).expect("locked"), 1);
+
+        let waiting = registry.drain_leases(&key, generation);
+        tokio::pin!(waiting);
+        assert!(
+            futures_util::poll!(waiting.as_mut()).is_pending(),
+            "cleanup must not proceed while a reader holds the member open"
+        );
+
+        drop(lease);
+        assert_eq!(registry.leases(&key, generation).expect("locked"), 0);
+        waiting
+            .await
+            .expect("cleanup proceeds once the reader is gone");
+    }
+
+    /// Draining a member no reader holds returns without waiting.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an unleased member makes cleanup wait, which would stall
+    /// every publication that has no concurrent read at all.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cleanup_does_not_wait_on_a_member_no_reader_holds() {
+        let registry = std::sync::Arc::new(ScribeHotSourceRegistry::new());
+        let key = seal_key();
+        let generation = GenerationOrdinal::new(0, 1);
+        registry
+            .register_memtable(&key, generation)
+            .expect("generation registers");
+        registry
+            .advance(&key, generation, staged())
+            .expect("generation stages");
+
+        registry
+            .drain_leases(&key, generation)
+            .await
+            .expect("an unleased member drains immediately");
     }
 }

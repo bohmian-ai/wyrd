@@ -198,7 +198,7 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
     assert_eq!(hot.len(), 1);
     assert_eq!(
         hot[0].origin,
-        crate::scribe::tail_rpc::HotBatchOrigin::Append {
+        crate::scribe::tail_rpc::HotBatchSource::Append {
             batch_id: *batch_id.as_bytes(),
         }
     );

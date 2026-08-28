@@ -1237,8 +1237,8 @@ fn inclusive_cursor(
 /// not be resumable.
 fn cursor_batch_id(batch: &HotBatch) -> Result<uuid::Uuid, TailReadError> {
     match batch.origin {
-        HotBatchOrigin::Append { batch_id } => Ok(uuid::Uuid::from_bytes(batch_id)),
-        HotBatchOrigin::StagedMember { member } => {
+        HotBatchSource::Append { batch_id } => Ok(uuid::Uuid::from_bytes(batch_id)),
+        HotBatchSource::StagedMember { member, .. } => {
             last_row_batch_id(&batch.rows).ok_or(TailReadError::State {
                 detail: format!(
                     "staged member {}-{} returned rows without a managed batch identity",
@@ -2423,12 +2423,12 @@ pub struct HotBatch {
     /// Highest WAL LSN the batch's rows cover.
     pub wal_lsn: WalLsn,
     /// Where the rows came from, and under whose identity.
-    pub origin: HotBatchOrigin,
+    pub origin: HotBatchSource,
     /// Arrow rows projected to the request's required columns.
     pub rows: arrow::record_batch::RecordBatch,
 }
 
-/// Provenance of one live-tail batch.
+/// Source identity of one live-tail batch.
 ///
 /// A batch is served either from the append that is still in memory or from the
 /// durable staged member that replaced it. Both identities are real durable
@@ -2436,7 +2436,7 @@ pub struct HotBatch {
 /// one actually produced its rows rather than a single field that would have to
 /// be invented for the other case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HotBatchOrigin {
+pub enum HotBatchSource {
     /// Rows still held by the append that wrote them.
     Append {
         /// Idempotency identity of the append.
@@ -2446,6 +2446,11 @@ pub enum HotBatchOrigin {
     StagedMember {
         /// Staged member identity holding the rows.
         member: crate::scribe::assembly::StagedMemberId,
+        /// Inclusive WAL bounds the member covers, as its record names them.
+        ///
+        /// A staged batch has no single append behind it, so the bounds are the
+        /// only exact answer to which WAL a reader's cut has to account for.
+        wal: (WalLsn, WalLsn),
     },
 }
 
@@ -2639,7 +2644,7 @@ impl FetchLiveTailService {
                 .map(|readable| HotBatch {
                     partition_day: readable.partition_day,
                     wal_lsn: readable.meta.wal_lsn_max,
-                    origin: HotBatchOrigin::Append {
+                    origin: HotBatchSource::Append {
                         batch_id: readable.meta.batch_id,
                     },
                     rows: readable.batch,
@@ -2676,11 +2681,11 @@ impl FetchLiveTailService {
             .map_err(|error| ScribeError::Internal {
                 detail: format!("resolve the staged members serving a live-tail read: {error}"),
             })?;
-        if sources.is_empty() {
+        if sources.sources().is_empty() {
             return Ok(Vec::new());
         }
         crate::scribe::staged_tail::StagedTailReader::default().read(
-            &sources,
+            sources.sources(),
             &crate::scribe::staged_tail::StagedTailRead {
                 required_columns: &request.required_columns,
                 limits: crate::scribe::memtable::ReadableBatchLimits {

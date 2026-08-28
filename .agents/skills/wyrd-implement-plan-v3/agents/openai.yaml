@@ -1,4 +1,0 @@
-interface:
-  display_name: "Wyrd Implement Plan v3"
-  short_description: "Execute Wyrd task packets"
-  default_prompt: "Use $wyrd-implement-plan-v3 to execute this Wyrd plan for the shortest expected wall time to accepted integrated code, using adaptive concurrency, focused verification, risk-routed review, reconciliation, serial integration, and cleanup."

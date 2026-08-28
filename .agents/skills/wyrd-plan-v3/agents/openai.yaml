@@ -1,4 +1,4 @@
 interface:
   display_name: "Wyrd Plan v3"
-  short_description: "Decompose Wyrd work into clear tasks"
-  default_prompt: "Use $wyrd-plan-v3 to produce the shortest credible wall-clock path to accepted integrated Wyrd code, using only concurrency that beats its orchestration and integration overhead."
+  short_description: "Plan actionable Wyrd claims and evidence"
+  default_prompt: "Use $wyrd-plan-v3 to create a source-grounded Wyrd plan with cohesive tasks, decision-complete claims, credible evidence expectations, and only real dependencies."

@@ -61,6 +61,8 @@ pub struct ClaimPublisher {
     mover: ScribeStageMover,
     /// Fenced `file_list` and audit transaction owner.
     reconciler: ScribePublicationReconciler,
+    /// Pod authority registry whose leases cleanup waits on, when one is owned.
+    hot_sources: Option<Arc<crate::scribe::hot_source::ScribeHotSourceRegistry>>,
 }
 
 impl ClaimPublisher {
@@ -75,7 +77,61 @@ impl ClaimPublisher {
             stage,
             mover,
             reconciler,
+            hot_sources: None,
         }
+    }
+
+    /// Binds the authority registry whose staged leases cleanup must respect.
+    ///
+    /// A publisher without one still publishes correctly; it simply removes a
+    /// member's directory as soon as the fenced transaction commits, which is
+    /// only safe where no live-tail reader can be holding those runs.
+    pub fn set_hot_sources(
+        &mut self,
+        hot_sources: Arc<crate::scribe::hot_source::ScribeHotSourceRegistry>,
+    ) {
+        self.hot_sources = Some(hot_sources);
+    }
+
+    /// Waits for every live-tail read holding one member's runs to finish.
+    ///
+    /// The member's authority is already `Published` by the time cleanup runs,
+    /// so no further lease can be taken and this waits only on reads that were
+    /// already in flight.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the registry lock is poisoned,
+    /// which leaves the member's directory in place rather than deleting runs
+    /// a reader may still open.
+    async fn await_lease_drain(
+        &self,
+        key: &crate::scribe::assembly::ScribeAssemblyKey,
+        member: crate::scribe::assembly::StagedMemberId,
+    ) -> Result<(), ScribeError> {
+        let Some(hot_sources) = &self.hot_sources else {
+            return Ok(());
+        };
+        hot_sources
+            .drain_leases(
+                &crate::scribe::seal_key::SealKey::new(
+                    key.tenant(),
+                    key.table().clone(),
+                    key.partition(),
+                ),
+                crate::scribe::hot_source::GenerationOrdinal::new(
+                    member.shard(),
+                    member.generation(),
+                ),
+            )
+            .await
+            .map_err(|error| ScribeError::Internal {
+                detail: format!(
+                    "wait for the readers of staged member {}-{} to finish: {error}",
+                    member.shard(),
+                    member.generation()
+                ),
+            })
     }
 
     /// Publishes one assembled claim and retires its contributing members.
@@ -228,6 +284,7 @@ impl ClaimPublisher {
                 .transition(key, member.id(), StagedMemberState::CleanupPending)
                 .await
                 .map_err(transition_failure(member.id()))?;
+            self.await_lease_drain(key, member.id()).await?;
             self.stage
                 .retire(key, member.id())
                 .await

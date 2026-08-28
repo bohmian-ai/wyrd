@@ -516,67 +516,45 @@ task packets, or documentation.
   decomposing work.
 - Wyrd Rust, Python, TypeScript, server, CLI, MCP, storage, Vala, and contract
   implementors must receive the `wyrd-implement` skill in their task packet.
-  Tasks in an explicitly opted-in v3 plan receive `wyrd-implement-v3` instead;
-  do not load both implementation workflows for one task.
+  A decision-ready task that explicitly names `wyrd-implement-v3`, or a user
+  who directly invokes it, receives `wyrd-implement-v3` instead. Do not load
+  both implementation workflows for one task. V3 accepts actionable direct
+  instructions and semantically complete task artifacts; it does not require a
+  dedicated plan controller or planner-specific serialization.
 - Wyrd UI implementors additionally receive the `wyrd-ui` skill when their
   write set enters the UI tree.
 - Complete-plan execution uses the global `wyrd-implement-plan` controller in
-  a dedicated clean worktree. It dispatches one serial task at a time through
-  the surface-appropriate implementation skill and the repo-local
-  `wyrd-review` skill, then owns integrated verification.
-- A plan may opt into the self-contained repo-local v3 pilot only when its
-  `Execution handoff` explicitly names `wyrd-implement-plan-v3`. An opted-in
-  plan uses concise task packets, a `$wyrd-plan-review-v3`-approved plan,
-  isolated rolling-DAG task implementation, risk-routed immutable-candidate review, resource-aware
-  focused verification, and serial root integration. The planner fully
-  decomposes the requested outcomes, decisions, owners, dependencies,
-  acceptance criteria, and proof obligations, then exposes separate execution
-  tracks only when they are expected to shorten the critical path. V3 execution
-  minimizes expected wall-clock time to accepted integrated code. Concurrency
-  is subordinate: the controller dispatches wall-time-beneficial ready work up
-  to available harness capacity only when its expected critical-path savings
-  exceed context acquisition, dispatch, resource contention, proof, review,
-  reconciliation, invalidation, and integration costs. Available capacity is a
-  ceiling, not a utilization target, and intentional idle capacity is correct
-  when another dispatch would likely delay acceptance. Fixed waves, broad join
-  tasks, and convenient ordering dependencies are invalid when narrower direct
-  dependencies would ship sooner. Verification and integration pressure may
-  throttle otherwise ready work when they are the measured wall-time
-  bottleneck. Every candidate receives focused proof; independent candidate
-  review is reserved
-  for public/generated contracts, shared seams, durable behavior, security,
-  tenancy, audit, migrations, cross-owner expansion, or suspicious evidence.
-  Passing isolated leaves do not require a reviewer. The controller reconciles
-  and integrates each eligible candidate as soon as its
-  actual dependencies and conflicts permit. Concrete agents, models, effort,
-  roles, and concurrency are execution-environment concerns; plans, task
-  packets, review contracts, and repository skills must not assign or require
-  them. Evidence scouts retrieve bounded evidence only and do not plan,
-  decide, edit, or execute. V3 plans require
-  bounded task scope, declared dependencies, focused proof, progressive
-  verification, optimistic scope discovery, autonomous reconciliation, and
-  serial root integration; they do not require an external readiness workflow.
-  Planning optimizes expected wall-clock time to accepted integrated code, not
-  packet count, theoretical DAG width, or executor utilization. Full decomposition
-  makes every outcome, owner, contract, dependency, acceptance criterion, and
-  proof obligation explicit; it does not require one execution task per
-  boundary or make an ownership boundary a serial dependency. Package that
-  decomposed work into coherent, decision-ready tasks for the shortest expected
-  wall time. A task may include inseparable consumer, test, journey, or wiring
-  closure across owned surfaces under one primary outcome. Add a direct
-  dependency only when the successor genuinely requires the predecessor's
-  integrated artifact or behavior; when planning fixes the shared contract,
-  independent producers and consumers should fan out. Split further only when
-  meaningful critical-path savings amortize context, dispatch, proof, review,
-  reconciliation, invalidation, and integration overhead.
-  Existing plans never inherit v3 behavior implicitly, and UI work is excluded
-  from the initial v3 pilot.
+  a dedicated clean worktree only when the user or plan explicitly invokes that
+  global workflow. Do not substitute it automatically for another retired or
+  absent controller.
+- V3 planning and implementation use a semantic claim-and-evidence contract.
+  `wyrd-plan-v3` defines source-grounded outcomes, material decisions, cohesive
+  owners, direct dependencies, required claims, accepted evidence classes, and
+  credible proof. Its preferred packet sections are guidance, not a parser
+  contract. `wyrd-plan-review-v3` reviews readiness without requiring an exact
+  handoff string, YAML shape, digest envelope, or scheduling strategy.
+- There is no repo-local v3 complete-plan controller. The calling agent or
+  active execution harness owns transient scheduling, worktree choice, task
+  sequencing, commits, integration, and resource management. Those mechanics
+  must not become Wyrd `Change` lifecycle state, skill protocol metadata, or a
+  renamed controller. Plans declare real dependencies and integrated evidence;
+  the caller chooses how to execute them.
+- `wyrd-implement-v3` owns one actionable task's complete implement, evidence,
+  and fix loop. It may accept direct instructions, task packets, or bounded
+  review findings. It reports claim-aligned evidence but does not verify or
+  authorize a Wyrd `Change`, finalize an `EvidenceManifest`, or imply merge.
+- `wyrd-review-v3` supports read-only `CHECKPOINT` review of ongoing mutable
+  work and `FINAL` review of an immutable candidate. Checkpoint findings are
+  provisional and never approve completion. Final review owns candidate-local
+  correctness, task alignment, required-claim closure, and focused evidence.
 - The complete integration review runs the global `review-and-plan` skill; its
   repo-specific review binding is the `wyrd-review` skill.
-  For an explicitly opted-in v3 plan, `wyrd-review-and-plan-v3` replaces that
-  terminal binding. Reversible findings return to autonomous v3 remediation;
-  only findings that require a new material decision route through
-  `wyrd-plan-v3`.
+  A plan may instead explicitly request `wyrd-review-and-plan-v3` for terminal
+  integrated claim, seam, journey, and drift review. It accepts an immutable
+  base/target plus plan/task authority and available evidence; controller
+  manifests and generations are never required. Reversible findings return to
+  bounded implementation; only material decisions route through
+  `wyrd-plan-v3` or the user.
 
 ## 15. Implementation Rules
 

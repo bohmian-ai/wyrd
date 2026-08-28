@@ -1,106 +1,127 @@
 ---
 name: wyrd-implement-v3
-description: Implement and fully verify one decision-complete Wyrd task packet or bounded remediation in an isolated worktree, then return one immutable candidate commit or a material BLOCKED result.
+description: Implement and verify an actionable Wyrd task or bounded remediation from direct instructions or a plan artifact. Align code to requested outcomes, repository authority, claims, evidence expectations, and referenced expertise; escalate only material unresolved decisions.
 ---
 
 # Wyrd Implement v3
 
-Own the complete task loop: acquire context, edit code and tests, run every
-task-required verification command, fix failures, and seal one immutable
-candidate only after required verification passes. The controller coordinates;
-the independent reviewer decides acceptance. Never plan, integrate, review,
-spawn children, or mutate controller state.
+Own the complete implementation loop: understand the task, acquire relevant
+context, edit code and tests, collect credible evidence, fix task-local
+failures, and report the result. Task correctness matters; planner-specific
+serialization and execution-controller bookkeeping do not.
 
-## Input and boundary
+## Determine the task contract
 
-Accept `request_id`, repository root, immutable task-packet path and digest,
-`parent_sha`, dedicated clean `worktree_path`, controller generation, and an
-optional remediation binding. The packet is immutable authority for task ID,
-dependencies, forecast `write_set`, explicit non-goals, acceptance criteria,
-and complete verification.
+Accept direct instructions, an issue, a Markdown task, a structured packet, or
+bounded review findings. The task is actionable when its requested outcome,
+affected surface, material constraints, and observable success conditions can
+be determined from the request plus repository authority.
 
-A remediation binding contains the prior review artifact path/digest,
-superseded candidate, and bound finding IDs. Terminal remediation also binds
-the reviewed integrated target. Verify all bindings before editing. Findings
-add only their bounded outcomes, assertions, owners, and checks; they do not
-authorize a new material decision.
+No YAML block, section name, ID, digest, source SHA, clean worktree, write set,
+predeclared command, candidate manifest, or controller generation is required.
+If explicit claims or acceptance criteria are absent, derive a concise working
+checklist from the requested behavior and repository completion rules, state
+material assumptions, and proceed. Normalize unlabeled obligations with local
+IDs when traceability helps.
 
-Read `AGENTS.md`, `architecture/agent-rules.md`, the complete packet, and
-applicable design/doctrine authorities. Inspect named paths, consumers, tests,
-manifests, and `mise` tasks. Use CodeGraph only when indexed at `parent_sha`.
-`write_set` is a coordination forecast, not an allowlist. Change supporting
-owners, consumers, generated artifacts, fixtures, and tests when implementation
-or diagnostics make them necessary, and record material forecast expansions.
-Do not alter plans/packets, merge, rebase, cherry-pick,
-integrate, push, or perform unrelated cleanup.
+Treat task claims as explainable obligations. Preserve their dispositions and
+accepted evidence classes when supplied. Deterministic tests, LLM review, and
+human attestation remain distinct; one never silently replaces another.
 
-## Implement and fully verify
+## Acquire relevant context
 
-Map every AC to source and test evidence. Make the smallest cohesive change,
-including required unit, integration, and user-journey coverage. Follow all
-repository ownership, struct-centered Rust, rustdoc, async, PyO3, contract, and
-test rules.
+Read `AGENTS.md`, `architecture/agent-rules.md`, and applicable design/doctrine
+authority. Read and apply every skill, architecture reference, pinned source,
+prior decision, and implementation example explicitly named by the task. Use
+each for the decisions it informs; repository authority and the locked outcome
+still govern.
+
+Follow CodeGraph instructions. Inspect the nearest behavior owner, callers,
+consumers, tests, manifests, generated surfaces, and current `mise` tasks.
+Treat a write set as a coordination forecast, not an allowlist. Make necessary
+supporting edits to callers, fixtures, projections, documentation, and tests,
+and report material scope expansion. Preserve unrelated user changes and avoid
+unrelated cleanup.
+
+If a named reference is unavailable, continue when the task and repository
+provide enough authority. Block only when it is essential to choose among
+materially different contracts or prove a required claim.
+
+## Implement the complete cohesive change
+
+Map every explicit or derived claim to source behavior and appropriate proof.
+Implement the complete owned outcome, including required unit, integration,
+user-journey, generated, and cross-language closure. Follow repository
+ownership, struct-centered Rust, rustdoc, async, PyO3, contract, audit,
+tenancy, and testing rules where applicable.
 
 Compiler, formatter, lint, test, fixture, codegen, and setup failures are
-ordinary feedback. Fix all explained task-local failures, including necessary
-callers, declarations, generated output, fixtures, rustdoc, and lint cleanup.
-Completion closure does not permit a new material behavior, owner, dependency,
-public/durable contract, acceptance outcome, or unrelated formatting.
+development feedback. Diagnose and fix task-local causes, including necessary
+consumers and declarations. Do not change a required claim's meaning, weaken a
+gate, hide a failure, or choose production behavior solely to satisfy a
+fixture. Ordinary local design choices remain yours when multiple
+repository-native implementations satisfy the task.
 
-Run fast diagnostics when useful, then the packet's complete required
-verification. The implementer—not the controller—owns this full edit -> verify
--> fix loop. Use a controller-managed resource lane when required, but retain
-execution ownership. Never weaken, replace, skip, mask, or falsely claim a
-check. Do not seal a candidate until all required checks pass.
+For bounded remediation, read the original task, cited findings, and relevant
+prior diff when available. Apply the required outcomes without demanding a
+generation, superseded candidate, artifact digest, or replacement-commit
+topology.
 
-For remediation, start from the original `parent_sha`, inspect the rejected
-diff and selected reviewer findings, produce one complete replacement rather
-than a repair descendant, apply every finding, and rerun complete task
-verification plus finding-specific checks. Every replacement receives fresh
-independent review.
+## Verify claims
 
-Return `BLOCKED` only after focused investigation for a material decision,
-unavailable authority, indeterminate acceptance outcome, or mandatory proof
-that cannot safely run. Ordinary failures, supporting
-files, and implementation choices are not blockers.
+Run the task's requested checks and the narrowest current `mise` checks required
+by `AGENTS.md` for every touched surface. Inspect `mise.toml` before relying on
+a command. Separate:
 
-## Compact proof
+- diagnostics, which provide quick feedback;
+- direct claim evidence, which proves specific required behavior; and
+- integrated evidence, which proves cross-task or journey behavior.
 
-Store full stdout/stderr once in a content-addressed artifact. Reports and
-state reference it; they never copy full logs, command strings, packet prose,
-or AC prose. Each command entry contains only:
+If a listed command is stale but its proof intent is clear, run the current
+canonical equivalent and disclose the substitution. Do not substitute when
+exact command identity or output is itself an explicit requirement. Never skip,
+weaken, mask, or falsely claim a check.
 
-```yaml
-command_id: <ID resolving to packet/remediation command>
-cwd: <bound cwd>
-timeout_seconds: <integer>
-started_at: <timestamp>
-finished_at: <timestamp>
-exit_status: <integer or null>
-result: <PASS|CODE_FAILURE|INFRA_UNAVAILABLE>
-output: {ref: <artifact ref>, sha256: <digest>}
-failure_excerpt: <short causal excerpt only when not PASS>
-```
+Record evidence compactly by subject, claim, evidence class, outcome, and
+source/test/command references. Full logs remain with the execution
+environment; do not invent an artifact store. Failed or missing evidence is
+`failed` or `indeterminate`, never success.
 
-## Seal and return
+Implementation completion means the behavior is implemented and declared
+evidence is collected. It does not independently verify or authorize a Wyrd
+`Change`, finalize an `EvidenceManifest`, imply merge, or grant deployment
+authority.
 
-Audit tracked/untracked changes, run `git diff --check`, verify configured Git
-identity, and confirm every AC has evidence. Create exactly one normal commit
-with `parent_sha` as sole parent, calculate the binary diff SHA-256, and leave
-the worktree clean. Never alter the reported commit.
+## Escalate narrowly
 
-Return one compact candidate manifest containing protocol/outcome, request,
-task ID and packet digest, generation, parent/candidate SHAs, binary diff
-digest, `sole_parent: true`, superseded SHA, sorted changed paths, forecast
-expansions with evidence refs, proof
-artifact ref/digest/result, remediation binding, and:
+Stop only when:
 
-```yaml
-acceptance_trace:
-  - {ac_id: <each AC/assertion once>, evidence_refs: [<source/test/proof refs>]}
-```
+- unresolved ambiguity selects materially different public, durable, security,
+  tenancy, migration, or acceptance behavior;
+- the task conflicts with higher repository authority and resolution changes
+  the requested outcome;
+- required external or destructive action lacks authorization; or
+- essential proof, infrastructure, or reference material is unavailable with
+  no safe equivalent.
 
-Blocked output contains the request/task binding, category, concise evidence
-refs, and one exact decision/correction required. Never return a partial
-candidate. A changed packet, parent, candidate, diff, or remediation binding
-invalidates proof and requires a new candidate and fresh review.
+Do not block on missing protocol metadata, absent claim IDs, imperfect packet
+structure, stale forecast paths, ordinary implementation choices, supporting
+edits, the first failed check, or lack of controller/artifact-store machinery.
+
+## Handoff
+
+Return a concise human-readable report:
+
+1. Implemented outcome and material design choices.
+2. Changed owners/surfaces and any justified scope expansion.
+3. Claim trace with evidence class and `satisfied`, `failed`, `indeterminate`,
+   or `not_evaluated` status.
+4. Commands and outcomes, including substitutions and limitations.
+5. Referenced expertise that materially affected the implementation.
+6. Remaining risks or one exact blocker.
+
+Create a commit only when the caller or active execution environment requests
+one. Then inspect the diff, run `git diff --check`, verify the existing Git
+identity, follow repository identity rules, and never rewrite unrelated user
+work. A commit is a delivery choice, not the definition of successful
+implementation.

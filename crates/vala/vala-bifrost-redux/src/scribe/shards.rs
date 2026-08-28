@@ -1741,7 +1741,7 @@ impl ShardOwner {
             .map(|batch| HotBatch {
                 partition_day: batch.partition_day,
                 wal_lsn: batch.meta.wal_lsn_max,
-                origin: crate::scribe::tail_rpc::HotBatchOrigin::Append {
+                origin: crate::scribe::tail_rpc::HotBatchSource::Append {
                     batch_id: batch.meta.batch_id,
                 },
                 rows: batch.batch,

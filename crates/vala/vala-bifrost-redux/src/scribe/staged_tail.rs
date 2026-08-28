@@ -20,7 +20,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use crate::contracts::ScribeError;
 use crate::scribe::hot_source::StagedSource;
 use crate::scribe::memtable::ReadableBatchLimits;
-use crate::scribe::tail_rpc::{HotBatch, HotBatchOrigin};
+use crate::scribe::tail_rpc::{HotBatch, HotBatchSource};
 use crate::scribe::wal::WalLsn;
 
 /// Rows decoded per Parquet read before the reader re-checks its bounds.
@@ -127,8 +127,9 @@ impl StagedTailReader {
             batches.push(HotBatch {
                 partition_day: source.key.partition,
                 wal_lsn: source.wal.1,
-                origin: HotBatchOrigin::StagedMember {
+                origin: HotBatchSource::StagedMember {
                     member: source.member,
+                    wal: source.wal,
                 },
                 rows: batch,
             });
@@ -370,8 +371,9 @@ mod tests {
         assert_eq!(rows.schema().field(1).name(), "ordinal");
         assert_eq!(
             batches[0].origin,
-            HotBatchOrigin::StagedMember {
-                member: StagedMemberId::new(0, 1)
+            HotBatchSource::StagedMember {
+                member: StagedMemberId::new(0, 1),
+                wal: (WalLsn::new(1), WalLsn::new(9)),
             }
         );
     }
@@ -414,8 +416,9 @@ mod tests {
         assert_eq!(batches.len(), 1);
         assert_eq!(
             batches[0].origin,
-            HotBatchOrigin::StagedMember {
-                member: StagedMemberId::new(0, 1)
+            HotBatchSource::StagedMember {
+                member: StagedMemberId::new(0, 1),
+                wal: (WalLsn::new(1), WalLsn::new(9)),
             },
             "the oldest source must be the one the truncated read returns"
         );
@@ -460,8 +463,9 @@ mod tests {
         assert_eq!(batches.len(), 1);
         assert_eq!(
             batches[0].origin,
-            HotBatchOrigin::StagedMember {
-                member: StagedMemberId::new(0, 2)
+            HotBatchSource::StagedMember {
+                member: StagedMemberId::new(0, 2),
+                wal: (WalLsn::new(5), WalLsn::new(19)),
             },
             "only the member whose whole range the cut owns is suppressed"
         );

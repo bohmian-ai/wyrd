@@ -1,4 +1,4 @@
 interface:
   display_name: "Wyrd Implement v3"
-  short_description: "Build one immutable candidate"
-  default_prompt: "Use $wyrd-implement-v3 to implement one Wyrd task packet in an isolated worktree and return one immutable candidate or BLOCKED."
+  short_description: "Implement and prove a Wyrd task"
+  default_prompt: "Use $wyrd-implement-v3 to implement this actionable Wyrd task, apply its referenced expertise, satisfy its required claims, collect credible evidence, and escalate only material unresolved decisions."

@@ -634,11 +634,11 @@ impl InterruptedStagingRow {
                 .map_err(|error| ForgeError::Reconciliation {
                     detail: error.to_string(),
                 })?,
-            operation_id: row.try_get("publication_operation_id").map_err(|error| {
-                ForgeError::Reconciliation {
+            operation_id: row
+                .try_get("forge_publication_operation_id")
+                .map_err(|error| ForgeError::Reconciliation {
                     detail: error.to_string(),
-                }
-            })?,
+                })?,
         })
     }
 }
@@ -1154,7 +1154,7 @@ impl Forge {
     ) -> Result<Option<InterruptedStagingTask>, ForgeError> {
         let rows = sqlx::query(
             r"SELECT id,file_path,file_size,min_event_time,max_event_time,
-                      partition_granularity,partition_start,compacted,publication_operation_id
+                      partition_granularity,partition_start,compacted,forge_publication_operation_id
                  FROM vala.file_list
                 WHERE data_tenant_id=$1 AND namespace=$2 AND table_name=$3 AND file_path=ANY($4)
                 ORDER BY partition_granularity,partition_start,min_event_time,max_event_time,id",
@@ -1932,7 +1932,7 @@ impl Forge {
         let ids: Vec<Uuid> = bin.files.iter().map(|file| file.id).collect();
         let result = sqlx::query(
             r"UPDATE vala.file_list
-              SET compacted = true, publication_operation_id = $1
+              SET compacted = true, forge_publication_operation_id = $1
             WHERE data_tenant_id = $2 AND namespace = $3 AND table_name = $4
               AND partition_granularity = $5 AND partition_start = $6 AND id = ANY($7)
               AND committed_snapshot_id IS NULL",
@@ -1989,7 +1989,7 @@ impl Forge {
               SET committed_snapshot_id = $1
             WHERE data_tenant_id = $2 AND namespace = $3 AND table_name = $4
               AND partition_granularity = $5 AND partition_start = $6 AND id = ANY($7)
-              AND compacted AND publication_operation_id = $8
+              AND compacted AND forge_publication_operation_id = $8
               AND (committed_snapshot_id IS NULL OR committed_snapshot_id = $1)",
         )
         .bind(snapshot_id)
@@ -2049,11 +2049,11 @@ impl Forge {
         let result = sqlx::query(
             r"UPDATE vala.file_list
               SET compacted = false, committed_snapshot_id = NULL,
-                  publication_operation_id = NULL
+                  forge_publication_operation_id = NULL
             WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3
               AND partition_granularity = $4 AND partition_start = $5 AND id = ANY($6)
               AND committed_snapshot_id IS NULL
-              AND publication_operation_id = $7",
+              AND forge_publication_operation_id = $7",
         )
         .bind(key.tenant.as_uuid())
         .bind(key.table_ref.namespace.as_str())
@@ -2166,7 +2166,7 @@ impl Forge {
         let result = sqlx::query(
             r"UPDATE vala.file_list
               SET compacted = false, committed_snapshot_id = NULL,
-                  publication_operation_id = NULL
+                  forge_publication_operation_id = NULL
             WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3
               AND partition_granularity = $4 AND partition_start = $5 AND id = ANY($6)
               AND committed_snapshot_id IS NULL",

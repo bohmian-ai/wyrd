@@ -340,9 +340,7 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
             };
             match event {
                 QueryStreamEvent::Batch(Some(Ok(batch))) => {
-                    query_telemetry.first_batch();
                     let batch_rows = batch.num_rows() as u64;
-                    row_count = row_count.saturating_add(batch_rows);
                     let Ok(frame) = ipc.write(&batch) else {
                         break failed_terminal_for_visibility(
                             QueryTerminalErrorCode::QueryExecutionFailed,
@@ -350,6 +348,11 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
                             visibility,
                         );
                     };
+                    let Some(frame) = frame else {
+                        continue;
+                    };
+                    query_telemetry.first_batch();
+                    row_count = row_count.saturating_add(batch_rows);
                     query_telemetry.record_payload(batch_rows, frame.arrow_ipc_batch.len());
                     yield Ok(QueryStreamFrame::Batch(frame));
                 }
@@ -740,17 +743,22 @@ impl QueryIpcEncoder {
     /// # Errors
     ///
     /// Returns [`BifrostError::QueryExecutionFailed`] when the stream is already
-    /// finished or Arrow IPC rejects the batch.
-    pub fn write(&mut self, batch: &RecordBatch) -> Result<QueryBatchFrame, BifrostError> {
+    /// finished or Arrow IPC rejects the batch. Returns `Ok(None)` for a
+    /// zero-row execution artifact because a wire batch must decode to exactly
+    /// one nonempty record batch.
+    pub fn write(&mut self, batch: &RecordBatch) -> Result<Option<QueryBatchFrame>, BifrostError> {
         if self.finished {
             return Err(BifrostError::QueryExecutionFailed);
+        }
+        if batch.num_rows() == 0 {
+            return Ok(None);
         }
         self.writer
             .write(batch)
             .map_err(|_| BifrostError::QueryExecutionFailed)?;
         let arrow_ipc_batch = std::mem::take(self.writer.get_mut());
         self.observe_retained(arrow_ipc_batch.len());
-        Ok(QueryBatchFrame { arrow_ipc_batch })
+        Ok(Some(QueryBatchFrame { arrow_ipc_batch }))
     }
 
     /// Closes the query's IPC stream once and returns its end-of-stream delta.
@@ -1459,8 +1467,22 @@ mod tests {
 
         let (mut encoder, schema_frame) =
             super::QueryIpcEncoder::new(&schema).expect("schema opens the stream");
-        let first_frame = encoder.write(&first).expect("first batch encodes");
-        let second_frame = encoder.write(&second).expect("second batch encodes");
+        let empty = arrow::record_batch::RecordBatch::new_empty(schema.clone());
+        assert!(
+            encoder
+                .write(&empty)
+                .expect("empty artifact is accepted")
+                .is_none(),
+            "a zero-row execution artifact must not become a wire batch"
+        );
+        let first_frame = encoder
+            .write(&first)
+            .expect("first batch encodes")
+            .expect("a nonempty batch produces a frame");
+        let second_frame = encoder
+            .write(&second)
+            .expect("second batch encodes")
+            .expect("a nonempty batch produces a frame");
         let eos = encoder.finish().expect("stream closes once");
         assert!(
             encoder.finish().is_err(),
@@ -1473,7 +1495,10 @@ mod tests {
         let standalone = {
             let (mut throwaway, standalone_schema) =
                 super::QueryIpcEncoder::new(&schema).expect("standalone schema");
-            let batch = throwaway.write(&second).expect("standalone batch");
+            let batch = throwaway
+                .write(&second)
+                .expect("standalone batch")
+                .expect("a nonempty standalone batch produces a frame");
             let eos = throwaway.finish().expect("standalone close");
             standalone_schema.arrow_ipc_schema.len() + batch.arrow_ipc_batch.len() + eos.len()
         };
@@ -1538,6 +1563,43 @@ mod tests {
             .accept_eos(&empty_eos)
             .expect("empty stream is proven complete by its end-of-stream");
         assert!(empty_decoder.eos_accepted());
+        let (mut empty_terminal_encoder, _) =
+            super::QueryIpcEncoder::new(&schema).expect("empty terminal stream opens");
+        let empty_terminal = super::close_ipc_stream(
+            &mut empty_terminal_encoder,
+            successful_terminal(
+                VisibilityMode::PublishedOnly,
+                FreshnessPolicy::Strict,
+                &[],
+                false,
+                0,
+            ),
+            VisibilityMode::PublishedOnly,
+            0,
+        );
+        assert_eq!(empty_terminal.row_count, 0);
+        empty_terminal
+            .validate(VisibilityMode::PublishedOnly)
+            .expect("empty logical result has one successful terminal");
+
+        let (mut mixed_terminal_encoder, _) =
+            super::QueryIpcEncoder::new(&schema).expect("mixed terminal stream opens");
+        let mixed_terminal = super::close_ipc_stream(
+            &mut mixed_terminal_encoder,
+            successful_terminal(
+                VisibilityMode::PublishedOnly,
+                FreshnessPolicy::Strict,
+                &[],
+                false,
+                5,
+            ),
+            VisibilityMode::PublishedOnly,
+            5,
+        );
+        assert_eq!(mixed_terminal.row_count, 5);
+        mixed_terminal
+            .validate(VisibilityMode::PublishedOnly)
+            .expect("mixed stream terminal agrees with emitted rows");
 
         // Ordering and malformed fragments are refused before Arrow sees them.
         let mut fresh = super::QueryIpcDecoder::new();

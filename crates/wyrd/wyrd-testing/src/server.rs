@@ -3568,10 +3568,29 @@ impl WyrdTestServerBuilder {
     /// startup fails, or socket binding fails. Cancellation may leave fixture
     /// database setup committed, while bound sockets close when owned state is
     /// dropped.
-    pub async fn start_bound(self) -> Result<WyrdTestServer, WyrdTestServerError> {
+    pub async fn start_bound(mut self) -> Result<WyrdTestServer, WyrdTestServerError> {
+        if self.bind_addrs.is_none() {
+            self.bind_addrs = Some((reserve_loopback_addr()?, reserve_loopback_addr()?));
+        }
         let srv = self.start_in_process().await?;
         srv.bind().await
     }
+}
+
+/// Ask the OS for one currently free loopback address used by a bound harness.
+///
+/// Reserving before server composition gives membership a concrete nonzero
+/// private endpoint. The production binder later claims this exact address.
+///
+/// # Errors
+///
+/// Returns a bind error when loopback binding or address lookup fails.
+pub(crate) fn reserve_loopback_addr() -> Result<std::net::SocketAddr, WyrdTestServerError> {
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .map_err(|error| WyrdTestServerError::Bind(error.to_string()))?;
+    listener
+        .local_addr()
+        .map_err(|error| WyrdTestServerError::Bind(error.to_string()))
 }
 
 /// Poll a bound test server until its HTTP health endpoint reports readiness.

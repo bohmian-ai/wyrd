@@ -152,6 +152,16 @@ pub enum HotSourceError {
         /// Refused authority label.
         to: &'static str,
     },
+    /// A replay named the same lifecycle stage with different durable identity.
+    #[error(
+        "Scribe hot authority for generation {generation} contradicts the recorded `{authority}` identity"
+    )]
+    Contradictory {
+        /// Generation whose replay identity disagreed.
+        generation: u64,
+        /// Lifecycle stage carrying the contradictory identity.
+        authority: &'static str,
+    },
     /// A transition or release named a generation with no recorded authority.
     #[error("Scribe hot authority for generation {generation} is not registered")]
     Unregistered {
@@ -321,6 +331,66 @@ impl ScribeHotSourceRegistry {
             });
         }
         *current = next;
+        Ok(())
+    }
+
+    /// Atomically advances every named generation under one seal key.
+    ///
+    /// The registry prevalidates the complete set while holding its one state
+    /// lock, then applies every move. An exact replay is idempotent; a missing
+    /// generation, backwards move, or same-stage identity contradiction leaves
+    /// the complete set unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed hot-source error when any member cannot make the exact
+    /// requested transition, or when the registry lock is poisoned.
+    pub fn advance_all_atomic(
+        &self,
+        key: &SealKey,
+        transitions: &[(GenerationOrdinal, HotAuthority)],
+    ) -> Result<(), HotSourceError> {
+        let mut state = self.lock()?;
+        let authorities = state.get_mut(key).ok_or_else(|| {
+            transitions.first().map_or(
+                HotSourceError::Unregistered { generation: 0 },
+                |(generation, _)| HotSourceError::Unregistered {
+                    generation: generation.get(),
+                },
+            )
+        })?;
+        for (generation, next) in transitions {
+            let current =
+                authorities
+                    .by_generation
+                    .get(generation)
+                    .ok_or(HotSourceError::Unregistered {
+                        generation: generation.get(),
+                    })?;
+            if current == next {
+                continue;
+            }
+            if next.stage() == current.stage() {
+                return Err(HotSourceError::Contradictory {
+                    generation: generation.get(),
+                    authority: current.label(),
+                });
+            }
+            if next.stage() < current.stage() {
+                return Err(HotSourceError::Backwards {
+                    generation: generation.get(),
+                    from: current.label(),
+                    to: next.label(),
+                });
+            }
+        }
+        for (generation, next) in transitions {
+            if let Some(current) = authorities.by_generation.get_mut(generation)
+                && current != next
+            {
+                *current = next.clone();
+            }
+        }
         Ok(())
     }
 
@@ -731,6 +801,58 @@ mod tests {
             registry.register_memtable(&key, generation),
             Err(HotSourceError::AlreadyRegistered { .. })
         ));
+    }
+
+    /// A complete claim transition is all-or-none and exact replay is success.
+    ///
+    /// # Panics
+    ///
+    /// Panics when prevalidation mutates an earlier member, when the corrected
+    /// complete retry does not publish both members, or when exact replay is
+    /// rejected.
+    #[test]
+    fn complete_claim_authority_transition_is_atomic_and_idempotent() {
+        let registry = ScribeHotSourceRegistry::new();
+        let key = seal_key();
+        let first = GenerationOrdinal::new(3, 1);
+        let second = GenerationOrdinal::new(7, 2);
+        registry
+            .restore_durable(&key, first, staged())
+            .expect("first staged member restores");
+        let published = HotAuthority::Published {
+            object_key: "hot/events/claim.parquet".to_owned(),
+        };
+        let transitions = vec![(first, published.clone()), (second, published.clone())];
+
+        assert!(matches!(
+            registry.advance_all_atomic(&key, &transitions),
+            Err(HotSourceError::Unregistered { generation: 2 })
+        ));
+        assert_eq!(
+            registry
+                .authority(&key, first)
+                .expect("first authority reads"),
+            Some(staged()),
+            "failure on a later member must not mutate an earlier member"
+        );
+
+        registry
+            .restore_durable(&key, second, staged())
+            .expect("missing staged member restores under the same identity");
+        registry
+            .advance_all_atomic(&key, &transitions)
+            .expect("the complete retry publishes atomically");
+        registry
+            .advance_all_atomic(&key, &transitions)
+            .expect("exact replay is idempotent success");
+        for generation in [first, second] {
+            assert_eq!(
+                registry
+                    .authority(&key, generation)
+                    .expect("published authority reads"),
+                Some(published.clone())
+            );
+        }
     }
 
     /// A generation is only released once something durable holds its rows.

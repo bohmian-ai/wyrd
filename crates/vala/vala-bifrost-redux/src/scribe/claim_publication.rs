@@ -125,10 +125,12 @@ impl ClaimPublisher {
             .first()
             .cloned()
             .unwrap_or_else(|| request.object_base.to_owned());
-        for member in request.claim.members() {
-            hot_sources
-                .advance(
-                    &seal_key,
+        let transitions = request
+            .claim
+            .members()
+            .iter()
+            .map(|member| {
+                (
                     crate::scribe::hot_source::GenerationOrdinal::new(
                         member.id().shard(),
                         member.id().generation(),
@@ -137,15 +139,56 @@ impl ClaimPublisher {
                         object_key: object_key.clone(),
                     },
                 )
-                .map_err(|error| ScribeError::Internal {
-                    detail: format!(
-                        "move published staged member {}-{} to its hot object: {error}",
-                        member.id().shard(),
-                        member.id().generation()
-                    ),
-                })?;
-        }
-        Ok(())
+            })
+            .collect::<Vec<_>>();
+        hot_sources
+            .advance_all_atomic(&seal_key, &transitions)
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("move complete claim authority to its hot objects: {error}"),
+            })
+    }
+
+    /// Releases one published member's authority from the pod registry.
+    ///
+    /// This is the last step of the handover the registry exists to describe:
+    /// the catalog now serves the rows, the member's local runs are gone, and
+    /// no reader can still be sent to them. Releasing earlier — when the
+    /// memtable dropped its Arrow copy, say — would remove the staged-run
+    /// authority a live-tail reader still needs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the registry refuses the release,
+    /// which means the member is unknown to it or nothing durable holds its
+    /// rows — either way the publication must not report a clean handover.
+    fn release_authority(
+        &self,
+        key: &crate::scribe::assembly::ScribeAssemblyKey,
+        member: crate::scribe::assembly::StagedMemberId,
+    ) -> Result<(), ScribeError> {
+        let Some(hot_sources) = &self.hot_sources else {
+            return Ok(());
+        };
+        hot_sources
+            .release(
+                &crate::scribe::seal_key::SealKey::new(
+                    key.tenant(),
+                    key.table().clone(),
+                    key.partition(),
+                ),
+                crate::scribe::hot_source::GenerationOrdinal::new(
+                    member.shard(),
+                    member.generation(),
+                ),
+            )
+            .map(|_| ())
+            .map_err(|error| ScribeError::Internal {
+                detail: format!(
+                    "release the authority of published staged member {}-{}: {error}",
+                    member.shard(),
+                    member.generation()
+                ),
+            })
     }
 
     /// Waits for every live-tail read holding one member's runs to finish.
@@ -325,20 +368,32 @@ impl ClaimPublisher {
                     ),
                 }
             })?;
+            let file_list_commit_key = format!(
+                "{}:{}:{}",
+                commit_key.node_id, commit_key.wal_lsn_min, commit_key.wal_lsn_max
+            );
+            let persisted_lsn_ranges = vec![staged.record().wal_range()];
             let published = StagedMemberState::Published {
-                file_list_commit_key: format!(
-                    "{}:{}:{}",
-                    commit_key.node_id, commit_key.wal_lsn_min, commit_key.wal_lsn_max
-                ),
+                claim_id: request.claim.id().to_string(),
+                file_list_commit_key: file_list_commit_key.clone(),
                 published_object_identities: object_identities.to_vec(),
-                persisted_lsn_ranges: vec![staged.record().wal_range()],
+                persisted_lsn_ranges: persisted_lsn_ranges.clone(),
             };
             self.stage
                 .transition(key, member.id(), published)
                 .await
                 .map_err(transition_failure(member.id()))?;
             self.stage
-                .transition(key, member.id(), StagedMemberState::CleanupPending)
+                .transition(
+                    key,
+                    member.id(),
+                    StagedMemberState::CleanupPending {
+                        claim_id: request.claim.id().to_string(),
+                        file_list_commit_key,
+                        published_object_identities: object_identities.to_vec(),
+                        persisted_lsn_ranges,
+                    },
+                )
                 .await
                 .map_err(transition_failure(member.id()))?;
             self.await_lease_drain(key, member.id()).await?;
@@ -352,9 +407,167 @@ impl ClaimPublisher {
                         member.id().generation()
                     ),
                 })?;
+            self.release_authority(key, member.id())?;
         }
         Ok(())
     }
+
+    /// Drives recovered published members through terminal cleanup.
+    ///
+    /// `Published` records first persist the complete `CleanupPending` facts;
+    /// already-pending records continue idempotently. In both cases the owner
+    /// prevents new leases through the restored published authority, drains
+    /// existing leases, removes member storage, and releases registry authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first durable transition, lease, filesystem, or registry
+    /// refusal. Unprocessed records remain intact for the next startup.
+    pub(crate) async fn recover_terminal_members(
+        &self,
+        key: &crate::scribe::assembly::ScribeAssemblyKey,
+        members: &[crate::scribe::hot_stage::StagedMember],
+    ) -> Result<RecoveredTerminalCleanup, ScribeError> {
+        let terminal_facts = members
+            .iter()
+            .filter_map(|member| match member.record().state() {
+                StagedMemberState::Published {
+                    claim_id,
+                    file_list_commit_key,
+                    published_object_identities,
+                    persisted_lsn_ranges,
+                }
+                | StagedMemberState::CleanupPending {
+                    claim_id,
+                    file_list_commit_key,
+                    published_object_identities,
+                    persisted_lsn_ranges,
+                } => Some((
+                    claim_id.clone(),
+                    file_list_commit_key.clone(),
+                    published_object_identities.clone(),
+                    persisted_lsn_ranges.clone(),
+                )),
+                StagedMemberState::Ready
+                | StagedMemberState::Claimed { .. }
+                | StagedMemberState::Publishing { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        let mut released_bytes = 0_u64;
+        let terminal_claims = terminal_facts
+            .iter()
+            .map(|(claim_id, ..)| claim_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        for member in members {
+            let id = member.record().member();
+            let (
+                claim_id,
+                file_list_commit_key,
+                published_object_identities,
+                persisted_lsn_ranges,
+                needs_published_transition,
+            ) = match member.record().state() {
+                StagedMemberState::Published {
+                    claim_id,
+                    file_list_commit_key,
+                    published_object_identities,
+                    persisted_lsn_ranges,
+                }
+                | StagedMemberState::CleanupPending {
+                    claim_id,
+                    file_list_commit_key,
+                    published_object_identities,
+                    persisted_lsn_ranges,
+                } => (
+                    claim_id.clone(),
+                    file_list_commit_key.clone(),
+                    published_object_identities.clone(),
+                    persisted_lsn_ranges.clone(),
+                    matches!(member.record().state(), StagedMemberState::Published { .. }),
+                ),
+                StagedMemberState::Publishing { claim_id, .. } => {
+                    let Some((_, commit_key, objects, _)) = terminal_facts
+                        .iter()
+                        .find(|(terminal_claim, ..)| terminal_claim == claim_id)
+                    else {
+                        continue;
+                    };
+                    (
+                        claim_id.clone(),
+                        commit_key.clone(),
+                        objects.clone(),
+                        vec![member.record().wal_range()],
+                        true,
+                    )
+                }
+                StagedMemberState::Ready | StagedMemberState::Claimed { .. } => continue,
+            };
+            if needs_published_transition
+                && matches!(
+                    member.record().state(),
+                    StagedMemberState::Publishing { .. }
+                )
+            {
+                self.stage
+                    .transition(
+                        key,
+                        id,
+                        StagedMemberState::Published {
+                            claim_id: claim_id.clone(),
+                            file_list_commit_key: file_list_commit_key.clone(),
+                            published_object_identities: published_object_identities.clone(),
+                            persisted_lsn_ranges: persisted_lsn_ranges.clone(),
+                        },
+                    )
+                    .await
+                    .map_err(transition_failure(id))?;
+            }
+            if needs_published_transition {
+                self.stage
+                    .transition(
+                        key,
+                        id,
+                        StagedMemberState::CleanupPending {
+                            claim_id,
+                            file_list_commit_key,
+                            published_object_identities,
+                            persisted_lsn_ranges,
+                        },
+                    )
+                    .await
+                    .map_err(transition_failure(id))?;
+            }
+            self.await_lease_drain(key, id).await?;
+            self.stage
+                .retire(key, id)
+                .await
+                .map_err(|error| ScribeError::Internal {
+                    detail: format!(
+                        "retire recovered published staged member {}-{}: {error}",
+                        id.shard(),
+                        id.generation()
+                    ),
+                })?;
+            self.release_authority(key, id)?;
+            released_bytes = released_bytes
+                .checked_add(member.record().encoded_bytes())
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "recovered published staged-byte total overflow".to_owned(),
+                })?;
+        }
+        Ok(RecoveredTerminalCleanup {
+            released_bytes,
+            terminal_claims,
+        })
+    }
+}
+
+/// Result of driving all surviving members of terminal claims to retirement.
+pub(crate) struct RecoveredTerminalCleanup {
+    /// Exact surviving staged bytes removed and eligible for release.
+    pub(crate) released_bytes: u64,
+    /// Scribe claim identities proven terminal by their durable member state.
+    pub(crate) terminal_claims: std::collections::HashSet<String>,
 }
 
 impl std::fmt::Debug for ClaimPublisher {

@@ -3391,10 +3391,7 @@ impl ShardOwner {
         segment_refs.sort_by(|left, right| left.path.cmp(&right.path));
         segment_refs.dedup_by(|left, right| left.path == right.path);
         self.wal_handle.retain_segments(&segment_refs)?;
-        let mut frozen = self.memtable.freeze_all_nonempty()?;
-        for member in &mut frozen {
-            member.shard_id = self.id;
-        }
+        let frozen = self.memtable.freeze_all_nonempty()?;
         let frozen_bytes = frozen.iter().try_fold(0_usize, |total, member| {
             total
                 .checked_add(member.arrow_bytes)

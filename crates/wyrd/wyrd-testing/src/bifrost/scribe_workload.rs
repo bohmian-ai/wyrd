@@ -225,7 +225,7 @@ impl ScribeProductionWorkloadV1 {
                     operations.push(ScribeWorkloadOperationV1::Append {
                         tenant,
                         table,
-                        batch_id: Uuid::from_u128(u128::from(seed) << 32 | u128::from(ordinal)),
+                        batch_id: deterministic_batch_id(seed, ordinal),
                         rows: (0..8_i64)
                             .map(|row| i64::try_from(ordinal).unwrap_or(i64::MAX) * 1_000 + row)
                             .collect(),
@@ -344,6 +344,22 @@ impl ScribeProductionWorkloadV1 {
             })
             .sum()
     }
+}
+
+/// Derives one deterministic `UUIDv7` batch identity from the record's seed.
+///
+/// The ingest contract requires a v7 batch id, and the record requires the id
+/// to be fixed: a replayed record must present the same batch identity so the
+/// server's exactly-once path recognises it as a retry rather than new rows.
+/// The seed and ordinal fill the free bits; the version and variant nibbles are
+/// stamped so the value is a legal v7 rather than an arbitrary 128-bit number.
+fn deterministic_batch_id(seed: u64, ordinal: u64) -> Uuid {
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(&seed.to_be_bytes());
+    bytes[8..].copy_from_slice(&ordinal.to_be_bytes());
+    bytes[6] = 0x70 | (bytes[6] & 0x0f);
+    bytes[8] = 0x80 | (bytes[8] & 0x3f);
+    Uuid::from_bytes(bytes)
 }
 
 /// Hashes a row set into the canonical digest both sides compare.
@@ -690,13 +706,16 @@ impl crate::WyrdTestServer {
                 deadline_ms: Some(60_000),
             })
             .await
-            .map_err(|error| crate::WyrdTestServerError::Start(error.to_string()))?;
+            .map_err(|error| {
+                crate::WyrdTestServerError::Start(format!("query {table_fqn}: {}", error.detail()))
+            })?;
         let mut values = Vec::new();
-        while let Some(batch) = stream
-            .next_batch()
-            .await
-            .map_err(|error| crate::WyrdTestServerError::Start(error.to_string()))?
-        {
+        while let Some(batch) = stream.next_batch().await.map_err(|error| {
+            crate::WyrdTestServerError::Start(format!(
+                "read a batch of {table_fqn}: {}",
+                error.detail()
+            ))
+        })? {
             let column = batch
                 .column_by_name("value")
                 .ok_or_else(|| {

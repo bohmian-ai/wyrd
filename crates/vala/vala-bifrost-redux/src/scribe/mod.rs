@@ -2466,6 +2466,12 @@ impl ScribeImpl {
                 stream = %self.stream,
                 "Scribe staged publications reconciled before WAL replay"
             );
+            let resumed = persistence.resume_staging_claims().await?;
+            tracing::info!(
+                resumed,
+                stream = %self.stream,
+                "Scribe durable claims resumed before WAL replay"
+            );
         }
         let result = self
             .wal_io

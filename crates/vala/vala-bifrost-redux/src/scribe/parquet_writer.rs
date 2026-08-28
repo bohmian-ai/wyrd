@@ -32,7 +32,7 @@ use crate::parquet::memory::{
     validate_writer_v2_structure,
 };
 use crate::parquet::writer_properties::bifrost_writer_properties_with_metadata;
-use crate::resources::ScribeGenerationScratch;
+use crate::resources::ScribeClaimScratch;
 use crate::scribe::geometry::DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES;
 use crate::scribe::memtable::FrozenMemtable;
 use crate::scribe::wal::ScribeAppendMeta;
@@ -140,7 +140,7 @@ pub struct BoundedParquetArtifactSet {
     /// Contiguous writer-v2 artifacts in publication order.
     artifacts: Vec<BoundedParquetArtifact>,
     /// Exact generation directory whose charge follows the artifacts.
-    scratch: Option<ScribeGenerationScratch>,
+    scratch: Option<ScribeClaimScratch>,
 }
 
 impl BoundedParquetArtifactSet {
@@ -172,7 +172,7 @@ impl BoundedParquetArtifactSet {
     /// Returns an internal error if scratch authority was already attached.
     pub(crate) fn attach_scratch(
         &mut self,
-        scratch: ScribeGenerationScratch,
+        scratch: ScribeClaimScratch,
     ) -> Result<(), ScribeError> {
         if self.scratch.replace(scratch).is_some() {
             return Err(ScribeError::Internal {
@@ -193,13 +193,18 @@ impl BoundedParquetArtifactSet {
     /// # Errors
     /// Returns an internal error when the bounded scratch cleanup protocol
     /// exhausts its retries and poisons shared volume health.
-    pub(crate) fn cleanup(mut self) -> Result<(), ScribeError> {
+    pub(crate) async fn cleanup(mut self) -> Result<(), ScribeError> {
         let Some(scratch) = self.scratch.take() else {
             return Ok(());
         };
-        scratch.cleanup().map_err(|error| ScribeError::Internal {
-            detail: format!("writer-v2 scratch cleanup failed: {error}"),
-        })
+        tokio::task::spawn_blocking(move || scratch.cleanup())
+            .await
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("writer-v2 scratch cleanup task failed: {error}"),
+            })?
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("writer-v2 scratch cleanup failed: {error}"),
+            })
     }
 
     /// Retains scratch and its charge after an unresolved commit outcome.

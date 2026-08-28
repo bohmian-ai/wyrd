@@ -34,7 +34,7 @@ use crate::bifrost::forge_harness::CommitUncertaintyCatalog;
 use crate::bifrost::telemetry::BifrostTelemetryCapture;
 use crate::server::{
     OracleRuntimeInspection, TestOraclePeerTls, WyrdTestServer, WyrdTestServerBuilder,
-    WyrdTestServerError, provision_oracle_peer_credentials, test_catalog,
+    WyrdTestServerError, provision_oracle_peer_credentials, reserve_loopback_addr, test_catalog,
 };
 
 /// Supported role topology for a Bifrost cluster journey.
@@ -2691,19 +2691,6 @@ fn create_spill_root(
     } else {
         tempfile::tempdir().map_err(|error| ClusterError::Resource(error.to_string()))
     }
-}
-
-/// Ask the OS for one currently free loopback port used by the cluster binder.
-///
-/// # Errors
-///
-/// Returns [`ClusterError::Resource`] when loopback binding or address lookup fails.
-fn reserve_loopback_addr() -> Result<std::net::SocketAddr, ClusterError> {
-    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-        .map_err(|error| ClusterError::Resource(error.to_string()))?;
-    listener
-        .local_addr()
-        .map_err(|error| ClusterError::Resource(error.to_string()))
 }
 
 /// Parse rendered Prometheus values without interpreting comments.

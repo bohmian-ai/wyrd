@@ -249,26 +249,6 @@ impl Memtable {
             })
     }
 
-    /// Releases one retired generation's authority from the pod registry.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError::Internal`] when the registry refuses the release
-    /// because nothing durable holds the generation's rows. Retiring under that
-    /// condition would drop the last copy, so the refusal is the correct
-    /// outcome and the caller keeps the generation.
-    fn release_hot_source(&self, key: &SealKey, seal_id: u64) -> Result<(), ScribeError> {
-        let Some(hot_sources) = &self.hot_sources else {
-            return Ok(());
-        };
-        hot_sources
-            .release(key, self.ordinal(seal_id))
-            .map(|_| ())
-            .map_err(|error| ScribeError::Internal {
-                detail: format!("release retired generation {seal_id}: {error}"),
-            })
-    }
-
     /// Construct a memtable with an explicit rotation threshold and max age.
     ///
     /// This is the constructor production wiring uses: the shard runtime threads
@@ -509,8 +489,8 @@ impl Memtable {
         let arrow_bytes = batches.iter().map(RecordBatch::get_array_memory_size).sum();
         Ok(FrozenMemtable {
             seal_id: 0,
-            // shard_id is assigned by the owning ShardOwner using the
-            // recorded shard_id from the ReplayedSealKey before dispatch.
+            // Both identities are stamped by the memtable that adopts this
+            // decoded generation, in `insert_replayed_frozen`.
             shard_id: 0,
             seal_key: replayed.seal_key.clone(),
             schema,
@@ -531,6 +511,7 @@ impl Memtable {
         if frozen.seal_id == 0 {
             frozen.seal_id = self.next_seal_id.fetch_add(1, Ordering::Relaxed);
         }
+        frozen.shard_id = self.shard_id;
         let mut immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
             detail: format!("memtable immutable lock poisoned: {e}"),
         })?;
@@ -640,7 +621,7 @@ impl Memtable {
         };
 
         let seal_id = self.next_seal_id.fetch_add(1, Ordering::Relaxed);
-        let frozen = bucket.freeze(seal_id);
+        let frozen = bucket.freeze(seal_id, self.shard_id);
 
         let mut immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
             detail: format!("memtable immutable lock poisoned: {e}"),
@@ -684,7 +665,7 @@ impl Memtable {
         let mut frozen = Vec::with_capacity(buckets.len());
         for (key, bucket) in buckets {
             let seal_id = self.next_seal_id.fetch_add(1, Ordering::Relaxed);
-            let member = bucket.freeze(seal_id);
+            let member = bucket.freeze(seal_id, self.shard_id);
             self.register_hot_source(&key, seal_id)?;
             immutable
                 .entry(key)
@@ -1221,11 +1202,14 @@ impl Memtable {
                     ),
                 });
             }
-            let key = entries[index].frozen.seal_key.clone();
             entries.remove(index);
             immutable.retain(|_, values| !values.is_empty());
             drop(immutable);
-            self.release_hot_source(&key, token.seal_id)?;
+            // The generation's authority is not released here. Dropping this
+            // Arrow copy is not a handover: the staged run is already
+            // authoritative for these rows and stays so until the published
+            // object replaces it, so the registry entry is released by the
+            // publication owner once the member is retired from the volume.
             return Ok(token.wal_range);
         }
         Err(ScribeError::Internal {
@@ -1448,7 +1432,13 @@ impl MemtableBucket {
         now.saturating_duration_since(self.first_insert_at) >= seal_max_age
     }
 
-    fn freeze(self, seal_id: u64) -> FrozenMemtable {
+    /// Detaches this bucket as one frozen generation of `shard_id`'s lane.
+    ///
+    /// The lane is stamped here rather than by the caller because the same
+    /// `(shard_id, seal_id)` pair is what the memtable registers in the
+    /// hot-source registry. Producing both from one value is what keeps a
+    /// published member's ordinal equal to its registered one.
+    fn freeze(self, seal_id: u64, shard_id: usize) -> FrozenMemtable {
         let batches = self.batches;
 
         let opened_at = self.first_insert_at;
@@ -1457,10 +1447,7 @@ impl MemtableBucket {
 
         FrozenMemtable {
             seal_id,
-            // shard_id is assigned by the owning ShardOwner after freeze so
-            // that post-commit routing can target the correct lane. Default 0
-            // is replaced before the FrozenMemtable leaves the ShardOwner.
-            shard_id: 0,
+            shard_id,
             seal_key: self.seal_key,
             schema: self.schema,
             batches,
@@ -1672,9 +1659,9 @@ pub(crate) struct CommittedRetirement {
 /// both forms here would double the Arrow memory charged to Scribe.
 ///
 /// The `shard_id` field carries the pod-local shard lane that froze this
-/// generation. It is set by the `ScribeShardRuntime` owner after
-/// freezing so that post-commit routing can dispatch back to the correct lane
-/// without recomputing the routing key.
+/// generation. It is stamped by the freezing memtable itself, which is the
+/// same owner that registers the generation's hot-source ordinal, so
+/// post-commit routing and authority lookup can never disagree about the lane.
 #[derive(Debug, Clone)]
 pub struct FrozenMemtable {
     /// Local immutable-generation identity.
@@ -1683,9 +1670,9 @@ pub struct FrozenMemtable {
     pub seal_key: SealKey,
     /// Pod-local shard lane that owns this frozen generation.
     ///
-    /// Populated by the shard owner that performed the freeze; zero until
-    /// explicitly set. Post-commit routing MUST use this field rather than
-    /// recomputing the route from `seal_key`.
+    /// Stamped by the freezing memtable from its bound lane identity, which is
+    /// the same value its hot-source ordinals carry. Post-commit routing MUST
+    /// use this field rather than recomputing the route from `seal_key`.
     pub shard_id: usize,
     /// Arrow schema shared by all append batches.
     pub schema: SchemaRef,
@@ -2724,6 +2711,105 @@ mod tests {
             )
             .expect("insert");
         assert!(memtable.should_seal(&key).expect("should_seal"));
+    }
+
+    /// Every seal cause and whole-generation rotation preserve a nonzero lane.
+    ///
+    /// # Panics
+    ///
+    /// Panics when size, age, pressure, or full rotation rewrites the bound
+    /// shard identity or registers a different hot-source ordinal.
+    #[test]
+    fn nonzero_shard_survives_size_age_pressure_and_full_rotation() {
+        const SHARD: usize = 7;
+        let exercise = |rotation_bytes: usize, max_age: Duration| {
+            let registry = Arc::new(crate::scribe::hot_source::ScribeHotSourceRegistry::new());
+            let memtable = Memtable::new_with_config(rotation_bytes, max_age)
+                .with_hot_sources(SHARD, Arc::clone(&registry));
+            (registry, memtable)
+        };
+        let key = make_test_seal_key();
+
+        let (size_registry, size) = exercise(1, Duration::from_secs(60));
+        size.insert(
+            &key,
+            make_test_event(),
+            make_test_meta(1),
+            make_test_batch(1),
+        )
+        .expect("size member inserts");
+        assert_eq!(size.should_seal(&key).expect("size predicate"), true);
+        let size_frozen = size.freeze(&key).expect("size member freezes");
+        assert_eq!(size_frozen.shard_id, SHARD);
+        assert!(
+            size_registry
+                .authority(
+                    &key,
+                    crate::scribe::hot_source::GenerationOrdinal::new(
+                        u16::try_from(SHARD).expect("fixture shard fits"),
+                        size_frozen.seal_id,
+                    ),
+                )
+                .expect("size authority")
+                .is_some()
+        );
+
+        let (_, age) = exercise(usize::MAX, Duration::ZERO);
+        age.insert(
+            &key,
+            make_test_event(),
+            make_test_meta(2),
+            make_test_batch(1),
+        )
+        .expect("age member inserts");
+        assert!(age.should_seal(&key).expect("age predicate"));
+        assert_eq!(
+            age.freeze(&key).expect("age member freezes").shard_id,
+            SHARD
+        );
+
+        let (_, pressure) = exercise(usize::MAX, Duration::from_secs(60));
+        pressure
+            .insert(
+                &key,
+                make_test_event(),
+                make_test_meta(3),
+                make_test_batch(1),
+            )
+            .expect("pressure member inserts");
+        let victim = Memtable::select_pressure_victims(
+            pressure.pressure_candidates().expect("pressure candidates"),
+            1,
+        )
+        .pop()
+        .expect("one pressure victim");
+        assert_eq!(
+            pressure
+                .freeze(&victim)
+                .expect("pressure member freezes")
+                .shard_id,
+            SHARD
+        );
+
+        let (_, rotation) = exercise(usize::MAX, Duration::from_secs(60));
+        let peer = SealKey::new(
+            key.tenant,
+            TableRef::new(BifrostNamespace::Bifrost, "nonzero-peer"),
+            key.partition,
+        );
+        for (candidate, lsn) in [(&key, 4), (&peer, 5)] {
+            rotation
+                .insert(
+                    candidate,
+                    make_test_event(),
+                    make_test_meta(lsn),
+                    make_test_batch(1),
+                )
+                .expect("rotation member inserts");
+        }
+        let cohort = rotation.freeze_all_nonempty().expect("full rotation");
+        assert_eq!(cohort.len(), 2);
+        assert!(cohort.iter().all(|member| member.shard_id == SHARD));
     }
 
     /// The age trigger fires exactly at `seal_max_age`, and size takes priority.

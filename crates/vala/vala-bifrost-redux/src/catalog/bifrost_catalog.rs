@@ -200,7 +200,7 @@ struct PinnedIcebergState {
     /// Current snapshot identity, when the table has committed data.
     snapshot_id: Option<i64>,
     /// Validated Forge publication operation recorded by the current snapshot.
-    publication_operation_id: Option<uuid::Uuid>,
+    forge_publication_operation_id: Option<uuid::Uuid>,
     /// Canonical paths used to exclude hot-manifest overlap.
     file_paths: BTreeSet<String>,
     /// Exact immutable metadata keyed by canonical path.
@@ -372,7 +372,7 @@ impl BifrostCatalog {
                 .unresolved_for_cut(
                     &mut conn,
                     &pinned_a.file_paths,
-                    pinned_a.publication_operation_id,
+                    pinned_a.forge_publication_operation_id,
                 )
                 .await?;
             conn.commit().await?;
@@ -405,13 +405,13 @@ impl BifrostCatalog {
         let Some(snapshot) = iceberg_table.metadata().current_snapshot() else {
             return Ok(PinnedIcebergState {
                 snapshot_id,
-                publication_operation_id: None,
+                forge_publication_operation_id: None,
                 file_paths,
                 files,
                 estimated_bytes,
             });
         };
-        let publication_operation_id = snapshot
+        let forge_publication_operation_id = snapshot
             .summary()
             .additional_properties
             .get("forge.operation_id")
@@ -464,7 +464,7 @@ impl BifrostCatalog {
         }
         Ok(PinnedIcebergState {
             snapshot_id,
-            publication_operation_id,
+            forge_publication_operation_id,
             file_paths,
             files,
             estimated_bytes,

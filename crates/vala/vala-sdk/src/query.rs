@@ -13,8 +13,9 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
     BifrostQueryRequest, CancelRunningQueryResponse, ListRunningQueriesResponse, QueryStreamFrame,
-    QueryTerminalFrame, QueryTerminalOutcome, RunningQuerySummary,
+    QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome, RunningQuerySummary,
 };
+use wyrd_spec::vala::error::BifrostError;
 use wyrd_tonic::frame_codec::FrameDecoder;
 use wyrd_tonic::query_conversion::QueryStreamConverter;
 
@@ -97,7 +98,7 @@ impl ValaSdkError {
             Self::Transport(error) => error.code(),
             Self::Protocol(_) | Self::Arrow(_) => "WYRD_VALA_502_QUERY_STREAM_PROTOCOL",
             Self::IncompleteQueryStream => "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE",
-            Self::FailedTerminal { .. } => "WYRD_VALA_500_QUERY_EXECUTION_FAILED",
+            Self::FailedTerminal { terminal } => terminal_bifrost_error(terminal).code(),
             Self::ResultTooLarge => "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE",
         }
     }
@@ -108,7 +109,7 @@ impl ValaSdkError {
         match self {
             Self::Transport(error) => error.status(),
             Self::Protocol(_) | Self::Arrow(_) | Self::IncompleteQueryStream => 502,
-            Self::FailedTerminal { .. } => 500,
+            Self::FailedTerminal { terminal } => terminal_bifrost_error(terminal).status(),
             Self::ResultTooLarge => 413,
         }
     }
@@ -120,7 +121,7 @@ impl ValaSdkError {
             Self::Transport(error) => error.title(),
             Self::Protocol(_) | Self::Arrow(_) => "Query stream protocol failed",
             Self::IncompleteQueryStream => "Query stream incomplete",
-            Self::FailedTerminal { .. } => "Query execution failed",
+            Self::FailedTerminal { terminal } => terminal_bifrost_error(terminal).title(),
             Self::ResultTooLarge => "Query result too large",
         }
     }
@@ -136,9 +137,7 @@ impl ValaSdkError {
             Self::IncompleteQueryStream => {
                 "Retry the query because the response ended before its required terminal frame."
             }
-            Self::FailedTerminal { .. } => {
-                "Inspect the retained terminal error and correct the query or source failure before retrying."
-            }
+            Self::FailedTerminal { terminal } => terminal_bifrost_error(terminal).remediation(),
             Self::ResultTooLarge => {
                 "Reduce the query result or raise the caller's explicit collection limit within its hard ceiling."
             }
@@ -155,6 +154,39 @@ impl ValaSdkError {
             | Self::Arrow(_)
             | Self::IncompleteQueryStream
             | Self::ResultTooLarge => None,
+        }
+    }
+}
+
+/// Projects one validated closed terminal code through the canonical catalog.
+fn terminal_bifrost_error(terminal: &QueryTerminalFrame) -> BifrostError {
+    let detail = terminal
+        .error
+        .as_ref()
+        .and_then(|error| error.detail.as_ref())
+        .map_or_else(
+            || "query terminal reported failure".to_owned(),
+            |detail| detail.as_str().to_owned(),
+        );
+    match terminal.error.as_ref().map(|error| error.code) {
+        Some(QueryTerminalErrorCode::QueryTimeout) => BifrostError::QueryTimeout,
+        Some(QueryTerminalErrorCode::QueryVisibilityUnavailable) => {
+            BifrostError::QueryVisibilityUnavailable
+        }
+        Some(QueryTerminalErrorCode::QueryTenantInvariant) => BifrostError::QueryTenantInvariant,
+        Some(QueryTerminalErrorCode::QueryReconciliationInvariant) => {
+            BifrostError::QueryReconciliationInvariant
+        }
+        Some(QueryTerminalErrorCode::QueryPeerSecurity) => BifrostError::QueryPeerSecurity,
+        Some(QueryTerminalErrorCode::QueryAuditUnavailable) => BifrostError::QueryAuditUnavailable,
+        Some(QueryTerminalErrorCode::CatalogUnreachable) => {
+            BifrostError::CatalogUnreachable { detail }
+        }
+        Some(QueryTerminalErrorCode::StorageUnreachable) => {
+            BifrostError::StorageUnreachable { detail }
+        }
+        Some(QueryTerminalErrorCode::QueryExecutionFailed) | None => {
+            BifrostError::QueryExecutionFailed
         }
     }
 }
@@ -1008,6 +1040,73 @@ mod tests {
         let too_large = ValaSdkError::ResultTooLarge;
         assert_eq!(too_large.detail(), "query result exceeds configured bounds");
         assert_eq!(too_large.safe_details(), None);
+    }
+
+    /// Every closed failed-terminal code projects through its catalog entry.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any code is flattened to generic query execution metadata.
+    #[test]
+    fn failed_terminal_metadata_projection_is_exhaustive() {
+        let cases = [
+            (
+                QueryTerminalErrorCode::QueryTimeout,
+                BifrostError::QueryTimeout,
+            ),
+            (
+                QueryTerminalErrorCode::QueryVisibilityUnavailable,
+                BifrostError::QueryVisibilityUnavailable,
+            ),
+            (
+                QueryTerminalErrorCode::QueryTenantInvariant,
+                BifrostError::QueryTenantInvariant,
+            ),
+            (
+                QueryTerminalErrorCode::QueryReconciliationInvariant,
+                BifrostError::QueryReconciliationInvariant,
+            ),
+            (
+                QueryTerminalErrorCode::QueryPeerSecurity,
+                BifrostError::QueryPeerSecurity,
+            ),
+            (
+                QueryTerminalErrorCode::QueryAuditUnavailable,
+                BifrostError::QueryAuditUnavailable,
+            ),
+            (
+                QueryTerminalErrorCode::CatalogUnreachable,
+                BifrostError::CatalogUnreachable {
+                    detail: "source failed".to_owned(),
+                },
+            ),
+            (
+                QueryTerminalErrorCode::StorageUnreachable,
+                BifrostError::StorageUnreachable {
+                    detail: "source failed".to_owned(),
+                },
+            ),
+            (
+                QueryTerminalErrorCode::QueryExecutionFailed,
+                BifrostError::QueryExecutionFailed,
+            ),
+        ];
+        for (code, expected) in cases {
+            let mut terminal = failed_terminal(0);
+            let error = terminal.error.as_mut().expect("failed terminal has error");
+            error.code = code;
+            error.detail =
+                Some(QueryErrorDetail::new("source failed").expect("detail is scrubbed"));
+            let projected = ValaSdkError::FailedTerminal { terminal };
+            assert_eq!(projected.code(), expected.code(), "code for {code:?}");
+            assert_eq!(projected.status(), expected.status(), "status for {code:?}");
+            assert_eq!(projected.title(), expected.title(), "title for {code:?}");
+            assert_eq!(
+                projected.remediation(),
+                expected.remediation(),
+                "remediation for {code:?}"
+            );
+        }
     }
 
     /// Builds the schema used by client state-machine tests.

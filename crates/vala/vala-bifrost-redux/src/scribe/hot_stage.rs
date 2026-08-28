@@ -169,6 +169,8 @@ pub enum StagedMemberState {
     },
     /// The claim committed; a published hot object now serves these rows.
     Published {
+        /// Deterministic identity of the Scribe claim that committed the rows.
+        claim_id: String,
         /// Commit key of the fenced `file_list` transaction.
         file_list_commit_key: String,
         /// Object identities the claim published, in artifact-ordinal order.
@@ -178,10 +180,31 @@ pub enum StagedMemberState {
         persisted_lsn_ranges: Vec<StagedLsnRange>,
     },
     /// Published and awaiting the last staged-reader lease before deletion.
-    CleanupPending,
+    CleanupPending {
+        /// Deterministic identity of the Scribe claim that committed the rows.
+        claim_id: String,
+        /// Commit key of the fenced `file_list` transaction.
+        file_list_commit_key: String,
+        /// Object identities the claim published, in artifact-ordinal order.
+        published_object_identities: Vec<String>,
+        /// WAL ranges already represented by the published objects.
+        persisted_lsn_ranges: Vec<StagedLsnRange>,
+    },
 }
 
 impl StagedMemberState {
+    /// Returns the durable Scribe claim identity carried after ownership begins.
+    #[must_use]
+    pub fn claim_id(&self) -> Option<&str> {
+        match self {
+            Self::Ready => None,
+            Self::Claimed { claim_id }
+            | Self::Publishing { claim_id, .. }
+            | Self::Published { claim_id, .. }
+            | Self::CleanupPending { claim_id, .. } => Some(claim_id),
+        }
+    }
+
     /// Returns this state's position in the staged lifecycle.
     const fn position(&self) -> u8 {
         match self {
@@ -189,7 +212,7 @@ impl StagedMemberState {
             Self::Claimed { .. } => 1,
             Self::Publishing { .. } => 2,
             Self::Published { .. } => 3,
-            Self::CleanupPending => 4,
+            Self::CleanupPending { .. } => 4,
         }
     }
 
@@ -203,7 +226,7 @@ impl StagedMemberState {
             Self::Claimed { .. } => "claimed",
             Self::Publishing { .. } => "publishing",
             Self::Published { .. } => "published",
-            Self::CleanupPending => "cleanup_pending",
+            Self::CleanupPending { .. } => "cleanup_pending",
         }
     }
 
@@ -496,7 +519,7 @@ impl StagedMember {
             StagedMemberState::Ready => return Ok(Some(RecoveredMember::Ready(member))),
             StagedMemberState::Claimed { claim_id }
             | StagedMemberState::Publishing { claim_id, .. } => claim_id,
-            StagedMemberState::Published { .. } | StagedMemberState::CleanupPending => {
+            StagedMemberState::Published { .. } | StagedMemberState::CleanupPending { .. } => {
                 return Ok(None);
             }
         };
@@ -608,8 +631,8 @@ impl ScribeHotStage {
 
     /// Moves one staged member forward to its next lifecycle state.
     ///
-    /// Only forward moves are accepted. A cancelled or interrupted claim keeps
-    /// its members claimed: claim identity is derived from the member set, so
+    /// Only forward moves and exact idempotent replay are accepted. A cancelled
+    /// or interrupted claim keeps its members claimed: claim identity is derived from the member set, so
     /// the retry re-derives the same claim and resumes it, while a back edge
     /// would let one member's rows be published under two identities.
     ///
@@ -637,6 +660,9 @@ impl ScribeHotStage {
             }
             Err(error) => return Err(error),
         };
+        if next == record.state {
+            return Ok(record);
+        }
         if next.position() <= record.state.position() {
             return Err(HotStageError::Backwards {
                 from: record.state.label(),
@@ -1272,12 +1298,23 @@ mod tests {
         assert_eq!(claimed.state(), &claim);
         assert!(!claimed.state().is_ready());
 
-        // Re-claiming, or returning to ready, would let one member's rows be
-        // published under two identities.
-        let refused = stage
-            .transition(&key, member, claim)
+        let replayed = stage
+            .transition(&key, member, claim.clone())
             .await
-            .expect_err("a member never re-enters the state it holds");
+            .expect("exact durable transition replay is idempotent");
+        assert_eq!(replayed.state(), &claim);
+        // A different claim at the same state, or returning to ready, would let
+        // one member's rows be published under two identities.
+        let refused = stage
+            .transition(
+                &key,
+                member,
+                StagedMemberState::Claimed {
+                    claim_id: "0022".to_owned(),
+                },
+            )
+            .await
+            .expect_err("a contradictory same-state identity is refused");
         assert!(
             matches!(
                 refused,
@@ -1343,6 +1380,7 @@ mod tests {
                 &key,
                 member,
                 StagedMemberState::Published {
+                    claim_id: "0011".to_owned(),
                     file_list_commit_key: "commit-1".to_owned(),
                     published_object_identities: vec!["objects/hot-0.parquet".to_owned()],
                     persisted_lsn_ranges: vec![StagedLsnRange { min: 4, max: 4 }],
@@ -1378,7 +1416,16 @@ mod tests {
                 .is_empty()
         );
         let unknown = stage
-            .transition(&key, member, StagedMemberState::CleanupPending)
+            .transition(
+                &key,
+                member,
+                StagedMemberState::CleanupPending {
+                    claim_id: "0011".to_owned(),
+                    file_list_commit_key: "commit-1".to_owned(),
+                    published_object_identities: vec!["hot/object.parquet".to_owned()],
+                    persisted_lsn_ranges: vec![StagedLsnRange { min: 1, max: 9 }],
+                },
+            )
             .await
             .expect_err("a retired member is unknown");
         assert!(
@@ -1464,7 +1511,7 @@ mod tests {
                 &key,
                 member,
                 StagedMemberState::Publishing {
-                    claim_id,
+                    claim_id: claim_id.clone(),
                     operation_id: Uuid::from_u128(5),
                 },
             )
@@ -1489,6 +1536,7 @@ mod tests {
                 &key,
                 member,
                 StagedMemberState::Published {
+                    claim_id,
                     file_list_commit_key: "commit-1".to_owned(),
                     published_object_identities: vec!["objects/hot-0.parquet".to_owned()],
                     persisted_lsn_ranges: vec![StagedLsnRange { min: 8, max: 8 }],

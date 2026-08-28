@@ -638,6 +638,19 @@ impl BifrostVolumeGovernor {
     }
 }
 
+/// Name prefix of the scratch directory one assembly claim merges into.
+const CLAIM_SCRATCH_PREFIX: &str = "scribe-claim-";
+
+/// Reports whether one directory name is a scratch directory this capability
+/// created and may therefore delete.
+///
+/// Deletion is gated on the same prefixes creation stamps, so a directory this
+/// process does not own — anything else sharing the registered namespace — is
+/// never a cleanup or reconciliation target.
+fn is_owned_scratch_name(name: &str) -> bool {
+    name.starts_with(CLAIM_SCRATCH_PREFIX)
+}
+
 /// Clears only process-owned Scribe runtime directories before readiness.
 ///
 /// # Errors
@@ -653,10 +666,7 @@ fn reconcile_scribe_scratch_namespace(root: &Path) -> Result<(), BifrostResource
             detail: format!("cannot inspect Scribe scratch namespace entry: {error}"),
         })?;
         let name = entry.file_name();
-        if name
-            .to_str()
-            .is_some_and(|name| name.starts_with("scribe-runtime-"))
-        {
+        if name.to_str().is_some_and(is_owned_scratch_name) {
             retry_scratch_cleanup(|| remove_exact_scratch_prefix(root, &entry.path())).map_err(
                 |error| BifrostResourceError::Unavailable {
                     detail: format!("cannot remove retained Scribe scratch namespace: {error}"),
@@ -951,27 +961,6 @@ impl ScratchVolume {
         })
     }
 
-    /// Creates one generation-owned Scribe output directory after exact admission.
-    ///
-    /// The returned owner removes only the directory it creates. Its name is
-    /// rooted beneath the registered Scribe namespace and carries the stream
-    /// and generation identity needed for restart reconciliation.
-    ///
-    /// # Errors
-    ///
-    /// Returns a typed plan error for a non-Scribe capability, a capacity
-    /// refusal from the shared device governor, or an unavailable error when
-    /// the exact owned directory cannot be created.
-    pub fn create_scribe_generation(
-        &self,
-        stream: &str,
-        generation: u64,
-        bytes: u64,
-    ) -> Result<ScribeGenerationScratch, BifrostResourceError> {
-        let component = safe_scratch_component(stream)?;
-        self.create_owned_directory(&format!("scribe-runtime-{component}-{generation}"), bytes)
-    }
-
     /// Creates the exact owned output directory one assembly claim merges into.
     ///
     /// A claim spans several shard generations, so its directory is named after
@@ -988,10 +977,10 @@ impl ScratchVolume {
         stream: &str,
         claim: &str,
         bytes: u64,
-    ) -> Result<ScribeGenerationScratch, BifrostResourceError> {
+    ) -> Result<ScribeClaimScratch, BifrostResourceError> {
         let component = safe_scratch_component(stream)?;
         let claim = safe_scratch_component(claim)?;
-        self.create_owned_directory(&format!("scribe-claim-{component}-{claim}"), bytes)
+        self.create_owned_directory(&format!("{CLAIM_SCRATCH_PREFIX}{component}-{claim}"), bytes)
     }
 
     /// Creates one uniquely suffixed owned directory under the Scribe namespace.
@@ -1009,11 +998,10 @@ impl ScratchVolume {
         &self,
         name: &str,
         bytes: u64,
-    ) -> Result<ScribeGenerationScratch, BifrostResourceError> {
+    ) -> Result<ScribeClaimScratch, BifrostResourceError> {
         if self.class != BifrostVolumeClass::ScribeOutput {
             return Err(BifrostResourceError::InvalidPlan {
-                detail: "Scribe generation scratch requires the Scribe output capability"
-                    .to_owned(),
+                detail: "Scribe claim scratch requires the Scribe output capability".to_owned(),
             });
         }
         let lease = self.try_acquire(bytes)?;
@@ -1025,9 +1013,9 @@ impl ScratchVolume {
         let suffix = SCRATCH_NAMESPACE_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
         let path = root.path.join(format!("{name}-{suffix}"));
         fs::create_dir(&path).map_err(|error| BifrostResourceError::Unavailable {
-            detail: format!("cannot create Scribe generation scratch: {error}"),
+            detail: format!("cannot create Scribe claim scratch: {error}"),
         })?;
-        Ok(ScribeGenerationScratch {
+        Ok(ScribeClaimScratch {
             path,
             namespace_root: root.path.clone(),
             lease: Some(lease),
@@ -1059,10 +1047,10 @@ fn safe_scratch_component(stream: &str) -> Result<&str, BifrostResourceError> {
     Ok(stream)
 }
 
-/// Generation-owned Scribe output directory and its exact physical charge.
+/// Claim-owned Scribe output directory and its exact physical charge.
 #[derive(Debug)]
-pub struct ScribeGenerationScratch {
-    /// Exact directory created for this generation.
+pub struct ScribeClaimScratch {
+    /// Exact directory created for this claim.
     path: PathBuf,
     /// Registered parent used to prove cleanup containment and fsync completion.
     namespace_root: PathBuf,
@@ -1072,14 +1060,14 @@ pub struct ScribeGenerationScratch {
     health: BifrostResourceHealth,
 }
 
-impl ScribeGenerationScratch {
-    /// Returns the exact directory available to the generation writer.
+impl ScribeClaimScratch {
+    /// Returns the exact directory available to the claim writer.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Removes the exact generation directory and releases its physical charge.
+    /// Removes the exact claim directory and releases its physical charge.
     ///
     /// # Errors
     ///
@@ -1114,16 +1102,27 @@ impl ScribeGenerationScratch {
         }
         self.health.poison(BifrostResourcePoisonReason::Volume);
         Err(BifrostResourceError::Poisoned {
-            detail: "Scribe generation scratch cleanup exhausted bounded retries".to_owned(),
+            detail: "Scribe claim scratch cleanup exhausted bounded retries".to_owned(),
         })
     }
 }
 
-impl Drop for ScribeGenerationScratch {
-    /// Applies the same exact-prefix cleanup on cancellation and unwind.
+impl Drop for ScribeClaimScratch {
+    /// Retains ownership without filesystem work on cancellation and unwind.
+    ///
+    /// Explicit cleanup owns the blocking deletion and bounded retry boundary.
+    /// A dropped owner may be running on a Tokio worker, so it cannot delete or
+    /// sleep here. Retaining the exact charge and poisoning shared health keeps
+    /// the residue visible to startup reconciliation and stops new admissions.
     fn drop(&mut self) {
-        if let Err(error) = self.cleanup_owned_prefix() {
-            tracing::error!(%error, path = %self.path.display(), "Scribe scratch cleanup failed");
+        if let Some(lease) = self.lease.take() {
+            lease.retain();
+            self.health.poison(BifrostResourcePoisonReason::Volume);
+            tracing::error!(
+                operation = "scribe_claim_scratch_drop",
+                outcome = "retained_poisoned",
+                "Scribe claim scratch ownership dropped before explicit cleanup"
+            );
         }
     }
 }
@@ -1139,15 +1138,18 @@ impl ScratchLease {
 
 /// Retries one exact cleanup operation at the constitution's bounded delays.
 fn retry_scratch_cleanup(mut cleanup: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
-    let mut final_error = None;
+    let mut final_error = match cleanup() {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
     for delay in SCRATCH_CLEANUP_BACKOFFS {
         std::thread::sleep(delay);
         match cleanup() {
             Ok(()) => return Ok(()),
-            Err(error) => final_error = Some(error),
+            Err(error) => final_error = error,
         }
     }
-    Err(final_error.unwrap_or_else(|| std::io::Error::other("scratch cleanup was not attempted")))
+    Err(final_error)
 }
 
 /// Deletes one proven child directory and fsyncs its registered parent.
@@ -1156,7 +1158,7 @@ fn remove_exact_scratch_prefix(root: &Path, owned: &Path) -> std::io::Result<()>
         || !owned
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("scribe-runtime-"))
+            .is_some_and(is_owned_scratch_name)
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -5640,7 +5642,7 @@ mod tests {
         assert_eq!(governor.health.reason(), None);
     }
 
-    /// Scribe scratch cancellation and restart cleanup stay inside the owned namespace.
+    /// Scribe scratch cancellation retains ownership without touching foreign siblings.
     ///
     /// # Panics
     ///
@@ -5658,11 +5660,12 @@ mod tests {
         }
         let retained_wal = wal.join("retained.wal");
         let peer = scribe.join("peer-owned");
-        let stale = scribe.join("scribe-runtime-old-7-0");
+        let stale = scribe.join("scribe-claim-old-claim-0");
         fs::write(&retained_wal, [1_u8]).expect("retained WAL");
         fs::create_dir(&peer).expect("peer directory");
         fs::create_dir(&stale).expect("stale runtime directory");
 
+        let health = BifrostResourceHealth::default();
         let governor = BifrostVolumeGovernor::register(
             BifrostVolumeRoots {
                 wal,
@@ -5672,7 +5675,7 @@ mod tests {
                 oracle_scratch: oracle,
             },
             1024,
-            BifrostResourceHealth::default(),
+            health.clone(),
         )
         .expect("registered roots reconcile process-owned scratch");
         assert!(!stale.exists());
@@ -5682,18 +5685,19 @@ mod tests {
         let scratch = governor
             .capabilities()
             .scribe_output
-            .create_scribe_generation("stream_1", 9, 32)
-            .expect("generation scratch");
+            .create_scribe_claim("stream_1", "claim_9", 32)
+            .expect("claim scratch");
         let owned = scratch.path().to_owned();
         assert_eq!(owned.parent(), Some(scribe.as_path()));
         assert!(
             owned
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("scribe-runtime-stream_1-9-"))
+                .is_some_and(|name| name.starts_with("scribe-claim-stream_1-claim_9-"))
         );
         drop(scratch);
-        assert!(!owned.exists());
+        assert!(owned.exists());
+        assert_eq!(health.reason(), Some(BifrostResourcePoisonReason::Volume));
         assert!(peer.exists());
         assert!(retained_wal.exists());
     }
@@ -5730,8 +5734,8 @@ mod tests {
         let mut scratch = governor
             .capabilities()
             .scribe_output
-            .create_scribe_generation("stream", 4, 32)
-            .expect("generation scratch");
+            .create_scribe_claim("stream", "claim_4", 32)
+            .expect("claim scratch");
         let attempts = std::cell::Cell::new(0);
         let error = scratch
             .cleanup_owned_prefix_with(|| {
@@ -5740,7 +5744,7 @@ mod tests {
             })
             .expect_err("exhausted cleanup must fail closed");
         assert!(matches!(error, BifrostResourceError::Poisoned { .. }));
-        assert_eq!(attempts.get(), 3);
+        assert_eq!(attempts.get(), 4);
         assert_eq!(health.reason(), Some(BifrostResourcePoisonReason::Volume));
         let root = governor
             .roots
@@ -5759,6 +5763,37 @@ mod tests {
                 .unwrap_or_default(),
             32
         );
+    }
+
+    /// Scratch cleanup attempts immediately and then after every configured delay.
+    ///
+    /// # Panics
+    ///
+    /// Panics when first-attempt success retries, or when any transient failure
+    /// count does not consume exactly that many retries before succeeding.
+    #[test]
+    fn scratch_cleanup_retry_attempts_have_exact_semantics() {
+        let immediate_attempts = std::cell::Cell::new(0);
+        retry_scratch_cleanup(|| {
+            immediate_attempts.set(immediate_attempts.get() + 1);
+            Ok(())
+        })
+        .expect("first cleanup attempt succeeds");
+        assert_eq!(immediate_attempts.get(), 1);
+
+        for transient_failures in 1..=SCRATCH_CLEANUP_BACKOFFS.len() {
+            let attempts = std::cell::Cell::new(0);
+            retry_scratch_cleanup(|| {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() <= transient_failures {
+                    Err(std::io::Error::other("transient cleanup failure"))
+                } else {
+                    Ok(())
+                }
+            })
+            .expect("cleanup succeeds after the configured transient failure");
+            assert_eq!(attempts.get(), transient_failures + 1);
+        }
     }
 
     /// Closed resource telemetry covers plans, grants, refusals, releases, and volume classes.

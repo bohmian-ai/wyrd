@@ -76,8 +76,9 @@ mod pg_tests {
             ("writer_epoch", "bigint", "NO"),
             ("wal_lsn_min", "bigint", "NO"),
             ("wal_lsn_max", "bigint", "NO"),
+            ("promotion_record", "jsonb", "NO"),
             ("created_at", "timestamp with time zone", "NO"),
-            ("publication_operation_id", "uuid", "YES"),
+            ("forge_publication_operation_id", "uuid", "YES"),
             ("file_ordinal", "smallint", "NO"),
             ("file_checksum", "text", "YES"),
         ];

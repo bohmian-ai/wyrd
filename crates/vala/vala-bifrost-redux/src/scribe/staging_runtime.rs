@@ -329,6 +329,24 @@ impl ScribeStagingRuntime {
         Ok(claim)
     }
 
+    /// Returns every outstanding claim under its original durable identity.
+    ///
+    /// Startup uses this after stage and publication-manifest recovery so
+    /// `Claimed` and `Publishing` work re-enters the production publisher
+    /// before admission opens. Live callers do not poll this queue because the
+    /// worker that took a new claim already owns its execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the ready-index owner is poisoned.
+    pub fn resumable_claims(&self) -> Result<Vec<StagingClaim>, ScribeError> {
+        Ok(self
+            .assembly
+            .lock()
+            .map_err(|_| poisoned("staged ready index"))?
+            .resumable_claims())
+    }
+
     /// Takes every ready member of one key as a residue claim.
     ///
     /// Used when waiting for target can no longer pay for itself: the partition
@@ -394,40 +412,53 @@ impl ScribeStagingRuntime {
             })?;
         let mut restored = 0;
         for (key, members) in recovered {
+            let staged_bytes = members.iter().fold(0_u64, |total, member| {
+                total.saturating_add(member.record().encoded_bytes())
+            });
+            self.restore_authorities(&key, &members)?;
+            self.stager.readmit_staged_bytes(staged_bytes)?;
+            let terminal = self
+                .publisher
+                .recover_terminal_members(&key, &members)
+                .await?;
+            self.stager.release_staged_bytes(terminal.released_bytes)?;
             let mut members_to_restore = Vec::with_capacity(members.len());
-            let mut staged_bytes = 0_u64;
             for member in &members {
+                if member
+                    .record()
+                    .state()
+                    .claim_id()
+                    .is_some_and(|claim| terminal.terminal_claims.contains(claim))
+                {
+                    continue;
+                }
                 let recovered = member.recovered().map_err(|error| ScribeError::Internal {
                     detail: format!("project a recovered staged member: {error}"),
                 })?;
                 let Some(recovered) = recovered else {
                     continue;
                 };
-                staged_bytes = staged_bytes.saturating_add(member.record().encoded_bytes());
                 members_to_restore.push(recovered);
             }
-            if members_to_restore.is_empty() {
-                continue;
+            if !members_to_restore.is_empty() {
+                let context = self.restore_context(pool, &key, &members).await?;
+                restored += members_to_restore.len();
+                self.assembly
+                    .lock()
+                    .map_err(|_| poisoned("staged ready index"))?
+                    .restore(&key, members_to_restore)
+                    .map_err(|error| ScribeError::Internal {
+                        detail: format!("restore a recovered staged key: {error}"),
+                    })?;
+                self.contexts
+                    .lock()
+                    .map_err(|_| poisoned("staged claim context registry"))?
+                    .insert(key.clone(), context);
             }
-            let context = self.restore_context(pool, &key, &members).await?;
-            restored += members_to_restore.len();
-            self.assembly
-                .lock()
-                .map_err(|_| poisoned("staged ready index"))?
-                .restore(&key, members_to_restore)
-                .map_err(|error| ScribeError::Internal {
-                    detail: format!("restore a recovered staged key: {error}"),
-                })?;
-            self.restore_authorities(&key, &members)?;
-            self.contexts
-                .lock()
-                .map_err(|_| poisoned("staged claim context registry"))?
-                .insert(key, context);
-            self.stager.readmit_staged_bytes(staged_bytes)?;
             self.observe(
                 crate::scribe::telemetry::StagingEffect::StagingRestored,
                 crate::scribe::telemetry::StagingFacts {
-                    members: restored,
+                    members: members.len(),
                     bytes: staged_bytes,
                     ..crate::scribe::telemetry::StagingFacts::default()
                 },
@@ -456,21 +487,28 @@ impl ScribeStagingRuntime {
             key.partition(),
         );
         for member in members {
-            let Some(recovered) = member.recovered().map_err(|error| ScribeError::Internal {
-                detail: format!("project a recovered staged member: {error}"),
-            })?
-            else {
-                continue;
-            };
-            let id = match &recovered {
-                crate::scribe::assembly::RecoveredMember::Ready(ready) => ready.id(),
-                crate::scribe::assembly::RecoveredMember::Claimed { member, .. } => member.id(),
-            };
+            let id = member.record().member();
             let wal = member.record().wal_range();
-            hot_sources
-                .restore_durable(
-                    &seal_key,
-                    crate::scribe::hot_source::GenerationOrdinal::new(id.shard(), id.generation()),
+            let authority = match member.record().state() {
+                crate::scribe::hot_stage::StagedMemberState::Published {
+                    published_object_identities,
+                    ..
+                }
+                | crate::scribe::hot_stage::StagedMemberState::CleanupPending {
+                    published_object_identities,
+                    ..
+                } => crate::scribe::hot_source::HotAuthority::Published {
+                    object_key: published_object_identities
+                        .first()
+                        .cloned()
+                        .ok_or_else(|| ScribeError::Internal {
+                            detail: "recovered published member names no object identity"
+                                .to_owned(),
+                        })?,
+                },
+                crate::scribe::hot_stage::StagedMemberState::Ready
+                | crate::scribe::hot_stage::StagedMemberState::Claimed { .. }
+                | crate::scribe::hot_stage::StagedMemberState::Publishing { .. } => {
                     crate::scribe::hot_source::HotAuthority::StagedRun {
                         member: id,
                         runs: member.run_paths(),
@@ -479,7 +517,14 @@ impl ScribeStagingRuntime {
                             crate::scribe::wal::WalLsn::new(wal.min),
                             crate::scribe::wal::WalLsn::new(wal.max),
                         ),
-                    },
+                    }
+                }
+            };
+            hot_sources
+                .restore_durable(
+                    &seal_key,
+                    crate::scribe::hot_source::GenerationOrdinal::new(id.shard(), id.generation()),
+                    authority,
                 )
                 .map_err(|error| ScribeError::Internal {
                     detail: format!(
@@ -1305,5 +1350,166 @@ mod tests {
             "the claim is outstanding until it settles or fails"
         );
         assert_eq!(claim.members().len(), 1);
+    }
+
+    /// A crash-split terminal claim recovers under its original Scribe identity.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot stage the claim, recovery derives a new
+    /// claim from its lone `Publishing` survivor, republishes through Postgres,
+    /// leaks staged bytes, or releases a restored authority more than once.
+    #[tokio::test]
+    async fn mixed_state_claim_recovery_retires_survivors_without_republication() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let stage_root = root.path().join("stage");
+        let wal_root = root.path().join("member-wal");
+        for path in [&stage_root, &wal_root] {
+            std::fs::create_dir_all(path).expect("fixture directory");
+        }
+        let node_id = NodeId::new(uuid::Uuid::from_u128(0xc01));
+        let stage = Arc::new(ScribeHotStage::new(stage_root.clone()));
+        let runtime = ScribeStagingRuntime::new(
+            Arc::clone(&stage),
+            staging_volume(root.path(), &stage_root),
+            publisher(Arc::clone(&stage), &wal_root, node_id),
+            StagingAssemblerConfig::new(512 * 1024 * 1024, std::time::Duration::from_mins(5), 4)
+                .expect("assembler controls"),
+        );
+        let tenant = DataTenantId::new_v7();
+        let schema = runtime_schema();
+        let layout = runtime_layout(schema.as_ref());
+        let mut key = None;
+        let mut member_ids = Vec::new();
+        for shard in 1_u8..=4 {
+            let frozen = frozen_member(tenant, 64, shard);
+            let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
+                .expect("tenant binding");
+            let staged = runtime
+                .encode_member(
+                    StageMemberRequest {
+                        frozen: &frozen,
+                        binding: &binding,
+                        layout: &layout,
+                        origin: StagedMemberOrigin {
+                            node_id,
+                            writer_epoch: WriterEpoch::new(1),
+                            shard: u16::from(shard),
+                            generation: u64::from(shard),
+                            wal: StagedLsnRange {
+                                min: u64::from(shard) * 10,
+                                max: u64::from(shard) * 10 + 9,
+                            },
+                        },
+                        footer_reservation:
+                            crate::scribe::memory::EncodedFooterReservation::for_test(),
+                    },
+                    ClaimContext {
+                        schema: Arc::clone(&schema),
+                        layout: layout.clone(),
+                        binding: binding.clone(),
+                    },
+                )
+                .expect("member stages");
+            key.get_or_insert_with(|| staged.key().clone());
+            member_ids.push(staged.member());
+            runtime
+                .register_member(staged, chrono::Utc::now())
+                .await
+                .expect("member becomes durable and ready");
+        }
+        let key = key.expect("one assembly key");
+        let claim = runtime
+            .take_residue(&key, ClaimCause::Drain)
+            .expect("residue claim")
+            .expect("four members form one claim");
+        assert_eq!(claim.members().len(), 4);
+        let claim_id = claim.id().to_string();
+        let objects = vec![format!("objects/{claim_id}/hot-0.parquet")];
+        stage
+            .transition(
+                &key,
+                member_ids[0],
+                crate::scribe::hot_stage::StagedMemberState::Publishing {
+                    claim_id: claim_id.clone(),
+                    operation_id: uuid::Uuid::from_u128(0xc01),
+                },
+            )
+            .await
+            .expect("first member remains publishing");
+        for (index, state) in [
+            crate::scribe::hot_stage::StagedMemberState::Published {
+                claim_id: claim_id.clone(),
+                file_list_commit_key: "node:10:49".to_owned(),
+                published_object_identities: objects.clone(),
+                persisted_lsn_ranges: vec![StagedLsnRange { min: 20, max: 29 }],
+            },
+            crate::scribe::hot_stage::StagedMemberState::CleanupPending {
+                claim_id: claim_id.clone(),
+                file_list_commit_key: "node:10:49".to_owned(),
+                published_object_identities: objects.clone(),
+                persisted_lsn_ranges: vec![StagedLsnRange { min: 30, max: 39 }],
+            },
+            crate::scribe::hot_stage::StagedMemberState::Published {
+                claim_id: claim_id.clone(),
+                file_list_commit_key: "node:10:49".to_owned(),
+                published_object_identities: objects,
+                persisted_lsn_ranges: vec![StagedLsnRange { min: 40, max: 49 }],
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            stage
+                .transition(&key, member_ids[index + 1], state)
+                .await
+                .expect("terminal member state persists");
+        }
+        stage
+            .retire(&key, member_ids[3])
+            .await
+            .expect("one member retired before the crash");
+        drop(runtime);
+
+        let hot_sources = Arc::new(crate::scribe::hot_source::ScribeHotSourceRegistry::new());
+        let recovered = ScribeStagingRuntime::new(
+            Arc::clone(&stage),
+            staging_volume(root.path(), &stage_root),
+            publisher(Arc::clone(&stage), &wal_root, node_id),
+            StagingAssemblerConfig::new(512 * 1024 * 1024, std::time::Duration::from_mins(5), 4)
+                .expect("assembler controls"),
+        )
+        .with_hot_sources(Arc::clone(&hot_sources));
+        let pool = sqlx::PgPool::connect_lazy("postgres://unused/unused").expect("lazy pool");
+        assert_eq!(
+            recovered
+                .restore(&pool)
+                .await
+                .expect("mixed claim recovers"),
+            0
+        );
+        assert!(
+            recovered
+                .resumable_claims()
+                .expect("claim index")
+                .is_empty()
+        );
+        assert!(stage.recover().await.expect("stage rescans").is_empty());
+        let seal_key = SealKey::new(key.tenant(), key.table().clone(), key.partition());
+        for member in member_ids {
+            assert_eq!(
+                hot_sources
+                    .authority(
+                        &seal_key,
+                        crate::scribe::hot_source::GenerationOrdinal::new(
+                            member.shard(),
+                            member.generation(),
+                        ),
+                    )
+                    .expect("authority lookup"),
+                None
+            );
+        }
+        assert_eq!(recovered.restore(&pool).await.expect("cleanup replays"), 0);
     }
 }

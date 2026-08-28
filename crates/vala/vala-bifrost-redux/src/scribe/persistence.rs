@@ -1066,6 +1066,36 @@ impl PersistenceRuntime {
             .recover_publications(reconciler, memory)
             .await
     }
+
+    /// Resumes every durable claimed or publishing claim before readiness.
+    ///
+    /// Publication-manifest recovery runs first, so this driver either replays
+    /// the exact already-committed file-list set or continues the same claim
+    /// from its staged members. It never derives a replacement claim identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first production publication failure. The durable claim and
+    /// its staged members remain retained for the next startup attempt.
+    pub(crate) async fn resume_staging_claims(&self) -> Result<usize, ScribeError> {
+        let Some(worker) = &self.worker else {
+            return Ok(0);
+        };
+        let Some(staging) = &worker.staging else {
+            return Ok(0);
+        };
+        let claims = staging.resumable_claims()?;
+        let mut resumed = 0_usize;
+        for claim in claims {
+            worker.publish_claim(staging, &claim, None).await?;
+            resumed = resumed
+                .checked_add(1)
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "resumed Scribe claim count overflow".to_owned(),
+                })?;
+        }
+        Ok(resumed)
+    }
 }
 
 /// Owns the dependencies and durable workflow for one persistence worker.
@@ -2595,7 +2625,7 @@ impl PersistenceWorker {
         let published = staging
             .publish(claim, &runs, &assembled, self.actor_stream)
             .await?;
-        assembled.artifacts.cleanup()?;
+        assembled.artifacts.cleanup().await?;
         drop(reservation);
         self.publish_staging_hint(claim.key());
         Ok(published.commit_key)

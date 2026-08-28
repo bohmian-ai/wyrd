@@ -438,6 +438,8 @@ pub enum ClaimCause {
     Pressure,
     /// Graceful drain is settling every admitted member before shutdown.
     Drain,
+    /// Startup resumed a durable claim taken by an earlier process.
+    Recovery,
 }
 
 impl ClaimCause {
@@ -452,6 +454,7 @@ impl ClaimCause {
             Self::PartitionClosed => "partition_closed",
             Self::Pressure => "pressure",
             Self::Drain => "drain",
+            Self::Recovery => "recovery",
         }
     }
 
@@ -559,6 +562,12 @@ pub enum AssemblyError {
     #[error("Scribe staging claim {claim} is not outstanding")]
     UnknownClaim {
         /// Identity the caller named.
+        claim: String,
+    },
+    /// Recovered member facts did not reproduce their recorded claim identity.
+    #[error("Scribe recovered staging claim {claim} does not match its durable member set")]
+    RestoredClaimMismatch {
+        /// Durable claim identity that failed reconstruction.
         claim: String,
     },
     /// A configured control was zero or otherwise unusable.
@@ -717,7 +726,7 @@ pub struct StagingAssembler {
     /// Keys per tenant, in turn order within that tenant.
     keys_by_tenant: HashMap<DataTenantId, VecDeque<ScribeAssemblyKey>>,
     /// Members currently owned by an outstanding claim, by claim identity.
-    outstanding: HashMap<StagingClaimId, Vec<(ScribeAssemblyKey, StagedMemberId)>>,
+    outstanding: HashMap<StagingClaimId, StagingClaim>,
     /// Every member the assembler currently owns, ready or claimed.
     owned: HashSet<(ScribeAssemblyKey, StagedMemberId)>,
 }
@@ -807,9 +816,44 @@ impl StagingAssembler {
                             generation: member.id().generation(),
                         });
                     }
-                    self.owned.insert(ownership.clone());
-                    self.outstanding.entry(claim).or_default().push(ownership);
+                    self.owned.insert(ownership);
+                    let restored = self
+                        .outstanding
+                        .entry(claim)
+                        .or_insert_with(|| StagingClaim {
+                            id: claim,
+                            key: key.clone(),
+                            members: Vec::new(),
+                            encoded_bytes: 0,
+                            rows: 0,
+                            cause: ClaimCause::Recovery,
+                        });
+                    if restored.key != *key {
+                        return Err(AssemblyError::RestoredClaimMismatch {
+                            claim: claim.to_string(),
+                        });
+                    }
+                    restored.members.push(member);
                 }
+            }
+        }
+        for restored in self
+            .outstanding
+            .values_mut()
+            .filter(|claim| claim.key == *key && claim.cause == ClaimCause::Recovery)
+        {
+            restored.members.sort_by_key(|member| member.order());
+            restored.encoded_bytes = restored.members.iter().fold(0_u64, |total, member| {
+                total.saturating_add(member.encoded_bytes())
+            });
+            restored.rows = restored
+                .members
+                .iter()
+                .fold(0_u64, |total, member| total.saturating_add(member.rows()));
+            if StagingClaimId::derive(key, &restored.members) != restored.id {
+                return Err(AssemblyError::RestoredClaimMismatch {
+                    claim: restored.id.to_string(),
+                });
             }
         }
         Ok(())
@@ -899,16 +943,27 @@ impl StagingAssembler {
     /// Returns [`AssemblyError::UnknownClaim`] when the identity is not
     /// outstanding, so a double settlement cannot silently free a slot twice.
     pub fn settle_claim(&mut self, claim: StagingClaimId) -> Result<(), AssemblyError> {
-        let members =
+        let settled =
             self.outstanding
                 .remove(&claim)
                 .ok_or_else(|| AssemblyError::UnknownClaim {
                     claim: claim.to_string(),
                 })?;
-        for ownership in members {
-            self.owned.remove(&ownership);
+        for member in settled.members {
+            self.owned.remove(&(settled.key.clone(), member.id()));
         }
         Ok(())
+    }
+
+    /// Returns every durable outstanding claim in deterministic identity order.
+    ///
+    /// Live claims and restart-restored claims share this queue, so a failed
+    /// publication remains driveable without inventing a replacement claim.
+    #[must_use]
+    pub fn resumable_claims(&self) -> Vec<StagingClaim> {
+        let mut claims = self.outstanding.values().cloned().collect::<Vec<_>>();
+        claims.sort_by(|left, right| left.id.as_bytes().cmp(right.id.as_bytes()));
+        claims
     }
 
     /// Returns how many claims are currently outstanding.
@@ -1010,21 +1065,16 @@ impl StagingAssembler {
             .iter()
             .fold(0_u64, |total, member| total.saturating_add(member.rows()));
         let id = StagingClaimId::derive(key, &members);
-        self.outstanding.insert(
-            id,
-            members
-                .iter()
-                .map(|member| (key.clone(), member.id()))
-                .collect(),
-        );
-        StagingClaim {
+        let claim = StagingClaim {
             id,
             key: key.clone(),
             members,
             encoded_bytes,
             rows,
             cause,
-        }
+        };
+        self.outstanding.insert(id, claim.clone());
+        claim
     }
 
     /// Moves a served key to the tail of its tenant's order, dropping it when empty.
@@ -1761,8 +1811,8 @@ mod tests {
     #[test]
     fn restored_claims_keep_their_members_and_their_slot() {
         let key = key_for(DataTenantId::new_v7(), 0);
-        let claim = StagingClaimId::from_hex(&"b".repeat(64)).expect("the fixture identity parses");
         let owned = member(2, 5, 1_000, 0);
+        let claim = StagingClaimId::derive(&key, &[owned]);
         let mut assembler = assembler(1_000, 1);
         assembler
             .restore(

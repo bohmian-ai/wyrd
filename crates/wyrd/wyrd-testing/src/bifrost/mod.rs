@@ -31,6 +31,7 @@ mod deployment_contract;
 pub mod forge_harness;
 pub mod harness;
 pub mod query_fixture;
+pub mod scribe_workload;
 pub mod telemetry;
 
 pub use cluster::{
@@ -45,6 +46,13 @@ pub use forge_harness::{
 };
 pub use harness::{BifrostHarness, HarnessError};
 pub use query_fixture::{SeededBifrostQuery, seed_query_fixture};
+pub use scribe_workload::{
+    SCRIBE_PRODUCTION_WORKLOAD_VERSION, ScribeCacheMode, ScribeCheckpointNameV1,
+    ScribeGeometryRecipeV1, ScribeLifecycleCheckpointV1, ScribeProductionEvidenceV1,
+    ScribeProductionWorkloadV1, ScribePublishedHotFileV1, ScribeWorkloadError,
+    ScribeWorkloadOperationV1, ScribeWorkloadTableKindV1, ScribeWorkloadTableV1,
+    ScribeWorkloadTenantBinding, ScribeWorkloadTenantV1,
+};
 pub use telemetry::{
     BifrostQueryTelemetryReport, BifrostTelemetryCapture, BifrostTelemetryCheckpoint,
     BifrostTelemetryReportError, ForgeCausalDiagnosis, ForgeCausalTelemetryReport,

@@ -13,6 +13,7 @@ pub mod filename;
 mod fixed_ipc;
 pub mod geometry;
 pub mod hot_source;
+pub mod hot_stage;
 mod ingress;
 pub mod manifest;
 mod material_plan;

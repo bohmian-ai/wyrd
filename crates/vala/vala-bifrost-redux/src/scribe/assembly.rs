@@ -105,6 +105,69 @@ impl ScribeAssemblyKey {
         }
     }
 
+    /// Rebuilds a key from fields recovered from a durable staged record.
+    ///
+    /// Recovery has the layout digest the member was staged under, not the
+    /// layout itself, and that digest is the fact that matters: a member may
+    /// only join a claim whose sort order and partitioning are the ones it was
+    /// written with, even if the table has since been re-registered.
+    #[must_use]
+    pub const fn from_parts(
+        tenant: DataTenantId,
+        table: TableRef,
+        schema_fingerprint: SchemaFingerprint,
+        layout_fingerprint: [u8; 32],
+        partition: TimePartition,
+        node_id: NodeId,
+        writer_epoch: WriterEpoch,
+    ) -> Self {
+        Self {
+            tenant,
+            table,
+            schema_fingerprint,
+            layout_fingerprint,
+            partition,
+            node_id,
+            writer_epoch,
+        }
+    }
+
+    /// Returns the user-schema fingerprint the members were encoded against.
+    #[must_use]
+    pub const fn schema_fingerprint(&self) -> SchemaFingerprint {
+        self.schema_fingerprint
+    }
+
+    /// Returns the digest of the canonical physical layout.
+    #[must_use]
+    pub const fn layout_fingerprint(&self) -> [u8; 32] {
+        self.layout_fingerprint
+    }
+
+    /// Returns the node whose staging volume holds the members.
+    #[must_use]
+    pub const fn node_id(&self) -> NodeId {
+        self.node_id
+    }
+
+    /// Returns the fenced writer epoch that produced the members.
+    #[must_use]
+    pub const fn writer_epoch(&self) -> WriterEpoch {
+        self.writer_epoch
+    }
+
+    /// Returns a stable digest over every field of the key.
+    ///
+    /// Used as the staged namespace's directory component so no tenant- or
+    /// user-controlled string ever becomes a path.
+    #[must_use]
+    pub fn digest(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"wyrd.scribe.assembly-key.v1");
+        self.hash_into(&mut hasher);
+        hasher.finalize().into()
+    }
+
     /// Returns the tenant that owns every member under this key.
     ///
     /// The claim scheduler needs it to rotate turns between tenants; it is not

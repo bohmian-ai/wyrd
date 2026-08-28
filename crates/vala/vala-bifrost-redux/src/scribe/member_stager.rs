@@ -147,6 +147,30 @@ impl ScribeMemberStager {
             })
     }
 
+    /// Re-charges the governed volume for members recovery found on it.
+    ///
+    /// Startup rebuilds its accounting from the files that survived, not from
+    /// what the previous process believed it had reserved. Charging the exact
+    /// recovered length keeps the first admission after restart bounded by the
+    /// bytes actually on the device.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the governed volume cannot admit
+    /// bytes it is already holding, which means the recovered namespace does
+    /// not fit its configured floor and no new member may be staged over it.
+    pub fn readmit_staged_bytes(&self, bytes: u64) -> Result<(), ScribeError> {
+        self.volume
+            .try_reserve_growth(bytes)
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("re-admit recovered staged bytes: {error}"),
+            })?
+            .commit(bytes)
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("commit recovered staged bytes: {error}"),
+            })
+    }
+
     /// Sorts, encodes, fsyncs, and preflights one frozen bucket's runs.
     ///
     /// This is the blocking half and belongs on the persistence CPU lane. It

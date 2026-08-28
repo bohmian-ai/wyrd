@@ -1058,6 +1058,34 @@ impl PersistenceRuntime {
         self.reconciler.clone()
     }
 
+    /// Rebuilds the staged ready and claim indexes from the durable volume.
+    ///
+    /// Runs before admission opens, so the members that survived the previous
+    /// process are owned again before any new one is staged over them. A pod
+    /// without staging restores nothing and reports zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the pod has staging but no
+    /// control pool to re-resolve write recipes with, and propagates the
+    /// staged namespace's fail-closed recovery refusals unchanged. Startup
+    /// stops rather than opening admission over evidence it cannot vouch for.
+    pub(crate) async fn restore_staging(&self) -> Result<usize, ScribeError> {
+        let Some(worker) = &self.worker else {
+            return Ok(0);
+        };
+        let Some(staging) = &worker.staging else {
+            return Ok(0);
+        };
+        let pool = worker
+            .operator_pool
+            .as_ref()
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "Scribe staged recovery has no control pool for write recipes".to_owned(),
+            })?;
+        staging.restore(pool.pool()).await
+    }
+
     /// Reconciles durable staged publications before WAL replay opens readiness.
     ///
     /// # Errors

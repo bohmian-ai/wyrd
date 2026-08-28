@@ -71,6 +71,8 @@ pub struct AssembleRequest<'a> {
 
 /// Owner of one pod's staged members, ready index, and claim lifecycle.
 pub struct ScribeStagingRuntime {
+    /// Durable staged namespace this pod recovers and serves from.
+    stage: Arc<ScribeHotStage>,
     /// Encoder and durable-charge owner for freshly frozen buckets.
     stager: ScribeMemberStager,
     /// Merge owner that re-validates a claim's members before encoding them.
@@ -95,6 +97,7 @@ impl ScribeStagingRuntime {
         config: StagingAssemblerConfig,
     ) -> Self {
         Self {
+            stage: Arc::clone(&stage),
             stager: ScribeMemberStager::new(Arc::clone(&stage), volume),
             claims: ClaimAssembler::new(stage),
             publisher,
@@ -196,6 +199,137 @@ impl ScribeStagingRuntime {
             .map_err(|error| ScribeError::Internal {
                 detail: format!("take the residue claim for a staged key: {error}"),
             })
+    }
+
+    /// Rebuilds the ready and claim indexes from what survived on the volume.
+    ///
+    /// Startup runs this before admission opens. Every recovered member has
+    /// already been validated byte-for-byte by the staged namespace, so what is
+    /// rebuilt here is the in-memory ownership those durable facts imply: ready
+    /// members re-enter the ready index, members an unsettled claim owns are
+    /// restored as that claim, and published members restore nothing because a
+    /// hot object already serves their rows.
+    ///
+    /// Each key's encoding context is reconstructed from the same two
+    /// authorities the members were staged under: the physical schema is read
+    /// from the members' own Parquet runs, and the write recipe is re-resolved
+    /// from the registry and then required to reproduce the exact key the
+    /// record carries. A registry that no longer produces that key is
+    /// contradictory lineage, not a recoverable difference, so the restore
+    /// fails closed rather than merging durable rows under a recipe they were
+    /// not written with.
+    ///
+    /// Returns the number of members restored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the staged namespace cannot be
+    /// recovered or validated, a member's binding, schema, or recipe cannot be
+    /// reconstructed, the recovered layout contradicts the key, the ready index
+    /// refuses a duplicate member, or the governed volume cannot re-admit the
+    /// bytes already on it.
+    pub async fn restore(&self, pool: &sqlx::PgPool) -> Result<usize, ScribeError> {
+        let recovered = self
+            .stage
+            .recover()
+            .await
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("recover the staged namespace: {error}"),
+            })?;
+        let mut restored = 0;
+        for (key, members) in recovered {
+            let mut members_to_restore = Vec::with_capacity(members.len());
+            let mut staged_bytes = 0_u64;
+            for member in &members {
+                let recovered = member.recovered().map_err(|error| ScribeError::Internal {
+                    detail: format!("project a recovered staged member: {error}"),
+                })?;
+                let Some(recovered) = recovered else {
+                    continue;
+                };
+                staged_bytes = staged_bytes.saturating_add(member.record().encoded_bytes());
+                members_to_restore.push(recovered);
+            }
+            if members_to_restore.is_empty() {
+                continue;
+            }
+            let context = self.restore_context(pool, &key, &members).await?;
+            restored += members_to_restore.len();
+            self.assembly
+                .lock()
+                .map_err(|_| poisoned("staged ready index"))?
+                .restore(&key, members_to_restore)
+                .map_err(|error| ScribeError::Internal {
+                    detail: format!("restore a recovered staged key: {error}"),
+                })?;
+            self.contexts
+                .lock()
+                .map_err(|_| poisoned("staged claim context registry"))?
+                .insert(key, context);
+            self.stager.readmit_staged_bytes(staged_bytes)?;
+        }
+        Ok(restored)
+    }
+
+    /// Reconstructs one recovered key's encoding context, or fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the key names no run to read the
+    /// schema from, the binding cannot be resolved, the schema on disk is not
+    /// the schema the key fingerprints, the registry has no recipe for the
+    /// table, or the resolved recipe does not reproduce the key.
+    async fn restore_context(
+        &self,
+        pool: &sqlx::PgPool,
+        key: &ScribeAssemblyKey,
+        members: &[crate::scribe::hot_stage::StagedMember],
+    ) -> Result<ClaimContext, ScribeError> {
+        let run = members
+            .iter()
+            .flat_map(crate::scribe::hot_stage::StagedMember::run_paths)
+            .next()
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "a recovered staged key names no run to read its schema from".to_owned(),
+            })?;
+        let schema = run_schema(&run)?;
+        if crate::parquet::memory::schema_fingerprint(schema.as_ref()) != key.schema_fingerprint() {
+            return Err(ScribeError::Internal {
+                detail: "a recovered staged run's schema is not the schema its key names"
+                    .to_owned(),
+            });
+        }
+        let binding =
+            TenantTableBinding::resolve((key.tenant(), key.table().clone())).map_err(|error| {
+                ScribeError::Internal {
+                    detail: format!(
+                        "resolve the binding a recovered staged key publishes under: {error}"
+                    ),
+                }
+            })?;
+        let layout =
+            crate::scribe::write_recipe::resolve_write_recipe(pool, &binding, schema.as_ref())
+                .await?;
+        let resolved = ScribeAssemblyKey::new(
+            key.tenant(),
+            key.table().clone(),
+            key.schema_fingerprint(),
+            layout.as_ref(),
+            key.partition(),
+            key.node_id(),
+            key.writer_epoch(),
+        );
+        if resolved != *key {
+            return Err(ScribeError::Internal {
+                detail: "the registered write recipe no longer reproduces a recovered staged key"
+                    .to_owned(),
+            });
+        }
+        Ok(ClaimContext {
+            schema,
+            layout: (*layout).clone(),
+            binding,
+        })
     }
 
     /// Returns every key that still holds ready, unpublished members.
@@ -322,6 +456,26 @@ impl ScribeStagingRuntime {
                 detail: "staged assembly key carries no recorded encoding context".to_owned(),
             })
     }
+}
+
+/// Reads the physical schema one staged run was encoded with.
+///
+/// The run's own footer is the authority: it describes the bytes that will be
+/// merged, which is exactly what the merge must be told about.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::Internal`] when the run cannot be opened or its
+/// Parquet metadata cannot be read.
+fn run_schema(run: &Path) -> Result<SchemaRef, ScribeError> {
+    let file = std::fs::File::open(run).map_err(|error| ScribeError::Internal {
+        detail: format!("open a recovered staged run: {error}"),
+    })?;
+    let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|error| ScribeError::Internal {
+            detail: format!("read a recovered staged run's metadata: {error}"),
+        })?;
+    Ok(Arc::clone(builder.schema()))
 }
 
 impl std::fmt::Debug for ScribeStagingRuntime {
@@ -603,6 +757,92 @@ mod tests {
                 .expect("claim object base")
                 .contains(&claim.id().to_string()),
             "objects are named after the claim that produced them"
+        );
+    }
+
+    /// What restart restores is exactly what the volume proves: a durable
+    /// member reappears as ready, its runs still carry the physical schema its
+    /// key fingerprints, and a fresh runtime over the same namespace can
+    /// therefore rebuild the encoding context without trusting memory that did
+    /// not survive.
+    #[tokio::test]
+    async fn a_staged_member_survives_as_the_facts_restore_rebuilds_from() {
+        let root = tempfile::tempdir().expect("runtime root");
+        let stage_root = root.path().join("stage");
+        let wal_root = root.path().join("member-wal");
+        for path in [&stage_root, &wal_root] {
+            std::fs::create_dir_all(path).expect("fixture directory");
+        }
+        let node_id = NodeId::new(uuid::Uuid::from_u128(0xe3a3));
+        let stage = Arc::new(ScribeHotStage::new(stage_root.clone()));
+        let runtime = ScribeStagingRuntime::new(
+            Arc::clone(&stage),
+            staging_volume(root.path(), &stage_root),
+            publisher(Arc::clone(&stage), &wal_root, node_id),
+            StagingAssemblerConfig::new(512 * 1024 * 1024, std::time::Duration::from_mins(5), 4)
+                .expect("assembler controls"),
+        );
+
+        let tenant = DataTenantId::new_v7();
+        let schema = runtime_schema();
+        let layout = runtime_layout(schema.as_ref());
+        let frozen = frozen_member(tenant, 512, 3);
+        let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
+            .expect("tenant binding");
+        let staged = runtime
+            .encode_member(
+                StageMemberRequest {
+                    frozen: &frozen,
+                    binding: &binding,
+                    layout: &layout,
+                    origin: StagedMemberOrigin {
+                        node_id,
+                        writer_epoch: WriterEpoch::new(1),
+                        shard: 3,
+                        generation: 11,
+                        wal: StagedLsnRange { min: 30, max: 39 },
+                    },
+                    footer_reservation: crate::scribe::memory::EncodedFooterReservation::for_test(),
+                },
+                ClaimContext {
+                    schema: Arc::clone(&schema),
+                    layout: layout.clone(),
+                    binding: binding.clone(),
+                },
+            )
+            .expect("member stages");
+        let key = staged.key().clone();
+        runtime
+            .register_member(staged, chrono::Utc::now())
+            .await
+            .expect("member becomes durable and ready");
+        drop(runtime);
+
+        let recovered = ScribeHotStage::new(stage_root)
+            .recover()
+            .await
+            .expect("the staged namespace validates");
+        let members = recovered.get(&key).expect("the durable key survived");
+        assert_eq!(members.len(), 1, "one member was staged under the key");
+        let member = &members[0];
+        assert!(
+            matches!(
+                member.recovered().expect("the member projects"),
+                Some(crate::scribe::assembly::RecoveredMember::Ready(ready))
+                    if ready.id() == StagedMemberId::new(3, 11)
+            ),
+            "an unclaimed durable member restores as ready"
+        );
+        let run = member
+            .run_paths()
+            .into_iter()
+            .next()
+            .expect("the member names a run");
+        let on_disk = run_schema(&run).expect("the run carries its schema");
+        assert_eq!(
+            crate::parquet::memory::schema_fingerprint(on_disk.as_ref()),
+            key.schema_fingerprint(),
+            "the schema restore reads back is the schema the key names"
         );
     }
 

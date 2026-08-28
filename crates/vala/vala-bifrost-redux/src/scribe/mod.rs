@@ -2885,6 +2885,12 @@ impl ScribeImpl {
             });
         }
         if let Some(persistence) = &self.persistence {
+            let restored = persistence.restore_staging().await?;
+            tracing::info!(
+                restored,
+                stream = %self.stream,
+                "Scribe staged members restored before WAL replay"
+            );
             let recovered = persistence.recover_staged_publications().await?;
             tracing::info!(
                 recovered,

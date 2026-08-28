@@ -43,7 +43,9 @@ use wyrd_spec::vala::api::TimePartitionWire;
 use crate::catalog::TableRef;
 use crate::catalog::layout::TimePartition;
 use crate::schema::fingerprint::SchemaFingerprint;
-use crate::scribe::assembly::{ReadyMember, ScribeAssemblyKey, StagedMemberId};
+use crate::scribe::assembly::{
+    ReadyMember, RecoveredMember, ScribeAssemblyKey, StagedMemberId, StagingClaimId,
+};
 use crate::scribe::stream_identity::{NodeId, WriterEpoch};
 
 /// Only staged-record version this server reads or writes.
@@ -455,6 +457,36 @@ impl StagedMember {
     #[must_use]
     pub const fn record(&self) -> &StagedHotSourceRecordV1 {
         &self.record
+    }
+
+    /// Projects the member into what the assembler must restore for it.
+    ///
+    /// A published member is no longer assembly work — a hot object already
+    /// serves its rows and it is waiting only for reader leases — so it
+    /// restores nothing and returns `None`. Everything earlier restores either
+    /// as ready or as owned by the claim recorded on it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HotStageError::Invalid`] when the member carries no bytes or
+    /// rows, or when a recorded claim identity is not the exact form the
+    /// assembler renders.
+    pub fn recovered(&self) -> Result<Option<RecoveredMember>, HotStageError> {
+        let name = RECORD_FILE_NAME;
+        let member = self.record.ready_member(name)?;
+        let claim_id = match self.record.state() {
+            StagedMemberState::Ready => return Ok(Some(RecoveredMember::Ready(member))),
+            StagedMemberState::Claimed { claim_id }
+            | StagedMemberState::Publishing { claim_id, .. } => claim_id,
+            StagedMemberState::Published { .. } | StagedMemberState::CleanupPending => {
+                return Ok(None);
+            }
+        };
+        let claim = StagingClaimId::from_hex(claim_id).ok_or_else(|| HotStageError::Invalid {
+            name: name.to_owned(),
+            detail: "the recorded claim identity is not a 32-byte hex digest".to_owned(),
+        })?;
+        Ok(Some(RecoveredMember::Claimed { claim, member }))
     }
 
     /// Returns absolute paths to the member's runs, in sort order.
@@ -1318,5 +1350,165 @@ mod tests {
             .retire(&key, member)
             .await
             .expect("retiring an absent member is idempotent");
+    }
+
+    /// An unsettled claim's members come back owned by that same claim.
+    ///
+    /// Restoring them as free would let a restarted pod take a second claim
+    /// over rows an interrupted publication may already have written.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture write, transition, or recovery is refused.
+    #[tokio::test]
+    async fn a_claimed_member_recovers_owned_by_its_claim() {
+        let directory = tempfile::tempdir().expect("staging root");
+        let stage = ScribeHotStage::new(directory.path().join("hot-stage"));
+        let key = fixture_key();
+        let member = StagedMemberId::new(6, 1);
+        let run = write_run(
+            &stage.member_directory(&key, member),
+            "run-0.parquet",
+            b"claimed-bytes",
+        )
+        .await;
+        let record = StagedHotSourceRecordV1::ready(
+            &key,
+            member,
+            StagedLsnRange { min: 8, max: 8 },
+            vec![run],
+            ready_at(),
+        );
+        stage
+            .publish_record(&key, &record)
+            .await
+            .expect("the record publishes");
+        let claim_id = "a".repeat(64);
+        let claim = StagingClaimId::from_hex(&claim_id).expect("the fixture identity parses");
+        stage
+            .transition(
+                &key,
+                member,
+                StagedMemberState::Claimed {
+                    claim_id: claim_id.clone(),
+                },
+            )
+            .await
+            .expect("ready moves to claimed");
+
+        let recovered = stage.recover().await.expect("the claimed member recovers");
+        let staged = &recovered
+            .get(&key)
+            .expect("the member recovers under its key")[0];
+        assert_eq!(
+            staged.recovered().expect("the member projects"),
+            Some(RecoveredMember::Claimed {
+                claim,
+                member: staged
+                    .record()
+                    .ready_member("member.staged.json")
+                    .expect("the member projects into the ready index"),
+            })
+        );
+
+        // Publishing keeps the same ownership: the operation may still be
+        // uncertain, and the claim that wrote it is the one that reconciles it.
+        stage
+            .transition(
+                &key,
+                member,
+                StagedMemberState::Publishing {
+                    claim_id,
+                    operation_id: Uuid::from_u128(5),
+                },
+            )
+            .await
+            .expect("claimed moves to publishing");
+        let recovered = stage
+            .recover()
+            .await
+            .expect("the publishing member recovers");
+        let staged = &recovered
+            .get(&key)
+            .expect("the member recovers under its key")[0];
+        assert!(matches!(
+            staged.recovered().expect("the member projects"),
+            Some(RecoveredMember::Claimed { .. })
+        ));
+
+        // Once published, a hot object serves the rows and the member is no
+        // longer assembly work.
+        stage
+            .transition(
+                &key,
+                member,
+                StagedMemberState::Published {
+                    file_list_commit_key: "commit-1".to_owned(),
+                    published_object_identities: vec!["objects/hot-0.parquet".to_owned()],
+                    persisted_lsn_ranges: vec![StagedLsnRange { min: 8, max: 8 }],
+                },
+            )
+            .await
+            .expect("publishing moves to published");
+        let recovered = stage
+            .recover()
+            .await
+            .expect("the published member recovers");
+        let staged = &recovered
+            .get(&key)
+            .expect("the member recovers under its key")[0];
+        assert_eq!(staged.recovered().expect("the member projects"), None);
+    }
+
+    /// A claim identity a record cannot have written refuses rather than resumes.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture write or recovery is refused.
+    #[tokio::test]
+    async fn a_malformed_claim_identity_refuses_recovery_projection() {
+        let directory = tempfile::tempdir().expect("staging root");
+        let stage = ScribeHotStage::new(directory.path().join("hot-stage"));
+        let key = fixture_key();
+        let member = StagedMemberId::new(3, 4);
+        let run = write_run(
+            &stage.member_directory(&key, member),
+            "run-0.parquet",
+            b"claimed-bytes",
+        )
+        .await;
+        let record = StagedHotSourceRecordV1::ready(
+            &key,
+            member,
+            StagedLsnRange { min: 2, max: 2 },
+            vec![run],
+            ready_at(),
+        );
+        stage
+            .publish_record(&key, &record)
+            .await
+            .expect("the record publishes");
+        stage
+            .transition(
+                &key,
+                member,
+                StagedMemberState::Claimed {
+                    claim_id: "not-a-digest".to_owned(),
+                },
+            )
+            .await
+            .expect("ready moves to claimed");
+
+        let recovered = stage.recover().await.expect("the record itself is valid");
+        let staged = &recovered
+            .get(&key)
+            .expect("the member recovers under its key")[0];
+        let error = staged
+            .recovered()
+            .expect_err("an unrenderable claim identity is never resumed");
+        assert!(
+            matches!(error, HotStageError::Invalid { .. }),
+            "unexpected refusal: {error}"
+        );
     }
 }

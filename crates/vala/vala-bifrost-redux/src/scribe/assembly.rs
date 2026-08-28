@@ -389,6 +389,24 @@ impl StagingClaimId {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    /// Parses the identity back from the lowercase hex a durable record holds.
+    ///
+    /// Recovery reads claim ownership out of staged records, so the rendered
+    /// form has to round-trip exactly; anything else is a corrupt record rather
+    /// than a claim this pod may resume.
+    #[must_use]
+    pub fn from_hex(value: &str) -> Option<Self> {
+        if value.len() != 64 {
+            return None;
+        }
+        let mut bytes = [0_u8; 32];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            let start = index * 2;
+            *byte = u8::from_str_radix(value.get(start..start + 2)?, 16).ok()?;
+        }
+        Some(Self(bytes))
+    }
 }
 
 impl std::fmt::Display for StagingClaimId {
@@ -662,6 +680,25 @@ impl KeyReadyIndex {
     }
 }
 
+/// One staged member as recovery found it.
+///
+/// Restart has to restore two different things: members that are free to be
+/// claimed, and members a claim already owns. Restoring the second kind as if
+/// it were the first would let a restarted pod take a second claim over rows an
+/// interrupted publication may already have written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveredMember {
+    /// Durable, validated, and free to join a new claim.
+    Ready(ReadyMember),
+    /// Already owned by a claim whose publication has not settled.
+    Claimed {
+        /// Identity of the claim that owns the member.
+        claim: StagingClaimId,
+        /// The member itself, kept for its bytes, rows and ready time.
+        member: ReadyMember,
+    },
+}
+
 /// Tenant-fair owner of the durable ready index and its assembly claims.
 ///
 /// Holds every member that is durable but not yet published, decides which
@@ -734,6 +771,47 @@ impl StagingAssembler {
         }
         self.ready.entry(key.clone()).or_default().insert(member);
         self.owned.insert(ownership);
+        Ok(())
+    }
+
+    /// Rebuilds one key's ownership from what recovery found on the volume.
+    ///
+    /// Ready members re-enter the ready index in their persisted order. Members
+    /// an unsettled claim owns are restored as that claim, so the claim keeps
+    /// its slot, its members cannot be claimed again, and the publication that
+    /// was interrupted resumes under the identity it already wrote.
+    ///
+    /// Restoring is deliberately not bounded by the claim budget: those claims
+    /// are already durable, and refusing them would strand their members. A
+    /// budget that recovery overshoots simply admits no new claim until enough
+    /// of the restored ones settle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AssemblyError::DuplicateMember`] when the same member is
+    /// restored twice, which would mean two durable records claim the same
+    /// rows.
+    pub fn restore(
+        &mut self,
+        key: &ScribeAssemblyKey,
+        members: impl IntoIterator<Item = RecoveredMember>,
+    ) -> Result<(), AssemblyError> {
+        for recovered in members {
+            match recovered {
+                RecoveredMember::Ready(member) => self.register_ready(key, member)?,
+                RecoveredMember::Claimed { claim, member } => {
+                    let ownership = (key.clone(), member.id());
+                    if self.owned.contains(&ownership) {
+                        return Err(AssemblyError::DuplicateMember {
+                            shard: member.id().shard(),
+                            generation: member.id().generation(),
+                        });
+                    }
+                    self.owned.insert(ownership.clone());
+                    self.outstanding.entry(claim).or_default().push(ownership);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1413,5 +1491,61 @@ mod tests {
             WriterEpoch::new(4),
         );
         assert_ne!(hourly, daily);
+    }
+
+    /// A restored claim keeps its slot and its members until it settles.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture registration, restore, or claim is refused.
+    #[test]
+    fn restored_claims_keep_their_members_and_their_slot() {
+        let key = key_for(DataTenantId::new_v7(), 0);
+        let claim = StagingClaimId::from_hex(&"b".repeat(64)).expect("the fixture identity parses");
+        let owned = member(2, 5, 1_000, 0);
+        let mut assembler = assembler(1_000, 1);
+        assembler
+            .restore(
+                &key,
+                [
+                    RecoveredMember::Claimed {
+                        claim,
+                        member: owned,
+                    },
+                    RecoveredMember::Ready(member(2, 6, 1_000, 1)),
+                ],
+            )
+            .expect("recovery restores both members");
+
+        assert_eq!(assembler.outstanding_claims(), 1);
+        assert_eq!(assembler.ready_members(&key).len(), 1);
+        // The restored claim holds the only slot, so the ready member waits
+        // rather than opening a second concurrent publication.
+        assert_eq!(
+            assembler
+                .next_claim(at(5))
+                .expect_err("the restored claim holds the budget"),
+            AssemblyError::ClaimBudgetExhausted { budget: 1 }
+        );
+        // Its members are still owned, so a replayed registration is refused.
+        assert_eq!(
+            assembler
+                .register_ready(&key, owned)
+                .expect_err("a claimed member is already owned"),
+            AssemblyError::DuplicateMember {
+                shard: 2,
+                generation: 5
+            }
+        );
+
+        assembler
+            .settle_claim(claim)
+            .expect("the restored claim settles");
+        let next = assembler
+            .next_claim(at(6))
+            .expect("the slot is free again")
+            .expect("the ready member reaches target");
+        assert_eq!(next.members().len(), 1);
+        assert_eq!(next.members()[0].id(), StagedMemberId::new(2, 6));
     }
 }

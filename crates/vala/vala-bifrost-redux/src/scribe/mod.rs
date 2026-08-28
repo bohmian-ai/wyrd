@@ -27,6 +27,7 @@ mod otlp_managed;
 pub mod parquet_writer;
 pub mod persistence;
 pub mod preprocess;
+pub mod promotion;
 pub mod registry;
 pub mod replay;
 pub mod routing;

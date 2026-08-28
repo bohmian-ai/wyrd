@@ -18,7 +18,7 @@ use crate::catalog::{TenantTableBinding, TenantTableKey};
 use crate::contracts::ScribeError;
 use crate::maintenance::StagingFilePublisher;
 use crate::parquet::object_uploader::{
-    BifrostParquetUploader, BifrostUploadRole, ParquetObjectIdentity,
+    BifrostParquetUploader, BifrostUploadRole, ParquetObjectIdentity, VerifiedParquetObject,
 };
 use crate::resources::{ScribeMemoryLease, ScribeResources};
 use crate::scribe::execution_lanes::{
@@ -1159,6 +1159,11 @@ impl ScribeStageMover {
 
     /// Finalizes, elects, and verifies each artifact while retaining every local winner.
     ///
+    /// Returns each elected local winner together with what the verifying
+    /// read-back observed about the remote object, so publication can check its
+    /// promotion evidence against the bytes that now exist rather than against
+    /// the bytes it intended to write.
+    ///
     /// # Errors
     ///
     /// Returns an internal error for staging, manifest, identity, or upload failure.
@@ -1173,7 +1178,7 @@ impl ScribeStageMover {
         object_base: &str,
         artifacts: &BoundedParquetArtifactSet,
         chunk: &mut [u8],
-    ) -> Result<Vec<StagedArtifactClaim>, ScribeError> {
+    ) -> Result<(Vec<StagedArtifactClaim>, Vec<VerifiedParquetObject>), ScribeError> {
         let mut claims = Vec::with_capacity(artifacts.len());
         let publication_identity = Self::publication_identity(object_base);
         for artifact in artifacts {
@@ -1206,6 +1211,7 @@ impl ScribeStageMover {
             };
             claims.push(claim);
         }
+        let mut verified = Vec::with_capacity(claims.len());
         for claim in &claims {
             let identity =
                 ParquetObjectIdentity::new(claim.object_key.clone()).map_err(|error| {
@@ -1213,7 +1219,8 @@ impl ScribeStageMover {
                         detail: format!("invalid recovered Scribe object identity: {error}"),
                     }
                 })?;
-            self.uploader
+            let object = self
+                .uploader
                 .upload_file_verified(
                     &identity,
                     &claim.staged_path,
@@ -1226,8 +1233,9 @@ impl ScribeStageMover {
                 .map_err(|error| ScribeError::Internal {
                     detail: format!("verified staged upload failed: {error}"),
                 })?;
+            verified.push(object);
         }
-        Ok(claims)
+        Ok((claims, verified))
     }
 
     /// Persists one complete member manifest after every candidate converges.

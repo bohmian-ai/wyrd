@@ -38,6 +38,13 @@ CREATE TABLE vala.file_list (
     writer_epoch          bigint NOT NULL,
     wal_lsn_min           bigint NOT NULL,
     wal_lsn_max           bigint NOT NULL,
+    -- Iceberg-ready promotion evidence for this exact object, as the writer
+    -- that closed its footer computed it. Written in the same fenced
+    -- transaction as the row and never updated afterward, so a promoter reads
+    -- statistics it can trust without reopening the object. NOT NULL: a row
+    -- with no evidence would be a file nothing can promote.
+    promotion_record      jsonb NOT NULL
+        CHECK (jsonb_typeof(promotion_record) = 'object'),
     created_at            timestamptz NOT NULL DEFAULT now()
 );
 

@@ -250,6 +250,17 @@ pub struct BoundedParquetArtifact {
     pub row_count: usize,
     /// Footer-derived row-group statistics.
     pub row_group_stats: Vec<RowGroupStats>,
+    /// Iceberg-ready metrics derived once from this artifact's closed footer.
+    ///
+    /// Publication turns this into the object's
+    /// [`ScribePublishedHotFileV1`](crate::scribe::promotion::ScribePublishedHotFileV1)
+    /// by adding the facts only the fenced transaction knows. Deriving it here,
+    /// from the footer the writer just closed and re-read, is what makes the
+    /// persisted record the writer's own evidence rather than a later
+    /// reconstruction.
+    pub data_file_metrics: crate::scribe::promotion::ScribeDataFileV1,
+    /// Lowercase hex Wyrd schema fingerprint the footer was sealed with.
+    pub schema_fingerprint: String,
 }
 
 /// Statistics for a single row group.
@@ -671,8 +682,13 @@ impl<'a> RollingArtifactWriter<'a> {
                 detail: "writer-v2 sealed artifact is empty".to_owned(),
             });
         }
-        let row_group_stats =
-            inspect_sealed_artifact(&scratch_path, schema.as_ref(), &object_identity)?;
+        let evidence =
+            inspect_sealed_artifact(&scratch_path, schema.as_ref(), &object_identity, file_size)?;
+        let SealedArtifactEvidence {
+            row_group_stats,
+            data_file_metrics,
+            schema_fingerprint,
+        } = evidence;
         self.row_group_stats.extend(row_group_stats.iter().cloned());
         self.artifacts.push(BoundedParquetArtifact {
             ordinal,
@@ -682,6 +698,8 @@ impl<'a> RollingArtifactWriter<'a> {
             checksum: checksum_file(&scratch_path)?,
             row_count: rows,
             row_group_stats,
+            data_file_metrics,
+            schema_fingerprint,
         });
         Ok(())
     }
@@ -802,7 +820,22 @@ fn sort_batch(batch: &RecordBatch, layout: &PhysicalLayout) -> Result<RecordBatc
     })
 }
 
-/// Validates one sealed artifact and returns its row-group statistics.
+/// What re-reading one sealed artifact's footer proved about it.
+///
+/// The writer re-opens every artifact it seals, so this is the one place that
+/// holds the parsed footer. Both the live-tail statistics and the promotion
+/// metrics are taken from that single read rather than from two passes that
+/// could disagree.
+struct SealedArtifactEvidence {
+    /// Per-row-group event-time statistics in write order.
+    row_group_stats: Vec<RowGroupStats>,
+    /// Iceberg-ready metrics for the whole object.
+    data_file_metrics: crate::scribe::promotion::ScribeDataFileV1,
+    /// Lowercase hex Wyrd schema fingerprint the footer carries.
+    schema_fingerprint: String,
+}
+
+/// Validates one sealed artifact and returns everything its footer proves.
 ///
 /// Validation is exact for everything the writer contract owns: trailer magic,
 /// footer envelope size, compact-Thrift preflight, footer metadata fields,
@@ -815,12 +848,14 @@ fn sort_batch(batch: &RecordBatch, layout: &PhysicalLayout) -> Result<RecordBatc
 /// Returns an internal persistence error for a malformed trailer, an
 /// out-of-contract footer envelope, unreadable Parquet metadata, a footer
 /// envelope that contradicts the expected schema or object identity, a
-/// structural limit violation, or a row group with missing statistics.
+/// structural limit violation, a row group with missing statistics, or a
+/// footer whose Iceberg projection is not representable.
 fn inspect_sealed_artifact(
     path: &Path,
     expected_schema: &Schema,
     expected_object_identity: &str,
-) -> Result<Vec<RowGroupStats>, ScribeError> {
+    file_size: u64,
+) -> Result<SealedArtifactEvidence, ScribeError> {
     use parquet::file::reader::{FileReader, SerializedFileReader};
 
     let mut file = std::fs::File::open(path).map_err(|error| ScribeError::Internal {
@@ -890,13 +925,69 @@ fn inspect_sealed_artifact(
     )
     .map_err(|detail| ScribeError::Internal { detail })?;
     validate_writer_v2_structure(metadata).map_err(|detail| ScribeError::Internal { detail })?;
-    let mut stats = Vec::new();
+    let mut row_group_stats = Vec::new();
 
     for rg in metadata.row_groups() {
-        stats.push(extract_row_group_time_range(rg)?);
+        row_group_stats.push(extract_row_group_time_range(rg)?);
     }
 
-    Ok(stats)
+    let data_file_metrics = derive_data_file_metrics(
+        expected_schema,
+        Arc::new(reader.metadata().clone()),
+        expected_object_identity,
+        file_size,
+    )?;
+    Ok(SealedArtifactEvidence {
+        row_group_stats,
+        data_file_metrics,
+        schema_fingerprint: hex::encode(
+            crate::schema::SchemaFingerprint::from_arrow_schema(expected_schema).0,
+        ),
+    })
+}
+
+/// Projects one sealed artifact's closed footer into Iceberg-ready metrics.
+///
+/// The projection is the managed Iceberg writer's own footer-to-`DataFile`
+/// conversion, so the per-column sizes, counts, and bounds Scribe persists are
+/// exactly the ones a catalog promoter would compute from the same object.
+/// Field ids come from the same automatic assignment the Bifrost catalog used
+/// when it created the physical table, which is what makes the ids in this
+/// projection the table's ids rather than a private numbering.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::Internal`] when the Arrow schema has no Iceberg
+/// projection, the footer cannot be converted, or the resulting file carries a
+/// bound with no binary single-value serialization.
+fn derive_data_file_metrics(
+    expected_schema: &Schema,
+    metadata: Arc<parquet::file::metadata::ParquetMetaData>,
+    object_identity: &str,
+    file_size: u64,
+) -> Result<crate::scribe::promotion::ScribeDataFileV1, ScribeError> {
+    let iceberg_schema = iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(expected_schema)
+        .map_err(|error| ScribeError::Internal {
+            detail: format!("sealed artifact schema has no Iceberg projection: {error}"),
+        })?;
+    let written = usize::try_from(file_size).map_err(|_| ScribeError::Internal {
+        detail: "sealed artifact size exceeds address space".to_owned(),
+    })?;
+    let data_file = iceberg::writer::file_writer::ParquetWriter::parquet_to_data_file_builder(
+        Arc::new(iceberg_schema),
+        metadata,
+        written,
+        object_identity.to_owned(),
+        std::collections::HashMap::new(),
+    )
+    .map_err(|error| ScribeError::Internal {
+        detail: format!("sealed artifact footer has no Iceberg projection: {error}"),
+    })?
+    .build()
+    .map_err(|error| ScribeError::Internal {
+        detail: format!("sealed artifact footer does not assemble a data file: {error}"),
+    })?;
+    crate::scribe::promotion::ScribeDataFileV1::from_data_file(&data_file)
 }
 
 /// Computes the required object checksum without retaining the file in memory.
@@ -1513,6 +1604,110 @@ mod tests {
             .expect("string tenant");
         assert_eq!(times, expected_times);
         assert!((0..tenants.len()).all(|index| tenants.value(index) == tenant));
+    }
+
+    /// Every sealed artifact carries Iceberg metrics that agree with the exact
+    /// footer it closed, plus the fingerprint of the schema it was sealed with.
+    ///
+    /// The metrics exist so a promoter never has to reopen the object. That is
+    /// only safe if they are the footer's own numbers, so this compares each
+    /// projected value against the footer read back from the file rather than
+    /// against the values the encoder was handed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a projected metric contradicts the footer, when the split
+    /// offsets do not name the artifact's row groups, or when the recorded
+    /// fingerprint is not the sealed schema's.
+    #[test]
+    fn sealed_artifacts_carry_footer_agreeing_iceberg_metrics() {
+        let tenant = DataTenantId::new_v7();
+        let tenant_string = tenant.to_string();
+        let day = crate::test_support::day_partition(2026, 7, 14);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("data_tenant_id", DataType::Utf8, false),
+            Field::new(
+                "wyrd_event_time",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec![tenant_string.as_str(); 4])),
+                Arc::new(TimestampMicrosecondArray::from(vec![10, 20, 30, 40])),
+            ],
+        )
+        .expect("stored batch");
+        let frozen = FrozenMemtable {
+            seal_id: 7,
+            seal_key: SealKey::new(
+                tenant,
+                TableRef::new(BifrostNamespace::Bifrost, "promotion_metrics"),
+                day,
+            ),
+            shard_id: 0,
+            schema: Arc::clone(&schema),
+            batches: vec![batch],
+            events: vec![],
+            metas: vec![],
+            opened_at: std::time::Instant::now(),
+            closed_at: std::time::Instant::now(),
+            arrow_bytes: 0,
+        };
+        let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
+            .expect("tenant binding");
+        let (_scratch, encoded) = encode_for_test(&frozen, &binding, tenant);
+        let artifact = &encoded.artifacts[0];
+
+        let reader = SerializedFileReader::new(
+            std::fs::File::open(&artifact.scratch_path).expect("sealed artifact"),
+        )
+        .expect("sealed footer");
+        let metadata = reader.metadata();
+        let footer_rows: u64 = metadata
+            .row_groups()
+            .iter()
+            .map(|group| u64::try_from(group.num_rows()).expect("nonnegative row count"))
+            .sum();
+
+        let metrics = &artifact.data_file_metrics;
+        assert_eq!(metrics.record_count, footer_rows);
+        assert_eq!(metrics.file_size_in_bytes, artifact.file_size);
+        assert_eq!(metrics.split_offsets.len(), metadata.num_row_groups());
+        assert_eq!(
+            metrics.split_offsets[0],
+            metadata.row_group(0).file_offset().unwrap_or(4)
+        );
+        for (field_id, size) in &metrics.column_sizes {
+            let footer_size: u64 = metadata
+                .row_groups()
+                .iter()
+                .flat_map(RowGroupMetaData::columns)
+                .filter(|column| {
+                    column.column_descr().name()
+                        == schema
+                            .field(usize::try_from(*field_id - 1).expect("field id is positive"))
+                            .name()
+                })
+                .map(|column| u64::try_from(column.compressed_size()).expect("nonnegative size"))
+                .sum();
+            assert_eq!(*size, footer_size);
+        }
+        assert_eq!(metrics.value_counts.len(), schema.fields().len());
+        assert!(
+            metrics
+                .value_counts
+                .values()
+                .all(|count| *count == footer_rows)
+        );
+        assert_eq!(metrics.lower_bounds.len(), schema.fields().len());
+        assert_eq!(metrics.upper_bounds.len(), schema.fields().len());
+        assert_eq!(
+            artifact.schema_fingerprint,
+            hex::encode(crate::schema::SchemaFingerprint::from_arrow_schema(schema.as_ref()).0)
+        );
     }
 
     /// Generation encoding sorts every stored batch together, stamps the

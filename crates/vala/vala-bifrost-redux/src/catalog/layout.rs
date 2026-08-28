@@ -46,6 +46,21 @@ pub const MANAGED_BLOOM_FLOOR: [&str; 3] = [RUN_ID, CARD_UID, PRINCIPAL_ID];
 /// unbounded list and silently truncating it.
 pub const MAX_SORT_KEYS: usize = 4;
 
+/// Partition spec id every Bifrost physical table carries.
+///
+/// Table creation installs exactly one partition spec and never evolves it, so
+/// the bound spec is always Iceberg's initial spec. Publication records the id
+/// on every promoted file, and this constant is what makes that recorded id a
+/// stated contract instead of a value copied out of a live table.
+pub const BIFROST_PARTITION_SPEC_ID: i32 = 0;
+
+/// Sort order id every Bifrost physical table carries.
+///
+/// [`PhysicalLayout::iceberg_sort_order`] builds the single order under this
+/// id at table creation, and writers preserve it, so a promoted file that
+/// names this id is asserting the order it was actually written in.
+pub const BIFROST_SORT_ORDER_ID: i32 = 1;
+
 /// Time-partition granularity owned by the engine.
 ///
 /// Bifrost v1 admits exactly these two Iceberg-native transforms on
@@ -550,7 +565,7 @@ impl PhysicalLayout {
     /// or when Iceberg rejects the bound sort fields.
     pub fn iceberg_sort_order(&self, iceberg_schema: &IcebergSchema) -> Result<SortOrder, String> {
         let mut builder = SortOrder::builder();
-        builder.with_order_id(1);
+        builder.with_order_id(i64::from(BIFROST_SORT_ORDER_ID));
         for key in &self.sort_keys {
             let field = iceberg_schema
                 .field_by_name(&key.column)

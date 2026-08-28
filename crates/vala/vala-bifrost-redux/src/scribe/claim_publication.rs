@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use crate::catalog::TenantTableBinding;
 use crate::contracts::ScribeError;
+use crate::parquet::object_uploader::VerifiedParquetObject;
 use crate::scribe::assembly::StagingClaim;
 use crate::scribe::claim_assembly::{AssembledClaim, ClaimRuns};
 use crate::scribe::file_list_writer::{self, FileListCommitKey};
@@ -235,7 +236,7 @@ impl ClaimPublisher {
         )
         .await?;
         let mut chunk = vec![0_u8; PARQUET_TRANSFER_BUFFER_BYTES];
-        let claims = self
+        let (claims, verified) = self
             .mover
             .stage_and_upload_candidate(
                 request.object_base,
@@ -243,6 +244,7 @@ impl ClaimPublisher {
                 &mut chunk,
             )
             .await?;
+        validate_promotion_records(&rows, &verified)?;
         self.mover
             .persist_publication(
                 request.object_base,
@@ -376,4 +378,42 @@ fn transition_failure(
             member.generation()
         ),
     }
+}
+
+/// Checks every publication row's promotion evidence against the live object.
+///
+/// The verifying upload re-stats and re-digests each object after writing it,
+/// so this compares the record Scribe is about to make durable with what a
+/// reader would actually find. Refusing here — before the local publication
+/// manifest and the fenced transaction — leaves the members staged and the WAL
+/// authoritative, which is the same position a failed upload leaves them in.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::Internal`] when the counts differ, a row has no
+/// verified object, or a record contradicts its object's key, size, or digest.
+fn validate_promotion_records(
+    rows: &[file_list_writer::FileListArtifactInsert],
+    verified: &[VerifiedParquetObject],
+) -> Result<(), ScribeError> {
+    if rows.len() != verified.len() {
+        return Err(ScribeError::Internal {
+            detail: "publication rows and verified objects disagree in count".to_owned(),
+        });
+    }
+    for row in rows {
+        let object = verified
+            .iter()
+            .find(|object| object.identity.as_str() == row.file_path)
+            .ok_or_else(|| ScribeError::Internal {
+                detail: format!("publication row {} has no verified object", row.file_path),
+            })?;
+        row.promotion_record
+            .validate_object(&crate::scribe::promotion::ObservedHotObject {
+                object_key: object.identity.as_str(),
+                file_size: object.length,
+                file_checksum: &hex::encode(object.sha256),
+            })?;
+    }
+    Ok(())
 }

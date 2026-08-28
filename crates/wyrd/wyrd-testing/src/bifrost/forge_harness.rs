@@ -1722,7 +1722,7 @@ impl ForgeFixture {
     /// Panics when the durable reference insert fails.
     pub async fn protect_path(&self, path: &str) {
         sqlx::query(
-            "INSERT INTO vala.file_list (id, data_tenant_id, namespace, table_name, file_path, file_size, row_count, min_event_time, max_event_time, partition_granularity, partition_start, node_id, writer_epoch, wal_lsn_min, wal_lsn_max) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+            "INSERT INTO vala.file_list (id, data_tenant_id, namespace, table_name, file_path, file_size, row_count, min_event_time, max_event_time, partition_granularity, partition_start, node_id, writer_epoch, wal_lsn_min, wal_lsn_max, promotion_record) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, '{\"fixture\": \"forge-harness\"}'::jsonb)",
         )
         .bind(uuid::Uuid::now_v7())
         .bind(self.tenant.as_uuid())
@@ -2334,7 +2334,7 @@ async fn seed_synthetic_forge_group_for_bench(
             let min_time = chrono::DateTime::from_timestamp_micros(base + file_number * 1_000_000)
                 .expect("Forge fixture timestamp");
             sqlx::query(
-            "INSERT INTO vala.file_list (id, data_tenant_id, namespace, table_name, file_path, file_size, row_count, min_event_time, max_event_time, partition_granularity, partition_start, node_id, writer_epoch, wal_lsn_min, wal_lsn_max) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+            "INSERT INTO vala.file_list (id, data_tenant_id, namespace, table_name, file_path, file_size, row_count, min_event_time, max_event_time, partition_granularity, partition_start, node_id, writer_epoch, wal_lsn_min, wal_lsn_max, promotion_record) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, '{\"fixture\": \"forge-harness\"}'::jsonb)",
         )
         .bind(uuid::Uuid::now_v7())
         .bind(tenant.as_uuid())

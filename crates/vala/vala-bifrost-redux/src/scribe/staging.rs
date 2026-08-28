@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::contracts::ScribeError;
 use crate::parquet::object_uploader::ParquetObjectIdentity;
 use crate::scribe::file_list_writer::FileListArtifactInsert;
+use crate::scribe::promotion::ScribePublishedHotFileV1;
 use crate::scribe::stream_identity::StreamIdentity;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::AuditEvent;
@@ -112,6 +113,12 @@ struct DurableFileListRow {
     file_ordinal: i16,
     /// Lowercase SHA-256 artifact digest.
     file_checksum: String,
+    /// Iceberg-ready promotion evidence published with the row.
+    ///
+    /// The manifest carries it so a recovered publication commits the exact
+    /// record the sealing writer derived, rather than one re-derived from an
+    /// object the recovering process would have to re-read.
+    promotion_record: ScribePublishedHotFileV1,
 }
 
 impl From<&FileListArtifactInsert> for DurableFileListRow {
@@ -137,6 +144,7 @@ impl From<&FileListArtifactInsert> for DurableFileListRow {
             wal_lsn_max: row.wal_lsn_max,
             file_ordinal: row.file_ordinal,
             file_checksum: row.file_checksum.clone(),
+            promotion_record: row.promotion_record.clone(),
         }
     }
 }
@@ -164,6 +172,7 @@ impl From<DurableFileListRow> for FileListArtifactInsert {
             wal_lsn_max: row.wal_lsn_max,
             file_ordinal: row.file_ordinal,
             file_checksum: row.file_checksum,
+            promotion_record: row.promotion_record,
         }
     }
 }
@@ -1245,6 +1254,46 @@ fn stage_io(operation: &'static str) -> impl FnOnce(std::io::Error) -> ScribeErr
 
 #[cfg(test)]
 mod tests {
+
+    /// Builds one publication record standing for a fixture object.
+    ///
+    /// The manifest round-trip only needs a record that encodes and compares
+    /// exactly, so the metrics are the empty projection of a one-row object
+    /// rather than a footer-derived one.
+    fn fixture_promotion_record(
+        tenant: DataTenantId,
+        object_key: &str,
+        checksum: &str,
+        file_size: u64,
+        partition: crate::catalog::layout::TimePartition,
+        file_list_id: Uuid,
+    ) -> ScribePublishedHotFileV1 {
+        ScribePublishedHotFileV1::from_metrics(
+            &crate::scribe::promotion::PublishedHotFileIdentity {
+                data_tenant_id: tenant.as_uuid(),
+                namespace: "vala.traces",
+                table_name: "spans",
+                file_list_id,
+                object_key,
+                file_checksum: checksum,
+                partition,
+                schema_fingerprint: "00".repeat(32),
+                partition_spec_id: crate::catalog::layout::BIFROST_PARTITION_SPEC_ID,
+                sort_order_id: crate::catalog::layout::BIFROST_SORT_ORDER_ID,
+            },
+            crate::scribe::promotion::ScribeDataFileV1 {
+                record_count: 1,
+                file_size_in_bytes: file_size,
+                column_sizes: std::collections::BTreeMap::new(),
+                value_counts: std::collections::BTreeMap::new(),
+                null_value_counts: std::collections::BTreeMap::new(),
+                nan_value_counts: std::collections::BTreeMap::new(),
+                lower_bounds: std::collections::BTreeMap::new(),
+                upper_bounds: std::collections::BTreeMap::new(),
+                split_offsets: vec![4],
+            },
+        )
+    }
     use sha2::{Digest as _, Sha256};
     use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
     use wyrd_spec::request_id::RequestId;
@@ -1536,8 +1585,9 @@ mod tests {
         );
         let tenant = DataTenantId::new_v7();
         let now = chrono::Utc::now();
+        let row_id = Uuid::now_v7();
         let rows = vec![FileListArtifactInsert {
-            id: Uuid::now_v7(),
+            id: row_id,
             data_tenant_id: tenant,
             namespace: "vala.traces".to_owned(),
             table_name: "spans".to_owned(),
@@ -1555,6 +1605,16 @@ mod tests {
             wal_lsn_max: 2,
             file_ordinal: 0,
             file_checksum: hex::encode(digest),
+            promotion_record: fixture_promotion_record(
+                tenant,
+                object_key,
+                &hex::encode(digest),
+                content.len() as u64,
+                crate::catalog::TimeGranularity::Hour
+                    .bucket(now)
+                    .expect("fixture instant buckets"),
+                row_id,
+            ),
         }];
         let events = vec![AuditEvent::new(
             RequestId::now_v7(),
@@ -1610,8 +1670,9 @@ mod tests {
         );
         let tenant = DataTenantId::new_v7();
         let now = chrono::Utc::now();
+        let row_id = Uuid::now_v7();
         let rows = vec![FileListArtifactInsert {
-            id: Uuid::now_v7(),
+            id: row_id,
             data_tenant_id: tenant,
             namespace: "vala.traces".to_owned(),
             table_name: "spans".to_owned(),
@@ -1629,6 +1690,16 @@ mod tests {
             wal_lsn_max: 2,
             file_ordinal: 0,
             file_checksum: hex::encode(digest),
+            promotion_record: fixture_promotion_record(
+                tenant,
+                object_key,
+                &hex::encode(digest),
+                content.len() as u64,
+                crate::catalog::TimeGranularity::Hour
+                    .bucket(now)
+                    .expect("fixture instant buckets"),
+                row_id,
+            ),
         }];
         let events = vec![AuditEvent::new(
             RequestId::now_v7(),

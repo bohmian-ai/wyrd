@@ -19,7 +19,6 @@ use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef, TenantTableBindi
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::parquet::writer_properties::bifrost_writer_properties;
 use vala_bifrost_redux::schema::with_managed_columns;
-use vala_bifrost_redux::scribe::file_list_writer::{FileListInsert, insert_and_audit};
 use vala_sdk::QueryClient;
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
@@ -216,30 +215,25 @@ pub(crate) async fn seed_foreign_hot_row(
         "foreign tripwire fixture".to_owned(),
     );
     let mut conn = cluster.pg_fixture().tenant_conn_for(owner).await?;
-    insert_and_audit(
-        &mut conn,
-        &FileListInsert {
-            id: uuid::Uuid::now_v7(),
-            data_tenant_id: owner,
-            namespace: &binding.logical_namespace,
-            table_name: &binding.table_name,
-            file_path: &path,
-            file_size: i64::try_from(parquet.len())?,
-            row_count: 1,
-            min_event_time: Utc::now(),
-            max_event_time: Utc::now(),
-            partition: vala_bifrost_redux::catalog::layout::TimePartition::new(
-                vala_bifrost_redux::catalog::layout::TimeGranularity::Day,
-                chrono::DateTime::UNIX_EPOCH,
-            )?,
-            node_id,
-            writer_epoch: 1,
-            wal_lsn_min: 9_001,
-            wal_lsn_max: 9_001,
-        },
-        &[event],
+    sqlx::query(
+        "INSERT INTO vala.file_list \
+         (id,data_tenant_id,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_granularity,partition_start,node_id,writer_epoch,wal_lsn_min,wal_lsn_max,promotion_record) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'day',$10,$11,1,9001,9001,'{\"fixture\": \"oracle-foreign-tripwire\"}'::jsonb)",
     )
+    .bind(uuid::Uuid::now_v7())
+    .bind(owner.as_uuid())
+    .bind(&binding.logical_namespace)
+    .bind(&binding.table_name)
+    .bind(&path)
+    .bind(i64::try_from(parquet.len())?)
+    .bind(1_i64)
+    .bind(Utc::now())
+    .bind(Utc::now())
+    .bind(chrono::DateTime::<Utc>::UNIX_EPOCH)
+    .bind(node_id)
+    .execute(&mut **conn.transaction())
     .await?;
+    vala_sql::queries::audit_outbox::append_audit(&mut conn, &event).await?;
     conn.commit().await?;
     Ok(())
 }

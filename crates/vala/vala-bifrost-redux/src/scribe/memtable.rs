@@ -90,6 +90,19 @@ pub struct Memtable {
     /// the age trigger uses the configured seconds-scale value rather than the
     /// [`ACTIVE_GENERATION_MAX_AGE`] constant.
     seal_max_age: Duration,
+    /// Pod-local shard lane this memtable belongs to, for registry identity.
+    ///
+    /// Zero for a bare memtable in a unit test, which registers nothing.
+    shard_id: usize,
+    /// Pod-wide authority registry, when this memtable belongs to a pod.
+    ///
+    /// Every immutable generation is registered here as memtable-authoritative
+    /// and forgotten when it retires, which is what lets the staging and
+    /// publication owners move that authority forward and what stops a
+    /// generation's Arrow from being released while nothing durable holds its
+    /// rows. A bare memtable in a unit test has no pod and therefore no
+    /// registry; it tracks no authority and none is asked of it.
+    hot_sources: Option<Arc<crate::scribe::hot_source::ScribeHotSourceRegistry>>,
 }
 
 /// Aggregate memory and generation state for a Scribe pod.
@@ -190,6 +203,73 @@ impl Memtable {
         Self::new_with_config(rotation_bytes, ACTIVE_GENERATION_MAX_AGE)
     }
 
+    /// Binds this memtable to its pod's hot-source authority registry.
+    ///
+    /// Production wiring calls this immediately after construction, before the
+    /// memtable accepts a row, so every generation it ever freezes is tracked
+    /// from its first moment as memtable-authoritative.
+    #[must_use]
+    pub(crate) fn with_hot_sources(
+        mut self,
+        shard_id: usize,
+        hot_sources: Arc<crate::scribe::hot_source::ScribeHotSourceRegistry>,
+    ) -> Self {
+        self.shard_id = shard_id;
+        self.hot_sources = Some(hot_sources);
+        self
+    }
+
+    /// Returns this memtable's registry identity for one of its generations.
+    ///
+    /// The shard lane is part of the identity because every lane numbers its
+    /// own generations from one: without it, two lanes serving the same seal
+    /// key would claim the same registry entry.
+    fn ordinal(&self, seal_id: u64) -> crate::scribe::hot_source::GenerationOrdinal {
+        crate::scribe::hot_source::GenerationOrdinal::new(
+            u16::try_from(self.shard_id).unwrap_or(u16::MAX),
+            seal_id,
+        )
+    }
+
+    /// Registers one newly frozen generation as memtable-authoritative.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the registry refuses the
+    /// registration, which means the generation identity was reused — a
+    /// reader following the older registration would look for rows in a
+    /// generation that no longer holds them.
+    fn register_hot_source(&self, key: &SealKey, seal_id: u64) -> Result<(), ScribeError> {
+        let Some(hot_sources) = &self.hot_sources else {
+            return Ok(());
+        };
+        hot_sources
+            .register_memtable(key, self.ordinal(seal_id))
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("register generation {seal_id} as memtable-authoritative: {error}"),
+            })
+    }
+
+    /// Releases one retired generation's authority from the pod registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the registry refuses the release
+    /// because nothing durable holds the generation's rows. Retiring under that
+    /// condition would drop the last copy, so the refusal is the correct
+    /// outcome and the caller keeps the generation.
+    fn release_hot_source(&self, key: &SealKey, seal_id: u64) -> Result<(), ScribeError> {
+        let Some(hot_sources) = &self.hot_sources else {
+            return Ok(());
+        };
+        hot_sources
+            .release(key, self.ordinal(seal_id))
+            .map(|_| ())
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("release retired generation {seal_id}: {error}"),
+            })
+    }
+
     /// Construct a memtable with an explicit rotation threshold and max age.
     ///
     /// This is the constructor production wiring uses: the shard runtime threads
@@ -208,6 +288,8 @@ impl Memtable {
             next_seal_id: Arc::new(AtomicU64::new(1)),
             rotation_bytes,
             seal_max_age,
+            shard_id: 0,
+            hot_sources: None,
         }
     }
 
@@ -457,6 +539,8 @@ impl Memtable {
             .entry(frozen.seal_key.clone())
             .or_default()
             .push(ImmutableEntry::pending(frozen.clone()));
+        drop(immutable);
+        self.register_hot_source(&frozen.seal_key, frozen.seal_id)?;
         Ok(frozen)
     }
 
@@ -566,6 +650,8 @@ impl Memtable {
             .entry(seal_key.clone())
             .or_default()
             .push(ImmutableEntry::pending(frozen.clone()));
+        drop(immutable);
+        self.register_hot_source(seal_key, frozen.seal_id)?;
         Ok(frozen)
     }
 
@@ -600,6 +686,7 @@ impl Memtable {
         for (key, bucket) in buckets {
             let seal_id = self.next_seal_id.fetch_add(1, Ordering::Relaxed);
             let member = bucket.freeze(seal_id);
+            self.register_hot_source(&key, seal_id)?;
             immutable
                 .entry(key)
                 .or_default()
@@ -1174,8 +1261,11 @@ impl Memtable {
                     ),
                 });
             }
+            let key = entries[index].frozen.seal_key.clone();
             entries.remove(index);
             immutable.retain(|_, values| !values.is_empty());
+            drop(immutable);
+            self.release_hot_source(&key, token.seal_id)?;
             return Ok(token.wal_range);
         }
         Err(ScribeError::Internal {
@@ -1211,16 +1301,28 @@ impl Memtable {
             .map_err(|error| ScribeError::Internal {
                 detail: format!("memtable immutable lock poisoned: {error}"),
             })?;
+        let mut discarded = None;
         for entries in immutable.values_mut() {
             if let Some(index) = entries
                 .iter()
                 .position(|entry| entry.seal_id == seal_id && entry.is_pending())
             {
+                discarded = Some(entries[index].frozen.seal_key.clone());
                 entries.remove(index);
                 break;
             }
         }
         immutable.retain(|_, entries| !entries.is_empty());
+        drop(immutable);
+        if let Some(key) = discarded
+            && let Some(hot_sources) = &self.hot_sources
+        {
+            hot_sources
+                .discard(&key, self.ordinal(seal_id))
+                .map_err(|error| ScribeError::Internal {
+                    detail: format!("forget abandoned generation {seal_id}: {error}"),
+                })?;
+        }
         Ok(())
     }
 

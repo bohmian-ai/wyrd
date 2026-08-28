@@ -112,6 +112,15 @@ impl StagedRuns {
     pub const fn staged_bytes(&self) -> u64 {
         self.staged_bytes
     }
+
+    /// Returns the inclusive WAL bounds the member's rows cover.
+    ///
+    /// A live-tail reader needs these to decide whether a pinned cut already
+    /// owns the member, so they travel with the runs rather than being read
+    /// back from the record the caller has not published yet.
+    pub const fn wal(&self) -> crate::scribe::hot_stage::StagedLsnRange {
+        self.wal
+    }
 }
 
 /// Encodes frozen buckets into durable local runs and stages them ready.

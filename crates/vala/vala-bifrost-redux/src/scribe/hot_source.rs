@@ -22,27 +22,45 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use crate::scribe::assembly::StagedMemberId;
 use crate::scribe::seal_key::SealKey;
+use crate::scribe::wal::WalLsn;
 
 /// Stable identity of one Scribe generation within its seal key.
 ///
-/// Monotonic per key. Comparison is meaningful: a lower ordinal is always an
-/// older generation of the same key, which is what makes "authority only moves
-/// forward" checkable rather than merely intended.
+/// A seal key is served by every shard lane that routed rows for it, and each
+/// lane numbers its own generations from one, so the generation number alone is
+/// not an identity — two lanes would collide on it. The pair is, and it is the
+/// same pair a staged member is named by.
+///
+/// Ordering is by generation first: a lower generation is older work regardless
+/// of which lane produced it, which is what makes "read the oldest rows first"
+/// and "authority only moves forward" checkable rather than merely intended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct GenerationOrdinal(u64);
+pub struct GenerationOrdinal {
+    /// Generation number within the shard lane that froze it.
+    generation: u64,
+    /// Pod-local shard lane that froze the generation.
+    shard: u16,
+}
 
 impl GenerationOrdinal {
-    /// Builds an ordinal from its raw monotonic value.
+    /// Builds an ordinal from the lane and the generation it numbered.
     #[must_use]
-    pub const fn new(value: u64) -> Self {
-        Self(value)
+    pub const fn new(shard: u16, generation: u64) -> Self {
+        Self { generation, shard }
     }
 
-    /// Returns the raw monotonic value.
+    /// Returns the generation number within its lane.
     #[must_use]
     pub const fn get(self) -> u64 {
-        self.0
+        self.generation
+    }
+
+    /// Returns the shard lane that froze the generation.
+    #[must_use]
+    pub const fn shard(self) -> u16 {
+        self.shard
     }
 }
 
@@ -56,16 +74,25 @@ impl GenerationOrdinal {
 pub enum HotAuthority {
     /// Readable from the in-memory generation that accepted the rows.
     Memtable,
-    /// Readable from a durable local sorted run fsynced under the staging root.
+    /// Readable from durable local sorted runs fsynced under the staging root.
     ///
     /// Reaching this state is the first durable boundary: the rows survive a
     /// process restart without the WAL, which is exactly what permits the WAL
     /// segments behind them to be retired.
+    ///
+    /// The runs are carried here rather than looked up per read because this is
+    /// the authority a live-tail reader resolves: asking the staged namespace
+    /// again on every query would put a directory scan on the read path and
+    /// could answer with a member this registry has already handed over.
     StagedRun {
-        /// Fsynced local run path serving the rows.
-        path: PathBuf,
-        /// Encoded bytes the run occupies on the staging volume.
+        /// Staged member identity serving the rows, for read provenance.
+        member: StagedMemberId,
+        /// Fsynced local run paths serving the rows, in merge order.
+        runs: Vec<PathBuf>,
+        /// Encoded bytes the runs occupy on the staging volume.
         bytes: u64,
+        /// Inclusive WAL bounds the member covers.
+        wal: (WalLsn, WalLsn),
     },
     /// Readable from a published hot object recorded in the catalog.
     Published {
@@ -153,6 +180,27 @@ pub enum HotSourceError {
         /// Lock failure detail.
         detail: String,
     },
+}
+
+/// One staged member a live-tail read may serve rows from.
+///
+/// Carries the provenance a returned batch needs — which member produced the
+/// rows and which WAL positions it covers — so a caller can suppress a member
+/// a pinned cut already owns without reopening the staged namespace.
+#[derive(Debug, Clone)]
+pub struct StagedSource {
+    /// Seal key whose partition the runs belong to.
+    pub key: SealKey,
+    /// Generation the member was staged from.
+    pub generation: GenerationOrdinal,
+    /// Staged member identity serving the rows.
+    pub member: StagedMemberId,
+    /// Fsynced local run paths, in merge order.
+    pub runs: Vec<PathBuf>,
+    /// Encoded bytes the runs occupy.
+    pub bytes: u64,
+    /// Inclusive WAL bounds the member covers.
+    pub wal: (WalLsn, WalLsn),
 }
 
 /// Live authority for one seal key's generations.
@@ -285,6 +333,73 @@ impl ScribeHotSourceRegistry {
         Ok(released)
     }
 
+    /// Restores one generation's durable authority found by startup recovery.
+    ///
+    /// A restarted pod never held these rows in memory, so there is no memtable
+    /// moment to register and then advance from. The durable evidence on the
+    /// volume is the whole history the new process has, and this installs
+    /// exactly that. Only a durable authority may be restored: a memtable
+    /// authority would claim rows this process does not hold.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HotSourceError::AlreadyRegistered`] when the generation is
+    /// already tracked, [`HotSourceError::NotDurable`] when the restored
+    /// authority is the memtable, and [`HotSourceError::Poisoned`] on a
+    /// poisoned lock.
+    pub fn restore_durable(
+        &self,
+        key: &SealKey,
+        generation: GenerationOrdinal,
+        authority: HotAuthority,
+    ) -> Result<(), HotSourceError> {
+        if !authority.is_durable() {
+            return Err(HotSourceError::NotDurable {
+                generation: generation.get(),
+                authority: authority.label(),
+            });
+        }
+        let mut state = self.lock()?;
+        let authorities = state.entry(key.clone()).or_default();
+        if authorities.by_generation.contains_key(&generation) {
+            return Err(HotSourceError::AlreadyRegistered {
+                generation: generation.get(),
+            });
+        }
+        authorities.by_generation.insert(generation, authority);
+        Ok(())
+    }
+
+    /// Forgets a generation that was abandoned before becoming durable.
+    ///
+    /// Replay can admit a generation into the memtable and then refuse it when
+    /// memory admission rejects the chunk. Nothing durable ever held those
+    /// rows, so [`Self::release`] would rightly refuse them; the WAL is still
+    /// their authority and the registry must simply stop tracking a generation
+    /// that no longer exists.
+    ///
+    /// Forgetting an unknown generation is not an error: the caller is
+    /// asserting the generation is gone, which it already is.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HotSourceError::Poisoned`] on a poisoned lock.
+    pub fn discard(
+        &self,
+        key: &SealKey,
+        generation: GenerationOrdinal,
+    ) -> Result<(), HotSourceError> {
+        let mut state = self.lock()?;
+        let Some(authorities) = state.get_mut(key) else {
+            return Ok(());
+        };
+        authorities.by_generation.remove(&generation);
+        if authorities.by_generation.is_empty() {
+            state.remove(key);
+        }
+        Ok(())
+    }
+
     /// Returns one generation's current authority, if it is still registered.
     ///
     /// # Errors
@@ -325,6 +440,63 @@ impl ScribeHotSourceRegistry {
             .collect();
         live.sort_by_key(|(generation, _)| *generation);
         Ok(live)
+    }
+
+    /// Returns every staged member readable for one table in a partition range.
+    ///
+    /// This is the read side of the staged boundary: a generation whose Arrow
+    /// has been released is served from exactly these runs until its claim
+    /// publishes. Results are ordered by partition and then generation so a
+    /// reader scans rows in age order, and a generation that is still memtable
+    /// or already published contributes nothing here — one authority per
+    /// generation, never two.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HotSourceError::Poisoned`] on a poisoned lock.
+    pub fn staged_sources(
+        &self,
+        tenant: wyrd_spec::ids::DataTenantId,
+        table: &crate::catalog::TableRef,
+        start: crate::catalog::layout::TimePartition,
+        end: crate::catalog::layout::TimePartition,
+    ) -> Result<Vec<StagedSource>, HotSourceError> {
+        let state = self.lock()?;
+        let mut sources = Vec::new();
+        for (key, authorities) in state.iter() {
+            if key.tenant != tenant || key.table != *table {
+                continue;
+            }
+            if key.partition < start || key.partition > end {
+                continue;
+            }
+            for (generation, authority) in &authorities.by_generation {
+                let HotAuthority::StagedRun {
+                    member,
+                    runs,
+                    bytes,
+                    wal,
+                } = authority
+                else {
+                    continue;
+                };
+                sources.push(StagedSource {
+                    key: key.clone(),
+                    generation: *generation,
+                    member: *member,
+                    runs: runs.clone(),
+                    bytes: *bytes,
+                    wal: *wal,
+                });
+            }
+        }
+        sources.sort_by(|left, right| {
+            left.key
+                .partition
+                .cmp(&right.key.partition)
+                .then(left.generation.cmp(&right.generation))
+        });
+        Ok(sources)
     }
 
     /// Reports whether every generation of a key is durably held.
@@ -389,8 +561,10 @@ mod tests {
     /// Builds a staged-run authority with a synthetic path.
     fn staged() -> HotAuthority {
         HotAuthority::StagedRun {
-            path: PathBuf::from("/stage/run-1.parquet"),
+            member: StagedMemberId::new(0, 1),
+            runs: vec![PathBuf::from("/stage/run-1.parquet")],
             bytes: 1_024,
+            wal: (WalLsn::new(1), WalLsn::new(9)),
         }
     }
 
@@ -404,7 +578,7 @@ mod tests {
     fn hot_authority_only_ever_moves_forward() {
         let registry = ScribeHotSourceRegistry::new();
         let key = seal_key();
-        let generation = GenerationOrdinal::new(1);
+        let generation = GenerationOrdinal::new(0, 1);
         registry
             .register_memtable(&key, generation)
             .expect("a new generation registers");
@@ -456,7 +630,7 @@ mod tests {
     fn memtable_only_generation_cannot_be_released() {
         let registry = ScribeHotSourceRegistry::new();
         let key = seal_key();
-        let generation = GenerationOrdinal::new(7);
+        let generation = GenerationOrdinal::new(0, 7);
         registry
             .register_memtable(&key, generation)
             .expect("registers");
@@ -500,14 +674,14 @@ mod tests {
         let key = seal_key();
         for ordinal in [3_u64, 1, 2] {
             registry
-                .register_memtable(&key, GenerationOrdinal::new(ordinal))
+                .register_memtable(&key, GenerationOrdinal::new(0, ordinal))
                 .expect("registers");
         }
         registry
-            .advance(&key, GenerationOrdinal::new(1), staged())
+            .advance(&key, GenerationOrdinal::new(0, 1), staged())
             .expect("stages the oldest");
         registry
-            .advance(&key, GenerationOrdinal::new(3), staged())
+            .advance(&key, GenerationOrdinal::new(0, 3), staged())
             .expect("stages the newest");
         assert!(
             !registry.is_fully_durable(&key).expect("locked"),
@@ -523,7 +697,7 @@ mod tests {
         assert_eq!(live[1].1.label(), "memtable");
 
         registry
-            .advance(&key, GenerationOrdinal::new(2), staged())
+            .advance(&key, GenerationOrdinal::new(0, 2), staged())
             .expect("stages the last one");
         assert!(registry.is_fully_durable(&key).expect("locked"));
     }
@@ -538,7 +712,7 @@ mod tests {
     fn unregistered_generations_are_refused() {
         let registry = ScribeHotSourceRegistry::new();
         let key = seal_key();
-        let generation = GenerationOrdinal::new(9);
+        let generation = GenerationOrdinal::new(0, 9);
         assert!(matches!(
             registry.advance(&key, generation, staged()),
             Err(HotSourceError::Unregistered { generation: 9 })
@@ -551,6 +725,79 @@ mod tests {
         assert!(
             registry.is_fully_durable(&key).expect("locked"),
             "a key with no live generations blocks nothing"
+        );
+    }
+
+    /// A staged read sees exactly the generations the staged boundary owns, in
+    /// age order, scoped to the requested table and partition range.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture registration or transition is refused.
+    #[test]
+    fn staged_sources_are_scoped_ordered_and_exclude_other_authorities() {
+        let registry = ScribeHotSourceRegistry::new();
+        let key = seal_key();
+        let next_day = SealKey::new(
+            key.tenant,
+            key.table.clone(),
+            TimePartition::new(
+                TimeGranularity::Day,
+                chrono::DateTime::from_timestamp(1_772_236_800, 0)
+                    .expect("a fixed representable instant"),
+            )
+            .expect("a fixed day boundary"),
+        );
+        let other_table = SealKey::new(
+            key.tenant,
+            TableRef::new(BifrostNamespace::Bifrost, "other"),
+            key.partition,
+        );
+        for (key, generation) in [(&key, 2_u64), (&key, 1), (&next_day, 3), (&other_table, 4)] {
+            let generation = GenerationOrdinal::new(0, generation);
+            registry
+                .register_memtable(key, generation)
+                .expect("generation registers");
+            registry
+                .advance(key, generation, staged())
+                .expect("generation stages");
+        }
+        let memtable_only = GenerationOrdinal::new(0, 5);
+        registry
+            .register_memtable(&key, memtable_only)
+            .expect("generation registers");
+        let published = GenerationOrdinal::new(0, 6);
+        registry
+            .register_memtable(&key, published)
+            .expect("generation registers");
+        registry
+            .advance(&key, published, staged())
+            .expect("generation stages");
+        registry
+            .advance(
+                &key,
+                published,
+                HotAuthority::Published {
+                    object_key: "objects/one.parquet".to_owned(),
+                },
+            )
+            .expect("generation publishes");
+
+        let sources = registry
+            .staged_sources(key.tenant, &key.table, key.partition, next_day.partition)
+            .expect("locked");
+        let named: Vec<(TimePartition, u64)> = sources
+            .iter()
+            .map(|source| (source.key.partition, source.generation.get()))
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                (key.partition, 1),
+                (key.partition, 2),
+                (next_day.partition, 3),
+            ],
+            "only staged generations of the requested table and range are readable, oldest first"
         );
     }
 }

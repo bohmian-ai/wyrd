@@ -33,6 +33,7 @@ pub mod routing;
 pub mod seal;
 pub mod seal_key;
 pub mod shards;
+pub(crate) mod staged_tail;
 pub(crate) mod staging;
 pub mod staging_runtime;
 pub mod stream_identity;
@@ -247,6 +248,31 @@ impl ScribeLaneConfig {
 /// owner performs WAL writes, memtable insertion, and `sync_data` in order.
 /// Rotation is a consumer-owned state swap; immutable generations are handed
 /// to the bounded persistence runtime.
+/// Owners the persistence runtime borrows from the Scribe build.
+///
+/// Exists so the persistence context can be assembled in one named place
+/// instead of inline in the middle of the build; it holds no state of its own.
+struct PersistenceDependencies {
+    /// Object-store operator shared by persistence workers.
+    operator: Arc<opendal::Operator>,
+    /// WAL writer used for manifest location and recovery identity.
+    wal: Arc<wal::WalWriter>,
+    /// Bounded CPU lane used to encode and merge.
+    persistence_cpu: crate::scribe::execution_lanes::ScribePersistenceCpuPool,
+    /// Bounded WAL lane used to advance manifests.
+    wal_io: crate::scribe::execution_lanes::ScribeWalIoPool,
+    /// Typed pod stream identity authorizing publication.
+    stream: stream_identity::StreamIdentity,
+    /// Scribe child budget used for per-job workspace reservations.
+    memory: crate::resources::ScribeResources,
+    /// Optional local wake-up publisher used after confirmed commits.
+    staging_file_publisher: Option<crate::maintenance::StagingFilePublisher>,
+    /// Validated geometry fixing the hot-object target and member dwell.
+    geometry: geometry::ScribeGeometry,
+    /// Pod-wide registry the staging runtime moves generation authority in.
+    hot_sources: Arc<hot_source::ScribeHotSourceRegistry>,
+}
+
 pub struct ScribeImpl {
     /// Catalog owner used to validate and resolve logical transport frames.
     catalog: Option<Arc<crate::catalog::BifrostCatalog>>,
@@ -265,6 +291,13 @@ pub struct ScribeImpl {
     memory: crate::resources::ScribeResources,
     /// Immutable boot-selected ingest ceilings shared with Gate.
     ingest_limits: crate::gate::limits::IngestLimits,
+    /// Pod-wide record of where every live generation's rows are readable.
+    ///
+    /// One registry is shared by the shard memtables that register generations,
+    /// the staging runtime that moves them to durable runs and then to
+    /// published objects, and the live-tail service that resolves which staged
+    /// members still serve rows.
+    hot_sources: Arc<hot_source::ScribeHotSourceRegistry>,
     /// Runtime pressure and lifecycle thresholds (D83 watermarks and max age).
     ///
     /// Shared by the admission path and the periodic age scanner so the
@@ -1150,6 +1183,49 @@ impl ScribeImpl {
         self
     }
 
+    /// Starts the persistence runtime from the dependencies every worker shares.
+    ///
+    /// Split out of [`Self::build`] because persistence is the one child whose
+    /// context is assembled rather than forwarded: it takes a slice of almost
+    /// every other owner, and inlining that assembly buries the shard and
+    /// lifecycle wiring that follows it.
+    fn start_persistence(
+        config: persistence::ScribePersistenceConfig,
+        dependencies: PersistenceDependencies,
+        runtime: &Handle,
+    ) -> Arc<persistence::PersistenceRuntime> {
+        #[cfg(any(test, feature = "test-support"))]
+        let faults = config.faults.clone();
+        let PersistenceDependencies {
+            operator,
+            wal,
+            persistence_cpu,
+            wal_io,
+            stream,
+            memory,
+            staging_file_publisher,
+            geometry,
+            hot_sources,
+        } = dependencies;
+        persistence::PersistenceRuntime::start(
+            config,
+            persistence::PersistenceRuntimeContext {
+                operator,
+                wal,
+                persistence_cpu,
+                wal_io,
+                actor_stream: stream,
+                memory,
+                staging_file_publisher,
+                geometry,
+                hot_sources,
+                #[cfg(any(test, feature = "test-support"))]
+                faults,
+            },
+            runtime,
+        )
+    }
+
     /// Builds the complete Scribe ownership graph from server-provisioned dependencies.
     ///
     /// This is the single internal construction path used by production and
@@ -1198,22 +1274,20 @@ impl ScribeImpl {
         let control_postgres = persistence_config
             .as_ref()
             .map(|config| Arc::clone(&config.postgres));
+        let hot_sources = Arc::new(hot_source::ScribeHotSourceRegistry::new());
         let persistence = persistence_config.map(|config| {
-            #[cfg(any(test, feature = "test-support"))]
-            let faults = config.faults.clone();
-            persistence::PersistenceRuntime::start(
+            Self::start_persistence(
                 config,
-                persistence::PersistenceRuntimeContext {
+                PersistenceDependencies {
                     operator: Arc::clone(&operator),
                     wal: Arc::clone(&wal),
                     persistence_cpu: persistence_cpu.clone(),
                     wal_io: wal_io.clone(),
-                    actor_stream: stream,
+                    stream,
                     memory: memory.clone(),
                     staging_file_publisher: staging_file_publisher.clone(),
                     geometry,
-                    #[cfg(any(test, feature = "test-support"))]
-                    faults,
+                    hot_sources: Arc::clone(&hot_sources),
                 },
                 &coordination_runtime,
             )
@@ -1230,6 +1304,7 @@ impl ScribeImpl {
                 control_postgres,
                 stream,
                 memory_ownership: memory_ownership.clone(),
+                hot_sources: Arc::clone(&hot_sources),
             },
             &coordination_runtime,
         );
@@ -1247,6 +1322,7 @@ impl ScribeImpl {
             ingest_limits,
             pressure_config,
             memory_ownership,
+            hot_sources,
             persistence_cpu,
             wal_io,
             ingress_cpu,
@@ -2965,6 +3041,7 @@ impl ScribeImpl {
             stream,
             Arc::clone(&self.shards),
             self.memory.clone(),
+            Arc::clone(&self.hot_sources),
         ))
     }
 

@@ -526,6 +526,8 @@ pub(crate) struct PersistenceRuntimeContext {
     pub(crate) staging_file_publisher: Option<StagingFilePublisher>,
     /// Validated geometry fixing the hot-object target and member dwell.
     pub(crate) geometry: crate::scribe::geometry::ScribeGeometry,
+    /// Pod-wide registry the staging runtime moves generation authority in.
+    pub(crate) hot_sources: Arc<crate::scribe::hot_source::ScribeHotSourceRegistry>,
     /// Deterministic fault points used only by test-tier persistence paths.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) faults: PersistenceFaults,
@@ -714,7 +716,8 @@ impl PersistenceRuntime {
         Some(Arc::new(
             crate::scribe::staging_runtime::ScribeStagingRuntime::new(
                 stage, volume, publisher, config,
-            ),
+            )
+            .with_hot_sources(Arc::clone(&context.hot_sources)),
         ))
     }
 
@@ -3034,6 +3037,12 @@ mod tests {
         /// Database retained until worker shutdown completes, and the source of
         /// the tenant connection the fixture registers its control row through.
         database: wyrd_dev_fixtures::pg::PgFixture,
+        /// Authority registry the fixture registers its generation in.
+        ///
+        /// Production registers at memtable freeze; this fixture has no
+        /// memtable, so it performs the same registration itself rather than
+        /// letting staging advance an authority nothing ever held.
+        hot_sources: Arc<crate::scribe::hot_source::ScribeHotSourceRegistry>,
         /// WAL directory retained until worker shutdown completes.
         _wal_root: tempfile::TempDir,
         /// Scratch namespace roots retained until worker shutdown completes.
@@ -3153,6 +3162,7 @@ mod tests {
                 .expect("test role resources");
             let memory = roles.scribe().expect("test Scribe resources");
             let (_, output_scratch) = memory.volume_capabilities().expect("test Scribe volumes");
+            let hot_sources = Arc::new(crate::scribe::hot_source::ScribeHotSourceRegistry::new());
             let runtime = PersistenceRuntime::start(
                 ScribePersistenceConfig::new(Arc::new(database.vala_postgres().clone()), 1, 1)
                     .with_operator_pool(database.operator_pool().clone())
@@ -3170,6 +3180,7 @@ mod tests {
                     memory,
                     staging_file_publisher: None,
                     geometry: crate::scribe::geometry::ScribeGeometry::default(),
+                    hot_sources: Arc::clone(&hot_sources),
                     faults: PersistenceFaults::default(),
                 },
                 &Handle::current(),
@@ -3180,6 +3191,7 @@ mod tests {
                 stream,
                 tenant,
                 database,
+                hot_sources,
                 _wal_root: wal_root,
                 _scratch_root: scratch_root,
             }
@@ -3322,6 +3334,12 @@ mod tests {
             );
             let binding =
                 TenantTableBinding::resolve((self.tenant, table.clone())).expect("binding");
+            self.hot_sources
+                .register_memtable(
+                    &seal_key,
+                    crate::scribe::hot_source::GenerationOrdinal::new(0, 1),
+                )
+                .expect("the fixture generation registers once");
             let batch_id = uuid::Uuid::now_v7();
             self.register_control_row(&table).await;
             let schema = Self::fixture_schema();

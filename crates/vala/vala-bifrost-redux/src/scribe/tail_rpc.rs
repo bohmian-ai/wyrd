@@ -1223,6 +1223,50 @@ fn inclusive_cursor(
     Ok(inclusive)
 }
 
+/// Returns the append identity a fence cursor orders one hot batch by.
+///
+/// An in-memory batch is exactly one append, so its own identity is the answer.
+/// A staged batch is not: its member merged many appends, and the cursor must
+/// name the identity of the last row it actually returns, which the managed
+/// `wyrd_batch_id` column carries per row.
+///
+/// # Errors
+///
+/// Returns [`TailReadError::State`] when a staged batch carries no usable
+/// managed batch identity, because a cursor derived from anything else would
+/// not be resumable.
+fn cursor_batch_id(batch: &HotBatch) -> Result<uuid::Uuid, TailReadError> {
+    match batch.origin {
+        HotBatchOrigin::Append { batch_id } => Ok(uuid::Uuid::from_bytes(batch_id)),
+        HotBatchOrigin::StagedMember { member } => {
+            last_row_batch_id(&batch.rows).ok_or(TailReadError::State {
+                detail: format!(
+                    "staged member {}-{} returned rows without a managed batch identity",
+                    member.shard(),
+                    member.generation()
+                ),
+            })
+        }
+    }
+}
+
+/// Reads the managed batch identity of a batch's last row, when it has one.
+fn last_row_batch_id(rows: &arrow::record_batch::RecordBatch) -> Option<uuid::Uuid> {
+    let row = rows.num_rows().checked_sub(1)?;
+    let index = rows
+        .schema()
+        .index_of(wyrd_spec::vala::managed_columns::WYRD_BATCH_ID)
+        .ok()?;
+    let values = rows
+        .column(index)
+        .as_any()
+        .downcast_ref::<arrow::array::FixedSizeBinaryArray>()?;
+    if arrow::array::Array::is_null(values, row) {
+        return None;
+    }
+    uuid::Uuid::from_slice(values.value(row)).ok()
+}
+
 /// Validates a continuation against the retained writer epoch and exact fence bounds.
 ///
 /// # Errors
@@ -1873,7 +1917,7 @@ impl ScribeTailReader {
             .map(|batch| {
                 Ok(RetainedBatch {
                     lsn: batch.wal_lsn,
-                    batch_id: uuid::Uuid::from_bytes(batch.batch_id),
+                    batch_id: cursor_batch_id(&batch)?,
                     rows: Arc::new(batch.rows),
                 })
             })
@@ -2376,12 +2420,33 @@ impl FetchLiveTailRequest {
 pub struct HotBatch {
     /// Exact partition day owning the batch.
     pub partition_day: TimePartition,
-    /// WAL LSN of the append.
+    /// Highest WAL LSN the batch's rows cover.
     pub wal_lsn: WalLsn,
-    /// Idempotency identity of the append.
-    pub batch_id: [u8; 16],
+    /// Where the rows came from, and under whose identity.
+    pub origin: HotBatchOrigin,
     /// Arrow rows projected to the request's required columns.
     pub rows: arrow::record_batch::RecordBatch,
+}
+
+/// Provenance of one live-tail batch.
+///
+/// A batch is served either from the append that is still in memory or from the
+/// durable staged member that replaced it. Both identities are real durable
+/// facts; neither is derivable from the other, so the batch carries whichever
+/// one actually produced its rows rather than a single field that would have to
+/// be invented for the other case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotBatchOrigin {
+    /// Rows still held by the append that wrote them.
+    Append {
+        /// Idempotency identity of the append.
+        batch_id: [u8; 16],
+    },
+    /// Rows served from a durable staged member.
+    StagedMember {
+        /// Staged member identity holding the rows.
+        member: crate::scribe::assembly::StagedMemberId,
+    },
 }
 
 /// Pod-local live-tail service over the Scribe memtable.
@@ -2393,6 +2458,11 @@ pub struct FetchLiveTailService {
     stream: StreamIdentity,
     /// Direct in-process memtable used only by narrow fixtures.
     memtable: Option<Arc<Memtable>>,
+    /// Pod-wide authority registry naming which staged members serve rows.
+    ///
+    /// `None` for the direct-memtable fixtures, which have no staged boundary:
+    /// their generations never leave memory.
+    hot_sources: Option<Arc<crate::scribe::hot_source::ScribeHotSourceRegistry>>,
     /// Production shard runtime that owns live generation state.
     shards: Option<Arc<ScribeShardRuntime>>,
 }
@@ -2412,6 +2482,7 @@ impl FetchLiveTailService {
         Self {
             resources,
             stream,
+            hot_sources: None,
             memtable: Some(memtable),
             shards: None,
         }
@@ -2424,10 +2495,12 @@ impl FetchLiveTailService {
         stream: StreamIdentity,
         shards: Arc<ScribeShardRuntime>,
         resources: crate::resources::ScribeResources,
+        hot_sources: Arc<crate::scribe::hot_source::ScribeHotSourceRegistry>,
     ) -> Self {
         Self {
             resources,
             stream,
+            hot_sources: Some(hot_sources),
             memtable: None,
             shards: Some(shards),
         }
@@ -2540,8 +2613,11 @@ impl FetchLiveTailService {
             });
         }
         let predicates = request.predicates.clone();
+        let staged = self.staged_batches(&request)?;
         let assembled = if let Some(shards) = &self.shards {
-            shards.snapshot(request).await?
+            let mut assembled = shards.snapshot(request).await?;
+            assembled.extend(staged);
+            assembled
         } else {
             self.memtable
                 .as_ref()
@@ -2563,12 +2639,58 @@ impl FetchLiveTailService {
                 .map(|readable| HotBatch {
                     partition_day: readable.partition_day,
                     wal_lsn: readable.meta.wal_lsn_max,
-                    batch_id: readable.meta.batch_id,
+                    origin: HotBatchOrigin::Append {
+                        batch_id: readable.meta.batch_id,
+                    },
                     rows: readable.batch,
                 })
                 .collect()
         };
         Self::retain_signed_rows(assembled, &predicates)
+    }
+
+    /// Returns the rows this request's staged members still serve.
+    ///
+    /// A generation whose Arrow was released after staging is invisible to the
+    /// shard snapshot, so without this a live-tail reader would see a gap
+    /// between staging and publication. The read is bounded by the same
+    /// projection, count, and retained-byte limits the memtable path obeys, and
+    /// a member whose complete WAL range the pinned cut already owns is skipped
+    /// because the published object serves those rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the registry is unavailable or a
+    /// staged run cannot be opened, projected, or decoded.
+    fn staged_batches(&self, request: &FetchLiveTailRequest) -> Result<Vec<HotBatch>, ScribeError> {
+        let Some(hot_sources) = &self.hot_sources else {
+            return Ok(Vec::new());
+        };
+        let sources = hot_sources
+            .staged_sources(
+                request.binding.tenant,
+                &request.binding.table_ref,
+                request.start_partition,
+                request.end_partition,
+            )
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("resolve the staged members serving a live-tail read: {error}"),
+            })?;
+        if sources.is_empty() {
+            return Ok(Vec::new());
+        }
+        crate::scribe::staged_tail::StagedTailReader::default().read(
+            &sources,
+            &crate::scribe::staged_tail::StagedTailRead {
+                required_columns: &request.required_columns,
+                limits: crate::scribe::memtable::ReadableBatchLimits {
+                    max_batches: request.max_batches,
+                    max_retained_bytes: request.max_retained_bytes,
+                },
+                persisted_cursor: request.after_lsn,
+                persisted_ranges: &request.persisted_lsn_ranges,
+            },
+        )
     }
 
     /// Applies the assignment's signed predicate conjunction to an assembled
@@ -2594,7 +2716,7 @@ impl FetchLiveTailService {
             let HotBatch {
                 partition_day,
                 wal_lsn,
-                batch_id,
+                origin,
                 rows,
             } = batch;
             let filter =
@@ -2611,7 +2733,7 @@ impl FetchLiveTailService {
                 retained.push(HotBatch {
                     partition_day,
                     wal_lsn,
-                    batch_id,
+                    origin,
                     rows,
                 });
             }

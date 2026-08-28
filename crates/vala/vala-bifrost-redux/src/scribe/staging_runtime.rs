@@ -85,6 +85,12 @@ pub struct ScribeStagingRuntime {
     contexts: Mutex<HashMap<ScribeAssemblyKey, ClaimContext>>,
     /// Approximate encoded size at which one published object closes.
     target_object_bytes: u64,
+    /// Pod-wide authority registry, when this runtime belongs to a pod.
+    ///
+    /// Staging and publication are the two moments a generation's rows change
+    /// hands, so this owner is what moves the authority forward. A fixture
+    /// runtime built without a pod tracks no authority and none is asked of it.
+    hot_sources: Option<Arc<crate::scribe::hot_source::ScribeHotSourceRegistry>>,
 }
 
 impl ScribeStagingRuntime {
@@ -104,7 +110,22 @@ impl ScribeStagingRuntime {
             assembly: Mutex::new(StagingAssembler::new(config)),
             contexts: Mutex::new(HashMap::new()),
             target_object_bytes: config.target_file_size_bytes(),
+            hot_sources: None,
         }
+    }
+
+    /// Binds this runtime to its pod's hot-source authority registry.
+    ///
+    /// Production wiring calls this before the runtime stages anything, so
+    /// every member it makes durable hands its generation's authority over from
+    /// the memtable in the same step that makes the rows survivable.
+    #[must_use]
+    pub fn with_hot_sources(
+        mut self,
+        hot_sources: Arc<crate::scribe::hot_source::ScribeHotSourceRegistry>,
+    ) -> Self {
+        self.hot_sources = Some(hot_sources);
+        self
     }
 
     /// Encodes one frozen bucket into durable, preflighted local runs.
@@ -151,6 +172,18 @@ impl ScribeStagingRuntime {
         ready_at: DateTime<Utc>,
     ) -> Result<(), ScribeError> {
         let key = staged.key().clone();
+        let member = staged.member();
+        let runs = staged
+            .runs()
+            .iter()
+            .map(|run| {
+                self.stage
+                    .member_directory(&key, member)
+                    .join(run.file_name())
+            })
+            .collect();
+        let bytes = staged.staged_bytes();
+        let wal = staged.wal();
         let ready = self.stager.publish_ready(staged, ready_at).await?;
         self.assembly
             .lock()
@@ -158,6 +191,57 @@ impl ScribeStagingRuntime {
             .register_ready(&key, ready)
             .map_err(|error| ScribeError::Internal {
                 detail: format!("register the staged member as ready: {error}"),
+            })?;
+        self.advance_authority(
+            &key,
+            member,
+            crate::scribe::hot_source::HotAuthority::StagedRun {
+                member,
+                runs,
+                bytes,
+                wal: (
+                    crate::scribe::wal::WalLsn::new(wal.min),
+                    crate::scribe::wal::WalLsn::new(wal.max),
+                ),
+            },
+        )
+    }
+
+    /// Moves one member's generation to a later authority in the pod registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the registry refuses the move,
+    /// which means the generation is unknown to it or the move is not strictly
+    /// forward — either way a reader could be sent to rows that are not there.
+    fn advance_authority(
+        &self,
+        key: &ScribeAssemblyKey,
+        member: crate::scribe::assembly::StagedMemberId,
+        authority: crate::scribe::hot_source::HotAuthority,
+    ) -> Result<(), ScribeError> {
+        let Some(hot_sources) = &self.hot_sources else {
+            return Ok(());
+        };
+        hot_sources
+            .advance(
+                &crate::scribe::seal_key::SealKey::new(
+                    key.tenant(),
+                    key.table().clone(),
+                    key.partition(),
+                ),
+                crate::scribe::hot_source::GenerationOrdinal::new(
+                    member.shard(),
+                    member.generation(),
+                ),
+                authority,
+            )
+            .map_err(|error| ScribeError::Internal {
+                detail: format!(
+                    "move the authority of staged member {}-{} forward: {error}",
+                    member.shard(),
+                    member.generation()
+                ),
             })
     }
 
@@ -262,6 +346,7 @@ impl ScribeStagingRuntime {
                 .map_err(|error| ScribeError::Internal {
                     detail: format!("restore a recovered staged key: {error}"),
                 })?;
+            self.restore_authorities(&key, &members)?;
             self.contexts
                 .lock()
                 .map_err(|_| poisoned("staged claim context registry"))?
@@ -269,6 +354,62 @@ impl ScribeStagingRuntime {
             self.stager.readmit_staged_bytes(staged_bytes)?;
         }
         Ok(restored)
+    }
+
+    /// Installs the durable authority of every member recovery kept.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the registry refuses a restored
+    /// authority, which means two durable records claim the same generation.
+    fn restore_authorities(
+        &self,
+        key: &ScribeAssemblyKey,
+        members: &[crate::scribe::hot_stage::StagedMember],
+    ) -> Result<(), ScribeError> {
+        let Some(hot_sources) = &self.hot_sources else {
+            return Ok(());
+        };
+        let seal_key = crate::scribe::seal_key::SealKey::new(
+            key.tenant(),
+            key.table().clone(),
+            key.partition(),
+        );
+        for member in members {
+            let Some(recovered) = member.recovered().map_err(|error| ScribeError::Internal {
+                detail: format!("project a recovered staged member: {error}"),
+            })?
+            else {
+                continue;
+            };
+            let id = match &recovered {
+                crate::scribe::assembly::RecoveredMember::Ready(ready) => ready.id(),
+                crate::scribe::assembly::RecoveredMember::Claimed { member, .. } => member.id(),
+            };
+            let wal = member.record().wal_range();
+            hot_sources
+                .restore_durable(
+                    &seal_key,
+                    crate::scribe::hot_source::GenerationOrdinal::new(id.shard(), id.generation()),
+                    crate::scribe::hot_source::HotAuthority::StagedRun {
+                        member: id,
+                        runs: member.run_paths(),
+                        bytes: member.record().encoded_bytes(),
+                        wal: (
+                            crate::scribe::wal::WalLsn::new(wal.min),
+                            crate::scribe::wal::WalLsn::new(wal.max),
+                        ),
+                    },
+                )
+                .map_err(|error| ScribeError::Internal {
+                    detail: format!(
+                        "restore the authority of staged member {}-{}: {error}",
+                        id.shard(),
+                        id.generation()
+                    ),
+                })?;
+        }
+        Ok(())
     }
 
     /// Reconstructs one recovered key's encoding context, or fails closed.
@@ -416,6 +557,19 @@ impl ScribeStagingRuntime {
                 actor_stream,
             })
             .await?;
+        for member in claim.members() {
+            self.advance_authority(
+                claim.key(),
+                member.id(),
+                crate::scribe::hot_source::HotAuthority::Published {
+                    object_key: published
+                        .object_identities
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| object_base.clone()),
+                },
+            )?;
+        }
         self.settle(claim.id(), published.released_bytes)?;
         Ok(published)
     }

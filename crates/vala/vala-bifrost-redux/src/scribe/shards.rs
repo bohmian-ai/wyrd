@@ -905,6 +905,8 @@ pub(crate) struct ScribeShardStartConfig {
     pub(crate) stream: StreamIdentity,
     /// Shared active/immutable memory ledger.
     pub(crate) memory_ownership: ScribeOwnership,
+    /// Pod-wide registry every owner's memtable registers its generations in.
+    pub(crate) hot_sources: Arc<crate::scribe::hot_source::ScribeHotSourceRegistry>,
 }
 
 impl ScribeShardRuntime {
@@ -1006,6 +1008,7 @@ impl ScribeShardRuntime {
             control_postgres,
             stream,
             memory_ownership,
+            hot_sources,
         } = config;
         let wal_segment_bytes = geometry.wal_segment_bytes();
         let generation_rotation_bytes = geometry.shard_generation_rotation_usize();
@@ -1052,7 +1055,8 @@ impl ScribeShardRuntime {
                 retained_generations: HashMap::new(),
                 retained_commit_ambiguity: None,
                 admission: admission.clone(),
-                memtable: Memtable::new_with_config(generation_rotation_bytes, seal_max_age),
+                memtable: Memtable::new_with_config(generation_rotation_bytes, seal_max_age)
+                    .with_hot_sources(id, Arc::clone(&hot_sources)),
                 persistence_cpu: persistence_cpu.clone(),
                 wal_io: wal_io.clone(),
                 persistence: persistence.clone(),
@@ -1737,7 +1741,9 @@ impl ShardOwner {
             .map(|batch| HotBatch {
                 partition_day: batch.partition_day,
                 wal_lsn: batch.meta.wal_lsn_max,
-                batch_id: batch.meta.batch_id,
+                origin: crate::scribe::tail_rpc::HotBatchOrigin::Append {
+                    batch_id: batch.meta.batch_id,
+                },
                 rows: batch.batch,
             })
             .collect())

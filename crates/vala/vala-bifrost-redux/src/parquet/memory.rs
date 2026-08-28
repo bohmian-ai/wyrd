@@ -174,6 +174,11 @@ impl BifrostLeafWidthProfile {
 impl BifrostParquetMemoryEnvelope {
     /// Constructs the exact nine footer fields for one admitted output batch.
     ///
+    /// Kept as the single-batch entry point; it admits the batch through the
+    /// logical sizer and then accumulates it, so a caller that writes one batch
+    /// and a caller that rolls many row groups produce the same footer for the
+    /// same rows.
+    ///
     /// # Errors
     /// Returns a data-layout refusal when the batch contains no rows, exceeds
     /// the 64-leaf contract, uses an unsupported Arrow layout, or overflows a
@@ -185,87 +190,10 @@ impl BifrostParquetMemoryEnvelope {
         if batch.num_rows() == 0 || object_identity.is_empty() {
             return Err("writer-v2 metadata requires rows and an object identity".to_owned());
         }
-        let leaf_paths = normalized_leaf_paths(batch.schema().as_ref())?;
-        let slices = BifrostArrowLogicalSizer::slice(batch)?;
-        let max_logical_row_bytes = slices
-            .iter()
-            .flat_map(|slice| slice.offset..slice.offset + slice.len)
-            .map(|row| {
-                batch
-                    .schema()
-                    .fields()
-                    .iter()
-                    .zip(batch.columns())
-                    .try_fold(0_u64, |sum, (field, column)| {
-                        sum.checked_add(
-                            field_row_leaf_bytes(field, column.as_ref(), row)?
-                                .into_iter()
-                                .try_fold(0_u64, |leaf_sum, value| {
-                                    leaf_sum
-                                        .checked_add(value)
-                                        .ok_or_else(|| "canonical row size overflows".to_owned())
-                                })?,
-                        )
-                        .ok_or_else(|| "canonical row size overflows".to_owned())
-                    })
-            })
-            .collect::<Result<Vec<_>, String>>()?
-            .into_iter()
-            .max()
-            .ok_or_else(|| "writer-v2 metadata requires a positive row".to_owned())?;
-        let mut leaf_maxima = vec![0_u64; leaf_paths.len()];
-        for row in 0..batch.num_rows() {
-            let mut offset = 0;
-            for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
-                for value in field_row_leaf_bytes(field, column.as_ref(), row)? {
-                    let slot = leaf_maxima.get_mut(offset).ok_or_else(|| {
-                        "writer-v2 leaf profile exceeded normalized schema order".to_owned()
-                    })?;
-                    *slot = (*slot).max(value);
-                    offset += 1;
-                }
-            }
-            if offset != leaf_maxima.len() {
-                return Err("writer-v2 leaf profile did not cover normalized schema".to_owned());
-            }
-        }
-        for width in &mut leaf_maxima {
-            *width = (*width).max(1);
-        }
-        let leaf_width_profile = format!(
-            "v1:{}",
-            leaf_maxima
-                .iter()
-                .map(u64::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        let schema = hex::encode(SchemaFingerprint::from_arrow_schema(batch.schema().as_ref()).0);
-        Ok([
-            (KEY_RECIPE, WRITER_RECIPE.to_owned()),
-            (
-                KEY_ENVELOPE_VERSION,
-                PARQUET_MEMORY_ENVELOPE_VERSION.to_owned(),
-            ),
-            (
-                KEY_ROW_GROUP_LOGICAL,
-                MAX_LOGICAL_ROW_GROUP_BYTES.to_string(),
-            ),
-            (
-                KEY_DECODE_WORKSPACE,
-                ROW_GROUP_DECODE_WORKSPACE_BYTES.to_string(),
-            ),
-            (KEY_SCHEMA, schema),
-            (KEY_OBJECT, object_identity.to_owned()),
-            (KEY_MAX_ROW, max_logical_row_bytes.to_string()),
-            (KEY_LEAF_PROFILE, leaf_width_profile),
-        ]
-        .into_iter()
-        .map(|(key, value)| KeyValue {
-            key: key.to_owned(),
-            value: Some(value),
-        })
-        .collect())
+        BifrostArrowLogicalSizer::slice(batch)?;
+        let mut accumulator = BifrostFooterAccumulator::new(batch.schema().as_ref())?;
+        accumulator.observe(batch)?;
+        accumulator.finish(object_identity)
     }
 
     /// Validates and decodes the exact writer-v2 metadata contract.
@@ -357,6 +285,141 @@ impl BifrostParquetMemoryEnvelope {
 }
 
 /// Sole canonical logical-byte measurer and deterministic row slicer.
+/// Running footer evidence for one physical object written as many row groups.
+///
+/// An object is closed when its *encoded* bytes reach the staging target, which
+/// is not known until the last row group is flushed. The two row-dependent
+/// footer fields — the largest standalone row and the per-leaf maxima — must
+/// therefore be accumulated while the rows stream past, because the alternative
+/// is concatenating every written batch again at close time, which would put a
+/// whole target-sized object back into Arrow memory that the rolling writer
+/// exists to avoid.
+///
+/// The accumulator observes rows only. Admitting them — the logical row-group
+/// sizing contract — belongs to the caller that decided what to write.
+#[derive(Debug)]
+pub struct BifrostFooterAccumulator {
+    /// Fingerprint every observed batch must carry.
+    schema_fingerprint: SchemaFingerprint,
+    /// Largest canonical standalone row seen so far.
+    max_logical_row_bytes: u64,
+    /// Per-normalized-leaf maxima in schema order.
+    leaf_maxima: Vec<u64>,
+    /// Rows observed so far.
+    rows: u64,
+}
+
+impl BifrostFooterAccumulator {
+    /// Starts accumulating footer evidence for one object's schema.
+    ///
+    /// # Errors
+    /// Returns a data-layout refusal when the schema exceeds the 64-leaf
+    /// contract or uses an unsupported Arrow layout.
+    pub fn new(schema: &Schema) -> Result<Self, String> {
+        let leaf_paths = normalized_leaf_paths(schema)?;
+        Ok(Self {
+            schema_fingerprint: SchemaFingerprint::from_arrow_schema(schema),
+            max_logical_row_bytes: 0,
+            leaf_maxima: vec![0_u64; leaf_paths.len()],
+            rows: 0,
+        })
+    }
+
+    /// Folds one written batch into the running evidence.
+    ///
+    /// Every row is measured once, in one pass, so the cost is the same whether
+    /// the object is written as one row group or as sixteen.
+    ///
+    /// # Errors
+    /// Returns a data-layout refusal when the batch carries a different schema
+    /// than the object was opened with, uses an unsupported Arrow layout, or
+    /// overflows a canonical standalone-row calculation.
+    pub fn observe(&mut self, batch: &RecordBatch) -> Result<(), String> {
+        if SchemaFingerprint::from_arrow_schema(batch.schema().as_ref()) != self.schema_fingerprint
+        {
+            return Err("writer-v2 footer accumulator observed a foreign schema".to_owned());
+        }
+        for row in 0..batch.num_rows() {
+            let mut row_bytes = 0_u64;
+            let mut offset = 0;
+            for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+                for value in field_row_leaf_bytes(field, column.as_ref(), row)? {
+                    let slot = self.leaf_maxima.get_mut(offset).ok_or_else(|| {
+                        "writer-v2 leaf profile exceeded normalized schema order".to_owned()
+                    })?;
+                    *slot = (*slot).max(value);
+                    row_bytes = row_bytes
+                        .checked_add(value)
+                        .ok_or_else(|| "canonical row size overflows".to_owned())?;
+                    offset += 1;
+                }
+            }
+            if offset != self.leaf_maxima.len() {
+                return Err("writer-v2 leaf profile did not cover normalized schema".to_owned());
+            }
+            self.max_logical_row_bytes = self.max_logical_row_bytes.max(row_bytes);
+            self.rows = self
+                .rows
+                .checked_add(1)
+                .ok_or_else(|| "writer-v2 footer row count overflows".to_owned())?;
+        }
+        Ok(())
+    }
+
+    /// Returns the rows observed so far.
+    #[must_use]
+    pub const fn rows(&self) -> u64 {
+        self.rows
+    }
+
+    /// Emits the exact nine footer fields for the object being closed.
+    ///
+    /// # Errors
+    /// Returns a data-layout refusal when no row was observed or the object
+    /// identity is empty; neither can describe a publishable artifact.
+    pub fn finish(mut self, object_identity: &str) -> Result<Vec<KeyValue>, String> {
+        if self.rows == 0 || object_identity.is_empty() {
+            return Err("writer-v2 metadata requires rows and an object identity".to_owned());
+        }
+        for width in &mut self.leaf_maxima {
+            *width = (*width).max(1);
+        }
+        let leaf_width_profile = format!(
+            "v1:{}",
+            self.leaf_maxima
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        Ok([
+            (KEY_RECIPE, WRITER_RECIPE.to_owned()),
+            (
+                KEY_ENVELOPE_VERSION,
+                PARQUET_MEMORY_ENVELOPE_VERSION.to_owned(),
+            ),
+            (
+                KEY_ROW_GROUP_LOGICAL,
+                MAX_LOGICAL_ROW_GROUP_BYTES.to_string(),
+            ),
+            (
+                KEY_DECODE_WORKSPACE,
+                ROW_GROUP_DECODE_WORKSPACE_BYTES.to_string(),
+            ),
+            (KEY_SCHEMA, hex::encode(self.schema_fingerprint.0)),
+            (KEY_OBJECT, object_identity.to_owned()),
+            (KEY_MAX_ROW, self.max_logical_row_bytes.to_string()),
+            (KEY_LEAF_PROFILE, leaf_width_profile),
+        ]
+        .into_iter()
+        .map(|(key, value)| KeyValue {
+            key: key.to_owned(),
+            value: Some(value),
+        })
+        .collect())
+    }
+}
+
 pub struct BifrostArrowLogicalSizer;
 
 impl BifrostArrowLogicalSizer {
@@ -1917,6 +1980,76 @@ mod tests {
             profile
                 .projected_bound(&reordered, &BifrostLeafSelection::All)
                 .is_err()
+        );
+    }
+
+    /// Accumulating row groups produces the footer a single batch would.
+    ///
+    /// This equivalence is what lets the writer roll a 512 MiB object across
+    /// many row groups: the footer no longer requires the whole object back in
+    /// Arrow memory to compute its row-dependent fields.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture batch or either footer projection is refused.
+    #[test]
+    fn accumulated_row_groups_produce_the_single_batch_footer() {
+        let batch = batch(vec![
+            "a".to_owned(),
+            "much-wider-payload".to_owned(),
+            "c".to_owned(),
+            "dd".to_owned(),
+        ]);
+        let object = "s3://bucket/table/day=2026-08-14/part-00000.parquet";
+        let whole = BifrostParquetMemoryEnvelope::metadata_for_batch(&batch, object)
+            .expect("canonical metadata");
+
+        let mut accumulator = BifrostFooterAccumulator::new(batch.schema().as_ref())
+            .expect("the fixture schema is representable");
+        for (offset, len) in [(0, 1), (1, 2), (3, 1)] {
+            accumulator
+                .observe(&batch.slice(offset, len))
+                .expect("each written row group is observed");
+        }
+        assert_eq!(accumulator.rows(), 4);
+        assert_eq!(
+            accumulator.finish(object).expect("canonical metadata"),
+            whole
+        );
+    }
+
+    /// The accumulator refuses rows from another schema and an empty object.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture batches are refused.
+    #[test]
+    fn the_footer_accumulator_refuses_foreign_rows_and_empty_objects() {
+        let batch = batch(vec!["a".to_owned()]);
+        let mut accumulator = BifrostFooterAccumulator::new(batch.schema().as_ref())
+            .expect("the fixture schema is representable");
+        let foreign = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from_iter_values(0..1))],
+        )
+        .expect("the fixture batch is structurally valid");
+        assert!(
+            accumulator.observe(&foreign).is_err(),
+            "a foreign schema would produce a leaf profile the footer cannot describe"
+        );
+        assert!(
+            BifrostFooterAccumulator::new(batch.schema().as_ref())
+                .expect("the fixture schema is representable")
+                .finish("object")
+                .is_err(),
+            "an object with no observed row is not publishable"
+        );
+        accumulator
+            .observe(&batch)
+            .expect("a matching batch is observed");
+        assert!(
+            accumulator.finish("").is_err(),
+            "an empty object identity is not publishable"
         );
     }
 }

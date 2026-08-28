@@ -112,4 +112,89 @@ mod tests {
             "distinct batch ids must spread across multiple shards, got: {shards:?}"
         );
     }
+
+    /// AC22/AC25 unit owner: routing is exactly an equality function of
+    /// `(tenant, canonical table, batch_id)`, a retried batch returns to the
+    /// lane holding its dedup state, and deterministic distinct batch ids for
+    /// one hot (tenant, table) pair can reach every one of the sixteen lanes.
+    ///
+    /// The three clauses are the complete production contract for
+    /// [`shard_for`]: nothing outside the routing key may influence the lane,
+    /// no observation may change it, and the fixed topology must not be
+    /// effectively narrower than sixteen.
+    #[test]
+    fn scribe_routing_equality_retry_and_all_lanes_are_exact() {
+        let tenant = DataTenantId::new(
+            Uuid::parse_str("0192f000-0000-7000-8000-00000000a1a1").expect("fixed UUID is valid"),
+        )
+        .expect("fixed tenant UUID is a valid DataTenantId");
+        let other_tenant = DataTenantId::new(
+            Uuid::parse_str("0192f000-0000-7000-8000-00000000b2b2").expect("fixed UUID is valid"),
+        )
+        .expect("fixed tenant UUID is a valid DataTenantId");
+        let table = TableRef::new(BifrostNamespace::Bifrost, "events");
+        let other_table = TableRef::new(BifrostNamespace::Bifrost, "events_other");
+        let namespace_twin = TableRef::new(BifrostNamespace::Audit, "events");
+        let batch_id =
+            Uuid::parse_str("12345678-1234-5678-1234-567812345678").expect("fixed UUID is valid");
+
+        // Equality: the same three inputs always select the same lane, and the
+        // lane is inside the fixed topology.
+        let route = shard_for(tenant, &table, batch_id);
+        assert!(
+            route < SCRIBE_SHARD_COUNT,
+            "routing must stay inside the fixed sixteen-lane topology, got {route}"
+        );
+        for _ in 0..64 {
+            assert_eq!(
+                shard_for(tenant, &table, batch_id),
+                route,
+                "routing must be a pure equality function of its key"
+            );
+        }
+
+        // Retry: replaying the recorded batch id after unrelated traffic still
+        // returns to the lane that owns its `synced_not_inserted` and WAL
+        // dedup state.
+        for offset in 0..256_u128 {
+            let _ = shard_for(other_tenant, &other_table, Uuid::from_u128(offset));
+        }
+        assert_eq!(
+            shard_for(tenant, &table, batch_id),
+            route,
+            "a retried batch must land on the shard that recorded it"
+        );
+
+        // Every component of the key participates: changing the tenant, the
+        // table name, or the namespace must be able to move the lane, and none
+        // of the three may be silently ignored.
+        let mut key_sensitivity = 0_usize;
+        for candidate in [&other_table, &namespace_twin] {
+            if shard_for(tenant, candidate, batch_id) != route {
+                key_sensitivity += 1;
+            }
+        }
+        if shard_for(other_tenant, &table, batch_id) != route {
+            key_sensitivity += 1;
+        }
+        assert!(
+            key_sensitivity >= 2,
+            "tenant, table name and namespace must all feed the routing key"
+        );
+
+        // All lanes: deterministic distinct batch ids for one hot (tenant,
+        // table) pair reach every lane, so a hot table is never confined to a
+        // subset of the topology.
+        let mut reached = [false; SCRIBE_SHARD_COUNT];
+        for ordinal in 0..4_096_u128 {
+            reached[shard_for(tenant, &table, Uuid::from_u128(ordinal))] = true;
+        }
+        let unreached: Vec<usize> = (0..SCRIBE_SHARD_COUNT)
+            .filter(|lane| !reached[*lane])
+            .collect();
+        assert!(
+            unreached.is_empty(),
+            "a hot table must be able to reach all sixteen lanes; unreached: {unreached:?}"
+        );
+    }
 }

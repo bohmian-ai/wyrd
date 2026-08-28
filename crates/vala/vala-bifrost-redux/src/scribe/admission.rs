@@ -980,6 +980,138 @@ mod tests {
         assert_eq!(admission.snapshot().bytes, 0);
     }
 
+    /// AC22/AC26 unit owner: pod resource admission is tenant-fair at the
+    /// production entry point.
+    ///
+    /// Drives [`AdmissionController::try_reserve_for_cell`] — the route every
+    /// production append takes — rather than the ledger directly, so the proof
+    /// covers the composition of the pod-global counters with the per-cell
+    /// charge. A greedy tenant is stopped at its own dynamically recomputed
+    /// share while a quiet neighbour is active, the neighbour is unaffected by
+    /// that saturation, the refusal leaves no ownership behind, and terminal
+    /// release balances every level back to zero.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a greedy tenant reaches past its fair share, when a quiet
+    /// tenant is refused capacity its share covers, when a refusal moves any
+    /// counter, or when a fully released pod still reports ownership.
+    #[test]
+    fn scribe_resource_admission_is_tenant_fair() {
+        let admission = AdmissionController::with_config(AdmissionConfig::default())
+            .expect("the default geometry fits the default budget");
+        let ledger = admission.contention();
+        let pod_bytes = default_pod_capacity().admission_bytes;
+        let chunk = pod_bytes / 16;
+        assert!(chunk > 0, "the fixture pod must admit a measurable chunk");
+
+        // The quiet tenant becomes an active owner with one small request, so
+        // the greedy tenant's share is recomputed over two live owners.
+        let quiet = cell_key(21, "quiet");
+        let greedy = cell_key(22, "greedy");
+        let quiet_first = admission
+            .try_reserve_for_cell(&quiet, "wyrd.quiet", chunk)
+            .expect("the first owner is admitted on an idle pod");
+
+        // The greedy tenant borrows genuinely idle capacity work-conservingly.
+        // Nothing here is unfair yet: the quiet tenant is holding far less than
+        // its share and has asked for nothing more.
+        let mut held = Vec::new();
+        let mut greedy_bytes = 0_usize;
+        while greedy_bytes + chunk <= pod_bytes - chunk * 3 {
+            held.push(
+                admission
+                    .try_reserve_for_cell(&greedy, "wyrd.greedy", chunk)
+                    .expect("idle capacity is lent to the only tenant asking for it"),
+            );
+            greedy_bytes += chunk;
+        }
+        assert!(
+            greedy_bytes > pod_bytes / 2,
+            "a lone borrower must reach past an equal split of idle capacity"
+        );
+
+        // The quiet tenant now contends for more than the pod has left. The
+        // refusal is caller-visible backpressure and registers its bounded
+        // demand; it must not fabricate ownership.
+        let contended = pod_bytes - greedy_bytes;
+        let refusal = admission
+            .try_reserve_for_cell(&quiet, "wyrd.quiet", contended)
+            .expect_err("a request larger than the free pod is refused");
+        assert!(
+            matches!(refusal, ScribeError::IngestBusy { .. }),
+            "a fair-share stop is caller-visible backpressure, got {refusal:?}"
+        );
+        assert_eq!(
+            ledger
+                .usage(&quiet, ContentionCategory::AdmissionBytes)
+                .expect("the quiet cell stays active"),
+            chunk,
+            "a refusal must leave the contender's ownership exactly as it was"
+        );
+        assert_eq!(
+            ledger
+                .usage(&greedy, ContentionCategory::AdmissionBytes)
+                .expect("the greedy cell is active"),
+            greedy_bytes,
+            "a peer's refusal must never revoke acknowledged ownership"
+        );
+
+        // With live contention recorded, the over-share incumbent is frozen out
+        // of further external acquisition even though the pod is not full.
+        let frozen = admission
+            .try_reserve_for_cell(&greedy, "wyrd.greedy", chunk)
+            .expect_err("an over-share incumbent may not grow while a peer waits");
+        assert!(
+            matches!(frozen, ScribeError::IngestBusy { .. }),
+            "incumbent throttling is backpressure, got {frozen:?}"
+        );
+
+        // Released capacity reaches the waiting contender rather than the
+        // incumbent that released it.
+        let returned = held.pop().expect("the incumbent holds reservations");
+        returned.release().expect("release settles the greedy cell");
+        let quiet_second = admission
+            .try_reserve_for_cell(&quiet, "wyrd.quiet", chunk)
+            .expect("the next released capacity is offered to the contender");
+
+        // Terminal release balances every level: cells retire, the tenant map
+        // empties, and both pod-global counters return to zero.
+        for reservation in held {
+            reservation
+                .release()
+                .expect("release settles the greedy cell");
+        }
+        quiet_first
+            .release()
+            .expect("release settles the quiet cell");
+        quiet_second
+            .release()
+            .expect("release settles the quiet cell");
+        for owner in [&quiet, &greedy] {
+            assert_eq!(
+                ledger.usage(owner, ContentionCategory::AdmissionBytes),
+                Err(ContentionRefusal::Inactive),
+                "a drained cell must be retired, not left occupying a slot"
+            );
+        }
+        assert_eq!(ledger.active_cells().expect("ledger readable"), 0);
+        assert_eq!(ledger.active_tenants().expect("ledger readable"), 0);
+        for category in [
+            ContentionCategory::AdmissionItems,
+            ContentionCategory::AdmissionBytes,
+        ] {
+            assert_eq!(
+                ledger.committed(category).expect("pod totals"),
+                0,
+                "{} must drain completely",
+                category.label()
+            );
+        }
+        assert_eq!(admission.snapshot().items, 0);
+        assert_eq!(admission.snapshot().bytes, 0);
+    }
+
     /// A refused shrink leaves the reservation, cell, and pod counters unmoved.
     ///
     /// Reproduces SCRIBE-CAP-04. The shrink path used to lower the pod-global

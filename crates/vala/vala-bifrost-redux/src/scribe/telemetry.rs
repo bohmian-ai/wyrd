@@ -1901,6 +1901,114 @@ mod contention_registry_tests {
         );
     }
 
+    /// AC22/AC21 unit owner: the Scribe observation registry is closed and its
+    /// transitions balance over a complete production lifecycle.
+    ///
+    /// Closed means an operator's label space cannot widen at runtime: every
+    /// entry occupies a distinct index in the counter space, publishes a
+    /// non-empty stage and decision, no two entries collapse onto the same
+    /// stage/decision series, and severity comes from a fixed three-value
+    /// vocabulary. Balanced means the counters reconcile rather than drift:
+    /// exactly one entry opens an active transition and one closes it, and a
+    /// pod driven through activation, charge, release, and terminal settlement
+    /// publishes zero active transitions and zero live vectors at the end.
+    ///
+    /// The lifecycle half runs against the real ledger rather than direct
+    /// emissions, because the property that matters is that the production
+    /// paths emit in balanced pairs, not that the counters can be balanced.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an entry duplicates an index or a label pair, publishes an
+    /// unknown severity, when the opener/closer sets are not singletons, or
+    /// when a drained ledger still reports live transitions or vectors.
+    #[test]
+    fn scribe_observation_registry_is_closed_and_balanced() {
+        // Closed: index space, labels, and severity vocabulary.
+        let mut claimed = [false; ContentionEffect::ALL.len()];
+        let mut pairs: Vec<(&'static str, &'static str)> = Vec::new();
+        for effect in ContentionEffect::ALL {
+            let index = effect.index();
+            assert!(
+                index < ContentionEffect::ALL.len(),
+                "{effect:?} indexes past the registry"
+            );
+            assert!(!claimed[index], "{effect:?} duplicates index {index}");
+            claimed[index] = true;
+            assert!(!effect.stage().is_empty(), "{effect:?} has no stage");
+            assert!(!effect.decision().is_empty(), "{effect:?} has no decision");
+            assert!(
+                matches!(effect.severity(), "info" | "warn" | "error"),
+                "{effect:?} publishes a severity outside the closed vocabulary"
+            );
+            assert!(
+                !pairs.contains(&(effect.stage(), effect.decision())),
+                "{effect:?} collapses onto an existing operator series"
+            );
+            pairs.push((effect.stage(), effect.decision()));
+        }
+        assert!(
+            claimed.iter().all(|slot| *slot),
+            "an index in the registry's counter space has no entry"
+        );
+
+        // Balanced: exactly one opener and one closer define the reconciliation.
+        assert_eq!(
+            ContentionEffect::ALL
+                .into_iter()
+                .filter(|effect| effect.is_start())
+                .collect::<Vec<_>>(),
+            vec![ContentionEffect::AdmissionAttempted]
+        );
+        assert_eq!(
+            ContentionEffect::ALL
+                .into_iter()
+                .filter(|effect| effect.is_terminal())
+                .collect::<Vec<_>>(),
+            vec![ContentionEffect::AdmissionSettled]
+        );
+
+        // Balanced over a real lifecycle: a pod driven from activation through
+        // terminal settlement publishes no live transition and no live vector.
+        let admission = crate::scribe::admission::AdmissionController::with_config(
+            crate::scribe::admission::AdmissionConfig::default(),
+        )
+        .expect("the default geometry fits the default budget");
+        let ledger = admission.contention();
+        let mut key_bytes = [31_u8; 16];
+        key_bytes[6] = 0x70 | (key_bytes[6] & 0x0f);
+        key_bytes[8] = 0x80 | (key_bytes[8] & 0x3f);
+        let owner = crate::scribe::contention::ContentionKey::new(
+            wyrd_spec::ids::DataTenantId::new(uuid::Uuid::from_bytes(key_bytes))
+                .expect("UUIDv7 test tenant"),
+            crate::catalog::TableRef::new(
+                crate::namespaces::BifrostNamespace::Datasets,
+                "observed",
+            ),
+        );
+        for _ in 0..8 {
+            admission
+                .try_reserve_for_cell(&owner, "wyrd.observed", 4_096)
+                .expect("the fixture pod admits a small request")
+                .release()
+                .expect("terminal release settles the cell");
+        }
+        let totals = ledger.telemetry_totals();
+        assert_eq!(totals.starts(), 8, "every admitted request opens once");
+        assert_eq!(totals.terminals(), 8, "every opened transition closes once");
+        assert_eq!(
+            totals.active_transitions(),
+            0,
+            "a drained pod publishes no live transition"
+        );
+        assert_eq!(
+            totals.live_vectors(),
+            0,
+            "a drained pod holds no installed lifecycle vector"
+        );
+        assert_eq!(ledger.active_cells().expect("ledger readable"), 0);
+    }
+
     /// An effect with no category publishes the closed `all` label, not an identity.
     ///
     /// Guards the emitter itself: the label set is built from the effect's own

@@ -7227,6 +7227,147 @@ mod tests {
         }
     }
 
+    /// Builds one scheduler item in an explicit namespace.
+    ///
+    /// Used where a case must distinguish a Wyrd system table (an owned
+    /// namespace such as `Audit`) from a dynamic user table (`Datasets`)
+    /// while keeping every other property of the item identical.
+    fn scheduled_in(
+        tenant: DataTenantId,
+        namespace: BifrostNamespace,
+        table: &str,
+        sequence: usize,
+    ) -> Item {
+        Item {
+            tenant,
+            table: TableRef::new(namespace, table),
+            bytes: 1,
+            sequence,
+        }
+    }
+
+    /// AC22/AC25 unit owner: the shard scheduler is exactly hierarchical —
+    /// tenant round-robin, then table round-robin inside a tenant, then strict
+    /// FIFO inside a table — with equal weight for system and dynamic tables
+    /// and a bounded group.
+    ///
+    /// The four clauses are the complete production contract for
+    /// [`TenantTableRoundRobin`]: no level may borrow another level's turn, a
+    /// table's admitted batches may never be reordered, table classification
+    /// may never become a priority lever, and one drain may never exceed
+    /// [`MAX_GROUP_ITEMS`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when a tenant takes two consecutive turns while a peer waits,
+    /// when a tenant's tables are not rotated inside its turn, when a table's
+    /// arrival order is not preserved, when a system and a dynamic table with
+    /// equal backlogs receive unequal service, or when one drain returns more
+    /// than `MAX_GROUP_ITEMS` requests.
+    #[test]
+    fn tenant_table_round_robin_is_hierarchical_and_fifo() {
+        let busy = DataTenantId::new_v7();
+        let quiet = DataTenantId::new_v7();
+        let mut scheduler = TenantTableRoundRobin::default();
+
+        // The busy tenant backs up two tables, one of them a system table; the
+        // quiet tenant arrives last with a single request.
+        for sequence in 1..=3 {
+            scheduler.push(scheduled_in(
+                busy,
+                BifrostNamespace::Datasets,
+                "dynamic",
+                sequence,
+            ));
+        }
+        for sequence in 11..=13 {
+            scheduler.push(scheduled_in(
+                busy,
+                BifrostNamespace::Audit,
+                "system",
+                sequence,
+            ));
+        }
+        scheduler.push(scheduled_in(
+            quiet,
+            BifrostNamespace::Datasets,
+            "dynamic",
+            21,
+        ));
+
+        let group = scheduler.pop_group();
+        assert_eq!(group.len(), 7, "one drain serves every pending request");
+        let served: Vec<(DataTenantId, BifrostNamespace, usize)> = group
+            .iter()
+            .map(|item| (item.tenant(), item.table().namespace, item.sequence))
+            .collect();
+        assert_eq!(
+            served,
+            vec![
+                (busy, BifrostNamespace::Datasets, 1),
+                (quiet, BifrostNamespace::Datasets, 21),
+                (busy, BifrostNamespace::Audit, 11),
+                (busy, BifrostNamespace::Datasets, 2),
+                (busy, BifrostNamespace::Audit, 12),
+                (busy, BifrostNamespace::Datasets, 3),
+                (busy, BifrostNamespace::Audit, 13),
+            ],
+            "tenants rotate outermost, then that tenant's tables, then FIFO"
+        );
+
+        // Equal weight: with equal backlogs a system table and a dynamic table
+        // of the same tenant receive exactly the same number of turns.
+        let system_turns = group
+            .iter()
+            .filter(|item| {
+                item.tenant() == busy && item.table().namespace == BifrostNamespace::Audit
+            })
+            .count();
+        let dynamic_turns = group
+            .iter()
+            .filter(|item| {
+                item.tenant() == busy && item.table().namespace == BifrostNamespace::Datasets
+            })
+            .count();
+        assert_eq!(
+            system_turns, dynamic_turns,
+            "a system table carries no hidden priority over a dynamic table"
+        );
+        assert!(
+            scheduler.is_empty(),
+            "the drain leaves no orphaned rotation"
+        );
+
+        // Bounded group: a single tenant/table backlog larger than the group
+        // bound is served across successive drains in strict arrival order and
+        // never in one oversized group.
+        let mut bounded = TenantTableRoundRobin::default();
+        let backlog = MAX_GROUP_ITEMS * 2 + 5;
+        for sequence in 0..backlog {
+            bounded.push(scheduled_in(
+                busy,
+                BifrostNamespace::Datasets,
+                "hot",
+                sequence,
+            ));
+        }
+        let mut drained = Vec::new();
+        while !bounded.is_empty() {
+            let next = bounded.pop_group();
+            assert!(
+                next.len() <= MAX_GROUP_ITEMS,
+                "one drain must stay inside the bounded fsync group"
+            );
+            assert!(!next.is_empty(), "a non-empty scheduler must make progress");
+            drained.extend(next.into_iter().map(|item| item.sequence));
+        }
+        assert_eq!(
+            drained,
+            (0..backlog).collect::<Vec<usize>>(),
+            "a table's admitted batches stay strictly FIFO across drains"
+        );
+    }
+
     /// A group rotates tenants first and never starves the second tenant.
     ///
     /// # Panics

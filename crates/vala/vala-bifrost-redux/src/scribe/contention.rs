@@ -1933,6 +1933,134 @@ mod tests {
             * vectors
     }
 
+    /// AC22/AC26 unit owner: tenant admission is elastic, fair, and balanced.
+    ///
+    /// One named owner for the three properties the ledger exists to hold
+    /// together, because each is only meaningful in the presence of the others:
+    /// capacity is lent work-conservingly to whoever is asking (elastic), the
+    /// level is recomputed from the live owners the moment a peer contends
+    /// (fair), and every success, refusal and release moves the identical
+    /// amount at the table, tenant and pod levels or moves it at none
+    /// (balanced). Categories are proven independent rather than summed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when idle capacity is stranded, when a contender does not shrink
+    /// an incumbent's level, when acknowledged ownership is revoked, when a
+    /// refusal moves a counter, when one category's exhaustion constrains
+    /// another, or when a fully drained ledger still reports ownership.
+    #[test]
+    fn tenant_admission_is_elastic_fair_and_balanced() {
+        let ledger = ledger_for(8);
+        let incumbent = key(1, "events");
+        let contender = key(2, "events");
+        let whole = capacity_of(8, ContentionCategory::Active);
+
+        // Elastic: the only owner asking reaches the pod's whole measured
+        // capacity. No share is reserved for a tenant that has sent nothing.
+        ledger
+            .activate(&incumbent)
+            .expect("the first table activates");
+        ledger
+            .charge(&incumbent, ContentionCategory::Active, whole)
+            .expect("a lone owner borrows every genuinely idle byte");
+        assert_eq!(
+            ledger.committed(ContentionCategory::Active).expect("pod"),
+            whole
+        );
+
+        // Fair: a second live owner immediately shrinks the incumbent's level
+        // for new acquisition, but never revokes what it already holds.
+        ledger
+            .activate(&contender)
+            .expect("the contender activates");
+        assert_eq!(
+            ledger
+                .usage(&incumbent, ContentionCategory::Active)
+                .expect("usage"),
+            whole,
+            "acknowledged ownership is never revoked by a new contender"
+        );
+        let frozen = ledger
+            .charge(&incumbent, ContentionCategory::Active, 1)
+            .expect_err("an over-share incumbent may not grow while a peer waits");
+        assert!(matches!(frozen, ContentionRefusal::Exhausted { .. }));
+        assert_eq!(
+            ledger
+                .usage(&incumbent, ContentionCategory::Active)
+                .expect("usage"),
+            whole,
+            "a refusal moves nothing at the table level"
+        );
+        assert_eq!(
+            ledger.committed(ContentionCategory::Active).expect("pod"),
+            whole,
+            "a refusal moves nothing at the pod level"
+        );
+
+        // Categories are independent: exhausting active bytes leaves the
+        // immutable, stage and scratch levels untouched.
+        for category in [
+            ContentionCategory::Immutable,
+            ContentionCategory::DurableStage,
+            ContentionCategory::MergeScratch,
+        ] {
+            let half = capacity_of(8, category) / 2;
+            ledger
+                .charge(&contender, category, half)
+                .expect("an exhausted category never constrains another");
+            ledger
+                .release(&contender, category, half)
+                .expect("the independent category returns exactly what it took");
+        }
+
+        // The next released capacity reaches the waiting contender, and the
+        // incumbent's drain is accounted at every level.
+        let half = whole / 2;
+        ledger
+            .release(&incumbent, ContentionCategory::Active, half)
+            .expect("acknowledged ownership drains normally");
+        assert_eq!(
+            ledger
+                .tenant_usage(&tenant_id(1), ContentionCategory::Active)
+                .expect("tenant usage"),
+            whole - half
+        );
+        ledger
+            .charge(&contender, ContentionCategory::Active, half)
+            .expect("released capacity is offered to the waiting contender");
+        assert_eq!(
+            ledger.committed(ContentionCategory::Active).expect("pod"),
+            whole,
+            "the pod total is exactly the sum of what its owners hold"
+        );
+
+        // Balanced: releasing everything returns each level to zero and retires
+        // both emptied cells and their tenants.
+        ledger
+            .release(&incumbent, ContentionCategory::Active, whole - half)
+            .expect("release");
+        ledger
+            .release(&contender, ContentionCategory::Active, half)
+            .expect("release");
+        for owner in [&incumbent, &contender] {
+            assert!(
+                ledger.settle(owner).expect("settlement is readable"),
+                "an emptied cell must retire rather than strand an ownership slot"
+            );
+        }
+        assert_eq!(ledger.active_cells().expect("cells"), 0);
+        assert_eq!(ledger.active_tenants().expect("tenants"), 0);
+        for category in ContentionCategory::ALL {
+            assert_eq!(
+                ledger.committed(category).expect("pod totals"),
+                0,
+                "{} must drain completely",
+                category.label()
+            );
+        }
+    }
+
     /// One tenant with one table may use every genuinely idle byte in the pod.
     ///
     /// This is the work-conserving rule: capacity is never stranded behind an

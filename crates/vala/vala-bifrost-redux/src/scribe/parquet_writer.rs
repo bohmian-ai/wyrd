@@ -1577,6 +1577,182 @@ mod tests {
         );
     }
 
+    /// AC22/AC3 unit owner: every sealed artifact's footer carries the complete
+    /// evidence a later claim needs, per artifact, across a rolled object.
+    ///
+    /// A claim reads objects it did not write. Everything it must decide —
+    /// which writer recipe and envelope version produced the file, which
+    /// schema it holds, which committed object it is, how much decode memory
+    /// one row group can demand, and where its row groups and their event-time
+    /// bounds are — has to be readable from that file's own footer. This owner
+    /// encodes a member that rolls into two artifacts and proves each footer
+    /// stands alone: identities are per artifact and never shared, the eight
+    /// envelope fields are present and exact, the returned row-group statistics
+    /// are the footer's own, and the physical size, checksum and row count
+    /// agree with the bytes on disk.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an artifact's footer is missing a field, carries another
+    /// artifact's identity, disagrees with the writer's reported statistics or
+    /// fingerprint, or does not decode to the rows the artifact claims.
+    #[test]
+    fn parquet_footer_preserves_complete_claim_evidence() {
+        let tenant = DataTenantId::new_v7();
+        let residue_rows = 16;
+        let frozen = incompressible_frozen(tenant, MAX_ROW_GROUP_ROWS + residue_rows);
+        let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
+            .expect("tenant binding");
+        let scratch = tempfile::tempdir().expect("rolling scratch");
+        let encoded = encode_with_target(
+            &frozen,
+            &binding,
+            tenant,
+            scratch.path(),
+            MAX_LOGICAL_ROW_GROUP_BYTES,
+        )
+        .expect("the rolling writer seals the member");
+        assert_eq!(
+            encoded.artifacts.len(),
+            2,
+            "the fixture must roll so per-artifact footer evidence is proven, not shared"
+        );
+
+        let mut identities = Vec::new();
+        for (offset, artifact) in encoded.artifacts.iter().enumerate() {
+            assert_eq!(
+                usize::from(artifact.ordinal),
+                offset,
+                "artifact ordinals are contiguous from zero"
+            );
+            identities.push(artifact.object_identity.clone());
+
+            let reader = SerializedFileReader::new(
+                std::fs::File::open(&artifact.scratch_path).expect("sealed artifact"),
+            )
+            .expect("sealed footer");
+            let metadata = reader.metadata();
+            let fields: std::collections::BTreeMap<String, String> = metadata
+                .file_metadata()
+                .key_value_metadata()
+                .expect("a sealed footer carries the writer envelope")
+                .iter()
+                .map(|field| {
+                    (
+                        field.key.clone(),
+                        field.value.clone().unwrap_or_else(|| {
+                            panic!("footer field {} must carry a value", field.key)
+                        }),
+                    )
+                })
+                .collect();
+
+            // The eight envelope fields, by their exact wire names, are the
+            // footer contract a claim parses.
+            assert_eq!(
+                fields.get("wyrd.bifrost.writer_recipe").map(String::as_str),
+                Some(crate::parquet::memory::WRITER_RECIPE)
+            );
+            assert_eq!(
+                fields
+                    .get("wyrd.bifrost.memory_envelope_version")
+                    .map(String::as_str),
+                Some(crate::parquet::memory::PARQUET_MEMORY_ENVELOPE_VERSION)
+            );
+            assert_eq!(
+                fields
+                    .get("wyrd.bifrost.row_group_logical_bytes")
+                    .map(String::as_str),
+                Some(MAX_LOGICAL_ROW_GROUP_BYTES.to_string().as_str()),
+                "the decode contract a claim must honour is stated in the file"
+            );
+            assert_eq!(
+                fields
+                    .get("wyrd.bifrost.schema_fingerprint")
+                    .map(String::as_str),
+                Some(artifact.schema_fingerprint.as_str()),
+                "the footer fingerprint is the one the writer reported"
+            );
+            assert_eq!(
+                fields
+                    .get("wyrd.bifrost.object_identity")
+                    .map(String::as_str),
+                Some(artifact.object_identity.as_str()),
+                "each artifact names itself, never its sibling"
+            );
+            for required in [
+                "wyrd.bifrost.decode_workspace_bytes",
+                "wyrd.bifrost.max_logical_row_bytes",
+                "wyrd.bifrost.leaf_width_profile",
+            ] {
+                assert!(
+                    fields.get(required).is_some_and(|value| !value.is_empty()),
+                    "{required} must be present and non-empty"
+                );
+            }
+            assert!(
+                fields
+                    .get("wyrd.bifrost.leaf_width_profile")
+                    .is_some_and(|profile| profile.starts_with("v1:")),
+                "the leaf profile is versioned so an unknown form fails closed"
+            );
+
+            // The statistics the writer reported are the footer's own, group
+            // for group, with event-time bounds preserved.
+            assert_eq!(
+                artifact.row_group_stats.len(),
+                metadata.num_row_groups(),
+                "one reported statistic per flushed row group"
+            );
+            for (group, stats) in metadata
+                .row_groups()
+                .iter()
+                .zip(artifact.row_group_stats.iter())
+            {
+                assert_eq!(
+                    u64::try_from(group.num_rows()).expect("nonnegative row count"),
+                    u64::try_from(stats.row_count).expect("row count fits u64")
+                );
+                assert!(
+                    stats.min_event_time.is_some() && stats.max_event_time.is_some(),
+                    "event-time bounds must survive into the claim's evidence"
+                );
+                assert!(
+                    stats.min_event_time <= stats.max_event_time,
+                    "event-time bounds must be ordered"
+                );
+            }
+
+            // The physical facts agree with the bytes on disk.
+            let on_disk = std::fs::metadata(&artifact.scratch_path).expect("sealed artifact stat");
+            assert_eq!(artifact.file_size, on_disk.len());
+            assert_eq!(
+                artifact.checksum,
+                checksum_file(&artifact.scratch_path).expect("checksum")
+            );
+            let decoded: usize = ParquetRecordBatchReaderBuilder::try_new(
+                std::fs::File::open(&artifact.scratch_path).expect("reopen artifact"),
+            )
+            .expect("decode builder")
+            .build()
+            .expect("decode reader")
+            .map(|batch| batch.expect("decoded batch").num_rows())
+            .sum();
+            assert_eq!(
+                decoded, artifact.row_count,
+                "the artifact decodes to exactly the rows it claims"
+            );
+        }
+
+        identities.sort_unstable();
+        identities.dedup();
+        assert_eq!(
+            identities.len(),
+            encoded.artifacts.len(),
+            "object identities are unique across the rolled claim"
+        );
+    }
+
     /// Reads one encoded artifact and proves its tenant and timestamp order.
     fn assert_encoded_rows(encoded: &ParquetEncoded, tenant: &str, expected_times: &[i64]) {
         let file =

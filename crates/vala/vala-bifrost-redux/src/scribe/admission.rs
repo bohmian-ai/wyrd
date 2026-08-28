@@ -980,6 +980,103 @@ mod tests {
         assert_eq!(admission.snapshot().bytes, 0);
     }
 
+    /// AC22/AC26 unit owner: cancellation and drain release every resource the
+    /// cancelled work owned.
+    ///
+    /// A request can leave the pod three ways — it is released normally, it is
+    /// dropped without ever being released because its caller was cancelled, or
+    /// it is still owned when the pod drains. All three must return the
+    /// identical amount at the pod, tenant and table levels; a cancelled path
+    /// that returns nothing strands capacity until restart, and one that
+    /// returns twice lets the pod over-admit forever. The lifecycle categories
+    /// a drain settles — durable stage, merge scratch and the staging and
+    /// upload claim items — are proven alongside admission so no category is
+    /// left holding a cancelled owner's charge.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a cancelled reservation does not return its charge, when a
+    /// drained ledger still reports ownership in any category, or when the
+    /// observation totals do not balance starts against terminals.
+    #[test]
+    fn cancellation_drain_releases_owned_resources() {
+        let admission = AdmissionController::with_config(AdmissionConfig::default())
+            .expect("the default geometry fits the default budget");
+        let ledger = admission.contention();
+        let cancelled_owner = cell_key(41, "cancelled");
+        let drained_owner = cell_key(42, "drained");
+
+        // Cancellation: a reservation dropped without an explicit release must
+        // return exactly what it took, at every level.
+        {
+            let _cancelled = admission
+                .try_reserve_for_cell(&cancelled_owner, "wyrd.cancelled", 8_192)
+                .expect("the fixture pod admits the request");
+            assert_eq!(
+                ledger
+                    .usage(&cancelled_owner, ContentionCategory::AdmissionBytes)
+                    .expect("the cancelled cell is active"),
+                8_192
+            );
+            assert_eq!(admission.snapshot().bytes, 8_192);
+        }
+        assert_eq!(
+            ledger.usage(&cancelled_owner, ContentionCategory::AdmissionBytes),
+            Err(ContentionRefusal::Inactive),
+            "a cancelled reservation must retire the cell it activated"
+        );
+        assert_eq!(admission.snapshot().items, 0);
+        assert_eq!(admission.snapshot().bytes, 0);
+
+        // Drain: an owner holding capacity in every lifecycle category returns
+        // all of it, and only then may its cell retire.
+        let held = admission
+            .try_reserve_for_cell(&drained_owner, "wyrd.drained", 4_096)
+            .expect("the fixture pod admits the request");
+        let lifecycle = [
+            ContentionCategory::DurableStage,
+            ContentionCategory::MergeScratch,
+            ContentionCategory::StagingClaim,
+            ContentionCategory::UploadClaim,
+        ];
+        for category in lifecycle {
+            ledger
+                .charge(&drained_owner, category, 1)
+                .expect("an active owner acquires each lifecycle category");
+        }
+        assert!(
+            ledger.settle(&drained_owner).is_ok_and(|retired| !retired),
+            "a cell still holding lifecycle capacity must not retire"
+        );
+        for category in lifecycle {
+            ledger
+                .release(&drained_owner, category, 1)
+                .expect("the drain returns each lifecycle category");
+        }
+        held.release().expect("the drain releases the request");
+
+        // Balanced: every category is zero, no cell or tenant survives, and the
+        // observation totals reconcile.
+        for category in ContentionCategory::ALL {
+            assert_eq!(
+                ledger.committed(category).expect("pod totals"),
+                0,
+                "{} must drain completely",
+                category.label()
+            );
+        }
+        assert_eq!(ledger.active_cells().expect("ledger readable"), 0);
+        assert_eq!(ledger.active_tenants().expect("ledger readable"), 0);
+        let totals = ledger.telemetry_totals();
+        assert_eq!(
+            totals.starts(),
+            totals.terminals(),
+            "a cancelled transition still closes exactly once"
+        );
+        assert_eq!(totals.active_transitions(), 0);
+        assert_eq!(totals.live_vectors(), 0);
+    }
+
     /// AC22/AC26 unit owner: pod resource admission is tenant-fair at the
     /// production entry point.
     ///

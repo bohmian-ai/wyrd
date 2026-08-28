@@ -1399,6 +1399,116 @@ mod tests {
         );
     }
 
+    /// AC22/AC7 unit owner: every staged lineage is claimed, published, and
+    /// retired exactly once.
+    ///
+    /// A lineage here is one staged member from its registration through the
+    /// claim that publishes it to the settlement that retires it. Publishing a
+    /// member twice duplicates rows in a hot object; retiring it twice frees a
+    /// claim slot the pod still owes. This owner walks members from several
+    /// shards and generations of one key through target-driven claims and a
+    /// residue sweep, and proves the partition is exact: every member appears
+    /// in exactly one claim, no member is claimed while another claim holds it,
+    /// each claim settles once and refuses a second settlement, and a fully
+    /// settled assembler owns nothing and has its whole claim budget back.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a member is claimed twice or never, when a settled claim
+    /// settles again, or when a drained assembler still reports ownership.
+    #[test]
+    fn staging_and_publication_retire_each_lineage_once() {
+        let tenant = DataTenantId::new_v7();
+        let key = key_for(tenant, 0);
+        let mut assembler = assembler(2_000, 8);
+
+        // Nine members arrive across three shards and three generations, the
+        // cross-generation shape a real key produces.
+        let lineage: Vec<StagedMemberId> = (0..9)
+            .map(|ordinal| {
+                let shard = u16::try_from(ordinal % 3).expect("small shard ordinal");
+                let generation = u64::try_from(ordinal / 3).expect("small generation");
+                let staged = member(shard, generation, 1_000, i64::from(ordinal));
+                let id = staged.id();
+                assembler
+                    .register_ready(&key, staged)
+                    .expect("a fresh lineage registers");
+                id
+            })
+            .collect();
+
+        // Drain the key: target-driven claims first, then one residue sweep for
+        // whatever the target left behind.
+        let mut claims = Vec::new();
+        while let Some(claim) = assembler
+            .next_claim(at(100))
+            .expect("the claim budget stays free")
+        {
+            claims.push(claim);
+        }
+        if let Some(residue) = assembler
+            .claim_residue(&key, ClaimCause::Drain)
+            .expect("the claim budget stays free")
+        {
+            claims.push(residue);
+        }
+        assert!(
+            assembler.ready_members(&key).is_empty(),
+            "the sweep must leave no staged member unclaimed"
+        );
+
+        // Exactly-once partition: every registered member appears in one claim.
+        let mut published: Vec<StagedMemberId> = claims
+            .iter()
+            .flat_map(|claim| claim.members().iter().map(|staged| staged.id()))
+            .collect();
+        let claimed_total = published.len();
+        published.sort_unstable_by_key(|id| (id.shard(), id.generation()));
+        published.dedup();
+        assert_eq!(
+            published.len(),
+            claimed_total,
+            "no staged member may appear in two claims"
+        );
+        let mut expected = lineage;
+        expected.sort_unstable_by_key(|id| (id.shard(), id.generation()));
+        assert_eq!(
+            published, expected,
+            "every registered member must be published exactly once"
+        );
+
+        // Exactly-once retirement: each claim settles once and refuses twice.
+        assert_eq!(assembler.outstanding_claims(), claims.len());
+        for claim in &claims {
+            assembler
+                .settle_claim(claim.id())
+                .expect("an outstanding claim settles");
+            assert_eq!(
+                assembler
+                    .settle_claim(claim.id())
+                    .expect_err("a settled claim may not free a slot twice"),
+                AssemblyError::UnknownClaim {
+                    claim: claim.id().to_string()
+                }
+            );
+        }
+        assert_eq!(
+            assembler.outstanding_claims(),
+            0,
+            "a fully settled assembler holds no claim slot"
+        );
+        assert!(
+            assembler.ready_keys().is_empty(),
+            "a retired lineage leaves no key holding ready members"
+        );
+
+        // The identities are free again, which is what lets a restart replay
+        // the same generations without colliding with retired ownership.
+        assembler
+            .register_ready(&key, member(0, 0, 1_000, 200))
+            .expect("a retired identity may be staged again");
+    }
+
     /// Outstanding claims are bounded, and settling one returns its slot.
     ///
     /// # Panics
@@ -1506,6 +1616,141 @@ mod tests {
             WriterEpoch::new(4),
         );
         assert_ne!(hourly, daily);
+    }
+
+    /// AC22/AC7 unit owner: a restart reconstructs the same claim from the same
+    /// members and reconciles an ambiguous publication onto it.
+    ///
+    /// Two failure modes meet at restart. If the pod re-derives a *different*
+    /// identity for the same rows, an interrupted publication that already
+    /// wrote an object is repeated under a new name and the rows land twice. If
+    /// it treats a member an unsettled claim already owns as free, a second
+    /// claim takes those rows concurrently. This owner proves both directions:
+    /// the identity is a function of the member set alone, so recovery in any
+    /// order rebuilds it exactly, and a member recovered as claimed stays owned
+    /// by that claim — unclaimable and unregisterable — until the reconciled
+    /// publication settles.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a replayed member set derives a different claim identity,
+    /// when an owned member can be re-registered or re-claimed, or when the
+    /// members do not become free exactly once the claim settles.
+    #[test]
+    fn replay_reconstructs_claim_and_reconciles_ambiguity() {
+        let tenant = DataTenantId::new_v7();
+        let key = key_for(tenant, 0);
+        let staged = [
+            member(0, 1, 1_000, 0),
+            member(3, 4, 1_000, 1),
+            member(7, 2, 1_000, 2),
+            member(9, 8, 1_000, 3),
+        ];
+
+        // Before the restart: the live pod claims the whole set as one object.
+        let mut live = assembler(4_000, 2);
+        for staged_member in staged {
+            live.register_ready(&key, staged_member)
+                .expect("a fresh member registers");
+        }
+        let before = live
+            .next_claim(at(10))
+            .expect("the claim budget is free")
+            .expect("the members reach target");
+        assert_eq!(before.members().len(), staged.len());
+
+        // After the restart: recovery walks the volume in a different order and
+        // must derive the identical claim.
+        let mut replayed = assembler(4_000, 2);
+        for staged_member in staged.iter().rev() {
+            replayed
+                .register_ready(&key, *staged_member)
+                .expect("a recovered member registers");
+        }
+        let after = replayed
+            .next_claim(at(10))
+            .expect("the claim budget is free")
+            .expect("the recovered members reach target");
+        assert_eq!(
+            after.id(),
+            before.id(),
+            "claim identity must be a function of the member set, not arrival order"
+        );
+
+        // A later member is a different claim: reconstruction must not absorb
+        // rows the interrupted publication never owned.
+        replayed
+            .settle_claim(after.id())
+            .expect("the reconstructed claim settles");
+        for staged_member in staged {
+            replayed
+                .register_ready(&key, staged_member)
+                .expect("a settled identity is free again");
+        }
+        replayed
+            .register_ready(&key, member(11, 1, 1_000, 20))
+            .expect("a later member registers");
+        let widened = replayed
+            .claim_residue(&key, ClaimCause::Drain)
+            .expect("the claim budget is free")
+            .expect("the key holds ready members");
+        assert_ne!(
+            widened.id(),
+            before.id(),
+            "a different member set must be a different claim"
+        );
+
+        // Ambiguity: recovery finds the members already owned by the durable
+        // claim whose SQL outcome is unknown. They stay that claim's until it
+        // settles; nothing may re-register or re-claim them meanwhile.
+        let mut reconciled = assembler(4_000, 2);
+        reconciled
+            .restore(
+                &key,
+                staged.map(|owned| RecoveredMember::Claimed {
+                    claim: before.id(),
+                    member: owned,
+                }),
+            )
+            .expect("recovery restores the interrupted claim");
+        assert_eq!(reconciled.outstanding_claims(), 1);
+        assert!(
+            reconciled.ready_members(&key).is_empty(),
+            "an owned member is never offered as ready"
+        );
+        assert!(
+            reconciled
+                .next_claim(at(30))
+                .expect("the claim budget is free")
+                .is_none(),
+            "no second claim may take rows an unsettled publication owns"
+        );
+        for staged_member in staged {
+            assert_eq!(
+                reconciled
+                    .register_ready(&key, staged_member)
+                    .expect_err("a claimed member is already owned"),
+                AssemblyError::DuplicateMember {
+                    shard: staged_member.id().shard(),
+                    generation: staged_member.id().generation(),
+                }
+            );
+        }
+
+        // Reconciliation completes exactly once: the second settlement of the
+        // same identity is refused rather than silently freeing a slot again.
+        reconciled
+            .settle_claim(before.id())
+            .expect("the reconciled claim settles");
+        assert_eq!(
+            reconciled
+                .settle_claim(before.id())
+                .expect_err("a settled claim cannot settle twice"),
+            AssemblyError::UnknownClaim {
+                claim: before.id().to_string()
+            }
+        );
+        assert_eq!(reconciled.outstanding_claims(), 0);
     }
 
     /// A restored claim keeps its slot and its members until it settles.

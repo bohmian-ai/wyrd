@@ -604,6 +604,21 @@ pub const DEFAULT_MINIMUM_STAGE_MEMBER_BYTES: usize = 32 * 1024 * 1024;
 /// the row-group size rather than equal to it.
 pub const DEFAULT_MINIMUM_MERGE_LANE_SCRATCH_BYTES: usize = 128 * 1024 * 1024;
 
+/// Returns `total * weight / sum`, the part of one memory ceiling a category owns.
+///
+/// The multiplication runs in `u128` because a large ceiling times a category
+/// weight overflows `usize` on a 64-bit target long before either input is
+/// unreasonable. The quotient is never larger than `total`, so narrowing back to
+/// `usize` cannot truncate. A zero `sum` yields zero, which
+/// [`ScribeArtifactPolicy::validate_capacity`] then refuses as an empty reserve
+/// rather than dividing by it here.
+const fn weighted_share(total: usize, weight: usize, sum: usize) -> usize {
+    if sum == 0 {
+        return 0;
+    }
+    ((total as u128) * (weight as u128) / (sum as u128)) as usize
+}
+
 /// Derives per-table contention reserves and validates pod startup capacity.
 ///
 /// The policy owns one validated [`ScribeGeometry`] and is the single place the
@@ -726,6 +741,23 @@ impl ScribeArtifactPolicy {
             .unwrap_or(0)
     }
 
+    /// Returns the smallest Scribe memory ceiling that can complete one table.
+    ///
+    /// The four memory-backed categories share one ceiling, so a pod can carry
+    /// a table only once that ceiling covers all four of its reserve components
+    /// at once. [`Self::pod_capacity`] splits by these same weights, which makes
+    /// this value the exact point at which every memory category holds one
+    /// complete vector: one byte less and the first category truncates below its
+    /// component.
+    #[must_use]
+    pub const fn minimum_scribe_memory_bytes(&self) -> usize {
+        let vector = self.reserve_vector();
+        vector.admission_bytes
+            + vector.active_bytes
+            + vector.immutable_bytes
+            + vector.merge_scratch_bytes
+    }
+
     /// Derives the pod capacity this policy is checked against.
     ///
     /// The three inputs are the only ones the node actually measures: the Scribe
@@ -734,10 +766,12 @@ impl ScribeArtifactPolicy {
     /// those, and each split is named rather than implied:
     ///
     /// - Admitted request bytes, active generations, immutable generations, and
-    ///   merge scratch all come out of the one memory ceiling, so each gets an
-    ///   equal quarter. An equal split is deliberate: any weighting would encode
-    ///   a guess about which phase dominates, and the phases genuinely trade off
-    ///   against each other over a pod's lifetime.
+    ///   merge scratch all come out of the one memory ceiling, so each gets the
+    ///   share of it that its own reserve component is of the four components
+    ///   summed. The weights are the geometry's declared per-table needs rather
+    ///   than a guess about which phase dominates, which is what makes the
+    ///   smallest bootable Scribe memory ceiling equal to one table's total
+    ///   memory need instead of four times its largest single phase.
     /// - Durable staging comes from the staging volume, which is disk and shares
     ///   nothing with memory.
     /// - Claim items are counted, not sized. An outstanding staging or upload
@@ -753,14 +787,19 @@ impl ScribeArtifactPolicy {
         staging_volume_bytes: usize,
         global_inflight_items: usize,
     ) -> ScribeGlobalCapacity {
-        let memory_share = scribe_memory_bytes / 4;
+        let vector = self.reserve_vector();
+        let need = self.minimum_scribe_memory_bytes();
         ScribeGlobalCapacity {
             admission_items: global_inflight_items,
-            admission_bytes: memory_share,
-            active_bytes: memory_share,
-            immutable_bytes: memory_share,
+            admission_bytes: weighted_share(scribe_memory_bytes, vector.admission_bytes, need),
+            active_bytes: weighted_share(scribe_memory_bytes, vector.active_bytes, need),
+            immutable_bytes: weighted_share(scribe_memory_bytes, vector.immutable_bytes, need),
             durable_stage_bytes: staging_volume_bytes,
-            merge_scratch_bytes: memory_share,
+            merge_scratch_bytes: weighted_share(
+                scribe_memory_bytes,
+                vector.merge_scratch_bytes,
+                need,
+            ),
             staging_claim_items: global_inflight_items,
             upload_claim_items: global_inflight_items,
         }

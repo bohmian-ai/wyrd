@@ -137,12 +137,11 @@ pub struct AdmissionConfig {
 /// Smallest pod memory budget the default Scribe geometry can be installed on.
 ///
 /// [`ScribeArtifactPolicy::pod_capacity`] splits the Scribe memory ceiling into
-/// four equal category shares, and the largest single-table component is merge
-/// scratch at `minimum_merge_lane_scratch_bytes`. Four times that — half a
-/// gibibyte — is the hard floor at which every category holds one complete
-/// lifecycle vector, and this default is eight times that floor so an embedded
-/// or test controller derives a useful multi-table ownership ceiling rather than
-/// a pod that can only ever carry one table. Nothing here scales with tenants or
+/// four weighted category shares, so the hard floor is one table's total memory
+/// need — `ScribeArtifactPolicy::minimum_scribe_memory_bytes` — rather than any
+/// single phase of it. This default sits well above that floor so an embedded or
+/// test controller derives a useful multi-table ownership ceiling rather than a
+/// pod that can only ever carry one table. Nothing here scales with tenants or
 /// tables: a smaller budget still starts, it just completes fewer tables at once.
 pub const DEFAULT_POD_MEMORY_LIMIT_BYTES: usize =
     32 * super::geometry::DEFAULT_MINIMUM_MERGE_LANE_SCRATCH_BYTES;
@@ -1178,9 +1177,9 @@ mod tests {
             .expect("the default budget holds one complete lifecycle vector");
 
         // The hard floor is one complete lifecycle vector, which memory reaches
-        // at four times the merge-lane scratch minimum. Exactly the floor serves
-        // one table; one memory share below it serves none.
-        let floor = 4 * crate::scribe::geometry::DEFAULT_MINIMUM_MERGE_LANE_SCRATCH_BYTES;
+        // at one table's total memory need. Exactly the floor serves one table;
+        // one memory share below it serves none.
+        let floor = ScribeArtifactPolicy::default().minimum_scribe_memory_bytes();
         AdmissionController::with_config_and_memory(
             AdmissionConfig {
                 memory_limit_bytes: floor,
@@ -1231,7 +1230,7 @@ mod tests {
         let config = AdmissionConfig {
             memory_limit_bytes: DEFAULT_POD_MEMORY_LIMIT_BYTES * 4,
             scribe_memory_limit_bytes: Some(
-                4 * crate::scribe::geometry::DEFAULT_MINIMUM_MERGE_LANE_SCRATCH_BYTES - 4,
+                ScribeArtifactPolicy::default().minimum_scribe_memory_bytes() - 4,
             ),
             ..AdmissionConfig::default()
         };

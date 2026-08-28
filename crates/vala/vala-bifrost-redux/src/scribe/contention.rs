@@ -577,6 +577,9 @@ enum Settlement {
 
 impl Settlement {
     /// Returns the registry effect this settlement outcome is reported as.
+    ///
+    /// `Untracked` shares the table effect because both callers return before
+    /// emitting anything for it: nothing was tracked, so nothing was settled.
     const fn effect(self) -> ContentionEffect {
         match self {
             Self::Untracked | Self::TableRetired => ContentionEffect::TableSettled,
@@ -756,16 +759,18 @@ impl ScribeContentionLedger {
             return Err(refusal);
         }
         Self::retire_activation(&mut state, key);
-        Self::emit(
-            &state,
-            ContentionEffect::ActivationInstalled,
-            ContentionFacts {
-                category: ContentionCategory::AdmissionBytes.label(),
-                requested: bytes,
-                held_after: state.held(key, ContentionCategory::AdmissionBytes),
-                ..ContentionFacts::default()
-            },
-        );
+        if outcome == ActivationOutcome::Created {
+            Self::emit(
+                &state,
+                ContentionEffect::ActivationInstalled,
+                ContentionFacts {
+                    category: ContentionCategory::AdmissionBytes.label(),
+                    requested: bytes,
+                    held_after: state.held(key, ContentionCategory::AdmissionBytes),
+                    ..ContentionFacts::default()
+                },
+            );
+        }
         Ok(outcome)
     }
 

@@ -85,6 +85,12 @@ pub struct ScribeStagingRuntime {
     contexts: Mutex<HashMap<ScribeAssemblyKey, ClaimContext>>,
     /// Approximate encoded size at which one published object closes.
     target_object_bytes: u64,
+    /// Pod-wide observation owner, when this runtime belongs to a pod.
+    ///
+    /// A fixture runtime built without one publishes no staged lifecycle
+    /// effects; production always binds the same owner admission publishes to,
+    /// so the pod has one set of reconcilable totals rather than two.
+    telemetry: Option<Arc<crate::scribe::telemetry::ScribeTelemetry>>,
     /// Pod-wide authority registry, when this runtime belongs to a pod.
     ///
     /// Staging and publication are the two moments a generation's rows change
@@ -110,6 +116,7 @@ impl ScribeStagingRuntime {
             assembly: Mutex::new(StagingAssembler::new(config)),
             contexts: Mutex::new(HashMap::new()),
             target_object_bytes: config.target_file_size_bytes(),
+            telemetry: None,
             hot_sources: None,
         }
     }
@@ -127,6 +134,44 @@ impl ScribeStagingRuntime {
         self.publisher.set_hot_sources(Arc::clone(&hot_sources));
         self.hot_sources = Some(hot_sources);
         self
+    }
+
+    /// Binds this runtime to its pod's single observation owner.
+    ///
+    /// Production wiring calls this before the runtime stages anything, so
+    /// every durable transition it performs is published through the same owner
+    /// admission and contention publish through.
+    #[must_use]
+    pub(crate) fn with_telemetry(
+        mut self,
+        telemetry: Arc<crate::scribe::telemetry::ScribeTelemetry>,
+    ) -> Self {
+        self.telemetry = Some(telemetry);
+        self
+    }
+
+    /// Publishes one staged or claim lifecycle effect, when a pod owns this runtime.
+    fn observe(
+        &self,
+        effect: crate::scribe::telemetry::StagingEffect,
+        facts: crate::scribe::telemetry::StagingFacts,
+    ) {
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.record_staging(effect, facts);
+        }
+    }
+
+    /// Publishes the effect one released claim records, whatever released it.
+    fn observe_claim(&self, effect: crate::scribe::telemetry::StagingEffect, claim: &StagingClaim) {
+        self.observe(
+            effect,
+            crate::scribe::telemetry::StagingFacts {
+                members: claim.members().len(),
+                bytes: claim.encoded_bytes(),
+                artifacts: 0,
+                cause: Some(claim.cause().label()),
+            },
+        );
     }
 
     /// Encodes one frozen bucket into durable, preflighted local runs.
@@ -193,6 +238,14 @@ impl ScribeStagingRuntime {
             .map_err(|error| ScribeError::Internal {
                 detail: format!("register the staged member as ready: {error}"),
             })?;
+        self.observe(
+            crate::scribe::telemetry::StagingEffect::MemberStaged,
+            crate::scribe::telemetry::StagingFacts {
+                members: 1,
+                bytes,
+                ..crate::scribe::telemetry::StagingFacts::default()
+            },
+        );
         self.advance_authority(
             &key,
             member,
@@ -243,7 +296,15 @@ impl ScribeStagingRuntime {
                     member.shard(),
                     member.generation()
                 ),
-            })
+            })?;
+        self.observe(
+            crate::scribe::telemetry::StagingEffect::SourceTransitioned,
+            crate::scribe::telemetry::StagingFacts {
+                members: 1,
+                ..crate::scribe::telemetry::StagingFacts::default()
+            },
+        );
+        Ok(())
     }
 
     /// Takes the next claim any tenant is entitled to, if one is due.
@@ -254,13 +315,18 @@ impl ScribeStagingRuntime {
     /// a key is due while every claim slot is held. A full budget with nothing
     /// due is not an error; it returns `Ok(None)` like any other idle poll.
     pub fn take_claim(&self, now: DateTime<Utc>) -> Result<Option<StagingClaim>, ScribeError> {
-        self.assembly
+        let claim = self
+            .assembly
             .lock()
             .map_err(|_| poisoned("staged ready index"))?
             .next_claim(now)
             .map_err(|error| ScribeError::Internal {
                 detail: format!("take the next due staging claim: {error}"),
-            })
+            })?;
+        if let Some(claim) = &claim {
+            self.observe_claim(crate::scribe::telemetry::StagingEffect::ClaimTaken, claim);
+        }
+        Ok(claim)
     }
 
     /// Takes every ready member of one key as a residue claim.
@@ -277,13 +343,18 @@ impl ScribeStagingRuntime {
         key: &ScribeAssemblyKey,
         cause: ClaimCause,
     ) -> Result<Option<StagingClaim>, ScribeError> {
-        self.assembly
+        let claim = self
+            .assembly
             .lock()
             .map_err(|_| poisoned("staged ready index"))?
             .claim_residue(key, cause)
             .map_err(|error| ScribeError::Internal {
                 detail: format!("take the residue claim for a staged key: {error}"),
-            })
+            })?;
+        if let Some(claim) = &claim {
+            self.observe_claim(crate::scribe::telemetry::StagingEffect::ClaimTaken, claim);
+        }
+        Ok(claim)
     }
 
     /// Rebuilds the ready and claim indexes from what survived on the volume.
@@ -353,6 +424,14 @@ impl ScribeStagingRuntime {
                 .map_err(|_| poisoned("staged claim context registry"))?
                 .insert(key, context);
             self.stager.readmit_staged_bytes(staged_bytes)?;
+            self.observe(
+                crate::scribe::telemetry::StagingEffect::StagingRestored,
+                crate::scribe::telemetry::StagingFacts {
+                    members: restored,
+                    bytes: staged_bytes,
+                    ..crate::scribe::telemetry::StagingFacts::default()
+                },
+            );
         }
         Ok(restored)
     }
@@ -547,7 +626,7 @@ impl ScribeStagingRuntime {
     ) -> Result<PublishedClaim, ScribeError> {
         let context = self.context_for(claim.key())?;
         let object_base = claim_object_base(claim, runs, &context)?;
-        let published = self
+        let published = match self
             .publisher
             .publish(PublishClaimRequest {
                 claim,
@@ -557,20 +636,32 @@ impl ScribeStagingRuntime {
                 object_base: &object_base,
                 actor_stream,
             })
-            .await?;
-        for member in claim.members() {
-            self.advance_authority(
-                claim.key(),
-                member.id(),
-                crate::scribe::hot_source::HotAuthority::Published {
-                    object_key: published
-                        .object_identities
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| object_base.clone()),
-                },
-            )?;
-        }
+            .await
+        {
+            Ok(published) => published,
+            Err(error) => {
+                self.observe_claim(crate::scribe::telemetry::StagingEffect::ClaimFailed, claim);
+                return Err(error);
+            }
+        };
+        self.observe(
+            crate::scribe::telemetry::StagingEffect::ClaimPublished,
+            crate::scribe::telemetry::StagingFacts {
+                members: claim.members().len(),
+                bytes: claim.encoded_bytes(),
+                artifacts: published.object_identities.len(),
+                cause: Some(claim.cause().label()),
+            },
+        );
+        self.observe(
+            crate::scribe::telemetry::StagingEffect::MemberRetired,
+            crate::scribe::telemetry::StagingFacts {
+                members: claim.members().len(),
+                bytes: claim.encoded_bytes(),
+                artifacts: 0,
+                cause: Some(claim.cause().label()),
+            },
+        );
         self.settle(claim.id(), published.released_bytes)?;
         Ok(published)
     }
@@ -590,7 +681,15 @@ impl ScribeStagingRuntime {
             .map_err(|error| ScribeError::Internal {
                 detail: format!("settle a published staging claim: {error}"),
             })?;
-        self.stager.release_staged_bytes(released_bytes)
+        self.stager.release_staged_bytes(released_bytes)?;
+        self.observe(
+            crate::scribe::telemetry::StagingEffect::ClaimSettled,
+            crate::scribe::telemetry::StagingFacts {
+                bytes: released_bytes,
+                ..crate::scribe::telemetry::StagingFacts::default()
+            },
+        );
+        Ok(())
     }
 
     /// Returns the encoding context recorded when the key first staged a member.
@@ -1091,5 +1190,120 @@ mod tests {
             runtime.ready_keys().expect("ready keys").is_empty(),
             "a swept key is no longer ready"
         );
+    }
+
+    /// The staged registry is closed and its production totals reconcile.
+    ///
+    /// AC21's registry is only worth having if every entry is distinguishable
+    /// and every emission moves a total a maintainer can check against durable
+    /// state. This drives the runtime's own public surfaces and asserts what
+    /// the transitions published, rather than asserting a counter directly.
+    ///
+    /// # Panics
+    ///
+    /// Panics when two registry entries share a stage/decision pair, when a
+    /// durable transition publishes nothing, or when the reconcilable totals
+    /// disagree with the members and claims the runtime actually holds.
+    #[tokio::test(flavor = "current_thread")]
+    async fn staged_lifecycle_effects_are_closed_and_totals_reconcile() {
+        use crate::scribe::telemetry::{ScribeTelemetry, StagingEffect};
+
+        let mut seen = std::collections::HashSet::new();
+        for effect in StagingEffect::ALL {
+            assert!(
+                seen.insert((effect.stage(), effect.decision())),
+                "two staged registry entries share the stage/decision pair {}/{}",
+                effect.stage(),
+                effect.decision()
+            );
+            assert_eq!(
+                StagingEffect::ALL[effect.index()],
+                effect,
+                "every entry indexes its own position"
+            );
+        }
+
+        let root = tempfile::tempdir().expect("runtime root");
+        let stage_root = root.path().join("stage");
+        let wal_root = root.path().join("member-wal");
+        for path in [&stage_root, &wal_root] {
+            std::fs::create_dir_all(path).expect("fixture directory");
+        }
+        let node_id = NodeId::new(uuid::Uuid::from_u128(0xd2a3));
+        let stage = Arc::new(ScribeHotStage::new(stage_root.clone()));
+        let telemetry = Arc::new(ScribeTelemetry::default());
+        let hot_sources = Arc::new(crate::scribe::hot_source::ScribeHotSourceRegistry::new());
+        let runtime = ScribeStagingRuntime::new(
+            Arc::clone(&stage),
+            staging_volume(root.path(), &stage_root),
+            publisher(stage, &wal_root, node_id),
+            StagingAssemblerConfig::new(512 * 1024 * 1024, std::time::Duration::from_mins(5), 4)
+                .expect("assembler controls"),
+        )
+        .with_hot_sources(Arc::clone(&hot_sources))
+        .with_telemetry(Arc::clone(&telemetry));
+
+        let schema = runtime_schema();
+        let layout = runtime_layout(schema.as_ref());
+        let tenant = DataTenantId::new_v7();
+        let frozen = frozen_member(tenant, 256, 1);
+        let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
+            .expect("tenant binding");
+        hot_sources
+            .register_memtable(
+                &frozen.seal_key,
+                crate::scribe::hot_source::GenerationOrdinal::new(1, 7),
+            )
+            .expect("the generation registers as memtable-authoritative");
+        let staged = runtime
+            .encode_member(
+                StageMemberRequest {
+                    frozen: &frozen,
+                    binding: &binding,
+                    layout: &layout,
+                    origin: StagedMemberOrigin {
+                        node_id,
+                        writer_epoch: WriterEpoch::new(1),
+                        shard: 1,
+                        generation: 7,
+                        wal: StagedLsnRange { min: 10, max: 19 },
+                    },
+                    footer_reservation: crate::scribe::memory::EncodedFooterReservation::for_test(),
+                },
+                ClaimContext {
+                    schema: Arc::clone(&schema),
+                    layout: layout.clone(),
+                    binding: binding.clone(),
+                },
+            )
+            .expect("member stages");
+        let key = staged.key().clone();
+        runtime
+            .register_member(staged, chrono::Utc::now())
+            .await
+            .expect("member becomes durable and ready");
+
+        let staged_totals = telemetry.staging_snapshot();
+        assert_eq!(staged_totals.count(StagingEffect::MemberStaged), 1);
+        assert_eq!(staged_totals.count(StagingEffect::SourceTransitioned), 1);
+        assert_eq!(
+            staged_totals.live_members(),
+            1,
+            "one durable member is staged and none has been retired"
+        );
+        assert_eq!(staged_totals.outstanding_claims(), 0);
+
+        let claim = runtime
+            .take_residue(&key, ClaimCause::Drain)
+            .expect("the ready key releases a residue claim")
+            .expect("a residue claim is due");
+        let claimed = telemetry.staging_snapshot();
+        assert_eq!(claimed.count(StagingEffect::ClaimTaken), 1);
+        assert_eq!(
+            claimed.outstanding_claims(),
+            1,
+            "the claim is outstanding until it settles or fails"
+        );
+        assert_eq!(claim.members().len(), 1);
     }
 }

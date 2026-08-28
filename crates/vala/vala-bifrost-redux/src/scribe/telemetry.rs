@@ -1230,6 +1230,208 @@ impl ScribeTelemetrySnapshot {
     }
 }
 
+/// Every staged-member and claim lifecycle effect Scribe can emit.
+///
+/// This is the second closed registry [`ScribeTelemetry`] publishes, and it
+/// covers the durability half of the pod: a generation becoming a durable
+/// staged member, the authority handover that makes those runs the live-tail
+/// source, the claim that gathers members into one published object, and the
+/// retirement that removes the runs the object replaced.
+///
+/// It is deliberately separate from [`ContentionEffect`] rather than folded
+/// into it. Contention effects answer "who was allowed to own capacity"; these
+/// answer "where do these rows live now". Their facts have no fields in common,
+/// and merging them would give every emission a half-empty payload and an
+/// operator vocabulary that means two different things per label.
+///
+/// [`StagingEffect::ALL`] is the inventory and is production state: totals are
+/// indexed by position in it, so an entry missing from `ALL` cannot be counted
+/// and an entry with no production emitter shows a permanent zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum StagingEffect {
+    /// A frozen generation became a durable, query-registered staged member.
+    MemberStaged,
+    /// One generation's authority moved forward to its next durable holder.
+    SourceTransitioned,
+    /// The assembler released one key's ready members as a claim.
+    ClaimTaken,
+    /// A claim's members merged into its sealed objects.
+    ClaimAssembled,
+    /// A claim's objects committed through the fenced `file_list` transaction.
+    ClaimPublished,
+    /// A published member's staged runs were removed after its readers drained.
+    MemberRetired,
+    /// A claim released its staged bytes and left the outstanding set.
+    ClaimSettled,
+    /// A claim could not publish and its members stayed durable and staged.
+    ClaimFailed,
+    /// Startup rebuilt the ready and claim indexes from durable evidence.
+    StagingRestored,
+}
+
+impl StagingEffect {
+    /// The complete registry inventory, in lifecycle order.
+    ///
+    /// Indexed by [`Self::index`], so the order here is the order of the
+    /// per-effect staging totals. Appending is safe; reordering silently
+    /// re-labels historical counters.
+    pub(crate) const ALL: [Self; 9] = [
+        Self::MemberStaged,
+        Self::SourceTransitioned,
+        Self::ClaimTaken,
+        Self::ClaimAssembled,
+        Self::ClaimPublished,
+        Self::MemberRetired,
+        Self::ClaimSettled,
+        Self::ClaimFailed,
+        Self::StagingRestored,
+    ];
+
+    /// Returns this effect's fixed position in [`Self::ALL`].
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::MemberStaged => 0,
+            Self::SourceTransitioned => 1,
+            Self::ClaimTaken => 2,
+            Self::ClaimAssembled => 3,
+            Self::ClaimPublished => 4,
+            Self::MemberRetired => 5,
+            Self::ClaimSettled => 6,
+            Self::ClaimFailed => 7,
+            Self::StagingRestored => 8,
+        }
+    }
+
+    /// Returns the closed lifecycle stage this effect belongs to.
+    pub(crate) const fn stage(self) -> &'static str {
+        match self {
+            Self::MemberStaged | Self::SourceTransitioned => "staged_source",
+            Self::ClaimTaken | Self::ClaimAssembled => "assembly",
+            Self::ClaimPublished => "publication",
+            Self::MemberRetired | Self::ClaimSettled | Self::ClaimFailed => "settlement",
+            Self::StagingRestored => "recovery",
+        }
+    }
+
+    /// Returns the closed decision this effect records within its stage.
+    pub(crate) const fn decision(self) -> &'static str {
+        match self {
+            Self::MemberStaged => "durable",
+            Self::SourceTransitioned => "authority_moved",
+            Self::ClaimTaken => "claimed",
+            Self::ClaimAssembled => "merged",
+            Self::ClaimPublished => "committed",
+            Self::MemberRetired => "runs_removed",
+            Self::ClaimSettled => "bytes_released",
+            Self::ClaimFailed => "retained_staged",
+            Self::StagingRestored => "reconciled",
+        }
+    }
+
+    /// Returns the closed severity an operator signal is bounded to.
+    ///
+    /// A failed claim is `warn` and not `error`: its members stay durable and
+    /// staged, so the outcome is a retry, not lost rows.
+    pub(crate) const fn severity(self) -> &'static str {
+        match self {
+            Self::ClaimFailed => "warn",
+            _ => "info",
+        }
+    }
+
+    /// Reports whether this effect makes one more member durably staged.
+    pub(crate) const fn stages_member(self) -> bool {
+        matches!(self, Self::MemberStaged)
+    }
+
+    /// Reports whether this effect removes one staged member's runs.
+    pub(crate) const fn retires_member(self) -> bool {
+        matches!(self, Self::MemberRetired)
+    }
+
+    /// Reports whether this effect opens one outstanding claim.
+    pub(crate) const fn opens_claim(self) -> bool {
+        matches!(self, Self::ClaimTaken)
+    }
+
+    /// Reports whether this effect closes one outstanding claim.
+    ///
+    /// A failed claim closes its outstanding transition too: its members return
+    /// to the ready index and a later claim takes them again, so counting it as
+    /// still outstanding would make a healthy pod look permanently backed up.
+    pub(crate) const fn closes_claim(self) -> bool {
+        matches!(self, Self::ClaimSettled | Self::ClaimFailed)
+    }
+}
+
+/// Bounded numeric facts describing one staged or claim lifecycle effect.
+///
+/// Every field is a count or a byte total. Tenant, table, node, and member
+/// identities stay on the caller's own `tracing` span, and no path, row, or
+/// query text ever reaches here.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct StagingFacts {
+    /// Staged members the effect concerns.
+    pub(crate) members: usize,
+    /// Encoded staged bytes the effect concerns.
+    pub(crate) bytes: u64,
+    /// Sealed objects the effect produced, when it produced any.
+    pub(crate) artifacts: usize,
+    /// Cause ordinal the assembler released a claim under, when one applies.
+    pub(crate) cause: Option<&'static str>,
+}
+
+impl StagingFacts {
+    /// Returns the closed cause label, or the no-cause placeholder.
+    const fn cause_label(&self) -> &'static str {
+        match self.cause {
+            Some(cause) => cause,
+            None => "none",
+        }
+    }
+}
+
+/// Reconcilable staged and claim totals one [`ScribeTelemetry`] has published.
+///
+/// Exposed so a caller can prove the published metrics agree with the durable
+/// state rather than inferring a stage from a counter: staged minus retired is
+/// the live member count, and claims taken minus claims closed is the number of
+/// publications still in flight.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScribeStagingSnapshot {
+    /// Emission count per registry entry, indexed by [`StagingEffect::index`].
+    counts: [u64; StagingEffect::ALL.len()],
+    /// Members made durable since startup.
+    members_staged: u64,
+    /// Members whose runs were removed since startup.
+    members_retired: u64,
+    /// Claims released by the assembler since startup.
+    claims_taken: u64,
+    /// Claims settled or failed since startup.
+    claims_closed: u64,
+}
+
+impl ScribeStagingSnapshot {
+    /// Returns how many times one registry entry was emitted.
+    pub(crate) const fn count(&self, effect: StagingEffect) -> u64 {
+        self.counts[effect.index()]
+    }
+
+    /// Returns staged members whose runs have not been retired.
+    ///
+    /// Reconciles against the staged namespace's own member count.
+    pub const fn live_members(&self) -> u64 {
+        self.members_staged.saturating_sub(self.members_retired)
+    }
+
+    /// Returns claims taken that have neither settled nor failed.
+    ///
+    /// A drained pod publishes zero here.
+    pub const fn outstanding_claims(&self) -> u64 {
+        self.claims_taken.saturating_sub(self.claims_closed)
+    }
+}
+
 /// The pod's single production observation owner for Scribe admission fairness.
 ///
 /// One instance lives beside the contention ledger it observes, and admission,
@@ -1246,6 +1448,8 @@ impl ScribeTelemetrySnapshot {
 pub(crate) struct ScribeTelemetry {
     /// Reconcilable totals published since startup.
     totals: Mutex<ScribeTelemetrySnapshot>,
+    /// Reconcilable staged and claim totals published since startup.
+    staging: Mutex<ScribeStagingSnapshot>,
 }
 
 impl Default for ScribeTelemetry {
@@ -1260,6 +1464,7 @@ impl Default for ScribeTelemetry {
                 vectors_released: 0,
                 demand_transitions: 0,
             }),
+            staging: Mutex::new(ScribeStagingSnapshot::default()),
         }
     }
 }
@@ -1372,6 +1577,80 @@ impl ScribeTelemetry {
             totals.demand_transitions = totals.demand_transitions.saturating_add(1);
         }
         *totals
+    }
+
+    /// Publishes one staged or claim lifecycle effect and its totals.
+    ///
+    /// The label set is built from the effect's own closed vocabulary plus the
+    /// closed claim cause; nothing a caller passes can widen it. As with the
+    /// contention registry, a poisoned totals lock stops the totals advancing
+    /// but never fails the durable transition being observed.
+    pub(crate) fn record_staging(&self, effect: StagingEffect, facts: StagingFacts) {
+        metrics::counter!(
+            "bifrost_scribe_staging_effects_total",
+            "stage" => effect.stage(),
+            "decision" => effect.decision(),
+            "severity" => effect.severity(),
+            "cause" => facts.cause_label(),
+        )
+        .increment(1);
+        let totals = self.accumulate_staging(effect, &facts);
+        metrics::gauge!("bifrost_scribe_staging_live_members")
+            .set(totals.live_members().to_f64().unwrap_or(f64::MAX));
+        metrics::gauge!("bifrost_scribe_staging_outstanding_claims")
+            .set(totals.outstanding_claims().to_f64().unwrap_or(f64::MAX));
+        tracing::info!(
+            stage = effect.stage(),
+            decision = effect.decision(),
+            severity = effect.severity(),
+            cause = facts.cause_label(),
+            members = facts.members,
+            bytes = facts.bytes,
+            artifacts = facts.artifacts,
+            live_members = totals.live_members(),
+            outstanding_claims = totals.outstanding_claims(),
+            effect_total = totals.count(effect),
+            "Scribe staged lifecycle"
+        );
+    }
+
+    /// Advances the staged totals and returns the view they now hold.
+    ///
+    /// A poisoned lock yields an all-zero view, which stops the totals
+    /// advancing without failing the durable transition being observed.
+    fn accumulate_staging(
+        &self,
+        effect: StagingEffect,
+        facts: &StagingFacts,
+    ) -> ScribeStagingSnapshot {
+        let Ok(mut totals) = self.staging.lock() else {
+            return ScribeStagingSnapshot::default();
+        };
+        totals.counts[effect.index()] = totals.counts[effect.index()].saturating_add(1);
+        let members = facts.members as u64;
+        if effect.stages_member() {
+            totals.members_staged = totals.members_staged.saturating_add(members.max(1));
+        }
+        if effect.retires_member() {
+            totals.members_retired = totals.members_retired.saturating_add(members.max(1));
+        }
+        if effect.opens_claim() {
+            totals.claims_taken = totals.claims_taken.saturating_add(1);
+        }
+        if effect.closes_claim() {
+            totals.claims_closed = totals.claims_closed.saturating_add(1);
+        }
+        *totals
+    }
+
+    /// Returns one consistent view of every reconcilable staged total.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the staged totals lock is poisoned, which can only happen if
+    /// a previous accumulation panicked inside this module.
+    pub(crate) fn staging_snapshot(&self) -> ScribeStagingSnapshot {
+        *self.staging.lock().expect("Scribe staging totals lock")
     }
 
     /// Returns one consistent view of every reconcilable total.

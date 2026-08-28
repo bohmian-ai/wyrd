@@ -528,6 +528,8 @@ pub(crate) struct PersistenceRuntimeContext {
     pub(crate) geometry: crate::scribe::geometry::ScribeGeometry,
     /// Pod-wide registry the staging runtime moves generation authority in.
     pub(crate) hot_sources: Arc<crate::scribe::hot_source::ScribeHotSourceRegistry>,
+    /// Pod-wide observation owner the staged and claim lifecycle publishes to.
+    pub(crate) telemetry: Arc<crate::scribe::telemetry::ScribeTelemetry>,
     /// Deterministic fault points used only by test-tier persistence paths.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) faults: PersistenceFaults,
@@ -717,7 +719,8 @@ impl PersistenceRuntime {
             crate::scribe::staging_runtime::ScribeStagingRuntime::new(
                 stage, volume, publisher, config,
             )
-            .with_hot_sources(Arc::clone(&context.hot_sources)),
+            .with_hot_sources(Arc::clone(&context.hot_sources))
+            .with_telemetry(Arc::clone(&context.telemetry)),
         ))
     }
 
@@ -3181,6 +3184,7 @@ mod tests {
                     staging_file_publisher: None,
                     geometry: crate::scribe::geometry::ScribeGeometry::default(),
                     hot_sources: Arc::clone(&hot_sources),
+                    telemetry: Arc::new(crate::scribe::telemetry::ScribeTelemetry::default()),
                     faults: PersistenceFaults::default(),
                 },
                 &Handle::current(),

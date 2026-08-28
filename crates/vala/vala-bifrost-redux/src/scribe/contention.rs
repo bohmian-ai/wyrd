@@ -45,7 +45,7 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use wyrd_spec::ids::DataTenantId;
@@ -644,7 +644,7 @@ pub struct ScribeContentionLedger {
     /// Installed owners and waiting demand.
     state: Mutex<LedgerState>,
     /// The pod's single production observation owner for these transitions.
-    telemetry: ScribeTelemetry,
+    telemetry: Arc<ScribeTelemetry>,
 }
 
 impl ScribeContentionLedger {
@@ -683,7 +683,7 @@ impl ScribeContentionLedger {
             demand_capacity,
             demand_ttl,
             state: Mutex::new(LedgerState::default()),
-            telemetry: ScribeTelemetry::default(),
+            telemetry: Arc::new(ScribeTelemetry::default()),
         }
     }
 
@@ -692,8 +692,19 @@ impl ScribeContentionLedger {
     /// The admission controller and its in-flight reservations publish through
     /// this same instance so pod-global admission transitions and per-table
     /// contention transitions reconcile against one set of totals.
-    pub(crate) const fn telemetry(&self) -> &ScribeTelemetry {
+    pub(crate) fn telemetry(&self) -> &ScribeTelemetry {
         &self.telemetry
+    }
+
+    /// Returns a shared handle to the pod's one observation owner.
+    ///
+    /// The staged and claim lifecycle publishes through the same owner as
+    /// admission does, so a pod has one set of reconcilable totals rather than
+    /// one per subsystem. The ledger is the owner because it is built first and
+    /// outlives every staging runtime the pod composes.
+    #[must_use]
+    pub(crate) fn telemetry_handle(&self) -> Arc<ScribeTelemetry> {
+        Arc::clone(&self.telemetry)
     }
 
     /// Returns the reconcilable observation totals this ledger has published.
@@ -705,6 +716,17 @@ impl ScribeContentionLedger {
     #[must_use]
     pub fn telemetry_totals(&self) -> ScribeTelemetrySnapshot {
         self.telemetry.snapshot()
+    }
+
+    /// Returns the reconcilable staged and claim totals published so far.
+    ///
+    /// Exposed alongside [`Self::telemetry_totals`] so an operator surface can
+    /// check the durable half of the pod the same way: staged minus retired
+    /// members against the staged namespace's own count, and claims taken minus
+    /// claims closed against the publications still in flight.
+    #[must_use]
+    pub fn staging_totals(&self) -> crate::scribe::telemetry::ScribeStagingSnapshot {
+        self.telemetry.staging_snapshot()
     }
 
     /// Returns the lifecycle reserve vector one active table is sized against.

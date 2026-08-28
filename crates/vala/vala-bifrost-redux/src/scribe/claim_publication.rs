@@ -93,6 +93,60 @@ impl ClaimPublisher {
         self.hot_sources = Some(hot_sources);
     }
 
+    /// Moves every published member's authority to the committed hot objects.
+    ///
+    /// This runs between the fenced commit and retirement, and the order is
+    /// what makes retirement safe: once a member is `Published` no further
+    /// staged lease can be taken for it, so waiting for the leases already held
+    /// is a wait that terminates. Advancing after retirement instead would
+    /// leave a window in which a reader could lease runs cleanup had removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the registry refuses the move,
+    /// which means the member's generation is unknown to it or already past
+    /// publication — either way retirement must not proceed on that evidence.
+    fn advance_published(
+        &self,
+        request: &PublishClaimRequest<'_>,
+        object_identities: &[String],
+    ) -> Result<(), ScribeError> {
+        let Some(hot_sources) = &self.hot_sources else {
+            return Ok(());
+        };
+        let key = request.claim.key();
+        let seal_key = crate::scribe::seal_key::SealKey::new(
+            key.tenant(),
+            key.table().clone(),
+            key.partition(),
+        );
+        let object_key = object_identities
+            .first()
+            .cloned()
+            .unwrap_or_else(|| request.object_base.to_owned());
+        for member in request.claim.members() {
+            hot_sources
+                .advance(
+                    &seal_key,
+                    crate::scribe::hot_source::GenerationOrdinal::new(
+                        member.id().shard(),
+                        member.id().generation(),
+                    ),
+                    crate::scribe::hot_source::HotAuthority::Published {
+                        object_key: object_key.clone(),
+                    },
+                )
+                .map_err(|error| ScribeError::Internal {
+                    detail: format!(
+                        "move published staged member {}-{} to its hot object: {error}",
+                        member.id().shard(),
+                        member.id().generation()
+                    ),
+                })?;
+        }
+        Ok(())
+    }
+
     /// Waits for every live-tail read holding one member's runs to finish.
     ///
     /// The member's authority is already `Published` by the time cleanup runs,
@@ -204,6 +258,7 @@ impl ClaimPublisher {
             | ScribePublicationOutcome::KnownNotCommitted(error) => return Err(error),
         };
         let object_identities: Vec<String> = rows.iter().map(|row| row.file_path.clone()).collect();
+        self.advance_published(&request, &object_identities)?;
         self.retire_members(&request, &outcome.commit_key, &object_identities)
             .await?;
         self.mover.cleanup_published(&claims).await?;

@@ -271,6 +271,8 @@ struct PersistenceDependencies {
     geometry: geometry::ScribeGeometry,
     /// Pod-wide registry the staging runtime moves generation authority in.
     hot_sources: Arc<hot_source::ScribeHotSourceRegistry>,
+    /// Pod-wide observation owner the staged and claim lifecycle publishes to.
+    telemetry: Arc<telemetry::ScribeTelemetry>,
 }
 
 pub struct ScribeImpl {
@@ -1206,6 +1208,7 @@ impl ScribeImpl {
             staging_file_publisher,
             geometry,
             hot_sources,
+            telemetry,
         } = dependencies;
         persistence::PersistenceRuntime::start(
             config,
@@ -1219,6 +1222,7 @@ impl ScribeImpl {
                 staging_file_publisher,
                 geometry,
                 hot_sources,
+                telemetry,
                 #[cfg(any(test, feature = "test-support"))]
                 faults,
             },
@@ -1288,6 +1292,7 @@ impl ScribeImpl {
                     staging_file_publisher: staging_file_publisher.clone(),
                     geometry,
                     hot_sources: Arc::clone(&hot_sources),
+                    telemetry: admission.contention().telemetry_handle(),
                 },
                 &coordination_runtime,
             )

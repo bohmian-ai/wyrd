@@ -1,240 +1,161 @@
 ---
 name: wyrd-implement
-description: Execute or resume exactly one active, decision-complete non-UI Wyrd implementation task through verified completion or a genuine material-authority blocker in Rust, Python, TypeScript, PyO3, contracts, SDKs, server, CLI, MCP, registry, storage, Skald, Vala/Bifrost, codegen, or cross-language tests. Use when a current user instruction or approved task assigns one bounded change. Persist through compile, lint, test, fixture, command, and repository-managed local-environment failures. Do not use to plan, decompose, close an entire implementation plan, or implement Svelte UI work.
+description: Implement and verify an actionable Wyrd task or bounded remediation from direct instructions or a plan artifact. Align code to requested outcomes, repository authority, claims, evidence expectations, and referenced expertise; escalate only material unresolved decisions.
 ---
 
 # Wyrd Implement
 
-Execute exactly one approved task through `COMPLETE` or a genuine material
-`BLOCKED` condition. Own reversible implementation mechanics. Do not redesign
-requirements or material boundaries.
+Own the complete implementation loop: understand the task, acquire relevant
+context, edit code and tests, collect credible evidence, fix task-local
+failures, and report the result. Task correctness matters; planner-specific
+serialization and execution-controller bookkeeping do not.
 
-Use one fixed loop:
+## Determine the task contract
 
-```text
-orient -> localize -> implement -> validate -> refine
-             ^                                  |
-             +----------------------------------+
-```
+Accept direct instructions, an issue, a Markdown task, a structured packet, or
+bounded review findings. The task is actionable when its requested outcome,
+affected surface, material constraints, and observable success conditions can
+be determined from the request plus repository authority.
 
-Test, compiler, formatter, Clippy, rustdoc, command, fixture, and local
-environment failures are refinement inputs. They are not terminal conditions
-by themselves.
+No YAML block, section name, ID, digest, source SHA, clean worktree, write set,
+predeclared command, candidate manifest, or controller generation is required.
+If explicit claims or acceptance criteria are absent, derive a concise working
+checklist from the requested behavior and repository completion rules, state
+material assumptions, and proceed. Normalize unlabeled obligations with local
+IDs when traceability helps.
 
-`$name` denotes a Wyrd skill; load it with the `Skill` tool. `Luna`, `Terra`,
-and `Sol` in a task packet are risk tiers, not model names.
+Treat task claims as explainable obligations. Preserve their dispositions and
+accepted evidence classes when supplied. Deterministic tests, LLM review, and
+human attestation remain distinct; one never silently replaces another.
 
-## When dispatched by $wyrd-implement-plan
+## Acquire relevant context
 
-The orchestrator supplies the worktree path, execution branch, active task, and
-diff base. Work only inside that worktree. The orchestrator owns task-status
-changes, acceptance decisions, and the final published history; you own keeping
-your own work durable while you produce it (see Checkpoint your work).
+Read `AGENTS.md`, `architecture/agent-rules.md`, and applicable design/doctrine
+authority. Read and apply every skill, architecture reference, pinned source,
+prior decision, and implementation example explicitly named by the task. Use
+each for the decisions it informs; repository authority and the locked outcome
+still govern.
 
-Return a terminal `COMPLETE` or `BLOCKED` report. If you return a nonterminal
-progress report, the orchestrator will resume **this same agent** with your
-context intact rather than replacing you, so do not restate prior work or
-re-derive what you already established. Route material questions to the
-orchestrator, never to the user.
+Start at [the canonical reference router](../../../architecture/references/README.md).
+Read [implementation execution](../../../architecture/references/languages/implementation-execution.md)
+for every task, then select and completely read the smallest additional set
+covering the actual implementation surfaces. Apply the references even when a
+task packet omitted them; task-provided links add context but are not the only
+discovery mechanism.
 
-## Load the task and repository
-
-Before editing:
-
-1. Read the active task, referenced approved-plan context, and applicable
-   `AGENTS.md` files completely.
-2. For a standardized Wyrd task, read
-   `.claude/skills/wyrd-plan/references/task-packet-format.md` and validate its
-   parent plan directory. The task must be `Ready`.
-3. Read `architecture/agent-rules.md` and `architecture/wyrd-design.md`. Read
-   `architecture/wyrd-doctrine.mdx` before changing Wyrd contracts, APIs,
-   SDKs, CLI, MCP, docs, generated artifacts, or behavior.
-4. Read
-   `architecture/references/languages/implementation-execution.md`; it defines
-   material boundaries, verification equivalence, local-environment recovery,
-   living-task updates, test integrity, and completion evidence.
-5. Read `architecture/references/README.md`, then load only the other
-   architecture references required by the affected surface using the routing
-   table below. Read every selected reference completely and state the
-   decision it governs before editing.
-6. Inspect Git status and preserve unrelated user changes.
-7. Inspect `mise.toml`, manifests, package configuration, and lockfiles before
-   relying on commands, features, dependencies, or environment.
-8. When `.codegraph/` exists, use CodeGraph before grep, find, or manual source
-   discovery.
-
-Build a checklist from required changes, acceptance criteria, required tests,
-focused commands, and completion evidence. Continue until every item is
-checked or a material boundary prevents it.
-
-### Architecture reference routing
-
-| Reference | Load when the task touches |
+| Reference | Select when implementation touches |
 |---|---|
-| `architecture/references/languages/implementation-execution.md` | Every task: authority boundaries, verification recovery, test integrity, diff audit, and completion evidence |
-| `architecture/references/doctrine/positioning-and-vocabulary.md` | Card vocabulary, `CardRef`, v1 kinds, or removed concepts |
-| `architecture/references/doctrine/architecture-constraints.md` | Tier boundaries, deployment, or observation identity |
-| `architecture/references/architecture/patterns.md` | Crate placement and server/client/storage/provider/audit patterns |
-| `architecture/references/languages/rust-core.md` | Rust ownership, traits, async, allocation, and idioms |
-| `architecture/references/languages/pyo3-boundaries.md` | PyO3 classes, GIL, lifetimes, conversions, and registration |
-| `architecture/references/languages/errors.md` | Stable errors and boundary mappings |
-| `architecture/references/languages/python-api-and-stubs.md` | Python exports, stubs, package layout, and tests |
-| `architecture/references/languages/testing-workflows.md` | Test tiers, verification levels, and boundary checks |
-| `architecture/references/languages/agent-harness.md` | MCP and other agent-facing contracts |
-| `architecture/references/languages/typescript-guide.md` | `@wyrd/sdk` and napi conventions |
-| `architecture/references/domain/iceberg-bifrost.md` | Bifrost, Iceberg, DataFusion, and object storage |
+| [Wyrd protocol authority](../../../architecture/wyrd-design.md) | Card contracts, identity, doctrine, cross-service boundaries, or public surfaces |
+| [Bifrost authority](../../../architecture/bifrost-design.md) | Scribe, Oracle, Forge, analytical storage, resources, or public query/ingest behavior |
+| [Security posture](../../../architecture/wyrd-security-posture.md) | Authentication, authorization, credentials, tenant security, audit integrity, or external-network trust |
+| [Operations authority](../../../architecture/operations/README.md) | Deployment, release, capacity, backup, recovery, SLOs, or incidents |
+| [Positioning and vocabulary](../../../architecture/references/doctrine/positioning-and-vocabulary.md) | Card vocabulary, envelope, `CardRef`, v1 kinds, or removed concepts |
+| [Architecture constraints](../../../architecture/references/doctrine/architecture-constraints.md) | Wyrd/Vala/Skald boundaries, deployment, tenant isolation, or observation identity |
+| [Architecture patterns](../../../architecture/references/architecture/patterns.md) | Ownership, contract placement, or server/client/storage/provider/audit structure |
+| [Implementation execution](../../../architecture/references/languages/implementation-execution.md) | Every task: execution authority, adaptation, verification recovery, test integrity, and completion evidence |
+| [Rust core](../../../architecture/references/languages/rust-core.md) | Rust ownership, async, traits, allocation, or API shape |
+| [PyO3 boundaries](../../../architecture/references/languages/pyo3-boundaries.md) | PyO3 classes, GIL, lifetimes, conversion, or module registration |
+| [Python API and stubs](../../../architecture/references/languages/python-api-and-stubs.md) | Python exports, stubs, package layout, or typing |
+| [TypeScript guide](../../../architecture/references/languages/typescript-guide.md) | TypeScript SDK, declarations, or napi boundaries |
+| [Testing workflows](../../../architecture/references/languages/testing-workflows.md) | User journeys, integration tests, unit tests, or repository verification |
+| [Agent harness](../../../architecture/references/languages/agent-harness.md) | MCP, agent-facing contracts, structured validation, or audit |
+| [Errors](../../../architecture/references/languages/errors.md) | Stable errors and Rust/Python/TypeScript/HTTP/CLI mapping |
+| [Vala architecture](../../../architecture/references/domain/vala-architecture.md) | Broad Vala ownership, Bifrost orientation, or cross-domain work |
+| [Telemetry observations](../../../architecture/references/domain/telemetry-observations.md) | OpenTelemetry signals, correlation, observation identity, or payload sensitivity |
+| [Evaluation](../../../architecture/references/domain/evaluation.md) | Eval Cards, scenarios, judge quality, scoring, or evidence |
+| [Drift monitoring](../../../architecture/references/domain/drift-monitoring.md) | Drift signals, baselines, thresholds, alert noise, or monitoring policy |
+| [OLAP serving](../../../architecture/references/domain/olap-serving.md) | Bifrost tables, ingest/query serving, admission, tenant safety, or analytical APIs |
+| [Iceberg](../../../architecture/references/domain/iceberg.md) | Snapshots, catalogs, schemas, partitions, object storage, or compaction |
+| [DataFusion](../../../architecture/references/domain/datafusion.md) | Logical/physical plans, provider pushdown, pruning, statistics, memory, or spills |
+| [Arrow analytical interop](../../../architecture/references/domain/arrow-analytical-interop.md) | Arrow, RecordBatch, Parquet, PyArrow, FFI, or Python analytical boundaries |
+| [Analytical operations reliability](../../../architecture/references/domain/analytical-operations-reliability.md) | Backpressure, durability, leases, repair, retention, SLOs, or failure recovery |
 
-When an approved task explicitly supersedes a Wyrd design decision, update the
-named design authority with the implementation and update doctrine when the
-principle changes. Otherwise follow current design and classify an implicit
-conflict as material.
+Follow CodeGraph instructions. Inspect the nearest behavior owner, callers,
+consumers, tests, manifests, generated surfaces, and current `mise` tasks.
+Treat a write set as a coordination forecast, not an allowlist. Make necessary
+supporting edits to callers, fixtures, projections, documentation, and tests,
+and report material scope expansion. Preserve unrelated user changes and avoid
+unrelated cleanup.
 
-## Enforce the material boundary
+If a named reference is unavailable, continue when the task and repository
+provide enough authority. Block only when it is essential to choose among
+materially different contracts or prove a required claim.
 
-Classify every mismatch before deciding whether to continue:
+## Implement the complete cohesive change
 
-| Class | Examples | Authority |
-|---|---|---|
-| Local and reversible | Private helpers, rustdoc, formatting, diff-caused Clippy, mechanical callers, existing fixtures | Implement, fix, and rerun |
-| Bounded correction | Equivalent command/filter, current private symbol, adjacent fixture inside the owner, repository-managed local environment, small touched-file lint | Proceed, record in the task, and continue |
-| Material | Public/wire/persisted contract, migration or destructive behavior, dependency or Cargo feature, auth/tenancy/policy/audit semantics, ownership redesign, changed acceptance outcome | Stop before the change and request authority |
+Map every explicit or derived claim to source behavior and appropriate proof.
+Implement the complete owned outcome, including required unit, integration,
+user-journey, generated, and cross-language closure. Follow repository
+ownership, struct-centered Rust, rustdoc, async, PyO3, contract, audit,
+tenancy, and testing rules where applicable.
 
-Expected paths and private symbol names are not a strict whitelist. Add an
-adjacent private implementation or test-support file inside the established
-owner when it is the smallest way to satisfy acceptance. Do not cross a
-prohibited material boundary.
+Compiler, formatter, lint, test, fixture, codegen, and setup failures are
+development feedback. Diagnose and fix task-local causes, including necessary
+consumers and declarations. Do not change a required claim's meaning, weaken a
+gate, hide a failure, or choose production behavior solely to satisfy a
+fixture. Ordinary local design choices remain yours when multiple
+repository-native implementations satisfy the task.
 
-Exact verification commands are recipes unless the task explicitly makes the
-exact lane, feature set, or environment normative. A defective recipe may be
-replaced with equivalent non-weaker proof.
+For bounded remediation, read the original task, cited findings, and relevant
+prior diff when available. Apply the required outcomes without demanding a
+generation, superseded candidate, artifact digest, or replacement-commit
+topology.
 
-## Execute the loop
+## Verify claims
 
-### Orient
+Run the task's requested checks and the narrowest current `mise` checks required
+by `AGENTS.md` for every touched surface. Inspect `mise.toml` before relying on
+a command. Separate:
 
-- Confirm objective, requirements, non-goals, allowed and prohibited scope,
-  material contracts, acceptance criteria, tests, features, and commands.
-- Reconstruct prior progress from the task, current diff, and verification
-  evidence after any interruption or context compaction.
+- diagnostics, which provide quick feedback;
+- direct claim evidence, which proves specific required behavior; and
+- integrated evidence, which proves cross-task or journey behavior.
 
-### Localize
+If a listed command is stale but its proof intent is clear, run the current
+canonical equivalent and disclose the substitution. Do not substitute when
+exact command identity or output is itself an explicit requirement. Never skip,
+weaken, mask, or falsely claim a check.
 
-- Locate current owners, callers, consumers, dispatch, fixtures, and tests.
-- Prefer current repository reality over stale private paths or helper names.
-- Reuse existing owners, abstractions, errors, fixtures, and support exports.
+Record evidence compactly by subject, claim, evidence class, outcome, and
+source/test/command references. Full logs remain with the execution
+environment; do not invent an artifact store. Failed or missing evidence is
+`failed` or `indeterminate`, never success.
 
-Before editing Rust, identify the owning concrete struct or domain type,
-earned async boundaries, nearest structural precedent, and rustdoc obligations
-for every touched item.
+Implementation completion means the behavior is implemented and declared
+evidence is collected. It does not independently verify or authorize a Wyrd
+`Change`, finalize an `EvidenceManifest`, imply merge, or grant deployment
+authority.
 
-### Implement
+## Escalate narrowly
 
-- Make the smallest cohesive in-scope change for the task at hand.
-- Preserve normative behavior, operation order, transactions, concurrency,
-  cancellation, side effects, error mapping, and invariants.
-- Follow `AGENTS.md`; do not duplicate its language, ownership, or test rules
-  here.
-- Write required tests with the implementation.
-- Do not implement later tasks, speculative cleanup, new architecture, or
-  unapproved material changes.
+Stop only when:
 
-### Validate
+- unresolved ambiguity selects materially different public, durable, security,
+  tenancy, migration, or acceptance behavior;
+- the task conflicts with higher repository authority and resolution changes
+  the requested outcome;
+- required external or destructive action lacks authorization; or
+- essential proof, infrastructure, or reference material is unavailable with
+  no safe equivalent.
 
-Run focused verification sequentially over the smallest complete affected
-surface. Inspect `mise` tasks before using them. Prefer the repository task
-that owns setup; use direct Cargo only for a narrow pure test or exact focused
-filter that needs no missing repository setup.
+Do not block on missing protocol metadata, absent claim IDs, imperfect packet
+structure, stale forecast paths, ordinary implementation choices, supporting
+edits, the first failed check, or lack of controller/artifact-store machinery.
 
-### Refine
+## Handoff
 
-Route every failure:
+Return a concise human-readable report:
 
-1. **Caused by the diff:** diagnose, fix, and rerun.
-2. **Small defect in touched code:** fix and report as incidental.
-3. **Defective command, filter, feature, or lane:** derive equivalent
-   non-weaker proof, update the task evidence, and rerun.
-4. **Missing private plumbing or fixture:** add the smallest adjacent support
-   inside the established owner and continue.
-5. **Missing repository-managed local setup:** inspect `mise.toml` and setup
-   scripts, start services, run migrations, use checked-in local test values,
-   and rerun.
-6. **Proven unrelated baseline failure:** record the proof and continue every
-   unaffected implementation and verification item. Fix if instructed.
-7. **Material change required:** stop before it and return `BLOCKED` with
-   repository evidence and the authority needed.
-8. **Uncertain classification:** gather more source and command evidence; do
-   not stop merely because diagnosis is incomplete.
+1. Implemented outcome and material design choices.
+2. Changed owners/surfaces and any justified scope expansion.
+3. Claim trace with evidence class and `satisfied`, `failed`, `indeterminate`,
+   or `not_evaluated` status.
+4. Commands and outcomes, including substitutions and limitations.
+5. Referenced expertise that materially affected the implementation.
+6. Remaining risks or one exact blocker.
 
-Do not create a remediation plan for classes 1–6.
-
-## Recover repository-managed test environments
-
-Missing local test variables or services are mechanical when the repository
-defines them.
-
-1. Inspect the relevant `mise` task, its `depends`, `env`, and invoked scripts.
-2. Run canonical setup and migration tasks.
-3. Invoke the owning `mise` task, or apply its checked-in local-only test
-   values to an equivalent focused command.
-4. Retry the intended test.
-
-Never invent, print, or persist production credentials. A genuinely
-unavailable external credential or protected service may block its mandatory
-proof only after all remaining work and verification complete.
-
-## Update the living task
-
-Record bounded corrections in the active task:
-
-- corrected repository facts, private paths, or symbol names;
-- existing or added private fixtures and support files;
-- equivalent commands and why their proof is not weaker;
-- progress, diagnoses, and verification evidence.
-
-Do not edit requirements, public or persisted contracts, security semantics,
-material architecture, data-loss behavior, or acceptance outcomes. A required
-change to those fields is `BLOCKED`, not a task rewrite.
-
-## Checkpoint your work
-
-Uncommitted work in a worktree is unrecoverable. A stray `git checkout`, `git
-restore`, `git stash`, `git clean`, or `git reset --hard` destroys it with no
-undo, and a "backup" produced by piping a command through an unverified shell
-wrapper is not a backup. Commit early and often.
-
-- Commit to the execution branch as soon as a coherent slice compiles, and
-  again before any long verification run. Small `wip(<scope>): ...` commits are
-  correct; the orchestrator squashes or rewrites them at integration.
-- Commit **before** running any command that can discard working-tree state,
-  and before running a command whose purpose is to move the tree to a different
-  revision. There is no exception for "I saved a patch first."
-- Never run `git checkout -- .`, `git restore`, `git stash`, `git clean -f`, or
-  `git reset --hard` while uncommitted work exists. To compare against another
-  revision, read it with `git show <rev>:<path>` instead of moving the tree.
-- If you must verify a baseline, do it from a committed state: commit your
-  work, then compare, then return to your commit.
-- Use your configured Git identity and add no co-author trailers, per
-  `AGENTS.md` §13.
-
-## Protect test integrity
-
-Never pass a gate by weakening assertions, adding sleeps for synchronization,
-ignoring tests, adding unjustified lint allowances, mocking away required
-behavior, swallowing errors, or changing production semantics to satisfy an
-incorrect test. Fix the cause or identify a material conflict.
-
-## Finish only at a terminal outcome
-
-Elapsed time, difficulty, partial progress, context length, recoverable tool
-failure, missing local setup, an invalid command, or remaining in-scope work
-are not terminal.
-
-- `COMPLETE`: every acceptance criterion and required proof is satisfied.
-- `BLOCKED`: no in-scope solution remains without a material change or
-  genuinely unavailable authority.
-
-Before reporting, commit all remaining work, inspect tracked and untracked
-changes, map every changed file to acceptance, remove accidental artifacts, and
-run `git diff --check`.
-Use the structured completion report in
-`architecture/references/languages/implementation-execution.md`.
+Create a commit only when the caller or active execution environment requests
+one. Then inspect the diff, run `git diff --check`, verify the existing Git
+identity, follow repository identity rules, and never rewrite unrelated user
+work. A commit is a delivery choice, not the definition of successful
+implementation.

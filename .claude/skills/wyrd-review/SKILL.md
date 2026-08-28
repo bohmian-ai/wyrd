@@ -1,246 +1,177 @@
 ---
 name: wyrd-review
-description: Review Wyrd implementations against approved wyrd-plan plans and task packets, living-task execution updates, architecture, ownership, contracts, repository rules, tests, and verification evidence. Use standalone after or during wyrd-implement, as the static task and final-plan reviewer controlled by $wyrd-implement-plan, or as the repository integration policy loaded by terminal review-and-plan branch reviews. Binding modes return static findings and evidence to their root orchestrator without writing another artifact, running verification, or routing work.
+description: Review either an ongoing Wyrd implementation checkpoint or a stable final candidate for task alignment, claim satisfaction, correctness, regressions, applicable repository rules, and credible evidence. Checkpoints never grant completion approval.
 ---
 
 # Wyrd Review
 
-Independently review implementation conformance and proof. Preserve the
-boundary used by `$wyrd-implement`: reversible mechanics remain implementation
-work; material decisions return to the applicable plan authority.
+Use `CHECKPOINT` to review mutable, partial work for current correctness,
+directional drift, and remaining gaps. Use `FINAL` to adjudicate a stable
+candidate for task completion. Remain read-only in both modes.
 
-Use one fixed loop:
+Review acceptance is an evidence contribution and candidate-local judgment. It
+does not transition a Wyrd `Change`, finalize an `EvidenceManifest`, grant
+authorization, imply merge, or replace policy evaluation over finalized
+evidence.
 
-```text
-resolve diff -> map requirements/ACs -> inspect source/tests
-             -> classify adaptations/evidence -> verdict -> route
-```
+## Common review principles
 
-Do not modify implementation source, tests, generated artifacts, or the
-reviewed plan/task. Writing the durable review is the only default mutation.
+Read `AGENTS.md`, `architecture/agent-rules.md`, the task or remediation
+authority, and relevant Wyrd design/doctrine. Follow CodeGraph instructions and
+inspect changed behavioral owners plus only the callers, consumers, error and
+cleanup paths, tests, and generated surfaces needed to establish task claims
+and candidate-introduced regressions.
 
-`$name` denotes a Wyrd skill; load it with the `Skill` tool.
+Review priorities are:
 
-## Plan-execution binding mode
+1. alignment with requested outcomes, locked decisions, scope, and non-goals;
+2. required claim or acceptance-criterion satisfaction;
+3. behavioral correctness, negative paths, regression, and consumer closure;
+4. credible evidence and verification; and
+5. applicable hard repository rules in changed code.
 
-When `$wyrd-implement-plan` dispatches this skill for one task or the final
-integrated plan, this mode overrides conflicting standalone instructions:
+Be risk-directed. State transitions, rollback, cancellation, concurrency,
+durability, tenancy, audit, bounds, and telemetry matter only where the changed
+behavior makes them relevant. Mechanical/generated/rename-only changes may be
+sampled once equivalence or generation provenance is established.
 
-- Review the orchestrator-provided task delta from the last accepted commit,
-  or the complete execution-baseline-through-branch delta for final review.
-- Read the canonical plan, active tasks, implementation reports, recorded
-  verification evidence, and applicable repository authorities completely.
-- Perform static source, contract, caller, consumer, manifest, generated
-  surface, and test analysis. Audit recorded verification semantically.
-- Do not run tests, builds, lints, formatters, generators, migrations,
-  services, plan validators, repository gates, or independent verification.
-- Load the progressive references required by the affected surface.
-- Return a requirement/acceptance traceability matrix, findings, evidence
-  audit, inspected surfaces, and material static-analysis limits.
-- **Cite every matrix row.** Each row must carry a concrete `path:line`
-  pointing into the reviewed delta, plus a source-derived explanation of how
-  the invariant is enforced and which exact assertion fails on regression. A
-  row backed only by a test name, a passing count, the implementation report,
-  task status, or a restated requirement is uncited. The orchestrator rejects
-  any `APPROVE` containing an uncited row, so an uncited matrix wastes the
-  review pass rather than completing it.
-- Use only these verdicts:
-  - `APPROVE`: implementation and proof satisfy the reviewed task or plan.
-  - `RESUME_IMPLEMENTATION`: reversible implementation or evidence work
-    remains.
-  - `ORCHESTRATOR_DECISION_REQUIRED`: a material plan, product, security,
-    contract, migration, dependency, ownership, or acceptance decision must be
-    resolved by the plan orchestrator.
-  - `REVIEW_BLOCKED`: the review target or mandatory evidence cannot be
-    resolved well enough for static review.
-- Do not write `review.md`, modify source or plan artifacts, assign task
-  status, invoke another skill, create a remediation plan, or communicate with
-  the user.
+Map obligations to the strongest applicable evidence. Runtime behavior normally
+needs tests; source, schema, documentation, or absence claims may be proven by
+static evidence. Commands are not proof when their assertions cannot detect the
+claimed defect. Preserve evidence-class distinctions; do not average
+deterministic evidence, model evaluation, and human attestation into a score.
 
-For first review, operate as a fresh independent agent. For focused re-review,
-verify prior findings first and inspect affected seams without reopening
-accepted decisions absent new evidence. The `$wyrd-implement-plan`
-orchestrator is the only controller, writer, committer, and router.
+## CHECKPOINT mode
 
-## Terminal integration-binding mode
+Checkpoint review judges the implemented slice and trajectory, not whole-task
+completion. Accept the task, an optional caller-declared checkpoint scope or
+claim subset, an optional task base, current `HEAD`, staged and unstaged diffs,
+and relevant untracked files. A clean tree, candidate commit, manifest, digest,
+or complete verification set is not required.
 
-When `$review-and-plan` or `$review-and-plan-quick` loads this skill as the Wyrd
-repository integration policy, this mode overrides conflicting standalone
-workflow instructions:
+At the start, record the available base, `HEAD`, staged/unstaged path inventory,
+and relevant untracked paths. Capture diff digests when practical. Never stash,
+reset, format, or mutate the implementer's tree. Recheck the snapshot at the
+end. If it changed, scope findings to the captured state or return
+`CHECKPOINT_STALE`; never imply the latest tree was reviewed.
 
-- Review only the orchestrator-provided committed target branch against the
-  committed base branch at their resolved SHAs.
-- Use only the caller-supplied optional reference as intent. Apply formal plan
-  conformance only when that reference is an approved Wyrd plan or task;
-  otherwise mark it not applicable while still applying Wyrd architecture and
-  repository rules.
-- Perform static source, contract, caller, consumer, manifest, and test
-  analysis. Do not run project tests, builds, lints, formatters, generators,
-  migrations, services, repository gates, or independent verification.
-- Load the progressive references required by the affected surface.
-- Return candidate findings, clean coverage, conformance evidence, and material
-  static-analysis limits to the root orchestrator.
-- Do not assign the final verdict or finding IDs, write `review.md`, modify the
-  reference, invoke `$wyrd-plan`, or route into implementation.
+A dirty-tree checkpoint is an ephemeral subject, not an immutable Wyrd
+`ChangeRevision`. Its evidence becomes stale when the subject changes.
 
-The terminal orchestrator is the only writer and owns deduplication, final
-classification, the durable artifact, and canonical planning.
+Classify the visible state:
 
-## Establish the review contract
+- `CURRENT_DEFECT` — implemented or claimed-complete behavior is wrong,
+  internally inconsistent, regressive, or violates an applicable hard rule;
+- `DIRECTIONAL_DRIFT` — the current design conflicts with a locked decision,
+  owner, non-goal, or required claim and continuing would compound rework;
+- `EXPECTED_GAP` — legitimate unfinished work outside the claimed checkpoint
+  slice or a natural later closure step; not a finding; or
+- `CURRENT_RISK` — a source-grounded concern that needs later proof but is not
+  yet a defect; nonblocking.
 
-1. Read `AGENTS.md`, `architecture/agent-rules.md`,
-   `architecture/wyrd-design.md`, and `architecture/wyrd-doctrine.mdx`
-   completely.
-2. Resolve the exact target from the caller-provided diff, commit range,
-   branch base, or working tree. Include untracked files and preserve unrelated
-   user changes.
-3. Locate the canonical plan and every task in scope when plan conformance is
-   claimed, and read them completely.
+Missing final tests are normally expected gaps. They become current defects
+when the checkpoint claims proof is complete or an existing test falsely passes
+and cannot detect the behavior it claims to establish. An intermediate build
+failure is expected only when the task/checkpoint explicitly permits that state
+or the breakage is an obvious bounded consequence of work underway.
 
-   Do not run the plan validator. Structural validation is the caller's job:
-   in a binding mode the orchestrator validates during preflight and passes the
-   result down; standalone, read the artifacts and judge them directly. Running
-   it here would contradict this skill's own prohibition on executing
-   repository tooling.
+Run only checks proportionate to the current slice: parse/type/compile,
+focused tests, meaningful format/lint, or a check needed to adjudicate a
+suspected defect. List final journeys, generated closure, and broad gates as
+remaining work rather than requiring them for a clear checkpoint.
 
-   Require an `Approved` parent plan. A `Ready` task is eligible for an active
-   or legacy review; `Complete` is the normal completion-review state; review
-   a `Blocked` task only to validate its blocker claim. A `Planned` task is not
-   eligible for implementation-conformance approval.
-4. Read `$wyrd-implement` completion evidence and living-task execution updates
-   when present. Treat them as claims to verify, not proof by themselves.
-5. Read the owning manifests, relevant `mise.toml` tasks, tests, generated
-   sources, and nearest implementation patterns needed to judge the change.
-6. Resolve the applicable execution skill from the task and write set. Use
-   `$wyrd-implement` for non-UI work and `$wyrd-ui` for Svelte/UI work; load
-   both when one task crosses the server/UI boundary. Treat a task that names
-   an execution skill which rejects its write set as an executable-task defect.
-7. When `.codegraph/` exists, use CodeGraph before grep or manual traversal to
-   locate owners, callers, consumers, dispatch paths, and tests.
+Checkpoint verdicts are:
 
-If no plan relationship is claimed, mark plan conformance
-`Not applicable: no plan relationship was claimed` and continue the repository
-review.
+- `CHECKPOINT_CLEAR`
+- `COURSE_CORRECTION_NEEDED`
+- `DECISION_NEEDED`
+- `CHECKPOINT_BLOCKED`
+- `CHECKPOINT_STALE`
 
-Apply authority in this order:
+Every checkpoint response begins:
 
-1. current user instructions;
-2. active task;
-3. approved parent plan;
-4. applicable `AGENTS.md` files;
-5. current repository architecture and conventions.
+`Checkpoint review only — this is not task completion approval.`
 
-## Load references progressively
+Report snapshot/scope, verdict, current defects or drift, provisional claim
+progress, expected gaps, focused verification, and risks. Use provisional claim
+statuses `PROVEN_NOW`, `IMPLEMENTED_UNVERIFIED`, `PARTIAL`, `NOT_STARTED`,
+`NOT_APPLICABLE`, or `DRIFTED`. Later changes may invalidate every status.
 
-Always read:
+## FINAL mode
 
-- `references/conformance-and-adaptation.md`
-- `architecture/references/languages/implementation-execution.md`
+Final review requires repository root, task/remediation authority, and an
+immutable, unambiguous base-to-candidate range. The base need not be the
+candidate's immediate parent and a merge is reviewable when the caller supplies
+unambiguous range semantics. Controller IDs, generations, manifests, and
+digests are optional provenance.
 
-Read `references/verification-evidence.md` when commands, test results,
-environment setup, coverage, or completion evidence are in scope. Read
-`references/review-format.md` before writing the review.
+When a Wyrd `ChangeRevisionId` is supplied, confirm its base/candidate subject
+identity matches the reviewed range. Report a stale or superseded revision as
+an integrity problem; never apply evidence from one revision to another.
 
-Read `architecture/references/README.md`, then load only the knowledge required
-by the affected surface:
+Review the diff before completing the claim trace. Reuse credible verification
+evidence and rerun only the narrowest checks needed when evidence is absent,
+contradictory, suspicious, stale, or insufficient. Accept an equivalent or
+stronger canonical `mise` command unless exact command identity is itself a
+task requirement. A candidate-caused failure, weakened gate, ineffective
+task-critical test, or unproved required behavior prevents acceptance.
 
-| Reference | Load when the review touches |
-|---|---|
-| `architecture/references/doctrine/positioning-and-vocabulary.md` | Card vocabulary, `CardRef`, v1 kinds, or removed concepts |
-| `architecture/references/doctrine/architecture-constraints.md` | Tier boundaries, deployment, or observation identity |
-| `architecture/references/architecture/patterns.md` | Crate placement and server/client/storage/provider/audit ownership |
-| `architecture/references/languages/rust-core.md` | Rust ownership, traits, async, allocation, or API shape |
-| `architecture/references/languages/pyo3-boundaries.md` | PyO3 classes, GIL, lifetimes, conversions, or registration |
-| `architecture/references/languages/errors.md` | Stable errors and boundary mappings |
-| `architecture/references/languages/python-api-and-stubs.md` | Python exports, stubs, package layout, or tests |
-| `architecture/references/languages/testing-workflows.md` | Test tiers, journey coverage, verification levels, or boundary gates |
-| `architecture/references/languages/agent-harness.md` | MCP and other agent-facing contracts |
-| `architecture/references/languages/typescript-guide.md` | `@wyrd/sdk` and napi conventions |
-| `architecture/references/domain/iceberg-bifrost.md` | Bifrost, Iceberg, DataFusion, or object storage |
+Pre-existing broad-lane failures may be recorded as static limits only when
+base comparison plus focused owning-surface evidence proves non-regression and
+the task does not own that failure. `NOT_APPLICABLE` requires a short
+task-authority reason.
 
-State which conditional references were loaded and the decision each governs.
-Do not duplicate their repository rules in this skill.
+Final verdicts are:
 
-## Review conformance and adaptations
+- `ACCEPT`
+- `CHANGES_REQUIRED`
+- `DECISION_REQUIRED`
+- `REVIEW_BLOCKED`
 
-Build a traceability matrix for every in-scope requirement and acceptance
-criterion:
+Only FINAL may return `ACCEPT`. Reassess all task changes and required claims;
+checkpoint results are hints, never inherited acceptance. When supplied, state
+whether prior checkpoint defects and expected gaps were resolved.
 
-- implementation `path:line` and owning symbol;
-- test or generated artifact, with the `path:line` of the deciding assertion;
-- verification evidence;
-- `PASS`, `FAIL`, or `UNVERIFIED`.
+## Finding threshold
 
-Every row is cited or the review does not count. See the citation rule in
-plan-execution binding mode above; it applies in every mode.
+A blocking finding requires:
 
-Inspect required behavior, invariants, ordering, errors, side effects,
-negative cases, non-goals, task boundaries, consumers, and changed files.
-Classify every difference between the task recipe and repository reality:
+- exact source or authority;
+- a reachable scenario;
+- a concrete observable consequence;
+- a violated required claim, contract, or applicable hard repository rule; and
+- a testable required outcome.
 
-| Class | Review treatment |
-|---|---|
-| Local mechanic | Accept when behavior, ownership, and proof remain intact |
-| Bounded correction | Validate its evidence; do not call it an unapproved deviation |
-| Material deviation | Standalone: require replanning. Plan-execution binding: return `ORCHESTRATOR_DECISION_REQUIRED` |
+Use severity proportionately:
 
-Expected private paths, helpers, and fixture layouts are guidance rather than a
-strict whitelist. Public/wire/generated/persisted contracts, migrations,
-destructive behavior, dependencies or Cargo features, auth/tenancy/policy/audit
-semantics, ownership direction, and acceptance outcomes are material.
+- `CRITICAL` — reachable security/tenant breach, data loss/corruption, unsafe
+  irreversible transition, or broken durability/audit invariant;
+- `MAJOR` — required claim or public/task behavior is wrong or unproved;
+- `MODERATE` — reachable in-scope correctness/reliability defect or material
+  regression risk with a concrete consequence; or
+- `NOTE` — preference, readability, speculative optimization, extra coverage,
+  or unrelated/pre-existing concern; never blocks and normally omit it.
 
-Review proof equivalence rather than command-string identity. A corrected
-command is acceptable only when it proves the same acceptance criterion,
-target, relevant features, test tier, environment behavior, negative cases,
-assertions, and consumers, and the living task records why the original recipe
-was defective.
+High-confidence source/test evidence may block. A medium-confidence finding
+must still demonstrate a reachable consequence. Low-confidence hypotheses do
+not block: investigate, note only if useful, or omit. Best-practice concerns
+block only when they violate an applicable hard rule or create a concrete
+in-scope correctness, security, or maintainability risk.
 
-## Assign the verdict
+Keep findings compact: ID, severity, location, affected claim/rule, reachable
+problem, impact, required outcome, and focused verification. Add class, owner,
+or confidence only when routing needs them. Do not report harmless preference
+differences or unrelated cleanup.
 
-- `APPROVE`: every in-scope requirement and acceptance criterion passes, the
-  required proof is sufficient, and no blocking finding remains.
-- `RESUME_IMPLEMENTATION`: bounded source, test, lint, fixture, setup, command,
-  or evidence work remains within the approved material contract.
-- `REPLAN_REQUIRED`: correctness requires changing a material decision or the
-  approved approach is materially invalid.
-- `REVIEW_BLOCKED`: the target, plan authority, task relationship, or mandatory
-  evidence cannot be resolved well enough to review.
+## Final output
 
-Use these exact uppercase verdict tokens in the artifact and handoff. Do not
-rename them to `PASS`, `REJECT`, `CHANGES_REQUIRED`, or `BLOCKED`.
+Lead with mode and verdict, then blocking findings, claim trace,
+verification/static limits, and optional high-value notes. Claim statuses are
+`PASS`, `FAIL`, `PARTIAL`, `NOT_APPLICABLE`, `UNVERIFIABLE`, or
+`DECISION_REQUIRED`. `PARTIAL`, `FAIL`, and task-critical `UNVERIFIABLE`
+prevent final acceptance.
 
-Do not approve intent, compilation alone, narrative claims, weakened proof, or
-a subset of acceptance criteria. Do not use `REPLAN_REQUIRED` for work that
-`$wyrd-implement` is already authorized to diagnose and fix.
-
-## Write and route the result
-
-Read `references/review-format.md` and write:
-
-```text
-.dev/review/<short-head>-<UTC-YYYYMMDD-HHMMSS>-wyrd-review/review.md
-```
-
-Use a caller-provided review directory when present. Write the artifact before
-invoking another skill.
-
-- For `APPROVE`, record that no work remains.
-- For `RESUME_IMPLEMENTATION`, return the existing active task to
-  its surface-appropriate execution skill with the finding IDs and evidence.
-  Use `$wyrd-implement` for non-UI work and `$wyrd-ui` for UI work. Do not
-  create a remediation plan.
-- For `REVIEW_BLOCKED`, record the exact missing authority or mandatory proof
-  and stop.
-- For `REPLAN_REQUIRED`, announce the handoff, load `$wyrd-plan`, and revise
-  the canonical plan/task when the original outcome remains active. Create a
-  separate remediation plan only when the review identifies an independent
-  follow-up after the original plan is closed.
-
-Invocation authorizes review and applicable planning artifacts only. It does
-not authorize source, test, generated-artifact, migration, dependency,
-configuration, or task-status changes.
-
-Return the review path, verdict, and next executable artifact: none for
-`APPROVE`, the existing task and applicable execution skill for
-`RESUME_IMPLEMENTATION`, the missing authority for `REVIEW_BLOCKED`, or the
-revised plan/task paths for `REPLAN_REQUIRED`.
+This skill owns checkpoint trajectory and candidate-local correctness, task
+conformance, immediate consumer closure, and focused evidence. Integrated
+cross-task seams, aggregate plan closure, and push readiness belong to
+`wyrd-review-and-plan`.

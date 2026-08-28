@@ -25,9 +25,9 @@ reusable knowledge lives in
 - Use Wyrd doctrine for architecture claims. Treat `architecture/wyrd-design.md`
   as the protocol authority and `architecture/wyrd-doctrine.mdx` as the public
   rationale; never invent a compatibility alias or legacy noun.
-- Obtain repository facts through a bounded Luna-medium repository scout. Label
+- Obtain repository facts through a bounded read-only repository scout. Label
   repository facts separately from design advice.
-- Obtain unstable external facts through a bounded Luna-medium source scout.
+- Obtain unstable external facts through a bounded read-only source scout.
   Prefer official Apache, OpenTelemetry, NIST, or original research sources and
   link them near the claim. Do not research stable doctrine already present
   locally.
@@ -35,8 +35,8 @@ reusable knowledge lives in
 ## Research delegation
 
 For any answer needing repository facts, external/current facts, or more than
-one Wyrd reference slice, spawn read-only Luna subagents at medium reasoning
-before researching directly.
+one Wyrd reference slice, spawn bounded read-only scouts before researching
+directly. The active harness chooses the concrete agent, model, and effort.
 
 - Use one scout for a bounded repository question: owner, symbol, call path,
   manifest, test coverage, or implementation state.

@@ -23,12 +23,14 @@ pyo3 = { workspace = true, optional = true }
 owner-crate `python` features and registers their submodules; it must not
 duplicate validation, lifecycle, registry, storage, or runtime logic.
 
-Approved owner crates today (12): `wyrd-cards`, `wyrd-config`,
-`wyrd-interfaces`, `wyrd-testing`, `wyrd-utils`, `skald-observer`,
-`skald-agent`, `skald-prompt`, `skald-runtime`, `skald-tool`,
-`skald-workflow`, `vala-sdk`. Enforced by `mise run check:pyo3-scope`. Do
-not add PyO3 to another crate without updating the architecture and the
-boundary gate.
+Approved owner crates are `wyrd-interfaces`, `wyrd-cards`, `wyrd-config`,
+`wyrd-utils`, `vala-sdk`, `skald-observer`, `skald-prompt`, `skald-runtime`,
+`skald-agent`, `skald-tool`, `skald-workflow`, and `wyrd-testing`.
+`check:pyo3-scope` enforces the foundational, shared, and Skald exclusions.
+Approved Wyrd and Vala owner features are additionally verified through crate
+manifests, `python/py-wyrd` feature wiring and registration, code generation,
+and public import tests. Do not add PyO3 to another crate without changing the
+architecture and its applicable verification.
 
 `wyrd-testing`'s `python` feature exposes the `WyrdTestServer` harness only;
 it is a test-tier crate and must never be enabled on production Python
@@ -40,7 +42,7 @@ Use `Bound<'py, T>` for new PyO3 code:
 
 ```rust
 #[cfg(feature = "python")]
-pub fn register(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
+pub fn register(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<CardRef>()?;
     Ok(())
 }
@@ -103,24 +105,21 @@ code outside an approved `python` feature boundary.
 ## Error Conversion At The Edge
 
 Do not store `PyErr` in reusable Rust errors. Convert `WyrdError` (or a
-crate-local `thiserror` enum) to a typed Python exception at the boundary:
+crate-local `thiserror` enum) to the structured Python exception hierarchy at
+the boundary. The shared helper must preserve the RFC 9457 projection rather
+than collapsing errors into Python's generic value/runtime classes:
 
 ```rust
 #[cfg(feature = "python")]
 pub fn wyrd_error_to_py_err(err: WyrdError) -> pyo3::PyErr {
-    let code = err.code();
-    let message = err.to_string();
-    // Choose an exception class from the Wyrd Python exception hierarchy
-    // based on err.status() / err.catalog_entry().category.
-    match err.status() {
-        400..=499 => pyo3::exceptions::PyValueError::new_err(format!("[{code}] {message}")),
-        _         => pyo3::exceptions::PyRuntimeError::new_err(format!("[{code}] {message}")),
-    }
+    wyrd_utils::py::wyrd_error_to_py_err(err)
 }
 ```
 
-Preserve the Wyrd error code in the Python-visible message so callers can
-assert on it.
+The Python exception exposes `code`, `message`, `details`, `remediation`,
+`status`, `title`, `type`, and the full `problem` payload as attributes. Domain
+subclasses may improve `except` ergonomics, but callers distinguish durable
+failure contracts by `code`, not by parsing text.
 
 ## Nested `#[pyclass]` Fields
 
@@ -151,8 +150,8 @@ values.
 ## GIL Discipline
 
 - Acquire the GIL only when working with Python objects.
-- Release the GIL for blocking disk or network work that is not already
-  routed through async infrastructure (`py.allow_threads(|| ...)`).
+- Detach from the interpreter for blocking disk or network work that is not
+  already routed through async infrastructure (`py.detach(|| ...)`).
 - Reacquire the GIL in spawned work only when converting back to Python
   objects.
 - Batch Python object work into one GIL acquisition when practical.
@@ -170,11 +169,12 @@ the work must still execute in Rust-owned async code.
 
 New Python-visible Rust functions/classes must be wired through
 `python/py-wyrd/src/lib.rs` and the owning crate's submodule registration
-function. Current submodules:
+function. Keep native extension topology distinct from the public Python
+package:
 
 - `agent` (from `skald-agent` + `skald-workflow`)
-- `cards` (from `wyrd-cards`, with `data`, `model`, `prompt` children)
-- `config` (from `wyrd-config`)
+- `cards` (from `wyrd-cards`, including native `data`, `model`, and `prompt`
+  children used to assemble public projections)
 - `tool` (from `skald-tool`)
 - `prompt` (from `skald-prompt`)
 - `providers` (from `skald-runtime`)
@@ -182,6 +182,10 @@ function. Current submodules:
 - `observe` (from `vala-sdk::observe` + `skald-observer`)
 - `testing` (from `wyrd-testing`, feature-gated, dev-only wheel)
 
+Users import the package projections such as `wyrd.cards`, `wyrd.data`,
+`wyrd.model`, and `wyrd.prompt`; they do not depend on the private
+`wyrd._wyrd.cards.*` registration tree.
+
 Do not stop after adding `#[pyclass]`; registration, Python package
 exports, generated stubs, and Python tests are all part of the public API
-surface (see `references/python-api-and-stubs.md`).
+surface (see [Python API and stubs](python-api-and-stubs.md)).

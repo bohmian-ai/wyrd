@@ -1,4 +1,0 @@
-interface:
-  display_name: "Wyrd Review v3"
-  short_description: "Review Wyrd checkpoints or candidates"
-  default_prompt: "Use $wyrd-review-v3 in CHECKPOINT mode for ongoing work or FINAL mode for a stable candidate, focusing on task alignment, required claims, correctness, regressions, hard repository rules, and credible evidence."

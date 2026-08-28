@@ -1,9 +1,8 @@
 # TypeScript Guide
 
 The `@wyrd/sdk` TypeScript client is a first-class Wyrd client. It projects
-server contracts, mirrors the `WyrdError` catalog, and — where a napi native
-addon is used — bridges into Rust-owned durable behavior via the same
-patterns as PyO3.
+server contracts and bridges through the N-API binding into shared Rust client
+behavior without owning durable server semantics.
 
 References this guide leans on:
 
@@ -12,14 +11,18 @@ References this guide leans on:
 
 ## Placement And Boundaries
 
-- Public TypeScript surface lives in `@wyrd/sdk` (root `package.json`;
-  see `mise run ts:build`, `ts:test:unit`, `ts:test:integration`,
-  `ts:typecheck`, `ts:napi:check`).
+- Public TypeScript source and package metadata live under `typescript/wyrd`
+  as `@wyrd/sdk` (see `mise run ts:build`, `ts:test:unit`,
+  `ts:test:integration`, `ts:typecheck`, and `ts:napi:check`).
+- Native bindings live in `crates/bindings/wyrd-node`. The private integration
+  harness lives in `crates/bindings/wyrd-node-testing` and
+  `typescript/testing`; production package dependencies must not expose it.
 - Napi-generated `index.d.ts` **must** be committed and verified by
   `mise run ts:napi:check` — never hand-edit it.
-- Contract types, error unions, and OpenAPI-derived request/response
-  shapes are **generated** from Wyrd sources. Do not hand-author parallel
-  types.
+- N-API declarations are generated from the Rust binding surface. Hand-authored
+  ergonomic TypeScript wrappers may project those declarations and wire
+  contracts, but they must not fork field names, error semantics, or lifecycle
+  behavior.
 - The TypeScript SDK may add ergonomic helpers (fluent builders, batching,
   retry policies, tracing hooks) but must not become the source of truth
   for durable server behavior.
@@ -62,8 +65,9 @@ export type Result<T, E = WyrdError> =
   | { ok: false; error: E };
 
 // Branded newtype for identifiers
-export type TenantId = string & { readonly __brand: 'TenantId' };
-export const TenantId = (id: string): TenantId => id as TenantId;
+declare const tenantIdBrand: unique symbol;
+export type TenantId = string & { readonly [tenantIdBrand]: true };
+export declare function tenantId(value: string): TenantId;
 ```
 
 Do not shape TypeScript APIs around what is easiest to serialize. Convert
@@ -71,39 +75,22 @@ at the wire boundary, then call typed core functions.
 
 ## Performance Best Practices
 
-Hot-path TypeScript in the SDK (napi bridge, request pipeline, batching)
-runs alongside V8 optimizations that reward predictable shapes:
+Keep ordinary TypeScript clear and optimize measured hot paths. At the SDK and
+N-API boundaries:
 
-- **Keep object shapes monomorphic.** V8's hidden-class optimization
-  degrades when the same variable holds objects with different property
-  orders. Initialize all fields in a constructor or object literal at
-  once; do not `delete` fields; assign properties in the same order every
-  time.
-- **Avoid `arguments`** in hot paths. Use rest parameters (`...args`)
-  which the compiler can specialize.
-- **Prefer `for` / `for-of` over `Array#forEach`** in hot loops. `forEach`
-  allocates a closure per call and disables some optimizations.
-- **Preallocate arrays** with `new Array(n)` when the size is known; avoid
-  repeated `Array#push` in tight loops.
 - **Batch napi boundary crossings.** Each JS ↔ Rust hop has fixed
   overhead — pass a batch of records, not one call per record.
-- **Reuse buffers** for streaming Arrow / IPC bytes. Do not allocate a
-  fresh `Uint8Array` per chunk.
-- **Avoid `try`/`catch` inside hot inner loops.** Move error handling to
-  the outer scope where possible; the V8 optimizer historically
-  deoptimizes functions containing `try` blocks (this has improved but
-  the guidance still holds for inner loops).
-- **Prefer `Map` over object literals** for dictionaries with unknown or
-  large key sets, or with non-string keys.
-- **Prefer `Set#has` over `Array#includes`** for membership tests.
+- **Make buffer ownership explicit.** Reuse Arrow/IPC buffers only when no
+  consumer retains or mutates them; otherwise transfer or copy at the owned
+  boundary.
 - **Avoid unnecessary `async`.** Every `async` function returns a fresh
   Promise; if the body is synchronous, do not mark it `async`.
 - **Do not stringify large payloads twice.** Pass raw `Buffer` /
   `Uint8Array` through the napi boundary; parse JSON at one boundary
   only.
 - **Guard against event-loop blocking.** Long CPU work belongs in the
-  napi Rust side (which can `spawn_blocking`) or a worker thread — do
-  not run it on the main JS thread.
+  Rust owner with explicit bounded execution or a worker thread. Do not run it
+  on the main JavaScript thread or create unbounded native work.
 
 ## Style Guide Highlights (mkosir)
 
@@ -148,38 +135,43 @@ function describe(kind: CardKind): string {
 
 ## Errors
 
-Mirror the Wyrd error catalog as a discriminated union generated from the
-`WyrdError` derive. Do not invent TypeScript-only error names or messages.
+Project the Wyrd error catalog through the SDK's `WyrdError` class. Do not
+invent TypeScript-only codes or messages.
 
 ```ts
-export type WyrdError =
-  | { code: 'WYRD_REGISTRY_404_CARD_NOT_FOUND'; status: 404; title: string; remediation: string; message: string; details: unknown }
-  | { code: 'WYRD_STORAGE_400_TENANT_PATH_MISMATCH'; status: 400; ... }
-  | /* ... rest of catalog ... */;
+export class WyrdError extends Error {
+  readonly code: string;
+  readonly status: number;
+  readonly title: string;
+  readonly detail: string;
+  readonly remediation: string | undefined;
+  readonly details: unknown;
+}
 ```
 
-The SDK throws a `WyrdErrorLike` object carrying `code`, `status`,
-`message`, `remediation`, and `details`. Callers narrow on `code`.
+The SDK throws `WyrdError` instances carrying `code`, `status`, `title`,
+`detail`, optional `remediation`, and `details`. Narrow error handling on
+`code`; never parse `message` to recover structured metadata. Generated code
+unions may refine the `code` property without replacing the runtime class.
 
 ## Async And Concurrency
 
-- Use `async/await`; avoid raw `.then()` chains except at boundaries with
-  legacy code.
-- **`Promise.all` for parallel independent work** (not `for await`).
-- **`Promise.allSettled` when partial success is meaningful.**
-- **Bound concurrency** with a semaphore or a batching helper — do not
-  fire N parallel requests when N is unbounded.
-- Add explicit timeouts (`AbortSignal.timeout(ms)`) on every external
-  call.
+- Use `async/await`; use raw promise chaining only when an API boundary makes it
+  clearer.
+- Run independent work concurrently only inside an explicit bound. A bare
+  `Promise.all` over an unbounded collection is not admission control.
+- Use `Promise.allSettled` only when partial success is part of the contract;
+  otherwise fail and cancel every unfinished operation.
+- Accept a caller `AbortSignal` for cancellable operations, compose it with an
+  explicit timeout, and release native resources when either fires.
 
 ## Napi Bridge
 
-For `@wyrd/sdk` napi-backed features:
+For `@wyrd/sdk` N-API-backed features:
 
-- Napi Rust side lives under the appropriate `crates/bindings/*` crate
-  (not yet in tree; plan pending). Until then, the TypeScript SDK talks
-  to `wyrd-server` over HTTP + gRPC (`wyrd-tonic`).
-- When napi is present, the `#[napi]` layer mirrors PyO3 rules: extract
+- The public native boundary lives in `crates/bindings/wyrd-node`; it remains a
+  thin binding over shared Rust client behavior and server wire contracts.
+- The `#[napi]` layer mirrors PyO3 rules: extract
   and validate at the boundary, call Rust-native APIs, convert errors at
   the edge.
 - Do not hold V8 handles across `.await` inside async napi tasks (same
@@ -187,7 +179,7 @@ For `@wyrd/sdk` napi-backed features:
 
 ## Tests
 
-Follow the three-tier taxonomy (`references/testing-workflows.md`):
+Follow the [three-tier testing taxonomy](testing-workflows.md):
 
 - **User-journey**: `mise run ts:test:integration` — client → server →
   client against an in-process `WyrdTestServer`.

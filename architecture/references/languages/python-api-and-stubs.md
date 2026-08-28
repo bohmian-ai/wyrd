@@ -43,21 +43,23 @@ python/py-wyrd/python/wyrd/
 ├── _wyrd.pyi              # extension-module stub
 ├── agent/                 # skald-agent, skald-workflow surface
 ├── bifrost/               # vala-sdk bifrost sink + query surface
-├── cards/                 # wyrd-cards Card wrappers
-│   ├── data/
-│   ├── model/
-│   └── prompt/
-├── config/                # wyrd-config
-├── observer.pyi
+├── cards/                 # CardKind, CardRef, and shared card surface
+├── config/                # public Wyrd configuration projection
+├── data/                  # public DataCard projection
+├── errors.py              # structured Wyrd exception exports
+├── model/                 # public ModelCard projection
 ├── observe/               # vala-sdk observe + skald-observer surface
-├── prompt/                # skald-prompt
-├── providers/             # skald-runtime
-├── testing/               # feature-gated, dev-only wheel
-└── tool/                  # skald-tool
+├── observer.py            # public observer projection
+├── otel.py                # OTEL integration helpers
+├── prompt/                # public Prompt and PromptCard projection
+└── testing/               # feature-gated, dev-only wheel
 ```
 
-`_wyrd` (extension module) is the private surface; users import from
-`wyrd.*` public modules.
+`_wyrd` is the private extension module. Its native registration tree may use
+children such as `wyrd._wyrd.cards.data`; users import the public projections
+from top-level `wyrd.data`, `wyrd.model`, `wyrd.prompt`, and `wyrd.cards`.
+Public imports and generated stubs must agree even when native registration is
+nested differently.
 
 ## Python Code Style
 
@@ -82,7 +84,7 @@ Python tests should model real user workflows:
 - Avoid credentials and live external services in unit tests.
 
 For user-facing capabilities, add a **user-journey** test (see
-`references/testing-workflows.md` §Tiers). Unit tests do not substitute
+[Testing workflows](testing-workflows.md)). Unit tests do not substitute
 for a missing journey.
 
 ## Test Conventions

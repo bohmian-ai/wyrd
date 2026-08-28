@@ -1,16 +1,16 @@
 # Bounded Implementation Execution
 
-This reference defines the detailed execution contract for one approved Wyrd
-task. The main `$wyrd-implement` skill owns the fixed loop. This document owns
-authority classification, controlled adaptation, verification recovery, test
-integrity, diff audit, and completion evidence.
+This reference defines the execution discipline for an actionable Wyrd change.
+It covers authority classification, controlled adaptation, verification
+recovery, test integrity, diff audit, and completion evidence without requiring
+a particular request or packet shape.
 
 ## Contents
 
 - [Authority](#authority)
-- [Task contract](#task-contract)
+- [Change contract](#change-contract)
 - [Three execution classes](#three-execution-classes)
-- [Living task updates](#living-task-updates)
+- [Execution record](#execution-record)
 - [Failure routing](#failure-routing)
 - [Repository-managed environments](#repository-managed-environments)
 - [Equivalent verification](#equivalent-verification)
@@ -23,19 +23,20 @@ integrity, diff audit, and completion evidence.
 
 Apply instructions in this order:
 
-1. current user instructions;
-2. active task;
-3. approved plan;
-4. applicable `AGENTS.md` files;
-5. repository architecture and conventions;
-6. local implementation preferences.
+1. current user instructions and explicitly locked outcomes;
+2. applicable `AGENTS.md` files and repository architecture authorities;
+3. the request's requirements, constraints, claims, and accepted evidence;
+4. repository conventions and established owner patterns;
+5. local implementation preferences.
 
-The task fixes required behavior, acceptance outcomes, public and persisted
-contracts, material architecture, prohibited changes, and safety boundaries.
-Repository reality fixes private mechanics unless the task explicitly marks
-them normative.
+The request fixes required behavior, acceptance outcomes, explicitly approved
+public or persisted contracts, prohibited changes, and safety boundaries.
+Repository architecture remains authoritative for ownership, protocol, tenant,
+security, and operational invariants unless the user explicitly changes that
+authority. Repository reality fixes private mechanics when several approaches
+satisfy the same contract.
 
-## Task contract
+## Change contract
 
 Before editing, establish:
 
@@ -46,13 +47,16 @@ Before editing, establish:
 - tests, focused verification, and completion evidence;
 - material stop conditions.
 
-For a standardized task, run the canonical structural validator. A structural
-failure blocks editing until corrected. A stale private name, defective command
-recipe, or missing local test setup does not make an otherwise clear behavioral
-contract malformed.
+Direct instructions, issues, Markdown, structured packets, and bounded review
+findings are all valid inputs. No YAML shape, section name, ID, digest, clean
+worktree, fixed write set, or predeclared command is required. When explicit
+claims are absent, derive a concise working checklist from the requested
+behavior and repository completion rules. A stale private name, defective
+command recipe, or missing local test setup does not make an otherwise clear
+behavioral contract malformed.
 
-Build a live checklist. The task remains active while any approved actionable
-item remains.
+Keep the checklist live until every actionable requirement and required proof
+is complete.
 
 ## Three execution classes
 
@@ -80,7 +84,7 @@ Proceed, record, and continue:
   environment;
 - recording a proven unrelated baseline failure while continuing unaffected
   proof;
-- appending repository discoveries to the living task.
+- recording repository discoveries with the execution evidence.
 
 The expected file list is not a strict whitelist for adjacent private
 implementation and verification support. Explicit prohibited material paths
@@ -101,9 +105,9 @@ Stop before implementation when correctness requires:
 Report repository evidence, why no in-scope solution remains, and the exact
 authority required to resume.
 
-## Living task updates
+## Execution record
 
-The executing agent may append or correct:
+The execution record may append or correct:
 
 - current repository facts;
 - internal paths and private symbol names;
@@ -117,14 +121,14 @@ Record:
 date/attempt
 classification: local | bounded correction
 discovery and repository evidence
-task section or command affected
+requirement, claim, or command affected
 action and verification result
 ```
 
 Do not rewrite the objective, requirement or decision IDs, required behavior,
 public or persisted contracts, security semantics, material architecture or
 ownership boundaries, prohibited material boundaries, or acceptance criteria.
-Set the task to `Blocked` when one must change.
+Stop for a material decision when one must change.
 
 ## Failure routing
 
@@ -205,6 +209,14 @@ Follow `AGENTS.md` and the applicable language references. In particular:
 - write tests alongside changed behavior;
 - map every test to an acceptance criterion;
 - preserve the repository's required rustdoc and struct-centered Rust style.
+- keep tenant SQL behind `TenantConn` or the explicitly authorized
+  `OperatorPool`; a `TenantConn` callee never commits or rolls back;
+- rely on Postgres RLS rather than duplicating tenant predicates on
+  tenant-scoped queries;
+- append audit at each independently durable transition, preserving Oracle's
+  WAL-before-rows exception and Forge's fenced operator capability;
+- resolve, screen, and pin user- or tenant-supplied URL destinations before
+  server-side fetches so DNS rebinding cannot bypass SSRF policy.
 
 Never pass a check by:
 
@@ -235,9 +247,10 @@ Prefer repository `mise` tasks after inspecting their implementation and setup.
 Use direct Cargo for a narrow pure test or focused filter when no suitable task
 exists. Run Cargo-backed work sequentially across agents sharing a target.
 
-Use default features unless the task explicitly earns exact optional features.
-Do not use `--all-features` for a bounded task unless the task requires it.
-Whole-plan gates belong to integrated closeout.
+Use default features unless the affected behavior explicitly requires optional
+features. Do not use `--all-features` for focused verification unless the
+affected behavior requires the full feature union. Broad feature-union gates
+belong to integrated verification.
 
 When a failure is proven unrelated, continue if it does not prevent required
 proof. If it prevents a mandatory acceptance outcome and no equivalent proof
@@ -256,7 +269,7 @@ Inspect tracked and untracked changes. For every changed file, confirm:
 - tests prove behavior without weakened integrity;
 - no debug artifacts, real secrets, or machine-specific values remain.
 
-Task-document updates must follow [Living task updates](#living-task-updates).
+Durable execution notes must follow [Execution record](#execution-record).
 
 ## Completion standard
 
@@ -301,7 +314,7 @@ Features enabled:
 ### Material Deviations
 - None | <approved deviation and impact>
 
-### Remaining Work
+### Blocking Work
 - None | <blocked item and exact authority required>
 
 ### Risks and Notes

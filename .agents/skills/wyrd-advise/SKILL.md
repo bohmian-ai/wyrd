@@ -78,21 +78,38 @@ on stable doctrine already loaded in the conversation. State that assumption.
 ## Route knowledge progressively
 
 For delegated local research, have the assigned scout start at
-`architecture/references/README.md`. Load only the reference slices needed for
-the question; use the compound examples there for mixed concerns. Do not copy a
-whole corpus into the answer. Each selected reference ends with stable Wyrd
-anchors and primary upstream grounding for follow-up reading.
+[the canonical reference router](../../../architecture/references/README.md).
+Load every selected reference completely and use the smallest complete set for
+the question; use the router's compound examples for mixed concerns. Do not
+copy the corpus into the answer. Each reference's Wyrd anchors and primary
+grounding guide any necessary repository or upstream follow-up.
 
-Useful routing cues:
-
-- broad Wyrd or Vala boundary → `domain/vala-architecture.md`;
-- traces, metrics, logs, observations, or identity → `domain/telemetry-observations.md`;
-- Eval design or judge quality → `domain/evaluation.md`;
-- drift signals, baselines, thresholds, or alert noise → `domain/drift-monitoring.md`;
-- query shape, admission, pruning, or serving → `domain/olap-serving.md` and `domain/datafusion.md`;
-- Iceberg snapshots, catalogs, partitioning, or compaction → `domain/iceberg.md` and `domain/analytical-operations-reliability.md`;
-- Arrow, Parquet, RecordBatch, PyArrow, or Python analytical boundaries → `domain/arrow-analytical-interop.md`;
-- operations, recovery, backpressure, or reliability → `domain/analytical-operations-reliability.md`.
+| Reference | Select when the advice touches |
+|---|---|
+| [Wyrd protocol authority](../../../architecture/wyrd-design.md) | Card contracts, identity, doctrine, cross-service boundaries, or public surfaces |
+| [Bifrost authority](../../../architecture/bifrost-design.md) | Scribe, Oracle, Forge, analytical storage, resources, or public query/ingest behavior |
+| [Security posture](../../../architecture/wyrd-security-posture.md) | Authentication, authorization, credentials, tenant security, audit integrity, or external-network trust |
+| [Operations authority](../../../architecture/operations/README.md) | Deployment, release, capacity, backup, recovery, SLOs, or incidents |
+| [Positioning and vocabulary](../../../architecture/references/doctrine/positioning-and-vocabulary.md) | Card vocabulary, envelope, `CardRef`, v1 kinds, or removed concepts |
+| [Architecture constraints](../../../architecture/references/doctrine/architecture-constraints.md) | Wyrd/Vala/Skald boundaries, deployment, tenant isolation, or observation identity |
+| [Architecture patterns](../../../architecture/references/architecture/patterns.md) | Ownership, contract placement, or server/client/storage/provider/audit structure |
+| [Implementation execution](../../../architecture/references/languages/implementation-execution.md) | Execution authority, adaptation, verification recovery, or completion evidence |
+| [Rust core](../../../architecture/references/languages/rust-core.md) | Rust ownership, async, traits, allocation, or API shape |
+| [PyO3 boundaries](../../../architecture/references/languages/pyo3-boundaries.md) | PyO3 classes, GIL, lifetimes, conversion, or module registration |
+| [Python API and stubs](../../../architecture/references/languages/python-api-and-stubs.md) | Python exports, stubs, package layout, or typing |
+| [TypeScript guide](../../../architecture/references/languages/typescript-guide.md) | TypeScript SDK, declarations, or napi boundaries |
+| [Testing workflows](../../../architecture/references/languages/testing-workflows.md) | User journeys, integration tests, unit tests, or repository verification |
+| [Agent harness](../../../architecture/references/languages/agent-harness.md) | MCP, agent-facing contracts, structured validation, or audit |
+| [Errors](../../../architecture/references/languages/errors.md) | Stable errors and Rust/Python/TypeScript/HTTP/CLI mapping |
+| [Vala architecture](../../../architecture/references/domain/vala-architecture.md) | Broad Vala ownership, Bifrost orientation, or cross-domain choices |
+| [Telemetry observations](../../../architecture/references/domain/telemetry-observations.md) | OpenTelemetry signals, correlation, observation identity, or payload sensitivity |
+| [Evaluation](../../../architecture/references/domain/evaluation.md) | Eval Cards, scenarios, judge quality, scoring, or evidence |
+| [Drift monitoring](../../../architecture/references/domain/drift-monitoring.md) | Drift signals, baselines, thresholds, alert noise, or monitoring policy |
+| [OLAP serving](../../../architecture/references/domain/olap-serving.md) | Bifrost tables, ingest/query serving, admission, tenant safety, or analytical APIs |
+| [Iceberg](../../../architecture/references/domain/iceberg.md) | Snapshots, catalogs, schemas, partitions, object storage, or compaction |
+| [DataFusion](../../../architecture/references/domain/datafusion.md) | Logical/physical plans, provider pushdown, pruning, statistics, memory, or spills |
+| [Arrow analytical interop](../../../architecture/references/domain/arrow-analytical-interop.md) | Arrow, RecordBatch, Parquet, PyArrow, FFI, or Python analytical boundaries |
+| [Analytical operations reliability](../../../architecture/references/domain/analytical-operations-reliability.md) | Backpressure, durability, leases, repair, retention, SLOs, or failure recovery |
 
 ## Answer shape
 

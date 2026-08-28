@@ -1,0 +1,4 @@
+interface:
+  display_name: "Wyrd Plan"
+  short_description: "Plan actionable Wyrd claims and evidence"
+  default_prompt: "Use $wyrd-plan to create a source-grounded Wyrd plan with cohesive tasks, decision-complete claims, credible evidence expectations, and only real dependencies."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Wyrd Plan Review"
+  short_description: "Review Wyrd plan readiness"
+  default_prompt: "Use $wyrd-plan-review to assess this plan's source grounding, decision completeness, executable ownership, real dependencies, required claims, and credible evidence without enforcing a document schema."

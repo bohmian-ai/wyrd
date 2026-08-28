@@ -211,7 +211,8 @@ Struct-centered design does not turn Wyrd Cards into active-record objects.
 Card envelopes and specs own declarative construction, validation, and pure
 transformation. Registry, storage, policy, and lifecycle IO stays on the
 service or handle that owns those dependencies. The canonical reference is
-`crates/shared/wyrd-registry/src/handle.rs::Cards`.
+`crates/wyrd/wyrd-storage/src/handle.rs::StorageHandle`: a public,
+dependency-owning handle with discoverable methods and focused private modules.
 
 ### Newtype identifiers
 
@@ -272,8 +273,8 @@ impl StorageBackend {
 ```
 
 Enum dispatch is preferred over `Box<dyn StorageBackend>` when the set is
-closed and the caller can be monomorphized. See `wyrd-storage` for the
-canonical pattern.
+closed. See `crates/wyrd/wyrd-storage/src/signer.rs::BackendSigner` for the
+repository pattern.
 
 ### Traits for real polymorphism
 
@@ -300,11 +301,11 @@ pub trait Observer: Send + Sync + 'static {
 }
 ```
 
-Real example: `crates/skald/skald-observer/src/lib.rs` (`Observer` trait with
-`Otel`, `Composite`, and `Scoped` implementations).
+Real example: `crates/skald/skald-observer/src/observer.rs` (`Observer` with
+`NoopObserver`, `CompositeObserver`, and `OtelObserver` implementations).
 
 Avoid platform traits invented for a single caller. If there is only one impl
-today and no clear second impl on the horizon, use a concrete type.
+and no concrete second implementation, use a concrete type.
 
 ## Zero-Cost Abstractions
 
@@ -335,7 +336,10 @@ Reach for `Box<dyn Trait>` only when runtime extensibility is intentional
 ///
 /// This zero-cost form is monomorphized for each iterator type.
 #[must_use]
-pub fn parse_all<I: IntoIterator<Item = &str>>(items: I) -> Vec<CardName> {
+pub fn parse_all<'a, I>(items: I) -> Vec<CardName>
+where
+    I: IntoIterator<Item = &'a str>,
+{
     items.into_iter().filter_map(|s| CardName::new(s).ok()).collect()
 }
 
@@ -359,9 +363,9 @@ expect. Reject un-Rust-y patterns even when they compile.
   primitives across module boundaries.
 - **Exhaustive `match`** on enums; do not use catch-all `_ =>` when the
   compiler could tell you about a missing variant tomorrow.
-- **`#[non_exhaustive]`** on public enums that may grow — forces
-  downstream `match` arms to keep a fallback and prevents accidental
-  breaking changes.
+- **`#[non_exhaustive]`** only on Rust library extension enums that are allowed
+  to grow. Do not use it to blur a closed wire, persisted, or policy enum whose
+  exhaustiveness is part of the contract.
 - **`#[must_use]`** on functions whose result must be observed
   (`Result`, iterators, builder terminals).
 - **`Default`** only when the default is meaningful; do not derive it to
@@ -408,9 +412,9 @@ expect. Reject un-Rust-y patterns even when they compile.
 - **Compose over collect.** `iter().filter(...).map(...).sum()` beats
   a loop that pushes into a `Vec<u64>` then sums it.
 - **`try_fold` / `try_for_each`** for short-circuit on `Result`.
-- **`itertools` crate** for `chunks`, `dedup`, `group_by`, `sorted_by`,
-  `cartesian_product` — but only when the stdlib primitive is genuinely
-  awkward.
+- **`itertools`** for operations whose standard-library form is genuinely
+  awkward, but only when the owning crate already carries it or the dependency
+  is explicitly approved.
 - **`Vec::extend` over repeated `push`** in a loop.
 
 ### Pattern matching
@@ -419,7 +423,10 @@ expect. Reject un-Rust-y patterns even when they compile.
 
   ```rust
   let Some(uid) = card.uid() else {
-      return Err(WyrdError::MissingUid { /* ... */ });
+      return Err(WyrdError::Validation {
+          message: "card uid is required".to_owned(),
+          details: serde_json::json!({ "field": "uid" }),
+      });
   };
   ```
 - **`matches!` macro** for boolean checks against a pattern.
@@ -440,9 +447,9 @@ expect. Reject un-Rust-y patterns even when they compile.
 
 - **`fn new` for the canonical constructor** on Rust structs (unrelated
   to the PyO3 `fn __new__` rule for `#[pyclass]`).
-- **Builder pattern** when a struct has ≥ 4 optional fields or when
-  construction has meaningful phases; return `Self` from each setter
-  and consume `self` on the terminal `build()`.
+- **Builder pattern** when construction has meaningful phases, cross-field
+  invariants, or enough optional state that a constructor is no longer clear;
+  return `Self` from each setter and consume `self` on terminal `build()`.
 - **`Default` + struct-update syntax** (`Foo { field: x, ..Default::default() }`)
   is often simpler than a builder for optional-heavy configs.
 
@@ -456,7 +463,8 @@ expect. Reject un-Rust-y patterns even when they compile.
 - **`Send` + `'static` bounds** on tasks that will cross a spawn
   boundary; the compiler will tell you when you forget.
 - **`tokio::select!`** for concurrent branches with cancellation.
-- **`FuturesUnordered` / `try_join_all`** for bounded fan-out.
+- **`FuturesUnordered` / `try_join_all`** only after admission has bounded the
+  input set; these combinators do not provide a concurrency limit themselves.
 - **`spawn_blocking`** for CPU-bound work inside an async runtime; never
   block the async worker.
 
@@ -468,8 +476,8 @@ expect. Reject un-Rust-y patterns even when they compile.
   the wrapped variant is unique in the enum.
 - **`anyhow::Context::context`** in binaries to add hints as errors
   bubble up.
-- **Never `.unwrap()` a `Result` in production code** unless the
-  invariant is documented and truly cannot fail.
+- **Never `.unwrap()` a `Result` in production code.** Return the error, or use
+  `expect()` only for a true invariant with a message naming that invariant.
 
 ### Testing
 
@@ -478,16 +486,17 @@ expect. Reject un-Rust-y patterns even when they compile.
 - **`#[should_panic(expected = "...")]`** with an explicit expected
   substring when testing panics; naked `#[should_panic]` masks
   regressions.
-- **`insta` or `expect_test` snapshots** for asserting complex output
-  shapes.
-- **`proptest` / `quickcheck`** when the invariant is easier to state
-  than the example.
+- **Snapshot testing** for complex stable output shapes when the owning crate
+  already uses an approved snapshot library.
+- **Property testing** when the invariant is easier to state than representative
+  examples and the dependency is already available or explicitly approved.
 
 ### Anti-patterns to reject
 
 - `Vec<Box<dyn Trait>>` where an enum would fit.
-- `Arc<Mutex<HashMap<K, V>>>` as a default cache — reach for
-  `dashmap`, `moka`, or a channel-owned actor first.
+- `Arc<Mutex<HashMap<K, V>>>` as a default cache — first reconsider ownership,
+  immutable state, a narrower lock, or message passing. Add a specialized cache
+  dependency only when the workload earns it.
 - `Rc<RefCell<T>>` in async code — it is `!Send` and will fail to
   compile; the presence usually means the wrong runtime shape.
 - `String` where `&str` would do; `Vec<T>` where `&[T]` would do;
@@ -566,7 +575,37 @@ async code.
   `wyrd-runtime` bridge.
 - Use bounded concurrency and timeouts for external calls.
 
-### Recorded deviation: Scribe CPU lanes run on fixed Rayon pools
+## Postgres And Tenant Boundaries
+
+Raw `sqlx::PgPool`, `Pool<Postgres>`, naked `PgConnection`, and caller-passed
+`Transaction<'_, Postgres>` values do not cross into library signatures or
+struct fields. Tenant-scoped behavior accepts `&mut TenantConn<'_>` under the
+non-bypass `wyrd_app` role; cross-tenant operator behavior accepts
+`&OperatorPool` under the explicit platform-admin role. Import these types
+through the owning tier's re-exports.
+
+Postgres row-level security is the load-bearing tenant boundary. Do not add
+manual tenant predicates to a `TenantConn` query or widen a tenant query for
+operator work. A callee receiving `&mut TenantConn<'_>` never commits or rolls
+back: the caller owns the transaction so several domain operations can compose
+atomically.
+
+Audit follows durable domain transitions. Append each auditable Postgres event
+inside the transaction that commits that transition. Oracle read admission is
+the narrow exception: fsync its versioned local audit WAL before rows and relay
+the canonical tenant outbox event at least once. Forge operator audit remains
+behind its fenced, tenant-bound capability.
+
+## External URL Safety
+
+Before server code fetches a user- or tenant-supplied URL, resolve DNS once,
+reject the effective address when policy forbids it, and pin the connection to
+that screened address. Always reject link-local and cloud-metadata ranges;
+Production also rejects loopback, private, carrier-grade NAT, and unique-local
+addresses. Never validate a URL string and then permit the client to resolve it
+again: that check-then-use split permits DNS rebinding.
+
+### Scribe CPU lanes run on fixed Rayon pools
 
 Tokio is Wyrd's only async runtime, and the rule above bans ad hoc runtimes.
 Scribe's CPU-bound work is a bounded, recorded exception: `vala-bifrost-redux`
@@ -613,7 +652,7 @@ Rust errors should be useful before they become HTTP or Python errors:
 - Preserve source errors with `#[source]` / `#[from]`.
 - Use the derive-backed `wyrd_spec::error::WyrdError` catalog for public
   errors that cross HTTP, Python, MCP, CLI, or generated-documentation
-  boundaries. See `references/errors.md`.
+  boundaries. See [Errors](errors.md).
 
 ### Crate-local thiserror
 

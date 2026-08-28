@@ -1,69 +1,93 @@
 # Evaluation
 
-Load for Eval Cards, agent or model quality measurement, judge design,
-scenario execution, or evidence needed for a release or policy decision.
+Load for Eval Cards, scenario execution, deterministic and LLM-based checks,
+judge quality, scoring, or evidence used by policy and release decisions.
 
-## Make evaluation a declared workflow
+## Evaluation is a declared workflow
 
-An `Eval` Card names one `subject_ref` and a typed workflow of checks. Keep
-deterministic assertions, trace assertions, and agent-behavior assertions in
-the same model; use an LLM judge only when a deterministic comparator cannot
-express the criterion. Dataset-driven evaluation exercises reproducible
-scenarios. Archived or online evaluation reads observations through a typed
-source and keeps the same subject identity.
+An `Eval` Card names one versioned `subject_ref` and a typed DAG of checks.
+Offline evaluation reads a versioned Data Card of scenarios. Archived or
+online evaluation reads observations from Bifrost or a read-only `Source` while
+retaining the same subject, time, and sampling identity. Presence of those
+inputs selects the mode; do not create a parallel evaluation ontology.
 
-Each check should define its input path, expected value, comparator, retry
-budget, and failure disposition. Dependencies form a bounded DAG; cycles,
-unbounded fan-out, and hidden network calls are validation errors. Aggregate
-scores must retain per-check evidence so a passing total cannot hide a critical
-failure.
+Each task has a stable ID, typed comparator, input selector, expected value,
+dependencies, retry budget, and failure disposition. Validate the DAG for
+cycles, depth, fan-out, inaccessible paths, and hidden network work before
+execution. Aggregate results retain every task result and criticality; a total
+score never hides a required failed assertion or missing evidence.
 
-## Evidence and repeatability
+Prefer deterministic assertions for equality, ranges, types, subsets, schema,
+trace facts, tool use, and workflow structure. Use an LLM judge only for a
+criterion that cannot be represented honestly by a deterministic comparator.
 
-- Version the subject Card, prompt/judge Card, dataset Card, and evaluator
-  configuration. A score without those identities is not reproducible.
-- Capture the Run and Observation context for every scenario. Store the raw
-  response or trace payload only under the appropriate sensitive permission.
-- Separate evaluator validity (does the check measure the intended property?)
-  from evaluator reliability (does it produce stable results?). Calibrate
-  judges against human-labelled examples and report agreement, abstentions, and
-  retries rather than a single opaque score.
-- Use deterministic seeds, explicit sampling, fixed time windows, and stable
-  ordering. Treat a changed dataset or rubric as a new evaluation input.
-- Map results to risk decisions: a score is evidence for a policy or release
-  choice, not an automatic guarantee of safety or correctness.
+## Reproducible evidence
+
+Bind every result to:
+
+- the exact subject Card version;
+- evaluator Card/configuration and task graph;
+- dataset/source identity, selected records, ordering, and time window;
+- prompt, judge Card, provider/model version, decoding parameters, and seed
+  where applicable;
+- scenario, Run, Observation, request, trace, and attempt identities;
+- retry, abstention, parse, provider, and terminal status;
+- the raw or derived evidence permitted by the configured capture and
+  sensitive-data policy.
+
+A repeatable assertion uses deterministic ordering and seeds. A remote model
+call is not guaranteed repeatable even with a seed; record the provider's
+sampling inputs and classify the result as stochastic evidence. A changed
+dataset, rubric, judge, model, prompt, or task graph is a new evaluation input
+and is never silently compared as the same experiment.
+
+Context capture is explicit and least-privilege. Full traces or payloads may be
+needed for agent diagnosis, but they require sensitive access, bounded size,
+redaction, and retention. Missing required context yields indeterminate or data
+quality failure, never a pass.
 
 ## LLM judges
 
-Prefer rubric prompts with a closed output schema, bounded retries, and a
-separate judge Card. Test position, verbosity, and model-version bias. Require
-an abstain or indeterminate result when evidence is missing. Never allow a
-judge to execute production tools or mutate the subject as part of scoring.
-Use pairwise or reference-based comparison only when its assumptions fit the
-decision; otherwise report the limits explicitly.
+- Use one versioned Prompt Card per judge task with a closed output schema.
+- Require `pass`, `fail`, and `indeterminate`/`abstain` outcomes; parsing or
+  missing-evidence failure is not a negative judgment about the subject.
+- Calibrate against representative human-labelled examples. Report agreement,
+  disagreement, abstention, retry, parse-failure, and subgroup behavior.
+- Test position, verbosity, reference, provider, and model-version sensitivity.
+- Keep bounded retries visible. A retry that changes a judgment is reliability
+  evidence, not noise to discard.
+- Do not let a judge invoke production tools, mutate the subject, retrieve
+  unrestricted context, or decide deployment solely from an opaque score.
 
-## Failure modes and anti-patterns
+Pairwise comparison is appropriate only with controlled ordering and a
+decision that is genuinely relative. Reference-based grading requires a valid
+reference. Otherwise use a rubric and disclose uncertainty.
 
-Do not conflate offline scenario quality with production reliability, aggregate
-away a safety-critical assertion, compare scores from incompatible rubrics, or
-let a flaky remote provider decide a deployment gate without an evidence trail.
-Retries can hide instability, so expose retry counts and classify exhausted
-checks separately from genuine failures. A green score with missing traces is a
-data-quality failure, not success.
+## Decision use
+
+Evaluation produces evidence. Policy, release, or human review consumes that
+evidence under an explicit risk rule. Separate evaluator validity (measures the
+intended property), reliability (stable enough for the decision), coverage
+(represents the operating distribution), and subject performance. Offline
+quality does not prove production availability, security, latency, or drift.
+
+## Failure modes
+
+Reject incompatible-score comparison, silent task skipping, safety-critical
+failure hidden by an average, unbounded task fan-out, provider calls without
+deadlines, retries omitted from results, a judge with production mutation
+authority, and a green result with missing required traces. Exhausted,
+cancelled, indeterminate, and failed checks remain distinct terminal states.
 
 ## Stable Wyrd anchors
 
-- Eval contract and subject direction: `architecture/wyrd-design.md` §Eval.
-- Eval IDs, status, and operators: `crates/wyrd-spec/src/vala/eval/`.
-- Evaluation engine and observation persistence: `crates/vala/vala-eval/` and
-  `crates/vala/vala-sdk/`.
-- Governance and audit surfaces: `crates/wyrd/wyrd-server/`.
+- Eval contract: `architecture/wyrd-design.md` §Eval.
+- Eval types: `crates/wyrd-spec/src/vala/eval/`.
+- Engine: `crates/vala/vala-eval/`.
+- Public client owner: `crates/vala/vala-sdk/`.
 
 ## Primary grounding
 
 - [NIST AI RMF 1.0](https://nvlpubs.nist.gov/nistpubs/ai/NIST.AI.100-1.pdf)
-- [HELM: Holistic Evaluation of Language Models](https://arxiv.org/abs/2211.09110)
-- [lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness)
-- [OpenTelemetry traces](https://opentelemetry.io/docs/concepts/signals/#traces)
-- Wyrd anchors: `architecture/wyrd-design.md` §Eval;
-  `crates/wyrd-spec/src/vala/eval/`; `crates/vala/vala-eval/`.
+- [HELM](https://arxiv.org/abs/2211.09110)
+- [OpenTelemetry traces](https://opentelemetry.io/docs/concepts/signals/traces/)

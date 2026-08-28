@@ -1,9 +1,9 @@
 ---
-name: wyrd-review-v3
+name: wyrd-review
 description: Review either an ongoing Wyrd implementation checkpoint or a stable final candidate for task alignment, claim satisfaction, correctness, regressions, applicable repository rules, and credible evidence. Checkpoints never grant completion approval.
 ---
 
-# Wyrd Review v3
+# Wyrd Review
 
 Use `CHECKPOINT` to review mutable, partial work for current correctness,
 directional drift, and remaining gaps. Use `FINAL` to adjudicate a stable
@@ -174,4 +174,4 @@ prevent final acceptance.
 This skill owns checkpoint trajectory and candidate-local correctness, task
 conformance, immediate consumer closure, and focused evidence. Integrated
 cross-task seams, aggregate plan closure, and push readiness belong to
-`wyrd-review-and-plan-v3`.
+`wyrd-review-and-plan`.

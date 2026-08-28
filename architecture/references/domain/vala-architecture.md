@@ -1,78 +1,100 @@
 # Vala architecture
 
-Load this reference for broad Wyrd/Vala advice, ownership questions, or a
-choice that crosses observations, evaluation, drift, and analytical storage.
-It is the orientation slice; load narrower references for mechanics.
+Load this reference for broad Wyrd/Vala ownership or a choice that crosses
+observations, evaluation, drift, and analytical storage. Load the narrower
+domain references for implementation mechanics.
 
-## Boundary
+## Product and serving boundary
 
-Wyrd owns durable cards, auth, policy, tenancy, audit, and the only network
-serving surface. Vala owns observation storage, telemetry projections,
-evaluation, drift computation, and the analytical data plane. Skald owns model,
-prompt, tool, and agent-runtime primitives. A client SDK projects the wire
-contract; it does not become a second registry or durable runtime.
-
-The public seam is typed and language-agnostic:
+`wyrd-server` is Wyrd's only external serving surface. It owns authentication,
+authorization, public HTTP and gRPC routes, MCP, request validation, tenancy,
+and public audit behavior. Vala owns the engines behind observation storage,
+telemetry projections, evaluation, drift computation, and Bifrost. Skald owns
+model, prompt, tool, and agent-runtime primitives. SDKs project the typed wire
+contract and never become durable registries, query engines, or data stores.
 
 ```text
-client / agent → wyrd-server → Vala engine → Bifrost tables
-                                      ↘ Source (read-only external data)
+client / agent
+  -> wyrd-server
+     -> Vala
+        -> Scribe: pod-local ingest, WAL, staged runs, hot publication
+        -> Oracle: interactive and streamed distributed reads
+        -> Forge: Iceberg promotion, rewrite, and maintenance
+        -> Source: read-only adapters for external data
 ```
 
-`Source` is a Card that describes how Vala reads an external system. Wyrd does
-not write external warehouses, metric backends, or object stores. Bifrost is
-Wyrd-owned analytical storage for observations, traces, evaluation records,
-drift records, and audit projections; it is not a Card kind.
+Internal Scribe live-tail and Oracle peer RPCs are authenticated engine seams,
+not independent public services. Vala crates may construct their service
+implementations, but `wyrd-server` owns listener lifecycle and the external
+network contract.
+
+`Source` is a Card describing how Vala reads an external system. Wyrd never
+writes external warehouses, metric backends, or user object stores. Bifrost is
+Wyrd-owned analytical storage and is not a Card kind.
+
+## Bifrost ownership
+
+- **Scribe** owns schema-checked append admission, sixteen fixed pod-local
+  shards, WAL/fsync/fence-before-acknowledgement, active and immutable rows,
+  durable staged-run authority, approximately 512 MiB immutable hot objects,
+  exact replay, and bounded live-tail service behavior. One logical append is
+  owned by one pod-local Scribe; ingest is not a distributed write protocol.
+- **Oracle** owns typed query admission, interactive execution, streamed
+  distributed analytical execution, pinned read cuts, tenant tripwires,
+  query-local memory and spill, cancellation, terminal streaming, and query
+  diagnostics.
+- **Forge** owns unchanged promotion of eligible Scribe hot objects into
+  Iceberg, managed-core rewrites toward approximately 1 GiB files, catalog
+  publication, leases and fences, reconciliation, retention, cleanup, and
+  maintenance telemetry.
+- **Postgres** owns catalog pointers, tenant-scoped control state, leases,
+  operation identities, and transactional audit rows. It does not store
+  analytical payload bytes.
+- **Object storage** owns immutable Parquet and Iceberg metadata objects. A
+  path or prefix is never an authorization boundary.
+
+The managed compaction core may plan and physically rewrite files, but it never
+owns Wyrd tenancy, leases, audit, or catalog commit. DataFusion executes plans;
+it never decides Wyrd authorization, admission, retry, or successful-terminal
+semantics.
 
 ## Durable invariants
 
+- Physical analytical identity is `(organization, logical table)`. Shared
+  physical tables with caller-supplied tenant predicates are forbidden.
+- Server-owned system columns and `(wyrd_batch_id, wyrd_row_ordinal)` survive
+  WAL, staging, Parquet, Iceberg promotion, Forge rewrite, and query unchanged.
 - A Card is the declared subject. A Run is one client execution. An Observation
-  carries the authenticated tenant, the asserted and authorized `card_ref`, an
-  opaque `run_id`, and the propagated `Wyrd-Request-Id`.
-- Physical analytical identity is `(organization, logical table)`. Never use a
-  shared physical table and hope a later predicate provides isolation.
-- Server-owned system columns are stamped at ingest and survive buffering,
-  file conversion, compaction, and query. Tenant checks fail closed.
-- `wyrd-spec` contains IO-free wire types. Server and Vala crates own behavior;
-  Python, Rust, and TypeScript clients only add ergonomic projections.
-- Query and ingest routes enforce permissions, bounded windows, payload
-  sensitivity, and audit requirements at the server boundary.
+  retains the authenticated tenant, authorized `card_ref`, opaque `run_id`, and
+  propagated `Wyrd-Request-Id` at the contract grain defined by its table.
+- `wyrd-spec` remains IO-free and owns wire types. Durable behavior belongs to
+  server and Vala owner crates; language bindings remain projections.
+- Every queue, reservation, retry, and cleanup path is bounded. Tenant
+  mismatch, contradictory durable evidence, or ambiguous publication fails
+  closed without discarding the last valid authority.
+- Audit cardinality follows independently durable domain transitions. Oracle
+  read admission uses the one local-WAL audit exception; other durable
+  transitions append audit evidence at their actual commit boundary.
 
-## Design choices
+## Rejected shapes
 
-Keep the engine/data-plane split because analytical dependencies are expensive
-and serving concerns require one lifecycle owner. Keep Postgres for catalog and
-control state while object storage holds analytical bytes. Keep Arrow as the
-in-process interchange and Parquet/Iceberg as durable representation. These
-choices trade a larger operational surface for column pruning, replayable
-snapshots, and cross-language interoperability.
-
-## Failure signals and anti-patterns
-
-Treat tenant mismatch, schema fingerprint conflict, duplicate batch IDs,
-unbounded query input, stale catalog epochs, and missing observation context as
-fail-closed errors. Retry only idempotent admission or append operations, and
-make recovery visible rather than silently dropping rows.
-
-Reject HTTP or gRPC listeners in Vala engine crates, Python-side durable state,
-external write adapters, stringly card/run identity, and a second warehouse
-noun or compatibility route. A UI view may explain Vala state but cannot be the
-only way to query, ingest, evaluate, or govern it.
+Reject listeners owned outside `wyrd-server`, Python-side durable logic,
+external write adapters, stringly identity, shared physical tenant tables,
+process-global analytical memory as query admission, a second warehouse noun,
+and compatibility routes. A UI may explain Vala state but can never be the only
+way to ingest, query, evaluate, monitor, or operate it.
 
 ## Stable Wyrd anchors
 
-- Protocol ownership and Bifrost vocabulary: `architecture/wyrd-design.md`
-  sections “Observation identity” and “Bifrost”.
+- Protocol and Card doctrine: `architecture/wyrd-design.md`.
+- Bifrost internals: `architecture/bifrost-design.md`.
 - Public Vala contracts: `crates/wyrd-spec/src/vala/`.
-- Vala engines and analytical clients: `crates/vala/` and `vala-sdk`.
-- Single serving owner: `crates/wyrd/wyrd-server/`.
+- Engines: `crates/vala/`.
+- External serving owner: `crates/wyrd/wyrd-server/`.
 
 ## Primary grounding
 
-- [Apache Iceberg overview](https://iceberg.apache.org/docs/latest/)
+- [Apache Iceberg specification](https://iceberg.apache.org/spec/)
+- [Apache DataFusion architecture](https://datafusion.apache.org/library-user-guide/building-logical-plans.html)
 - [Apache Arrow columnar format](https://arrow.apache.org/docs/format/Columnar.html)
-- [Apache DataFusion features](https://datafusion.apache.org/user-guide/features.html)
 - [OpenTelemetry signals](https://opentelemetry.io/docs/concepts/signals/)
-- [NIST AI RMF 1.0](https://nvlpubs.nist.gov/nistpubs/ai/NIST.AI.100-1.pdf)
-- Wyrd anchors: `architecture/wyrd-design.md` §Bifrost; `crates/vala/`;
-  `crates/wyrd/wyrd-server/`.

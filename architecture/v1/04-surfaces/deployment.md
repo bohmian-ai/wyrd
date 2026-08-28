@@ -1,34 +1,57 @@
 # Deployment
 
-Wyrd SQL deployments size connection pools per server stack. The default pool
-settings target a small self-hosted or low-replica SaaS deployment that connects
-directly to Postgres.
+Wyrd deploys as one logical `wyrd-server` serving surface backed by durable
+Postgres and object storage. The logical server may use multiple replicas and
+role-targeted pods behind one gateway. Supported tenant topologies are
+self-hosted, multi-tenant SaaS, and single-tenant enterprise cloud; they share
+one protocol and server architecture.
 
-The steady-state runtime budget is:
+The normative operating contracts are:
+
+- [`operations/deployment-and-release.md`](../../operations/deployment-and-release.md)
+  for topology, TLS, configuration, database roles, migrations, rollout, and
+  version skew;
+- [`operations/reliability-and-recovery.md`](../../operations/reliability-and-recovery.md)
+  for objectives, capacity, backup, restore, failure boundaries, and incidents;
+  and
+- [`wyrd-security-posture.md`](../../wyrd-security-posture.md) for identity,
+  authorization, tenant isolation, credentials, peer trust, Sources, and audit.
+
+## Database connection budget
+
+Wyrd SQL deployments size pools across the largest permitted replica count,
+including rollout surge:
 
 ```text
-pods * (app_max + platform_admin_max) + migrator_max <= pg.max_connections - reserved
+replicas * (app_max + platform_admin_max)
+  + concurrent_migrator_max
+  + database_reserved
+  <= postgres_max_connections
 ```
 
-Use `reserved = 10` as the baseline for Postgres administration, replication,
-and extension roles. The default platform-admin pool max is `2`, and the
-migrator max is `2` but exists only during boot.
+`database_reserved` is an explicit deployment value covering administration,
+replication, monitoring, failover, and extension roles. It is not silently
+derived from the remainder.
 
-For a tenant stack on Postgres with `max_connections = 100`:
+The canonical application DSN is `WYRD_DATABASE_URL`. The boot-only migrator
+password is `WYRD_DATABASE_MIGRATOR_PASSWORD`; the optional privileged operator
+password is `WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD`. Unsuffixed `WYRD_DB_*`
+settings tune the tenant application pool, and `_MIGRATOR` and
+`_PLATFORM_ADMIN` suffixes tune the corresponding role pools.
 
-| Pods | Formula result | Deployment guidance |
-|---:|---:|---|
-| 1 | `(100 - 10 - 2) / 1 - 2 = 86` | Default `WYRD_DB_MAX_CONNECTIONS=32` has headroom. |
-| 2 | `(100 - 10 - 2) / 2 - 2 = 42` | Default `32` still fits. |
-| 4 | `(100 - 10 - 2) / 4 - 2 = 20` | Set `WYRD_DB_MAX_CONNECTIONS=20`. |
-| 8 | `(100 - 10 - 2) / 8 - 2 = 9` | Introduce PgBouncer or lower concurrency expectations. |
+The migrator pool exists only for the migration gate and is closed before
+normal traffic becomes ready. Runtime tenant work uses `TenantConn` under RLS.
+Cross-tenant operator work uses only the narrow `OperatorPool` capabilities
+approved by repository architecture.
 
-SaaS-per-tenant deployments run one Wyrd stack per tenant. Apply the same
-formula independently to each tenant's stack and database budget. Pool config
-does not carry a tenant dimension because each tenant stack owns its own
-runtime pool.
+Transaction-mode PgBouncer requires statement-cache capacity `0` on every pool
+that passes through it. Tenant state is transaction-local; session-scoped SQL
+state, session advisory locks, and `LISTEN`/`NOTIFY` are not supported on that
+path.
 
-When a deployment uses PgBouncer in transaction pooling mode, set
-`WYRD_DB_STATEMENT_CACHE_CAPACITY=0` for the runtime pool and equivalent
-suffixed variables for any pool routed through the bouncer. Keep tenant binding
-transaction-scoped; do not introduce session-scoped SQL state in request paths.
+## Readiness
+
+A replica reports ready only for roles whose dependencies, security material,
+audit path, resource governors, persistent volumes, schema versions, and
+recovery state are valid. The gateway routes a request only to a replica ready
+for that surface. Liveness does not imply readiness.

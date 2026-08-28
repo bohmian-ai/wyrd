@@ -1,22 +1,23 @@
 # Security Foundation
 
-This is the reader path for Wyrd's Auth plane foundation. It cross-references
-the per-stage architecture notes landed by PR 5.3.
+This is the reader path for Wyrd's Auth and Policy plane foundation. The
+repository-level security contract is
+[`../../wyrd-security-posture.md`](../../wyrd-security-posture.md); the pages
+below define the narrower v1 types and service boundaries.
 
 ## Reader Path
 
-1. `principal.md` - identity types, principal ids, and delegation chain shape.
-2. `permission-model.md` - typed permissions and resolution rules.
-3. `permission-check.md` - the authorization chokepoint trait.
-4. `token-issue.md` - issuing JWTs, delegated tokens, and API keys.
-5. `token-verify.md` - verifying JWTs, resolver seam, and chain flattening.
-6. `builtin-roles.md` - five builtin roles and seed lifecycle.
-7. `service-identity.md` - card-bound non-human runtime identity and token exchange.
-8. `errors.md` - wire-visible error-code foundations.
-
-Some per-stage notes may land after this index. When a file is missing, use the
-corresponding plan stage as the temporary source until the architecture page is
-added.
+1. [`principal-extraction.md`](principal-extraction.md) - verified principal
+   extraction at request boundaries.
+2. [`permission-model.md`](permission-model.md) - typed permissions and
+   resolution rules.
+3. [`permission-check.md`](permission-check.md) - the authorization
+   chokepoint.
+4. [`policy-hook.md`](policy-hook.md) - policy evaluation and fail-closed
+   composition.
+5. [`service-identity.md`](service-identity.md) - card-bound non-human runtime
+   identity.
+6. [`errors.md`](errors.md) - wire-visible error foundations.
 
 ## Boundary Diagram
 
@@ -63,9 +64,15 @@ Public errors are mapped through `wyrd_spec::error::WyrdError`. Auth verifier
 unavailability is `WYRD_AUTH_503_VERIFY_UNAVAILABLE` and is retryable with
 backoff; permission denial is `WYRD_PERMISSION_403_DENIED_RBAC`.
 
-## Deferred Work
+## Security contract
 
-Policy-plane authorization for richer card and runtime decisions lands in a
-later PR. Mesh `ext_authz` uses the same `X-Wyrd-Access-Token` contract; no
-additional Wyrd identity header is introduced. JWKS discovery, hot key reload,
-enterprise OIDC login, and user impersonation are also later work.
+Production composition supplies a real permission resolver, policy decision
+point, canonical audit writer, Oracle audit relay, and external audit-anchor
+publisher. Permit-all, no-op, in-memory, and test substitutes cannot satisfy
+production readiness.
+
+Mesh `ext_authz` uses the same `X-Wyrd-Access-Token` contract; no additional
+Wyrd identity header is introduced. JWT verification uses configured issuer,
+audience, algorithm, key identity, JWKS refresh, revocation epoch, delegation,
+and expiry rules from the repository-level security posture. Uncertainty in
+identity, policy, or revocation state fails closed.

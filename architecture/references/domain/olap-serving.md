@@ -1,77 +1,126 @@
 # OLAP serving
 
-Load for Bifrost table design, ingest and query paths, analytical API shape,
-admission control, or tenant-safe serving decisions.
+Load for Bifrost table design, ingest and query paths, admission, consistency,
+tenant-safe analytical APIs, or high-throughput warehouse behavior.
 
 ## One analytical substrate
 
-Bifrost is Wyrd's internal OLAP surface. Every logical table resolves to one
-organization-qualified physical Iceberg table backed by object storage. The
-catalog and control state live in Postgres; analytical bytes do not. Built-in
-observation tables and user-defined analytical tables use the same binding and
-system-column rules.
+Bifrost is Wyrd's internal distributed OLAP warehouse. Every logical table
+resolves to one tenant-qualified physical Iceberg table. Postgres owns
+catalog and control state; object storage owns analytical bytes. Built-in and
+user-defined tables use the same managed envelope, physical binding, admission,
+and tenant rules.
 
-The serving boundary belongs to `wyrd-server`. Vala crates provide engines and
-adapters. A query request is typed, tenant-bound, projection-aware, and
-time-bounded before DataFusion planning. A record write is schema-checked,
-idempotent, and stamped with event time, ingest time, batch ID, row ordinal, and
-authenticated tenant.
+`wyrd-server` owns the public API. Vala owns Scribe, Oracle, and Forge behind
+that boundary. Public requests are typed, authenticated, tenant-bound, and
+budgeted before analytical work begins.
 
-## Query path
+## Write and visibility lifecycle
 
-1. Authenticate the principal and resolve `(organization, TableRef)`.
-2. Admit only allowed query classes, bounded time windows, and safe projections.
-3. Build a typed DataFusion logical plan; do not pass arbitrary SQL through a
-   privileged context.
-4. Apply tenant and time predicates at the provider boundary, push projection
-   and filters into the scan, and verify plan-root tenant protection.
-5. Stream bounded Arrow batches or length-delimited frames. Expose diagnostics
-   such as files, partitions, row groups, bytes, spills, and elapsed time.
+```text
+validated append
+  -> global / tenant / table admission
+  -> one of sixteen deterministic pod-local Scribe shards
+  -> shard WAL append + fsync + durable batch fence
+  -> active memtable authority
+  -> immutable member
+  -> fsynced, checksummed, query-registered staged run authority
+  -> approximately 512 MiB published Scribe hot object
+  -> unchanged-object Iceberg promotion snapshot
+  -> managed Forge rewrite toward approximately 1 GiB files
+  -> fenced Iceberg rewrite snapshot
+```
 
-Avoid collecting a full result in a request path. A caller-facing page or
-stream must have an explicit byte, row, or time budget. Sensitive payload
-columns (trace, log, GenAI, and agent-trace data) require an elevated read
-permission in both typed and generic query paths.
+Acknowledgement occurs after WAL durability, batch fencing, and authoritative
+active insertion. It does not wait for staging, object publication, Iceberg
+promotion, or compaction. WAL retirement occurs only after every member in the
+rotation cohort has a validated staged replacement registered for live-tail
+reads. Staged authority switches to the published hot object only after the
+fenced `file_list` and audit transaction commits or reconciles as identical.
 
-## Write path and consistency
+Scribe writes 32 MiB logical or 131,072-row Parquet row groups and combines
+compatible same-node staged runs into approximately 512 MiB immutable hot
+objects. Those values are independent: a row group is a bounded write unit,
+not a whole-file ceiling, and indivisible groups or residues may cross or miss
+the approximate object target. Forge first appends eligible hot objects to
+Iceberg unchanged, then uses the managed compaction core to rewrite eligible
+live files toward an independent approximately 1 GiB target with an independent
+128 MiB encoded-row-group target. The managed writer rolls only between
+completed writes after its encoded-size estimate exceeds the target; per-
+partition residue and compression variance make physical sizes approximate.
 
-Bounded buffering amortizes object-store and catalog overhead. A durable append
-ack means the WAL or equivalent durable queue has accepted the immutable batch;
-it does not imply that compaction is complete. Control rows and Iceberg
-snapshots need explicit recovery markers when they cannot commit atomically.
-Retries use batch identity and never append the same batch twice.
+Scribe owns writes within one pod. Routing and replay do not coordinate one
+logical append across pods. Oracle may distribute reads across authenticated
+peers; distributed reads do not imply distributed ingest or catalog writes.
 
-## Trade-offs and failures
+## Oracle read paths
 
-Strict admission protects a multi-tenant service but can reject exploratory
-queries; provide a safe diagnostic or explain surface rather than bypassing the
-gate. Streaming lowers memory pressure but requires backpressure and clear
-cancellation semantics. Caching table providers improves latency but requires
-catalog-epoch invalidation; stale schemas must fail with a typed conflict.
+Oracle pins one consistent cut across the selected Iceberg snapshot, published
+hot objects, and Scribe live-tail authority. It never opens another node's
+local staged files and does not query WAL in normal operation.
 
-Fail closed on tenant mismatch, schema fingerprint conflict, oversized query,
-unregistered table, replayed batch, unknown sensitive projection, or missing
-catalog metadata. Do not hide a partial stream as a successful result.
+The interactive path remains the default for low-latency scans and plans that
+do not require a network exchange. The analytical path executes joins,
+high-cardinality aggregation, partitioned windows, subqueries, and
+deduplicating set operations through streamed partitioned exchanges. It has no
+materialized shuffle service or independent scheduler.
 
-## Anti-patterns
+Both paths:
 
-Reject shared physical tables with caller-supplied tenant filters, one commit
-per event, a global mutex around all tables, unbounded `collect()`, positional
-schema mapping, generic SQL as the only authorization boundary, and network
-listeners in Vala crates.
+1. authenticate the principal and resolve `(data_tenant_id, TableRef)`;
+2. authorize the query class, projection, time window, and sensitive columns;
+3. acquire path-specific slots from one atomic capacity check and a query-owned
+   memory/spill grant;
+4. bind the optimized plan to the pinned snapshot and post-pruning statistics;
+5. preserve the plan-root tenant predicate and `TenantTripwireExec`;
+6. stream bounded Arrow batches with one explicit terminal result.
+
+Distributed stages bind tenant, snapshot digest, fragment digest, and fence
+before plan decoding or IO. Every worker receives the admitted query-owned
+runtime, memory pool, exchange child budget, spill allocation, deadline, and
+cancellation tree. Head cancellation joins all descendants. One deterministic
+authenticated availability-loss retry may re-execute against the same pinned
+cut within the original deadline only before Oracle emits a result-data frame.
+Later loss fails the stream terminally; success can never contain partial or
+duplicate rows.
+
+Interactive and analytical work use separate queues and counters. Analytical
+work cannot borrow the protected interactive slot floor. Both remain beneath
+one total Oracle capacity check and one shared elastic resource root.
+
+## Admission and failure semantics
+
+Route from the optimized plan and exact statistics over post-pruning pinned
+files. Missing or invalid estimates select the conservative interactive path.
+An analytical candidate without an actual network exchange executes
+interactively. Planning fallback never bypasses authorization, admission,
+deadline, audit, or result budgets.
+
+Fail closed on tenant mismatch, schema fingerprint conflict, unknown columns,
+unregistered tables, replay identity conflict, unsupported expressions,
+oversized input or result, sensitive-column denial, memory or exchange-budget
+refusal, invalid stage authority, missing catalog evidence, or ambiguous
+publication. Never represent a truncated or failed stream as success.
+
+## Rejected shapes
+
+Reject caller-controlled tenant predicates, one object or catalog commit per
+event, cross-pod reads of local Scribe files, a global table lock, unbounded
+`collect()`, positional schema mapping, SQL text as the authorization boundary,
+materialized shuffle infrastructure, distributed writes, and network listeners
+owned by Vala crates.
 
 ## Stable Wyrd anchors
 
-- Bifrost contract and serving rule: `architecture/wyrd-design.md` §Bifrost.
-- Query and table contracts: `crates/wyrd-spec/src/vala/api/`.
-- Query admission and server routes: `crates/wyrd/wyrd-server/`.
-- Engine implementation: `crates/vala/vala-bifrost-redux/`.
+- Bifrost authority: `architecture/bifrost-design.md`.
+- Cross-system doctrine: `architecture/wyrd-design.md` §Bifrost.
+- Wire contracts: `crates/wyrd-spec/src/vala/api.rs`.
+- Engine: `crates/vala/vala-bifrost-redux/`.
+- Public serving: `crates/wyrd/wyrd-server/`.
 
 ## Primary grounding
 
-- [Apache Iceberg overview](https://iceberg.apache.org/docs/latest/)
-- [Apache DataFusion configuration and pruning](https://datafusion.apache.org/user-guide/configs.html)
+- [Apache Iceberg specification](https://iceberg.apache.org/spec/)
+- [Apache DataFusion features](https://datafusion.apache.org/user-guide/features.html)
+- [Apache DataFusion configuration](https://datafusion.apache.org/user-guide/configs.html)
 - [Apache Arrow columnar format](https://arrow.apache.org/docs/format/Columnar.html)
-- [NIST AI RMF 1.0](https://nvlpubs.nist.gov/nistpubs/ai/NIST.AI.100-1.pdf)
-- Wyrd anchors: `architecture/wyrd-design.md` §Bifrost;
-  `crates/wyrd/wyrd-server/`; `crates/vala/vala-bifrost-redux/`.

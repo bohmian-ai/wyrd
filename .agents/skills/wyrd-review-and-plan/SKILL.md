@@ -1,9 +1,9 @@
 ---
-name: wyrd-review-and-plan-v3
+name: wyrd-review-and-plan
 description: Run the terminal static review of an immutable integrated Wyrd change against its intent, plan, tasks, claims, code, and available evidence. Use after integrated verification as the final merge- or push-readiness review; no execution controller artifacts are required.
 ---
 
-# Wyrd Review And Plan v3
+# Wyrd Review And Plan
 
 Review one immutable integrated base-to-target range for aggregate intent and
 plan closure, cross-task correctness, architecture and contract drift,
@@ -133,8 +133,8 @@ merge/push readiness. Do not require a durable review directory or exact YAML
 schema unless the caller requests an automation artifact.
 
 Return reversible findings directly to the caller for bounded
-`$wyrd-implement-v3` remediation. A repaired immutable candidate receives
-focused `$wyrd-review-v3`, integration, applicable integrated checks, and a
-fresh terminal review. Route only `MATERIAL` findings to `$wyrd-plan-v3` or the
+`$wyrd-implement` remediation. A repaired immutable candidate receives
+focused `$wyrd-review`, integration, applicable integrated checks, and a
+fresh terminal review. Route only `MATERIAL` findings to `$wyrd-plan` or the
 user. No repository skill owns scheduling, leases, generations, worktrees,
 candidate refs, serial integration, or remediation-controller state.

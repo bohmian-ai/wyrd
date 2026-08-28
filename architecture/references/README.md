@@ -1,9 +1,30 @@
 # Wyrd Doctrine Reference Library
 
-`architecture/references/` is the sole reusable Wyrd knowledge library.
-Skills own conversational or execution process; this library owns concise,
-durable product and implementation knowledge. Start here and load only the
-slices required by the question or change.
+`architecture/references/` is Wyrd's reusable technical knowledge library. It
+translates the repository's architecture and engineering rules into focused,
+durable guidance. Start here and load only the slices required by the design or
+implementation concern.
+
+## Authority hierarchy
+
+The references do not create independent architecture. Apply them under the
+following authorities:
+
+| Authority | Governs |
+|---|---|
+| `AGENTS.md` | Repository-wide ownership, coding, testing, verification, and contribution rules |
+| `architecture/agent-rules.md` | Mandatory implementation boundaries, including SQL tenancy, audit, SSRF, and repository gates |
+| `architecture/wyrd-design.md` | Wyrd protocol, Card model, identities, cross-system contracts, and public surfaces |
+| `architecture/bifrost-design.md` | Bifrost ingest, storage, maintenance, and query architecture |
+| `architecture/wyrd-security-posture.md` | Trust boundaries, authorization, tenant security, audit integrity, credentials, and security operations |
+| `architecture/operations/` | Deployment, release, capacity, backup, recovery, and incident contracts |
+| `architecture/wyrd-doctrine.mdx` | Product rationale and design doctrine |
+| `architecture/references/` | Focused application guidance derived from the authorities above |
+
+All applicable authorities must be satisfied. A focused reference yields to
+the governing architecture or repository rule when they disagree. Reference
+prose describes the required architecture; implementation that differs is
+drift, not precedent.
 
 ## Layout
 
@@ -50,28 +71,19 @@ Use the smallest complete set; compound concerns should load each named slice:
 | “How should we evaluate an agent and turn failures into a safe release signal?” | `domain/evaluation.md` + `domain/telemetry-observations.md` + `domain/drift-monitoring.md` + `doctrine/positioning-and-vocabulary.md` |
 | “Why did latency drift page after a trace pipeline change?” | `domain/telemetry-observations.md` + `domain/drift-monitoring.md` + `domain/analytical-operations-reliability.md` |
 | “Which query shape will prune files and stay tenant-safe?” | `domain/olap-serving.md` + `domain/datafusion.md` + `domain/iceberg.md` |
-| “When should compaction refresh the catalog, and what can fail?” | `domain/iceberg.md` + `domain/analytical-operations-reliability.md` + `domain/olap-serving.md` |
+| “When should compaction refresh the catalog, and what can fail?” | `domain/iceberg.md` + `domain/datafusion.md` + `domain/analytical-operations-reliability.md` + `domain/olap-serving.md` |
 | “How do Python callers receive analytical data without copies or hidden IO?” | `domain/arrow-analytical-interop.md` + `languages/pyo3-boundaries.md` + `languages/python-api-and-stubs.md` |
 | “How should an MCP or HTTP surface expose this capability?” | `languages/agent-harness.md` + `doctrine/positioning-and-vocabulary.md` + `domain/vala-architecture.md` |
 | “This is a non-Vala Card, SDK, Rust, or server question.” | Start with the matching `doctrine/`, `architecture/`, or `languages/` slice; do not load domain references unless the evidence crosses into Vala. |
 
 ## Reading rules
 
-- Read a selected file completely, then use its stable Wyrd anchors to inspect
-  current code only when the question depends on implementation reality.
-- Treat `architecture/wyrd-design.md` as the protocol authority and
-  `architecture/wyrd-doctrine.mdx` as the public rationale when references and
-  code disagree.
-- Treat upstream links in each reference's `Primary grounding` section as
-  live technical sources. Browse them when API behavior, standards, or research
-  may have changed; prefer primary sources over summaries.
+- Read every selected file completely and follow its Wyrd anchors back to the
+  governing architecture where necessary.
+- Use implementation inspection to measure conformance, never to redefine an
+  architectural requirement.
+- When a reference includes a `Primary grounding` section, treat those links as
+  technical sources rather than Wyrd authority. Revalidate version-sensitive
+  API behavior and standards against primary sources.
 - Keep this library concise and nonredundant. Add or extend a reference only
   when a durable knowledge gap is demonstrated.
-
-## Consumers
-
-- `.agents/skills/wyrd-advise/SKILL.md`
-- `.agents/skills/wyrd-implement/SKILL.md`
-- `.agents/skills/wyrd-plan/SKILL.md`
-- `.agents/skills/wyrd-review/SKILL.md`
-- `.claude/skills/wyrd-implement/SKILL.md`

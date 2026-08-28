@@ -1,9 +1,9 @@
 ---
-name: wyrd-plan-review-v3
+name: wyrd-plan-review
 description: Review a Wyrd plan or task packet for source-grounded decision completeness, executability, real dependencies, claim coverage, and credible evidence. Use before implementation when readiness matters; do not enforce a particular document layout or execution controller.
 ---
 
-# Wyrd Plan Review v3
+# Wyrd Plan Review
 
 Decide whether implementers can execute the proposed work without inventing a
 material product, contract, ownership, persistence, security, tenancy,

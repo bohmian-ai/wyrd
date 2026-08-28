@@ -1,9 +1,9 @@
 ---
-name: wyrd-implement-v3
+name: wyrd-implement
 description: Implement and verify an actionable Wyrd task or bounded remediation from direct instructions or a plan artifact. Align code to requested outcomes, repository authority, claims, evidence expectations, and referenced expertise; escalate only material unresolved decisions.
 ---
 
-# Wyrd Implement v3
+# Wyrd Implement
 
 Own the complete implementation loop: understand the task, acquire relevant
 context, edit code and tests, collect credible evidence, fix task-local
@@ -35,6 +35,40 @@ authority. Read and apply every skill, architecture reference, pinned source,
 prior decision, and implementation example explicitly named by the task. Use
 each for the decisions it informs; repository authority and the locked outcome
 still govern.
+
+Start at [the canonical reference router](../../../architecture/references/README.md).
+Read [implementation execution](../../../architecture/references/languages/implementation-execution.md)
+for every task, then select and completely read the smallest additional set
+covering the actual implementation surfaces. Apply the references even when a
+task packet omitted them; task-provided links add context but are not the only
+discovery mechanism.
+
+| Reference | Select when implementation touches |
+|---|---|
+| [Wyrd protocol authority](../../../architecture/wyrd-design.md) | Card contracts, identity, doctrine, cross-service boundaries, or public surfaces |
+| [Bifrost authority](../../../architecture/bifrost-design.md) | Scribe, Oracle, Forge, analytical storage, resources, or public query/ingest behavior |
+| [Security posture](../../../architecture/wyrd-security-posture.md) | Authentication, authorization, credentials, tenant security, audit integrity, or external-network trust |
+| [Operations authority](../../../architecture/operations/README.md) | Deployment, release, capacity, backup, recovery, SLOs, or incidents |
+| [Positioning and vocabulary](../../../architecture/references/doctrine/positioning-and-vocabulary.md) | Card vocabulary, envelope, `CardRef`, v1 kinds, or removed concepts |
+| [Architecture constraints](../../../architecture/references/doctrine/architecture-constraints.md) | Wyrd/Vala/Skald boundaries, deployment, tenant isolation, or observation identity |
+| [Architecture patterns](../../../architecture/references/architecture/patterns.md) | Ownership, contract placement, or server/client/storage/provider/audit structure |
+| [Implementation execution](../../../architecture/references/languages/implementation-execution.md) | Every task: execution authority, adaptation, verification recovery, test integrity, and completion evidence |
+| [Rust core](../../../architecture/references/languages/rust-core.md) | Rust ownership, async, traits, allocation, or API shape |
+| [PyO3 boundaries](../../../architecture/references/languages/pyo3-boundaries.md) | PyO3 classes, GIL, lifetimes, conversion, or module registration |
+| [Python API and stubs](../../../architecture/references/languages/python-api-and-stubs.md) | Python exports, stubs, package layout, or typing |
+| [TypeScript guide](../../../architecture/references/languages/typescript-guide.md) | TypeScript SDK, declarations, or napi boundaries |
+| [Testing workflows](../../../architecture/references/languages/testing-workflows.md) | User journeys, integration tests, unit tests, or repository verification |
+| [Agent harness](../../../architecture/references/languages/agent-harness.md) | MCP, agent-facing contracts, structured validation, or audit |
+| [Errors](../../../architecture/references/languages/errors.md) | Stable errors and Rust/Python/TypeScript/HTTP/CLI mapping |
+| [Vala architecture](../../../architecture/references/domain/vala-architecture.md) | Broad Vala ownership, Bifrost orientation, or cross-domain work |
+| [Telemetry observations](../../../architecture/references/domain/telemetry-observations.md) | OpenTelemetry signals, correlation, observation identity, or payload sensitivity |
+| [Evaluation](../../../architecture/references/domain/evaluation.md) | Eval Cards, scenarios, judge quality, scoring, or evidence |
+| [Drift monitoring](../../../architecture/references/domain/drift-monitoring.md) | Drift signals, baselines, thresholds, alert noise, or monitoring policy |
+| [OLAP serving](../../../architecture/references/domain/olap-serving.md) | Bifrost tables, ingest/query serving, admission, tenant safety, or analytical APIs |
+| [Iceberg](../../../architecture/references/domain/iceberg.md) | Snapshots, catalogs, schemas, partitions, object storage, or compaction |
+| [DataFusion](../../../architecture/references/domain/datafusion.md) | Logical/physical plans, provider pushdown, pruning, statistics, memory, or spills |
+| [Arrow analytical interop](../../../architecture/references/domain/arrow-analytical-interop.md) | Arrow, RecordBatch, Parquet, PyArrow, FFI, or Python analytical boundaries |
+| [Analytical operations reliability](../../../architecture/references/domain/analytical-operations-reliability.md) | Backpressure, durability, leases, repair, retention, SLOs, or failure recovery |
 
 Follow CodeGraph instructions. Inspect the nearest behavior owner, callers,
 consumers, tests, manifests, generated surfaces, and current `mise` tasks.

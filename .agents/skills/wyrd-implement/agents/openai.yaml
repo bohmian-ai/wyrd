@@ -1,0 +1,4 @@
+interface:
+  display_name: "Wyrd Implement"
+  short_description: "Implement and prove a Wyrd task"
+  default_prompt: "Use $wyrd-implement to implement this actionable Wyrd task, apply its referenced expertise, satisfy its required claims, collect credible evidence, and escalate only material unresolved decisions."

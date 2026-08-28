@@ -2,13 +2,12 @@
 
 **Version:** v1
 
-This document is the current design of the Wyrd protocol. It is **stateless**:
-it reflects the shape as it stands now. Decision history lives in git
-(`git log architecture/wyrd-design.md`).
+This document defines the Wyrd protocol. It is normative and stateless:
+decision history and implementation progress live outside the architecture.
 
-When this disagrees with `wyrd-protocol.openapi.yaml`, `wyrd-protocol.md`,
-`specs/*.yaml`, or the Rust code in `crates/wyrd-spec`, **this file wins**.
-Downstream artifacts are brought up to this version in a sync pass.
+When this disagrees with generated contracts or the Rust code in
+`crates/wyrd-spec`, **this file wins**. Downstream artifacts must be brought up
+to this version from their owning sources.
 
 ---
 
@@ -16,19 +15,19 @@ Downstream artifacts are brought up to this version in a sync pass.
 
 - [Doctrine](#doctrine) — 20 design principles
 - [Client model](#client-model) — language-agnostic protocol and first-class SDKs
-- [Kind catalog](#kind-catalog) — 16 native kinds + External
+- [Kind catalog](#kind-catalog) — 16 registrable kinds + External discriminator
 - [Per-kind specs](#per-kind-specs) — field shapes per kind
   - [Data](#data) · [Model](#model) · [Artifact](#artifact) · [Experiment](#experiment)
   - [Prompt](#prompt) · [Agent](#agent) · [Workflow](#workflow) · [Mcp](#mcp)
   - [Service](#service) · [Policy](#policy) · [Audit](#audit)
-  - [Drift](#drift) · [Eval](#eval) · [Source](#source) · [Bifrost](#bifrost--wyrds-olap-warehouse)
+  - [Drift](#drift) · [Eval](#eval) · [Source](#source) · [Bifrost](#bifrost)
   - [Trigger](#trigger) · [Operator](#operator)
 - [Bifrost design](./bifrost-design.md) — OLAP warehouse: tables, Scribe ingest, Oracle admission, Forge, public surface
 - [Spec-file authoring](#spec-file-authoring) — `ref` / `select` / `path` / `inline`, pre-registration matrix
 - [Workspace config](#workspace-config-wyrdtoml) — `wyrd.toml` defaults and merge rules
 - [Reference-direction quick reference](#reference-direction-quick-reference) — who refs whom
 - [Worked directory layout](#worked-directory-layout) — example deployment tree
-- [Questions and resolutions](#questions-and-resolutions) — open and resolved design decisions
+- [Decisions](#decisions) — protocol choices that constrain implementations
 
 ---
 
@@ -83,15 +82,14 @@ Downstream artifacts are brought up to this version in a sync pass.
     Workflow, Audit, Service) is spec-only: `wyrd apply -f file.yaml` reads
     and registers in one move. No separate storage step, no programmatic
     registration prerequisite.
-17. **Light cards may inline in place of a `CardRef`.** Wherever a `CardRef`
-    points at a light card and the inline target has no need for cross-spec
-    identity, the parent spec MAY embed the full definition instead. Today
-    `Agent.prompt` accepts `PromptRef = CardRef | Inline`. Inline definitions
-    have no card identity, are not registered
-    standalone, and cannot be referenced from outside their parent. To reuse,
-    register as a card and reference by `CardRef`. Heavy refs (`subject_ref`,
-    `dataset`, `Service.components.ref`, `Workflow.steps.target`) stay
-    `CardRef`-only — identity is the point.
+17. **Inline is field-specific, not a property of every light Card.**
+    `Agent.prompt` accepts `PromptRef = CardRef | Inline`, and a workflow
+    Agent action accepts `AgentRef = CardRef | Inline`. No other v1 reference
+    slot inlines. Inline definitions have no Card identity, are not registered
+    independently, and cannot be referenced outside their parent. To reuse one,
+    register it as a Card and use `CardRef`. Model, Data, Experiment, Artifact,
+    `subject_ref`, `dataset`, and `Service.components.ref` always preserve
+    independent identity.
 18. **Auth and Policy are two distinct planes.** Emit is **not** a third
     plane: a deployed service's observation/ingest writes are ordinary
     Auth-plane routes, authorized by the same JWT and a
@@ -152,15 +150,16 @@ Downstream artifacts are brought up to this version in a sync pass.
     and `X-Original-*` to `/v1/authz/check`; the body is empty. Both caller
     and callee identities are server-verified from one signed delegated
     JWT — no enforcement-point JWT, no SPIFFE/mTLS callee derivation.
-19. **Reference slots accept `ref | select | path | inline`.** Wherever a
-    card spec references another card — light or heavy (Prompt, Agent,
-    Workflow, Mcp, Policy, Eval, Trigger, Operator, Source, Audit, Service,
-    Model, Data, Experiment, Artifact) — the slot is a tagged-by-key union,
-    mutually exclusive. The key IS the discriminator:
+19. **Reference slots use one exact identity model.** Every reference-bearing
+    field accepts a `ref:` whose wire value is a `CardRef`. Client authoring
+    may use `select:` or `path:` for any `CardRef` slot; the loader resolves
+    either form to `ref:` before transmission. `inline:` exists only where the
+    field's typed wire contract explicitly declares an inline union; v1 uses it
+    for `PromptRef` and workflow `AgentRef`. The forms are mutually exclusive,
+    and the key is the discriminator:
     - `ref:`    — a `CardRef` with exact identity: `kind`, `name`, `version`,
-                  optional `space`, optional `uid`. The only durable form that
-                  crosses the wire. `CardRef` never carries `labels` or
-                  `annotations`.
+                  required `space`, optional `uid`. `CardRef` never carries
+                  `labels` or `annotations`.
     - `select:` — client-side authoring sugar. A `CardSelector` that matches on
                   target-card **metadata** (`kind`, optional `name`, `version`,
                   `space`, `labels`, `annotations`, `latest`). `wyrd plan` /
@@ -173,20 +172,19 @@ Downstream artifacts are brought up to this version in a sync pass.
                   on disk (`apiVersion` + `kind` + `metadata` + `spec`). The
                   loader registers it as an independent card and rewrites the
                   parent slot to `ref: CardRef`. Never on the wire.
-    - `inline:` — spec body embedded in the parent, prefixed with `kind:`. No
-                  card identity; not addressable from outside the parent. Light
-                  cards only.
+    - `inline:` — typed Prompt or Agent spec embedded in its approved parent
+                  field. It has no independent Card identity and is not
+                  addressable outside that parent.
 
-    `select` and `path` resolve to `ref` before send; only `ref` and `inline`
-    cross the wire. Heavy cards (Model, Data, Experiment, Artifact) accept
-    `ref` or `select` only — `inline` is rejected because identity anchors
-    lineage. Environment/stage is target-card metadata (`labels` /
+    Heavy cards (Model, Data, Experiment, Artifact) never inline because their
+    identity anchors lineage. Environment/stage is target-card metadata (`labels` /
     `annotations`), never `space`; `space` is team/workspace scope only, and
     one server may hold development, staging, and production cards side by side.
-    See §"Light-card reference forms" for loader rules and the slot inventory.
+    See [Reference forms](#reference-forms) for loader rules and the slot inventory.
 20. **User journeys are the primary test contract.** A capability is not done
     until a real user/agent path proves it end-to-end — client → server →
-    client, against a real server (`WyrdTestServer` + embedded Postgres), not a
+    client, against a real server (`WyrdTestServer` + repository-managed
+    Postgres), not a
     mock. The journey is the unit of correctness: for a data surface,
     instantiate → write → shutdown/flush → read; for an agent/MCP surface,
     discover → act → observe. Unit and integration tests support journeys by
@@ -209,8 +207,7 @@ Rust, Python, and TypeScript are Wyrd's first-class client languages. Wyrd
 maintains idiomatic SDKs, generated types, examples, and client → server →
 client journeys for all three. Surface ergonomics may differ, but durable
 nouns, fields, errors, permissions, side effects, and lifecycle semantics do
-not. Go is planned. It becomes first-class only when its SDK and the same
-contract and journey gates ship.
+not. Go is not a first-class client language.
 
 The public protocol remains open to every language. HTTP, MCP, generated
 schemas, stable errors, and machine-readable documentation are sufficient to
@@ -221,7 +218,10 @@ internals.
 
 ## Kind catalog
 
-16 native kinds + `External { name, schema_hash }` for forward-compat.
+Wyrd registers 16 native Card kinds. `CardKind::External` is a non-registrable
+discriminator used when reading foreign or unknown kind metadata. The foreign
+payload remains opaque and source-specific; it is not a Wyrd Card. There is no
+`ExternalSpec` and no External Card registration path.
 
 | Domain        | Kinds |
 |---------------|-------|
@@ -342,7 +342,7 @@ directory, not Service components.
 ```yaml
 spec:
   description?: string
-  components: [ServiceComponent] # { alias, ref | select | path | inline }
+  components: [ServiceComponent] # { alias, ref | select | path }
   entry_point?: string           # SDK AppState bootstrap module (e.g. `acme.copilot.app:app`).
                                  # Importing it materializes the service's locked card snapshot
                                  # at runtime. Wyrd doesn't import this; the deploy image does.
@@ -350,10 +350,6 @@ spec:
 
 Identity is derived from the Service's `card_ref` and bound on first deploy
 contact — no `service_account` field on the spec. See "Runtime identity".
-
-Worked examples: `architecture/specs/01-ml-prediction-service.yaml`,
-`architecture/specs/02-llm-agent-service.yaml`,
-`architecture/specs/06-multi-agent-service.yaml`.
 
 ### Policy
 Declarative governance rules. CEL-evaluated. Three lifecycle phases share one
@@ -371,8 +367,8 @@ rule shape; the `action` field on each rule says when it fires:
                                 code.
 
 Composition: `org_global ∪ service_local`, deny-overrides. Service-local can
-only tighten. CEL parse + evaluation is owned by the Stage-5 enterprise
-engine; `wyrd-spec` enforces only `CelExpression` transport invariants
+only tighten. CEL parse and evaluation are owned by the Policy engine;
+`wyrd-spec` enforces only `CelExpression` transport invariants
 (non-empty, ≤4096 chars, no control chars).
 
 ```yaml
@@ -473,19 +469,15 @@ Contract:
   call (top-level `principal` is the hop's callee, `act` chain is the
   caller path).
 
-Storage tier, query API, and CEL surface (e.g. a `chain.*` binding) are
-implementation concerns deferred to the runtime stage.
+Storage, query, and CEL surfaces must preserve this correlator and may not
+introduce a competing request identity.
 
 #### Observation identity — `Card → Run → Observation`
 
 How an observation ties to a Run and a Card, and how the server resolves it.
-The lineage spine is fixed by the concept docs — `Card → Run`
-([`run.mdx`](../docs/src/content/docs/concepts/run.mdx): every Run is bound to a
-Card version, its **Target**) and `Run → Observation`
-([`observation.mdx`](../docs/src/content/docs/concepts/observation.mdx): every
-Observation anchors to the Card version **and** Run it belongs to). This section
-states only the runtime resolution, which lives in the server, not the concept
-docs.
+The lineage spine is fixed: every Run is bound to a Card version, its
+**Target**, and every Observation anchors to both that Card version and the Run
+it belongs to. The server owns runtime resolution of that identity.
 
 **A principal is not a card.** A Service or Agent principal is bound to one card
 (its `card_ref`), but a Service card *nests components* — each a card in its own
@@ -533,25 +525,22 @@ Consequences, stated so they stop drifting:
   specs contribute their declared card refs according to the shared card-ref
   extraction rules. A `card_ref` outside that set is rejected: a principal may
   not attribute records to a card outside its declared graph. The scope can be resolved from the
-  registry at ingest or carried as a claim minted into the JWT at `/auth/token`
-  — an implementation choice deferred to the runtime stage.
+  signed `card_ref_scope` claim minted into the JWT at `/auth/token`.
 - **This is not the governance token.** `card_ref` is one field in the
   observation envelope, authorized by the existing JWT plus the principal's
   declared card-ref graph — not a separate per-card credential (doctrine #18).
   The token still proves the principal; it bounds a *set* of emittable cards,
   and the envelope selects one within it.
-- **There is no run registry.** Runs are a client-side execution record
-  ([`run.mdx`](../docs/src/content/docs/concepts/run.mdx)); the server never
-  persists a run table and never resolves `run_id` back to a card — the card is
-  the authorized `card_ref` on the row. `run_id` is an **opaque** correlation id,
-  never a composite that encodes the card.
+- **There is no run registry.** Runs are client-side execution records; the
+  server never persists a run table and never resolves `run_id` back to a card
+  — the card is the authorized `card_ref` on the row. `run_id` is an **opaque**
+  correlation id, never a composite that encodes the card.
 - **`Card → Run → Observation` is the `(card_ref, run_id)` pair on the row;** the
   request spine is the `wyrd_request_id` label that joins many runs across hops.
-- **Subject ≠ emitter is deferred to produced kinds.** A monitor emitting Drift/
-  Eval about a card *outside* its own scope carries an explicit `subject_ref`
-  with its own authorization — distinct from the in-scope `card_ref` above. That
-  lands with `vala-drift`/`vala-eval`, against a real consumer — not on the
-  Stage-3 `Record` envelope.
+- **Subject ≠ emitter belongs to produced kinds.** A monitor emitting Drift or
+  Eval about a card outside its own scope carries an explicit, independently
+  authorized `subject_ref`. It is distinct from the in-scope `card_ref` above
+  and does not alter the observation `Record` envelope.
 
 ### Runtime authz: `POST /v1/authz/check`
 
@@ -652,12 +641,13 @@ produced the chain, the lineage subgraph at snapshot time (cards + edges
 by `card_ref`), and the criteria for re-fetching the relevant observations
 from vala. Size is bounded by lineage depth, not by observation count.
 
-**Replay.** The card's attributes are the source of truth. The lineage
+**Replay.** The Audit Card's `spec` is the source of truth. The lineage
 half is read inline from the card; the observation half is re-fetched by
 running the inline criteria against vala's observation store.
 `card_ref`s are version-locked (doctrine #8), so lineage anchors stay
 valid as long as the registry retains the cited cards. Observation
-retention in vala (years) covers the replay window.
+retention policy must cover the requested replay window; creation fails with a
+typed retention error when it cannot.
 
 ```yaml
 spec:
@@ -711,7 +701,7 @@ timeline.
 
 `Investigator` is a closed enum identifying who ran the investigation. The
 server fills this from the calling principal; callers cannot self-assert
-identity (same posture as `ServiceIdentity`, doctrine #15).
+identity (the same posture as every server-derived `Principal`, doctrine #15).
 
 | Variant   | Carries                           |
 |-----------|-----------------------------------|
@@ -742,7 +732,7 @@ The query carries no `kinds` or `space` filter. Both were removed by
 design:
 
 - **No `kinds`.** Filtering would silently narrow the pinned subgraph,
-  giving future readers a forensic false signal that the investigator
+  giving later readers a forensic false signal that the investigator
   considered only those kinds. Display filtering is a UI concern; the
   audit pins the whole neighborhood.
 - **No `space`.** Visibility is already RBAC-enforced server-side. A
@@ -785,7 +775,7 @@ typed refs is a versioned breaking change that adds variants.
 | Variant     | Source-card fields                                                |
 |-------------|-------------------------------------------------------------------|
 | `Subject`   | `Drift.subject_ref`, `Eval.subject_ref`                           |
-| `Component` | `Service.components[].ref`, `Workflow.steps[].target`             |
+| `Component` | `Service.components[].ref`, `Workflow.steps[].action.target`      |
 | `Artifact`  | `Data.card_refs[]`, `Model.card_refs[]`                   |
 | `Prompt`    | `Agent.prompt`, `Eval.tasks[].LlmJudge.judge_ref`                 |
 | `Dataset`   | `Eval.dataset`                                                    |
@@ -833,7 +823,7 @@ ObservationCriteria:
   time_range: TimeRange                        # closed [from, to] — bounds the case file
 
   signals?: [Signal]                           # closed-enum filter; absent = all signals
-  actors?: [ActorRef]                          # filter on emit_actor (ServiceIdentity / Human); absent = all
+  actors?: [ActorRef]                          # filter on verified emitting principal; absent = all
   request_ids?: [WyrdRequestId]                # pin to specific runtime hops; absent = no pin
   labels?: { string: string }                  # attribute equality filter (tenant, region, etc.)
 ```
@@ -853,21 +843,21 @@ Excluded fields, with reasoning matching `ProvenanceQuery`:
 
 - **No `space`.** Already pinned by version-locked `subject_refs`.
 - **No `kinds`.** Implied by `subject_refs[i].kind`; an explicit filter
-  would silently narrow replay and give future readers a forensic false
+  would silently narrow replay and give later readers a forensic false
   signal.
 - **No `limit` / `cursor`.** Replay must return the deterministic full
   set; pagination is a render-side concern at the API boundary.
 
 **Replay determinism.** The same `ObservationCriteria` against the same
 vala store at the same logical time returns the same observation set —
-the property the audit's `digest` depends on. Vala's append-only,
-time-bounded retention (years) covers the window. If a referenced subject
+the property the audit's `digest` depends on. The deployment's qualified
+retention policy must cover the window. If a referenced subject
 is purged from the registry, the criteria still validates structurally
 and vala returns whatever observations remain; the audit's `digest`
 captures what *was* materialized at `snapshot_at`.
 
-**Under design (wire shape deferred):**
-- Multi-party `attestations` — deferred to v1.1; `details` may carry informally in v1.
+Multi-party attestations are not part of the v1 Audit wire contract. Values in
+`details` are descriptive and never acquire approval or authorization meaning.
 
 ### Drift
 Observation producer for a single subject. Envelope is orthogonal: subject +
@@ -884,18 +874,11 @@ spec:
   details: { string: NonSecretValue }
 ```
 
-Worked examples: `architecture/specs/01-ml-prediction-service.yaml`,
-`architecture/specs/04-external-mlflow.yaml`.
-
 **`Agent` is deliberately absent from `DriftMethod` in v1.** Agent-behavior drift
 (tool-call distribution shifts, response-format drift, step-count anomalies) is
 real but underspecified: it has no settled signal vocabulary, no profile shape,
-and no canonical scoring algorithm. Adding the enum variant before that work
-lands would freeze a contract we cannot honor. The variant is re-added once a
-follow-up design dialogue locks `AgentDriftProfile`, its signal channels, and
-the scoring algorithm — tracked as Drift-7 in
-`wyrd-plan/plans/phase-4-vala/02-foundations/implementation_plan/03-drift-primitive/12-followups.md`.
-Eval-score drift on agents is addressable today via `DriftSignal::EvalScore` +
+and no canonical scoring algorithm. Adding the enum variant would freeze a
+contract Wyrd cannot honor. Eval-score drift on agents uses `DriftSignal::EvalScore` +
 `DriftMethod::Spc`.
 
 `DriftSignal` is a closed enum:
@@ -921,7 +904,7 @@ authoring; the card stores resolved bounds):
 ### Eval
 Behavioral assessment workflow for a single subject. Envelope is orthogonal:
 **what** is judged (`subject_ref`), **how** (`tasks` DAG), **where to read its
-observations from** (`source_ref`, deferred), and an optional **offline
+observations from** (`source_ref`), and an optional **offline
 driver** (`dataset`). No scheduling, no dispatch, no fire condition — fire
 lives on `Drift` with `DriftSignal::EvalScore`. Eval is a single typed task
 workflow, not a parallel mode/profile split.
@@ -931,7 +914,7 @@ spec:
   subject_ref: CardRef           # → Agent | Workflow | Service | Model — WHAT is judged
   tasks: [EvalTask]              # evaluation workflow — DAG via depends_on
   dataset?: DatasetRef           # → Data — offline scenario driver
-  source_ref?: CardRef           # DEFERRED — landing in §Eval online-mode commit; not implemented
+  source_ref?: CardRef           # → Source — archived or external observation input
   sampling?: EvalSampling
   pass_gate?: EvalPassGate
   context_capture?: EvalContextCapture
@@ -952,13 +935,13 @@ of refs is the mode):
 | `dataset` | `source_ref` | Runtime behavior |
 |---------------|--------------|------------------|
 | set           | unset        | Offline batch. Engine invokes `subject_ref` against the Data card's scenario rows, captures traces inline. |
-| unset         | set          | Online / archived (deferred — DESIGN §13). Engine reads the user's sink, filters records by subject identity, samples records into the task workflow. |
-| set           | set          | Same tasks, both modes (online deferred — DESIGN §13). Offline gate and online monitor share one task definition. |
+| unset         | set          | Online / archived. Engine reads the source, filters records by subject identity, and samples records into the task workflow. |
+| set           | set          | The same tasks run in both modes. Offline gates and online monitors share one task definition. |
 | unset         | unset        | Online over `vala`'s default observation archive. |
 
 **Directional flow.** All three refs are `CardRef`s authored on `Eval`; nothing
 points back. At runtime: engine resolves `subject_ref` (identity filter),
-resolves `source_ref` (read location, deferred — see DESIGN.md §13), opens the
+resolves `source_ref`, opens the
 Source, queries records, feeds them into the `tasks` workflow, aggregates
 per-task pass/fail into a score stream consumed downstream by a `Drift` card with
 `DriftSignal::EvalScore`.
@@ -971,15 +954,14 @@ per-task pass/fail into a score stream consumed downstream by a `Drift` card wit
 |------------------|---------------------------------------------------------------------------------------------------|-----|
 | `Assertion`      | `context_path?: string`, `operator: ComparisonOperator`, `expected: ParameterValue`, `description?: string` | Deterministic check on a dot-path into a record |
 | `LlmJudge` (`llm_judge`) | `judge_ref: CardRef` (→ Prompt card), `operator: ComparisonOperator`, `expected: ParameterValue`, `max_retries: u32` | LLM judge: one Prompt card per task, judge response compared to expected value |
-| `TraceAssertion` | `span_selector: JsonPath`, `operator: ComparisonOperator`, `expected: ParameterValue`             | OTel span selector (tokens, duration_ms, retry_count, etc.) read via `source_ref` (deferred — see DESIGN.md §13) |
-| `AgentAssertion` | `workflow_field_path: JsonPath`, `operator: ComparisonOperator`, `expected: ParameterValue`       | Tool-call / response-shape check read via `source_ref` (deferred — see DESIGN.md §13) |
+| `TraceAssertion` | `span_selector: JsonPath`, `operator: ComparisonOperator`, `expected: ParameterValue`             | OTel span selector (tokens, duration_ms, retry_count, etc.) read via `source_ref` |
+| `AgentAssertion` | `workflow_field_path: JsonPath`, `operator: ComparisonOperator`, `expected: ParameterValue`       | Tool-call / response-shape check read via `source_ref` |
 
-`ComparisonOperator` is a frozen 56-variant catalog (12 numeric, 15 string,
-14 collection, 9 type, 6 tolerance / advanced). Parameterless variants
+`ComparisonOperator` is a closed typed catalog covering numeric, string,
+collection, type, and tolerance operations. Parameterless variants
 serialize as scalar `snake_case`; parameterized variants as `kind`-tagged
-objects. Canonical source:
-`crates/wyrd-spec/src/vala/eval/operator.rs:62-264`. The locked collection /
-type / tolerance families are required to keep authors out of LLM-judge calls
+objects. The collection, type, and tolerance families are required to keep
+authors out of LLM-judge calls
 for deterministic checks ("agent only used allowed tools" → `IsSubset`, "no
 duplicate tool calls" → `UniqueValues`, "score within 10% of baseline" →
 `WithinPctTolerance`, "output is valid JSON" → `IsJson`).
@@ -1005,9 +987,6 @@ Scenario-local `tasks` are the **passenger view** (judged against the agent's
 final response for that scenario); top-level `Eval.tasks` are the **mechanic
 view** (judged against intermediate workflow records / spans / tool calls).
 Both run in one pass.
-
-Worked examples: `architecture/specs/02-llm-agent-service.yaml`,
-`architecture/specs/03-rag-workflow-service.yaml`.
 
 ### Source
 Read-side reference to an external data system. **Wyrd reads, never writes.**
@@ -1087,12 +1066,12 @@ query, HTTP query) are different drivers behind one read trait; the Card schema
 never declares strategy — `vala` chooses it from the bucket and vendor, the same
 way it chooses the Drift/Eval evaluation strategy.
 
-### Bifrost — Wyrd's OLAP warehouse
+### Bifrost
 
 `Source` is the external read side ("Wyrd reads, never writes" — Doctrine #7).
 **Bifrost** is its Wyrd-owned counterpart: the public OLAP warehouse surface and
 analytical storage substrate `vala` uses to record Wyrd's **own** observations
-(drift events, eval records, OTel / GenAI traces, audit projections, and future
+(drift events, eval records, OTel / GenAI traces, audit projections, and
 analytical tables). It is Wyrd server state, not an external system and not a
 vendor.
 
@@ -1108,10 +1087,12 @@ internal surfaces — it would collide with the external `sql_warehouse` Source
 semantics.
 
 The full Bifrost design lives in [`bifrost-design.md`](./bifrost-design.md) —
-the managed table envelope and row identity, Scribe ingest and pressure sealing,
-Oracle read-audit durability and memory admission, Forge compaction bounds, and
-the public HTTP/gRPC/Python surface. That file is the design authority for
-Bifrost internals; this file stays authority for doctrine, the Card catalog, and
+the managed table envelope and row identity, sixteen-lane Scribe ingest and
+durable live tail, Oracle interactive and streamed distributed execution,
+read-audit durability and query-owned resources, unchanged-object Forge
+promotion and managed-core compaction, reconciliation and cleanup, and every
+public analytical projection. That file is the design authority for Bifrost
+internals; this file stays authority for doctrine, the Card catalog, and
 cross-kind contracts, including the two rules directly above.
 
 ### Trigger
@@ -1207,11 +1188,11 @@ Exact field schema for each context lives in OpenAPI.
 
 ## Spec-file authoring
 
-Two complementary mechanisms — `wyrd apply -f file.yaml` reads + registers in
-one move, and reference slots accept `ref | select | path | inline` so a card
-can be pinned by identity, matched by metadata, split into its own file, or
-inlined where its own identity isn't needed. `select` and `path` are authoring
-sugar the loader resolves to `ref` before send.
+Two complementary mechanisms apply. `wyrd apply -f file.yaml` reads and
+registers in one move. Every CardRef slot accepts `ref | select | path` so a
+Card can be pinned by identity, matched by metadata, or split into its own
+file; only `PromptRef` and workflow `AgentRef` add typed inline forms. `select`
+and `path` are authoring sugar the loader resolves to `ref` before send.
 
 ### Pre-registration matrix (Rule 16)
 
@@ -1222,7 +1203,7 @@ sugar the loader resolves to `ref` before send.
 | `Experiment`   | **Yes** | Carries run history. |
 | `Artifact`     | **Yes** (typically derived from heavy cards) | Pointer to durable bytes. |
 | `Prompt`       | Optional | Light. Inlineable as `PromptRef` inside `Agent.prompt`; referenced by `EvalTask::LlmJudge.judge_ref`. |
-| `Agent`        | Optional | Light. Spec-only; `apply` registers it. No v1 field accepts inline `AgentRef` (see Q11). |
+| `Agent`        | Optional | Light. Spec-only; workflow actions may carry a typed inline `AgentRef`; reusable agents register independently. |
 | `Eval`, `Policy`, `Trigger`, `Operator`, `Source`, `Mcp`, `Workflow`, `Audit`, `Service` | Optional | Light. Spec-only; `apply` registers each card as it's read. |
 
 A single YAML file may contain many `---`-separated card documents — `wyrd
@@ -1232,12 +1213,11 @@ ship in one file.
 
 ### Reference forms
 
-A reference slot accepts exactly one of four keys: `ref`, `select`, `path`,
-or `inline`. The key IS the discriminator; there is no separate `kind:` tag
-for the variant. Two of the four are durable wire forms (`ref`, `inline`);
-the other two (`select`, `path`) are client-side authoring sugar that the
-loader resolves to `ref` before anything leaves the client. The four forms in
-isolation:
+Every reference slot accepts `ref`. Client authoring accepts `select` or
+`path` anywhere a `CardRef` is expected and resolves either to `ref` before
+transmission. `inline` is a wire form only for typed `PromptRef` and workflow
+`AgentRef` fields. The key is the discriminator; forms cannot be combined.
+The forms in isolation:
 
 ```yaml
 # 1. ref — points at a registered card by exact identity.
@@ -1256,14 +1236,10 @@ select:
 #    independent card and rewrites this slot to `ref: CardRef`.
 path: ./policies/pii-redaction.yaml
 
-# 4. inline — full spec body embedded in the parent. No card identity.
+# 4. inline — only in an approved PromptRef or AgentRef field. No card identity.
 inline:
-  kind: Policy
-  rules:
-    - name: redact-ssn
-      expression: "message.contains_pii('ssn')"
-      action: gate
-  scope: service_local
+  description: inline workflow agent
+  prompt: { kind: Prompt, name: triage, version: "1.0.0", space: prod }
 ```
 
 The wire `CardRef` requires `space`. Omitting `space` in an authored `ref:` is
@@ -1273,7 +1249,7 @@ that has crossed an API boundary always carries `space` verbatim. `CardRef` is
 exact identity only — it never carries `labels` or `annotations`. Metadata
 matching is the job of `select`, not `ref`.
 
-In context — `Service.components[]` mixing all four forms plus a heavy-card ref:
+In context, `Service.components[]` may mix the three CardRef authoring forms:
 
 ```yaml
 components:
@@ -1287,26 +1263,21 @@ components:
   - alias: prompt
     path: ./prompts/triage-system.yaml
   - alias: pii-policy
-    inline:
-      kind: Policy
-      rules:
-        - name: redact-ssn
-          expression: "message.contains_pii('ssn')"
-          action: gate
-      scope: service_local
+    ref: { kind: Policy, name: pii-redaction, version: "1.0.0", space: prod }
 ```
 
 ### Reference-slot inventory
 
-The four-key shape applies at **every** reference slot, light or heavy — not a
-per-surface subset. There is one canonical slot inventory, and the loader,
-`$service.*` sugar rewrite, diagnostics, and relationship tests all project
-from it (they do not maintain parallel hand-written lists):
+The `ref | select | path` authoring shape applies at every CardRef slot. Inline
+support is part of the field's typed `PromptRef` or `AgentRef` contract, never
+inferred merely because a Card kind is light. There is one canonical slot
+inventory, and the loader, diagnostics, and relationship tests project from it:
 
 - `Service.components[]` (light and heavy targets)
-- `Agent.prompt`
-- `Trigger.target`
-- `Workflow.steps[].target`
+- `Agent.prompt` (`PromptRef` may inline)
+- `Trigger.operator_ref`
+- `Workflow.steps[].action.target`; `Agent` actions use `AgentRef` and may
+  inline, while `Mcp` and `Prompt` actions use `CardRef`
 - `Eval` task refs, including `EvalTask::LlmJudge.judge_ref`
 - `Drift.subject_ref`, `Drift.signal.eval_ref`, `Drift.signal.source_ref`
 - Heavy anchors: `Model`/`Data`/`Experiment` `*_refs`, `Artifact` refs
@@ -1390,10 +1361,10 @@ touching the wire.
   (package root) already give engineers and prevents a stray
   `wyrd.toml` outside the user's workspace from being silently
   loaded in CI runners, containers, or shared user homes.
-- Explicit override: `WyrdConfig::load(Some(&path))` accepts an
-  exact file path (used by the future `wyrd --config <path>` flag
-  and `WYRD_CONFIG` env var; both are spec'd but not wired in this
-  packet). Explicit relative paths are preserved as-given; the
+- Explicit override: the CLI and SDK configuration contract exposes
+  `wyrd --config <path>` and `WYRD_CONFIG`; both pass an exact file path to
+  `WyrdConfig::load(Some(&path))`.
+  Explicit relative paths are preserved as-given; the
   ancestor walk does not run.
 - Absent file: not an error. The CLI/SDK operates with system
   defaults only.
@@ -1428,10 +1399,8 @@ tier = "governance"
   authored intents (auto-bump from latest, prefix-line bump, exact
   pin). Filling `metadata.version` from the loader would silently
   change which branch the server takes — a wire-shape violation
-  even though the field itself remains in the payload. The
-  `bump_intent` semantics required to make defaulting safe are
-  out of scope for this packet; `version` returns to `[defaults]`
-  alongside them.
+  even though the field itself remains in the payload. Therefore `version` is
+  never read from `[defaults]`.
 - **Per-kind table keys are PascalCase** matching
   `CardKind::wire_name()` — the same identifier appears identically
   in YAML (`kind: Model`), TOML (`[kind.Model]`), and Rust source.
@@ -1441,8 +1410,8 @@ tier = "governance"
 - **Unknown tables and unknown keys are errors**
   (`#[serde(deny_unknown_fields)]`). A typo like `[default]`
   (missing `s`) surfaces at parse time, not as silent drop. The
-  `deny_unknown_fields` posture means any future top-level table
-  addition requires a coordinated client release.
+  `deny_unknown_fields` posture means adding a top-level table requires a
+  coordinated protocol/client release.
 
 ### Precedence (most specific wins)
 
@@ -1462,12 +1431,12 @@ tier = "governance"
   still apply.
 - **`version`, `name`, `uid`, `bump`, `spec_hash`, `artifact_hash`
   are never touched** by the loader. The first three are author
-  identity / intent (lock L4 plus Q5 for `version`); the last three
+  identity or intent; the last three
   are server-derived.
 
 This is the same architectural slot as the loader-side
-`metadata.space` inheritance documented in "Light-card reference
-forms" above: the wire payload still arrives at the server fully
+`metadata.space` inheritance documented in [Reference forms](#reference-forms):
+the wire payload still arrives at the server fully
 populated; the server never reads `wyrd.toml`.
 
 ### No lockfile by design
@@ -1479,10 +1448,8 @@ Adding a `wyrd.lock` would teach users a mental model that contradicts
 the wire contract — they would expect `version: latest` to be
 resolvable, and the honest answer is "no."
 
-A future `[dependencies]` table in `wyrd.toml` is reserved for
-cross-tenant foreign-card content pinning (a `go.sum`-flavored
-integrity check, not a range resolver). It is **out of scope** until
-cross-tenant card import is a supported workflow.
+`wyrd.toml` has no `[dependencies]` table. Cross-tenant card import and
+foreign-card content pinning are not supported workflows.
 
 ---
 
@@ -1493,10 +1460,10 @@ cross-tenant card import is a supported workflow.
 | Data    | `card_refs`, `splits`            | `Drift.signal.baseline_ref`, `Eval.dataset`, `Experiment.target_refs` |
 | Model   | `card_refs`                      | `Drift.subject_ref`, `Eval.subject_ref`, `Service.components.ref`, `Experiment.target_refs` |
 | Agent   | `prompt`, `tool_names`               | `Drift.subject_ref`, `Eval.subject_ref`, `Service.components.ref`, Agent prompts (sub-agent calls) |
-| Workflow| `steps.*.target`                     | `Eval.subject_ref`, `Service.components.ref`, `Operator.action.workflow_ref` |
+| Workflow| `steps[].action.target` (`AgentRef` or `Mcp`/`Prompt` `CardRef`) | `Eval.subject_ref`, `Service.components.ref`, `Operator.action.workflow_ref` |
 | Mcp     | `server_name`, `transport`, `scopes` | `Service.components.ref` |
 | Drift   | `subject_ref`, `signal.*` (`baseline_ref` \| `eval_ref` \| `source_ref`) | `Trigger.source.drift_ref`, `Drift.signal.eval_ref` (other Drifts watching an Eval indirectly) |
-| Eval    | `subject_ref`, `dataset`, `source_ref` (deferred), `tasks[].LlmJudge.judge_ref` (Prompt card ref) | `Drift.signal.eval_ref`, `Trigger.source.eval_ref` |
+| Eval    | `subject_ref`, `dataset`, `source_ref`, `tasks[].LlmJudge.judge_ref` (Prompt card ref) | `Drift.signal.eval_ref`, `Trigger.source.eval_ref` |
 | Audit   | `subject_refs`, `query` (roots), `lineage` (nodes), `investigator` (Agent variant) | — |
 | Service | `components[].ref`                   | `Drift.subject_ref` (service-level), `Eval.subject_ref` |
 | Policy  | `rules`                              | `Service.components.ref`, `Operator.pre_invoke`, `Operator.post_invoke` |
@@ -1545,33 +1512,18 @@ services/ops-copilot/
 
 ---
 
-## Questions and resolutions
+## Decisions
 
-**Open**
-
-1. Per-component Policy binding on `ServiceComponent`. Workaround: rule
-   expressions scope by `agent.name`. Decision pending a real use case.
-2. Format negotiation for `object_store` Source — schema-on-read vs registered
-   schema reference.
-3. Time-window semantics for how Drift/Eval cards describe the read range
-   over `source_ref`.
-4. Service-level Drift subject semantics — what "drift on a Service" computes
-   when Wyrd reads internal traces vs external Sources, given the subject is
-   singular.
-5. Default Source binding at the Service or Agent level to avoid repeating
-   `source_ref` on every Drift/Eval.
-6. Whether tool hook phases need a closed enum on `Policy.rules` or can stay
-   off the wire entirely (no consumer today).
-
-**Resolved**
+The following choices constrain every implementation:
 
 - **Source vendor read adapters.** `SourceKind` is a closed, bucket-keyed tagged
   union (`object_store`, `sql_warehouse`, `metrics`, `logs`, `traces`); each
   bucket nests a `vendor`-keyed `*Connection` union, and secrets are server-side
   env-var names (`SourceAuth`), never card values. Adding a vendor is a new
-  `*Connection` variant plus a `vala` read adapter — no bucket or consumer churn.
-  Remaining runtime work: the `vala` read trait keyed on `(kind, vendor)`, and a
-  connectivity preflight (`wyrd source check <ref>`).
+  `*Connection` variant plus a Vala read adapter — no bucket or consumer churn.
+  Vala exposes the read trait keyed on `(kind, vendor)`. The CLI contract
+  includes `wyrd source check <ref>` and runs the same credential,
+  network-safety, and connectivity preflight used by runtime reads.
 
 - **Eval signal decomposition.** `Eval` does not carry its own `signal`
   decomposition. Eval IS the signal — its per-task pass/fail aggregates into a
@@ -1579,36 +1531,3 @@ services/ops-copilot/
   input edges (`dataset` vs `source_ref`) are optional refs, not a tagged enum:
   presence is the mode (offline driver, online sink, both, or neither → vala
   default archive).
-
----
-
-## Appendix: Implementation status
-
-This section tracks reconciliation work in progress. It is internal bookkeeping
-and does not affect the protocol contract above.
-
-**Active reconciliation (as of v1):**
-- The active doctrine is the 16 native kind catalog plus `External`. Current
-  `wyrd-spec` code and generated schemas no longer expose stale `Tool`, `Skill`,
-  or `SubAgent` specs; they now expose `SourceSpec` (the bucket-keyed `SourceKind`
-  union). New work must follow this document: tools are runtime registry entries,
-  sub-agency is an Agent relationship, skills are not a v1 Card kind, and external
-  observations are read through `Source` cards.
-- Do not expand stale card kinds or cite generated schema presence as doctrine.
-- Remaining `Source` follow-up: the runtime read adapter in `vala` keyed on
-  `(kind, vendor)` and the `wyrd source check` preflight.
-
-**Governance token removal (doctrine #18):**
-- Emit is an Auth-plane route, not a third plane. The JWT (`principal.card_ref`)
-  plus `run_id` carry everything an emission needs.
-- The following scaffolding has been deleted: the `wyrd.auth_governance_tokens`
-  table (migration `20260601000001_auth.sql`), its `GovernanceTokenRow` row mirror
-  and query slot, the `migration_pg.rs` table assertion, and `Scope::TokenIssue`
-  (`token:issue`).
-- Wyrd is open source and independently publishable. It contains no enterprise
-  licensing keys, feature gates, startup hooks, or private-product contracts.
-  A future private `wyrd-enterprise` repository may depend on and extend public
-  Wyrd crates; Wyrd never depends on that private repository. Enterprise
-  deployment language in this document describes topology, tenant isolation,
-  and operational requirements rather than an in-tree commercial edition.
-- No `WYRD_GOV_TOKEN` env var. No `wyrd gov-token` CLI.

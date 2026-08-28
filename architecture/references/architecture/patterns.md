@@ -6,10 +6,10 @@ logic in Rust. Contracts live on the API wire through typed schemas,
 HTTP/MCP payloads, generated docs, and stable errors so any language can
 implement a client.
 
-First-class SDKs ship for Python, Rust, and TypeScript. Go is planned but
-not first-class until its SDK ships. First-class SDKs may add local
-authoring helpers, OTEL hooks, and agent workflow integration; they must
-not duplicate durable server behavior or make Wyrd language-exclusive.
+First-class SDKs ship for Python, Rust, and TypeScript. First-class SDKs may add
+local authoring helpers, OTEL hooks, and agent workflow integration; they must
+not duplicate durable server behavior or make Wyrd language-exclusive. Other
+languages implement the same protocol through the public wire contracts.
 
 Wyrd is agent-first and headless: MCP, CLI, HTTP, generated schemas,
 stable errors, and machine-readable docs are primary surfaces. The
@@ -32,9 +32,9 @@ object-store engines. When a behavior crosses a boundary, put the shared
 contract in `wyrd-spec`, durable behavior in its owner, and expose it through
 typed HTTP/MCP/SDK projections.
 
-For current owner paths and approved Python features, consult `AGENTS.md` and
-the focused language references; this file documents structural patterns, not
-a frozen package inventory.
+For exact owner paths and approved Python features, consult `AGENTS.md` and the
+focused language references; this file documents structural patterns rather
+than a package inventory.
 
 ## Contract Placement
 
@@ -71,19 +71,19 @@ Wyrd Rust code uses the required struct-centered hybrid style from
 | Service or handle | Clients, stores, configuration, runtime state, IO workflows | Concrete struct with explicit fields, constructor, and inherent methods |
 | Pure helper | Stateless deterministic calculation or narrow conversion | Small module function |
 
-`crates/shared/wyrd-registry/src/handle.rs::Cards` is the canonical service
-pattern. `Cards` owns a shared `RegistryEngine`; callers discover registry
-workflows through methods such as `register`, `get`, `load`, and `delete`.
-Focused internal modules implement narrow stages, while the public handle owns
-the capability and workflow boundary.
+`crates/wyrd/wyrd-storage/src/handle.rs::StorageHandle` is the canonical
+service pattern. `StorageHandle` owns the configured backend, signer, and
+storage policy; callers discover workflows through typed methods instead of
+receiving its dependencies separately. Focused backend modules implement
+narrow mechanics, while the public handle owns the capability boundary.
 
 ```text
-Cards
-└── RegistryEngine
-    ├── WyrdClient
-    └── storage client
+StorageHandle
+├── backend
+├── signer
+└── storage policy
 
-Cards methods             public and internal workflows
+StorageHandle methods     public and internal workflows
 Focused private methods   stateful workflow stages
 Module helper functions   pure validation and transformation only
 ```
@@ -120,6 +120,8 @@ Server handlers:
 - Carry trace instrumentation (`#[tracing::instrument]` with scrubbed
   args).
 - Attach request and audit context for durable writes.
+- Derive tenant and actor identity from verified authentication state, never
+  from an untrusted request field.
 - Avoid cloning heavy state.
 - Avoid constructing clients or pools inside handlers.
 
@@ -145,7 +147,14 @@ Clients (Rust, Python, TypeScript SDKs):
 - Keep encryption and key handling centralized.
 - Do not bypass registry, storage, or audit invariants from convenience
   paths.
-- Card registry writes stay inside the caller's `TenantConn` tx
+- Tenant-scoped SQL accepts `&mut TenantConn<'_>` and relies on Postgres RLS;
+  it does not accept a raw pool, connection, or transaction and does not add a
+  parallel hand-written tenant predicate.
+- The caller owns commit and rollback. Callees compose work inside the supplied
+  transaction without ending it.
+- Cross-tenant operator work uses `OperatorPool` under explicit administrative
+  authority and preserves tenant-qualified identities at every durable seam.
+- Card registry writes stay inside the caller's `TenantConn` transaction
   (enforced by `check:registry-tx-coupling`).
 - Single `wyrd.cards` table; no per-kind shadow tables (enforced by
   `check:registry-single-table`).
@@ -163,6 +172,33 @@ Provider code separates:
 
 Do not scatter provider string checks across unrelated crates. Add typed
 capability or provider metadata instead.
+
+## External Network Pattern
+
+`Source` adapters are read-only and server-owned. Operator HTTP actions are
+also server-owned. Cards carry typed non-secret coordinates and secret-store or
+environment references, never credential values.
+
+For every tenant-controlled URL:
+
+1. Resolve DNS once.
+2. Reject the request if any resolved address violates the deployment's network
+   policy.
+3. Connect to the screened address without re-resolution.
+4. Repeat resolution, screening, and pinning for every redirect.
+
+Cloud metadata and link-local ranges are always blocked. Production also
+blocks loopback, private, carrier-grade NAT, and unique-local ranges. Validating
+the input string and resolving again at connection time is not sufficient; it
+permits DNS rebinding.
+
+## Agent Surface Pattern
+
+HTTP, MCP, CLI, and SDK surfaces project the same typed request, response,
+permission, error, and audit contracts. MCP read tools are always available;
+write tools require explicit scopes. An agent-facing convenience path must not
+weaken tenant isolation, policy, input validation, audit, or error stability,
+and the UI cannot be its only surface.
 
 ## Observability And Evaluation Pattern
 
@@ -184,13 +220,37 @@ provider responses.
 
 ## Audit Pattern
 
-Audit is foundational across every surface. Every durable read and write
-appends an `vala.audit_outbox` row in the same transaction as the
-mutation. The single writer is
-`crates/vala/vala-sql/src/queries/audit_outbox.rs::append_audit`. Do not
-create parallel writers.
+Audit is foundational across every surface. Audit cardinality follows
+auditable domain operations and independently durable transitions, not handler
+or request count. One request can produce several audit records; supporting
+bookkeeping does not receive its own record unless it is independently
+meaningful.
+
+Every auditable Postgres transition appends through the canonical audit writer
+in the same transaction as that transition. A workflow spanning transactions
+or an external effect records each security- or lifecycle-significant commit
+boundary independently; it does not claim whole-workflow atomicity. Do not
+create parallel audit writers.
 
 The one narrow exception is Oracle query-read admission: it first fsyncs a
 versioned CRC-framed local WAL record, then a single bounded background relay
 calls the same `append_audit` writer at least once. This exception does not
 apply to Postgres mutations or any other durable transition.
+
+Forge may append tenant-owned audit only through the crate-private,
+tenant-bound `OperatorAudit` capability after scheduler fencing and tenant
+equality checks succeed. The capability performs canonical audit append inside
+the same fenced operator transaction and exposes no generic executor escape
+hatch.
+
+## Verification Pattern
+
+Every user- or agent-facing capability is proven through a real client → server
+→ client journey on each public surface it ships. The journey covers its happy
+path and applicable negative and edge paths, including permission denial,
+conflict, replay, backpressure, and rejection behavior. Integration and unit
+tests isolate supporting seams; they do not replace the journey.
+
+Generated schemas, stubs, OpenAPI, and golden contracts are derived from their
+owning sources and checked for drift. Runtime MCP catalogs are verified by
+their owning MCP tests. Never edit a generated artifact directly.

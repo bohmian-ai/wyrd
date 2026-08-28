@@ -1,72 +1,97 @@
 # Drift and monitoring
 
-Load for Drift Cards, baselines, thresholds, data or concept drift, alert
-quality, and monitoring strategy.
+Load for Drift Cards, versioned baselines, windows, statistical methods,
+thresholds, alert quality, or reactions to observed change.
 
-## Choose the signal before the statistic
+## Declare the subject and signal first
 
-A `Drift` Card names one `subject_ref`, a signal, a method, a condition, and a
-profile. The signal is the measured fact: feature distribution, a runtime
-metric, an Eval score, or a read-only external source. The method (for example
-PSI, SPC, or a bounded custom method) is selected only after the signal's
-sampling grain and failure semantics are clear.
+A `Drift` Card names one versioned `subject_ref`, one typed signal, one method,
+one resolved condition, and method-specific profile. Select statistics only
+after defining the signal's unit, population, sampling grain, completeness,
+delay, and failure semantics.
 
-Distinguish:
+- **Data drift** compares a versioned baseline distribution with a bounded
+  comparison window. Preserve feature set, bin edges or sketch configuration,
+  missingness, sample count, and cohort identity.
+- **Concept or performance drift** compares delayed labels, outcomes, or Eval
+  scores against the same subject, cohort, and time basis.
+- **Operational drift** measures latency, errors, token use, cost, tool calls,
+  or workflow behavior from authorized telemetry with stable deployment and
+  resource dimensions.
 
-- **Data drift:** the input distribution changes; compare a versioned baseline
-  with a current window and disclose binning, missingness, and sample size.
-- **Concept or performance drift:** the relationship or outcome changes; join
-  delayed labels or Eval scores to the same subject and time window.
-- **Operational drift:** latency, error rate, token use, cost, or tool-call
-  behavior changes; use telemetry with stable resource and deployment labels.
+External measurements enter through a read-only `Source`; Bifrost observations
+use the native archive. Never let a vendor-specific push create a parallel
+drift protocol.
+
+## Baselines and windows are durable inputs
+
+The baseline is a versioned Data Card, immutable observation selection, or
+typed source query whose identity and selection parameters are persisted with
+the Drift result. It is never "the rows in a mutable table at evaluation
+time." Record baseline and comparison-window boundaries, watermarks, late-data policy, cohort,
+schema fingerprint, method/profile version, threshold, and source snapshot or
+query identity.
+
+Choose windows from process cadence and decision latency. Event-time windows
+use explicit lateness and completeness rules. Do not evaluate until minimum
+count, required dimensions, and source-completeness conditions hold. A partial
+window, schema mismatch, source outage, or insufficient sample returns a typed
+`indeterminate`/`insufficient_data` result—not "no drift."
 
 ## Statistical hygiene
 
-Choose a window that matches the process cadence, not an arbitrary dashboard
-interval. Report sample count, missing values, confidence or control limits,
-and the practical effect size. PSI is useful for coarse population comparison
-but is sensitive to bins and small samples; combine it with a minimum-count
-floor and a business-relevant metric. SPC needs a stable baseline and an
-explicit treatment of autocorrelation and seasonality. Thresholds should be
-resolved into a typed condition and versioned with the Card.
+- Report sample count, missingness, effect size, uncertainty/control limits,
+  and practical threshold beside the drift statistic.
+- PSI is bin-sensitive and unstable at small counts. Persist binning, apply
+  minimum expected/observed floors, and pair it with a practical effect rule.
+- SPC requires a stable baseline, correct subgrouping, and explicit handling
+  of autocorrelation, seasonality, and recalibration. Do not silently update
+  limits after an alarm.
+- Distribution tests can detect a difference without proving business impact,
+  causality, or model degradation. Keep those decisions separate.
+- Segment by a bounded, declared cohort set. Do not discover and alert over
+  unlimited label combinations.
 
-## Operations
+Thresholds and profiles are versioned with the Card. A threshold update starts
+a new comparable regime and does not rewrite prior observations.
 
-Separate measurement from scheduling and reaction: Drift produces an
-observation, Trigger schedules evaluation, and Operator performs one action.
-Use hysteresis, cooldowns, and deduplication at the reaction boundary so a
-noisy metric does not page repeatedly. Record the baseline, window, method,
-threshold, and source in the emitted observation. A drift finding is evidence
-for investigation, rollback, retraining, or policy review; it is not an
-automatic diagnosis.
+## Scheduling and reaction
 
-## Failure modes and anti-patterns
+Drift computes and emits an Observation. Trigger owns scheduling and condition
+evaluation. Operator owns one reaction. Keep notification, rollback,
+retraining, and workflow dispatch out of the Drift evaluator.
 
-Reject a single global threshold across tenants, silently changing baselines,
-mixing deployment cohorts, alerting on a metric before its ingest is complete,
-and treating statistical significance as business significance. Missing labels,
-late data, schema changes, and source outages must produce an explicit
-unknown/degraded state rather than a false “no drift” result.
+Reaction policy uses hysteresis, cooldown, minimum consecutive breaches,
+deduplication key, and recovery conditions appropriate to the signal. It
+records the exact Drift observation and rule that caused the action. A drift
+finding is evidence for investigation or policy action; it is not an automatic
+diagnosis.
 
-Do not put schedules or notification code inside Drift. Do not point a monitor
-at an unversioned subject, or let an external provider push arbitrary events
-onto the Wyrd wire; read it through `Source` and retain the same subject
-identity.
+## Monitoring the monitor
+
+Measure source freshness, selected rows, late/drop counts, evaluation latency,
+indeterminate rate, threshold breaches, notification suppression, reaction
+success/failure, and baseline age. Alert separately on monitor failure versus
+subject drift so a broken pipeline cannot look healthy.
+
+## Rejected shapes
+
+Reject global thresholds across heterogeneous tenants, mutable implicit
+baselines, mixed deployment cohorts, windows evaluated before completeness,
+silent baseline rebasing, unbounded segmentation, schedules or notification
+code inside Drift, an unversioned subject, and statistical significance treated
+as causality or business impact.
 
 ## Stable Wyrd anchors
 
-- Drift envelope and signal vocabulary: `architecture/wyrd-design.md` §Drift.
-- Drift types and profiles: `crates/wyrd-spec/src/vala/drift/`.
-- Scheduling and reactions: `architecture/wyrd-design.md` §§Trigger and
-  Operator.
-- Observation storage and query: `crates/vala/` and
-  `crates/wyrd/wyrd-server/`.
+- Drift contract: `architecture/wyrd-design.md` §Drift.
+- Drift types: `crates/wyrd-spec/src/vala/drift/`.
+- Trigger and Operator: `architecture/wyrd-design.md` §§Trigger and Operator.
+- Observation store: `crates/vala/`.
 
 ## Primary grounding
 
 - [NIST AI RMF 1.0](https://nvlpubs.nist.gov/nistpubs/ai/NIST.AI.100-1.pdf)
 - [Gama et al., A survey on concept drift adaptation](https://dl.acm.org/doi/10.1145/2523813)
-- [OpenTelemetry metrics](https://opentelemetry.io/docs/concepts/signals/#metrics)
-- [Apache DataFusion pruning features](https://datafusion.apache.org/user-guide/features.html)
-- Wyrd anchors: `architecture/wyrd-design.md` §Drift;
-  `crates/wyrd-spec/src/vala/drift/`; `crates/vala/`.
+- [NIST/SEMATECH control charts](https://www.itl.nist.gov/div898/handbook/pmc/section3/pmc3.htm)
+- [OpenTelemetry metrics](https://opentelemetry.io/docs/concepts/signals/metrics/)

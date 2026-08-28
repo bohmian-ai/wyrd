@@ -1,9 +1,9 @@
 ---
-name: wyrd-plan-v3
+name: wyrd-plan
 description: Create an actionable Wyrd implementation plan with source-grounded decisions, cohesive tasks, claim-shaped acceptance obligations, and credible evidence expectations. Use when implementation should be decomposed without executing it; task shape is flexible and scales with risk.
 ---
 
-# Wyrd Plan v3
+# Wyrd Plan
 
 Turn a Wyrd request into work an implementer can execute without reopening a
 material product, contract, ownership, security, tenancy, migration, or
@@ -23,6 +23,42 @@ only when a choice changes material behavior, a public or durable contract,
 ownership, security, tenancy, migration, rollout, or the acceptance outcome.
 Bounded read-only evidence scouts are useful for genuinely independent evidence
 gaps; they gather facts and do not decide or write the plan.
+
+### Architecture and expertise routing
+
+Start at [the canonical reference router](../../../architecture/references/README.md).
+Read [implementation execution](../../../architecture/references/languages/implementation-execution.md)
+for every implementation plan, then select and completely read the smallest
+additional set that covers the affected surfaces. Record the selected links in
+the plan or applicable task packets and state the decision or constraint each
+reference informs. Do not attach irrelevant references merely to fill a field.
+
+| Reference | Select when the plan touches |
+|---|---|
+| [Wyrd protocol authority](../../../architecture/wyrd-design.md) | Card contracts, identity, doctrine, cross-service boundaries, or public surfaces |
+| [Bifrost authority](../../../architecture/bifrost-design.md) | Scribe, Oracle, Forge, analytical storage, resources, or public query/ingest behavior |
+| [Security posture](../../../architecture/wyrd-security-posture.md) | Authentication, authorization, credentials, tenant security, audit integrity, or external-network trust |
+| [Operations authority](../../../architecture/operations/README.md) | Deployment, release, capacity, backup, recovery, SLOs, or incidents |
+| [Positioning and vocabulary](../../../architecture/references/doctrine/positioning-and-vocabulary.md) | Card vocabulary, envelope, `CardRef`, v1 kinds, or removed concepts |
+| [Architecture constraints](../../../architecture/references/doctrine/architecture-constraints.md) | Wyrd/Vala/Skald boundaries, deployment, tenant isolation, or observation identity |
+| [Architecture patterns](../../../architecture/references/architecture/patterns.md) | Ownership, contract placement, or server/client/storage/provider/audit structure |
+| [Implementation execution](../../../architecture/references/languages/implementation-execution.md) | Every plan: execution authority, adaptation, verification recovery, and completion evidence |
+| [Rust core](../../../architecture/references/languages/rust-core.md) | Rust ownership, async, traits, allocation, or API shape |
+| [PyO3 boundaries](../../../architecture/references/languages/pyo3-boundaries.md) | PyO3 classes, GIL, lifetimes, conversion, or module registration |
+| [Python API and stubs](../../../architecture/references/languages/python-api-and-stubs.md) | Python exports, stubs, package layout, or typing |
+| [TypeScript guide](../../../architecture/references/languages/typescript-guide.md) | TypeScript SDK, declarations, or napi boundaries |
+| [Testing workflows](../../../architecture/references/languages/testing-workflows.md) | User journeys, integration tests, unit tests, or repository verification |
+| [Agent harness](../../../architecture/references/languages/agent-harness.md) | MCP, agent-facing contracts, structured validation, or audit |
+| [Errors](../../../architecture/references/languages/errors.md) | Stable errors and Rust/Python/TypeScript/HTTP/CLI mapping |
+| [Vala architecture](../../../architecture/references/domain/vala-architecture.md) | Broad Vala ownership, Bifrost orientation, or cross-domain work |
+| [Telemetry observations](../../../architecture/references/domain/telemetry-observations.md) | OpenTelemetry signals, correlation, observation identity, or payload sensitivity |
+| [Evaluation](../../../architecture/references/domain/evaluation.md) | Eval Cards, scenarios, judge quality, scoring, or evidence |
+| [Drift monitoring](../../../architecture/references/domain/drift-monitoring.md) | Drift signals, baselines, thresholds, alert noise, or monitoring policy |
+| [OLAP serving](../../../architecture/references/domain/olap-serving.md) | Bifrost tables, ingest/query serving, admission, tenant safety, or analytical APIs |
+| [Iceberg](../../../architecture/references/domain/iceberg.md) | Snapshots, catalogs, schemas, partitions, object storage, or compaction |
+| [DataFusion](../../../architecture/references/domain/datafusion.md) | Logical/physical plans, provider pushdown, pruning, statistics, memory, or spills |
+| [Arrow analytical interop](../../../architecture/references/domain/arrow-analytical-interop.md) | Arrow, RecordBatch, Parquet, PyArrow, FFI, or Python analytical boundaries |
+| [Analytical operations reliability](../../../architecture/references/domain/analytical-operations-reliability.md) | Backpressure, durability, leases, repair, retention, SLOs, or failure recovery |
 
 ## Model obligations as claims
 
@@ -80,7 +116,8 @@ Use these sections when they improve execution; combine or omit them for smaller
 tasks. Equivalent Markdown, YAML, tables, or supplied prose are valid.
 
 1. **Task contract** — ID, primary outcome, owners, dependencies, optional
-   write forecast, claims, evidence plan, and referenced expertise.
+   write forecast, claims, evidence plan, and linked architecture/expertise
+   references with the decision each informs.
 2. **Outcome** — observable result and user/operator value.
 3. **Context and authority** — only evidence that constrains implementation.
 4. **Scope and non-goals** — owned behavior and intentional exclusions.
@@ -120,8 +157,8 @@ canonical `mise` commands and the smallest proof that can fail for the claimed
 defect. User- or agent-facing behavior receives the journeys required by
 `AGENTS.md`. Broad gates belong only where the plan's breadth earns them.
 
-When exact command text is not yet knowable, state the proof obligation and
-owner rather than inventing a future selector. Exact command identity is
+When exact command text is not knowable during planning, state the proof
+obligation and owner rather than inventing a selector. Exact command identity is
 binding only when it is itself part of the accepted contract.
 
 ## Readiness rule
@@ -136,6 +173,6 @@ only when a material decision or acceptance outcome is genuinely unresolved.
 Before handoff, confirm every requested outcome is covered, each material
 contract has an owner and consumers, dependencies are real, required claims are
 collectively sufficient, evidence can detect failure, and integrated journeys
-cover user-facing behavior. Use `$wyrd-plan-review-v3` when the caller requests
+cover user-facing behavior. Use `$wyrd-plan-review` when the caller requests
 review or when independent readiness review is proportionate to risk. Correct
 bounded findings without turning the review format into plan authority.

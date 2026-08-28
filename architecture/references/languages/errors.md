@@ -69,10 +69,12 @@ Do not hand-write parallel implementations of those methods. If a public
 error needs a new code, add the variant metadata and let the derive generate
 the catalog and problem payload.
 
-Every public variant should carry `message: String` and
-`details: serde_json::Value` unless there is a concrete reason for a more
-specific shape. The generated problem payload uses `message` for `detail`
-and `details` for structured context.
+The top-level `WyrdError` boundary variants carry the canonical human-readable
+message and JSON-safe structured details needed for uniform projection.
+Subordinate Wyrd-coded enums should instead use typed fields that describe the
+failure precisely, as in `WyrdStorageError` above. Their derive maps those
+fields into `detail` and `details`; do not force generic `message` and
+`details` fields onto every subordinate variant.
 
 ## Crate-Local Rust Errors
 
@@ -110,7 +112,7 @@ impl From<RegistryError> for WyrdError {
     fn from(err: RegistryError) -> Self {
         match err {
             RegistryError::CardNotFound { kind, space, name, version } =>
-                WyrdError::CardNotFound {
+                WyrdError::RegistryCardNotFound {
                     message: format!("card not found: {kind}/{space}/{name}@{version}"),
                     details: serde_json::json!({ "kind": kind, "space": space, "name": name, "version": version }),
                 },
@@ -130,7 +132,7 @@ impl From<RegistryError> for WyrdError {
 
 Do not store `PyErr` in reusable Rust errors. Convert Rust errors to typed
 Python exceptions at the PyO3 boundary (see
-`references/pyo3-boundaries.md`).
+[PyO3 boundaries](pyo3-boundaries.md)).
 
 Python exceptions must preserve:
 
@@ -150,10 +152,12 @@ by `check:single-into-response-impl`).
 
 ## TypeScript Errors
 
-The `@wyrd/sdk` TypeScript client mirrors Wyrd error codes as typed union
-members with `code`, `status`, `title`, `remediation`, `message`, and
-`details` fields, generated from the same catalog. Do not invent
-TypeScript-only error names.
+The `@wyrd/sdk` TypeScript boundary throws a `WyrdError` class with `code`,
+`status`, `title`, `detail`, optional `remediation`, and JSON-safe `details`.
+The class may be hand-authored ergonomic TypeScript, but its fields and values
+must project the derive-backed catalog and problem payload exactly. Generated
+error-code unions may narrow `code`; do not invent TypeScript-only codes or
+reinterpret `detail` as a separate durable contract.
 
 ## CLI Errors
 

@@ -14,17 +14,20 @@ the public doctrine summary for developers and agents.
 |---|---|---|
 | `wyrd-doctrine.mdx` | Design doctrine — the "why" | Stable guidance |
 | `wyrd-design.md` | Protocol spec — the "what" | Wins on conflict |
-| `wyrd-protocol.md` | Older draft — historical reference | Partially superseded |
+| `bifrost-design.md` | Scribe, Oracle, Forge, and analytical storage | Bifrost authority |
+| `wyrd-security-posture.md` | Identity, authorization, tenant security, audit, and external trust | Security authority |
+| `operations/` | Deployment, release, recovery, and incident behavior | Operations authority |
 
 ## Purpose
 
 Wyrd is the AI layer for human and agentic work. It does not become the user's
 application runtime, training framework, workflow engine, or cloud platform.
 
-Wyrd makes AI work declarative, connectable, inspectable, auditable, reproducible, and operable. Users/Agents
+Wyrd makes AI work declarative, connectable, inspectable, auditable,
+reproducible, and operable. Users and agents
 describe the things that matter. Wyrd records those descriptions, validates
 them, links them, observes what happens, governs decisions, and exposes the
-result through human and agent-facing surfaces and an enterprise intelligence layer called Fathom. 
+result through human- and agent-facing surfaces.
 Wyrd is the platform users and agents love to build on, not the platform that builds for them.
 
 ## Object model
@@ -70,7 +73,8 @@ express the concept without lying.
 
 ## Card kinds
 
-The v1 doctrine has 16 native kinds plus `External` for forward compatibility.
+The v1 doctrine has 16 registrable native kinds. `CardKind::External` is a
+non-registrable discriminator for foreign schema descriptors, not a Card spec.
 
 | Domain | Kinds |
 |---|---|
@@ -140,7 +144,10 @@ Services compose foundations instead of inventing private shapes:
 - **Registry** stores and validates cards; derives relationships from `CardRef`s; manages version and space isolation.
 - **Lineage** reads derived relationships to answer provenance queries.
 - **Policy** evaluates CEL rules at register-time (classify), deploy-time (gate), and runtime (invoke).
-- **Bifrost / Observability** records runs and observations in Wyrd's internal OLAP store; reads external data through `Source` cards.
+- **Bifrost / Observability** records runs and observations through Scribe,
+  serves interactive and streamed distributed reads through Oracle, promotes
+  and rewrites Iceberg data through Forge, and reads external data through
+  `Source` cards.
 
 ## Runtime boundary
 
@@ -162,8 +169,8 @@ server-internal state. All contracts live on the API wire, making Wyrd language-
 
 Rust, Python, and TypeScript are first-class SDK languages. Each SDK provides
 idiomatic authoring and client ergonomics over the same server contract, with
-generated types, examples, and user-journey coverage. Go is planned, but it is
-not first-class until those same SDK and verification surfaces ship.
+generated types, examples, and user-journey coverage. Go is not a first-class
+SDK language.
 
 The public protocol remains open to every language. A client needs only the
 HTTP and MCP contracts, generated schemas, machine-readable documentation, and
@@ -222,7 +229,7 @@ reason strong enough to survive review.
 
 | Topic | Location |
 |---|---|
-| Full doctrine (18 numbered principles) | `architecture/wyrd-design.md §Doctrine` |
+| Full doctrine (20 numbered principles) | `architecture/wyrd-design.md §Doctrine` |
 | Per-kind spec reference | `architecture/wyrd-design.md §Per-kind specs` |
 | Spec-file authoring, `path:` / `inline:` / `ref:` | `architecture/wyrd-design.md §Spec-file authoring` |
 | Workspace config (`wyrd.toml`) | `architecture/wyrd-design.md §Workspace config` |

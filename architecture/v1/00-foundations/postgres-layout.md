@@ -1,40 +1,50 @@
 # Postgres Layout
 
-Wyrd uses one PostgreSQL database. Runtime request handling uses the
-`wyrd_app` pool, boot migrations use a short-lived `wyrd_migrator` pool, and
-audited cross-tenant operations use the optional `wyrd_platform_admin` pool.
-SQL ownership is split by crate:
+Wyrd uses one PostgreSQL control-plane database with schema ownership split by
+crate:
 
-- `wyrd-sql` owns `platform` and `wyrd`.
-- `vala-sql` owns `vala`.
-- No `skald` schema exists in this phase.
+- `wyrd-sql` owns `platform` and `wyrd`;
+- `vala-sql` owns `vala`; and
+- Skald owns no schema in the Wyrd control-plane database.
 
-`wyrd-sql` boots its schemas through two forward-only migrations:
+The runtime application role is `wyrd_app`. The short-lived migration role is
+`wyrd_migrator`. Named, audited cross-tenant operator capabilities use
+`wyrd_platform_admin` only when their owner requires it. Migrations never
+create cluster login roles; deployment bootstrap provisions roles before the
+migration gate.
 
-1. `0001_platform.sql` creates the `platform` and `wyrd` schemas, validates the
-   three pre-provisioned login roles, grants object privileges, defines
-   `wyrd.current_tenant()`, creates `platform.tenants`, and installs the
-   hardened `platform.resolve_tenant_by_slug(text)` lookup.
-2. `0002_auth.sql` creates tenant-scoped `wyrd.auth_*` identity and credential
-   tables. Every row carries `data_tenant_id UUID NOT NULL REFERENCES
-   platform.tenants(data_tenant_id)`, tenant-aware child foreign keys use
-   composite keys, and every table ships with the `ENABLE` + `FORCE` +
-   `tenant_isolation` RLS policy block.
+## Migration ownership and order
 
-Migrations never create cluster roles. Role provisioning is handled by external
-infrastructure bootstrap or embedded Postgres boot before SQL migrations run.
+Migration sources are the ordered, immutable migration registries owned by
+`wyrd-sql` and `vala-sql`. Architecture does not duplicate filenames, counts,
+or a snapshot of the table inventory. The deployment gate:
 
-`wyrd-server` applies migrators in this order:
+1. acquires one deployment migration lease;
+2. verifies applied and source checksums;
+3. applies `wyrd_sql::migrate`;
+4. applies `vala_sql::migrate`;
+5. verifies schema ownership, grants, RLS, required sentinels, and migration
+   state; and
+6. closes every migrator connection before runtime readiness.
 
-1. `wyrd_sql::migrate(pool)`
-2. `vala_sql::migrate(pool)`
+The order allows tenant-aware `vala.*` references to Wyrd control-plane state.
+There is no `skald_sql::migrate` step in the Wyrd server sequence.
 
-The order lets future `vala.*` migrations reference `wyrd.registry_cards` with
-tenant-aware composite foreign keys after Wyrd control-plane tables exist.
-`skald_sql::migrate(pool)` is deferred until the Skald storage phase.
+## Tenant layout
 
-Tenant-scoped query paths in both `wyrd.*` and `vala.*` use
-`wyrd_sql::TenantConn` so each logical operation runs in a transaction with
-`app.current_tenant` bound through `set_config(..., true)`. RLS policies are the
-database-enforced tenant boundary; application-layer tenant filters are not the
-source of truth.
+Every tenant-scoped row carries
+`data_tenant_id UUID NOT NULL REFERENCES platform.tenants(data_tenant_id)`.
+Tenant-aware parent/child references use composite keys that include
+`data_tenant_id`. Each tenant table enables and forces RLS and installs both
+read and write tenant predicates through `wyrd.current_tenant()`.
+
+Tenant-scoped paths in both schemas use `TenantConn`. The caller owns its
+transaction; callees neither commit nor roll back. RLS is the database-enforced
+boundary, so query modules do not add a parallel tenant predicate. Cross-tenant
+work uses a narrow `OperatorPool` capability rather than a raw pool,
+connection, or transaction.
+
+See [`sql-foundation.md`](sql-foundation.md) for the complete binding and
+transaction contract and
+[`../../operations/deployment-and-release.md`](../../operations/deployment-and-release.md)
+for migration, release, and connection-budget behavior.

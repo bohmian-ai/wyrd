@@ -595,6 +595,8 @@ impl ScribeImpl {
         {
             ScribePersistenceCpuResult::Prepared(value) => value,
             ScribePersistenceCpuResult::ParquetEncoded(_)
+            | ScribePersistenceCpuResult::MemberStaged(_)
+            | ScribePersistenceCpuResult::ClaimAssembled(_)
             | ScribePersistenceCpuResult::ReplayRestored(_) => {
                 return Err(ScribeError::Internal {
                     detail: "persistence lane returned the wrong preparation result".to_owned(),

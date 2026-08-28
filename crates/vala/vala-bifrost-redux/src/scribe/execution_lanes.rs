@@ -1044,6 +1044,10 @@ fn append_managed_columns(
 pub(crate) enum ScribePersistenceCpuOp {
     Preprocess(Box<AdmittedAppend>),
     EncodeParquet(Box<EncodeParquetOp>),
+    /// Encode one frozen generation into durable staged runs.
+    StageMember(Box<StageMemberOp>),
+    /// Merge one claim's staged runs into rolling sealed objects.
+    AssembleClaim(Box<AssembleClaimOp>),
     RestoreReplay {
         replayed: Box<ReplayedSealKey>,
     },
@@ -1097,12 +1101,55 @@ pub(crate) struct EncodeParquetOp {
     pub(crate) layout: std::sync::Arc<crate::catalog::layout::PhysicalLayout>,
 }
 
+/// Move-only inputs for staging one frozen generation onto the staging volume.
+///
+/// Staging is the blocking half of the durable boundary the WAL retires
+/// against, so it runs on the same bounded lane as Parquet encoding rather
+/// than on a runtime thread: the rows are sorted, encoded, fsynced, and
+/// preflighted before the operation returns.
+#[derive(Debug)]
+pub(crate) struct StageMemberOp {
+    /// Frozen generation staged without retaining the shard actor.
+    pub(crate) frozen: Box<FrozenMemtable>,
+    /// Tenant-qualified physical table binding.
+    pub(crate) binding: TenantTableBinding,
+    /// Registered physical write recipe resolved before the lane was entered.
+    pub(crate) layout: std::sync::Arc<crate::catalog::layout::PhysicalLayout>,
+    /// Shard, epoch, node, and WAL facts describing where the rows came from.
+    pub(crate) origin: crate::scribe::member_stager::StagedMemberOrigin,
+    /// Exact pre-writer footer child retained through sealed inspection.
+    pub(crate) footer_reservation: crate::scribe::memory::EncodedFooterReservation,
+    /// Pod-level owner of the staged namespace the runs are written into.
+    pub(crate) staging: std::sync::Arc<crate::scribe::staging_runtime::ScribeStagingRuntime>,
+}
+
+/// Move-only inputs for merging one claim's staged runs into sealed objects.
+///
+/// The merge decodes one bounded batch per member at a time, which is CPU and
+/// allocation bound rather than IO bound, so it belongs on the same lane as
+/// encoding rather than on a runtime thread serving other shards.
+#[derive(Debug)]
+pub(crate) struct AssembleClaimOp {
+    /// Claim whose members are being merged.
+    pub(crate) claim: Box<crate::scribe::assembly::StagingClaim>,
+    /// Runs gathered and re-validated for that claim.
+    pub(crate) runs: Box<crate::scribe::claim_assembly::ClaimRuns>,
+    /// Claim-owned output directory receiving the sealed objects.
+    pub(crate) scratch_dir: std::path::PathBuf,
+    /// Exact pre-writer footer child retained through sealed inspection.
+    pub(crate) footer_reservation: crate::scribe::memory::EncodedFooterReservation,
+    /// Pod-level owner holding the schema and layout the claim merges under.
+    pub(crate) staging: std::sync::Arc<crate::scribe::staging_runtime::ScribeStagingRuntime>,
+}
+
 /// Results produced by [`ScribePersistenceCpuPool`].
 #[derive(Debug)]
 pub(crate) enum ScribePersistenceCpuResult {
     Prepared(PreparedAppend),
     ParquetEncoded(ParquetEncoded),
     ReplayRestored(Box<FrozenMemtable>),
+    MemberStaged(Box<crate::scribe::member_stager::StagedRuns>),
+    ClaimAssembled(Box<crate::scribe::claim_assembly::AssembledClaim>),
 }
 
 /// Executes one persistence operation after it has moved onto a Rayon worker.
@@ -1164,6 +1211,8 @@ fn execute_persistence_operation(
             }
             .map(ScribePersistenceCpuResult::ParquetEncoded)
         }
+        ScribePersistenceCpuOp::StageMember(operation) => stage_member(*operation),
+        ScribePersistenceCpuOp::AssembleClaim(operation) => assemble_claim(*operation),
         ScribePersistenceCpuOp::RestoreReplay { replayed } => {
             let frozen = crate::scribe::memtable::Memtable::decode_replayed(&replayed)?;
             Ok(ScribePersistenceCpuResult::ReplayRestored(Box::new(frozen)))
@@ -1190,6 +1239,71 @@ fn execute_persistence_operation(
             })
         }
     }
+}
+
+/// Encodes one frozen generation into durable staged runs.
+///
+/// The context the runs are recorded under is the one they are encoded with,
+/// so a later merge of this member cannot pick up a schema or sort order the
+/// rows were not written against.
+///
+/// # Errors
+///
+/// Returns the staging failure when the member directory, encoding, fsync,
+/// preflight, or durable byte admission refuses the member.
+fn stage_member(operation: StageMemberOp) -> Result<ScribePersistenceCpuResult, ScribeError> {
+    let StageMemberOp {
+        frozen,
+        binding,
+        layout,
+        origin,
+        footer_reservation,
+        staging,
+    } = operation;
+    let context = crate::scribe::staging_runtime::ClaimContext {
+        schema: std::sync::Arc::clone(&frozen.schema),
+        layout: (*layout).clone(),
+        binding: binding.clone(),
+    };
+    staging
+        .encode_member(
+            crate::scribe::member_stager::StageMemberRequest {
+                frozen: &frozen,
+                binding: &binding,
+                layout: &layout,
+                origin,
+                footer_reservation,
+            },
+            context,
+        )
+        .map(|staged| ScribePersistenceCpuResult::MemberStaged(Box::new(staged)))
+}
+
+/// Merges one claim's staged runs into rolling sealed objects.
+///
+/// # Errors
+///
+/// Returns the assembly failure when a run cannot be decoded, the writer
+/// refuses a batch, or the merge writes a different number of rows than the
+/// claim's members promised.
+fn assemble_claim(operation: AssembleClaimOp) -> Result<ScribePersistenceCpuResult, ScribeError> {
+    let AssembleClaimOp {
+        claim,
+        runs,
+        scratch_dir,
+        footer_reservation,
+        staging,
+    } = operation;
+    staging
+        .assemble(
+            &claim,
+            crate::scribe::staging_runtime::AssembleRequest {
+                runs: &runs,
+                scratch_dir: &scratch_dir,
+                footer_reservation,
+            },
+        )
+        .map(|assembled| ScribePersistenceCpuResult::ClaimAssembled(Box::new(assembled)))
 }
 
 /// Bounded persistence CPU lane for day splitting and WAL serialization.

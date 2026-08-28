@@ -73,7 +73,7 @@ impl SealTriggerReason {
 /// `ScribeAppendMeta` list. Freezing a seal-key detaches an immutable snapshot.
 ///
 /// Retirement is immediate: a generation is eligible the moment it enters
-/// [`ImmutableState::Committed`], which is only reached after the fenced
+/// [`ImmutableState::Durable`], which is only reached after the fenced
 /// `vala.file_list` + audit transaction commits. Retired Arrow memory is
 /// released before WAL segment retirement is submitted, preserving the
 /// ordering contract in `ShardOwner::retire_committed`.
@@ -166,7 +166,7 @@ fn retained_identity_rows(
 impl Memtable {
     /// Construct a new empty memtable with the default active-bucket rotation threshold.
     ///
-    /// Retirement is immediate: a [`ImmutableState::Committed`] generation is
+    /// Retirement is immediate: a [`ImmutableState::Durable`] generation is
     /// eligible at the first lifecycle sweep after its SQL commit.
     #[must_use]
     pub fn new() -> Self {
@@ -979,20 +979,44 @@ impl Memtable {
         })?;
         for entries in immutable.values_mut() {
             if let Some(entry) = entries.iter_mut().find(|entry| entry.seal_id() == seal_id) {
-                match &entry.state {
-                    ImmutableState::PendingCommit => {
-                        entry.state = ImmutableState::Committed {
-                            observed_at: Instant::now(),
-                            file_list_key,
-                        };
-                    }
-                    ImmutableState::Committed { .. } => {}
-                }
+                entry.record_durable(DurableEvidence::Published(file_list_key));
                 return Ok(());
             }
         }
         Err(ScribeError::Internal {
             detail: format!("post-commit token references unknown seal generation {seal_id}"),
+        })
+    }
+
+    /// Mark a prepared generation durable after its staged member is published.
+    ///
+    /// This is the boundary Scribe normally retires against: the member's runs
+    /// are fsynced, checksum-validated, and named by a record that makes them a
+    /// query source, so the rows survive without the WAL long before the claim
+    /// that publishes them is due. Repeating the operation is idempotent, and a
+    /// generation that is already durable keeps its first evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the immutable-generation lock is
+    /// poisoned or no generation carries `seal_id`, which would mean a shard
+    /// retired a generation the staged boundary never covered.
+    pub fn complete_staged(
+        &self,
+        seal_id: u64,
+        member: crate::scribe::assembly::StagedMemberId,
+    ) -> Result<(), ScribeError> {
+        let mut immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
+            detail: format!("memtable immutable lock poisoned: {e}"),
+        })?;
+        for entries in immutable.values_mut() {
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.seal_id() == seal_id) {
+                entry.record_durable(DurableEvidence::Staged(member));
+                return Ok(());
+            }
+        }
+        Err(ScribeError::Internal {
+            detail: format!("staged token references unknown seal generation {seal_id}"),
         })
     }
 
@@ -1017,7 +1041,7 @@ impl Memtable {
     /// Retire all committed immutable generations at the current sweep.
     ///
     /// A generation is retirement-eligible the moment its state is
-    /// [`ImmutableState::Committed`]. `Committed` is only reached after the
+    /// [`ImmutableState::Durable`]. `Committed` is only reached after the
     /// fenced `vala.file_list` + audit transaction commits, so retired data is
     /// always readable from published parquet. The returned WAL ranges are the
     /// only ranges eligible for WAL retirement on this sweep.
@@ -1038,7 +1062,7 @@ impl Memtable {
     ///
     /// This shared primitive keeps ordinary WAL retirement and test-only memory
     /// accounting aligned: both consume exactly the generations removed here.
-    /// Eligibility is immediate for any generation in [`ImmutableState::Committed`];
+    /// Eligibility is immediate for any generation in [`ImmutableState::Durable`];
     /// [`ImmutableState::PendingCommit`] generations are never retired.
     ///
     /// # Errors
@@ -1055,7 +1079,7 @@ impl Memtable {
                 // A committed generation is immediately retirement-eligible:
                 // `Committed` is only entered after the fenced file-list/audit
                 // transaction commits, so parquet is already readable.
-                if matches!(entry.state, ImmutableState::Committed { .. }) {
+                if matches!(entry.state, ImmutableState::Durable { .. }) {
                     retired.push((
                         seal_key.clone(),
                         entry.wal_range(),
@@ -1075,7 +1099,7 @@ impl Memtable {
     ///
     /// This test-support helper reports only bytes removed from the immutable
     /// map, so callers cannot double-release memory for a still-pending
-    /// generation. Eligibility is immediate: any [`ImmutableState::Committed`]
+    /// generation. Eligibility is immediate: any [`ImmutableState::Durable`]
     /// generation is retired on the first call after its commit completes.
     ///
     /// # Errors
@@ -1106,7 +1130,7 @@ impl Memtable {
                 detail: format!("memtable immutable lock poisoned: {error}"),
             })?;
         Ok(immutable.values().flatten().find_map(|entry| {
-            if entry.seal_id == seal_id && matches!(entry.state, ImmutableState::Committed { .. }) {
+            if entry.seal_id == seal_id && matches!(entry.state, ImmutableState::Durable { .. }) {
                 Some(CommittedRetirement {
                     seal_id,
                     arrow_bytes: entry.frozen.arrow_bytes,
@@ -1137,7 +1161,7 @@ impl Memtable {
             let Some(index) = entries.iter().position(|entry| {
                 entry.seal_id == token.seal_id
                     && entry.frozen.arrow_bytes == token.arrow_bytes
-                    && matches!(entry.state, ImmutableState::Committed { .. })
+                    && matches!(entry.state, ImmutableState::Durable { .. })
             }) else {
                 continue;
             };
@@ -1407,35 +1431,50 @@ impl MemtableBucket {
     }
 }
 
+/// What makes one immutable generation's rows survive without its WAL.
+///
+/// Both variants are equally authoritative for retirement; they differ only in
+/// who serves the rows. A staged member is Parquet this pod fsynced,
+/// checksum-validated, and registered as a query source, and it becomes a
+/// published object later when its assembly claim is due. A published key names
+/// rows already in the fenced file list.
+#[derive(Debug, Clone)]
+pub enum DurableEvidence {
+    /// Rows are durable and servable as a staged member on this pod's volume.
+    Staged(crate::scribe::assembly::StagedMemberId),
+    /// Rows are published into the fenced file list under this commit key.
+    Published(FileListCommitKey),
+}
+
 /// The lifecycle state of one immutable generation.
 ///
-/// The two variants govern retirement eligibility: only [`Committed`] generations
+/// The two variants govern retirement eligibility: only [`Durable`] generations
 /// are retirement-eligible, and they are eligible immediately — there is no
 /// timed grace period. [`PendingCommit`] generations are never retired until
-/// their SQL transaction durably commits.
+/// their rows survive without the WAL behind them.
 ///
-/// [`Committed`]: ImmutableState::Committed
+/// [`Durable`]: ImmutableState::Durable
 /// [`PendingCommit`]: ImmutableState::PendingCommit
 #[derive(Debug)]
 pub enum ImmutableState {
-    /// The generation's SQL transaction is not yet durable.
+    /// The generation's rows do not yet survive without their WAL.
     ///
     /// A generation in this state is never retirement-eligible, even if the
-    /// lifecycle sweep runs. Retirement would release accounting before parquet
-    /// is readable, violating the invariant that retired data is always
-    /// accessible from published parquet.
+    /// lifecycle sweep runs. Retirement would release accounting before the
+    /// rows are readable from anything else, violating the invariant that
+    /// retired data is always accessible without the WAL.
     PendingCommit,
-    /// The fenced `vala.file_list` + audit transaction has committed durably.
+    /// The generation's rows survive and are servable without their WAL.
     ///
-    /// A generation in this state is immediately retirement-eligible: parquet
-    /// is already readable from the published file list before this variant is
-    /// entered. The `observed_at` timestamp records when the commit was
+    /// A generation in this state is immediately retirement-eligible: the
+    /// evidence naming where its rows now live is durable before this variant
+    /// is entered. The `observed_at` timestamp records when that was
     /// acknowledged locally, for observability and tracing.
-    Committed {
-        /// Local time at which the SQL commit was acknowledged.
+    Durable {
+        /// Local time at which the durable boundary was acknowledged.
         observed_at: Instant,
-        /// Exact durable file-list identity used for replay reconciliation.
-        file_list_key: FileListCommitKey,
+        /// Exact durable identity used for replay reconciliation.
+        evidence: DurableEvidence,
     },
 }
 
@@ -1455,6 +1494,24 @@ pub struct ImmutableEntry {
 }
 
 impl ImmutableEntry {
+    /// Records the first durable evidence this generation earned.
+    ///
+    /// A generation that is already durable keeps the evidence it entered that
+    /// state with: overwriting it would move the retirement boundary a shard
+    /// may already have acted on, and both evidences authorize retirement
+    /// equally, so there is nothing to gain by replacing one with the other.
+    fn record_durable(&mut self, evidence: DurableEvidence) {
+        match &self.state {
+            ImmutableState::PendingCommit => {
+                self.state = ImmutableState::Durable {
+                    observed_at: Instant::now(),
+                    evidence,
+                };
+            }
+            ImmutableState::Durable { .. } => {}
+        }
+    }
+
     fn pending(frozen: FrozenMemtable) -> Self {
         Self {
             seal_id: frozen.seal_id,

@@ -943,7 +943,9 @@ impl SealDriver {
             .await?
         {
             ScribePersistenceCpuResult::ParquetEncoded(encoded) => Ok(encoded),
-            ScribePersistenceCpuResult::Prepared(_) => Err(ScribeError::Internal {
+            ScribePersistenceCpuResult::Prepared(_)
+            | ScribePersistenceCpuResult::MemberStaged(_)
+            | ScribePersistenceCpuResult::ClaimAssembled(_) => Err(ScribeError::Internal {
                 detail: "persistence lane returned the wrong seal result".to_owned(),
             }),
             ScribePersistenceCpuResult::ReplayRestored(_) => Err(ScribeError::Internal {

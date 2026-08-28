@@ -1197,6 +1197,7 @@ impl ScribeImpl {
                     actor_stream: stream,
                     memory: memory.clone(),
                     staging_file_publisher: staging_file_publisher.clone(),
+                    geometry,
                     #[cfg(any(test, feature = "test-support"))]
                     faults,
                 },

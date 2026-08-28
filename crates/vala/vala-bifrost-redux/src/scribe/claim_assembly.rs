@@ -32,7 +32,7 @@ use crate::scribe::parquet_writer::{
 /// The merge holds one decoded batch per run, so this is what bounds a claim's
 /// Arrow footprint: members, not object size, decide how much memory assembly
 /// owns.
-const MERGE_BATCH_ROWS: usize = 8 * 1024;
+pub(crate) const MERGE_BATCH_ROWS: usize = 8 * 1024;
 
 /// One claim's validated runs, ready for the blocking merge and encode.
 #[derive(Debug, Clone)]

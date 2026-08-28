@@ -2924,8 +2924,8 @@ impl ShardOwner {
                 waiter,
             );
         }
-        let Some(file_list_key) = completion.file_list_key.clone() else {
-            let detail = "persistence completion omitted its file-list key".to_owned();
+        let Some(member) = completion.staged else {
+            let detail = "persistence completion omitted its staged member".to_owned();
             return self.fail_persistence_completion(
                 &seal_key,
                 replay_owned,
@@ -2934,10 +2934,7 @@ impl ShardOwner {
                 waiter,
             );
         };
-        if let Err(error) = self
-            .memtable
-            .complete_post_commit(generation_id, file_list_key)
-        {
+        if let Err(error) = self.memtable.complete_staged(generation_id, member) {
             let detail = error.to_string();
             tracing::warn!(error = %error, generation_id, "shard persistence completion could not publish generation");
             return self.fail_persistence_completion(
@@ -3251,15 +3248,12 @@ impl ShardOwner {
             Self::send_waiter_error(waiter, error.clone());
             return Err(error);
         }
-        let Some(file_list_key) = completion.file_list_key else {
-            let detail = "persistence completion omitted its file-list key".to_owned();
+        let Some(member) = completion.staged else {
+            let detail = "persistence completion omitted its staged member".to_owned();
             Self::send_waiter_error(waiter, detail.clone());
             return Err(detail);
         };
-        if let Err(error) = self
-            .memtable
-            .complete_post_commit(generation_id, file_list_key)
-        {
+        if let Err(error) = self.memtable.complete_staged(generation_id, member) {
             let detail = error.to_string();
             Self::send_waiter_error(waiter, detail.clone());
             return Err(detail);
@@ -5711,7 +5705,7 @@ mod tests {
         let completion_result = owner.handle_persistence_completion(
             PersistenceCompletion {
                 generation_id: current.generation_id,
-                file_list_key: Some(owner_file_list_key(current_key)),
+                staged: Some(owner_staged_member(1)),
                 wal_segments: Vec::new(),
                 wal: current.wal.clone(),
                 arrow_bytes: current.arrow_bytes,
@@ -6136,7 +6130,7 @@ mod tests {
             .handle_persistence_completion(
                 PersistenceCompletion {
                     generation_id: retirement_generation.generation_id,
-                    file_list_key: Some(owner_file_list_key(&retirement_key)),
+                    staged: Some(owner_staged_member(1)),
                     wal_segments: Vec::new(),
                     wal: retirement_generation.wal.clone(),
                     arrow_bytes: retirement_generation.arrow_bytes,
@@ -6504,16 +6498,12 @@ mod tests {
         }
     }
 
-    fn owner_file_list_key(key: &SealKey) -> crate::scribe::file_list_writer::FileListCommitKey {
-        crate::scribe::file_list_writer::FileListCommitKey {
-            data_tenant_id: key.tenant,
-            namespace: key.table.namespace.as_str().to_owned(),
-            table_name: key.table.name.clone(),
-            node_id: uuid::Uuid::nil(),
-            writer_epoch: 1,
-            wal_lsn_min: 1,
-            wal_lsn_max: 1,
-        }
+    /// Builds the staged member identity one completion fixture reports.
+    ///
+    /// Completions carry staged evidence rather than a file-list key: what a
+    /// shard reconciles is the member its generation became durable as.
+    fn owner_staged_member(generation: u64) -> crate::scribe::assembly::StagedMemberId {
+        crate::scribe::assembly::StagedMemberId::new(0, generation)
     }
 
     /// Builds one isolated owner whose mailbox handler can be exercised directly.
@@ -6748,7 +6738,7 @@ mod tests {
             .expect("owner insert");
         let frozen = memtable.freeze(&key).expect("owner freeze");
         memtable
-            .complete_post_commit(frozen.seal_id, owner_file_list_key(&key))
+            .complete_staged(frozen.seal_id, owner_staged_member(frozen.seal_id))
             .expect("owner completion");
         let wal_root = tempfile::tempdir().expect("WAL directory");
         let node = crate::scribe::stream_identity::NodeId::generate();
@@ -7091,7 +7081,7 @@ mod tests {
             .handle_command(ShardCommand::PersistenceComplete {
                 completion: Box::new(PersistenceCompletion {
                     generation_id: generation.generation_id,
-                    file_list_key: Some(owner_file_list_key(&key)),
+                    staged: Some(owner_staged_member(1)),
                     wal_segments: Vec::new(),
                     wal: wal_handle,
                     arrow_bytes: generation.arrow_bytes,
@@ -7249,7 +7239,6 @@ mod tests {
     /// A shard publication failure returns the identical error to visibility and caller acknowledgments.
     #[tokio::test]
     async fn persistence_command_preserves_publication_failure_for_both_waiters() {
-        let key = owner_key();
         let wal_root = tempfile::tempdir().expect("WAL directory");
         let node = crate::scribe::stream_identity::NodeId::generate();
         let stream = StreamIdentity::new(node, crate::scribe::stream_identity::WriterEpoch::new(1));
@@ -7271,7 +7260,7 @@ mod tests {
             .handle_command(ShardCommand::PersistenceComplete {
                 completion: Box::new(PersistenceCompletion {
                     generation_id: crate::scribe::persistence::GenerationId(999),
-                    file_list_key: Some(owner_file_list_key(&key)),
+                    staged: Some(owner_staged_member(1)),
                     wal_segments: Vec::new(),
                     wal: wal_handle,
                     arrow_bytes: 1,
@@ -7420,7 +7409,7 @@ mod tests {
             .send(ShardCommand::PersistenceComplete {
                 completion: Box::new(PersistenceCompletion {
                     generation_id: generation.generation_id,
-                    file_list_key: Some(owner_file_list_key(&key)),
+                    staged: Some(owner_staged_member(1)),
                     wal_segments: generation.wal_segments.clone(),
                     wal: generation.wal.clone(),
                     arrow_bytes: generation.arrow_bytes,
@@ -7457,7 +7446,7 @@ mod tests {
             .expect("owner insert");
         let frozen = owner.freeze(&key).expect("owner freeze");
         owner
-            .complete_post_commit(frozen.seal_id, owner_file_list_key(&key))
+            .complete_staged(frozen.seal_id, owner_staged_member(frozen.seal_id))
             .expect("owner completion");
         let stats = owner.stats().expect("owner stats");
         assert_eq!(stats.immutable_generations, 1);
@@ -7478,7 +7467,7 @@ mod tests {
             .expect("owner insert");
         let frozen = owner.freeze(&key).expect("owner freeze");
         owner
-            .complete_post_commit(frozen.seal_id, owner_file_list_key(&key))
+            .complete_staged(frozen.seal_id, owner_staged_member(frozen.seal_id))
             .expect("owner completion");
         assert_eq!(
             owner.sweep_once().expect("immediate sweep").len(),
@@ -8076,7 +8065,7 @@ mod tests {
             .expect("owner insert");
         let frozen = memtable.freeze(&key).expect("owner freeze");
         memtable
-            .complete_post_commit(frozen.seal_id, owner_file_list_key(&key))
+            .complete_staged(frozen.seal_id, owner_staged_member(frozen.seal_id))
             .expect("owner completion");
         let wal_root = tempfile::tempdir().expect("WAL directory");
         let node = crate::scribe::stream_identity::NodeId::generate();

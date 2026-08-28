@@ -968,13 +968,54 @@ impl ScratchVolume {
         generation: u64,
         bytes: u64,
     ) -> Result<ScribeGenerationScratch, BifrostResourceError> {
+        let component = safe_scratch_component(stream)?;
+        self.create_owned_directory(&format!("scribe-runtime-{component}-{generation}"), bytes)
+    }
+
+    /// Creates the exact owned output directory one assembly claim merges into.
+    ///
+    /// A claim spans several shard generations, so its directory is named after
+    /// the claim rather than after any one of them; restart reconciliation then
+    /// attributes surviving residue to the publication that was interrupted.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed plan error for a non-Scribe capability or an unsafe
+    /// stream component, a capacity refusal from the shared device governor, or
+    /// an unavailable error when the exact owned directory cannot be created.
+    pub fn create_scribe_claim(
+        &self,
+        stream: &str,
+        claim: &str,
+        bytes: u64,
+    ) -> Result<ScribeGenerationScratch, BifrostResourceError> {
+        let component = safe_scratch_component(stream)?;
+        let claim = safe_scratch_component(claim)?;
+        self.create_owned_directory(&format!("scribe-claim-{component}-{claim}"), bytes)
+    }
+
+    /// Creates one uniquely suffixed owned directory under the Scribe namespace.
+    ///
+    /// The returned owner removes only the directory it creates. Its name is
+    /// rooted beneath the registered Scribe namespace and carries the identity
+    /// its caller needs for restart reconciliation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed plan error for a non-Scribe capability, a capacity
+    /// refusal from the shared device governor, or an unavailable error when
+    /// the exact owned directory cannot be created.
+    fn create_owned_directory(
+        &self,
+        name: &str,
+        bytes: u64,
+    ) -> Result<ScribeGenerationScratch, BifrostResourceError> {
         if self.class != BifrostVolumeClass::ScribeOutput {
             return Err(BifrostResourceError::InvalidPlan {
                 detail: "Scribe generation scratch requires the Scribe output capability"
                     .to_owned(),
             });
         }
-        let component = safe_scratch_component(stream)?;
         let lease = self.try_acquire(bytes)?;
         let root = self
             .governor
@@ -982,9 +1023,7 @@ impl ScratchVolume {
             .get(&self.class)
             .ok_or_else(accounting_overflow)?;
         let suffix = SCRATCH_NAMESPACE_SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed);
-        let path = root
-            .path
-            .join(format!("scribe-runtime-{component}-{generation}-{suffix}"));
+        let path = root.path.join(format!("{name}-{suffix}"));
         fs::create_dir(&path).map_err(|error| BifrostResourceError::Unavailable {
             detail: format!("cannot create Scribe generation scratch: {error}"),
         })?;
@@ -2144,6 +2183,19 @@ impl ScribeResources {
     pub(crate) fn cgroup_tripwire_engaged(&self) -> bool {
         matches!(self.governor.cgroup_pressure(), Some((current, limit)) if current.saturating_mul(100) >= limit.saturating_mul(90))
     }
+    /// Returns a fresh handle on the durable Scribe staging volume.
+    ///
+    /// Kept separate from [`Self::volume_capabilities`] because staged runs are
+    /// durable in a way output scratch is not: they authorize WAL retirement,
+    /// so a caller that only needs encoding workspace must not be handed the
+    /// capability that charges the staging floor.
+    #[must_use]
+    pub fn stage_volume(&self) -> Option<StageVolume> {
+        self.volumes
+            .as_ref()
+            .map(|volumes| volumes.capabilities().scribe_stage)
+    }
+
     /// Returns fresh non-cloneable WAL and output-scratch capabilities.
     #[must_use]
     pub fn volume_capabilities(&self) -> Option<(WalVolume, ScratchVolume)> {

@@ -78,24 +78,6 @@ pub(crate) fn file_candidates(batches: &[RecordBatch]) -> Vec<FileCandidate> {
     candidates
 }
 
-impl FileCandidate {
-    /// Returns the exact Arrow memory represented by this whole-batch candidate.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError::Internal`] when the candidate byte sum overflows.
-    pub(crate) fn arrow_bytes(self, batches: &[RecordBatch]) -> Result<usize, ScribeError> {
-        batches[self.start..self.end]
-            .iter()
-            .try_fold(0_usize, |sum, batch| {
-                sum.checked_add(batch.get_array_memory_size())
-                    .ok_or_else(|| ScribeError::Internal {
-                        detail: "Parquet candidate Arrow footprint overflowed".to_owned(),
-                    })
-            })
-    }
-}
-
 /// Returns the largest exact Arrow footprint among whole-batch candidates.
 ///
 /// Admission shares the encoder's candidate grouping, ensuring several small

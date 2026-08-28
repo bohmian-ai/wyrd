@@ -38,6 +38,7 @@ use sha2::{Digest as _, Sha256};
 use tokio::io::AsyncReadExt as _;
 use uuid::Uuid;
 use wyrd_spec::ids::DataTenantId;
+use wyrd_spec::vala::api::AuditEvent;
 use wyrd_spec::vala::api::TimePartitionWire;
 
 use crate::catalog::TableRef;
@@ -271,7 +272,7 @@ impl StagedRunFile {
 /// Everything the ready index, the live-tail reader, and WAL retirement need is
 /// here, because at recovery time this record is all there is: the memtable is
 /// gone and the WAL behind the member may already have been retired.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StagedHotSourceRecordV1 {
     /// Closed format version validated before any other field is trusted.
     version: u16,
@@ -301,6 +302,15 @@ pub struct StagedHotSourceRecordV1 {
     ready_at: DateTime<Utc>,
     /// Current lifecycle position.
     state: StagedMemberState,
+    /// Seal audit event the member's publication event is derived from.
+    ///
+    /// The member outlives the memtable that carried its audit envelope, and a
+    /// claim publishes rows from several members in one fenced transaction, so
+    /// the one event that transaction records has to survive here. A member
+    /// sealed without an audit envelope carries `None` and contributes no
+    /// publication event, exactly as an empty envelope does today.
+    #[serde(default)]
+    publication_audit: Option<AuditEvent>,
 }
 
 impl StagedHotSourceRecordV1 {
@@ -315,6 +325,7 @@ impl StagedHotSourceRecordV1 {
         wal_range: StagedLsnRange,
         runs: Vec<StagedRunFile>,
         ready_at: DateTime<Utc>,
+        publication_audit: Option<AuditEvent>,
     ) -> Self {
         Self {
             version: STAGED_RECORD_VERSION,
@@ -331,6 +342,7 @@ impl StagedHotSourceRecordV1 {
             runs,
             ready_at,
             state: StagedMemberState::Ready,
+            publication_audit,
         }
     }
 
@@ -356,6 +368,12 @@ impl StagedHotSourceRecordV1 {
     #[must_use]
     pub fn runs(&self) -> &[StagedRunFile] {
         &self.runs
+    }
+
+    /// Returns the seal audit event a claim's publication event derives from.
+    #[must_use]
+    pub const fn publication_audit(&self) -> Option<&AuditEvent> {
+        self.publication_audit.as_ref()
     }
 
     /// Returns the summed encoded bytes across every run.
@@ -1034,6 +1052,7 @@ mod tests {
             StagedLsnRange { min: 10, max: 42 },
             vec![run],
             ready_at(),
+            None,
         );
         stage
             .publish_record(&key, &record)
@@ -1123,6 +1142,7 @@ mod tests {
             StagedLsnRange { min: 1, max: 2 },
             vec![run],
             ready_at(),
+            None,
         );
         let mut encoded: serde_json::Value =
             serde_json::to_value(&record).expect("the record encodes");
@@ -1173,6 +1193,7 @@ mod tests {
             StagedLsnRange { min: 3, max: 9 },
             vec![run],
             ready_at(),
+            None,
         );
         stage
             .publish_record(&key, &record)
@@ -1234,6 +1255,7 @@ mod tests {
             StagedLsnRange { min: 4, max: 4 },
             vec![run],
             ready_at(),
+            None,
         );
         stage
             .publish_record(&key, &record)
@@ -1299,6 +1321,7 @@ mod tests {
             StagedLsnRange { min: 4, max: 4 },
             vec![run],
             ready_at(),
+            None,
         );
         stage
             .publish_record(&key, &record)
@@ -1400,6 +1423,7 @@ mod tests {
             StagedLsnRange { min: 8, max: 8 },
             vec![run],
             ready_at(),
+            None,
         );
         stage
             .publish_record(&key, &record)
@@ -1505,6 +1529,7 @@ mod tests {
             StagedLsnRange { min: 2, max: 2 },
             vec![run],
             ready_at(),
+            None,
         );
         stage
             .publish_record(&key, &record)

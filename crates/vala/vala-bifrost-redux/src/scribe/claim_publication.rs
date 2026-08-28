@@ -1,0 +1,267 @@
+//! Claim publication — making one assembled claim's objects authoritative.
+//!
+//! Assembly produces sealed local objects; this module is what turns them into
+//! the rows Oracle reads. The order is the only order that keeps both durable
+//! boundaries: the objects are staged and uploaded first, then the fenced
+//! `file_list` and audit transaction commits, and only after that commit do the
+//! contributing members stop being the live-tail authority for their rows.
+//!
+//! Nothing here decides *which* members publish. The assembler chose them and
+//! [`ClaimAssembler`](crate::scribe::claim_assembly::ClaimAssembler) merged
+//! them; this owner carries that decision across the durable boundary and
+//! reports what committed so its caller can settle the claim and retire the
+//! members' staged bytes.
+
+use std::sync::Arc;
+
+use crate::catalog::TenantTableBinding;
+use crate::contracts::ScribeError;
+use crate::scribe::assembly::StagingClaim;
+use crate::scribe::claim_assembly::{AssembledClaim, ClaimRuns};
+use crate::scribe::file_list_writer::{self, FileListCommitKey};
+use crate::scribe::hot_stage::{ScribeHotStage, StagedMemberState};
+use crate::scribe::memory::PARQUET_TRANSFER_BUFFER_BYTES;
+use crate::scribe::persistence::{
+    ScribePublicationOutcome, ScribePublicationReconciler, ScribeStageMover,
+};
+use crate::scribe::stream_identity::StreamIdentity;
+
+/// Borrowed inputs for publishing one assembled claim.
+pub struct PublishClaimRequest<'a> {
+    /// The claim whose members produced the objects.
+    pub claim: &'a StagingClaim,
+    /// Runs gathered for the claim, carrying its WAL span and audit envelope.
+    pub runs: &'a ClaimRuns,
+    /// Sealed objects the claim produced, in publication order.
+    pub assembled: &'a AssembledClaim,
+    /// Tenant-qualified physical binding the rows are published under.
+    pub binding: &'a TenantTableBinding,
+    /// Deterministic object prefix the claim's objects were sealed under.
+    pub object_base: &'a str,
+    /// Fenced writer identity authorizing the publication transaction.
+    pub actor_stream: StreamIdentity,
+}
+
+/// What one committed claim publication left behind.
+#[derive(Debug, Clone)]
+pub struct PublishedClaim {
+    /// Commit key of the fenced `file_list` transaction.
+    pub commit_key: FileListCommitKey,
+    /// Object identities published, in artifact-ordinal order.
+    pub object_identities: Vec<String>,
+    /// Staged bytes the retired members released back to the staging volume.
+    pub released_bytes: u64,
+}
+
+/// Publishes assembled claims and retires the members they replace.
+pub struct ClaimPublisher {
+    /// Durable staged namespace holding the members being replaced.
+    stage: Arc<ScribeHotStage>,
+    /// Local election, publication manifest, and verified upload owner.
+    mover: ScribeStageMover,
+    /// Fenced `file_list` and audit transaction owner.
+    reconciler: ScribePublicationReconciler,
+}
+
+impl ClaimPublisher {
+    /// Binds the publisher to the staged namespace, uploader, and fenced owner.
+    #[must_use]
+    pub const fn new(
+        stage: Arc<ScribeHotStage>,
+        mover: ScribeStageMover,
+        reconciler: ScribePublicationReconciler,
+    ) -> Self {
+        Self {
+            stage,
+            mover,
+            reconciler,
+        }
+    }
+
+    /// Publishes one assembled claim and retires its contributing members.
+    ///
+    /// Every step before the fenced commit is repeatable: staging elects the
+    /// same local winner, upload converges the same verified object, and the
+    /// publication manifest names the same rows. An uncertain commit therefore
+    /// leaves the members claimed and the WAL authoritative, which is what a
+    /// retry needs to resume the identical publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the rows cannot be built, staging
+    /// or upload fails, the fenced transaction is refused or uncertain, or a
+    /// member cannot be moved forward through its durable lifecycle.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation before the commit leaves elected stages, uploaded objects,
+    /// and a publication manifest as deterministic recovery evidence.
+    /// Cancellation after it leaves members published and their local files
+    /// present; retirement is idempotent and resumes.
+    pub async fn publish(
+        &self,
+        request: PublishClaimRequest<'_>,
+    ) -> Result<PublishedClaim, ScribeError> {
+        let rows = file_list_writer::build_claim_inserts(
+            request.claim.key(),
+            &request.assembled.artifacts,
+            request.binding,
+            request.runs.wal(),
+        )?;
+        let events = request
+            .runs
+            .publication_audit()
+            .map(|event| {
+                crate::scribe::audit_envelope::publication_audit_events(std::slice::from_ref(event))
+            })
+            .unwrap_or_default();
+        let operation_id = uuid::Uuid::new_v4();
+        self.move_members(
+            request.claim,
+            StagedMemberState::Publishing {
+                claim_id: request.claim.id().to_string(),
+                operation_id,
+            },
+        )
+        .await?;
+        let mut chunk = vec![0_u8; PARQUET_TRANSFER_BUFFER_BYTES];
+        let claims = self
+            .mover
+            .stage_and_upload_candidate(
+                request.object_base,
+                &request.assembled.artifacts,
+                &mut chunk,
+            )
+            .await?;
+        self.mover
+            .persist_publication(
+                request.object_base,
+                request.actor_stream,
+                &rows,
+                &events,
+                &claims,
+            )
+            .await?;
+        let outcome = match self.reconciler.publish(&rows, &events).await {
+            ScribePublicationOutcome::Committed(outcome) => outcome,
+            ScribePublicationOutcome::UnknownCommitOutcome(error)
+            | ScribePublicationOutcome::KnownNotCommitted(error) => return Err(error),
+        };
+        let object_identities: Vec<String> = rows.iter().map(|row| row.file_path.clone()).collect();
+        self.retire_members(&request, &outcome.commit_key, &object_identities)
+            .await?;
+        self.mover.cleanup_published(&claims).await?;
+        Ok(PublishedClaim {
+            commit_key: outcome.commit_key,
+            object_identities,
+            released_bytes: request.claim.encoded_bytes(),
+        })
+    }
+
+    /// Moves every member of one claim to the same next durable state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when a member's record cannot be moved
+    /// forward, which leaves the claim resumable rather than half published.
+    async fn move_members(
+        &self,
+        claim: &StagingClaim,
+        next: StagedMemberState,
+    ) -> Result<(), ScribeError> {
+        for member in claim.members() {
+            self.stage
+                .transition(claim.key(), member.id(), next.clone())
+                .await
+                .map_err(|error| ScribeError::Internal {
+                    detail: format!(
+                        "move staged member {}-{} to {}: {error}",
+                        member.id().shard(),
+                        member.id().generation(),
+                        next.label()
+                    ),
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Records the commit on every member, then deletes their local files.
+    ///
+    /// The published state is written before anything is deleted so a crash
+    /// between the two leaves members that name the object serving their rows,
+    /// rather than rows with no authority at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when a member cannot record the commit
+    /// or its directory cannot be removed.
+    async fn retire_members(
+        &self,
+        request: &PublishClaimRequest<'_>,
+        commit_key: &FileListCommitKey,
+        object_identities: &[String],
+    ) -> Result<(), ScribeError> {
+        let key = request.claim.key();
+        for member in request.claim.members() {
+            let staged = self.stage.member(key, member.id()).await.map_err(|error| {
+                ScribeError::Internal {
+                    detail: format!(
+                        "reload staged member {}-{} before publishing it: {error}",
+                        member.id().shard(),
+                        member.id().generation()
+                    ),
+                }
+            })?;
+            let published = StagedMemberState::Published {
+                file_list_commit_key: format!(
+                    "{}:{}:{}",
+                    commit_key.node_id, commit_key.wal_lsn_min, commit_key.wal_lsn_max
+                ),
+                published_object_identities: object_identities.to_vec(),
+                persisted_lsn_ranges: vec![staged.record().wal_range()],
+            };
+            self.stage
+                .transition(key, member.id(), published)
+                .await
+                .map_err(transition_failure(member.id()))?;
+            self.stage
+                .transition(key, member.id(), StagedMemberState::CleanupPending)
+                .await
+                .map_err(transition_failure(member.id()))?;
+            self.stage
+                .retire(key, member.id())
+                .await
+                .map_err(|error| ScribeError::Internal {
+                    detail: format!(
+                        "retire published staged member {}-{}: {error}",
+                        member.id().shard(),
+                        member.id().generation()
+                    ),
+                })?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for ClaimPublisher {
+    /// Names the publisher without exposing its pooled or object-store owners.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ClaimPublisher")
+            .field("stage", &self.stage.root())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Builds the failure describing one member's refused durable transition.
+fn transition_failure(
+    member: crate::scribe::assembly::StagedMemberId,
+) -> impl Fn(crate::scribe::hot_stage::HotStageError) -> ScribeError {
+    move |error| ScribeError::Internal {
+        detail: format!(
+            "record the publication of staged member {}-{}: {error}",
+            member.shard(),
+            member.generation()
+        ),
+    }
+}

@@ -1168,7 +1168,7 @@ struct PersistenceCandidate<'a> {
 }
 
 /// Separate Scribe mover that uploads finalized stages but owns no catalog decision.
-struct ScribeStageMover {
+pub struct ScribeStageMover {
     /// Durable local namespace that owns election and crash-recovery manifests.
     staging: ScribeStaging,
     /// Shared bounded uploader that converges deterministic remote content.
@@ -1177,7 +1177,8 @@ struct ScribeStageMover {
 
 impl ScribeStageMover {
     /// Builds the mover over the WAL-root stage namespace and durable object store.
-    fn new(wal: Arc<WalWriter>, operator: opendal::Operator) -> Self {
+    #[must_use]
+    pub fn new(wal: Arc<WalWriter>, operator: opendal::Operator) -> Self {
         Self {
             staging: ScribeStaging::new(wal),
             uploader: BifrostParquetUploader::new(operator),
@@ -1195,7 +1196,7 @@ impl ScribeStageMover {
     /// Cancellation may leave elected local stages, a publication manifest, or
     /// verified remote objects. Those artifacts are intentionally retained so
     /// startup recovery can converge the same deterministic publication.
-    async fn stage_and_upload_candidate(
+    pub(crate) async fn stage_and_upload_candidate(
         &self,
         object_base: &str,
         artifacts: &BoundedParquetArtifactSet,
@@ -1263,7 +1264,7 @@ impl ScribeStageMover {
     ///
     /// Returns an internal error when the complete rows, audit transition, or
     /// durable stage claims contradict their deterministic generation identity.
-    async fn persist_publication(
+    pub(crate) async fn persist_publication(
         &self,
         object_base: &str,
         actor_stream: StreamIdentity,
@@ -1301,7 +1302,10 @@ impl ScribeStageMover {
     /// Cancellation may clean only a prefix of the claims. Exact cleanup is
     /// idempotent, and the publication manifest remains until every claim has
     /// been processed.
-    async fn cleanup_published(&self, claims: &[StagedArtifactClaim]) -> Result<(), ScribeError> {
+    pub(crate) async fn cleanup_published(
+        &self,
+        claims: &[StagedArtifactClaim],
+    ) -> Result<(), ScribeError> {
         let publication_identity = claims
             .first()
             .and_then(|claim| {
@@ -1867,7 +1871,7 @@ pub struct ScribePublicationReconciler {
 impl ScribePublicationReconciler {
     /// Constructs the sole publication reconciler for one persistence worker.
     #[must_use]
-    fn new(
+    pub(crate) fn new(
         operator_pool: vala_sql::OperatorPool,
         actor_stream: StreamIdentity,
         #[cfg(any(test, feature = "test-support"))] faults: PersistenceFaults,

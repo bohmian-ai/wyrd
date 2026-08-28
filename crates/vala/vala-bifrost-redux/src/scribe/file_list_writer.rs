@@ -240,16 +240,105 @@ pub fn build_artifact_inserts(
         detail: format!("invalid writer-v2 node identity: {error}"),
     })?;
     let (wal_lsn_min, wal_lsn_max) = extract_lsn_range(encoded)?;
-    let first_ordinal = encoded
-        .artifacts
-        .first()
-        .map_or(0_usize, |artifact| usize::from(artifact.ordinal));
-    encoded
-        .artifacts
-        .iter()
+    build_inserts(
+        encoded.artifacts.iter(),
+        &PublishedArtifactFacts {
+            binding,
+            partition: encoded.partition,
+            node_id,
+            writer_epoch,
+            wal_lsn_min,
+            wal_lsn_max,
+        },
+    )
+}
+
+/// Builds the ordered writer-v2 SQL rows for one assembled claim's objects.
+///
+/// A claim has no frozen generation behind it: its identity comes from the
+/// assembly key every contributing member shares, and its WAL range is the
+/// union of the members' ranges, which is exactly the span the published object
+/// makes retirable.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::Internal`] for an empty or noncontiguous object set,
+/// a malformed checksum, an assembly key whose tenant or table is not the
+/// binding's, a reversed WAL range, or values outside `PostgreSQL` integer
+/// domains.
+pub fn build_claim_inserts(
+    key: &crate::scribe::assembly::ScribeAssemblyKey,
+    artifacts: &crate::scribe::parquet_writer::BoundedParquetArtifactSet,
+    binding: &TenantTableBinding,
+    wal: crate::scribe::hot_stage::StagedLsnRange,
+) -> Result<Vec<FileListArtifactInsert>, ScribeError> {
+    if artifacts.is_empty() || binding.tenant != key.tenant() || binding.table_ref != *key.table() {
+        return Err(ScribeError::Internal {
+            detail: "assembled claim objects do not match their assembly key".to_owned(),
+        });
+    }
+    if wal.min > wal.max {
+        return Err(ScribeError::Internal {
+            detail: "assembled claim carries a reversed WAL range".to_owned(),
+        });
+    }
+    let wal_lsn_min = i64::try_from(wal.min).map_err(|_| ScribeError::Internal {
+        detail: "assembled claim wal_lsn_min exceeds bigint".to_owned(),
+    })?;
+    let wal_lsn_max = i64::try_from(wal.max).map_err(|_| ScribeError::Internal {
+        detail: "assembled claim wal_lsn_max exceeds bigint".to_owned(),
+    })?;
+    build_inserts(
+        artifacts.iter(),
+        &PublishedArtifactFacts {
+            binding,
+            partition: key.partition(),
+            node_id: key.node_id().as_uuid(),
+            writer_epoch: key.writer_epoch().as_i64(),
+            wal_lsn_min,
+            wal_lsn_max,
+        },
+    )
+}
+
+/// Publication facts every object of one set shares.
+///
+/// These are the columns that describe *where* the rows came from rather than
+/// what one object contains, so they are resolved once and applied to every row
+/// of the set; a per-artifact copy would let two objects of one publication
+/// disagree about their own origin.
+struct PublishedArtifactFacts<'a> {
+    /// Tenant-qualified physical binding the rows are published under.
+    binding: &'a TenantTableBinding,
+    /// Physical partition the objects belong to.
+    partition: crate::catalog::layout::TimePartition,
+    /// Node whose writer produced the rows.
+    node_id: Uuid,
+    /// Fenced writer epoch that produced the rows.
+    writer_epoch: i64,
+    /// Inclusive lower WAL bound the objects make retirable.
+    wal_lsn_min: i64,
+    /// Inclusive upper WAL bound the objects make retirable.
+    wal_lsn_max: i64,
+}
+
+/// Builds one contiguous set's rows from its objects and shared facts.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::Internal`] when ordinals are noncontiguous, a
+/// checksum is not lowercase hex of the expected length, or a value is outside
+/// a `PostgreSQL` integer domain.
+fn build_inserts<'a>(
+    artifacts: impl Iterator<Item = &'a crate::scribe::parquet_writer::BoundedParquetArtifact>,
+    facts: &PublishedArtifactFacts<'_>,
+) -> Result<Vec<FileListArtifactInsert>, ScribeError> {
+    let mut first_ordinal = None;
+    artifacts
         .enumerate()
         .map(|(offset, artifact)| {
-            if usize::from(artifact.ordinal) != first_ordinal.saturating_add(offset)
+            let first = *first_ordinal.get_or_insert(usize::from(artifact.ordinal));
+            if usize::from(artifact.ordinal) != first.saturating_add(offset)
                 || artifact.checksum.len() != 64
                 || !artifact
                     .checksum
@@ -277,9 +366,9 @@ pub fn build_artifact_inserts(
                 .unwrap_or(epoch);
             Ok(FileListArtifactInsert {
                 id: artifact_row_id(&artifact.object_identity),
-                data_tenant_id: binding.tenant,
-                namespace: binding.logical_namespace.clone(),
-                table_name: binding.table_name.clone(),
+                data_tenant_id: facts.binding.tenant,
+                namespace: facts.binding.logical_namespace.clone(),
+                table_name: facts.binding.table_name.clone(),
                 file_path: artifact.object_identity.clone(),
                 file_size: i64::try_from(artifact.file_size).map_err(|_| {
                     ScribeError::Internal {
@@ -293,11 +382,11 @@ pub fn build_artifact_inserts(
                 })?,
                 min_event_time,
                 max_event_time,
-                partition: encoded.partition,
-                node_id,
-                writer_epoch,
-                wal_lsn_min,
-                wal_lsn_max,
+                partition: facts.partition,
+                node_id: facts.node_id,
+                writer_epoch: facts.writer_epoch,
+                wal_lsn_min: facts.wal_lsn_min,
+                wal_lsn_max: facts.wal_lsn_max,
                 file_ordinal: i16::try_from(artifact.ordinal).map_err(|_| {
                     ScribeError::Internal {
                         detail: "writer-v2 ordinal exceeds smallint".to_owned(),

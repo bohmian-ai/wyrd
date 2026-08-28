@@ -16,12 +16,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
+use wyrd_spec::vala::api::AuditEvent;
 
 use crate::catalog::layout::PhysicalLayout;
 use crate::contracts::ScribeError;
 use crate::scribe::assembly::{StagingClaim, StagingClaimId};
 use crate::scribe::claim_merge::StagedRunMerge;
-use crate::scribe::hot_stage::ScribeHotStage;
+use crate::scribe::hot_stage::{ScribeHotStage, StagedLsnRange, StagedMemberState};
 use crate::scribe::parquet_writer::{
     ArtifactPlan, BoundedParquetArtifactSet, RowGroupStats, encode_ordered_claim,
 };
@@ -42,6 +43,10 @@ pub struct ClaimRuns {
     runs: Vec<PathBuf>,
     /// Rows the claim's members promised between them.
     rows: u64,
+    /// Union of the members' WAL ranges, which the objects make retirable.
+    wal: StagedLsnRange,
+    /// Seal audit event the claim's publication event derives from.
+    publication_audit: Option<AuditEvent>,
 }
 
 impl ClaimRuns {
@@ -55,6 +60,18 @@ impl ClaimRuns {
     #[must_use]
     pub fn runs(&self) -> &[PathBuf] {
         &self.runs
+    }
+
+    /// Returns the WAL span the claim's published objects will cover.
+    #[must_use]
+    pub const fn wal(&self) -> StagedLsnRange {
+        self.wal
+    }
+
+    /// Returns the seal audit event the publication event derives from.
+    #[must_use]
+    pub const fn publication_audit(&self) -> Option<&AuditEvent> {
+        self.publication_audit.as_ref()
     }
 }
 
@@ -117,6 +134,8 @@ impl ClaimAssembler {
     /// member's record disagrees with the claim's key.
     pub async fn gather(&self, claim: &StagingClaim) -> Result<ClaimRuns, ScribeError> {
         let mut runs = Vec::new();
+        let mut wal: Option<StagedLsnRange> = None;
+        let mut publication_audit = None;
         for member in claim.members() {
             let staged = self
                 .stage
@@ -138,6 +157,17 @@ impl ClaimAssembler {
                     ),
                 });
             }
+            let staged = self.own_member(claim, staged).await?;
+            let member_wal = staged.record().wal_range();
+            wal = Some(
+                wal.map_or(member_wal, |span: StagedLsnRange| StagedLsnRange {
+                    min: span.min.min(member_wal.min),
+                    max: span.max.max(member_wal.max),
+                }),
+            );
+            if publication_audit.is_none() {
+                publication_audit = staged.record().publication_audit().cloned();
+            }
             runs.extend(staged.run_paths());
         }
         if runs.is_empty() {
@@ -145,11 +175,76 @@ impl ClaimAssembler {
                 detail: "a claim named no runs to assemble".to_owned(),
             });
         }
+        let wal = wal.ok_or_else(|| ScribeError::Internal {
+            detail: "a claim named no members to assemble".to_owned(),
+        })?;
         Ok(ClaimRuns {
             claim: claim.id(),
             runs,
             rows: claim.rows(),
+            wal,
+            publication_audit,
         })
+    }
+
+    /// Records the claim's durable ownership of one member before any merge.
+    ///
+    /// Membership is durable before the merge begins so an interrupted claim
+    /// resumes as itself: the claim identity is derived from its member set, so
+    /// a restart re-derives the same claim and finds its members already owned
+    /// rather than free to join a different one.
+    ///
+    /// A member this claim already owns is left as it is, which is what makes
+    /// the gather idempotent across a retry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the member is owned by another
+    /// claim, has already been published, or the durable transition fails.
+    async fn own_member(
+        &self,
+        claim: &StagingClaim,
+        staged: crate::scribe::hot_stage::StagedMember,
+    ) -> Result<crate::scribe::hot_stage::StagedMember, ScribeError> {
+        let member = staged.record().member();
+        let claim_id = claim.id().to_string();
+        match staged.record().state() {
+            StagedMemberState::Ready => {}
+            StagedMemberState::Claimed { claim_id: owner }
+            | StagedMemberState::Publishing {
+                claim_id: owner, ..
+            } if *owner == claim_id => return Ok(staged),
+            state => {
+                return Err(ScribeError::Internal {
+                    detail: format!(
+                        "staged member {}-{} is {} and cannot join this claim",
+                        member.shard(),
+                        member.generation(),
+                        state.label()
+                    ),
+                });
+            }
+        }
+        self.stage
+            .transition(claim.key(), member, StagedMemberState::Claimed { claim_id })
+            .await
+            .map_err(|error| ScribeError::Internal {
+                detail: format!(
+                    "record the claim's ownership of staged member {}-{}: {error}",
+                    member.shard(),
+                    member.generation()
+                ),
+            })?;
+        self.stage
+            .member(claim.key(), member)
+            .await
+            .map_err(|error| ScribeError::Internal {
+                detail: format!(
+                    "reload staged member {}-{} after claiming it: {error}",
+                    member.shard(),
+                    member.generation()
+                ),
+            })
     }
 
     /// Merges the gathered runs and encodes them into rolling hot objects.
@@ -221,7 +316,6 @@ mod tests {
     use crate::scribe::assembly::{
         ClaimCause, StagedMemberId, StagingAssembler, StagingAssemblerConfig,
     };
-    use crate::scribe::hot_stage::StagedLsnRange;
     use crate::scribe::member_stager::{
         ScribeMemberStager, StageMemberRequest, StagedMemberOrigin,
     };

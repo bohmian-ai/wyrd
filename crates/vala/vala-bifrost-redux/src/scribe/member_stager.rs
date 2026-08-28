@@ -82,6 +82,8 @@ pub struct StagedRuns {
     wal: StagedLsnRange,
     /// Sorted runs in sort order, named relative to the member directory.
     runs: Vec<StagedRunFile>,
+    /// Seal audit event the member's later publication event derives from.
+    publication_audit: Option<wyrd_spec::vala::api::AuditEvent>,
     /// Durable staged bytes committed to the staging volume for these runs.
     staged_bytes: u64,
 }
@@ -240,6 +242,7 @@ impl ScribeMemberStager {
             member,
             wal: request.origin.wal,
             runs,
+            publication_audit: request.frozen.events.first().cloned(),
             staged_bytes,
         })
     }
@@ -264,6 +267,7 @@ impl ScribeMemberStager {
             staged.wal,
             staged.runs,
             ready_at,
+            staged.publication_audit,
         );
         self.stage
             .publish_record(&staged.key, &record)

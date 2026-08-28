@@ -848,6 +848,8 @@ pub struct AdmissionSnapshot {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::scribe::contention::ContentionRefusal;
 
@@ -879,6 +881,436 @@ mod tests {
             usize::try_from(staging).unwrap_or(usize::MAX),
             GLOBAL_INFLIGHT_ITEMS,
         )
+    }
+
+    /// Sequential traffic across distinct tables reuses the pod's ownership slots.
+    ///
+    /// Reproduces SCRIBE-CAP-03 through the production lifecycle rather than a
+    /// direct ledger call. Normal release returns balances but used to leave the
+    /// emptied cell installed, and an installed empty cell still occupies one of
+    /// the pod's resource-derived ownership slots. Walking more distinct tables
+    /// than the ceiling therefore refused every later table while the pod owned
+    /// nothing at all.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any table past the derived ceiling is refused, or when the
+    /// final active-table, active-tenant, and category totals are not zero.
+    #[test]
+    fn sequential_tables_reuse_the_pods_derived_ownership_slots() {
+        let admission = AdmissionController::with_config(AdmissionConfig::default())
+            .expect("the default geometry fits the default budget");
+        let ledger = admission.contention();
+        let ceiling = ledger.ownership_ceiling();
+        assert!(
+            ceiling > 0,
+            "the fixture pod must complete at least one table"
+        );
+
+        for step in 0..(ceiling * 2 + 1) {
+            let owner = cell_key(11, &format!("sequential_{step}"));
+            let reservation = admission
+                .try_reserve_for_cell(&owner, "wyrd.sequential", 4_096)
+                .unwrap_or_else(|error| {
+                    panic!("table {step} must reuse a settled ownership slot: {error}")
+                });
+            assert_eq!(ledger.active_cells().expect("readable"), 1);
+            reservation
+                .release()
+                .expect("terminal release settles the table");
+            assert_eq!(
+                ledger.active_cells().expect("readable"),
+                0,
+                "table {step} must not strand an empty ownership slot"
+            );
+        }
+
+        assert_eq!(ledger.active_tenants().expect("readable"), 0);
+        for category in [
+            ContentionCategory::AdmissionItems,
+            ContentionCategory::AdmissionBytes,
+        ] {
+            assert_eq!(
+                ledger.committed(category).expect("pod totals"),
+                0,
+                "{} must drain completely",
+                category.label()
+            );
+        }
+        assert_eq!(admission.snapshot().items, 0);
+        assert_eq!(admission.snapshot().bytes, 0);
+    }
+
+    /// A refused shrink leaves the reservation, cell, and pod counters unmoved.
+    ///
+    /// Reproduces SCRIBE-CAP-04. The shrink path used to lower the pod-global
+    /// byte counter before the fallible cell release and never put it back, so a
+    /// refused release left the pod believing bytes were returned that the table
+    /// still owned. Growth and shrink must both move the identical delta at
+    /// every level or move it at none.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a refused shrink changes any counter, or when restoring the
+    /// cell does not let the reservation balance every level back to zero.
+    #[test]
+    fn a_refused_shrink_leaves_every_level_unmoved() {
+        let admission = AdmissionController::with_config(AdmissionConfig::default())
+            .expect("the default geometry fits the default budget");
+        let ledger = admission.contention();
+        let owner = cell_key(12, "events");
+        let mut reservation = admission
+            .try_reserve_for_cell(&owner, "wyrd.events", 8_192)
+            .expect("a first request activates the cell and reserves inside it");
+
+        // Empty the cell behind the reservation so the shrink's own cell release
+        // is the operation that fails, which is the exact refusal the pod
+        // counter used to be lowered ahead of.
+        ledger
+            .release(&owner, ContentionCategory::AdmissionBytes, 8_192)
+            .expect("the cell's admitted bytes are returned out of band");
+
+        let before = admission.snapshot();
+        let refusal = reservation
+            .resize(4_096)
+            .expect_err("the cell cannot return bytes it no longer holds");
+        assert!(matches!(refusal, ScribeError::Internal { .. }));
+        assert_eq!(
+            admission.snapshot().bytes,
+            before.bytes,
+            "a refused shrink must not lower the pod-global byte counter"
+        );
+        assert_eq!(admission.snapshot().items, before.items);
+        assert_eq!(
+            ledger
+                .usage(&owner, ContentionCategory::AdmissionBytes)
+                .expect("the cell survives a refused shrink"),
+            0
+        );
+        assert_eq!(reservation.bytes(), 8_192);
+
+        // Restoring what the test removed proves the reservation still owns
+        // exactly the delta it was holding before the refusal.
+        ledger
+            .charge(&owner, ContentionCategory::AdmissionBytes, 8_192)
+            .expect("the cell reclaims the bytes the test released");
+        reservation.release().expect("the reservation balances");
+        assert_eq!(admission.snapshot().items, 0);
+        assert_eq!(admission.snapshot().bytes, 0);
+        assert_eq!(ledger.active_cells().expect("readable"), 0);
+    }
+
+    /// Every contention registry entry has a production emitter, and no others exist.
+    ///
+    /// Drives the public ledger and admission surfaces through success,
+    /// refusal, rollback, partial progress, retry, expiry, cancellation, queue
+    /// saturation, settlement, resize, and invariant failure, then compares the
+    /// closed decisions those real transitions emitted against
+    /// [`ContentionEffect::ALL`]. A registry entry with no production caller and
+    /// a production emission with no registry entry both fail here, which is why
+    /// the events are captured from the transitions themselves rather than by
+    /// calling the emitter directly.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the registry and the captured production emissions disagree,
+    /// or when any workload identity reaches a metric-eligible field.
+    #[test]
+    fn scribe_contention_registry_is_closed_and_has_production_emitters() {
+        use crate::scribe::telemetry::producer_lifecycle_tests::{EventCaptureSubscriber, field};
+
+        let subscriber = EventCaptureSubscriber::default();
+        let events = Arc::clone(&subscriber.events);
+        tracing::subscriber::with_default(subscriber, drive_every_contention_effect);
+
+        let captured = events.lock().expect("event capture");
+        let mut emitted: Vec<String> = captured
+            .iter()
+            .filter(|event| {
+                event.iter().any(|(name, _)| name == "stage")
+                    && event.iter().any(|(name, _)| name == "decision")
+            })
+            .map(|event| format!("{}/{}", field(event, "stage"), field(event, "decision")))
+            .collect();
+        emitted.sort_unstable();
+        emitted.dedup();
+
+        let mut registry: Vec<String> = ContentionEffect::ALL
+            .iter()
+            .map(|effect| format!("{}/{}", effect.stage(), effect.decision()))
+            .collect();
+        registry.sort_unstable();
+        let mut unique = registry.clone();
+        unique.dedup();
+        assert_eq!(
+            registry, unique,
+            "two registry entries share one stage/decision pair"
+        );
+        assert_eq!(
+            emitted, registry,
+            "the registry and its production emitters must agree exactly"
+        );
+
+        for event in captured
+            .iter()
+            .filter(|event| event.iter().any(|(name, _)| name == "decision"))
+        {
+            for (name, _) in event.iter() {
+                assert!(
+                    !matches!(
+                        name.as_str(),
+                        "tenant"
+                            | "table"
+                            | "request_id"
+                            | "batch_id"
+                            | "generation"
+                            | "path"
+                            | "row"
+                            | "sql"
+                            | "credential"
+                            | "token"
+                    ),
+                    "workload identity {name} reached a contention effect field"
+                );
+            }
+        }
+    }
+
+    /// Exercises one real transition for every entry in the contention registry.
+    ///
+    /// Extracted from its assertions so the capture subscriber wraps production
+    /// work only, and split by the part of the lifecycle each block reaches so
+    /// no single fixture owns the whole registry.
+    fn drive_every_contention_effect() {
+        drive_single_vector_effects();
+        drive_demand_expiry_effect();
+        drive_contender_priority_effects();
+        drive_sibling_settlement_effect();
+        drive_resize_effects();
+    }
+
+    /// Returns the pod capacity that completes exactly `vectors` lifecycle vectors.
+    fn capacity_for_vectors(vectors: usize) -> crate::scribe::geometry::ScribeGlobalCapacity {
+        let vector = ScribeArtifactPolicy::default().reserve_vector();
+        crate::scribe::geometry::ScribeGlobalCapacity {
+            admission_items: vector.admission_items * vectors,
+            admission_bytes: vector.admission_bytes * vectors,
+            active_bytes: vector.active_bytes * vectors,
+            immutable_bytes: vector.immutable_bytes * vectors,
+            durable_stage_bytes: vector.durable_stage_bytes * vectors,
+            merge_scratch_bytes: vector.merge_scratch_bytes * vectors,
+            staging_claim_items: vector.staging_claim_items * vectors,
+            upload_claim_items: vector.upload_claim_items * vectors,
+        }
+    }
+
+    /// Drives activation, charge, demand, and settlement effects on a one-table pod.
+    ///
+    /// A pod that completes exactly one lifecycle vector puts activation
+    /// refusal, pod exhaustion, and queue saturation one arrival apart, which is
+    /// what makes each of those decisions reachable without contriving state.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a transition this fixture depends on does not behave as the
+    /// ledger's own focused tests already prove it does.
+    fn drive_single_vector_effects() {
+        let policy = ScribeArtifactPolicy::default();
+        let vector = policy.reserve_vector();
+        let ledger = ScribeContentionLedger::with_demand_bounds(
+            policy,
+            capacity_for_vectors(1),
+            1,
+            Duration::from_secs(30),
+        );
+        let first = cell_key(21, "first");
+        let second = cell_key(22, "second");
+        let third = cell_key(23, "third");
+
+        // activation/installed, charge/committed, demand/served.
+        ledger
+            .admit(&first, vector.admission_bytes)
+            .expect("the only table borrows the whole pod");
+        // activation/ceiling_refused and demand/enqueued.
+        ledger
+            .admit(&second, 1)
+            .expect_err("a one-vector pod carries one table");
+        // demand/refreshed: the same contender retries and keeps its position.
+        ledger
+            .admit(&second, 1)
+            .expect_err("a one-vector pod carries one table");
+        // demand/queue_full: a second distinct contender finds the queue full.
+        ledger
+            .admit(&third, 1)
+            .expect_err("a one-vector pod carries one table");
+        // demand/cancelled.
+        ledger
+            .cancel_demand(&second)
+            .expect("the contender withdraws");
+        // charge/released and settlement/nonempty.
+        ledger
+            .release(
+                &first,
+                ContentionCategory::AdmissionBytes,
+                vector.admission_bytes,
+            )
+            .expect("the owner drains its bytes");
+        assert!(
+            !ledger.settle(&first).expect("readable"),
+            "the item charge is still outstanding"
+        );
+        // charge/over_release.
+        ledger
+            .release(&first, ContentionCategory::AdmissionItems, 2)
+            .expect_err("a cell cannot return more than it holds");
+        // charge/refused: nothing is queued, so this is plain exhaustion.
+        ledger
+            .charge(
+                &first,
+                ContentionCategory::AdmissionItems,
+                vector.admission_items,
+            )
+            .expect_err("the item capacity is already held");
+        // settlement/tenant_retired.
+        ledger
+            .release(&first, ContentionCategory::AdmissionItems, 1)
+            .expect("the owner drains its item");
+        assert!(ledger.settle(&first).expect("readable"));
+    }
+
+    /// Drives `demand/expired` with a record that stops conferring priority at once.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an expired record is still counted as waiting.
+    fn drive_demand_expiry_effect() {
+        let policy = ScribeArtifactPolicy::default();
+        let vector = policy.reserve_vector();
+        let ledger = ScribeContentionLedger::with_demand_bounds(
+            policy,
+            capacity_for_vectors(1),
+            8,
+            Duration::from_nanos(1),
+        );
+        let held = cell_key(25, "held");
+        let waiting = cell_key(26, "waiting");
+        ledger
+            .admit(&held, vector.admission_bytes)
+            .expect("the only table borrows the whole pod");
+        ledger
+            .admit(&waiting, 1)
+            .expect_err("a one-vector pod carries one table");
+        assert_eq!(
+            ledger.waiting_demand().expect("readable"),
+            0,
+            "the record expired before it was counted"
+        );
+    }
+
+    /// Drives `activation/rolled_back` and `charge/contender_priority`.
+    ///
+    /// A contender is installed, refused on bytes, and unwound, and the
+    /// incumbent is then held back by the claim that rollback left live.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the incumbent reacquires the vector the contender is owed.
+    fn drive_contender_priority_effects() {
+        let vector = ScribeArtifactPolicy::default().reserve_vector();
+        let ledger = ledger_for_vectors(2);
+        let incumbent = cell_key(27, "incumbent");
+        let contender = cell_key(28, "contender");
+        ledger
+            .admit(&incumbent, vector.admission_bytes * 2)
+            .expect("a lone owner borrows every idle byte");
+        ledger
+            .admit(&contender, vector.admission_bytes)
+            .expect_err("every byte is owned");
+        ledger
+            .release(
+                &incumbent,
+                ContentionCategory::AdmissionBytes,
+                vector.admission_bytes,
+            )
+            .expect("the incumbent drains one vector");
+        ledger
+            .charge(
+                &incumbent,
+                ContentionCategory::AdmissionBytes,
+                vector.admission_bytes,
+            )
+            .expect_err("the queued contender owns the released vector");
+    }
+
+    /// Drives `settlement/table_retired` with a tenant that keeps a sibling table.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the emptied table does not settle.
+    fn drive_sibling_settlement_effect() {
+        let ledger = ledger_for_vectors(4);
+        let kept = cell_key(30, "kept");
+        let settled = cell_key(30, "settled");
+        ledger.admit(&kept, 1).expect("the kept table admits");
+        ledger
+            .admit(&settled, 1)
+            .expect("the settling table admits");
+        ledger
+            .release(&settled, ContentionCategory::AdmissionBytes, 1)
+            .expect("bytes return");
+        ledger
+            .release(&settled, ContentionCategory::AdmissionItems, 1)
+            .expect("items return");
+        assert!(ledger.settle(&settled).expect("readable"));
+    }
+
+    /// Drives `resize/grown`, `resize/shrunk`, `resize/refused`, and `invariant/corrupt`.
+    ///
+    /// The final block makes the reservation claim more bytes than the pod
+    /// counter holds, which is the accounting contradiction the invariant entry
+    /// exists to report; the reservation is then neutralized so its drop cannot
+    /// re-enter the poisoned path.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a resize that must succeed is refused, or when a resize that
+    /// must be refused succeeds.
+    fn drive_resize_effects() {
+        let admission = AdmissionController::with_config(AdmissionConfig::default())
+            .expect("the default geometry fits the default budget");
+        let owner = cell_key(29, "resize");
+        let mut reservation = admission
+            .try_reserve_for_cell(&owner, "wyrd.resize", 4_096)
+            .expect("a first request activates the cell");
+        reservation.resize(8_192).expect("growth fits");
+        reservation.resize(4_096).expect("shrink fits");
+        admission
+            .contention()
+            .release(&owner, ContentionCategory::AdmissionBytes, 4_096)
+            .expect("the cell's bytes are returned out of band");
+        reservation
+            .resize(1_024)
+            .expect_err("the cell cannot return bytes it no longer holds");
+        reservation.bytes = usize::MAX;
+        reservation
+            .resize(0)
+            .expect_err("the pod counter cannot absorb an impossible shrink");
+        reservation.bytes = 0;
+        std::mem::forget(reservation);
+    }
+
+    /// Builds a ledger whose measured capacity completes exactly `vectors` tables.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the derived capacity does not satisfy the default policy.
+    fn ledger_for_vectors(vectors: usize) -> ScribeContentionLedger {
+        let policy = ScribeArtifactPolicy::default();
+        let capacity = capacity_for_vectors(vectors);
+        policy
+            .validate_capacity(&capacity)
+            .expect("a fixture capacity must hold one complete lifecycle vector");
+        ScribeContentionLedger::new(policy, capacity)
     }
 
     /// A first request refused on admission items installs no cell at all.

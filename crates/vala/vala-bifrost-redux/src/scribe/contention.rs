@@ -738,12 +738,9 @@ impl ScribeContentionLedger {
             // it a moment ago under the same lock. A failure here is a ledger
             // invariant break, not a caller error, so it is reported as one and
             // the rollback still completes.
-            if let Err(error) = Self::release_locked(
-                &mut state,
-                key,
-                ContentionCategory::AdmissionItems,
-                1,
-            ) {
+            if let Err(error) =
+                Self::release_locked(&mut state, key, ContentionCategory::AdmissionItems, 1)
+            {
                 self.emit(
                     &state,
                     ContentionEffect::InvariantFailure,
@@ -1048,7 +1045,7 @@ impl ScribeContentionLedger {
     /// error here: settlement is evaluated after every release, and most
     /// releases legitimately leave work behind. The cell is removed exactly once
     /// and only when every governed category is zero; the tenant goes with its
-    /// final table.
+    /// final table, and the settled table's stale demand records go with it.
     ///
     /// # Errors
     ///
@@ -1096,6 +1093,11 @@ impl ScribeContentionLedger {
             }
         }
         tenant.tables.remove(&key.table);
+        // A category record belongs to an active table that was refused
+        // capacity. The table is gone, so the record is stale, and leaving it
+        // would reserve a lifecycle quantum for an owner that is no longer
+        // waiting for anything.
+        state.demand.retain(|record| &record.key != key);
         if tenant.tables.is_empty() {
             state.tenants.remove(&key.tenant);
             return Ok(Settlement::TenantRetired);
@@ -1167,9 +1169,7 @@ impl ScribeContentionLedger {
 
         // Capacity the queue is holding for contenders ahead of this caller.
         let contenders = state.reserved_ahead(key, category, request.quantum);
-        let reserved = contenders
-            .saturating_mul(request.quantum)
-            .min(capacity);
+        let reserved = contenders.saturating_mul(request.quantum).min(capacity);
         let available = capacity - reserved;
 
         // Hard pod bound first. A fair level says what an owner *should* hold;
@@ -1199,14 +1199,7 @@ impl ScribeContentionLedger {
         let (mut table_demands, charging_table, table_held) = state.table_demands(request)?;
         let table_level = max_min_level(tenant_level.min(available), &mut table_demands);
         if charging_table > table_level {
-            return Err(self.refuse(
-                state,
-                request,
-                "table",
-                table_level,
-                table_held,
-                contenders,
-            ));
+            return Err(self.refuse(state, request, "table", table_level, table_held, contenders));
         }
 
         if let Some(cell) = state
@@ -2207,6 +2200,221 @@ mod tests {
             ledger.committed(ContentionCategory::Active).expect("pod"),
             whole,
             "every quantum the borrower released reached a contender"
+        );
+    }
+
+    /// Activation and the first admission charges commit or roll back together.
+    ///
+    /// Reproduces SCRIBE-CAP-01 without a timing loop. A contender that is
+    /// installed but not yet charged holds nothing and, if its ordering record
+    /// were retired at activation, would read as zero demand: an incumbent
+    /// above its recomputed share could take the capacity the contender had
+    /// just been promised. Because activation, both charges, demand retirement,
+    /// and rollback happen inside one lock, there is no state in which the
+    /// contender is an unprotected zero-demand owner, and the incumbent is
+    /// refused at exactly the boundary that used to be unlocked.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a refused initial transition leaves a cell or loses the
+    /// contender's ordering claim, when the incumbent reacquires the released
+    /// vector, or when the contender's admitted charges do not both land.
+    #[test]
+    fn activation_and_initial_charges_are_one_transition() {
+        let ledger = ledger_for(2);
+        let quantum = ledger.reserve_vector().admission_bytes;
+        let incumbent = key(1, "hot");
+        let contender = key(2, "cold");
+
+        ledger
+            .admit(
+                &incumbent,
+                capacity_of(2, ContentionCategory::AdmissionBytes),
+            )
+            .expect("a lone owner may borrow every idle byte");
+
+        // The contender's byte charge cannot fit, so the whole transition must
+        // unwind: no cell, no charges, and a live ordering claim.
+        let refusal = ledger
+            .admit(&contender, quantum)
+            .expect_err("the pod has no bytes left for a second table");
+        assert!(matches!(refusal, ContentionRefusal::Exhausted { .. }));
+        assert_eq!(
+            ledger.usage(&contender, ContentionCategory::AdmissionItems),
+            Err(ContentionRefusal::Inactive)
+        );
+        assert_eq!(ledger.active_cells().expect("readable"), 1);
+        assert_eq!(
+            ledger
+                .usage(&incumbent, ContentionCategory::AdmissionItems)
+                .expect("the incumbent keeps acknowledged work"),
+            1
+        );
+        assert_eq!(ledger.waiting_demand().expect("readable"), 1);
+
+        // One complete vector turns over. It belongs to the contender, and the
+        // incumbent is refused at the exact boundary that used to be unlocked.
+        ledger
+            .release(&incumbent, ContentionCategory::AdmissionBytes, quantum)
+            .expect("the incumbent drains normally");
+        assert!(
+            ledger
+                .charge(&incumbent, ContentionCategory::AdmissionBytes, quantum)
+                .is_err(),
+            "an over-share incumbent must not reborrow past a waiting contender"
+        );
+
+        ledger
+            .admit(&contender, quantum)
+            .expect("the queued contender receives the released vector");
+        assert_eq!(
+            ledger
+                .usage(&contender, ContentionCategory::AdmissionItems)
+                .expect("the contender is active"),
+            1
+        );
+        assert_eq!(
+            ledger
+                .usage(&contender, ContentionCategory::AdmissionBytes)
+                .expect("the contender is active"),
+            quantum
+        );
+    }
+
+    /// A partial turnover is kept but does not end the contender's turn.
+    ///
+    /// Reproduces SCRIBE-CAP-02. A contender queued for one lifecycle quantum
+    /// that receives half of it is still below the quantum it was promised.
+    /// Retiring its record on that partial success is what would let the
+    /// incumbent reborrow the remainder, so the record survives until the whole
+    /// quantum is held.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a partial charge retires the contender's claim, when the
+    /// incumbent reacquires the remainder, or when the completed quantum does
+    /// not retire the claim.
+    #[test]
+    fn a_partial_charge_keeps_the_contenders_place_in_line() {
+        let ledger = ledger_for(2);
+        let quantum = ledger.reserve_vector().admission_bytes;
+        let half = quantum / 2;
+        let incumbent = key(1, "hot");
+        let contender = key(2, "cold");
+
+        ledger
+            .admit(
+                &incumbent,
+                capacity_of(2, ContentionCategory::AdmissionBytes),
+            )
+            .expect("a lone owner may borrow every idle byte");
+        ledger
+            .activate(&contender)
+            .expect("the pod still completes a second table");
+        ledger
+            .charge(&contender, ContentionCategory::AdmissionBytes, quantum)
+            .expect_err("every byte is currently owned");
+        assert_eq!(ledger.waiting_demand().expect("readable"), 1);
+
+        ledger
+            .release(&incumbent, ContentionCategory::AdmissionBytes, half)
+            .expect("the incumbent drains part of one vector");
+        ledger
+            .charge(&contender, ContentionCategory::AdmissionBytes, half)
+            .expect("work-conserving: the contender keeps what turned over");
+        assert_eq!(
+            ledger.waiting_demand().expect("readable"),
+            1,
+            "a partial turnover must not forfeit the rest of the contender's turn"
+        );
+        assert!(
+            ledger
+                .charge(&incumbent, ContentionCategory::AdmissionBytes, 1)
+                .is_err(),
+            "the incumbent must not reborrow the remainder the contender is owed"
+        );
+        // The incumbent's own refusal queued it; it is not the subject here.
+        ledger
+            .cancel_demand(&incumbent)
+            .expect("the incumbent withdraws its record");
+        assert_eq!(ledger.waiting_demand().expect("readable"), 1);
+
+        ledger
+            .release(&incumbent, ContentionCategory::AdmissionBytes, half)
+            .expect("the incumbent drains the rest of the vector");
+        ledger
+            .charge(&contender, ContentionCategory::AdmissionBytes, half)
+            .expect("the contender completes its quantum");
+        assert_eq!(
+            ledger.waiting_demand().expect("readable"),
+            0,
+            "a served contender stops holding the queue"
+        );
+    }
+
+    /// Terminal settlement retires an empty table exactly once, and never a full one.
+    ///
+    /// Settlement is evaluated after every release, so most calls legitimately
+    /// find work still in flight. Those must leave the cell and every derived
+    /// total untouched; only the final zero transition removes the table, and
+    /// the tenant goes with its last table.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a nonempty cell is retired, when a settled cell is retired
+    /// twice, or when the tenant outlives its final table.
+    #[test]
+    fn terminal_settlement_retires_only_a_completely_empty_cell() {
+        let ledger = ledger_for(4);
+        let first = key(1, "first");
+        let second = key(1, "second");
+        ledger.admit(&first, 1).expect("first table admits");
+        ledger.admit(&second, 1).expect("second table admits");
+
+        for category in [
+            ContentionCategory::AdmissionItems,
+            ContentionCategory::AdmissionBytes,
+        ] {
+            assert!(
+                !ledger.settle(&first).expect("readable"),
+                "{} still holds capacity",
+                category.label()
+            );
+            assert_eq!(ledger.active_cells().expect("readable"), 2);
+        }
+
+        ledger
+            .release(&first, ContentionCategory::AdmissionItems, 1)
+            .expect("items return");
+        ledger
+            .release(&first, ContentionCategory::AdmissionBytes, 1)
+            .expect("bytes return");
+        assert!(
+            ledger.settle(&first).expect("readable"),
+            "the cell is empty"
+        );
+        assert!(
+            !ledger.settle(&first).expect("readable"),
+            "an already-settled table is not retired twice"
+        );
+        assert_eq!(ledger.active_cells().expect("readable"), 1);
+        assert_eq!(ledger.active_tenants().expect("readable"), 1);
+
+        ledger
+            .release(&second, ContentionCategory::AdmissionItems, 1)
+            .expect("items return");
+        ledger
+            .release(&second, ContentionCategory::AdmissionBytes, 1)
+            .expect("bytes return");
+        assert!(
+            ledger.settle(&second).expect("readable"),
+            "the cell is empty"
+        );
+        assert_eq!(ledger.active_cells().expect("readable"), 0);
+        assert_eq!(
+            ledger.active_tenants().expect("readable"),
+            0,
+            "a tenant leaves no cell behind its final table"
         );
     }
 

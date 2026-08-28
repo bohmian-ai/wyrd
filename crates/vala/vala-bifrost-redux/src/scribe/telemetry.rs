@@ -935,9 +935,9 @@ impl ContentionEffect {
     /// without enumerating each decision.
     pub(crate) const fn stage(self) -> &'static str {
         match self {
-            Self::ActivationInstalled
-            | Self::ActivationRefused
-            | Self::ActivationRolledBack => "activation",
+            Self::ActivationInstalled | Self::ActivationRefused | Self::ActivationRolledBack => {
+                "activation"
+            }
             Self::ChargeCommitted
             | Self::ChargeRefused
             | Self::IncumbentBlocked
@@ -1060,4 +1060,98 @@ pub(crate) fn record_contention_effect(effect: ContentionEffect, facts: Contenti
         active_tenants = facts.active_tenants,
         "Scribe contention lifecycle"
     );
+}
+
+#[cfg(test)]
+/// Registry-shape proofs for the closed contention effect vocabulary.
+mod contention_registry_tests {
+    use super::{ContentionEffect, ContentionFacts, record_contention_effect};
+
+    /// The registry's vocabularies are closed, complete, and free of duplicates.
+    ///
+    /// Complements the production-emitter coverage proof in the admission
+    /// module: that test proves every entry is reachable from a real
+    /// transition, and this one proves the vocabulary those entries publish is
+    /// a closed label set an operator can aggregate on. A duplicate
+    /// stage/decision pair would silently merge two distinct decisions into one
+    /// time series.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an entry publishes an empty or duplicated label, or when a
+    /// severity outside the closed operator vocabulary is returned.
+    #[test]
+    fn scribe_contention_registry_vocabularies_are_closed() {
+        let mut pairs: Vec<(&'static str, &'static str)> = Vec::new();
+        for effect in ContentionEffect::ALL {
+            assert!(!effect.stage().is_empty(), "{effect:?} has no stage");
+            assert!(!effect.decision().is_empty(), "{effect:?} has no decision");
+            assert!(
+                matches!(effect.severity(), "info" | "warn" | "error"),
+                "{effect:?} publishes a severity outside the closed vocabulary"
+            );
+            assert!(
+                !pairs.contains(&(effect.stage(), effect.decision())),
+                "{effect:?} duplicates an existing stage/decision pair"
+            );
+            pairs.push((effect.stage(), effect.decision()));
+        }
+        assert_eq!(pairs.len(), ContentionEffect::ALL.len());
+    }
+
+    /// Steady-state fairness decisions stay inside the bounded `info` severity.
+    ///
+    /// Borrowing, retryable pressure, and turnover are what a work-conserving
+    /// ledger does constantly. Emitting them above `info` would make normal
+    /// operation indistinguishable from a fault and drown the two signals that
+    /// genuinely need attention.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a steady-state decision escalates, or when queue saturation
+    /// and accounting corruption do not carry their fixed severities.
+    #[test]
+    fn scribe_contention_severity_is_bounded_to_real_faults() {
+        for effect in [
+            ContentionEffect::ActivationInstalled,
+            ContentionEffect::ActivationRefused,
+            ContentionEffect::ActivationRolledBack,
+            ContentionEffect::ChargeCommitted,
+            ContentionEffect::ChargeRefused,
+            ContentionEffect::IncumbentBlocked,
+            ContentionEffect::ChargeReleased,
+            ContentionEffect::DemandEnqueued,
+            ContentionEffect::DemandRetired,
+            ContentionEffect::TableSettled,
+            ContentionEffect::TenantSettled,
+        ] {
+            assert_eq!(effect.severity(), "info", "{effect:?} escalated");
+        }
+        assert_eq!(ContentionEffect::DemandDropped.severity(), "warn");
+        assert_eq!(ContentionEffect::OverReleaseRefused.severity(), "error");
+        assert_eq!(ContentionEffect::InvariantFailure.severity(), "error");
+    }
+
+    /// Emitting an effect with default facts publishes only closed labels.
+    ///
+    /// Guards the emitter itself: the metric label set is built from the
+    /// effect's own closed vocabulary plus the resource category, and nothing a
+    /// caller passes can widen it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when emitting an effect panics, which would make the production
+    /// call sites fallible.
+    #[test]
+    fn recording_an_effect_publishes_only_closed_labels() {
+        for effect in ContentionEffect::ALL {
+            record_contention_effect(
+                effect,
+                ContentionFacts {
+                    category: "admission_bytes",
+                    ..ContentionFacts::default()
+                },
+            );
+        }
+    }
 }

@@ -27,7 +27,7 @@ const ROWS_PER_REQUEST: usize = 12_000;
 /// leave a smaller residue object behind rather than rolling exactly once.
 const REQUESTS: usize = 52;
 
-/// AC22 Tier-2 owner: the production default closes a real 512 MiB object.
+/// The production default geometry closes a real 512 MiB object.
 ///
 /// Everything else in the suite proves Scribe publishes the right rows. This
 /// owner proves it publishes them into the right *physical* shape at the
@@ -73,7 +73,7 @@ async fn scribe_512_mib_physical_object_qualifies() {
     }
 
     server
-        .flush_bifrost_for_tenant(tenant)
+        .flush_bifrost()
         .await
         .expect("the staged members publish");
 

@@ -135,6 +135,20 @@ pub enum ScribeWorkloadOperationV1 {
         /// Values written, in order.
         rows: Vec<i64>,
     },
+    /// Freeze every writable generation into an immutable staged member.
+    ///
+    /// This is the first half of the durable lifecycle on its own: the rows
+    /// stop being appendable and become a sealed member the staging runtime
+    /// owns, but nothing is assembled or published. It is the only way to reach
+    /// [`ScribeCheckpointNameV1::ActiveToStaged`] as a real boundary rather
+    /// than as a name, because the tenant flush below performs the freeze and
+    /// the publication together and so can never be observed between them.
+    ///
+    /// The operation carries no owner ordinal for the same reason the pod
+    /// lifecycle operations do not: the seal is pod-wide, and a record that
+    /// named a tenant here would imply a per-tenant freeze the shard owner does
+    /// not have.
+    Seal,
     /// Drive one tenant's durable seal and publication to completion.
     Flush {
         /// Ordinal of the tenant to flush.
@@ -147,6 +161,27 @@ pub enum ScribeWorkloadOperationV1 {
         /// Ordinal of the table to read.
         table: usize,
     },
+    /// Stop the pod and start it again on its retained durable roots.
+    ///
+    /// Recovery is a lifecycle transition of the whole pod, so the operation
+    /// carries no owner ordinal: there is nothing tenant-scoped about it, and a
+    /// record that named a tenant here would imply a per-tenant restart the
+    /// server does not have.
+    Restart,
+    /// Re-send every append this record already declared, verbatim.
+    ///
+    /// The batch identities are the record's own, so a replay is by
+    /// construction the same batches rather than new ones. That is why the
+    /// operation carries no payload: an author cannot accidentally replay a
+    /// different batch, and the runner cannot add a row.
+    Replay,
+    /// Drain the pod terminally and observe what it still owned.
+    ///
+    /// This is the last thing a record can ask for: the pod is gone afterwards,
+    /// so any operation after it would have no server to run on. Only a
+    /// checkpoint may follow, and it reports the reads taken before the drain
+    /// together with what the drain released.
+    Drain,
     /// Record a named lifecycle checkpoint from the observed state.
     Checkpoint {
         /// Which lifecycle boundary this checkpoint names.
@@ -284,6 +319,14 @@ impl ScribeProductionWorkloadV1 {
         operations.push(ScribeWorkloadOperationV1::Checkpoint {
             name: ScribeCheckpointNameV1::AfterAck,
         });
+        // The freeze is taken on its own before any publication so that the
+        // boundary between "appendable" and "sealed" is observable at all. A
+        // record that went straight to the tenant flush would perform both
+        // halves inside one call and could only ever name this boundary.
+        operations.push(ScribeWorkloadOperationV1::Seal);
+        operations.push(ScribeWorkloadOperationV1::Checkpoint {
+            name: ScribeCheckpointNameV1::ActiveToStaged,
+        });
         for tenant in 0..tenants.len() {
             operations.push(ScribeWorkloadOperationV1::Flush { tenant });
         }
@@ -297,6 +340,37 @@ impl ScribeProductionWorkloadV1 {
         }
         operations.push(ScribeWorkloadOperationV1::Checkpoint {
             name: ScribeCheckpointNameV1::SnapshotAdvance,
+        });
+        // Recovery, then replay under the record's own identities, then a read
+        // that has to return exactly what was there before either. Replay comes
+        // after the restart on purpose: a replay against a pod that never
+        // stopped proves only that ingest is idempotent, not that a recovered
+        // pod recognises the history it rebuilt.
+        operations.push(ScribeWorkloadOperationV1::Restart);
+        operations.push(ScribeWorkloadOperationV1::Replay);
+        for tenant in 0..tenants.len() {
+            operations.push(ScribeWorkloadOperationV1::Flush { tenant });
+        }
+        for tenant in 0..tenants.len() {
+            for table in 0..2 {
+                operations.push(ScribeWorkloadOperationV1::Read { tenant, table });
+            }
+        }
+        operations.push(ScribeWorkloadOperationV1::Checkpoint {
+            name: ScribeCheckpointNameV1::RestartReplay,
+        });
+        // The last read has to happen before the drain, because after it there
+        // is no pod to read from. The terminal checkpoint therefore reports the
+        // rows as they stood immediately before the drain, together with what
+        // the drain released.
+        for tenant in 0..tenants.len() {
+            for table in 0..2 {
+                operations.push(ScribeWorkloadOperationV1::Read { tenant, table });
+            }
+        }
+        operations.push(ScribeWorkloadOperationV1::Drain);
+        operations.push(ScribeWorkloadOperationV1::Checkpoint {
+            name: ScribeCheckpointNameV1::TerminalDrain,
         });
 
         Self {
@@ -312,8 +386,11 @@ impl ScribeProductionWorkloadV1 {
             operations,
             required_checkpoints: vec![
                 ScribeCheckpointNameV1::AfterAck,
+                ScribeCheckpointNameV1::ActiveToStaged,
                 ScribeCheckpointNameV1::StagedToHot,
                 ScribeCheckpointNameV1::SnapshotAdvance,
+                ScribeCheckpointNameV1::RestartReplay,
+                ScribeCheckpointNameV1::TerminalDrain,
             ],
         }
     }
@@ -342,7 +419,11 @@ impl ScribeProductionWorkloadV1 {
                 ScribeWorkloadOperationV1::Append { tenant, table, .. }
                 | ScribeWorkloadOperationV1::Read { tenant, table } => (*tenant, Some(*table)),
                 ScribeWorkloadOperationV1::Flush { tenant } => (*tenant, None),
-                ScribeWorkloadOperationV1::Checkpoint { .. } => continue,
+                ScribeWorkloadOperationV1::Seal
+                | ScribeWorkloadOperationV1::Restart
+                | ScribeWorkloadOperationV1::Replay
+                | ScribeWorkloadOperationV1::Drain
+                | ScribeWorkloadOperationV1::Checkpoint { .. } => continue,
             };
             let declared = self
                 .tenants
@@ -357,6 +438,74 @@ impl ScribeProductionWorkloadV1 {
             }
         }
         self.assert_read_required_checkpoints_read_for_themselves()?;
+        self.assert_replay_follows_a_restart()?;
+        self.assert_drain_is_terminal()?;
+        Ok(())
+    }
+
+    /// Refuses a record that replays without having restarted first.
+    ///
+    /// A replay against a pod that never stopped proves only that ingest is
+    /// idempotent in memory. The claim the restart boundary makes is stronger:
+    /// a pod that rebuilt its state from durable roots still recognises the
+    /// batch identities it recovered. Ordering the replay after the restart is
+    /// what makes it that claim, so a record that has them the other way round
+    /// describes a weaker run than the one the boundary is named for.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeWorkloadError::Malformed`] when a
+    /// [`ScribeWorkloadOperationV1::Replay`] appears with no
+    /// [`ScribeWorkloadOperationV1::Restart`] before it.
+    fn assert_replay_follows_a_restart(&self) -> Result<(), ScribeWorkloadError> {
+        let mut restarted = false;
+        for operation in &self.operations {
+            match operation {
+                ScribeWorkloadOperationV1::Restart => restarted = true,
+                ScribeWorkloadOperationV1::Replay if !restarted => {
+                    return Err(ScribeWorkloadError::Malformed {
+                        detail: "a replay is declared before any restart",
+                    });
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuses a record that asks for work after the pod is gone.
+    ///
+    /// The drain consumes the pod, so nothing that needs a server can follow
+    /// it. Only a checkpoint may, and only one: the checkpoint reports the
+    /// reads taken before the drain together with what the drain released.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeWorkloadError::Malformed`] when an operation other than
+    /// a single trailing checkpoint follows the drain, or when a record
+    /// declares more than one drain.
+    fn assert_drain_is_terminal(&self) -> Result<(), ScribeWorkloadError> {
+        let Some(drain) = self
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, ScribeWorkloadOperationV1::Drain))
+        else {
+            return Ok(());
+        };
+        let after = &self.operations[drain + 1..];
+        if after
+            .iter()
+            .any(|operation| !matches!(operation, ScribeWorkloadOperationV1::Checkpoint { .. }))
+        {
+            return Err(ScribeWorkloadError::Malformed {
+                detail: "an operation needing a live pod is declared after the terminal drain",
+            });
+        }
+        if after.len() > 1 {
+            return Err(ScribeWorkloadError::Malformed {
+                detail: "more than one checkpoint is declared after the terminal drain",
+            });
+        }
         Ok(())
     }
 
@@ -393,7 +542,11 @@ impl ScribeProductionWorkloadV1 {
                     read_since_checkpoint = false;
                 }
                 ScribeWorkloadOperationV1::Append { .. }
-                | ScribeWorkloadOperationV1::Flush { .. } => {}
+                | ScribeWorkloadOperationV1::Seal
+                | ScribeWorkloadOperationV1::Flush { .. }
+                | ScribeWorkloadOperationV1::Restart
+                | ScribeWorkloadOperationV1::Replay
+                | ScribeWorkloadOperationV1::Drain => {}
             }
         }
         Ok(())
@@ -420,6 +573,21 @@ impl ScribeProductionWorkloadV1 {
             }
         }
         row_digest(&mut rows)
+    }
+
+    /// Returns how many appends the record declares.
+    ///
+    /// A replay re-sends exactly these, so this is also the number of batch
+    /// identities the restart boundary must report as replayed. Counting them
+    /// from the record rather than from the run is what makes the count
+    /// evidence: a run that replayed fewer batches cannot describe itself as
+    /// having replayed them all.
+    #[must_use]
+    pub fn append_count(&self) -> u64 {
+        self.operations
+            .iter()
+            .filter(|operation| matches!(operation, ScribeWorkloadOperationV1::Append { .. }))
+            .count() as u64
     }
 
     /// Returns how many rows the record's appends declare in total.
@@ -451,11 +619,6 @@ fn deterministic_batch_id(seed: u64, ordinal: u64) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
-/// Hashes a row set into the canonical digest both sides compare.
-///
-/// Sorting first is what makes the digest an identity of the *set* of rows: a
-/// run may legitimately return them in a different physical order across
-/// artifacts, and that must not read as data loss.
 /// Returns the SHA-256 of one serialized workload record, lowercase hex.
 ///
 /// The record's wire bytes are the handoff to every other consumer, so a
@@ -468,6 +631,11 @@ pub fn scribe_workload_digest(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Hashes a row set into the canonical digest both sides compare.
+///
+/// Sorting first is what makes the digest an identity of the *set* of rows: a
+/// run may legitimately return them in a different physical order across
+/// artifacts, and that must not read as data loss.
 fn row_digest(rows: &mut [(usize, usize, i64)]) -> String {
     rows.sort_unstable();
     let mut hasher = Sha256::new();
@@ -477,6 +645,44 @@ fn row_digest(rows: &mut [(usize, usize, i64)]) -> String {
         hasher.update(value.to_le_bytes());
     }
     hex::encode(hasher.finalize())
+}
+
+/// What one pod restart and the replay that followed it actually did.
+///
+/// A restart boundary's whole claim is that recovery changed nothing: the pod
+/// came back on its own durable roots, the record's own batch identities were
+/// presented again, and the server recognised every one of them as a retry.
+/// Counting the replayed batches and the rows they added is what separates that
+/// from a run that quietly re-ingested its own history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScribeRecoveryObservationV1 {
+    /// Whether the pod was actually stopped and started again.
+    pub restarted: bool,
+    /// Batch identities the replay presented, all of them the record's own.
+    pub replayed_batches: u64,
+    /// Rows the replay added. Exactly-once ingest makes this zero.
+    pub added_rows: u64,
+}
+
+/// What one terminal drain released.
+///
+/// Every field is a count of something the pod still owned when it stopped.
+/// A drain that leaves any of them non-zero has leaked the resource, which no
+/// row-level assertion can see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScribeDrainObservationV1 {
+    /// Whether every server task stopped.
+    pub servers_stopped: bool,
+    /// Whether every public listener stopped.
+    pub listeners_stopped: bool,
+    /// Appends still admitted when the pod stopped.
+    pub admitted: u64,
+    /// Shard commands still queued when the pod stopped.
+    pub queued: u64,
+    /// Shard WAL streams still open when the pod stopped.
+    pub wal_streams: u64,
+    /// Supervised tasks still retained when the pod stopped.
+    pub supervised_tasks: u64,
 }
 
 /// One observed lifecycle boundary of a production run.
@@ -490,6 +696,12 @@ pub struct ScribeLifecycleCheckpointV1 {
     pub published: BTreeMap<String, Vec<ScribePublishedHotFileV1>>,
     /// Canonical digest of everything read back at this boundary, when read.
     pub observed_row_digest: Option<String>,
+    /// Recovery observed at this boundary, present only at a restart boundary.
+    #[serde(default)]
+    pub recovered: Option<ScribeRecoveryObservationV1>,
+    /// Drain observed at this boundary, present only at a terminal boundary.
+    #[serde(default)]
+    pub drained: Option<ScribeDrainObservationV1>,
 }
 
 /// Everything one production run observed, in checkpoint order.
@@ -588,6 +800,133 @@ impl ScribeProductionEvidenceV1 {
                 None => {}
             }
             Self::assert_publication(*required, observed)?;
+        }
+        self.assert_recovery_evidence(workload)?;
+        self.assert_drain_evidence()?;
+        Ok(())
+    }
+
+    /// Judges the restart boundary's recovery record.
+    ///
+    /// The restart boundary claims three separable things, and a row digest
+    /// sees none of them: that the pod actually stopped and started again,
+    /// that the replay presented every batch identity the record declares, and
+    /// that exactly-once ingest added no row for any of them. A run that
+    /// skipped the restart, replayed a subset, or re-ingested its own history
+    /// can still read back the right rows, so the boundary carries the counts
+    /// and this compares them.
+    ///
+    /// The record is required at the restart boundary and refused at every
+    /// other one: a run that attached recovery evidence to an unrelated
+    /// boundary is describing a restart that boundary did not perform.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeWorkloadError::Evidence`] when the restart boundary
+    /// carries no recovery record, when it reports that the pod was not
+    /// restarted, when the replayed batch count is not the record's own append
+    /// count, when the replay added rows, or when any other boundary carries a
+    /// recovery record.
+    fn assert_recovery_evidence(
+        &self,
+        workload: &ScribeProductionWorkloadV1,
+    ) -> Result<(), ScribeWorkloadError> {
+        for observed in &self.checkpoints {
+            if observed.name != ScribeCheckpointNameV1::RestartReplay {
+                if observed.recovered.is_some() {
+                    return Err(ScribeWorkloadError::Evidence {
+                        detail: format!(
+                            "checkpoint {:?} carries recovery evidence, but it is not the restart boundary",
+                            observed.name
+                        ),
+                    });
+                }
+                continue;
+            }
+            let recovered =
+                observed
+                    .recovered
+                    .ok_or_else(|| ScribeWorkloadError::Evidence {
+                        detail: "the restart boundary carries no recovery evidence".to_owned(),
+                    })?;
+            if !recovered.restarted {
+                return Err(ScribeWorkloadError::Evidence {
+                    detail: "the restart boundary reports that the pod was never restarted"
+                        .to_owned(),
+                });
+            }
+            let expected = workload.append_count();
+            if recovered.replayed_batches != expected {
+                return Err(ScribeWorkloadError::Evidence {
+                    detail: format!(
+                        "the restart boundary replayed {} batch identities, the record declares {expected}",
+                        recovered.replayed_batches
+                    ),
+                });
+            }
+            if recovered.added_rows != 0 {
+                return Err(ScribeWorkloadError::Evidence {
+                    detail: format!(
+                        "a replay of already-acknowledged batch identities added {} rows",
+                        recovered.added_rows
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Judges the terminal boundary's drain record.
+    ///
+    /// Every field counts something the pod still owned when it stopped. A
+    /// leaked admission, queued command, WAL stream, or supervised task is
+    /// invisible to a row assertion because the rows are correct either way,
+    /// so the boundary carries the counts and all of them must be zero.
+    ///
+    /// As with recovery, the record is required at the terminal boundary and
+    /// refused everywhere else.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeWorkloadError::Evidence`] when the terminal boundary
+    /// carries no drain record, when a server or listener did not stop, when
+    /// the pod still owned an admission, queued command, WAL stream, or
+    /// supervised task, or when any other boundary carries a drain record.
+    fn assert_drain_evidence(&self) -> Result<(), ScribeWorkloadError> {
+        for observed in &self.checkpoints {
+            if observed.name != ScribeCheckpointNameV1::TerminalDrain {
+                if observed.drained.is_some() {
+                    return Err(ScribeWorkloadError::Evidence {
+                        detail: format!(
+                            "checkpoint {:?} carries drain evidence, but it is not the terminal boundary",
+                            observed.name
+                        ),
+                    });
+                }
+                continue;
+            }
+            let drained = observed.drained.ok_or_else(|| ScribeWorkloadError::Evidence {
+                detail: "the terminal boundary carries no drain evidence".to_owned(),
+            })?;
+            if !drained.servers_stopped || !drained.listeners_stopped {
+                return Err(ScribeWorkloadError::Evidence {
+                    detail: format!(
+                        "a terminal drain must stop every server and listener, observed {drained:?}"
+                    ),
+                });
+            }
+            for (retained, what) in [
+                (drained.admitted, "admitted append"),
+                (drained.queued, "queued shard command"),
+                (drained.wal_streams, "open WAL stream"),
+                (drained.supervised_tasks, "supervised task"),
+            ] {
+                if retained != 0 {
+                    return Err(ScribeWorkloadError::Evidence {
+                        detail: format!("a drained pod still owned {retained} {what}(s)"),
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -730,40 +1069,23 @@ pub struct ScribeWorkloadRunV1 {
     pub bindings: Vec<ScribeWorkloadTenantBinding>,
 }
 
-/// Runs the canonical workload against one live server through public routes.
+/// Per-pod public operations the workload runner drives.
 impl crate::WyrdTestServer {
-    /// Executes one canonical Scribe production workload and returns its evidence.
+    /// Seeds every tenant and table the record declares, in its declared order.
     ///
-    /// Every operation goes through a public surface: tenant seeding and table
-    /// registration through the server's own catalog, appends through the
-    /// public gRPC ingest route with the record's fixed batch ids, seals
-    /// through the tenant-bound flush control, and reads through the public
-    /// query route. Nothing here fabricates a row, an object, or a durable
-    /// record; the runner only observes what the production path produced.
-    ///
-    /// `cache_mode` is recorded in the evidence and nothing else: this crate
-    /// owns no cache behavior, and the Scribe candidate runs with the cache
-    /// absent.
+    /// Both go through the server's own catalog rather than any fixture, so
+    /// the run is against owners a real caller could have created. Slugs are
+    /// suffixed with a fresh identity so the same record can run repeatedly
+    /// against one database.
     ///
     /// # Errors
     ///
-    /// Returns [`WyrdTestServerError`](crate::WyrdTestServerError) when the
-    /// record does not validate, when a tenant, table, append, flush or read
-    /// on a public route fails, or when a published promotion record cannot be
-    /// read back from its fenced `file_list` row.
-    ///
-    /// # Panics
-    ///
-    /// Does not panic; every failure is reported as an error.
-    pub async fn run_scribe_production_workload(
+    /// Returns an error when a tenant cannot be seeded, when the record names
+    /// a namespace this build does not own, or when a table cannot be created.
+    pub async fn seed_scribe_workload_owners_for_test(
         &self,
         workload: &ScribeProductionWorkloadV1,
-        cache_mode: ScribeCacheMode,
-    ) -> Result<ScribeWorkloadRunV1, crate::WyrdTestServerError> {
-        workload
-            .validate()
-            .map_err(|error| crate::WyrdTestServerError::Start(error.to_string()))?;
-
+    ) -> Result<Vec<ScribeWorkloadTenantBinding>, crate::WyrdTestServerError> {
         let mut bindings: Vec<ScribeWorkloadTenantBinding> = Vec::new();
         for (ordinal, declared) in workload.tenants.iter().enumerate() {
             let slug = format!("{}-{}", declared.slug, Uuid::now_v7().simple());
@@ -793,92 +1115,70 @@ impl crate::WyrdTestServer {
             });
             debug_assert_eq!(bindings.len(), ordinal + 1);
         }
+        Ok(bindings)
+    }
 
-        let mut acknowledged = 0_u64;
-        // Reads observed since the *previous* checkpoint. A checkpoint consumes
-        // this buffer, so every digest is evidence of a read that happened
-        // after the boundary before it. Carrying reads forward would let one
-        // early read vouch for every later boundary, and accumulating repeated
-        // full reads would hash duplicated rows into a false mismatch.
-        let mut read_since_checkpoint: Vec<(usize, usize, i64)> = Vec::new();
-        let mut checkpoints = Vec::new();
-        for operation in &workload.operations {
-            match operation {
-                ScribeWorkloadOperationV1::Append {
-                    tenant,
-                    table,
-                    batch_id,
-                    rows,
-                } => {
-                    let binding = binding_at(&bindings, *tenant)?;
-                    let declared = table_at(workload, *tenant, *table)?;
-                    self.append_workload_batch_for_test(
+    /// Reads every published hot object the record's owners currently have.
+    ///
+    /// Keyed by the record's declared slug rather than the seeded one, so the
+    /// evidence a run produces is comparable across runs of the same record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the record names a namespace this build does not
+    /// own, or when a published promotion record cannot be read back from its
+    /// fenced `file_list` row.
+    pub async fn observe_scribe_workload_publication_for_test(
+        &self,
+        workload: &ScribeProductionWorkloadV1,
+        bindings: &[ScribeWorkloadTenantBinding],
+    ) -> Result<BTreeMap<String, Vec<ScribePublishedHotFileV1>>, crate::WyrdTestServerError> {
+        let mut published: BTreeMap<String, Vec<ScribePublishedHotFileV1>> = BTreeMap::new();
+        for (ordinal, binding) in bindings.iter().enumerate() {
+            let mut records = Vec::new();
+            for table in &workload.tenants[ordinal].tables {
+                records.extend(
+                    self.published_hot_files_for_test(
                         binding.tenant,
-                        &declared.fqn(),
-                        *batch_id,
-                        rows,
+                        namespace_of(table)?.as_str(),
+                        &table.name,
                     )
-                    .await?;
-                    acknowledged += rows.len() as u64;
-                }
-                ScribeWorkloadOperationV1::Flush { tenant } => {
-                    let binding = binding_at(&bindings, *tenant)?;
-                    self.flush_bifrost_for_tenant(binding.tenant).await?;
-                }
-                ScribeWorkloadOperationV1::Read { tenant, table } => {
-                    let binding = binding_at(&bindings, *tenant)?;
-                    let declared = table_at(workload, *tenant, *table)?;
-                    for value in self
-                        .read_workload_table_for_test(binding.tenant, &declared.fqn())
-                        .await?
-                    {
-                        read_since_checkpoint.push((*tenant, *table, value));
-                    }
-                }
-                ScribeWorkloadOperationV1::Checkpoint { name } => {
-                    let mut published: BTreeMap<String, Vec<ScribePublishedHotFileV1>> =
-                        BTreeMap::new();
-                    for (ordinal, binding) in bindings.iter().enumerate() {
-                        let mut records = Vec::new();
-                        for table in &workload.tenants[ordinal].tables {
-                            records.extend(
-                                self.published_hot_files_for_test(
-                                    binding.tenant,
-                                    namespace_of(table)?.as_str(),
-                                    &table.name,
-                                )
-                                .await?
-                                .into_iter()
-                                .map(|observed| observed.promotion_record),
-                            );
-                        }
-                        published.insert(binding.slug.clone(), records);
-                    }
-                    checkpoints.push(ScribeLifecycleCheckpointV1 {
-                        name: *name,
-                        acknowledged_rows: acknowledged,
-                        published,
-                        observed_row_digest: {
-                            let mut observed = std::mem::take(&mut read_since_checkpoint);
-                            if observed.is_empty() {
-                                None
-                            } else {
-                                Some(row_digest(&mut observed))
-                            }
-                        },
-                    });
+                    .await?
+                    .into_iter()
+                    .map(|observed| observed.promotion_record),
+                );
+            }
+            published.insert(binding.slug.clone(), records);
+        }
+        Ok(published)
+    }
+
+    /// Reads every table the record declares and returns the observed triples.
+    ///
+    /// Used both to fill a checkpoint's digest and to measure what a replay
+    /// added: the replay's whole claim is that the count did not move, which
+    /// is only observable by reading either side of it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a public read fails for any declared table.
+    pub async fn read_scribe_workload_rows_for_test(
+        &self,
+        workload: &ScribeProductionWorkloadV1,
+        bindings: &[ScribeWorkloadTenantBinding],
+    ) -> Result<Vec<(usize, usize, i64)>, crate::WyrdTestServerError> {
+        let mut rows = Vec::new();
+        for (tenant, binding) in bindings.iter().enumerate() {
+            for (table, declared) in workload.tenants[tenant].tables.iter().enumerate() {
+                for value in self
+                    .read_workload_table_for_test(binding.tenant, &declared.fqn())
+                    .await?
+                {
+                    rows.push((tenant, table, value));
                 }
             }
         }
-
-        Ok(ScribeWorkloadRunV1 {
-            evidence: ScribeProductionEvidenceV1 {
-                version: workload.version,
-                cache_mode,
-                checkpoints,
-            },
-            bindings,
-        })
+        Ok(rows)
     }
 
     /// Appends one fixed-identity batch through the public gRPC ingest route.
@@ -1071,7 +1371,7 @@ mod tests {
 
     use super::*;
 
-    /// AC22/AC23 unit owner: the canonical workload survives its own wire form
+    /// The canonical workload survives its own wire form
     /// and its evidence comparator is exact.
     ///
     /// The record is a handoff: Scribe, the cache task and Forge all run the
@@ -1099,11 +1399,81 @@ mod tests {
         let workload = ScribeProductionWorkloadV1::canonical();
         workload.validate().expect("the canonical record validates");
 
+        // The record itself has to declare the whole lifecycle. A consumer that
+        // executed only the operations named here would otherwise never restart
+        // the pod, never replay its own batches, and never drain it, and the
+        // comparator's recovery and drain refusals would guard a boundary no
+        // run could reach.
+        for required in [
+            ScribeWorkloadOperationV1::Restart,
+            ScribeWorkloadOperationV1::Replay,
+            ScribeWorkloadOperationV1::Drain,
+        ] {
+            assert!(
+                workload.operations.contains(&required),
+                "the canonical operation sequence must declare {required:?}"
+            );
+        }
+        let restart_at = workload
+            .operations
+            .iter()
+            .position(|operation| *operation == ScribeWorkloadOperationV1::Restart)
+            .expect("the canonical record restarts");
+        let replay_at = workload
+            .operations
+            .iter()
+            .position(|operation| *operation == ScribeWorkloadOperationV1::Replay)
+            .expect("the canonical record replays");
+        let drain_at = workload
+            .operations
+            .iter()
+            .position(|operation| *operation == ScribeWorkloadOperationV1::Drain)
+            .expect("the canonical record drains");
+        assert!(
+            restart_at < replay_at,
+            "replay is what a restarted pod does with its own history; replaying \
+             before the restart would prove nothing about recovery"
+        );
+        assert!(
+            replay_at < drain_at,
+            "the terminal drain destroys the pod, so every operation must precede it"
+        );
+
+        // Exactly the six named boundaries, in the one order a pod can reach
+        // them. Any other set is a different lifecycle contract.
+        assert_eq!(
+            workload.required_checkpoints,
+            vec![
+                ScribeCheckpointNameV1::AfterAck,
+                ScribeCheckpointNameV1::ActiveToStaged,
+                ScribeCheckpointNameV1::StagedToHot,
+                ScribeCheckpointNameV1::SnapshotAdvance,
+                ScribeCheckpointNameV1::RestartReplay,
+                ScribeCheckpointNameV1::TerminalDrain,
+            ],
+            "the canonical record declares exactly the six ordered lifecycle boundaries"
+        );
+
         // Round trip: nothing about the record is process-local.
         let encoded = serde_json::to_vec(&workload).expect("the record serializes");
         let decoded: ScribeProductionWorkloadV1 =
             serde_json::from_slice(&encoded).expect("the record deserializes");
         assert_eq!(decoded, workload, "the wire form must be lossless");
+
+        // The handoff is the bytes, not the value: Scribe, the cache task and
+        // Forge each execute a copy that travelled as JSON. Re-serializing the
+        // decoded record must reproduce those exact bytes, so a consumer can
+        // identify the record it ran by digest alone.
+        let re_encoded = serde_json::to_vec(&decoded).expect("the decoded record serializes");
+        assert_eq!(
+            re_encoded, encoded,
+            "the serialized form must be byte-stable across a round trip"
+        );
+        assert_eq!(
+            scribe_workload_digest(&re_encoded),
+            scribe_workload_digest(&encoded),
+            "the handoff digest must identify the record rather than the process"
+        );
         assert_eq!(
             decoded.expected_row_digest(),
             workload.expected_row_digest(),
@@ -1150,6 +1520,23 @@ mod tests {
                     } else {
                         None
                     },
+                    recovered: (*name == ScribeCheckpointNameV1::RestartReplay).then_some(
+                        ScribeRecoveryObservationV1 {
+                            restarted: true,
+                            replayed_batches: workload.append_count(),
+                            added_rows: 0,
+                        },
+                    ),
+                    drained: (*name == ScribeCheckpointNameV1::TerminalDrain).then_some(
+                        ScribeDrainObservationV1 {
+                            servers_stopped: true,
+                            listeners_stopped: true,
+                            admitted: 0,
+                            queued: 0,
+                            wal_streams: 0,
+                            supervised_tasks: 0,
+                        },
+                    ),
                 })
                 .collect(),
         };
@@ -1279,6 +1666,172 @@ mod tests {
             .assert_matches(&workload, ScribeCacheMode::Enabled)
             .expect("the same evidence is accepted when judged as the run it was");
 
+        // Recovery evidence: the restart boundary's whole claim is the three
+        // counts, so removing them, contradicting any one of them, or
+        // attaching them to a boundary that did not restart must all fail
+        // closed. None of these is visible in a row digest.
+        let restart = conforming
+            .checkpoints
+            .iter()
+            .position(|checkpoint| checkpoint.name == ScribeCheckpointNameV1::RestartReplay)
+            .expect("the canonical record requires a restart boundary");
+        let terminal = conforming
+            .checkpoints
+            .iter()
+            .position(|checkpoint| checkpoint.name == ScribeCheckpointNameV1::TerminalDrain)
+            .expect("the canonical record requires a terminal boundary");
+
+        let mut unrecovered = conforming.clone();
+        unrecovered.checkpoints[restart].recovered = None;
+        assert!(
+            unrecovered
+                .assert_matches(&workload, ScribeCacheMode::Disabled)
+                .is_err(),
+            "a restart boundary with no recovery evidence must be refused"
+        );
+
+        for (label, mutation) in [
+            (
+                "a pod that was never restarted",
+                ScribeRecoveryObservationV1 {
+                    restarted: false,
+                    replayed_batches: workload.append_count(),
+                    added_rows: 0,
+                },
+            ),
+            (
+                "a replay that presented fewer batches than the record declares",
+                ScribeRecoveryObservationV1 {
+                    restarted: true,
+                    replayed_batches: workload.append_count() - 1,
+                    added_rows: 0,
+                },
+            ),
+            (
+                "a replay that re-ingested its own history",
+                ScribeRecoveryObservationV1 {
+                    restarted: true,
+                    replayed_batches: workload.append_count(),
+                    added_rows: 1,
+                },
+            ),
+        ] {
+            let mut contradicted = conforming.clone();
+            contradicted.checkpoints[restart].recovered = Some(mutation);
+            assert!(
+                contradicted
+                    .assert_matches(&workload, ScribeCacheMode::Disabled)
+                    .is_err(),
+                "{label} must be refused"
+            );
+        }
+
+        // Duplicated onto a boundary that performed no restart. The counts are
+        // individually correct, which is exactly why the comparator has to
+        // judge where they are attached rather than only what they say.
+        let mut misattributed = conforming.clone();
+        misattributed.checkpoints[0].recovered = conforming.checkpoints[restart].recovered;
+        assert!(
+            misattributed
+                .assert_matches(&workload, ScribeCacheMode::Disabled)
+                .is_err(),
+            "recovery evidence attached to a boundary that did not restart must be refused"
+        );
+
+        // Drain evidence: every field counts something the pod still owned, so
+        // a missing record, a leaked resource, or a listener that did not stop
+        // must all fail closed.
+        let mut undrained = conforming.clone();
+        undrained.checkpoints[terminal].drained = None;
+        assert!(
+            undrained
+                .assert_matches(&workload, ScribeCacheMode::Disabled)
+                .is_err(),
+            "a terminal boundary with no drain evidence must be refused"
+        );
+
+        let clean = ScribeDrainObservationV1 {
+            servers_stopped: true,
+            listeners_stopped: true,
+            admitted: 0,
+            queued: 0,
+            wal_streams: 0,
+            supervised_tasks: 0,
+        };
+        for (label, mutation) in [
+            (
+                "a server that did not stop",
+                ScribeDrainObservationV1 {
+                    servers_stopped: false,
+                    ..clean
+                },
+            ),
+            (
+                "a listener that did not stop",
+                ScribeDrainObservationV1 {
+                    listeners_stopped: false,
+                    ..clean
+                },
+            ),
+            (
+                "a leaked admission",
+                ScribeDrainObservationV1 {
+                    admitted: 1,
+                    ..clean
+                },
+            ),
+            (
+                "a leaked shard command",
+                ScribeDrainObservationV1 { queued: 1, ..clean },
+            ),
+            (
+                "a leaked WAL stream",
+                ScribeDrainObservationV1 {
+                    wal_streams: 1,
+                    ..clean
+                },
+            ),
+            (
+                "a retained supervised task",
+                ScribeDrainObservationV1 {
+                    supervised_tasks: 1,
+                    ..clean
+                },
+            ),
+        ] {
+            let mut leaked = conforming.clone();
+            leaked.checkpoints[terminal].drained = Some(mutation);
+            assert!(
+                leaked
+                    .assert_matches(&workload, ScribeCacheMode::Disabled)
+                    .is_err(),
+                "{label} must be refused"
+            );
+        }
+
+        let mut premature = conforming.clone();
+        premature.checkpoints[0].drained = Some(clean);
+        assert!(
+            premature
+                .assert_matches(&workload, ScribeCacheMode::Disabled)
+                .is_err(),
+            "drain evidence attached to a boundary that drained nothing must be refused"
+        );
+
+        // Swapped: each observation is well formed and both are present, but
+        // each is attached to the boundary the other one describes.
+        let mut swapped = conforming.clone();
+        swapped.checkpoints[restart].recovered = None;
+        swapped.checkpoints[restart].drained = conforming.checkpoints[terminal].drained;
+        swapped.checkpoints[terminal].drained = None;
+        swapped.checkpoints[terminal].recovered = conforming.checkpoints[restart].recovered;
+        assert!(
+            swapped
+                .assert_matches(&workload, ScribeCacheMode::Disabled)
+                .is_err(),
+            "recovery and drain evidence exchanged between their boundaries must be refused"
+        );
+
         // Evidence claiming another contract version is refused.
         let mut foreign = conforming;
         foreign.version = SCRIBE_PRODUCTION_WORKLOAD_VERSION + 1;
@@ -1290,7 +1843,7 @@ mod tests {
         );
     }
 
-    /// AC22 unit owner: every read-required boundary reads back for itself.
+    /// Every read-required boundary reads back for itself.
     ///
     /// A boundary such as `RestartReplay` or `TerminalDrain` claims the rows
     /// are still exactly readable *after* that transition. The runner binds
@@ -1312,9 +1865,25 @@ mod tests {
             .validate()
             .expect("the canonical record reads before its read-required boundary");
 
+        // These cases append boundaries, so they build on the record's prefix
+        // up to the terminal drain: the drain destroys the pod, and a record
+        // that declares work after it is refused for that reason instead of
+        // for the read-reuse this owner is about.
+        let mut base = workload.clone();
+        let drain = base
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, ScribeWorkloadOperationV1::Drain))
+            .expect("the canonical record ends in a terminal drain");
+        base.operations.truncate(drain);
+        base.required_checkpoints
+            .retain(|name| *name != ScribeCheckpointNameV1::TerminalDrain);
+        base.validate()
+            .expect("the record's pre-drain prefix is well formed on its own");
+
         // A read-required boundary with no read of its own is refused, even
         // though an earlier boundary in the same run was read for.
-        let mut stale = workload.clone();
+        let mut stale = base.clone();
         stale
             .operations
             .push(ScribeWorkloadOperationV1::Checkpoint {
@@ -1326,7 +1895,7 @@ mod tests {
         );
 
         // Giving that boundary its own read makes the same record valid.
-        let mut fresh = workload.clone();
+        let mut fresh = base;
         fresh.operations.push(ScribeWorkloadOperationV1::Read {
             tenant: 0,
             table: 0,
@@ -1416,4 +1985,261 @@ mod tests {
             },
         )
     }
+}
+
+/// Drives one canonical workload against a cluster it owns for the whole run.
+impl crate::bifrost::WyrdTestCluster {
+    /// Executes one canonical Scribe production workload and returns its evidence.
+    ///
+    /// Every operation goes through a public surface: tenant seeding and table
+    /// registration through the server's own catalog, appends through the
+    /// public gRPC ingest route with the record's fixed batch ids, the freeze
+    /// and publication through the pod's own lifecycle controls, reads through
+    /// the public query route, and restart and drain through the cluster's node
+    /// lifecycle. Nothing here fabricates a row, an object, or a durable
+    /// record; the runner only observes what the production path produced.
+    ///
+    /// The cluster is consumed because the record's terminal operation is a
+    /// drain: after it there is no pod, which is exactly what makes the drain
+    /// evidence a terminal observation rather than a mid-run sample. Taking
+    /// ownership is what lets one runner cover the whole lifecycle instead of
+    /// stopping at publication and leaving recovery to each caller's own
+    /// hand-written epilogue.
+    ///
+    /// `cache_mode` is recorded in the evidence and nothing else: this crate
+    /// owns no cache behavior, and the Scribe candidate runs with the cache
+    /// absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdTestServerError`](crate::WyrdTestServerError) when the
+    /// record does not validate, when the cluster has no running pod at an
+    /// operation that needs one, when a tenant, table, append, seal, flush or
+    /// read on a public route fails, when a node cannot be stopped or
+    /// restarted, when the terminal drain fails, or when a published promotion
+    /// record cannot be read back from its fenced `file_list` row.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic; every failure is reported as an error.
+    pub async fn run_scribe_production_workload(
+        self,
+        workload: &ScribeProductionWorkloadV1,
+        cache_mode: ScribeCacheMode,
+    ) -> Result<ScribeWorkloadRunV1, crate::WyrdTestServerError> {
+        workload
+            .validate()
+            .map_err(|error| crate::WyrdTestServerError::Start(error.to_string()))?;
+
+        let mut cluster = Some(self);
+        let node = running_pod(&cluster)?.node_id();
+        let bindings = running_pod(&cluster)?
+            .seed_scribe_workload_owners_for_test(workload)
+            .await?;
+
+        let mut acknowledged = 0_u64;
+        // Reads observed since the *previous* checkpoint. A checkpoint consumes
+        // this buffer, so every digest is evidence of a read that happened
+        // after the boundary before it. Carrying reads forward would let one
+        // early read vouch for every later boundary, and accumulating repeated
+        // full reads would hash duplicated rows into a false mismatch.
+        let mut read_since_checkpoint: Vec<(usize, usize, i64)> = Vec::new();
+        let mut checkpoints = Vec::new();
+        let mut restarted = false;
+        let mut recovered: Option<ScribeRecoveryObservationV1> = None;
+        let mut drained: Option<ScribeDrainObservationV1> = None;
+        // Publication as it stood immediately before the drain. The terminal
+        // boundary is defined by published objects, and after the drain there
+        // is no pod left to ask, so the observation is taken while there still
+        // is one.
+        let mut published_at_drain: Option<BTreeMap<String, Vec<ScribePublishedHotFileV1>>> = None;
+
+        for operation in &workload.operations {
+            match operation {
+                ScribeWorkloadOperationV1::Append {
+                    tenant,
+                    table,
+                    batch_id,
+                    rows,
+                } => {
+                    let binding = binding_at(&bindings, *tenant)?;
+                    let declared = table_at(workload, *tenant, *table)?;
+                    running_pod(&cluster)?
+                        .append_workload_batch_for_test(
+                            binding.tenant,
+                            &declared.fqn(),
+                            *batch_id,
+                            rows,
+                        )
+                        .await?;
+                    acknowledged += rows.len() as u64;
+                }
+                ScribeWorkloadOperationV1::Seal => {
+                    running_pod(&cluster)?
+                        .seal_bifrost_writable_for_test()
+                        .await?;
+                }
+                ScribeWorkloadOperationV1::Flush { tenant } => {
+                    // The declared tenant index is still validated: a record
+                    // naming a tenant the run never bound is a malformed
+                    // record, even though the pod flush that follows covers
+                    // every bucket the pod holds regardless of tenant.
+                    binding_at(&bindings, *tenant)?;
+                    running_pod(&cluster)?.flush_bifrost().await?;
+                }
+                ScribeWorkloadOperationV1::Read { tenant, table } => {
+                    let binding = binding_at(&bindings, *tenant)?;
+                    let declared = table_at(workload, *tenant, *table)?;
+                    for value in running_pod(&cluster)?
+                        .read_workload_table_for_test(binding.tenant, &declared.fqn())
+                        .await?
+                    {
+                        read_since_checkpoint.push((*tenant, *table, value));
+                    }
+                }
+                ScribeWorkloadOperationV1::Restart => {
+                    let owner = cluster.as_mut().ok_or_else(|| {
+                        crate::WyrdTestServerError::Start(
+                            "the record restarts a pod after the terminal drain".to_owned(),
+                        )
+                    })?;
+                    owner
+                        .stop_node(node)
+                        .await
+                        .map_err(|error| crate::WyrdTestServerError::Start(error.to_string()))?;
+                    owner
+                        .restart_node(node)
+                        .await
+                        .map_err(|error| crate::WyrdTestServerError::Start(error.to_string()))?;
+                    restarted = true;
+                }
+                ScribeWorkloadOperationV1::Replay => {
+                    // Rows either side of the replay, read through the public
+                    // route. The replay's whole claim is that this count does
+                    // not move, and it is only observable by reading twice.
+                    let before = running_pod(&cluster)?
+                        .read_scribe_workload_rows_for_test(workload, &bindings)
+                        .await?
+                        .len() as u64;
+                    let mut replayed = 0_u64;
+                    for replayed_operation in &workload.operations {
+                        if let ScribeWorkloadOperationV1::Append {
+                            tenant,
+                            table,
+                            batch_id,
+                            rows,
+                        } = replayed_operation
+                        {
+                            let binding = binding_at(&bindings, *tenant)?;
+                            let declared = table_at(workload, *tenant, *table)?;
+                            running_pod(&cluster)?
+                                .append_workload_batch_for_test(
+                                    binding.tenant,
+                                    &declared.fqn(),
+                                    *batch_id,
+                                    rows,
+                                )
+                                .await?;
+                            replayed += 1;
+                        }
+                    }
+                    let after = running_pod(&cluster)?
+                        .read_scribe_workload_rows_for_test(workload, &bindings)
+                        .await?
+                        .len() as u64;
+                    recovered = Some(ScribeRecoveryObservationV1 {
+                        restarted,
+                        replayed_batches: replayed,
+                        added_rows: after.saturating_sub(before),
+                    });
+                }
+                ScribeWorkloadOperationV1::Drain => {
+                    let owner = cluster.take().ok_or_else(|| {
+                        crate::WyrdTestServerError::Start(
+                            "the record drains the pod twice".to_owned(),
+                        )
+                    })?;
+                    let observed = owner
+                        .server(0)
+                        .ok_or_else(|| {
+                            crate::WyrdTestServerError::Start(
+                                "the cluster has no running pod to drain".to_owned(),
+                            )
+                        })?
+                        .observe_scribe_workload_publication_for_test(workload, &bindings)
+                        .await?;
+                    published_at_drain = Some(observed);
+                    let inspection = owner
+                        .shutdown_and_inspect()
+                        .await
+                        .map_err(|error| crate::WyrdTestServerError::Start(error.to_string()))?;
+                    drained = Some(ScribeDrainObservationV1 {
+                        servers_stopped: inspection.servers_stopped,
+                        listeners_stopped: inspection.listeners_stopped,
+                        admitted: inspection.scribe_inflight,
+                        queued: inspection.scribe_queued,
+                        wal_streams: inspection.scribe_wal_streams,
+                        supervised_tasks: inspection.supervised_tasks,
+                    });
+                }
+                ScribeWorkloadOperationV1::Checkpoint { name } => {
+                    let published = match published_at_drain.take() {
+                        Some(observed) => observed,
+                        None => {
+                            running_pod(&cluster)?
+                                .observe_scribe_workload_publication_for_test(workload, &bindings)
+                                .await?
+                        }
+                    };
+                    checkpoints.push(ScribeLifecycleCheckpointV1 {
+                        name: *name,
+                        acknowledged_rows: acknowledged,
+                        published,
+                        observed_row_digest: {
+                            let mut observed = std::mem::take(&mut read_since_checkpoint);
+                            if observed.is_empty() {
+                                None
+                            } else {
+                                Some(row_digest(&mut observed))
+                            }
+                        },
+                        recovered: recovered.take(),
+                        drained: drained.take(),
+                    });
+                }
+            }
+        }
+
+        Ok(ScribeWorkloadRunV1 {
+            evidence: ScribeProductionEvidenceV1 {
+                version: workload.version,
+                cache_mode,
+                checkpoints,
+            },
+            bindings,
+        })
+    }
+}
+
+/// Borrows the cluster's running pod, or names why there is not one.
+///
+/// Every per-pod operation goes through here so that "the record asked for work
+/// after the terminal drain" is reported once, as itself, rather than as a
+/// panic on an absent server at whichever operation happened to be next.
+///
+/// # Errors
+///
+/// Returns [`WyrdTestServerError`](crate::WyrdTestServerError) when the cluster
+/// has already been drained, or when it holds no pod at index zero.
+fn running_pod(
+    cluster: &Option<crate::bifrost::WyrdTestCluster>,
+) -> Result<&crate::WyrdTestServer, crate::WyrdTestServerError> {
+    cluster
+        .as_ref()
+        .and_then(|owner| owner.server(0))
+        .ok_or_else(|| {
+            crate::WyrdTestServerError::Start(
+                "the record needs a running pod, but the cluster has been drained".to_owned(),
+            )
+        })
 }

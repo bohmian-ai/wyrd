@@ -268,16 +268,6 @@ fn push_scribe_cut(
     buffer.extend_from_slice(&cut.writer_epoch.to_be_bytes());
     push_time_partition(buffer, cut.start_partition);
     push_time_partition(buffer, cut.end_partition);
-    buffer.extend_from_slice(&cut.persisted_cursor.to_be_bytes());
-    push_count(
-        buffer,
-        cut.persisted_ranges.len(),
-        "scribe_cut.persisted_ranges",
-    )?;
-    for range in &cut.persisted_ranges {
-        buffer.extend_from_slice(&range.start_lsn.to_be_bytes());
-        buffer.extend_from_slice(&range.end_lsn.to_be_bytes());
-    }
     let batch_count = cut.maximum_batch_count;
     buffer.extend_from_slice(&batch_count.to_be_bytes());
     buffer.extend_from_slice(&cut.maximum_retained_bytes.to_be_bytes());
@@ -394,20 +384,14 @@ mod tests {
     use crate::vala::api::{ScribeProviderCut, TimeGranularityWire, TimePartitionWire};
 
     /// Builds the normative v3 Scribe cut: writer epoch 7, the two hourly
-    /// partitions `2026-08-23T14:00:00Z` and `2026-08-23T15:00:00Z`, persisted
-    /// cursor 41 with the single range `[1, 40]`, 16 maximum batches, and 1 MiB
-    /// maximum retained bytes. The projection closure lives on the enclosing
-    /// assignment, never on the cut.
+    /// partitions `2026-08-23T14:00:00Z` and `2026-08-23T15:00:00Z`, 16 maximum
+    /// batches, and 1 MiB maximum retained bytes. The projection closure lives
+    /// on the enclosing assignment, never on the cut.
     fn normative_scribe_cut() -> ScribeProviderCut {
         ScribeProviderCut {
             writer_epoch: 7,
             start_partition: hour_partition(1_787_493_600_000_000),
             end_partition: hour_partition(1_787_497_200_000_000),
-            persisted_cursor: 41,
-            persisted_ranges: vec![crate::vala::api::PersistedWalRange {
-                start_lsn: 1,
-                end_lsn: 40,
-            }],
             maximum_batch_count: 16,
             maximum_retained_bytes: 1_048_576,
         }
@@ -425,7 +409,7 @@ mod tests {
     /// `00112233-4455-6677-8899-aabbccddeeff`, table `logs.records`, fingerprint
     /// `00..1f`, one file, three required columns carried once on the
     /// assignment, a single `Eq(service_name, "api")` predicate, and the
-    /// normative Scribe cut must encode to exactly 305 bytes and hash to the
+    /// normative Scribe cut must encode to exactly 277 bytes and hash to the
     /// fixed digest below. Asserting both the byte length and the hash prevents
     /// a compensating pair of layout mistakes from passing.
     #[test]
@@ -458,14 +442,14 @@ mod tests {
         let bytes = encode_assignment_authority_bytes(std::slice::from_ref(&assignment)).unwrap();
         assert_eq!(
             bytes.len(),
-            305,
-            "normative vector must encode to exactly 305 bytes"
+            277,
+            "normative vector must encode to exactly 277 bytes"
         );
 
         let digest = assignment_authority_digest(std::slice::from_ref(&assignment)).unwrap();
         assert_eq!(
             digest,
-            "a8ec167a1925681edb74bee14a50a3c9e682bc3c0f62f3bead333e5156711250"
+            "949a3d1c1e779d23e57fbd1569fab6cdbcd65dd30eac5a0dfa1ab5facd7b4394"
         );
     }
 

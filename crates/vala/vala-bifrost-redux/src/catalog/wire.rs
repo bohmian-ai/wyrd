@@ -176,17 +176,73 @@ fn to_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use wyrd_spec::vala::{
+        PRINCIPAL_ID, RESERVED_CORRELATION_COLUMNS, RESERVED_MANAGED_COLUMNS,
+    };
+
     use super::*;
 
+    /// Every canonical reserved name, managed and correlation alike, is refused.
+    ///
+    /// The sets are iterated from the spec constants rather than spelled out
+    /// here. A hand-written list silently stops covering a name the moment one
+    /// is added to the contract, which is how `principal_id` went unproven
+    /// while it was already reserved.
     #[test]
-    fn reserved_fields_are_rejected() {
-        for name in ["run_id", "card_uid", "wyrd_event_time", "data_tenant_id"] {
-            let error = reject_reserved_field_names(&[Field::new(name, DataType::Int64, true)])
-                .expect_err("reserved field must fail");
-            assert!(matches!(
-                error,
-                BifrostCatalogError::ReservedColumn(column) if column == name
-            ));
+    fn every_canonical_reserved_field_name_is_rejected() {
+        let canonical = RESERVED_MANAGED_COLUMNS
+            .iter()
+            .chain(RESERVED_CORRELATION_COLUMNS.iter());
+        for name in canonical {
+            let error = reject_reserved_field_names(&[Field::new(*name, DataType::Int64, true)])
+                .expect_err("every reserved field must fail");
+            assert!(
+                matches!(error, BifrostCatalogError::ReservedColumn(ref column) if column == name),
+                "reserved column {name} was refused as {error:?}"
+            );
         }
+        assert!(
+            RESERVED_CORRELATION_COLUMNS.contains(&PRINCIPAL_ID),
+            "the server-stamped principal column must stay reserved"
+        );
+    }
+
+    /// Projection classifies exactly the correlation columns, hides the managed
+    /// ones, and leaves user fields unannotated.
+    ///
+    /// The correlation class is what tells a client which columns it may not
+    /// declare but will still read back. Missing one member — again, the case
+    /// `principal_id` was in — would present a server-stamped column as an
+    /// ordinary user field.
+    #[test]
+    fn stored_schema_projection_classifies_every_correlation_column() {
+        let mut fields: Vec<Field> = RESERVED_MANAGED_COLUMNS
+            .iter()
+            .chain(RESERVED_CORRELATION_COLUMNS.iter())
+            .map(|name| Field::new(*name, DataType::Utf8, true))
+            .collect();
+        fields.push(Field::new("value", DataType::Int64, true));
+        let schema = Schema::new(fields);
+
+        let projected =
+            fields_from_stored_schema(&schema).expect("the stored schema projects onto the wire");
+
+        let classified: Vec<&str> = projected
+            .iter()
+            .filter(|spec| {
+                spec.metadata.get(COLUMN_CLASS_KEY).map(String::as_str)
+                    == Some(COLUMN_CLASS_CORRELATION)
+            })
+            .map(|spec| spec.name.as_str())
+            .collect();
+        assert_eq!(
+            classified, RESERVED_CORRELATION_COLUMNS,
+            "exactly the canonical correlation columns carry the correlation class"
+        );
+        assert_eq!(
+            projected.len(),
+            RESERVED_CORRELATION_COLUMNS.len() + 1,
+            "managed columns must not reach the wire: {projected:?}"
+        );
     }
 }

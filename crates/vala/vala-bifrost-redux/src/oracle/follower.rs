@@ -35,7 +35,6 @@ use crate::catalog::layout::TimePartition;
 use crate::catalog::{BifrostCatalog, TableRef, TenantTableBinding as CatalogTableBinding};
 use crate::scribe::stream_identity::StreamIdentity;
 use crate::scribe::tail_rpc::{FetchLiveTailRequest, FetchLiveTailService, HotBatch};
-use crate::scribe::wal::WalLsn;
 
 /// Hard private plan-size default enforced before protobuf decoding.
 pub const DEFAULT_MAX_PHYSICAL_PLAN_BYTES: usize = 8 * 1024 * 1024;
@@ -599,16 +598,6 @@ where
         if u64::try_from(stream.writer_epoch.as_i64()).ok() != Some(cut.writer_epoch) {
             return Err("Scribe writer epoch differs from the authenticated cut".to_owned());
         }
-        let persisted_lsn_ranges = cut
-            .persisted_ranges
-            .iter()
-            .map(|range| {
-                Ok((
-                    checked_wal_lsn(range.start_lsn)?,
-                    checked_wal_lsn(range.end_lsn)?,
-                ))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
         let binding = crate::catalog::TenantTableBinding::resolve((
             assignment.binding.tenant_id,
             assignment_table(&assignment.binding)?,
@@ -655,8 +644,6 @@ where
                 target_stream: stream,
                 start_partition,
                 end_partition,
-                after_lsn: checked_wal_lsn(cut.persisted_cursor)?,
-                persisted_lsn_ranges,
                 required_columns: assignment.required_columns.clone(),
                 predicates: assignment.predicates.clone(),
                 max_batches,
@@ -824,18 +811,6 @@ fn physical_file_location(store: &str, path: &str) -> String {
         format!("{store}{path}")
     } else {
         format!("{store}/{path}")
-    }
-}
-
-/// Converts one validated wire endpoint into the Redux WAL owner type.
-///
-/// # Errors
-/// Returns an error when the endpoint exceeds Redux's signed persistence bound.
-fn checked_wal_lsn(value: u64) -> Result<WalLsn, String> {
-    if value > i64::MAX as u64 {
-        Err("WAL endpoint exceeds the Redux persistence bound".to_owned())
-    } else {
-        Ok(WalLsn::new(value))
     }
 }
 
@@ -1314,6 +1289,8 @@ pub fn authenticated_preflight(
 #[cfg(test)]
 pub(crate) mod tests {
     //! Authenticated preflight and role-local provider behavior proofs.
+
+    use crate::scribe::wal::WalLsn;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Builds one admitted follower session grant for in-process tests.
@@ -1341,7 +1318,7 @@ pub(crate) mod tests {
     use datafusion::physical_plan::collect;
     use datafusion_proto::bytes::physical_plan_to_bytes_with_extension_codec;
     use wyrd_spec::vala::api::{
-        PersistedFileAssignment, PersistedWalRange, ScribeProviderCut, SignedPeerTicket,
+        PersistedFileAssignment, ScribeProviderCut, SignedPeerTicket,
     };
 
     use super::*;
@@ -1467,14 +1444,12 @@ pub(crate) mod tests {
         );
     }
 
-    /// Builds one otherwise-valid Scribe provider cut for focused range tests.
-    fn cut(ranges: Vec<PersistedWalRange>) -> ScribeProviderCut {
+    /// Builds one otherwise-valid Scribe provider cut for focused tests.
+    fn cut() -> ScribeProviderCut {
         ScribeProviderCut {
             writer_epoch: 2,
             start_partition: crate::test_support::day_partition(2026, 8, 19).to_wire(),
             end_partition: crate::test_support::day_partition(2026, 8, 19).to_wire(),
-            persisted_cursor: 7,
-            persisted_ranges: ranges,
             maximum_batch_count: 8,
             maximum_retained_bytes: 1024,
         }
@@ -1627,79 +1602,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// The resolver boundary preserves caller-projected WAL range order.
-    ///
-    /// # Panics
-    /// Panics if canonical fixture construction, provider resolution, or the
-    /// recording seam violates its test invariant.
-    #[tokio::test]
-    async fn scribe_provider_preserves_ordered_ranges_in_one_tail_call() {
-        let tenant_id = DataTenantId::new_v7();
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let stream = StreamIdentity::new(
-            crate::scribe::stream_identity::NodeId::new(uuid::Uuid::now_v7()),
-            WriterEpoch::new(2),
-        );
-        let tail = Arc::new(RecordingTail {
-            stream,
-            requests: Arc::clone(&requests),
-            batches: Vec::new(),
-        });
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "wyrd_event_time",
-            DataType::Utf8,
-            true,
-        )]));
-        let resolver = ScribeTailResolver::with_schema(tail, Arc::clone(&schema));
-        let ranges = vec![
-            PersistedWalRange {
-                start_lsn: 8,
-                end_lsn: 9,
-            },
-            PersistedWalRange {
-                start_lsn: 12,
-                end_lsn: 13,
-            },
-        ];
-        let session = SessionContext::new().state();
-        let binding = TenantTableBinding {
-            tenant_id,
-            namespace: "vala.logs".to_owned(),
-            table: "records".to_owned(),
-        };
-        resolver
-            .resolve(
-                ClusterRole::Scribe,
-                &FollowerScanAssignment {
-                    scan_id: local_scribe_scan_id(&binding, stream),
-                    binding,
-                    persisted: PersistedFileAssignment { files: Vec::new() },
-                    scribe_provider_cut: Some(cut(ranges)),
-                    schema_fingerprint: super::super::assignment_schema_fingerprint(
-                        schema.as_ref(),
-                    ),
-                    required_columns: vec!["data_tenant_id".to_owned()],
-                    predicates: Vec::new(),
-                },
-                &session,
-            )
-            .await
-            .expect("Scribe provider resolves");
-        let requests = requests
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].after_lsn.as_u64(), 7);
-        assert_eq!(
-            requests[0]
-                .persisted_lsn_ranges
-                .iter()
-                .map(|(start, end)| (start.as_u64(), end.as_u64()))
-                .collect::<Vec<_>>(),
-            vec![(8, 9), (12, 13)]
-        );
-    }
-
     /// The local identity fetches hot data while a sibling placeholder resolves empty.
     #[tokio::test]
     async fn scribe_provider_executes_only_its_identity_bound_scan() {
@@ -1729,7 +1631,7 @@ pub(crate) mod tests {
             scan_id,
             binding: binding.clone(),
             persisted: PersistedFileAssignment { files: Vec::new() },
-            scribe_provider_cut: Some(cut(Vec::new())),
+            scribe_provider_cut: Some(cut()),
             schema_fingerprint: "schema".to_owned(),
             required_columns: vec!["data_tenant_id".to_owned()],
             predicates: Vec::new(),
@@ -1827,7 +1729,7 @@ pub(crate) mod tests {
                     .map(|index| format!("file-{index}.parquet"))
                     .collect(),
             },
-            scribe_provider_cut: cut.then(|| self::cut(Vec::new())),
+            scribe_provider_cut: cut.then(|| self::cut()),
             schema_fingerprint: "shape".to_owned(),
             required_columns: vec!["data_tenant_id".to_owned()],
             predicates: Vec::new(),
@@ -1986,7 +1888,7 @@ pub(crate) mod tests {
         case.target_fence.fencing_token += 1;
         malformed.push(case);
         let mut case = request.clone();
-        case.assignments[0].scribe_provider_cut = Some(cut(Vec::new()));
+        case.assignments[0].scribe_provider_cut = Some(cut());
         malformed.push(case);
         let mut case = request.clone();
         case.assignments[0].scan_id = "unknown".to_owned();
@@ -2124,7 +2026,7 @@ pub(crate) mod tests {
                     scan_id: local_scribe_scan_id(&binding, stream),
                     binding,
                     persisted: PersistedFileAssignment { files: Vec::new() },
-                    scribe_provider_cut: Some(cut(Vec::new())),
+                    scribe_provider_cut: Some(cut()),
                     schema_fingerprint: super::super::assignment_schema_fingerprint(
                         schema.as_ref(),
                     ),

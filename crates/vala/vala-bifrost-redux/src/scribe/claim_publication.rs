@@ -125,10 +125,11 @@ impl ClaimPublisher {
             key.table().clone(),
             key.partition(),
         );
-        let object_key = object_identities
-            .first()
-            .cloned()
-            .unwrap_or_else(|| request.object_base.to_owned());
+        let object_keys = if object_identities.is_empty() {
+            vec![request.object_base.to_owned()]
+        } else {
+            object_identities.to_vec()
+        };
         let transitions = request
             .claim
             .members()
@@ -140,7 +141,7 @@ impl ClaimPublisher {
                         member.id().generation(),
                     ),
                     crate::scribe::hot_source::HotAuthority::Published {
-                        object_key: object_key.clone(),
+                        object_keys: object_keys.clone(),
                     },
                 )
             })
@@ -244,11 +245,22 @@ impl ClaimPublisher {
     /// leaves the members claimed and the WAL authoritative, which is what a
     /// retry needs to resume the identical publication.
     ///
+    /// An uncertain commit is settled here rather than deferred. The identical
+    /// fenced full-set transaction is replay-exact, so it is run once more to
+    /// learn whether the rows landed. If they did, the claim's members advance
+    /// and retire exactly as a certain commit would, because a durable object
+    /// serving rows whose generations are still live in memory would let one
+    /// reader see those rows from both authorities. The caller is still told
+    /// the publication was uncertain: the ambiguity belongs to the response,
+    /// not to the pod's durable state.
+    ///
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when the rows cannot be built, staging
-    /// or upload fails, the fenced transaction is refused or uncertain, or a
-    /// member cannot be moved forward through its durable lifecycle.
+    /// or upload fails, the fenced transaction is refused, the commit remains
+    /// uncertain after reconciliation, or a member cannot be moved forward
+    /// through its durable lifecycle. An uncertain commit that reconciles as
+    /// committed still returns its original error after the members settle.
     ///
     /// # Cancellation
     ///
@@ -310,16 +322,34 @@ impl ClaimPublisher {
                 &claims,
             )
             .await?;
-        let outcome = match self.reconciler.publish(&rows, &events).await {
-            ScribePublicationOutcome::Committed(outcome) => outcome,
-            ScribePublicationOutcome::UnknownCommitOutcome(error)
-            | ScribePublicationOutcome::KnownNotCommitted(error) => return Err(error),
+        let (outcome, ambiguity) = match self.reconciler.publish(&rows, &events).await {
+            ScribePublicationOutcome::Committed(outcome) => (outcome, None),
+            ScribePublicationOutcome::KnownNotCommitted(error) => return Err(error),
+            ScribePublicationOutcome::UnknownCommitOutcome(error) => {
+                // The transaction may already hold these rows. Leaving that
+                // undecided is the one outcome this pod cannot carry: a
+                // committed object would serve the claim's rows while the
+                // generations behind it stayed live in memory, and a reader
+                // pinning both authorities would see every row twice. The
+                // fenced full-set transaction is replay-exact on the identical
+                // rows, so running it once more settles the fact rather than
+                // guessing it. The caller still learns the publication was
+                // uncertain; only the pod's own state stops being uncertain.
+                match self.reconciler.publish(&rows, &events).await {
+                    ScribePublicationOutcome::Committed(outcome) => (outcome, Some(error)),
+                    ScribePublicationOutcome::UnknownCommitOutcome(_)
+                    | ScribePublicationOutcome::KnownNotCommitted(_) => return Err(error),
+                }
+            }
         };
         let object_identities: Vec<String> = rows.iter().map(|row| row.file_path.clone()).collect();
         self.advance_published(&request, &object_identities)?;
         self.retire_members(&request, &outcome.commit_key, &object_identities)
             .await?;
         self.mover.cleanup_published(&claims).await?;
+        if let Some(error) = ambiguity {
+            return Err(error);
+        }
         Ok(PublishedClaim {
             commit_key: outcome.commit_key,
             object_identities,

@@ -5,7 +5,7 @@ use super::support::{
     start_scribe_server, tenant_client, unique_table,
 };
 
-/// AC22/AC24 Tier-2 owner: every authoritative source transition is exact.
+/// Every authoritative source transition is exact.
 ///
 /// A row acknowledged by Scribe is owned in turn by an active memtable, a
 /// durable staged member, and finally a published hot object. Each handoff is
@@ -90,7 +90,7 @@ async fn scribe_local_stage_to_hot_source_transition_is_exact() {
     // Second boundary: publication. The staged members become committed hot
     // objects and the same read must still be exact.
     server
-        .flush_bifrost_for_tenant(tenant)
+        .flush_bifrost()
         .await
         .expect("the staged members publish");
     let published = server

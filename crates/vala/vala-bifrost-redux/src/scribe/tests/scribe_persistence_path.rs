@@ -10,7 +10,7 @@ use crate::scribe::admission::EventTimeWindow;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use crate::scribe::tail_rpc::FetchLiveTailRequest;
-use crate::scribe::wal::{WalConfig, WalLsn, WalWriter};
+use crate::scribe::wal::{WalConfig, WalWriter};
 use arrow::array::{ArrayRef, Int64Array, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -182,8 +182,6 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
         target_stream: stream,
         start_partition: day,
         end_partition: day,
-        after_lsn: WalLsn::ZERO,
-        persisted_lsn_ranges: Vec::new(),
         required_columns: vec!["value".to_owned()],
         predicates: Vec::new(),
         max_batches: 64,
@@ -314,8 +312,6 @@ async fn assert_pointer_identity(
             target_stream: stream,
             start_partition: day,
             end_partition: day,
-            after_lsn: WalLsn::ZERO,
-            persisted_lsn_ranges: Vec::new(),
             required_columns: vec!["value".to_owned()],
             predicates: Vec::new(),
             max_batches: 64,
@@ -366,8 +362,6 @@ async fn assert_cross_day_materialization(
         target_stream: stream,
         start_partition: day,
         end_partition: day,
-        after_lsn: WalLsn::ZERO,
-        persisted_lsn_ranges: Vec::new(),
         required_columns: vec!["value".to_owned()],
         predicates: Vec::new(),
         max_batches: 64,
@@ -421,8 +415,6 @@ async fn assert_other_tenant_isolated(
             target_stream: stream,
             start_partition: day,
             end_partition: day,
-            after_lsn: WalLsn::ZERO,
-            persisted_lsn_ranges: Vec::new(),
             required_columns: vec!["value".to_owned()],
             predicates: Vec::new(),
             max_batches: 64,

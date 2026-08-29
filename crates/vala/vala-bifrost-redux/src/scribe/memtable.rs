@@ -1023,12 +1023,21 @@ impl Memtable {
         Ok(batches.finish())
     }
 
-    /// Captures one atomic active-plus-immutable provider cut at a persisted cursor.
+    /// Captures one atomic active-plus-immutable provider cut.
     ///
-    /// Both owner maps remain locked while the cut is selected. A publication
-    /// that has not advanced the caller's pinned manifest cursor therefore
-    /// remains represented by its immutable Arrow member, while batches at or
-    /// below the cursor are excluded because the persisted provider owns them.
+    /// Both owner maps remain locked while the cut is selected, so the answer is
+    /// one consistent moment rather than two.
+    ///
+    /// Publication is not decided here and is not inferred from WAL positions.
+    /// A generation whose rows a durable member already serves is marked
+    /// [`ImmutableState::Durable`] before that member becomes readable, and the
+    /// collector skips exactly those; every generation this cut still returns is
+    /// one nothing else serves. WAL records are numbered from one node-global
+    /// counter while generations are sealed per tenant, table, partition, and
+    /// shard, so a published member's bounds routinely enclose positions a live
+    /// generation owns, and treating that containment as ownership would drop
+    /// acknowledged rows no object ever carried.
+    ///
     /// This provider interlock is consumed by Oracle execution; it performs no
     /// remote query and introduces no local-Parquet tier.
     ///
@@ -1050,18 +1059,7 @@ impl Memtable {
             cut.required_columns,
             cut.limits,
         )?;
-        Ok(batches
-            .into_iter()
-            .filter(|batch| {
-                let lsn = batch.meta.wal_lsn_max;
-                (cut.persisted_cursor == crate::scribe::wal::WalLsn::ZERO
-                    || lsn > cut.persisted_cursor)
-                    && !cut
-                        .persisted_ranges
-                        .iter()
-                        .any(|(min, max)| *min <= lsn && lsn <= *max)
-            })
-            .collect())
+        Ok(batches)
     }
 
     /// Return all readable batches for a table, preserving the old unit-test
@@ -1674,10 +1672,6 @@ pub(crate) struct ProviderCut<'a> {
     pub(crate) end_partition: crate::catalog::layout::TimePartition,
     /// Requested projection in caller order.
     pub(crate) required_columns: &'a [String],
-    /// Inclusive persisted prefix owned by the pinned manifest.
-    pub(crate) persisted_cursor: crate::scribe::wal::WalLsn,
-    /// Independently published non-prefix ranges owned by that manifest.
-    pub(crate) persisted_ranges: &'a [(crate::scribe::wal::WalLsn, crate::scribe::wal::WalLsn)],
     /// Count and retained-byte bounds for the shallow snapshot.
     pub(crate) limits: ReadableBatchLimits,
 }
@@ -2072,13 +2066,24 @@ mod tests {
         );
     }
 
-    /// A pinned provider cut includes every not-yet-persisted immutable member
-    /// plus active rows and excludes exactly the cursor-covered prefix.
+    /// A provider cut suppresses exactly the generations a durable member serves.
+    ///
+    /// Publication is a fact about a generation, not about a WAL interval. WAL
+    /// records are numbered from one node-global counter while generations are
+    /// sealed per tenant, table, partition, and shard, so a published member's
+    /// bounds routinely enclose positions a still-live generation owns. The cut
+    /// therefore excludes a generation only once something durable is already
+    /// serving its rows, and an enclosed live generation stays readable.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a live generation is dropped or a durable one is served
+    /// twice.
     #[test]
-    fn provider_cut_filters_cursor_and_nonprefix_ranges() {
+    fn a_provider_cut_suppresses_only_generations_a_durable_member_serves() {
         let memtable = Memtable::new();
         let key = make_test_seal_key();
-        for lsn in [1_u64, 2] {
+        for lsn in [1_u64, 30] {
             memtable
                 .insert(
                     &key,
@@ -2086,63 +2091,65 @@ mod tests {
                     make_test_meta(lsn),
                     make_test_batch(1),
                 )
-                .expect("cohort source insert");
+                .expect("enclosing generation insert");
         }
-        memtable.freeze(&key).expect("immutable cohort member");
+        let enclosing = memtable.freeze(&key).expect("enclosing generation");
+        for lsn in [12_u64, 20] {
+            memtable
+                .insert(
+                    &key,
+                    make_test_event(),
+                    make_test_meta(lsn),
+                    make_test_batch(1),
+                )
+                .expect("enclosed generation insert");
+        }
+        memtable.freeze(&key).expect("enclosed generation");
         memtable
             .insert(
                 &key,
                 make_test_event(),
-                make_test_meta(3),
+                make_test_meta(31),
                 make_test_batch(1),
             )
-            .expect("fresh active insert");
+            .expect("active insert");
         let limits = ReadableBatchLimits {
-            max_batches: 3,
+            max_batches: 8,
             max_retained_bytes: usize::MAX,
         };
-        let before_publication = memtable
-            .readable_batches_for_provider_cut(
-                key.tenant,
-                &key.table,
-                &ProviderCut {
-                    start_partition: key.partition,
-                    end_partition: key.partition,
-                    required_columns: &[],
-                    persisted_cursor: WalLsn::ZERO,
-                    persisted_ranges: &[],
-                    limits,
-                },
-            )
-            .expect("pre-publication cut");
-        assert_eq!(
-            before_publication
+        let cut = |memtable: &Memtable| {
+            memtable
+                .readable_batches_for_provider_cut(
+                    key.tenant,
+                    &key.table,
+                    &ProviderCut {
+                        start_partition: key.partition,
+                        end_partition: key.partition,
+                        required_columns: &[],
+                        limits,
+                    },
+                )
+                .expect("provider cut")
                 .iter()
                 .map(|batch| batch.meta.wal_lsn_max.as_u64())
-                .collect::<std::collections::BTreeSet<_>>(),
-            [1_u64, 2, 3].into_iter().collect()
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+
+        assert_eq!(
+            cut(&memtable),
+            [1_u64, 12, 20, 30, 31].into_iter().collect(),
+            "nothing durable serves these rows yet, so every one of them is live"
         );
-        let after_partial_publication = memtable
-            .readable_batches_for_provider_cut(
-                key.tenant,
-                &key.table,
-                &ProviderCut {
-                    start_partition: key.partition,
-                    end_partition: key.partition,
-                    required_columns: &[],
-                    persisted_cursor: WalLsn::ZERO,
-                    persisted_ranges: &[(WalLsn::new(2), WalLsn::new(2))],
-                    limits,
-                },
-            )
-            .expect("post-publication cut");
-        assert_eq!(after_partial_publication.len(), 2);
+
+        memtable
+            .complete_staged(enclosing.seal_id, staged_member(1))
+            .expect("the enclosing generation is staged");
+
         assert_eq!(
-            after_partial_publication
-                .iter()
-                .map(|batch| batch.meta.wal_lsn_max.as_u64())
-                .collect::<std::collections::BTreeSet<_>>(),
-            [1_u64, 3].into_iter().collect()
+            cut(&memtable),
+            [12_u64, 20, 31].into_iter().collect(),
+            "the enclosed generation owns its own rows and the enclosing member's \
+             bounds are not evidence about them"
         );
     }
 

@@ -1063,7 +1063,7 @@ pub(crate) async fn preload_reference_rows(
     if writer_nodes.is_empty() {
         return Err("reference cluster has no tenant writer Server".into());
     }
-    for (tenant_index, tenant) in tenants.iter().copied().enumerate() {
+    for tenant_index in 0..tenants.len() {
         for batch in 0..(PRELOAD_ROWS / u64::from(ROWS_PER_WRITE)) {
             clients[tenant_index]
                 .writer
@@ -1081,13 +1081,16 @@ pub(crate) async fn preload_reference_rows(
         cluster
             .server_by_node(writer_nodes[tenant_index % writer_nodes.len()])
             .ok_or("preload Server is absent")?
-            .flush_bifrost_for_tenant(tenant)
+        .flush_bifrost()
             .await?;
     }
     Ok(())
 }
 
-/// Flush each tenant exactly once through the Server that owns its writer.
+/// Flush every Server that owns a tenant writer exactly once.
+///
+/// Scribe publication is a pod operation rather than a tenant operation, so
+/// this walks the tenants only to reach the pods their writers were placed on.
 ///
 /// # Errors
 /// Returns an error when an owning Server is absent or its Scribe flush fails.
@@ -1099,17 +1102,17 @@ pub(crate) async fn flush_tenant_writers(
     if writer_nodes.is_empty() {
         return Err("reference cluster has no tenant writer Server".into());
     }
-    for (tenant_index, tenant) in tenants.iter().copied().enumerate() {
+    for tenant_index in 0..tenants.len() {
         cluster
             .server_by_node(writer_nodes[tenant_index % writer_nodes.len()])
             .ok_or("reference cluster has no tenant writer Server")?
-            .flush_bifrost_for_tenant(tenant)
+        .flush_bifrost()
             .await?;
     }
     Ok(())
 }
 
-/// Flush only the tenant selected for this staggered cadence slot.
+/// Flush only the pod owning the tenant selected for this staggered slot.
 async fn flush_one_tenant(
     cluster: &WyrdTestCluster,
     tenants: &[DataTenantId],
@@ -1119,16 +1122,16 @@ async fn flush_one_tenant(
     if writer_nodes.is_empty() {
         return Err("reference cluster has no tenant writer Server".into());
     }
-    let tenant = tenants
-        .get(tenant_index)
-        .ok_or("staggered flush selected an unknown tenant")?;
+    if tenant_index >= tenants.len() {
+        return Err("staggered flush selected an unknown tenant".into());
+    }
     let node = writer_nodes
         .get(tenant_index % writer_nodes.len())
         .ok_or("reference cluster has no tenant writer Server")?;
     cluster
         .server_by_node(*node)
         .ok_or("reference cluster has no tenant writer Server")?
-        .flush_bifrost_for_tenant(*tenant)
+        .flush_bifrost()
         .await?;
     Ok(())
 }

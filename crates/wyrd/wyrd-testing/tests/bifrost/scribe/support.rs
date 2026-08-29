@@ -65,6 +65,26 @@ pub(super) async fn start_scribe_server_with_geometry(geometry: ScribeGeometry) 
         .expect("the Scribe production harness starts with the requested geometry")
 }
 
+/// Starts one bound production server with an explicit Scribe admission config.
+///
+/// The admission configuration is the only control that moves the pod's derived
+/// ownership ceiling, which is what a fairness case needs: real contention
+/// cannot be placed on a pod whose measured capacity completes more tables than
+/// the case can ever occupy. Every other control stays exactly what production
+/// uses, so the scheduler under test is the production scheduler.
+pub(super) async fn start_scribe_server_with_admission(
+    admission: vala_bifrost_redux::scribe::admission::AdmissionConfig,
+) -> WyrdTestServer {
+    let mut builder = WyrdTestServer::builder().with_scribe_admission_for_test(admission);
+    if let Some(telemetry) = shared_telemetry() {
+        builder = builder.with_telemetry_for_test(telemetry);
+    }
+    builder
+        .start_bound()
+        .await
+        .expect("the Scribe production harness starts with the requested admission capacity")
+}
+
 /// Registers one single-column table for a tenant through the real catalog.
 pub(super) async fn register_table(
     server: &WyrdTestServer,
@@ -329,5 +349,98 @@ pub(super) async fn await_persistence_drained(scribe: &vala_bifrost_redux::scrib
             "Scribe persistence queue did not drain after the freeze"
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// The pod's stable public refusal for capacity it cannot lend right now.
+///
+/// Shared rather than restated per case: a contention case that matched a
+/// different code would silently accept a fault as backpressure.
+pub(super) const INGEST_BUSY: &str = "WYRD_VALA_429_INGEST_BUSY";
+
+/// How long one contending append may keep retrying before it counts as stuck.
+///
+/// The deadline is a diagnostic bound, never an ordering device: no assertion
+/// in any case depends on how long a turn took, only on whether every
+/// participant eventually got one. A participant that reaches this bound has
+/// not lost a race, it has been passed over indefinitely.
+const ADMISSION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Longest pause between two retries of a refused append.
+///
+/// A refusal is a complete public round trip, so retrying in a tight loop makes
+/// request throughput an accidental input to a fairness measurement: the
+/// participant that happens to be scheduled most often issues the most attempts
+/// and records the most refusals. Backing off bounds that, and bounds the load
+/// a waiting participant puts on the pod it is waiting for.
+const ADMISSION_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// Sends one append through public ingest until the pod admits it.
+///
+/// Capacity refusal is the one outcome this retries. Every other error is a
+/// fault and fails the case immediately, so a case can never mistake a broken
+/// route for a busy one. The returned count is how many times the pod refused
+/// before admitting, which is the measure of whose turn the scheduler kept
+/// giving away.
+///
+/// Retries back off geometrically to [`ADMISSION_MAX_BACKOFF`] rather than
+/// spinning, and give up at [`ADMISSION_DEADLINE`] with the label and the
+/// refusal count in the message.
+///
+/// # Panics
+///
+/// Panics when the append fails for any reason other than capacity pressure,
+/// or when it is still refused at [`ADMISSION_DEADLINE`].
+pub(super) async fn append_until_admitted(
+    client: &wyrd_client::WyrdClient,
+    table: &str,
+    rows: &[i64],
+    label: &str,
+) -> usize {
+    until_admitted(label, || append_values(client, table, uuid::Uuid::now_v7(), rows)).await
+}
+
+/// Retries one caller-supplied public ingest attempt until the pod admits it.
+///
+/// This is the bounded waiting rule every contending case shares, factored out
+/// so a case that needs to record something at the moment of admission — which
+/// table took the turn, which tenant, which ordinal — still waits the same way
+/// rather than spinning on its own budget. `send` is called once per attempt
+/// and must be a complete public round trip, so the count it returns is the
+/// number of times the pod refused before admitting.
+///
+/// Retries back off geometrically to [`ADMISSION_MAX_BACKOFF`] rather than
+/// spinning, and give up at [`ADMISSION_DEADLINE`] with the label and the
+/// refusal count in the message. Nothing here measures elapsed time as
+/// evidence: the deadline exists only to turn indefinite starvation into a
+/// diagnosable failure.
+///
+/// # Panics
+///
+/// Panics when the attempt fails for any reason other than capacity pressure,
+/// or when it is still refused at [`ADMISSION_DEADLINE`].
+pub(super) async fn until_admitted<F, Fut>(label: &str, mut send: F) -> usize
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), wyrd_spec::error::WyrdError>>,
+{
+    let deadline = tokio::time::Instant::now() + ADMISSION_DEADLINE;
+    let mut backoff = std::time::Duration::from_millis(1);
+    let mut refusals = 0_usize;
+    loop {
+        match send().await {
+            Ok(()) => return refusals,
+            Err(error) if error.code() == INGEST_BUSY => {
+                refusals += 1;
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{label} was refused {refusals} times and never admitted inside \
+                     {ADMISSION_DEADLINE:?}; the pod is not rotating its capacity"
+                );
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(ADMISSION_MAX_BACKOFF);
+            }
+            Err(error) => panic!("{label} must be acknowledged: {error:?}"),
+        }
     }
 }

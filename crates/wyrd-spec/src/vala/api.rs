@@ -2471,16 +2471,6 @@ pub struct PersistedFileAssignment {
     pub files: Vec<String>,
 }
 
-/// Inclusive persisted WAL interval excluded from a Scribe memory provider.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct PersistedWalRange {
-    /// First persisted Redux WAL LSN in the interval.
-    pub start_lsn: u64,
-    /// Last persisted Redux WAL LSN in the interval.
-    pub end_lsn: u64,
-}
-
 /// Immutable Scribe memory-provider cut carried by the private follower wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
@@ -2491,10 +2481,6 @@ pub struct ScribeProviderCut {
     pub start_partition: TimePartitionWire,
     /// Inclusive final partition in the provider projection.
     pub end_partition: TimePartitionWire,
-    /// Highest persisted stream cursor visible to this cut.
-    pub persisted_cursor: u64,
-    /// Ascending inclusive persisted WAL intervals excluded from memory.
-    pub persisted_ranges: Vec<PersistedWalRange>,
     /// Maximum Arrow batches retained by the provider.
     pub maximum_batch_count: u32,
     /// Maximum bytes retained by the provider.
@@ -2502,7 +2488,13 @@ pub struct ScribeProviderCut {
 }
 
 impl ScribeProviderCut {
-    /// Validates the canonical ordered inclusive persisted-WAL cut.
+    /// Validates the canonical Scribe memory-provider cut.
+    ///
+    /// The cut bounds which partitions a follower may read from memory, on which
+    /// writer incarnation, and how much it may retain. It carries no statement
+    /// about which rows are already published: Scribe decides that from the
+    /// generation authority it owns, and a WAL interval on the wire would be a
+    /// second, weaker answer that a reader could mistake for ownership.
     #[must_use]
     pub fn is_valid(&self) -> bool {
         self.writer_epoch > 0
@@ -2510,34 +2502,7 @@ impl ScribeProviderCut {
             && self.start_partition <= self.end_partition
             && self.maximum_batch_count > 0
             && self.maximum_retained_bytes > 0
-            && persisted_wal_ranges_are_valid(self.persisted_cursor, &self.persisted_ranges)
     }
-}
-
-/// Validates one canonical persisted cursor and its ordered inclusive WAL ranges.
-///
-/// Endpoints must fit the durable signed domain, every range must be forward,
-/// and the ranges must ascend. A range may lie wholly on either side of the
-/// cursor, but may not contain values on both sides; a range ending exactly at
-/// the cursor is therefore valid.
-///
-/// Ranges may overlap. A producing node numbers WAL records from one node-global
-/// counter while it seals generations per partition bucket, so one published
-/// generation's inclusive bounds routinely span records another bucket's
-/// generation owns. Rejecting that would reject an ordinary table whose rows
-/// arrived for two partitions at once.
-#[must_use]
-pub fn persisted_wal_ranges_are_valid(persisted_cursor: u64, ranges: &[PersistedWalRange]) -> bool {
-    persisted_cursor <= i64::MAX as u64
-        && ranges.iter().all(|range| {
-            range.start_lsn <= i64::MAX as u64
-                && range.end_lsn <= i64::MAX as u64
-                && range.start_lsn <= range.end_lsn
-                && !(range.start_lsn <= persisted_cursor && persisted_cursor < range.end_lsn)
-        })
-        && ranges.windows(2).all(|pair| {
-            (pair[0].start_lsn, pair[0].end_lsn) <= (pair[1].start_lsn, pair[1].end_lsn)
-        })
 }
 
 /// One scan-keyed role-local follower assignment.

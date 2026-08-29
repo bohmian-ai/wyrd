@@ -430,7 +430,7 @@ mod error_mapper_tests {
             },
             wyrd_spec::vala::error::BifrostError::QueryMemoryRequestTooLarge.into(),
             wyrd_spec::vala::error::BifrostError::QueryExecutionFailed.into(),
-            wyrd_spec::vala::error::BifrostError::PayloadTooLarge { bytes: 1 }.into(),
+            wyrd_spec::vala::error::BifrostError::PayloadTooLarge { bytes: 1, limit: 1 }.into(),
             wyrd_spec::vala::error::BifrostError::WalDiskFull.into(),
         ] {
             let response = WyrdErrorResponse::from(error).into_response();
@@ -441,6 +441,54 @@ mod error_mapper_tests {
                     .is_none()
             );
         }
+    }
+
+    /// Proves the enforced payload ceiling survives the HTTP problem+json
+    /// rendering. An agent reading only the response body must be able to see
+    /// both what it sent and what the server would have accepted; a remediation
+    /// asserting a fixed ceiling would contradict the configured limit.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the code, status, measured bytes, enforced limit, detail, or
+    /// remediation is lost or contradicted at the HTTP boundary.
+    #[tokio::test]
+    async fn payload_limit_survives_the_http_boundary() {
+        let response = WyrdErrorResponse::from(WyrdError::from(
+            wyrd_spec::vala::error::BifrostError::PayloadTooLarge {
+                bytes: 41_943_040,
+                limit: 8_388_608,
+            },
+        ))
+        .into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("problem body reads");
+        let problem: serde_json::Value =
+            serde_json::from_slice(&body).expect("problem body is JSON");
+
+        assert_eq!(problem["code"], "WYRD_VALA_413_PAYLOAD_TOO_LARGE");
+        assert_eq!(problem["status"], 413);
+        assert_eq!(
+            problem["details"]["data"]["bytes"], 41_943_040,
+            "measured bytes must survive HTTP: {problem}"
+        );
+        assert_eq!(
+            problem["details"]["data"]["limit"], 8_388_608,
+            "the enforced limit must survive HTTP: {problem}"
+        );
+        let detail = problem["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("41943040") && detail.contains("8388608"),
+            "detail must name both bounds: {problem}"
+        );
+        let remediation = problem["remediation"].as_str().unwrap_or_default();
+        assert!(
+            !remediation.contains("32 MiB") && remediation.contains("limit"),
+            "remediation must point at the supplied limit: {problem}"
+        );
     }
 
     #[test]

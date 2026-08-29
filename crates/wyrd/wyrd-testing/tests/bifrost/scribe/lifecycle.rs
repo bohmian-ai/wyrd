@@ -9,7 +9,7 @@ use super::support::{
     tenant_client, unique_table,
 };
 
-/// AC22 Tier-2 owner: a stopping pod either publishes its rows or keeps them.
+/// A stopping pod either publishes its acknowledged rows or retains them.
 ///
 /// Acknowledged rows outlive the process that accepted them, and there are
 /// exactly two honest ways for that to be true. A pod told to stop drains: it
@@ -137,7 +137,7 @@ async fn scribe_shutdown_drains_or_preserves_replay() {
     // What the replacement pod restored is ordinary staged work, so it
     // publishes once, under a fence the rows were never written by.
     server
-        .flush_bifrost_for_tenant(tenant)
+        .flush_bifrost()
         .await
         .expect("the restored rows publish");
     assert_eq!(

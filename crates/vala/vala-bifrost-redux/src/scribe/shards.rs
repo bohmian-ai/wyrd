@@ -1523,8 +1523,6 @@ impl ShardOwner {
                 start_partition: request.start_partition,
                 end_partition: request.end_partition,
                 required_columns: &request.required_columns,
-                persisted_cursor: request.after_lsn,
-                persisted_ranges: &request.persisted_lsn_ranges,
                 limits: ReadableBatchLimits {
                     max_batches: request.max_batches,
                     max_retained_bytes: request.max_retained_bytes,
@@ -7136,8 +7134,6 @@ mod tests {
                     target_stream: stream,
                     start_partition: key.partition,
                     end_partition: key.partition,
-                    after_lsn: crate::scribe::wal::WalLsn::ZERO,
-                    persisted_lsn_ranges: Vec::new(),
                     required_columns: vec!["value".to_owned()],
                     predicates: Vec::new(),
                     max_batches: 4,

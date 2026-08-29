@@ -1618,6 +1618,63 @@ impl ScribeImpl {
             .map_or(0, |persistence| persistence.queue_depth())
     }
 
+    /// Publish only the staged residue belonging to one physical partition.
+    ///
+    /// Drives the production residue claim and fenced publication owner for the
+    /// already-existing ready keys of that partition and nothing else, so a
+    /// caller can place the real production state in which one partition is
+    /// served by a hot object while a neighbouring partition is still served by
+    /// its live authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the selected key's residue claim or its
+    /// fenced publication is refused. The remaining keys stay staged and their
+    /// WAL stays authoritative.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn publish_partition_for_test(
+        &self,
+        partition: crate::catalog::layout::TimePartition,
+    ) -> Result<usize, ScribeError> {
+        match self.persistence.as_ref() {
+            Some(persistence) => persistence.publish_partition_for_test(partition).await,
+            None => Ok(0),
+        }
+    }
+
+    /// Return where every generation this pod still tracks is readable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the hot-source registry lock is
+    /// poisoned, which means a holder already panicked.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn live_authorities_for_test(
+        &self,
+    ) -> Result<Vec<hot_source::LiveAuthority>, ScribeError> {
+        self.hot_sources
+            .live_authorities_for_test()
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("read the pod's live hot authorities: {error}"),
+            })
+    }
+
+    /// Return every claim this Scribe's staging runtime has published.
+    ///
+    /// One entry per committed claim, naming the objects it published and the
+    /// distinct shard lanes its members were frozen on. This is the only place
+    /// that binding is observable: publication records rows, not lanes.
+    #[must_use]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn published_claims_for_test(
+        &self,
+    ) -> Vec<crate::scribe::staging_runtime::PublishedClaimObservation> {
+        self.persistence
+            .as_ref()
+            .map(|persistence| persistence.published_claims_for_test())
+            .unwrap_or_default()
+    }
+
     /// Return the exact admitted request count still owned by Scribe.
     ///
     /// This test-support inspection reads the production admission owner; it
@@ -2211,6 +2268,29 @@ mod telemetry_tests {
 }
 
 impl ScribeImpl {
+    /// Reports the pod's closed contention registry totals.
+    ///
+    /// The registry is the production observation owner for admission,
+    /// activation, borrowing, and demand transitions, so a fairness case reads
+    /// its totals rather than installing a parallel counter. Read-only: nothing
+    /// here moves capacity or changes a scheduling decision.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn contention_totals_for_test(&self) -> crate::scribe::telemetry::ScribeTelemetrySnapshot {
+        self.admission.contention().telemetry_totals()
+    }
+
+    /// Reports how many complete lifecycle vectors this pod's capacity completes.
+    ///
+    /// Derived once at startup from measured capacity, so a case that has to
+    /// place real contention reads the pod's own ceiling instead of recomputing
+    /// it from configuration.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn ownership_ceiling_for_test(&self) -> usize {
+        self.admission.contention().ownership_ceiling()
+    }
+
     /// Install a one-shot test barrier at the public write seam.
     #[cfg(any(test, feature = "test-support"))]
     pub fn stall_next_ingest_for_test(&self) -> Arc<IngestStall> {

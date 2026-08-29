@@ -1901,8 +1901,6 @@ impl ScribeTailReader {
                 target_stream: stream,
                 start_partition: time_partition,
                 end_partition: time_partition,
-                after_lsn: WalLsn::ZERO,
-                persisted_lsn_ranges: Vec::new(),
                 required_columns: Vec::new(),
                 predicates: Vec::new(),
                 max_batches: self.config.max_page_rows as usize,
@@ -2372,13 +2370,6 @@ pub struct FetchLiveTailRequest {
     pub start_partition: TimePartition,
     /// Inclusive last partition day governed by the query.
     pub end_partition: TimePartition,
-    /// Emit only records with `LSN > after_lsn`.
-    pub after_lsn: WalLsn,
-    /// Manifest-pinned inclusive WAL ranges already owned by persisted files.
-    ///
-    /// Each range suppresses only its cohort member, so an independently
-    /// published later member cannot hide an earlier hot member.
-    pub persisted_lsn_ranges: Vec<(WalLsn, WalLsn)>,
     /// Columns required by Oracle filters, ordering, tripwire, and projection.
     pub required_columns: Vec<String>,
     /// Signed closed predicates the assignment authorized for this scan.
@@ -2659,9 +2650,10 @@ impl FetchLiveTailService {
     /// A generation whose Arrow was released after staging is invisible to the
     /// shard snapshot, so without this a live-tail reader would see a gap
     /// between staging and publication. The read is bounded by the same
-    /// projection, count, and retained-byte limits the memtable path obeys, and
-    /// a member whose complete WAL range the pinned cut already owns is skipped
-    /// because the published object serves those rows.
+    /// projection, count, and retained-byte limits the memtable path obeys. No
+    /// member is skipped here: the registry hands back only the generations it
+    /// still holds staged authority for, so a generation a published object
+    /// already serves is absent rather than filtered out.
     ///
     /// # Errors
     ///
@@ -2692,8 +2684,6 @@ impl FetchLiveTailService {
                     max_batches: request.max_batches,
                     max_retained_bytes: request.max_retained_bytes,
                 },
-                persisted_cursor: request.after_lsn,
-                persisted_ranges: &request.persisted_lsn_ranges,
             },
         )
     }
@@ -2953,8 +2943,6 @@ mod tests {
             target_stream: stream,
             start_partition: day,
             end_partition: day,
-            after_lsn: WalLsn::ZERO,
-            persisted_lsn_ranges: Vec::new(),
             required_columns: vec!["value".to_owned()],
             predicates,
             max_batches: 64,

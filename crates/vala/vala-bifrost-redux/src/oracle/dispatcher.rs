@@ -3067,7 +3067,7 @@ mod tests {
     use datafusion::execution::memory_pool::GreedyMemoryPool;
     use wyrd_spec::vala::api::{
         ClusterCapabilities, ClusterNodeKey, ClusterRole, ClusterRoleLease, FollowerScanAssignment,
-        OracleCapabilitiesV1, PersistedFileAssignment, PersistedWalRange, ScribeProviderCut,
+        OracleCapabilitiesV1, PersistedFileAssignment, ScribeProviderCut,
         TenantTableBinding, TimeGranularityWire,
     };
 
@@ -3194,11 +3194,6 @@ mod tests {
             writer_epoch,
             start_partition: fixture_partition(TimeGranularityWire::Hour, 1_787_493_600_000_000),
             end_partition: fixture_partition(TimeGranularityWire::Hour, 1_787_497_200_000_000),
-            persisted_cursor: 41,
-            persisted_ranges: vec![PersistedWalRange {
-                start_lsn: 1,
-                end_lsn: 40,
-            }],
             maximum_batch_count: 16,
             maximum_retained_bytes: 1_048_576,
         }

@@ -168,7 +168,7 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
             .bucket(chrono::Utc::now())?
             .to_wire();
         for (index, tenant) in tenants.iter().copied().enumerate() {
-            ingest_server.flush_bifrost_for_tenant(tenant).await?;
+            ingest_server.flush_bifrost().await?;
             cluster
                 .observe_live_tail_for_tenant(tenant, &table_fqn, partition)
                 .await?;
@@ -189,9 +189,7 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
         }
         VisibilityMode::Fused
     } else {
-        for tenant in tenants.iter().copied() {
-            ingest_server.flush_bifrost_for_tenant(tenant).await?;
-        }
+        ingest_server.flush_bifrost().await?;
         VisibilityMode::PublishedOnly
     };
     let analytical = case_id.contains("analytical");

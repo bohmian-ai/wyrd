@@ -19,7 +19,6 @@ use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
 use vala_bifrost_redux::scribe::persistence::PersistenceFaults;
 use vala_bifrost_redux::scribe::tail_rpc::FetchLiveTailRequest;
-use vala_bifrost_redux::scribe::wal::WalLsn;
 use vala_sdk::{BifrostFrame, BifrostGrpcTransport};
 use wyrd_bench::{
     BenchmarkReadiness, BifrostFaultProfile, BifrostReportEnvelope, BifrostScenario,
@@ -320,8 +319,6 @@ async fn query_scribe_rows(
                     target_stream: tail.stream(),
                     start_partition: partition,
                     end_partition: partition,
-                    after_lsn: WalLsn::ZERO,
-                    persisted_lsn_ranges: Vec::new(),
                     required_columns: vec!["value".to_owned()],
                     predicates: Vec::new(),
                     max_batches: 4_096,

@@ -21,7 +21,6 @@ use crate::contracts::ScribeError;
 use crate::scribe::hot_source::StagedSource;
 use crate::scribe::memtable::ReadableBatchLimits;
 use crate::scribe::tail_rpc::{HotBatch, HotBatchSource};
-use crate::scribe::wal::WalLsn;
 
 /// Rows decoded per Parquet read before the reader re-checks its bounds.
 ///
@@ -36,10 +35,6 @@ pub(crate) struct StagedTailRead<'a> {
     pub(crate) required_columns: &'a [String],
     /// Count and retained-byte ceilings shared with the memtable path.
     pub(crate) limits: ReadableBatchLimits,
-    /// Inclusive persisted prefix owned by the pinned manifest.
-    pub(crate) persisted_cursor: WalLsn,
-    /// Independently published non-prefix ranges owned by that manifest.
-    pub(crate) persisted_ranges: &'a [(WalLsn, WalLsn)],
 }
 
 /// Reads bounded Arrow batches out of durable staged runs.
@@ -59,13 +54,20 @@ impl Default for StagedTailReader {
 }
 
 impl StagedTailReader {
-    /// Returns rows from the staged sources the caller's cut does not own.
+    /// Returns rows from every staged source the caller leased.
     ///
     /// Sources arrive oldest first and are read in that order, so a truncated
-    /// read returns the oldest rows rather than an arbitrary subset. A member
-    /// whose complete WAL range the pinned cut already owns is skipped without
-    /// being opened: the published object serves those rows, and returning them
-    /// here would double-count them.
+    /// read returns the oldest rows rather than an arbitrary subset.
+    ///
+    /// Nothing is filtered here. A staged source exists only while the
+    /// hot-source registry names its generation's runs as the one authority for
+    /// those rows; the moment a hot object serves them the registry holds
+    /// `Published` instead and the generation is not leased at all. Deciding
+    /// again from WAL positions would be a second, weaker answer to a question
+    /// the registry has already answered exactly: WAL records are numbered from
+    /// one node-global counter while members are sealed per tenant, table,
+    /// partition, and shard, so one member's bounds routinely enclose positions
+    /// another member owns, and containment is not ownership.
     ///
     /// # Errors
     ///
@@ -81,9 +83,6 @@ impl StagedTailReader {
         let mut batches = Vec::new();
         let mut retained_bytes = 0_usize;
         for source in sources {
-            if cut_owns(source.wal, read.persisted_cursor, read.persisted_ranges) {
-                continue;
-            }
             for run in &source.runs {
                 if batches.len() >= read.limits.max_batches
                     || retained_bytes >= read.limits.max_retained_bytes
@@ -141,26 +140,6 @@ impl StagedTailReader {
         }
         Ok(())
     }
-}
-
-/// Reports whether a pinned cut already owns a member's complete WAL range.
-///
-/// Partial coverage is deliberately not enough. A member is one indivisible
-/// staged unit: suppressing it because part of its range was published would
-/// hide the rows in the rest of it, so the member stays readable until the cut
-/// owns all of it.
-fn cut_owns(
-    wal: (WalLsn, WalLsn),
-    persisted_cursor: WalLsn,
-    persisted_ranges: &[(WalLsn, WalLsn)],
-) -> bool {
-    let (min, max) = wal;
-    if persisted_cursor != WalLsn::ZERO && max <= persisted_cursor {
-        return true;
-    }
-    persisted_ranges
-        .iter()
-        .any(|(range_min, range_max)| *range_min <= min && max <= *range_max)
 }
 
 /// Builds the Parquet projection for the caller's required columns.
@@ -269,6 +248,7 @@ mod tests {
     use crate::namespaces::BifrostNamespace;
     use crate::scribe::assembly::StagedMemberId;
     use crate::scribe::hot_source::GenerationOrdinal;
+    use crate::scribe::wal::WalLsn;
     use crate::scribe::seal_key::SealKey;
     use wyrd_spec::ids::DataTenantId;
 
@@ -332,7 +312,7 @@ mod tests {
         }
     }
 
-    /// Builds an unbounded read requesting `columns` under an empty cut.
+    /// Builds an unbounded read requesting `columns`.
     fn unbounded(columns: &[String]) -> StagedTailRead<'_> {
         StagedTailRead {
             required_columns: columns,
@@ -340,8 +320,6 @@ mod tests {
                 max_batches: usize::MAX,
                 max_retained_bytes: usize::MAX,
             },
-            persisted_cursor: WalLsn::ZERO,
-            persisted_ranges: &[],
         }
     }
 
@@ -400,8 +378,6 @@ mod tests {
                 max_batches: 1,
                 max_retained_bytes: usize::MAX,
             },
-            persisted_cursor: WalLsn::ZERO,
-            persisted_ranges: &[],
         };
         let batches = StagedTailReader::default()
             .read(
@@ -424,79 +400,53 @@ mod tests {
         );
     }
 
-    /// A member the pinned cut fully owns is suppressed; a partly covered one is not.
+    /// A member whose WAL range another member's bounds enclose is still read.
     ///
-    /// Suppression prevents double-counting rows the published object already
-    /// serves. Partial coverage cannot suppress: a member is one indivisible
-    /// staged unit, so dropping it for a partly published range would hide the
-    /// rest of its rows entirely.
+    /// WAL records are numbered from one node-global counter while members are
+    /// sealed per tenant, table, partition, and shard, so a member covering
+    /// records 1 through 30 routinely encloses a different member's 12 through
+    /// 20 without owning a single one of its rows. The reader serves what it was
+    /// leased; publication is decided by the hot-source registry, which never
+    /// leases a generation a hot object already serves.
     ///
     /// # Panics
     ///
-    /// Panics when a fully covered member is still served or a partly covered
-    /// one is dropped.
+    /// Panics when an enclosed member's rows are dropped, which is how a
+    /// numeric-containment inference shows up: acknowledged rows vanish from a
+    /// strict read while the enclosing object never carried them.
     #[test]
-    fn a_pinned_cut_suppresses_only_the_members_it_fully_owns() {
+    fn an_enclosed_member_is_read_because_containment_is_not_ownership() {
         let root = tempfile::tempdir().expect("staged root");
-        let covered = write_run(root.path(), "covered.parquet", 2);
-        let partial = write_run(root.path(), "partial.parquet", 2);
+        let enclosing = write_run(root.path(), "enclosing.parquet", 2);
+        let enclosed = write_run(root.path(), "enclosed.parquet", 2);
         let columns = Vec::new();
-        let read = StagedTailRead {
-            required_columns: &columns,
-            limits: ReadableBatchLimits {
-                max_batches: usize::MAX,
-                max_retained_bytes: usize::MAX,
-            },
-            persisted_cursor: WalLsn::new(9),
-            persisted_ranges: &[],
-        };
         let batches = StagedTailReader::default()
             .read(
                 &[
-                    source(1, vec![covered], (1, 9)),
-                    source(2, vec![partial], (5, 19)),
+                    source(1, vec![enclosing], (1, 30)),
+                    source(2, vec![enclosed], (12, 20)),
                 ],
-                &read,
+                &unbounded(&columns),
             )
             .expect("the staged runs read");
 
-        assert_eq!(batches.len(), 1);
         assert_eq!(
-            batches[0].origin,
-            HotBatchSource::StagedMember {
-                member: StagedMemberId::new(0, 2),
-                wal: (WalLsn::new(5), WalLsn::new(19)),
-            },
-            "only the member whose whole range the cut owns is suppressed"
+            batches
+                .iter()
+                .map(|batch| batch.origin.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                HotBatchSource::StagedMember {
+                    member: StagedMemberId::new(0, 1),
+                    wal: (WalLsn::new(1), WalLsn::new(30)),
+                },
+                HotBatchSource::StagedMember {
+                    member: StagedMemberId::new(0, 2),
+                    wal: (WalLsn::new(12), WalLsn::new(20)),
+                },
+            ],
+            "an enclosed member owns its own rows and must be served"
         );
-    }
-
-    /// A published non-prefix range suppresses the member it fully contains.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a member covered by an independently published range is
-    /// still served.
-    #[test]
-    fn a_published_range_suppresses_the_member_it_contains() {
-        let root = tempfile::tempdir().expect("staged root");
-        let run = write_run(root.path(), "run-1.parquet", 2);
-        let columns = Vec::new();
-        let ranges = [(WalLsn::new(10), WalLsn::new(30))];
-        let read = StagedTailRead {
-            required_columns: &columns,
-            limits: ReadableBatchLimits {
-                max_batches: usize::MAX,
-                max_retained_bytes: usize::MAX,
-            },
-            persisted_cursor: WalLsn::ZERO,
-            persisted_ranges: &ranges,
-        };
-        let batches = StagedTailReader::default()
-            .read(&[source(1, vec![run], (12, 20))], &read)
-            .expect("the staged run reads");
-
-        assert!(batches.is_empty());
     }
 
     /// A required column the run does not carry is refused, naming the run.

@@ -337,6 +337,10 @@ struct PublishedHotFileRow {
     file_checksum: Option<String>,
     /// Stored promotion evidence.
     promotion_record: serde_json::Value,
+    /// Inclusive lower WAL bound the publication set recorded.
+    wal_lsn_min: i64,
+    /// Inclusive upper WAL bound the publication set recorded.
+    wal_lsn_max: i64,
 }
 
 /// One committed Scribe hot object as `vala.file_list` recorded it.
@@ -360,6 +364,14 @@ pub struct PublishedHotFileInspection {
     pub file_checksum: String,
     /// Typed promotion evidence committed in the same transaction.
     pub promotion_record: vala_bifrost_redux::scribe::promotion::ScribePublishedHotFileV1,
+    /// Inclusive lower WAL bound the publication set recorded.
+    ///
+    /// The bound spans every member the publishing claim merged, so it is an
+    /// envelope over the node-global WAL counter rather than a statement about
+    /// which members the object owns.
+    pub wal_lsn_min: u64,
+    /// Inclusive upper WAL bound the publication set recorded.
+    pub wal_lsn_max: u64,
 }
 
 /// Durable pre-snapshot Forge workflow state for one tenant table.
@@ -876,6 +888,79 @@ impl WyrdTestServer {
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))
     }
 
+    /// Freeze every writable generation into an immutable staged member.
+    ///
+    /// This is the first half of the durable lifecycle taken on its own.
+    /// [`flush_bifrost`](Self::flush_bifrost) performs the freeze and the
+    /// publication together, so a caller that only uses it can never observe
+    /// the state between them. Sealing separately is what makes the
+    /// active-to-staged boundary a real transition a workload can checkpoint
+    /// rather than a name with nothing behind it.
+    ///
+    /// The seal is pod-wide, matching the shard owner it drives: there is no
+    /// per-tenant freeze.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the server owns no Scribe, or when a shard cannot
+    /// freeze its writable generations. A shard that did not freeze leaves its
+    /// rows appendable and WAL-authoritative, so the caller may retry.
+    pub async fn seal_bifrost_writable_for_test(&self) -> Result<(), WyrdTestServerError> {
+        self.bifrost_scribe()
+            .ok_or_else(|| WyrdTestServerError::Start("server owns no Scribe".to_owned()))?
+            .flush_writable_for_test()
+            .await
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))
+    }
+
+    /// Publish only the staged residue belonging to one physical partition.
+    ///
+    /// [`flush_bifrost`](Self::flush_bifrost) settles every ready key at once,
+    /// so a caller that only uses it can never observe a pod in which one
+    /// partition is served by a published hot object while a neighbouring
+    /// partition is still served by its live authority. That mixed state is an
+    /// ordinary production state, and it is the state a pinned cut has to read
+    /// correctly. This drives the same production residue and fenced
+    /// publication owner for the already-staged keys of one partition.
+    ///
+    /// Returns how many claims published.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the server owns no Scribe, or when the selected
+    /// key's residue claim or its fenced publication is refused. The remaining
+    /// keys stay staged and their WAL stays authoritative.
+    pub async fn publish_bifrost_partition_for_test(
+        &self,
+        partition: vala_bifrost_redux::catalog::TimePartition,
+    ) -> Result<usize, WyrdTestServerError> {
+        self.bifrost_scribe()
+            .ok_or_else(|| WyrdTestServerError::Start("server owns no Scribe".to_owned()))?
+            .publish_partition_for_test(partition)
+            .await
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))
+    }
+
+    /// Report where every generation this pod still tracks is readable.
+    ///
+    /// The hot-source registry is the pod's single answer to that question, so
+    /// a case proving one partition is hot-published while another is still
+    /// live reads the authority itself rather than inferring it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the server owns no Scribe or the registry lock is
+    /// poisoned.
+    pub fn bifrost_live_authorities_for_test(
+        &self,
+    ) -> Result<Vec<vala_bifrost_redux::scribe::hot_source::LiveAuthority>, WyrdTestServerError>
+    {
+        self.bifrost_scribe()
+            .ok_or_else(|| WyrdTestServerError::Start("server owns no Scribe".to_owned()))?
+            .live_authorities_for_test()
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))
+    }
+
     /// Seed deterministic rows through the public gRPC ingest and Scribe flush paths.
     ///
     /// # Errors
@@ -960,7 +1045,7 @@ impl WyrdTestServer {
             .insert_batch(table, Uuid::now_v7().into_bytes(), ipc)
             .await
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        self.flush_bifrost_for_tenant(tenant_id).await?;
+        self.flush_bifrost().await?;
         Ok(rows.to_vec())
     }
 
@@ -1206,26 +1291,6 @@ impl WyrdTestServer {
         Ok(probe)
     }
 
-    /// Flush the server-owned Scribe through its staged and claim lifecycle.
-    ///
-    /// The pod flush is tenant-independent: it covers every active bucket the
-    /// pod holds, so the tenant argument is retained only because callers name
-    /// the tenant they are about to read back.
-    ///
-    /// # Errors
-    /// Returns an error when the server has no Scribe or a residue claim
-    /// cannot publish.
-    pub async fn flush_bifrost_for_tenant(
-        &self,
-        _tenant: DataTenantId,
-    ) -> Result<(), WyrdTestServerError> {
-        self.inner
-            .state
-            .flush_scribe_for_test()
-            .await
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))
-    }
-
     /// Wake the already-running production Forge scheduler for a test pass.
     ///
     /// The trigger is observation-only plumbing: planning, claims, rewrites,
@@ -1292,7 +1357,8 @@ impl WyrdTestServer {
     ) -> Result<Vec<PublishedHotFileInspection>, WyrdTestServerError> {
         let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
         let rows: Vec<PublishedHotFileRow> = sqlx::query_as(
-            "SELECT id,file_path,file_size,row_count,file_ordinal,file_checksum,promotion_record \
+            "SELECT id,file_path,file_size,row_count,file_ordinal,file_checksum,promotion_record,\
+             wal_lsn_min,wal_lsn_max \
              FROM vala.file_list \
              WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 \
              ORDER BY wal_lsn_min, file_ordinal",
@@ -1325,6 +1391,16 @@ impl WyrdTestServer {
                             &row.promotion_record,
                         )
                         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
+                    wal_lsn_min: u64::try_from(row.wal_lsn_min).map_err(|_| {
+                        WyrdTestServerError::Start(
+                            "published hot file has a negative WAL lower bound".to_owned(),
+                        )
+                    })?,
+                    wal_lsn_max: u64::try_from(row.wal_lsn_max).map_err(|_| {
+                        WyrdTestServerError::Start(
+                            "published hot file has a negative WAL upper bound".to_owned(),
+                        )
+                    })?,
                 })
             })
             .collect()
@@ -1402,6 +1478,88 @@ impl WyrdTestServer {
         )
         .bind(tenant.as_uuid())
         .fetch_optional(&pool)
+        .await
+        .map_err(sql)
+    }
+
+    /// Return every claim this pod's Scribe has published, in commit order.
+    ///
+    /// Each entry names the objects one committed claim produced and the
+    /// distinct shard lanes its contributing members were frozen on. Neither
+    /// the `file_list` row nor its promotion record carries that binding, so
+    /// this is how a harness proves a published object is the product of a real
+    /// cross-shard merge rather than inferring it from object counts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this server owns no Scribe.
+    pub fn published_scribe_claims_for_test(
+        &self,
+    ) -> Result<
+        Vec<vala_bifrost_redux::scribe::staging_runtime::PublishedClaimObservation>,
+        WyrdTestServerError,
+    > {
+        self.bifrost_scribe()
+            .map(|scribe| scribe.published_claims_for_test())
+            .ok_or_else(|| WyrdTestServerError::Start("server owns no Scribe".to_owned()))
+    }
+
+    /// Report the pod's closed contention registry totals.
+    ///
+    /// Fairness is a scheduling decision, not a row: the only truthful evidence
+    /// that a vector was lent, released, or queued is the production registry
+    /// that recorded the decision, so a contention case reads these totals
+    /// instead of inferring capacity from configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this server owns no Scribe.
+    pub fn scribe_contention_totals_for_test(
+        &self,
+    ) -> Result<vala_bifrost_redux::scribe::telemetry::ScribeTelemetrySnapshot, WyrdTestServerError>
+    {
+        self.bifrost_scribe()
+            .map(|scribe| scribe.contention_totals_for_test())
+            .ok_or_else(|| WyrdTestServerError::Start("server owns no Scribe".to_owned()))
+    }
+
+    /// Report how many complete lifecycle vectors this pod's capacity completes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this server owns no Scribe.
+    pub fn scribe_ownership_ceiling_for_test(&self) -> Result<usize, WyrdTestServerError> {
+        self.bifrost_scribe()
+            .map(|scribe| scribe.ownership_ceiling_for_test())
+            .ok_or_else(|| WyrdTestServerError::Start("server owns no Scribe".to_owned()))
+    }
+
+    /// Count the durable Scribe publication transitions one table has recorded.
+    ///
+    /// A file-list commit emits exactly one `bifrost.scribe.visibility.publish`
+    /// row per published generation, and a reconciling retry that inserts no
+    /// new artifact rows emits none. Counting them is therefore how a caller
+    /// distinguishes "the retry reconciled the identical publication" from
+    /// "the retry published a second time under a new identity".
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the fixture's superuser pool cannot be acquired or
+    /// the tenant-scoped audit query fails.
+    pub async fn scribe_publication_audit_count_for_test(
+        &self,
+        tenant: DataTenantId,
+        resource: &str,
+    ) -> Result<i64, WyrdTestServerError> {
+        let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM vala.audit_outbox \
+             WHERE data_tenant_id = $1 AND resource = $2 \
+               AND operation = 'bifrost.scribe.visibility.publish'",
+        )
+        .bind(tenant.as_uuid())
+        .bind(resource)
+        .fetch_one(&pool)
         .await
         .map_err(sql)
     }

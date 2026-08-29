@@ -407,8 +407,11 @@ pub(crate) trait MaterializerBackend: Send + Sync {
         batch_id: [u8; 16],
         payload: Bytes,
     ) -> Result<(), WyrdError>;
-    /// Trigger the documented tenant flush surface.
-    async fn flush(&self, tenant: DataTenantId) -> Result<(), String>;
+    /// Trigger the documented pod-wide Scribe publication surface.
+    ///
+    /// Publication settles every ready key the pod owns, so it takes no tenant:
+    /// naming one would suggest a tenant-scoped flush the server does not have.
+    async fn flush(&self) -> Result<(), String>;
     /// Return the public Oracle count for one logical day range.
     ///
     /// # Errors
@@ -656,7 +659,7 @@ impl<'a> BifrostDatasetMaterializer<'a> {
                         row = row.saturating_add(count);
                     }
                     self.backend
-                        .flush(tenant)
+                        .flush()
                         .await
                         .map_err(MaterializationError::Backend)?;
                     if self.cancellation.is_cancelled() {
@@ -1138,9 +1141,9 @@ impl MaterializerBackend for RealMaterializerBackend<'_> {
             .await
     }
 
-    async fn flush(&self, tenant: DataTenantId) -> Result<(), String> {
+    async fn flush(&self) -> Result<(), String> {
         self.server
-            .flush_bifrost_for_tenant(tenant)
+            .flush_bifrost()
             .await
             .map_err(|error| error.to_string())
     }
@@ -1378,7 +1381,7 @@ mod tests {
             outcome
         }
 
-        async fn flush(&self, _tenant: DataTenantId) -> Result<(), String> {
+        async fn flush(&self) -> Result<(), String> {
             self.flush_completed
                 .lock()
                 .expect("flush completion")

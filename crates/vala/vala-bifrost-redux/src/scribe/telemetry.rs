@@ -1901,7 +1901,7 @@ mod contention_registry_tests {
         );
     }
 
-    /// AC22/AC21 unit owner: both Scribe observation registries are closed and
+    /// Both Scribe observation registries are closed and
     /// their transitions balance over a complete production lifecycle.
     ///
     /// [`ScribeTelemetry`] publishes two closed registries — contention, which

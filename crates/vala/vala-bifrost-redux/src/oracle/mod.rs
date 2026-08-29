@@ -48,7 +48,7 @@ use wyrd_spec::vala::api::{
 use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
 
 use crate::catalog::{
-    BifrostCatalog, BifrostCatalogError, PinnedSealedTable, TableRef, project_persisted_wal_cut,
+    BifrostCatalog, BifrostCatalogError, PinnedSealedTable, TableRef,
 };
 use crate::cluster::{ClusterRegistry, ClusterSnapshot, RegisteredRole};
 use crate::schema::SchemaFingerprint;
@@ -2685,7 +2685,6 @@ impl Oracle {
         build_scribe_follower_sources(
             &tables,
             participant_cut.scribes(),
-            participant_cut.observed_at(),
             self.planner.config.attempt_max_bytes,
         )
     }
@@ -4631,15 +4630,66 @@ fn validate_read_only_plan(
     Ok(())
 }
 
-/// Cross-products pinned tables and Scribes into explicit-empty persisted assignments.
+/// Returns the partition bounds one Scribe memory cut may claim.
+///
+/// The bounds are the complete bucketable hourly span, and that is the exact
+/// answer rather than a missing optimization. A Scribe holds a partition in
+/// memory precisely while nothing has published it, so the only evidence Oracle
+/// has — the sealed manifest — describes the partitions that are *not* the ones
+/// this cut needs to reach. Narrowing the window to the published partitions
+/// would drop every acknowledged row still waiting in memory for a partition
+/// that has published nothing yet, and no wider inference from published rows
+/// recovers it either. Scribe answers what it still holds from the generation
+/// authority it owns; the cut bounds the reader by writer incarnation,
+/// projection, batch count, and retained bytes, which are the bounds Oracle can
+/// state truthfully.
+///
+/// The endpoints are one hour inside the nanosecond instant domain because that
+/// is the domain partition bucketing itself is defined on; an event time
+/// outside it cannot become a partition at all, so no admitted row can fall
+/// beyond these bounds.
 ///
 /// # Errors
-/// Returns visibility unavailable when a persisted cursor, WAL projection, or
-/// configured retained-byte ceiling cannot be represented by the private cut.
+///
+/// Returns [`BifrostError::QueryVisibilityUnavailable`] when either endpoint
+/// does not bucket into a canonical hourly partition, which the fixed margin
+/// makes unreachable.
+fn scribe_memory_partition_bounds() -> Result<
+    (
+        wyrd_spec::vala::api::TimePartitionWire,
+        wyrd_spec::vala::api::TimePartitionWire,
+    ),
+    BifrostError,
+> {
+    /// Nanoseconds in one hour, the margin that keeps truncation representable.
+    const MARGIN_NANOS: i64 = 3_600 * 1_000_000_000;
+
+    let hour = crate::catalog::TimeGranularity::Hour;
+    let bucket = |instant: DateTime<Utc>| {
+        hour.bucket(instant)
+            .map(crate::catalog::layout::TimePartition::to_wire)
+            .map_err(|_| BifrostError::QueryVisibilityUnavailable)
+    };
+    let first = bucket(DateTime::from_timestamp_nanos(i64::MIN + MARGIN_NANOS))?;
+    let last = bucket(DateTime::from_timestamp_nanos(i64::MAX - MARGIN_NANOS))?;
+    Ok((first, last))
+}
+
+/// Cross-products pinned tables and Scribes into explicit-empty persisted assignments.
+///
+/// The cut bounds a follower's partition range, writer incarnation, and
+/// retention. It deliberately carries no published-WAL interval: a node numbers
+/// WAL records from one global counter while sealing per `(table, partition)`,
+/// so a published envelope routinely encloses records belonging to a still-live
+/// member of another bucket. Scribe answers what remains readable from its own
+/// generation authority, which is exact.
+///
+/// # Errors
+/// Returns visibility unavailable when a partition bound or the configured
+/// retained-byte ceiling cannot be represented by the private cut.
 fn build_scribe_follower_sources(
     tables: &[ScribeAssignmentTable<'_>],
     scribes: &[OracleQueryParticipant],
-    observed_at: DateTime<Utc>,
     attempt_max_bytes: usize,
 ) -> Result<Vec<ScribeFollowerSource>, BifrostError> {
     tables
@@ -4657,31 +4707,18 @@ fn build_scribe_follower_sources(
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            let cut = project_persisted_wal_cut(&stream_rows)
-                .map_err(BifrostCatalogError::into_public)?;
             tracing::debug!(
                 operation = "oracle_scribe_cut",
                 node = %node_id.as_uuid(),
                 writer_epoch,
                 sealed_rows = stream_rows.len(),
-                persisted_cursor = cut.persisted_cursor,
                 bounds = ?stream_rows
                     .iter()
                     .map(|row| (row.wal_lsn_min, row.wal_lsn_max, row.file_ordinal))
                     .collect::<Vec<_>>(),
-                "Oracle pinned one Scribe memory cut at the published WAL prefix"
+                "Oracle pinned one Scribe memory cut for a Scribe stream"
             );
-            let mut partitions = stream_rows
-                .iter()
-                .map(crate::oracle::tail_fence::hot_row_partition)
-                .collect::<Result<Vec<_>, _>>()?;
-            partitions.sort();
-            let fallback = crate::catalog::TimeGranularity::Hour
-                .bucket(observed_at)
-                .map(crate::catalog::layout::TimePartition::to_wire)
-                .map_err(|_| BifrostError::QueryVisibilityUnavailable)?;
-            let start_partition = partitions.first().copied().unwrap_or(fallback);
-            let end_partition = partitions.last().copied().unwrap_or(fallback);
+            let (start_partition, end_partition) = scribe_memory_partition_bounds()?;
             Ok(ScribeFollowerSource {
                 table: table.table.clone(),
                 node_id,
@@ -4697,8 +4734,6 @@ fn build_scribe_follower_sources(
                         writer_epoch,
                         start_partition,
                         end_partition,
-                        persisted_cursor: cut.persisted_cursor,
-                        persisted_ranges: cut.persisted_ranges,
                         maximum_batch_count: 1_024,
                         maximum_retained_bytes: u64::try_from(attempt_max_bytes)
                             .map_err(|_| BifrostError::QueryVisibilityUnavailable)?,
@@ -5072,7 +5107,7 @@ mod tests {
                 ),
             })
             .collect::<Vec<_>>();
-        let assignments = build_scribe_follower_sources(&tables, &scribes, Utc::now(), 64 * 1024)
+        let assignments = build_scribe_follower_sources(&tables, &scribes, 64 * 1024)
             .expect("valid pinned Scribes produce bounded assignments");
 
         assert_eq!(assignments.len(), tables.len() * scribes.len());
@@ -5102,7 +5137,6 @@ mod tests {
                 .scribe_provider_cut
                 .expect("every pinned Scribe assignment carries the mandatory hot cut");
             assert_eq!(provider.writer_epoch, participant.fencing_token);
-            assert_eq!(provider.persisted_cursor, 0);
             assert_eq!(
                 source.assignment.required_columns,
                 vec!["event_id".to_owned()]
@@ -5171,8 +5205,6 @@ mod tests {
             writer_epoch: 7,
             start_partition: crate::test_support::day_partition(2026, 8, 20).to_wire(),
             end_partition: crate::test_support::day_partition(2026, 8, 20).to_wire(),
-            persisted_cursor: 0,
-            persisted_ranges: Vec::new(),
             maximum_batch_count: 1,
             maximum_retained_bytes: 1024,
         });
@@ -5259,8 +5291,6 @@ mod tests {
             writer_epoch: 7,
             start_partition: crate::test_support::day_partition(2026, 8, 20).to_wire(),
             end_partition: crate::test_support::day_partition(2026, 8, 20).to_wire(),
-            persisted_cursor: 0,
-            persisted_ranges: Vec::new(),
             maximum_batch_count: 1,
             maximum_retained_bytes: 1024,
         });
@@ -5806,83 +5836,5 @@ mod tests {
             assignment_schema_fingerprint(&iceberg),
             assignment_schema_fingerprint(&parquet),
         );
-    }
-
-    /// Canonical persisted-WAL validation rejects reversals and cursor straddling.
-    ///
-    /// Overlapping ranges are accepted: a node-global LSN counter and
-    /// per-partition sealing make one generation's bounds span another's
-    /// records without either owning the other.
-    #[test]
-    /// # Panics
-    /// Panics if invalid, overlapping, or cursor-contradictory ranges are accepted.
-    fn persisted_wal_range_validation_rejects_invalid_or_cursor_contradictory_input() {
-        use wyrd_spec::vala::api::{PersistedWalRange, ScribeProviderCut};
-
-        let mut cut = ScribeProviderCut {
-            writer_epoch: 1,
-            start_partition: crate::test_support::day_partition(2026, 8, 19).to_wire(),
-            end_partition: crate::test_support::day_partition(2026, 8, 19).to_wire(),
-            persisted_cursor: 7,
-            persisted_ranges: vec![PersistedWalRange {
-                start_lsn: 9,
-                end_lsn: 8,
-            }],
-            maximum_batch_count: 1,
-            maximum_retained_bytes: 1,
-        };
-        assert!(!cut.is_valid());
-        cut.persisted_ranges = vec![PersistedWalRange {
-            start_lsn: 1,
-            end_lsn: 7,
-        }];
-        assert!(
-            cut.is_valid(),
-            "a wholly pre-cursor inclusive range is valid"
-        );
-        cut.persisted_ranges = vec![PersistedWalRange {
-            start_lsn: 8,
-            end_lsn: 9,
-        }];
-        assert!(cut.is_valid(), "a wholly post-cursor range is valid");
-        cut.persisted_ranges = vec![PersistedWalRange {
-            start_lsn: 7,
-            end_lsn: 8,
-        }];
-        assert!(!cut.is_valid());
-        cut.persisted_ranges = vec![
-            PersistedWalRange {
-                start_lsn: 8,
-                end_lsn: 12,
-            },
-            PersistedWalRange {
-                start_lsn: 10,
-                end_lsn: 10,
-            },
-        ];
-        assert!(
-            cut.is_valid(),
-            "one generation's bounds may span another generation's records"
-        );
-        cut.persisted_ranges = vec![
-            PersistedWalRange {
-                start_lsn: 10,
-                end_lsn: 12,
-            },
-            PersistedWalRange {
-                start_lsn: 8,
-                end_lsn: 9,
-            },
-        ];
-        assert!(!cut.is_valid(), "descending ranges are not a canonical cut");
-        cut.persisted_ranges.clear();
-        cut.persisted_cursor = i64::MAX as u64 + 1;
-        assert!(!cut.is_valid());
-        cut.persisted_cursor = 0;
-        cut.persisted_ranges = vec![PersistedWalRange {
-            start_lsn: i64::MAX as u64 + 1,
-            end_lsn: i64::MAX as u64 + 1,
-        }];
-        assert!(!cut.is_valid());
     }
 }

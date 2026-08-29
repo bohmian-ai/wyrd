@@ -991,31 +991,21 @@ impl From<domain::FollowerScanAssignment> for proto::FollowerScanAssignment {
 impl TryFrom<proto::ScribeProviderCut> for domain::ScribeProviderCut {
     type Error = PrivateConversionError;
 
-    /// Decodes the bounded Scribe provider projection without erasing endpoint presence.
+    /// Decodes the bounded Scribe provider projection.
+    ///
+    /// The cut bounds partitions, writer incarnation, and retention only. It
+    /// carries no published-WAL statement, because Scribe's generation
+    /// authority is the exact answer to what a follower may still read from
+    /// memory and a wire-carried interval would be a weaker second one.
     ///
     /// # Errors
-    /// Returns a conversion error when either WAL endpoint is absent or the
-    /// complete cut violates its canonical ordering, cursor, or signed bounds.
+    /// Returns a conversion error when either partition endpoint is absent or
+    /// the complete cut violates its canonical ordering or signed bounds.
     fn try_from(value: proto::ScribeProviderCut) -> Result<Self, Self::Error> {
         let cut = Self {
             writer_epoch: value.writer_epoch,
             start_partition: time_partition(value.start_partition, "start_partition")?,
             end_partition: time_partition(value.end_partition, "end_partition")?,
-            persisted_cursor: value.persisted_cursor,
-            persisted_ranges: value
-                .persisted_ranges
-                .into_iter()
-                .map(|range| {
-                    Ok(domain::PersistedWalRange {
-                        start_lsn: range
-                            .start_lsn
-                            .ok_or(PrivateConversionError::Missing("start_lsn"))?,
-                        end_lsn: range
-                            .end_lsn
-                            .ok_or(PrivateConversionError::Missing("end_lsn"))?,
-                    })
-                })
-                .collect::<Result<_, PrivateConversionError>>()?,
             maximum_batch_count: value.maximum_batch_count,
             maximum_retained_bytes: value.maximum_retained_bytes,
         };
@@ -1035,15 +1025,6 @@ impl From<domain::ScribeProviderCut> for proto::ScribeProviderCut {
             writer_epoch: value.writer_epoch,
             start_partition: Some(time_partition_proto(value.start_partition)),
             end_partition: Some(time_partition_proto(value.end_partition)),
-            persisted_cursor: value.persisted_cursor,
-            persisted_ranges: value
-                .persisted_ranges
-                .into_iter()
-                .map(|range| proto::PersistedWalRange {
-                    start_lsn: Some(range.start_lsn),
-                    end_lsn: Some(range.end_lsn),
-                })
-                .collect(),
             maximum_batch_count: value.maximum_batch_count,
             maximum_retained_bytes: value.maximum_retained_bytes,
         }
@@ -1503,11 +1484,6 @@ mod tests {
             writer_epoch: 7,
             start_partition: hour_partition(1_787_493_600_000_000),
             end_partition: hour_partition(1_787_497_200_000_000),
-            persisted_cursor: 41,
-            persisted_ranges: vec![domain::PersistedWalRange {
-                start_lsn: 1,
-                end_lsn: 40,
-            }],
             maximum_batch_count: 16,
             maximum_retained_bytes: 1_048_576,
         };
@@ -1803,24 +1779,6 @@ mod tests {
             .expect("owner-local get response round-trips"),
             get
         );
-    }
-
-    /// Optional protobuf WAL endpoints distinguish explicit zero from absence.
-    #[test]
-    /// # Panics
-    /// Panics if optional persisted-WAL endpoints lose their wire presence.
-    fn oracle_execute_fragment_preserves_optional_wal_endpoint_presence() {
-        let present = proto::PersistedWalRange {
-            start_lsn: Some(0),
-            end_lsn: Some(0),
-        };
-        assert_eq!(present.start_lsn, Some(0));
-        assert_eq!(present.end_lsn, Some(0));
-        let missing = proto::PersistedWalRange {
-            start_lsn: None,
-            end_lsn: Some(0),
-        };
-        assert!(missing.start_lsn.is_none());
     }
 
     /// A completed worker footer round-trips as the terminal frame.

@@ -31,7 +31,7 @@ const BATCHES_BEFORE_PRESSURE: usize = 8;
 /// something to reclaim. Every other control stays production.
 const WAL_SEGMENT_BYTES: u64 = 64 * 1024;
 
-/// AC22 Tier-2 owner: pressure refuses fairly and the pod comes back.
+/// Pressure refuses fairly, pod-wide, and the pod recovers afterwards.
 ///
 /// A full WAL disk is the one condition Scribe cannot write through, so it
 /// refuses at admission before touching the disk. Two things about that refusal
@@ -140,7 +140,7 @@ async fn scribe_backpressure_disk_pressure_and_fairness_recover() {
     // Publication retires the closed WAL segments, which is the event that
     // frees space and therefore the only event allowed to clear the breaker.
     server
-        .flush_bifrost_for_tenant(first_tenant)
+        .flush_bifrost()
         .await
         .expect("the staged members publish");
 
@@ -155,7 +155,7 @@ async fn scribe_backpressure_disk_pressure_and_fairness_recover() {
         .expect("the second tenant is served again once WAL space is reclaimed");
 
     server
-        .flush_bifrost_for_tenant(first_tenant)
+        .flush_bifrost()
         .await
         .expect("the recovered rows publish");
     let mut expected = admitted.clone();

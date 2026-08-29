@@ -227,6 +227,13 @@ fn bifrost_error_from_code(
         "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE" => BifrostError::QueryStreamIncomplete,
         "WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE" => BifrostError::QueryAuditUnavailable,
         "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE" => BifrostError::QueryResultTooLarge,
+        // The enforced ceiling is configured, not universal. A caller that only
+        // learns "too large" cannot resize its batch to fit; it has to guess at
+        // a limit the server never promised, so both bounds are reconstructed.
+        "WYRD_VALA_413_PAYLOAD_TOO_LARGE" => {
+            let (bytes, limit) = payload_bounds_from(message, details);
+            BifrostError::PayloadTooLarge { bytes, limit }
+        }
         "WYRD_VALA_400_EVENT_TIME_OUT_OF_RANGE" => {
             let (value, past_bound, future_bound) = event_time_window_bounds_from_message(message);
             BifrostError::EventTimeOutOfRange {
@@ -268,6 +275,36 @@ fn event_time_window_bounds_from_message(message: &str) -> (String, String, Stri
     parsed.unwrap_or_else(|| {
         let unknown = "<unknown>".to_owned();
         (unknown.clone(), unknown.clone(), unknown)
+    })
+}
+
+/// Recover the measured byte count and enforced ceiling from a payload-limit
+/// failure.
+///
+/// The gRPC projection carries only the stable code and the rendered detail
+/// message, so the bounds are parsed from that message first and the structured
+/// HTTP `details.data` payload is used as the fallback. Both transports
+/// therefore reconstruct the identical typed error. Unparseable input yields
+/// zeroes rather than a panic, because a malformed upstream response must not
+/// take down the caller.
+fn payload_bounds_from(message: &str, details: &serde_json::Value) -> (usize, usize) {
+    let from_message = message
+        .strip_prefix("ingest payload too large: ")
+        .and_then(|rest| rest.split_once(" bytes exceeds the "))
+        .and_then(|(bytes, rest)| {
+            let limit = rest.strip_suffix(" byte limit")?;
+            Some((bytes.parse().ok()?, limit.parse().ok()?))
+        });
+    from_message.unwrap_or_else(|| {
+        let field = |name: &str| {
+            details
+                .get("data")
+                .and_then(|data| data.get(name))
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(0)
+        };
+        (field("bytes"), field("limit"))
     })
 }
 
@@ -537,6 +574,67 @@ mod tests {
                 from_http.as_problem_json(),
                 "gRPC and HTTP mappers must produce identical WyrdError for the same stable code"
             );
+        }
+
+        /// The enforced payload ceiling must reach the caller identically over
+        /// both transports. A client that cannot read `limit` from the
+        /// reconstructed error cannot resize its batch to fit; it can only
+        /// guess at a ceiling the server never promised.
+        ///
+        /// # Panics
+        ///
+        /// Panics when either transport loses the code, status, measured bytes,
+        /// enforced limit, detail, or remediation, or when the two disagree.
+        #[test]
+        fn payload_limit_reconstructs_identically_across_transports() {
+            let detail = "ingest payload too large: 41943040 bytes exceeds the 8388608 byte limit";
+            let grpc = wyrd_tonic::tonic::Status::with_error_details(
+                Code::ResourceExhausted,
+                detail,
+                ErrorDetails::with_error_info(
+                    "WYRD_VALA_413_PAYLOAD_TOO_LARGE",
+                    "wyrd.dev",
+                    HashMap::new(),
+                ),
+            );
+            let http = serde_json::json!({
+                "code": "WYRD_VALA_413_PAYLOAD_TOO_LARGE",
+                "status": 413,
+                "detail": detail,
+                "details": { "variant": "payload_too_large", "data": { "bytes": 41_943_040, "limit": 8_388_608 } },
+            });
+
+            let from_grpc = from_grpc_status(&grpc);
+            let from_http = from_problem_json(&http);
+            assert_eq!(
+                from_grpc.as_problem_json(),
+                from_http.as_problem_json(),
+                "both transports must reconstruct the same payload-limit error"
+            );
+
+            for reconstructed in [&from_grpc, &from_http] {
+                assert_eq!(reconstructed.code(), "WYRD_VALA_413_PAYLOAD_TOO_LARGE");
+                assert_eq!(reconstructed.status(), 413);
+                assert_eq!(reconstructed.to_string(), detail);
+                let problem = reconstructed.as_problem_json();
+                assert_eq!(
+                    problem["details"]["data"]["bytes"], 41_943_040,
+                    "measured bytes must survive the transport: {problem}"
+                );
+                assert_eq!(
+                    problem["details"]["data"]["limit"], 8_388_608,
+                    "the enforced limit must survive the transport: {problem}"
+                );
+                let remediation = problem["remediation"].as_str().unwrap_or_default();
+                assert!(
+                    !remediation.contains("32 MiB"),
+                    "remediation must not contradict the supplied limit: {problem}"
+                );
+                assert!(
+                    remediation.contains("limit"),
+                    "remediation must point at the supplied limit: {problem}"
+                );
+            }
         }
 
         #[test]

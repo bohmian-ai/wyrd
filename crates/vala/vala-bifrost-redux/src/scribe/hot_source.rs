@@ -94,10 +94,13 @@ pub enum HotAuthority {
         /// Inclusive WAL bounds the member covers.
         wal: (WalLsn, WalLsn),
     },
-    /// Readable from a published hot object recorded in the catalog.
+    /// Readable from the published hot objects recorded in the catalog.
     Published {
-        /// Remote object key the catalog row points at.
-        object_key: String,
+        /// Every remote object key the generation's catalog rows point at, in
+        /// publication order. A claim that packs its merged rows into more than
+        /// one row group writes more than one object, and naming only the first
+        /// would leave the rest of the generation unattributed.
+        object_keys: Vec<String>,
     },
 }
 
@@ -211,6 +214,22 @@ pub struct StagedSource {
     pub bytes: u64,
     /// Inclusive WAL bounds the member covers.
     pub wal: (WalLsn, WalLsn),
+}
+
+/// One generation's current authority, as the registry holds it.
+///
+/// Read-only observation used to prove which of a pod's live generations are
+/// already served by a published object and which are still served by their
+/// memtable or staged runs.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Clone)]
+pub struct LiveAuthority {
+    /// Seal key the generation belongs to.
+    pub key: SealKey,
+    /// Generation the authority describes.
+    pub generation: GenerationOrdinal,
+    /// Where the generation's rows are readable right now.
+    pub authority: HotAuthority,
 }
 
 /// Staged sources one reader holds open for the length of its read.
@@ -547,6 +566,39 @@ impl ScribeHotSourceRegistry {
         Ok(live)
     }
 
+    /// Returns every generation the registry still tracks, with its authority.
+    ///
+    /// The registry is the pod's single answer to "where are this generation's
+    /// rows readable now", so a harness that has to prove one partition is
+    /// served by a published object while a neighbouring partition is still
+    /// served by a live authority reads that fact here rather than inferring it
+    /// from object counts or WAL bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HotSourceError::Poisoned`] on a poisoned lock.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn live_authorities_for_test(&self) -> Result<Vec<LiveAuthority>, HotSourceError> {
+        let state = self.lock()?;
+        let mut live: Vec<LiveAuthority> = state
+            .iter()
+            .flat_map(|(key, authorities)| {
+                authorities
+                    .by_generation
+                    .iter()
+                    .map(|(generation, authority)| LiveAuthority {
+                        key: key.clone(),
+                        generation: *generation,
+                        authority: authority.clone(),
+                    })
+            })
+            .collect();
+        live.sort_by(|left, right| {
+            (&left.key.partition, left.generation).cmp(&(&right.key.partition, right.generation))
+        });
+        Ok(live)
+    }
+
     /// Returns the highest generation number one lane already owns for a key.
     ///
     /// Generation numbers are allocated by the shard lane that freezes them and
@@ -803,7 +855,7 @@ mod tests {
             .advance(&key, generation, staged())
             .expect("memtable advances to a staged run");
         let published = HotAuthority::Published {
-            object_key: "hot/events/0001.parquet".to_owned(),
+            object_keys: vec!["hot/events/0001.parquet".to_owned()],
         };
         registry
             .advance(&key, generation, published.clone())
@@ -849,7 +901,7 @@ mod tests {
             .restore_durable(&key, first, staged())
             .expect("first staged member restores");
         let published = HotAuthority::Published {
-            object_key: "hot/events/claim.parquet".to_owned(),
+            object_keys: vec!["hot/events/claim.parquet".to_owned()],
         };
         let transitions = vec![(first, published.clone()), (second, published.clone())];
 
@@ -1049,7 +1101,7 @@ mod tests {
                 &key,
                 published,
                 HotAuthority::Published {
-                    object_key: "objects/one.parquet".to_owned(),
+                    object_keys: vec!["objects/one.parquet".to_owned()],
                 },
             )
             .expect("generation publishes");

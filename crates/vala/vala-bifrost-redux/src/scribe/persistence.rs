@@ -973,6 +973,47 @@ impl PersistenceRuntime {
         worker.publish_residue(cause).await
     }
 
+    /// Publishes only the staged residue belonging to one physical partition.
+    ///
+    /// Returns zero when the pod has no persistence worker or no staging
+    /// volume, which is the same condition under which it can publish nothing
+    /// at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the selected key's residue claim or its
+    /// fenced publication is refused; the key stays staged and its WAL stays
+    /// authoritative.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn publish_partition_for_test(
+        &self,
+        partition: crate::catalog::layout::TimePartition,
+    ) -> Result<usize, ScribeError> {
+        let Some(worker) = &self.worker else {
+            return Ok(0);
+        };
+        if worker.staging.is_none() {
+            return Ok(0);
+        }
+        worker.publish_partition_residue(partition).await
+    }
+
+    /// Returns every claim this pod's staging runtime has published.
+    ///
+    /// Empty when the pod has no persistence worker or no staging volume, which
+    /// is the same condition under which it can publish nothing at all.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn published_claims_for_test(
+        &self,
+    ) -> Vec<crate::scribe::staging_runtime::PublishedClaimObservation> {
+        self.worker
+            .as_ref()
+            .and_then(|worker| worker.staging.as_ref())
+            .map(|staging| staging.published_claims_for_test())
+            .unwrap_or_default()
+    }
+
     /// Aborts every retained persistence worker without touching the async join registry.
     ///
     /// The abort-handle registry is drained before cancellation so repeated
@@ -2575,6 +2616,48 @@ impl PersistenceWorker {
         }
         for key in staging.ready_keys()? {
             while let Some(claim) = staging.take_residue(&key, cause)? {
+                self.publish_claim(&staging, &claim, None).await?;
+                published += 1;
+            }
+        }
+        Ok(published)
+    }
+
+    /// Publishes only the residue of the assembly keys owning one partition.
+    ///
+    /// Publication is otherwise pod-wide: every ready key settles together, so
+    /// no caller can observe a pod in which one partition is served by a hot
+    /// object while a neighbouring partition is still served by its live
+    /// authority. That mixed state is a real production state — a claim becomes
+    /// due when its own dwell or target says so, not when the pod is quiescent
+    /// — and it is the state in which a cut must distinguish what it actually
+    /// owns from what merely falls inside its bounds.
+    ///
+    /// This selects an already-existing ready key and drives the same residue
+    /// claim and fenced publication owner `publish_residue` uses. It fabricates
+    /// no member, object, row, or cut.
+    ///
+    /// Returns the number of claims published.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the staging capability is absent, when the
+    /// assembler refuses a residue claim, or when a claim fails to publish. The
+    /// remaining keys stay staged and the WAL stays authoritative for them.
+    #[cfg(any(test, feature = "test-support"))]
+    async fn publish_partition_residue(
+        &self,
+        partition: crate::catalog::layout::TimePartition,
+    ) -> Result<usize, ScribeError> {
+        let staging = self.staging()?;
+        let mut published = 0;
+        for key in staging.ready_keys()? {
+            if key.partition() != partition {
+                continue;
+            }
+            while let Some(claim) =
+                staging.take_residue(&key, crate::scribe::assembly::ClaimCause::Drain)?
+            {
                 self.publish_claim(&staging, &claim, None).await?;
                 published += 1;
             }

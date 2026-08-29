@@ -237,7 +237,7 @@ async fn run_on_cluster(
 ) -> Result<Report, BenchError> {
     let endpoints = provision_endpoints(cluster, scenario).await?;
     let prewarm_accepted_spans = prewarm_endpoints(&endpoints).await?;
-    flush_tenants(cluster, &endpoints).await?;
+    flush_pods(cluster).await?;
     let mut warmup = PhaseStats::default();
     if scenario.warmup_seconds > 0 {
         warmup = run_phase(
@@ -508,18 +508,9 @@ async fn prewarm_endpoints(endpoints: &[Endpoint]) -> Result<u64, BenchError> {
     Ok(accepted_spans)
 }
 
-async fn flush_tenants(
-    cluster: &WyrdTestCluster,
-    endpoints: &[Endpoint],
-) -> Result<(), BenchError> {
-    let mut tenant_ids = BTreeMap::new();
-    for endpoint in endpoints {
-        tenant_ids.insert(endpoint.tenant_index, endpoint.tenant);
-    }
-    for tenant in tenant_ids.values() {
-        for server in cluster.servers() {
-            server.flush_bifrost_for_tenant(*tenant).await?;
-        }
+async fn flush_pods(cluster: &WyrdTestCluster) -> Result<(), BenchError> {
+    for server in cluster.servers() {
+        server.flush_bifrost().await?;
     }
     Ok(())
 }
@@ -582,7 +573,7 @@ async fn verify_run(
     for endpoint in endpoints {
         tenant_ids.insert(endpoint.tenant_index, endpoint.tenant);
     }
-    flush_tenants(cluster, endpoints).await?;
+    flush_pods(cluster).await?;
 
     let mut query_latencies = Vec::new();
     let mut verification = VerificationReport {

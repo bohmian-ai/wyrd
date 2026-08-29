@@ -435,16 +435,23 @@ pub enum BifrostError {
     QueryResultTooLarge,
 
     /// The decompressed canonical ingest payload exceeded the Scribe limit.
-    #[error("ingest payload too large: {bytes} bytes")]
+    ///
+    /// Both bounds are public data: `bytes` is what the server measured and
+    /// `limit` is the ceiling it actually enforced for this request. The limit
+    /// is configured rather than universal, so callers must read it from the
+    /// problem document instead of assuming a fixed transport ceiling.
+    #[error("ingest payload too large: {bytes} bytes exceeds the {limit} byte limit")]
     #[wyrd_error(
         code = "WYRD_VALA_413_PAYLOAD_TOO_LARGE",
         status = 413,
         title = "Ingest payload too large",
-        remediation = "Reduce the request to at most 32 MiB of canonical transport bytes and retry."
+        remediation = "Reduce the request below the enforced limit reported in this problem and retry."
     )]
     PayloadTooLarge {
         /// Server-measured canonical transport bytes.
         bytes: usize,
+        /// Canonical transport byte ceiling enforced for this request.
+        limit: usize,
     },
 
     /// The ingest request exceeded the aggregate row bound.
@@ -846,6 +853,46 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Proves the ingest payload ceiling is carried as structured data rather than
+    /// being frozen into prose: the enforced `limit` travels beside the measured
+    /// `bytes` through the public catalog projection, so a caller reading only the
+    /// problem document can compute how far over the configured ceiling it went.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the code, status, structured details, or remediation drift from
+    /// the durable public contract.
+    #[test]
+    fn payload_too_large_reports_the_enforced_limit() {
+        let error = BifrostError::PayloadTooLarge {
+            bytes: 41_943_040,
+            limit: 8_388_608,
+        };
+        assert_eq!(error.code(), "WYRD_VALA_413_PAYLOAD_TOO_LARGE");
+        assert_eq!(error.status(), 413);
+
+        let details = serde_json::to_value(&error).expect("payload error serializes");
+        assert_eq!(
+            details["data"]["bytes"], 41_943_040,
+            "measured transport bytes must survive the public projection: {details}"
+        );
+        assert_eq!(
+            details["data"]["limit"], 8_388_608,
+            "the enforced ceiling must survive the public projection: {details}"
+        );
+
+        let remediation = error.remediation();
+        assert!(
+            !remediation.contains("32 MiB"),
+            "remediation must not assert a fixed ceiling that contradicts the \
+             supplied limit: {remediation}"
+        );
+        assert!(
+            remediation.contains("limit"),
+            "remediation must point the caller at the supplied limit: {remediation}"
+        );
     }
 
     /// Confirms the closed token vocabulary is snake_case on the wire so SDKs can

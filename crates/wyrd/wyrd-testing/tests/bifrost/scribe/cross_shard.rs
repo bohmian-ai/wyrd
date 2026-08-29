@@ -7,14 +7,46 @@ use super::support::{
     tenant_client, unique_table,
 };
 
-/// AC22 Tier-2 owner: one publication covers every shard's generation once.
+/// Rows appended in one public request.
+///
+/// Sized so the encoded Arrow IPC envelope stays far below the production
+/// ingest request ceiling while the case still reaches its row target in a
+/// bounded number of requests.
+const ROWS_PER_BATCH: i64 = 6_000;
+
+/// Public requests the case sends.
+///
+/// `BATCHES * ROWS_PER_BATCH` must exceed the canonical 131,072-row group
+/// bound, because a merged object below that bound would close with a single
+/// row group and the physical half of this owner would prove nothing.
+const BATCHES: i64 = 24;
+
+/// Canonical rows one Parquet row group holds before the writer rolls.
+const ROW_GROUP_ROWS: i64 = 131_072;
+
+/// One publication covers every shard's generation exactly once, in multi-group
+/// objects.
 ///
 /// Batches route by `(tenant, table, batch_id)`, so one table's rows are sealed
 /// as separate generations on separate shard owners. A publication assembles
 /// those generations into hot objects, and each generation may end up merged
-/// into an object with its peers rather than owning one. Two things have to
-/// hold at once: every generation's rows reach exactly one published object,
-/// and a second publication pass finds nothing left to do.
+/// into an object with its peers rather than owning one. Three things have to
+/// hold at once: every generation's rows reach exactly one published object, an
+/// object built from members on more than one shard closes with more than one
+/// row group, and a second publication pass finds nothing left to do.
+///
+/// The group count is asserted exactly, not merely as "more than one". A claim
+/// merges many staged runs, most of them far smaller than a group; writing one
+/// group per run would still clear a `> 1` check while making the footer grow
+/// with the number of runs merged instead of with the object's size. The
+/// fewest-groups-its-rows-allow form is the one that separates packed groups
+/// from per-run groups.
+///
+/// The row target is the load-bearing part of the physical claim. A merged
+/// object holding fewer than one row group's worth of rows would satisfy every
+/// exactly-once assertion while still being written one input run per group, so
+/// the case sends past the canonical group bound and then reads the sealed
+/// footer's split offsets rather than trusting the object count.
 ///
 /// The case drives real appends until the production router has spread the
 /// table across several shards, so the merge it proves is the one production
@@ -23,7 +55,9 @@ use super::support::{
 /// # Panics
 ///
 /// Panics when a public append or read fails, when the router leaves the table
-/// on one shard, when the published objects do not account for exactly the
+/// on one shard, when no published object was merged from members on more than
+/// one shard, when such an object closed with a single, non-ascending, or
+/// unpacked set of row groups, when the published objects do not account for exactly the
 /// acknowledged rows, or when a second publication pass republishes them.
 #[tokio::test]
 #[ignore = "requires Postgres and object storage"]
@@ -35,14 +69,21 @@ async fn scribe_cross_shard_generations_publish_multi_group_objects_once() {
     let client = tenant_client(&server, tenant).await;
 
     let mut expected = Vec::new();
-    for batch in 0..24_i64 {
-        let rows: Vec<i64> = (batch * 100..batch * 100 + 8).collect();
+    for batch in 0..BATCHES {
+        let start = batch * ROWS_PER_BATCH;
+        let rows: Vec<i64> = (start..start + ROWS_PER_BATCH).collect();
         append_values(&client, &table, uuid::Uuid::now_v7(), &rows)
             .await
             .expect("every batch is acknowledged");
         expected.extend_from_slice(&rows);
     }
     expected.sort_unstable();
+    assert!(
+        expected.len() as i64 > ROW_GROUP_ROWS,
+        "the case must send past the canonical row-group bound to prove a \
+         multi-group object; it sent {}",
+        expected.len()
+    );
 
     let occupied_shards = server
         .scribe_inspection_snapshot()
@@ -62,7 +103,7 @@ async fn scribe_cross_shard_generations_publish_multi_group_objects_once() {
     );
 
     server
-        .flush_bifrost_for_tenant(tenant)
+        .flush_bifrost()
         .await
         .expect("the cross-shard generations publish");
     let published = server
@@ -104,10 +145,58 @@ async fn scribe_cross_shard_generations_publish_multi_group_objects_once() {
         "published objects must read back exactly the acknowledged rows"
     );
 
+    // Which lanes produced an object is not a fact the file-list row or its
+    // promotion record carries, so the claim observation is what makes "this
+    // object is a real cross-shard merge" an assertion rather than an
+    // inference from how few objects were published.
+    let claims = server
+        .published_scribe_claims_for_test()
+        .expect("the production Scribe reports what its claims published");
+    let merged: Vec<&str> = claims
+        .iter()
+        .filter(|claim| claim.member_shards.len() > 1)
+        .flat_map(|claim| claim.object_keys.iter().map(String::as_str))
+        .collect();
+    assert!(
+        !merged.is_empty(),
+        "at least one published claim must have drawn members from more than one \
+         shard: {claims:?}"
+    );
+
+    let mut multi_group = 0_usize;
+    for file in &published {
+        if !merged.contains(&file.object_key.as_str()) {
+            continue;
+        }
+        let offsets = &file.promotion_record.data_file.split_offsets;
+        assert!(
+            offsets.windows(2).all(|pair| pair[0] < pair[1]),
+            "row-group offsets must be strictly ascending in {}: {offsets:?}",
+            file.object_key
+        );
+        let rows = file.promotion_record.data_file.record_count;
+        assert_eq!(
+            offsets.len() as u64,
+            rows.div_ceil(ROW_GROUP_ROWS as u64),
+            "a merged object must hold the fewest groups its {rows} rows allow, \
+             not one per input run, in {}: {offsets:?}",
+            file.object_key
+        );
+        if offsets.len() > 1 {
+            multi_group += 1;
+        }
+    }
+    assert!(
+        multi_group > 0,
+        "a cross-shard merge holding {} rows must close at least one object with \
+         more than one row group; every merged object closed with one",
+        expected.len()
+    );
+
     // A second pass has nothing left to publish: the same rows, the same
     // objects, and the same durable file-list identities.
     server
-        .flush_bifrost_for_tenant(tenant)
+        .flush_bifrost()
         .await
         .expect("a second publication pass succeeds");
     let republished = server

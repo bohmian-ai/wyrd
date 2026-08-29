@@ -97,6 +97,29 @@ pub struct ScribeStagingRuntime {
     /// hands, so this owner is what moves the authority forward. A fixture
     /// runtime built without a pod tracks no authority and none is asked of it.
     hot_sources: Option<Arc<crate::scribe::hot_source::ScribeHotSourceRegistry>>,
+    /// Read-only record of which shards contributed to each published claim.
+    ///
+    /// Neither the `file_list` row nor its promotion record names the shard
+    /// lanes that produced an object — publication is a fact about rows, not
+    /// about which lane froze them. Harnesses that need to prove a real
+    /// cross-shard merge occurred read it here instead of inferring it from
+    /// object counts.
+    #[cfg(any(test, feature = "test-support"))]
+    published_claims: Mutex<Vec<PublishedClaimObservation>>,
+}
+
+/// Which shards one published claim drew from, and what it published.
+///
+/// Recorded only under test support. Every object in one entry came from the
+/// same merged claim, so an entry naming more than one shard proves each of its
+/// objects is the product of a real cross-shard merge.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedClaimObservation {
+    /// Object keys the claim committed, in artifact-ordinal order.
+    pub object_keys: Vec<String>,
+    /// Distinct shard lanes that froze the claim's contributing members.
+    pub member_shards: Vec<u16>,
 }
 
 impl ScribeStagingRuntime {
@@ -118,6 +141,8 @@ impl ScribeStagingRuntime {
             target_object_bytes: config.target_file_size_bytes(),
             telemetry: None,
             hot_sources: None,
+            #[cfg(any(test, feature = "test-support"))]
+            published_claims: Mutex::new(Vec::new()),
         }
     }
 
@@ -542,15 +567,17 @@ impl ScribeStagingRuntime {
                 | crate::scribe::hot_stage::StagedMemberState::CleanupPending {
                     published_object_identities,
                     ..
-                } => crate::scribe::hot_source::HotAuthority::Published {
-                    object_key: published_object_identities
-                        .first()
-                        .cloned()
-                        .ok_or_else(|| ScribeError::Internal {
+                } => {
+                    if published_object_identities.is_empty() {
+                        return Err(ScribeError::Internal {
                             detail: "recovered published member names no object identity"
                                 .to_owned(),
-                        })?,
-                },
+                        });
+                    }
+                    crate::scribe::hot_source::HotAuthority::Published {
+                        object_keys: published_object_identities.clone(),
+                    }
+                }
                 crate::scribe::hot_stage::StagedMemberState::Ready
                 | crate::scribe::hot_stage::StagedMemberState::Claimed { .. }
                 | crate::scribe::hot_stage::StagedMemberState::Publishing { .. } => {
@@ -734,6 +761,8 @@ impl ScribeStagingRuntime {
                 return Err(error);
             }
         };
+        #[cfg(any(test, feature = "test-support"))]
+        self.record_published_claim(claim, &published);
         self.observe(
             crate::scribe::telemetry::StagingEffect::ClaimPublished,
             crate::scribe::telemetry::StagingFacts {
@@ -754,6 +783,43 @@ impl ScribeStagingRuntime {
         );
         self.settle(claim.id(), published.released_bytes)?;
         Ok(published)
+    }
+
+    /// Records which shards produced the members of one committed claim.
+    ///
+    /// Deliberately infallible and lock-tolerant: a poisoned observation lock
+    /// must never turn a successful publication into a failure, because the
+    /// record exists only so a harness can read what already happened.
+    #[cfg(any(test, feature = "test-support"))]
+    fn record_published_claim(&self, claim: &StagingClaim, published: &PublishedClaim) {
+        let mut member_shards: Vec<u16> = claim
+            .members()
+            .iter()
+            .map(|member| member.id().shard())
+            .collect();
+        member_shards.sort_unstable();
+        member_shards.dedup();
+        if let Ok(mut observations) = self.published_claims.lock() {
+            observations.push(PublishedClaimObservation {
+                object_keys: published.object_identities.clone(),
+                member_shards,
+            });
+        }
+    }
+
+    /// Returns every claim this runtime has published, in publication order.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the observation lock is poisoned, which means a harness
+    /// thread already failed while holding it.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn published_claims_for_test(&self) -> Vec<PublishedClaimObservation> {
+        self.published_claims
+            .lock()
+            .expect("staged publication observations are not poisoned")
+            .clone()
     }
 
     /// Returns the claim slot and the staged bytes a settled claim released.

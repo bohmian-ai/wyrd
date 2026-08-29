@@ -238,8 +238,9 @@ impl IngestError {
                 table: table.clone(),
             }
             .into(),
-            Self::PayloadTooLarge { bytes, .. } => BifrostError::PayloadTooLarge {
+            Self::PayloadTooLarge { bytes, limit } => BifrostError::PayloadTooLarge {
                 bytes: usize::try_from(*bytes).unwrap_or(usize::MAX),
+                limit: usize::try_from(*limit).unwrap_or(usize::MAX),
             }
             .into(),
             Self::TooManyRows { rows, limit } => BifrostError::IngestOversized {
@@ -751,6 +752,55 @@ mod tests {
                     "ingest writer busy: vala.metrics.points"
                 );
             }
+        }
+    }
+
+    /// Proves the enforced payload ceiling survives both hops of the Scribe →
+    /// Gate → public projection. A caller that only sees the problem document
+    /// must still be able to tell how far over the *configured* limit it went,
+    /// so dropping `limit` anywhere along the chain is a public-contract defect.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either the measured bytes or the enforced limit is lost or
+    /// altered by a projection hop.
+    #[test]
+    fn payload_limit_survives_the_scribe_to_public_projection() {
+        for scribe_error in [
+            ScribeError::PayloadTooLarge {
+                bytes: 2,
+                limit: 1,
+            },
+            ScribeError::DecodedPayloadTooLarge {
+                bytes: 2,
+                limit: 1,
+            },
+        ] {
+            let ingest_error = IngestError::from_scribe(scribe_error);
+            assert!(
+                matches!(
+                    ingest_error,
+                    IngestError::PayloadTooLarge {
+                        bytes: 2,
+                        limit: 1
+                    }
+                ),
+                "gate taxonomy must retain both bounds: {ingest_error:?}"
+            );
+
+            let public = ingest_error.to_wyrd_error("vala.traces.spans");
+            assert_eq!(public.code(), "WYRD_VALA_413_PAYLOAD_TOO_LARGE");
+            assert_eq!(public.status(), 413);
+
+            let problem = public.as_problem_json();
+            assert_eq!(
+                problem["details"]["data"]["bytes"], 2,
+                "measured bytes must survive the public projection: {problem}"
+            );
+            assert_eq!(
+                problem["details"]["data"]["limit"], 1,
+                "the enforced limit must survive the public projection: {problem}"
+            );
         }
     }
 }

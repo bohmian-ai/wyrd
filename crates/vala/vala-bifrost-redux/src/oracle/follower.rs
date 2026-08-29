@@ -644,7 +644,18 @@ where
                 target_stream: stream,
                 start_partition,
                 end_partition,
-                required_columns: assignment.required_columns.clone(),
+                // Empty means every column of the table schema. This leaf must
+                // produce the assignment's declared schema: the leader
+                // fingerprint-validates that full schema above, the empty-scan
+                // branch returns a full-schema batch, and the serialized plan's
+                // `Column` indices are full-schema indices. Narrowing the fetch
+                // to `required_columns` here would hand the memory source a
+                // projected batch under a full-schema declaration, and execution
+                // would then index past its end for every required column that
+                // is not already at ordinal zero. The signed closure still bounds
+                // the predicates below; the projection belongs to the plan above
+                // this leaf, not to the source.
+                required_columns: Vec::new(),
                 predicates: assignment.predicates.clone(),
                 max_batches,
                 max_retained_bytes,

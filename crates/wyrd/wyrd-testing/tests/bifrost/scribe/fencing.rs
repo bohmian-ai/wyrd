@@ -3,6 +3,7 @@
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 
 use super::support::{
+    hour_start,
     append_batch, append_values, append_values_at, await_persistence_drained, published_rows,
     read_sql, register_table, sorted_values, start_scribe_server, tenant_client, unique_table,
 };
@@ -261,17 +262,4 @@ async fn scribe_tenant_partition_schema_fencing() {
     );
 
     server.shutdown().await.expect("the server drains cleanly");
-}
-
-/// Returns the hour-partition boundary one event time belongs to.
-///
-/// The default physical layout partitions by hour, so this is the exact
-/// `partition.start_utc` the promotion record must carry for rows stamped with
-/// `at`.
-fn hour_start(at: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
-    use chrono::Timelike;
-    at.with_minute(0)
-        .and_then(|value| value.with_second(0))
-        .and_then(|value| value.with_nanosecond(0))
-        .expect("an hour boundary is a valid instant")
 }

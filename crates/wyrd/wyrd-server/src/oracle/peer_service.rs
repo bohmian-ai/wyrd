@@ -247,6 +247,12 @@ impl OraclePeerGrpc {
             }
             while let Some(batch) = batches.next().await {
                 let batch = batch.map_err(|error| {
+                    // The classification below keeps only a closed outcome, so
+                    // without this the cause of a failed hot-tail fragment is
+                    // lost entirely and the leader sees a bare `Unavailable`.
+                    // The Oracle follower stream logs its own cause the same
+                    // way; this is the Scribe half of that pair.
+                    tracing::warn!(?error, "Scribe follower execution stream failed");
                     if vala_bifrost_redux::oracle::is_stale_iceberg_object_error(&error) {
                         DispatchError::StaleObject
                     } else if vala_bifrost_redux::oracle::is_tenant_invariant_error(&error) {

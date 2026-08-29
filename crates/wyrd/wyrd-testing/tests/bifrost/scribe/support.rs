@@ -447,3 +447,78 @@ where
         }
     }
 }
+
+/// Builds one `vala.traces.spans` batch carrying `values` as `duration_ms`.
+///
+/// Every other column is a well-formed constant: the cases that send these rows
+/// are about how Scribe schedules, stages and publishes the built-in, so the
+/// payload only has to be a real built-in row that public ingest accepts, with
+/// one column (`duration_ms`) a read-back can compare exactly.
+pub(super) fn span_batch(values: &[i64]) -> arrow::record_batch::RecordBatch {
+    use arrow::array::{
+        FixedSizeBinaryBuilder, Int64Array, StringArray, TimestampMicrosecondArray,
+    };
+    let definition = vala_bifrost_redux::tables::builtin_table("traces", "spans")
+        .expect("traces spans built-in");
+    let schema = std::sync::Arc::new(arrow::datatypes::Schema::new((definition.arrow_fields)()));
+    let rows = values.len();
+    let mut trace_id = FixedSizeBinaryBuilder::with_capacity(rows, 16);
+    let mut span_id = FixedSizeBinaryBuilder::with_capacity(rows, 8);
+    let mut parent_span_id = FixedSizeBinaryBuilder::with_capacity(rows, 8);
+    for value in values {
+        let mut trace = [0_u8; 16];
+        trace[..8].copy_from_slice(&value.to_be_bytes());
+        trace_id.append_value(trace).expect("trace id width");
+        span_id
+            .append_value(value.to_be_bytes())
+            .expect("span id width");
+        parent_span_id.append_null();
+    }
+    let now = chrono::Utc::now().timestamp_micros();
+    let text = |literal: &str| {
+        std::sync::Arc::new(StringArray::from(vec![literal; rows])) as arrow::array::ArrayRef
+    };
+    let zeros =
+        || std::sync::Arc::new(Int64Array::from(vec![0_i64; rows])) as arrow::array::ArrayRef;
+    let stamps = || {
+        std::sync::Arc::new(TimestampMicrosecondArray::from(vec![now; rows]).with_timezone("UTC"))
+            as arrow::array::ArrayRef
+    };
+    arrow::record_batch::RecordBatch::try_new(
+        schema,
+        vec![
+            std::sync::Arc::new(trace_id.finish()),
+            std::sync::Arc::new(span_id.finish()),
+            std::sync::Arc::new(parent_span_id.finish()),
+            zeros(),
+            text("scribe-journey"),
+            text("scribe-journey"),
+            text("SPAN_KIND_INTERNAL"),
+            stamps(),
+            stamps(),
+            std::sync::Arc::new(Int64Array::from(values.to_vec())),
+            text("STATUS_CODE_OK"),
+            text("{}"),
+            zeros(),
+            zeros(),
+            zeros(),
+            text("scribe"),
+            text("1"),
+            text("wyrd-testing"),
+        ],
+    )
+    .expect("span batch")
+}
+
+/// Returns the hour-partition boundary one event time belongs to.
+///
+/// The default physical layout partitions by hour, so this is the exact
+/// `partition.start_utc` the promotion record must carry for rows stamped with
+/// `at`.
+pub(super) fn hour_start(at: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+    use chrono::Timelike;
+    at.with_minute(0)
+        .and_then(|value| value.with_second(0))
+        .and_then(|value| value.with_nanosecond(0))
+        .expect("an hour boundary is a valid instant")
+}

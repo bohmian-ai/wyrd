@@ -2752,6 +2752,14 @@ impl PersistenceWorker {
         let published = published?;
         drop(reservation);
         self.publish_staging_hint(claim.key());
+        if let Some(detail) = published.unacknowledged {
+            let error = ScribeError::Internal { detail };
+            // The publication committed and every member retired; the response
+            // to it did not survive. Failing here keeps the flush honest about
+            // what its caller knows without leaving the pod holding a claim
+            // whose rows a durable object already serves.
+            return Err(error);
+        }
         Ok(published.commit_key)
     }
 

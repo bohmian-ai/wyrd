@@ -56,6 +56,15 @@ pub struct PublishedClaim {
     pub object_identities: Vec<String>,
     /// Staged bytes the retired members released back to the staging volume.
     pub released_bytes: u64,
+    /// Why the commit's response was lost, when the rows reconciled as
+    /// committed anyway.
+    ///
+    /// The publication is complete and its members are retired; only the
+    /// caller's knowledge of it is uncertain, so the flush that requested it
+    /// still fails with this detail after every durable transition has
+    /// settled. It is carried as the detail rather than the error so a
+    /// published claim stays cloneable.
+    pub unacknowledged: Option<String>,
 }
 
 /// Publishes assembled claims and retires the members they replace.
@@ -250,9 +259,10 @@ impl ClaimPublisher {
     /// learn whether the rows landed. If they did, the claim's members advance
     /// and retire exactly as a certain commit would, because a durable object
     /// serving rows whose generations are still live in memory would let one
-    /// reader see those rows from both authorities. The caller is still told
-    /// the publication was uncertain: the ambiguity belongs to the response,
-    /// not to the pod's durable state.
+    /// reader see those rows from both authorities. The ambiguity is reported
+    /// back through [`PublishedClaim::unacknowledged`] rather than as an error
+    /// here, so the claim leaves every index and volume exactly as a certain
+    /// commit leaves it and the flush still fails for its caller.
     ///
     /// # Errors
     ///
@@ -260,7 +270,8 @@ impl ClaimPublisher {
     /// or upload fails, the fenced transaction is refused, the commit remains
     /// uncertain after reconciliation, or a member cannot be moved forward
     /// through its durable lifecycle. An uncertain commit that reconciles as
-    /// committed still returns its original error after the members settle.
+    /// committed is not an error here; it is reported through the returned
+    /// claim.
     ///
     /// # Cancellation
     ///
@@ -336,7 +347,9 @@ impl ClaimPublisher {
                 // guessing it. The caller still learns the publication was
                 // uncertain; only the pod's own state stops being uncertain.
                 match self.reconciler.publish(&rows, &events).await {
-                    ScribePublicationOutcome::Committed(outcome) => (outcome, Some(error)),
+                    ScribePublicationOutcome::Committed(outcome) => {
+                        (outcome, Some(error.to_string()))
+                    }
                     ScribePublicationOutcome::UnknownCommitOutcome(_)
                     | ScribePublicationOutcome::KnownNotCommitted(_) => return Err(error),
                 }
@@ -347,13 +360,11 @@ impl ClaimPublisher {
         self.retire_members(&request, &outcome.commit_key, &object_identities)
             .await?;
         self.mover.cleanup_published(&claims).await?;
-        if let Some(error) = ambiguity {
-            return Err(error);
-        }
         Ok(PublishedClaim {
             commit_key: outcome.commit_key,
             object_identities,
             released_bytes: request.claim.encoded_bytes(),
+            unacknowledged: ambiguity,
         })
     }
 

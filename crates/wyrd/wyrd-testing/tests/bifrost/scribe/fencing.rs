@@ -3,9 +3,9 @@
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 
 use super::support::{
-    hour_start,
-    append_batch, append_values, append_values_at, await_persistence_drained, published_rows,
-    read_sql, register_table, sorted_values, start_scribe_server, tenant_client, unique_table,
+    append_batch, append_values, append_values_at, await_persistence_drained, hour_start,
+    published_rows, read_sql, register_table, sorted_values, start_scribe_server, tenant_client,
+    unique_table,
 };
 
 /// One table name is three independent fences.

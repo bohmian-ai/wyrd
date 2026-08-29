@@ -6,8 +6,8 @@ use vala_bifrost_redux::scribe::geometry::ScribeArtifactPolicy;
 use vala_bifrost_redux::scribe::routing::SCRIBE_SHARD_COUNT;
 
 use super::support::{
-    INGEST_BUSY, append_batch, append_values, read_sql, register_table, sorted_values,
-    span_batch, start_scribe_server_with_admission, tenant_client, unique_table, until_admitted,
+    INGEST_BUSY, append_batch, append_values, read_sql, register_table, sorted_values, span_batch,
+    start_scribe_server_with_admission, tenant_client, unique_table, until_admitted,
 };
 
 /// Batches each of the two tables sends in the interleaving phase.

@@ -182,7 +182,12 @@ async fn scribe_sustained_ingest_oracle_hot_read_journey() {
         "sustained multi-tenant ingest must not change the fixed lane topology"
     );
     assert!(
-        active.memory_by_shard.iter().filter(|held| **held > 0).count() > 1,
+        active
+            .memory_by_shard
+            .iter()
+            .filter(|held| **held > 0)
+            .count()
+            > 1,
         "sixty-four distinct batch identities must route across more than one \
          lane: {:?}",
         active.memory_by_shard

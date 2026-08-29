@@ -2,6 +2,7 @@ mod backpressure;
 mod budgets;
 mod cross_shard;
 mod fencing;
+mod horizontal_ingest;
 mod lifecycle;
 mod qualification;
 mod round_robin;

@@ -1077,6 +1077,43 @@ mod tests {
         assert_eq!(totals.live_vectors(), 0);
     }
 
+    /// Proves an incumbent's stop is a share stop rather than a pod-full stop.
+    ///
+    /// Extracted from [`scribe_resource_admission_is_tenant_fair`] so that owner
+    /// stays inside the repository line bound. A refusal issued only because the
+    /// pod had no bytes left would satisfy the backpressure assertion without
+    /// proving any fairness at all, so this requires idle capacity to remain at
+    /// the moment the incumbent was frozen, and requires the refusal to have
+    /// moved nothing at the incumbent's own level.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the pod held no room for another chunk when the incumbent was
+    /// stopped, or when the refusal changed the incumbent's committed bytes.
+    fn share_stop_left_idle_capacity(
+        ledger: &ScribeContentionLedger,
+        greedy: &ContentionKey,
+        greedy_bytes: usize,
+        chunk: usize,
+        pod_bytes: usize,
+    ) {
+        let committed = ledger
+            .committed(ContentionCategory::AdmissionBytes)
+            .expect("pod totals");
+        assert!(
+            committed + chunk <= pod_bytes,
+            "the incumbent must be stopped at its recomputed share, not merely \
+             because the pod is full: {committed} of {pod_bytes} held"
+        );
+        assert_eq!(
+            ledger
+                .usage(greedy, ContentionCategory::AdmissionBytes)
+                .expect("the greedy cell is active"),
+            greedy_bytes,
+            "the share stop moves nothing at the incumbent's own level"
+        );
+    }
+
     /// AC22/AC26 unit owner: pod resource admission is tenant-fair at the
     /// production entry point.
     ///
@@ -1163,6 +1200,7 @@ mod tests {
             matches!(frozen, ScribeError::IngestBusy { .. }),
             "incumbent throttling is backpressure, got {frozen:?}"
         );
+        share_stop_left_idle_capacity(ledger, &greedy, greedy_bytes, chunk, pod_bytes);
 
         // Released capacity reaches the waiting contender rather than the
         // incumbent that released it.

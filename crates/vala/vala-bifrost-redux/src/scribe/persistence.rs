@@ -37,8 +37,7 @@ use crate::scribe::staging::{
 };
 use crate::scribe::stream_identity::StreamIdentity;
 use crate::scribe::telemetry::{
-    ProducerLifecycleEvent, ProducerLifecycleIdentity, ScribeEffect, ScribeEffectFacts,
-    ScribeEffectOutcome, ScribeEffectReason, ScribeTelemetry, record_producer_lifecycle,
+    ProducerLifecycleEvent, ProducerLifecycleIdentity, record_producer_lifecycle,
 };
 use crate::scribe::wal::{ScribeAppendMeta, WalLsn, WalSegmentRef, WalWriter};
 
@@ -563,8 +562,6 @@ pub struct PersistenceRuntime {
     /// `None` only for the workerless test constructors, which have no staged
     /// members to settle.
     worker: Option<Arc<PersistenceWorker>>,
-    /// Top-level production effect owner shared with queue transitions.
-    telemetry: Option<Arc<ScribeTelemetry>>,
 }
 
 /// Reason a non-blocking persistence submission retained ownership of its job.
@@ -613,7 +610,6 @@ impl PersistenceRuntime {
             recovery_operator: None,
             recovery_memory: None,
             worker: None,
-            telemetry: None,
         }
     }
 
@@ -634,7 +630,6 @@ impl PersistenceRuntime {
             recovery_operator: None,
             recovery_memory: None,
             worker: None,
-            telemetry: None,
         };
         (runtime, receiver)
     }
@@ -683,8 +678,7 @@ impl PersistenceRuntime {
                 #[cfg(any(test, feature = "test-support"))]
                 context.faults.clone(),
             ),
-        )
-        .with_telemetry(Arc::clone(&context.telemetry));
+        );
         Some(Arc::new(
             crate::scribe::staging_runtime::ScribeStagingRuntime::new(
                 stage, volume, publisher, config,
@@ -750,7 +744,6 @@ impl PersistenceRuntime {
         let recovery_wal = Arc::clone(&context.wal);
         let recovery_operator = (*context.operator).clone();
         let recovery_memory = context.memory.clone();
-        let telemetry = Arc::clone(&context.telemetry);
         let failures = Arc::new(Mutex::new(Vec::new()));
         let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
         let staging = Self::build_staging(&context, config.operator_pool.as_ref(), config.workers);
@@ -775,7 +768,6 @@ impl PersistenceRuntime {
             recovery_operator: Some(recovery_operator),
             recovery_memory: Some(recovery_memory),
             worker: Some(Arc::clone(&worker)),
-            telemetry: Some(telemetry),
         });
         let mut tasks = Vec::with_capacity(config.workers);
         for _ in 0..config.workers {
@@ -819,17 +811,6 @@ impl PersistenceRuntime {
         self.queued_bytes.fetch_add(queued_bytes, Ordering::AcqRel);
         match sender.try_send(Box::new(job)) {
             Ok(()) => {
-                if let Some(telemetry) = &self.telemetry {
-                    telemetry.record_effect(
-                        ScribeEffect::QueueEntered,
-                        ScribeEffectFacts {
-                            bytes: u64::try_from(queued_bytes).unwrap_or(u64::MAX),
-                            outcome: ScribeEffectOutcome::Queued,
-                            reason: ScribeEffectReason::CapacityAvailable,
-                            ..ScribeEffectFacts::default()
-                        },
-                    );
-                }
                 metrics::gauge!("bifrost_scribe_persistence_queue_depth").set(
                     self.queued
                         .load(Ordering::Acquire)
@@ -1125,8 +1106,6 @@ impl PersistenceRuntime {
 /// and upload different generations.
 #[derive(Clone)]
 struct PersistenceWorker {
-    /// Top-level production effect owner for persistence stages.
-    telemetry: Arc<ScribeTelemetry>,
     /// Audited operator pool for atomically fenced publication.
     operator_pool: Option<vala_sql::OperatorPool>,
     /// Shared durable failure ledger consumed by startup recovery.
@@ -2033,7 +2012,6 @@ impl PersistenceWorker {
         staging: Option<Arc<crate::scribe::staging_runtime::ScribeStagingRuntime>>,
     ) -> Self {
         Self {
-            telemetry: Arc::clone(&context.telemetry),
             operator_pool,
             failures,
             actor_stream: context.actor_stream,
@@ -2070,15 +2048,6 @@ impl PersistenceWorker {
     /// Cancellation can occur after object or SQL side effects. The shard keeps
     /// the generation pending and WAL replay reconciles any partial progress.
     async fn process_job(&self, job: PersistenceJob) {
-        self.telemetry.record_effect(
-            ScribeEffect::ScheduleStarted,
-            ScribeEffectFacts {
-                bytes: u64::try_from(job.generation.arrow_bytes).unwrap_or(u64::MAX),
-                outcome: ScribeEffectOutcome::Started,
-                reason: ScribeEffectReason::Dequeued,
-                ..ScribeEffectFacts::default()
-            },
-        );
         let mut visibility = VisibilityPublishGuard::new();
         visibility.arm_cancellation();
         let generation = Arc::clone(&job.generation);
@@ -2130,23 +2099,6 @@ impl PersistenceWorker {
                 .as_secs_f64(),
         );
         let publication_succeeded = result.is_ok();
-        self.telemetry.record_effect(
-            ScribeEffect::ScheduleSettled,
-            ScribeEffectFacts {
-                bytes: u64::try_from(generation.arrow_bytes).unwrap_or(u64::MAX),
-                outcome: if publication_succeeded {
-                    ScribeEffectOutcome::Success
-                } else {
-                    ScribeEffectOutcome::Failed
-                },
-                reason: if publication_succeeded {
-                    ScribeEffectReason::Published
-                } else {
-                    ScribeEffectReason::Retained
-                },
-                ..ScribeEffectFacts::default()
-            },
-        );
         tracing::info!(
             tenant = %generation.table_key.0,
             table = %generation.table_key.1,
@@ -2426,16 +2378,6 @@ impl PersistenceWorker {
             staged.is_ok(),
         );
         let member = staged?;
-        self.telemetry.record_effect(
-            ScribeEffect::RunDurable,
-            ScribeEffectFacts {
-                rows: u64::try_from(frozen.row_count()).unwrap_or(u64::MAX),
-                bytes: u64::try_from(frozen.arrow_bytes).unwrap_or(u64::MAX),
-                artifacts: 1,
-                outcome: ScribeEffectOutcome::Success,
-                reason: ScribeEffectReason::Fsynced,
-            },
-        );
         if defer_manifest_advance {
             tracing::debug!(
                 generation_id,
@@ -2443,16 +2385,6 @@ impl PersistenceWorker {
             );
         } else {
             self.advance_manifest(generation).await?;
-            self.telemetry.record_effect(
-                ScribeEffect::ManifestDurable,
-                ScribeEffectFacts {
-                    rows: u64::try_from(frozen.row_count()).unwrap_or(u64::MAX),
-                    bytes: u64::try_from(frozen.arrow_bytes).unwrap_or(u64::MAX),
-                    artifacts: 1,
-                    outcome: ScribeEffectOutcome::Success,
-                    reason: ScribeEffectReason::Advanced,
-                },
-            );
         }
         tracing::debug!(generation_id, "generation is durable on the staging volume");
         let published = self.publish_due_claims(producer_identity).await?;
@@ -2982,7 +2914,6 @@ mod tests {
             recovery_operator: None,
             recovery_memory: None,
             worker: None,
-            telemetry: None,
         }
     }
 

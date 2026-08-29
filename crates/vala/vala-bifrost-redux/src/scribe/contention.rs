@@ -1933,6 +1933,124 @@ mod tests {
             * vectors
     }
 
+    /// Proves a queued contender outranks an incumbent that queued first.
+    ///
+    /// Extracted from [`tenant_admission_is_elastic_fair_and_balanced`] so that
+    /// owner stays inside the repository line bound while still asserting the
+    /// clause: once a contender has been refused its demand is queued, and the
+    /// capacity the incumbent then releases is held for that contender rather than
+    /// being re-taken -- even when the incumbent queued first and asks for exactly
+    /// what it dropped. Without it "fair" would only restate "the pod is full" and
+    /// a busy incumbent could starve a peer by retrying faster than it.
+    ///
+    /// `whole` is the pod's whole measured `Active` capacity for the fixture.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the incumbent reacquires ahead of the unserved contender, when
+    /// the refused reacquisition moves the incumbent's own level, or when the
+    /// contender never receives the released capacity.
+    fn contended_incumbent_yields_to_a_queued_peer(whole: usize) {
+        // Fair, separately from full: once a contender has been refused its
+        // demand is queued, and the capacity the incumbent then releases is
+        // held for that contender rather than being re-taken -- even when the
+        // incumbent queued first and asks for exactly what it dropped. Without
+        // this the "fair" clause would only restate "the pod is full" and a
+        // busy incumbent could starve a peer by retrying faster than it.
+        let quantum = capacity_of(8, ContentionCategory::Active) / 8;
+        let contested = ledger_for(8);
+        let first = key(1, "hot");
+        let second = key(2, "cold");
+        contested
+            .activate(&first)
+            .expect("the first table activates");
+        contested
+            .charge(&first, ContentionCategory::Active, whole)
+            .expect("a lone owner borrows every genuinely idle byte");
+        contested
+            .activate(&second)
+            .expect("the contender activates");
+        contested
+            .charge(&first, ContentionCategory::Active, quantum)
+            .expect_err("a full pod refuses the incumbent and queues it first");
+        contested
+            .charge(&second, ContentionCategory::Active, quantum)
+            .expect_err("a full pod refuses the contender and queues it behind");
+        contested
+            .release(&first, ContentionCategory::Active, quantum)
+            .expect("the incumbent drains through the normal lifecycle route");
+        let bound = contested
+            .charge(&first, ContentionCategory::Active, quantum)
+            .expect_err("a served incumbent may not reacquire ahead of an unserved contender");
+        assert!(
+            matches!(bound, ContentionRefusal::Exhausted { .. }),
+            "reacquisition ahead of a contender is a typed contention refusal; got {bound:?}"
+        );
+        assert_eq!(
+            contested
+                .usage(&first, ContentionCategory::Active)
+                .expect("usage"),
+            whole - quantum,
+            "the refused reacquisition moves nothing at the table level"
+        );
+        contested
+            .charge(&second, ContentionCategory::Active, quantum)
+            .expect("the waiting contender receives the released capacity");
+        assert_eq!(
+            contested
+                .committed(ContentionCategory::Active)
+                .expect("pod"),
+            whole,
+            "honouring the reservation neither strands nor overcommits capacity"
+        );
+    }
+
+    /// Proves a complete drain returns every accounting level to zero.
+    ///
+    /// Extracted from [`tenant_admission_is_elastic_fair_and_balanced`] so that
+    /// owner stays inside the repository line bound. Releasing the remainder
+    /// each owner still holds must retire both emptied cells and their tenants
+    /// and return every category's pod total to zero; a level that kept a
+    /// residue would strand an ownership slot no later charge could reclaim.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a release is refused, when an emptied cell does not settle,
+    /// when cells or tenants remain active, or when any category still reports
+    /// committed capacity.
+    fn balanced_drain_retires_every_level(
+        ledger: &ScribeContentionLedger,
+        incumbent: &ContentionKey,
+        contender: &ContentionKey,
+        whole: usize,
+        half: usize,
+    ) {
+        // Balanced: releasing everything returns each level to zero and retires
+        // both emptied cells and their tenants.
+        ledger
+            .release(incumbent, ContentionCategory::Active, whole - half)
+            .expect("release");
+        ledger
+            .release(contender, ContentionCategory::Active, half)
+            .expect("release");
+        for owner in [incumbent, contender] {
+            assert!(
+                ledger.settle(owner).expect("settlement is readable"),
+                "an emptied cell must retire rather than strand an ownership slot"
+            );
+        }
+        assert_eq!(ledger.active_cells().expect("cells"), 0);
+        assert_eq!(ledger.active_tenants().expect("tenants"), 0);
+        for category in ContentionCategory::ALL {
+            assert_eq!(
+                ledger.committed(category).expect("pod totals"),
+                0,
+                "{} must drain completely",
+                category.label()
+            );
+        }
+    }
+
     /// AC22/AC26 unit owner: tenant admission is elastic, fair, and balanced.
     ///
     /// One named owner for the three properties the ledger exists to hold
@@ -1984,7 +2102,17 @@ mod tests {
         let frozen = ledger
             .charge(&incumbent, ContentionCategory::Active, 1)
             .expect_err("an over-share incumbent may not grow while a peer waits");
-        assert!(matches!(frozen, ContentionRefusal::Exhausted { .. }));
+        assert!(
+            matches!(
+                frozen,
+                ContentionRefusal::Exhausted {
+                    scope: "pod",
+                    ceiling,
+                    ..
+                } if ceiling == whole
+            ),
+            "an incumbent holding the whole pod runs into the pod bound, got {frozen:?}"
+        );
         assert_eq!(
             ledger
                 .usage(&incumbent, ContentionCategory::Active)
@@ -1997,6 +2125,8 @@ mod tests {
             whole,
             "a refusal moves nothing at the pod level"
         );
+
+        contended_incumbent_yields_to_a_queued_peer(whole);
 
         // Categories are independent: exhausting active bytes leaves the
         // immutable, stage and scratch levels untouched.
@@ -2035,30 +2165,7 @@ mod tests {
             "the pod total is exactly the sum of what its owners hold"
         );
 
-        // Balanced: releasing everything returns each level to zero and retires
-        // both emptied cells and their tenants.
-        ledger
-            .release(&incumbent, ContentionCategory::Active, whole - half)
-            .expect("release");
-        ledger
-            .release(&contender, ContentionCategory::Active, half)
-            .expect("release");
-        for owner in [&incumbent, &contender] {
-            assert!(
-                ledger.settle(owner).expect("settlement is readable"),
-                "an emptied cell must retire rather than strand an ownership slot"
-            );
-        }
-        assert_eq!(ledger.active_cells().expect("cells"), 0);
-        assert_eq!(ledger.active_tenants().expect("tenants"), 0);
-        for category in ContentionCategory::ALL {
-            assert_eq!(
-                ledger.committed(category).expect("pod totals"),
-                0,
-                "{} must drain completely",
-                category.label()
-            );
-        }
+        balanced_drain_retires_every_level(&ledger, &incumbent, &contender, whole, half);
     }
 
     /// One tenant with one table may use every genuinely idle byte in the pod.
@@ -2562,55 +2669,6 @@ mod tests {
         ledger
             .charge(&owner, ContentionCategory::Active, whole)
             .expect("an unblocked owner reacquires when nobody else waits");
-    }
-
-    /// An active contender receives released capacity before reacquisition.
-    ///
-    /// The incumbent queued first and is already served, so it yields to the
-    /// contender regardless of queue order; the contender is unserved and takes
-    /// what the incumbent drops.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the incumbent reacquires ahead of the contender, or when the
-    /// contender never receives the released capacity.
-    #[test]
-    fn an_active_contender_is_served_before_incumbent_reacquisition() {
-        let ledger = ledger_for(4);
-        let incumbent = key(1, "hot");
-        let contender = key(2, "cold");
-        let whole = capacity_of(4, ContentionCategory::Active);
-        let quantum = capacity_of(1, ContentionCategory::Active);
-        ledger.activate(&incumbent).expect("incumbent activates");
-        ledger
-            .charge(&incumbent, ContentionCategory::Active, whole)
-            .expect("the idle pod lets the first owner take everything");
-        ledger.activate(&contender).expect("contender activates");
-
-        // The incumbent queues first, then the contender. Queue order must not
-        // let a served incumbent outrank an unserved contender.
-        ledger
-            .charge(&incumbent, ContentionCategory::Active, quantum)
-            .expect_err("a full pod refuses the incumbent");
-        ledger
-            .charge(&contender, ContentionCategory::Active, quantum)
-            .expect_err("a full pod refuses the contender too");
-
-        ledger
-            .release(&incumbent, ContentionCategory::Active, quantum)
-            .expect("the incumbent drains through the normal lifecycle route");
-        ledger
-            .charge(&incumbent, ContentionCategory::Active, quantum)
-            .expect_err("a served incumbent may not reacquire while a contender waits");
-        ledger
-            .charge(&contender, ContentionCategory::Active, quantum)
-            .expect("the waiting contender receives the released capacity");
-        assert_eq!(
-            ledger
-                .usage(&contender, ContentionCategory::Active)
-                .expect("usage"),
-            quantum
-        );
     }
 
     /// The last table activates once a vector turns over, and cannot be jumped.

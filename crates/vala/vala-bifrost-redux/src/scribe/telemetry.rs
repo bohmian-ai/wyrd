@@ -1,6 +1,5 @@
 //! Optional stage measurements for real Scribe workload runs.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -11,367 +10,6 @@ use crate::scribe::geometry::ContentionCategory;
 use crate::scribe::material_plan::IngestMaterialPlan;
 use crate::scribe::memory::MEMORY_CATEGORY_COUNT;
 use crate::scribe::seal_key::SealKey;
-
-/// Declares the closed, compile-time Scribe hot-path effect registry.
-macro_rules! scribe_effects {
-    ($(#[$meta:meta] $variant:ident => ($stage:literal, $decision:literal, $terminal:expr, $delta:expr)),+ $(,)?) => {
-        /// Every production Scribe lifecycle effect accepted by [`ScribeTelemetry`].
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-        pub(crate) enum ScribeEffect {
-            $(#[$meta] $variant),+
-        }
-
-        impl ScribeEffect {
-            /// Complete registry in stable metric-index order.
-            pub(crate) const ALL: [Self; scribe_effects!(@count $($variant),+)] = [
-                $(Self::$variant),+
-            ];
-
-            /// Returns the stable registry index for this effect.
-            pub(crate) fn index(self) -> usize {
-                Self::ALL
-                    .iter()
-                    .position(|candidate| *candidate == self)
-                    .expect("invariant: every Scribe effect is in the closed registry")
-            }
-
-            /// Returns the closed lifecycle stage label.
-            pub(crate) const fn stage(self) -> &'static str {
-                match self { $(Self::$variant => $stage),+ }
-            }
-
-            /// Returns the closed decision label.
-            pub(crate) const fn decision(self) -> &'static str {
-                match self { $(Self::$variant => $decision),+ }
-            }
-
-            /// Reports whether the effect terminates one active lifecycle.
-            pub(crate) const fn is_terminal(self) -> bool {
-                match self { $(Self::$variant => $terminal),+ }
-            }
-
-            /// Returns the effect's active-gauge movement.
-            pub(crate) const fn active_delta(self) -> i8 {
-                match self { $(Self::$variant => $delta),+ }
-            }
-        }
-    };
-    (@count $($variant:ident),+) => { <[()]>::len(&[$(scribe_effects!(@one $variant)),+]) };
-    (@one $variant:ident) => { () };
-}
-
-scribe_effects! {
-    /// Global admission attempt entered.
-    AdmissionStarted => ("admission", "started", false, 1),
-    /// Global admission attempt settled.
-    AdmissionSettled => ("admission", "settled", true, -1),
-    /// Tenant/table fair share changed.
-    ShareDecided => ("admission", "share_decided", true, 0),
-    /// Bounded demand entered or advanced in fairness order.
-    DemandQueued => ("admission", "demand_queued", false, 0),
-    /// Bounded demand left fairness order.
-    DemandSettled => ("admission", "demand_settled", true, 0),
-    /// One request was routed to its recorded shard.
-    RouteDecided => ("route", "shard_selected", true, 0),
-    /// One shard job entered a bounded queue.
-    QueueEntered => ("queue", "entered", false, 1),
-    /// One queued shard job began service.
-    ScheduleStarted => ("schedule", "started", false, 0),
-    /// One shard job reached a terminal outcome.
-    ScheduleSettled => ("schedule", "settled", true, -1),
-    /// One physical WAL append began.
-    WalAppendStarted => ("wal_append", "started", false, 1),
-    /// One physical WAL append completed.
-    WalAppendSettled => ("wal_append", "settled", true, -1),
-    /// One WAL fsync began.
-    WalFsyncStarted => ("wal_fsync", "started", false, 1),
-    /// One WAL fsync completed.
-    WalFsyncSettled => ("wal_fsync", "settled", true, -1),
-    /// Committed WAL coverage retired.
-    WalRetired => ("wal_retire", "retired", true, 0),
-    /// Startup WAL replay began.
-    WalReplayStarted => ("wal_replay", "started", false, 1),
-    /// Startup WAL replay completed or failed closed.
-    WalReplaySettled => ("wal_replay", "settled", true, -1),
-    /// An active generation rotated.
-    GenerationRotated => ("rotation", "rotated", true, 0),
-    /// An active generation froze immutably.
-    GenerationFrozen => ("freeze", "frozen", true, 0),
-    /// A sorted run became durable.
-    RunDurable => ("run", "durable", true, 0),
-    /// A staged manifest became durable.
-    ManifestDurable => ("manifest", "durable", true, 0),
-    /// Query authority moved to its next source.
-    SourceTransitioned => ("source", "transitioned", true, 0),
-    /// A staged member entered the ready set.
-    MemberReady => ("ready", "member_ready", true, 0),
-    /// An assembler claim began.
-    ClaimStarted => ("claim", "started", false, 1),
-    /// An assembler claim terminated.
-    ClaimSettled => ("claim", "settled", true, -1),
-    /// A merge pass completed.
-    MergePassCompleted => ("merge", "pass_completed", true, 0),
-    /// A Parquet row group flushed.
-    RowGroupFlushed => ("row_group", "flushed", true, 0),
-    /// A target-sized object closed.
-    TargetObjectClosed => ("object_close", "target", true, 0),
-    /// A terminal residue object closed.
-    ResidueObjectClosed => ("object_close", "residue", true, 0),
-    /// One object upload began.
-    UploadStarted => ("upload", "started", false, 1),
-    /// One object upload terminated.
-    UploadSettled => ("upload", "settled", true, -1),
-    /// One publication manifest became durable.
-    PublicationManifestDurable => ("publication_manifest", "durable", true, 0),
-    /// One fenced file-list transaction began.
-    FileListCommitStarted => ("file_list", "started", false, 1),
-    /// One fenced file-list transaction terminated.
-    FileListCommitSettled => ("file_list", "settled", true, -1),
-    /// Lease-drained cleanup began.
-    CleanupStarted => ("cleanup", "started", false, 1),
-    /// Lease-drained cleanup terminated.
-    CleanupSettled => ("cleanup", "settled", true, -1),
-    /// Cancellation began deterministic ownership settlement.
-    CancellationStarted => ("cancellation", "started", false, 1),
-    /// Cancellation settlement terminated.
-    CancellationSettled => ("cancellation", "settled", true, -1),
-    /// Process drain began.
-    DrainStarted => ("drain", "started", false, 1),
-    /// Process drain terminated.
-    DrainSettled => ("drain", "settled", true, -1),
-    /// Terminal resource accounting reconciled.
-    ResourceSettled => ("settlement", "resource_settled", true, 0),
-}
-
-/// Closed terminal outcomes accepted by the top-level hot-path registry.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum ScribeEffectOutcome {
-    /// The activity has acquired ownership and begun.
-    Started,
-    /// Work entered a bounded queue.
-    Queued,
-    /// A closed decision was observed without opening an activity.
-    #[default]
-    Observed,
-    /// The activity completed successfully.
-    Success,
-    /// The activity failed while retaining recoverable ownership.
-    Failed,
-    /// Cancellation terminated the activity.
-    Cancelled,
-}
-
-impl ScribeEffectOutcome {
-    /// Returns the fixed-cardinality metric label.
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Started => "started",
-            Self::Queued => "queued",
-            Self::Observed => "observed",
-            Self::Success => "success",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-        }
-    }
-}
-
-/// Closed reasons accepted by the top-level hot-path registry.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum ScribeEffectReason {
-    /// No narrower reason applies.
-    #[default]
-    None,
-    /// Normal owner progress.
-    Routine,
-    /// Capacity was available immediately.
-    CapacityAvailable,
-    /// A fair tenant/table group owns the operation.
-    FairGroup,
-    /// Work left its bounded queue.
-    Dequeued,
-    /// Routing preserved the recorded shard.
-    RecordedShard,
-    /// A durable filesystem boundary completed.
-    Fsynced,
-    /// A durable manifest advanced.
-    Advanced,
-    /// A claim finished assembly.
-    ClaimAssembled,
-    /// The publication manifest is durable.
-    ManifestDurable,
-    /// Publication committed.
-    Committed,
-    /// Publication is durable and cleanup may start.
-    Published,
-    /// Physical evidence was revalidated.
-    Verified,
-    /// Upload failed closed.
-    UploadRefused,
-    /// Ownership remains available for retry or reconciliation.
-    Retained,
-    /// Terminal cleanup retired the owned artifacts.
-    Retired,
-    /// The generation committed and permits WAL retirement.
-    GenerationCommitted,
-    /// A sealed Parquet footer owns the observation.
-    SealedFooter,
-    /// Startup recovery owns the operation.
-    Startup,
-    /// Graceful shutdown owns the operation.
-    Shutdown,
-    /// The shutdown deadline elapsed.
-    Deadline,
-    /// Retained async owners were aborted.
-    OwnersAborted,
-    /// The process drained normally.
-    Drained,
-    /// A dropped future cancelled its owner.
-    FutureDropped,
-    /// Size triggered generation rotation.
-    Size,
-    /// Age triggered generation rotation.
-    Age,
-    /// Pressure triggered generation rotation.
-    Pressure,
-    /// An explicit request triggered generation rotation.
-    Explicit,
-    /// The configured target released an assembly claim.
-    Target,
-    /// A physical object reached its configured target.
-    TargetReached,
-    /// A claim exhausted its members below the physical target.
-    ClaimExhausted,
-    /// Maximum dwell released an assembly claim.
-    Dwell,
-    /// A closed partition released an assembly claim.
-    PartitionClosed,
-    /// Drain released an assembly claim.
-    Drain,
-    /// Recovery resumed an assembly claim.
-    Recovery,
-    /// A bounded contention decision was informational.
-    ContentionInfo,
-    /// A bounded contention decision reported pressure.
-    ContentionWarn,
-    /// A contention invariant failed.
-    ContentionError,
-}
-
-impl ScribeEffectReason {
-    /// Returns the fixed-cardinality metric label.
-    const fn label(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Routine => "routine",
-            Self::CapacityAvailable => "capacity_available",
-            Self::FairGroup => "fair_group",
-            Self::Dequeued => "dequeued",
-            Self::RecordedShard => "recorded_shard",
-            Self::Fsynced => "fsynced",
-            Self::Advanced => "advanced",
-            Self::ClaimAssembled => "claim_assembled",
-            Self::ManifestDurable => "manifest_durable",
-            Self::Committed => "committed",
-            Self::Published => "published",
-            Self::Verified => "verified",
-            Self::UploadRefused => "upload_refused",
-            Self::Retained => "retained",
-            Self::Retired => "retired",
-            Self::GenerationCommitted => "generation_committed",
-            Self::SealedFooter => "sealed_footer",
-            Self::Startup => "startup",
-            Self::Shutdown => "shutdown",
-            Self::Deadline => "deadline",
-            Self::OwnersAborted => "owners_aborted",
-            Self::Drained => "drained",
-            Self::FutureDropped => "future_dropped",
-            Self::Size => "size",
-            Self::Age => "age",
-            Self::Pressure => "pressure",
-            Self::Explicit => "explicit",
-            Self::Target => "target",
-            Self::TargetReached => "target_reached",
-            Self::ClaimExhausted => "claim_exhausted",
-            Self::Dwell => "dwell",
-            Self::PartitionClosed => "partition_closed",
-            Self::Drain => "drain",
-            Self::Recovery => "recovery",
-            Self::ContentionInfo => "contention_info",
-            Self::ContentionWarn => "contention_warn",
-            Self::ContentionError => "contention_error",
-        }
-    }
-}
-
-/// Bounded numeric facts shared by the top-level hot-path registry.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct ScribeEffectFacts {
-    /// Rows affected by the transition.
-    pub(crate) rows: u64,
-    /// Bytes affected by the transition.
-    pub(crate) bytes: u64,
-    /// Objects affected by the transition.
-    pub(crate) artifacts: u64,
-    /// Closed outcome label.
-    pub(crate) outcome: ScribeEffectOutcome,
-    /// Closed reason label.
-    pub(crate) reason: ScribeEffectReason,
-}
-
-/// RAII owner for one registered active Scribe lifecycle.
-pub(crate) struct ScribeEffectGuard {
-    /// Shared production telemetry owner.
-    telemetry: Arc<ScribeTelemetry>,
-    /// Required terminal paired with the already-emitted start.
-    terminal: ScribeEffect,
-    /// Bounded numeric facts retained through cancellation.
-    facts: ScribeEffectFacts,
-    /// Whether an explicit terminal already emitted.
-    settled: bool,
-}
-
-/// Immutable top-level production telemetry totals for evidence capture.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ScribeHotPathSnapshot {
-    /// Counts keyed by the registry's stable `stage.decision` identity.
-    pub effects: BTreeMap<String, u64>,
-    /// Rows accumulated per registered effect identity.
-    pub rows: BTreeMap<String, u64>,
-    /// Bytes accumulated per registered effect identity.
-    pub bytes: BTreeMap<String, u64>,
-    /// Artifacts accumulated per registered effect identity.
-    pub artifacts: BTreeMap<String, u64>,
-    /// Current sum of every registered active-gauge movement.
-    pub active: i64,
-}
-
-impl ScribeEffectGuard {
-    /// Emits the activity's explicit terminal exactly once.
-    pub(crate) fn settle(
-        mut self,
-        outcome: ScribeEffectOutcome,
-        reason: ScribeEffectReason,
-        artifacts: u64,
-    ) {
-        self.facts.outcome = outcome;
-        self.facts.reason = reason;
-        self.facts.artifacts = artifacts;
-        self.telemetry.record_effect(self.terminal, self.facts);
-        self.settled = true;
-    }
-}
-
-impl Drop for ScribeEffectGuard {
-    /// Balances a dropped future as cancellation without performing IO.
-    fn drop(&mut self) {
-        if self.settled {
-            return;
-        }
-        self.facts.outcome = ScribeEffectOutcome::Cancelled;
-        self.facts.reason = ScribeEffectReason::FutureDropped;
-        self.telemetry.record_effect(self.terminal, self.facts);
-    }
-}
 
 /// Closed resource and state facts for one producer lifecycle transition.
 #[derive(Clone, Copy)]
@@ -1287,41 +925,6 @@ pub(crate) enum ContentionEffect {
 }
 
 impl ContentionEffect {
-    /// Projects the detailed contention decision into the top-level registry.
-    const fn top_effect(self) -> ScribeEffect {
-        match self {
-            Self::AdmissionAttempted => ScribeEffect::AdmissionStarted,
-            Self::AdmissionSettled => ScribeEffect::AdmissionSettled,
-            Self::ShareRecomputed
-            | Self::CapacityBorrowed
-            | Self::ChargeCommitted
-            | Self::ChargeRefused
-            | Self::IncumbentBlocked
-            | Self::ChargeReleased
-            | Self::OverReleaseRefused
-            | Self::ResizeGrown
-            | Self::ResizeShrunk
-            | Self::ResizeRefused => ScribeEffect::ShareDecided,
-            Self::DemandEnqueued
-            | Self::DemandRefreshed
-            | Self::DemandPartiallyServed
-            | Self::DemandRestored => ScribeEffect::DemandQueued,
-            Self::DemandDropped
-            | Self::DemandRetired
-            | Self::DemandCancelled
-            | Self::DemandInvalidated
-            | Self::DemandExpired => ScribeEffect::DemandSettled,
-            Self::ActivationInstalled
-            | Self::ActivationRefused
-            | Self::ActivationRolledBack
-            | Self::TableSettled
-            | Self::TenantSettled
-            | Self::SettlementDeferred
-            | Self::ResourceSettled
-            | Self::InvariantFailure => ScribeEffect::ResourceSettled,
-        }
-    }
-
     /// The complete registry inventory, in lifecycle order.
     ///
     /// Indexed by [`Self::index`], so the order here is the order of
@@ -1667,20 +1270,6 @@ pub(crate) enum StagingEffect {
 }
 
 impl StagingEffect {
-    /// Projects the detailed staging decision into the top-level registry.
-    const fn top_effect(self) -> ScribeEffect {
-        match self {
-            Self::MemberStaged => ScribeEffect::MemberReady,
-            Self::SourceTransitioned => ScribeEffect::SourceTransitioned,
-            Self::ClaimTaken => ScribeEffect::ClaimStarted,
-            Self::ClaimAssembled => ScribeEffect::MergePassCompleted,
-            Self::ClaimPublished => ScribeEffect::PublicationManifestDurable,
-            Self::MemberRetired => ScribeEffect::ResourceSettled,
-            Self::ClaimSettled | Self::ClaimFailed => ScribeEffect::ClaimSettled,
-            Self::StagingRestored => ScribeEffect::ResourceSettled,
-        }
-    }
-
     /// The complete registry inventory, in lifecycle order.
     ///
     /// Indexed by [`Self::index`], so the order here is the order of the
@@ -1789,30 +1378,15 @@ pub(crate) struct StagingFacts {
     /// Sealed objects the effect produced, when it produced any.
     pub(crate) artifacts: usize,
     /// Cause ordinal the assembler released a claim under, when one applies.
-    pub(crate) cause: Option<crate::scribe::assembly::ClaimCause>,
+    pub(crate) cause: Option<&'static str>,
 }
 
 impl StagingFacts {
     /// Returns the closed cause label, or the no-cause placeholder.
     const fn cause_label(&self) -> &'static str {
         match self.cause {
-            Some(cause) => cause.label(),
+            Some(cause) => cause,
             None => "none",
-        }
-    }
-
-    /// Projects the closed claim cause into the top-level reason vocabulary.
-    const fn effect_reason(&self) -> ScribeEffectReason {
-        match self.cause {
-            Some(crate::scribe::assembly::ClaimCause::Target) => ScribeEffectReason::Target,
-            Some(crate::scribe::assembly::ClaimCause::Dwell) => ScribeEffectReason::Dwell,
-            Some(crate::scribe::assembly::ClaimCause::PartitionClosed) => {
-                ScribeEffectReason::PartitionClosed
-            }
-            Some(crate::scribe::assembly::ClaimCause::Pressure) => ScribeEffectReason::Pressure,
-            Some(crate::scribe::assembly::ClaimCause::Drain) => ScribeEffectReason::Drain,
-            Some(crate::scribe::assembly::ClaimCause::Recovery) => ScribeEffectReason::Recovery,
-            None => ScribeEffectReason::Routine,
         }
     }
 }
@@ -1876,16 +1450,6 @@ pub(crate) struct ScribeTelemetry {
     totals: Mutex<ScribeTelemetrySnapshot>,
     /// Reconcilable staged and claim totals published since startup.
     staging: Mutex<ScribeStagingSnapshot>,
-    /// Complete hot-path effect counts in [`ScribeEffect::ALL`] order.
-    effects: Mutex<[u64; ScribeEffect::ALL.len()]>,
-    /// Row totals in [`ScribeEffect::ALL`] order.
-    effect_rows: Mutex<[u64; ScribeEffect::ALL.len()]>,
-    /// Byte totals in [`ScribeEffect::ALL`] order.
-    effect_bytes: Mutex<[u64; ScribeEffect::ALL.len()]>,
-    /// Artifact totals in [`ScribeEffect::ALL`] order.
-    effect_artifacts: Mutex<[u64; ScribeEffect::ALL.len()]>,
-    /// Sum of all registered active-gauge movements.
-    active_effects: Mutex<i64>,
 }
 
 impl Default for ScribeTelemetry {
@@ -1901,131 +1465,11 @@ impl Default for ScribeTelemetry {
                 demand_transitions: 0,
             }),
             staging: Mutex::new(ScribeStagingSnapshot::default()),
-            effects: Mutex::new([0; ScribeEffect::ALL.len()]),
-            effect_rows: Mutex::new([0; ScribeEffect::ALL.len()]),
-            effect_bytes: Mutex::new([0; ScribeEffect::ALL.len()]),
-            effect_artifacts: Mutex::new([0; ScribeEffect::ALL.len()]),
-            active_effects: Mutex::new(0),
         }
     }
 }
 
 impl ScribeTelemetry {
-    /// Opens one RAII-balanced registered activity.
-    pub(crate) fn start_effect(
-        self: &Arc<Self>,
-        start: ScribeEffect,
-        terminal: ScribeEffect,
-        facts: ScribeEffectFacts,
-    ) -> ScribeEffectGuard {
-        debug_assert_eq!(start.active_delta(), 1);
-        debug_assert_eq!(terminal.active_delta(), -1);
-        self.record_effect(start, facts);
-        ScribeEffectGuard {
-            telemetry: Arc::clone(self),
-            terminal,
-            facts,
-            settled: false,
-        }
-    }
-
-    /// Publishes one registered production hot-path effect.
-    ///
-    /// Only registry-owned stage and decision strings become labels. Workload
-    /// identities stay on the caller's enclosing trace span.
-    pub(crate) fn record_effect(&self, effect: ScribeEffect, facts: ScribeEffectFacts) {
-        metrics::counter!(
-            "bifrost_scribe_effects_total",
-            "stage" => effect.stage(),
-            "decision" => effect.decision(),
-            "outcome" => facts.outcome.label(),
-            "reason" => facts.reason.label(),
-        )
-        .increment(1);
-        if let Ok(mut counts) = self.effects.lock() {
-            counts[effect.index()] = counts[effect.index()].saturating_add(1);
-        }
-        if let Ok(mut rows) = self.effect_rows.lock() {
-            rows[effect.index()] = rows[effect.index()].saturating_add(facts.rows);
-        }
-        if let Ok(mut bytes) = self.effect_bytes.lock() {
-            bytes[effect.index()] = bytes[effect.index()].saturating_add(facts.bytes);
-        }
-        if let Ok(mut artifacts) = self.effect_artifacts.lock() {
-            artifacts[effect.index()] = artifacts[effect.index()].saturating_add(facts.artifacts);
-        }
-        let active = if let Ok(mut active) = self.active_effects.lock() {
-            *active = active.saturating_add(i64::from(effect.active_delta()));
-            *active
-        } else {
-            0
-        };
-        metrics::gauge!("bifrost_scribe_effects_active").set(active as f64);
-        tracing::info!(
-            stage = effect.stage(),
-            decision = effect.decision(),
-            outcome = facts.outcome.label(),
-            reason = facts.reason.label(),
-            rows = facts.rows,
-            bytes = facts.bytes,
-            artifacts = facts.artifacts,
-            active,
-            terminal = effect.is_terminal(),
-            "Scribe hot-path lifecycle"
-        );
-    }
-
-    /// Returns the exact emission count for one registered effect.
-    #[cfg(test)]
-    pub(crate) fn effect_count(&self, effect: ScribeEffect) -> u64 {
-        self.effects
-            .lock()
-            .map_or(0, |counts| counts[effect.index()])
-    }
-
-    /// Returns the current top-level active lifecycle balance.
-    pub(crate) fn active_effects(&self) -> i64 {
-        self.active_effects.lock().map_or(0, |active| *active)
-    }
-
-    /// Captures every registered effect, including zero-count entries.
-    pub(crate) fn hot_path_snapshot(&self) -> ScribeHotPathSnapshot {
-        let counts = self
-            .effects
-            .lock()
-            .map_or_else(|_| [0; ScribeEffect::ALL.len()], |counts| *counts);
-        let rows = self
-            .effect_rows
-            .lock()
-            .map_or_else(|_| [0; ScribeEffect::ALL.len()], |rows| *rows);
-        let bytes = self
-            .effect_bytes
-            .lock()
-            .map_or_else(|_| [0; ScribeEffect::ALL.len()], |bytes| *bytes);
-        let artifacts = self
-            .effect_artifacts
-            .lock()
-            .map_or_else(|_| [0; ScribeEffect::ALL.len()], |artifacts| *artifacts);
-        let keyed = |values: [u64; ScribeEffect::ALL.len()]| {
-            ScribeEffect::ALL
-                .into_iter()
-                .map(|effect| {
-                    (
-                        format!("{}.{}", effect.stage(), effect.decision()),
-                        values[effect.index()],
-                    )
-                })
-                .collect()
-        };
-        ScribeHotPathSnapshot {
-            effects: keyed(counts),
-            rows: keyed(rows),
-            bytes: keyed(bytes),
-            artifacts: keyed(artifacts),
-            active: self.active_effects(),
-        }
-    }
-
     /// Publishes one production effect as metrics, a trace event, and totals.
     ///
     /// The counter and gauge label sets are built from the effect's own closed
@@ -2039,19 +1483,6 @@ impl ScribeTelemetry {
     /// totals stop advancing, because losing observation is strictly better than
     /// refusing admitted work.
     pub(crate) fn record(&self, effect: ContentionEffect, facts: ContentionFacts) {
-        self.record_effect(
-            effect.top_effect(),
-            ScribeEffectFacts {
-                bytes: u64::try_from(facts.requested).unwrap_or(u64::MAX),
-                outcome: ScribeEffectOutcome::Observed,
-                reason: match effect.severity() {
-                    "warn" => ScribeEffectReason::ContentionWarn,
-                    "error" => ScribeEffectReason::ContentionError,
-                    _ => ScribeEffectReason::ContentionInfo,
-                },
-                ..ScribeEffectFacts::default()
-            },
-        );
         let category = facts.category_label();
         metrics::counter!(
             "bifrost_scribe_contention_effects_total",
@@ -2155,22 +1586,6 @@ impl ScribeTelemetry {
     /// contention registry, a poisoned totals lock stops the totals advancing
     /// but never fails the durable transition being observed.
     pub(crate) fn record_staging(&self, effect: StagingEffect, facts: StagingFacts) {
-        self.record_effect(
-            effect.top_effect(),
-            ScribeEffectFacts {
-                bytes: facts.bytes,
-                artifacts: u64::try_from(facts.artifacts).unwrap_or(u64::MAX),
-                outcome: if matches!(effect, StagingEffect::ClaimFailed) {
-                    ScribeEffectOutcome::Failed
-                } else if matches!(effect, StagingEffect::ClaimTaken) {
-                    ScribeEffectOutcome::Started
-                } else {
-                    ScribeEffectOutcome::Success
-                },
-                reason: facts.effect_reason(),
-                ..ScribeEffectFacts::default()
-            },
-        );
         metrics::counter!(
             "bifrost_scribe_staging_effects_total",
             "stage" => effect.stage(),
@@ -2260,14 +1675,8 @@ fn gauge_value(count: usize) -> f64 {
 #[cfg(test)]
 /// Registry-shape proofs for the closed contention effect vocabulary.
 mod contention_registry_tests {
-    use std::sync::Arc;
-
-    use super::{
-        ContentionEffect, ContentionFacts, ScribeEffect, ScribeEffectFacts, ScribeEffectOutcome,
-        ScribeEffectReason, ScribeTelemetry,
-    };
+    use super::{ContentionEffect, ContentionFacts, ScribeTelemetry};
     use crate::scribe::geometry::ContentionCategory;
-    use crate::scribe::telemetry::producer_lifecycle_tests::EventCaptureSubscriber;
 
     /// The registry's inventory is a bijection with its own index space.
     ///
@@ -2515,31 +1924,6 @@ mod contention_registry_tests {
     /// when a drained ledger still reports live transitions or vectors.
     #[test]
     fn scribe_observation_registry_is_closed_and_balanced() {
-        let mut top_claimed = vec![false; ScribeEffect::ALL.len()];
-        let mut top_pairs = Vec::new();
-        for effect in ScribeEffect::ALL {
-            let index = effect.index();
-            assert!(!top_claimed[index], "{effect:?} duplicates index {index}");
-            top_claimed[index] = true;
-            assert!(!effect.stage().is_empty(), "{effect:?} has no stage");
-            assert!(!effect.decision().is_empty(), "{effect:?} has no decision");
-            assert!(
-                !top_pairs.contains(&(effect.stage(), effect.decision())),
-                "{effect:?} collapses onto an existing top-level series"
-            );
-            top_pairs.push((effect.stage(), effect.decision()));
-        }
-        assert!(top_claimed.into_iter().all(|claimed| claimed));
-        assert_eq!(
-            ScribeEffect::ALL
-                .into_iter()
-                .map(ScribeEffect::active_delta)
-                .map(i64::from)
-                .sum::<i64>(),
-            0,
-            "the complete registry must define balanced active movements"
-        );
-
         // Closed: index space, labels, and severity vocabulary.
         let mut claimed = [false; ContentionEffect::ALL.len()];
         let mut pairs: Vec<(&'static str, &'static str)> = Vec::new();
@@ -2623,19 +2007,6 @@ mod contention_registry_tests {
             "a drained pod holds no installed lifecycle vector"
         );
         assert_eq!(ledger.active_cells().expect("ledger readable"), 0);
-        assert_eq!(ledger.telemetry().active_effects(), 0);
-        assert_eq!(
-            ledger
-                .telemetry()
-                .effect_count(ScribeEffect::AdmissionStarted),
-            8
-        );
-        assert_eq!(
-            ledger
-                .telemetry()
-                .effect_count(ScribeEffect::AdmissionSettled),
-            8
-        );
     }
 
     /// An effect with no category publishes the closed `all` label, not an identity.
@@ -2666,82 +2037,5 @@ mod contention_registry_tests {
                 .count(ContentionEffect::ChargeCommitted),
             u64::try_from(ContentionCategory::ALL.len() + 1).expect("small count")
         );
-    }
-
-    /// The concrete metric recorder and trace subscriber observe only bounded labels.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a workload identity reaches the metric key or when the trace
-    /// event omits the registered lifecycle vocabulary.
-    #[test]
-    fn top_level_effect_recorder_and_trace_are_cardinality_closed() {
-        let recorder = wyrd_bench::BenchmarkRecorder::default();
-        let subscriber = EventCaptureSubscriber::default();
-        let events = Arc::clone(&subscriber.events);
-        let telemetry = ScribeTelemetry::default();
-        metrics::with_local_recorder(&recorder, || {
-            tracing::subscriber::with_default(subscriber, || {
-                telemetry.record_effect(
-                    ScribeEffect::RouteDecided,
-                    ScribeEffectFacts {
-                        rows: 3,
-                        bytes: 4096,
-                        artifacts: 1,
-                        outcome: ScribeEffectOutcome::Success,
-                        reason: ScribeEffectReason::RecordedShard,
-                    },
-                );
-            });
-        });
-
-        let snapshot = recorder.snapshot();
-        let key = snapshot
-            .counters
-            .keys()
-            .find(|key| key.starts_with("bifrost_scribe_effects_total{"))
-            .expect("top-level effect counter");
-        for expected in [
-            "stage=\"route\"",
-            "decision=\"shard_selected\"",
-            "outcome=\"success\"",
-            "reason=\"recorded_shard\"",
-        ] {
-            assert!(key.contains(expected), "missing {expected} from {key}");
-        }
-        for forbidden in [
-            "tenant",
-            "table",
-            "request",
-            "batch",
-            "member",
-            "generation",
-            "claim",
-            "object",
-            "node",
-            "sql",
-            "path",
-        ] {
-            assert!(
-                !key.contains(forbidden),
-                "identity label `{forbidden}` in {key}"
-            );
-        }
-
-        let events = events.lock().expect("trace capture");
-        let event = events.last().expect("top-level lifecycle trace event");
-        let names = event
-            .iter()
-            .map(|(name, _)| name.as_str())
-            .collect::<Vec<_>>();
-        for required in ["stage", "decision", "outcome", "reason", "rows", "bytes"] {
-            assert!(
-                names.contains(&required),
-                "trace omitted `{required}`: {event:?}"
-            );
-        }
-        for forbidden in ["sql", "path", "credential", "token"] {
-            assert!(!names.contains(&forbidden), "trace exposed `{forbidden}`");
-        }
     }
 }

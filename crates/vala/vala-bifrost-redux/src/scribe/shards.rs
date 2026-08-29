@@ -718,8 +718,6 @@ pub(crate) enum ShardCommand {
 /// Keeping these values together makes FIFO, replay, memory release, and
 /// shutdown transitions occur only at the shard boundary.
 struct ShardOwner {
-    /// Pod-wide closed hot-path telemetry owner.
-    telemetry: Arc<crate::scribe::telemetry::ScribeTelemetry>,
     /// Stable pod-local shard number used for routing and diagnostics.
     id: usize,
     /// Bounded command mailbox consumed in FIFO order.
@@ -984,7 +982,6 @@ impl ScribeShardRuntime {
         } = config;
         let wal_segment_bytes = geometry.wal_segment_bytes();
         let generation_rotation_bytes = geometry.shard_generation_rotation_usize();
-        let telemetry = admission.contention().telemetry_handle();
         let mut set = ScribeShardSet::<ShardCommand>::new();
         let receivers = set.take_receivers().unwrap_or_default();
         let senders: Vec<ScribeShard<ShardCommand>> =
@@ -1009,7 +1006,6 @@ impl ScribeShardRuntime {
             });
             let (_, pressure_receiver) = &pressure_channels[id];
             let owner = ShardOwner {
-                telemetry: Arc::clone(&telemetry),
                 id,
                 receiver,
                 pressure_receiver: pressure_receiver.clone(),
@@ -1475,18 +1471,7 @@ impl ShardOwner {
     /// Applies one command and returns whether it requested owner shutdown.
     async fn handle_command(&mut self, command: ShardCommand) -> bool {
         match command {
-            ShardCommand::Append(append) => {
-                self.telemetry.record_effect(
-                    crate::scribe::telemetry::ScribeEffect::RouteDecided,
-                    crate::scribe::telemetry::ScribeEffectFacts {
-                        bytes: u64::try_from(append.prepared_bytes).unwrap_or(u64::MAX),
-                        outcome: crate::scribe::telemetry::ScribeEffectOutcome::Success,
-                        reason: crate::scribe::telemetry::ScribeEffectReason::RecordedShard,
-                        ..crate::scribe::telemetry::ScribeEffectFacts::default()
-                    },
-                );
-                self.scheduler.push(*append);
-            }
+            ShardCommand::Append(append) => self.scheduler.push(*append),
             ShardCommand::Snapshot { request, response } => {
                 let _ = response.send(self.snapshot_at(&request));
             }
@@ -2199,29 +2184,6 @@ impl ShardOwner {
                 return Err(error);
             }
             let frozen = self.memtable.freeze(&seal_key)?;
-            let reason = match trigger {
-                Some(SealTriggerReason::Size) => crate::scribe::telemetry::ScribeEffectReason::Size,
-                Some(SealTriggerReason::Age) => crate::scribe::telemetry::ScribeEffectReason::Age,
-                Some(SealTriggerReason::Pressure) => {
-                    crate::scribe::telemetry::ScribeEffectReason::Pressure
-                }
-                None => crate::scribe::telemetry::ScribeEffectReason::Explicit,
-            };
-            for effect in [
-                crate::scribe::telemetry::ScribeEffect::GenerationRotated,
-                crate::scribe::telemetry::ScribeEffect::GenerationFrozen,
-            ] {
-                self.telemetry.record_effect(
-                    effect,
-                    crate::scribe::telemetry::ScribeEffectFacts {
-                        rows: u64::try_from(frozen.row_count()).unwrap_or(u64::MAX),
-                        bytes: u64::try_from(frozen.arrow_bytes).unwrap_or(u64::MAX),
-                        outcome: crate::scribe::telemetry::ScribeEffectOutcome::Success,
-                        reason,
-                        ..crate::scribe::telemetry::ScribeEffectFacts::default()
-                    },
-                );
-            }
             if has_rows && let Some(trigger) = trigger {
                 record_seal(trigger);
             }
@@ -2519,8 +2481,7 @@ impl ShardOwner {
             let Some(retained) = self.retire_committed_generation(generation_id)? else {
                 continue;
             };
-            let retired_segments = u64::try_from(retained.wal_segments.len()).unwrap_or(u64::MAX);
-            match self
+            if let Err(error) = self
                 .wal_io
                 .submit(ScribeWalIoOp::RetireWal {
                     wal: retained.wal,
@@ -2528,18 +2489,7 @@ impl ShardOwner {
                 })
                 .await
             {
-                Ok(_) => self.telemetry.record_effect(
-                    crate::scribe::telemetry::ScribeEffect::WalRetired,
-                    crate::scribe::telemetry::ScribeEffectFacts {
-                        artifacts: retired_segments,
-                        outcome: crate::scribe::telemetry::ScribeEffectOutcome::Success,
-                        reason: crate::scribe::telemetry::ScribeEffectReason::GenerationCommitted,
-                        ..crate::scribe::telemetry::ScribeEffectFacts::default()
-                    },
-                ),
-                Err(error) => {
-                    tracing::warn!(error = %error, generation_id, "WAL retirement submission failed");
-                }
+                tracing::warn!(error = %error, generation_id, "WAL retirement submission failed");
             }
         }
         Ok(())
@@ -3136,52 +3086,6 @@ impl ShardOwner {
     /// prepared ACK waiters receive the same completion error and reservations
     /// are released before the error returns.
     async fn process_group(&mut self, group: Vec<PreparedAppend>) -> Result<(), ScribeError> {
-        let bytes = u64::try_from(
-            group
-                .iter()
-                .map(ShardItem::bytes)
-                .fold(0_usize, usize::saturating_add),
-        )
-        .unwrap_or(u64::MAX);
-        let append = self.telemetry.start_effect(
-            crate::scribe::telemetry::ScribeEffect::WalAppendStarted,
-            crate::scribe::telemetry::ScribeEffect::WalAppendSettled,
-            crate::scribe::telemetry::ScribeEffectFacts {
-                bytes,
-                outcome: crate::scribe::telemetry::ScribeEffectOutcome::Started,
-                reason: crate::scribe::telemetry::ScribeEffectReason::FairGroup,
-                ..crate::scribe::telemetry::ScribeEffectFacts::default()
-            },
-        );
-        let fsync = self.telemetry.start_effect(
-            crate::scribe::telemetry::ScribeEffect::WalFsyncStarted,
-            crate::scribe::telemetry::ScribeEffect::WalFsyncSettled,
-            crate::scribe::telemetry::ScribeEffectFacts {
-                bytes,
-                outcome: crate::scribe::telemetry::ScribeEffectOutcome::Started,
-                reason: crate::scribe::telemetry::ScribeEffectReason::FairGroup,
-                ..crate::scribe::telemetry::ScribeEffectFacts::default()
-            },
-        );
-        let result = self.process_group_inner(group).await;
-        let (outcome, reason) = if result.is_ok() {
-            (
-                crate::scribe::telemetry::ScribeEffectOutcome::Success,
-                crate::scribe::telemetry::ScribeEffectReason::Committed,
-            )
-        } else {
-            (
-                crate::scribe::telemetry::ScribeEffectOutcome::Failed,
-                crate::scribe::telemetry::ScribeEffectReason::Retained,
-            )
-        };
-        append.settle(outcome, reason, 0);
-        fsync.settle(outcome, reason, 0);
-        result
-    }
-
-    /// Executes one group beneath the balanced WAL activity guards.
-    async fn process_group_inner(&mut self, group: Vec<PreparedAppend>) -> Result<(), ScribeError> {
         self.retry_retained_post_commit()?;
         self.rotate_before_append_if_needed(&group)?;
         let mut state = self.write_group(group).await?;
@@ -6350,15 +6254,8 @@ mod tests {
         let (pressure_tx, pressure_receiver) = watch::channel(None);
         let budget =
             crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
-        let admission = AdmissionController::with_config_and_memory(
-            crate::scribe::admission::AdmissionConfig::default(),
-            budget.clone(),
-        )
-        .expect("the default Scribe geometry fits the default test budget");
-        let telemetry = admission.contention().telemetry_handle();
         let _ = wal;
         let owner = ShardOwner {
-            telemetry,
             id: 0,
             receiver,
             pressure_receiver,
@@ -6377,7 +6274,11 @@ mod tests {
             seal_retry: HashSet::new(),
             retained_generations: HashMap::new(),
             retained_commit_ambiguity: None,
-            admission,
+            admission: AdmissionController::with_config_and_memory(
+                crate::scribe::admission::AdmissionConfig::default(),
+                budget.clone(),
+            )
+            .expect("the default Scribe geometry fits the default test budget"),
             memtable,
             persistence_cpu: ScribePersistenceCpuPool::new(1),
             wal_io: ScribeWalIoPool::new(1),
@@ -7342,6 +7243,101 @@ mod tests {
         }
     }
 
+    /// Proves the bounded fsync group preserves FIFO and the tenant rotation.
+    ///
+    /// Extracted from [`tenant_table_round_robin_is_hierarchical_and_fifo`] so
+    /// that owner stays inside the repository line bound. The rotation is a
+    /// property of the scheduler rather than of one drain, so both clauses need
+    /// backlogs larger than `MAX_GROUP_ITEMS`: one tenant proves a table's
+    /// arrivals survive being cut across groups, and two tenants prove the turn
+    /// order survives every group boundary.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a drain exceeds `MAX_GROUP_ITEMS`, when a non-empty
+    /// scheduler makes no progress, when a tenant's arrivals are reordered, or
+    /// when equal backlogs diverge by more than one turn at a group boundary.
+    fn bounded_group_preserves_fifo_and_rotation(busy: DataTenantId, quiet: DataTenantId) {
+        // Bounded group: a single tenant/table backlog larger than the group
+        // bound is served across successive drains in strict arrival order and
+        // never in one oversized group.
+        let mut bounded = TenantTableRoundRobin::default();
+        let backlog = MAX_GROUP_ITEMS * 2 + 5;
+        for sequence in 0..backlog {
+            bounded.push(scheduled_in(
+                busy,
+                BifrostNamespace::Datasets,
+                "hot",
+                sequence,
+            ));
+        }
+        let mut drained = Vec::new();
+        while !bounded.is_empty() {
+            let next = bounded.pop_group();
+            assert!(
+                next.len() <= MAX_GROUP_ITEMS,
+                "one drain must stay inside the bounded fsync group"
+            );
+            assert!(!next.is_empty(), "a non-empty scheduler must make progress");
+            drained.extend(next.into_iter().map(|item| item.sequence));
+        }
+        assert_eq!(
+            drained,
+            (0..backlog).collect::<Vec<usize>>(),
+            "a table's admitted batches stay strictly FIFO across drains"
+        );
+
+        // The rotation is a property of the scheduler, not of one drain: when
+        // two tenants each hold more than a group's worth of work, the turn
+        // order must survive every group boundary. A cursor that restarted per
+        // drain would let whichever tenant sorts first take every group.
+        let mut across_drains = TenantTableRoundRobin::default();
+        let per_tenant = MAX_GROUP_ITEMS * 2 + 3;
+        for sequence in 0..per_tenant {
+            across_drains.push(scheduled_in(
+                busy,
+                BifrostNamespace::Datasets,
+                "hot",
+                sequence,
+            ));
+            across_drains.push(scheduled_in(
+                quiet,
+                BifrostNamespace::Datasets,
+                "hot",
+                sequence,
+            ));
+        }
+        let mut busy_served = 0_usize;
+        let mut quiet_served = 0_usize;
+        let mut busy_order = Vec::new();
+        let mut quiet_order = Vec::new();
+        while !across_drains.is_empty() {
+            for item in across_drains.pop_group() {
+                if item.tenant() == busy {
+                    busy_served += 1;
+                    busy_order.push(item.sequence);
+                } else {
+                    quiet_served += 1;
+                    quiet_order.push(item.sequence);
+                }
+            }
+            assert!(
+                busy_served.abs_diff(quiet_served) <= 1,
+                "equal backlogs must stay within one turn of each other at every \
+             group boundary, got busy={busy_served} quiet={quiet_served}"
+            );
+        }
+        let expected_order: Vec<usize> = (0..per_tenant).collect();
+        assert_eq!(
+            busy_order, expected_order,
+            "cross-drain rotation must not reorder a tenant's own arrivals"
+        );
+        assert_eq!(
+            quiet_order, expected_order,
+            "cross-drain rotation must not reorder a tenant's own arrivals"
+        );
+    }
+
     /// AC22/AC25 unit owner: the shard scheduler is exactly hierarchical —
     /// tenant round-robin, then table round-robin inside a tenant, then strict
     /// FIFO inside a table — with equal weight for system and dynamic tables
@@ -7434,90 +7430,7 @@ mod tests {
             "the drain leaves no orphaned rotation"
         );
 
-        // Bounded group: a single tenant/table backlog larger than the group
-        // bound is served across successive drains in strict arrival order and
-        // never in one oversized group.
-        let mut bounded = TenantTableRoundRobin::default();
-        let backlog = MAX_GROUP_ITEMS * 2 + 5;
-        for sequence in 0..backlog {
-            bounded.push(scheduled_in(
-                busy,
-                BifrostNamespace::Datasets,
-                "hot",
-                sequence,
-            ));
-        }
-        let mut drained = Vec::new();
-        while !bounded.is_empty() {
-            let next = bounded.pop_group();
-            assert!(
-                next.len() <= MAX_GROUP_ITEMS,
-                "one drain must stay inside the bounded fsync group"
-            );
-            assert!(!next.is_empty(), "a non-empty scheduler must make progress");
-            drained.extend(next.into_iter().map(|item| item.sequence));
-        }
-        assert_eq!(
-            drained,
-            (0..backlog).collect::<Vec<usize>>(),
-            "a table's admitted batches stay strictly FIFO across drains"
-        );
-    }
-
-    /// A group rotates tenants first and never starves the second tenant.
-    ///
-    /// # Panics
-    ///
-    /// Panics when one tenant takes two consecutive turns while another has
-    /// pending work, or when a tenant's own arrival order is not preserved.
-    #[test]
-    fn scheduler_rotates_between_tenants() {
-        let first = DataTenantId::new_v7();
-        let second = DataTenantId::new_v7();
-        let mut scheduler = TenantTableRoundRobin::default();
-        scheduler.push(scheduled(first, "events", 1));
-        scheduler.push(scheduled(first, "events", 2));
-        scheduler.push(scheduled(second, "events", 3));
-        let first_group = scheduler.pop_group();
-        assert_eq!(first_group.len(), 3);
-        assert_eq!(first_group[0].tenant(), first);
-        assert_eq!(first_group[1].tenant(), second);
-        assert_eq!(first_group[1].sequence, 3);
-        assert_eq!(first_group[2].sequence, 2);
-        let second_group = scheduler.pop_group();
-        assert!(second_group.is_empty());
-        assert!(scheduler.pop_group().is_empty());
-    }
-
-    /// One tenant's hot table cannot consume that tenant's whole turn.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a tenant's tables are not rotated inside its turn, when
-    /// arrival order within one table is not preserved, or when a quiet table
-    /// waits behind more than one request of its busy sibling.
-    #[test]
-    fn scheduler_rotates_tables_inside_one_tenant() {
-        let tenant = DataTenantId::new_v7();
-        let mut scheduler = TenantTableRoundRobin::default();
-        // Four requests for the hot table arrive before the quiet table's one.
-        for sequence in 1..=4 {
-            scheduler.push(scheduled(tenant, "hot", sequence));
-        }
-        scheduler.push(scheduled(tenant, "quiet", 5));
-
-        let group = scheduler.pop_group();
-        assert_eq!(group.len(), 5);
-        let served: Vec<(&str, usize)> = group
-            .iter()
-            .map(|item| (item.table().name.as_str(), item.sequence))
-            .collect();
-        assert_eq!(
-            served,
-            vec![("hot", 1), ("quiet", 5), ("hot", 2), ("hot", 3), ("hot", 4),],
-            "the quiet table takes its turn after one hot request, not after four"
-        );
-        assert!(scheduler.is_empty());
+        bounded_group_preserves_fifo_and_rotation(busy, quiet);
     }
 
     /// Two tenants with uneven table counts still alternate at the tenant level.

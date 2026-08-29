@@ -925,6 +925,34 @@ mod tests {
             "1 GiB across sixteen shards is 64 MiB each, not sixteen reservations of 512 MiB"
         );
 
+        // The derivation is exactly `min(ceiling, floor(budget / 16))` for
+        // budgets that do not divide evenly, and the sixteen derived limits
+        // together never exceed the one global budget. A limit that rounded up
+        // would let the fixed topology overcommit the pod.
+        for budget in [
+            u64::from(u32::try_from(SCRIBE_SHARD_COUNT).unwrap()),
+            1024 * 1024 * 1024 + 1,
+            1024 * 1024 * 1024 + u64::from(u32::try_from(SCRIBE_SHARD_COUNT - 1).unwrap()),
+            3 * 1024 * 1024 * 1024 + 7,
+            17 * 1024 * 1024 + 13,
+        ] {
+            for ceiling in [1, 64 * 1024 * 1024, 512 * 1024 * 1024, u64::MAX / 2] {
+                let geometry = geometry_with(budget, ceiling)
+                    .expect("a budget of at least one byte per shard is coherent");
+                let limit = geometry.shard_generation_rotation_bytes();
+                let shards = u64::from(u32::try_from(SCRIBE_SHARD_COUNT).unwrap());
+                assert_eq!(
+                    limit,
+                    ceiling.min(budget / shards),
+                    "budget {budget} and ceiling {ceiling} must derive the exact minimum"
+                );
+                assert!(
+                    limit.saturating_mul(shards) <= budget,
+                    "sixteen limits of {limit} overcommit the {budget} byte global budget"
+                );
+            }
+        }
+
         // A budget that cannot give every shard even one byte is incoherent.
         let starved = geometry_with(u64::from(u32::try_from(SCRIBE_SHARD_COUNT - 1).unwrap()), 1)
             .expect_err("a budget below one byte per shard must refuse");

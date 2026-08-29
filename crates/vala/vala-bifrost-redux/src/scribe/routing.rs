@@ -43,76 +43,6 @@ mod tests {
     use super::*;
     use crate::namespaces::BifrostNamespace;
 
-    /// Verify the routing key stays within the fixed 16-shard topology.
-    #[test]
-    fn routing_stays_within_the_fixed_topology() {
-        let tenant = DataTenantId::new_v7();
-        let table = TableRef::new(BifrostNamespace::Bifrost, "events");
-        let batch_id = Uuid::new_v4();
-        assert!(shard_for(tenant, &table, batch_id) < SCRIBE_SHARD_COUNT);
-        assert_eq!(
-            shard_for(tenant, &table, batch_id),
-            shard_for(tenant, &table, batch_id)
-        );
-    }
-
-    /// Verify that the table namespace and name are both part of the key.
-    #[test]
-    fn namespace_and_name_are_part_of_the_routing_key() {
-        let tenant = DataTenantId::new_v7();
-        let batch_id = Uuid::new_v4();
-        let first = TableRef::new(BifrostNamespace::Bifrost, "events");
-        let second = TableRef::new(BifrostNamespace::Audit, "events");
-        assert_ne!(first.fqn(), second.fqn());
-        let _ = (
-            shard_for(tenant, &first, batch_id),
-            shard_for(tenant, &second, batch_id),
-        );
-    }
-
-    /// A retried batch (same `batch_id`) routes deterministically to the same
-    /// shard lane, so the lane's in-memory and WAL dedup state absorbs it.
-    /// AC1.
-    #[test]
-    fn same_batch_id_routes_to_one_shard_across_retries() {
-        let tenant = DataTenantId::new_v7();
-        let table = TableRef::new(BifrostNamespace::Bifrost, "events");
-        // Use a fixed UUID so this test is reproducible regardless of UUIDv7 time.
-        let batch_id =
-            Uuid::parse_str("12345678-1234-5678-1234-567812345678").expect("fixed UUID is valid");
-        let first_route = shard_for(tenant, &table, batch_id);
-        let second_route = shard_for(tenant, &table, batch_id);
-        let third_route = shard_for(tenant, &table, batch_id);
-        assert_eq!(
-            first_route, second_route,
-            "retry must land on the same shard"
-        );
-        assert_eq!(
-            second_route, third_route,
-            "retry must land on the same shard"
-        );
-    }
-
-    /// Distinct batch ids for one (tenant, table) route to at least two distinct
-    /// shards, proving write-load spread. We choose UUIDs that are known to produce
-    /// different first-byte outputs from blake3. AC1.
-    #[test]
-    fn distinct_batches_spread_one_table_across_shards() {
-        let tenant = DataTenantId::new_v7();
-        let table = TableRef::new(BifrostNamespace::Bifrost, "events");
-        // Collect shard indices for 32 different batch ids and assert spread.
-        let shards: std::collections::HashSet<usize> = (0_u128..32)
-            .map(|i| {
-                let batch_id = Uuid::from_u128(i.wrapping_add(0x1000_0000_0000_0000));
-                shard_for(tenant, &table, batch_id)
-            })
-            .collect();
-        assert!(
-            shards.len() > 1,
-            "distinct batch ids must spread across multiple shards, got: {shards:?}"
-        );
-    }
-
     /// AC22/AC25 unit owner: routing is exactly an equality function of
     /// `(tenant, canonical table, batch_id)`, a retried batch returns to the
     /// lane holding its dedup state, and deterministic distinct batch ids for
@@ -168,23 +98,31 @@ mod tests {
         // Every component of the key participates: changing the tenant, the
         // table name, or the namespace must be able to move the lane, and none
         // of the three may be silently ignored.
-        let mut key_sensitivity = 0_usize;
-        for candidate in [&other_table, &namespace_twin] {
-            if shard_for(tenant, candidate, batch_id) != route {
-                key_sensitivity += 1;
-            }
+        for (component, probe) in [
+            (
+                "table name",
+                Box::new(|batch: Uuid| shard_for(tenant, &other_table, batch))
+                    as Box<dyn Fn(Uuid) -> usize>,
+            ),
+            (
+                "table namespace",
+                Box::new(|batch: Uuid| shard_for(tenant, &namespace_twin, batch)),
+            ),
+            (
+                "tenant",
+                Box::new(|batch: Uuid| shard_for(other_tenant, &table, batch)),
+            ),
+        ] {
+            let diverged = (0..256_u128).any(|ordinal| {
+                let batch = Uuid::from_u128(ordinal);
+                probe(batch) != shard_for(tenant, &table, batch)
+            });
+            assert!(
+                diverged,
+                "{component} must feed the routing key: varying it never changed a lane"
+            );
         }
-        if shard_for(other_tenant, &table, batch_id) != route {
-            key_sensitivity += 1;
-        }
-        assert!(
-            key_sensitivity >= 2,
-            "tenant, table name and namespace must all feed the routing key"
-        );
 
-        // All lanes: deterministic distinct batch ids for one hot (tenant,
-        // table) pair reach every lane, so a hot table is never confined to a
-        // subset of the topology.
         let mut reached = [false; SCRIBE_SHARD_COUNT];
         for ordinal in 0..4_096_u128 {
             reached[shard_for(tenant, &table, Uuid::from_u128(ordinal))] = true;

@@ -251,3 +251,43 @@ pub(super) async fn published_object_count(
         .expect("published hot files are inspectable")
         .len()
 }
+
+/// Returns how many rows one tenant's published hot objects account for.
+///
+/// Row count rather than object count is what proves exactly-once publication:
+/// the same rows may legitimately land in one object or several, but the sum
+/// must always equal what the client acknowledged.
+pub(super) async fn published_rows(
+    server: &WyrdTestServer,
+    tenant: DataTenantId,
+    table_name: &str,
+) -> u64 {
+    server
+        .published_hot_files_for_test(tenant, BifrostNamespace::Datasets.as_str(), table_name)
+        .await
+        .expect("published hot files are inspectable")
+        .iter()
+        .map(|file| file.row_count)
+        .sum()
+}
+
+/// Waits until Scribe's bounded persistence queue has settled.
+///
+/// The freeze hands generations to the persistence runtime; the staged member
+/// exists only once that queue has processed them. Polling the production
+/// depth is what makes the following assertions observations of a settled pod
+/// rather than of a race.
+///
+/// # Panics
+///
+/// Panics when the queue has not drained inside the case deadline.
+pub(super) async fn await_persistence_drained(scribe: &vala_bifrost_redux::scribe::ScribeImpl) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while scribe.persistence_queue_depth_for_test() > 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "Scribe persistence queue did not drain after the freeze"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}

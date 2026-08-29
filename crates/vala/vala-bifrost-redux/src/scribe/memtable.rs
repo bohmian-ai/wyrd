@@ -230,6 +230,45 @@ impl Memtable {
         )
     }
 
+    /// Allocates the next generation number this lane may freeze under `key`.
+    ///
+    /// The counter is pod-local and starts at one, so on its own it would
+    /// re-issue ordinals that startup recovery restored for members an earlier
+    /// process froze. Every allocation therefore takes the counter forward past
+    /// whatever the authority registry already owns for this lane and key,
+    /// which keeps generations unique and in age order across a restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the authority registry is
+    /// poisoned, because an unreadable registry cannot prove the ordinal is
+    /// free.
+    fn allocate_seal_id(&self, key: &SealKey) -> Result<u64, ScribeError> {
+        let candidate = self.next_seal_id.fetch_add(1, Ordering::Relaxed);
+        let Some(hot_sources) = &self.hot_sources else {
+            return Ok(candidate);
+        };
+        let highest = hot_sources
+            .highest_generation(key, u16::try_from(self.shard_id).unwrap_or(u16::MAX))
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("read the highest registered generation for {key}: {error}"),
+            })?;
+        if candidate > highest {
+            return Ok(candidate);
+        }
+        self.next_seal_id.fetch_max(highest + 1, Ordering::Relaxed);
+        let reserved = self.next_seal_id.fetch_add(1, Ordering::Relaxed);
+        tracing::info!(
+            operation = "scribe_generation_reserved",
+            shard = self.shard_id,
+            seal_key = %key,
+            restored_high_water = highest,
+            allocated = reserved,
+            "lane resumed generation numbering above the authorities recovery restored"
+        );
+        Ok(reserved)
+    }
+
     /// Registers one newly frozen generation as memtable-authoritative.
     ///
     /// # Errors
@@ -403,7 +442,7 @@ impl Memtable {
         replayed: &crate::scribe::replay::ReplayedSealKey,
     ) -> Result<FrozenMemtable, ScribeError> {
         let mut frozen = Self::decode_replayed(replayed)?;
-        frozen.seal_id = self.next_seal_id.fetch_add(1, Ordering::Relaxed);
+        frozen.seal_id = self.allocate_seal_id(&frozen.seal_key)?;
         self.insert_replayed_frozen(frozen)
     }
 
@@ -509,7 +548,7 @@ impl Memtable {
         mut frozen: FrozenMemtable,
     ) -> Result<FrozenMemtable, ScribeError> {
         if frozen.seal_id == 0 {
-            frozen.seal_id = self.next_seal_id.fetch_add(1, Ordering::Relaxed);
+            frozen.seal_id = self.allocate_seal_id(&frozen.seal_key)?;
         }
         frozen.shard_id = self.shard_id;
         let mut immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
@@ -620,7 +659,7 @@ impl Memtable {
                 });
         };
 
-        let seal_id = self.next_seal_id.fetch_add(1, Ordering::Relaxed);
+        let seal_id = self.allocate_seal_id(seal_key)?;
         let frozen = bucket.freeze(seal_id, self.shard_id);
 
         let mut immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
@@ -664,7 +703,7 @@ impl Memtable {
         buckets.sort_by_key(|(key, _)| key.to_string());
         let mut frozen = Vec::with_capacity(buckets.len());
         for (key, bucket) in buckets {
-            let seal_id = self.next_seal_id.fetch_add(1, Ordering::Relaxed);
+            let seal_id = self.allocate_seal_id(&key)?;
             let member = bucket.freeze(seal_id, self.shard_id);
             self.register_hot_source(&key, seal_id)?;
             immutable

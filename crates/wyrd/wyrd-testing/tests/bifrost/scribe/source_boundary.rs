@@ -1,8 +1,8 @@
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 
 use super::support::{
-    published_object_count, register_table, sorted_values, start_scribe_server, tenant_client,
-    unique_table,
+    await_persistence_drained, published_object_count, register_table, sorted_values,
+    start_scribe_server, tenant_client, unique_table,
 };
 
 /// AC22/AC24 Tier-2 owner: every authoritative source transition is exact.
@@ -119,25 +119,4 @@ async fn scribe_local_stage_to_hot_source_transition_is_exact() {
     );
 
     server.shutdown().await.expect("the server drains cleanly");
-}
-
-/// Waits until Scribe's bounded persistence queue has settled.
-///
-/// The freeze hands generations to the persistence runtime; the staged member
-/// exists only once that queue has processed them. Polling the production
-/// depth is what makes the following assertions observations of a settled pod
-/// rather than of a race.
-///
-/// # Panics
-///
-/// Panics when the queue has not drained inside the case deadline.
-async fn await_persistence_drained(scribe: &vala_bifrost_redux::scribe::ScribeImpl) {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-    while scribe.persistence_queue_depth_for_test() > 0 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "Scribe persistence queue did not drain after the freeze"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
 }

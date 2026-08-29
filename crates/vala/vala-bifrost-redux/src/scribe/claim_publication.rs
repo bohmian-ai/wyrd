@@ -39,7 +39,11 @@ pub struct PublishClaimRequest<'a> {
     pub binding: &'a TenantTableBinding,
     /// Deterministic object prefix the claim's objects were sealed under.
     pub object_base: &'a str,
-    /// Fenced writer identity authorizing the publication transaction.
+    /// Fenced writer identity of the pod authorizing the transaction.
+    ///
+    /// This is the publishing pod, which is not always the pod that produced
+    /// the rows: a replacement pod publishes members it replayed under an
+    /// earlier epoch.
     pub actor_stream: StreamIdentity,
 }
 
@@ -288,10 +292,19 @@ impl ClaimPublisher {
             )
             .await?;
         validate_promotion_records(&rows, &verified)?;
+        // The manifest records the stream that produced the rows, not the pod
+        // writing it. They are the same stream for a publication this pod also
+        // ingested, and they differ for members a replacement pod restored from
+        // the WAL: those rows keep the epoch that acknowledged them, which is
+        // what replay correlation reads them back by. The current pod's fence
+        // still authorizes the transaction below.
         self.mover
             .persist_publication(
                 request.object_base,
-                request.actor_stream,
+                StreamIdentity::new(
+                    request.claim.key().node_id(),
+                    request.claim.key().writer_epoch(),
+                ),
                 &rows,
                 &events,
                 &claims,

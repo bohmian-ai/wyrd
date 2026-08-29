@@ -266,8 +266,10 @@ impl StagedRunMerge {
         if batch.schema() != self.schema {
             return Err(ScribeError::Internal {
                 detail: format!(
-                    "staged run `{}` was encoded under a different physical schema",
-                    run.display()
+                    "staged run `{}` was encoded under a different physical schema: run [{}], claim [{}]",
+                    run.display(),
+                    field_names(batch.schema_ref()),
+                    field_names(&self.schema)
                 ),
             });
         }
@@ -359,6 +361,20 @@ fn decode_next(reader: &mut ParquetRecordBatchReader) -> Result<Option<RecordBat
             return Ok(Some(batch));
         }
     }
+}
+
+/// Renders one schema's fields as `name:type` for a contradiction message.
+///
+/// A merge that refuses a run needs to say how the two schemas differ, and the
+/// full `Debug` of an Arrow schema is too large to read in a log line. The
+/// field list is what actually distinguishes two physical layouts here.
+fn field_names(schema: &arrow::datatypes::Schema) -> String {
+    schema
+        .fields()
+        .iter()
+        .map(|field| format!("{}:{}", field.name(), field.data_type()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]

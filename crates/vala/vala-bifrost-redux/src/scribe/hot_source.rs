@@ -547,6 +547,35 @@ impl ScribeHotSourceRegistry {
         Ok(live)
     }
 
+    /// Returns the highest generation number one lane already owns for a key.
+    ///
+    /// Generation numbers are allocated by the shard lane that freezes them and
+    /// start again at one in a new process, while startup recovery restores the
+    /// authorities of members an earlier process numbered. A lane that begins
+    /// numbering from one after such a restore would reuse an ordinal the
+    /// registry still holds, and the registration that discovers it fails the
+    /// pod's recovery. Asking the registry for the ordinal already in use is
+    /// what lets the lane resume above it instead.
+    ///
+    /// Returns zero when the lane owns no generation for the key, so the first
+    /// allocation is one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HotSourceError::Poisoned`] on a poisoned lock.
+    pub fn highest_generation(&self, key: &SealKey, shard: u16) -> Result<u64, HotSourceError> {
+        let state = self.lock()?;
+        Ok(state.get(key).map_or(0, |authorities| {
+            authorities
+                .by_generation
+                .keys()
+                .filter(|generation| generation.shard() == shard)
+                .map(|generation| generation.get())
+                .max()
+                .unwrap_or(0)
+        }))
+    }
+
     /// Returns every staged member readable for one table in a partition range.
     ///
     /// This is the read side of the staged boundary: a generation whose Arrow

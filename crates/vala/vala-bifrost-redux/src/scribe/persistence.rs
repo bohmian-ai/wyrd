@@ -2648,6 +2648,18 @@ impl PersistenceWorker {
         let published = staging
             .publish(claim, &runs, &assembled, self.actor_stream)
             .await;
+        if let Err(error) = &published {
+            tracing::warn!(
+                operation = "scribe_claim_publication",
+                outcome = "refused",
+                claim = %claim.id(),
+                tenant = %claim.key().tenant(),
+                table = %claim.key().table(),
+                members = claim.members().len(),
+                error = %error,
+                "Scribe claim publication was refused; its members stay staged"
+            );
+        }
         // The scratch is disposable once the candidate has been uploaded: the
         // object and its publication manifest are the recovery evidence, and the
         // success path deletes the scratch immediately after the commit anyway.

@@ -682,7 +682,11 @@ impl ScribeStaging {
                     return Ok(());
                 }
                 return Err(ScribeError::Internal {
-                    detail: "Scribe publication manifest identity contradiction".to_owned(),
+                    detail: format!(
+                        "Scribe publication manifest identity contradiction for {logical_identity} (retained {} bytes, produced {} bytes)",
+                        retained.len(),
+                        manifest_bytes.len()
+                    ),
                 });
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -998,16 +1002,28 @@ fn validate_publication(
         let expected_ordinal = i16::try_from(ordinal).map_err(|_| ScribeError::Internal {
             detail: "Scribe publication ordinal exceeds durable range".to_owned(),
         })?;
-        if row.file_ordinal != expected_ordinal
-            || row.node_id != actor_stream.node_id.as_uuid()
-            || row.writer_epoch != actor_stream.writer_epoch.as_i64()
-            || row.file_path != claim.object_key
-            || row.file_checksum != hex::encode(claim.sha256)
-            || row.file_size != i64::try_from(claim.length).unwrap_or(-1)
-            || !claim.logical_identity.starts_with(logical_identity)
-        {
+        let contradiction = if row.file_ordinal != expected_ordinal {
+            Some("file ordinal")
+        } else if row.node_id != actor_stream.node_id.as_uuid() {
+            Some("node identity")
+        } else if row.writer_epoch != actor_stream.writer_epoch.as_i64() {
+            Some("writer epoch")
+        } else if row.file_path != claim.object_key {
+            Some("object key")
+        } else if row.file_checksum != hex::encode(claim.sha256) {
+            Some("object checksum")
+        } else if row.file_size != i64::try_from(claim.length).unwrap_or(-1) {
+            Some("object length")
+        } else if !claim.logical_identity.starts_with(logical_identity) {
+            Some("logical identity")
+        } else {
+            None
+        };
+        if let Some(field) = contradiction {
             return Err(ScribeError::Internal {
-                detail: "Scribe publication manifest identity contradiction".to_owned(),
+                detail: format!(
+                    "Scribe publication manifest identity contradiction: {field} for {logical_identity}"
+                ),
             });
         }
     }

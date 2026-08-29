@@ -2,7 +2,9 @@ use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::scribe::persistence::PersistenceFaults;
 use wyrd_testing::WyrdTestServer;
 
-use super::support::{append_values, register_table, sorted_values, tenant_client, unique_table};
+use super::support::{
+    append_values, published_rows, register_table, sorted_values, tenant_client, unique_table,
+};
 
 /// AC22/AC28 Tier-2 owner: failure, retry, and replay never change row identity.
 ///
@@ -151,19 +153,4 @@ async fn scribe_failure_retry_replay_remain_atomic() {
     );
 
     server.shutdown().await.expect("the server drains cleanly");
-}
-
-/// Returns how many rows one tenant's published hot objects account for.
-async fn published_rows(
-    server: &WyrdTestServer,
-    tenant: wyrd_spec::DataTenantId,
-    name: &str,
-) -> u64 {
-    server
-        .published_hot_files_for_test(tenant, BifrostNamespace::Datasets.as_str(), name)
-        .await
-        .expect("published hot files are inspectable")
-        .iter()
-        .map(|file| file.row_count)
-        .sum()
 }

@@ -33,6 +33,9 @@ const STAGED_READ_BATCH_ROWS: usize = 8 * 1024;
 pub(crate) struct StagedTailRead<'a> {
     /// Requested projection in caller order; empty means the whole schema.
     pub(crate) required_columns: &'a [String],
+    /// Signed predicate conjunction the assignment authorized for this scan;
+    /// empty means every decoded row is retained.
+    pub(crate) predicates: &'a [wyrd_spec::vala::assignment_authority::ScanPredicate],
     /// Count and retained-byte ceilings shared with the memtable path.
     pub(crate) limits: ReadableBatchLimits,
 }
@@ -56,58 +59,65 @@ impl Default for StagedTailReader {
 impl StagedTailReader {
     /// Returns rows from every staged source the caller leased.
     ///
-    /// Sources arrive oldest first and are read in that order, so a truncated
-    /// read returns the oldest rows rather than an arbitrary subset.
+    /// Sources arrive oldest first and are read in that order, so the answer
+    /// preserves acknowledgement order. The read is exact rather than
+    /// truncating: every leased source is visited so a later matching row
+    /// cannot be hidden by an earlier one, and a matching result that will not
+    /// fit the caller's ceilings is refused instead of returned as a prefix.
     ///
-    /// Nothing is filtered here. A staged source exists only while the
-    /// hot-source registry names its generation's runs as the one authority for
-    /// those rows; the moment a hot object serves them the registry holds
-    /// `Published` instead and the generation is not leased at all. Deciding
-    /// again from WAL positions would be a second, weaker answer to a question
-    /// the registry has already answered exactly: WAL records are numbered from
-    /// one node-global counter while members are sealed per tenant, table,
-    /// partition, and shard, so one member's bounds routinely enclose positions
-    /// another member owns, and containment is not ownership.
+    /// Nothing is filtered here beyond the caller's own signed predicate. A
+    /// staged source exists only while the hot-source registry names its
+    /// generation's runs as the one authority for those rows; the moment a hot
+    /// object serves them the registry holds `Published` instead and the
+    /// generation is not leased at all. Deciding again from WAL positions would
+    /// be a second, weaker answer to a question the registry has already
+    /// answered exactly: WAL records are numbered from one node-global counter
+    /// while members are sealed per tenant, table, partition, and shard, so one
+    /// member's bounds routinely enclose positions another member owns, and
+    /// containment is not ownership.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::Internal`] when a run cannot be opened, its
-    /// projection cannot be resolved against the run's own schema, or a batch
-    /// cannot be decoded. A refusal names the run, because a staged run that
-    /// cannot be read is a durable-evidence problem, not a query problem.
+    /// Returns [`ScribeError::IngestBusy`] for `live-tail snapshot` when the
+    /// rows the signed predicate retains exceed the caller's batch-count or
+    /// retained-byte ceiling. Returns [`ScribeError::Internal`] when a run
+    /// cannot be opened, its projection cannot be resolved against the run's
+    /// own schema, a batch cannot be decoded, or the signed predicate cannot be
+    /// compiled against or evaluated over a decoded batch. A refusal names the
+    /// run, because a staged run that cannot be read is a durable-evidence
+    /// problem, not a query problem.
     pub(crate) fn read(
         self,
         sources: &[StagedSource],
         read: &StagedTailRead<'_>,
     ) -> Result<Vec<HotBatch>, ScribeError> {
-        let mut batches = Vec::new();
-        let mut retained_bytes = 0_usize;
+        let mut accepted = AcceptedStagedBatches::new(read.limits);
         for source in sources {
             for run in &source.runs {
-                if batches.len() >= read.limits.max_batches
-                    || retained_bytes >= read.limits.max_retained_bytes
-                {
-                    return Ok(batches);
-                }
-                self.read_run(run, source, read, &mut batches, &mut retained_bytes)?;
+                self.read_run(run, source, read, &mut accepted)?;
             }
         }
-        Ok(batches)
+        Ok(accepted.finish())
     }
 
-    /// Decodes one run until the caller's bounds are reached.
+    /// Decodes one run, retaining only the rows its signed predicate authorizes.
+    ///
+    /// The predicate is compiled once per run against the projected schema and
+    /// reused for every decode window, and a window retaining no row charges
+    /// neither ceiling.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::Internal`] when the run cannot be opened, its
-    /// projection cannot be resolved, or a batch cannot be decoded.
+    /// Returns [`ScribeError::IngestBusy`] when a retained window does not fit
+    /// the caller's ceilings, or [`ScribeError::Internal`] when the run cannot
+    /// be opened, its projection cannot be resolved, a batch cannot be decoded,
+    /// or the signed predicate cannot be compiled or evaluated.
     fn read_run(
         self,
         run: &std::path::Path,
         source: &StagedSource,
         read: &StagedTailRead<'_>,
-        batches: &mut Vec<HotBatch>,
-        retained_bytes: &mut usize,
+        accepted: &mut AcceptedStagedBatches,
     ) -> Result<(), ScribeError> {
         let file = std::fs::File::open(run).map_err(run_failure(run, "open"))?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)
@@ -119,11 +129,38 @@ impl StagedTailReader {
             .with_projection(projection)
             .build()
             .map_err(run_failure(run, "start reading"))?;
+        let mut filter = None;
         for batch in reader {
             let batch = batch.map_err(run_failure(run, "decode a batch from"))?;
             let batch = reorder(&batch, &schema, read.required_columns, run)?;
-            *retained_bytes = retained_bytes.saturating_add(batch.get_array_memory_size());
-            batches.push(HotBatch {
+            let batch = if read.predicates.is_empty() {
+                batch
+            } else {
+                let filter = match &filter {
+                    Some(filter) => filter,
+                    None => filter.insert(
+                        crate::oracle::exec::ScanPredicateFilter::compile(
+                            &batch.schema(),
+                            read.predicates,
+                        )
+                        .map_err(|error| ScribeError::Internal {
+                            detail: format!(
+                                "live-tail predicate is invalid for this snapshot: {error}"
+                            ),
+                        })?,
+                    ),
+                };
+                filter
+                    .retain(batch)
+                    .map_err(|error| ScribeError::Internal {
+                        detail: format!("live-tail predicate evaluation failed: {error}"),
+                    })?
+            };
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            accepted.preflight(batch.get_array_memory_size())?;
+            accepted.push(HotBatch {
                 partition_day: source.key.partition,
                 wal_lsn: source.wal.1,
                 origin: HotBatchSource::StagedMember {
@@ -132,13 +169,72 @@ impl StagedTailReader {
                 },
                 rows: batch,
             });
-            if batches.len() >= read.limits.max_batches
-                || *retained_bytes >= read.limits.max_retained_bytes
-            {
-                return Ok(());
-            }
         }
         Ok(())
+    }
+}
+
+/// Owns the batches one staged read has accepted under the caller's ceilings.
+///
+/// Charging happens only after the signed predicate has run, so a decoded
+/// window holding no authorized row never consumes a response slot that a later
+/// acknowledged match still needs.
+struct AcceptedStagedBatches {
+    /// Count and retained-byte ceilings this read must not exceed.
+    limits: ReadableBatchLimits,
+    /// Arrow bytes charged by the batches accepted so far.
+    retained_bytes: usize,
+    /// Accepted batches in leased source order.
+    output: Vec<HotBatch>,
+}
+
+impl AcceptedStagedBatches {
+    /// Creates an empty accumulator bounded by `limits`.
+    fn new(limits: ReadableBatchLimits) -> Self {
+        Self {
+            limits,
+            retained_bytes: 0,
+            output: Vec::new(),
+        }
+    }
+
+    /// Charges one retained batch against both ceilings before it is kept.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::IngestBusy`] for `live-tail snapshot` when either
+    /// ceiling is exhausted, so an exact acknowledged read is refused rather
+    /// than returned as a successful prefix. Returns
+    /// [`ScribeError::Internal`] when the retained-byte total overflows.
+    fn preflight(&mut self, batch_bytes: usize) -> Result<(), ScribeError> {
+        if self.output.len() == self.limits.max_batches {
+            return Err(ScribeError::IngestBusy {
+                table: "live-tail snapshot".to_owned(),
+            });
+        }
+        let next_bytes = self
+            .retained_bytes
+            .checked_add(batch_bytes)
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "live-tail retained byte count overflow".to_owned(),
+            })?;
+        if next_bytes > self.limits.max_retained_bytes {
+            return Err(ScribeError::IngestBusy {
+                table: "live-tail snapshot".to_owned(),
+            });
+        }
+        self.retained_bytes = next_bytes;
+        Ok(())
+    }
+
+    /// Appends one batch that already passed [`Self::preflight`].
+    fn push(&mut self, batch: HotBatch) {
+        self.output.push(batch);
+    }
+
+    /// Consumes the accumulator and returns its bounded batches.
+    fn finish(self) -> Vec<HotBatch> {
+        self.output
     }
 }
 
@@ -316,6 +412,7 @@ mod tests {
     fn unbounded(columns: &[String]) -> StagedTailRead<'_> {
         StagedTailRead {
             required_columns: columns,
+            predicates: &[],
             limits: ReadableBatchLimits {
                 max_batches: usize::MAX,
                 max_retained_bytes: usize::MAX,
@@ -356,24 +453,31 @@ mod tests {
         );
     }
 
-    /// A read stops at the caller's batch ceiling instead of draining a member.
+    /// A staged read filters before charging its ceilings and never truncates.
     ///
-    /// The ceiling is what keeps one large staged member from materializing
-    /// unboundedly into a query, and the oldest source is read first so the
-    /// truncated answer is a prefix rather than an arbitrary subset.
+    /// The signed predicate decides which rows the caller may see, so a batch
+    /// holding none of them must not consume a response slot that a later
+    /// acknowledged match still needs. And once the matching rows themselves
+    /// exceed a ceiling there is no honest prefix to return: an exact
+    /// acknowledged read is either complete or refused.
     ///
     /// # Panics
     ///
-    /// Panics when the reader returns more batches than the ceiling allows or
-    /// serves them out of source order.
+    /// Panics when an irrelevant member consumes the batch budget, when the
+    /// later matching row is dropped, or when an overflowing match is returned
+    /// as a successful prefix.
     #[test]
-    fn a_staged_read_stops_at_the_caller_batch_ceiling_oldest_first() {
+    fn a_staged_read_filters_before_limits_and_refuses_partial_success() {
+        use wyrd_spec::vala::assignment_authority::{ScanLiteral, ScanPredicate};
+
         let root = tempfile::tempdir().expect("staged root");
-        let first = write_run(root.path(), "run-1.parquet", 2);
-        let second = write_run(root.path(), "run-2.parquet", 2);
-        let columns = Vec::new();
+        let older = write_run(root.path(), "older.parquet", 1);
+        let later = write_run(root.path(), "later.parquet", 2);
+        let columns = vec!["ordinal".to_owned()];
+        let predicates = vec![ScanPredicate::Eq("ordinal".to_owned(), ScanLiteral::I64(1))];
         let read = StagedTailRead {
             required_columns: &columns,
+            predicates: &predicates,
             limits: ReadableBatchLimits {
                 max_batches: 1,
                 max_retained_bytes: usize::MAX,
@@ -382,21 +486,39 @@ mod tests {
         let batches = StagedTailReader::default()
             .read(
                 &[
-                    source(1, vec![first], (1, 9)),
-                    source(2, vec![second], (10, 19)),
+                    source(1, vec![older], (1, 9)),
+                    source(2, vec![later.clone()], (10, 19)),
                 ],
                 &read,
             )
             .expect("the staged runs read");
 
-        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches.len(),
+            1,
+            "the member retaining no row must not consume the batch budget"
+        );
+        assert_eq!(batches[0].rows.num_rows(), 1);
         assert_eq!(
             batches[0].origin,
             HotBatchSource::StagedMember {
-                member: StagedMemberId::new(0, 1),
-                wal: (WalLsn::new(1), WalLsn::new(9)),
+                member: StagedMemberId::new(0, 2),
+                wal: (WalLsn::new(10), WalLsn::new(19)),
             },
-            "the oldest source must be the one the truncated read returns"
+            "the later matching member owns the only retained row"
+        );
+
+        let both_match = StagedTailReader::default().read(
+            &[
+                source(1, vec![later.clone()], (1, 9)),
+                source(2, vec![later], (10, 19)),
+            ],
+            &read,
+        );
+        let error = both_match.expect_err("a matching result over the ceiling is refused");
+        assert!(
+            matches!(&error, ScribeError::IngestBusy { table } if table == "live-tail snapshot"),
+            "{error}"
         );
     }
 

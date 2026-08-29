@@ -2680,6 +2680,7 @@ impl FetchLiveTailService {
             sources.sources(),
             &crate::scribe::staged_tail::StagedTailRead {
                 required_columns: &request.required_columns,
+                predicates: &request.predicates,
                 limits: crate::scribe::memtable::ReadableBatchLimits {
                     max_batches: request.max_batches,
                     max_retained_bytes: request.max_retained_bytes,

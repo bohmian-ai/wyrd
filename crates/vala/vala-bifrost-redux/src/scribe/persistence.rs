@@ -47,6 +47,35 @@ fn register_idle_persistence_queue() {
     metrics::gauge!("bifrost_scribe_persistence_queue_bytes").set(0.0);
 }
 
+/// Removes one claim's scratch directory after a known-unpublished terminal.
+///
+/// [`ScribeClaimScratch`](crate::resources::ScribeClaimScratch) deletes on its
+/// explicit blocking boundary and never in `Drop`, because a dropped owner may
+/// sit on a Tokio worker. Dropping it therefore retains the charge and poisons
+/// shared volume health, which the resource-health worker escalates into
+/// terminating the pod. A publication that never committed is retryable, so its
+/// scratch is cleaned here instead. A cleanup failure has already poisoned
+/// health inside the resource layer; it is logged and swallowed so the caller
+/// still reports the original publication error.
+async fn discard_claim_scratch(scratch: crate::resources::ScribeClaimScratch) {
+    let outcome = tokio::task::spawn_blocking(move || scratch.cleanup()).await;
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::error!(
+            operation = "scribe_claim_scratch_discard",
+            outcome = "cleanup_failed",
+            error = %error,
+            "Scribe claim scratch cleanup failed after a refused publication"
+        ),
+        Err(error) => tracing::error!(
+            operation = "scribe_claim_scratch_discard",
+            outcome = "task_failed",
+            error = %error,
+            "Scribe claim scratch cleanup task failed after a refused publication"
+        ),
+    }
+}
+
 /// Record the elapsed seconds for one persistence stage (D84).
 ///
 /// The end-to-end `bifrost_scribe_persistence_publication_seconds` histogram
@@ -2521,6 +2550,11 @@ impl PersistenceWorker {
     ///
     /// # Errors
     ///
+    /// An outstanding claim that was refused before its fenced transaction is
+    /// resumed before the ready sweep, because settlement is what returns
+    /// members to the budget and a refused claim never settled. A claim with an
+    /// unresolved commit outcome is left to startup reconciliation.
+    ///
     /// Returns [`ScribeError`] when the staging capability is absent, when the
     /// assembler refuses a residue claim, or when a claim fails to publish. The
     /// remaining keys stay staged and the WAL stays authoritative for them.
@@ -2530,6 +2564,15 @@ impl PersistenceWorker {
     ) -> Result<usize, ScribeError> {
         let staging = self.staging()?;
         let mut published = 0;
+        // A claim whose publication was refused keeps its slot and its members;
+        // nothing returns it to the ready index, so the sweep below cannot see
+        // it. Driving those claims first is what makes a pre-commit refusal
+        // retryable inside one process instead of only after a restart, and it
+        // reuses the original claim identity rather than inventing a new one.
+        for claim in staging.retryable_claims().await? {
+            self.publish_claim(&staging, &claim, None).await?;
+            published += 1;
+        }
         for key in staging.ready_keys()? {
             while let Some(claim) = staging.take_residue(&key, cause)? {
                 self.publish_claim(&staging, &claim, None).await?;
@@ -2583,13 +2626,64 @@ impl PersistenceWorker {
             .map_err(|error| ScribeError::Internal {
                 detail: format!("Scribe claim scratch admission failed: {error}"),
             })?;
+        #[cfg(any(test, feature = "test-support"))]
+        let _object_write_guard = self.faults.begin_object_write().await;
+        let mut assembled = match self
+            .assemble_claim_output(staging, claim, &runs, scratch.path(), footer_reservation)
+            .await
+        {
+            Ok(assembled) => assembled,
+            Err(error) => {
+                // Assembly never reached the fenced publication, so nothing this
+                // claim produced can be authoritative. The scratch directory must
+                // be removed on its owning blocking boundary: dropping it here
+                // would retain the charge and poison shared volume health, which
+                // the resource-health worker escalates into terminating the pod
+                // for what is a retryable flush.
+                discard_claim_scratch(scratch).await;
+                return Err(error);
+            }
+        };
+        assembled.artifacts.attach_scratch(scratch)?;
+        let published = staging
+            .publish(claim, &runs, &assembled, self.actor_stream)
+            .await;
+        // The scratch is disposable once the candidate has been uploaded: the
+        // object and its publication manifest are the recovery evidence, and the
+        // success path deletes the scratch immediately after the commit anyway.
+        // Cleaning it on both terminals keeps a refused publication retryable
+        // instead of poisoning volume health through the artifact set's drop.
+        assembled.artifacts.cleanup().await?;
+        let published = published?;
+        drop(reservation);
+        self.publish_staging_hint(claim.key());
+        Ok(published.commit_key)
+    }
+
+    /// Merges one claim's gathered runs into sealed artifacts under `scratch_dir`.
+    ///
+    /// Split out of [`Self::publish_claim`] so every pre-publication failure
+    /// surfaces as one error value whose caller still owns the claim scratch and
+    /// can clean it explicitly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when a test fault seam is armed, when
+    /// the persistence lane rejects the assembly, or when the lane returns a
+    /// result that does not belong to claim assembly.
+    async fn assemble_claim_output(
+        &self,
+        staging: &Arc<crate::scribe::staging_runtime::ScribeStagingRuntime>,
+        claim: &crate::scribe::assembly::StagingClaim,
+        runs: &crate::scribe::claim_assembly::ClaimRuns,
+        scratch_dir: &std::path::Path,
+        footer_reservation: crate::scribe::memory::EncodedFooterReservation,
+    ) -> Result<crate::scribe::claim_assembly::AssembledClaim, ScribeError> {
         if self.fail_before_sql_commit() {
             return Err(ScribeError::Internal {
                 detail: "test SQL failure before the first COMMIT attempt".to_owned(),
             });
         }
-        #[cfg(any(test, feature = "test-support"))]
-        let _object_write_guard = self.faults.begin_object_write().await;
         #[cfg(any(test, feature = "test-support"))]
         if self.faults.take_object_write() {
             return Err(ScribeError::Internal {
@@ -2598,13 +2692,13 @@ impl PersistenceWorker {
         }
         tracing::debug!(claim = %claim.id(), stage = "assemble_claim", "persist stage start");
         let assemble_started = std::time::Instant::now();
-        let mut assembled = match self
+        let assembled = match self
             .persistence_cpu
             .submit(ScribePersistenceCpuOp::AssembleClaim(Box::new(
                 crate::scribe::execution_lanes::AssembleClaimOp {
                     claim: Box::new(claim.clone()),
                     runs: Box::new(runs.clone()),
-                    scratch_dir: scratch.path().to_path_buf(),
+                    scratch_dir: scratch_dir.to_path_buf(),
                     footer_reservation,
                     staging: Arc::clone(staging),
                 },
@@ -2621,14 +2715,7 @@ impl PersistenceWorker {
             }
         };
         record_persist_stage("assemble_claim", assemble_started);
-        assembled.artifacts.attach_scratch(scratch)?;
-        let published = staging
-            .publish(claim, &runs, &assembled, self.actor_stream)
-            .await?;
-        assembled.artifacts.cleanup().await?;
-        drop(reservation);
-        self.publish_staging_hint(claim.key());
-        Ok(published.commit_key)
+        Ok(assembled)
     }
 
     /// Returns this worker's staged lifecycle owner.

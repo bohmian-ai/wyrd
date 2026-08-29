@@ -347,6 +347,51 @@ impl ScribeStagingRuntime {
             .resumable_claims())
     }
 
+    /// Returns outstanding claims that never attempted a fenced commit.
+    ///
+    /// A publication refused before its transaction leaves every member still
+    /// `Claimed`, so the identical claim can simply be run again in this
+    /// process. A claim whose members reached `Publishing` has an outcome only
+    /// the publication manifest can resolve, and that reconciliation belongs to
+    /// startup recovery, so it is deliberately excluded here rather than
+    /// re-driven against a member the lifecycle will refuse to move.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the ready-index owner is poisoned
+    /// or a claimed member's durable record cannot be read.
+    pub async fn retryable_claims(&self) -> Result<Vec<StagingClaim>, ScribeError> {
+        let mut retryable = Vec::new();
+        for claim in self.resumable_claims()? {
+            let mut publishing = false;
+            for member in claim.members() {
+                let staged =
+                    self.stage
+                        .member(claim.key(), member.id())
+                        .await
+                        .map_err(|error| ScribeError::Internal {
+                            detail: format!(
+                                "read staged member {}-{} before resuming its claim: {error}",
+                                member.id().shard(),
+                                member.id().generation()
+                            ),
+                        })?;
+                if !matches!(
+                    staged.record().state(),
+                    crate::scribe::hot_stage::StagedMemberState::Ready
+                        | crate::scribe::hot_stage::StagedMemberState::Claimed { .. }
+                ) {
+                    publishing = true;
+                    break;
+                }
+            }
+            if !publishing {
+                retryable.push(claim);
+            }
+        }
+        Ok(retryable)
+    }
+
     /// Takes every ready member of one key as a residue claim.
     ///
     /// Used when waiting for target can no longer pay for itself: the partition

@@ -1048,11 +1048,30 @@ mod tests {
             ledger.settle(&drained_owner).is_ok_and(|retired| !retired),
             "a cell still holding lifecycle capacity must not retire"
         );
+        assert_eq!(
+            ledger
+                .tenant_usage(&drained_owner.tenant, ContentionCategory::AdmissionBytes)
+                .expect("the drained tenant is active"),
+            4_096,
+            "the tenant level carries exactly what its one table holds"
+        );
+
+        assert_over_release_is_refused(ledger, &drained_owner);
+
         for category in lifecycle {
             ledger
                 .release(&drained_owner, category, 1)
                 .expect("the drain returns each lifecycle category");
         }
+        // The second return of an already-drained category is refused for the
+        // same reason: a drain that ran twice must not free a slot twice.
+        assert!(
+            matches!(
+                ledger.release(&drained_owner, ContentionCategory::UploadClaim, 1),
+                Err(ContentionRefusal::OverRelease { .. })
+            ),
+            "a drained category cannot be returned a second time"
+        );
         held.release().expect("the drain releases the request");
 
         // Balanced: every category is zero, no cell or tenant survives, and the
@@ -1075,6 +1094,56 @@ mod tests {
         );
         assert_eq!(totals.active_transitions(), 0);
         assert_eq!(totals.live_vectors(), 0);
+    }
+
+    /// Asserts a release larger than a cell holds is refused, not clamped.
+    ///
+    /// A drain that returns more than the owner took is a bookkeeping bug, not
+    /// a rounding one. Clamping it would hand the pod capacity nobody ever
+    /// charged and hide the double release that produced it, so the refusal is
+    /// checked together with the table-level and pod-level totals being left
+    /// exactly where they were.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an over-release is admitted, when the refusal does not name
+    /// the category and its held and requested amounts, or when a refused
+    /// release moves the table or pod totals.
+    fn assert_over_release_is_refused(ledger: &ScribeContentionLedger, owner: &ContentionKey) {
+        // A drain that returns more than the owner took is a bookkeeping bug,
+        // not a rounding one. Clamping it would hand the pod capacity nobody
+        // ever charged and hide the double release that produced it, so the
+        // over-release is refused and every level is left exactly as it was.
+        for (category, amount) in [
+            (ContentionCategory::StagingClaim, 2),
+            (ContentionCategory::AdmissionBytes, 4_097),
+        ] {
+            let before = ledger
+                .usage(owner, category)
+                .expect("the drained cell is active");
+            assert_eq!(
+                ledger.release(owner, category, amount),
+                Err(ContentionRefusal::OverRelease {
+                    category: category.label(),
+                    held: before,
+                    requested: amount,
+                }),
+                "{} must refuse a release larger than the cell holds",
+                category.label()
+            );
+            assert_eq!(
+                ledger
+                    .usage(owner, category)
+                    .expect("the drained cell survives a refused release"),
+                before,
+                "a refused release moves nothing at the table level"
+            );
+            assert_eq!(
+                ledger.committed(category).expect("pod totals"),
+                before,
+                "a refused release moves nothing at the pod level"
+            );
+        }
     }
 
     /// Proves an incumbent's stop is a share stop rather than a pod-full stop.

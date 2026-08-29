@@ -75,7 +75,7 @@ async fn scribe_write_flush_read_user_journey() {
         .await
         .expect("the production workload runs on public routes");
     evidence
-        .assert_matches(&workload)
+        .assert_matches(&workload, ScribeCacheMode::Disabled)
         .expect("the run satisfies every normative field of the record");
 
     let published = evidence

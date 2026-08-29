@@ -1673,9 +1673,9 @@ fn gauge_value(count: usize) -> f64 {
 }
 
 #[cfg(test)]
-/// Registry-shape proofs for the closed contention effect vocabulary.
+/// Registry-shape proofs for the closed contention and staging vocabularies.
 mod contention_registry_tests {
-    use super::{ContentionEffect, ContentionFacts, ScribeTelemetry};
+    use super::{ContentionEffect, ContentionFacts, ScribeTelemetry, StagingEffect, StagingFacts};
     use crate::scribe::geometry::ContentionCategory;
 
     /// The registry's inventory is a bijection with its own index space.
@@ -1901,27 +1901,37 @@ mod contention_registry_tests {
         );
     }
 
-    /// AC22/AC21 unit owner: the Scribe observation registry is closed and its
-    /// transitions balance over a complete production lifecycle.
+    /// AC22/AC21 unit owner: both Scribe observation registries are closed and
+    /// their transitions balance over a complete production lifecycle.
+    ///
+    /// [`ScribeTelemetry`] publishes two closed registries — contention, which
+    /// records who was allowed to own capacity, and staging, which records where
+    /// rows now live. Both are operator-facing label spaces and both carry
+    /// reconcilable totals, so proving one closed and balanced says nothing
+    /// about the other; this owner covers both.
     ///
     /// Closed means an operator's label space cannot widen at runtime: every
-    /// entry occupies a distinct index in the counter space, publishes a
-    /// non-empty stage and decision, no two entries collapse onto the same
-    /// stage/decision series, and severity comes from a fixed three-value
-    /// vocabulary. Balanced means the counters reconcile rather than drift:
-    /// exactly one entry opens an active transition and one closes it, and a
-    /// pod driven through activation, charge, release, and terminal settlement
-    /// publishes zero active transitions and zero live vectors at the end.
+    /// entry occupies a distinct index in its registry's counter space,
+    /// publishes a non-empty stage and decision, no two entries collapse onto
+    /// the same stage/decision series, and severity comes from a fixed
+    /// three-value vocabulary. Balanced means the counters reconcile rather than
+    /// drift: each registry's opener and closer predicates select the exact
+    /// entries that move its live totals, and a pod driven through a complete
+    /// lifecycle publishes zero live transitions, vectors, members, and claims.
     ///
-    /// The lifecycle half runs against the real ledger rather than direct
-    /// emissions, because the property that matters is that the production
-    /// paths emit in balanced pairs, not that the counters can be balanced.
+    /// The contention lifecycle half runs against the real ledger rather than
+    /// direct emissions, because the property that matters is that the
+    /// production paths emit in balanced pairs, not that the counters can be
+    /// balanced. The staging half drives the owner directly: its emitters are
+    /// spread across the durable persistence path, and the reconciliation being
+    /// proven here is the owner's own arithmetic over the closed registry.
     ///
     /// # Panics
     ///
-    /// Panics when an entry duplicates an index or a label pair, publishes an
-    /// unknown severity, when the opener/closer sets are not singletons, or
-    /// when a drained ledger still reports live transitions or vectors.
+    /// Panics when an entry in either registry duplicates an index or a label
+    /// pair, publishes an unknown severity, when a predicate that must select a
+    /// single entry selects another, or when a drained lifecycle still reports
+    /// live transitions, vectors, members, or claims.
     #[test]
     fn scribe_observation_registry_is_closed_and_balanced() {
         // Closed: index space, labels, and severity vocabulary.
@@ -1951,6 +1961,8 @@ mod contention_registry_tests {
             claimed.iter().all(|slot| *slot),
             "an index in the registry's counter space has no entry"
         );
+
+        assert_staging_registry_is_closed_and_selective();
 
         // Balanced: exactly one opener and one closer define the reconciliation.
         assert_eq!(
@@ -2007,6 +2019,201 @@ mod contention_registry_tests {
             "a drained pod holds no installed lifecycle vector"
         );
         assert_eq!(ledger.active_cells().expect("ledger readable"), 0);
+
+        assert_staged_lifecycle_balances();
+    }
+
+    /// Asserts the staging registry is a closed label space with exact predicates.
+    ///
+    /// The staging registry is the second closed label space and is held to the
+    /// same rules as the contention one: an entry that shared an index would
+    /// overwrite another entry's counter, and one that shared a stage/decision
+    /// pair would fuse two lifecycle transitions into a single operator series.
+    /// Its predicates are what move the reconcilable totals, so each must
+    /// select exactly the entries whose durable transition it names — a widened
+    /// predicate would count one member or claim twice, a narrowed one would
+    /// strand it as permanently live.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an index is not a bijection over the registry, when a stage
+    /// or decision is empty or collapsed onto another entry, when a severity is
+    /// outside the operator vocabulary, or when a predicate selects other than
+    /// exactly the transitions it names.
+    fn assert_staging_registry_is_closed_and_selective() {
+        // The staging registry is the second closed label space and is held to
+        // the same rules: an entry that shared an index would overwrite another
+        // entry's counter, and one that shared a stage/decision pair would fuse
+        // two lifecycle transitions into a single operator series.
+        let mut staging_claimed = [false; StagingEffect::ALL.len()];
+        let mut staging_pairs: Vec<(&'static str, &'static str)> = Vec::new();
+        for effect in StagingEffect::ALL {
+            let index = effect.index();
+            assert!(
+                index < StagingEffect::ALL.len(),
+                "{effect:?} indexes past the staging registry"
+            );
+            assert!(
+                !staging_claimed[index],
+                "{effect:?} duplicates staging index {index}"
+            );
+            staging_claimed[index] = true;
+            assert!(!effect.stage().is_empty(), "{effect:?} has no stage");
+            assert!(!effect.decision().is_empty(), "{effect:?} has no decision");
+            assert!(
+                matches!(effect.severity(), "info" | "warn" | "error"),
+                "{effect:?} publishes a severity outside the closed vocabulary"
+            );
+            assert!(
+                !staging_pairs.contains(&(effect.stage(), effect.decision())),
+                "{effect:?} collapses onto an existing staging series"
+            );
+            staging_pairs.push((effect.stage(), effect.decision()));
+        }
+        assert!(
+            staging_claimed.iter().all(|slot| *slot),
+            "an index in the staging registry's counter space has no entry"
+        );
+
+        // The staging predicates are what move the reconcilable totals, so each
+        // must select exactly the entries whose durable transition it names. A
+        // widened predicate would count one member or claim twice; a narrowed
+        // one would strand it as permanently live.
+        let staging_selecting = |predicate: fn(StagingEffect) -> bool| {
+            StagingEffect::ALL
+                .into_iter()
+                .filter(|effect| predicate(*effect))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            staging_selecting(StagingEffect::stages_member),
+            vec![StagingEffect::MemberStaged]
+        );
+        assert_eq!(
+            staging_selecting(StagingEffect::retires_member),
+            vec![StagingEffect::MemberRetired]
+        );
+        assert_eq!(
+            staging_selecting(StagingEffect::opens_claim),
+            vec![StagingEffect::ClaimTaken]
+        );
+        assert_eq!(
+            staging_selecting(StagingEffect::closes_claim),
+            vec![StagingEffect::ClaimSettled, StagingEffect::ClaimFailed],
+            "a failed claim closes its outstanding transition alongside a settled one"
+        );
+    }
+
+    /// Asserts a complete staged lifecycle leaves nothing live or outstanding.
+    ///
+    /// Three members become durable, one claim gathers and publishes them,
+    /// their runs are retired and the claim settles. Live members and
+    /// outstanding claims are derived differences, so a stage that counted a
+    /// member twice or never retired it would leave a permanent nonzero here
+    /// rather than a transient one. A claim that could not publish closes the
+    /// same way: its members stay durable and staged for a later claim, so
+    /// leaving it outstanding would make a recovering pod look permanently
+    /// backed up.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a completed lifecycle leaves a live member or an outstanding
+    /// claim, or when any transition is observed other than exactly once.
+    fn assert_staged_lifecycle_balances() {
+        // Balanced over the staged lifecycle: three members become durable, one
+        // claim gathers and publishes them, their runs are retired and the claim
+        // settles. Live members and outstanding claims are derived differences,
+        // so a stage that counted a member twice or never retired it would leave
+        // a permanent nonzero here rather than a transient one.
+        let staged = ScribeTelemetry::default();
+        let members = 3;
+        staged.record_staging(
+            StagingEffect::MemberStaged,
+            StagingFacts {
+                members,
+                bytes: 3_072,
+                ..StagingFacts::default()
+            },
+        );
+        assert_eq!(
+            staged.staging_snapshot().live_members(),
+            members as u64,
+            "a staged member is live until its runs are removed"
+        );
+        for effect in [
+            StagingEffect::SourceTransitioned,
+            StagingEffect::ClaimTaken,
+            StagingEffect::ClaimAssembled,
+            StagingEffect::ClaimPublished,
+        ] {
+            staged.record_staging(
+                effect,
+                StagingFacts {
+                    members,
+                    bytes: 3_072,
+                    artifacts: 1,
+                    cause: Some("target"),
+                },
+            );
+        }
+        assert_eq!(
+            staged.staging_snapshot().outstanding_claims(),
+            1,
+            "a taken claim is outstanding until it settles or fails"
+        );
+        staged.record_staging(
+            StagingEffect::MemberRetired,
+            StagingFacts {
+                members,
+                bytes: 3_072,
+                ..StagingFacts::default()
+            },
+        );
+        staged.record_staging(
+            StagingEffect::ClaimSettled,
+            StagingFacts {
+                members,
+                bytes: 3_072,
+                cause: Some("target"),
+                ..StagingFacts::default()
+            },
+        );
+        let settled = staged.staging_snapshot();
+        assert_eq!(
+            settled.live_members(),
+            0,
+            "a fully retired lineage leaves no live staged member"
+        );
+        assert_eq!(
+            settled.outstanding_claims(),
+            0,
+            "a settled claim leaves no outstanding publication"
+        );
+        for effect in [
+            StagingEffect::MemberStaged,
+            StagingEffect::ClaimTaken,
+            StagingEffect::ClaimPublished,
+            StagingEffect::ClaimSettled,
+        ] {
+            assert_eq!(settled.count(effect), 1, "{effect:?} was not counted once");
+        }
+
+        // A claim that could not publish also closes: its members stay durable
+        // and staged for a later claim, so leaving it outstanding would make a
+        // recovering pod look permanently backed up.
+        let failing = ScribeTelemetry::default();
+        failing.record_staging(StagingEffect::ClaimTaken, StagingFacts::default());
+        failing.record_staging(StagingEffect::ClaimFailed, StagingFacts::default());
+        assert_eq!(
+            failing.staging_snapshot().outstanding_claims(),
+            0,
+            "a failed claim closes its outstanding transition"
+        );
+        assert_eq!(
+            failing.staging_snapshot().live_members(),
+            0,
+            "a failed claim retires nothing and stages nothing"
+        );
     }
 
     /// An effect with no category publishes the closed `all` label, not an identity.

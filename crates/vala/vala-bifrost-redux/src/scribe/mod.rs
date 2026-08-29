@@ -303,9 +303,13 @@ pub struct ScribeImpl {
     pressure_config: ScribePressureConfig,
     /// Validated geometry this Scribe booted with.
     ///
-    /// Retained so the running service can state the rotation limits and
-    /// assembled-object target it is actually enforcing; the shard owners and
-    /// persistence runtime each received a copy of this same value at start.
+    /// The shard owners and the persistence runtime each received their own copy
+    /// of this value at start and enforce it from there, so nothing in the
+    /// serving path reads it back. It is retained only so a scaled production
+    /// test can assert through [`Self::geometry_for_test`] that the geometry it
+    /// configured is the one the pod actually booted with, and is therefore
+    /// compiled out of a production build.
+    #[cfg(any(test, feature = "test-support"))]
     geometry: geometry::ScribeGeometry,
     /// Shared active/immutable Arrow ownership ledger.
     memory_ownership: memory::ScribeOwnership,
@@ -1228,6 +1232,7 @@ impl ScribeImpl {
             memory,
             ingest_limits,
             pressure_config,
+            #[cfg(any(test, feature = "test-support"))]
             geometry,
             memory_ownership,
             hot_sources,

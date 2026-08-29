@@ -154,6 +154,23 @@ pub enum ScribeWorkloadOperationV1 {
     },
 }
 
+/// What a checkpoint's own definition says about published hot objects.
+///
+/// The expectation is a property of the named boundary rather than of a run:
+/// "nothing is published yet" and "the members are now published" are the two
+/// facts that make `AfterAck` and `StagedToHot` different boundaries at all. A
+/// comparator that did not check it would accept a run that published early or
+/// one that reached a publication boundary having published nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScribePublicationExpectationV1 {
+    /// The boundary is defined by nothing being published yet.
+    Absent,
+    /// The boundary constrains publication in neither direction.
+    Unconstrained,
+    /// The boundary is defined by at least one published hot object.
+    Present,
+}
+
 /// The named lifecycle boundaries a production run must account for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -170,6 +187,37 @@ pub enum ScribeCheckpointNameV1 {
     SnapshotAdvance,
     /// The pod drained; every owned resource is released.
     TerminalDrain,
+}
+
+impl ScribeCheckpointNameV1 {
+    /// Reports whether reaching this boundary requires reading rows back.
+    ///
+    /// The boundaries after publication are the ones whose whole claim is that
+    /// the rows are still exactly readable — a replay that changed nothing, a
+    /// snapshot that advanced onto the published objects, a drain that lost
+    /// nothing. Reaching one of those with no read-back is not evidence of
+    /// anything, so the comparator requires the digest rather than treating an
+    /// absent one as "not read, therefore fine".
+    #[must_use]
+    pub const fn requires_read_back_digest(self) -> bool {
+        matches!(
+            self,
+            Self::RestartReplay | Self::SnapshotAdvance | Self::TerminalDrain
+        )
+    }
+
+    /// Returns what this boundary's definition asserts about publication.
+    #[must_use]
+    pub const fn publication_expectation(self) -> ScribePublicationExpectationV1 {
+        match self {
+            Self::AfterAck => ScribePublicationExpectationV1::Absent,
+            Self::ActiveToStaged => ScribePublicationExpectationV1::Unconstrained,
+            Self::StagedToHot
+            | Self::RestartReplay
+            | Self::SnapshotAdvance
+            | Self::TerminalDrain => ScribePublicationExpectationV1::Present,
+        }
+    }
 }
 
 /// The canonical serializable Scribe production workload.
@@ -421,19 +469,37 @@ impl ScribeProductionEvidenceV1 {
     /// # Errors
     ///
     /// Returns [`ScribeWorkloadError::Evidence`] naming the first requirement
-    /// the run did not satisfy: a wrong contract version, a missing required
-    /// checkpoint, an acknowledged-row count below what the record declares, a
-    /// read-back digest that is not the record's, or a published object whose
-    /// promotion record cannot rebuild the Iceberg `DataFile` it claims.
+    /// the run did not satisfy: a wrong contract version, evidence produced
+    /// under a different cache mode than the caller is judging, a repeated or
+    /// out-of-order checkpoint, a missing required checkpoint, an
+    /// acknowledged-row count that is not what the record declares, a boundary
+    /// that requires a read-back and carries none, a read-back digest that is
+    /// not the record's, a publication expectation the boundary contradicts, or
+    /// a published object whose promotion record cannot rebuild the Iceberg
+    /// `DataFile` it claims.
     pub fn assert_matches(
         &self,
         workload: &ScribeProductionWorkloadV1,
+        expected_cache_mode: ScribeCacheMode,
     ) -> Result<(), ScribeWorkloadError> {
         if self.version != workload.version {
             return Err(ScribeWorkloadError::Evidence {
                 detail: "evidence version does not match the workload it claims".to_owned(),
             });
         }
+        // The cache mode is the run's own authority claim. Scribe proves
+        // authoritative correctness with the cache absent, so evidence produced
+        // with a cache participating may not be presented as the authoritative
+        // run of the same bytes.
+        if self.cache_mode != expected_cache_mode {
+            return Err(ScribeWorkloadError::Evidence {
+                detail: format!(
+                    "evidence was produced under {:?} but is being judged as {expected_cache_mode:?}",
+                    self.cache_mode
+                ),
+            });
+        }
+        self.assert_checkpoint_sequence(workload)?;
         let expected_digest = workload.expected_row_digest();
         let expected_rows = workload.expected_rows();
         for required in &workload.required_checkpoints {
@@ -450,25 +516,112 @@ impl ScribeProductionEvidenceV1 {
                     ),
                 });
             }
-            if observed
-                .observed_row_digest
-                .as_ref()
-                .is_some_and(|digest| digest != &expected_digest)
-            {
+            match &observed.observed_row_digest {
+                Some(digest) if digest == &expected_digest => {}
+                Some(_) => {
+                    return Err(ScribeWorkloadError::Evidence {
+                        detail: format!(
+                            "checkpoint {required:?} read back a different row set than the record declares"
+                        ),
+                    });
+                }
+                None if required.requires_read_back_digest() => {
+                    return Err(ScribeWorkloadError::Evidence {
+                        detail: format!(
+                            "checkpoint {required:?} is only reached by reading rows back, but the run recorded no digest"
+                        ),
+                    });
+                }
+                None => {}
+            }
+            Self::assert_publication(*required, observed)?;
+        }
+        Ok(())
+    }
+
+    /// Refuses a checkpoint sequence that repeats or reorders a boundary.
+    ///
+    /// [`Self::checkpoint`] resolves a name to its first observation, so a run
+    /// that recorded a boundary twice could satisfy the comparator with the
+    /// earlier of the two, and a run that reached the boundaries in a different
+    /// order than the record declares would be judged as if it had not. Both are
+    /// a different run from the one the record describes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeWorkloadError::Evidence`] when a checkpoint name appears
+    /// more than once, or when the required boundaries do not appear in the
+    /// record's declared order.
+    fn assert_checkpoint_sequence(
+        &self,
+        workload: &ScribeProductionWorkloadV1,
+    ) -> Result<(), ScribeWorkloadError> {
+        let mut seen: Vec<ScribeCheckpointNameV1> = Vec::new();
+        for observed in &self.checkpoints {
+            if seen.contains(&observed.name) {
                 return Err(ScribeWorkloadError::Evidence {
                     detail: format!(
-                        "checkpoint {required:?} read back a different row set than the record declares"
+                        "checkpoint {:?} was recorded more than once in one run",
+                        observed.name
                     ),
                 });
             }
-            for records in observed.published.values() {
-                for published in records {
-                    published
-                        .data_file()
-                        .map_err(|error| ScribeWorkloadError::Evidence {
-                            detail: format!("a published promotion record is unusable: {error}"),
-                        })?;
-                }
+            seen.push(observed.name);
+        }
+        let ordered: Vec<ScribeCheckpointNameV1> = seen
+            .into_iter()
+            .filter(|name| workload.required_checkpoints.contains(name))
+            .collect();
+        if ordered != workload.required_checkpoints {
+            return Err(ScribeWorkloadError::Evidence {
+                detail: format!(
+                    "the run reached the required boundaries as {ordered:?}, the record declares {:?}",
+                    workload.required_checkpoints
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Judges one checkpoint's published evidence against its own definition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeWorkloadError::Evidence`] when a boundary defined by
+    /// nothing being published carries a published object, when a boundary
+    /// defined by publication carries none, or when a promotion record cannot
+    /// rebuild the Iceberg `DataFile` it claims.
+    fn assert_publication(
+        name: ScribeCheckpointNameV1,
+        observed: &ScribeLifecycleCheckpointV1,
+    ) -> Result<(), ScribeWorkloadError> {
+        let published = observed.published.values().map(Vec::len).sum::<usize>();
+        match name.publication_expectation() {
+            ScribePublicationExpectationV1::Absent if published > 0 => {
+                return Err(ScribeWorkloadError::Evidence {
+                    detail: format!(
+                        "checkpoint {name:?} is defined by nothing being published, but the run observed {published} objects"
+                    ),
+                });
+            }
+            ScribePublicationExpectationV1::Present if published == 0 => {
+                return Err(ScribeWorkloadError::Evidence {
+                    detail: format!(
+                        "checkpoint {name:?} is defined by published hot objects, but the run observed none"
+                    ),
+                });
+            }
+            ScribePublicationExpectationV1::Absent
+            | ScribePublicationExpectationV1::Present
+            | ScribePublicationExpectationV1::Unconstrained => {}
+        }
+        for records in observed.published.values() {
+            for record in records {
+                record
+                    .data_file()
+                    .map_err(|error| ScribeWorkloadError::Evidence {
+                        detail: format!("a published promotion record is unusable: {error}"),
+                    })?;
             }
         }
         Ok(())
@@ -828,6 +981,11 @@ fn table_at(
 
 #[cfg(test)]
 mod tests {
+    use vala_bifrost_redux::catalog::layout::{
+        BIFROST_PARTITION_SPEC_ID, BIFROST_SORT_ORDER_ID, TimeGranularity, TimePartition,
+    };
+    use vala_bifrost_redux::scribe::promotion::{PublishedHotFileIdentity, ScribeDataFileV1};
+
     use super::*;
 
     /// AC22/AC23 unit owner: the canonical workload survives its own wire form
@@ -841,11 +999,18 @@ mod tests {
     /// record rather than of an execution, accepts an exactly-conforming
     /// evidence value, and refuses each way a run can fall short.
     ///
+    /// The refusals are the substance. A comparator that only counted rows
+    /// would accept a run that never read anything back, that recorded a
+    /// boundary twice, that reached the boundaries in another order, that ran
+    /// with a cache participating, or that arrived at a publication boundary
+    /// having published nothing — every one of which is a different run from the
+    /// one the record describes.
+    ///
     /// # Panics
     ///
     /// Panics when the record does not survive serialization, when conforming
-    /// evidence is refused, or when short, silent or misread evidence is
-    /// accepted.
+    /// evidence is refused, or when short, silent, misread, misordered,
+    /// duplicated, cache-assisted or unpublished evidence is accepted.
     #[test]
     fn scribe_production_workload_v1_round_trips_and_evidence_is_exact() {
         let workload = ScribeProductionWorkloadV1::canonical();
@@ -883,7 +1048,10 @@ mod tests {
             }
         );
 
-        // A conforming run is accepted.
+        // A conforming run is accepted. Each checkpoint carries exactly what its
+        // own definition requires: a read-back digest where the boundary is
+        // reached by reading, and published objects where the boundary is
+        // defined by publication.
         let conforming = ScribeProductionEvidenceV1 {
             version: workload.version,
             cache_mode: ScribeCacheMode::Disabled,
@@ -893,20 +1061,26 @@ mod tests {
                 .map(|name| ScribeLifecycleCheckpointV1 {
                     name: *name,
                     acknowledged_rows: workload.expected_rows(),
-                    published: BTreeMap::new(),
-                    observed_row_digest: Some(workload.expected_row_digest()),
+                    published: conforming_publication(*name),
+                    observed_row_digest: if name.requires_read_back_digest() {
+                        Some(workload.expected_row_digest())
+                    } else {
+                        None
+                    },
                 })
                 .collect(),
         };
         conforming
-            .assert_matches(&workload)
+            .assert_matches(&workload, ScribeCacheMode::Disabled)
             .expect("an exactly conforming run is accepted");
 
         // A missing checkpoint is refused.
         let mut short = conforming.clone();
         short.checkpoints.pop();
         assert!(
-            short.assert_matches(&workload).is_err(),
+            short
+                .assert_matches(&workload, ScribeCacheMode::Disabled)
+                .is_err(),
             "a run that never reached a required checkpoint must be refused"
         );
 
@@ -914,24 +1088,185 @@ mod tests {
         let mut lossy = conforming.clone();
         lossy.checkpoints[0].acknowledged_rows -= 1;
         assert!(
-            lossy.assert_matches(&workload).is_err(),
+            lossy
+                .assert_matches(&workload, ScribeCacheMode::Disabled)
+                .is_err(),
             "a run that acknowledged fewer rows than the record declares must be refused"
         );
 
         // A read-back of different rows is refused even when the count matches.
         let mut misread = conforming.clone();
-        misread.checkpoints[0].observed_row_digest = Some("0".repeat(64));
+        let reading = misread
+            .checkpoints
+            .iter()
+            .position(|checkpoint| checkpoint.name.requires_read_back_digest())
+            .expect("the canonical record requires at least one read-back boundary");
+        misread.checkpoints[reading].observed_row_digest = Some("0".repeat(64));
         assert!(
-            misread.assert_matches(&workload).is_err(),
+            misread
+                .assert_matches(&workload, ScribeCacheMode::Disabled)
+                .is_err(),
             "a run that read back a different row set must be refused"
         );
+
+        // A boundary reached without reading anything back is refused. A silent
+        // run is the failure this comparator exists to catch: it would otherwise
+        // satisfy every count while proving nothing about row identity.
+        let mut silent = conforming.clone();
+        silent.checkpoints[reading].observed_row_digest = None;
+        assert!(
+            silent
+                .assert_matches(&workload, ScribeCacheMode::Disabled)
+                .is_err(),
+            "a read-back boundary reached with no digest must be refused"
+        );
+
+        // A publication boundary that published nothing is refused, and a
+        // pre-publication boundary that published something is too: each
+        // boundary is defined by that fact, in one direction or the other.
+        let mut unpublished = conforming.clone();
+        let publishing = unpublished
+            .checkpoints
+            .iter()
+            .position(|checkpoint| {
+                checkpoint.name.publication_expectation() == ScribePublicationExpectationV1::Present
+            })
+            .expect("the canonical record requires at least one publication boundary");
+        unpublished.checkpoints[publishing].published = BTreeMap::new();
+        assert!(
+            unpublished
+                .assert_matches(&workload, ScribeCacheMode::Disabled)
+                .is_err(),
+            "a publication boundary observing no object must be refused"
+        );
+        let mut early = conforming.clone();
+        let pre_publication = early
+            .checkpoints
+            .iter()
+            .position(|checkpoint| {
+                checkpoint.name.publication_expectation() == ScribePublicationExpectationV1::Absent
+            })
+            .expect("the canonical record requires at least one pre-publication boundary");
+        early.checkpoints[pre_publication].published =
+            conforming_publication(early.checkpoints[publishing].name);
+        assert!(
+            early
+                .assert_matches(&workload, ScribeCacheMode::Disabled)
+                .is_err(),
+            "an object published before the acknowledgement boundary must be refused"
+        );
+
+        // A boundary recorded twice is refused: the comparator resolves a name
+        // to its first observation, so a duplicate would let the earlier of two
+        // contradictory observations stand in for the run.
+        let mut duplicated = conforming.clone();
+        duplicated
+            .checkpoints
+            .push(conforming.checkpoints[0].clone());
+        assert!(
+            duplicated
+                .assert_matches(&workload, ScribeCacheMode::Disabled)
+                .is_err(),
+            "one run may record each boundary only once"
+        );
+
+        // Boundaries reached in another order are a different lifecycle: rows
+        // published before they were acknowledged is not the run the record
+        // describes, even when every count agrees.
+        let mut reordered = conforming.clone();
+        reordered.checkpoints.reverse();
+        assert!(
+            reordered
+                .assert_matches(&workload, ScribeCacheMode::Disabled)
+                .is_err(),
+            "the required boundaries must be reached in the record's declared order"
+        );
+
+        // Evidence produced with a cache participating is not the authoritative
+        // run, and may not be presented as one.
+        let mut cached = conforming.clone();
+        cached.cache_mode = ScribeCacheMode::Enabled;
+        assert!(
+            cached
+                .assert_matches(&workload, ScribeCacheMode::Disabled)
+                .is_err(),
+            "a cache-assisted run may not be judged as the authoritative one"
+        );
+        cached
+            .assert_matches(&workload, ScribeCacheMode::Enabled)
+            .expect("the same evidence is accepted when judged as the run it was");
 
         // Evidence claiming another contract version is refused.
         let mut foreign = conforming;
         foreign.version = SCRIBE_PRODUCTION_WORKLOAD_VERSION + 1;
         assert!(
-            foreign.assert_matches(&workload).is_err(),
+            foreign
+                .assert_matches(&workload, ScribeCacheMode::Disabled)
+                .is_err(),
             "evidence must name the contract version it was produced under"
         );
+    }
+
+    /// Returns publication evidence satisfying one boundary's own expectation.
+    ///
+    /// Boundaries defined by publication need a real promotion record, and one
+    /// that round-trips its Iceberg projection, or the comparator would refuse
+    /// the conforming case for the wrong reason.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture promotion record does not rebuild its own data
+    /// file, which would be a fixture bug rather than comparator behavior.
+    fn conforming_publication(
+        name: ScribeCheckpointNameV1,
+    ) -> BTreeMap<String, Vec<ScribePublishedHotFileV1>> {
+        if name.publication_expectation() != ScribePublicationExpectationV1::Present {
+            return BTreeMap::new();
+        }
+        let record = fixture_published_hot_file();
+        record
+            .data_file()
+            .expect("the fixture promotion record rebuilds its data file");
+        BTreeMap::from([("scribe-workload-0".to_owned(), vec![record])])
+    }
+
+    /// Builds one minimal, self-consistent promotion record.
+    ///
+    /// The record carries only what makes it rebuildable — a canonical
+    /// partition boundary, a real row count and object size, and one ascending
+    /// split offset. Column statistics are deliberately absent: this fixture
+    /// exists to let the comparator see *a* published object, and the exactness
+    /// of footer statistics is owned by the writer's own test, not by this one.
+    fn fixture_published_hot_file() -> ScribePublishedHotFileV1 {
+        let partition = TimePartition::new(
+            TimeGranularity::Hour,
+            chrono::DateTime::from_timestamp(0, 0).expect("the epoch is a representable instant"),
+        )
+        .expect("the epoch is a canonical hour boundary");
+        ScribePublishedHotFileV1::from_metrics(
+            &PublishedHotFileIdentity {
+                data_tenant_id: Uuid::nil(),
+                namespace: "wyrd",
+                table_name: "scribe_workload",
+                file_list_id: Uuid::nil(),
+                object_key: "scribe/workload/000.parquet",
+                file_checksum: &"0".repeat(64),
+                partition,
+                schema_fingerprint: "0".repeat(64),
+                partition_spec_id: BIFROST_PARTITION_SPEC_ID,
+                sort_order_id: BIFROST_SORT_ORDER_ID,
+            },
+            ScribeDataFileV1 {
+                record_count: 1,
+                file_size_in_bytes: 1_024,
+                column_sizes: BTreeMap::new(),
+                value_counts: BTreeMap::new(),
+                null_value_counts: BTreeMap::new(),
+                nan_value_counts: BTreeMap::new(),
+                lower_bounds: BTreeMap::new(),
+                upper_bounds: BTreeMap::new(),
+                split_offsets: vec![4],
+            },
+        )
     }
 }

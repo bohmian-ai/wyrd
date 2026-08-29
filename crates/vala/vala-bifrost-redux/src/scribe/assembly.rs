@@ -1176,6 +1176,33 @@ mod tests {
         .expect("a nonempty fixture member")
     }
 
+    /// Builds one ready member with byte and row counts stated independently.
+    ///
+    /// [`member`] derives rows from bytes, which cannot distinguish a claim that
+    /// hashes its members' bytes from one that hashes their rows as well. Cases
+    /// that must tell those apart state both counts here.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the member facts are empty, which would be a fixture bug.
+    fn member_with_rows(
+        shard: u16,
+        generation: u64,
+        bytes: u64,
+        rows: u64,
+        ready_seconds: i64,
+    ) -> ReadyMember {
+        let ready_at = chrono::DateTime::from_timestamp(1_772_150_400 + ready_seconds, 0)
+            .expect("a fixed representable instant");
+        ReadyMember::new(
+            StagedMemberId::new(shard, generation),
+            bytes,
+            rows,
+            ready_at,
+        )
+        .expect("a nonempty fixture member")
+    }
+
     /// Returns the fixture instant `seconds` after the fixture epoch.
     ///
     /// # Panics
@@ -1261,6 +1288,33 @@ mod tests {
             .expect("the prefix reaches target");
         assert_ne!(first.id(), different.id());
 
+        // Rows are part of the identity independently of bytes. A re-encode
+        // that produced the same compressed size from a different number of
+        // rows is a different claim, or a restart would publish it as the one
+        // already committed.
+        let same_bytes_fewer_rows = StagingClaimId::derive(
+            &key,
+            &[
+                member_with_rows(3, 7, 400, 40, 10),
+                member_with_rows(11, 7, 400, 40, 20),
+                member_with_rows(3, 9, 400, 40, 30),
+            ],
+        );
+        let same_bytes_more_rows = StagingClaimId::derive(
+            &key,
+            &[
+                member_with_rows(3, 7, 400, 40, 10),
+                member_with_rows(11, 7, 400, 41, 20),
+                member_with_rows(3, 9, 400, 40, 30),
+            ],
+        );
+        assert_ne!(
+            same_bytes_fewer_rows, same_bytes_more_rows,
+            "member rows must contribute to claim identity, not only bytes"
+        );
+
+        assert_claim_identity_is_scoped_to_its_key(tenant, &first);
+
         // An incompatible key never contributes, even for the same tenant and
         // table: a different partition is a different file-list row.
         let other_partition = key_for(tenant, 1);
@@ -1279,6 +1333,113 @@ mod tests {
             .expect("one of the two keys is due");
         assert_eq!(claimed.key(), &key);
         assert_eq!(claimed.id(), first.id());
+
+        assert_equal_instant_members_still_order_totally(&key);
+    }
+
+    /// Asserts one member set derives a different claim under a different key.
+    ///
+    /// The key is part of the identity: the same member set staged for a
+    /// different partition, table, or writer epoch is a different object, and
+    /// must never resolve to the identity the other one published under.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a foreign key derives the identity `claimed` published under.
+    fn assert_claim_identity_is_scoped_to_its_key(tenant: DataTenantId, claimed: &StagingClaim) {
+        // The key is part of the identity too. The same member set staged for a
+        // different partition, table, or writer epoch is a different object,
+        // and must never resolve to the identity the other one published under.
+        for other in [
+            key_for(tenant, 1),
+            ScribeAssemblyKey::new(
+                DataTenantId::new_v7(),
+                TableRef::new(BifrostNamespace::Bifrost, "events"),
+                SchemaFingerprint([7; 32]),
+                &layout(None),
+                partition(0),
+                NodeId::new(uuid::Uuid::from_u128(9)),
+                WriterEpoch::new(4),
+            ),
+            ScribeAssemblyKey::new(
+                tenant,
+                TableRef::new(BifrostNamespace::Bifrost, "events"),
+                SchemaFingerprint([7; 32]),
+                &layout(None),
+                partition(0),
+                NodeId::new(uuid::Uuid::from_u128(9)),
+                WriterEpoch::new(5),
+            ),
+        ] {
+            assert_ne!(
+                StagingClaimId::derive(&other, claimed.members()),
+                claimed.id(),
+                "the same members under a different key must be a different claim"
+            );
+        }
+    }
+
+    /// Asserts members durable in the same instant still order totally.
+    ///
+    /// Shard lanes fsync concurrently, so equal persisted ready times are
+    /// ordinary. Without a tie-break the claim's member order — and with it its
+    /// identity — would depend on which shard the walk happened to see first,
+    /// and two replays of one volume would disagree.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture registration or claim is refused, when equal ready
+    /// times do not break on the immutable member identity, or when the two
+    /// registration orders derive different claim identities.
+    fn assert_equal_instant_members_still_order_totally(key: &ScribeAssemblyKey) {
+        // Members that became durable in the same instant still order totally.
+        // Shard lanes fsync concurrently, so equal persisted ready times are
+        // ordinary; without a tie-break the claim's member order — and with it
+        // its identity — would depend on which shard the walk happened to see
+        // first, and two replays of one volume would disagree.
+        let tied = [
+            member(12, 1, 500, 60),
+            member(4, 3, 500, 60),
+            member(4, 2, 500, 60),
+        ];
+        let mut forward_ties = assembler(1_500, 4);
+        let mut reversed_ties = assembler(1_500, 4);
+        for entry in tied {
+            forward_ties
+                .register_ready(key, entry)
+                .expect("a fresh member registers");
+        }
+        for entry in tied.iter().rev() {
+            reversed_ties
+                .register_ready(key, *entry)
+                .expect("a fresh member registers");
+        }
+        let forward_claim = forward_ties
+            .next_claim(at(70))
+            .expect("claim budget is free")
+            .expect("the tied members reach target");
+        let reverse_claim = reversed_ties
+            .next_claim(at(70))
+            .expect("claim budget is free")
+            .expect("the tied members reach target");
+        assert_eq!(
+            forward_claim
+                .members()
+                .iter()
+                .map(|staged| staged.id())
+                .collect::<Vec<_>>(),
+            vec![
+                StagedMemberId::new(4, 2),
+                StagedMemberId::new(4, 3),
+                StagedMemberId::new(12, 1)
+            ],
+            "equal ready times must break on the immutable member identity"
+        );
+        assert_eq!(
+            forward_claim.id(),
+            reverse_claim.id(),
+            "a total order makes an equal-instant claim replayable"
+        );
     }
 
     /// Target claims take the smallest sufficient prefix; the rest waits, then leaves.
@@ -1294,18 +1455,18 @@ mod tests {
     fn staging_assembler_merges_rolls_and_releases_residue() {
         let tenant = DataTenantId::new_v7();
         let key = key_for(tenant, 0);
-        let mut assembler = assembler(1_000, 4);
+        let mut filling = assembler(1_000, 4);
         for entry in [
             member(1, 1, 600, 0),
             member(2, 1, 600, 5),
             member(3, 1, 300, 10),
         ] {
-            assembler
+            filling
                 .register_ready(&key, entry)
                 .expect("a fresh member registers");
         }
 
-        let target = assembler
+        let target = filling
             .next_claim(at(20))
             .expect("claim budget is free")
             .expect("two members reach the target");
@@ -1322,9 +1483,9 @@ mod tests {
         );
 
         // The 300-byte remainder is below target, so nothing is due yet.
-        assert_eq!(assembler.ready_members(&key).len(), 1);
+        assert_eq!(filling.ready_members(&key).len(), 1);
         assert!(
-            assembler
+            filling
                 .next_claim(at(30))
                 .expect("claim budget is free")
                 .is_none()
@@ -1332,15 +1493,121 @@ mod tests {
 
         // Once it has waited out its dwell it is released as residue rather
         // than held for a partner.
-        let residue = assembler
+        let residue = filling
             .next_claim(at(620))
             .expect("claim budget is free")
             .expect("the aged remainder is due");
         assert_eq!(residue.cause(), ClaimCause::Dwell);
         assert_eq!(residue.encoded_bytes(), 300);
         assert!(!residue.cause().is_target());
-        assert!(assembler.ready_members(&key).is_empty());
+        assert!(filling.ready_members(&key).is_empty());
         assert_ne!(residue.id(), target.id());
+
+        // Reaching the target exactly closes at target rather than waiting for
+        // one more member: the prefix rule is `>=`, and a `>` would leave every
+        // exactly-sized key filling forever.
+        let exact_key = key_for(tenant, 1);
+        let mut exact = assembler(1_000, 4);
+        exact
+            .register_ready(&exact_key, member(1, 1, 1_000, 0))
+            .expect("a fresh member registers");
+        let on_target = exact
+            .next_claim(at(1))
+            .expect("claim budget is free")
+            .expect("a member exactly at target is due");
+        assert_eq!(on_target.cause(), ClaimCause::Target);
+        assert_eq!(on_target.encoded_bytes(), 1_000);
+
+        assert_a_full_key_rolls_into_successive_target_claims();
+
+        // Dwell is measured from whichever member is oldest *now*. After a
+        // target claim drains the front of the index, the residue clock restarts
+        // from the surviving member rather than from the retired one, so a
+        // remainder is not released the instant its predecessors aged out.
+        let dwell_key = key_for(DataTenantId::new_v7(), 0);
+        let mut dwelling = assembler(1_000, 4);
+        dwelling
+            .register_ready(&dwell_key, member(1, 1, 1_000, 0))
+            .expect("a fresh member registers");
+        dwelling
+            .register_ready(&dwell_key, member(2, 1, 100, 400))
+            .expect("a fresh member registers");
+        dwelling
+            .next_claim(at(500))
+            .expect("claim budget is free")
+            .expect("the first member is at target");
+        assert!(
+            dwelling
+                .next_claim(at(900))
+                .expect("claim budget is free")
+                .is_none(),
+            "the remainder's own dwell has not expired yet"
+        );
+        let rebased = dwelling
+            .next_claim(at(1_100))
+            .expect("claim budget is free")
+            .expect("the remainder has now waited out its own dwell");
+        assert_eq!(rebased.cause(), ClaimCause::Dwell);
+        assert_eq!(rebased.encoded_bytes(), 100);
+    }
+
+    /// Asserts one key holding many members rolls into successive target claims.
+    ///
+    /// A key with more than a target's worth staged must yield successive
+    /// target-sized objects, each the smallest sufficient prefix, rather than
+    /// one oversized object; and no member may be dropped or published twice
+    /// across the rolls.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture registration or claim is refused, when a roll is
+    /// not the smallest sufficient prefix, or when a member is lost or reused.
+    fn assert_a_full_key_rolls_into_successive_target_claims() {
+        // Rolling: one key holding many members yields successive target claims
+        // rather than one oversized object, each the smallest sufficient prefix,
+        // and no member is dropped or reused across the rolls.
+        let roll_key = key_for(DataTenantId::new_v7(), 0);
+        let mut rolling = assembler(1_000, 16);
+        for ordinal in 0..6_u64 {
+            rolling
+                .register_ready(&roll_key, member(1, ordinal, 600, ordinal.cast_signed()))
+                .expect("a fresh member registers");
+        }
+        let mut rolled = Vec::new();
+        while let Some(claim) = rolling
+            .next_claim(at(10))
+            .expect("the claim budget stays free")
+        {
+            rolled.push(claim);
+        }
+        assert_eq!(
+            rolled.len(),
+            3,
+            "six 600-byte members roll into three objects"
+        );
+        for claim in &rolled {
+            assert_eq!(claim.cause(), ClaimCause::Target);
+            assert_eq!(
+                claim.members().len(),
+                2,
+                "each roll takes the smallest prefix that reaches target"
+            );
+            assert_eq!(claim.encoded_bytes(), 1_200);
+        }
+        let mut rolled_ids: Vec<StagedMemberId> = rolled
+            .iter()
+            .flat_map(|claim| claim.members().iter().map(|staged| staged.id()))
+            .collect();
+        let rolled_total = rolled_ids.len();
+        rolled_ids.sort_unstable_by_key(|id| (id.shard(), id.generation()));
+        rolled_ids.dedup();
+        assert_eq!(
+            rolled_ids.len(),
+            rolled_total,
+            "no member may be published by two rolls"
+        );
+        assert_eq!(rolled_total, 6, "every rolled member is published once");
+        assert!(rolling.ready_members(&roll_key).is_empty());
     }
 
     /// One tenant filling toward target never costs another tenant its turn.
@@ -1470,7 +1737,7 @@ mod tests {
     fn staging_and_publication_retire_each_lineage_once() {
         let tenant = DataTenantId::new_v7();
         let key = key_for(tenant, 0);
-        let mut assembler = assembler(2_000, 8);
+        let mut retiring = assembler(2_000, 8);
 
         // Nine members arrive across three shards and three generations, the
         // cross-generation shape a real key produces.
@@ -1480,7 +1747,7 @@ mod tests {
                 let generation = u64::try_from(ordinal / 3).expect("small generation");
                 let staged = member(shard, generation, 1_000, i64::from(ordinal));
                 let id = staged.id();
-                assembler
+                retiring
                     .register_ready(&key, staged)
                     .expect("a fresh lineage registers");
                 id
@@ -1490,20 +1757,20 @@ mod tests {
         // Drain the key: target-driven claims first, then one residue sweep for
         // whatever the target left behind.
         let mut claims = Vec::new();
-        while let Some(claim) = assembler
+        while let Some(claim) = retiring
             .next_claim(at(100))
             .expect("the claim budget stays free")
         {
             claims.push(claim);
         }
-        if let Some(residue) = assembler
+        if let Some(residue) = retiring
             .claim_residue(&key, ClaimCause::Drain)
             .expect("the claim budget stays free")
         {
             claims.push(residue);
         }
         assert!(
-            assembler.ready_members(&key).is_empty(),
+            retiring.ready_members(&key).is_empty(),
             "the sweep must leave no staged member unclaimed"
         );
 
@@ -1528,13 +1795,13 @@ mod tests {
         );
 
         // Exactly-once retirement: each claim settles once and refuses twice.
-        assert_eq!(assembler.outstanding_claims(), claims.len());
+        assert_eq!(retiring.outstanding_claims(), claims.len());
         for claim in &claims {
-            assembler
+            retiring
                 .settle_claim(claim.id())
                 .expect("an outstanding claim settles");
             assert_eq!(
-                assembler
+                retiring
                     .settle_claim(claim.id())
                     .expect_err("a settled claim may not free a slot twice"),
                 AssemblyError::UnknownClaim {
@@ -1543,20 +1810,86 @@ mod tests {
             );
         }
         assert_eq!(
-            assembler.outstanding_claims(),
+            retiring.outstanding_claims(),
             0,
-            "a fully settled assembler holds no claim slot"
+            "a fully settled retiring holds no claim slot"
         );
         assert!(
-            assembler.ready_keys().is_empty(),
+            retiring.ready_keys().is_empty(),
             "a retired lineage leaves no key holding ready members"
         );
 
         // The identities are free again, which is what lets a restart replay
         // the same generations without colliding with retired ownership.
-        assembler
+        retiring
             .register_ready(&key, member(0, 0, 1_000, 200))
             .expect("a retired identity may be staged again");
+
+        assert_retirement_is_scoped_to_one_lineage(tenant, &key);
+    }
+
+    /// Asserts a residue sweep retires only the lineage it swept.
+    ///
+    /// Retirement is scoped to one lineage: a residue sweep of one key must not
+    /// claim, publish, or retire a neighbouring key's staged members. They
+    /// belong to a different partition and a different object, so sweeping them
+    /// together would publish rows into the wrong file-list row while leaving
+    /// the swept key's own budget accounting short.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture registration or claim is refused, when a sweep
+    /// takes a neighbouring lineage's member, or when either lineage retires
+    /// other than exactly once.
+    fn assert_retirement_is_scoped_to_one_lineage(tenant: DataTenantId, key: &ScribeAssemblyKey) {
+        // Retirement is scoped to one lineage. A residue sweep of one key must
+        // not claim, publish, or retire a neighbouring key's staged members:
+        // they belong to a different partition and a different object, and
+        // sweeping them together would publish rows into the wrong file-list
+        // row while leaving the swept key's own budget accounting short.
+        let neighbour = key_for(tenant, 1);
+        let mut scoped = assembler(2_000, 8);
+        for (staged_key, shard) in [(key, 0_u16), (&neighbour, 1_u16)] {
+            scoped
+                .register_ready(staged_key, member(shard, 1, 500, 0))
+                .expect("a fresh lineage registers");
+        }
+        let swept = scoped
+            .claim_residue(key, ClaimCause::Drain)
+            .expect("the claim budget is free")
+            .expect("the swept key holds a ready member");
+        assert_eq!(swept.key(), key);
+        assert_eq!(
+            swept
+                .members()
+                .iter()
+                .map(|staged| staged.id())
+                .collect::<Vec<_>>(),
+            vec![StagedMemberId::new(0, 1)],
+            "a residue sweep takes only the swept key's own lineage"
+        );
+        assert_eq!(
+            scoped.ready_members(&neighbour).len(),
+            1,
+            "the neighbouring lineage stays staged and unretired"
+        );
+        assert_eq!(scoped.ready_keys(), vec![neighbour.clone()]);
+        let neighbour_claim = scoped
+            .claim_residue(&neighbour, ClaimCause::Drain)
+            .expect("the claim budget is free")
+            .expect("the neighbouring key holds a ready member");
+        assert_ne!(
+            neighbour_claim.id(),
+            swept.id(),
+            "two lineages never share one claim identity"
+        );
+        for claim in [&swept, &neighbour_claim] {
+            scoped
+                .settle_claim(claim.id())
+                .expect("each lineage retires once");
+        }
+        assert_eq!(scoped.outstanding_claims(), 0);
+        assert!(scoped.ready_keys().is_empty());
     }
 
     /// Outstanding claims are bounded, and settling one returns its slot.
@@ -1801,6 +2134,101 @@ mod tests {
             }
         );
         assert_eq!(reconciled.outstanding_claims(), 0);
+
+        assert_contradictory_restore_evidence_fails_closed(tenant, &key, &staged, &before);
+    }
+
+    /// Asserts a restore whose members contradict its record is refused.
+    ///
+    /// A durable record naming an identity its own member set does not derive
+    /// means the record and the members disagree about which rows were
+    /// published; resuming it would settle a publication over the wrong set.
+    /// The refusal covers a truncated set, a widened one — identity is the
+    /// whole set, in both directions — and one identity restored under a second
+    /// assembly key, which would merge two incompatible partitions into one
+    /// publication.
+    ///
+    /// # Panics
+    ///
+    /// Panics when contradictory evidence is accepted, or when the refusal does
+    /// not name the claim the record carried.
+    fn assert_contradictory_restore_evidence_fails_closed(
+        tenant: DataTenantId,
+        key: &ScribeAssemblyKey,
+        staged: &[ReadyMember],
+        before: &StagingClaim,
+    ) {
+        // Contradictory evidence fails closed rather than reconciling onto a
+        // claim the volume does not support. A durable record naming an
+        // identity its own member set does not derive means the record and the
+        // members disagree about which rows were published; resuming it would
+        // settle a publication over the wrong set.
+        let mut partial = assembler(4_000, 2);
+        assert_eq!(
+            partial
+                .restore(
+                    key,
+                    staged[..2].iter().map(|owned| RecoveredMember::Claimed {
+                        claim: before.id(),
+                        member: *owned,
+                    }),
+                )
+                .expect_err("a partial member set cannot reconstruct its claim"),
+            AssemblyError::RestoredClaimMismatch {
+                claim: before.id().to_string()
+            }
+        );
+
+        // The same refusal covers a member set that was widened rather than
+        // truncated: identity is the whole set, in both directions.
+        let mut widened_restore = assembler(4_000, 2);
+        assert_eq!(
+            widened_restore
+                .restore(
+                    key,
+                    staged
+                        .iter()
+                        .copied()
+                        .chain([member(11, 1, 1_000, 20)])
+                        .map(|owned| RecoveredMember::Claimed {
+                            claim: before.id(),
+                            member: owned,
+                        }),
+                )
+                .expect_err("an extra member cannot reconstruct its claim"),
+            AssemblyError::RestoredClaimMismatch {
+                claim: before.id().to_string()
+            }
+        );
+
+        // One durable claim identity belongs to exactly one assembly key. A
+        // second key claiming it would merge two incompatible partitions into
+        // one publication, so the restore refuses instead of widening the key.
+        let other_key = key_for(tenant, 1);
+        let mut crossed = assembler(4_000, 2);
+        crossed
+            .restore(
+                key,
+                staged.iter().map(|owned| RecoveredMember::Claimed {
+                    claim: before.id(),
+                    member: *owned,
+                }),
+            )
+            .expect("the interrupted claim restores under its own key");
+        assert_eq!(
+            crossed
+                .restore(
+                    &other_key,
+                    [RecoveredMember::Claimed {
+                        claim: before.id(),
+                        member: member(11, 1, 1_000, 20),
+                    }],
+                )
+                .expect_err("one claim identity may not span two assembly keys"),
+            AssemblyError::RestoredClaimMismatch {
+                claim: before.id().to_string()
+            }
+        );
     }
 
     /// A restored claim keeps its slot and its members until it settles.

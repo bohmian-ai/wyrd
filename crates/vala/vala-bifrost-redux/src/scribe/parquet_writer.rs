@@ -1747,6 +1747,12 @@ mod tests {
                 decoded, artifact.row_count,
                 "the artifact decodes to exactly the rows it claims"
             );
+
+            assert_promotion_record_describes_this_artifact(
+                artifact,
+                on_disk.len(),
+                metadata.num_row_groups(),
+            );
         }
 
         identities.sort_unstable();
@@ -1755,6 +1761,100 @@ mod tests {
             identities.len(),
             encoded.artifacts.len(),
             "object identities are unique across the rolled claim"
+        );
+    }
+
+    /// Asserts one artifact's promotion record describes that artifact's bytes.
+    ///
+    /// The promotion record is the evidence a later claim and the catalog
+    /// promoter actually consume, so it is part of the footer contract rather
+    /// than a by-product: it must describe *this* artifact's own bytes, carry
+    /// one split offset per row group in ascending order, and hold bounds that
+    /// rebuild losslessly. A record derived from a sibling's size or a stale
+    /// row count would promote an object the table cannot read.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the record contradicts the artifact's row count or on-disk
+    /// size, when its split offsets do not match the footer's row groups in
+    /// ascending order, when its statistics are empty or disagree, or when its
+    /// wire form is not byte-stable across a round trip.
+    fn assert_promotion_record_describes_this_artifact(
+        artifact: &BoundedParquetArtifact,
+        on_disk_len: u64,
+        row_groups: usize,
+    ) {
+        // The promotion record is the evidence a later claim and the
+        // catalog promoter actually consume, so it is part of the footer
+        // contract rather than a by-product: it must describe *this*
+        // artifact's own bytes, carry one split offset per row group in
+        // ascending order, and hold bounds that rebuild losslessly. A
+        // record derived from a sibling's size or a stale row count would
+        // promote an object the table cannot read.
+        let metrics = &artifact.data_file_metrics;
+        assert_eq!(
+            metrics.record_count,
+            u64::try_from(artifact.row_count).expect("row count fits u64"),
+            "the promotion record counts this artifact's own rows"
+        );
+        assert_eq!(
+            metrics.file_size_in_bytes, on_disk_len,
+            "the promotion record states the bytes actually on disk"
+        );
+        assert_eq!(
+            metrics.split_offsets.len(),
+            row_groups,
+            "one split offset per row group the footer holds"
+        );
+        assert!(
+            metrics
+                .split_offsets
+                .windows(2)
+                .all(|pair| pair[0] < pair[1]),
+            "split offsets must ascend so a reader can bound a group"
+        );
+        assert!(
+            metrics
+                .split_offsets
+                .first()
+                .is_some_and(|first| *first >= 0),
+            "a split offset is a position inside the object"
+        );
+        assert!(
+            !metrics.column_sizes.is_empty() && !metrics.value_counts.is_empty(),
+            "per-column footer statistics must survive into the record"
+        );
+        for (field, count) in &metrics.value_counts {
+            assert_eq!(
+                *count, metrics.record_count,
+                "field {field} must count every row of the artifact"
+            );
+        }
+        assert_eq!(
+            metrics.lower_bounds.keys().collect::<Vec<_>>(),
+            metrics.upper_bounds.keys().collect::<Vec<_>>(),
+            "a bounded column carries both of its bounds"
+        );
+        assert!(
+            !metrics.lower_bounds.is_empty(),
+            "an artifact with rows has at least one bounded column"
+        );
+        // The record travels to publication, S6 and Forge as bytes, so a
+        // projection that only holds together in this process proves
+        // nothing. Round-tripping it here is the writer's half of that
+        // handoff: the wire form must be lossless and, because every map is
+        // ordered, byte-identical for the same footer on every replay.
+        let wire = serde_json::to_vec(metrics).expect("the promotion record serializes");
+        let returned: crate::scribe::promotion::ScribeDataFileV1 =
+            serde_json::from_slice(&wire).expect("the promotion record deserializes");
+        assert_eq!(
+            &returned, metrics,
+            "the promotion record's wire form must be lossless"
+        );
+        assert_eq!(
+            serde_json::to_vec(&returned).expect("the returned record serializes"),
+            wire,
+            "the same footer must encode to the same bytes on every replay"
         );
     }
 

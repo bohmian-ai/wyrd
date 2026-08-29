@@ -965,33 +965,111 @@ mod tests {
         ));
     }
 
+    /// Every geometry field with the production default in every other slot.
+    ///
+    /// Independence and zero-refusal are both properties of *one* field moving
+    /// while the rest hold their defaults, so both halves of the owner build
+    /// their inputs here rather than restating twelve arguments per case.
+    #[derive(Debug, Clone, Copy)]
+    struct GeometryOverride {
+        /// Encoded bytes in one WAL segment before rotation.
+        wal_segment_bytes: u64,
+        /// Pod-wide active-generation budget shared by all sixteen shards.
+        active_generation_budget_bytes: u64,
+        /// Absolute per-shard rotation ceiling applied after the budget divides.
+        generation_rotation_ceiling_bytes: u64,
+        /// Maximum age of an active shard generation before rotation.
+        generation_max_age: Duration,
+        /// Optional per-`SealKey` early-seal size.
+        seal_key_early_seal_bytes: Option<usize>,
+        /// Optional per-`SealKey` early-seal age.
+        seal_key_max_age: Option<Duration>,
+        /// Encoded Parquet target for one assembled hot object.
+        staging_target_file_size_bytes: u64,
+        /// Maximum encoded bytes accepted for one ingress request.
+        maximum_ingress_envelope_bytes: usize,
+        /// Arrow bytes one table may own in a still-writable generation.
+        maximum_active_request_ownership_bytes: usize,
+        /// Arrow bytes one table may own in a frozen generation.
+        maximum_immutable_member_ownership_bytes: usize,
+        /// Local durable-staging bytes one table's smallest staged member needs.
+        minimum_stage_member_bytes: usize,
+        /// Scratch bytes one admitted merge lane reserves before starting.
+        minimum_merge_lane_scratch_bytes: usize,
+    }
+
+    impl GeometryOverride {
+        /// Returns every field at its production default.
+        fn defaults() -> Self {
+            Self {
+                wal_segment_bytes: DEFAULT_WAL_SEGMENT_BYTES,
+                active_generation_budget_bytes: DEFAULT_ACTIVE_GENERATION_BUDGET_BYTES,
+                generation_rotation_ceiling_bytes: DEFAULT_GENERATION_ROTATION_CEILING_BYTES,
+                generation_max_age: DEFAULT_GENERATION_MAX_AGE,
+                seal_key_early_seal_bytes: None,
+                seal_key_max_age: None,
+                staging_target_file_size_bytes: DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES,
+                maximum_ingress_envelope_bytes:
+                    crate::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES,
+                maximum_active_request_ownership_bytes:
+                    DEFAULT_MAXIMUM_ACTIVE_REQUEST_OWNERSHIP_BYTES,
+                maximum_immutable_member_ownership_bytes:
+                    DEFAULT_MAXIMUM_IMMUTABLE_MEMBER_OWNERSHIP_BYTES,
+                minimum_stage_member_bytes: DEFAULT_MINIMUM_STAGE_MEMBER_BYTES,
+                minimum_merge_lane_scratch_bytes: DEFAULT_MINIMUM_MERGE_LANE_SCRATCH_BYTES,
+            }
+        }
+
+        /// Runs this override through the production constructor.
+        ///
+        /// # Errors
+        ///
+        /// Returns whatever [`ScribeGeometry::new`] refuses, which is the
+        /// outcome every negative case asserts on.
+        fn build(self) -> Result<ScribeGeometry, ScribeGeometryError> {
+            ScribeGeometry::new(
+                self.wal_segment_bytes,
+                self.active_generation_budget_bytes,
+                self.generation_rotation_ceiling_bytes,
+                self.generation_max_age,
+                self.seal_key_early_seal_bytes,
+                self.seal_key_max_age,
+                self.staging_target_file_size_bytes,
+                self.maximum_ingress_envelope_bytes,
+                self.maximum_active_request_ownership_bytes,
+                self.maximum_immutable_member_ownership_bytes,
+                self.minimum_stage_member_bytes,
+                self.minimum_merge_lane_scratch_bytes,
+            )
+        }
+    }
+
     /// The five geometries move independently and each is bounded on its own.
+    ///
+    /// Independence means one knob moving leaves every other derived value
+    /// exactly where it was: a WAL segment is not a rotation limit, a rotation
+    /// limit is not an object-size promise, and an object target is neither.
+    /// Bounded means *every* required field is refused at zero by its own name,
+    /// not only the two the derivation happens to divide, and that both
+    /// per-`SealKey` controls may only fire earlier than the shard they precede.
+    /// The zero half walks the complete field inventory so a validator that
+    /// stopped checking one field fails here rather than booting a pod whose
+    /// ownership bound silently vanished.
     ///
     /// # Panics
     ///
-    /// Panics when changing one geometry moves another, when a zero is
-    /// accepted, or when an early seal is allowed to fire after its shard would
-    /// already have rotated.
+    /// Panics when changing one geometry moves another, when any required field
+    /// is accepted at zero or is refused under another field's name, or when a
+    /// per-key control is allowed to fire after its shard would already have
+    /// rotated.
     #[test]
     fn scribe_geometry_controls_are_independent_and_bounded() {
         let base = ScribeGeometry::default();
 
         // Moving the WAL segment leaves the generation and object targets alone.
-        let wal_moved = ScribeGeometry::new(
-            64 * 1024 * 1024,
-            DEFAULT_ACTIVE_GENERATION_BUDGET_BYTES,
-            DEFAULT_GENERATION_ROTATION_CEILING_BYTES,
-            DEFAULT_GENERATION_MAX_AGE,
-            None,
-            None,
-            DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES,
-            crate::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES,
-            DEFAULT_MAXIMUM_ACTIVE_REQUEST_OWNERSHIP_BYTES,
-            DEFAULT_MAXIMUM_IMMUTABLE_MEMBER_OWNERSHIP_BYTES,
-            DEFAULT_MINIMUM_STAGE_MEMBER_BYTES,
-            DEFAULT_MINIMUM_MERGE_LANE_SCRATCH_BYTES,
-        )
-        .expect("a smaller WAL segment is valid on its own");
+        let mut moved = GeometryOverride::defaults();
+        moved.wal_segment_bytes = 64 * 1024 * 1024;
+        let wal_moved = moved.build().expect("a smaller WAL segment is valid alone");
         assert_eq!(wal_moved.wal_segment_bytes(), 64 * 1024 * 1024);
         assert_eq!(
             wal_moved.shard_generation_rotation_bytes(),
@@ -1014,44 +1092,182 @@ mod tests {
             generation_moved.staging_target_file_size_bytes(),
             DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES
         );
-
-        // Zero is refused on every required field, naming the field.
-        assert!(matches!(
-            geometry_with(0, DEFAULT_GENERATION_ROTATION_CEILING_BYTES),
-            Err(ScribeGeometryError::Zero {
-                field: "active_generation_budget_bytes"
-            })
-        ));
-        assert!(matches!(
-            geometry_with(DEFAULT_ACTIVE_GENERATION_BUDGET_BYTES, 0),
-            Err(ScribeGeometryError::Zero {
-                field: "generation_rotation_ceiling_bytes"
-            })
-        ));
-
-        // A key may seal earlier than its shard, never later.
-        let early = ScribeGeometry::new(
-            DEFAULT_WAL_SEGMENT_BYTES,
-            DEFAULT_ACTIVE_GENERATION_BUDGET_BYTES,
-            DEFAULT_GENERATION_ROTATION_CEILING_BYTES,
-            DEFAULT_GENERATION_MAX_AGE,
-            Some(usize::try_from(DEFAULT_GENERATION_ROTATION_CEILING_BYTES).expect("fits"))
-                .map(|limit| limit + 1),
-            None,
-            DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES,
-            crate::gate::limits::BIFROST_INGEST_REQUEST_LIMIT_BYTES,
-            DEFAULT_MAXIMUM_ACTIVE_REQUEST_OWNERSHIP_BYTES,
-            DEFAULT_MAXIMUM_IMMUTABLE_MEMBER_OWNERSHIP_BYTES,
-            DEFAULT_MINIMUM_STAGE_MEMBER_BYTES,
-            DEFAULT_MINIMUM_MERGE_LANE_SCRATCH_BYTES,
+        assert_eq!(
+            generation_moved.wal_segment_bytes(),
+            base.wal_segment_bytes()
         );
+
+        // Moving the object target moves neither the WAL segment nor the shard
+        // rotation limit: the assembled object is the fifth, separate geometry.
+        let target_moved = base
+            .with_staging_target_file_size_bytes(64 * 1024 * 1024)
+            .expect("a smaller object target is valid alone");
+        assert_eq!(
+            target_moved.staging_target_file_size_bytes(),
+            64 * 1024 * 1024
+        );
+        assert_eq!(target_moved.wal_segment_bytes(), base.wal_segment_bytes());
+        assert_eq!(
+            target_moved.shard_generation_rotation_bytes(),
+            base.shard_generation_rotation_bytes()
+        );
+        assert_eq!(target_moved.generation_max_age(), base.generation_max_age());
+
+        assert_every_required_field_is_refused_at_zero();
+        assert_per_key_controls_may_only_fire_earlier();
+    }
+
+    /// One zeroed field and its expected refusal name.
+    ///
+    /// Named because the inventory is an array of function pointers: spelling
+    /// the pair out once keeps the walk readable and satisfies the workspace
+    /// bar on inline type complexity.
+    type ZeroCase = (&'static str, fn(&mut GeometryOverride));
+
+    /// Asserts every required geometry field is refused at zero, by its own name.
+    ///
+    /// Walking the complete inventory is what makes the bound a property of the
+    /// validator rather than of the two fields a derivation happens to divide:
+    /// a validator that stopped checking one field fails here instead of
+    /// booting a pod whose ownership bound silently vanished.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any required field is accepted at zero or is refused under
+    /// another field's name.
+    fn assert_every_required_field_is_refused_at_zero() {
+        // Bounded: every required field is refused at zero, under its own name.
+        // Each case zeroes exactly one field and leaves the rest at production
+        // defaults, so a refusal proves that field is checked rather than that
+        // some other field happened to fail first.
+        let zero_cases: [ZeroCase; 9] = [
+            ("wal_segment_bytes", |over| over.wal_segment_bytes = 0),
+            ("active_generation_budget_bytes", |over| {
+                over.active_generation_budget_bytes = 0;
+            }),
+            ("generation_rotation_ceiling_bytes", |over| {
+                over.generation_rotation_ceiling_bytes = 0;
+            }),
+            ("staging_target_file_size_bytes", |over| {
+                over.staging_target_file_size_bytes = 0;
+            }),
+            ("maximum_ingress_envelope_bytes", |over| {
+                over.maximum_ingress_envelope_bytes = 0;
+            }),
+            ("maximum_active_request_ownership_bytes", |over| {
+                over.maximum_active_request_ownership_bytes = 0;
+            }),
+            ("maximum_immutable_member_ownership_bytes", |over| {
+                over.maximum_immutable_member_ownership_bytes = 0;
+            }),
+            ("minimum_stage_member_bytes", |over| {
+                over.minimum_stage_member_bytes = 0;
+            }),
+            ("minimum_merge_lane_scratch_bytes", |over| {
+                over.minimum_merge_lane_scratch_bytes = 0;
+            }),
+        ];
+        for (field, zero) in zero_cases {
+            let mut over = GeometryOverride::defaults();
+            zero(&mut over);
+            assert_eq!(
+                over.build()
+                    .expect_err("a zero required field must refuse by name"),
+                ScribeGeometryError::Zero { field },
+                "zeroing {field} must be refused under its own name"
+            );
+        }
+
+        // A zero generation age is a vanished rotation control, not a disabled
+        // one, so it is refused by name alongside the byte-valued fields.
+        let mut ageless = GeometryOverride::defaults();
+        ageless.generation_max_age = Duration::ZERO;
+        assert_eq!(
+            ageless
+                .build()
+                .expect_err("a zero generation age must refuse"),
+            ScribeGeometryError::Zero {
+                field: "generation_max_age"
+            }
+        );
+    }
+
+    /// Asserts each per-`SealKey` control may only fire earlier than its shard.
+    ///
+    /// The per-key controls exist to seal a hot key ahead of the shard that
+    /// contains it. A control permitted to fire *after* its shard would already
+    /// have rotated is not an early seal at all, and one permitted at zero
+    /// would rotate every key on its first row, so both directions are refused
+    /// and the coherent interior is proven to be accepted.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a late or zero per-key control is admitted, or when a
+    /// control strictly inside its shard's own limit is refused.
+    fn assert_per_key_controls_may_only_fire_earlier() {
+        // A key may seal earlier than its shard, never later — on size.
+        let ceiling =
+            usize::try_from(DEFAULT_GENERATION_ROTATION_CEILING_BYTES).expect("ceiling fits");
+        let mut late_size = GeometryOverride::defaults();
+        late_size.seal_key_early_seal_bytes = Some(ceiling + 1);
         assert!(matches!(
-            early,
-            Err(ScribeGeometryError::Incoherent {
+            late_size.build().expect_err("a late size seal must refuse"),
+            ScribeGeometryError::Incoherent {
                 field: "seal_key_early_seal_bytes",
                 ..
-            })
+            }
         ));
+        // Exactly at the shard limit is the boundary that still fires with it.
+        let mut at_limit = GeometryOverride::defaults();
+        at_limit.seal_key_early_seal_bytes = Some(ceiling);
+        assert_eq!(
+            at_limit
+                .build()
+                .expect("a seal exactly at the shard limit is coherent")
+                .seal_key_early_seal_bytes(),
+            Some(ceiling)
+        );
+        // A zero early seal would rotate every key on its first row.
+        let mut zero_size = GeometryOverride::defaults();
+        zero_size.seal_key_early_seal_bytes = Some(0);
+        assert_eq!(
+            zero_size
+                .build()
+                .expect_err("a zero early seal must refuse"),
+            ScribeGeometryError::Zero {
+                field: "seal_key_early_seal_bytes"
+            }
+        );
+
+        // And never later on age either, in both incoherent directions.
+        for late_age in [
+            Duration::ZERO,
+            DEFAULT_GENERATION_MAX_AGE + Duration::from_secs(1),
+        ] {
+            let mut over = GeometryOverride::defaults();
+            over.seal_key_max_age = Some(late_age);
+            assert!(
+                matches!(
+                    over.build()
+                        .expect_err("a key may only seal earlier than its shard"),
+                    ScribeGeometryError::Incoherent {
+                        field: "seal_key_max_age",
+                        ..
+                    }
+                ),
+                "a per-key age of {late_age:?} must be refused"
+            );
+        }
+        // An age strictly inside the shard's own is the control's whole point.
+        let mut early_age = GeometryOverride::defaults();
+        early_age.seal_key_max_age = Some(DEFAULT_GENERATION_MAX_AGE / 2);
+        assert_eq!(
+            early_age
+                .build()
+                .expect("a key sealing earlier than its shard is coherent")
+                .seal_key_max_age(),
+            Some(DEFAULT_GENERATION_MAX_AGE / 2)
+        );
     }
 
     /// Startup accepts the exact minimum capacity and refuses one unit below it.

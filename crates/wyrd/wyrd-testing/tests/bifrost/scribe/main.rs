@@ -8,4 +8,5 @@ mod round_robin;
 mod source_boundary;
 mod source_boundary_recovery;
 mod support;
+mod telemetry;
 mod write_read;

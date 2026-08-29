@@ -2278,6 +2278,19 @@ impl ScribeImpl {
         self.admission.contention().telemetry_totals()
     }
 
+    /// Reports the pod's closed staged-member and claim registry totals.
+    ///
+    /// The same retained observation owner that records admission also records
+    /// the durability half of the pod, so a reconciliation case reads staged
+    /// minus retired members and claims taken minus claims closed from here
+    /// rather than inferring a durable transition from a published object.
+    /// Read-only: nothing here stages, claims, publishes, or retires.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn staging_totals_for_test(&self) -> crate::scribe::telemetry::ScribeStagingSnapshot {
+        self.admission.contention().staging_totals()
+    }
+
     /// Reports how many complete lifecycle vectors this pod's capacity completes.
     ///
     /// Derived once at startup from measured capacity, so a case that has to

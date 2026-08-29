@@ -569,7 +569,7 @@ pub(crate) struct PreparedSlice {
 ///
 /// # Errors
 ///
-/// Returns an internal error when the stable buffer length exceeds its WAL-v4
+/// Returns an internal error when the stable buffer length exceeds its WAL-v6
 /// metadata representation.
 pub(crate) fn logical_data_identity(rows: &RecordBatch) -> Result<([u8; 32], u32), ScribeError> {
     fn update(data: &ArrayData, digest: &mut Sha256, bytes: &mut usize) -> Result<(), ScribeError> {
@@ -602,14 +602,34 @@ pub(crate) fn logical_data_identity(rows: &RecordBatch) -> Result<([u8; 32], u32
     let mut digest = Sha256::new();
     let mut bytes = 0_usize;
     for (field, column) in rows.schema().fields().iter().zip(rows.columns()) {
-        if matches!(
-            field.name().as_str(),
-            WYRD_REQUEST_ID | WYRD_EVENT_TIME | WYRD_INGESTED_AT
-        ) {
+        // Request-scoped columns are stamped fresh on every attempt, so they
+        // describe *which* request carried the rows, not what the rows are.
+        // Binding any of them would make an honest client retry of the same
+        // batch look like a different batch. The correlation set is taken from
+        // the spec predicate rather than restated here so a newly reserved
+        // correlation column cannot silently re-enter this identity.
+        if wyrd_spec::vala::managed_columns::is_reserved_correlation_column(field.name())
+            || matches!(
+                field.name().as_str(),
+                WYRD_REQUEST_ID | WYRD_EVENT_TIME | WYRD_INGESTED_AT
+            )
+        {
             continue;
         }
         digest.update(field.name().as_bytes());
+        let before = bytes;
         update(&column.to_data(), &mut digest, &mut bytes)?;
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let mut column_digest = Sha256::new();
+            let mut column_bytes = 0_usize;
+            update(&column.to_data(), &mut column_digest, &mut column_bytes)?;
+            tracing::debug!(
+                column = field.name().as_str(),
+                digest = %hex_digest(&column_digest.finalize().into()),
+                bytes = bytes.saturating_sub(before),
+                "logical batch identity column contribution"
+            );
+        }
     }
     let bytes = u32::try_from(bytes).map_err(|_| ScribeError::Internal {
         detail: "logical Arrow identity exceeds its u32 bound".to_owned(),
@@ -684,12 +704,12 @@ fn prepare_rows(
                 &rows,
             )?;
             let slice_count = u32::try_from(slices.len()).map_err(|_| ScribeError::Internal {
-                detail: "Scribe batch exceeds the v4 WAL slice-count bound".to_owned(),
+                detail: "Scribe batch exceeds the v6 WAL slice-count bound".to_owned(),
             })?;
             for (slice_index, slice) in slices.iter_mut().enumerate() {
                 let slice_index =
                     u32::try_from(slice_index).map_err(|_| ScribeError::Internal {
-                        detail: "Scribe batch slice index exceeds the v4 WAL bound".to_owned(),
+                        detail: "Scribe batch slice index exceeds the v6 WAL bound".to_owned(),
                     })?;
                 slice
                     .wal_append
@@ -736,14 +756,14 @@ fn prepare_rows(
 ///
 /// # Errors
 ///
-/// Returns an internal error when the slice set exceeds WAL v4 integer bounds.
+/// Returns an internal error when the slice set exceeds WAL v6 integer bounds.
 fn assign_slice_ordinals(slices: &mut [PreparedSlice]) -> Result<(), ScribeError> {
     let count = u32::try_from(slices.len()).map_err(|_| ScribeError::Internal {
-        detail: "Scribe batch exceeds the v4 WAL slice-count bound".to_owned(),
+        detail: "Scribe batch exceeds the v6 WAL slice-count bound".to_owned(),
     })?;
     for (index, slice) in slices.iter_mut().enumerate() {
         let index = u32::try_from(index).map_err(|_| ScribeError::Internal {
-            detail: "Scribe batch slice index exceeds the v4 WAL bound".to_owned(),
+            detail: "Scribe batch slice index exceeds the v6 WAL bound".to_owned(),
         })?;
         slice.wal_append.assign_slice_ordinal(index, count);
         slice.id.slice_index = index;
@@ -971,7 +991,13 @@ fn prepare_slice(
     slice_audit.payload_summary = format!("{} rows", rows.num_rows());
     let audit_payload = encode_audit_event_bounded(&slice_audit, context.wal_workspace_bytes)?;
     let data_payload = encode_ipc_fixed(&rows, ipc_plan)?;
-    let (logical_data_digest, logical_data_len) = logical_data_identity(&rows)?;
+    let identity_span = tracing::debug_span!(
+        "scribe_logical_batch_identity",
+        batch_id = %context.batch_id,
+        table = %context.table.fqn(),
+    );
+    let (logical_data_digest, logical_data_len) =
+        identity_span.in_scope(|| logical_data_identity(&rows))?;
     let wal_append = PreparedWalAppend::new(
         crate::scribe::wal::WalLsn::ZERO,
         *context.batch_id.as_bytes(),
@@ -983,7 +1009,7 @@ fn prepare_slice(
         SchemaFingerprint::from_arrow_schema(&rows.schema()).0,
     )
     .with_logical_data_identity(logical_data_digest, logical_data_len);
-    let memtable_bytes = rows.get_array_memory_size();
+    let memtable_bytes = crate::scribe::memory::retained_arrow_bytes(&rows);
     Ok(PreparedSlice {
         id: AppendSliceId {
             batch_id: context.batch_id,
@@ -1031,6 +1057,78 @@ fn notify_completion(
 ) {
     if let Some(sender) = completion.take() {
         let _ = sender.send(Err(error.completion_copy()));
+    }
+}
+
+/// Renders a digest as lowercase hex for a diagnostic field.
+///
+/// Only diagnostics use this: the durable identity always compares raw bytes.
+#[must_use]
+fn hex_digest(digest: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    digest
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+}
+
+/// Accumulates the canonical logical identity of one ordered batch slice set.
+///
+/// The durable Scribe batch fence answers "is this the same batch the client
+/// already sent?". That question must be settled by the rows themselves, so
+/// this digest binds only stable logical facts: the slice ordinal, the approved
+/// Arrow schema fingerprint, and the logical data identity from
+/// [`logical_data_identity`], which deliberately omits the per-request managed
+/// columns. It must never bind the WAL slice payload, whose audit envelope
+/// carries a fresh request identity and timestamps on every attempt and would
+/// therefore make an honest client retry look like a contradiction.
+///
+/// This is not the WAL v6 `wal_digest`. That digest binds exact payload bytes so
+/// a substituted slice cannot be authorized by a valid terminal record. The two
+/// answer different questions, are computed apart, and the v6 COMMIT record
+/// persists both — see [`crate::scribe::wal::WalCommitIdentity`].
+///
+/// The owner exists so there is one layout for this durable identity. It is
+/// computed exactly once, on the ingest write path, and the terminal COMMIT
+/// carries the result; replay reads that durable field rather than recomputing
+/// it, so the two paths cannot drift.
+pub(crate) struct LogicalBatchDigest {
+    /// Running SHA-256 over every slice pushed so far, in ordinal order.
+    inner: Sha256,
+}
+
+impl LogicalBatchDigest {
+    /// Starts an empty ordered accumulation.
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Sha256::new(),
+        }
+    }
+
+    /// Binds one slice's stable logical identity in its ordinal position.
+    ///
+    /// The caller must push slices in ascending `slice_index` order; ordering
+    /// is part of the identity, so a reordered set yields a different digest.
+    pub(crate) fn push_slice(
+        &mut self,
+        slice_index: u32,
+        schema_fingerprint: &[u8; 32],
+        data_digest: &[u8; 32],
+        data_len: u32,
+    ) {
+        self.inner.update(slice_index.to_le_bytes());
+        self.inner.update(schema_fingerprint);
+        self.inner.update(data_digest);
+        self.inner.update(data_len.to_le_bytes());
+    }
+
+    /// Returns the canonical digest over every pushed slice.
+    #[must_use]
+    pub(crate) fn finish(self) -> [u8; 32] {
+        self.inner.finalize().into()
     }
 }
 

@@ -1159,8 +1159,12 @@ impl ScribeImpl {
         let memory = config.resources.clone();
         let memory_ownership =
             memory::ScribeOwnership::new(&memory).expect("zero-sized root ownership must be valid");
-        let admission =
-            AdmissionController::with_config_and_memory(config.admission, memory.clone())?;
+        let wal_breaker = Some(config.wal.disk_full_breaker());
+        let admission = AdmissionController::with_config_memory_and_wal(
+            config.admission,
+            memory.clone(),
+            wal_breaker,
+        )?;
         let ScribeBuildConfig {
             catalog,
             operator,
@@ -1176,7 +1180,6 @@ impl ScribeImpl {
             staging_file_publisher,
         } = config;
         let seal_max_age = geometry.generation_max_age();
-        let (node_id, writer_epoch) = (stream.node_id.to_string(), stream.writer_epoch.as_i64());
         let ScribeExecutionPools {
             ingress_cpu,
             persistence_cpu,
@@ -1220,18 +1223,17 @@ impl ScribeImpl {
             },
             &coordination_runtime,
         );
-        let pressure_config = ScribePressureConfig::new(75, 50, seal_max_age);
         Self::install_boot_metrics(wal.bytes_on_disk());
         Ok(Self {
             catalog,
             wal,
-            node_id,
+            node_id: stream.node_id.to_string(),
             stream,
-            writer_epoch,
+            writer_epoch: stream.writer_epoch.as_i64(),
             admission,
             memory,
             ingest_limits,
-            pressure_config,
+            pressure_config: ScribePressureConfig::new(75, 50, seal_max_age),
             #[cfg(any(test, feature = "test-support"))]
             geometry,
             memory_ownership,
@@ -1605,25 +1607,6 @@ impl ScribeImpl {
     #[cfg(any(test, feature = "test-support"))]
     pub async fn flush_writable_for_test(&self) -> Result<(), ScribeError> {
         self.shards.flush_all().await
-    }
-
-    /// Retire all committed generations through an acknowledged test-only retirement pass.
-    ///
-    /// Production lifecycle scheduling uses `Scribe::check_age` as a
-    /// coalescing best-effort signal. Tests use this control when they need to
-    /// observe the public read path after every eligible committed generation
-    /// has been retired.
-    ///
-    /// Retirement is immediate: all `ImmutableState::Committed` generations across
-    /// every shard are retired on this call with no grace period.
-    ///
-    /// # Errors
-    ///
-    /// Returns the owner error when a shard cannot run the retirement pass,
-    /// including when a shard has stopped.
-    #[cfg(any(test, feature = "test-support"))]
-    pub async fn retire_committed_for_test(&self) -> Result<(), ScribeError> {
-        self.shards.retire_committed_for_test().await
     }
 
     /// Return the bounded persistence queue depth for test-tier drain checks.
@@ -2416,15 +2399,20 @@ impl ScribeImpl {
     /// durable staged members, and the ready members that target and dwell
     /// would still hold publish as residue claims.
     ///
+    /// The flush finishes the lifecycle it started: once the claims are
+    /// published it retires the committed generations, so ownership of their
+    /// Arrow copies is released before it returns rather than on the next age
+    /// tick.
+    ///
     /// Returns the number of claims published, which is zero for a pod with
     /// nothing staged rather than an error.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError`] when a shard cannot flush, or when a residue
-    /// claim cannot be taken, merged, or published. Members that did not
-    /// publish stay durable and staged and the WAL stays authoritative for
-    /// their rows, so the caller may retry.
+    /// Returns [`ScribeError`] when a shard cannot flush, when a residue claim
+    /// cannot be taken, merged, or published, or when a shard cannot run the
+    /// retirement pass. Members that did not publish stay durable and staged
+    /// and the WAL stays authoritative for their rows, so the caller may retry.
     pub async fn flush_staged(&self) -> Result<usize, ScribeError> {
         self.shards.flush_all().await?;
         self.shards.drain().await;
@@ -2436,6 +2424,12 @@ impl ScribeImpl {
             .publish_residue(crate::scribe::assembly::ClaimCause::Drain)
             .await?;
         self.shards.drain().await;
+        // Publication makes the rows readable from parquet; it does not release
+        // the Arrow copy the shard still owns. That release is otherwise driven
+        // by the coalescing age tick, so a flush that stopped here would return
+        // with its own generations still owning immutable memory until an
+        // unrelated timer fired. Retire them on the flush that published them.
+        self.shards.retire_committed().await?;
         Ok(published)
     }
 

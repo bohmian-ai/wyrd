@@ -26,7 +26,8 @@ use crate::scribe::stream_identity::StreamIdentity;
 #[cfg(test)]
 use crate::scribe::wal::WalConfig;
 use crate::scribe::wal::{
-    DecodedSlicePayload, WalLsn, WalReader, WalRecord, WalSegmentRef, decode_slice_payload,
+    DecodedSlicePayload, WalCommitIdentity, WalLsn, WalReader, WalRecord, WalSegmentRef,
+    decode_slice_payload,
 };
 
 const REPLAY_RECORD_OVERHEAD_BYTES: usize = 1024;
@@ -121,9 +122,9 @@ pub(crate) struct ReplayChunkResponse {
 pub struct ReplayedAppendMeta {
     /// Batch ID for dedup.
     pub batch_id: [u8; 16],
-    /// SHA-256 digest of the exact WAL-v4 slice payload.
+    /// SHA-256 digest of the exact WAL-v6 slice payload.
     pub payload_digest: [u8; 32],
-    /// Exact WAL-v4 slice payload length.
+    /// Exact WAL-v6 slice payload length.
     pub payload_len: u32,
     /// Complete committed batch slice count.
     pub slice_count: u32,
@@ -138,7 +139,7 @@ pub struct ReplayedAppendMeta {
 }
 
 /// Replay the WAL directory and reconstruct per-seal-key state from complete
-/// self-describing v4 slice sets.
+/// self-describing v6 slice sets.
 ///
 /// Reads the manifest (if present), scans all segments, skips sealed LSNs,
 /// truncates torn tails, dedupes by `AppendSliceId`, and groups records by
@@ -261,7 +262,7 @@ pub(crate) fn replay_wal_directory_stream_accounted(
                 .ok_or_else(|| ScribeError::Internal {
                     detail: "replay accumulator disappeared at segment boundary".to_owned(),
                 })?;
-            // WAL v4 may roll between a SLICE and its terminal COMMIT. Keep
+            // WAL v6 may roll between a SLICE and its terminal COMMIT. Keep
             // that incomplete batch and its segment refs together, then emit
             // at the first later boundary where no batch crosses the cut.
             if accumulator.pending_batches.is_empty() {
@@ -393,7 +394,7 @@ struct ReplayAccumulator<'a> {
     shard_id: u8,
     /// Per-seal-key manifest watermarks below which records are skipped.
     sealed_lsn_map: HashMap<String, WalLsn>,
-    /// Incomplete v4 batches retained until their terminal COMMIT is read.
+    /// Incomplete v6 batches retained until their terminal COMMIT is read.
     pending_batches: HashMap<[u8; 16], PendingBatch>,
     /// Decode ownership retained exclusively by incomplete slice sets.
     pending_memory: Option<ScribeMemoryLease>,
@@ -482,7 +483,7 @@ impl<'a> ReplayAccumulator<'a> {
         }
         if !record.is_slice() {
             return Err(ScribeError::Internal {
-                detail: "WAL v4 contains an unknown record flag".to_owned(),
+                detail: "WAL v6 contains an unknown record flag".to_owned(),
             });
         }
         if self.validate_pending_slice_header(record)? {
@@ -540,7 +541,7 @@ impl<'a> ReplayAccumulator<'a> {
         let seal_key_path = seal_key.as_path_components();
         if record.tenant_id != *seal_key.tenant.as_uuid().as_bytes() {
             return Err(ScribeError::Internal {
-                detail: "WAL v4 slice tenant does not match its self-describing seal key"
+                detail: "WAL v6 slice tenant does not match its self-describing seal key"
                     .to_owned(),
             });
         }
@@ -550,7 +551,7 @@ impl<'a> ReplayAccumulator<'a> {
             .or_insert_with(|| PendingBatch::new(record.tenant_id, record.slice_count));
         if pending.tenant_id != record.tenant_id || pending.slice_count != record.slice_count {
             return Err(ScribeError::Internal {
-                detail: "WAL v4 batch has contradictory slice-set identity".to_owned(),
+                detail: "WAL v6 batch has contradictory slice-set identity".to_owned(),
             });
         }
         pending.slices.insert(
@@ -581,7 +582,7 @@ impl<'a> ReplayAccumulator<'a> {
         };
         if pending.tenant_id != record.tenant_id || pending.slice_count != record.slice_count {
             return Err(ScribeError::Internal {
-                detail: "WAL v4 batch has contradictory slice-set identity".to_owned(),
+                detail: "WAL v6 batch has contradictory slice-set identity".to_owned(),
             });
         }
         let Some(existing) = pending.slices.get(&record.slice_index) else {
@@ -589,7 +590,7 @@ impl<'a> ReplayAccumulator<'a> {
         };
         if !same_slice_retry_facts(&existing.record, record) {
             return Err(ScribeError::Internal {
-                detail: "WAL v4 batch has a contradictory duplicate slice".to_owned(),
+                detail: "WAL v6 batch has a contradictory duplicate slice".to_owned(),
             });
         }
         Ok(true)
@@ -603,18 +604,20 @@ impl<'a> ReplayAccumulator<'a> {
     /// set, its tenant or digest disagrees with the set, or a slice payload
     /// cannot be decoded into replay state.
     fn commit(&mut self, segment_path: &Path, record: &WalRecord) -> Result<(), ScribeError> {
+        let identity = record.commit_identity()?;
         if let Some(committed) = self
             .committed_batches
             .iter()
             .find(|committed| committed.batch_id == record.batch_id)
         {
-            if !committed.identity.matches(record) {
+            let retained = committed.identity.clone();
+            if !retained.matches_frame(record) || !retained.matches_rows(&identity.logical_digest) {
                 return Err(ScribeError::Internal {
-                    detail: "WAL v4 batch has a contradictory duplicate COMMIT".to_owned(),
+                    detail: "WAL v6 batch has a contradictory duplicate COMMIT".to_owned(),
                 });
             }
             if let Some(pending) = self.pending_batches.remove(&record.batch_id) {
-                validate_pending_batch(&pending, record)?;
+                validate_pending_batch(&pending, record, &identity)?;
                 let bytes = pending.memory_bytes()?;
                 self.pending_memory_bytes = self
                     .pending_memory_bytes
@@ -630,12 +633,13 @@ impl<'a> ReplayAccumulator<'a> {
             .pending_batches
             .remove(&record.batch_id)
             .ok_or_else(|| ScribeError::Internal {
-                detail: "WAL v4 COMMIT has no preceding complete slice set".to_owned(),
+                detail: "WAL v6 COMMIT has no preceding complete slice set".to_owned(),
             })?;
-        validate_pending_batch(&pending, record)?;
+        validate_pending_batch(&pending, record, &identity)?;
         let pending_bytes = pending.memory_bytes()?;
         self.transfer_pending_to_completed(pending_bytes)?;
-        let commit = replayed_commit_identity(segment_path, &pending, record)?;
+        let commit =
+            replayed_commit_identity(segment_path, &pending, identity.logical_digest, record)?;
         for slice in pending.slices.into_values() {
             if self
                 .sealed_lsn_map
@@ -648,7 +652,7 @@ impl<'a> ReplayAccumulator<'a> {
         self.reserve_committed_identity()?;
         self.committed_batches.push(CommittedBatchEntry {
             batch_id: record.batch_id,
-            identity: CommittedBatchIdentity::from_commit(record),
+            identity: CommittedBatchIdentity::from_commit(record, identity.logical_digest),
         });
         Ok(())
     }
@@ -843,7 +847,7 @@ fn replay_record_memory_bytes(record: &WalRecord) -> Result<usize, ScribeError> 
         })
 }
 
-/// A v4 slice set held until its terminal WAL COMMIT proves it complete.
+/// A v6 slice set held until its terminal WAL COMMIT proves it complete.
 #[derive(Debug)]
 struct PendingBatch {
     /// Tenant copied from every slice and checked against the COMMIT header.
@@ -856,17 +860,26 @@ struct PendingBatch {
 
 /// Minimal canonical identity retained after one batch has replayed.
 ///
-/// Replay retains the terminal digest instead of every slice payload. A later
-/// retry must first reproduce a complete slice set whose canonical digest
-/// matches this identity before its duplicate COMMIT is accepted.
-#[derive(Debug)]
+/// Replay retains this identity instead of every slice payload. A later
+/// duplicate COMMIT is accepted only when its frame agrees and the slice set it
+/// closes reproduces the same logical rows, so a batch identity reused for
+/// different rows is still refused while an honest retry of the same rows is
+/// recognized as the batch that already committed.
+#[derive(Clone, Debug)]
 struct CommittedBatchIdentity {
     /// Tenant authenticated by both the slice set and its terminal record.
     tenant_id: [u8; 16],
     /// Number of ordered slices authenticated by the terminal record.
     slice_count: u32,
-    /// Exact canonical digest carried by the terminal record.
-    slice_set_digest: [u8; 32],
+    /// Logical row identity of the batch this terminal record closed.
+    ///
+    /// This is the digest the durable SQL fence stores. It is carried by the
+    /// terminal record itself alongside the WAL digest: the WAL digest binds
+    /// exact frame bytes, and every slice payload embeds its own attempt's
+    /// audit envelope, so a second honest attempt at the same batch
+    /// legitimately carries a different WAL digest. Only the logical identity
+    /// can answer whether two terminal records closed the same rows.
+    logical_digest: [u8; 32],
 }
 
 /// Fixed-layout lookup entry retained for exact retry validation during replay.
@@ -874,7 +887,7 @@ struct CommittedBatchIdentity {
 struct CommittedBatchEntry {
     /// Stable logical batch key within this WAL stream and shard.
     batch_id: [u8; 16],
-    /// Canonical terminal identity authenticated by WAL v4.
+    /// Canonical terminal identity authenticated by WAL v6.
     identity: CommittedBatchIdentity,
 }
 
@@ -883,26 +896,34 @@ impl CommittedBatchIdentity {
     ///
     /// # Panics
     ///
-    /// Panics only if replay calls this after bypassing the v4 decoder's fixed
-    /// 32-byte COMMIT payload invariant.
+    /// Never panics; `logical_digest` is supplied by the caller after decoding
+    /// the terminal record's [`WalCommitIdentity`].
     #[must_use]
-    fn from_commit(record: &WalRecord) -> Self {
-        let mut slice_set_digest = [0_u8; 32];
-        slice_set_digest.copy_from_slice(&record.payload);
+    fn from_commit(record: &WalRecord, logical_digest: [u8; 32]) -> Self {
         Self {
             tenant_id: record.tenant_id,
             slice_count: record.slice_count,
-            slice_set_digest,
+            logical_digest,
         }
     }
 
-    /// Returns whether `record` is the same terminal identity.
+    /// Returns whether `record` is a terminal record framed for this batch.
+    ///
+    /// This checks only what the COMMIT record itself can authenticate: that it
+    /// is a terminal record for the same tenant closing the same cardinality.
+    /// Whether it closed the same rows is [`Self::matches_rows`], because that
+    /// question needs the duplicate's slice set and not just its frame.
     #[must_use]
-    fn matches(&self, record: &WalRecord) -> bool {
+    fn matches_frame(&self, record: &WalRecord) -> bool {
         record.is_commit()
             && self.tenant_id == record.tenant_id
             && self.slice_count == record.slice_count
-            && self.slice_set_digest.as_slice() == record.payload.as_slice()
+    }
+
+    /// Returns whether a duplicate COMMIT closed this batch's same logical rows.
+    #[must_use]
+    fn matches_rows(&self, logical_digest: &[u8; 32]) -> bool {
+        self.logical_digest == *logical_digest
     }
 }
 
@@ -958,7 +979,7 @@ struct PendingSlice {
     seal_key_path: String,
 }
 
-/// Computes the v4 COMMIT digest over one ordered slice set.
+/// Computes the v6 COMMIT `wal_digest` over one ordered slice set.
 ///
 /// The write path and replay both bind the ordinal, exact payload length, and
 /// SHA-256 payload digest, so a reordered or substituted slice cannot be
@@ -982,23 +1003,20 @@ fn slice_set_digest<'a>(slices: impl Iterator<Item = &'a PendingSlice>) -> [u8; 
 ///
 /// # Errors
 ///
-/// Returns [`ScribeError`] when the commit digest, segment sequence, first LSN,
-/// or audit request UUID cannot be reconstructed from validated WAL state.
+/// Returns [`ScribeError`] when the segment sequence, first LSN, or audit
+/// request UUID cannot be reconstructed from validated WAL state.
 fn replayed_commit_identity(
     segment_path: &Path,
     pending: &PendingBatch,
+    slice_set_digest: [u8; 32],
     commit: &WalRecord,
 ) -> Result<ReplayedCommitIdentity, ScribeError> {
-    let mut slice_set_digest = [0_u8; 32];
-    slice_set_digest
-        .as_mut_slice()
-        .copy_from_slice(commit.payload.as_slice());
     let first = pending
         .slices
         .values()
         .next()
         .ok_or_else(|| ScribeError::Internal {
-            detail: "WAL v4 COMMIT has no first slice identity".to_owned(),
+            detail: "WAL v6 COMMIT has no first slice identity".to_owned(),
         })?;
     let event = decode_audit_event(&first.decoded.audit)?;
     let request_id = uuid::Uuid::parse_str(event.request_id.as_str()).map_err(|error| {
@@ -1029,11 +1047,16 @@ fn replayed_commit_identity(
 /// # Errors
 ///
 /// Returns [`ScribeError`] when tenant or cardinality identity disagrees, the
-/// slice ordinals are incomplete, or the canonical payload digest differs.
-fn validate_pending_batch(pending: &PendingBatch, commit: &WalRecord) -> Result<(), ScribeError> {
+/// slice ordinals are incomplete, or the replayed slice frames do not reproduce
+/// the terminal record's `wal_digest`.
+fn validate_pending_batch(
+    pending: &PendingBatch,
+    commit: &WalRecord,
+    identity: &WalCommitIdentity,
+) -> Result<(), ScribeError> {
     if pending.tenant_id != commit.tenant_id || pending.slice_count != commit.slice_count {
         return Err(ScribeError::Internal {
-            detail: "WAL v4 COMMIT identity does not match its slice set".to_owned(),
+            detail: "WAL v6 COMMIT identity does not match its slice set".to_owned(),
         });
     }
     if usize::try_from(pending.slice_count).ok() != Some(pending.slices.len())
@@ -1044,12 +1067,12 @@ fn validate_pending_batch(pending: &PendingBatch, commit: &WalRecord) -> Result<
             .any(|(index, slice_index)| usize::try_from(*slice_index).ok() != Some(index))
     {
         return Err(ScribeError::Internal {
-            detail: "WAL v4 COMMIT closes an incomplete or unordered slice set".to_owned(),
+            detail: "WAL v6 COMMIT closes an incomplete or unordered slice set".to_owned(),
         });
     }
-    if slice_set_digest(pending.slices.values()) != commit.payload.as_slice() {
+    if slice_set_digest(pending.slices.values()) != identity.wal_digest {
         return Err(ScribeError::Internal {
-            detail: "WAL v4 COMMIT digest does not match its slice set".to_owned(),
+            detail: "WAL v6 COMMIT digest does not match its slice set".to_owned(),
         });
     }
     Ok(())
@@ -1434,10 +1457,10 @@ mod tests {
         //
     }
 
-    /// Existing v4 headers, slice/commit identities, and the manifest cursor
+    /// Existing v6 headers, slice/commit identities, and the manifest cursor
     /// reconstruct one stable remaining cohort without a new WAL marker.
     #[test]
-    fn replay_reconstructs_cohort_from_v4_segment_without_new_format() {
+    fn replay_reconstructs_cohort_from_v6_segment_without_new_format() {
         let temp_dir = TempDir::new().expect("temp dir");
         let node_id = NodeId::generate();
         let tenant = crate::test_support::tenant();
@@ -2055,7 +2078,7 @@ mod tests {
         assert!(matches!(
             error,
             ScribeError::Internal { detail }
-                if detail == "WAL v4 batch has a contradictory duplicate COMMIT"
+                if detail == "WAL v6 batch has a contradictory duplicate COMMIT"
         ));
     }
 
@@ -2092,7 +2115,7 @@ mod tests {
         assert!(matches!(
             error,
             ScribeError::Internal { detail }
-                if detail == "WAL v4 batch has a contradictory duplicate slice"
+                if detail == "WAL v6 batch has a contradictory duplicate slice"
         ));
     }
 
@@ -2151,7 +2174,13 @@ mod tests {
             batch_id,
             *seal_key.tenant.as_uuid().as_bytes(),
             2,
-            slice_set_digest.finalize().into(),
+            WalCommitIdentity {
+                wal_digest: slice_set_digest.finalize().into(),
+                logical_digest: fixture_logical_digest(&[
+                    (0, [7_u8; 32], b"first"),
+                    (1, [7_u8; 32], b"second"),
+                ]),
+            },
         );
         touched.extend(
             wal.append_prepared(commit)
@@ -2210,7 +2239,10 @@ mod tests {
             digest.update(0_u32.to_le_bytes());
             digest.update(result.payload_len.to_le_bytes());
             digest.update(result.payload_digest);
-            digests.push(digest.finalize().into());
+            digests.push(WalCommitIdentity {
+                wal_digest: digest.finalize().into(),
+                logical_digest: fixture_logical_digest(&[(0, [3_u8; 32], &payload)]),
+            });
             touched.extend(result.touched_segments);
         }
 
@@ -2231,9 +2263,9 @@ mod tests {
             );
         }
 
-        for (batch_id, digest) in complete_batches.into_iter().zip(digests) {
+        for (batch_id, identity) in complete_batches.into_iter().zip(digests) {
             let mut commit =
-                PreparedWalAppend::commit(batch_id, *tenant.as_uuid().as_bytes(), 1, digest);
+                PreparedWalAppend::commit(batch_id, *tenant.as_uuid().as_bytes(), 1, identity);
             commit.shard_id = Some(shard_id);
             touched.extend(
                 wal.append_prepared(commit)
@@ -2243,6 +2275,25 @@ mod tests {
         }
         WalWriter::sync_segments(&touched).expect("sync writer group");
         complete_batches.len()
+    }
+
+    /// Builds the logical half of a terminal identity for a framing fixture.
+    ///
+    /// WAL framing is indifferent to how the logical identity was derived, so a
+    /// fixture that writes opaque payloads binds them the way the production
+    /// preprocessor binds Arrow rows: one ordinal-scoped entry per slice over a
+    /// digest and length of that slice's data.
+    fn fixture_logical_digest(slices: &[(u32, [u8; 32], &[u8])]) -> [u8; 32] {
+        let mut logical = crate::scribe::preprocess::LogicalBatchDigest::new();
+        for (slice_index, schema_fingerprint, data) in slices {
+            logical.push_slice(
+                *slice_index,
+                schema_fingerprint,
+                &Sha256::digest(data).into(),
+                u32::try_from(data.len()).expect("fixture payload fits u32"),
+            );
+        }
+        logical.finish()
     }
 
     /// Proves production writer ordering emits each committed batch while an

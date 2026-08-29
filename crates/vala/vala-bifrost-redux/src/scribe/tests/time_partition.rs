@@ -1,4 +1,4 @@
-//! One exact-partition contract spanning admission accounting, WAL v5 replay,
+//! One exact-partition contract spanning admission accounting, WAL v6 replay,
 //! and live-tail identity.
 //!
 //! These three seams share one failure mode: if two different physical
@@ -71,7 +71,7 @@ fn batch_with_event_times(micros: Vec<i64>) -> arrow::record_batch::RecordBatch 
     .expect("fixture batch is well formed")
 }
 
-/// Admission accounting, WAL v5 replay, and tail identity agree on exactly one
+/// Admission accounting, WAL v6 replay, and tail identity agree on exactly one
 /// partition per row.
 ///
 /// Covers the per-source ceiling at both its accepted and rejected boundary,
@@ -111,7 +111,7 @@ fn time_partition_wal_tail_exact_once() {
         .expect("the same source is one day at daily granularity");
     assert!(daily.len() < plan.len());
 
-    // Every appended partition survives a WAL v5 round trip with its exact
+    // Every appended partition survives a WAL v6 round trip with its exact
     // identity, and each is replayed exactly once.
     let temp_dir = TempDir::new().expect("temp WAL directory");
     let node_id = NodeId::new(uuid::Uuid::now_v7());

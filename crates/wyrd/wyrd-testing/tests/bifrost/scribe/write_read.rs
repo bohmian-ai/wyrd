@@ -10,51 +10,203 @@ use vala_sdk::query::ValaSdkError;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
 use wyrd_spec::vala::api::{BifrostQueryRequest, QueryTerminalErrorCode, VisibilityMode};
-use wyrd_testing::bifrost::{ScribeCacheMode, ScribeProductionWorkloadV1};
+use wyrd_testing::bifrost::{
+    BifrostClusterSpec, ScribeCacheMode, ScribeProductionWorkloadV1, ScribeWorkloadOperationV1,
+    WyrdTestCluster,
+};
 
 use super::support::{register_table, start_scribe_server, unique_table};
 
-/// AC22 journey owner: a client writes, seals, and reads its own rows back.
+/// AC22 journey owner: the complete client-to-server Scribe contract.
 ///
-/// This is the complete client-to-server path a real caller takes — public
-/// gRPC ingest, the durable seal and publication, and the public query route —
-/// driven by the canonical production workload record rather than a fixture
-/// local to this file, so the cache task and Forge later run these exact bytes.
+/// This is the whole path a real caller takes, in the order a real caller takes
+/// it: public registration, public append with a durable acknowledgment, the
+/// freeze and publication that move those rows between authoritative sources, a
+/// strict public read at each of them, a replayed identical batch that must not
+/// duplicate a row, a pod restart that must recover the same rows under the
+/// same identities, and a terminal drain that must leak no ownership.
 ///
-/// The record is serialized and deserialized before the run so a field that
-/// only exists in this process cannot become part of the contract.
+/// It is driven by the canonical production workload record rather than a
+/// fixture local to this file, and the record is serialized once, hashed, and
+/// re-read from those exact bytes, so a field that only exists in this process
+/// cannot become part of the contract and the bytes Forge and the cache task
+/// later run are provably the bytes this journey ran.
+///
+/// The pod runs inside a one-node cluster because the last two boundaries need
+/// a pod that can be stopped and started again on its retained roots.
 ///
 /// # Panics
 ///
 /// Panics when the record does not survive its wire form, when the run does not
-/// satisfy the record's checkpoints and digest, or when a published object's
-/// promotion record cannot rebuild the Iceberg `DataFile` it claims.
+/// satisfy the record's checkpoints and digest, when a published object's
+/// promotion record cannot rebuild the Iceberg `DataFile` it claims, when a
+/// replayed batch duplicates rows, when a restart does not recover exactly the
+/// acknowledged rows, or when the drained pod still owns Scribe memory.
 #[tokio::test]
 #[ignore = "requires Postgres and object storage"]
 async fn scribe_write_flush_read_user_journey() {
-    let _tmp_guard = wyrd_telemetry::init(wyrd_telemetry::TelemetryConfig {
-        filter: "vala_bifrost_redux=debug,wyrd_server=debug,datafusion=debug".to_owned(),
-        ..wyrd_telemetry::TelemetryConfig::default()
-    });
     let canonical = ScribeProductionWorkloadV1::canonical();
     let bytes = serde_json::to_vec(&canonical).expect("the canonical record serializes");
+    let digest = wyrd_testing::bifrost::scribe_workload_digest(&bytes);
     let workload: ScribeProductionWorkloadV1 =
         serde_json::from_slice(&bytes).expect("the canonical record deserializes");
     assert_eq!(workload, canonical, "the handoff must be lossless");
+    assert_eq!(
+        wyrd_testing::bifrost::scribe_workload_digest(
+            &serde_json::to_vec(&workload).expect("the round-tripped record re-serializes")
+        ),
+        digest,
+        "the record's wire bytes must be stable across the round trip that consumers repeat"
+    );
 
-    let server = start_scribe_server().await;
-    let empty_tenant = server.data_tenant_id();
-    let empty_table = register_table(
-        &server,
-        empty_tenant,
+    let mut cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed())
+        .await
+        .expect("the one-pod mixed cluster starts");
+    let node = {
+        let server = cluster.server(0).expect("the mixed pod is running");
+        assert_empty_table_reads_cleanly(server).await;
+        server.node_id()
+    };
+
+    let run = {
+        let server = cluster.server(0).expect("the mixed pod is running");
+        let run = server
+            .run_scribe_production_workload(&workload, ScribeCacheMode::Disabled)
+            .await
+            .expect("the production workload runs on public routes");
+        run.evidence
+            .assert_matches(&workload, ScribeCacheMode::Disabled)
+            .expect("the run satisfies every normative field of the record");
+
+        let published = run
+            .evidence
+            .checkpoints
+            .last()
+            .expect("the run reached its final checkpoint");
+        let objects: usize = published
+            .published
+            .values()
+            .map(|records| records.len())
+            .sum();
+        assert!(
+            objects > 0,
+            "a sealed journey must publish at least one hot object"
+        );
+        for records in published.published.values() {
+            for record in records {
+                record
+                    .data_file()
+                    .expect("every published record rebuilds its Iceberg data file");
+            }
+        }
+        run
+    };
+
+    // What the caller was acknowledged for, per table, read through the public
+    // route. Every later boundary is compared against exactly this.
+    let mut acknowledged: Vec<(usize, usize, Vec<i64>)> = Vec::new();
+    {
+        let server = cluster.server(0).expect("the mixed pod is running");
+        for (ordinal, binding) in run.bindings.iter().enumerate() {
+            for (table, declared) in workload.tenants[ordinal].tables.iter().enumerate() {
+                let mut rows = read_workload_rows(server, binding.tenant, &declared.fqn()).await;
+                rows.sort_unstable();
+                assert!(
+                    !rows.is_empty(),
+                    "every table in the record must have acknowledged rows to recover"
+                );
+                acknowledged.push((ordinal, table, rows));
+            }
+        }
+    }
+
+    // Replay: the identical batch identities the record already sent must be
+    // acknowledged again and must not add a row.
+    {
+        let server = cluster.server(0).expect("the mixed pod is running");
+        for operation in &workload.operations {
+            if let ScribeWorkloadOperationV1::Append {
+                tenant,
+                table,
+                batch_id,
+                rows,
+            } = operation
+            {
+                let binding = &run.bindings[*tenant];
+                let declared = &workload.tenants[*tenant].tables[*table];
+                server
+                    .append_workload_batch_for_test(
+                        binding.tenant,
+                        &declared.fqn(),
+                        *batch_id,
+                        rows,
+                    )
+                    .await
+                    .expect("a replayed batch identity is acknowledged again");
+            }
+        }
+        server
+            .flush_bifrost()
+            .await
+            .expect("anything the replay staged publishes");
+        assert_rows_unchanged(server, &run, &workload, &acknowledged, "replay").await;
+    }
+
+    // Restart: the same identities recover exactly the same rows.
+    cluster
+        .stop_node(node)
+        .await
+        .expect("the pod shuts down gracefully");
+    cluster
+        .restart_node(node)
+        .await
+        .expect("the pod restarts on its retained roots");
+    {
+        let server = cluster.server(0).expect("the restarted pod is running");
+        assert_rows_unchanged(server, &run, &workload, &acknowledged, "restart").await;
+    }
+
+    // Terminal drain: the pod releases everything it owned.
+    let drained = cluster
+        .shutdown_and_inspect()
+        .await
+        .expect("the pod drains and reports what it still owned");
+    assert!(
+        drained.servers_stopped && drained.listeners_stopped,
+        "a terminal drain must stop every server and listener: {drained:?}"
+    );
+    assert_eq!(
+        drained.scribe_inflight, 0,
+        "a drained pod must hold no admitted append"
+    );
+    assert_eq!(
+        drained.scribe_queued, 0,
+        "a drained pod must hold no queued shard command"
+    );
+    assert_eq!(
+        drained.scribe_wal_streams, 0,
+        "a drained pod must leave no open WAL stream"
+    );
+    assert_eq!(
+        drained.supervised_tasks, 0,
+        "a drained pod must retain no supervised task"
+    );
+}
+
+/// Asserts an unwritten table's strict read reaches a clean empty terminal.
+async fn assert_empty_table_reads_cleanly(server: &wyrd_testing::WyrdTestServer) {
+    let tenant = server.data_tenant_id();
+    let table = register_table(
+        server,
+        tenant,
         BifrostNamespace::Datasets,
         &unique_table("empty_query"),
     )
     .await;
-    let empty_client = tenant_client(&server, empty_tenant).await;
-    let mut empty = vala_sdk::query::QueryClient::new(&empty_client)
+    let client = tenant_client(server, tenant).await;
+    let mut empty = vala_sdk::query::QueryClient::new(&client)
         .query(&BifrostQueryRequest {
-            sql: format!("SELECT value FROM {empty_table}"),
+            sql: format!("SELECT value FROM {table}"),
             visibility: VisibilityMode::Fused,
             freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
             deadline_ms: Some(60_000),
@@ -69,37 +221,41 @@ async fn scribe_write_flush_read_user_journey() {
             .is_none(),
         "empty logical results must not emit zero-row batch frames"
     );
+}
 
-    let evidence = server
-        .run_scribe_production_workload(&workload, ScribeCacheMode::Disabled)
+/// Reads one workload table's `value` column through the public query route.
+async fn read_workload_rows(
+    server: &wyrd_testing::WyrdTestServer,
+    tenant: wyrd_spec::DataTenantId,
+    table_fqn: &str,
+) -> Vec<i64> {
+    server
+        .read_workload_table_for_test(tenant, table_fqn)
         .await
-        .expect("the production workload runs on public routes");
-    evidence
-        .assert_matches(&workload, ScribeCacheMode::Disabled)
-        .expect("the run satisfies every normative field of the record");
+        .expect("the public strict read succeeds")
+}
 
-    let published = evidence
-        .checkpoints
-        .last()
-        .expect("the run reached its final checkpoint");
-    let objects: usize = published
-        .published
-        .values()
-        .map(|records| records.len())
-        .sum();
-    assert!(
-        objects > 0,
-        "a sealed journey must publish at least one hot object"
-    );
-    for records in published.published.values() {
-        for record in records {
-            record
-                .data_file()
-                .expect("every published record rebuilds its Iceberg data file");
-        }
+/// Asserts every workload table still reads back exactly its acknowledged rows.
+///
+/// `boundary` names the transition under test so a failure says which one lost
+/// or duplicated rows rather than only that a comparison failed.
+async fn assert_rows_unchanged(
+    server: &wyrd_testing::WyrdTestServer,
+    run: &wyrd_testing::bifrost::ScribeWorkloadRunV1,
+    workload: &ScribeProductionWorkloadV1,
+    acknowledged: &[(usize, usize, Vec<i64>)],
+    boundary: &str,
+) {
+    for (ordinal, table, expected) in acknowledged {
+        let binding = &run.bindings[*ordinal];
+        let declared = &workload.tenants[*ordinal].tables[*table];
+        let mut observed = read_workload_rows(server, binding.tenant, &declared.fqn()).await;
+        observed.sort_unstable();
+        assert_eq!(
+            &observed, expected,
+            "{boundary} must leave tenant {ordinal} table {table} reading back exactly its acknowledged rows"
+        );
     }
-
-    server.shutdown().await.expect("the server drains cleanly");
 }
 
 /// An undialable ready Scribe peer fails a strict fused read with its typed 503.

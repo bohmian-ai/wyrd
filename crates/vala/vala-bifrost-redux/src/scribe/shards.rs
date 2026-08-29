@@ -669,14 +669,13 @@ pub(crate) enum ShardCommand {
     FlushExpired {
         now: std::time::Instant,
     },
-    /// Retire committed generations and acknowledge completion for test control.
+    /// Retire committed generations and acknowledge completion.
     ///
     /// Retirement is immediate: any `ImmutableState::Committed` generation is
-    /// retired on this pass. The `response` fires after the owner completes the
-    /// retirement and the test-support sweep, so the caller has a deterministic
-    /// observation point.
-    #[cfg(any(test, feature = "test-support"))]
-    RetireCommittedForTest {
+    /// retired on this pass. Unlike [`ShardCommand::FlushExpired`], the
+    /// `response` fires after the owner completes the pass, so a caller that
+    /// must observe settled ownership has a definite boundary to await.
+    RetireCommitted {
         /// Completes after the owner handles the retirement pass.
         response: tokio::sync::oneshot::Sender<Result<(), ScribeError>>,
     },
@@ -1198,11 +1197,13 @@ impl ScribeShardRuntime {
         }
     }
 
-    /// Run one committed-generation retirement pass across every shard for tests.
+    /// Run one committed-generation retirement pass across every shard.
     ///
-    /// Unlike the production coalescing signal, this waits until every owner
-    /// has completed its retirement pass. It lets integration journeys establish
-    /// a deterministic observation point without changing production scheduling.
+    /// Unlike [`ShardSet::request_expired_flush`], which coalesces a
+    /// best-effort age signal, this waits until every owner has completed its
+    /// pass. `Scribe::flush_staged` uses it to release the Arrow copies of the
+    /// generations it just published rather than leaving them owned until the
+    /// next age tick.
     ///
     /// Retirement is immediate: all `ImmutableState::Committed` generations are
     /// retired on this call.
@@ -1211,17 +1212,16 @@ impl ScribeShardRuntime {
     ///
     /// Returns [`ScribeError::IngressClosed`] when an owner has stopped, or an
     /// owner-reported retirement error when one shard cannot process the pass.
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) async fn retire_committed_for_test(&self) -> Result<(), ScribeError> {
+    pub(crate) async fn retire_committed(&self) -> Result<(), ScribeError> {
         for sender in &self.senders {
             let (response, result) = tokio::sync::oneshot::channel();
             sender
                 .sender
-                .send(ShardCommand::RetireCommittedForTest { response })
+                .send(ShardCommand::RetireCommitted { response })
                 .await
                 .map_err(|_| ScribeError::IngressClosed)?;
             result.await.map_err(|_| ScribeError::Internal {
-                detail: "shard dropped test expiry response".to_owned(),
+                detail: "shard dropped retirement response".to_owned(),
             })??;
         }
         Ok(())
@@ -1483,8 +1483,7 @@ impl ShardOwner {
                     tracing::warn!(error = %error, shard = self.id, "committed generation retirement failed");
                 }
             }
-            #[cfg(any(test, feature = "test-support"))]
-            ShardCommand::RetireCommittedForTest { response } => {
+            ShardCommand::RetireCommitted { response } => {
                 let _ = response.send(self.retire_committed().await);
             }
             ShardCommand::FlushAll { response } => {
@@ -3043,6 +3042,30 @@ struct WalSliceState {
     slice_count: u32,
 }
 
+/// The two distinct digests one closed WAL slice set must produce.
+///
+/// A batch commits against two independent authorities that ask different
+/// questions, so it carries two digests rather than one reused value. Deriving
+/// both in one pass keeps them consistent with the same validated slice set.
+struct BatchCommitIdentity {
+    /// Index in `GroupWalState::durable` of the batch's first slice.
+    first_index: usize,
+    /// Validated cardinality of the closed slice set.
+    slice_count: u32,
+    /// Digest over exact WAL payload bytes, carried by the v6 COMMIT record.
+    ///
+    /// This is a WAL integrity fact: it authorizes exactly the slices that were
+    /// fsynced, so a substituted or reordered slice cannot be closed by a valid
+    /// terminal record.
+    wal_digest: [u8; 32],
+    /// Digest over stable logical row identity, stored in the durable SQL fence.
+    ///
+    /// This is a client-visible idempotency fact: it must be reproducible by an
+    /// honest retry of the same batch, so it binds only the rows and their
+    /// schema and never the per-attempt audit envelope or WAL coordinates.
+    logical_digest: [u8; 32],
+}
+
 /// Intermediate state shared by the WAL write, sync, and insert stages.
 struct GroupWalState {
     /// Prepared appends whose ACKs wait for the group result.
@@ -3053,6 +3076,12 @@ struct GroupWalState {
     touched: HashMap<std::path::PathBuf, Arc<crate::scribe::wal::WalSegment>>,
     /// Rows accepted per original append batch.
     rows_by_append: HashMap<[u8; 16], u64>,
+    /// Batch identities the durable fence already committed from another attempt.
+    ///
+    /// Their WAL slices are durable but must never become visible a second
+    /// time, so insertion releases them instead of inserting them and replay
+    /// suppresses them on the same logical-identity rule.
+    spent_batch_ids: HashSet<[u8; 16]>,
 }
 
 /// Owns one WAL/SQL-committed group until every retained batch is query-visible.
@@ -3362,7 +3391,7 @@ impl ShardOwner {
             // Once WAL close begins, retrying as a normal active generation
             // could duplicate cohort ownership. Preserve every durable file
             // and frozen member, fail-stop admission, and let startup replay
-            // reconstruct the sole owner from WAL v4.
+            // reconstruct the sole owner from WAL v6.
             self.memory_ownership.poison();
         }
         result
@@ -3429,20 +3458,27 @@ impl ShardOwner {
                 pending_member_seal_ids.insert(*generation_id);
             }
         }
-        self.rotation_cohorts.push_back(ShardRotationCohort {
-            shard_id: self.id,
-            wal_segments: segment_refs.clone(),
-            pending_member_seal_ids,
-        });
-        let cohort = self
-            .rotation_cohorts
-            .back()
-            .expect("rotation cohort was just inserted");
+        let cohort_member_count = pending_member_seal_ids.len();
+        if pending_member_seal_ids.is_empty() {
+            // Nothing froze and no pending or retained generation reads these
+            // segments, so no member will ever complete a cohort over them. A
+            // cohort installed here would hold the retention reference taken
+            // above forever: the closed bytes would never become deletable and
+            // WAL disk pressure could never clear. Release the reference
+            // instead, which is exactly what a terminal cohort would have done.
+            self.wal_handle.retire_segments(&segment_refs)?;
+        } else {
+            self.rotation_cohorts.push_back(ShardRotationCohort {
+                shard_id: self.id,
+                wal_segments: segment_refs.clone(),
+                pending_member_seal_ids,
+            });
+        }
         tracing::info!(
             shard_id = self.id,
             shard_generation = ?segment_refs.first().map(|segment| &segment.path),
             cohort_id = ?segment_refs.first().map(|segment| &segment.path),
-            cohort_member_count = cohort.pending_member_seal_ids.len(),
+            cohort_member_count,
             terminal = true,
             outcome = "rotated",
             "Scribe shard generation rotation settled"
@@ -3512,7 +3548,7 @@ impl ShardOwner {
     fn batch_commit_identity(
         state: &GroupWalState,
         append: &PreparedAppend,
-    ) -> Result<Option<(usize, u32, [u8; 32])>, ScribeError> {
+    ) -> Result<Option<BatchCommitIdentity>, ScribeError> {
         let batch_id = *append.batch_id.as_bytes();
         let Some(first_index) = state
             .durable
@@ -3545,7 +3581,8 @@ impl ShardOwner {
                 detail: "cannot commit an incomplete or unordered WAL slice set".to_owned(),
             });
         }
-        let mut digest = Sha256::new();
+        let mut wal_digest = Sha256::new();
+        let mut logical = crate::scribe::preprocess::LogicalBatchDigest::new();
         for slice_index in 0..slice_count {
             let slice = state
                 .durable
@@ -3559,14 +3596,25 @@ impl ShardOwner {
                     detail: "cannot commit an incomplete or unordered WAL slice set".to_owned(),
                 });
             }
-            digest.update(slice.slice_index.to_le_bytes());
-            digest.update(slice.payload_len.to_le_bytes());
-            digest.update(slice.payload_digest);
+            wal_digest.update(slice.slice_index.to_le_bytes());
+            wal_digest.update(slice.payload_len.to_le_bytes());
+            wal_digest.update(slice.payload_digest);
+            logical.push_slice(
+                slice.slice_index,
+                &slice.schema_fingerprint,
+                &slice.data_digest,
+                slice.data_len,
+            );
         }
-        Ok(Some((first_index, slice_count, digest.finalize().into())))
+        Ok(Some(BatchCommitIdentity {
+            first_index,
+            slice_count,
+            wal_digest: wal_digest.finalize().into(),
+            logical_digest: logical.finish(),
+        }))
     }
 
-    /// Appends and fsyncs one v4 COMMIT record for every complete batch in a group.
+    /// Appends and fsyncs one v6 COMMIT record for every complete batch in a group.
     ///
     /// Each batch's SLICE records were fsynced before this method starts. The
     /// terminal COMMIT therefore closes only a complete ordered slice set; no
@@ -3581,8 +3629,12 @@ impl ShardOwner {
         state: &mut GroupWalState,
     ) -> Result<(), ScribeError> {
         for append in &state.prepared {
-            let Some((first_index, slice_count, digest)) =
-                Self::batch_commit_identity(state, append)?
+            let Some(BatchCommitIdentity {
+                first_index,
+                slice_count,
+                wal_digest,
+                logical_digest,
+            }) = Self::batch_commit_identity(state, append)?
             else {
                 continue;
             };
@@ -3594,7 +3646,10 @@ impl ShardOwner {
                         *append.batch_id.as_bytes(),
                         *append.tenant.as_uuid().as_bytes(),
                         slice_count,
-                        digest,
+                        crate::scribe::wal::WalCommitIdentity {
+                            wal_digest,
+                            logical_digest,
+                        },
                     ),
                 })
                 .await?
@@ -3607,7 +3662,7 @@ impl ShardOwner {
                 .touched_segments
                 .first()
                 .ok_or_else(|| ScribeError::Internal {
-                    detail: "WAL v4 batch commit did not retain its segment identity".to_owned(),
+                    detail: "WAL v6 batch commit did not retain its segment identity".to_owned(),
                 })?;
             let header = segment.header().clone();
             let commit_lsn = result.lsn;
@@ -3628,9 +3683,9 @@ impl ShardOwner {
                     tenant: append.tenant,
                     logical_table_fqn: append.table.fqn(),
                     batch_id: append.batch_id,
-                    slice_set_digest: digest,
+                    slice_set_digest: logical_digest,
                     slice_count: i32::try_from(slice_count).map_err(|_| ScribeError::Internal {
-                        detail: "WAL v4 slice count exceeds SQL integer range".to_owned(),
+                        detail: "WAL v6 slice count exceeds SQL integer range".to_owned(),
                     })?,
                     wal_node_id: uuid::Uuid::from_bytes(header.node_id),
                     wal_writer_epoch: header.writer_epoch,
@@ -3652,12 +3707,22 @@ impl ShardOwner {
                     })?,
                     request_id,
                 };
-                self.commit_batch_control_fence(
-                    postgres,
-                    &commit,
-                    &state.durable[first_index].audit_event,
-                )
-                .await?;
+                if self
+                    .commit_batch_control_fence(
+                        postgres,
+                        &commit,
+                        &state.durable[first_index].audit_event,
+                    )
+                    .await?
+                {
+                    tracing::info!(
+                        tenant = %append.tenant,
+                        table = %append.table.fqn(),
+                        batch_id = %append.batch_id,
+                        "Scribe batch identity already committed; suppressing a second insertion"
+                    );
+                    state.spent_batch_ids.insert(*append.batch_id.as_bytes());
+                }
             }
         }
         Ok(())
@@ -3682,12 +3747,17 @@ impl ShardOwner {
         postgres: &vala_sql::ValaPostgres,
         commit: &vala_sql::queries::scribe_batch_commits::ScribeBatchCommit,
         audit_event: &wyrd_spec::vala::api::AuditEvent,
-    ) -> Result<(), ScribeError> {
+    ) -> Result<bool, ScribeError> {
         loop {
             let mut conn = postgres.tenant_conn(commit.tenant).await?;
-            vala_sql::queries::scribe_batch_commits::record(&mut conn, commit, audit_event).await?;
+            let recorded =
+                vala_sql::queries::scribe_batch_commits::record(&mut conn, commit, audit_event)
+                    .await?;
             if conn.commit().await.is_ok() {
-                return Ok(());
+                return Ok(matches!(
+                    recorded,
+                    vala_sql::queries::scribe_batch_commits::ScribeBatchCommitResolution::AlreadyCommitted
+                ));
             }
 
             let mut reconciliation = match postgres.tenant_conn(commit.tenant).await {
@@ -3703,7 +3773,12 @@ impl ShardOwner {
                 Ok(
                     vala_sql::queries::scribe_batch_commits::ScribeBatchCommitResolution::Committed,
                 ) => {
-                    return Ok(());
+                    return Ok(false);
+                }
+                Ok(
+                    vala_sql::queries::scribe_batch_commits::ScribeBatchCommitResolution::AlreadyCommitted,
+                ) => {
+                    return Ok(true);
                 }
                 Ok(
                     vala_sql::queries::scribe_batch_commits::ScribeBatchCommitResolution::Absent,
@@ -3821,6 +3896,7 @@ impl ShardOwner {
             durable,
             touched,
             rows_by_append,
+            spent_batch_ids: HashSet::new(),
         })
     }
 
@@ -4064,9 +4140,50 @@ impl ShardOwner {
         let mut touched_keys = HashSet::new();
         while !state.durable.is_empty() {
             let slice = state.durable.remove(0);
+            if state.spent_batch_ids.contains(&slice.batch_id) {
+                self.discard_already_committed_slice(slice, &mut state.rows_by_append)?;
+                continue;
+            }
             self.insert_committed_slice(slice, &mut state.rows_by_append, &mut touched_keys)?;
         }
         Ok(touched_keys)
+    }
+
+    /// Settles one slice whose batch identity the durable fence already spent.
+    ///
+    /// The rows are dropped rather than inserted: the identical batch is
+    /// already query-visible from its first commit, so inserting them would
+    /// publish the same rows twice under one batch identity. Everything else
+    /// the insertion path settles still has to happen — the active reservation
+    /// this slice holds is released, its retry index entry is cleared, and its
+    /// row count is reported so the caller's ACK still describes the batch it
+    /// sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when the slice lost its rows before settlement
+    /// or when releasing its active admission and memory ownership fails.
+    fn discard_already_committed_slice(
+        &mut self,
+        mut slice: DurableSlice,
+        rows_by_append: &mut HashMap<[u8; 16], u64>,
+    ) -> Result<(), ScribeError> {
+        let rows = slice.rows.take().ok_or_else(|| ScribeError::Internal {
+            detail: "durable slice rows were lost before duplicate settlement".to_owned(),
+        })?;
+        let row_count = rows.num_rows();
+        drop(rows);
+        if slice.active_reserved {
+            self.release_active_ownership(slice.memtable_bytes, true)?;
+        }
+        self.synced_not_inserted.remove(&AppendSliceId {
+            batch_id: uuid::Uuid::from_bytes(slice.batch_id),
+            seal_key: slice.seal_key,
+            slice_index: slice.slice_index,
+        });
+        let entry = rows_by_append.entry(slice.batch_id).or_default();
+        *entry = entry.saturating_add(u64::try_from(row_count).unwrap_or(u64::MAX));
+        Ok(())
     }
 
     /// Inserts one post-fence slice and transfers its active owner to memtable.
@@ -6301,11 +6418,7 @@ mod tests {
     fn insert_group_pre_seals_full_bucket() {
         let key = owner_key();
         let first = owner_batch();
-        let rotation_bytes = first
-            .columns()
-            .iter()
-            .map(|column| column.get_array_memory_size())
-            .sum();
+        let rotation_bytes = crate::scribe::memory::retained_arrow_bytes(&first);
         let memtable = Memtable::new_with_rotation(rotation_bytes);
         memtable
             .insert(&key, owner_event(), owner_meta(&key), first)
@@ -7044,7 +7157,7 @@ mod tests {
         );
         let (retire_response, retire_result) = tokio::sync::oneshot::channel();
         command_tx
-            .send(ShardCommand::RetireCommittedForTest {
+            .send(ShardCommand::RetireCommitted {
                 response: retire_response,
             })
             .await
@@ -7785,7 +7898,7 @@ mod tests {
         owner.arm_retirement_release_fault_for_test();
         let (response, result) = tokio::sync::oneshot::channel();
         owner
-            .handle_command(ShardCommand::RetireCommittedForTest { response })
+            .handle_command(ShardCommand::RetireCommitted { response })
             .await;
         assert!(result.await.expect("test retirement response").is_err());
         assert!(owner.retained_generations.contains_key(&generation_id));

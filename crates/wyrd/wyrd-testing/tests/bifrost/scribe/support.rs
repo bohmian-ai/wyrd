@@ -13,12 +13,37 @@ use wyrd_testing::WyrdTestServer;
 
 use arrow::datatypes::{DataType, Field};
 
+/// Installs the production-shaped telemetry pipeline once for this binary.
+///
+/// Every case in this suite drives real shard, staging and publication owners
+/// whose settlement decisions are only observable through their emitted spans
+/// and events. Without a subscriber those tests run blind: a failure reports
+/// the assertion and nothing about the lifecycle that produced it. The
+/// subscriber is global and installs at most once per process, so the guard is
+/// retained for the life of the binary and every server started here shares it.
+fn shared_telemetry() -> Option<std::sync::Arc<wyrd_telemetry::TelemetryGuard>> {
+    static TELEMETRY: std::sync::OnceLock<Option<std::sync::Arc<wyrd_telemetry::TelemetryGuard>>> =
+        std::sync::OnceLock::new();
+    TELEMETRY
+        .get_or_init(|| {
+            wyrd_telemetry::init_test_capture(wyrd_telemetry::TelemetryConfig::default())
+                .ok()
+                .map(|(guard, _capture)| std::sync::Arc::new(guard))
+        })
+        .clone()
+}
+
 /// Starts one bound production server with the default Scribe geometry.
 ///
 /// Bound rather than in-process because every Scribe case here drives public
 /// gRPC ingest and the public query route, which need real endpoints.
 pub(super) async fn start_scribe_server() -> WyrdTestServer {
-    WyrdTestServer::start_bound()
+    let mut builder = WyrdTestServer::builder();
+    if let Some(telemetry) = shared_telemetry() {
+        builder = builder.with_telemetry_for_test(telemetry);
+    }
+    builder
+        .start_bound()
         .await
         .expect("the Scribe production harness starts")
 }
@@ -30,8 +55,11 @@ pub(super) async fn start_scribe_server() -> WyrdTestServer {
 /// production-sized data, while every other control stays exactly what
 /// production uses.
 pub(super) async fn start_scribe_server_with_geometry(geometry: ScribeGeometry) -> WyrdTestServer {
-    WyrdTestServer::builder()
-        .with_scribe_geometry_for_test(geometry)
+    let mut builder = WyrdTestServer::builder().with_scribe_geometry_for_test(geometry);
+    if let Some(telemetry) = shared_telemetry() {
+        builder = builder.with_telemetry_for_test(telemetry);
+    }
+    builder
         .start_bound()
         .await
         .expect("the Scribe production harness starts with the requested geometry")

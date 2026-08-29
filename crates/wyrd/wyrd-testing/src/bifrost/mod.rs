@@ -50,8 +50,9 @@ pub use scribe_workload::{
     SCRIBE_PRODUCTION_WORKLOAD_VERSION, ScribeCacheMode, ScribeCheckpointNameV1,
     ScribeGeometryRecipeV1, ScribeLifecycleCheckpointV1, ScribeProductionEvidenceV1,
     ScribeProductionWorkloadV1, ScribePublishedHotFileV1, ScribeWorkloadError,
-    ScribeWorkloadOperationV1, ScribeWorkloadTableKindV1, ScribeWorkloadTableV1,
-    ScribeWorkloadTenantBinding, ScribeWorkloadTenantV1,
+    ScribeWorkloadOperationV1, ScribeWorkloadRunV1, ScribeWorkloadTableKindV1,
+    ScribeWorkloadTableV1, ScribeWorkloadTenantBinding, ScribeWorkloadTenantV1,
+    scribe_workload_digest,
 };
 pub use telemetry::{
     BifrostQueryTelemetryReport, BifrostTelemetryCapture, BifrostTelemetryCheckpoint,

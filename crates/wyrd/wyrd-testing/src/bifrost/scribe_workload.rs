@@ -456,6 +456,18 @@ fn deterministic_batch_id(seed: u64, ordinal: u64) -> Uuid {
 /// Sorting first is what makes the digest an identity of the *set* of rows: a
 /// run may legitimately return them in a different physical order across
 /// artifacts, and that must not read as data loss.
+/// Returns the SHA-256 of one serialized workload record, lowercase hex.
+///
+/// The record's wire bytes are the handoff to every other consumer, so a
+/// journey records this digest to say exactly which bytes it ran rather than
+/// only that some canonical record existed.
+#[must_use]
+pub fn scribe_workload_digest(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
 fn row_digest(rows: &mut [(usize, usize, i64)]) -> String {
     rows.sort_unstable();
     let mut hasher = Sha256::new();
@@ -704,6 +716,20 @@ pub struct ScribeWorkloadTenantBinding {
     pub slug: String,
 }
 
+/// One executed workload: its evidence and the identities it ran against.
+///
+/// The bindings are returned rather than discarded because a journey that ends
+/// at the last checkpoint has not proved recovery. Restart, replay, and drain
+/// all have to address the same tenants and tables the run used, and a caller
+/// cannot reconstruct the seeded tenant ids from the record alone.
+#[derive(Debug)]
+pub struct ScribeWorkloadRunV1 {
+    /// Observed evidence the comparator checks against the record.
+    pub evidence: ScribeProductionEvidenceV1,
+    /// Tenants seeded for the run, in the record's declared order.
+    pub bindings: Vec<ScribeWorkloadTenantBinding>,
+}
+
 /// Runs the canonical workload against one live server through public routes.
 impl crate::WyrdTestServer {
     /// Executes one canonical Scribe production workload and returns its evidence.
@@ -733,7 +759,7 @@ impl crate::WyrdTestServer {
         &self,
         workload: &ScribeProductionWorkloadV1,
         cache_mode: ScribeCacheMode,
-    ) -> Result<ScribeProductionEvidenceV1, crate::WyrdTestServerError> {
+    ) -> Result<ScribeWorkloadRunV1, crate::WyrdTestServerError> {
         workload
             .validate()
             .map_err(|error| crate::WyrdTestServerError::Start(error.to_string()))?;
@@ -786,8 +812,13 @@ impl crate::WyrdTestServer {
                 } => {
                     let binding = binding_at(&bindings, *tenant)?;
                     let declared = table_at(workload, *tenant, *table)?;
-                    self.append_workload_batch(binding.tenant, &declared.fqn(), *batch_id, rows)
-                        .await?;
+                    self.append_workload_batch_for_test(
+                        binding.tenant,
+                        &declared.fqn(),
+                        *batch_id,
+                        rows,
+                    )
+                    .await?;
                     acknowledged += rows.len() as u64;
                 }
                 ScribeWorkloadOperationV1::Flush { tenant } => {
@@ -798,7 +829,7 @@ impl crate::WyrdTestServer {
                     let binding = binding_at(&bindings, *tenant)?;
                     let declared = table_at(workload, *tenant, *table)?;
                     for value in self
-                        .read_workload_table(binding.tenant, &declared.fqn())
+                        .read_workload_table_for_test(binding.tenant, &declared.fqn())
                         .await?
                     {
                         read_since_checkpoint.push((*tenant, *table, value));
@@ -840,10 +871,13 @@ impl crate::WyrdTestServer {
             }
         }
 
-        Ok(ScribeProductionEvidenceV1 {
-            version: workload.version,
-            cache_mode,
-            checkpoints,
+        Ok(ScribeWorkloadRunV1 {
+            evidence: ScribeProductionEvidenceV1 {
+                version: workload.version,
+                cache_mode,
+                checkpoints,
+            },
+            bindings,
         })
     }
 
@@ -853,7 +887,7 @@ impl crate::WyrdTestServer {
     ///
     /// Returns an error when the tenant credential, Arrow IPC encoding, client
     /// construction, or the public insert fails.
-    async fn append_workload_batch(
+    pub async fn append_workload_batch_for_test(
         &self,
         tenant: DataTenantId,
         table_fqn: &str,
@@ -893,7 +927,7 @@ impl crate::WyrdTestServer {
     ///
     /// Returns an error when the tenant credential, query start, or batch
     /// streaming fails, or when the returned column is not the declared type.
-    async fn read_workload_table(
+    pub async fn read_workload_table_for_test(
         &self,
         tenant: DataTenantId,
         table_fqn: &str,

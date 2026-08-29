@@ -30,7 +30,15 @@ pub const MAX_ROW_GROUP_ROWS: usize = 131_072;
 /// leaves a wide margin above that for indivisible overshoot and for compression
 /// putting physical bytes well under the logical estimate. It is deliberately not
 /// an object-size promise: the object target lives in Scribe's staging geometry.
-pub const MAX_FOOTER_ROW_GROUPS: usize = 1_024;
+///
+/// The upper bound is set by decode, not by margin. A ceiling only means
+/// something if the widest footer it admits can actually be read inside the
+/// workspace reserved for reading it, so this value is the largest group count
+/// whose worst case — this many groups of [`MAX_FILE_LEAF_COLUMNS`] leaf columns
+/// — decodes within [`FOOTER_DECODE_WORKSPACE_BYTES`]. A higher ceiling would
+/// admit objects the reservation cannot decode, which is a read failure on an
+/// object Bifrost itself sealed.
+pub const MAX_FOOTER_ROW_GROUPS: usize = 512;
 /// Maximum normalized leaf columns represented by one physical object.
 pub const MAX_FILE_LEAF_COLUMNS: usize = 64;
 /// Maximum Parquet schema nodes, including nested group nodes.
@@ -1496,6 +1504,22 @@ mod tests {
         leaf_columns: usize,
         row_groups: usize,
     ) -> (tempfile::TempDir, parquet::file::metadata::ParquetMetaData) {
+        let (directory, path, _footer) = structural_footer_file(leaf_columns, row_groups);
+        let reader =
+            SerializedFileReader::new(std::fs::File::open(path).expect("open structural file"))
+                .expect("standard structural decoder");
+        (directory, reader.metadata().clone())
+    }
+
+    /// Writes one real writer-v2 object of the requested structural shape.
+    ///
+    /// Returns the owning directory, the object path, and the exact encoded
+    /// footer bytes, so a caller can preflight the footer, measure its
+    /// allowance, and decode the same file without writing it twice.
+    fn structural_footer_file(
+        leaf_columns: usize,
+        row_groups: usize,
+    ) -> (tempfile::TempDir, std::path::PathBuf, Vec<u8>) {
         let schema = Arc::new(Schema::new(
             (0..leaf_columns)
                 .map(|index| Field::new(format!("c{index}"), DataType::Int64, false))
@@ -1527,40 +1551,7 @@ mod tests {
             writer.flush().expect("flush structural row group");
         }
         writer.close().expect("structural close");
-        let reader =
-            SerializedFileReader::new(std::fs::File::open(path).expect("open structural file"))
-                .expect("standard structural decoder");
-        (directory, reader.metadata().clone())
-    }
-
-    /// Writes a real Parquet footer with caller-selected synthetic metadata.
-    fn synthetic_metadata_footer(
-        key_count: usize,
-    ) -> (tempfile::TempDir, std::path::PathBuf, Vec<u8>) {
-        let directory = tempfile::tempdir().expect("synthetic footer directory");
-        let path = directory.path().join("synthetic.parquet");
-        let batch = batch(vec!["value".to_owned()]);
-        let metadata = (0..key_count)
-            .map(|index| KeyValue {
-                key: format!("synthetic-{index:04}"),
-                value: Some("v".to_owned()),
-            })
-            .collect();
-        let mut writer = ArrowWriter::try_new(
-            std::fs::File::create(&path).expect("synthetic footer file"),
-            batch.schema(),
-            Some(
-                crate::parquet::writer_properties::bifrost_writer_properties_with_metadata(
-                    batch.num_rows(),
-                    metadata,
-                    &[],
-                ),
-            ),
-        )
-        .expect("synthetic footer writer");
-        writer.write(&batch).expect("synthetic footer row group");
-        writer.close().expect("synthetic footer close");
-        let file = std::fs::read(&path).expect("read synthetic test file");
+        let file = std::fs::read(&path).expect("read structural test file");
         let trailer = file
             .get(file.len().saturating_sub(8)..)
             .expect("Parquet trailer");
@@ -1572,7 +1563,8 @@ mod tests {
             .len()
             .checked_sub(8 + footer_len)
             .expect("footer lies inside test file");
-        (directory, path, file[footer_start..file.len() - 8].to_vec())
+        let footer = file[footer_start..file.len() - 8].to_vec();
+        (directory, path, footer)
     }
 
     /// Structural preflight bounds decode work without capping object row groups.
@@ -1622,34 +1614,43 @@ mod tests {
             "the chunk ceiling still refuses"
         );
         assert!(validate_structural_counts(4, 64, 129, 256, 390).is_err());
-        assert!(validate_structural_counts(4, 64, 65, 256, 4_097).is_err());
+        assert!(
+            validate_structural_counts(
+                4,
+                64,
+                65,
+                256,
+                crate::parquet::footer_preflight::MAX_FOOTER_STRUCTURAL_ELEMENTS + 1
+            )
+            .is_err(),
+            "the aggregate structural ceiling still refuses"
+        );
     }
 
-    /// The largest real footer admitted by preflight decodes inside 32 MiB.
+    /// The widest object writer-v2 can seal decodes inside its reserved budget.
+    ///
+    /// The structural ceiling exists to bound footer decode work, and the only
+    /// footers Bifrost has to decode are the ones its own writer produced. The
+    /// widest of those is [`MAX_FOOTER_ROW_GROUPS`] row groups of
+    /// [`MAX_FILE_LEAF_COLUMNS`] leaf columns, so that shape — not a synthetic
+    /// key/value footer — is what preflight must admit, what the 8 MiB encoded
+    /// allowance must hold, and what the standard decoder must read inside the
+    /// 32 MiB workspace. A ceiling that refused it would refuse an object the
+    /// writer is required to be able to produce.
     #[test]
-    fn bifrost_maximum_synthetic_footer_uses_bounded_standard_decoder() {
-        let mut low = 0_usize;
-        let mut high = crate::parquet::footer_preflight::MAX_FOOTER_STRUCTURAL_ELEMENTS;
-        while low < high {
-            let middle = low + (high - low).div_ceil(2);
-            let (_directory, _path, footer) = synthetic_metadata_footer(middle);
-            if crate::parquet::footer_preflight::preflight_compact_thrift(&footer).is_ok() {
-                low = middle;
-            } else {
-                high = middle - 1;
-            }
-        }
-        let (_directory, path, footer) = synthetic_metadata_footer(low);
+    fn bifrost_widest_writer_v2_footer_uses_bounded_standard_decoder() {
+        let (_directory, path, footer) =
+            structural_footer_file(MAX_FILE_LEAF_COLUMNS, MAX_FOOTER_ROW_GROUPS);
         let elements =
             crate::parquet::footer_preflight::compact_thrift_structural_elements(&footer)
-                .expect("maximum accepted real footer");
-        let (_rejected_directory, _rejected_path, rejected) = synthetic_metadata_footer(low + 1);
-        assert!(crate::parquet::footer_preflight::preflight_compact_thrift(&rejected).is_err());
-        assert_eq!(
-            elements,
-            crate::parquet::footer_preflight::MAX_FOOTER_STRUCTURAL_ELEMENTS,
-            "maximum accepted real footer reaches the exact structural ceiling"
+                .expect("the widest writer-v2 footer passes structural preflight");
+        assert!(
+            elements <= crate::parquet::footer_preflight::MAX_FOOTER_STRUCTURAL_ELEMENTS,
+            "the structural ceiling must admit the widest writer-v2 footer: {elements} declared"
         );
+        validate_encoded_footer_bytes(u64::try_from(footer.len()).expect("footer length fits u64"))
+            .expect("the widest writer-v2 footer fits its 8 MiB allowance");
+
         let control_peak = isolated_decoder_peak(&path, "control");
         let decode_process_peak = isolated_decoder_peak(&path, "decode");
         // Guard the subtraction before trusting it. The two peaks come from
@@ -1670,10 +1671,9 @@ mod tests {
                     .expect("workspace fits address space"),
             "standard decoder peak {decoder_peak} exceeds the 32 MiB workspace"
         );
-        let reader = SerializedFileReader::new(
-            std::fs::File::open(path).expect("open maximum accepted footer"),
-        )
-        .expect("standard decoder accepts maximum preflighted footer");
+        let reader =
+            SerializedFileReader::new(std::fs::File::open(path).expect("open the widest footer"))
+                .expect("standard decoder accepts the widest writer-v2 footer");
         assert!(
             reader.metadata().memory_size()
                 <= usize::try_from(FOOTER_DECODE_WORKSPACE_BYTES)

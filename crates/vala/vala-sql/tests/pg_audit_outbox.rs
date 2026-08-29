@@ -192,9 +192,13 @@ mod pg_tests {
             let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
                 .await
                 .expect("tenant connection");
-            vala_sql::queries::scribe_batch_commits::record(&mut conn, &canonical, &audit)
-                .await
-                .expect("canonical fence");
+            assert_eq!(
+                vala_sql::queries::scribe_batch_commits::record(&mut conn, &canonical, &audit)
+                    .await
+                    .expect("canonical fence"),
+                vala_sql::queries::scribe_batch_commits::ScribeBatchCommitResolution::Committed,
+                "a first observation of a batch identity commits it"
+            );
             conn.commit().await.expect("commit canonical fence");
 
             let retry = vala_sql::queries::scribe_batch_commits::ScribeBatchCommit {
@@ -213,6 +217,24 @@ mod pg_tests {
                     .expect("exact retry resolution"),
                 vala_sql::queries::scribe_batch_commits::ScribeBatchReplayResolution::Suppress
             );
+            // A client re-sending the same rows under a fresh request lands on
+            // new WAL coordinates and a new correlation id. That is the same
+            // batch, so it must be acknowledged as already committed rather
+            // than refused as a contradiction, and it must not audit twice.
+            let resend_audit = event("bifrost.append");
+            let resend = vala_sql::queries::scribe_batch_commits::ScribeBatchCommit {
+                request_id: Uuid::parse_str(resend_audit.request_id.as_str())
+                    .expect("re-sent request UUID"),
+                ..retry.clone()
+            };
+            assert_eq!(
+                vala_sql::queries::scribe_batch_commits::record(&mut conn, &resend, &resend_audit)
+                    .await
+                    .expect("re-sent identical batch resolves"),
+                vala_sql::queries::scribe_batch_commits::ScribeBatchCommitResolution::AlreadyCommitted,
+                "the same rows from a later attempt are already committed, not contradictory"
+            );
+
             let contradiction = vala_sql::queries::scribe_batch_commits::ScribeBatchCommit {
                 slice_set_digest: [8; 32],
                 ..retry

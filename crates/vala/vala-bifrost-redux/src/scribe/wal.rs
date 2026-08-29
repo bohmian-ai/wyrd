@@ -1,6 +1,6 @@
 //! Write-Ahead Log (WAL) for Scribe — crash-consistent framed records.
 //!
-//! Every prepared partition slice emits one self-describing v5 `SLICE` record.
+//! Every prepared partition slice emits one self-describing v6 `SLICE` record.
 //! After
 //! all ordered slices are durable, one `COMMIT` record authenticates their
 //! complete digest before replay may restore any of them.
@@ -155,16 +155,93 @@ pub struct SegmentHeader {
 
 const WAL_MAGIC: u32 = 0x5741_5257; // "WRAW"
 /// The only persisted WAL version accepted by this Scribe.
-const WAL_VERSION: u16 = 5;
+const WAL_VERSION: u16 = 6;
 const SEGMENT_HEADER_SIZE: usize = 64;
 #[cfg(test)]
 const APPEND_FRAME_MAGIC_V3: [u8; 4] = *b"SWF3";
-/// Fixed byte length of every v4 record header before its payload and CRC.
+/// Fixed byte length of every v6 record header before its payload and CRC.
 const RECORD_HEADER_SIZE: usize = 72;
-/// `u16` wire encoding of the immutable v4 record-header length.
+/// `u16` wire encoding of the immutable v6 record-header length.
 const RECORD_HEADER_SIZE_U16: u16 = 72;
-/// Exact v4 record magic.
-const RECORD_MAGIC: [u8; 8] = *b"WYRDWAL5";
+/// Exact v6 record magic.
+const RECORD_MAGIC: [u8; 8] = *b"WYRDWAL6";
+/// Exact magic prefixing every v6 COMMIT payload.
+const COMMIT_PAYLOAD_MAGIC: [u8; 4] = *b"S6CM";
+/// Exact encoded width of a v6 COMMIT payload.
+///
+/// The layout is fixed and total: magic, WAL digest, logical digest. A COMMIT
+/// record whose declared payload is any other length is refused rather than
+/// interpreted, so a record written by a different format can never be read as
+/// a truncated or extended identity.
+const COMMIT_PAYLOAD_BYTES: usize = COMMIT_PAYLOAD_MAGIC.len() + 32 + 32;
+
+/// Complete batch identity carried by one terminal v6 COMMIT record.
+///
+/// A batch has two distinct identities and the terminal record persists both,
+/// because each answers a question the other cannot.
+///
+/// `wal_digest` binds the exact ordered WAL slice frames this attempt wrote. It
+/// is what proves a replayed slice set is the one the commit closed, and it is
+/// deliberately attempt-specific: every slice payload embeds that attempt's
+/// audit envelope, so an honest client retry of the same rows produces a
+/// different `wal_digest`.
+///
+/// `logical_digest` identifies the rows independently of that envelope. It is
+/// the value the durable SQL fence stores, so replay must present it verbatim
+/// rather than derive something else. Persisting it here is what removes the
+/// need for recovery to decode Arrow payloads purely to reconstruct a
+/// deduplication key: the live path computes it once, during preprocessing, and
+/// replay reads the same durable field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalCommitIdentity {
+    /// SHA-256 over this attempt's ordered slice frames.
+    pub wal_digest: [u8; 32],
+    /// SHA-256 over the batch's attempt-independent logical row identity.
+    pub logical_digest: [u8; 32],
+}
+
+impl WalCommitIdentity {
+    /// Encodes the fixed-width COMMIT payload.
+    #[must_use]
+    pub fn encode(&self) -> [u8; COMMIT_PAYLOAD_BYTES] {
+        let mut encoded = [0_u8; COMMIT_PAYLOAD_BYTES];
+        encoded[0..4].copy_from_slice(&COMMIT_PAYLOAD_MAGIC);
+        encoded[4..36].copy_from_slice(&self.wal_digest);
+        encoded[36..68].copy_from_slice(&self.logical_digest);
+        encoded
+    }
+
+    /// Decodes one terminal COMMIT payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the payload is not exactly
+    /// [`COMMIT_PAYLOAD_BYTES`] long or does not carry the v6 COMMIT magic.
+    pub fn decode(payload: &[u8]) -> Result<Self, ScribeError> {
+        if payload.len() != COMMIT_PAYLOAD_BYTES {
+            return Err(ScribeError::Internal {
+                detail: format!(
+                    "WAL v6 COMMIT payload is {} bytes, expected {COMMIT_PAYLOAD_BYTES}",
+                    payload.len()
+                ),
+            });
+        }
+        if payload[0..4] != COMMIT_PAYLOAD_MAGIC {
+            return Err(ScribeError::Internal {
+                detail: "WAL v6 COMMIT payload magic mismatch".to_owned(),
+            });
+        }
+        let mut wal_digest = [0_u8; 32];
+        wal_digest.copy_from_slice(&payload[4..36]);
+        let mut logical_digest = [0_u8; 32];
+        logical_digest.copy_from_slice(&payload[36..68]);
+        Ok(Self {
+            wal_digest,
+            logical_digest,
+        })
+    }
+}
+
 /// A record carrying one ordered batch slice.
 const RECORD_FLAG_SLICE: u32 = 1;
 /// A record carrying the digest that closes one ordered slice set.
@@ -212,7 +289,7 @@ impl SegmentHeader {
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when the magic, version, reserved
-    /// fields, shard identifier, or header checksum violates WAL v4 framing.
+    /// fields, shard identifier, or header checksum violates WAL v6 framing.
     pub fn decode(buf: &[u8; SEGMENT_HEADER_SIZE]) -> Result<Self, ScribeError> {
         let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         if magic != WAL_MAGIC {
@@ -291,7 +368,7 @@ impl SegmentHeader {
     }
 }
 
-/// WAL record — a v4 slice or commit framed entry.
+/// WAL record — a v6 slice or commit framed entry.
 ///
 /// Its fixed 72-byte little-endian header is followed by its declared payload
 /// and a CRC32C trailer over both. A record never carries a mixed flag set.
@@ -314,7 +391,7 @@ pub struct WalRecord {
     pub payload: Vec<u8>,
 }
 
-/// Validated fixed v4 record header retained while replay selects the next LSN.
+/// Validated fixed v6 record header retained while replay selects the next LSN.
 ///
 /// The header contains no scalable payload allocation. Replay can therefore
 /// peek across the fixed shard set, choose the stream-wide next record, and
@@ -410,8 +487,8 @@ pub(crate) struct PreparedWalAppend {
     pub(crate) slice_index: u32,
     /// Total slices in this batch's closed set.
     pub(crate) slice_count: u32,
-    /// Terminal digest when this prepared record closes a batch slice set.
-    pub(crate) commit_digest: Option<[u8; 32]>,
+    /// Terminal identity when this prepared record closes a batch slice set.
+    pub(crate) commit_identity: Option<WalCommitIdentity>,
     /// Authenticated tenant encoded by a terminal commit record.
     pub(crate) commit_tenant: Option<[u8; 16]>,
 }
@@ -443,17 +520,21 @@ impl PreparedWalAppend {
             shard_id: None,
             slice_index: 0,
             slice_count: 1,
-            commit_digest: None,
+            commit_identity: None,
             commit_tenant: None,
         }
     }
 
-    /// Builds a terminal v4 commit record without allocating a duplicate digest buffer.
+    /// Builds a terminal v6 commit record carrying the batch's complete identity.
+    ///
+    /// `identity` is computed once on the live path and is the only place the
+    /// batch's logical row identity becomes durable in the WAL. Replay reads it
+    /// back verbatim rather than reconstructing it from Arrow payloads.
     pub(crate) fn commit(
         batch_id: [u8; 16],
         tenant_id: [u8; 16],
         slice_count: u32,
-        digest: [u8; 32],
+        identity: WalCommitIdentity,
     ) -> Self {
         Self {
             lsn: WalLsn::ZERO,
@@ -467,7 +548,7 @@ impl PreparedWalAppend {
             shard_id: None,
             slice_index: slice_count,
             slice_count,
-            commit_digest: Some(digest),
+            commit_identity: Some(identity),
             commit_tenant: Some(tenant_id),
         }
     }
@@ -496,9 +577,9 @@ impl PreparedWalAppend {
     /// # Errors
     ///
     /// Returns an internal invariant error when the prepared slice lacks its
-    /// self-describing key or a fixed-width WAL-v4 field cannot represent it.
+    /// self-describing key or a fixed-width WAL-v6 field cannot represent it.
     pub(crate) fn payload_identity(&self) -> Result<ScribeAppendPayloadIdentity, ScribeError> {
-        if self.commit_digest.is_some() {
+        if self.commit_identity.is_some() {
             return Err(ScribeError::Internal {
                 detail: "terminal WAL COMMIT has no retained slice identity".to_owned(),
             });
@@ -535,16 +616,16 @@ impl PreparedWalAppend {
         if WAL_COUNT_ACTIVE.load(Ordering::Relaxed) {
             WAL_ENCODE_COUNT.with(|count| count.set(count.get() + 1));
         }
-        if let Some(digest) = self.commit_digest {
+        if let Some(identity) = self.commit_identity {
             let tenant_id = self.commit_tenant.ok_or_else(|| ScribeError::Internal {
-                detail: "WAL v4 commit is missing its authenticated tenant".to_owned(),
+                detail: "WAL v6 commit is missing its authenticated tenant".to_owned(),
             })?;
             return Ok(WalRecord::commit(
                 self.lsn,
                 tenant_id,
                 self.batch_id,
                 self.slice_count,
-                digest,
+                identity,
             ));
         }
         let seal_key = self
@@ -579,7 +660,7 @@ impl PreparedWalAppend {
             })
     }
 
-    /// Returns the exact uncompressed v4 packet payload length.
+    /// Returns the exact uncompressed v6 packet payload length.
     ///
     /// This includes the self-describing seal-key, schema, audit, and Arrow
     /// fields that are part of the durable packet. Rotation must use this
@@ -589,7 +670,7 @@ impl PreparedWalAppend {
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when a self-describing field exceeds
-    /// its v4 width or checked packet-length arithmetic overflows.
+    /// its v6 width or checked packet-length arithmetic overflows.
     pub(crate) fn uncompressed_len(&self) -> Result<usize, ScribeError> {
         self.payload_len()
     }
@@ -601,8 +682,8 @@ impl PreparedWalAppend {
     /// Returns an internal invariant error when a self-describing field exceeds
     /// its fixed WAL width or checked length arithmetic overflows.
     fn payload_len(&self) -> Result<usize, ScribeError> {
-        if self.commit_digest.is_some() {
-            return Ok(32);
+        if self.commit_identity.is_some() {
+            return Ok(COMMIT_PAYLOAD_BYTES);
         }
         let seal_key = self
             .seal_key
@@ -613,13 +694,13 @@ impl PreparedWalAppend {
         let table_len =
             u16::try_from(seal_key.table.namespace.as_str().len() + 1 + seal_key.table.name.len())
                 .map_err(|_| ScribeError::Internal {
-                    detail: "WAL table FQN exceeds v3 payload limits".to_owned(),
+                    detail: "WAL table FQN exceeds v6 payload limits".to_owned(),
                 })?;
         let audit_len = u32::try_from(self.audit.len()).map_err(|_| ScribeError::Internal {
-            detail: "WAL audit payload exceeds v3 payload limits".to_owned(),
+            detail: "WAL audit payload exceeds v6 payload limits".to_owned(),
         })?;
         let data_len = u32::try_from(self.data.len()).map_err(|_| ScribeError::Internal {
-            detail: "WAL Arrow payload exceeds v3 payload limits".to_owned(),
+            detail: "WAL Arrow payload exceeds v6 payload limits".to_owned(),
         })?;
         let payload_len = 62usize
             .saturating_add(usize::from(table_len))
@@ -643,15 +724,15 @@ fn append_prepared_borrowed(
 ) -> Result<([u8; 32], u32), ScribeError> {
     let payload_len =
         u32::try_from(prepared.payload_len()?).map_err(|_| ScribeError::Internal {
-            detail: "WAL v4 payload exceeds its u32 record bound".to_owned(),
+            detail: "WAL v6 payload exceeds its u32 record bound".to_owned(),
         })?;
-    let (flags, tenant_id) = if prepared.commit_digest.is_some() {
+    let (flags, tenant_id) = if prepared.commit_identity.is_some() {
         (
             RECORD_FLAG_COMMIT,
             prepared
                 .commit_tenant
                 .ok_or_else(|| ScribeError::Internal {
-                    detail: "WAL v4 commit is missing its authenticated tenant".to_owned(),
+                    detail: "WAL v6 commit is missing its authenticated tenant".to_owned(),
                 })?,
         )
     } else {
@@ -682,8 +763,8 @@ fn append_prepared_borrowed(
         segment.append_borrowed(&header, parts, crc.to_le_bytes(), encoded_len)?;
         Ok(digest.finalize().into())
     };
-    let payload_digest = if let Some(digest) = prepared.commit_digest.as_ref() {
-        write_parts(&[digest.as_slice()])?
+    let payload_digest = if let Some(identity) = prepared.commit_identity.as_ref() {
+        write_parts(&[identity.encode().as_slice()])?
     } else {
         let seal_key = prepared
             .seal_key
@@ -696,19 +777,19 @@ fn append_prepared_borrowed(
         let tenant_id = *seal_key.tenant.as_uuid().as_bytes();
         let table_len = u16::try_from(namespace.len() + 1 + name.len())
             .map_err(|_| ScribeError::Internal {
-                detail: "WAL table FQN exceeds v3 payload limits".to_owned(),
+                detail: "WAL table FQN exceeds v6 payload limits".to_owned(),
             })?
             .to_le_bytes();
         let granularity_tag = [seal_key.partition.granularity_tag()];
         let partition_start = seal_key.partition.start_unix_micros().to_be_bytes();
         let audit_len = u32::try_from(prepared.audit.len())
             .map_err(|_| ScribeError::Internal {
-                detail: "WAL audit payload exceeds v3 payload limits".to_owned(),
+                detail: "WAL audit payload exceeds v6 payload limits".to_owned(),
             })?
             .to_le_bytes();
         let data_len = u32::try_from(prepared.data.len())
             .map_err(|_| ScribeError::Internal {
-                detail: "WAL Arrow payload exceeds v3 payload limits".to_owned(),
+                detail: "WAL Arrow payload exceeds v6 payload limits".to_owned(),
             })?
             .to_le_bytes();
         let parts: [&[u8]; 13] = [
@@ -731,7 +812,7 @@ fn append_prepared_borrowed(
     Ok((payload_digest, payload_len))
 }
 
-const SLICE_PAYLOAD_MAGIC: [u8; 4] = *b"S5SL";
+const SLICE_PAYLOAD_MAGIC: [u8; 4] = *b"S6SL";
 /// Fixed encoded width of the typed partition field: one granularity tag plus
 /// a signed big-endian epoch-microsecond start.
 const SLICE_PARTITION_BYTES: usize = 9;
@@ -763,13 +844,13 @@ fn encode_slice_payload_parts(
     data: &[u8],
 ) -> Result<Vec<u8>, ScribeError> {
     let table_len = u16::try_from(table_fqn.len()).map_err(|_| ScribeError::Internal {
-        detail: "WAL table FQN exceeds v5 payload limits".to_owned(),
+        detail: "WAL table FQN exceeds v6 payload limits".to_owned(),
     })?;
     let audit_len = u32::try_from(audit.len()).map_err(|_| ScribeError::Internal {
-        detail: "WAL audit payload exceeds v3 payload limits".to_owned(),
+        detail: "WAL audit payload exceeds v6 payload limits".to_owned(),
     })?;
     let data_len = u32::try_from(data.len()).map_err(|_| ScribeError::Internal {
-        detail: "WAL Arrow payload exceeds v3 payload limits".to_owned(),
+        detail: "WAL Arrow payload exceeds v6 payload limits".to_owned(),
     })?;
     let capacity = 4usize
         .saturating_add(16)
@@ -916,14 +997,14 @@ fn decode_slice_table(table_fqn: &str) -> Result<TableRef, ScribeError> {
 /// out of range or non-canonical.
 fn decode_slice_partition(encoded: &[u8]) -> Result<TimePartition, ScribeError> {
     let (tag, start) = encoded.split_first().ok_or_else(|| ScribeError::Internal {
-        detail: "WAL v5 slice partition field is truncated".to_owned(),
+        detail: "WAL v6 slice partition field is truncated".to_owned(),
     })?;
     let start: [u8; 8] = start.try_into().map_err(|_| ScribeError::Internal {
-        detail: "WAL v5 slice partition start is truncated".to_owned(),
+        detail: "WAL v6 slice partition start is truncated".to_owned(),
     })?;
     TimePartition::from_durable(*tag, i64::from_be_bytes(start)).map_err(|error| {
         ScribeError::Internal {
-            detail: format!("WAL v5 slice partition is invalid: {error}"),
+            detail: format!("WAL v6 slice partition is invalid: {error}"),
         }
     })
 }
@@ -934,13 +1015,13 @@ struct DecodedSliceMetadata {
     schema_fingerprint: [u8; 32],
 }
 
-/// Validate the v5 marker and decode the tenant/table/partition/schema identity.
+/// Validate the v6 marker and decode the tenant/table/partition/schema identity.
 fn decode_slice_metadata(
     reader: &mut SlicePayloadReader<'_>,
 ) -> Result<DecodedSliceMetadata, ScribeError> {
     if reader.take(SLICE_PAYLOAD_MAGIC.len())? != SLICE_PAYLOAD_MAGIC {
         return Err(ScribeError::Internal {
-            detail: "WAL v5 slice magic mismatch".to_owned(),
+            detail: "WAL v6 slice magic mismatch".to_owned(),
         });
     }
     let tenant = decode_slice_tenant(reader.take(16)?)?;
@@ -991,7 +1072,7 @@ pub(crate) fn decode_slice_payload(payload: &[u8]) -> Result<DecodedSlicePayload
 }
 
 impl WalRecord {
-    /// Construct a one-slice v4 record for a test or low-level caller.
+    /// Construct a one-slice v6 record for a test or low-level caller.
     ///
     /// Production writers use [`Self::slice`] with the authenticated tenant.
     #[must_use]
@@ -1027,7 +1108,7 @@ impl WalRecord {
         tenant_id: [u8; 16],
         batch_id: [u8; 16],
         slice_count: u32,
-        digest: [u8; 32],
+        identity: WalCommitIdentity,
     ) -> Self {
         Self {
             lsn,
@@ -1036,8 +1117,23 @@ impl WalRecord {
             batch_id,
             slice_index: slice_count,
             slice_count,
-            payload: digest.to_vec(),
+            payload: identity.encode().to_vec(),
         }
+    }
+
+    /// Decodes the complete batch identity carried by a terminal record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when this record is not a COMMIT or
+    /// its payload is not a well-formed [`WalCommitIdentity`].
+    pub fn commit_identity(&self) -> Result<WalCommitIdentity, ScribeError> {
+        if !self.is_commit() {
+            return Err(ScribeError::Internal {
+                detail: "WAL record is not a terminal COMMIT".to_owned(),
+            });
+        }
+        WalCommitIdentity::decode(&self.payload)
     }
 
     /// Returns whether this record is one payload-bearing slice.
@@ -1076,7 +1172,7 @@ impl WalRecord {
         buf.extend_from_slice(&0_u32.to_le_bytes());
         buf.extend_from_slice(&self.payload);
 
-        // Compute CRC over the complete v4 header followed by payload.
+        // Compute CRC over the complete v6 header followed by payload.
         let crc = crc32c_hash(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
 
@@ -1091,7 +1187,7 @@ impl WalRecord {
     /// # Errors
     ///
     /// Returns [`ScribeError`] for a torn final write, a CRC mismatch, an
-    /// unsupported version, or any invalid v4 header or payload bound.
+    /// unsupported version, or any invalid v6 header or payload bound.
     ///
     /// # Panics
     ///
@@ -1123,7 +1219,7 @@ impl WalRecord {
                 reader
                     .read_exact(&mut header[1..])
                     .map_err(|error| ScribeError::Internal {
-                        detail: format!("WAL torn v4 record header: {error}"),
+                        detail: format!("WAL torn v6 record header: {error}"),
                     })?;
             }
             Ok(_) => {
@@ -1139,7 +1235,7 @@ impl WalRecord {
         }
         if header[..8] != RECORD_MAGIC {
             return Err(ScribeError::Internal {
-                detail: "invalid WAL v4 record magic".to_owned(),
+                detail: "invalid WAL v6 record magic".to_owned(),
             });
         }
         let version = u16::from_le_bytes([header[8], header[9]]);
@@ -1149,13 +1245,13 @@ impl WalRecord {
         let header_len = u16::from_le_bytes([header[10], header[11]]);
         if usize::from(header_len) != RECORD_HEADER_SIZE {
             return Err(ScribeError::Internal {
-                detail: "invalid WAL v4 record header length".to_owned(),
+                detail: "invalid WAL v6 record header length".to_owned(),
             });
         }
         let flags = u32::from_le_bytes(header[12..16].try_into().expect("fixed record header"));
         if !matches!(flags, RECORD_FLAG_SLICE | RECORD_FLAG_COMMIT) {
             return Err(ScribeError::Internal {
-                detail: "invalid WAL v4 record flags".to_owned(),
+                detail: "invalid WAL v6 record flags".to_owned(),
             });
         }
         let lsn = WalLsn::new(u64::from_le_bytes(
@@ -1176,10 +1272,12 @@ impl WalRecord {
             || slice_count == 0
             || slice_index > slice_count
             || (flags == RECORD_FLAG_SLICE && slice_index >= slice_count)
-            || (flags == RECORD_FLAG_COMMIT && (slice_index != slice_count || payload_len != 32))
+            || (flags == RECORD_FLAG_COMMIT
+                && (slice_index != slice_count
+                    || usize::try_from(payload_len).ok() != Some(COMMIT_PAYLOAD_BYTES)))
         {
             return Err(ScribeError::Internal {
-                detail: "invalid WAL v4 record bounds".to_owned(),
+                detail: "invalid WAL v6 record bounds".to_owned(),
             });
         }
         Ok(Some(DecodedWalRecordHeader {
@@ -1217,7 +1315,7 @@ impl WalRecord {
         reader
             .read_exact(&mut payload)
             .map_err(|e| ScribeError::Internal {
-                detail: format!("WAL torn v4 record payload: {e}"),
+                detail: format!("WAL torn v6 record payload: {e}"),
             })?;
 
         // Read CRC
@@ -1225,7 +1323,7 @@ impl WalRecord {
         reader
             .read_exact(&mut crc_buf)
             .map_err(|e| ScribeError::Internal {
-                detail: format!("WAL torn v4 record CRC: {e}"),
+                detail: format!("WAL torn v6 record CRC: {e}"),
             })?;
         let expected_crc = u32::from_le_bytes(crc_buf);
 
@@ -1420,6 +1518,13 @@ struct WalDiskState {
     base_dir: PathBuf,
     configured_limit_bytes: Option<u64>,
     sample: Mutex<Option<DiskSample>>,
+    /// Pod-wide "the WAL disk is full" latch.
+    ///
+    /// Set on a terminal ENOSPC and cleared by [`WalDiskState::recover_if_drained`]
+    /// once a fresh sample says the condition has passed. Admission reaches the
+    /// same latch through [`WalDiskBreaker`] rather than mirroring it, because a
+    /// second copy could only diverge into a pod that refuses every append with
+    /// nothing left able to clear the refusal.
     hard_failed: AtomicBool,
     accounted_bytes: AtomicU64,
     #[cfg(test)]
@@ -1435,6 +1540,38 @@ struct WalDiskState {
 enum ForcedSample {
     Failure,
     Value((u64, u64)),
+}
+
+/// Pod-wide WAL writability breaker shared with Scribe admission.
+///
+/// Admission has to refuse a full-disk append before the request reaches the
+/// WAL, which means it needs the WAL's own answer rather than a mirrored copy
+/// of it. This handle is that answer: one owner, asked on the admission path,
+/// which both trips on a terminal ENOSPC and clears itself once a fresh
+/// filesystem sample says the pod can write again. Without the clearing half a
+/// single transient ENOSPC would end ingest until the process restarted.
+#[derive(Debug, Clone)]
+pub struct WalDiskBreaker {
+    /// The one disk-state owner this breaker speaks for.
+    disk: Arc<WalDiskState>,
+}
+
+impl WalDiskBreaker {
+    /// Reports whether the WAL disk currently refuses writes.
+    ///
+    /// One atomic load. The latch is cleared by the retirement that actually
+    /// reclaims space, not by asking again: re-evaluating here would clear a
+    /// genuine ENOSPC on the very next request and turn the breaker into a
+    /// no-op.
+    #[must_use]
+    pub fn is_full(&self) -> bool {
+        self.disk.is_hard_failed()
+    }
+
+    /// Trips the breaker after a terminal WAL capacity result.
+    pub fn trip(&self) {
+        self.disk.mark_hard_failed();
+    }
 }
 
 impl WalDiskState {
@@ -1561,8 +1698,37 @@ impl WalDiskState {
         Ok(())
     }
 
+    fn is_hard_failed(&self) -> bool {
+        self.hard_failed.load(Ordering::Acquire)
+    }
+
     fn mark_hard_failed(&self) {
         self.hard_failed.store(true, Ordering::Release);
+    }
+
+    /// Clears the latch once the disk-full condition has actually passed.
+    ///
+    /// The latch exists so a pod stops hammering a disk it cannot write to, not
+    /// so one ENOSPC ends the pod. Re-evaluation measures the current sample and
+    /// byte total with no proposed append, and clears the latch only when that
+    /// measurement is no longer hard; a disk that is still full stays tripped.
+    /// The sample is the same one-second-cached reading every append uses, so a
+    /// pod under sustained pressure does not re-`statfs` per request.
+    ///
+    /// Returns whether the WAL is writable after this evaluation.
+    fn recover_if_drained(&self) -> bool {
+        if !self.hard_failed.load(Ordering::Acquire) {
+            return true;
+        }
+        if self.pressure(self.bytes(), 0).hard {
+            return false;
+        }
+        self.hard_failed.store(false, Ordering::Release);
+        tracing::info!(
+            wal_bytes = self.bytes(),
+            "WAL disk breaker cleared after retirement reclaimed space"
+        );
+        true
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1909,7 +2075,7 @@ impl WalSegment {
     /// # Errors
     ///
     /// Returns [`ScribeError`] when the segment cannot be read or synced, the
-    /// visitor fails, or a committed prefix violates the v4 frame or LSN
+    /// visitor fails, or a committed prefix violates the v6 frame or LSN
     /// invariants. A short final record is the sole truncation case.
     pub(crate) fn for_each_record<F>(&self, mut visit: F) -> Result<(), ScribeError>
     where
@@ -1934,7 +2100,7 @@ impl WalSegment {
                 Ok(Some(record)) => {
                     if previous_lsn.is_some_and(|previous| record.lsn <= previous) {
                         return Err(ScribeError::Internal {
-                            detail: "WAL v4 contains non-monotonic committed LSNs".to_owned(),
+                            detail: "WAL v6 contains non-monotonic committed LSNs".to_owned(),
                         });
                     }
                     previous_lsn = Some(record.lsn);
@@ -1990,7 +2156,7 @@ impl WalSegment {
 /// tail. Structural violations and CRC mismatches in a complete frame are
 /// durable corruption and must fail-stop rather than silently discard data.
 fn is_torn_tail_error(error: &ScribeError) -> bool {
-    matches!(error, ScribeError::Internal { detail } if detail.starts_with("WAL torn v4"))
+    matches!(error, ScribeError::Internal { detail } if detail.starts_with("WAL torn v6"))
 }
 
 /// WAL writer — owns one fixed set of shard streams with automatic rollover.
@@ -2040,7 +2206,7 @@ impl WalHandle {
         &self,
         mut append: PreparedWalAppend,
     ) -> Result<WalAppendResult, ScribeError> {
-        if append.seal_key.is_none() && append.commit_digest.is_none() {
+        if append.seal_key.is_none() && append.commit_identity.is_none() {
             return Err(ScribeError::Internal {
                 detail: "shard WAL append is missing its self-describing seal key".to_owned(),
             });
@@ -2379,12 +2545,34 @@ impl WalWriter {
         Ok(())
     }
 
+    /// Returns the pod-wide WAL writability breaker for this writer's disk.
+    ///
+    /// Admission refuses against this handle rather than against a copy of its
+    /// state, so the disk-full condition has exactly one owner and admission
+    /// recovers the moment that owner says the condition has passed.
+    #[must_use]
+    pub fn disk_full_breaker(&self) -> WalDiskBreaker {
+        WalDiskBreaker {
+            disk: Arc::clone(&self.disk),
+        }
+    }
+
     /// Trip the concrete WAL disk breaker for deterministic failure-path
     /// tests. This uses the same hard-state check as a real ENOSPC result and
     /// therefore exercises rejection before LSN allocation or file mutation.
     #[cfg(any(test, feature = "test-support"))]
     pub fn trip_disk_full_for_test(&self) {
         self.disk.mark_hard_failed();
+    }
+
+    /// Re-evaluates the disk-full latch the way retirement does.
+    ///
+    /// Exposed so a test can drive the recovery half of the breaker without
+    /// having to produce a real segment retirement; the evaluation itself is
+    /// the production one.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn recover_disk_for_test(&self) {
+        self.disk.recover_if_drained();
     }
 
     /// Inject one WAL `sync_data` failure after the record write and before
@@ -2436,7 +2624,7 @@ impl WalWriter {
         }
     }
 
-    /// Append one self-describing v4 slice record for test-tier probes.
+    /// Append one self-describing v6 slice record for test-tier probes.
     #[cfg(any(test, feature = "test-support"))]
     pub fn append_and_fsync_for_test(
         &self,
@@ -2448,7 +2636,7 @@ impl WalWriter {
         self.append_and_fsync_for_key(seal_key, batch_id, audit_payload, data_payload)
     }
 
-    /// Append, commit, and fsync one one-slice v4 batch for replay tests.
+    /// Append, commit, and fsync one one-slice v6 batch for replay tests.
     ///
     /// This test-only helper deliberately models the production `SLICE` then
     /// `COMMIT` ordering without changing lower-level WAL tests that need to
@@ -2476,6 +2664,16 @@ impl WalWriter {
             Bytes::copy_from_slice(data_payload),
         )
         .for_slice(seal_key.clone(), [0; 32]);
+        // Framing tests write opaque payloads, so the logical identity is taken
+        // over the payload bytes themselves. The production path substitutes the
+        // Arrow logical identity here; the WAL format is indifferent to which,
+        // which is the property these tests exercise.
+        let logical_data_len =
+            u32::try_from(data_payload.len()).map_err(|_| ScribeError::Internal {
+                detail: "test WAL payload exceeds its u32 logical length bound".to_owned(),
+            })?;
+        prepared = prepared
+            .with_logical_data_identity(Sha256::digest(data_payload).into(), logical_data_len);
         prepared.shard_id = Some(
             u8::try_from(crate::scribe::routing::shard_for(
                 seal_key.tenant,
@@ -2485,6 +2683,14 @@ impl WalWriter {
             .expect("fixed shard count fits in u8"),
         );
         let shard_id = prepared.shard_id;
+        let mut logical = crate::scribe::preprocess::LogicalBatchDigest::new();
+        logical.push_slice(
+            0,
+            &prepared.schema_fingerprint,
+            &prepared.logical_data_digest,
+            prepared.logical_data_len,
+        );
+        let logical_digest = logical.finish();
         let slice = self.append_prepared(prepared)?;
         let mut digest = Sha256::new();
         digest.update(0_u32.to_le_bytes());
@@ -2494,7 +2700,10 @@ impl WalWriter {
             batch_id,
             *seal_key.tenant.as_uuid().as_bytes(),
             1,
-            digest.finalize().into(),
+            WalCommitIdentity {
+                wal_digest: digest.finalize().into(),
+                logical_digest,
+            },
         );
         commit.shard_id = shard_id;
         let terminal = self.append_prepared(commit)?;
@@ -2524,7 +2733,7 @@ impl WalWriter {
         )
     }
 
-    /// Append one prepared v4 record without syncing it.
+    /// Append one prepared v6 record without syncing it.
     ///
     /// # Errors
     ///
@@ -2985,6 +3194,9 @@ impl WalWriter {
         }
         metrics::gauge!("bifrost_scribe_wal_disk_bytes")
             .set(self.bytes_on_disk().to_f64().unwrap_or(f64::MAX));
+        // Reclaiming segment bytes is the one event that can end a disk-full
+        // condition, so it is the one place the latch is re-evaluated.
+        self.disk.recover_if_drained();
         Ok(())
     }
 
@@ -3223,7 +3435,7 @@ impl ShardRecordCursor {
             .is_some_and(|previous| record.lsn <= previous)
         {
             return Err(ScribeError::Internal {
-                detail: "WAL v4 contains non-monotonic committed LSNs across ordered segments"
+                detail: "WAL v6 contains non-monotonic committed LSNs across ordered segments"
                     .to_owned(),
             });
         }
@@ -3306,7 +3518,7 @@ impl ShardRecordCursor {
     fn repair_torn_tail(&mut self) -> Result<(), ScribeError> {
         if self.next_segment < self.segments.len() {
             return Err(ScribeError::Internal {
-                detail: "WAL v4 contains a torn record before a later shard segment".to_owned(),
+                detail: "WAL v6 contains a torn record before a later shard segment".to_owned(),
             });
         }
         let file = self.file.as_mut().ok_or_else(|| ScribeError::Internal {
@@ -3624,7 +3836,7 @@ impl WalReader {
                 };
                 if previous_lsn.is_some_and(|previous| record.lsn <= previous) {
                     return Err(ScribeError::Internal {
-                        detail: "WAL v4 contains non-monotonic stream-wide committed LSNs"
+                        detail: "WAL v6 contains non-monotonic stream-wide committed LSNs"
                             .to_owned(),
                     });
                 }
@@ -3711,9 +3923,9 @@ pub struct ScribeAppendMeta {
     pub data_digest: [u8; 32],
     /// Canonical Arrow data length, excluding volatile audit bytes.
     pub data_len: u32,
-    /// SHA-256 digest of the exact WAL-v4 slice payload.
+    /// SHA-256 digest of the exact WAL-v6 slice payload.
     pub payload_digest: [u8; 32],
-    /// Exact WAL-v4 slice payload length.
+    /// Exact WAL-v6 slice payload length.
     pub payload_len: u32,
     /// Zero-based ordinal in the committed batch slice set.
     pub slice_index: u32,
@@ -3957,7 +4169,7 @@ mod tests {
         assert!(matches!(
             error,
             ScribeError::Internal { detail }
-                if detail == "WAL v4 contains non-monotonic stream-wide committed LSNs"
+                if detail == "WAL v6 contains non-monotonic stream-wide committed LSNs"
         ));
     }
 
@@ -4000,7 +4212,7 @@ mod tests {
         assert!(matches!(
             error,
             ScribeError::Internal { detail }
-                if detail == "WAL v4 contains a torn record before a later shard segment"
+                if detail == "WAL v6 contains a torn record before a later shard segment"
         ));
         assert_eq!(
             std::fs::metadata(first_path)
@@ -4039,7 +4251,7 @@ mod tests {
         assert_eq!(decoded.shard_id, 3);
     }
 
-    /// Proves both reserved byte ranges in the v4 segment prologue fail closed.
+    /// Proves both reserved byte ranges in the v6 segment prologue fail closed.
     #[test]
     fn segment_header_rejects_nonzero_reserved_byte_ranges() {
         for reserved_index in [33_usize, 39, 48, 59] {
@@ -4074,7 +4286,7 @@ mod tests {
         ));
     }
 
-    /// Proves the v4 record header carries the required slice identity.
+    /// Proves the v6 record header carries the required slice identity.
     #[test]
     fn wal_record_roundtrip() {
         let batch_id = [42u8; 16];
@@ -4092,21 +4304,57 @@ mod tests {
         assert_eq!(decoded.payload, b"test data");
     }
 
-    /// Proves a v5 commit has the exact fixed header fields and digest payload.
+    /// Proves a v6 commit has the exact fixed header fields and identity payload.
+    ///
+    /// The terminal record is the only durable carrier of the batch's logical
+    /// row identity, so this pins both digests surviving a round trip rather
+    /// than only the frame fields.
     #[test]
     fn wal_commit_record_uses_the_terminal_slice_identity() {
-        let record = WalRecord::commit(WalLsn::new(9), [7; 16], [8; 16], 3, [9; 32]);
+        let identity = WalCommitIdentity {
+            wal_digest: [9; 32],
+            logical_digest: [11; 32],
+        };
+        let record = WalRecord::commit(WalLsn::new(9), [7; 16], [8; 16], 3, identity);
         let encoded = record.encode();
 
-        assert_eq!(&encoded[..8], b"WYRDWAL5");
-        assert_eq!(encoded.len(), RECORD_HEADER_SIZE + 32 + 4);
+        assert_eq!(&encoded[..8], b"WYRDWAL6");
+        assert_eq!(encoded.len(), RECORD_HEADER_SIZE + COMMIT_PAYLOAD_BYTES + 4);
         let decoded = WalRecord::decode_from(&mut std::io::Cursor::new(encoded))
             .expect("decode terminal record")
             .expect("terminal record exists");
         assert!(decoded.is_commit());
         assert_eq!(decoded.slice_index, 3);
         assert_eq!(decoded.slice_count, 3);
-        assert_eq!(decoded.payload, vec![9; 32]);
+        assert_eq!(
+            decoded
+                .commit_identity()
+                .expect("terminal identity decodes"),
+            identity
+        );
+    }
+
+    /// Proves a COMMIT payload of any other shape is refused, not interpreted.
+    ///
+    /// The v6 identity is fixed-width and total. A record written under a
+    /// different layout must fail closed rather than be read as a truncated or
+    /// extended identity, which is what makes the version bump load-bearing.
+    #[test]
+    fn wal_commit_identity_rejects_a_foreign_payload() {
+        let identity = WalCommitIdentity {
+            wal_digest: [1; 32],
+            logical_digest: [2; 32],
+        };
+        let encoded = identity.encode();
+
+        assert!(WalCommitIdentity::decode(&encoded[..COMMIT_PAYLOAD_BYTES - 1]).is_err());
+        let mut extended = encoded.to_vec();
+        extended.push(0);
+        assert!(WalCommitIdentity::decode(&extended).is_err());
+        let mut wrong_magic = encoded;
+        wrong_magic[0] = b'X';
+        assert!(WalCommitIdentity::decode(&wrong_magic).is_err());
+        assert!(WalCommitIdentity::decode(&[0_u8; 32]).is_err());
     }
 
     #[test]

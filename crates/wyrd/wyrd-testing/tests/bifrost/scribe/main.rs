@@ -1,6 +1,10 @@
+mod backpressure;
+mod budgets;
 mod cross_shard;
 mod fencing;
 mod lifecycle;
+mod qualification;
+mod round_robin;
 mod source_boundary;
 mod source_boundary_recovery;
 mod support;

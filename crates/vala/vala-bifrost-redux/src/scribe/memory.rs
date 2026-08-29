@@ -36,6 +36,54 @@ pub(crate) const PARQUET_TRANSFER_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 /// Number of bounded lifecycle memory categories.
 pub const MEMORY_CATEGORY_COUNT: usize = 8;
 
+/// Returns the distinct allocated bytes one decoded batch keeps alive.
+///
+/// Arrow's own `get_array_memory_size` sums every buffer's whole allocation
+/// once per array that references it. That is exact for a batch whose columns
+/// each own their buffers, and badly wrong for a zero-copy native decode: every
+/// column of an Arrow IPC frame is a view into the one received allocation, so
+/// an eleven-column frame reports eleven times the memory it actually retains.
+/// Scribe plans an envelope for a request and then measures what the
+/// materialized rows retain, so an inflated measure refuses requests that fit.
+///
+/// This walks the same buffers and charges each distinct allocation once, keyed
+/// by the allocation the buffer points into rather than by the view. Arrays
+/// that own their buffers are unaffected, so a projected or OTLP batch measures
+/// exactly what Arrow reports for it.
+pub(crate) fn retained_arrow_bytes(batch: &arrow::record_batch::RecordBatch) -> usize {
+    let mut charged = std::collections::HashSet::new();
+    batch.columns().iter().fold(0_usize, |total, column| {
+        total.saturating_add(retained_array_bytes(&column.to_data(), &mut charged))
+    })
+}
+
+/// Charges one array's own allocations, then its children's, once each.
+///
+/// `charged` carries the allocations already counted for this batch. The key is
+/// the allocation start and its capacity, so two views into one buffer collapse
+/// to one charge while two equally sized distinct buffers stay separate.
+fn retained_array_bytes(
+    data: &arrow::array::ArrayData,
+    charged: &mut std::collections::HashSet<(usize, usize)>,
+) -> usize {
+    let mut total = size_of::<arrow::array::ArrayData>();
+    let mut charge = |buffer: &arrow::buffer::Buffer, total: &mut usize| {
+        let allocation = (buffer.data_ptr().as_ptr() as usize, buffer.capacity());
+        if charged.insert(allocation) {
+            *total = total.saturating_add(buffer.capacity());
+        }
+    };
+    for buffer in data.buffers() {
+        charge(buffer, &mut total);
+    }
+    if let Some(nulls) = data.nulls() {
+        charge(nulls.inner().inner(), &mut total);
+    }
+    data.child_data().iter().fold(total, |total, child| {
+        total.saturating_add(retained_array_bytes(child, charged))
+    })
+}
+
 /// Returns the checked incremental workspace for one whole-batch candidate.
 ///
 /// The immutable Arrow input remains charged to its existing owner. The
@@ -940,7 +988,89 @@ fn read_memory_limit(path: &str) -> Option<usize> {
 #[cfg(test)]
 /// Focused ownership and lifecycle reconciliation proofs.
 mod tests {
-    use super::{MemoryCategory, ScribeOwnership};
+    use super::{MemoryCategory, ScribeOwnership, retained_arrow_bytes};
+
+    /// Builds one two-column batch of `rows` rows for the retention proofs.
+    fn payload_batch(rows: usize) -> arrow::record_batch::RecordBatch {
+        let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("value", arrow::datatypes::DataType::Int64, false),
+            arrow::datatypes::Field::new("payload", arrow::datatypes::DataType::Binary, false),
+        ]));
+        let mut payloads =
+            arrow::array::BinaryBuilder::with_capacity(rows, rows.saturating_mul(1024));
+        for _ in 0..rows {
+            payloads.append_value([9_u8; 1024]);
+        }
+        arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![
+                std::sync::Arc::new(arrow::array::Int64Array::from(
+                    (0..i64::try_from(rows).expect("invariant: fixture row count fits i64"))
+                        .collect::<Vec<_>>(),
+                )),
+                std::sync::Arc::new(payloads.finish()),
+            ],
+        )
+        .expect("payload batch")
+    }
+
+    /// A zero-copy decoded frame is charged its allocation once, not per column.
+    ///
+    /// Every column of an Arrow IPC frame views the one received allocation, so
+    /// Arrow's own per-array measure multiplies that allocation by the column
+    /// count. Scribe admits a request against a planned envelope and then
+    /// charges what the materialized rows retain, so the inflated measure would
+    /// refuse requests that fit.
+    #[test]
+    fn a_zero_copy_frame_is_charged_its_allocation_once() {
+        let rows = 4_000;
+        let batch = payload_batch(rows);
+        let mut ipc = Vec::new();
+        {
+            let mut writer =
+                arrow::ipc::writer::StreamWriter::try_new(&mut ipc, batch.schema().as_ref())
+                    .expect("IPC writer");
+            writer.write(&batch).expect("IPC batch");
+            writer.finish().expect("IPC terminal");
+        }
+        let decoded = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(ipc), None)
+            .expect("IPC reader")
+            .next()
+            .expect("one decoded batch")
+            .expect("the decoded batch is valid");
+
+        let retained = retained_arrow_bytes(&decoded);
+        let per_array = arrow::array::RecordBatch::get_array_memory_size(&decoded);
+        assert!(
+            retained < per_array,
+            "a shared allocation must be charged once: retained {retained}, per-array {per_array}"
+        );
+        assert!(
+            retained >= rows * 1024,
+            "the charge must still cover the payload it retains: {retained}"
+        );
+        assert!(
+            retained < rows * 1024 * 2,
+            "the charge must not double the allocation it retains: {retained}"
+        );
+    }
+
+    /// A batch whose columns own their buffers is charged every allocation.
+    ///
+    /// Nothing is shared here, so the charge must track Arrow's own measure.
+    /// The two differ only by the per-array struct each counts — Arrow adds the
+    /// concrete array type, this adds its `ArrayData` — which is tens of bytes
+    /// against a quarter-megabyte batch.
+    #[test]
+    fn an_owned_batch_is_charged_what_arrow_reports() {
+        let batch = payload_batch(256);
+        let retained = retained_arrow_bytes(&batch);
+        let per_array = arrow::array::RecordBatch::get_array_memory_size(&batch);
+        assert!(
+            retained.abs_diff(per_array) < 1_024,
+            "distinct allocations must each be charged in full: retained {retained}, per-array {per_array}"
+        );
+    }
 
     /// Generation observations follow the enforcing active/immutable owner exactly.
     #[test]

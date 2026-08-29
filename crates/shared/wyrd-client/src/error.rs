@@ -192,6 +192,11 @@ fn bifrost_error_from_code(
                 .to_owned(),
         },
         "WYRD_VALA_503_ORACLE_ROLE_UNAVAILABLE" => BifrostError::OracleRoleUnavailable,
+        // Ingest backpressure. A caller that cannot see this code cannot tell
+        // "the pod is out of WAL space, retry when it drains" from a generic
+        // upstream failure, which is the difference between a client that waits
+        // and a client that gives up on rows the server would have taken.
+        "WYRD_VALA_507_WAL_DISK_FULL" => BifrostError::WalDiskFull,
         "WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND" => BifrostError::RunningQueryNotFound,
         "WYRD_VALA_409_RUNNING_QUERY_CONFLICT" => BifrostError::RunningQueryConflict,
         "WYRD_VALA_503_RUNNING_QUERY_CONTROL_UNAVAILABLE" => {

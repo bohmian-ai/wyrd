@@ -4,8 +4,33 @@
 pub(crate) const MAX_FOOTER_DEPTH: usize = 32;
 /// Maximum declared members in any one Compact-Thrift collection.
 pub(crate) const MAX_FOOTER_COLLECTION_ITEMS: usize = 4_096;
+/// Structural elements one row group's column chunk may declare.
+///
+/// A `ColumnChunk` contributes its own fields, the `ColumnMetaData` fields, the
+/// encodings and schema-path lists, both bound statistics structs, and the page
+/// and dictionary offsets. The widest writer-v2 object measured — 1,024 row
+/// groups of 64 leaf columns — declares just over thirty-seven members per
+/// chunk, so forty-eight admits it with room for the optional members writer-v2
+/// does not currently emit.
+const MAX_FOOTER_ELEMENTS_PER_COLUMN_CHUNK: usize = 48;
+/// Structural elements one footer declares outside its column chunks.
+///
+/// The schema element list, the writer-v2 key/value metadata, and the
+/// file-level fields are all bounded and small next to the chunk metadata, so
+/// one flat allowance covers them without a second derivation.
+const MAX_FOOTER_FILE_LEVEL_ELEMENTS: usize = 4_096;
 /// Maximum aggregate fields and collection members in one footer.
-pub(crate) const MAX_FOOTER_STRUCTURAL_ELEMENTS: usize = 4_096;
+///
+/// Derived from the writer-v2 object contract rather than chosen: a footer may
+/// describe [`MAX_FILE_COLUMN_CHUNKS`] chunks, each declaring at most
+/// [`MAX_FOOTER_ELEMENTS_PER_COLUMN_CHUNK`] members, plus the file-level
+/// allowance. A flat ceiling below that refuses objects the writer is required
+/// to produce: an assembled hot object at the approximately 512 MiB staging
+/// target holds roughly sixteen row groups, and sixteen groups of an ordinary
+/// eleven-column table already declare more than four thousand elements.
+pub(crate) const MAX_FOOTER_STRUCTURAL_ELEMENTS: usize =
+    crate::parquet::memory::MAX_FILE_COLUMN_CHUNKS * MAX_FOOTER_ELEMENTS_PER_COLUMN_CHUNK
+        + MAX_FOOTER_FILE_LEVEL_ELEMENTS;
 /// Maximum one binary/string value accepted before decoder allocation.
 pub(crate) const MAX_FOOTER_STRING_BYTES: usize = 8 * 1024 * 1024;
 
@@ -258,21 +283,33 @@ mod tests {
         assert!(CompactScanner::require_collection(MAX_FOOTER_COLLECTION_ITEMS).is_ok());
         assert!(CompactScanner::require_collection(MAX_FOOTER_COLLECTION_ITEMS + 1).is_err());
 
-        let mut accepted = vec![0x19, 0xf1];
-        accepted.extend(encode_varint(MAX_FOOTER_STRUCTURAL_ELEMENTS - 1));
-        accepted.extend(std::iter::repeat_n(1, MAX_FOOTER_STRUCTURAL_ELEMENTS - 1));
-        accepted.push(0);
-        assert!(preflight_compact_thrift(&accepted).is_ok());
-        assert_eq!(
-            compact_thrift_structural_elements(&accepted).expect("exact structural maximum"),
-            MAX_FOOTER_STRUCTURAL_ELEMENTS
+        // The aggregate ceiling now sits far above the per-collection one, so a
+        // footer that reaches it declares hundreds of collections rather than
+        // one. The accumulator itself is what the boundary lives on, so drive it
+        // directly instead of encoding a multi-megabyte fixture whose first
+        // refusal would come from the collection ceiling.
+        let mut scanner = CompactScanner {
+            bytes: &[],
+            cursor: 0,
+            elements: 0,
+        };
+        scanner
+            .add_elements(MAX_FOOTER_STRUCTURAL_ELEMENTS)
+            .expect("the exact structural maximum is accepted");
+        assert!(
+            scanner.add_elements(1).is_err(),
+            "one element past the ceiling is refused"
         );
 
-        let mut refused = vec![0x19, 0xf1];
-        refused.extend(encode_varint(MAX_FOOTER_STRUCTURAL_ELEMENTS));
-        refused.extend(std::iter::repeat_n(1, MAX_FOOTER_STRUCTURAL_ELEMENTS));
-        refused.push(0);
-        assert!(preflight_compact_thrift(&refused).is_err());
+        let mut small = vec![0x19, 0xf1];
+        small.extend(encode_varint(MAX_FOOTER_COLLECTION_ITEMS));
+        small.extend(std::iter::repeat_n(1, MAX_FOOTER_COLLECTION_ITEMS));
+        small.push(0);
+        assert!(preflight_compact_thrift(&small).is_ok());
+        assert_eq!(
+            compact_thrift_structural_elements(&small).expect("one full collection"),
+            MAX_FOOTER_COLLECTION_ITEMS + 1
+        );
     }
 
     /// Binary declarations accept exactly 8 MiB and refuse one byte more.

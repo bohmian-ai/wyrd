@@ -322,7 +322,13 @@ impl IngestError {
             crate::contracts::ScribeError::WalDiskFull => Self::WalDiskFull,
             other => {
                 tracing::error!(error = %other, "Scribe ingest failed after transport validation");
-                Self::Internal("Scribe ingest failed".to_owned())
+                // The mapped variants above are the ones a caller can act on;
+                // everything else lands here, and a bare "Scribe ingest failed"
+                // leaves the operator with nothing to act on either. Naming the
+                // underlying Scribe error costs nothing at the wire (this is
+                // already the internal class) and is the difference between a
+                // reportable failure and a shrug.
+                Self::Internal(format!("Scribe ingest failed: {other}"))
             }
         }
     }

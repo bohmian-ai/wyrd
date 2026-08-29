@@ -17,7 +17,14 @@ pub struct ScribeBatchCommit {
     pub logical_table_fqn: String,
     /// Stable client batch identity.
     pub batch_id: uuid::Uuid,
-    /// SHA-256 digest over ordered slice identities and payload digests.
+    /// SHA-256 digest over the batch's ordered logical slice identities.
+    ///
+    /// This is a client-reproducible fact: it binds slice ordinals, the Arrow
+    /// schema fingerprint, and the logical row identity, and deliberately not
+    /// the WAL payload bytes, whose audit envelope carries a fresh request
+    /// identity on every attempt. An honest retry of the same batch therefore
+    /// produces this same digest, which is what makes idempotent acknowledgement
+    /// distinguishable from a genuine identity contradiction.
     pub slice_set_digest: [u8; 32],
     /// Number of validated slices in the closed set.
     pub slice_count: i32,
@@ -40,7 +47,7 @@ pub struct ScribeBatchCommit {
 /// Tenant-visible durable identity loaded after an idempotency conflict.
 #[derive(Debug, sqlx::FromRow)]
 struct ExistingScribeBatchCommit {
-    /// Persisted ordered slice-set digest.
+    /// Persisted ordered logical slice-set digest.
     slice_set_digest: Vec<u8>,
     /// Persisted closed-set cardinality.
     slice_count: i32,
@@ -74,6 +81,59 @@ impl ExistingScribeBatchCommit {
             && self.wal_lsn_max == commit.wal_lsn_max
             && self.request_id == commit.request_id
     }
+
+    /// Returns whether this row holds the same logical batch as `commit`.
+    ///
+    /// Logical identity is the rows themselves: the ordered slice-set digest
+    /// and the closed-set cardinality. WAL coordinates and the request
+    /// correlation describe *which attempt* durably wrote the batch, not what
+    /// the batch is, so a client that re-sends the same batch under a new
+    /// request is logically identical here and contradictory only in
+    /// [`Self::matches`].
+    #[must_use]
+    fn matches_logical(&self, commit: &ScribeBatchCommit) -> bool {
+        self.slice_set_digest == commit.slice_set_digest && self.slice_count == commit.slice_count
+    }
+
+    /// Names the durable identity fields that diverge from `commit`.
+    ///
+    /// A batch-identity contradiction is a fail-closed internal error, so the
+    /// operator sees only a refusal. This lists the columns that actually
+    /// disagree so the refusal can be attributed to a real cause — a client
+    /// reusing one batch identity for different rows, a truncated slice set,
+    /// or a WAL owner that moved — instead of requiring a database read.
+    #[must_use]
+    fn divergent_fields(&self, commit: &ScribeBatchCommit) -> Vec<&'static str> {
+        let mut divergent = Vec::new();
+        if self.slice_set_digest != commit.slice_set_digest {
+            divergent.push("slice_set_digest");
+        }
+        if self.slice_count != commit.slice_count {
+            divergent.push("slice_count");
+        }
+        if self.wal_node_id != commit.wal_node_id {
+            divergent.push("wal_node_id");
+        }
+        if self.wal_writer_epoch != commit.wal_writer_epoch {
+            divergent.push("wal_writer_epoch");
+        }
+        if self.wal_shard_id != commit.wal_shard_id {
+            divergent.push("wal_shard_id");
+        }
+        if self.wal_segment_sequence != commit.wal_segment_sequence {
+            divergent.push("wal_segment_sequence");
+        }
+        if self.wal_lsn_min != commit.wal_lsn_min {
+            divergent.push("wal_lsn_min");
+        }
+        if self.wal_lsn_max != commit.wal_lsn_max {
+            divergent.push("wal_lsn_max");
+        }
+        if self.request_id != commit.request_id {
+            divergent.push("request_id");
+        }
+        divergent
+    }
 }
 
 /// Durable resolution of one exact tenant-scoped Scribe batch identity.
@@ -83,6 +143,13 @@ pub enum ScribeBatchCommitResolution {
     Absent,
     /// The durable fence exists and every identity field matches exactly.
     Committed,
+    /// The same logical batch already committed from a different WAL attempt.
+    ///
+    /// The batch identity is spent. The caller must acknowledge it without
+    /// making its rows visible a second time; the WAL slices this attempt
+    /// wrote are suppressed on replay by [`resolve_replay`] for the same
+    /// reason.
+    AlreadyCommitted,
 }
 
 /// Durable replay decision for one tenant/table/batch identity.
@@ -137,7 +204,7 @@ pub async fn resolve_replay(
 /// # Errors
 ///
 /// Returns [`SqlError`] when the tenant differs from `conn`, the lookup is
-/// unavailable, or the durable row contradicts `commit`.
+/// unavailable, or the durable row holds different rows under this identity.
 pub async fn resolve(
     conn: &mut TenantConn<'_>,
     commit: &ScribeBatchCommit,
@@ -151,27 +218,44 @@ pub async fn resolve(
     match existing {
         None => Ok(ScribeBatchCommitResolution::Absent),
         Some(existing) if existing.matches(commit) => Ok(ScribeBatchCommitResolution::Committed),
-        Some(_) => Err(invariant("scribe batch commit identity mismatch")),
+        Some(existing) if existing.matches_logical(commit) => {
+            Ok(ScribeBatchCommitResolution::AlreadyCommitted)
+        }
+        Some(existing) => {
+            tracing::warn!(
+                logical_table = %commit.logical_table_fqn,
+                batch_id = %commit.batch_id,
+                divergent = ?existing.divergent_fields(commit),
+                durable_slice_count = existing.slice_count,
+                offered_slice_count = commit.slice_count,
+                "Scribe batch identity contradicts its durable fence"
+            );
+            Err(invariant("scribe batch commit identity mismatch"))
+        }
     }
 }
 
-/// Records a Scribe commit and its audit event, or verifies an exact replay.
+/// Records a Scribe commit and its audit event, or classifies the conflict.
 ///
 /// The caller commits the supplied tenant transaction. A first observation
-/// inserts the fence and appends the audit event. A primary-key conflict is a
-/// success only when every durable identity field is identical; it never emits
-/// a second audit event.
+/// inserts the fence, appends the audit event, and reports
+/// [`ScribeBatchCommitResolution::Committed`]. A primary-key conflict never
+/// emits a second audit event and is classified by logical identity: the same
+/// attempt is `Committed`, the same rows from a different attempt are
+/// [`ScribeBatchCommitResolution::AlreadyCommitted`] and the caller must not
+/// make them visible again, and different rows under the same batch identity
+/// are a contradiction. `Absent` is never returned.
 ///
 /// # Errors
 ///
 /// Returns [`SqlError`] when the tenant does not match `conn`, the insert or
 /// audit write fails, the audit request identity differs from the durable
-/// fence, or an existing commit has contradictory durable identity.
+/// fence, or an existing commit holds different rows under the same identity.
 pub async fn record(
     conn: &mut TenantConn<'_>,
     commit: &ScribeBatchCommit,
     audit_event: &AuditEvent,
-) -> Result<(), SqlError> {
+) -> Result<ScribeBatchCommitResolution, SqlError> {
     if conn.data_tenant_id() != commit.tenant {
         return Err(invariant(
             "scribe batch commit tenant does not match TenantConn",
@@ -209,7 +293,7 @@ pub async fn record(
     .map_err(SqlError::from)?;
     if inserted.is_some() {
         super::audit_outbox::append_audit(conn, audit_event).await?;
-        return Ok(());
+        return Ok(ScribeBatchCommitResolution::Committed);
     }
 
     let existing = load(conn, commit).await?;
@@ -218,10 +302,21 @@ pub async fn record(
             "scribe batch commit conflict was not visible through TenantConn",
         ));
     };
-    if !existing.matches(commit) {
-        return Err(invariant("scribe batch commit identity mismatch"));
+    if existing.matches(commit) {
+        return Ok(ScribeBatchCommitResolution::Committed);
     }
-    Ok(())
+    if existing.matches_logical(commit) {
+        return Ok(ScribeBatchCommitResolution::AlreadyCommitted);
+    }
+    tracing::warn!(
+        logical_table = %commit.logical_table_fqn,
+        batch_id = %commit.batch_id,
+        divergent = ?existing.divergent_fields(commit),
+        durable_slice_count = existing.slice_count,
+        offered_slice_count = commit.slice_count,
+        "Scribe batch identity contradicts its durable fence"
+    );
+    Err(invariant("scribe batch commit identity mismatch"))
 }
 
 /// Loads one tenant-visible durable batch fence without interpreting identity.

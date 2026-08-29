@@ -181,7 +181,17 @@ impl AdmissionInner {
 struct AdmissionInner {
     config: AdmissionConfig,
     state: Mutex<AdmissionState>,
-    wal_available: AtomicBool,
+    /// The WAL disk's own writability breaker, when this pod has a WAL.
+    ///
+    /// Admission refuses before a request ever reaches the WAL, so it must ask
+    /// the WAL rather than keep a copy of its state: the disk owner both trips
+    /// the condition on a terminal ENOSPC and clears it once a fresh sample
+    /// says the pod can write again. A controller built without a WAL — the
+    /// unit-test and capacity-probe path — falls back to [`Self::wal_disk_full`],
+    /// a private latch nothing outside this controller can trip.
+    wal_breaker: Option<crate::scribe::wal::WalDiskBreaker>,
+    /// Latch used only when no WAL breaker is bound.
+    wal_disk_full: AtomicBool,
     memory: ScribeResources,
     contention: ScribeContentionLedger,
 }
@@ -245,6 +255,24 @@ impl AdmissionController {
         config: AdmissionConfig,
         memory: ScribeResources,
     ) -> Result<Self, ScribeGeometryError> {
+        Self::with_config_memory_and_wal(config, memory, None)
+    }
+
+    /// Constructs admission bound to the WAL disk's own full-disk breaker.
+    ///
+    /// This is the production constructor: passing the WAL's flag is what makes
+    /// the refusal admission serves and the condition the WAL observes one fact
+    /// with one owner, so the retirement that frees space also restores ingest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeGeometryError`] when the resolved node capacity cannot
+    /// satisfy the configured Scribe geometry.
+    pub fn with_config_memory_and_wal(
+        config: AdmissionConfig,
+        memory: ScribeResources,
+        wal_breaker: Option<crate::scribe::wal::WalDiskBreaker>,
+    ) -> Result<Self, ScribeGeometryError> {
         // The staging volume is disk the ledger only ever compares against, so
         // an absent volume yields zero rather than a fabricated allowance: a pod
         // with no staging volume must fail startup, not pretend.
@@ -266,7 +294,8 @@ impl AdmissionController {
             inner: Arc::new(AdmissionInner {
                 config,
                 state: Mutex::new(AdmissionState::default()),
-                wal_available: AtomicBool::new(true),
+                wal_breaker,
+                wal_disk_full: AtomicBool::new(false),
                 memory,
                 contention: ScribeContentionLedger::new(config.policy, capacity),
             }),
@@ -332,7 +361,7 @@ impl AdmissionController {
                 detail: "memory accounting poisoned; restart required".to_owned(),
             });
         }
-        if !self.inner.wal_available.load(Ordering::Acquire) {
+        if self.wal_disk_full() {
             super::record_scribe_rejection("wal");
             return Err(ScribeError::WalDiskFull);
         }
@@ -507,7 +536,10 @@ impl AdmissionController {
         if state.active_bytes < bytes || state.immutable_bytes.checked_add(bytes).is_none() {
             self.inner.memory.poison();
             return Err(ScribeError::Internal {
-                detail: "admission active-to-immutable transfer failed preflight".to_owned(),
+                detail: format!(
+                    "admission active-to-immutable transfer failed preflight: {bytes} bytes moved from {} active and {} immutable",
+                    state.active_bytes, state.immutable_bytes
+                ),
             });
         }
         Ok(())
@@ -619,9 +651,24 @@ impl AdmissionController {
         self.inner.config.memory_limit_bytes.saturating_mul(90) / 100
     }
 
+    /// Reports whether the WAL disk currently refuses writes.
+    ///
+    /// Asks the bound WAL breaker when there is one so a condition the disk has
+    /// since cleared does not keep refusing traffic, and otherwise reads the
+    /// private latch a WAL-less controller owns.
+    fn wal_disk_full(&self) -> bool {
+        self.inner.wal_breaker.as_ref().map_or_else(
+            || self.inner.wal_disk_full.load(Ordering::Acquire),
+            crate::scribe::wal::WalDiskBreaker::is_full,
+        )
+    }
+
     /// Trip the pod-wide WAL breaker after a terminal ENOSPC result.
     pub(crate) fn trip_wal_disk_full(&self) {
-        self.inner.wal_available.store(false, Ordering::Release);
+        match &self.inner.wal_breaker {
+            Some(breaker) => breaker.trip(),
+            None => self.inner.wal_disk_full.store(true, Ordering::Release),
+        }
     }
 
     fn release_request(&self, bytes: usize) -> Result<(), ScribeError> {
@@ -2025,6 +2072,54 @@ mod tests {
         let error = admission.try_reserve("events", 1).expect_err("busy");
         assert!(matches!(error, ScribeError::IngestBusy { .. }));
         assert_eq!(admission.snapshot().items, GLOBAL_INFLIGHT_ITEMS);
+    }
+
+    /// A WAL-bound controller refuses on the disk's latch and recovers with it.
+    ///
+    /// The production controller does not own its own copy of the disk-full
+    /// condition, so this covers the wiring that unit tests using the default
+    /// controller cannot: tripping the WAL itself must refuse at admission, and
+    /// the disk clearing the condition must restore admission without any
+    /// second action. A regression here is a pod that either ignores a full
+    /// disk or never serves again after one.
+    #[test]
+    fn wal_bound_admission_refuses_and_recovers_with_the_disk() {
+        let directory = tempfile::tempdir().expect("temporary WAL root");
+        let wal = crate::scribe::wal::WalWriter::new(
+            directory.path(),
+            [7_u8; 16],
+            1,
+            crate::scribe::wal::WalConfig::default(),
+        )
+        .expect("the WAL writer starts on a temporary root");
+        let config = AdmissionConfig::default();
+        let admission = AdmissionController::with_config_memory_and_wal(
+            config,
+            crate::scribe::embedded_scribe_resources(&config),
+            Some(wal.disk_full_breaker()),
+        )
+        .expect("the default geometry fits the default budget");
+
+        admission
+            .try_reserve("events", 1)
+            .expect("a healthy WAL admits");
+        wal.trip_disk_full_for_test();
+        assert!(
+            matches!(
+                admission.try_reserve("events", 1),
+                Err(ScribeError::WalDiskFull)
+            ),
+            "admission must refuse on the WAL's own disk-full latch"
+        );
+        assert!(
+            wal.disk_full_breaker().is_full(),
+            "the breaker must report the condition admission refused on"
+        );
+
+        wal.recover_disk_for_test();
+        admission
+            .try_reserve("events", 1)
+            .expect("admission recovers when the disk clears its own condition");
     }
 
     /// Actual admission branches emit their exact closed rejection reasons once.

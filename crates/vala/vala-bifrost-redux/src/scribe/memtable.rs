@@ -525,7 +525,10 @@ impl Memtable {
                 .ok_or_else(|| ScribeError::Internal {
                     detail: "replayed seal range contained no data".to_owned(),
                 })?;
-        let arrow_bytes = batches.iter().map(RecordBatch::get_array_memory_size).sum();
+        let arrow_bytes = batches
+            .iter()
+            .map(crate::scribe::memory::retained_arrow_bytes)
+            .sum();
         Ok(FrozenMemtable {
             seal_id: 0,
             // Both identities are stamped by the memtable that adopts this
@@ -1884,13 +1887,15 @@ fn projection_indices(
     Ok(indices)
 }
 
-/// Estimate batch size in bytes (Arrow column sizes + overhead).
+/// Returns the bytes one batch adds to the memtable's charged ownership.
+///
+/// This is the same measure preprocessing charged when it admitted the rows,
+/// so the freeze that moves a generation from active to immutable ownership
+/// transfers exactly what the insert reserved. Summing Arrow's per-column
+/// allocation instead would charge a zero-copy native frame once per column and
+/// break that transfer.
 fn estimate_batch_bytes(batch: &RecordBatch) -> usize {
-    batch
-        .columns()
-        .iter()
-        .map(|col| col.get_array_memory_size())
-        .sum()
+    crate::scribe::memory::retained_arrow_bytes(batch)
 }
 
 #[cfg(test)]

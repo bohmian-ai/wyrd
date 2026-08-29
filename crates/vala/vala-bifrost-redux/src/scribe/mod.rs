@@ -1649,9 +1649,7 @@ impl ScribeImpl {
     /// Returns [`ScribeError::Internal`] when the hot-source registry lock is
     /// poisoned, which means a holder already panicked.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn live_authorities_for_test(
-        &self,
-    ) -> Result<Vec<hot_source::LiveAuthority>, ScribeError> {
+    pub fn live_authorities_for_test(&self) -> Result<Vec<hot_source::LiveAuthority>, ScribeError> {
         self.hot_sources
             .live_authorities_for_test()
             .map_err(|error| ScribeError::Internal {

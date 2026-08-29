@@ -808,7 +808,7 @@ async fn run_public_matrix(
                 .as_ref()
                 .map(|observer| observer.completed().saturating_add(1));
             writer
-        .flush_bifrost()
+                .flush_bifrost()
                 .await
                 .map_err(|error| ClusterLoadError::Cluster(error.to_string()))?;
             let pending_forge_tasks = writer

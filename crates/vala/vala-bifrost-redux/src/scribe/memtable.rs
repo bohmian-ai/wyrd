@@ -2801,7 +2801,7 @@ mod tests {
         };
         let key = make_test_seal_key();
 
-        let (size_registry, size) = exercise(1, Duration::from_secs(60));
+        let (size_registry, size) = exercise(1, Duration::from_mins(1));
         size.insert(
             &key,
             make_test_event(),
@@ -2809,7 +2809,7 @@ mod tests {
             make_test_batch(1),
         )
         .expect("size member inserts");
-        assert_eq!(size.should_seal(&key).expect("size predicate"), true);
+        assert!(size.should_seal(&key).expect("size predicate"));
         let size_frozen = size.freeze(&key).expect("size member freezes");
         assert_eq!(size_frozen.shard_id, SHARD);
         assert!(
@@ -2839,7 +2839,7 @@ mod tests {
             SHARD
         );
 
-        let (_, pressure) = exercise(usize::MAX, Duration::from_secs(60));
+        let (_, pressure) = exercise(usize::MAX, Duration::from_mins(1));
         pressure
             .insert(
                 &key,
@@ -2862,7 +2862,7 @@ mod tests {
             SHARD
         );
 
-        let (_, rotation) = exercise(usize::MAX, Duration::from_secs(60));
+        let (_, rotation) = exercise(usize::MAX, Duration::from_mins(1));
         let peer = SealKey::new(
             key.tenant,
             TableRef::new(BifrostNamespace::Bifrost, "nonzero-peer"),

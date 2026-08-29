@@ -3067,8 +3067,8 @@ mod tests {
     use datafusion::execution::memory_pool::GreedyMemoryPool;
     use wyrd_spec::vala::api::{
         ClusterCapabilities, ClusterNodeKey, ClusterRole, ClusterRoleLease, FollowerScanAssignment,
-        OracleCapabilitiesV1, PersistedFileAssignment, ScribeProviderCut,
-        TenantTableBinding, TimeGranularityWire,
+        OracleCapabilitiesV1, PersistedFileAssignment, ScribeProviderCut, TenantTableBinding,
+        TimeGranularityWire,
     };
 
     /// Deterministic verifier that preserves the already encoded claims bytes.

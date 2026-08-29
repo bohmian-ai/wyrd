@@ -1463,6 +1463,158 @@ mod tests {
         assert_eq!(claim.members().len(), 1);
     }
 
+    /// Stages four shards of one partition through `runtime` and drives each to
+    /// durable, ready state, returning the shared assembly key and the staged
+    /// member ids in shard order.
+    ///
+    /// Recovery owners need a claim whose members can be moved into different
+    /// terminal states independently, so the fixture stages real members rather
+    /// than synthesising stage entries.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a member fails to resolve its binding, encode, or register,
+    /// or when the four members do not share one assembly key.
+    async fn stage_four_durable_members(
+        runtime: &ScribeStagingRuntime,
+        tenant: DataTenantId,
+        node_id: NodeId,
+        schema: &SchemaRef,
+        layout: &PhysicalLayout,
+    ) -> (ScribeAssemblyKey, Vec<StagedMemberId>) {
+        let mut key = None;
+        let mut member_ids = Vec::new();
+        for shard in 1_u8..=4 {
+            let frozen = frozen_member(tenant, 64, shard);
+            let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
+                .expect("tenant binding");
+            let staged = runtime
+                .encode_member(
+                    StageMemberRequest {
+                        frozen: &frozen,
+                        binding: &binding,
+                        layout,
+                        origin: StagedMemberOrigin {
+                            node_id,
+                            writer_epoch: WriterEpoch::new(1),
+                            shard: u16::from(shard),
+                            generation: u64::from(shard),
+                            wal: StagedLsnRange {
+                                min: u64::from(shard) * 10,
+                                max: u64::from(shard) * 10 + 9,
+                            },
+                        },
+                        footer_reservation:
+                            crate::scribe::memory::EncodedFooterReservation::for_test(),
+                    },
+                    ClaimContext {
+                        schema: Arc::clone(schema),
+                        layout: layout.clone(),
+                        binding: binding.clone(),
+                    },
+                )
+                .expect("member stages");
+            key.get_or_insert_with(|| staged.key().clone());
+            member_ids.push(staged.member());
+            runtime
+                .register_member(staged, chrono::Utc::now())
+                .await
+                .expect("member becomes durable and ready");
+        }
+        (key.expect("one assembly key"), member_ids)
+    }
+
+    /// Leaves the claim's members in the mixed terminal states a crash can
+    /// strand: one still `Publishing`, one `Published`, one `CleanupPending`,
+    /// and one `Published` again, each carrying its own persisted LSN range.
+    ///
+    /// This is the exact shape recovery must retire without republishing, so
+    /// the states are written directly onto the stage rather than reached
+    /// through a publication that would also commit.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the stage refuses any transition.
+    async fn drive_mixed_member_states(
+        stage: &ScribeHotStage,
+        key: &ScribeAssemblyKey,
+        member_ids: &[StagedMemberId],
+        claim_id: &str,
+    ) {
+        let objects = vec![format!("objects/{claim_id}/hot-0.parquet")];
+        stage
+            .transition(
+                key,
+                member_ids[0],
+                crate::scribe::hot_stage::StagedMemberState::Publishing {
+                    claim_id: claim_id.to_owned(),
+                    operation_id: uuid::Uuid::from_u128(0xc01),
+                },
+            )
+            .await
+            .expect("first member remains publishing");
+        for (index, state) in [
+            crate::scribe::hot_stage::StagedMemberState::Published {
+                claim_id: claim_id.to_owned(),
+                file_list_commit_key: "node:10:49".to_owned(),
+                published_object_identities: objects.clone(),
+                persisted_lsn_ranges: vec![StagedLsnRange { min: 20, max: 29 }],
+            },
+            crate::scribe::hot_stage::StagedMemberState::CleanupPending {
+                claim_id: claim_id.to_owned(),
+                file_list_commit_key: "node:10:49".to_owned(),
+                published_object_identities: objects.clone(),
+                persisted_lsn_ranges: vec![StagedLsnRange { min: 30, max: 39 }],
+            },
+            crate::scribe::hot_stage::StagedMemberState::Published {
+                claim_id: claim_id.to_owned(),
+                file_list_commit_key: "node:10:49".to_owned(),
+                published_object_identities: objects,
+                persisted_lsn_ranges: vec![StagedLsnRange { min: 40, max: 49 }],
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            stage
+                .transition(key, member_ids[index + 1], state)
+                .await
+                .expect("terminal member state persists");
+        }
+    }
+
+    /// Asserts recovery left no hot-source authority behind for any member of
+    /// the restored claim.
+    ///
+    /// A surviving authority would let a reader serve rows from a member the
+    /// claim already retired, so every generation ordinal must resolve to
+    /// `None` once restore completes.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an authority lookup fails or still names a live authority.
+    fn assert_no_restored_authority_survives(
+        hot_sources: &crate::scribe::hot_source::ScribeHotSourceRegistry,
+        key: &ScribeAssemblyKey,
+        member_ids: &[StagedMemberId],
+    ) {
+        let seal_key = SealKey::new(key.tenant(), key.table().clone(), key.partition());
+        for member in member_ids {
+            assert_eq!(
+                hot_sources
+                    .authority(
+                        &seal_key,
+                        crate::scribe::hot_source::GenerationOrdinal::new(
+                            member.shard(),
+                            member.generation(),
+                        ),
+                    )
+                    .expect("authority lookup"),
+                None
+            );
+        }
+    }
+
     /// A crash-split terminal claim recovers under its original Scribe identity.
     ///
     /// # Panics
@@ -1490,92 +1642,15 @@ mod tests {
         let tenant = DataTenantId::new_v7();
         let schema = runtime_schema();
         let layout = runtime_layout(schema.as_ref());
-        let mut key = None;
-        let mut member_ids = Vec::new();
-        for shard in 1_u8..=4 {
-            let frozen = frozen_member(tenant, 64, shard);
-            let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone()))
-                .expect("tenant binding");
-            let staged = runtime
-                .encode_member(
-                    StageMemberRequest {
-                        frozen: &frozen,
-                        binding: &binding,
-                        layout: &layout,
-                        origin: StagedMemberOrigin {
-                            node_id,
-                            writer_epoch: WriterEpoch::new(1),
-                            shard: u16::from(shard),
-                            generation: u64::from(shard),
-                            wal: StagedLsnRange {
-                                min: u64::from(shard) * 10,
-                                max: u64::from(shard) * 10 + 9,
-                            },
-                        },
-                        footer_reservation:
-                            crate::scribe::memory::EncodedFooterReservation::for_test(),
-                    },
-                    ClaimContext {
-                        schema: Arc::clone(&schema),
-                        layout: layout.clone(),
-                        binding: binding.clone(),
-                    },
-                )
-                .expect("member stages");
-            key.get_or_insert_with(|| staged.key().clone());
-            member_ids.push(staged.member());
-            runtime
-                .register_member(staged, chrono::Utc::now())
-                .await
-                .expect("member becomes durable and ready");
-        }
-        let key = key.expect("one assembly key");
+        let (key, member_ids) =
+            stage_four_durable_members(&runtime, tenant, node_id, &schema, &layout).await;
         let claim = runtime
             .take_residue(&key, ClaimCause::Drain)
             .expect("residue claim")
             .expect("four members form one claim");
         assert_eq!(claim.members().len(), 4);
         let claim_id = claim.id().to_string();
-        let objects = vec![format!("objects/{claim_id}/hot-0.parquet")];
-        stage
-            .transition(
-                &key,
-                member_ids[0],
-                crate::scribe::hot_stage::StagedMemberState::Publishing {
-                    claim_id: claim_id.clone(),
-                    operation_id: uuid::Uuid::from_u128(0xc01),
-                },
-            )
-            .await
-            .expect("first member remains publishing");
-        for (index, state) in [
-            crate::scribe::hot_stage::StagedMemberState::Published {
-                claim_id: claim_id.clone(),
-                file_list_commit_key: "node:10:49".to_owned(),
-                published_object_identities: objects.clone(),
-                persisted_lsn_ranges: vec![StagedLsnRange { min: 20, max: 29 }],
-            },
-            crate::scribe::hot_stage::StagedMemberState::CleanupPending {
-                claim_id: claim_id.clone(),
-                file_list_commit_key: "node:10:49".to_owned(),
-                published_object_identities: objects.clone(),
-                persisted_lsn_ranges: vec![StagedLsnRange { min: 30, max: 39 }],
-            },
-            crate::scribe::hot_stage::StagedMemberState::Published {
-                claim_id: claim_id.clone(),
-                file_list_commit_key: "node:10:49".to_owned(),
-                published_object_identities: objects,
-                persisted_lsn_ranges: vec![StagedLsnRange { min: 40, max: 49 }],
-            },
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            stage
-                .transition(&key, member_ids[index + 1], state)
-                .await
-                .expect("terminal member state persists");
-        }
+        drive_mixed_member_states(&stage, &key, &member_ids, &claim_id).await;
         stage
             .retire(&key, member_ids[3])
             .await
@@ -1606,21 +1681,7 @@ mod tests {
                 .is_empty()
         );
         assert!(stage.recover().await.expect("stage rescans").is_empty());
-        let seal_key = SealKey::new(key.tenant(), key.table().clone(), key.partition());
-        for member in member_ids {
-            assert_eq!(
-                hot_sources
-                    .authority(
-                        &seal_key,
-                        crate::scribe::hot_source::GenerationOrdinal::new(
-                            member.shard(),
-                            member.generation(),
-                        ),
-                    )
-                    .expect("authority lookup"),
-                None
-            );
-        }
+        assert_no_restored_authority_survives(&hot_sources, &key, &member_ids);
         assert_eq!(recovered.restore(&pool).await.expect("cleanup replays"), 0);
     }
 }

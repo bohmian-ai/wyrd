@@ -47,9 +47,7 @@ use wyrd_spec::vala::api::{
 };
 use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
 
-use crate::catalog::{
-    BifrostCatalog, BifrostCatalogError, PinnedSealedTable, TableRef,
-};
+use crate::catalog::{BifrostCatalog, BifrostCatalogError, PinnedSealedTable, TableRef};
 use crate::cluster::{ClusterRegistry, ClusterSnapshot, RegisteredRole};
 use crate::schema::SchemaFingerprint;
 use crate::scribe::tail_rpc::{TAIL_PROTOCOL_VERSION, TailReadTransport};

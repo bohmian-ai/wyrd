@@ -1657,6 +1657,111 @@ mod tests {
         );
     }
 
+    /// Asserts the row-group statistics the writer reported are the footer's
+    /// own, group for group, with event-time bounds preserved and ordered.
+    ///
+    /// A claim prunes on these bounds without reopening the data pages, so a
+    /// reported statistic that does not correspond to a flushed row group, or
+    /// that lost its event-time bounds, would silently break pruning.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the counts disagree, a group's row count differs from the
+    /// reported one, or an event-time bound is absent or misordered.
+    fn assert_row_group_stats_match_footer(
+        metadata: &parquet::file::metadata::ParquetMetaData,
+        artifact: &BoundedParquetArtifact,
+    ) {
+        assert_eq!(
+            artifact.row_group_stats.len(),
+            metadata.num_row_groups(),
+            "one reported statistic per flushed row group"
+        );
+        for (group, stats) in metadata
+            .row_groups()
+            .iter()
+            .zip(artifact.row_group_stats.iter())
+        {
+            assert_eq!(
+                u64::try_from(group.num_rows()).expect("nonnegative row count"),
+                u64::try_from(stats.row_count).expect("row count fits u64")
+            );
+            assert!(
+                stats.min_event_time.is_some() && stats.max_event_time.is_some(),
+                "event-time bounds must survive into the claim's evidence"
+            );
+            assert!(
+                stats.min_event_time <= stats.max_event_time,
+                "event-time bounds must be ordered"
+            );
+        }
+    }
+
+    /// Asserts one sealed footer's eight envelope fields, by their exact wire
+    /// names, describe the artifact that carries them.
+    ///
+    /// A claim parses these fields from a file it did not write, so each has to
+    /// be present, non-empty, versioned where a future form must fail closed,
+    /// and — for the fingerprint and object identity — the artifact's own
+    /// rather than a sibling's.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a field is missing, empty, unversioned, or names another
+    /// artifact.
+    fn assert_footer_envelope_names_this_artifact(
+        fields: &std::collections::BTreeMap<String, String>,
+        artifact: &BoundedParquetArtifact,
+    ) {
+        assert_eq!(
+            fields.get("wyrd.bifrost.writer_recipe").map(String::as_str),
+            Some(crate::parquet::memory::WRITER_RECIPE)
+        );
+        assert_eq!(
+            fields
+                .get("wyrd.bifrost.memory_envelope_version")
+                .map(String::as_str),
+            Some(crate::parquet::memory::PARQUET_MEMORY_ENVELOPE_VERSION)
+        );
+        assert_eq!(
+            fields
+                .get("wyrd.bifrost.row_group_logical_bytes")
+                .map(String::as_str),
+            Some(MAX_LOGICAL_ROW_GROUP_BYTES.to_string().as_str()),
+            "the decode contract a claim must honour is stated in the file"
+        );
+        assert_eq!(
+            fields
+                .get("wyrd.bifrost.schema_fingerprint")
+                .map(String::as_str),
+            Some(artifact.schema_fingerprint.as_str()),
+            "the footer fingerprint is the one the writer reported"
+        );
+        assert_eq!(
+            fields
+                .get("wyrd.bifrost.object_identity")
+                .map(String::as_str),
+            Some(artifact.object_identity.as_str()),
+            "each artifact names itself, never its sibling"
+        );
+        for required in [
+            "wyrd.bifrost.decode_workspace_bytes",
+            "wyrd.bifrost.max_logical_row_bytes",
+            "wyrd.bifrost.leaf_width_profile",
+        ] {
+            assert!(
+                fields.get(required).is_some_and(|value| !value.is_empty()),
+                "{required} must be present and non-empty"
+            );
+        }
+        assert!(
+            fields
+                .get("wyrd.bifrost.leaf_width_profile")
+                .is_some_and(|profile| profile.starts_with("v1:")),
+            "the leaf profile is versioned so an unknown form fails closed"
+        );
+    }
+
     /// AC22/AC3 unit owner: every sealed artifact's footer carries the complete
     /// evidence a later claim needs, per artifact, across a rolled object.
     ///
@@ -1727,81 +1832,9 @@ mod tests {
                 })
                 .collect();
 
-            // The eight envelope fields, by their exact wire names, are the
-            // footer contract a claim parses.
-            assert_eq!(
-                fields.get("wyrd.bifrost.writer_recipe").map(String::as_str),
-                Some(crate::parquet::memory::WRITER_RECIPE)
-            );
-            assert_eq!(
-                fields
-                    .get("wyrd.bifrost.memory_envelope_version")
-                    .map(String::as_str),
-                Some(crate::parquet::memory::PARQUET_MEMORY_ENVELOPE_VERSION)
-            );
-            assert_eq!(
-                fields
-                    .get("wyrd.bifrost.row_group_logical_bytes")
-                    .map(String::as_str),
-                Some(MAX_LOGICAL_ROW_GROUP_BYTES.to_string().as_str()),
-                "the decode contract a claim must honour is stated in the file"
-            );
-            assert_eq!(
-                fields
-                    .get("wyrd.bifrost.schema_fingerprint")
-                    .map(String::as_str),
-                Some(artifact.schema_fingerprint.as_str()),
-                "the footer fingerprint is the one the writer reported"
-            );
-            assert_eq!(
-                fields
-                    .get("wyrd.bifrost.object_identity")
-                    .map(String::as_str),
-                Some(artifact.object_identity.as_str()),
-                "each artifact names itself, never its sibling"
-            );
-            for required in [
-                "wyrd.bifrost.decode_workspace_bytes",
-                "wyrd.bifrost.max_logical_row_bytes",
-                "wyrd.bifrost.leaf_width_profile",
-            ] {
-                assert!(
-                    fields.get(required).is_some_and(|value| !value.is_empty()),
-                    "{required} must be present and non-empty"
-                );
-            }
-            assert!(
-                fields
-                    .get("wyrd.bifrost.leaf_width_profile")
-                    .is_some_and(|profile| profile.starts_with("v1:")),
-                "the leaf profile is versioned so an unknown form fails closed"
-            );
+            assert_footer_envelope_names_this_artifact(&fields, artifact);
 
-            // The statistics the writer reported are the footer's own, group
-            // for group, with event-time bounds preserved.
-            assert_eq!(
-                artifact.row_group_stats.len(),
-                metadata.num_row_groups(),
-                "one reported statistic per flushed row group"
-            );
-            for (group, stats) in metadata
-                .row_groups()
-                .iter()
-                .zip(artifact.row_group_stats.iter())
-            {
-                assert_eq!(
-                    u64::try_from(group.num_rows()).expect("nonnegative row count"),
-                    u64::try_from(stats.row_count).expect("row count fits u64")
-                );
-                assert!(
-                    stats.min_event_time.is_some() && stats.max_event_time.is_some(),
-                    "event-time bounds must survive into the claim's evidence"
-                );
-                assert!(
-                    stats.min_event_time <= stats.max_event_time,
-                    "event-time bounds must be ordered"
-                );
-            }
+            assert_row_group_stats_match_footer(metadata, artifact);
 
             // The physical facts agree with the bytes on disk.
             let on_disk = std::fs::metadata(&artifact.scratch_path).expect("sealed artifact stat");

@@ -1450,6 +1450,145 @@ mod tests {
         .expect("dictionary batch builds")
     }
 
+    /// Encodes `batch` as its own single-batch IPC stream and reports the total
+    /// wire cost of that stream: schema message, batch message, end-of-stream.
+    ///
+    /// The stateful protocol contract compares a continuation fragment against
+    /// this number to prove the schema is paid for exactly once per stream.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the throwaway encoder rejects the schema, the batch, or the
+    /// close, which would mean the encoder cannot round-trip its own input.
+    fn standalone_stream_bytes(
+        schema: &arrow::datatypes::SchemaRef,
+        batch: &arrow::record_batch::RecordBatch,
+    ) -> usize {
+        let (mut throwaway, standalone_schema) =
+            super::QueryIpcEncoder::new(schema).expect("standalone schema");
+        let frame = throwaway
+            .write(batch)
+            .expect("standalone batch")
+            .expect("a nonempty standalone batch produces a frame");
+        let eos = throwaway.finish().expect("standalone close");
+        standalone_schema.arrow_ipc_schema.len() + frame.arrow_ipc_batch.len() + eos.len()
+    }
+
+    /// Pins the terminal half of the protocol for the two row-count extremes a
+    /// caller can observe: a stream that emitted no rows at all, and one whose
+    /// terminal must agree with the rows already handed out.
+    ///
+    /// An empty logical result is schema-then-terminal, and its terminal still
+    /// carries the one end-of-stream the stream ever produces.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either stream fails to open, close, decode, or validate, or if
+    /// a terminal disagrees with the row count it was closed with.
+    fn terminal_contract_for_empty_and_mixed_streams(schema: &arrow::datatypes::SchemaRef) {
+        let (mut empty_encoder, empty_schema) =
+            super::QueryIpcEncoder::new(schema).expect("empty schema opens the stream");
+        let empty_eos = empty_encoder.finish().expect("empty stream closes");
+        let mut empty_decoder = super::QueryIpcDecoder::new();
+        empty_decoder
+            .accept_schema(&empty_schema.arrow_ipc_schema)
+            .expect("empty schema decodes");
+        empty_decoder
+            .accept_eos(&empty_eos)
+            .expect("empty stream is proven complete by its end-of-stream");
+        assert!(empty_decoder.eos_accepted());
+        let (mut empty_terminal_encoder, _) =
+            super::QueryIpcEncoder::new(schema).expect("empty terminal stream opens");
+        let empty_terminal = super::close_ipc_stream(
+            &mut empty_terminal_encoder,
+            successful_terminal(
+                VisibilityMode::PublishedOnly,
+                FreshnessPolicy::Strict,
+                &[],
+                false,
+                0,
+            ),
+            VisibilityMode::PublishedOnly,
+            0,
+        );
+        assert_eq!(empty_terminal.row_count, 0);
+        empty_terminal
+            .validate(VisibilityMode::PublishedOnly)
+            .expect("empty logical result has one successful terminal");
+
+        let (mut mixed_terminal_encoder, _) =
+            super::QueryIpcEncoder::new(schema).expect("mixed terminal stream opens");
+        let mixed_terminal = super::close_ipc_stream(
+            &mut mixed_terminal_encoder,
+            successful_terminal(
+                VisibilityMode::PublishedOnly,
+                FreshnessPolicy::Strict,
+                &[],
+                false,
+                5,
+            ),
+            VisibilityMode::PublishedOnly,
+            5,
+        );
+        assert_eq!(mixed_terminal.row_count, 5);
+        mixed_terminal
+            .validate(VisibilityMode::PublishedOnly)
+            .expect("mixed stream terminal agrees with emitted rows");
+    }
+
+    /// Pins the decoder's ordering and framing refusals: a fragment or
+    /// end-of-stream before the schema, a repeated schema, an absent
+    /// end-of-stream, and bytes Arrow could never parse.
+    ///
+    /// Each is rejected by the decoder's own state machine before the payload
+    /// reaches Arrow, so a malformed peer cannot drive Arrow decode work.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the schema fragment fails to decode, or if any of the refused
+    /// sequences is accepted.
+    fn decoder_rejects_out_of_order_fragments(
+        schema_fragment: &[u8],
+        batch_fragment: &[u8],
+        eos: &[u8],
+    ) {
+        let mut fresh = super::QueryIpcDecoder::new();
+        assert!(fresh.accept_batch(batch_fragment).is_err());
+        assert!(fresh.accept_eos(eos).is_err());
+        fresh
+            .accept_schema(schema_fragment)
+            .expect("schema fragment decodes");
+        assert!(fresh.accept_schema(schema_fragment).is_err());
+        assert!(
+            fresh.accept_eos(&[]).is_err(),
+            "an absent EOS is not an EOS"
+        );
+        assert!(fresh.accept_batch(&[0xAA, 0xBB, 0xCC]).is_err());
+    }
+
+    /// Pins the failure half of the terminal contract: a stream dropped without
+    /// `finish` — the cancelled or failed path — produces no end-of-stream, and
+    /// its terminal validates precisely because it carries none.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the stream fails to open, if the failed terminal carries an
+    /// end-of-stream, or if it fails validation.
+    fn failed_stream_terminal_carries_no_end_of_stream(schema: &arrow::datatypes::SchemaRef) {
+        let (dropped, _dropped_schema) =
+            super::QueryIpcEncoder::new(schema).expect("failed stream opens");
+        drop(dropped);
+        let failed = failed_terminal_for_visibility(
+            QueryTerminalErrorCode::QueryExecutionFailed,
+            0,
+            VisibilityMode::PublishedOnly,
+        );
+        assert!(failed.arrow_ipc_eos.is_empty());
+        failed
+            .validate(VisibilityMode::PublishedOnly)
+            .expect("a failed terminal validates without an end-of-stream");
+    }
+
     /// The split query stream is exactly one Arrow IPC stream, closed once.
     ///
     /// This pins the whole encoder/decoder state machine in the shape the wire
@@ -1492,18 +1631,8 @@ mod tests {
         // Schema-once: the second batch's fragment carries no schema message, so
         // it is strictly smaller than a standalone per-batch IPC stream of the
         // same rows would be.
-        let standalone = {
-            let (mut throwaway, standalone_schema) =
-                super::QueryIpcEncoder::new(&schema).expect("standalone schema");
-            let batch = throwaway
-                .write(&second)
-                .expect("standalone batch")
-                .expect("a nonempty standalone batch produces a frame");
-            let eos = throwaway.finish().expect("standalone close");
-            standalone_schema.arrow_ipc_schema.len() + batch.arrow_ipc_batch.len() + eos.len()
-        };
         assert!(
-            second_frame.arrow_ipc_batch.len() < standalone,
+            second_frame.arrow_ipc_batch.len() < standalone_stream_bytes(&schema, &second),
             "a continuation fragment must cost less than a standalone stream"
         );
 
@@ -1550,85 +1679,15 @@ mod tests {
         assert!(encoder.peak_retained_ipc_bytes() <= ceiling);
         assert!(decoder.peak_pending_frame_bytes() <= ceiling);
 
-        // Empty success: schema then terminal, with the terminal carrying the
-        // only end-of-stream the stream ever produces.
-        let (mut empty_encoder, empty_schema) =
-            super::QueryIpcEncoder::new(&schema).expect("empty schema opens the stream");
-        let empty_eos = empty_encoder.finish().expect("empty stream closes");
-        let mut empty_decoder = super::QueryIpcDecoder::new();
-        empty_decoder
-            .accept_schema(&empty_schema.arrow_ipc_schema)
-            .expect("empty schema decodes");
-        empty_decoder
-            .accept_eos(&empty_eos)
-            .expect("empty stream is proven complete by its end-of-stream");
-        assert!(empty_decoder.eos_accepted());
-        let (mut empty_terminal_encoder, _) =
-            super::QueryIpcEncoder::new(&schema).expect("empty terminal stream opens");
-        let empty_terminal = super::close_ipc_stream(
-            &mut empty_terminal_encoder,
-            successful_terminal(
-                VisibilityMode::PublishedOnly,
-                FreshnessPolicy::Strict,
-                &[],
-                false,
-                0,
-            ),
-            VisibilityMode::PublishedOnly,
-            0,
-        );
-        assert_eq!(empty_terminal.row_count, 0);
-        empty_terminal
-            .validate(VisibilityMode::PublishedOnly)
-            .expect("empty logical result has one successful terminal");
+        terminal_contract_for_empty_and_mixed_streams(&schema);
 
-        let (mut mixed_terminal_encoder, _) =
-            super::QueryIpcEncoder::new(&schema).expect("mixed terminal stream opens");
-        let mixed_terminal = super::close_ipc_stream(
-            &mut mixed_terminal_encoder,
-            successful_terminal(
-                VisibilityMode::PublishedOnly,
-                FreshnessPolicy::Strict,
-                &[],
-                false,
-                5,
-            ),
-            VisibilityMode::PublishedOnly,
-            5,
+        decoder_rejects_out_of_order_fragments(
+            &schema_frame.arrow_ipc_schema,
+            &first_frame.arrow_ipc_batch,
+            &eos,
         );
-        assert_eq!(mixed_terminal.row_count, 5);
-        mixed_terminal
-            .validate(VisibilityMode::PublishedOnly)
-            .expect("mixed stream terminal agrees with emitted rows");
 
-        // Ordering and malformed fragments are refused before Arrow sees them.
-        let mut fresh = super::QueryIpcDecoder::new();
-        assert!(fresh.accept_batch(&first_frame.arrow_ipc_batch).is_err());
-        assert!(fresh.accept_eos(&eos).is_err());
-        fresh
-            .accept_schema(&schema_frame.arrow_ipc_schema)
-            .expect("schema fragment decodes");
-        assert!(fresh.accept_schema(&schema_frame.arrow_ipc_schema).is_err());
-        assert!(
-            fresh.accept_eos(&[]).is_err(),
-            "an absent EOS is not an EOS"
-        );
-        assert!(fresh.accept_batch(&[0xAA, 0xBB, 0xCC]).is_err());
-
-        // A failed or cancelled stream is dropped without `finish`, so its
-        // terminal legitimately carries no end-of-stream.
-        let (dropped, _dropped_schema) =
-            super::QueryIpcEncoder::new(&schema).expect("failed stream opens");
-        drop(dropped);
-        let failed = failed_terminal_for_visibility(
-            QueryTerminalErrorCode::QueryExecutionFailed,
-            0,
-            VisibilityMode::PublishedOnly,
-        );
-        assert!(failed.arrow_ipc_eos.is_empty());
-        failed
-            .validate(VisibilityMode::PublishedOnly)
-            .expect("a failed terminal validates without an end-of-stream");
+        failed_stream_terminal_carries_no_end_of_stream(&schema);
     }
 
     /// Synthetic owner state used to exercise stream cancellation ordering.

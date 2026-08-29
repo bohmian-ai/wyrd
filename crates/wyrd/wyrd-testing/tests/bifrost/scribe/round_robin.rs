@@ -393,7 +393,11 @@ fn assert_rotation_between_tables(turns: &[Turn]) {
     let mut run = 0_usize;
     let mut previous: Option<TableClass> = None;
     for turn in turns.iter().take(last_contested) {
-        run = if previous == Some(turn.class) { run + 1 } else { 1 };
+        run = if previous == Some(turn.class) {
+            run + 1
+        } else {
+            1
+        };
         previous = Some(turn.class);
         assert!(
             run <= MAX_CONSECUTIVE_TURNS,

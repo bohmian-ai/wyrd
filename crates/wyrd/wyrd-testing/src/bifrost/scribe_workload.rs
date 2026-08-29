@@ -843,12 +843,11 @@ impl ScribeProductionEvidenceV1 {
                 }
                 continue;
             }
-            let recovered =
-                observed
-                    .recovered
-                    .ok_or_else(|| ScribeWorkloadError::Evidence {
-                        detail: "the restart boundary carries no recovery evidence".to_owned(),
-                    })?;
+            let recovered = observed
+                .recovered
+                .ok_or_else(|| ScribeWorkloadError::Evidence {
+                    detail: "the restart boundary carries no recovery evidence".to_owned(),
+                })?;
             if !recovered.restarted {
                 return Err(ScribeWorkloadError::Evidence {
                     detail: "the restart boundary reports that the pod was never restarted"
@@ -905,9 +904,11 @@ impl ScribeProductionEvidenceV1 {
                 }
                 continue;
             }
-            let drained = observed.drained.ok_or_else(|| ScribeWorkloadError::Evidence {
-                detail: "the terminal boundary carries no drain evidence".to_owned(),
-            })?;
+            let drained = observed
+                .drained
+                .ok_or_else(|| ScribeWorkloadError::Evidence {
+                    detail: "the terminal boundary carries no drain evidence".to_owned(),
+                })?;
             if !drained.servers_stopped || !drained.listeners_stopped {
                 return Err(ScribeWorkloadError::Evidence {
                     detail: format!(
@@ -1359,6 +1360,263 @@ fn table_at(
         .and_then(|declared| declared.tables.get(table))
         .ok_or_else(|| {
             crate::WyrdTestServerError::Start("workload names an undeclared table".to_owned())
+        })
+}
+
+/// Drives one canonical workload against a cluster it owns for the whole run.
+impl crate::bifrost::WyrdTestCluster {
+    /// Executes one canonical Scribe production workload and returns its evidence.
+    ///
+    /// Every operation goes through a public surface: tenant seeding and table
+    /// registration through the server's own catalog, appends through the
+    /// public gRPC ingest route with the record's fixed batch ids, the freeze
+    /// and publication through the pod's own lifecycle controls, reads through
+    /// the public query route, and restart and drain through the cluster's node
+    /// lifecycle. Nothing here fabricates a row, an object, or a durable
+    /// record; the runner only observes what the production path produced.
+    ///
+    /// The cluster is consumed because the record's terminal operation is a
+    /// drain: after it there is no pod, which is exactly what makes the drain
+    /// evidence a terminal observation rather than a mid-run sample. Taking
+    /// ownership is what lets one runner cover the whole lifecycle instead of
+    /// stopping at publication and leaving recovery to each caller's own
+    /// hand-written epilogue.
+    ///
+    /// `cache_mode` is recorded in the evidence and nothing else: this crate
+    /// owns no cache behavior, and the Scribe candidate runs with the cache
+    /// absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdTestServerError`](crate::WyrdTestServerError) when the
+    /// record does not validate, when the cluster has no running pod at an
+    /// operation that needs one, when a tenant, table, append, seal, flush or
+    /// read on a public route fails, when a node cannot be stopped or
+    /// restarted, when the terminal drain fails, or when a published promotion
+    /// record cannot be read back from its fenced `file_list` row.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic; every failure is reported as an error.
+    pub async fn run_scribe_production_workload(
+        self,
+        workload: &ScribeProductionWorkloadV1,
+        cache_mode: ScribeCacheMode,
+    ) -> Result<ScribeWorkloadRunV1, crate::WyrdTestServerError> {
+        workload
+            .validate()
+            .map_err(|error| crate::WyrdTestServerError::Start(error.to_string()))?;
+
+        let mut cluster = Some(self);
+        let node = running_pod(&cluster)?.node_id();
+        let bindings = running_pod(&cluster)?
+            .seed_scribe_workload_owners_for_test(workload)
+            .await?;
+
+        let mut acknowledged = 0_u64;
+        // Reads observed since the *previous* checkpoint. A checkpoint consumes
+        // this buffer, so every digest is evidence of a read that happened
+        // after the boundary before it. Carrying reads forward would let one
+        // early read vouch for every later boundary, and accumulating repeated
+        // full reads would hash duplicated rows into a false mismatch.
+        let mut read_since_checkpoint: Vec<(usize, usize, i64)> = Vec::new();
+        let mut checkpoints = Vec::new();
+        let mut restarted = false;
+        let mut recovered: Option<ScribeRecoveryObservationV1> = None;
+        let mut drained: Option<ScribeDrainObservationV1> = None;
+        // Publication as it stood immediately before the drain. The terminal
+        // boundary is defined by published objects, and after the drain there
+        // is no pod left to ask, so the observation is taken while there still
+        // is one.
+        let mut published_at_drain: Option<BTreeMap<String, Vec<ScribePublishedHotFileV1>>> = None;
+
+        for operation in &workload.operations {
+            match operation {
+                ScribeWorkloadOperationV1::Append {
+                    tenant,
+                    table,
+                    batch_id,
+                    rows,
+                } => {
+                    let binding = binding_at(&bindings, *tenant)?;
+                    let declared = table_at(workload, *tenant, *table)?;
+                    running_pod(&cluster)?
+                        .append_workload_batch_for_test(
+                            binding.tenant,
+                            &declared.fqn(),
+                            *batch_id,
+                            rows,
+                        )
+                        .await?;
+                    acknowledged += rows.len() as u64;
+                }
+                ScribeWorkloadOperationV1::Seal => {
+                    running_pod(&cluster)?
+                        .seal_bifrost_writable_for_test()
+                        .await?;
+                }
+                ScribeWorkloadOperationV1::Flush { tenant } => {
+                    // The declared tenant index is still validated: a record
+                    // naming a tenant the run never bound is a malformed
+                    // record, even though the pod flush that follows covers
+                    // every bucket the pod holds regardless of tenant.
+                    binding_at(&bindings, *tenant)?;
+                    running_pod(&cluster)?.flush_bifrost().await?;
+                }
+                ScribeWorkloadOperationV1::Read { tenant, table } => {
+                    let binding = binding_at(&bindings, *tenant)?;
+                    let declared = table_at(workload, *tenant, *table)?;
+                    for value in running_pod(&cluster)?
+                        .read_workload_table_for_test(binding.tenant, &declared.fqn())
+                        .await?
+                    {
+                        read_since_checkpoint.push((*tenant, *table, value));
+                    }
+                }
+                ScribeWorkloadOperationV1::Restart => {
+                    let owner = cluster.as_mut().ok_or_else(|| {
+                        crate::WyrdTestServerError::Start(
+                            "the record restarts a pod after the terminal drain".to_owned(),
+                        )
+                    })?;
+                    owner
+                        .stop_node(node)
+                        .await
+                        .map_err(|error| crate::WyrdTestServerError::Start(error.to_string()))?;
+                    owner
+                        .restart_node(node)
+                        .await
+                        .map_err(|error| crate::WyrdTestServerError::Start(error.to_string()))?;
+                    restarted = true;
+                }
+                ScribeWorkloadOperationV1::Replay => {
+                    // Rows either side of the replay, read through the public
+                    // route. The replay's whole claim is that this count does
+                    // not move, and it is only observable by reading twice.
+                    let before = running_pod(&cluster)?
+                        .read_scribe_workload_rows_for_test(workload, &bindings)
+                        .await?
+                        .len() as u64;
+                    let mut replayed = 0_u64;
+                    for replayed_operation in &workload.operations {
+                        if let ScribeWorkloadOperationV1::Append {
+                            tenant,
+                            table,
+                            batch_id,
+                            rows,
+                        } = replayed_operation
+                        {
+                            let binding = binding_at(&bindings, *tenant)?;
+                            let declared = table_at(workload, *tenant, *table)?;
+                            running_pod(&cluster)?
+                                .append_workload_batch_for_test(
+                                    binding.tenant,
+                                    &declared.fqn(),
+                                    *batch_id,
+                                    rows,
+                                )
+                                .await?;
+                            replayed += 1;
+                        }
+                    }
+                    let after = running_pod(&cluster)?
+                        .read_scribe_workload_rows_for_test(workload, &bindings)
+                        .await?
+                        .len() as u64;
+                    recovered = Some(ScribeRecoveryObservationV1 {
+                        restarted,
+                        replayed_batches: replayed,
+                        added_rows: after.saturating_sub(before),
+                    });
+                }
+                ScribeWorkloadOperationV1::Drain => {
+                    let owner = cluster.take().ok_or_else(|| {
+                        crate::WyrdTestServerError::Start(
+                            "the record drains the pod twice".to_owned(),
+                        )
+                    })?;
+                    let observed = owner
+                        .server(0)
+                        .ok_or_else(|| {
+                            crate::WyrdTestServerError::Start(
+                                "the cluster has no running pod to drain".to_owned(),
+                            )
+                        })?
+                        .observe_scribe_workload_publication_for_test(workload, &bindings)
+                        .await?;
+                    published_at_drain = Some(observed);
+                    let inspection = owner
+                        .shutdown_and_inspect()
+                        .await
+                        .map_err(|error| crate::WyrdTestServerError::Start(error.to_string()))?;
+                    drained = Some(ScribeDrainObservationV1 {
+                        servers_stopped: inspection.servers_stopped,
+                        listeners_stopped: inspection.listeners_stopped,
+                        admitted: inspection.scribe_inflight,
+                        queued: inspection.scribe_queued,
+                        wal_streams: inspection.scribe_wal_streams,
+                        supervised_tasks: inspection.supervised_tasks,
+                    });
+                }
+                ScribeWorkloadOperationV1::Checkpoint { name } => {
+                    let published = match published_at_drain.take() {
+                        Some(observed) => observed,
+                        None => {
+                            running_pod(&cluster)?
+                                .observe_scribe_workload_publication_for_test(workload, &bindings)
+                                .await?
+                        }
+                    };
+                    checkpoints.push(ScribeLifecycleCheckpointV1 {
+                        name: *name,
+                        acknowledged_rows: acknowledged,
+                        published,
+                        observed_row_digest: {
+                            let mut observed = std::mem::take(&mut read_since_checkpoint);
+                            if observed.is_empty() {
+                                None
+                            } else {
+                                Some(row_digest(&mut observed))
+                            }
+                        },
+                        recovered: recovered.take(),
+                        drained: drained.take(),
+                    });
+                }
+            }
+        }
+
+        Ok(ScribeWorkloadRunV1 {
+            evidence: ScribeProductionEvidenceV1 {
+                version: workload.version,
+                cache_mode,
+                checkpoints,
+            },
+            bindings,
+        })
+    }
+}
+
+/// Borrows the cluster's running pod, or names why there is not one.
+///
+/// Every per-pod operation goes through here so that "the record asked for work
+/// after the terminal drain" is reported once, as itself, rather than as a
+/// panic on an absent server at whichever operation happened to be next.
+///
+/// # Errors
+///
+/// Returns [`WyrdTestServerError`](crate::WyrdTestServerError) when the cluster
+/// has already been drained, or when it holds no pod at index zero.
+fn running_pod(
+    cluster: &Option<crate::bifrost::WyrdTestCluster>,
+) -> Result<&crate::WyrdTestServer, crate::WyrdTestServerError> {
+    cluster
+        .as_ref()
+        .and_then(|owner| owner.server(0))
+        .ok_or_else(|| {
+            crate::WyrdTestServerError::Start(
+                "the record needs a running pod, but the cluster has been drained".to_owned(),
+            )
         })
 }
 
@@ -1985,261 +2243,4 @@ mod tests {
             },
         )
     }
-}
-
-/// Drives one canonical workload against a cluster it owns for the whole run.
-impl crate::bifrost::WyrdTestCluster {
-    /// Executes one canonical Scribe production workload and returns its evidence.
-    ///
-    /// Every operation goes through a public surface: tenant seeding and table
-    /// registration through the server's own catalog, appends through the
-    /// public gRPC ingest route with the record's fixed batch ids, the freeze
-    /// and publication through the pod's own lifecycle controls, reads through
-    /// the public query route, and restart and drain through the cluster's node
-    /// lifecycle. Nothing here fabricates a row, an object, or a durable
-    /// record; the runner only observes what the production path produced.
-    ///
-    /// The cluster is consumed because the record's terminal operation is a
-    /// drain: after it there is no pod, which is exactly what makes the drain
-    /// evidence a terminal observation rather than a mid-run sample. Taking
-    /// ownership is what lets one runner cover the whole lifecycle instead of
-    /// stopping at publication and leaving recovery to each caller's own
-    /// hand-written epilogue.
-    ///
-    /// `cache_mode` is recorded in the evidence and nothing else: this crate
-    /// owns no cache behavior, and the Scribe candidate runs with the cache
-    /// absent.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WyrdTestServerError`](crate::WyrdTestServerError) when the
-    /// record does not validate, when the cluster has no running pod at an
-    /// operation that needs one, when a tenant, table, append, seal, flush or
-    /// read on a public route fails, when a node cannot be stopped or
-    /// restarted, when the terminal drain fails, or when a published promotion
-    /// record cannot be read back from its fenced `file_list` row.
-    ///
-    /// # Panics
-    ///
-    /// Does not panic; every failure is reported as an error.
-    pub async fn run_scribe_production_workload(
-        self,
-        workload: &ScribeProductionWorkloadV1,
-        cache_mode: ScribeCacheMode,
-    ) -> Result<ScribeWorkloadRunV1, crate::WyrdTestServerError> {
-        workload
-            .validate()
-            .map_err(|error| crate::WyrdTestServerError::Start(error.to_string()))?;
-
-        let mut cluster = Some(self);
-        let node = running_pod(&cluster)?.node_id();
-        let bindings = running_pod(&cluster)?
-            .seed_scribe_workload_owners_for_test(workload)
-            .await?;
-
-        let mut acknowledged = 0_u64;
-        // Reads observed since the *previous* checkpoint. A checkpoint consumes
-        // this buffer, so every digest is evidence of a read that happened
-        // after the boundary before it. Carrying reads forward would let one
-        // early read vouch for every later boundary, and accumulating repeated
-        // full reads would hash duplicated rows into a false mismatch.
-        let mut read_since_checkpoint: Vec<(usize, usize, i64)> = Vec::new();
-        let mut checkpoints = Vec::new();
-        let mut restarted = false;
-        let mut recovered: Option<ScribeRecoveryObservationV1> = None;
-        let mut drained: Option<ScribeDrainObservationV1> = None;
-        // Publication as it stood immediately before the drain. The terminal
-        // boundary is defined by published objects, and after the drain there
-        // is no pod left to ask, so the observation is taken while there still
-        // is one.
-        let mut published_at_drain: Option<BTreeMap<String, Vec<ScribePublishedHotFileV1>>> = None;
-
-        for operation in &workload.operations {
-            match operation {
-                ScribeWorkloadOperationV1::Append {
-                    tenant,
-                    table,
-                    batch_id,
-                    rows,
-                } => {
-                    let binding = binding_at(&bindings, *tenant)?;
-                    let declared = table_at(workload, *tenant, *table)?;
-                    running_pod(&cluster)?
-                        .append_workload_batch_for_test(
-                            binding.tenant,
-                            &declared.fqn(),
-                            *batch_id,
-                            rows,
-                        )
-                        .await?;
-                    acknowledged += rows.len() as u64;
-                }
-                ScribeWorkloadOperationV1::Seal => {
-                    running_pod(&cluster)?
-                        .seal_bifrost_writable_for_test()
-                        .await?;
-                }
-                ScribeWorkloadOperationV1::Flush { tenant } => {
-                    // The declared tenant index is still validated: a record
-                    // naming a tenant the run never bound is a malformed
-                    // record, even though the pod flush that follows covers
-                    // every bucket the pod holds regardless of tenant.
-                    binding_at(&bindings, *tenant)?;
-                    running_pod(&cluster)?.flush_bifrost().await?;
-                }
-                ScribeWorkloadOperationV1::Read { tenant, table } => {
-                    let binding = binding_at(&bindings, *tenant)?;
-                    let declared = table_at(workload, *tenant, *table)?;
-                    for value in running_pod(&cluster)?
-                        .read_workload_table_for_test(binding.tenant, &declared.fqn())
-                        .await?
-                    {
-                        read_since_checkpoint.push((*tenant, *table, value));
-                    }
-                }
-                ScribeWorkloadOperationV1::Restart => {
-                    let owner = cluster.as_mut().ok_or_else(|| {
-                        crate::WyrdTestServerError::Start(
-                            "the record restarts a pod after the terminal drain".to_owned(),
-                        )
-                    })?;
-                    owner
-                        .stop_node(node)
-                        .await
-                        .map_err(|error| crate::WyrdTestServerError::Start(error.to_string()))?;
-                    owner
-                        .restart_node(node)
-                        .await
-                        .map_err(|error| crate::WyrdTestServerError::Start(error.to_string()))?;
-                    restarted = true;
-                }
-                ScribeWorkloadOperationV1::Replay => {
-                    // Rows either side of the replay, read through the public
-                    // route. The replay's whole claim is that this count does
-                    // not move, and it is only observable by reading twice.
-                    let before = running_pod(&cluster)?
-                        .read_scribe_workload_rows_for_test(workload, &bindings)
-                        .await?
-                        .len() as u64;
-                    let mut replayed = 0_u64;
-                    for replayed_operation in &workload.operations {
-                        if let ScribeWorkloadOperationV1::Append {
-                            tenant,
-                            table,
-                            batch_id,
-                            rows,
-                        } = replayed_operation
-                        {
-                            let binding = binding_at(&bindings, *tenant)?;
-                            let declared = table_at(workload, *tenant, *table)?;
-                            running_pod(&cluster)?
-                                .append_workload_batch_for_test(
-                                    binding.tenant,
-                                    &declared.fqn(),
-                                    *batch_id,
-                                    rows,
-                                )
-                                .await?;
-                            replayed += 1;
-                        }
-                    }
-                    let after = running_pod(&cluster)?
-                        .read_scribe_workload_rows_for_test(workload, &bindings)
-                        .await?
-                        .len() as u64;
-                    recovered = Some(ScribeRecoveryObservationV1 {
-                        restarted,
-                        replayed_batches: replayed,
-                        added_rows: after.saturating_sub(before),
-                    });
-                }
-                ScribeWorkloadOperationV1::Drain => {
-                    let owner = cluster.take().ok_or_else(|| {
-                        crate::WyrdTestServerError::Start(
-                            "the record drains the pod twice".to_owned(),
-                        )
-                    })?;
-                    let observed = owner
-                        .server(0)
-                        .ok_or_else(|| {
-                            crate::WyrdTestServerError::Start(
-                                "the cluster has no running pod to drain".to_owned(),
-                            )
-                        })?
-                        .observe_scribe_workload_publication_for_test(workload, &bindings)
-                        .await?;
-                    published_at_drain = Some(observed);
-                    let inspection = owner
-                        .shutdown_and_inspect()
-                        .await
-                        .map_err(|error| crate::WyrdTestServerError::Start(error.to_string()))?;
-                    drained = Some(ScribeDrainObservationV1 {
-                        servers_stopped: inspection.servers_stopped,
-                        listeners_stopped: inspection.listeners_stopped,
-                        admitted: inspection.scribe_inflight,
-                        queued: inspection.scribe_queued,
-                        wal_streams: inspection.scribe_wal_streams,
-                        supervised_tasks: inspection.supervised_tasks,
-                    });
-                }
-                ScribeWorkloadOperationV1::Checkpoint { name } => {
-                    let published = match published_at_drain.take() {
-                        Some(observed) => observed,
-                        None => {
-                            running_pod(&cluster)?
-                                .observe_scribe_workload_publication_for_test(workload, &bindings)
-                                .await?
-                        }
-                    };
-                    checkpoints.push(ScribeLifecycleCheckpointV1 {
-                        name: *name,
-                        acknowledged_rows: acknowledged,
-                        published,
-                        observed_row_digest: {
-                            let mut observed = std::mem::take(&mut read_since_checkpoint);
-                            if observed.is_empty() {
-                                None
-                            } else {
-                                Some(row_digest(&mut observed))
-                            }
-                        },
-                        recovered: recovered.take(),
-                        drained: drained.take(),
-                    });
-                }
-            }
-        }
-
-        Ok(ScribeWorkloadRunV1 {
-            evidence: ScribeProductionEvidenceV1 {
-                version: workload.version,
-                cache_mode,
-                checkpoints,
-            },
-            bindings,
-        })
-    }
-}
-
-/// Borrows the cluster's running pod, or names why there is not one.
-///
-/// Every per-pod operation goes through here so that "the record asked for work
-/// after the terminal drain" is reported once, as itself, rather than as a
-/// panic on an absent server at whichever operation happened to be next.
-///
-/// # Errors
-///
-/// Returns [`WyrdTestServerError`](crate::WyrdTestServerError) when the cluster
-/// has already been drained, or when it holds no pod at index zero.
-fn running_pod(
-    cluster: &Option<crate::bifrost::WyrdTestCluster>,
-) -> Result<&crate::WyrdTestServer, crate::WyrdTestServerError> {
-    cluster
-        .as_ref()
-        .and_then(|owner| owner.server(0))
-        .ok_or_else(|| {
-            crate::WyrdTestServerError::Start(
-                "the record needs a running pod, but the cluster has been drained".to_owned(),
-            )
-        })
 }

@@ -79,7 +79,6 @@ async fn scribe_write_flush_read_user_journey() {
         .expect("the run satisfies every normative field of the record");
 }
 
-
 /// Asserts an unwritten table's strict read reaches a clean empty terminal.
 async fn assert_empty_table_reads_cleanly(server: &wyrd_testing::WyrdTestServer) {
     let tenant = server.data_tenant_id();
@@ -109,8 +108,6 @@ async fn assert_empty_table_reads_cleanly(server: &wyrd_testing::WyrdTestServer)
         "empty logical results must not emit zero-row batch frames"
     );
 }
-
-
 
 /// An undialable ready Scribe peer fails a strict fused read with its typed 503.
 ///
@@ -194,12 +191,10 @@ async fn scribe_undialable_private_peer_returns_typed_visibility_failure() {
         .await;
     let error = match started {
         Err(error) => error,
-        Ok(mut stream) => loop {
-            match stream.next_batch().await {
-                Err(error) => break error,
-                Ok(Some(_)) => panic!("undialable strict read emitted a successful batch"),
-                Ok(None) => panic!("undialable strict read emitted a successful terminal"),
-            }
+        Ok(mut stream) => match stream.next_batch().await {
+            Err(error) => error,
+            Ok(Some(_)) => panic!("undialable strict read emitted a successful batch"),
+            Ok(None) => panic!("undialable strict read emitted a successful terminal"),
         },
     };
     match &error {

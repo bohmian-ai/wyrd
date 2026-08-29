@@ -1317,9 +1317,7 @@ pub(crate) mod tests {
     use datafusion::execution::object_store::ObjectStoreUrl;
     use datafusion::physical_plan::collect;
     use datafusion_proto::bytes::physical_plan_to_bytes_with_extension_codec;
-    use wyrd_spec::vala::api::{
-        PersistedFileAssignment, ScribeProviderCut, SignedPeerTicket,
-    };
+    use wyrd_spec::vala::api::{PersistedFileAssignment, ScribeProviderCut, SignedPeerTicket};
 
     use super::*;
     use crate::oracle::codec::RemoteSourcePlaceholderExec;
@@ -1729,7 +1727,7 @@ pub(crate) mod tests {
                     .map(|index| format!("file-{index}.parquet"))
                     .collect(),
             },
-            scribe_provider_cut: cut.then(|| self::cut()),
+            scribe_provider_cut: cut.then(self::cut),
             schema_fingerprint: "shape".to_owned(),
             required_columns: vec!["data_tenant_id".to_owned()],
             predicates: Vec::new(),

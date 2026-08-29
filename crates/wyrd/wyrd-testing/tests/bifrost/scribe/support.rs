@@ -397,7 +397,10 @@ pub(super) async fn append_until_admitted(
     rows: &[i64],
     label: &str,
 ) -> usize {
-    until_admitted(label, || append_values(client, table, uuid::Uuid::now_v7(), rows)).await
+    until_admitted(label, || {
+        append_values(client, table, uuid::Uuid::now_v7(), rows)
+    })
+    .await
 }
 
 /// Retries one caller-supplied public ingest attempt until the pod admits it.

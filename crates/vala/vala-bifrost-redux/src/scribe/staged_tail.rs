@@ -248,8 +248,8 @@ mod tests {
     use crate::namespaces::BifrostNamespace;
     use crate::scribe::assembly::StagedMemberId;
     use crate::scribe::hot_source::GenerationOrdinal;
-    use crate::scribe::wal::WalLsn;
     use crate::scribe::seal_key::SealKey;
+    use crate::scribe::wal::WalLsn;
     use wyrd_spec::ids::DataTenantId;
 
     /// Builds the two-column schema every staged fixture run is written under.
@@ -431,10 +431,7 @@ mod tests {
             .expect("the staged runs read");
 
         assert_eq!(
-            batches
-                .iter()
-                .map(|batch| batch.origin.clone())
-                .collect::<Vec<_>>(),
+            batches.iter().map(|batch| batch.origin).collect::<Vec<_>>(),
             vec![
                 HotBatchSource::StagedMember {
                     member: StagedMemberId::new(0, 1),

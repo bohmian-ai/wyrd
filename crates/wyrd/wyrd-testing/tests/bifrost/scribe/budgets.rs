@@ -543,7 +543,10 @@ async fn scribe_seventeen_tables_rotate_without_starvation() {
     // acknowledgement order is what separates rotation from that: the earliest
     // table to finish its demand may not finish before the latest table to
     // start has had its first turn.
-    let order = order.lock().expect("the acknowledgement order is readable");
+    let order: Vec<usize> = order
+        .lock()
+        .expect("the acknowledgement order is readable")
+        .clone();
     let mut first_turns = Vec::with_capacity(ROTATION_TABLES);
     let mut last_turns = Vec::with_capacity(ROTATION_TABLES);
     for ordinal in 0..ROTATION_TABLES {
@@ -581,7 +584,6 @@ async fn scribe_seventeen_tables_rotate_without_starvation() {
          turn; the last table to start did so at {latest_start} and the first to \
          finish did so at {earliest_finish}: {order:?}"
     );
-    drop(order);
 
     for (ordinal, table) in tables.iter().enumerate() {
         assert_eq!(
@@ -707,7 +709,10 @@ async fn scribe_ten_tenants_rotate_fairly() {
          other; only {contested} was ever refused"
     );
 
-    let order = order.lock().expect("the acknowledgement order is readable");
+    let order: Vec<usize> = order
+        .lock()
+        .expect("the acknowledgement order is readable")
+        .clone();
     let incumbent_completed = order
         .iter()
         .rposition(|tenant| *tenant == 0)
@@ -724,7 +729,6 @@ async fn scribe_ten_tenants_rotate_fairly() {
              tenant is admitted once: {order:?}"
         );
     }
-    drop(order);
 
     for (ordinal, (client, table)) in equals.iter().enumerate() {
         assert_eq!(

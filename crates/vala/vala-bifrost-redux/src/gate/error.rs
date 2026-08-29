@@ -767,23 +767,14 @@ mod tests {
     #[test]
     fn payload_limit_survives_the_scribe_to_public_projection() {
         for scribe_error in [
-            ScribeError::PayloadTooLarge {
-                bytes: 2,
-                limit: 1,
-            },
-            ScribeError::DecodedPayloadTooLarge {
-                bytes: 2,
-                limit: 1,
-            },
+            ScribeError::PayloadTooLarge { bytes: 2, limit: 1 },
+            ScribeError::DecodedPayloadTooLarge { bytes: 2, limit: 1 },
         ] {
             let ingest_error = IngestError::from_scribe(scribe_error);
             assert!(
                 matches!(
                     ingest_error,
-                    IngestError::PayloadTooLarge {
-                        bytes: 2,
-                        limit: 1
-                    }
+                    IngestError::PayloadTooLarge { bytes: 2, limit: 1 }
                 ),
                 "gate taxonomy must retain both bounds: {ingest_error:?}"
             );

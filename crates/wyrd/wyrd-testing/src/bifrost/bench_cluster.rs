@@ -1081,7 +1081,7 @@ pub(crate) async fn preload_reference_rows(
         cluster
             .server_by_node(writer_nodes[tenant_index % writer_nodes.len()])
             .ok_or("preload Server is absent")?
-        .flush_bifrost()
+            .flush_bifrost()
             .await?;
     }
     Ok(())
@@ -1106,7 +1106,7 @@ pub(crate) async fn flush_tenant_writers(
         cluster
             .server_by_node(writer_nodes[tenant_index % writer_nodes.len()])
             .ok_or("reference cluster has no tenant writer Server")?
-        .flush_bifrost()
+            .flush_bifrost()
             .await?;
     }
     Ok(())

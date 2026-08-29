@@ -6991,18 +6991,22 @@ mod tests {
         assert!(visibility_error.contains("generation"));
     }
 
-    /// Drains the owner's visible rows, retires the generation, and shuts it down.
+    /// Proves the staged generation left the owner's snapshot, then retires it.
     ///
     /// The snapshot goes through the real `Snapshot` mailbox command with a
-    /// narrow required-column projection, so this proves the persisted
-    /// generation is visible through the owner's own live-tail path rather than
-    /// by reading its internals. Retirement and shutdown then run as mailbox
-    /// commands too, so the owner task must terminate on its own.
+    /// narrow required-column projection, so this observes the owner's own
+    /// live-tail path rather than its internals. A generation whose persistence
+    /// completion carried a staged member has handed its rows to that member:
+    /// the staged source is their single authority from that moment, and an
+    /// owner that still served the retained Arrow copy would double every one
+    /// of those rows for any reader that consults both. Retirement and shutdown
+    /// then run as mailbox commands too, so the owner task must terminate on
+    /// its own.
     ///
     /// # Panics
     ///
-    /// Panics if any mailbox send or response fails, if the snapshot does not
-    /// return exactly one batch of one row, or if the owner task does not join.
+    /// Panics if any mailbox send or response fails, if the owner still serves
+    /// the staged generation, or if the owner task does not join.
     async fn assert_visible_rows_then_retire_and_shutdown(
         key: &SealKey,
         stream: StreamIdentity,
@@ -7034,8 +7038,10 @@ mod tests {
             .await
             .expect("snapshot response")
             .expect("visible owner rows");
-        assert_eq!(visible.len(), 1);
-        assert_eq!(visible[0].rows.num_rows(), 1);
+        assert!(
+            visible.is_empty(),
+            "a staged generation's rows belong to its staged member, not to the owner's Arrow copy"
+        );
         let (retire_response, retire_result) = tokio::sync::oneshot::channel();
         command_tx
             .send(ShardCommand::RetireCommittedForTest {

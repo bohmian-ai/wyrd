@@ -963,6 +963,15 @@ impl Memtable {
         for (seal_key, entries) in immutable.iter() {
             if selects(seal_key) {
                 for entry in entries {
+                    // A durable generation's rows are already served by the
+                    // staged member the registry advanced it onto, and the
+                    // staging owner registers that authority before it marks
+                    // the generation durable here. Reading the retained Arrow
+                    // copy as well would return every one of those rows twice
+                    // until the retirement sweep happens to drop it.
+                    if matches!(entry.state, ImmutableState::Durable { .. }) {
+                        continue;
+                    }
                     entry
                         .frozen
                         .append_readable_batches(required_columns, &mut batches)?;
@@ -2246,6 +2255,13 @@ mod tests {
         );
     }
 
+    /// One seal key retains several frozen generations, and only the ones that
+    /// have not yet been staged are served from memory.
+    ///
+    /// The two clauses belong together: freezing must not collapse generations
+    /// into one another, and a generation that reached its staged member must
+    /// stop being served here, because from that point the staged source is its
+    /// single authority and serving both would double its rows.
     #[test]
     fn test_multiple_frozen_generations_same_seal_key() {
         let memtable = Memtable::new();
@@ -2281,7 +2297,11 @@ mod tests {
             .into_iter()
             .map(|batch| batch.meta.wal_lsn_max)
             .collect();
-        assert_eq!(lsns, vec![WalLsn::new(10), WalLsn::new(20)]);
+        assert_eq!(
+            lsns,
+            vec![WalLsn::new(20)],
+            "a staged generation is served by its staged member, not by the retained Arrow copy"
+        );
     }
 
     /// Live-tail snapshots refuse count and byte overflow before projection growth.

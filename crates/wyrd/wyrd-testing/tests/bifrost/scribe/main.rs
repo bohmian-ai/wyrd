@@ -1,3 +1,4 @@
+mod cross_shard;
 mod fencing;
 mod lifecycle;
 mod source_boundary;

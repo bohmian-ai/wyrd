@@ -29,7 +29,7 @@ use crate::catalog::layout::TimePartition;
 use crate::contracts::ScribeError;
 use crate::parquet::memory::{
     BifrostArrowLogicalSizer, BifrostFooterAccumulator, BifrostParquetMemoryEnvelope,
-    validate_writer_v2_structure,
+    MAX_LOGICAL_ROW_GROUP_BYTES, MAX_ROW_GROUP_ROWS, validate_writer_v2_structure,
 };
 use crate::parquet::writer_properties::bifrost_writer_properties_with_metadata;
 use crate::resources::ScribeClaimScratch;
@@ -517,6 +517,12 @@ struct RollingArtifactWriter<'a> {
     artifacts: Vec<BoundedParquetArtifact>,
     /// Footer-derived statistics for every sealed row group in write order.
     row_group_stats: Vec<RowGroupStats>,
+    /// Ordered slices accumulated toward the next complete row group.
+    pending: Vec<RecordBatch>,
+    /// Rows currently accumulated in `pending`.
+    pending_rows: usize,
+    /// Canonical logical bytes currently accumulated in `pending`.
+    pending_logical_bytes: u64,
 }
 
 impl<'a> RollingArtifactWriter<'a> {
@@ -528,19 +534,28 @@ impl<'a> RollingArtifactWriter<'a> {
             open: None,
             artifacts: Vec::new(),
             row_group_stats: Vec::new(),
+            pending: Vec::new(),
+            pending_rows: 0,
+            pending_logical_bytes: 0,
         }
     }
 
-    /// Appends one already ordered batch as one or more complete row groups.
+    /// Accumulates one already ordered batch toward complete row groups.
     ///
-    /// The batch is split by the canonical logical sizer and each slice is
-    /// written and explicitly flushed as exactly one Parquet row group, which
-    /// is what makes a roll decision land on a group boundary.
+    /// The batch is split by the canonical logical sizer, and its slices join
+    /// whatever the previous batches left pending rather than becoming row
+    /// groups of their own. A claim assembles many staged runs, and most of
+    /// them are far smaller than a group: writing one group per input would
+    /// make the footer grow with the number of runs merged instead of with the
+    /// object's size, and a large claim would then describe more structure than
+    /// the footer contract admits. A group is cut only when the next slice
+    /// would carry it past the canonical row or logical-byte ceiling, so a
+    /// sealed object holds the fewest groups its rows allow.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when logical slicing refuses the
-    /// batch, the batch is empty, or appending a row group fails.
+    /// batch, the batch is empty, or writing a completed row group fails.
     fn append_ordered_batch(&mut self, ordered_batch: &RecordBatch) -> Result<(), ScribeError> {
         let slices = BifrostArrowLogicalSizer::slice(ordered_batch).map_err(|detail| {
             ScribeError::Internal {
@@ -553,9 +568,68 @@ impl<'a> RollingArtifactWriter<'a> {
             });
         }
         for slice in slices {
-            self.append_row_group(&ordered_batch.slice(slice.offset, slice.len))?;
+            if self.pending_would_overflow(slice.len, slice.logical_bytes) {
+                self.write_pending_row_group()?;
+            }
+            self.pending
+                .push(ordered_batch.slice(slice.offset, slice.len));
+            self.pending_rows = self.pending_rows.saturating_add(slice.len);
+            self.pending_logical_bytes = self
+                .pending_logical_bytes
+                .saturating_add(slice.logical_bytes);
         }
         Ok(())
+    }
+
+    /// Whether adding one more slice would break this writer's group ceilings.
+    ///
+    /// Nothing pending never overflows: the sizer already bounded that slice to
+    /// one admissible group, so it always starts the next one.
+    fn pending_would_overflow(&self, rows: usize, logical_bytes: u64) -> bool {
+        !self.pending.is_empty()
+            && (self.pending_rows.saturating_add(rows) > MAX_ROW_GROUP_ROWS
+                || self.pending_logical_bytes.saturating_add(logical_bytes)
+                    > self.group_logical_ceiling())
+    }
+
+    /// Returns the logical bytes one row group of this writer may accumulate.
+    ///
+    /// The canonical ceiling bounds every group, and the object target bounds it
+    /// again: rolling happens only between completed groups, so a group larger
+    /// than the object it lands in would make the target unreachable rather
+    /// than approximate.
+    fn group_logical_ceiling(&self) -> u64 {
+        MAX_LOGICAL_ROW_GROUP_BYTES.min(self.plan.target_object_bytes.max(1))
+    }
+
+    /// Writes everything accumulated so far as exactly one Parquet row group.
+    ///
+    /// Concatenation happens here rather than at slice time so the rows are
+    /// materialized once, in write order, and only for a group that is due.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::Internal`] when the pending slices cannot be
+    /// concatenated or the completed group cannot be written.
+    fn write_pending_row_group(&mut self) -> Result<(), ScribeError> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let pending = std::mem::take(&mut self.pending);
+        self.pending_rows = 0;
+        self.pending_logical_bytes = 0;
+        let schema = pending[0].schema();
+        let group = if pending.len() == 1 {
+            pending
+                .into_iter()
+                .next()
+                .expect("a one-element pending group has its batch")
+        } else {
+            concat_batches(&schema, &pending).map_err(|error| ScribeError::Internal {
+                detail: format!("concatenate writer-v2 row-group slices: {error}"),
+            })?
+        };
+        self.append_row_group(&group)
     }
 
     /// Writes one admitted slice as a complete row group and rolls if it is due.
@@ -656,6 +730,7 @@ impl<'a> RollingArtifactWriter<'a> {
     /// the Parquet artifact cannot be sealed or measured, the sealed file is
     /// empty, or footer inspection or checksumming refuses it.
     fn seal_open_artifact(&mut self) -> Result<(), ScribeError> {
+        self.write_pending_row_group()?;
         let Some(open) = self.open.take() else {
             return Ok(());
         };

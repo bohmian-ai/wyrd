@@ -224,7 +224,7 @@ impl StagedRunMerge {
             self.cursors[cursor].drained = true;
             return Ok(());
         };
-        if batch.schema() != self.schema {
+        if batch.schema_ref().fields() != self.schema.fields() {
             return Err(ScribeError::Internal {
                 detail: "staged run changed schema between batches".to_owned(),
             });
@@ -244,9 +244,18 @@ impl StagedRunMerge {
     ///
     /// # Errors
     ///
+    /// The comparison is over fields alone. A claim's schema may arrive
+    /// carrying the writer-v2 key/value envelope a sealed run's footer records,
+    /// while a batch decoded back out of Parquet carries none, and those two
+    /// describe the same physical layout: metadata is publication evidence, not
+    /// column identity. Comparing whole schemas refuses such a run for a
+    /// difference that has no bearing on merging it.
+    ///
+    /// # Errors
+    ///
     /// Returns [`ScribeError::Internal`] when the run cannot be opened or
-    /// decoded, its schema is not the claim's schema, or its sort key cannot be
-    /// encoded.
+    /// decoded, its fields are not the claim's fields, or its sort key cannot
+    /// be encoded.
     fn open_cursor(&mut self, run: &Path) -> Result<Option<RunCursor>, ScribeError> {
         let file = std::fs::File::open(run).map_err(|error| ScribeError::Internal {
             detail: format!("open the staged run for merge: {error}"),
@@ -263,7 +272,7 @@ impl StagedRunMerge {
         let Some(batch) = decode_next(&mut reader)? else {
             return Ok(None);
         };
-        if batch.schema() != self.schema {
+        if batch.schema_ref().fields() != self.schema.fields() {
             return Err(ScribeError::Internal {
                 detail: format!(
                     "staged run `{}` was encoded under a different physical schema: run [{}], claim [{}]",
@@ -363,18 +372,39 @@ fn decode_next(reader: &mut ParquetRecordBatchReader) -> Result<Option<RecordBat
     }
 }
 
-/// Renders one schema's fields as `name:type` for a contradiction message.
+/// Renders every field property a schema comparison can differ on.
 ///
 /// A merge that refuses a run needs to say how the two schemas differ, and the
-/// full `Debug` of an Arrow schema is too large to read in a log line. The
-/// field list is what actually distinguishes two physical layouts here.
+/// full `Debug` of an Arrow schema is too large to read in a log line. Arrow
+/// compares names, types, nullability, and field metadata, so all four appear
+/// here: a message that printed only names and types would show two identical
+/// lists for a run refused over a nullability or metadata difference.
 fn field_names(schema: &arrow::datatypes::Schema) -> String {
-    schema
+    let fields = schema
         .fields()
         .iter()
-        .map(|field| format!("{}:{}", field.name(), field.data_type()))
+        .map(|field| {
+            let mut rendered = format!("{}:{}", field.name(), field.data_type());
+            if field.is_nullable() {
+                rendered.push_str(":null");
+            }
+            if !field.metadata().is_empty() {
+                let mut keys = field.metadata().keys().cloned().collect::<Vec<_>>();
+                keys.sort_unstable();
+                rendered.push_str(":meta{");
+                rendered.push_str(&keys.join(","));
+                rendered.push('}');
+            }
+            rendered
+        })
         .collect::<Vec<_>>()
-        .join(", ")
+        .join(", ");
+    if schema.metadata().is_empty() {
+        return fields;
+    }
+    let mut keys = schema.metadata().keys().cloned().collect::<Vec<_>>();
+    keys.sort_unstable();
+    format!("{fields} | schema meta {{{}}}", keys.join(","))
 }
 
 #[cfg(test)]

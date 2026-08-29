@@ -203,7 +203,10 @@ impl CompactScanner<'_> {
             .checked_add(count)
             .ok_or_else(|| "Compact-Thrift structural count overflows".to_owned())?;
         if self.elements > MAX_FOOTER_STRUCTURAL_ELEMENTS {
-            return Err("Compact-Thrift footer structural count exceeds its ceiling".to_owned());
+            return Err(format!(
+                "Compact-Thrift footer structural count exceeds its ceiling: {} declared, {MAX_FOOTER_STRUCTURAL_ELEMENTS} allowed",
+                self.elements
+            ));
         }
         Ok(())
     }

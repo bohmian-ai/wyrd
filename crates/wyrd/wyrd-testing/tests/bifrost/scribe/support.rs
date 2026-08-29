@@ -151,10 +151,27 @@ pub(super) async fn append_values(
         ))],
     )
     .expect("value batch");
+    append_batch(client, table, batch_id, &batch).await
+}
+
+/// Appends one caller-built batch through public gRPC ingest.
+///
+/// Fencing cases need to send a batch whose schema is deliberately not the
+/// registered one, which the typed helpers cannot express.
+///
+/// # Errors
+///
+/// Returns the stable Wyrd error the public ingest route produced.
+pub(super) async fn append_batch(
+    client: &wyrd_client::WyrdClient,
+    table: &str,
+    batch_id: uuid::Uuid,
+    batch: &arrow::record_batch::RecordBatch,
+) -> Result<(), wyrd_spec::error::WyrdError> {
     vala_sdk::grpc::BifrostGrpcTransport::connect(client)
         .await
         .expect("public ingest transport connects")
-        .insert_batch(table, batch_id.into_bytes(), encode_ipc(&batch))
+        .insert_batch(table, batch_id.into_bytes(), encode_ipc(batch))
         .await
         .map(|_| ())
 }
@@ -186,12 +203,7 @@ pub(super) async fn append_values_at(
         ],
     )
     .expect("event-time batch");
-    vala_sdk::grpc::BifrostGrpcTransport::connect(client)
-        .await
-        .expect("public ingest transport connects")
-        .insert_batch(table, batch_id.into_bytes(), encode_ipc(&batch))
-        .await
-        .map(|_| ())
+    append_batch(client, table, batch_id, &batch).await
 }
 
 /// Reads one table's values back through the public strict fused query route.

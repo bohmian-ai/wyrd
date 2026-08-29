@@ -12,8 +12,8 @@ mod wire;
 
 pub(crate) use bifrost_catalog::schema_shape_matches;
 pub use bifrost_catalog::{
-    BifrostCatalog, CreateTableRequest, PinnedIcebergFile, PinnedSealedTable, TableUid,
-    project_persisted_wal_ranges,
+    BifrostCatalog, CreateTableRequest, PersistedWalCut, PinnedIcebergFile, PinnedSealedTable,
+    TableUid, project_persisted_wal_cut,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use bifrost_catalog::{reset_sealed_pin_count_for_test, sealed_pin_count_for_test};

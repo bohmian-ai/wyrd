@@ -2493,7 +2493,7 @@ pub struct ScribeProviderCut {
     pub end_partition: TimePartitionWire,
     /// Highest persisted stream cursor visible to this cut.
     pub persisted_cursor: u64,
-    /// Ordered, disjoint persisted WAL intervals excluded from memory.
+    /// Ascending inclusive persisted WAL intervals excluded from memory.
     pub persisted_ranges: Vec<PersistedWalRange>,
     /// Maximum Arrow batches retained by the provider.
     pub maximum_batch_count: u32,
@@ -2517,9 +2517,15 @@ impl ScribeProviderCut {
 /// Validates one canonical persisted cursor and its ordered inclusive WAL ranges.
 ///
 /// Endpoints must fit the durable signed domain, every range must be forward,
-/// and consecutive ranges must be strictly disjoint. A range may lie wholly on
-/// either side of the cursor, but may not contain values on both sides; a range
-/// ending exactly at the cursor is therefore valid.
+/// and the ranges must ascend. A range may lie wholly on either side of the
+/// cursor, but may not contain values on both sides; a range ending exactly at
+/// the cursor is therefore valid.
+///
+/// Ranges may overlap. A producing node numbers WAL records from one node-global
+/// counter while it seals generations per partition bucket, so one published
+/// generation's inclusive bounds routinely span records another bucket's
+/// generation owns. Rejecting that would reject an ordinary table whose rows
+/// arrived for two partitions at once.
 #[must_use]
 pub fn persisted_wal_ranges_are_valid(persisted_cursor: u64, ranges: &[PersistedWalRange]) -> bool {
     persisted_cursor <= i64::MAX as u64
@@ -2529,9 +2535,9 @@ pub fn persisted_wal_ranges_are_valid(persisted_cursor: u64, ranges: &[Persisted
                 && range.start_lsn <= range.end_lsn
                 && !(range.start_lsn <= persisted_cursor && persisted_cursor < range.end_lsn)
         })
-        && ranges
-            .windows(2)
-            .all(|pair| pair[0].end_lsn < pair[1].start_lsn)
+        && ranges.windows(2).all(|pair| {
+            (pair[0].start_lsn, pair[0].end_lsn) <= (pair[1].start_lsn, pair[1].end_lsn)
+        })
 }
 
 /// One scan-keyed role-local follower assignment.

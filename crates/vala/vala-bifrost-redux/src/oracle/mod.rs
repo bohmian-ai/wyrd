@@ -48,7 +48,7 @@ use wyrd_spec::vala::api::{
 use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
 
 use crate::catalog::{
-    BifrostCatalog, BifrostCatalogError, PinnedSealedTable, TableRef, project_persisted_wal_ranges,
+    BifrostCatalog, BifrostCatalogError, PinnedSealedTable, TableRef, project_persisted_wal_cut,
 };
 use crate::cluster::{ClusterRegistry, ClusterSnapshot, RegisteredRole};
 use crate::schema::SchemaFingerprint;
@@ -4657,16 +4657,20 @@ fn build_scribe_follower_sources(
                 })
                 .cloned()
                 .collect::<Vec<_>>();
-            let cursor = stream_rows
-                .iter()
-                .map(|row| u64::try_from(row.wal_lsn_max))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| BifrostError::QueryVisibilityUnavailable)?
-                .into_iter()
-                .max()
-                .unwrap_or(0);
-            let persisted_ranges = project_persisted_wal_ranges(&stream_rows, cursor)
+            let cut = project_persisted_wal_cut(&stream_rows)
                 .map_err(BifrostCatalogError::into_public)?;
+            tracing::debug!(
+                operation = "oracle_scribe_cut",
+                node = %node_id.as_uuid(),
+                writer_epoch,
+                sealed_rows = stream_rows.len(),
+                persisted_cursor = cut.persisted_cursor,
+                bounds = ?stream_rows
+                    .iter()
+                    .map(|row| (row.wal_lsn_min, row.wal_lsn_max, row.file_ordinal))
+                    .collect::<Vec<_>>(),
+                "Oracle pinned one Scribe memory cut at the published WAL prefix"
+            );
             let mut partitions = stream_rows
                 .iter()
                 .map(crate::oracle::tail_fence::hot_row_partition)
@@ -4693,8 +4697,8 @@ fn build_scribe_follower_sources(
                         writer_epoch,
                         start_partition,
                         end_partition,
-                        persisted_cursor: cursor,
-                        persisted_ranges,
+                        persisted_cursor: cut.persisted_cursor,
+                        persisted_ranges: cut.persisted_ranges,
                         maximum_batch_count: 1_024,
                         maximum_retained_bytes: u64::try_from(attempt_max_bytes)
                             .map_err(|_| BifrostError::QueryVisibilityUnavailable)?,
@@ -5805,6 +5809,10 @@ mod tests {
     }
 
     /// Canonical persisted-WAL validation rejects reversals and cursor straddling.
+    ///
+    /// Overlapping ranges are accepted: a node-global LSN counter and
+    /// per-partition sealing make one generation's bounds span another's
+    /// records without either owning the other.
     #[test]
     /// # Panics
     /// Panics if invalid, overlapping, or cursor-contradictory ranges are accepted.
@@ -5845,14 +5853,28 @@ mod tests {
         cut.persisted_ranges = vec![
             PersistedWalRange {
                 start_lsn: 8,
+                end_lsn: 12,
+            },
+            PersistedWalRange {
+                start_lsn: 10,
                 end_lsn: 10,
             },
+        ];
+        assert!(
+            cut.is_valid(),
+            "one generation's bounds may span another generation's records"
+        );
+        cut.persisted_ranges = vec![
             PersistedWalRange {
                 start_lsn: 10,
                 end_lsn: 12,
             },
+            PersistedWalRange {
+                start_lsn: 8,
+                end_lsn: 9,
+            },
         ];
-        assert!(!cut.is_valid());
+        assert!(!cut.is_valid(), "descending ranges are not a canonical cut");
         cut.persisted_ranges.clear();
         cut.persisted_cursor = i64::MAX as u64 + 1;
         assert!(!cut.is_valid());

@@ -441,7 +441,129 @@ impl ClaimPublisher {
         key: &crate::scribe::assembly::ScribeAssemblyKey,
         members: &[crate::scribe::hot_stage::StagedMember],
     ) -> Result<RecoveredTerminalCleanup, ScribeError> {
-        let terminal_facts = members
+        let terminal_facts = TerminalPublicationFacts::collect(members);
+        let mut released_bytes = 0_u64;
+        for member in members {
+            let Some(plan) = terminal_facts.plan_for(member) else {
+                continue;
+            };
+            self.retire_terminal_member(key, member.record().member(), plan)
+                .await?;
+            released_bytes = released_bytes
+                .checked_add(member.record().encoded_bytes())
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "recovered published staged-byte total overflow".to_owned(),
+                })?;
+        }
+        Ok(RecoveredTerminalCleanup {
+            released_bytes,
+            terminal_claims: terminal_facts.claim_ids(),
+        })
+    }
+
+    /// Drives one recovered member to the end of its terminal cleanup.
+    ///
+    /// A member whose durable record does not yet name the committed
+    /// publication is first advanced through `Published` so the facts survive a
+    /// crash inside this sweep; a member already in `CleanupPending` skips
+    /// straight to draining, deletion, and authority release.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first durable transition, lease-drain, filesystem, or
+    /// registry refusal. The member's record is left wherever that refusal
+    /// found it, which the next startup re-reads.
+    async fn retire_terminal_member(
+        &self,
+        key: &crate::scribe::assembly::ScribeAssemblyKey,
+        id: crate::scribe::assembly::StagedMemberId,
+        plan: TerminalMemberPlan,
+    ) -> Result<(), ScribeError> {
+        if plan.records_publication {
+            self.stage
+                .transition(
+                    key,
+                    id,
+                    StagedMemberState::Published {
+                        claim_id: plan.facts.claim_id.clone(),
+                        file_list_commit_key: plan.facts.file_list_commit_key.clone(),
+                        published_object_identities: plan.facts.published_object_identities.clone(),
+                        persisted_lsn_ranges: plan.persisted_lsn_ranges.clone(),
+                    },
+                )
+                .await
+                .map_err(transition_failure(id))?;
+        }
+        if plan.needs_cleanup_transition {
+            self.stage
+                .transition(
+                    key,
+                    id,
+                    StagedMemberState::CleanupPending {
+                        claim_id: plan.facts.claim_id,
+                        file_list_commit_key: plan.facts.file_list_commit_key,
+                        published_object_identities: plan.facts.published_object_identities,
+                        persisted_lsn_ranges: plan.persisted_lsn_ranges,
+                    },
+                )
+                .await
+                .map_err(transition_failure(id))?;
+        }
+        self.await_lease_drain(key, id).await?;
+        self.stage
+            .retire(key, id)
+            .await
+            .map_err(|error| ScribeError::Internal {
+                detail: format!(
+                    "retire recovered published staged member {}-{}: {error}",
+                    id.shard(),
+                    id.generation(),
+                ),
+            })?;
+        self.release_authority(key, id)
+    }
+}
+
+/// Publication facts recovered from the members whose claims already committed.
+///
+/// A claim commits for all of its members at once, so a member left in
+/// `Publishing` by a crash is terminal exactly when one of its siblings carries
+/// the committed facts. Collecting those facts once is what lets the sweep
+/// decide each member's disposition without re-scanning the cohort.
+struct TerminalPublicationFacts {
+    /// Committed facts, keyed in arrival order by their owning claim.
+    facts: Vec<PublishedFacts>,
+}
+
+/// The committed publication facts one terminal claim carries.
+#[derive(Clone)]
+struct PublishedFacts {
+    /// Deterministic identity of the claim that committed the rows.
+    claim_id: String,
+    /// Commit key of the fenced `file_list` transaction.
+    file_list_commit_key: String,
+    /// Object identities the claim published, in artifact-ordinal order.
+    published_object_identities: Vec<String>,
+    /// WAL ranges the publishing member itself recorded, when it had them.
+    persisted_lsn_ranges: Vec<crate::scribe::hot_stage::StagedLsnRange>,
+}
+
+/// One member's disposition inside a terminal-cleanup sweep.
+struct TerminalMemberPlan {
+    /// Committed facts the member's record must end up carrying.
+    facts: PublishedFacts,
+    /// WAL ranges to record, which for a resumed member are its own.
+    persisted_lsn_ranges: Vec<crate::scribe::hot_stage::StagedLsnRange>,
+    /// Whether the record still has to name its committed publication.
+    records_publication: bool,
+    /// Whether the record still has to be advanced to `CleanupPending`.
+    needs_cleanup_transition: bool,
+}
+
+impl TerminalPublicationFacts {
+    /// Collects the committed facts every terminal claim in the cohort carries.
+    fn collect(members: &[crate::scribe::hot_stage::StagedMember]) -> Self {
+        let facts = members
             .iter()
             .filter_map(|member| match member.record().state() {
                 StagedMemberState::Published {
@@ -455,123 +577,75 @@ impl ClaimPublisher {
                     file_list_commit_key,
                     published_object_identities,
                     persisted_lsn_ranges,
-                } => Some((
-                    claim_id.clone(),
-                    file_list_commit_key.clone(),
-                    published_object_identities.clone(),
-                    persisted_lsn_ranges.clone(),
-                )),
+                } => Some(PublishedFacts {
+                    claim_id: claim_id.clone(),
+                    file_list_commit_key: file_list_commit_key.clone(),
+                    published_object_identities: published_object_identities.clone(),
+                    persisted_lsn_ranges: persisted_lsn_ranges.clone(),
+                }),
                 StagedMemberState::Ready
                 | StagedMemberState::Claimed { .. }
                 | StagedMemberState::Publishing { .. } => None,
             })
-            .collect::<Vec<_>>();
-        let mut released_bytes = 0_u64;
-        let terminal_claims = terminal_facts
+            .collect();
+        Self { facts }
+    }
+
+    /// Returns the claim identities proven terminal by durable member state.
+    fn claim_ids(&self) -> std::collections::HashSet<String> {
+        self.facts
             .iter()
-            .map(|(claim_id, ..)| claim_id.clone())
-            .collect::<std::collections::HashSet<_>>();
-        for member in members {
-            let id = member.record().member();
-            let (
-                claim_id,
-                file_list_commit_key,
-                published_object_identities,
-                persisted_lsn_ranges,
-                needs_published_transition,
-            ) = match member.record().state() {
-                StagedMemberState::Published {
-                    claim_id,
-                    file_list_commit_key,
-                    published_object_identities,
-                    persisted_lsn_ranges,
-                }
-                | StagedMemberState::CleanupPending {
-                    claim_id,
-                    file_list_commit_key,
-                    published_object_identities,
-                    persisted_lsn_ranges,
-                } => (
-                    claim_id.clone(),
-                    file_list_commit_key.clone(),
-                    published_object_identities.clone(),
-                    persisted_lsn_ranges.clone(),
-                    matches!(member.record().state(), StagedMemberState::Published { .. }),
-                ),
-                StagedMemberState::Publishing { claim_id, .. } => {
-                    let Some((_, commit_key, objects, _)) = terminal_facts
-                        .iter()
-                        .find(|(terminal_claim, ..)| terminal_claim == claim_id)
-                    else {
-                        continue;
-                    };
-                    (
-                        claim_id.clone(),
-                        commit_key.clone(),
-                        objects.clone(),
-                        vec![member.record().wal_range()],
-                        true,
-                    )
-                }
-                StagedMemberState::Ready | StagedMemberState::Claimed { .. } => continue,
-            };
-            if needs_published_transition
-                && matches!(
-                    member.record().state(),
-                    StagedMemberState::Publishing { .. }
-                )
-            {
-                self.stage
-                    .transition(
-                        key,
-                        id,
-                        StagedMemberState::Published {
-                            claim_id: claim_id.clone(),
-                            file_list_commit_key: file_list_commit_key.clone(),
-                            published_object_identities: published_object_identities.clone(),
-                            persisted_lsn_ranges: persisted_lsn_ranges.clone(),
-                        },
-                    )
-                    .await
-                    .map_err(transition_failure(id))?;
+            .map(|facts| facts.claim_id.clone())
+            .collect()
+    }
+
+    /// Decides what one member of the cohort still owes terminal cleanup.
+    ///
+    /// A `Published` member owes the `CleanupPending` transition, a
+    /// `CleanupPending` member owes only the drain and deletion, and a
+    /// `Publishing` member owes the full sequence under its sibling's committed
+    /// facts — but only when such a sibling exists, because nothing else proves
+    /// its claim committed. A member is never transitioned onto the state it is
+    /// already in; the stage refuses that as a lifecycle contradiction.
+    fn plan_for(
+        &self,
+        member: &crate::scribe::hot_stage::StagedMember,
+    ) -> Option<TerminalMemberPlan> {
+        match member.record().state() {
+            StagedMemberState::Published { claim_id, .. } => {
+                let facts = self.facts_for(claim_id)?;
+                Some(TerminalMemberPlan {
+                    persisted_lsn_ranges: facts.persisted_lsn_ranges.clone(),
+                    facts,
+                    records_publication: false,
+                    needs_cleanup_transition: true,
+                })
             }
-            if needs_published_transition {
-                self.stage
-                    .transition(
-                        key,
-                        id,
-                        StagedMemberState::CleanupPending {
-                            claim_id,
-                            file_list_commit_key,
-                            published_object_identities,
-                            persisted_lsn_ranges,
-                        },
-                    )
-                    .await
-                    .map_err(transition_failure(id))?;
+            StagedMemberState::CleanupPending { claim_id, .. } => {
+                let facts = self.facts_for(claim_id)?;
+                Some(TerminalMemberPlan {
+                    persisted_lsn_ranges: facts.persisted_lsn_ranges.clone(),
+                    facts,
+                    records_publication: false,
+                    needs_cleanup_transition: false,
+                })
             }
-            self.await_lease_drain(key, id).await?;
-            self.stage
-                .retire(key, id)
-                .await
-                .map_err(|error| ScribeError::Internal {
-                    detail: format!(
-                        "retire recovered published staged member {}-{}: {error}",
-                        id.shard(),
-                        id.generation()
-                    ),
-                })?;
-            self.release_authority(key, id)?;
-            released_bytes = released_bytes
-                .checked_add(member.record().encoded_bytes())
-                .ok_or_else(|| ScribeError::Internal {
-                    detail: "recovered published staged-byte total overflow".to_owned(),
-                })?;
+            StagedMemberState::Publishing { claim_id, .. } => Some(TerminalMemberPlan {
+                facts: self.facts_for(claim_id)?,
+                persisted_lsn_ranges: vec![member.record().wal_range()],
+                records_publication: true,
+                needs_cleanup_transition: true,
+            }),
+            StagedMemberState::Ready | StagedMemberState::Claimed { .. } => None,
         }
-        Ok(RecoveredTerminalCleanup {
-            released_bytes,
-            terminal_claims,
-        })
+    }
+
+    /// Returns the committed facts recorded for one claim identity.
+    fn facts_for(&self, claim_id: &str) -> Option<PublishedFacts> {
+        self.facts
+            .iter()
+            .find(|facts| facts.claim_id == claim_id)
+            .cloned()
     }
 }
 

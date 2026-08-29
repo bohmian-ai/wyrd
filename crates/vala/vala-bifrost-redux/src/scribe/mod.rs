@@ -1413,7 +1413,7 @@ impl ScribeImpl {
         // a dwell this process will not outlive. Publish that residue while the
         // CPU, WAL, and object lanes are still open.
         if graceful {
-            graceful = self.publish_staged_residue(deadline).await;
+            graceful = Box::pin(self.publish_staged_residue(deadline)).await;
         }
         self.close_lanes();
         if graceful {
@@ -1524,7 +1524,7 @@ impl ScribeImpl {
         };
         match timed_shutdown_phase(
             deadline,
-            persistence.publish_residue(crate::scribe::assembly::ClaimCause::Drain),
+            Box::pin(persistence.publish_residue(crate::scribe::assembly::ClaimCause::Drain)),
         )
         .await
         {

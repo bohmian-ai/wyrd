@@ -1,3 +1,4 @@
+mod fencing;
 mod lifecycle;
 mod source_boundary;
 mod source_boundary_recovery;

@@ -22,6 +22,7 @@ use wyrd_spec::DataTenantId;
 use super::support::{
     INGEST_BUSY, append_until_admitted, append_values, register_table, sorted_values,
     start_scribe_server, start_scribe_server_with_admission, tenant_client, unique_table,
+    until_admitted,
 };
 
 /// Tenants that are concurrently resident on the topology pod.
@@ -55,15 +56,38 @@ const ROTATION_TENANTS: usize = 10;
 const ROTATION_ROWS: usize = 32;
 /// Batches each rotation participant sends.
 ///
-/// Two batches were measured and rejected. At two, a participant's second turn
-/// is also its last, so "every participant starts before any participant
-/// finishes" can only hold under perfect global rotation — and the pod hands a
-/// released vector to an already-served participant whenever a late starter's
-/// backoff retry has not yet landed, which is ordinary scheduling jitter
-/// rather than starvation. The third batch moves the last turn out past that
-/// jitter while leaving the starvation this owner exists to catch — one
-/// participant run to completion ahead of its peers — plainly detectable.
+/// Three rounds of demand is what makes continued rotation observable. One
+/// round proves only that everyone was admitted once, which a pod that then
+/// served its tables serially would also satisfy.
 const ROTATION_BATCHES: usize = 3;
+/// Consecutive turns one participant may take while peers are demonstrably
+/// contending.
+///
+/// One: a released vector may not return to the participant that just held it
+/// while other participants are asking. This is measured, not inherited. Two
+/// was tried first, on the precedent of the system-and-dynamic owner, and is
+/// too generous here — it admits a pod that serves one polite opening round
+/// and then hands every participant two turns back to back forever, which
+/// starves all but the participant being served. The production pod holds to
+/// one because sixteen looping peers keep recorded demand in front of it at
+/// every release, so `reserved_ahead` forbids the reacquisition. A turn
+/// granted with fewer than [`MIN_LIVE_CONTENDERS`] live peers is not measured
+/// at all, which is what keeps this bound from asserting perfect alternation
+/// across asynchronous client loops.
+const MAX_CONSECUTIVE_TURNS: usize = 1;
+/// Peers that must have a public append in flight for a turn to be measured.
+///
+/// A participant between a refusal and its next attempt is not a contender the
+/// scheduler can see, so a turn granted while nobody else is asking proves
+/// nothing about rotation. Requiring two live peers means every measured turn
+/// was granted against real, simultaneous demand.
+const MIN_LIVE_CONTENDERS: usize = 2;
+/// Turns one contended interval must contain before its bound means anything.
+///
+/// A bound satisfied over two or three turns is not evidence of rotation, so
+/// the run must contain at least one full round of contended turns for every
+/// participant. Without this an owner could pass by never contending at all.
+const MIN_MEASURED_TURNS: usize = ROTATION_TABLES;
 
 /// Returns the admission configuration that starves the pod to one vector.
 ///
@@ -501,9 +525,10 @@ async fn scribe_waiting_contender_precedes_incumbent_reacquisition() {
 /// Panics when the pod does not derive a single-vector ceiling, when the tables
 /// never actually contend, when any table is refused past the shared admission
 /// deadline, when a table is acknowledged a different number of times than it
-/// declared, when one table completes its whole demand before every peer has
-/// taken a turn, or when a table does not read back exactly the rows its turns
-/// acknowledged.
+/// declared, when one table holds the vector for more consecutive turns than
+/// the bound allows while peers are demonstrably asking, when no contended
+/// stretch was long enough to measure that bound, or when a table does not read
+/// back exactly the rows its turns acknowledged.
 #[tokio::test]
 #[ignore = "requires Postgres and object storage"]
 async fn scribe_seventeen_tables_rotate_without_starvation() {
@@ -524,7 +549,7 @@ async fn scribe_seventeen_tables_rotate_without_starvation() {
         );
     }
 
-    let order = Arc::new(Mutex::new(Vec::<usize>::new()));
+    let ledger = Arc::new(Mutex::new(RotationLedger::default()));
     let mut turns = Vec::with_capacity(ROTATION_TABLES);
     for (ordinal, table) in tables.iter().enumerate() {
         turns.push(tokio::spawn(rotation_participant(
@@ -532,7 +557,7 @@ async fn scribe_seventeen_tables_rotate_without_starvation() {
             table.clone(),
             ordinal,
             0,
-            Arc::clone(&order),
+            Arc::clone(&ledger),
         )));
     }
     let mut contested = 0_usize;
@@ -546,53 +571,27 @@ async fn scribe_seventeen_tables_rotate_without_starvation() {
         "seventeen tables sharing one vector must actually contend; none was refused"
     );
 
-    // Progress alone is not the claim. A pod that served one table to
-    // completion, then the next, would also finish every table inside the
-    // deadline while starving sixteen of them for the whole run. The
-    // acknowledgement order is what separates rotation from that: the earliest
-    // table to finish its demand may not finish before the latest table to
-    // start has had its first turn.
-    let order: Vec<usize> = order
+    // Progress alone is not the claim, and neither is participation. A pod
+    // that gave every table one turn and then served them one at a time to
+    // completion would satisfy "everybody started before anybody finished"
+    // while starving sixteen tables for the rest of the run. What the pod owes
+    // its tables is that it keeps rotating for as long as they keep asking, so
+    // that is what is measured — against the demand the scheduler could
+    // actually see at each turn.
+    let recorded = ledger
         .lock()
-        .expect("the acknowledgement order is readable")
+        .expect("the rotation ledger is readable")
+        .turns
         .clone();
-    let mut first_turns = Vec::with_capacity(ROTATION_TABLES);
-    let mut last_turns = Vec::with_capacity(ROTATION_TABLES);
+    let order: Vec<usize> = recorded.iter().map(|turn| turn.participant).collect();
     for ordinal in 0..ROTATION_TABLES {
         assert_eq!(
             order.iter().filter(|table| **table == ordinal).count(),
             ROTATION_BATCHES,
             "table {ordinal} must be acknowledged exactly once per declared batch: {order:?}"
         );
-        first_turns.push(
-            order
-                .iter()
-                .position(|table| *table == ordinal)
-                .expect("every table is admitted"),
-        );
-        last_turns.push(
-            order
-                .iter()
-                .rposition(|table| *table == ordinal)
-                .expect("every table completes its demand"),
-        );
     }
-    let latest_start = first_turns
-        .iter()
-        .max()
-        .copied()
-        .expect("seventeen tables declare turns");
-    let earliest_finish = last_turns
-        .iter()
-        .min()
-        .copied()
-        .expect("seventeen tables declare turns");
-    assert!(
-        latest_start < earliest_finish,
-        "no table may complete its whole demand before every peer has taken a \
-         turn; the last table to start did so at {latest_start} and the first to \
-         finish did so at {earliest_finish}: {order:?}"
-    );
+    assert_bounded_rotation_under_live_contention(&recorded);
 
     for (ordinal, table) in tables.iter().enumerate() {
         assert_eq!(
@@ -693,7 +692,7 @@ async fn scribe_ten_tenants_rotate_fairly() {
 
     // Every tenant now drives its whole demand through the shared bounded
     // retry, and each acknowledgement is recorded in the order the pod gave it.
-    let order = Arc::new(Mutex::new(Vec::<usize>::new()));
+    let ledger = Arc::new(Mutex::new(RotationLedger::default()));
     let mut demands = Vec::with_capacity(ROTATION_TENANTS);
     for (ordinal, (client, table)) in equals.iter().enumerate() {
         demands.push(tokio::spawn(rotation_participant(
@@ -703,7 +702,7 @@ async fn scribe_ten_tenants_rotate_fairly() {
             // Tenant zero resumes at its second batch only if the append it
             // held inside the barrier was actually acknowledged.
             usize::from(ordinal == 0 && incumbent_first_admitted),
-            Arc::clone(&order),
+            Arc::clone(&ledger),
         )));
     }
     let mut contested = 0_usize;
@@ -718,10 +717,10 @@ async fn scribe_ten_tenants_rotate_fairly() {
          other; only {contested} was ever refused"
     );
 
-    let order: Vec<usize> = order
+    let order = ledger
         .lock()
-        .expect("the acknowledgement order is readable")
-        .clone();
+        .expect("the rotation ledger is readable")
+        .participants();
     let incumbent_completed = order
         .iter()
         .rposition(|tenant| *tenant == 0)
@@ -789,9 +788,11 @@ fn batch_id_routing_to(tenant: DataTenantId, table_name: &str, lane: usize) -> U
 ///
 /// `first_batch` lets a participant resume a demand it has already partly sent,
 /// which is what a case that seeds the queue with a real incumbent needs.
-/// `order` records each acknowledgement in the order the pod granted it, so a
-/// case can judge whose turn came when instead of only how many refusals it
-/// took.
+/// Every attempt is registered in `ledger` for the whole time it is on the
+/// wire, so the ledger records each acknowledgement together with the peers
+/// that were demonstrably asking alongside it. A case can then judge whose turn
+/// came when, and against how much live demand, instead of only how many
+/// refusals it took.
 ///
 /// # Panics
 ///
@@ -802,24 +803,205 @@ async fn rotation_participant(
     table: String,
     ordinal: usize,
     first_batch: usize,
-    order: Arc<Mutex<Vec<usize>>>,
+    ledger: Arc<Mutex<RotationLedger>>,
 ) -> usize {
     let mut refusals = 0_usize;
     for batch in first_batch..ROTATION_BATCHES {
         let rows = rotation_batch(ordinal, batch);
-        refusals += append_until_admitted(
-            &client,
-            &table,
-            &rows,
-            &format!("participant {ordinal} batch {batch}"),
-        )
+        let label = format!("participant {ordinal} batch {batch}");
+        refusals += until_admitted(&label, || async {
+            ledger
+                .lock()
+                .expect("the rotation ledger is writable")
+                .enter(ordinal);
+            let outcome = append_values(&client, &table, Uuid::now_v7(), &rows).await;
+            ledger
+                .lock()
+                .expect("the rotation ledger is writable")
+                .leave(ordinal, outcome.is_ok());
+            outcome
+        })
         .await;
-        order
-            .lock()
-            .expect("the acknowledgement order is writable")
-            .push(ordinal);
     }
     refusals
+}
+
+/// One acknowledged turn, together with the contention that was live when the
+/// pod granted it.
+///
+/// Rotation can only be judged against demand the scheduler could actually
+/// see. Recording the contending peers beside the turn is what lets the owner
+/// measure the pod where it was choosing between askers and stay silent where
+/// it was not.
+#[derive(Debug, Clone, Copy)]
+struct RotationTurn {
+    /// The participant the pod admitted.
+    participant: usize,
+    /// Peers that had their own public append in flight at that moment.
+    contending_peers: usize,
+}
+
+/// The live-demand ledger the rotation owners measure the pod against.
+///
+/// Participants drive asynchronous client loops, so "still has batches to
+/// send" is not the same as "is asking right now": between a refusal and the
+/// next attempt a participant is invisible to the scheduler. This ledger
+/// tracks the requests actually outstanding, so each recorded turn carries the
+/// contention that existed when the pod chose.
+#[derive(Debug, Default)]
+struct RotationLedger {
+    /// Participants with a public append outstanding right now.
+    in_flight: std::collections::BTreeSet<usize>,
+    /// Acknowledged turns, in the order the pod granted them.
+    turns: Vec<RotationTurn>,
+}
+
+impl RotationLedger {
+    /// Records that `participant` has put one public append on the wire.
+    fn enter(&mut self, participant: usize) {
+        self.in_flight.insert(participant);
+    }
+
+    /// Retires `participant`'s outstanding append, recording a turn when the
+    /// pod admitted it.
+    ///
+    /// The contending-peer count is taken before the participant is removed,
+    /// so it names the peers that were asking alongside it rather than after
+    /// it withdrew.
+    fn leave(&mut self, participant: usize, admitted: bool) {
+        if admitted {
+            self.turns.push(RotationTurn {
+                participant,
+                contending_peers: self.in_flight.len().saturating_sub(1),
+            });
+        }
+        self.in_flight.remove(&participant);
+    }
+
+    /// Returns the acknowledged participants in the order the pod admitted them.
+    fn participants(&self) -> Vec<usize> {
+        self.turns.iter().map(|turn| turn.participant).collect()
+    }
+}
+
+/// Asserts the pod kept rotating for as long as its participants kept asking.
+///
+/// Only turns granted while at least [`MIN_LIVE_CONTENDERS`] peers had a
+/// public append in flight are measured: elsewhere the pod had no one to
+/// rotate to, and holding it to a rotation bound there would assert perfect
+/// alternation between asynchronous client loops rather than the contract.
+/// Within each contended interval no participant may hold the vector for more
+/// than [`MAX_CONSECUTIVE_TURNS`] turns in a row, and one interval must run at
+/// least [`MIN_MEASURED_TURNS`] turns so the bound is asserted over a real
+/// contended stretch rather than a lucky pair.
+///
+/// # Panics
+///
+/// Panics when a participant exceeds the consecutive-turn bound under live
+/// contention, or when no contended interval was long enough to measure.
+fn assert_bounded_rotation_under_live_contention(turns: &[RotationTurn]) {
+    let mut longest_interval = 0_usize;
+    let mut interval = 0_usize;
+    let mut run = 0_usize;
+    let mut previous: Option<usize> = None;
+    for (index, turn) in turns.iter().enumerate() {
+        if turn.contending_peers < MIN_LIVE_CONTENDERS {
+            interval = 0;
+            run = 0;
+            previous = None;
+            continue;
+        }
+        interval += 1;
+        longest_interval = longest_interval.max(interval);
+        run = if previous == Some(turn.participant) {
+            run + 1
+        } else {
+            1
+        };
+        previous = Some(turn.participant);
+        assert!(
+            run <= MAX_CONSECUTIVE_TURNS,
+            "participant {} took {run} consecutive turns at index {index} while \
+             {} peers had a public append in flight; a released vector may not \
+             return to its incumbent ahead of recorded contenders: {turns:?}",
+            turn.participant,
+            turn.contending_peers
+        );
+    }
+    assert!(
+        longest_interval >= MIN_MEASURED_TURNS,
+        "the rotation bound must be asserted over a contended stretch of at \
+         least {MIN_MEASURED_TURNS} turns; the longest run of turns granted \
+         against {MIN_LIVE_CONTENDERS} or more live peers was \
+         {longest_interval}: {turns:?}"
+    );
+}
+
+/// A pod that serves its participants serially after one opening round is
+/// rejected, though every participant did start before any of them finished.
+///
+/// This is the failure the previous formulation of this owner could not see.
+/// "Nobody finishes before everybody starts" is satisfied by one polite
+/// opening round followed by strictly serial service, which starves every
+/// participant but the one being served for the rest of the run. The bounded
+/// claim measures what the pod owes its participants — that it keeps rotating
+/// while they keep asking — so it rejects the same order.
+///
+/// # Panics
+///
+/// Panics when the serial order is not accepted by the superseded start/finish
+/// condition, or when the bounded claim fails to reject it.
+#[test]
+fn serial_service_after_one_round_is_rejected() {
+    let mut turns: Vec<RotationTurn> = (0..ROTATION_TABLES)
+        .map(|participant| RotationTurn {
+            participant,
+            contending_peers: ROTATION_TABLES - 1,
+        })
+        .collect();
+    for participant in 0..ROTATION_TABLES {
+        for _ in 1..ROTATION_BATCHES {
+            turns.push(RotationTurn {
+                participant,
+                contending_peers: ROTATION_TABLES - 1,
+            });
+        }
+    }
+    let order: Vec<usize> = turns.iter().map(|turn| turn.participant).collect();
+
+    // The superseded condition accepts this order: the last participant to
+    // start did so in the opening round, before any participant finished.
+    let latest_start = (0..ROTATION_TABLES)
+        .map(|participant| {
+            order
+                .iter()
+                .position(|taken| *taken == participant)
+                .expect("every participant starts")
+        })
+        .max()
+        .expect("participants declare turns");
+    let earliest_finish = (0..ROTATION_TABLES)
+        .map(|participant| {
+            order
+                .iter()
+                .rposition(|taken| *taken == participant)
+                .expect("every participant finishes")
+        })
+        .min()
+        .expect("participants declare turns");
+    assert!(
+        latest_start < earliest_finish,
+        "the superseded condition must accept this order, or it proves nothing \
+         about what the bounded claim adds: {order:?}"
+    );
+
+    let rejected = std::panic::catch_unwind(|| {
+        assert_bounded_rotation_under_live_contention(&turns);
+    });
+    assert!(
+        rejected.is_err(),
+        "serial service under live contention must be rejected: {order:?}"
+    );
 }
 
 /// Returns the rows one rotation participant sends in one batch.

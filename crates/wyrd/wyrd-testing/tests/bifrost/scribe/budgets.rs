@@ -54,6 +54,15 @@ const ROTATION_TENANTS: usize = 10;
 /// than a byte ceiling.
 const ROTATION_ROWS: usize = 32;
 /// Batches each rotation participant sends.
+///
+/// Two batches were measured and rejected. At two, a participant's second turn
+/// is also its last, so "every participant starts before any participant
+/// finishes" can only hold under perfect global rotation — and the pod hands a
+/// released vector to an already-served participant whenever a late starter's
+/// backoff retry has not yet landed, which is ordinary scheduling jitter
+/// rather than starvation. The third batch moves the last turn out past that
+/// jitter while leaving the starvation this owner exists to catch — one
+/// participant run to completion ahead of its peers — plainly detectable.
 const ROTATION_BATCHES: usize = 3;
 
 /// Returns the admission configuration that starves the pod to one vector.

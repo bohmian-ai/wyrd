@@ -324,7 +324,8 @@ impl ScribeProductionWorkloadV1 {
     ///
     /// Returns [`ScribeWorkloadError::UnsupportedVersion`] for an unknown
     /// version, [`ScribeWorkloadError::Malformed`] when an operation names an
-    /// owner the record does not declare, and
+    /// owner the record does not declare or when a read-required checkpoint is
+    /// not preceded by a read of its own, and
     /// [`ScribeWorkloadError::Geometry`] when the geometry recipe does not
     /// validate.
     pub fn validate(&self) -> Result<(), ScribeWorkloadError> {
@@ -353,6 +354,46 @@ impl ScribeProductionWorkloadV1 {
                 return Err(ScribeWorkloadError::Malformed {
                     detail: "an operation names an undeclared table",
                 });
+            }
+        }
+        self.assert_read_required_checkpoints_read_for_themselves()?;
+        Ok(())
+    }
+
+    /// Refuses a record whose read-required boundary reuses an earlier read.
+    ///
+    /// A boundary that [requires a read-back
+    /// digest](ScribeCheckpointNameV1::requires_read_back_digest) claims the
+    /// rows are still exactly readable *after* that transition. The runner
+    /// binds each checkpoint's digest to the reads observed since the previous
+    /// checkpoint, so a record that places two read-required boundaries in a
+    /// row with only one read between them describes a run whose second
+    /// boundary can produce no digest at all. Refusing the record here names
+    /// the authoring mistake instead of letting it surface later as an
+    /// evidence mismatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeWorkloadError::Malformed`] when a read-required
+    /// checkpoint has no [`ScribeWorkloadOperationV1::Read`] between it and the
+    /// checkpoint before it.
+    fn assert_read_required_checkpoints_read_for_themselves(
+        &self,
+    ) -> Result<(), ScribeWorkloadError> {
+        let mut read_since_checkpoint = false;
+        for operation in &self.operations {
+            match operation {
+                ScribeWorkloadOperationV1::Read { .. } => read_since_checkpoint = true,
+                ScribeWorkloadOperationV1::Checkpoint { name } => {
+                    if name.requires_read_back_digest() && !read_since_checkpoint {
+                        return Err(ScribeWorkloadError::Malformed {
+                            detail: "a read-required checkpoint is not preceded by a read of its own",
+                        });
+                    }
+                    read_since_checkpoint = false;
+                }
+                ScribeWorkloadOperationV1::Append { .. }
+                | ScribeWorkloadOperationV1::Flush { .. } => {}
             }
         }
         Ok(())
@@ -728,7 +769,12 @@ impl crate::WyrdTestServer {
         }
 
         let mut acknowledged = 0_u64;
-        let mut read_back: Vec<(usize, usize, i64)> = Vec::new();
+        // Reads observed since the *previous* checkpoint. A checkpoint consumes
+        // this buffer, so every digest is evidence of a read that happened
+        // after the boundary before it. Carrying reads forward would let one
+        // early read vouch for every later boundary, and accumulating repeated
+        // full reads would hash duplicated rows into a false mismatch.
+        let mut read_since_checkpoint: Vec<(usize, usize, i64)> = Vec::new();
         let mut checkpoints = Vec::new();
         for operation in &workload.operations {
             match operation {
@@ -755,7 +801,7 @@ impl crate::WyrdTestServer {
                         .read_workload_table(binding.tenant, &declared.fqn())
                         .await?
                     {
-                        read_back.push((*tenant, *table, value));
+                        read_since_checkpoint.push((*tenant, *table, value));
                     }
                 }
                 ScribeWorkloadOperationV1::Checkpoint { name } => {
@@ -781,10 +827,13 @@ impl crate::WyrdTestServer {
                         name: *name,
                         acknowledged_rows: acknowledged,
                         published,
-                        observed_row_digest: if read_back.is_empty() {
-                            None
-                        } else {
-                            Some(row_digest(&mut read_back.clone()))
+                        observed_row_digest: {
+                            let mut observed = std::mem::take(&mut read_since_checkpoint);
+                            if observed.is_empty() {
+                                None
+                            } else {
+                                Some(row_digest(&mut observed))
+                            }
                         },
                     });
                 }
@@ -1204,6 +1253,70 @@ mod tests {
                 .assert_matches(&workload, ScribeCacheMode::Disabled)
                 .is_err(),
             "evidence must name the contract version it was produced under"
+        );
+    }
+
+    /// AC22 unit owner: every read-required boundary reads back for itself.
+    ///
+    /// A boundary such as `RestartReplay` or `TerminalDrain` claims the rows
+    /// are still exactly readable *after* that transition. The runner binds
+    /// each checkpoint's digest to the reads observed since the previous
+    /// checkpoint, so an earlier read cannot vouch for a later boundary. This
+    /// owner proves the record refuses the authoring shape that would ask it
+    /// to: two read-required boundaries in a row with only one read between
+    /// them, and a read-required boundary with no read before it at all.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the canonical record is refused, when a record whose
+    /// read-required boundary reuses an earlier read is accepted, or when
+    /// inserting the missing read does not make the record valid again.
+    #[test]
+    fn scribe_workload_read_boundaries_may_not_reuse_an_earlier_read() {
+        let workload = ScribeProductionWorkloadV1::canonical();
+        workload
+            .validate()
+            .expect("the canonical record reads before its read-required boundary");
+
+        // A read-required boundary with no read of its own is refused, even
+        // though an earlier boundary in the same run was read for.
+        let mut stale = workload.clone();
+        stale
+            .operations
+            .push(ScribeWorkloadOperationV1::Checkpoint {
+                name: ScribeCheckpointNameV1::TerminalDrain,
+            });
+        assert!(
+            matches!(stale.validate(), Err(ScribeWorkloadError::Malformed { .. })),
+            "a second read-required boundary may not reuse the read the first consumed"
+        );
+
+        // Giving that boundary its own read makes the same record valid.
+        let mut fresh = workload.clone();
+        fresh.operations.push(ScribeWorkloadOperationV1::Read {
+            tenant: 0,
+            table: 0,
+        });
+        fresh
+            .operations
+            .push(ScribeWorkloadOperationV1::Checkpoint {
+                name: ScribeCheckpointNameV1::TerminalDrain,
+            });
+        fresh
+            .validate()
+            .expect("a read-required boundary with its own read is well formed");
+
+        // A read-required boundary reached before any read is refused.
+        let mut unread = workload;
+        unread
+            .operations
+            .retain(|operation| !matches!(operation, ScribeWorkloadOperationV1::Read { .. }));
+        assert!(
+            matches!(
+                unread.validate(),
+                Err(ScribeWorkloadError::Malformed { .. })
+            ),
+            "a read-required boundary reached with no read at all is not evidence"
         );
     }
 

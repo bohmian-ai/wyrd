@@ -58,10 +58,7 @@ struct StorageRequestGuard<'telemetry> {
 
 impl<'telemetry> StorageRequestGuard<'telemetry> {
     /// Admits one logical request and raises the active-request count.
-    fn admit(
-        telemetry: &'telemetry BifrostStorageTelemetry,
-        operation: StorageOperation,
-    ) -> Self {
+    fn admit(telemetry: &'telemetry BifrostStorageTelemetry, operation: StorageOperation) -> Self {
         telemetry.record_request_start(operation);
         Self {
             telemetry,
@@ -749,15 +746,11 @@ impl BifrostStorage {
     where
         Fut: std::future::Future<Output = Result<T, opendal::Error>>,
     {
-        let permit = self
-            .requests
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| {
-                AttemptFailure::terminal(BifrostStorageError::RateLimited {
-                    detail: "node-wide storage request admission is full".to_owned(),
-                })
-            })?;
+        let permit = self.requests.clone().try_acquire_owned().map_err(|_| {
+            AttemptFailure::terminal(BifrostStorageError::RateLimited {
+                detail: "node-wide storage request admission is full".to_owned(),
+            })
+        })?;
         let deadline = bound.unwrap_or_else(|| Instant::now() + self.policy.max_retry_elapsed());
         tracing::trace!(
             operation = operation.as_str(),
@@ -1042,7 +1035,11 @@ mod governed_request_tests {
         );
         let snapshot = storage.telemetry_snapshot();
         assert_eq!(snapshot.request_retries(), 2);
-        assert_eq!(snapshot.request_starts(), 1, "a retried read is one request");
+        assert_eq!(
+            snapshot.request_starts(),
+            1,
+            "a retried read is one request"
+        );
         assert_eq!(
             snapshot.request_terminal(StorageRequestOutcome::Deadline),
             1
@@ -1291,11 +1288,7 @@ mod governed_request_tests {
     /// # Panics
     /// Panics when the terminal count differs, starts and terminals disagree,
     /// active work is nonzero, or any settlement was unmatched.
-    fn assert_reconciled(
-        storage: &BifrostStorage,
-        outcome: StorageRequestOutcome,
-        expected: u64,
-    ) {
+    fn assert_reconciled(storage: &BifrostStorage, outcome: StorageRequestOutcome, expected: u64) {
         let snapshot = storage.telemetry_snapshot();
         assert_eq!(
             snapshot.request_terminal(outcome),

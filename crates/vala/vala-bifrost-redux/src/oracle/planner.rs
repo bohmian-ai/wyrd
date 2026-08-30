@@ -226,6 +226,7 @@ impl OraclePlanner {
             let hot_files = local_hot_sources(catalog, &cut)?;
             let provider = OracleTableProvider::try_new(OracleTableInputs {
                 table: cut.iceberg_table,
+                storage: Arc::clone(catalog.storage()),
                 distributed_iceberg_batches: None,
                 hot_files,
                 distributed_hot_batches: Vec::new(),
@@ -527,10 +528,12 @@ fn local_hot_sources(
                 usize::try_from(file.file_size).map_err(|_| BifrostError::MetadataMismatch {
                     detail: "hot file size exceeds process bounds".to_owned(),
                 })?;
+            let location = catalog
+                .object_location(&cut.binding, &file.file_path)
+                .map_err(BifrostCatalogError::into_public)?;
             Ok(HotFileSource {
-                location: catalog
-                    .object_location(&cut.binding, &file.file_path)
-                    .map_err(BifrostCatalogError::into_public)?,
+                metadata_key: super::exec::hot_metadata_key(file, size_bytes)?,
+                location,
                 size_bytes,
                 event_time:
                     crate::catalog::event_time::EventTimeStatistics::from_catalog_timestamps(

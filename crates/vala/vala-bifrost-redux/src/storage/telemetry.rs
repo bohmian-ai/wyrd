@@ -418,8 +418,11 @@ pub enum TelemetryTransition {
 
 impl TelemetryTransition {
     /// Every transition, in index order.
-    pub(crate) const ALL: [Self; 3] =
-        [Self::LoadTerminal, Self::WaiterSettled, Self::RequestTerminal];
+    pub(crate) const ALL: [Self; 3] = [
+        Self::LoadTerminal,
+        Self::WaiterSettled,
+        Self::RequestTerminal,
+    ];
 
     /// Returns this transition's dense index into the anomaly totals.
     pub(crate) const fn index(self) -> usize {

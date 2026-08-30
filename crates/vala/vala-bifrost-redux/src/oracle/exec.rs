@@ -1329,6 +1329,47 @@ impl ExecutionPlan for OracleIcebergScanExec {
     }
 }
 
+/// Builds one hot object's node-wide decoded-metadata identity.
+///
+/// The identity is taken from the durable `vala.file_list` row rather than from
+/// the object's location, because the location is a path and two distinct
+/// durable objects must never share a decode. A row without a usable writer
+/// checksum is refused here rather than keyed on a zero digest, which would let
+/// every unchecksummed object collide on one entry.
+///
+/// # Errors
+/// Returns `BifrostError::MetadataMismatch` when the row carries no decodable
+/// nonzero SHA-256.
+pub(super) fn hot_metadata_key(
+    file: &vala_sql::row_types::file_list::HotFileRow,
+    size_bytes: usize,
+) -> Result<crate::storage::HotMetadataKey, BifrostError> {
+    let size_bytes_u64 = u64::try_from(size_bytes).map_err(|_| BifrostError::MetadataMismatch {
+        detail: "hot file size exceeds process bounds".to_owned(),
+    })?;
+    let checksum = file
+        .file_checksum
+        .as_deref()
+        .and_then(|hex| hex::decode(hex).ok())
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
+        .filter(|checksum| checksum != &[0_u8; 32])
+        .ok_or_else(|| BifrostError::MetadataMismatch {
+            detail: "hot file row carries no usable object checksum".to_owned(),
+        })?;
+    Ok(crate::storage::HotMetadataKey::new(
+        wyrd_spec::DataTenantId::new(file.data_tenant_id).map_err(|_| {
+            BifrostError::MetadataMismatch {
+                detail: "hot file row carries a non-v7 tenant identity".to_owned(),
+            }
+        })?,
+        file.table_name.clone(),
+        file.file_path.clone(),
+        file.id,
+        checksum,
+        size_bytes_u64,
+    ))
+}
+
 /// One validated immutable hot-file source selected by the pinned cut.
 #[derive(Debug, Clone)]
 pub(crate) struct HotFileSource {
@@ -1342,12 +1383,20 @@ pub(crate) struct HotFileSource {
     /// Carried from the durable `vala.file_list` row so a scan can decide the
     /// file before it is opened. Unusable statistics retain the file.
     pub(crate) event_time: crate::catalog::event_time::EventTimeStatistics,
+    /// Immutable node-wide identity this object's decoded metadata is keyed by.
+    ///
+    /// Built from the signed `vala.file_list` facts rather than from the
+    /// location, so two queries for the same durable object share one decode
+    /// and two distinct objects never collide even under the same path prefix.
+    pub(crate) metadata_key: crate::storage::HotMetadataKey,
 }
 
 /// Complete immutable inputs for constructing one authenticated table provider.
 pub(crate) struct OracleTableInputs {
     /// Pinned Iceberg table for the sealed cut.
     pub(crate) table: iceberg::table::Table,
+    /// The node's one storage owner, which decodes every hot object's metadata.
+    pub(crate) storage: Arc<crate::storage::BifrostStorage>,
     /// Footer-validated distributed Iceberg batches, when peer dispatch was selected.
     pub(crate) distributed_iceberg_batches: Option<Vec<RecordBatch>>,
     /// Leader-local hot files absent from the pinned Iceberg snapshot.
@@ -1386,6 +1435,8 @@ pub(crate) struct OracleTableProvider {
     live_batches: Vec<RecordBatch>,
     /// File reader inherited from the pinned Iceberg table.
     file_io: FileIO,
+    /// The node's one storage owner, handed to every hot leaf this builds.
+    storage: Arc<crate::storage::BifrostStorage>,
     /// Full physical schema, including the hidden tenant column.
     physical_schema: SchemaRef,
     /// Caller-visible schema after the tripwire removes its tenant column.
@@ -1550,6 +1601,7 @@ impl OracleTableProvider {
     pub(crate) async fn try_new(inputs: OracleTableInputs) -> DataFusionResult<Self> {
         let OracleTableInputs {
             table,
+            storage,
             distributed_iceberg_batches,
             hot_files,
             distributed_hot_batches,
@@ -1591,6 +1643,7 @@ impl OracleTableProvider {
             distributed_hot_batches,
             live_batches,
             file_io,
+            storage,
             physical_schema,
             public_schema,
             context,
@@ -1799,6 +1852,7 @@ impl TableProvider for OracleTableProvider {
             let hot = Arc::new(HotParquetExec::new(
                 self.retained_hot_files(&supported_predicates),
                 self.file_io.clone(),
+                Arc::clone(&self.storage),
                 Arc::clone(&required_schema),
                 HotParquetGovernance::Leader {
                     memory: self.memory.clone(),
@@ -2290,10 +2344,53 @@ impl HotParquetGovernance {
     }
 }
 
+/// One hot object's ranged reader, opened on first use.
+///
+/// The storage owner decodes metadata through a reader *factory*, because a
+/// retried decode needs a reader that has not already consumed part of a
+/// response. Opening an Iceberg input is asynchronous and a factory is not, so
+/// the open is deferred to the first range instead of being performed eagerly
+/// by the factory.
+enum HotObjectSource {
+    /// Not yet opened; carries exactly what opening needs.
+    Pending {
+        /// File reader inherited from the pinned Iceberg table.
+        file_io: FileIO,
+        /// Absolute storage path accepted by that `FileIO`.
+        location: String,
+    },
+    /// Opened ranged reader for the pinned object.
+    ///
+    /// Shared rather than owned because `FileRead::read` borrows for `'static`,
+    /// so a range is issued from a cloned handle rather than from a borrow of
+    /// this enum.
+    Open(Arc<dyn FileRead>),
+}
+
+impl HotObjectSource {
+    /// Reads one exact range, opening the object on the first call.
+    ///
+    /// # Errors
+    /// Returns the Iceberg failure from opening the input or reading the range.
+    async fn read(&mut self, range: Range<u64>) -> Result<bytes::Bytes, iceberg::Error> {
+        if let Self::Pending { file_io, location } = self {
+            let reader = file_io.new_input(location)?.reader().await?;
+            *self = Self::Open(Arc::new(reader));
+        }
+        match self {
+            Self::Open(reader) => Arc::clone(reader).read(range).await,
+            Self::Pending { .. } => Err(iceberg::Error::new(
+                iceberg::ErrorKind::Unexpected,
+                "a hot object source failed to open before its first range",
+            )),
+        }
+    }
+}
+
 /// Iceberg ranged storage adapted to Parquet with pre-IO Oracle accounting.
 struct IcebergParquetReader {
     /// Pinned ranged reader for one immutable hot object.
-    reader: Box<dyn FileRead>,
+    reader: HotObjectSource,
     /// Pinned manifest size used to reject invalid ranges.
     size: u64,
     /// Closed governance mode owning every range reservation this reader takes.
@@ -2306,9 +2403,9 @@ struct IcebergParquetReader {
 }
 
 impl IcebergParquetReader {
-    /// Creates a governed reader for one pinned immutable hot object.
+    /// Creates a governed reader that opens one pinned object on first range.
     fn new(
-        reader: Box<dyn FileRead>,
+        reader: HotObjectSource,
         size: u64,
         governance: HotParquetGovernance,
         metrics: Arc<OracleScanMetricsHandle>,
@@ -2419,6 +2516,8 @@ impl AsyncFileReader for IcebergParquetReader {
 pub(super) struct HotParquetExec {
     /// Validated immutable manifest entries.
     files: Vec<HotFileSource>,
+    /// The node's one storage owner, asked to decode each object's metadata.
+    storage: Arc<crate::storage::BifrostStorage>,
     /// Pinned Iceberg storage reader.
     file_io: FileIO,
     /// Complete physical table schema.
@@ -2456,6 +2555,7 @@ impl HotParquetExec {
     pub(super) fn new(
         files: Vec<HotFileSource>,
         file_io: FileIO,
+        storage: Arc<crate::storage::BifrostStorage>,
         schema: SchemaRef,
         governance: HotParquetGovernance,
         metrics: Arc<OracleScanMetricsHandle>,
@@ -2464,6 +2564,7 @@ impl HotParquetExec {
         Self {
             files,
             file_io,
+            storage,
             governance,
             metrics,
             predicates,
@@ -2587,35 +2688,49 @@ fn hot_stream(
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> + Send + 'static {
     let files = exec.files.clone();
     let file_io = exec.file_io.clone();
+    let storage = Arc::clone(&exec.storage);
     let schema = Arc::clone(&exec.schema);
     let governance = exec.governance.clone();
     let metrics = Arc::clone(&exec.metrics);
     let predicates = exec.predicates.clone();
     #[cfg(test)]
     let reader_override = exec.reader_override.clone();
+    // Cancelling the query drops this stream, which drops the guard and
+    // cancels any metadata decode this stream still has outstanding. Owner
+    // shutdown cancels the same work through the owner's own token.
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_on_drop = cancel.clone().drop_guard();
     async_stream::try_stream! {
+        let _cancel_on_drop = cancel_on_drop;
         for file in files {
-            let input = file_io
-                .new_input(&file.location)
-                .map_err(|error| DataFusionError::External(Box::new(error)))?;
-            let reader = input
-                .reader()
-                .await
-                .map_err(|error| DataFusionError::External(Box::new(error)))?;
             let size = u64::try_from(file.size_bytes).map_err(|_| {
                 DataFusionError::Execution("hot object size exceeds u64".to_owned())
             })?;
-            let reader = IcebergParquetReader::new(
-                reader,
-                size,
-                governance.clone(),
-                Arc::clone(&metrics),
-            );
-            #[cfg(test)]
-            let reader = if let Some(override_reader) = reader_override.as_ref() {
-                reader.with_test_reader(file.location.clone(), Arc::clone(override_reader))
-            } else {
-                reader
+            let build_reader = {
+                let file_io = file_io.clone();
+                let location = file.location.clone();
+                let governance = governance.clone();
+                let metrics = Arc::clone(&metrics);
+                #[cfg(test)]
+                let reader_override = reader_override.clone();
+                move || {
+                    let reader = IcebergParquetReader::new(
+                        HotObjectSource::Pending {
+                            file_io: file_io.clone(),
+                            location: location.clone(),
+                        },
+                        size,
+                        governance.clone(),
+                        Arc::clone(&metrics),
+                    );
+                    #[cfg(test)]
+                    let reader = if let Some(override_reader) = reader_override.as_ref() {
+                        reader.with_test_reader(location.clone(), Arc::clone(override_reader))
+                    } else {
+                        reader
+                    };
+                    reader
+                }
             };
             // Recorded before the footer is read so a file observation exists
             // for every attempt on this file, including one whose reader fails
@@ -2623,9 +2738,27 @@ fn hot_stream(
             // separately, so a file whose groups are all pruned still counts as
             // opened rather than vanishing from the scan accounting.
             metrics.record_hot_file();
-            let builder = ParquetRecordBatchStreamBuilder::new(reader)
+            // The owner, not this leaf, decides whether this object's footer is
+            // decoded again: it owns the node-wide cache, single-flight, request
+            // admission, and retry bound for every hot identity.
+            let retained = storage
+                .hot_metadata(
+                    file.metadata_key.clone(),
+                    build_reader.clone(),
+                    storage.metadata_deadline(),
+                    cancel.clone(),
+                )
                 .await
-                .map_err(|error| DataFusionError::External(Box::new(error)))?;
+                .map_err(|error| {
+                    DataFusionError::External(Box::new((*error).clone()))
+                })?;
+            let metadata = parquet::arrow::arrow_reader::ArrowReaderMetadata::try_new(
+                Arc::clone(retained.metadata()),
+                ArrowReaderOptions::new(),
+            )
+            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+            let builder =
+                ParquetRecordBatchStreamBuilder::new_with_metadata(build_reader(), metadata);
             let selection = select_row_groups_for_predicates(builder.metadata(), &predicates);
             metrics.record_row_groups(&selection);
             if selection.excludes_file() {

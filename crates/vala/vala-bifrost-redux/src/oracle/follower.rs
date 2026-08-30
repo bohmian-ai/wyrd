@@ -457,7 +457,9 @@ impl FollowerSourceResolver for OracleCatalogResolver {
         if source == super::AssignedPersistedSource::Hot {
             let files = assigned_locations
                 .iter()
-                .map(|(descriptor, _, location)| signed_hot_source(descriptor, location))
+                .map(|(descriptor, _, location)| {
+                    signed_hot_source(descriptor, location, &assignment.binding)
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             // Every object identity, size, and assignment fence has been
             // validated above, so the shared hot leaf is constructed in
@@ -469,6 +471,7 @@ impl FollowerSourceResolver for OracleCatalogResolver {
                 plan: Arc::new(super::exec::HotParquetExec::new(
                     files,
                     self.catalog.file_io().clone(),
+                    Arc::clone(self.catalog.storage()),
                     required_schema,
                     super::exec::HotParquetGovernance::Follower {
                         memory_pool: session.runtime_env().memory_pool.clone(),
@@ -542,11 +545,27 @@ impl FollowerSourceResolver for OracleCatalogResolver {
 fn signed_hot_source(
     descriptor: &PersistedFileDescriptor,
     location: &str,
+    binding: &wyrd_spec::vala::api::TenantTableBinding,
 ) -> Result<super::exec::HotFileSource, String> {
+    let PersistedFileDescriptor::Hot(hot) = descriptor else {
+        return Err("authenticated Oracle hot provider failed".to_owned());
+    };
+    let size_bytes = usize::try_from(descriptor.size_bytes())
+        .map_err(|_| "authenticated Oracle hot provider failed".to_owned())?;
     Ok(super::exec::HotFileSource {
+        // Keyed on the leader's signed `vala.file_list` identity and decoded
+        // checksum, the same identity the leader itself keys on, so a follower
+        // reading the same durable object shares the node's one decode.
+        metadata_key: crate::storage::HotMetadataKey::new(
+            binding.tenant_id,
+            binding.table.clone(),
+            hot.path.clone(),
+            hot.file_list_id,
+            hot.sha256,
+            hot.size_bytes,
+        ),
         location: location.to_owned(),
-        size_bytes: usize::try_from(descriptor.size_bytes())
-            .map_err(|_| "authenticated Oracle hot provider failed".to_owned())?,
+        size_bytes,
         event_time: crate::catalog::event_time::EventTimeStatistics::Unusable(
             crate::catalog::event_time::EventTimeBoundsDefect::Missing,
         ),

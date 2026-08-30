@@ -3325,6 +3325,7 @@ impl Oracle {
         };
         let provider_inputs = OracleTableInputs {
             table: cut.iceberg_table,
+            storage: Arc::clone(self.catalog.storage()),
             distributed_iceberg_batches: None,
             hot_files: local_hot_files,
             distributed_hot_batches: Vec::new(),
@@ -3768,6 +3769,7 @@ impl Oracle {
                     }
                 })?;
                 Ok(HotFileSource {
+                    metadata_key: exec::hot_metadata_key(file, size_bytes)?,
                     location: self
                         .catalog
                         .object_location(&cut.binding, &file.file_path)

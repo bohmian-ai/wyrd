@@ -525,7 +525,10 @@ mod tests {
             .await
             .expect_err("a closed owner admits no ranged read through an open reader");
         assert!(
-            storage.list(&format!("{warehouse}/datasets"), true).await.is_err(),
+            storage
+                .list(&format!("{warehouse}/datasets"), true)
+                .await
+                .is_err(),
             "a closed owner admits no list"
         );
         storage

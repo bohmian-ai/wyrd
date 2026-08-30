@@ -229,6 +229,8 @@ pub struct BifrostCatalog {
     postgres: ValaPostgres,
     warehouse: String,
     file_io: FileIO,
+    /// The node's one storage owner every catalog and hot read runs through.
+    storage: Arc<BifrostStorage>,
 }
 
 /// Catalog pins observed by production code paths during serialized tests.
@@ -535,7 +537,18 @@ impl BifrostCatalog {
             postgres,
             warehouse,
             file_io,
+            storage,
         })
+    }
+
+    /// Borrows the node's one storage owner this catalog binds Iceberg to.
+    ///
+    /// Oracle needs the owner itself, not only the `FileIO` built over it,
+    /// because the hot-footer path asks the owner to decode metadata under its
+    /// cache, admission, and retry policy rather than reading ranges blindly.
+    #[must_use]
+    pub fn storage(&self) -> &Arc<BifrostStorage> {
+        &self.storage
     }
 
     /// Borrow the exact Iceberg catalog used by Redux physical table registration.

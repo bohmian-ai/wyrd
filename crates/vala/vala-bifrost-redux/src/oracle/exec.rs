@@ -897,6 +897,58 @@ impl OracleQueryScanStats {
     }
 }
 
+/// Records the exact column closure each Iceberg physical scan is built with.
+///
+/// The compacted read path is only observable from a journey through its
+/// physical byte counter, and that counter cannot separate a broad read from a
+/// narrow one on a small data file: the dependency prefetches file tail for
+/// Parquet metadata and coalesces nearby byte ranges, so a file below those
+/// thresholds is fetched whole whatever columns were asked for. That is a real
+/// property of the current reader policy, not of Wyrd's projection, and tuning
+/// it is a separate production decision with its own evidence requirements.
+///
+/// This owner therefore exposes the fact the journey actually needs — which
+/// columns the signed closure handed to the Iceberg scan — without changing
+/// what any metric means and without adding production logging. It exists only
+/// under `test-support`; the production build has no recorder and no call site.
+#[cfg(feature = "test-support")]
+pub mod iceberg_projection_probe {
+    use std::sync::Mutex;
+
+    /// Closures observed since the last [`reset`], in scan-construction order.
+    ///
+    /// `None` is retained rather than skipped: a scan built with no projection
+    /// at all is exactly the regression a projection proof must catch, so it
+    /// has to be visible to the assertion rather than absent from it.
+    static OBSERVED: Mutex<Vec<Option<Vec<String>>>> = Mutex::new(Vec::new());
+
+    /// Discards every previously observed closure.
+    ///
+    /// A journey calls this immediately before the query it intends to
+    /// observe, so the closures it reads back belong to that query alone.
+    pub fn reset() {
+        if let Ok(mut observed) = OBSERVED.lock() {
+            observed.clear();
+        }
+    }
+
+    /// Returns the closures observed since the last [`reset`].
+    #[must_use]
+    pub fn observed() -> Vec<Option<Vec<String>>> {
+        OBSERVED
+            .lock()
+            .map(|observed| observed.clone())
+            .unwrap_or_default()
+    }
+
+    /// Records one Iceberg scan's closure as the scan starts its reader.
+    pub(super) fn record(projection: Option<&[String]>) {
+        if let Ok(mut observed) = OBSERVED.lock() {
+            observed.push(projection.map(<[String]>::to_vec));
+        }
+    }
+}
+
 /// Wyrd-owned Iceberg scan that retains the dependency's ranged-read metrics.
 #[derive(Clone)]
 pub(crate) struct OracleIcebergScanExec {
@@ -1125,6 +1177,8 @@ impl OracleIcebergScanExec {
         if let (None, Some(predicate)) = (&self.assigned_files, &self.predicates) {
             builder = builder.with_filter(predicate.clone());
         }
+        #[cfg(feature = "test-support")]
+        iceberg_projection_probe::record(self.projection.as_deref());
         let scan = builder.build().map_err(iceberg_datafusion_error)?;
         let tasks = scan.plan_files().await.map_err(iceberg_datafusion_error)?;
         let tasks = tasks
@@ -3408,6 +3462,13 @@ pub(super) fn select_row_groups_for_predicates(
 
 /// Projects one physical batch to the pinned schema by field name.
 ///
+/// The row count is carried explicitly rather than inferred from the columns,
+/// because the pinned schema is legitimately allowed to be empty: `count(*)`
+/// requests no output column, so its closure is the hidden tenant column alone
+/// and the batch that survives the tripwire has zero columns and a real row
+/// count. Arrow cannot recover that count from the columns, so dropping it
+/// would turn a valid narrow scan into an execution failure.
+///
 /// # Errors
 ///
 /// Returns a `DataFusion` error when a required field is missing, a cast fails,
@@ -3431,7 +3492,12 @@ fn project_batch(batch: &RecordBatch, schema: SchemaRef) -> DataFusionResult<Rec
             }
         })
         .collect::<DataFusionResult<Vec<_>>>()?;
-    RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
+    RecordBatch::try_new_with_options(
+        schema,
+        columns,
+        &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )
+    .map_err(DataFusionError::from)
 }
 
 /// Removes one named physical field from a schema.
@@ -3458,6 +3524,10 @@ fn schema_without(schema: &Schema, name: &str) -> DataFusionResult<SchemaRef> {
 
 /// Removes one named array from a batch without copying retained arrays.
 ///
+/// The row count is carried explicitly so a batch whose only column was the
+/// hidden tenant column — the closure of a `count(*)` scan — survives the
+/// tripwire as a zero-column batch with its real row count intact.
+///
 /// # Errors
 ///
 /// Returns a `DataFusion` execution error when the field is absent or Arrow
@@ -3475,7 +3545,12 @@ fn remove_column(batch: &RecordBatch, name: &str) -> DataFusionResult<RecordBatc
         .filter(|(ordinal, _)| *ordinal != index)
         .map(|(_, column)| Arc::clone(column))
         .collect();
-    RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
+    RecordBatch::try_new_with_options(
+        schema,
+        columns,
+        &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )
+    .map_err(DataFusionError::from)
 }
 
 /// Creates bounded cooperative properties for one single-partition operator.
@@ -3572,6 +3647,99 @@ mod tests {
                 tenant_mismatch_row(&batch, tenant).expect("tenant column is valid"),
                 Some(position)
             );
+        }
+    }
+
+    /// A `count(*)` closure survives the tripwire as a zero-column batch and
+    /// still refuses a foreign row.
+    ///
+    /// `count(*)` requests no output column, so its signed closure is the
+    /// hidden tenant column alone and the batch the tripwire emits has zero
+    /// columns. Arrow cannot infer a row count from no columns, so the count
+    /// has to be carried explicitly; when it was not, the leaf failed with
+    /// `must either specify a row count or at least one column` and the query
+    /// surfaced as a degraded partition rather than as the tenant refusal it
+    /// actually was. Both halves are pinned here: the owning-tenant scan keeps
+    /// its rows, and the foreign row is still classified as a tenant invariant.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture plan cannot be built or executed, or when the
+    /// tripwire loses the row count or the refusal.
+    #[tokio::test]
+    async fn count_star_closure_keeps_its_row_count_through_the_tripwire() {
+        let tenant = wyrd_spec::DataTenantId::new_v7();
+        let foreign = wyrd_spec::DataTenantId::new_v7();
+        for (owner_rows, expect_refusal) in [(3_usize, false), (3, true)] {
+            let values = (0..owner_rows)
+                .map(|row| {
+                    if expect_refusal && row == 1 {
+                        foreign.to_string()
+                    } else {
+                        tenant.to_string()
+                    }
+                })
+                .collect::<Vec<_>>();
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                DATA_TENANT_ID,
+                DataType::Utf8,
+                false,
+            )]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(StringArray::from(values)) as ArrayRef],
+            )
+            .expect("tenant-only closure batch");
+            let source =
+                MemorySourceConfig::try_new_exec(std::slice::from_ref(&vec![batch]), schema, None)
+                    .expect("closure source");
+            let principal = Principal {
+                id: PrincipalId::new(uuid::Uuid::now_v7()),
+                kind: wyrd_runtime::PrincipalKind::User,
+                tenant_id: tenant,
+                roles: Vec::new(),
+                effective_permissions: PermissionSet::default(),
+            };
+            let context = AuthorizedQueryContext::try_new(
+                principal,
+                tenant,
+                RequestId::now_v7(),
+                None,
+                AuthMethod::Internal,
+                "bifrost_query:read",
+            )
+            .expect("query context");
+            let tripwire = TenantTripwireExec::new(
+                source,
+                context,
+                "vala.traces.spans".to_owned(),
+                Arc::new(NoopAudit),
+            )
+            .expect("tripwire plan");
+            assert_eq!(
+                tripwire.schema().fields().len(),
+                0,
+                "a count(*) closure leaves the tripwire with no output column"
+            );
+            let stream = tripwire
+                .execute(0, Arc::new(TaskContext::default()))
+                .expect("tripwire stream");
+            let collected = futures_util::TryStreamExt::try_collect::<Vec<_>>(stream).await;
+            if expect_refusal {
+                let error = collected.expect_err("a foreign row must refuse the scan");
+                assert!(
+                    is_tenant_invariant_error(&error),
+                    "the refusal must stay a tenant invariant: {error}"
+                );
+            } else {
+                let batches = collected.expect("an owning-tenant closure scan succeeds");
+                let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+                assert_eq!(rows, owner_rows, "the zero-column batch kept its row count");
+                assert!(
+                    batches.iter().all(|batch| batch.num_columns() == 0),
+                    "the tenant column must not survive the tripwire"
+                );
+            }
         }
     }
 

@@ -9,6 +9,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
+use vala_bifrost_redux::oracle::iceberg_projection_probe;
 use vala_sdk::{BifrostGrpcTransport, QueryClient, ValaSdkError};
 use wyrd_client::WyrdClient;
 use wyrd_spec::error::WyrdError;
@@ -673,22 +674,32 @@ async fn prove_hot_and_compacted_pruning() -> Result<(), JourneyError> {
 /// compacted-only cut, before the hot cohort is written.
 ///
 /// This is the compacted owner: the tier counts are asserted first, so every
-/// file the query can reach is a published Iceberg data file and the byte
-/// difference below cannot be attributed to the hot leaf. The two queries share
-/// a predicate, a cut, and a residual row set; they differ only in whether they
-/// request the wide `unused_payload` column, so a strictly smaller narrow scan
-/// is the physical projection reaching `provider.scan`.
+/// file the query can reach is a published Iceberg data file and nothing
+/// observed here can be attributed to the hot leaf.
 ///
-/// The hot-only journey owns the same proof for `HotParquetExec`. Neither is
-/// inferred from an aggregate reduction over the mixed-tier cut this journey
+/// The evidence is the closure the Iceberg physical scan was built with, not a
+/// byte count. Scanned bytes cannot decide this leg: the dependency's reader
+/// prefetches file tail for Parquet metadata and coalesces nearby byte ranges,
+/// so a published file below those thresholds is fetched whole regardless of
+/// which columns were requested, and both queries report the same total. That
+/// is a property of the current reader policy — changing it is a separate
+/// production performance decision with its own evidence requirements — not a
+/// property of Wyrd's projection. What this proves, exactly, is that the narrow
+/// closure reaches the Iceberg physical reader: the broad scan carries
+/// `unused_payload`, the narrow one does not, both retain the hidden tenant
+/// column, and the narrow closure is a strict subset of the broad one. It does
+/// not claim that the narrow query issued fewer object-store bytes.
+///
+/// The hot-only journey owns the byte proof for `HotParquetExec`. Neither leg
+/// is inferred from an aggregate reduction over the mixed-tier cut this journey
 /// later builds.
 ///
 /// # Errors
 ///
 /// Returns a client, Postgres, or telemetry error surfaced by any step, and a
 /// descriptive error when the cut is not compacted-only, when the two queries
-/// disagree on residual identity, or when the narrow query does not scan
-/// strictly fewer bytes.
+/// disagree on residual identity, or when the observed Iceberg closures do not
+/// show the narrow projection reaching the reader.
 async fn prove_compacted_only_projection(
     cluster: &WyrdTestCluster,
     tenant: wyrd_spec::DataTenantId,
@@ -711,10 +722,7 @@ async fn prove_compacted_only_projection(
         .filter(|id| marker_value(*id) == "target")
         .collect();
 
-    let broad_checkpoint = cluster
-        .telemetry()
-        .checkpoint()
-        .map_err(|error| error.to_string())?;
+    iceberg_projection_probe::reset();
     let broad_ids = query_ids(
         &reader,
         format!(
@@ -723,6 +731,7 @@ async fn prove_compacted_only_projection(
         ),
     )
     .await?;
+    let broad_closure = observed_iceberg_closure("broad")?;
     if broad_ids != expected_ids {
         return Err(format!(
             "compacted-only broad query returned the wrong residual rows: \
@@ -730,23 +739,16 @@ async fn prove_compacted_only_projection(
         )
         .into());
     }
-    let broad_bytes = sum_metric(
-        &cluster
-            .telemetry()
-            .delta_since(&broad_checkpoint)
-            .map_err(|error| error.to_string())?,
-        "oracle_query_bytes_scanned_total",
-    );
 
-    let narrow_checkpoint = cluster
-        .telemetry()
-        .checkpoint()
-        .map_err(|error| error.to_string())?;
+    iceberg_projection_probe::reset();
     let narrow_ids = query_ids(
         &reader,
         format!("SELECT id FROM {table_fqn} WHERE filter_key = 'target' ORDER BY id"),
     )
     .await?;
+    let narrow_closure = observed_iceberg_closure("narrow")?;
+    // Row identity first: a projection that reached the reader but changed the
+    // answer is a defect, not a proof.
     if narrow_ids != broad_ids {
         return Err(format!(
             "compacted-only narrow projection must return the same rows: \
@@ -754,34 +756,82 @@ async fn prove_compacted_only_projection(
         )
         .into());
     }
-    let narrow_bytes = sum_metric(
-        &cluster
-            .telemetry()
-            .delta_since(&narrow_checkpoint)
-            .map_err(|error| error.to_string())?,
-        "oracle_query_bytes_scanned_total",
-    );
-    // Positive follower scan evidence first: `sum_metric` reports an absent
-    // family as 0.0, so a leaf that recorded nothing must fail here rather
-    // than satisfy the comparison below by being small.
-    if narrow_bytes <= 0.0 {
+
+    if !broad_closure.iter().any(|name| name == "unused_payload") {
         return Err(format!(
-            "compacted-only narrow projection reported no scanned bytes: {narrow_bytes}"
+            "the broad query must carry the wide column into the Iceberg scan: {broad_closure:?}"
         )
         .into());
     }
-    // Strict `Less`, so an incomparable (NaN) metric fails this proof.
-    if !matches!(
-        narrow_bytes.partial_cmp(&broad_bytes),
-        Some(std::cmp::Ordering::Less)
-    ) {
+    if narrow_closure.iter().any(|name| name == "unused_payload") {
         return Err(format!(
-            "compacted-only narrow projection must scan strictly fewer bytes: \
-             narrow={narrow_bytes} broad={broad_bytes}"
+            "the narrow query must not carry the wide column into the Iceberg scan: \
+             {narrow_closure:?}"
+        )
+        .into());
+    }
+    // The hidden tenant column survives to the reader on both, because the
+    // tripwire downstream cannot enforce isolation on a column that was never
+    // read.
+    for (label, closure) in [("broad", &broad_closure), ("narrow", &narrow_closure)] {
+        if !closure
+            .iter()
+            .any(|name| name == wyrd_spec::vala::managed_columns::DATA_TENANT_ID)
+        {
+            return Err(format!(
+                "the {label} Iceberg closure dropped the hidden tenant column: {closure:?}"
+            )
+            .into());
+        }
+    }
+    // Strict subset, so a narrow closure that merely reordered the broad one
+    // fails rather than passes.
+    if !narrow_closure
+        .iter()
+        .all(|name| broad_closure.contains(name))
+        || narrow_closure.len() >= broad_closure.len()
+    {
+        return Err(format!(
+            "the narrow Iceberg closure must be strictly narrower than the broad one: \
+             narrow={narrow_closure:?} broad={broad_closure:?}"
         )
         .into());
     }
     Ok(())
+}
+
+/// Returns the one column closure every Iceberg physical scan was built with
+/// since the last probe reset.
+///
+/// A distributed query builds one Iceberg leaf per follower assignment, so
+/// several scans are expected; what the proof requires is that they all carry
+/// the same closure, because the leader signs one closure for the whole
+/// fragment and a leaf that disagreed with it would be reading columns nobody
+/// authorized.
+///
+/// # Errors
+///
+/// Returns an error when no scan was observed, when the observed scans disagree
+/// on their closure, and when any observed scan carried no projection at all —
+/// the last being exactly the regression this proof exists to catch.
+fn observed_iceberg_closure(label: &str) -> Result<Vec<String>, JourneyError> {
+    let observed = iceberg_projection_probe::observed();
+    let Some(first) = observed.first() else {
+        return Err(format!("the {label} query built no Iceberg scan at all").into());
+    };
+    let closure = first.clone().ok_or_else(|| -> JourneyError {
+        format!("the {label} query built its Iceberg scan with no projection at all").into()
+    })?;
+    for other in &observed {
+        if other.as_ref() != Some(&closure) {
+            return Err(format!(
+                "the {label} query's Iceberg leaves disagree on their closure: \
+                 {closure:?} and {other:?}"
+            )
+            .into());
+        }
+    }
+    Ok(closure)
 }
 
 /// The marker a given id carries: every `MARKER_STRIDE`-th row of the

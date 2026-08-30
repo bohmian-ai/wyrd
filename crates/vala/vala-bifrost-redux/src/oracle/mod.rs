@@ -57,6 +57,15 @@ pub mod attempt;
 pub mod codec;
 pub mod dispatcher;
 pub(crate) mod exec;
+
+/// Test-only observation of the column closure each Iceberg physical scan is
+/// built with.
+///
+/// Re-exported here because [`exec`] is crate-private while the Oracle journeys
+/// that need this evidence live outside the crate. Present only under
+/// `test-support`.
+#[cfg(feature = "test-support")]
+pub use exec::iceberg_projection_probe;
 #[cfg(feature = "test-support")]
 pub use exec::{remote_partition_attempts_for_test, reset_remote_partition_attempts_for_test};
 pub mod follower;

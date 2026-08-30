@@ -235,9 +235,9 @@ pub(crate) fn unique_table(prefix: &str) -> String {
 
 /// Number of hex characters in one row's `unused_payload` value.
 ///
-/// Large enough that the column's Parquet chunk dominates a single-row file,
-/// so a query that does not request it measurably scans fewer bytes than one
-/// that does. Small enough that a journey's fixture stays cheap to write.
+/// Large enough that the column is a real fraction of a published file rather
+/// than a rounding error, and small enough that a journey writing dozens of
+/// single-row batches through the public ingest path stays quick.
 const UNUSED_PAYLOAD_CHARS: usize = 4096;
 
 /// Builds one row's deterministic, high-entropy `unused_payload` value.

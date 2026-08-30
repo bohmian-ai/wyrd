@@ -7,8 +7,6 @@ pub mod bench_dataset;
 #[cfg(feature = "bench")]
 pub mod bench_families;
 #[cfg(feature = "bench")]
-pub mod bench_forge;
-#[cfg(feature = "bench")]
 pub mod bench_materializer;
 #[cfg(feature = "bench")]
 pub mod bench_oracle;
@@ -40,7 +38,7 @@ pub use cluster::{
     full_bifrost_topology, shared_process_telemetry_for_test,
 };
 pub use forge_harness::{
-    CommitUncertaintyCatalog, ForgeFixture, ForgeObjectStoreControl, StandaloneForgeFixture,
+    CommitUncertaintyCatalog, ForgeFixture, ForgeObjectStoreControl,
     seed_forge_group, seed_forge_group_for_tenant, seed_forge_group_for_tenant_with_schema,
     seed_forge_group_for_tenant_with_schema_and_days,
 };

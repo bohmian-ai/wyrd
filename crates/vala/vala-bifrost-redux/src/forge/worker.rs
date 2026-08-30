@@ -37,9 +37,6 @@ use super::error::{ForgeCapacityFailurePhase, ForgeError, ForgeFailureClass};
 use super::expire::{PendingExpiryTerminal, derive_recovered_files, table_resource_for_key};
 use super::identity::task_table_binding;
 use super::lease::{ForgeLease, forge_lease_key};
-use super::live_replace::{
-    IcebergRewriteDisposition, TaskLiveRewriteRequest, TaskLiveRewriteResult,
-};
 use super::maintenance::{ForgeMaintenance, ForgeMaintenanceResult};
 use super::metrics::{
     ForgeAttemptResource, ForgeCapacityRefusalPhase, ForgeCleanupKind, ForgeConflictKind,
@@ -47,7 +44,6 @@ use super::metrics::{
     ForgeTaskMetricStrategy, ForgeTaskTerminalResult,
 };
 use super::path::catalog_path_to_object_key;
-use super::rewrite::ForgeRewritePipeline;
 use super::{Forge, ForgeCapacity};
 use crate::catalog::TenantTableBinding;
 
@@ -84,8 +80,6 @@ struct ForgeDispatchRequest<'a> {
     table: Table,
     /// Cancellation token this strategy observes before any committed effect.
     stop: &'a CancellationToken,
-    /// Attempt-local pipeline bound to the retained operation lease.
-    rewrite: &'a ForgeRewritePipeline,
 }
 
 /// Validated maintenance effects encoded by one durable task plan.
@@ -1743,17 +1737,6 @@ impl ForgeWorker {
         let table = self.forge.load_table(&binding.table_ident()).await?;
         self.verify_committed_evidence(binding, &table, evidence)
             .await?;
-        if task.strategy == ForgeTaskStrategy::StagingFold {
-            let snapshot_id =
-                evidence
-                    .committed_snapshot_id
-                    .ok_or_else(|| ForgeError::Reconciliation {
-                        detail: "recovered staging task has no committed snapshot".to_owned(),
-                    })?;
-            self.forge
-                .stamp_recovered_staging_task(lease, binding, &task.plan.inputs, snapshot_id)
-                .await?;
-        }
         let expiry_terminals = if task.strategy == ForgeTaskStrategy::SnapshotExpiry {
             let key = super::compact::ForgeTableKey {
                 tenant: task.data_tenant_id,
@@ -1898,9 +1881,6 @@ impl ForgeWorker {
             });
         }
         let (expected_kind, stage) = match &task.strategy {
-            ForgeClaimStrategy::Known(ForgeTaskStrategy::StagingFold) => {
-                ("staging_fold", ForgeMetricStage::StagingFold)
-            }
             ForgeClaimStrategy::Known(ForgeTaskStrategy::SmallFiles) => {
                 ("live_rewrite", ForgeMetricStage::IcebergRewrite)
             }
@@ -2175,27 +2155,6 @@ impl ForgeWorker {
             .await
             .map_err(ForgeError::Sql)?;
         lease.require_fence(&self.forge.core.operator_pool).await?;
-        if matches!(state, ForgeExecutionEvidenceState::RecoveredCommit)
-            && matches!(
-                claim.strategy,
-                ForgeClaimStrategy::Known(ForgeTaskStrategy::StagingFold)
-            )
-        {
-            let snapshot_id =
-                evidence
-                    .committed_snapshot_id
-                    .ok_or_else(|| ForgeError::Reconciliation {
-                        detail: "recovered staging task has no committed snapshot".to_owned(),
-                    })?;
-            let binding = task_table_binding(
-                claim.data_tenant_id,
-                claim.execution_tenant_id,
-                &claim.table_ref,
-            )?;
-            self.forge
-                .stamp_recovered_staging_task(lease, &binding, &claim.plan.inputs, snapshot_id)
-                .await?;
-        }
         match state {
             ForgeExecutionEvidenceState::Fresh | ForgeExecutionEvidenceState::RecoveredCommit => {
                 self.persist_success(claim, attempt, lease, evidence).await
@@ -2359,16 +2318,6 @@ impl ForgeWorker {
             stop,
             rewrite,
         } = request;
-        if matches!(
-            claim.strategy,
-            ForgeClaimStrategy::Known(ForgeTaskStrategy::StagingFold)
-        ) && let Some(recovered) = self
-            .forge
-            .recover_interrupted_staging_task(lease, binding, &claim.plan.inputs, &table)
-            .await?
-        {
-            return Ok(ForgeDispatchResult::Committed(recovered));
-        }
         if Self::current_snapshot_matches_task(&table, claim.task_id) {
             return Ok(ForgeDispatchResult::Committed(table));
         }
@@ -2385,31 +2334,6 @@ impl ForgeWorker {
             });
         }
         match &claim.strategy {
-            ForgeClaimStrategy::Known(ForgeTaskStrategy::StagingFold) => self
-                .forge
-                .execute_staging_task(super::compact::StagingTaskRequest {
-                    rewrite,
-                    lease,
-                    binding,
-                    inputs: &claim.plan.inputs,
-                    task_id: claim.task_id,
-                    attempt_id: attempt,
-                    stop,
-                })
-                .await
-                .map(ForgeDispatchResult::Committed),
-            ForgeClaimStrategy::Known(ForgeTaskStrategy::SmallFiles) => {
-                self.dispatch_small_files(ForgeDispatchRequest {
-                    claim,
-                    attempt,
-                    binding,
-                    lease,
-                    table,
-                    stop,
-                    rewrite,
-                })
-                .await
-            }
             ForgeClaimStrategy::Known(
                 ForgeTaskStrategy::ManifestRewrite | ForgeTaskStrategy::SnapshotExpiry,
             ) => {
@@ -2451,73 +2375,6 @@ impl ForgeWorker {
             )
             .await
             .map_err(ForgeError::Sql)
-    }
-
-    /// Executes one exact small-file task against its rediscovered live group.
-    ///
-    /// The persisted input list is authoritative: the group is rediscovered
-    /// from the loaded snapshot and rewritten under the same attempt fence and
-    /// operation lease. A non-committing disposition is an invariant failure
-    /// for an exact task, because the caller already proved the base snapshot
-    /// still matches.
-    ///
-    /// # Errors
-    ///
-    /// Returns discovery, rewrite, catalog, fencing, or reconciliation
-    /// failures, including a disposition that performed no committed work.
-    async fn dispatch_small_files(
-        &self,
-        request: ForgeDispatchRequest<'_>,
-    ) -> Result<ForgeDispatchResult, ForgeError> {
-        let ForgeDispatchRequest {
-            claim,
-            attempt,
-            binding,
-            lease,
-            table,
-            stop,
-            rewrite,
-        } = request;
-        let group = self
-            .forge
-            .discover_exact_live_group(binding, &table, &claim.plan.inputs)
-            .await?;
-        let TaskLiveRewriteResult {
-            disposition,
-            committed_table,
-        } = self
-            .forge
-            .replace_live_group_for_task(TaskLiveRewriteRequest {
-                rewrite,
-                lease,
-                binding,
-                table: &table,
-                base_snapshot_id: claim.base_snapshot_id,
-                group: &group,
-                task_id: claim.task_id,
-                attempt_id: attempt,
-                stop,
-            })
-            .await?;
-        match (disposition, committed_table) {
-            (IcebergRewriteDisposition::Committed { spill_bytes, .. }, Some(table)) => {
-                self.forge
-                    .core
-                    .telemetry
-                    .record_task_spill(ForgeTaskMetricStrategy::SmallFiles, spill_bytes);
-                Ok(ForgeDispatchResult::Committed(table))
-            }
-            (IcebergRewriteDisposition::NoWork | IcebergRewriteDisposition::SnapshotChanged, _) => {
-                Err(ForgeError::Reconciliation {
-                    detail: "exact small-file task did not commit".to_owned(),
-                })
-            }
-            (IcebergRewriteDisposition::Committed { .. }, None) => {
-                Err(ForgeError::Reconciliation {
-                    detail: "committed rewrite lost its returned table".to_owned(),
-                })
-            }
-        }
     }
 
     /// Persists exact cleanup evidence, deletes it with a durable cursor, then runs orphan GC.
@@ -3318,8 +3175,7 @@ impl ForgeWorker {
                         ForgeError::ExecutionEnvelopeExceeded {
                             resource: "scratch",
                             ..
-                        }
-                        | ForgeError::SpillLimitExceeded { .. } => ForgeAttemptResource::Scratch,
+                        } => ForgeAttemptResource::Scratch,
                         _ => ForgeAttemptResource::Memory,
                     })
                 } else {
@@ -3923,7 +3779,7 @@ mod tests {
         observer.record(
             Uuid::now_v7(),
             Uuid::now_v7(),
-            ForgeClaimStrategy::Known(ForgeTaskStrategy::StagingFold),
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::SmallFiles),
         );
         observer.wait_for_at_least(1).await;
         assert_eq!(observer.completed(), 1);
@@ -3944,7 +3800,7 @@ mod tests {
         observer.record(
             Uuid::now_v7(),
             Uuid::now_v7(),
-            ForgeClaimStrategy::Known(ForgeTaskStrategy::StagingFold),
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::SmallFiles),
         );
         release.wait().await;
         tokio::time::timeout(Duration::from_secs(1), waiter)

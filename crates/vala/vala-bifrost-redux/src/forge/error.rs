@@ -20,13 +20,6 @@ mod tests {
     #[test]
     fn failure_mapping_is_exhaustive_and_capacity_phase_aware() {
         assert_eq!(
-            ForgeError::DataRefusal {
-                detail: "footer".to_owned()
-            }
-            .failure_class(),
-            ForgeFailureClass::DataRefusal
-        );
-        assert_eq!(
             ForgeError::ScratchIo {
                 kind: std::io::ErrorKind::PermissionDenied,
                 detail: "scratch".to_owned(),
@@ -95,17 +88,6 @@ pub enum ForgeError {
     /// A staging or rewritten object operation failed.
     #[error("Forge staging object read failed: {0}")]
     ObjectStore(#[source] opendal::Error),
-    /// Deterministic source metadata proves the input cannot fit the decoded allowance.
-    #[error("Forge refused unsafe input data: {detail}")]
-    DataRefusal { detail: String },
-    /// A sealed output row group must be deterministically bisected and retried.
-    #[error("Forge encoded row group {row_group} exceeded 32 MiB for {rows} rows")]
-    EncodedRowGroupOverflow {
-        /// Zero-based row-group position in the attempted physical file.
-        row_group: usize,
-        /// Rows in the offending logical slice.
-        rows: usize,
-    },
     /// Attempt-local scratch IO failed with its typed operating-system category.
     #[error("Forge scratch IO failed ({kind:?}): {detail}")]
     ScratchIo {
@@ -126,9 +108,6 @@ pub enum ForgeError {
     /// A fenced orphan object could not be deleted.
     #[error("Forge object deletion failed: {0}")]
     ObjectDelete(#[source] opendal::Error),
-    /// Parquet decoding, encoding, or owned spill-path setup failed.
-    #[error("Forge parquet operation failed: {detail}")]
-    Parquet { detail: String },
     /// A staging batch did not match the registered physical schema.
     #[error("Forge schema validation failed: {detail}")]
     Schema { detail: String },
@@ -173,12 +152,6 @@ pub enum ForgeError {
     /// A second long-lived scheduler attempted to use the same owner.
     #[error("Forge scheduler is already running")]
     AlreadyRunning,
-    /// `DataFusion` failed while executing the spillable physical rewrite.
-    #[error("Forge DataFusion execution failed: {0}")]
-    DataFusion(#[source] datafusion::error::DataFusionError),
-    /// `DataFusion` exhausted the configured operation spill ceiling.
-    #[error("Forge spill limit of {limit_bytes} bytes was exceeded")]
-    SpillLimitExceeded { limit_bytes: u64 },
 }
 
 impl ForgeError {
@@ -204,22 +177,17 @@ impl ForgeError {
     #[must_use]
     pub fn failure_class(&self) -> ForgeFailureClass {
         match self {
-            Self::DataRefusal { .. } | Self::EncodedRowGroupOverflow { .. } => {
-                ForgeFailureClass::DataRefusal
-            }
             Self::ScratchIo { .. } => ForgeFailureClass::StorageHealth,
-            Self::Capacity { .. }
-            | Self::ExecutionEnvelopeExceeded { .. }
-            | Self::DataFusion(datafusion::error::DataFusionError::ResourcesExhausted(_))
-            | Self::SpillLimitExceeded { .. } => ForgeFailureClass::CapacityRefused,
+            Self::Capacity { .. } | Self::ExecutionEnvelopeExceeded { .. } => {
+                ForgeFailureClass::CapacityRefused
+            }
             Self::ObjectStore(_)
             | Self::ObjectList(_)
             | Self::ObjectDelete(_)
             | Self::Catalog(_)
             | Self::Timeout { .. }
             | Self::SnapshotExpiry { .. }
-            | Self::LiveSet { .. }
-            | Self::Parquet { .. } => ForgeFailureClass::TransientObjectStore,
+            | Self::LiveSet { .. } => ForgeFailureClass::TransientObjectStore,
             Self::Lease(_)
             | Self::Sql(_)
             | Self::FenceLost { .. }
@@ -229,7 +197,6 @@ impl ForgeError {
             | Self::Invariant { .. }
             | Self::InvalidConfig { .. }
             | Self::AlreadyRunning
-            | Self::DataFusion(_)
             | Self::Shutdown
             | Self::ShutdownRetained => ForgeFailureClass::InternalInvariant,
         }
@@ -240,9 +207,7 @@ impl ForgeError {
     pub const fn capacity_failure_phase(&self) -> Option<ForgeCapacityFailurePhase> {
         match self {
             Self::Capacity { .. } => Some(ForgeCapacityFailurePhase::Admission),
-            Self::ExecutionEnvelopeExceeded { .. }
-            | Self::DataFusion(datafusion::error::DataFusionError::ResourcesExhausted(_))
-            | Self::SpillLimitExceeded { .. } => Some(ForgeCapacityFailurePhase::Execution),
+            Self::ExecutionEnvelopeExceeded { .. } => Some(ForgeCapacityFailurePhase::Execution),
             _ => None,
         }
     }

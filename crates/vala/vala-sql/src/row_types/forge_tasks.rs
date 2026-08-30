@@ -753,8 +753,6 @@ fn evidence_from_value(value: serde_json::Value) -> Result<ForgeTaskEvidence, Sq
 /// Closed Forge maintenance strategies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForgeTaskStrategy {
-    /// Fold staging files.
-    StagingFold,
     /// Compact small files.
     SmallFiles,
     /// Repair full table identity.
@@ -803,7 +801,6 @@ impl ForgeTaskStrategy {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::StagingFold => "staging_fold",
             Self::SmallFiles => "small_files",
             Self::FullIdentity => "full_identity",
             Self::ManifestRewrite => "manifest_rewrite",
@@ -820,7 +817,6 @@ impl FromStr for ForgeTaskStrategy {
     /// Returns [`SqlError::InvariantViolation`] for an unknown value.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
-            "staging_fold" => Ok(Self::StagingFold),
             "small_files" => Ok(Self::SmallFiles),
             "full_identity" => Ok(Self::FullIdentity),
             "manifest_rewrite" => Ok(Self::ManifestRewrite),
@@ -1324,7 +1320,6 @@ impl TryFrom<ForgeTaskClaimSqlRow> for ForgeTaskClaim {
         let strategy = ForgeClaimStrategy::from_raw(row.task.strategy.clone());
         row.task.strategy = match &strategy {
             ForgeClaimStrategy::Known(value) => value.as_str().to_owned(),
-            ForgeClaimStrategy::Unknown(_) => ForgeTaskStrategy::StagingFold.as_str().to_owned(),
         };
         let task: ForgeTask = row.task.try_into()?;
         Ok(Self {

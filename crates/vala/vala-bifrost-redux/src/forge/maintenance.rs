@@ -376,8 +376,6 @@ impl ForgeMaintenance {
             &candidates,
             self.forge.core.config.manifest_rewrite_target_size_bytes,
             self.forge.core.config.manifest_rewrite_min_count,
-            self.forge.core.config.max_files_per_tick,
-            self.forge.core.config.max_bytes_per_tick,
         ))
     }
 
@@ -412,8 +410,6 @@ impl ForgeMaintenance {
                 manifest_paths: rewrite_paths,
             },
             ManifestRewriteLimits {
-                max_manifests: self.forge.core.config.max_files_per_tick,
-                max_entries: self.forge.core.config.max_files_per_tick,
                 max_bytes: self.forge.core.config.manifest_rewrite_target_size_bytes,
             },
         );

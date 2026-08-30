@@ -24,8 +24,8 @@ use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
 use super::Forge;
-use super::binpack::ForgeGroupKey;
 use super::error::ForgeError;
+use super::compact::ForgeGroupKey;
 use super::identity::task_table_binding;
 use super::maintenance::{
     ManifestRewriteCandidate, manifest_rewrite_is_due, select_bounded_manifest_rewrite_paths,
@@ -723,47 +723,6 @@ impl<'forge> ForgeScheduler<'forge> {
             &demand.table_ref,
         )?;
         let table = self.forge.load_table(&binding.table_ident()).await?;
-        let now = self.forge.core.clock.now()?;
-        let discovered = self
-            .forge
-            .discover_live_rewrites(&binding, &table, now)
-            .await?;
-        let compaction_debt_files = discovered
-            .groups()
-            .iter()
-            .try_fold(0_u64, |total, group| {
-                total.checked_add(u64::try_from(group.files().len()).unwrap_or(u64::MAX))
-            })
-            .ok_or_else(|| ForgeError::Invariant {
-                detail: "Forge live candidate file debt exceeds u64".to_owned(),
-            })?;
-        let compaction_debt_bytes = discovered
-            .groups()
-            .iter()
-            .flat_map(super::right_size::IcebergRewriteGroup::files)
-            .try_fold(0_u64, |total, file| {
-                total.checked_add(file.file_size_bytes())
-            })
-            .ok_or_else(|| ForgeError::Invariant {
-                detail: "Forge live candidate byte debt exceeds u64".to_owned(),
-            })?;
-        let mut candidates = self
-            .forge
-            .discover_staging_task_candidates(&binding, now, self.capacity)
-            .await?;
-        if candidates.is_empty() {
-            candidates = discovered
-                .groups()
-                .iter()
-                .map(|group| {
-                    ForgePlanCandidate::from_live_group(
-                        group,
-                        self.forge.core.config.max_concurrent_reads,
-                        self.capacity,
-                    )
-                })
-                .collect::<Result<Vec<_>, ForgeError>>()?;
-        }
         // Manifest rewrite and snapshot expiry are schedulable separately,
         // then executes rewrite first when both have work.  Keep that split:
         // a fragmented manifest list must not wait for snapshot retention to
@@ -970,8 +929,6 @@ impl<'forge> ForgeScheduler<'forge> {
             &candidates,
             self.forge.core.config.manifest_rewrite_target_size_bytes,
             self.forge.core.config.manifest_rewrite_min_count,
-            self.forge.core.config.max_files_per_tick,
-            self.forge.core.config.max_bytes_per_tick,
         )
     }
 
@@ -999,10 +956,7 @@ impl<'forge> ForgeScheduler<'forge> {
         let mut inputs = Vec::new();
         let mut input_bytes = Vec::new();
         let mut bytes = 0_u64;
-        for manifest in maintenance_inputs
-            .into_iter()
-            .take(self.forge.core.config.max_files_per_tick)
-        {
+        for manifest in maintenance_inputs.into_iter() {
             let size =
                 u64::try_from(manifest.manifest_length).map_err(|_| ForgeError::Invariant {
                     detail: "Iceberg manifest length is negative".to_owned(),
@@ -1012,9 +966,6 @@ impl<'forge> ForgeScheduler<'forge> {
                     detail: "manifest maintenance byte estimate overflowed".to_owned(),
                 });
             };
-            if !inputs.is_empty() && next > self.forge.core.config.max_bytes_per_tick {
-                break;
-            }
             bytes = next;
             inputs.push(manifest.manifest_path.clone());
             input_bytes.push(size.max(1));

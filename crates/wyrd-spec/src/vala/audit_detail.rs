@@ -382,31 +382,6 @@ pub enum AuditDetail {
         /// Exact ordered rewritten object paths added by the Iceberg action.
         output_paths: Vec<StoragePath>,
     },
-    /// A Forge compaction operation and its external Iceberg boundary.
-    ///
-    /// The ordered `output_paths` list is the sole greenfield output shape;
-    /// prepared and terminal audit rows preserve writer-rotation order and do
-    /// not expose a scalar compatibility form.
-    ForgeCompaction {
-        /// Deterministic identifier shared by prepared and terminal rows.
-        operation_id: uuid::Uuid,
-        /// Durable phase represented by this audit row.
-        phase: ForgeCompactionPhase,
-        /// Canonical tenant/table/partition group identity.
-        group: String,
-        /// Exact staging rows transitioned by the operation.
-        input_file_ids: Vec<uuid::Uuid>,
-        /// Exact staging paths consumed by the operation.
-        input_paths: Vec<StoragePath>,
-        /// Deterministic compacted output paths in writer-rotation order.
-        ///
-        /// This ordered collection is the only output representation for
-        /// greenfield Forge audit rows, shared by prepared and terminal
-        /// phases without a scalar compatibility field.
-        output_paths: Vec<StoragePath>,
-        /// Iceberg snapshot returned by a committed operation, when known.
-        snapshot_id: Option<i64>,
-    },
     /// A Forge snapshot-expiry operation and its Iceberg metadata boundary.
     ForgeSnapshotExpire {
         /// Deterministic identifier shared by prepared and terminal rows.
@@ -603,21 +578,6 @@ impl AuditDetail {
         }
         Ok(())
     }
-}
-
-/// Durable phase recorded for a Forge compaction operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum ForgeCompactionPhase {
-    /// Inputs were hidden before the external Iceberg commit.
-    Prepared,
-    /// The external Iceberg commit completed.
-    Committed,
-    /// Reconciliation recovered a previously completed external commit.
-    Recovered,
-    /// Reconciliation made the exact inputs visible again after expiry.
-    Reset,
 }
 
 /// Durable phase recorded for a live Iceberg replacement operation.

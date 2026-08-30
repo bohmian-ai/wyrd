@@ -6,7 +6,7 @@ CREATE TABLE vala.forge_tasks (
     catalog_name text NOT NULL CHECK (catalog_name = 'wyrd-redux'),
     namespace_name text NOT NULL CHECK (namespace_name IN ('vala.system','vala.bifrost','vala.traces','vala.metrics','vala.logs','vala.genai','vala.eval','vala.drift','vala.dev','vala.datasets')),
     table_name text NOT NULL CHECK (table_name <> '' AND length(table_name) <= 63 AND table_name ~ '^[A-Za-z0-9_.-]+$' AND table_name NOT LIKE '%..%' AND table_name !~ '^\\.|\\.$'),
-    strategy text NOT NULL CHECK (strategy IN ('staging_fold','small_files','full_identity','manifest_rewrite','snapshot_expiry','expired_cleanup','orphan_cleanup')),
+    strategy text NOT NULL CHECK (strategy IN ('small_files','full_identity','manifest_rewrite','snapshot_expiry','expired_cleanup','orphan_cleanup')),
     lane text NOT NULL CHECK (lane IN ('ordinary','large_singleton')),
     base_snapshot_id bigint NOT NULL,
     plan jsonb NOT NULL,

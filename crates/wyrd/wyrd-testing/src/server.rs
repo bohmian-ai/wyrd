@@ -455,8 +455,6 @@ pub struct WyrdTestServerBuilder {
     trusted_issuer_configs: Vec<IssuerEntry>,
     workload_binding_configs: Vec<WorkloadBindingEntry>,
     forge_interval: Duration,
-    /// Test-tier bin width makes three-file current-day journeys deterministic.
-    forge_max_files_per_bin: usize,
     wal_sync_delay: Duration,
     scribe_admission: Option<AdmissionConfig>,
     /// One immutable lowerable limits snapshot shared by the test server's ingest owners.
@@ -534,7 +532,6 @@ impl Default for WyrdTestServerBuilder {
             trusted_issuer_configs: Vec::new(),
             workload_binding_configs: Vec::new(),
             forge_interval: Duration::from_secs(60),
-            forge_max_files_per_bin: 3,
             wal_sync_delay: Duration::ZERO,
             scribe_admission: None,
             scribe_ingest_limits: IngestLimits::default(),
@@ -3583,10 +3580,7 @@ impl WyrdTestServerBuilder {
         } else {
             ClusterRegistry::new(postgres.vala().clone(), node_id)
         });
-        let forge_config = self.forge_config.unwrap_or_else(|| ForgeConfig {
-            max_files_per_bin: self.forge_max_files_per_bin,
-            ..ForgeConfig::default()
-        });
+        let forge_config = self.forge_config.unwrap_or_default();
         let (forge_clock, forge_clock_control) = ForgeClock::manual(Utc::now());
         let forge_scheduler_trigger = ForgeSchedulerTrigger::new();
         let forge_object_store = (self

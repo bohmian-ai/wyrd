@@ -11,10 +11,8 @@ use std::time::Duration;
 
 use iceberg::Catalog;
 
-pub(crate) mod binpack;
 mod clock;
 pub(crate) mod compact;
-mod discovery;
 pub(crate) mod error;
 pub(crate) mod expire;
 mod identity;
@@ -28,7 +26,6 @@ mod path;
 mod planner;
 mod planning_scheduler;
 pub(crate) mod rewrite;
-pub(crate) mod right_size;
 mod scheduler;
 mod worker;
 
@@ -40,16 +37,10 @@ pub use error::ForgeError;
 pub use metrics::ForgeTelemetry;
 pub use planner::{
     ForgeCapacity, ForgeEnvelopeSizer, ForgePlanCandidate, ForgePlanCapacity, ForgePlanner,
-    ForgeTableSnapshot, PlannedForgeTask,
+    PlannedForgeTask,
 };
 pub use planning_scheduler::{ForgeScheduleOutcome, ForgeScheduler};
 pub use rewrite::ForgeRewriteRuntime;
-#[cfg(feature = "test-support")]
-pub use rewrite::deterministic_output_path_for_test;
-#[cfg(feature = "test-support")]
-pub use rewrite::{data_page_reads_for_test, reset_data_page_reads_for_test};
-#[cfg(feature = "test-support")]
-pub use rewrite::{reset_scratch_peak_for_test, scratch_peak_for_test};
 pub use scheduler::ForgeSchedulerTrigger;
 pub use worker::{
     ForgeLifecycleEvent, ForgeWorker, ForgeWorkerCompletionObserver, ForgeWorkerConfig,
@@ -60,15 +51,9 @@ pub use lease::{ForgeLease, forge_lease_key};
 #[cfg(feature = "test-support")]
 pub use live_reconcile::LiveReconciliationTestOutcome;
 #[cfg(feature = "test-support")]
-pub use live_replace::IcebergRewriteDisposition;
-#[cfg(feature = "test-support")]
 pub use maintenance::MaintenanceTestControls;
 #[cfg(feature = "test-support")]
 pub use orphan_gc::{OrphanGcReport, current_gc_gate_for_test};
-#[cfg(feature = "test-support")]
-pub use right_size::{IcebergCandidateFile, IcebergRewriteGroup, IcebergTablePlan};
-
-use rewrite::ForgeRewritePipeline;
 
 /// Construction-time dependency graph for one Forge maintenance handle.
 pub struct ForgeBuildConfig {
@@ -126,8 +111,6 @@ pub(crate) struct ForgeCore {
     staging: Arc<opendal::Operator>,
     /// Narrow object-store seam used by rewrite and garbage-collection IO.
     object_store: Arc<dyn ForgeObjectStore>,
-    /// Streaming rewrite dependencies; workers attach their leased runtime.
-    rewrite: ForgeRewritePipeline,
     /// Pod-local base for attempt-owned disposable scratch directories.
     rewrite_spill_root: std::path::PathBuf,
     /// Validated maintenance and rewrite limits.
@@ -165,11 +148,6 @@ impl Forge {
         }
         build.config.validate()?;
         ForgeRewriteRuntime::prepare_root(&build.rewrite_spill_root)?;
-        let rewrite = ForgeRewritePipeline::new(
-            Arc::clone(&build.staging),
-            Arc::clone(&build.object_store),
-            build.config.max_concurrent_reads,
-        )?;
         let core = ForgeCore {
             resources: build.resources,
             vala: build.vala,
@@ -177,7 +155,6 @@ impl Forge {
             catalog: build.catalog,
             staging: build.staging,
             object_store: build.object_store,
-            rewrite,
             rewrite_spill_root: build.rewrite_spill_root,
             config: build.config,
             maintenance_interval: build.maintenance_interval,
@@ -190,7 +167,6 @@ impl Forge {
             #[cfg(feature = "test-support")]
             fail_after_maintenance_prepared: AtomicBool::new(false),
         };
-        debug_assert!(core.rewrite.uses_staging(&core.staging));
         Ok(Self {
             core: Arc::new(core),
             hints: tokio::sync::Mutex::new(build.hints),

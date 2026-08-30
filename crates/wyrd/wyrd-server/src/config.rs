@@ -234,16 +234,6 @@ pub struct ForgeRuntimeConfig {
     /// positive when set. Default 60.
     #[serde(default)]
     pub maintenance_interval_secs: Option<u64>,
-    /// Maximum number of input files a single compaction tick processes. Must
-    /// be positive and at least `max_files_per_bin` (an internal limit). Default
-    /// 1024.
-    #[serde(default)]
-    pub max_files_per_tick: Option<usize>,
-    /// Maximum input bytes a single compaction tick processes. Must be positive
-    /// and within the internal oversized-singleton ceiling. Default 1073741824
-    /// (1 GiB).
-    #[serde(default)]
-    pub max_bytes_per_tick: Option<u64>,
 }
 
 const fn default_forge_worker_concurrency() -> usize {
@@ -263,8 +253,6 @@ impl Default for ForgeRuntimeConfig {
             orphan_gc_max_list_pages: None,
             orphan_gc_run_budget_secs: None,
             maintenance_interval_secs: None,
-            max_files_per_tick: None,
-            max_bytes_per_tick: None,
         }
     }
 }
@@ -3099,8 +3087,6 @@ mod tests {
         assert_eq!(forge.orphan_gc_max_list_pages, None);
         assert_eq!(forge.orphan_gc_run_budget_secs, None);
         assert_eq!(forge.maintenance_interval_secs, None);
-        assert_eq!(forge.max_files_per_tick, None);
-        assert_eq!(forge.max_bytes_per_tick, None);
     }
 
     /// A `[forge]` section parses every promoted operational field onto
@@ -3119,8 +3105,6 @@ maintenance_trigger_interval_secs = 900
 orphan_gc_max_list_pages = 64
 orphan_gc_run_budget_secs = 30
 maintenance_interval_secs = 45
-max_files_per_tick = 512
-max_bytes_per_tick = 268435456
 "#;
         let config = from_toml_str_with_dev_oracle_opt_in(toml).expect("forge section parses");
         let forge = &config.forge;
@@ -3134,8 +3118,6 @@ max_bytes_per_tick = 268435456
         assert_eq!(forge.orphan_gc_max_list_pages, Some(64));
         assert_eq!(forge.orphan_gc_run_budget_secs, Some(30));
         assert_eq!(forge.maintenance_interval_secs, Some(45));
-        assert_eq!(forge.max_files_per_tick, Some(512));
-        assert_eq!(forge.max_bytes_per_tick, Some(268_435_456));
     }
 
     /// An unknown key under `[forge]` is rejected at parse time by

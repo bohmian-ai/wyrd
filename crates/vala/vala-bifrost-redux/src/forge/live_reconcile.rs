@@ -11,7 +11,7 @@ use vala_sql::row_types::forge_operations::{ForgeOperationFamily, ForgeOperation
 use wyrd_spec::vala::api::{AuditDetail, ForgeIcebergRewritePhase, StoragePath};
 
 use super::Forge;
-use super::binpack::ForgeGroupKey;
+use super::compact::ForgeGroupKey;
 use super::compact::ForgeTableKey;
 use super::error::ForgeError;
 use super::lease::ForgeLease;

@@ -4,5 +4,4 @@
 //! durable state a real Scribe seal produced. `support.rs` owns the supervisor
 //! lifecycle shared by the modules; it contains no tests.
 
-mod staged_compaction;
 mod support;

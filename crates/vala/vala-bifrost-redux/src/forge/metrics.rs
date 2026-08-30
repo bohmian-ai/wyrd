@@ -74,8 +74,6 @@ pub(super) enum ForgeMetricStage {
     ReconcileStaging,
     /// Reconcile current-snapshot replacement operations.
     ReconcileIceberg,
-    /// Fold staging files into Iceberg.
-    StagingFold,
     /// Discover current-snapshot rewrite groups.
     ManifestDiscovery,
     /// Replace one current-snapshot group.
@@ -90,10 +88,9 @@ pub(super) enum ForgeMetricStage {
 
 impl ForgeMetricStage {
     /// Every stage label registered for Forge duration and failure series.
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 7] = [
         Self::ReconcileStaging,
         Self::ReconcileIceberg,
-        Self::StagingFold,
         Self::ManifestDiscovery,
         Self::IcebergRewrite,
         Self::ManifestRewrite,
@@ -106,7 +103,6 @@ impl ForgeMetricStage {
         match self {
             Self::ReconcileStaging => "reconcile_staging",
             Self::ReconcileIceberg => "reconcile_iceberg",
-            Self::StagingFold => "staging_fold",
             Self::ManifestDiscovery => "manifest_discovery",
             Self::IcebergRewrite => "iceberg_rewrite",
             Self::ManifestRewrite => "manifest_rewrite",
@@ -119,8 +115,6 @@ impl ForgeMetricStage {
 /// Closed strategy inventory for authoritative Forge catalog commits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ForgeCatalogCommitStrategy {
-    /// A staged-file fold publishes its replacement output.
-    StagingFold,
     /// A live small-file rewrite replaces current Iceberg data files.
     SmallFiles,
 }
@@ -129,7 +123,6 @@ impl ForgeCatalogCommitStrategy {
     /// Return the stable span value for this catalog commit strategy.
     pub(super) const fn as_str(self) -> &'static str {
         match self {
-            Self::StagingFold => "staging_fold",
             Self::SmallFiles => "small_files",
         }
     }
@@ -208,8 +201,6 @@ impl ForgeLeaseResult {
 /// Closed strategy labels retained by the task-duration and spill metric schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) enum ForgeTaskMetricStrategy {
-    /// Fold staging files into an Iceberg snapshot.
-    StagingFold,
     /// Compact current Iceberg small files.
     SmallFiles,
     /// Rewrite fragmented Iceberg manifests.
@@ -220,8 +211,7 @@ pub(super) enum ForgeTaskMetricStrategy {
 
 impl ForgeTaskMetricStrategy {
     /// Every strategy label eagerly registered for task-duration and spill series.
-    const ALL: [Self; 4] = [
-        Self::StagingFold,
+    const ALL: [Self; 3] = [
         Self::SmallFiles,
         Self::ManifestRewrite,
         Self::SnapshotExpiry,
@@ -230,7 +220,6 @@ impl ForgeTaskMetricStrategy {
     /// Returns the stable task metric label for this strategy.
     pub(super) const fn as_str(self) -> &'static str {
         match self {
-            Self::StagingFold => "staging_fold",
             Self::SmallFiles => "small_files",
             Self::ManifestRewrite => "manifest_rewrite",
             Self::SnapshotExpiry => "snapshot_expiry",
@@ -249,7 +238,6 @@ impl TryFrom<ForgeTaskStrategy> for ForgeTaskMetricStrategy {
     /// unexpected durable strategy.
     fn try_from(strategy: ForgeTaskStrategy) -> Result<Self, Self::Error> {
         match strategy {
-            ForgeTaskStrategy::StagingFold => Ok(Self::StagingFold),
             ForgeTaskStrategy::SmallFiles => Ok(Self::SmallFiles),
             ForgeTaskStrategy::ManifestRewrite => Ok(Self::ManifestRewrite),
             ForgeTaskStrategy::SnapshotExpiry => Ok(Self::SnapshotExpiry),
@@ -1432,7 +1420,7 @@ mod tests {
         });
         assert_owner_transition(recorder, "bifrost_forge_task_duration_seconds", || {
             telemetry.record_task_terminal(
-                ForgeTaskMetricStrategy::StagingFold,
+                ForgeTaskMetricStrategy::SmallFiles,
                 ForgeTaskTerminalResult::Succeeded,
                 Duration::from_millis(2),
             );
@@ -1444,7 +1432,7 @@ mod tests {
             telemetry.record_planning_status(Duration::from_secs(2), 2);
         });
         assert_owner_transition(recorder, "bifrost_forge_task_spill_bytes", || {
-            telemetry.record_task_spill(ForgeTaskMetricStrategy::StagingFold, 4096);
+            telemetry.record_task_spill(ForgeTaskMetricStrategy::SmallFiles, 4096);
         });
         for kind in ForgeConflictKind::ALL {
             assert_owner_transition(recorder, "bifrost_forge_conflicts_total", || {
@@ -1574,10 +1562,6 @@ mod tests {
                 "cancelled",
                 "unschedulable",
             ]
-        );
-        assert_eq!(
-            ForgeTaskMetricStrategy::try_from(ForgeTaskStrategy::StagingFold),
-            Ok(ForgeTaskMetricStrategy::StagingFold)
         );
         assert_eq!(
             ForgeTaskMetricStrategy::try_from(ForgeTaskStrategy::SmallFiles),

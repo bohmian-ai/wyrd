@@ -326,12 +326,6 @@ fn resolve_forge_config(
 ) -> (ForgeConfig, std::time::Duration) {
     let base = ForgeConfig::default();
     let config = ForgeConfig {
-        max_files_per_tick: forge_runtime
-            .max_files_per_tick
-            .unwrap_or(base.max_files_per_tick),
-        max_bytes_per_tick: forge_runtime
-            .max_bytes_per_tick
-            .unwrap_or(base.max_bytes_per_tick),
         snapshot_retention: forge_runtime
             .snapshot_retention_secs
             .map(std::time::Duration::from_secs)
@@ -2193,8 +2187,6 @@ mod tests {
             orphan_gc_max_list_pages: Some(64),
             orphan_gc_run_budget_secs: Some(30),
             maintenance_interval_secs: Some(45),
-            max_files_per_tick: Some(512),
-            max_bytes_per_tick: Some(256 * 1024 * 1024),
             ..crate::config::ForgeRuntimeConfig::default()
         };
         let (config, maintenance_interval) = resolve_forge_config(&runtime);
@@ -2214,14 +2206,11 @@ mod tests {
             config.orphan_gc_run_budget,
             std::time::Duration::from_secs(30)
         );
-        assert_eq!(config.max_files_per_tick, 512);
-        assert_eq!(config.max_bytes_per_tick, 256 * 1024 * 1024);
         assert_eq!(maintenance_interval, std::time::Duration::from_secs(45));
         config
             .validate()
             .expect("resolved override config must validate");
         // Fields outside the promoted set retain their compiled defaults.
-        assert_eq!(config.min_files, ForgeConfig::default().min_files);
         assert_eq!(config.lease_ttl, ForgeConfig::default().lease_ttl);
     }
 

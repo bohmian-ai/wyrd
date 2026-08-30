@@ -749,7 +749,6 @@ impl Forge {
             &table,
             &committed,
             cleanup_traversal_items(&self.core.config)?,
-            self.core.config.max_bytes_per_tick,
             self.core.config.max_gc_candidates_per_batch,
         )
         .await?;
@@ -844,7 +843,6 @@ pub(super) async fn derive_recovered_files(
         table.metadata(),
         CleanupTraversalLimits {
             max_items: cleanup_traversal_items(config)?,
-            max_bytes: config.max_bytes_per_tick,
         },
     )
     .await

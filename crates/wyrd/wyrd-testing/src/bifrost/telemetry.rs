@@ -2544,8 +2544,6 @@ pub enum ForgeCausalDiagnosis {
 /// Closed task strategy projected from production Forge metric labels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub enum ForgeTelemetryStrategy {
-    /// Fold staged WAL generations into Iceberg.
-    StagingFold,
     /// Rewrite current-snapshot small files.
     SmallFiles,
     /// Rewrite fragmented Iceberg manifests.
@@ -2576,8 +2574,6 @@ pub enum ForgeTelemetryStage {
     ReconcileStaging,
     /// Reconcile Iceberg replacement operations.
     ReconcileIceberg,
-    /// Publish staged files into Iceberg.
-    StagingFold,
     /// Discover current-snapshot rewrite groups.
     ManifestDiscovery,
     /// Rewrite an Iceberg data-file group.
@@ -3373,7 +3369,6 @@ fn validate_causal_metric_contract(
                 &[(
                     "strategy",
                     &[
-                        "staging_fold",
                         "small_files",
                         "manifest_rewrite",
                         "snapshot_expiry",
@@ -3389,8 +3384,7 @@ fn validate_causal_metric_contract(
                     (
                         "strategy",
                         &[
-                            "staging_fold",
-                            "small_files",
+                                "small_files",
                             "manifest_rewrite",
                             "snapshot_expiry",
                         ],
@@ -3414,7 +3408,6 @@ fn validate_causal_metric_contract(
                     &[
                         "reconcile_staging",
                         "reconcile_iceberg",
-                        "staging_fold",
                         "manifest_discovery",
                         "iceberg_rewrite",
                         "manifest_rewrite",
@@ -3703,7 +3696,6 @@ fn causal_terminal_tasks(
     delta: &BifrostTelemetryDelta,
 ) -> Result<Vec<ForgeTerminalTaskTelemetry>, BifrostTelemetryReportError> {
     let strategies = [
-        ("staging_fold", ForgeTelemetryStrategy::StagingFold),
         ("small_files", ForgeTelemetryStrategy::SmallFiles),
         ("manifest_rewrite", ForgeTelemetryStrategy::ManifestRewrite),
         ("snapshot_expiry", ForgeTelemetryStrategy::SnapshotExpiry),
@@ -3746,7 +3738,6 @@ fn causal_discovered_candidates(
     delta: &BifrostTelemetryDelta,
 ) -> Result<Vec<ForgeDiscoveredCandidateTelemetry>, BifrostTelemetryReportError> {
     let strategies = [
-        ("staging_fold", ForgeTelemetryStrategy::StagingFold),
         ("small_files", ForgeTelemetryStrategy::SmallFiles),
         ("manifest_rewrite", ForgeTelemetryStrategy::ManifestRewrite),
         ("snapshot_expiry", ForgeTelemetryStrategy::SnapshotExpiry),
@@ -3792,7 +3783,6 @@ fn causal_stage_failures(
     let stages = [
         ("reconcile_staging", ForgeTelemetryStage::ReconcileStaging),
         ("reconcile_iceberg", ForgeTelemetryStage::ReconcileIceberg),
-        ("staging_fold", ForgeTelemetryStage::StagingFold),
         ("manifest_discovery", ForgeTelemetryStage::ManifestDiscovery),
         ("iceberg_rewrite", ForgeTelemetryStage::IcebergRewrite),
         ("manifest_rewrite", ForgeTelemetryStage::ManifestRewrite),
@@ -3925,10 +3915,9 @@ fn causal_spans(
                 span,
                 "strategy",
                 if name == ForgeCausalSpanName::CatalogCommit {
-                    &["staging_fold", "small_files", "manifest_rewrite"]
+                    &["small_files", "manifest_rewrite"]
                 } else {
                     &[
-                        "staging_fold",
                         "small_files",
                         "manifest_rewrite",
                         "snapshot_expiry",
@@ -4100,7 +4089,6 @@ fn validate_forge_span_contract(
                     span,
                     "strategy",
                     &[
-                        "staging_fold",
                         "small_files",
                         "manifest_rewrite",
                         "snapshot_expiry",
@@ -4129,7 +4117,7 @@ fn validate_forge_span_contract(
                 validate_closed_span_attribute(
                     span,
                     "strategy",
-                    &["staging_fold", "small_files", "manifest_rewrite"],
+                    &["small_files", "manifest_rewrite"],
                 )?;
                 validate_closed_span_attribute(
                     span,
@@ -4326,8 +4314,7 @@ fn validate_forge_label_contract(
                     (
                         "strategy",
                         &[
-                            "staging_fold",
-                            "small_files",
+                                "small_files",
                             "manifest_rewrite",
                             "snapshot_expiry",
                         ],
@@ -4417,7 +4404,6 @@ fn validate_forge_label_contract(
                 &[(
                     "strategy",
                     &[
-                        "staging_fold",
                         "small_files",
                         "manifest_rewrite",
                         "snapshot_expiry",
@@ -6678,7 +6664,7 @@ mod tests {
                 sample(
                     "bifrost_forge_task_duration_seconds",
                     &[
-                        ("strategy", "staging_fold"),
+                        ("strategy", "small_files"),
                         ("result", "succeeded"),
                         ("le", "0.1"),
                     ],
@@ -6686,13 +6672,13 @@ mod tests {
                 ),
                 histogram_count(
                     "bifrost_forge_task_duration_seconds",
-                    &[("strategy", "staging_fold"), ("result", "succeeded")],
+                    &[("strategy", "small_files"), ("result", "succeeded")],
                     1.0,
                 ),
                 sample(
                     "bifrost_forge_task_duration_seconds",
                     &[
-                        ("strategy", "staging_fold"),
+                        ("strategy", "small_files"),
                         ("result", "succeeded"),
                         ("le", "+Inf"),
                     ],
@@ -6700,17 +6686,17 @@ mod tests {
                 ),
                 sample(
                     "bifrost_forge_task_spill_bytes",
-                    &[("strategy", "staging_fold"), ("le", "65536")],
+                    &[("strategy", "small_files"), ("le", "65536")],
                     1.0,
                 ),
                 histogram_count(
                     "bifrost_forge_task_spill_bytes",
-                    &[("strategy", "staging_fold")],
+                    &[("strategy", "small_files")],
                     1.0,
                 ),
                 sample(
                     "bifrost_forge_task_spill_bytes",
-                    &[("strategy", "staging_fold"), ("le", "+Inf")],
+                    &[("strategy", "small_files"), ("le", "+Inf")],
                     1.0,
                 ),
                 sample(
@@ -6755,12 +6741,12 @@ mod tests {
                 ),
                 histogram_sum(
                     "bifrost_forge_task_duration_seconds",
-                    &[("strategy", "staging_fold"), ("result", "succeeded")],
+                    &[("strategy", "small_files"), ("result", "succeeded")],
                     0.1,
                 ),
                 histogram_sum(
                     "bifrost_forge_task_spill_bytes",
-                    &[("strategy", "staging_fold")],
+                    &[("strategy", "small_files")],
                     65_536.0,
                 ),
                 histogram_sum(
@@ -6810,7 +6796,7 @@ mod tests {
                         ("attempt_id", "01890f28-7c4a-7000-98e7-4f4a3c2d1b02"),
                         ("result", "succeeded"),
                         ("role", "forge_worker"),
-                        ("strategy", "staging_fold"),
+                        ("strategy", "small_files"),
                         ("task_id", "01890f28-7c4a-7000-98e7-4f4a3c2d1b01"),
                     ],
                 ),
@@ -7073,21 +7059,6 @@ mod tests {
         assert_projection!(delta, role_topology);
     }
 
-    /// Reject benchmark-local derivation paths outside the production capture mapper.
-    #[test]
-    fn forge_benchmark_has_no_parallel_metric_derivation() {
-        let source = include_str!("bench_forge.rs");
-        for prohibited in [
-            "Instant::elapsed",
-            "query_latency",
-            "schedule_once",
-            "execute_one_for_test",
-        ] {
-            assert!(!source.contains(prohibited));
-        }
-        assert!(source.contains("ForgeMaintenanceTelemetryReport::from_production_delta"));
-    }
-
     /// Prove replacement starts remain distinct from maximum and final concurrency.
     #[test]
     fn forge_role_topology_survives_worker_replacement() {
@@ -7322,12 +7293,12 @@ mod tests {
             ForgeCausalDiagnosis::Converged
         );
         let unschedulable = ForgeWorkflowInspection {
-            tasks: vec![("staging_fold".to_owned(), "unschedulable".to_owned())],
+            tasks: vec![("small_files".to_owned(), "unschedulable".to_owned())],
             ..empty.clone()
         };
         let mut blocked = report.clone();
         blocked.terminal_tasks.push(ForgeTerminalTaskTelemetry {
-            strategy: ForgeTelemetryStrategy::StagingFold,
+            strategy: ForgeTelemetryStrategy::SmallFiles,
             result: ForgeTelemetryTaskResult::Unschedulable,
             count: 1,
             duration_seconds_sum: 0.1,

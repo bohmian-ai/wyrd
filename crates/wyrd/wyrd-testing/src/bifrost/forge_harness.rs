@@ -105,10 +105,8 @@ pub struct ForgeFixture {
     pub tenant: DataTenantId,
     /// Real Scribe owner every durable fixture append and seal runs through.
     ///
-    /// `None` only for the benchmark-only synthetic fixture built by
-    /// [`StandaloneForgeFixture`], which stands up no Scribe at all. Every
-    /// correctness fixture carries one, and [`ForgeFixture::scribe`] refuses
-    /// rather than silently falling back to a fabricated durable row.
+    /// Every correctness fixture carries one, and [`ForgeFixture::scribe`]
+    /// refuses rather than silently falling back to a fabricated durable row.
     scribe: Option<Arc<ScribeImpl>>,
     /// Catalog owner retained so incremental appends can resolve the live
     /// schema fingerprint Scribe ingress requires.
@@ -149,150 +147,6 @@ struct ForgeFixtureSupervision {
     completion_observer: Option<ForgeWorkerCompletionObserver>,
     /// Trigger that wakes the production scheduler loop without invoking it directly.
     scheduler_trigger: Option<ForgeSchedulerTrigger>,
-}
-
-/// Owns a real Forge fixture without composing an HTTP or gRPC server.
-pub struct StandaloneForgeFixture {
-    /// Database lifetime guard shared by catalog, scheduler, and worker owners.
-    _database: Arc<PgFixture>,
-    /// Object storage lifetime guard shared by setup and Forge.
-    _storage: Arc<StorageHandle>,
-    /// Local backend lifetime guard.
-    _storage_root: Arc<tempfile::TempDir>,
-    /// Seeded Forge owner and durable table state.
-    fixtures: Vec<ForgeFixture>,
-}
-
-impl StandaloneForgeFixture {
-    /// Start real Postgres, catalog, object storage, and Forge owners without a server.
-    ///
-    /// # Errors
-    ///
-    /// Returns fixture, storage, catalog, or Forge construction errors. No HTTP,
-    /// gRPC, `AppState`, or [`WyrdTestServer`] is created by this constructor.
-    pub async fn start(table_name: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::start_topology(table_name, 1).await
-    }
-
-    /// Start one shared standalone Forge graph with the requested tenant count.
-    ///
-    /// # Errors
-    ///
-    /// Returns fixture, tenant, storage, catalog, or Forge construction errors,
-    /// including a zero-tenant topology.
-    pub async fn start_topology(
-        table_name: &str,
-        tenant_count: u32,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        if tenant_count == 0 {
-            return Err("standalone Forge topology needs at least one tenant".into());
-        }
-        let database = Arc::new(PgFixture::start().await?);
-        let storage_root = Arc::new(tempfile::tempdir()?);
-        let storage = StorageHandle::from_settings(StorageSettings {
-            backend: BackendConfig::Local {
-                root: storage_root.path().to_path_buf(),
-            },
-            require_encryption: false,
-            presign_ttl: std::time::Duration::from_secs(600),
-            part_size_bytes: 16 * 1024 * 1024,
-            multipart_threshold_bytes: 100 * 1024 * 1024,
-            public_base_url: Some("https://wyrd.test".to_owned()),
-        })
-        .await?;
-        let catalog =
-            crate::server::test_catalog(&database, crate::server::test_storage_owner(&storage))
-                .await?;
-        let config = ForgeConfig::default();
-        let spill_root = Arc::new(tempfile::tempdir()?);
-        let runtime_resources =
-            forge_runtime_resources(spill_root.path(), 10 * 1024 * 1024 * 1024)?;
-        let roles = runtime_resources
-            .compose_roles()
-            .map_err(|error| crate::server::WyrdTestServerError::Start(error.to_string()))?;
-        let memory = roles.clone();
-        let staging = Arc::new(storage.operator().clone());
-        let object_store: Arc<dyn ForgeObjectStore> =
-            ForgeObjectStoreControl::new(Arc::clone(&staging));
-        let (_, inbox) = staging_file_channel(config.max_hints_per_wake)?;
-        let forge = Arc::new(Forge::new(ForgeBuildConfig {
-            resources: roles.forge().ok_or_else(|| {
-                crate::server::WyrdTestServerError::Start(
-                    "Forge composition must issue a Forge capability".to_owned(),
-                )
-            })?,
-            vala: database.vala_postgres().clone(),
-            operator_pool: database.operator_pool().clone(),
-            catalog: catalog.iceberg_catalog(),
-            staging: Arc::clone(&staging),
-            object_store: Arc::clone(&object_store),
-            rewrite_spill_root: spill_root.path().to_owned(),
-            hints: inbox,
-            config: config.clone(),
-            maintenance_interval: std::time::Duration::from_secs(60),
-            clock: vala_bifrost_redux::forge::ForgeClock::system(),
-            completion_observer: None,
-            scheduler_trigger: None,
-            telemetry: Arc::new(vala_bifrost_redux::forge::ForgeTelemetry::new()),
-        })?);
-        let resources = ForgeFixtureResources {
-            forge,
-            vala: database.vala_postgres().clone(),
-            operator_pool: database.operator_pool().clone(),
-            bifrost_catalog: catalog,
-            staging,
-            object_store,
-            spill_root,
-            memory,
-            config,
-        };
-        let mut tenants = Vec::with_capacity(usize::try_from(tenant_count)?);
-        tenants.push(database.data_tenant_id());
-        for index in 1..tenant_count {
-            tenants.push(
-                database
-                    .seed_additional_tenant(&format!("forge-benchmark-{index}"))
-                    .await?,
-            );
-        }
-        let partition_day = default_fixture_day();
-        let mut fixtures = Vec::with_capacity(tenants.len());
-        for tenant in tenants {
-            fixtures.push(
-                seed_synthetic_forge_group_for_bench(
-                    resources.clone(),
-                    tenant,
-                    table_name,
-                    false,
-                    &[partition_day],
-                )
-                .await,
-            );
-        }
-        Ok(Self {
-            _database: database,
-            _storage: storage,
-            _storage_root: storage_root,
-            fixtures,
-        })
-    }
-
-    /// Return the seeded real Forge fixture.
-    ///
-    /// # Panics
-    ///
-    /// Panics only if the constructor invariant requiring at least one tenant
-    /// fixture is violated.
-    #[must_use]
-    pub fn fixture(&self) -> &ForgeFixture {
-        &self.fixtures[0]
-    }
-
-    /// Borrow every tenant-scoped table in the shared standalone Forge graph.
-    #[must_use]
-    pub fn fixtures(&self) -> &[ForgeFixture] {
-        &self.fixtures
-    }
 }
 
 /// Read-only probe for the DataFusion pool owned by one Forge fixture.
@@ -1290,7 +1144,7 @@ impl ForgeFixture {
     /// to remove.
     fn scribe(&self) -> &Arc<ScribeImpl> {
         self.scribe.as_ref().expect(
-            "this Forge fixture was built by seed_synthetic_forge_group_for_bench, which has no Scribe",
+            "this Forge fixture has no Scribe",
         )
     }
 
@@ -2211,181 +2065,6 @@ async fn seed_forge_group_with_scribe(
     }
 }
 
-/// Seed a synthetic Forge group for the Forge benchmark harness only.
-///
-/// **Third documented raw-insert exemption.** [`StandaloneForgeFixture`] stands
-/// up Postgres, storage, a catalog, and Forge without an HTTP server,
-/// `AppState`, or [`WyrdTestServer`], and therefore has no Scribe to append
-/// through. Reaching a real seal from there would mean assembling a full
-/// `ScribeImpl` — WAL directories, execution pools, persistence config, and
-/// tenant setup — inside a fixture whose entire purpose is to exclude that
-/// stack.
-///
-/// That is the right split rather than a concession. Its only consumer is
-/// `bench_forge`, which measures Forge compaction throughput; routing its setup
-/// through a real Scribe would make the benchmark measure Scribe ingest as well
-/// and couple a performance number to an unrelated subsystem. And the property
-/// the Scribe-backed seeder protects — a fixture cannot describe a file
-/// production would never produce — exists to stop a *correctness* test passing
-/// against impossible state. A benchmark asserts nothing, so a synthetic seed
-/// here cannot manufacture a false green.
-///
-/// # Panics
-///
-/// Panics when `partition_days` is empty or when table creation, object
-/// encoding, or the durable fixture insert fails.
-async fn seed_synthetic_forge_group_for_bench(
-    resources: ForgeFixtureResources,
-    tenant: DataTenantId,
-    table_name: &str,
-    schema_variant: bool,
-    partition_days: &[chrono::NaiveDate],
-) -> ForgeFixture {
-    assert!(
-        !partition_days.is_empty(),
-        "Forge fixture needs one partition day"
-    );
-    let staging = Arc::clone(&resources.staging);
-    let binding = create_fixture_table(
-        &resources.bifrost_catalog,
-        tenant,
-        table_name,
-        schema_variant,
-    )
-    .await;
-    let catalog = resources.bifrost_catalog.iceberg_catalog();
-    let schema = ArrowSchema::new(with_managed_columns(if schema_variant {
-        vec![
-            Field::new("value", DataType::Int64, false),
-            Field::new("schema_variant", DataType::Int64, false),
-        ]
-    } else {
-        vec![Field::new("value", DataType::Int64, false)]
-    }));
-
-    let mut conn = resources
-        .vala
-        .tenant_conn(tenant)
-        .await
-        .expect("Forge fixture tenant connection");
-    for (day_index, partition_day) in partition_days.iter().enumerate() {
-        let base = partition_day
-            .and_hms_opt(12, 0, 0)
-            .expect("Forge fixture timestamp")
-            .and_utc()
-            .timestamp_micros();
-        for file_number in 0..2_i64 {
-            let file_number =
-                i64::try_from(day_index).expect("partition day index") * 2 + file_number;
-            let mut columns = vec![
-                Arc::new(Int64Array::from(vec![file_number, file_number + 10]))
-                    as Arc<dyn arrow::array::Array>,
-            ];
-            if schema_variant {
-                columns
-                    .push(Arc::new(Int64Array::from(vec![1_i64, 1_i64]))
-                        as Arc<dyn arrow::array::Array>);
-            }
-            let mut batch_ids = FixedSizeBinaryBuilder::with_capacity(2, 16);
-            for _ in 0..2 {
-                batch_ids
-                    .append_value([0_u8; 16])
-                    .expect("fixed batch identifier");
-            }
-            columns.extend([
-                Arc::new(StringArray::from(vec![None::<&str>; 2])) as Arc<dyn arrow::array::Array>,
-                Arc::new(StringArray::from(vec![None::<&str>; 2])) as Arc<dyn arrow::array::Array>,
-                Arc::new(StringArray::from(vec!["principal"; 2])) as Arc<dyn arrow::array::Array>,
-                Arc::new(StringArray::from(vec!["request"; 2])) as Arc<dyn arrow::array::Array>,
-                Arc::new(
-                    TimestampMicrosecondArray::from(vec![
-                        base + file_number * 1_000_000,
-                        base + file_number * 1_000_000 + 1_000,
-                    ])
-                    .with_timezone("UTC"),
-                ) as Arc<dyn arrow::array::Array>,
-                Arc::new(
-                    TimestampMicrosecondArray::from(vec![
-                        base + file_number * 1_000_000,
-                        base + file_number * 1_000_000 + 1_000,
-                    ])
-                    .with_timezone("UTC"),
-                ) as Arc<dyn arrow::array::Array>,
-                Arc::new(batch_ids.finish()) as Arc<dyn arrow::array::Array>,
-                Arc::new(Int32Array::from(vec![0_i32, 1_i32])) as Arc<dyn arrow::array::Array>,
-                Arc::new(StringArray::from(vec![tenant.to_string(); 2]))
-                    as Arc<dyn arrow::array::Array>,
-            ]);
-            let batch = RecordBatch::try_new(Arc::new(schema.clone()), columns)
-                .expect("Forge fixture batch");
-            let path = format!("{}/journey-{file_number}.parquet", binding.object_prefix);
-            let metadata = BifrostParquetMemoryEnvelope::metadata_for_batch(&batch, &path)
-                .expect("Forge fixture writer-v2 metadata");
-            let mut bytes = Vec::new();
-            let properties =
-                bifrost_writer_properties_with_metadata(batch.num_rows(), metadata, &[]);
-            let mut writer = ArrowWriter::try_new(&mut bytes, batch.schema(), Some(properties))
-                .expect("Parquet writer");
-            writer.write(&batch).expect("Parquet batch");
-            writer.close().expect("Parquet close");
-            let size = i64::try_from(bytes.len()).expect("Forge fixture file size");
-            staging
-                .write(&path, Buffer::from(bytes))
-                .await
-                .expect("Forge fixture object");
-            let min_time = chrono::DateTime::from_timestamp_micros(base + file_number * 1_000_000)
-                .expect("Forge fixture timestamp");
-            sqlx::query(
-            "INSERT INTO vala.file_list (id, data_tenant_id, namespace, table_name, file_path, file_size, row_count, min_event_time, max_event_time, partition_granularity, partition_start, node_id, writer_epoch, wal_lsn_min, wal_lsn_max, promotion_record) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, '{\"fixture\": \"forge-harness\"}'::jsonb)",
-        )
-        .bind(uuid::Uuid::now_v7())
-        .bind(tenant.as_uuid())
-        .bind(&binding.logical_namespace)
-        .bind(&binding.table_name)
-        .bind(path)
-        .bind(size)
-        .bind(2_i64)
-        .bind(min_time)
-        .bind(min_time + chrono::Duration::milliseconds(1))
-        .bind("day")
-        .bind(day_partition_start(*partition_day))
-        .bind(uuid::Uuid::now_v7())
-        .bind(1_i64)
-        .bind(file_number * 2 + 1)
-        .bind(file_number * 2 + 2)
-        .execute(&mut **conn.transaction())
-        .await
-        .expect("Forge fixture file-list row");
-        }
-    }
-    conn.commit().await.expect("Forge fixture commit");
-    sqlx::query(
-        "UPDATE vala.file_list SET created_at = now() - interval '3 minutes' WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3",
-    )
-    .bind(tenant.as_uuid())
-    .bind(&binding.logical_namespace)
-    .bind(&binding.table_name)
-    .execute(resources.operator_pool.pool())
-    .await
-    .expect("Forge fixture aging");
-
-    ForgeFixture {
-        forge: resources.forge,
-        vala: resources.vala,
-        operator_pool: resources.operator_pool,
-        catalog,
-        staging,
-        object_store: resources.object_store,
-        spill_root: resources.spill_root,
-        memory: resources.memory,
-        config: resources.config,
-        binding,
-        tenant,
-        scribe: None,
-        bifrost_catalog: resources.bifrost_catalog,
-    }
-}
-
 /// Real Forge worker lifecycle proofs over the one production resource root.
 ///
 /// Every test drives the production `ForgeWorker` against real Postgres,
@@ -2399,27 +2078,7 @@ mod worker_lifecycle_tests {
     use vala_bifrost_redux::forge::{ForgeWorker, ForgeWorkerConfig};
     use vala_bifrost_redux::resources::ForgeRewriteRequest;
 
-    use super::{
-        CommitUncertaintyCatalog, ForgeFixture, ForgeObjectStoreControl, StandaloneForgeFixture,
-    };
-
-    /// Seeds one compaction-ready standalone fixture with a bounded bin.
-    async fn lifecycle_fixture(table: &str) -> StandaloneForgeFixture {
-        let standalone = StandaloneForgeFixture::start(table)
-            .await
-            .expect("standalone Forge fixture");
-        standalone.fixture().append_forge_file(101).await;
-        standalone.fixture().append_forge_file(102).await;
-        standalone
-    }
-
-    /// Returns a bounded compaction config that plans one small rewrite bin.
-    fn lifecycle_config(fixture: &ForgeFixture) -> vala_bifrost_redux::forge::ForgeConfig {
-        let mut config = fixture.config.clone();
-        config.max_files_per_bin = 2;
-        config.max_files_per_tick = 2;
-        config
-    }
+    use super::{CommitUncertaintyCatalog, ForgeFixture, ForgeObjectStoreControl};
 
     /// Awaits one fixture signal under a bounded lifecycle deadline.
     async fn bounded<F: std::future::Future>(label: &str, future: F) -> F::Output {

@@ -418,74 +418,6 @@
           }
         },
         {
-          "description": "A Forge compaction operation and its external Iceberg boundary.\n\nThe ordered `output_paths` list is the sole greenfield output shape; prepared and terminal audit rows preserve writer-rotation order and do not expose a scalar compatibility form.",
-          "type": "object",
-          "required": [
-            "group",
-            "input_file_ids",
-            "input_paths",
-            "kind",
-            "operation_id",
-            "output_paths",
-            "phase"
-          ],
-          "properties": {
-            "group": {
-              "description": "Canonical tenant/table/partition group identity.",
-              "type": "string"
-            },
-            "input_file_ids": {
-              "description": "Exact staging rows transitioned by the operation.",
-              "type": "array",
-              "items": {
-                "type": "string",
-                "format": "uuid"
-              }
-            },
-            "input_paths": {
-              "description": "Exact staging paths consumed by the operation.",
-              "type": "array",
-              "items": {
-                "type": "string"
-              }
-            },
-            "kind": {
-              "type": "string",
-              "enum": [
-                "forge_compaction"
-              ]
-            },
-            "operation_id": {
-              "description": "Deterministic identifier shared by prepared and terminal rows.",
-              "type": "string",
-              "format": "uuid"
-            },
-            "output_paths": {
-              "description": "Deterministic compacted output paths in writer-rotation order.\n\nThis ordered collection is the only output representation for greenfield Forge audit rows, shared by prepared and terminal phases without a scalar compatibility field.",
-              "type": "array",
-              "items": {
-                "type": "string"
-              }
-            },
-            "phase": {
-              "description": "Durable phase represented by this audit row.",
-              "allOf": [
-                {
-                  "$ref": "#/definitions/ForgeCompactionPhase"
-                }
-              ]
-            },
-            "snapshot_id": {
-              "description": "Iceberg snapshot returned by a committed operation, when known.",
-              "type": [
-                "integer",
-                "null"
-              ],
-              "format": "int64"
-            }
-          }
-        },
-        {
           "description": "A Forge snapshot-expiry operation and its Iceberg metadata boundary.",
           "type": "object",
           "required": [
@@ -1461,39 +1393,6 @@
       "maxLength": 40,
       "minLength": 7,
       "pattern": "^[0-9a-f]{7,40}$"
-    },
-    "ForgeCompactionPhase": {
-      "description": "Durable phase recorded for a Forge compaction operation.",
-      "oneOf": [
-        {
-          "description": "Inputs were hidden before the external Iceberg commit.",
-          "type": "string",
-          "enum": [
-            "prepared"
-          ]
-        },
-        {
-          "description": "The external Iceberg commit completed.",
-          "type": "string",
-          "enum": [
-            "committed"
-          ]
-        },
-        {
-          "description": "Reconciliation recovered a previously completed external commit.",
-          "type": "string",
-          "enum": [
-            "recovered"
-          ]
-        },
-        {
-          "description": "Reconciliation made the exact inputs visible again after expiry.",
-          "type": "string",
-          "enum": [
-            "reset"
-          ]
-        }
-      ]
     },
     "ForgeIcebergRewritePhase": {
       "description": "Durable phase recorded for a live Iceberg replacement operation.",

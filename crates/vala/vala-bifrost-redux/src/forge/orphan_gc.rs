@@ -284,8 +284,7 @@ struct CatalogProtection {
 /// Returns output objects that nonterminal operations must retain.
 fn operation_output_paths(detail: &AuditDetail) -> &[StoragePath] {
     match detail {
-        AuditDetail::ForgeCompaction { output_paths, .. }
-        | AuditDetail::ForgeIcebergRewrite { output_paths, .. } => output_paths,
+        AuditDetail::ForgeIcebergRewrite { output_paths, .. } => output_paths,
         _ => &[],
     }
 }
@@ -839,10 +838,7 @@ impl Forge {
     ) -> Result<(BTreeSet<String>, bool), ForgeError> {
         let mut paths = BTreeSet::new();
         let mut overflowed = false;
-        for family in [
-            ForgeOperationFamily::StagingFold,
-            ForgeOperationFamily::IcebergRewrite,
-        ] {
+        for family in [ForgeOperationFamily::IcebergRewrite] {
             let page = ForgeOperations::new(resource, family)
                 .map_err(ForgeError::Sql)?
                 .list_reset(conn, cap)

@@ -464,8 +464,8 @@ fn ipc_marked(id: i64, filter_key: &str) -> Vec<u8> {
 const COMPACTION_PASS_BUDGET: usize = 32;
 
 /// Number of rows written before compaction. Every one of them is sealed as
-/// its own Parquet file, so the Forge pass has `min_files` worth of real
-/// inputs to rewrite into a single published data file.
+/// its own Parquet file, so the Forge pass has enough real inputs to rewrite
+/// into a single published data file.
 const COMPACTED_BATCH_ROWS: i64 = 20;
 
 /// Number of rows written after compaction. These stay in the hot manifest for

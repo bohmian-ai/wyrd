@@ -410,31 +410,10 @@ impl FollowerSourceResolver for OracleCatalogResolver {
             })
             .collect::<Result<Vec<_>, _>>()?;
         if source == super::AssignedPersistedSource::Hot {
-            let mut files = Vec::with_capacity(assigned_locations.len());
-            for (_, _, location) in &assigned_locations {
-                let input = self
-                    .catalog
-                    .file_io()
-                    .new_input(location)
-                    .map_err(|_| "authenticated Oracle hot provider failed".to_owned())?;
-                let metadata = input
-                    .metadata()
-                    .await
-                    .map_err(|_| "authenticated Oracle hot provider failed".to_owned())?;
-                let size_bytes = usize::try_from(metadata.size)
-                    .map_err(|_| "authenticated Oracle hot provider failed".to_owned())?;
-                files.push(super::exec::HotFileSource {
-                    location: location.clone(),
-                    size_bytes,
-                    // A follower re-decides nothing: the leader already applied
-                    // the query interval to this file list and signed the
-                    // result, so every assigned file is retained by
-                    // construction and carries no local decision.
-                    event_time: crate::catalog::event_time::EventTimeStatistics::Unusable(
-                        crate::catalog::event_time::EventTimeBoundsDefect::Missing,
-                    ),
-                });
-            }
+            let files = assigned_locations
+                .iter()
+                .map(|(descriptor, _, location)| signed_hot_source(descriptor, location))
+                .collect::<Result<Vec<_>, _>>()?;
             // Every object identity, size, and assignment fence has been
             // validated above, so the shared hot leaf is constructed in
             // follower governance: its reservations are charged to the
@@ -494,6 +473,39 @@ impl FollowerSourceResolver for OracleCatalogResolver {
             .map_err(|_| "authenticated Oracle closure normalization failed".to_owned())?;
         Ok(ResolvedFollowerSource { plan, full_schema })
     }
+}
+
+/// Builds one hot leaf source from the signed descriptor and its resolved
+/// location, without touching the object.
+///
+/// The descriptor's `size_bytes` is the leader's own durable statement of the
+/// object's exact length, taken from the `vala.file_list` row it signed and
+/// covered by the assignment-authority digest this follower already verified.
+/// Re-reading the length from storage would replace that verified fact with an
+/// unauthenticated one — an object whose length disagreed would be read at
+/// whatever length storage reported rather than refused — and would spend one
+/// round trip per assigned file before the scan begins.
+///
+/// The event-time interval is deliberately dropped: the leader already applied
+/// the query interval to this list and signed the result, so every assigned
+/// file is retained by construction and a second local decision here could only
+/// disagree with a signed one.
+///
+/// # Errors
+/// Returns a redacted resolution error when the signed length does not fit this
+/// platform's `usize`, which is a malformed assignment rather than a large file.
+fn signed_hot_source(
+    descriptor: &PersistedFileDescriptor,
+    location: &str,
+) -> Result<super::exec::HotFileSource, String> {
+    Ok(super::exec::HotFileSource {
+        location: location.to_owned(),
+        size_bytes: usize::try_from(descriptor.size_bytes())
+            .map_err(|_| "authenticated Oracle hot provider failed".to_owned())?,
+        event_time: crate::catalog::event_time::EventTimeStatistics::Unusable(
+            crate::catalog::event_time::EventTimeBoundsDefect::Missing,
+        ),
+    })
 }
 
 /// Follower resolver that serves one fixed in-memory cohort for every
@@ -1911,6 +1923,39 @@ pub(crate) mod tests {
     /// Follower sessions are shaped only by the admitted grant and assigned work.
     ///
     /// This is the follower half of the resource-parity contract: the session's
+    /// A hot leaf source takes its exact length from the signed descriptor, not
+    /// from a fresh read of the object.
+    ///
+    /// The leader signed `size_bytes` from the `vala.file_list` row and the
+    /// assignment-authority digest covers it. Re-reading the length from
+    /// storage would replace that verified fact with an unauthenticated one and
+    /// spend a round trip per assigned file before the scan begins, so the
+    /// fixture's descriptor length deliberately differs from anything a real
+    /// object would report — nothing here exists in storage at all.
+    ///
+    /// # Panics
+    /// Panics when the built source does not carry the signed length.
+    #[test]
+    fn hot_leaf_sources_take_their_length_from_the_signed_descriptor() {
+        let descriptor = PersistedFileDescriptor::Hot(wyrd_spec::vala::api::HotFileDescriptor {
+            path: "tenant/spans/a.parquet".to_owned(),
+            size_bytes: 987_654,
+            row_count: 3,
+            file_list_id: uuid::Uuid::now_v7(),
+            sha256: [4_u8; 32],
+            min_event_time_micros: Some(1),
+            max_event_time_micros: Some(2),
+        });
+        let source = signed_hot_source(&descriptor, "memory:///tenant/spans/a.parquet")
+            .expect("signed descriptor builds a hot source");
+        assert_eq!(source.size_bytes, 987_654);
+        assert_eq!(source.location, "memory:///tenant/spans/a.parquet");
+        assert!(
+            source.event_time.interval().is_none(),
+            "a follower carries no local pruning decision: the leader already made and signed it"
+        );
+    }
+
     /// Preflight refuses a signed assignment whose file list names both hot and
     /// Iceberg descriptors, before any provider resolution or object I/O.
     ///

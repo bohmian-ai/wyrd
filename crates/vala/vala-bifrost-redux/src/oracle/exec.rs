@@ -1499,18 +1499,6 @@ impl OracleTableProvider {
         )
     }
 
-    /// Converts footer-validated distributed batches into the leader memory source.
-    pub(super) fn validated_memory_source(
-        batches: &Vec<RecordBatch>,
-        schema: SchemaRef,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        Ok(MemorySourceConfig::try_new_exec(
-            std::slice::from_ref(batches),
-            schema,
-            None,
-        )?)
-    }
-
     /// Narrows already-validated in-memory batches to the scan's closure schema.
     ///
     /// Distributed and drained live rows arrive at the complete physical schema.
@@ -1520,11 +1508,19 @@ impl OracleTableProvider {
     /// still yields a source declaring the closure, so an empty branch is
     /// schema-identical to a populated one.
     ///
+    /// Rebuilding each batch against the pinned schema also normalizes field
+    /// metadata, not only order. A catalog-derived closure carries Iceberg's
+    /// `PARQUET:field_id` on every field while rows projected out of a Scribe
+    /// memtable do not, and the attempt encoder compares a fragment's declared
+    /// schema against each batch exactly — so a leaf that declared the closure
+    /// but emitted metadata-free batches would fail the fragment on its first
+    /// row rather than serve it.
+    ///
     /// # Errors
     ///
     /// Returns a `DataFusion` error when a batch is missing a closure column,
     /// a cast fails, or Arrow rejects the projected batch.
-    fn projected_memory_source(
+    pub(super) fn projected_memory_source(
         batches: &[RecordBatch],
         schema: &SchemaRef,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
@@ -5619,30 +5615,18 @@ mod tests {
             .collect()
     }
 
-    /// One leader-owned closure governs every leaf, the placeholder, the
-    /// tripwire, the provider-local filter, and the public result.
+    /// Builds the pinned wide-table provider the closure owner scans.
     ///
-    /// This is the production Interactive leader path for
-    /// `SELECT duration_ms FROM ... WHERE status_code = 'STATUS_CODE_ERROR'`.
-    /// The closure is `[duration_ms, status_code, data_tenant_id]`: the
-    /// requested output, the predicate-only column that must survive to the
-    /// provider-local filter, and the hidden tenant column that must survive to
-    /// the tripwire. `unused_payload` is requested by nobody and must not
-    /// appear in any leaf. The remote placeholder still advertises the
-    /// *complete* four-column fingerprint, because that value identifies the
-    /// table's canonical schema rather than this query's projection.
+    /// The live batch carries the full four-column physical schema —
+    /// `unused_payload`, `duration_ms`, `status_code`, `data_tenant_id` — with
+    /// one `STATUS_CODE_ERROR` row and one `STATUS_CODE_OK` row, both owned by
+    /// `tenant`. Keeping fixture construction here leaves the owning test to
+    /// assert only closure behavior.
     ///
     /// # Panics
-    /// Panics if provider construction, scan planning, or execution violates
-    /// the closure contract this owner pins.
-    #[tokio::test]
-    async fn projected_leaf_union_preserves_predicate_and_tenant_columns() {
-        use datafusion::execution::context::SessionContext;
-        use datafusion::logical_expr::{col, lit};
-        use datafusion::physical_plan::collect;
-        use datafusion::physical_plan::filter::FilterExec;
-
-        let tenant = wyrd_spec::DataTenantId::new_v7();
+    /// Panics if the authorization context, fixture batch, or provider cannot
+    /// be constructed, since none of those are the behavior under test.
+    async fn projection_closure_provider(tenant: wyrd_spec::DataTenantId) -> OracleTableProvider {
         let principal = Principal {
             id: PrincipalId::new(uuid::Uuid::now_v7()),
             kind: wyrd_runtime::PrincipalKind::User,
@@ -5682,7 +5666,7 @@ mod tests {
             ],
         )
         .expect("live fixture batch");
-        let provider = OracleTableProvider::try_new_distributed(
+        OracleTableProvider::try_new_distributed(
             OracleTableInputs {
                 table: projection_fixture_table(),
                 distributed_iceberg_batches: None,
@@ -5706,7 +5690,34 @@ mod tests {
             },
         )
         .await
-        .expect("pinned fixture provider");
+        .expect("pinned fixture provider")
+    }
+
+    /// One leader-owned closure governs every leaf, the placeholder, the
+    /// tripwire, the provider-local filter, and the public result.
+    ///
+    /// This is the production Interactive leader path for
+    /// `SELECT duration_ms FROM ... WHERE status_code = 'STATUS_CODE_ERROR'`.
+    /// The closure is `[duration_ms, status_code, data_tenant_id]`: the
+    /// requested output, the predicate-only column that must survive to the
+    /// provider-local filter, and the hidden tenant column that must survive to
+    /// the tripwire. `unused_payload` is requested by nobody and must not
+    /// appear in any leaf. The remote placeholder still advertises the
+    /// *complete* four-column fingerprint, because that value identifies the
+    /// table's canonical schema rather than this query's projection.
+    ///
+    /// # Panics
+    /// Panics if provider construction, scan planning, or execution violates
+    /// the closure contract this owner pins.
+    #[tokio::test]
+    async fn projected_leaf_union_preserves_predicate_and_tenant_columns() {
+        use datafusion::execution::context::SessionContext;
+        use datafusion::logical_expr::{col, lit};
+        use datafusion::physical_plan::collect;
+        use datafusion::physical_plan::filter::FilterExec;
+
+        let tenant = wyrd_spec::DataTenantId::new_v7();
+        let provider = projection_closure_provider(tenant).await;
 
         let complete_fingerprint =
             super::super::assignment_schema_fingerprint(provider.physical_schema.as_ref());
@@ -5722,17 +5733,17 @@ mod tests {
         // The public result is exactly the requested column.
         assert_eq!(column_names(&plan), vec!["duration_ms".to_string()]);
 
-        let filtered = Arc::clone(&plan.children()[0]);
+        let filtered = Arc::clone(plan.children()[0]);
         let filter = filtered
             .downcast_ref::<FilterExec>()
             .expect("provider keeps its local filter over the closed predicates");
-        let tripwire_plan = Arc::clone(&filter.children()[0]);
+        let tripwire_plan = Arc::clone(filter.children()[0]);
         let tripwire = tripwire_plan
             .downcast_ref::<TenantTripwireExec>()
             .expect("tripwire sits directly under the provider-local filter");
 
         // The tripwire consumes the tenant column and never emits it.
-        let union = Arc::clone(&tripwire.children()[0]);
+        let union = Arc::clone(tripwire.children()[0]);
         let closure = vec![
             "duration_ms".to_string(),
             "status_code".to_string(),

@@ -71,7 +71,7 @@ impl Participant {
     ///
     /// The read is deliberately narrow and filtered: it requests one column of
     /// a wide built-in and constrains a second one the result never carries.
-    /// That is the signed projection closure `[duration_ms, status_code,
+    /// That is the signed projection closure `[duration_ms, status,
     /// data_tenant_id]` exercised end to end through whichever authority
     /// currently owns the rows — active buckets, staged members, or published
     /// hot objects. Every fixture row carries `STATUS_CODE_OK`, so the
@@ -82,7 +82,7 @@ impl Participant {
             &self.client,
             &format!(
                 "SELECT duration_ms AS value FROM {SYSTEM_TABLE} \
-                 WHERE status_code = 'STATUS_CODE_OK'"
+                 WHERE status = 'STATUS_CODE_OK'"
             ),
         )
         .await;

@@ -811,12 +811,9 @@ where
             .into_iter()
             .map(|batch| batch.rows)
             .collect::<Vec<_>>();
-        super::exec::OracleTableProvider::validated_memory_source(
-            &rows,
-            Arc::clone(&required_schema),
-        )
-        .map(|plan| ResolvedFollowerSource { plan, full_schema })
-        .map_err(|_| "Scribe Arrow provider construction failed".to_owned())
+        super::exec::OracleTableProvider::projected_memory_source(&rows, &required_schema)
+            .map(|plan| ResolvedFollowerSource { plan, full_schema })
+            .map_err(|_| "Scribe Arrow provider construction failed".to_owned())
     }
 }
 
@@ -2331,34 +2328,32 @@ pub(crate) mod tests {
         }
     }
 
-    /// The Scribe follower fetches and exposes exactly the signed closure, at a
-    /// non-zero ordinal, and validates the full schema before any source IO.
+    /// Returns one plan's output field names in closure order.
+    fn plan_column_names(plan: &Arc<dyn ExecutionPlan>) -> Vec<String> {
+        plan.schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect()
+    }
+
+    /// Stands up the Scribe live-tail resolver the closure owner interrogates.
     ///
-    /// This is the production live-tail leaf for
-    /// `SELECT duration_ms ... WHERE status_code = 'STATUS_CODE_ERROR'`. Three
-    /// distinct properties are pinned together because they are one contract:
-    ///
-    /// 1. the fetch request copies `assignment.required_columns` byte-for-byte
-    ///    and retains `assignment.predicates`, so the memtable projects and
-    ///    filters rather than the plan above discarding wide columns later;
-    /// 2. the resolved leaf — and the non-owning empty branch, which produces
-    ///    no rows at all — declares that same closure schema, so the serialized
-    ///    plan's `Column` indices are closure indices on every branch;
-    /// 3. an assignment whose *full* schema fingerprint does not match refuses
-    ///    before the live-tail source is touched at all.
-    ///
-    /// `duration_ms` sits at closure ordinal 0 but complete-schema ordinal 1,
-    /// so a leaf that declares the closure while returning complete-schema rows
-    /// would read the wrong column rather than merely a wide one.
+    /// Returns the owning tenant, the complete fixture schema, the writer
+    /// stream whose identity names the local scan id, and a resolver backed by
+    /// a real `FetchLiveTailService` over the seeded memtable. Keeping this
+    /// construction here leaves the owning test to assert only closure
+    /// behavior.
     ///
     /// # Panics
-    ///
-    /// Panics if resolution, execution, or the recorded request violates the
-    /// closure contract this owner pins.
-    #[tokio::test]
-    async fn scribe_provider_projects_and_filters_a_nonzero_ordinal() {
-        use arrow::array::Int64Array;
-
+    /// Panics if the Scribe role capability cannot be composed, since role
+    /// composition is not the behavior under test.
+    fn closure_fixture_resolver() -> (
+        DataTenantId,
+        Arc<Schema>,
+        StreamIdentity,
+        ScribeTailResolver,
+    ) {
         let tenant_id = DataTenantId::new_v7();
         let schema = closure_fixture_schema();
         let day = crate::test_support::day_partition(2026, 8, 19);
@@ -2379,6 +2374,40 @@ pub(crate) mod tests {
             role_resources.scribe().expect("Scribe capability"),
         ));
         let resolver = ScribeTailResolver::with_schema(service, Arc::clone(&schema));
+        (tenant_id, schema, stream, resolver)
+    }
+
+    /// The Scribe follower fetches and exposes exactly the signed closure, at a
+    /// non-zero ordinal, and validates the full schema before any source IO.
+    ///
+    /// This is the production live-tail leaf for
+    /// `SELECT duration_ms ... WHERE status_code = 'STATUS_CODE_ERROR'`. Two
+    /// distinct properties are pinned together because they are one contract:
+    ///
+    /// 1. the fetch request copies `assignment.required_columns` byte-for-byte
+    ///    and retains `assignment.predicates`, so the memtable projects and
+    ///    filters rather than the plan above discarding wide columns later;
+    /// 2. the resolved leaf — and the non-owning empty branch, which produces
+    ///    no rows at all — declares that same closure schema, so the serialized
+    ///    plan's `Column` indices are closure indices on every branch.
+    ///
+    /// The refusal half of the contract — an assignment whose *full* schema
+    /// fingerprint does not match — is pinned by
+    /// `scribe_provider_refuses_a_mismatched_full_schema_fingerprint`.
+    ///
+    /// `duration_ms` sits at closure ordinal 0 but complete-schema ordinal 1,
+    /// so a leaf that declares the closure while returning complete-schema rows
+    /// would read the wrong column rather than merely a wide one.
+    ///
+    /// # Panics
+    ///
+    /// Panics if resolution, execution, or the recorded request violates the
+    /// closure contract this owner pins.
+    #[tokio::test]
+    async fn scribe_provider_projects_and_filters_a_nonzero_ordinal() {
+        use arrow::array::Int64Array;
+
+        let (tenant_id, schema, stream, resolver) = closure_fixture_resolver();
         let session = SessionContext::new().state();
         let binding = TenantTableBinding {
             tenant_id,
@@ -2407,13 +2436,7 @@ pub(crate) mod tests {
             .await
             .expect("signed closure resolves");
         assert_eq!(
-            owned
-                .plan
-                .schema()
-                .fields()
-                .iter()
-                .map(|field| field.name().clone())
-                .collect::<Vec<_>>(),
+            plan_column_names(&owned.plan),
             closure,
             "the live-tail leaf exposes exactly the signed closure"
         );
@@ -2456,18 +2479,40 @@ pub(crate) mod tests {
             .await
             .expect("a non-owning assignment resolves to an empty branch");
         assert_eq!(
-            unowned
-                .plan
-                .schema()
-                .fields()
-                .iter()
-                .map(|field| field.name().clone())
-                .collect::<Vec<_>>(),
+            plan_column_names(&unowned.plan),
             closure,
             "the empty branch declares the same closure schema"
         );
+    }
 
-        // A mismatched *full* schema fingerprint refuses before any source IO.
+    /// A mismatched *full* schema fingerprint refuses before any source IO.
+    ///
+    /// The closure a leader signs narrows the columns a leaf returns; it never
+    /// narrows the identity the leaf authenticates against. This owner pins the
+    /// negative half of that rule: when the assignment's complete-schema
+    /// fingerprint disagrees with the follower's pinned schema, resolution
+    /// refuses, and the live-tail service is never asked for a single batch, so
+    /// a forged or stale assignment cannot cause a read at all.
+    ///
+    /// # Panics
+    ///
+    /// Panics if resolution accepts the mismatch or if the live-tail source was
+    /// touched despite the refusal.
+    #[tokio::test]
+    async fn scribe_provider_refuses_a_mismatched_full_schema_fingerprint() {
+        let (tenant_id, schema, stream, _resolver) = closure_fixture_resolver();
+        let session = SessionContext::new().state();
+        let binding = TenantTableBinding {
+            tenant_id,
+            namespace: "vala.traces".to_owned(),
+            table: "spans".to_owned(),
+        };
+        let closure = vec![
+            "duration_ms".to_owned(),
+            "status_code".to_owned(),
+            DATA_TENANT_ID.to_owned(),
+        ];
+
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let counting = ScribeTailResolver::with_schema(
             Arc::new(RecordingTail {

@@ -183,6 +183,12 @@ pub struct WyrdTestServer {
     readiness_failure: bool,
     /// Optional test-only serve task that ignores cancellation until aborted.
     stalled_drain_for_test: Option<Arc<AtomicBool>>,
+    /// Optional bounded drain budget applied to the bound production server.
+    ///
+    /// Copied into `WyrdServerConfig.shutdown.drain_ms` when this server binds,
+    /// so a journey can exercise the real expired-deadline branch of production
+    /// shutdown rather than a test substitute for it.
+    shutdown_drain_for_test: Option<Duration>,
     /// Test-only request to panic the bound serve task after its drain returns.
     serve_task_panic_for_test: bool,
 }
@@ -240,6 +246,12 @@ pub struct ServerShutdownInspection {
     pub listeners_stopped: bool,
     /// Supervisor join handles still retained after shutdown.
     pub supervised_tasks: u64,
+    /// Final storage-owner reconciliation snapshot when this process had one.
+    ///
+    /// Captured after the bound production serve task joins and before the
+    /// harness drops, so it is the state production teardown actually left
+    /// rather than the state a test-invoked second shutdown produced.
+    pub storage: Option<vala_bifrost_redux::storage::MetadataCacheSnapshot>,
 }
 
 /// Exact query-owned resources inspected by test-tier cancellation journeys.
@@ -504,6 +516,14 @@ pub struct WyrdTestServerBuilder {
     limits: Option<wyrd_server::state::LimitsConfig>,
     /// Replace the serve task with a cancellation-resistant test task.
     stalled_drain_for_test: Option<Arc<AtomicBool>>,
+    /// Optional bounded drain budget copied into the bound server's config.
+    shutdown_drain_for_test: Option<Duration>,
+    /// Storage I/O bounds this server's one Bifrost storage owner resolves.
+    ///
+    /// The same operator-facing type production reads from configuration, so a
+    /// journey that declares a cache mode configures the production owner
+    /// rather than labelling evidence.
+    bifrost_storage_io: wyrd_server::config::BifrostStorageIoConfig,
     /// Test-only request to panic the bound serve task after its drain returns.
     serve_task_panic_for_test: bool,
 }
@@ -567,6 +587,8 @@ impl Default for WyrdTestServerBuilder {
             omit_token_verifier: false,
             limits: None,
             stalled_drain_for_test: None,
+            shutdown_drain_for_test: None,
+            bifrost_storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
             serve_task_panic_for_test: false,
         }
     }
@@ -843,10 +865,17 @@ impl WyrdTestServer {
             .bifrost_scribe_for_test()
             .map(|_| self.scribe_inspection_snapshot())
             .transpose()?;
+        let storage = self
+            .inner
+            .state
+            .bifrost
+            .bifrost_storage()
+            .map(|storage| storage.telemetry_snapshot());
         let inspection = ServerShutdownInspection {
             scribe,
             listeners_stopped,
             supervised_tasks: self.supervised_task_count_for_test() as u64,
+            storage,
         };
         tokio::task::spawn_blocking(move || drop(self))
             .await
@@ -2867,6 +2896,9 @@ impl WyrdTestServer {
         }
         config.metrics.enabled = false;
         config.serve.mode = ServeMode::Both;
+        if let Some(drain) = self.shutdown_drain_for_test {
+            config.shutdown.drain_ms = u64::try_from(drain.as_millis()).unwrap_or(u64::MAX);
+        }
 
         let bound = WyrdServer::new(config, state)
             .map_err(|e| WyrdTestServerError::Start(e.to_string()))?
@@ -3075,6 +3107,35 @@ impl WyrdTestServerBuilder {
     #[must_use]
     pub fn with_stalled_drain_for_test(mut self, aborted: Arc<AtomicBool>) -> Self {
         self.stalled_drain_for_test = Some(aborted);
+        self
+    }
+
+    /// Bound the production shutdown drain this server binds with.
+    ///
+    /// Copied into `WyrdServerConfig.shutdown.drain_ms` in
+    /// [`bind`](WyrdTestServer::bind) and nowhere else, so it narrows the real
+    /// production drain budget instead of replacing production's shutdown
+    /// implementation. `Duration::ZERO` is how a journey reaches the
+    /// already-expired branch deterministically.
+    #[must_use]
+    pub const fn with_shutdown_drain_for_test(mut self, drain: Duration) -> Self {
+        self.shutdown_drain_for_test = Some(drain);
+        self
+    }
+
+    /// Resolve this server's one Bifrost storage owner from explicit I/O bounds.
+    ///
+    /// The value is both the input to the owner's policy resolution and the
+    /// value composed into `BifrostRuntimeConfig.storage`, so the harness never
+    /// carries two answers about what the node's storage owner is allowed to
+    /// spend. Used by cluster journeys to make a declared metadata-cache mode a
+    /// real boot input.
+    #[must_use]
+    pub const fn with_bifrost_storage_io_for_test(
+        mut self,
+        storage_io: wyrd_server::config::BifrostStorageIoConfig,
+    ) -> Self {
+        self.bifrost_storage_io = storage_io;
         self
     }
 
@@ -3568,7 +3629,7 @@ impl WyrdTestServerBuilder {
         let bifrost_storage = Arc::new(vala_bifrost_redux::storage::BifrostStorage::new(
             Arc::clone(&storage),
             vala_bifrost_redux::storage::BifrostStoragePolicy::resolve(
-                vala_bifrost_redux::storage::BifrostStorageConfig::default(),
+                self.bifrost_storage_io.to_storage_config(),
                 u64::try_from(bifrost_resources.plan().managed_memory_bytes).unwrap_or(u64::MAX),
                 bifrost_resources.oracle().is_some(),
             )
@@ -3629,6 +3690,7 @@ impl WyrdTestServerBuilder {
         };
         let mut bifrost_config = BifrostRuntimeConfig::default();
         bifrost_config.scribe.ingest_request_bytes = self.scribe_ingest_limits.max_frame_bytes;
+        bifrost_config.storage = self.bifrost_storage_io;
         let forge_runtime = ForgeRuntimeConfig {
             maintenance_interval_secs: Some(self.forge_interval.as_secs()),
             ..ForgeRuntimeConfig::default()
@@ -3736,6 +3798,7 @@ impl WyrdTestServerBuilder {
             requested_oracle_peer_tls: self.oracle_peer_tls,
             readiness_failure: self.readiness_failure,
             stalled_drain_for_test: self.stalled_drain_for_test,
+            shutdown_drain_for_test: self.shutdown_drain_for_test,
             serve_task_panic_for_test: self.serve_task_panic_for_test,
         })
     }

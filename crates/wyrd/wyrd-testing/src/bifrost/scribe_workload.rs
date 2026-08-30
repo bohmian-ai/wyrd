@@ -26,9 +26,12 @@ pub const SCRIBE_PRODUCTION_WORKLOAD_VERSION: u16 = 1;
 
 /// Whether the run is executed with the read cache absent or present.
 ///
-/// Scribe proves authoritative correctness with the cache absent. The variant
-/// exists so the cache task can run these exact bytes twice and compare, not so
-/// this crate can configure cache behavior — it owns none.
+/// A boot input, not a label. The cluster resolves the production storage
+/// owner's decoded-metadata budget from this mode — an explicit zero for
+/// `Disabled` and a small nonzero budget for `Enabled` — and the runner refuses
+/// to start when the live owner does not agree with the mode it was handed. A
+/// parity pair therefore differs in exactly one configured scalar and the
+/// evidence's `cache_mode` names a composition that actually happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScribeCacheMode {
@@ -669,7 +672,7 @@ pub struct ScribeRecoveryObservationV1 {
 /// Every field is a count of something the pod still owned when it stopped.
 /// A drain that leaves any of them non-zero has leaked the resource, which no
 /// row-level assertion can see.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScribeDrainObservationV1 {
     /// Whether every server task stopped.
     pub servers_stopped: bool,
@@ -683,6 +686,88 @@ pub struct ScribeDrainObservationV1 {
     pub wal_streams: u64,
     /// Supervised tasks still retained when the pod stopped.
     pub supervised_tasks: u64,
+    /// Storage-owner reconciliation the pod's production teardown left behind.
+    ///
+    /// Optional because a topology with no composed storage owner still drains;
+    /// present for every real pod. Carried here rather than reduced to a
+    /// boolean so a consumer can assert the owner's lifecycle, its balanced
+    /// starts and terminals, and its zero anomalies rather than a summary of
+    /// them.
+    #[serde(default)]
+    pub storage: Option<ScribeStorageDrainObservationV1>,
+}
+
+/// One pod's terminal storage-owner reconciliation, in wire-portable form.
+///
+/// A serializable projection of the production owner's retained snapshot: the
+/// record travels between processes, and the owner's own snapshot type is a
+/// live in-process observation rather than a contract. Every field is a total
+/// or a settled live count, so a drained pod's state is a set of equalities.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScribeStorageDrainObservationV1 {
+    /// The owner's retained lifecycle label at teardown.
+    pub lifecycle: String,
+    /// Metadata loads started by an owning caller.
+    pub load_starts: u64,
+    /// Terminal metadata loads, summed across outcomes.
+    pub load_terminals: u64,
+    /// Successful entries still retained.
+    pub resident_entries: u64,
+    /// Charged bytes still retained.
+    pub resident_bytes: u64,
+    /// Loads with an owner and no terminal result.
+    pub inflight_loads: u64,
+    /// Callers still joined to another caller's load.
+    pub waiters: u64,
+    /// Logical governed storage requests admitted.
+    pub request_starts: u64,
+    /// Terminal governed storage requests, summed across outcomes.
+    pub request_terminals: u64,
+    /// Logical requests still admitted with no terminal.
+    pub active_requests: u64,
+    /// Attempts admitted after a logical read's first attempt.
+    pub request_retries: u64,
+    /// Lookups a resident entry satisfied.
+    pub cache_hits: u64,
+    /// Lookups that elected this caller as the loader.
+    pub cache_misses: u64,
+    /// Lookups that joined another caller's in-flight load.
+    pub cache_joins: u64,
+    /// Lookups the cache did not participate in.
+    pub cache_bypasses: u64,
+    /// Bypasses taken because this composition booted with no cache at all.
+    pub cache_bypasses_disabled: u64,
+    /// Settlements that had no matching admission; always zero when correct.
+    pub anomalies: u64,
+}
+
+impl ScribeStorageDrainObservationV1 {
+    /// Projects one production owner snapshot into the portable record.
+    #[must_use]
+    pub fn from_snapshot(
+        snapshot: &vala_bifrost_redux::storage::MetadataCacheSnapshot,
+    ) -> Self {
+        use vala_bifrost_redux::storage::{CacheEffect, CacheEffectReason};
+        Self {
+            lifecycle: snapshot.lifecycle().as_str().to_owned(),
+            load_starts: snapshot.load_starts(),
+            load_terminals: snapshot.load_terminals(),
+            resident_entries: snapshot.resident_entries(),
+            resident_bytes: snapshot.resident_bytes(),
+            inflight_loads: snapshot.inflight_loads(),
+            waiters: snapshot.waiters(),
+            request_starts: snapshot.request_starts(),
+            request_terminals: snapshot.request_terminals(),
+            active_requests: snapshot.active_requests(),
+            request_retries: snapshot.request_retries(),
+            cache_hits: snapshot.effect(CacheEffect::Hit),
+            cache_misses: snapshot.effect(CacheEffect::Miss),
+            cache_joins: snapshot.effect(CacheEffect::Join),
+            cache_bypasses: snapshot.effect(CacheEffect::Bypass),
+            cache_bypasses_disabled: snapshot.reason(CacheEffectReason::Disabled),
+            anomalies: snapshot.anomalies(),
+        }
+    }
 }
 
 /// One observed lifecycle boundary of a production run.
@@ -906,6 +991,7 @@ impl ScribeProductionEvidenceV1 {
             }
             let drained = observed
                 .drained
+                .as_ref()
                 .ok_or_else(|| ScribeWorkloadError::Evidence {
                     detail: "the terminal boundary carries no drain evidence".to_owned(),
                 })?;
@@ -1382,9 +1468,10 @@ impl crate::bifrost::WyrdTestCluster {
     /// stopping at publication and leaving recovery to each caller's own
     /// hand-written epilogue.
     ///
-    /// `cache_mode` is recorded in the evidence and nothing else: this crate
-    /// owns no cache behavior, and the Scribe candidate runs with the cache
-    /// absent.
+    /// `cache_mode` must already be the composition the cluster booted: the
+    /// runner reads the live production owner before its first operation and
+    /// refuses to run when the declared mode and the composed owner disagree,
+    /// so a parity pair can never silently be two runs of the same composition.
     ///
     /// # Errors
     ///
@@ -1408,6 +1495,26 @@ impl crate::bifrost::WyrdTestCluster {
             .map_err(|error| crate::WyrdTestServerError::Start(error.to_string()))?;
 
         let mut cluster = Some(self);
+        // The declared mode is a claim about the composition this run happens
+        // on. Checking it against the live owner before any operation is what
+        // makes a cache-off/cache-on comparison a comparison of two
+        // compositions rather than of one composition run twice.
+        let composed = running_pod(&cluster)?
+            .state()
+            .bifrost_storage()
+            .ok_or_else(|| {
+                crate::WyrdTestServerError::Start(
+                    "the running pod composed no Bifrost storage owner".to_owned(),
+                )
+            })?
+            .metadata_cache_enabled();
+        let declared = matches!(cache_mode, ScribeCacheMode::Enabled);
+        if composed != declared {
+            return Err(crate::WyrdTestServerError::Start(format!(
+                "the run declares {cache_mode:?} but the composed storage owner reports \
+                 metadata_cache_enabled={composed}"
+            )));
+        }
         let node = running_pod(&cluster)?.node_id();
         let bindings = running_pod(&cluster)?
             .seed_scribe_workload_owners_for_test(workload)
@@ -1556,6 +1663,10 @@ impl crate::bifrost::WyrdTestCluster {
                         queued: inspection.scribe_queued,
                         wal_streams: inspection.scribe_wal_streams,
                         supervised_tasks: inspection.supervised_tasks,
+                        storage: inspection
+                            .storage
+                            .first()
+                            .map(ScribeStorageDrainObservationV1::from_snapshot),
                     });
                 }
                 ScribeWorkloadOperationV1::Checkpoint { name } => {
@@ -1793,6 +1904,7 @@ mod tests {
                             queued: 0,
                             wal_streams: 0,
                             supervised_tasks: 0,
+                            storage: None,
                         },
                     ),
                 })
@@ -2015,45 +2127,46 @@ mod tests {
             queued: 0,
             wal_streams: 0,
             supervised_tasks: 0,
+            storage: None,
         };
         for (label, mutation) in [
             (
                 "a server that did not stop",
                 ScribeDrainObservationV1 {
                     servers_stopped: false,
-                    ..clean
+                    ..clean.clone()
                 },
             ),
             (
                 "a listener that did not stop",
                 ScribeDrainObservationV1 {
                     listeners_stopped: false,
-                    ..clean
+                    ..clean.clone()
                 },
             ),
             (
                 "a leaked admission",
                 ScribeDrainObservationV1 {
                     admitted: 1,
-                    ..clean
+                    ..clean.clone()
                 },
             ),
             (
                 "a leaked shard command",
-                ScribeDrainObservationV1 { queued: 1, ..clean },
+                ScribeDrainObservationV1 { queued: 1, ..clean.clone() },
             ),
             (
                 "a leaked WAL stream",
                 ScribeDrainObservationV1 {
                     wal_streams: 1,
-                    ..clean
+                    ..clean.clone()
                 },
             ),
             (
                 "a retained supervised task",
                 ScribeDrainObservationV1 {
                     supervised_tasks: 1,
-                    ..clean
+                    ..clean.clone()
                 },
             ),
         ] {
@@ -2080,7 +2193,7 @@ mod tests {
         // each is attached to the boundary the other one describes.
         let mut swapped = conforming.clone();
         swapped.checkpoints[restart].recovered = None;
-        swapped.checkpoints[restart].drained = conforming.checkpoints[terminal].drained;
+        swapped.checkpoints[restart].drained = conforming.checkpoints[terminal].drained.clone();
         swapped.checkpoints[terminal].drained = None;
         swapped.checkpoints[terminal].recovered = conforming.checkpoints[restart].recovered;
         assert!(

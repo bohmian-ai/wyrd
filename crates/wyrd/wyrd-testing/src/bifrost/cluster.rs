@@ -134,6 +134,12 @@ pub struct BifrostClusterSpec {
     /// Optional deterministic controls for the real Scribe publisher.
     scribe_persistence_faults_for_test:
         Option<vala_bifrost_redux::scribe::persistence::PersistenceFaults>,
+    /// Storage I/O bounds every node in this cluster resolves its owner from.
+    ///
+    /// Carried on the spec rather than applied per start so a restarted node
+    /// composes the same owner as its first boot; a cache mode that changed
+    /// across a restart would make a parity comparison meaningless.
+    storage_io: wyrd_server::config::BifrostStorageIoConfig,
 }
 
 impl BifrostClusterSpec {
@@ -154,6 +160,22 @@ impl BifrostClusterSpec {
         geometry: vala_bifrost_redux::scribe::geometry::ScribeGeometry,
     ) -> Self {
         self.scribe_geometry_for_test = Some(geometry);
+        self
+    }
+
+    /// Selects the decoded-metadata cache mode every node in this cluster boots with.
+    ///
+    /// The mode is a boot input, not a label: disabled resolves the production
+    /// owner with an explicit zero budget and enabled resolves it with a small
+    /// nonzero one, leaving every other storage bound at its default. Both are
+    /// values the production policy validates, so a parity run differs from its
+    /// twin in exactly one configured scalar.
+    #[must_use]
+    pub fn with_metadata_cache_mode(mut self, mode: crate::bifrost::ScribeCacheMode) -> Self {
+        self.storage_io.metadata_cache_bytes = Some(match mode {
+            crate::bifrost::ScribeCacheMode::Disabled => 0,
+            crate::bifrost::ScribeCacheMode::Enabled => 32 * 1024 * 1024,
+        });
         self
     }
 
@@ -205,6 +227,7 @@ impl BifrostClusterSpec {
             ],
             scribe_geometry_for_test: None,
             scribe_persistence_faults_for_test: None,
+            storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
         }
     }
 
@@ -230,6 +253,7 @@ impl BifrostClusterSpec {
             nodes,
             scribe_geometry_for_test: None,
             scribe_persistence_faults_for_test: None,
+            storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
         }
     }
 
@@ -258,6 +282,7 @@ impl BifrostClusterSpec {
             nodes,
             scribe_geometry_for_test: None,
             scribe_persistence_faults_for_test: None,
+            storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
         }
     }
 
@@ -279,6 +304,7 @@ impl BifrostClusterSpec {
                 .collect(),
             scribe_geometry_for_test: None,
             scribe_persistence_faults_for_test: None,
+            storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
         }
     }
 
@@ -453,7 +479,7 @@ pub struct OracleInspection {
 }
 
 /// Concrete result of stopping every server/listener in a test cluster.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterShutdownInspection {
     /// Every server stop operation completed successfully.
     pub servers_stopped: bool,
@@ -471,6 +497,13 @@ pub struct ClusterShutdownInspection {
     pub forge_active_attempts: u64,
     /// Supervised server tasks retained after every server owner is dropped.
     pub supervised_tasks: u64,
+    /// Each stopped node's terminal storage-owner snapshot, in stop order.
+    ///
+    /// Kept per node rather than summed: the storage owner is a per-node
+    /// resource, and adding two nodes' counts together would turn a per-node
+    /// reconciliation into a cluster-wide one that no single owner ever has to
+    /// satisfy.
+    pub storage: Vec<vala_bifrost_redux::storage::MetadataCacheSnapshot>,
 }
 
 /// One parsed production Prometheus series.
@@ -778,6 +811,8 @@ pub struct WyrdTestCluster {
     /// Optional test-only persistence controls retained across restarts.
     scribe_persistence_faults_for_test:
         Option<vala_bifrost_redux::scribe::persistence::PersistenceFaults>,
+    /// Storage I/O bounds every node start and restart resolves its owner from.
+    storage_io: wyrd_server::config::BifrostStorageIoConfig,
     /// Scoped transport fault state.
     faults: OracleFaultController,
     /// Read-only process telemetry handle.
@@ -1660,6 +1695,7 @@ impl WyrdTestCluster {
         spec.validate()?;
         let scribe_geometry_for_test = spec.scribe_geometry_for_test;
         let scribe_persistence_faults_for_test = spec.scribe_persistence_faults_for_test.clone();
+        let storage_io = spec.storage_io;
         let process = process_telemetry()?;
         // `explicit_root` is the storage root to reuse (a shared or a
         // caller-declared dedicated root); `None` selects a temporary root.
@@ -1831,6 +1867,7 @@ impl WyrdTestCluster {
             scribe_admission_node,
             scribe_geometry_for_test,
             scribe_persistence_faults_for_test,
+            storage_io,
             faults: OracleFaultController::default(),
             telemetry: process.forge_capture.clone(),
             oracle_peer_credentials,
@@ -1869,6 +1906,7 @@ impl WyrdTestCluster {
             )
             .with_bind_addrs(resources.http_addr, resources.grpc_addr)
             .with_oracle_peer_credentials(Arc::clone(&self.oracle_peer_credentials))
+            .with_bifrost_storage_io_for_test(self.storage_io)
             .with_telemetry(Arc::clone(&process_telemetry()?.guard));
         if let Some(timing) = resources.spec.role_timing {
             builder = builder.with_role_timing_for_test(timing);
@@ -2552,6 +2590,7 @@ impl WyrdTestCluster {
         let mut scribe_wal_streams = 0_u64;
         let mut listeners_stopped = true;
         let mut supervised_tasks = 0_u64;
+        let mut storage = Vec::new();
         let node_ids = self.servers.keys().copied().collect::<Vec<_>>();
         let expected_servers = node_ids.len();
         let mut stopped_servers = 0_usize;
@@ -2579,6 +2618,7 @@ impl WyrdTestCluster {
                         listeners_stopped &= server_inspection.listeners_stopped;
                         supervised_tasks =
                             supervised_tasks.saturating_add(server_inspection.supervised_tasks);
+                        storage.extend(server_inspection.storage);
                         if let Some(snapshot) = server_inspection.scribe {
                             scribe_queued =
                                 scribe_queued.saturating_add(snapshot.queued_items as u64);
@@ -2608,6 +2648,7 @@ impl WyrdTestCluster {
                 forge_active_claims: inspection.forge_active_claims,
                 forge_active_attempts: inspection.forge_active_attempts,
                 supervised_tasks,
+                storage,
             }),
         }
     }

@@ -72,12 +72,35 @@ impl SupervisedForge {
         fixture: &ForgeFixture,
         config: vala_bifrost_redux::forge::ForgeConfig,
     ) -> Self {
+        Self::start_with_seams(
+            fixture,
+            config,
+            Arc::clone(&fixture.catalog),
+            Arc::clone(&fixture.object_store),
+        )
+    }
+
+    /// Start the same supervised pair over explicit catalog and object-store seams.
+    ///
+    /// Fault-injection journeys wrap one production interface and otherwise
+    /// keep the fixture's real graph, so an injected condition is observed by
+    /// the production scheduler and worker rather than by a substitute owner.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot construct its validated worker graph.
+    pub(crate) fn start_with_seams(
+        fixture: &ForgeFixture,
+        config: vala_bifrost_redux::forge::ForgeConfig,
+        catalog: Arc<dyn iceberg::Catalog>,
+        object_store: Arc<dyn vala_bifrost_redux::forge::ForgeObjectStore>,
+    ) -> Self {
         let scheduler_trigger = ForgeSchedulerTrigger::with_owner_for_test(uuid::Uuid::now_v7());
         let worker_observer = ForgeWorkerCompletionObserver::new();
         let (forge, _publisher) = fixture.context_with_worker_supervision(
             config,
-            Arc::clone(&fixture.catalog),
-            Arc::clone(&fixture.object_store),
+            catalog,
+            object_store,
             worker_observer.clone(),
             scheduler_trigger.clone(),
         );
@@ -115,7 +138,7 @@ impl SupervisedForge {
     /// # Panics
     ///
     /// Panics when the scheduler does not return within the deterministic bound.
-    async fn schedule_once(&self) {
+    pub(crate) async fn schedule_once(&self) {
         let expected = self.scheduler_trigger.completed_passes().saturating_add(1);
         self.scheduler_trigger.request_pass();
         tokio::time::timeout(

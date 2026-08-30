@@ -12,7 +12,7 @@ use std::str::FromStr;
 
 use sqlx::types::Uuid;
 use wyrd_spec::vala::api::{
-    AuditDetail, ForgeIcebergRewritePhase, ForgeOrphanGcPhase,
+    AuditDetail, ForgeIcebergRewritePhase, ForgeOrphanGcPhase, ForgeScribePromotionPhase,
     ForgeSnapshotExpirePhase, audit_detail_canonical_json,
 };
 
@@ -21,6 +21,8 @@ use crate::SqlError;
 /// Closed Forge operation families tracked by the state projection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForgeOperationFamily {
+    /// Scribe hot-object promotion operations (`forge.scribe_promotion.*`).
+    ScribePromotion,
     /// Iceberg partition-rewrite operations (`forge.iceberg_rewrite.*`).
     IcebergRewrite,
     /// Snapshot-expiry operations (`forge.snapshot_expire.*`).
@@ -34,6 +36,7 @@ impl ForgeOperationFamily {
     #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::ScribePromotion => "scribe_promotion",
             Self::IcebergRewrite => "iceberg_rewrite",
             Self::SnapshotExpire => "snapshot_expire",
             Self::OrphanGc => "orphan_gc",
@@ -44,6 +47,7 @@ impl ForgeOperationFamily {
     #[must_use]
     pub fn expected_detail_kind(&self) -> &'static str {
         match self {
+            Self::ScribePromotion => "forge_scribe_promotion",
             Self::IcebergRewrite => "forge_iceberg_rewrite",
             Self::SnapshotExpire => "forge_snapshot_expire",
             Self::OrphanGc => "forge_orphan_gc",
@@ -54,6 +58,7 @@ impl ForgeOperationFamily {
     #[must_use]
     pub fn operation_prefix(&self) -> &'static str {
         match self {
+            Self::ScribePromotion => "forge.scribe_promotion",
             Self::IcebergRewrite => "forge.iceberg_rewrite",
             Self::SnapshotExpire => "forge.snapshot_expire",
             Self::OrphanGc => "forge.orphan_gc",
@@ -70,6 +75,7 @@ impl std::str::FromStr for ForgeOperationFamily {
     /// Returns [`SqlError::InvariantViolation`] when `s` is not a known family.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
+            "scribe_promotion" => Ok(Self::ScribePromotion),
             "iceberg_rewrite" => Ok(Self::IcebergRewrite),
             "snapshot_expire" => Ok(Self::SnapshotExpire),
             "orphan_gc" => Ok(Self::OrphanGc),
@@ -89,8 +95,8 @@ pub enum ForgeOperationPhase {
     Committed,
     /// Reconciliation recovered the external commit.
     Recovered,
-    /// Operation was reset after a failed external commit (iceberg_rewrite
-    /// only).
+    /// Operation was reset after a failed external commit (scribe_promotion
+    /// and iceberg_rewrite only).
     Reset,
 }
 
@@ -419,6 +425,11 @@ fn validate_detail_identity(
     expected_phase: ForgeOperationPhase,
 ) -> Result<(), SqlError> {
     let (actual_operation_id, actual_group, actual_kind) = match detail {
+        AuditDetail::ForgeScribePromotion {
+            operation_id,
+            group,
+            ..
+        } => (*operation_id, group.as_str(), "forge_scribe_promotion"),
         AuditDetail::ForgeIcebergRewrite {
             operation_id,
             group,
@@ -466,6 +477,12 @@ fn validate_detail_identity(
 
     let expected_phase_name = expected_phase.as_str();
     let detail_phase_str = match detail {
+        AuditDetail::ForgeScribePromotion { phase, .. } => match phase {
+            ForgeScribePromotionPhase::Prepared => "prepared",
+            ForgeScribePromotionPhase::Committed => "committed",
+            ForgeScribePromotionPhase::Recovered => "recovered",
+            ForgeScribePromotionPhase::Reset => "reset",
+        },
         AuditDetail::ForgeIcebergRewrite { phase, .. } => match phase {
             ForgeIcebergRewritePhase::Prepared => "prepared",
             ForgeIcebergRewritePhase::Committed => "committed",

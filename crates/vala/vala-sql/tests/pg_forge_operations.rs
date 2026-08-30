@@ -26,7 +26,6 @@ mod pg_tests {
         };
 
         use vala_sql::queries::forge_operations::ForgeOperations;
-        use vala_sql::queries::forge_tasks::FAIR_CLAIM_SQL;
         use vala_sql::row_types::forge_operations::{
             ForgeOperationFamily, ForgeOperationTransition,
         };
@@ -42,32 +41,17 @@ mod pg_tests {
             fixture: PgFixture,
             /// Migrator-role pool for schema and plan assertions.
             superuser: PgPool,
-            /// Second tenant used for RLS isolation checks.
-            tenant_b: DataTenantId,
         }
 
-        /// Starts an isolated Postgres fixture with a second tenant.
+        /// Starts an isolated migrated Postgres fixture for one Forge SQL test.
         ///
         /// # Panics
         ///
-        /// Panics when PostgreSQL setup, role-backed pool creation, or tenant
-        /// seeding fails.
+        /// Panics when PostgreSQL setup or role-backed pool creation fails.
         async fn setup() -> TestFixtures {
             let fixture = PgFixture::start().await.expect("fixture");
             let superuser = fixture.superuser_pool().await.expect("superuser pool");
-            let tenant_b = DataTenantId::new_v7();
-            fixture
-                .seed_additional_tenant_with_uuid(
-                    tenant_b,
-                    &format!("test-{}", tenant_b.as_uuid().simple()),
-                )
-                .await
-                .expect("seed second tenant");
-            TestFixtures {
-                fixture,
-                superuser,
-                tenant_b,
-            }
+            TestFixtures { fixture, superuser }
         }
 
         /// Returns the primary logical Forge resource used by the tests.
@@ -249,10 +233,11 @@ mod pg_tests {
         ///
         /// # Panics
         ///
-        /// Panics when `detail` is not one of the three Forge detail variants.
+        /// Panics when `detail` is not one of the four Forge detail variants.
         fn forge_operation_id(detail: &AuditDetail) -> Uuid {
             match detail {
-                AuditDetail::ForgeIcebergRewrite { operation_id, .. }
+                AuditDetail::ForgeScribePromotion { operation_id, .. }
+                | AuditDetail::ForgeIcebergRewrite { operation_id, .. }
                 | AuditDetail::ForgeSnapshotExpire { operation_id, .. }
                 | AuditDetail::ForgeOrphanGc { operation_id, .. } => *operation_id,
                 _ => panic!("expected Forge audit detail"),
@@ -274,7 +259,6 @@ mod pg_tests {
             let TestFixtures {
                 fixture: _fixture,
                 superuser,
-                ..
             } = setup().await;
 
             let columns: Vec<(String, String, String)> = sqlx::query_as(
@@ -368,7 +352,7 @@ mod pg_tests {
                     ),
                     (
                         "forge_operation_state_family_check".to_owned(),
-                        "CHECK ((family = ANY (ARRAY['iceberg_rewrite'::text, 'snapshot_expire'::text, 'orphan_gc'::text])))".to_owned(),
+                        "CHECK ((family = ANY (ARRAY['scribe_promotion'::text, 'iceberg_rewrite'::text, 'snapshot_expire'::text, 'orphan_gc'::text])))".to_owned(),
                     ),
                     (
                         "forge_operation_state_phase_check".to_owned(),
@@ -463,7 +447,6 @@ mod pg_tests {
                 "complete role/privilege set"
             );
         }
-
 
         // -----------------------------------------------------------------------
         // Iceberg rewrite family
@@ -796,5 +779,164 @@ mod pg_tests {
             assert_eq!(count_audit(pool, tenant).await, 2);
         }
 
+        // -----------------------------------------------------------------------
+        // Scribe promotion family
+        // -----------------------------------------------------------------------
+
+        /// Builds one Scribe-promotion detail for the fixed test resource.
+        ///
+        /// # Panics
+        /// Panics when the fixed promoted-file tuple or path is invalid.
+        fn promotion_detail(
+            operation_id: Uuid,
+            phase: wyrd_spec::vala::api::ForgeScribePromotionPhase,
+            committed_snapshot_id: Option<i64>,
+            checksum: &str,
+        ) -> AuditDetail {
+            let promoted = [wyrd_spec::vala::api::ForgePromotedFile::new(
+                Uuid::from_u128(5),
+                StoragePath::new("table/hot-a.parquet").expect("valid path"),
+                checksum,
+            )
+            .expect("promoted file")];
+            AuditDetail::ForgeScribePromotion {
+                operation_id,
+                phase,
+                group: resource().to_owned(),
+                base_snapshot_id: 200,
+                committed_snapshot_id,
+                input_file_ids: vec![Uuid::from_u128(5)],
+                input_paths: vec![StoragePath::new("table/hot-a.parquet").expect("valid path")],
+                promoted_file_set_digest: wyrd_spec::vala::api::ForgePromotedFileSetDigest::compute(
+                    &promoted,
+                ),
+            }
+        }
+
+        /// Verifies that the Scribe-promotion family transitions under the same
+        /// fence and transactional audit contract as every other Forge family.
+        ///
+        /// A Prepared row persists with its prepared audit sequence, the
+        /// Committed transition persists the promotion snapshot and its own
+        /// terminal sequence, and each transition contributes exactly one audit
+        /// row. The negative arms prove the fence is real rather than
+        /// incidental: a promotion detail presented under the wrong family, a
+        /// terminal event whose digest no longer matches the prepared file set,
+        /// and an event carrying no audit detail at all each fail without
+        /// leaving durable state behind.
+        ///
+        /// # Panics
+        ///
+        /// Panics when setup, typed detail construction, transitions, or exact
+        /// persisted phase, sequence, digest, and cardinality assertions fail.
+        #[tokio::test]
+        async fn scribe_promotion_operation_transitions_are_fenced_and_audited() {
+            let TestFixtures { fixture, .. } = setup().await;
+            let pool = fixture.app_pool();
+            let tenant = fixture.data_tenant_id();
+            let family = ForgeOperationFamily::ScribePromotion;
+
+            assert_eq!(family.as_str(), "scribe_promotion");
+            assert_eq!(family.operation_prefix(), "forge.scribe_promotion");
+            assert_eq!(family.expected_detail_kind(), "forge_scribe_promotion");
+
+            let operation_id = Uuid::now_v7();
+            let prepared_detail = promotion_detail(
+                operation_id,
+                wyrd_spec::vala::api::ForgeScribePromotionPhase::Prepared,
+                None,
+                "aa11",
+            );
+            let prepared_event = event(
+                "forge.scribe_promotion.prepared",
+                resource(),
+                Some(prepared_detail.clone()),
+            );
+            let prepared_seq =
+                match append_prepared(pool, tenant, resource(), family, &prepared_event)
+                    .await
+                    .expect("promotion prepared")
+                {
+                    ForgeOperationTransition::Applied { audit_seq } => audit_seq,
+                    other => panic!("expected prepared application, got {other:?}"),
+                };
+            assert_eq!(forge_operation_id(&prepared_detail), operation_id);
+
+            // A promotion detail presented under another family is refused
+            // before any durable effect.
+            let mismatched = append_prepared(
+                pool,
+                tenant,
+                resource(),
+                ForgeOperationFamily::IcebergRewrite,
+                &prepared_event,
+            )
+            .await;
+            assert!(
+                matches!(mismatched, Err(SqlError::Conflict { .. })),
+                "promotion detail must not transition another family, got {mismatched:?}"
+            );
+
+            // A terminal event with no detail cannot settle the operation.
+            let detailless = event("forge.scribe_promotion.committed", resource(), None);
+            assert!(
+                matches!(
+                    append_terminal(pool, tenant, resource(), family, &detailless).await,
+                    Err(SqlError::Conflict { .. })
+                ),
+                "a terminal transition without audit detail must fail closed"
+            );
+
+            let committed_event = event(
+                "forge.scribe_promotion.committed",
+                resource(),
+                Some(promotion_detail(
+                    operation_id,
+                    wyrd_spec::vala::api::ForgeScribePromotionPhase::Committed,
+                    Some(201),
+                    "aa11",
+                )),
+            );
+            let terminal_seq =
+                match append_terminal(pool, tenant, resource(), family, &committed_event)
+                    .await
+                    .expect("promotion committed")
+                {
+                    ForgeOperationTransition::Applied { audit_seq } => audit_seq,
+                    other => panic!("expected terminal application, got {other:?}"),
+                };
+
+            assert_eq!(
+                state_snapshot(pool, tenant, family, operation_id).await,
+                StateSnapshot {
+                    phase: "committed".to_owned(),
+                    prepared_audit_seq: prepared_seq,
+                    terminal_audit_seq: Some(terminal_seq),
+                }
+            );
+
+            // A replay whose promoted file set digests differently is not the
+            // same settlement and must not be accepted as idempotent.
+            let redigested = event(
+                "forge.scribe_promotion.committed",
+                resource(),
+                Some(promotion_detail(
+                    operation_id,
+                    wyrd_spec::vala::api::ForgeScribePromotionPhase::Committed,
+                    Some(201),
+                    "bb22",
+                )),
+            );
+            assert!(
+                matches!(
+                    append_terminal(pool, tenant, resource(), family, &redigested).await,
+                    Err(SqlError::Conflict { .. })
+                ),
+                "a differing promoted-file-set digest must not replay as idempotent"
+            );
+
+            assert_eq!(count_state(pool, tenant).await, 1);
+            assert_eq!(count_audit(pool, tenant).await, 2);
+        }
     }
 }

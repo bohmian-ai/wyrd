@@ -750,9 +750,15 @@ fn evidence_from_value(value: serde_json::Value) -> Result<ForgeTaskEvidence, Sq
     })
 }
 
-/// Closed Forge maintenance strategies.
+/// Closed Forge task strategies.
+///
+/// The set spans publication work (`scribe_promotion`), rewrite work, and
+/// maintenance-family cleanup; [`ForgeTaskStrategy::is_maintenance`] is the
+/// only classification that distinguishes them for scheduling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForgeTaskStrategy {
+    /// Promote already-published Scribe hot objects into the table unchanged.
+    ScribePromotion,
     /// Compact small files.
     SmallFiles,
     /// Repair full table identity.
@@ -801,6 +807,7 @@ impl ForgeTaskStrategy {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::ScribePromotion => "scribe_promotion",
             Self::SmallFiles => "small_files",
             Self::FullIdentity => "full_identity",
             Self::ManifestRewrite => "manifest_rewrite",
@@ -817,6 +824,7 @@ impl FromStr for ForgeTaskStrategy {
     /// Returns [`SqlError::InvariantViolation`] for an unknown value.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
+            "scribe_promotion" => Ok(Self::ScribePromotion),
             "small_files" => Ok(Self::SmallFiles),
             "full_identity" => Ok(Self::FullIdentity),
             "manifest_rewrite" => Ok(Self::ManifestRewrite),
@@ -829,6 +837,17 @@ impl FromStr for ForgeTaskStrategy {
         }
     }
 }
+
+/// Closed placeholder written into the projected task row when the claim
+/// boundary decoded an unrecognized raw strategy tag.
+///
+/// The authoritative value for such a claim is
+/// [`ForgeClaimStrategy::Unknown`], which retains the exact raw tag for
+/// terminal quarantine audit. The projected [`ForgeTask`] contract is closed
+/// over [`ForgeTaskStrategy`], so a placeholder is required to build it. It is
+/// deliberately a dormant rewrite identity and never a live route: an
+/// unrecognized tag must never be observable as a claimable promotion.
+const QUARANTINE_STRATEGY_PLACEHOLDER: ForgeTaskStrategy = ForgeTaskStrategy::SmallFiles;
 
 /// Claim-boundary strategy decoded from an independently persisted raw tag.
 ///
@@ -1320,6 +1339,7 @@ impl TryFrom<ForgeTaskClaimSqlRow> for ForgeTaskClaim {
         let strategy = ForgeClaimStrategy::from_raw(row.task.strategy.clone());
         row.task.strategy = match &strategy {
             ForgeClaimStrategy::Known(value) => value.as_str().to_owned(),
+            ForgeClaimStrategy::Unknown(_) => QUARANTINE_STRATEGY_PLACEHOLDER.as_str().to_owned(),
         };
         let task: ForgeTask = row.task.try_into()?;
         Ok(Self {

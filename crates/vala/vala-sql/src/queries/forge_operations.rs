@@ -23,7 +23,7 @@ use chrono::Utc;
 use sqlx::types::Uuid;
 use wyrd_spec::vala::api::{
     AuditDetail, AuditEvent, ForgeIcebergRewritePhase, ForgeOrphanGcPhase,
-    ForgeSnapshotExpirePhase, audit_detail_canonical_json,
+    ForgeScribePromotionPhase, ForgeSnapshotExpirePhase, audit_detail_canonical_json,
 };
 
 use crate::queries::audit_outbox::append_audit;
@@ -222,9 +222,14 @@ impl<'resource> ForgeOperations<'resource> {
             });
         }
 
-        // Reset is only valid for the iceberg_rewrite family.
+        // Reset is only valid for the scribe_promotion and iceberg_rewrite
+        // families: they are the only ones whose external commit can be proven
+        // not to have happened, making the prepared inputs visible again.
         if terminal_phase == ForgeOperationPhase::Reset
-            && !matches!(self.family, ForgeOperationFamily::IcebergRewrite)
+            && !matches!(
+                self.family,
+                ForgeOperationFamily::ScribePromotion | ForgeOperationFamily::IcebergRewrite
+            )
         {
             return Err(SqlError::Conflict {
                 detail: format!(
@@ -723,6 +728,11 @@ fn extract_detail_identity<'a>(
     expected_kind: &str,
 ) -> Result<(Uuid, &'a str), SqlError> {
     let (actual_kind, operation_id, group) = match detail {
+        AuditDetail::ForgeScribePromotion {
+            operation_id,
+            group,
+            ..
+        } => ("forge_scribe_promotion", operation_id, group),
         AuditDetail::ForgeIcebergRewrite {
             operation_id,
             group,
@@ -760,6 +770,12 @@ fn extract_detail_identity<'a>(
 /// Returns [`SqlError::Conflict`] when `detail` is not a Forge detail.
 fn extract_detail_phase(detail: &AuditDetail) -> Result<ForgeOperationPhase, SqlError> {
     let phase = match detail {
+        AuditDetail::ForgeScribePromotion { phase, .. } => match phase {
+            ForgeScribePromotionPhase::Prepared => ForgeOperationPhase::Prepared,
+            ForgeScribePromotionPhase::Committed => ForgeOperationPhase::Committed,
+            ForgeScribePromotionPhase::Recovered => ForgeOperationPhase::Recovered,
+            ForgeScribePromotionPhase::Reset => ForgeOperationPhase::Reset,
+        },
         AuditDetail::ForgeIcebergRewrite { phase, .. } => match phase {
             ForgeIcebergRewritePhase::Prepared => ForgeOperationPhase::Prepared,
             ForgeIcebergRewritePhase::Committed => ForgeOperationPhase::Committed,

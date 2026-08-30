@@ -10,7 +10,7 @@ CREATE TABLE vala.forge_operation_state (
     data_tenant_id    uuid        NOT NULL,
     resource          text        NOT NULL,
     family            text        NOT NULL CHECK (family IN (
-        'iceberg_rewrite', 'snapshot_expire', 'orphan_gc'
+        'scribe_promotion', 'iceberg_rewrite', 'snapshot_expire', 'orphan_gc'
     )),
     operation_id      uuid        NOT NULL,
     phase             text        NOT NULL CHECK (phase IN (

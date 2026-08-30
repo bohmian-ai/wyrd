@@ -2676,4 +2676,167 @@ mod pg_tests {
             "unfiltered claim drains the compaction backlog"
         );
     }
+
+    /// Builds the locked Scribe-promotion task parameters for one ordered file set.
+    ///
+    /// The shape is the durable contract: `kind` is `scribe_promotion`, the
+    /// target branch is bound, and the ordered `file_list` IDs, logical paths,
+    /// and normalized checksums accompany the digest computed over exactly
+    /// those tuples.
+    fn scribe_promotion_parameters(
+        branch: &str,
+        files: &[wyrd_spec::vala::api::ForgePromotedFile],
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "scribe_promotion",
+            "branch": branch,
+            "file_ids": files
+                .iter()
+                .map(|file| file.file_id().hyphenated().to_string())
+                .collect::<Vec<_>>(),
+            "paths": files
+                .iter()
+                .map(|file| file.path().as_str().to_owned())
+                .collect::<Vec<_>>(),
+            "checksums": files
+                .iter()
+                .map(|file| file.checksum().to_owned())
+                .collect::<Vec<_>>(),
+            "promoted_file_set_digest":
+                wyrd_spec::vala::api::ForgePromotedFileSetDigest::compute(files).as_str(),
+        })
+    }
+
+    /// A `scribe_promotion` task survives enqueue, fair claim, and projection
+    /// with its exact strategy and parameters, while an unrecognized persisted
+    /// strategy tag quarantines at the claim boundary instead of decaying into
+    /// promotion.
+    ///
+    /// The two halves are one obligation: the durable strategy set must admit
+    /// exactly `scribe_promotion` and nothing else, so the same test proves the
+    /// canonical constraint accepts the new value and that a forward-
+    /// incompatible or corrupted tag is retained verbatim as
+    /// [`ForgeClaimStrategy::Unknown`]. Promotion is ordinary-lane publication
+    /// work, so it is deliberately excluded from the maintenance-reserved slot.
+    ///
+    /// # Panics
+    /// Panics when PostgreSQL setup, enqueue, claim, or the exact strategy,
+    /// lane, and parameter assertions fail.
+    #[tokio::test]
+    async fn scribe_promotion_task_round_trips_and_unknown_strategy_quarantines() {
+        let (fixture, admin) = setup().await;
+        let op = fixture.operator_pool();
+        let tasks = ForgeTasks::new(op.clone());
+        let tenant = fixture.data_tenant_id();
+
+        let promoted = [
+            wyrd_spec::vala::api::ForgePromotedFile::new(
+                Uuid::from_u128(1),
+                wyrd_spec::vala::api::StoragePath::new("data/hot-a.parquet").expect("path"),
+                "AA11",
+            )
+            .expect("promoted file"),
+            wyrd_spec::vala::api::ForgePromotedFile::new(
+                Uuid::from_u128(2),
+                wyrd_spec::vala::api::StoragePath::new("data/hot-b.parquet").expect("path"),
+                "bb22",
+            )
+            .expect("promoted file"),
+        ];
+        let parameters = scribe_promotion_parameters("main", &promoted);
+        let promotion = NewForgeTask {
+            strategy: ForgeTaskStrategy::ScribePromotion,
+            plan: ForgeTaskPlan {
+                version: FORGE_TASK_PAYLOAD_VERSION,
+                inputs: vec![
+                    "data/hot-a.parquet".to_owned(),
+                    "data/hot-b.parquet".to_owned(),
+                ],
+                parameters: parameters.clone(),
+            },
+            ..task(tenant, "promotion_table", ForgeTaskLane::Ordinary, 7)
+        };
+
+        assert_eq!(
+            ForgeTaskStrategy::ScribePromotion.as_str(),
+            "scribe_promotion"
+        );
+        assert!(
+            !ForgeTaskStrategy::ScribePromotion.is_maintenance(),
+            "promotion is publication work, not maintenance-family cleanup"
+        );
+        assert!(
+            !MAINTENANCE_STRATEGIES.contains(&ForgeTaskStrategy::ScribePromotion),
+            "the reserved maintenance slot must not claim promotion"
+        );
+
+        let promotion_task_id = tasks.enqueue(&promotion).await.expect("enqueue promotion");
+        let stored: String =
+            sqlx::query_scalar("SELECT strategy FROM vala.forge_tasks WHERE task_id=$1")
+                .bind(promotion_task_id)
+                .fetch_one(&admin)
+                .await
+                .expect("stored strategy");
+        assert_eq!(stored, "scribe_promotion");
+
+        assert!(
+            tasks
+                .claim_fair(Uuid::now_v7(), limits(8), Some(MAINTENANCE_STRATEGIES))
+                .await
+                .expect("maintenance-filtered claim")
+                .is_none(),
+            "promotion must not be claimable through the maintenance filter"
+        );
+
+        let claim = tasks
+            .claim_fair(Uuid::now_v7(), limits(8), None)
+            .await
+            .expect("unfiltered claim")
+            .expect("promotion task is claimable");
+        assert_eq!(claim.task_id, promotion_task_id);
+        assert_eq!(
+            claim.strategy,
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::ScribePromotion)
+        );
+        assert_eq!(claim.lane, ForgeTaskLane::Ordinary);
+        assert_eq!(claim.plan.parameters, parameters);
+        assert_eq!(claim.plan.parameters["kind"], "scribe_promotion");
+
+        // A raw tag no worker version recognizes can only reach the claim
+        // boundary through corruption or a forward-incompatible writer, so it
+        // is arranged with the migrator role after dropping the canonical
+        // constraint that ordinary writers cannot bypass.
+        let quarantined = tasks
+            .enqueue(&NewForgeTask {
+                ..task(tenant, "quarantine_table", ForgeTaskLane::Ordinary, 9)
+            })
+            .await
+            .expect("enqueue quarantine candidate");
+        sqlx::query("ALTER TABLE vala.forge_tasks DROP CONSTRAINT forge_tasks_strategy_check")
+            .execute(&admin)
+            .await
+            .expect("drop strategy check");
+        sqlx::query("UPDATE vala.forge_tasks SET strategy='promotion_v2' WHERE task_id=$1")
+            .bind(quarantined)
+            .execute(&admin)
+            .await
+            .expect("persist unknown strategy");
+
+        let unknown = tasks
+            .claim_fair(Uuid::now_v7(), limits(8), None)
+            .await
+            .expect("claim of unknown strategy")
+            .expect("unknown strategy still claims for quarantine");
+        assert_eq!(unknown.task_id, quarantined);
+        assert_eq!(
+            unknown.strategy,
+            ForgeClaimStrategy::Unknown("promotion_v2".to_owned()),
+            "an unrecognized tag is retained verbatim and never mapped to a known strategy"
+        );
+        assert_ne!(
+            unknown.strategy,
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::ScribePromotion),
+            "an unrecognized tag must never fall back to promotion"
+        );
+    }
 }

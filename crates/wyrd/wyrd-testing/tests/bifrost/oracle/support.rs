@@ -14,6 +14,7 @@ use arrow::record_batch::RecordBatch;
 use chrono::Utc;
 use opendal::Buffer;
 use parquet::arrow::ArrowWriter;
+use sha2::{Digest as _, Sha256};
 use std::sync::Arc;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef, TenantTableBinding};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
@@ -118,6 +119,12 @@ pub(crate) async fn client_from_bootstrap(
 }
 /// Persist one foreign-tenant physical row beneath the production provider union.
 ///
+/// The row is well formed in every respect except its tenancy, including the
+/// durable SHA-256 the Scribe file-list writer always publishes. That matters:
+/// the Oracle refuses a hot row whose checksum is not an identity before it
+/// signs a descriptor, so a checksumless row would fail closed for the wrong
+/// reason and never reach the tenant invariant this fixture exists to trip.
+///
 /// # Errors
 ///
 /// Returns an Arrow, Parquet, storage, tenant-SQL, or manifest persistence error.
@@ -182,8 +189,8 @@ pub(crate) async fn seed_foreign_hot_row(
     let mut conn = cluster.pg_fixture().tenant_conn_for(owner).await?;
     sqlx::query(
         "INSERT INTO vala.file_list \
-         (id,data_tenant_id,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_granularity,partition_start,node_id,writer_epoch,wal_lsn_min,wal_lsn_max,promotion_record) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'day',$10,$11,1,9001,9001,'{\"fixture\": \"oracle-foreign-tripwire\"}'::jsonb)",
+         (id,data_tenant_id,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_granularity,partition_start,node_id,file_checksum,writer_epoch,wal_lsn_min,wal_lsn_max,promotion_record) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'day',$10,$11,$12,1,9001,9001,'{\"fixture\": \"oracle-foreign-tripwire\"}'::jsonb)",
     )
     .bind(uuid::Uuid::now_v7())
     .bind(owner.as_uuid())
@@ -196,6 +203,7 @@ pub(crate) async fn seed_foreign_hot_row(
     .bind(Utc::now())
     .bind(chrono::DateTime::<Utc>::UNIX_EPOCH)
     .bind(node_id)
+    .bind(hex::encode(Sha256::digest(&parquet)))
     .execute(&mut **conn.transaction())
     .await?;
     vala_sql::queries::audit_outbox::append_audit(&mut conn, &event).await?;

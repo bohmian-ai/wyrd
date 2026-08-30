@@ -3399,7 +3399,7 @@ impl Oracle {
                 .hot_files
                 .iter()
                 .map(hot_file_descriptor)
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>, _>>()?;
             files.sort_by(|left, right| left.path().cmp(right.path()));
             assignments.record_scan(
                 &scan_id,
@@ -5042,13 +5042,18 @@ fn iceberg_file_descriptor(
 /// The row's identity and decoded checksum are what let a follower resolve the
 /// object without querying the catalog by path, and are what make the hot
 /// metadata cache key safe: two distinct objects that shared a key would return
-/// one object's footer for the other's rows. A row whose durable size or row
-/// count cannot be represented, or whose checksum is absent or not exactly 32
-/// decoded bytes, yields a descriptor that fails validation rather than a
-/// guessed identity.
+/// one object's footer for the other's rows.
+///
+/// # Errors
+/// Returns [`BifrostError::QueryExecutionFailed`] when the row's checksum is
+/// absent, not valid hex, not exactly 32 decoded bytes, or all zero, and when
+/// its durable size or row count cannot be represented. Defaulting any of these
+/// would mint a valid-looking identity — every unchecksummed object in a tenant
+/// would share the all-zero key — so the query fails here, before the
+/// descriptor is signed and before any provider, cache, or object I/O sees it.
 fn hot_file_descriptor(
     row: &vala_sql::row_types::file_list::HotFileRow,
-) -> PersistedFileDescriptor {
+) -> Result<PersistedFileDescriptor, BifrostError> {
     let event_time = crate::catalog::event_time::EventTimeStatistics::from_catalog_timestamps(
         row.min_event_time,
         row.max_event_time,
@@ -5059,16 +5064,21 @@ fn hot_file_descriptor(
         .as_deref()
         .and_then(|hex| hex::decode(hex).ok())
         .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
-        .unwrap_or_default();
-    PersistedFileDescriptor::Hot(wyrd_spec::vala::api::HotFileDescriptor {
-        path: row.file_path.clone(),
-        size_bytes: u64::try_from(row.file_size).unwrap_or_default(),
-        row_count: u64::try_from(row.row_count).unwrap_or_default(),
-        file_list_id: row.id,
-        sha256,
-        min_event_time_micros,
-        max_event_time_micros,
-    })
+        .filter(|sha256| sha256 != &[0_u8; 32])
+        .ok_or(BifrostError::QueryExecutionFailed)?;
+    Ok(PersistedFileDescriptor::Hot(
+        wyrd_spec::vala::api::HotFileDescriptor {
+            path: row.file_path.clone(),
+            size_bytes: u64::try_from(row.file_size)
+                .map_err(|_| BifrostError::QueryExecutionFailed)?,
+            row_count: u64::try_from(row.row_count)
+                .map_err(|_| BifrostError::QueryExecutionFailed)?,
+            file_list_id: row.id,
+            sha256,
+            min_event_time_micros,
+            max_event_time_micros,
+        },
+    ))
 }
 
 /// Derives the identity-bound common-plan placeholder for one pinned Scribe stream.
@@ -5612,6 +5622,77 @@ mod tests {
                 &[QuerySource::LiveTail],
             ));
         }
+    }
+
+    /// A hot file-list row with no usable checksum yields no descriptor at all.
+    ///
+    /// Defaulting the digest would mint a valid-looking identity that every
+    /// unchecksummed object in the tenant shares, and that identity is the hot
+    /// metadata cache key: two distinct objects under one key return one
+    /// object's footer for the other's rows. The refusal happens while the
+    /// assignment is being built, so nothing is signed, resolved, cached, or
+    /// opened on the strength of a guessed identity.
+    ///
+    /// # Panics
+    /// Panics when an unusable checksum, size, or row count produces a
+    /// descriptor.
+    #[test]
+    fn a_hot_row_without_a_usable_checksum_produces_no_signed_descriptor() {
+        let row = |checksum: Option<&str>| vala_sql::row_types::file_list::HotFileRow {
+            id: uuid::Uuid::now_v7(),
+            data_tenant_id: uuid::Uuid::now_v7(),
+            namespace: "vala.traces".to_owned(),
+            table_name: "spans".to_owned(),
+            file_path: "tenant/spans/a.parquet".to_owned(),
+            file_ordinal: 0,
+            file_checksum: checksum.map(ToOwned::to_owned),
+            file_size: 4_096,
+            row_count: 1,
+            min_event_time: None,
+            max_event_time: None,
+            partition_granularity: "hour".to_owned(),
+            partition_start: chrono::DateTime::from_timestamp_micros(1_787_493_600_000_000)
+                .expect("fixture partition start is representable"),
+            compacted: false,
+            committed_snapshot_id: None,
+            forge_publication_operation_id: None,
+            node_id: uuid::Uuid::now_v7(),
+            writer_epoch: 1,
+            wal_lsn_min: 1,
+            wal_lsn_max: 1,
+            created_at: chrono::DateTime::from_timestamp_micros(1_787_493_600_000_000)
+                .expect("fixture creation time is representable"),
+        };
+        let valid = "a".repeat(64);
+        let descriptor = hot_file_descriptor(&row(Some(&valid))).expect("a checksummed row signs");
+        assert!(
+            descriptor.is_valid(),
+            "a decoded 32-byte digest is a usable identity"
+        );
+
+        for unusable in [
+            None,
+            Some(""),
+            // Not hex.
+            Some("zz"),
+            // Sixteen bytes, not thirty-two.
+            Some("00112233445566778899aabbccddeeff"),
+            // Decodes cleanly to the value a default would have produced.
+            Some("0".repeat(64).as_str()),
+        ] {
+            assert!(
+                hot_file_descriptor(&row(unusable)).is_err(),
+                "{unusable:?} is not an object identity"
+            );
+        }
+
+        // A descriptor that reached the wire carrying the defaulted digest is
+        // refused by validation as well, so neither side depends on the other.
+        let mut defaulted = descriptor;
+        if let PersistedFileDescriptor::Hot(hot) = &mut defaulted {
+            hot.sha256 = [0_u8; 32];
+        }
+        assert!(!defaulted.is_valid());
     }
 
     /// The persisted source of an assignment is its descriptors' variant, and a

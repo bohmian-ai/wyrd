@@ -2537,8 +2537,8 @@ impl PersistedFileDescriptor {
     ///
     /// The minimal identity differs by source because the authorities differ: a
     /// hot object is identified by its `vala.file_list` row and the writer's
-    /// decoded SHA-256, while a pinned Iceberg object is identified by the
-    /// snapshot its manifest belongs to. Both require a canonical nonempty path
+    /// decoded SHA-256, neither of which may be the zero value, while a pinned
+    /// Iceberg object is identified by the snapshot its manifest belongs to. Both require a canonical nonempty path
     /// and a positive size, and both require an event-time pair that is either
     /// wholly absent or ordered.
     ///
@@ -2550,7 +2550,12 @@ impl PersistedFileDescriptor {
     pub fn is_valid(&self) -> bool {
         let (min, max) = match self {
             Self::Hot(hot) => {
-                if hot.file_list_id.is_nil() {
+                // An all-zero digest is what a defaulted checksum looks like,
+                // and every object that produced one would share a cache key
+                // with every other — returning one object's footer for
+                // another's rows. It is refused as an absent identity, not
+                // accepted as an unlikely one.
+                if hot.file_list_id.is_nil() || hot.sha256 == [0_u8; 32] {
                     return false;
                 }
                 (hot.min_event_time_micros, hot.max_event_time_micros)

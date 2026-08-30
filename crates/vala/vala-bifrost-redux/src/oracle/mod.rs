@@ -40,10 +40,11 @@ use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult};
 use wyrd_spec::vala::api::{
     AuditDetail, AuthMethod, BifrostQueryRequest, BifrostSecurityPhase,
     BifrostSecurityViolationKind, ClusterCapabilities, FollowerScanAssignment, NodeId,
-    PersistedFileAssignment, QueryAuditDigest, QueryBatchFrame, QueryClass, QueryExecutionMode,
-    QueryFreshness, QueryId, QuerySchemaFrame, QuerySource, QueryStreamFrame,
-    QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome, ScribeProviderCut,
-    SourceCompletion, SourceCompletionOutcome, TenantTableBinding, VisibilityMode,
+    PersistedFileAssignment, PersistedFileDescriptor, QueryAuditDigest, QueryBatchFrame,
+    QueryClass, QueryExecutionMode, QueryFreshness, QueryId, QuerySchemaFrame, QuerySource,
+    QueryStreamFrame, QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome,
+    ScribeProviderCut, SourceCompletion, SourceCompletionOutcome, TenantTableBinding,
+    VisibilityMode,
 };
 use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
 
@@ -170,6 +171,24 @@ pub struct AuthorizedQueryContext {
     pub auth_method: AuthMethod,
     /// Effective permission checked before the query entered Oracle.
     pub permission: String,
+}
+
+/// Builds one valid pinned-Iceberg descriptor for assignment-shape tests.
+///
+/// Tests that only care about which object paths an assignment carries still
+/// need a descriptor that satisfies [`PersistedFileDescriptor::is_valid`], so
+/// this fixture supplies the smallest legal identity for `path`: a positive
+/// size and snapshot, one row, and absent event-time bounds.
+#[cfg(test)]
+pub(crate) fn test_persisted_descriptor(path: &str) -> PersistedFileDescriptor {
+    PersistedFileDescriptor::Iceberg(wyrd_spec::vala::api::IcebergFileDescriptor {
+        path: path.to_owned(),
+        size_bytes: 1,
+        row_count: 1,
+        snapshot_id: 1,
+        min_event_time_micros: None,
+        max_event_time_micros: None,
+    })
 }
 
 /// Classifies only parent-contract-eligible live-tail loss as degraded.
@@ -1509,7 +1528,7 @@ impl CutAssignments {
         binding: &TenantTableBinding,
         schema_fingerprint: &str,
         physical_schema: &Schema,
-        files: Vec<String>,
+        files: Vec<PersistedFileDescriptor>,
     ) {
         self.oracle_assignments.insert(
             scan_id.to_owned(),
@@ -3287,9 +3306,9 @@ impl Oracle {
             let mut files = cut
                 .iceberg_files
                 .iter()
-                .map(|file| file.file_path.clone())
+                .map(|file| iceberg_file_descriptor(file, cut.snapshot_id))
                 .collect::<Vec<_>>();
-            files.sort();
+            files.sort_by(|left, right| left.path().cmp(right.path()));
             assignments.record_scan(
                 &scan_id,
                 &table_name,
@@ -3306,9 +3325,9 @@ impl Oracle {
             let mut files = cut
                 .hot_files
                 .iter()
-                .map(|file| file.file_path.clone())
+                .map(hot_file_descriptor)
                 .collect::<Vec<_>>();
-            files.sort();
+            files.sort_by(|left, right| left.path().cmp(right.path()));
             assignments.record_scan(
                 &scan_id,
                 &table_name,
@@ -4858,8 +4877,8 @@ fn partition_oracle_assignments(
                 .map(|worker| worker.node_id.as_uuid().as_bytes().to_vec())
                 .collect::<Vec<_>>(),
             OraclePartitionStrategy::default(),
-            |path| path.len() as u64,
-            |path| path.as_bytes().to_vec(),
+            |descriptor| descriptor.size_bytes(),
+            |descriptor| descriptor.path().as_bytes().to_vec(),
         );
         for (partition, files) in partitions.iter_mut().zip(specialized_files) {
             let mut specialized = assignment.clone();
@@ -4868,6 +4887,63 @@ fn partition_oracle_assignments(
         }
     }
     partitions
+}
+
+/// Projects one pinned Iceberg manifest entry into the descriptor a follower is
+/// signed to read.
+///
+/// The pinned snapshot is the object's publication authority, so a cut with no
+/// snapshot yields zero — a value descriptor validation refuses — rather than
+/// inventing one. Unusable event-time statistics reach the wire as the absent
+/// pair, which is the descriptor's only representation of "retain this file".
+fn iceberg_file_descriptor(
+    file: &crate::catalog::PinnedIcebergFile,
+    snapshot_id: Option<i64>,
+) -> PersistedFileDescriptor {
+    let (min_event_time_micros, max_event_time_micros) = file.event_time.descriptor_pair();
+    PersistedFileDescriptor::Iceberg(wyrd_spec::vala::api::IcebergFileDescriptor {
+        path: file.file_path.clone(),
+        size_bytes: file.file_size,
+        row_count: file.row_count,
+        snapshot_id: snapshot_id.unwrap_or_default(),
+        min_event_time_micros,
+        max_event_time_micros,
+    })
+}
+
+/// Projects one unresolved `vala.file_list` row into the descriptor a follower
+/// is signed to read.
+///
+/// The row's identity and decoded checksum are what let a follower resolve the
+/// object without querying the catalog by path, and are what make the hot
+/// metadata cache key safe: two distinct objects that shared a key would return
+/// one object's footer for the other's rows. A row whose durable size or row
+/// count cannot be represented, or whose checksum is absent or not exactly 32
+/// decoded bytes, yields a descriptor that fails validation rather than a
+/// guessed identity.
+fn hot_file_descriptor(
+    row: &vala_sql::row_types::file_list::HotFileRow,
+) -> PersistedFileDescriptor {
+    let event_time = crate::catalog::event_time::EventTimeStatistics::from_catalog_timestamps(
+        row.min_event_time,
+        row.max_event_time,
+    );
+    let (min_event_time_micros, max_event_time_micros) = event_time.descriptor_pair();
+    let sha256 = row
+        .file_checksum
+        .as_deref()
+        .and_then(|hex| hex::decode(hex).ok())
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
+        .unwrap_or_default();
+    PersistedFileDescriptor::Hot(wyrd_spec::vala::api::HotFileDescriptor {
+        path: row.file_path.clone(),
+        size_bytes: u64::try_from(row.file_size).unwrap_or_default(),
+        row_count: u64::try_from(row.row_count).unwrap_or_default(),
+        file_list_id: row.id,
+        sha256,
+        min_event_time_micros,
+        max_event_time_micros,
+    })
 }
 
 /// Derives the identity-bound common-plan placeholder for one pinned Scribe stream.
@@ -5049,7 +5125,10 @@ mod tests {
             scan_id: scan_id.to_owned(),
             binding: test_follower_binding(scan_id),
             persisted: PersistedFileAssignment {
-                files: files.iter().map(|file| (*file).to_owned()).collect(),
+                files: files
+                    .iter()
+                    .map(|file| test_persisted_descriptor(file))
+                    .collect(),
             },
             scribe_provider_cut: None,
             schema_fingerprint: format!("schema-{scan_id}"),
@@ -5185,9 +5264,12 @@ mod tests {
                 .map(|partition| partition[scan_ordinal].persisted.files.clone())
                 .collect::<Vec<_>>();
             let mut union = worker_files.iter().flatten().cloned().collect::<Vec<_>>();
-            union.sort();
+            union.sort_by(|left, right| left.path().cmp(right.path()));
             assert_eq!(union, original.persisted.files);
-            let unique = union.iter().collect::<HashSet<_>>();
+            let unique = union
+                .iter()
+                .map(PersistedFileDescriptor::path)
+                .collect::<HashSet<_>>();
             assert_eq!(unique.len(), union.len(), "no file is duplicated");
             for left in 0..worker_files.len() {
                 for right in (left + 1)..worker_files.len() {

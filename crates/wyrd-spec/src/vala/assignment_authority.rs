@@ -627,14 +627,13 @@ mod tests {
             assert_ne!(baseline, digest_with(&mutated), "{field} must be bound");
         }
 
-        let iceberg_mutation =
-            |mutate: fn(&mut crate::vala::api::IcebergFileDescriptor)| {
-                let mut descriptor = normative_iceberg_descriptor();
-                if let PersistedFileDescriptor::Iceberg(iceberg) = &mut descriptor {
-                    mutate(iceberg);
-                }
-                vec![descriptor]
-            };
+        let iceberg_mutation = |mutate: fn(&mut crate::vala::api::IcebergFileDescriptor)| {
+            let mut descriptor = normative_iceberg_descriptor();
+            if let PersistedFileDescriptor::Iceberg(iceberg) = &mut descriptor {
+                mutate(iceberg);
+            }
+            vec![descriptor]
+        };
         let iceberg_baseline = digest_with(std::slice::from_ref(&normative_iceberg_descriptor()));
         for (field, mutated) in [
             ("size_bytes", iceberg_mutation(|file| file.size_bytes += 1)),

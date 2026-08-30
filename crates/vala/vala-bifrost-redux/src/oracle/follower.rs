@@ -24,8 +24,8 @@ use prost::Message;
 use thiserror::Error;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
-    ClusterRole, ExecuteFragmentRequest, FollowerScanAssignment, OracleRoleFence, ReservationId,
-    TenantTableBinding,
+    ClusterRole, ExecuteFragmentRequest, FollowerScanAssignment, OracleRoleFence,
+    PersistedFileDescriptor, ReservationId, TenantTableBinding,
 };
 use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
 
@@ -387,15 +387,16 @@ impl FollowerSourceResolver for OracleCatalogResolver {
             .persisted
             .files
             .iter()
-            .map(|file| {
-                let table_relative = file
+            .map(|descriptor| {
+                let path = descriptor.path();
+                let table_relative = path
                     .strip_prefix(&catalog_binding.object_prefix)
                     .and_then(|suffix| suffix.strip_prefix('/'))
                     .ok_or_else(|| "authenticated Oracle assignment binding failed".to_owned())?
                     .to_owned();
                 self.catalog
-                    .object_location(&catalog_binding, file)
-                    .map(|location| (file.clone(), table_relative, location))
+                    .object_location(&catalog_binding, path)
+                    .map(|location| (descriptor.clone(), table_relative, location))
                     .map_err(|_| "authenticated Oracle assignment location failed".to_owned())
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -459,7 +460,20 @@ impl FollowerSourceResolver for OracleCatalogResolver {
             .scan(session, Some(&indices), &pushdown, None)
             .await
             .map_err(|_| "authenticated Oracle physical scan failed".to_owned())?;
-        let plan = restrict_plan_to_assigned_files(plan, &assigned_locations)?;
+        // The descriptor is retained on each assigned location for identity-bearing
+        // reads; plan restriction itself only needs the canonical path, the
+        // table-relative alias, and the resolved object location.
+        let restriction = assigned_locations
+            .iter()
+            .map(|(descriptor, table_relative, location)| {
+                (
+                    descriptor.path().to_owned(),
+                    table_relative.clone(),
+                    location.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let plan = restrict_plan_to_assigned_files(plan, &restriction)?;
         let plan = super::exec::project_plan_by_name(plan, &assignment.required_columns)
             .map_err(|_| "authenticated Oracle closure normalization failed".to_owned())?;
         Ok(ResolvedFollowerSource { plan, full_schema })
@@ -1307,9 +1321,11 @@ where
     }
 
     /// Requires canonical non-empty object locations with no duplicates.
-    fn valid_persisted_files(files: &[String]) -> bool {
-        files.iter().all(|file| !file.trim().is_empty())
-            && files.windows(2).all(|pair| pair[0] < pair[1])
+    fn valid_persisted_files(files: &[PersistedFileDescriptor]) -> bool {
+        files
+            .iter()
+            .all(|file| file.is_valid() && !file.path().trim().is_empty())
+            && files.windows(2).all(|pair| pair[0].path() < pair[1].path())
     }
 
     /// Walks every child of follower-permitted native operators and leaf extensions.
@@ -1734,7 +1750,9 @@ pub(crate) mod tests {
                     scan_id: "scan".to_owned(),
                     binding: binding.clone(),
                     persisted: PersistedFileAssignment {
-                        files: vec!["s3://bucket/file.parquet".to_owned()],
+                        files: vec![crate::oracle::test_persisted_descriptor(
+                            "s3://bucket/file.parquet",
+                        )],
                     },
                     scribe_provider_cut: None,
                     schema_fingerprint: fingerprint,
@@ -1884,7 +1902,9 @@ pub(crate) mod tests {
             },
             persisted: PersistedFileAssignment {
                 files: (0..files)
-                    .map(|index| format!("file-{index}.parquet"))
+                    .map(|index| {
+                        crate::oracle::test_persisted_descriptor(&format!("file-{index}.parquet"))
+                    })
                     .collect(),
             },
             scribe_provider_cut: cut.then(self::cut),

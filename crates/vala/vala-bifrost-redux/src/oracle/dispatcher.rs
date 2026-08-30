@@ -3323,7 +3323,9 @@ mod tests {
             PersistedFileAssignment { files: Vec::new() }
         } else {
             PersistedFileAssignment {
-                files: vec!["dispatcher-test-file-0.parquet".to_owned()],
+                files: vec![crate::oracle::test_persisted_descriptor(
+                    "dispatcher-test-file-0.parquet",
+                )],
             }
         };
         let assignments = vec![FollowerScanAssignment {
@@ -4334,10 +4336,9 @@ mod tests {
                 request.assignments[0].required_columns = vec!["tampered_column".to_owned()];
             }),
             Box::new(|request| {
-                request.assignments[0]
-                    .persisted
-                    .files
-                    .push("s3://bucket/tampered.parquet".to_owned());
+                request.assignments[0].persisted.files.push(
+                    crate::oracle::test_persisted_descriptor("s3://bucket/tampered.parquet"),
+                );
             }),
             Box::new(|request| {
                 request.assignments[0].schema_fingerprint = "f".repeat(64);

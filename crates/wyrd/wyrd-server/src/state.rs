@@ -1980,6 +1980,17 @@ impl AppState {
         self.bifrost.resources()
     }
 
+    /// Borrow this node's one Bifrost storage owner for test-tier fixtures.
+    ///
+    /// Exposed so a journey can assert node identity directly: co-located roles
+    /// must observe one pointer, and two simulated nodes must not, even when
+    /// they share the same test backend.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn bifrost_storage(&self) -> Option<&Arc<vala_bifrost_redux::storage::BifrostStorage>> {
+        self.bifrost.bifrost_storage()
+    }
+
     /// Borrow the Oracle private peer runtime for test-tier transport fixtures.
     #[cfg(feature = "test-support")]
     #[must_use]

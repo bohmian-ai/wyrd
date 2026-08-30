@@ -73,6 +73,7 @@ mod ownership;
 mod participant_cut;
 pub mod peer;
 mod planner;
+pub(crate) mod pruning;
 mod query_stream;
 mod running;
 mod spill;

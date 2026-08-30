@@ -42,6 +42,7 @@ pub mod trace;
 
 pub use audit_detail::{
     AuditDetail, AuditDetailValueError, BatchId, ForgeIcebergRewritePhase, ForgeOrphanGcPhase,
+    ForgePromotedFile, ForgePromotedFileSetDigest, ForgeScribePromotionPhase,
     ForgeSnapshotExpirePhase, ScopeHash, StoragePath, audit_detail_canonical_json,
 };
 pub use correlation::{CorrelationColumns, CorrelationContext};

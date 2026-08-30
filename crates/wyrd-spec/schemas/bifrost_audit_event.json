@@ -418,6 +418,77 @@
           }
         },
         {
+          "description": "A Forge Scribe-promotion operation and its Iceberg catalog boundary.\n\nPromotion appends already-published hot objects unchanged, so the row records exactly which `file_list` rows and object paths moved, the snapshot the append started from, the snapshot it produced when known, and the digest binding that ordered file set to this operation.",
+          "type": "object",
+          "required": [
+            "base_snapshot_id",
+            "group",
+            "input_file_ids",
+            "input_paths",
+            "kind",
+            "operation_id",
+            "phase",
+            "promoted_file_set_digest"
+          ],
+          "properties": {
+            "base_snapshot_id": {
+              "description": "Snapshot observed before the promotion append.",
+              "type": "integer",
+              "format": "int64"
+            },
+            "committed_snapshot_id": {
+              "description": "Snapshot returned by a proven promotion commit, when known.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            },
+            "group": {
+              "description": "Canonical tenant/table resource identity.",
+              "type": "string"
+            },
+            "input_file_ids": {
+              "description": "Exact ordered `file_list` rows promoted by the operation.",
+              "type": "array",
+              "items": {
+                "type": "string",
+                "format": "uuid"
+              }
+            },
+            "input_paths": {
+              "description": "Exact ordered logical object paths promoted by the operation.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "forge_scribe_promotion"
+              ]
+            },
+            "operation_id": {
+              "description": "Deterministic identifier shared by prepared and terminal rows.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "phase": {
+              "description": "Durable phase represented by this audit row.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ForgeScribePromotionPhase"
+                }
+              ]
+            },
+            "promoted_file_set_digest": {
+              "description": "Digest binding the ordered promoted file set to this operation.",
+              "type": "string"
+            }
+          }
+        },
+        {
           "description": "A Forge snapshot-expiry operation and its Iceberg metadata boundary.",
           "type": "object",
           "required": [
@@ -1449,6 +1520,39 @@
           "type": "string",
           "enum": [
             "recovered"
+          ]
+        }
+      ]
+    },
+    "ForgeScribePromotionPhase": {
+      "description": "Durable phase recorded for a Forge Scribe-promotion operation.",
+      "oneOf": [
+        {
+          "description": "The exact promoted file set was fixed before the catalog append.",
+          "type": "string",
+          "enum": [
+            "prepared"
+          ]
+        },
+        {
+          "description": "The catalog append completed and returned a promotion snapshot.",
+          "type": "string",
+          "enum": [
+            "committed"
+          ]
+        },
+        {
+          "description": "Reconciliation proved a previously uncertain append had completed.",
+          "type": "string",
+          "enum": [
+            "recovered"
+          ]
+        },
+        {
+          "description": "Reconciliation proved the prepared append was not committed.",
+          "type": "string",
+          "enum": [
+            "reset"
           ]
         }
       ]

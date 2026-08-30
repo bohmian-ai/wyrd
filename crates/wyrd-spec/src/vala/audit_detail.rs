@@ -39,6 +39,12 @@ pub enum AuditDetailValueError {
         /// The audit-detail field being validated.
         field: &'static str,
     },
+    /// The value does not match the closed canonical form for its field.
+    #[error("{field} is not in its canonical form")]
+    Malformed {
+        /// The audit-detail field being validated.
+        field: &'static str,
+    },
     /// Related audit fields violate a closed contract invariant.
     #[error("audit detail fields violate the {invariant} invariant")]
     InvalidCombination {
@@ -133,6 +139,185 @@ audit_detail_value!(
     "query_audit_digest",
     "Stable non-secret digest used by a Bifrost query audit decision."
 );
+
+/// Domain separator prefixed to every Scribe-promotion digest preimage.
+///
+/// It binds the digest to this exact algorithm and field order so a byte
+/// stream produced for any other Wyrd purpose can never collide with a
+/// promoted-file-set identity.
+const SCRIBE_PROMOTION_DIGEST_DOMAIN: &str = "wyrd.forge.scribe-promotion.v1";
+
+/// Stable, non-secret digest identifying the exact ordered file set promoted by
+/// one Forge Scribe-promotion operation.
+///
+/// The only representable form is the literal `sha256:` prefix followed by
+/// exactly 64 lowercase hexadecimal characters. Prepared and terminal audit
+/// rows carry the same value, so a reader can prove that a committed promotion
+/// moved precisely the file set that was prepared.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(transparent)]
+pub struct ForgePromotedFileSetDigest(
+    /// Canonical `sha256:`-prefixed lowercase hexadecimal digest.
+    String,
+);
+
+impl ForgePromotedFileSetDigest {
+    /// Byte length of the canonical `sha256:<64 hex>` representation.
+    const CANONICAL_LEN: usize = 7 + 64;
+
+    /// Accepts an already-formed digest in its exact canonical form.
+    ///
+    /// No normalization is applied: an uppercase, unprefixed, truncated, or
+    /// differently labelled value is a caller error rather than something to
+    /// repair, because a repaired digest would silently claim an identity the
+    /// caller never computed.
+    ///
+    /// # Errors
+    /// Returns [`AuditDetailValueError::Malformed`] when the value is not
+    /// `sha256:` followed by 64 lowercase hexadecimal characters.
+    pub fn new(value: impl Into<String>) -> Result<Self, AuditDetailValueError> {
+        let value = value.into();
+        let Some(body) = value.strip_prefix("sha256:") else {
+            return Err(AuditDetailValueError::Malformed {
+                field: "promoted_file_set_digest",
+            });
+        };
+        if value.len() != Self::CANONICAL_LEN
+            || !body
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(AuditDetailValueError::Malformed {
+                field: "promoted_file_set_digest",
+            });
+        }
+        Ok(Self(value))
+    }
+
+    /// Computes the digest over one ordered promoted-file set.
+    ///
+    /// The preimage is the domain separator followed, in the caller's promoted
+    /// order, by each file's lowercase hyphenated file-list UUID, canonical
+    /// logical path, and normalized checksum. Every field is prefixed by its
+    /// unsigned 64-bit big-endian UTF-8 byte length so no field boundary can be
+    /// shifted without changing the digest, and the whole stream is hashed with
+    /// SHA-256. Order is significant: the promoted order is part of the
+    /// identity, so callers must not sort here.
+    #[must_use]
+    pub fn compute(files: &[ForgePromotedFile]) -> Self {
+        use sha2::Digest as _;
+
+        fn framed(hasher: &mut sha2::Sha256, field: &str) {
+            hasher.update((field.len() as u64).to_be_bytes());
+            hasher.update(field.as_bytes());
+        }
+
+        let mut hasher = sha2::Sha256::new();
+        framed(&mut hasher, SCRIBE_PROMOTION_DIGEST_DOMAIN);
+        for file in files {
+            framed(&mut hasher, &file.file_id.hyphenated().to_string());
+            framed(&mut hasher, file.path.as_str());
+            framed(&mut hasher, &file.checksum);
+        }
+        Self(format!("sha256:{}", hex::encode(hasher.finalize())))
+    }
+
+    /// Borrows the canonical digest text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ForgePromotedFileSetDigest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<ForgePromotedFileSetDigest> for String {
+    fn from(value: ForgePromotedFileSetDigest) -> Self {
+        value.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ForgePromotedFileSetDigest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// One promoted hot object contributing a tuple to the promoted-file-set digest.
+///
+/// This is a pure domain value: it normalizes and validates its own fields at
+/// construction so [`ForgePromotedFileSetDigest::compute`] can hash them
+/// without re-deciding what "normalized" means. It carries no row payload,
+/// SQL, credential, or secret.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ForgePromotedFile {
+    /// Durable `file_list` identity of the promoted hot object.
+    file_id: uuid::Uuid,
+    /// Canonical logical path of the promoted object.
+    path: StoragePath,
+    /// Normalized lowercase checksum recorded for the promoted object.
+    checksum: String,
+}
+
+impl ForgePromotedFile {
+    /// Constructs one validated promoted-file tuple.
+    ///
+    /// The checksum is normalized by trimming surrounding whitespace and
+    /// lowercasing ASCII, because publication and revalidation read it from
+    /// different producers and the digest must not depend on which one wrote
+    /// it. The path is already canonical by [`StoragePath`]'s own contract.
+    ///
+    /// # Errors
+    /// Returns [`AuditDetailValueError::Empty`] when the checksum is empty
+    /// after normalization and [`AuditDetailValueError::ControlCharacter`] when
+    /// it contains a control character.
+    pub fn new(
+        file_id: uuid::Uuid,
+        path: StoragePath,
+        checksum: impl Into<String>,
+    ) -> Result<Self, AuditDetailValueError> {
+        let checksum = checksum.into();
+        let checksum = checksum.trim().to_ascii_lowercase();
+        if checksum.is_empty() {
+            return Err(AuditDetailValueError::Empty { field: "checksum" });
+        }
+        if checksum.chars().any(char::is_control) {
+            return Err(AuditDetailValueError::ControlCharacter { field: "checksum" });
+        }
+        Ok(Self {
+            file_id,
+            path,
+            checksum,
+        })
+    }
+
+    /// Returns the durable `file_list` identity.
+    #[must_use]
+    pub const fn file_id(&self) -> uuid::Uuid {
+        self.file_id
+    }
+
+    /// Borrows the canonical logical path.
+    #[must_use]
+    pub const fn path(&self) -> &StoragePath {
+        &self.path
+    }
+
+    /// Borrows the normalized checksum.
+    #[must_use]
+    pub fn checksum(&self) -> &str {
+        &self.checksum
+    }
+}
 
 /// Closed execution topology recorded by a Bifrost read decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -382,6 +567,30 @@ pub enum AuditDetail {
         /// Exact ordered rewritten object paths added by the Iceberg action.
         output_paths: Vec<StoragePath>,
     },
+    /// A Forge Scribe-promotion operation and its Iceberg catalog boundary.
+    ///
+    /// Promotion appends already-published hot objects unchanged, so the row
+    /// records exactly which `file_list` rows and object paths moved, the
+    /// snapshot the append started from, the snapshot it produced when known,
+    /// and the digest binding that ordered file set to this operation.
+    ForgeScribePromotion {
+        /// Deterministic identifier shared by prepared and terminal rows.
+        operation_id: uuid::Uuid,
+        /// Durable phase represented by this audit row.
+        phase: ForgeScribePromotionPhase,
+        /// Canonical tenant/table resource identity.
+        group: String,
+        /// Snapshot observed before the promotion append.
+        base_snapshot_id: i64,
+        /// Snapshot returned by a proven promotion commit, when known.
+        committed_snapshot_id: Option<i64>,
+        /// Exact ordered `file_list` rows promoted by the operation.
+        input_file_ids: Vec<uuid::Uuid>,
+        /// Exact ordered logical object paths promoted by the operation.
+        input_paths: Vec<StoragePath>,
+        /// Digest binding the ordered promoted file set to this operation.
+        promoted_file_set_digest: ForgePromotedFileSetDigest,
+    },
     /// A Forge snapshot-expiry operation and its Iceberg metadata boundary.
     ForgeSnapshotExpire {
         /// Deterministic identifier shared by prepared and terminal rows.
@@ -592,6 +801,21 @@ pub enum ForgeIcebergRewritePhase {
     /// Reconciliation proved a previously uncertain commit completed.
     Recovered,
     /// Reconciliation proved the prepared operation was not committed.
+    Reset,
+}
+
+/// Durable phase recorded for a Forge Scribe-promotion operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ForgeScribePromotionPhase {
+    /// The exact promoted file set was fixed before the catalog append.
+    Prepared,
+    /// The catalog append completed and returned a promotion snapshot.
+    Committed,
+    /// Reconciliation proved a previously uncertain append had completed.
+    Recovered,
+    /// Reconciliation proved the prepared append was not committed.
     Reset,
 }
 
@@ -976,6 +1200,182 @@ mod tests {
         assert_eq!(
             serde_json::to_value(present).expect("serialize present detail")["detail"]["kind"],
             "storage"
+        );
+    }
+
+    /// The promoted-file-set digest newtype admits only the locked canonical
+    /// form: the literal `sha256:` prefix followed by exactly 64 lowercase
+    /// hexadecimal characters.
+    ///
+    /// Every other shape a caller could plausibly produce — an uppercase
+    /// digest, a bare hex digest, a different algorithm label, a truncated or
+    /// over-long body, or a non-hexadecimal character — must be refused at the
+    /// constructor so no audit row can carry an unverifiable promotion
+    /// identity.
+    #[test]
+    fn forge_promoted_file_set_digest_accepts_only_canonical_sha256() {
+        let canonical = format!("sha256:{}", "ab12cd34".repeat(8));
+        assert_eq!(canonical.len(), 7 + 64);
+        let digest = super::ForgePromotedFileSetDigest::new(&canonical).expect("canonical digest");
+        assert_eq!(digest.as_str(), canonical);
+
+        for rejected in [
+            canonical.to_ascii_uppercase(),
+            format!("SHA256:{}", "ab12cd34".repeat(8)),
+            "ab12cd34".repeat(8),
+            format!("sha512:{}", "ab12cd34".repeat(8)),
+            format!("sha256:{}", "ab12cd34".repeat(7)),
+            format!("sha256:{}0", "ab12cd34".repeat(8)),
+            format!("sha256:{}zz", "ab12cd34".repeat(7) + "ab12cd"),
+            "sha256:".to_owned(),
+            String::new(),
+        ] {
+            assert!(
+                super::ForgePromotedFileSetDigest::new(&rejected).is_err(),
+                "digest newtype accepted non-canonical value `{rejected}`"
+            );
+        }
+    }
+
+    /// The digest preimage is exactly the locked byte stream: the
+    /// `wyrd.forge.scribe-promotion.v1` domain separator followed, in promoted
+    /// order, by each tuple's lowercase hyphenated file-list UUID, canonical
+    /// logical path, and normalized checksum, every field prefixed by its
+    /// unsigned 64-bit big-endian UTF-8 byte length.
+    ///
+    /// The independent recomputation below pins the separator, the field
+    /// order, and the framing. The mutations then prove sensitivity: reordering
+    /// the tuples changes the digest, and shifting one byte across a field
+    /// boundary changes it too, which unframed concatenation could not detect.
+    #[test]
+    fn forge_promoted_file_set_digest_is_ordered_length_framed_and_domain_separated() {
+        use sha2::Digest as _;
+
+        fn expected(files: &[super::ForgePromotedFile]) -> String {
+            fn framed(hasher: &mut sha2::Sha256, field: &str) {
+                hasher.update((field.len() as u64).to_be_bytes());
+                hasher.update(field.as_bytes());
+            }
+            let mut hasher = sha2::Sha256::new();
+            framed(&mut hasher, "wyrd.forge.scribe-promotion.v1");
+            for file in files {
+                framed(&mut hasher, &file.file_id().hyphenated().to_string());
+                framed(&mut hasher, file.path().as_str());
+                framed(&mut hasher, file.checksum());
+            }
+            format!("sha256:{}", hex::encode(hasher.finalize()))
+        }
+
+        let first = super::ForgePromotedFile::new(
+            uuid::Uuid::from_u128(1),
+            StoragePath::new("tenant/table/data/a.parquet").expect("path"),
+            "AB12",
+        )
+        .expect("first promoted file");
+        let second = super::ForgePromotedFile::new(
+            uuid::Uuid::from_u128(2),
+            StoragePath::new("tenant/table/data/b.parquet").expect("path"),
+            "cd34",
+        )
+        .expect("second promoted file");
+
+        assert_eq!(first.checksum(), "ab12", "checksum must be normalized");
+
+        let ordered = [first.clone(), second.clone()];
+        let digest = super::ForgePromotedFileSetDigest::compute(&ordered);
+        assert_eq!(digest.as_str(), expected(&ordered));
+
+        let reversed = [second, first.clone()];
+        assert_ne!(
+            super::ForgePromotedFileSetDigest::compute(&reversed).as_str(),
+            digest.as_str(),
+            "digest must depend on promoted order"
+        );
+
+        let shifted = [
+            first,
+            super::ForgePromotedFile::new(
+                uuid::Uuid::from_u128(2),
+                StoragePath::new("tenant/table/data/b.parquetc").expect("path"),
+                "d34",
+            )
+            .expect("boundary-shifted promoted file"),
+        ];
+        assert_ne!(
+            super::ForgePromotedFileSetDigest::compute(&shifted).as_str(),
+            super::ForgePromotedFileSetDigest::compute(&ordered).as_str(),
+            "length framing must separate adjacent fields"
+        );
+    }
+
+    /// The Scribe-promotion audit detail serializes under the locked
+    /// `forge_scribe_promotion` kind, carries exactly the eight locked fields,
+    /// round-trips without loss, and refuses an unknown phase.
+    #[test]
+    fn forge_scribe_promotion_audit_detail_round_trips_exactly() {
+        let promoted = [super::ForgePromotedFile::new(
+            uuid::Uuid::from_u128(7),
+            StoragePath::new("tenant/table/data/a.parquet").expect("path"),
+            "ab12",
+        )
+        .expect("promoted file")];
+        let detail = AuditDetail::ForgeScribePromotion {
+            operation_id: uuid::Uuid::from_u128(11),
+            phase: super::ForgeScribePromotionPhase::Committed,
+            group: "tenant/00000000-0000-0000-0000-000000000001/table/events".to_owned(),
+            base_snapshot_id: 41,
+            committed_snapshot_id: Some(42),
+            input_file_ids: vec![uuid::Uuid::from_u128(7)],
+            input_paths: vec![StoragePath::new("tenant/table/data/a.parquet").expect("path")],
+            promoted_file_set_digest: super::ForgePromotedFileSetDigest::compute(&promoted),
+        };
+        detail.validate().expect("promotion detail is valid");
+
+        let value = serde_json::to_value(&detail).expect("serialize promotion detail");
+        assert_eq!(value["kind"], "forge_scribe_promotion");
+        assert_eq!(value["phase"], "committed");
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .expect("object detail")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "base_snapshot_id",
+                "committed_snapshot_id",
+                "group",
+                "input_file_ids",
+                "input_paths",
+                "kind",
+                "operation_id",
+                "phase",
+                "promoted_file_set_digest",
+            ]
+        );
+
+        let round_tripped: AuditDetail =
+            serde_json::from_value(value).expect("deserialize promotion detail");
+        assert_eq!(round_tripped, detail);
+        assert!(!audit_detail_canonical_json(&detail).is_empty());
+
+        for phase in ["prepared", "committed", "recovered", "reset"] {
+            let parsed: super::ForgeScribePromotionPhase =
+                serde_json::from_value(serde_json::Value::String(phase.to_owned()))
+                    .expect("closed phase parses");
+            assert_eq!(
+                serde_json::to_value(parsed).expect("phase serializes"),
+                serde_json::Value::String(phase.to_owned())
+            );
+        }
+        assert!(
+            serde_json::from_value::<super::ForgeScribePromotionPhase>(serde_json::Value::String(
+                "settled".to_owned()
+            ))
+            .is_err(),
+            "phase set must stay closed"
         );
     }
 }

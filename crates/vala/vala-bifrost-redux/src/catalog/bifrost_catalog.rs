@@ -15,13 +15,15 @@ use wyrd_spec::vala::WYRD_EVENT_TIME;
 use wyrd_spec::vala::api::{
     AuditEvent, BifrostTableDescription, BifrostTableEntry, PhysicalLayoutWire,
 };
-use wyrd_storage::settings::BackendConfig;
 
 use crate::catalog::error::BifrostCatalogError;
 use crate::catalog::event_time::{EventTimeBoundsDefect, EventTimeStatistics};
 use crate::catalog::iceberg_sql;
 use crate::catalog::layout::PhysicalLayout;
-use crate::catalog::storage::{iceberg_storage_factory, warehouse_uri};
+use iceberg::io::StorageFactory;
+
+use crate::catalog::iceberg_storage::BifrostIcebergStorageFactory;
+use crate::catalog::storage::{iceberg_catalog_properties, warehouse_uri};
 use crate::catalog::wire::{
     entry_from_row, fields_from_stored_schema, layout_wire_from_row, reject_reserved_field_names,
 };
@@ -29,6 +31,7 @@ use crate::catalog::{TableRef, TenantTableBinding};
 use crate::namespaces::BifrostNamespace;
 use crate::provider::ReduxTableProvider;
 use crate::schema::{SchemaFingerprint, with_managed_columns};
+use crate::storage::BifrostStorage;
 use crate::tables::{BuiltinTableDefinition, builtin_table};
 
 /// Hashes an ordered metadata identity projection for immutable cut auditing.
@@ -497,18 +500,29 @@ impl BifrostCatalog {
     }
     /// Build the Redux Iceberg SQL catalog and tenant-scoped control-plane handle.
     ///
+    /// The catalog does not resolve its own backend client. It is handed this
+    /// node's one storage owner and binds Iceberg to it, so catalog metadata
+    /// I/O, hot-footer reads, and publication all reach the same backend under
+    /// the same governance rather than through three independently configured
+    /// clients that merely happen to agree.
+    ///
     /// # Errors
     /// Returns a catalog error when the Iceberg SQL catalog cannot be loaded.
     pub async fn new(
         catalog_uri: &str,
-        backend: &BackendConfig,
+        storage: Arc<BifrostStorage>,
         postgres: ValaPostgres,
     ) -> Result<Self, BifrostCatalogError> {
-        let (storage_factory, storage_properties) = iceberg_storage_factory(backend);
+        let backend = storage.handle().backend_config();
+        let warehouse = warehouse_uri(backend);
+        let storage_properties = iceberg_catalog_properties(backend);
+        let storage_factory = Arc::new(BifrostIcebergStorageFactory::new(
+            Arc::clone(&storage),
+            &warehouse,
+        )) as Arc<dyn StorageFactory>;
         let file_io = FileIOBuilder::new(Arc::clone(&storage_factory))
             .with_props(storage_properties.clone())
             .build();
-        let warehouse = warehouse_uri(backend);
         let catalog = iceberg_sql::build_catalog(
             catalog_uri,
             &warehouse,
@@ -1348,6 +1362,8 @@ mod production_pin_tests {
     use secrecy::ExposeSecret as _;
     use wyrd_spec::vala::WYRD_EVENT_TIME;
 
+    use std::sync::Arc;
+
     use super::BifrostCatalog;
     use crate::catalog::TableRef;
     use crate::catalog::event_time::{EventTimeBoundsDefect, EventTimeStatistics};
@@ -1363,6 +1379,32 @@ mod production_pin_tests {
         upper: Option<iceberg::spec::Datum>,
         /// Statistics the pinned cut must derive from that manifest evidence.
         expected: EventTimeStatistics,
+    }
+
+    /// Builds a storage owner over one local warehouse root.
+    ///
+    /// The catalog now runs its Iceberg I/O through the node's storage owner,
+    /// so a catalog fixture must compose the same owner production does rather
+    /// than hand the catalog a bare backend description.
+    ///
+    /// # Panics
+    /// Panics when the signer, resource observation, or storage policy the
+    /// fixture asks for is invalid.
+    fn local_storage_owner(root: &std::path::Path) -> Arc<crate::storage::BifrostStorage> {
+        let signer = wyrd_storage::signer::BackendSigner::Local(
+            wyrd_storage::local::LocalSigner::new(root.to_path_buf())
+                .expect("fixture local signer"),
+        );
+        Arc::new(crate::storage::BifrostStorage::new(
+            Arc::new(wyrd_storage::handle::StorageHandle::new(signer)),
+            crate::storage::BifrostStoragePolicy::resolve(
+                crate::storage::BifrostStorageConfig::default(),
+                2 * 1024 * 1024 * 1024,
+                false,
+            )
+            .expect("the fixture storage policy is valid"),
+            None,
+        ))
     }
 
     /// Builds the manifest evidence table one committed cut must reproduce.
@@ -1482,9 +1524,7 @@ mod production_pin_tests {
             let warehouse = tempfile::tempdir().expect("warehouse directory");
             let catalog = BifrostCatalog::new(
                 fixture.catalog_dsn().expose_secret(),
-                &wyrd_storage::settings::BackendConfig::Local {
-                    root: warehouse.path().to_path_buf(),
-                },
+                local_storage_owner(warehouse.path()),
                 fixture.vala_postgres().clone(),
             )
             .await
@@ -1596,9 +1636,7 @@ mod production_pin_tests {
             let warehouse = tempfile::tempdir().expect("warehouse directory");
             let catalog = BifrostCatalog::new(
                 fixture.catalog_dsn().expose_secret(),
-                &wyrd_storage::settings::BackendConfig::Local {
-                    root: warehouse.path().to_path_buf(),
-                },
+                local_storage_owner(warehouse.path()),
                 fixture.vala_postgres().clone(),
             )
             .await

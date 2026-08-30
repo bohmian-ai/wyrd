@@ -48,7 +48,7 @@ parquet = { workspace = true, features = ["async"] }
 iceberg = { workspace = true }
 iceberg-datafusion = { workspace = true }
 iceberg-catalog-sql = { workspace = true }
-iceberg-storage-opendal = { workspace = true }
+typetag = { workspace = true }
 lru = { workspace = true }
 datafusion-distributed = { workspace = true }
 url = { workspace = true }
@@ -80,7 +80,6 @@ tempfile = { workspace = true }
 wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
 wyrd-bench = { workspace = true }
 iceberg-catalog-sql = { workspace = true }
-iceberg-storage-opendal = { workspace = true }
 datafusion-distributed = { workspace = true }
 url = { workspace = true }
 

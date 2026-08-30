@@ -765,8 +765,6 @@ pub struct WyrdTestCluster {
     storage: Arc<StorageHandle>,
     /// Shared local storage lifetime guard.
     storage_root: Arc<ClusterStorageRoot>,
-    /// Shared Redux Bifrost catalog.
-    catalog: Arc<BifrostCatalog>,
     /// Named topology retained for existing lane selection.
     topology: BifrostTopology,
     /// Builder fault configuration retained by the cluster.
@@ -1721,10 +1719,17 @@ impl WyrdTestCluster {
         })
         .await
         .map_err(|error| ClusterError::Resource(error.to_string()))?;
-        let catalog: Arc<BifrostCatalog> = test_catalog(&fixture, &storage).await?;
-        let commit_uncertainty_catalog = options
-            .inject_uncertainty
-            .then(|| CommitUncertaintyCatalog::new(catalog.iceberg_catalog()));
+        // Only the uncertainty wrapper needs a cluster-level catalog handle;
+        // every node otherwise builds its own from its own storage owner, so
+        // constructing one unconditionally would create a catalog no node uses.
+        let commit_uncertainty_catalog = match options.inject_uncertainty {
+            false => None,
+            true => {
+                let catalog: Arc<BifrostCatalog> =
+                    test_catalog(&fixture, crate::server::test_storage_owner(&storage)).await?;
+                Some(CommitUncertaintyCatalog::new(catalog.iceberg_catalog()))
+            }
+        };
         // Reuse the once-provisioned shared credentials when booting over shared
         // resources; their provisioning path is non-idempotent plain inserts, so
         // a fresh provision only runs when this cluster owns its fixture.
@@ -1820,7 +1825,6 @@ impl WyrdTestCluster {
             fixture,
             storage,
             storage_root,
-            catalog,
             topology,
             wal_sync_delay,
             scribe_admission,
@@ -1903,12 +1907,7 @@ impl WyrdTestCluster {
             builder = builder.with_oracle_peer_tls(tls.clone());
         }
         Ok(builder
-            .start_with_resources(
-                Arc::clone(&self.fixture),
-                Arc::clone(&self.storage),
-                Arc::clone(&self.catalog),
-                None,
-            )
+            .start_with_resources(Arc::clone(&self.fixture), Arc::clone(&self.storage), None)
             .await?
             .bind()
             .await?)

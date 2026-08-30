@@ -200,7 +200,9 @@ impl StandaloneForgeFixture {
             public_base_url: Some("https://wyrd.test".to_owned()),
         })
         .await?;
-        let catalog = crate::server::test_catalog(&database, &storage).await?;
+        let catalog =
+            crate::server::test_catalog(&database, crate::server::test_storage_owner(&storage))
+                .await?;
         let config = ForgeConfig::default();
         let spill_root = Arc::new(tempfile::tempdir()?);
         let runtime_resources =

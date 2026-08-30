@@ -62,9 +62,19 @@ async fn build_shared() -> SharedCatalog {
     .await
     .expect("local storage handle");
 
+    let bifrost_storage = Arc::new(vala_bifrost_redux::storage::BifrostStorage::new(
+        Arc::clone(&storage),
+        vala_bifrost_redux::storage::BifrostStoragePolicy::resolve(
+            vala_bifrost_redux::storage::BifrostStorageConfig::default(),
+            u64::from(u32::MAX),
+            false,
+        )
+        .expect("the default storage policy is valid"),
+        None,
+    ));
     let catalog = BifrostCatalog::new(
         fixture.catalog_dsn().expose_secret(),
-        storage.backend_config(),
+        bifrost_storage,
         fixture.vala_postgres().clone(),
     )
     .await

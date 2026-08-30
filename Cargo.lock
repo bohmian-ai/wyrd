@@ -676,16 +676,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "asyncband"
-version = "0.6.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94a214ba60d6231afd0e805e3c27c45a1626d9debaa5a5061c45a1ea1b2f1ed0"
-dependencies = [
- "hashbrown 0.17.1",
- "slab",
-]
-
-[[package]]
 name = "atoi"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2111,16 +2101,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
 
 [[package]]
-name = "crc-fast"
-version = "1.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e75b2483e97a5a7da73ac68a05b629f9c53cff58d8ed1c77866079e18b00dba5"
-dependencies = [
- "digest 0.10.7",
- "spin 0.10.1",
-]
-
-[[package]]
 name = "crc32c"
 version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2292,10 +2272,6 @@ name = "ctor"
 version = "1.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d83cb7e7a873830708d6b02a78cd36a592c6fa14bf267b68725103b85c0d77f"
-dependencies = [
- "link-section",
- "linktime-proc-macro",
-]
 
 [[package]]
 name = "ctr"
@@ -3719,7 +3695,7 @@ checksum = "da0e4dd2a88388a1f4ccc7c9ce104604dab68d9f408dc34cd45823d5a9069095"
 dependencies = [
  "futures-core",
  "futures-sink",
- "spin 0.9.9",
+ "spin",
 ]
 
 [[package]]
@@ -3730,7 +3706,7 @@ checksum = "5e139bc46ca777eb5efaf62df0ab8cc5fd400866427e56c68b22e414e53bd3be"
 dependencies = [
  "futures-core",
  "futures-sink",
- "spin 0.9.9",
+ "spin",
 ]
 
 [[package]]
@@ -4603,26 +4579,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "iceberg-storage-opendal"
-version = "0.10.0"
-source = "git+https://github.com/bohmian-ai/iceberg-rust?rev=57772676f85b138648c2f4e7f95e6dc3850d62fe#57772676f85b138648c2f4e7f95e6dc3850d62fe"
-dependencies = [
- "anyhow",
- "async-trait",
- "bytes",
- "cfg-if",
- "futures",
- "iceberg",
- "once_cell",
- "opendal 0.58.2",
- "reqsign-aws-v4",
- "reqsign-core",
- "serde",
- "typetag",
- "url",
-]
-
-[[package]]
 name = "icu_collections"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5089,7 +5045,7 @@ version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 dependencies = [
- "spin 0.9.9",
+ "spin",
 ]
 
 [[package]]
@@ -5219,18 +5175,6 @@ dependencies = [
  "pkg-config",
  "vcpkg",
 ]
-
-[[package]]
-name = "link-section"
-version = "0.19.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ee1a0d6e252afe82e7bc2db42fba60e02ddf3b1accaf8cb21d96e34ba61f3d4"
-
-[[package]]
-name = "linktime-proc-macro"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "348d0075b1fc163b26d72a7f75fc5141daf2fd1bdf128d873cbaf6785d495bdf"
 
 [[package]]
 name = "linux-raw-sys"
@@ -5851,30 +5795,11 @@ version = "0.57.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96c9c85ce253ff87225e7669979d877a20c98a06604ec9d6dd5f4473e08f1ae1"
 dependencies = [
- "opendal-core 0.57.0",
+ "opendal-core",
  "opendal-service-azblob",
- "opendal-service-fs 0.57.0",
- "opendal-service-gcs 0.57.0",
- "opendal-service-s3 0.57.0",
-]
-
-[[package]]
-name = "opendal"
-version = "0.58.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33dbff14cc9bb085224256d6a81289d2f3202e85b06f408d42534b42162a4231"
-dependencies = [
- "ctor",
- "opendal-core 0.58.2",
- "opendal-http-transport-reqwest",
- "opendal-layer-concurrent-limit",
- "opendal-layer-logging",
- "opendal-layer-retry",
- "opendal-layer-timeout",
- "opendal-service-azdls",
- "opendal-service-fs 0.58.2",
- "opendal-service-gcs 0.58.2",
- "opendal-service-s3 0.58.2",
+ "opendal-service-fs",
+ "opendal-service-gcs",
+ "opendal-service-s3",
 ]
 
 [[package]]
@@ -5906,89 +5831,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "opendal-core"
-version = "0.58.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48dbcef97d3eb7591db2c18d5cae95c836bcce07359b98d98dd6f4e861eb77b7"
-dependencies = [
- "anyhow",
- "asyncband",
- "base64 0.23.1",
- "bytes",
- "futures",
- "http 1.5.0",
- "jiff",
- "log",
- "md-5 0.11.0",
- "percent-encoding",
- "quick-xml 0.41.0",
- "reqsign-core",
- "serde",
- "serde_json",
- "tokio",
- "url",
- "uuid",
- "web-time",
-]
-
-[[package]]
-name = "opendal-http-transport-reqwest"
-version = "0.58.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85663452ea32bbc17e8f79ab29788c846d116ec7de31451be9c787e462dcb36c"
-dependencies = [
- "bytes",
- "futures",
- "http 1.5.0",
- "http-body 1.1.0",
- "opendal-core 0.58.2",
- "reqwest 0.13.4",
-]
-
-[[package]]
-name = "opendal-layer-concurrent-limit"
-version = "0.58.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03f9e144b5228d741c3763ade8711d9b72e5fb6d998e779f2d7a09da0b5a3eba"
-dependencies = [
- "asyncband",
- "futures",
- "http 1.5.0",
- "opendal-core 0.58.2",
-]
-
-[[package]]
-name = "opendal-layer-logging"
-version = "0.58.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2de17c61cd32e9d8d7d8efb91795e714dbccbafbc3c4e219e1542f4d6324161"
-dependencies = [
- "log",
- "opendal-core 0.58.2",
-]
-
-[[package]]
-name = "opendal-layer-retry"
-version = "0.58.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e94db301964a25366090484d61e6da16d5979cc8faf02c3e12210dc74fafed38"
-dependencies = [
- "backon",
- "log",
- "opendal-core 0.58.2",
-]
-
-[[package]]
-name = "opendal-layer-timeout"
-version = "0.58.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08956ddda07465449bfd48825f4f0f25e0351278ac974eaa659895d9d74f2c80"
-dependencies = [
- "opendal-core 0.58.2",
- "tokio",
-]
-
-[[package]]
 name = "opendal-service-azblob"
 version = "0.57.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5998,8 +5840,8 @@ dependencies = [
  "bytes",
  "http 1.5.0",
  "log",
- "opendal-core 0.57.0",
- "opendal-service-azure-common 0.57.0",
+ "opendal-core",
+ "opendal-service-azure-common",
  "quick-xml 0.39.4",
  "reqsign-azure-storage",
  "reqsign-core",
@@ -6010,44 +5852,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "opendal-service-azdls"
-version = "0.58.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d564484a8f7d091827e825cfc91ed45bd48e64d262451ee041fe843db81bd8a"
-dependencies = [
- "asyncband",
- "base64 0.23.1",
- "bytes",
- "http 1.5.0",
- "log",
- "opendal-core 0.58.2",
- "opendal-service-azure-common 0.58.2",
- "quick-xml 0.41.0",
- "reqsign-azure-storage",
- "reqsign-core",
- "reqsign-file-read-tokio",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "opendal-service-azure-common"
 version = "0.57.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b489f13c42e69d69bdd72952b634356ec43a7881a20259b38b540fcecdf4051"
 dependencies = [
  "http 1.5.0",
- "opendal-core 0.57.0",
-]
-
-[[package]]
-name = "opendal-service-azure-common"
-version = "0.58.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfcc1bfdac4f54d9018c462dd32ad9e2f68fdf584f825c811550c8ffc87894cd"
-dependencies = [
- "http 1.5.0",
- "opendal-core 0.58.2",
+ "opendal-core",
 ]
 
 [[package]]
@@ -6058,21 +5869,7 @@ checksum = "22e89a665fef0e6bd249cf5ea47fc174b7ba892159bee4b9382528b1ca873a2c"
 dependencies = [
  "bytes",
  "log",
- "opendal-core 0.57.0",
- "serde",
- "tokio",
- "xattr",
-]
-
-[[package]]
-name = "opendal-service-fs"
-version = "0.58.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7ef1e1c45f3f89282a59073897e0d685e51385fed0aea771714789525cff996"
-dependencies = [
- "bytes",
- "log",
- "opendal-core 0.58.2",
+ "opendal-core",
  "serde",
  "tokio",
  "xattr",
@@ -6088,30 +5885,9 @@ dependencies = [
  "bytes",
  "http 1.5.0",
  "log",
- "opendal-core 0.57.0",
+ "opendal-core",
  "percent-encoding",
  "quick-xml 0.39.4",
- "reqsign-core",
- "reqsign-file-read-tokio",
- "reqsign-google",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "opendal-service-gcs"
-version = "0.58.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da1f2a8c975fd22fea01f0409bcb8774f1ac02ad79863a3490098203121555d3"
-dependencies = [
- "async-trait",
- "bytes",
- "http 1.5.0",
- "log",
- "opendal-core 0.58.2",
- "percent-encoding",
- "quick-xml 0.41.0",
  "reqsign-core",
  "reqsign-file-read-tokio",
  "reqsign-google",
@@ -6132,29 +5908,8 @@ dependencies = [
  "http 1.5.0",
  "log",
  "md-5 0.11.0",
- "opendal-core 0.57.0",
+ "opendal-core",
  "quick-xml 0.39.4",
- "reqsign-aws-v4",
- "reqsign-core",
- "reqsign-file-read-tokio",
- "serde",
- "url",
-]
-
-[[package]]
-name = "opendal-service-s3"
-version = "0.58.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c64335f9f24ccb62ac36f1d976342b48611a75ba61979813a4f78a4ebd94de42"
-dependencies = [
- "base64 0.23.1",
- "bytes",
- "crc-fast",
- "http 1.5.0",
- "log",
- "md-5 0.11.0",
- "opendal-core 0.58.2",
- "quick-xml 0.41.0",
  "reqsign-aws-v4",
  "reqsign-core",
  "reqsign-file-read-tokio",
@@ -8687,12 +8442,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "spin"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
-
-[[package]]
 name = "spinning_top"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10099,11 +9848,10 @@ dependencies = [
  "iceberg",
  "iceberg-catalog-sql",
  "iceberg-datafusion",
- "iceberg-storage-opendal",
  "lru",
  "metrics",
  "num-traits",
- "opendal 0.57.0",
+ "opendal",
  "parquet",
  "prost",
  "rand 0.8.7",
@@ -10120,6 +9868,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "typetag",
  "ulid",
  "url",
  "uuid",
@@ -11215,7 +10964,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "moka",
- "opendal 0.57.0",
+ "opendal",
  "rand 0.9.5",
  "reqwest 0.13.4",
  "rustix",
@@ -11339,7 +11088,7 @@ dependencies = [
  "gcloud-auth",
  "gcloud-storage",
  "metrics",
- "opendal 0.57.0",
+ "opendal",
  "regex",
  "reqwest 0.13.4",
  "serde_json",
@@ -11427,7 +11176,7 @@ dependencies = [
  "iceberg",
  "metrics",
  "metrics-exporter-prometheus",
- "opendal 0.57.0",
+ "opendal",
  "parquet",
  "pyo3",
  "rand 0.9.5",

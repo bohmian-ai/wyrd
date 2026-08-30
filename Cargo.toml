@@ -183,9 +183,10 @@ azure_identity = "0.21.0"
 azure_storage = "0.21.0"
 azure_storage_blobs = "0.21.0"
 # opendal 0.57 pinned as the wyrd-storage substrate (stage0) and the future
-# iceberg-storage-opendal substrate (stage1). reqwest-rustls-tls is mandatory:
+# iceberg substrate (stage1). reqwest-rustls-tls is mandatory:
 # default-features=false drops it, leaving an HTTP-only client that fails all
 # cloud HTTPS requests.
+typetag = "0.2.23"
 opendal = { version = "0.57", default-features = false, features = [
   "services-fs", "services-s3", "services-gcs", "services-azblob",
   "reqwest-rustls-tls",
@@ -205,7 +206,6 @@ iceberg = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "57772676f
 # sqlx 0.8.1 is a hard dep in this crate — there is no sqlx feature flag to add.
 iceberg-catalog-sql = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "57772676f85b138648c2f4e7f95e6dc3850d62fe" }
 iceberg-datafusion = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "57772676f85b138648c2f4e7f95e6dc3850d62fe" }
-iceberg-storage-opendal = { git = "https://github.com/bohmian-ai/iceberg-rust", rev = "57772676f85b138648c2f4e7f95e6dc3850d62fe", features = ["opendal-s3", "opendal-gcs", "opendal-azdls", "opendal-fs", "opendal-memory"] }
 # Test-only. Pinned to an immutable revision so the Bifrost integration target can
 # prove that Wyrd's Oracle SessionState composes with the distributed planner over
 # one shared native DataFusion 55 universe. Wyrd ships no distributed query path.

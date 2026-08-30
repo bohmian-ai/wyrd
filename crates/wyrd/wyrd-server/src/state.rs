@@ -58,6 +58,12 @@ pub struct BifrostBuildInputs {
     pub postgres: ServerPostgres,
     /// Shared object-storage handle used by Scribe and Forge construction.
     pub storage: Arc<StorageHandle>,
+    /// This node's one Bifrost storage owner.
+    ///
+    /// Retained so every co-located role shares one pointer-identical owner,
+    /// one request ceiling, and one shutdown, rather than each role composing
+    /// its own view of the same backend.
+    pub bifrost_storage: Arc<vala_bifrost_redux::storage::BifrostStorage>,
     /// Shared tenant-qualified Bifrost catalog.
     pub catalog: Arc<BifrostCatalog>,
     /// One root-derived resource graph for every selected local role.
@@ -1350,6 +1356,11 @@ pub struct Bifrost {
     forge: Option<Arc<Forge>>,
     /// Selected Oracle runtime, when this process owns the role.
     oracle: Option<Arc<Oracle>>,
+    /// This node's one Bifrost storage owner, shared by every co-located role.
+    ///
+    /// `None` only for the ownerless unit-test shell, which composes no role and
+    /// therefore performs no object I/O at all.
+    bifrost_storage: Option<Arc<vala_bifrost_redux::storage::BifrostStorage>>,
     /// Process-wide encoded-body admission shared by every transport edge.
     transport: vala_bifrost_redux::gate::limits::BifrostTransportAdmission,
     /// Verifier shared by public Gate work and the private peer service.
@@ -1384,6 +1395,8 @@ pub(crate) struct BifrostComposition {
     pub(crate) forge: Option<Arc<Forge>>,
     /// Selected Oracle runtime, when this process owns the role.
     pub(crate) oracle: Option<Arc<Oracle>>,
+    /// This node's one Bifrost storage owner, shared by every co-located role.
+    pub(crate) bifrost_storage: Arc<vala_bifrost_redux::storage::BifrostStorage>,
     /// Process-wide encoded-body admission shared by every transport edge.
     pub(crate) transport: vala_bifrost_redux::gate::limits::BifrostTransportAdmission,
     /// Verifier shared by public Gate work and the private peer service.
@@ -1403,6 +1416,7 @@ impl Bifrost {
             scribe,
             forge,
             oracle,
+            bifrost_storage,
             transport,
             token_verifier,
             query_forwarder,
@@ -1414,6 +1428,7 @@ impl Bifrost {
             scribe,
             forge,
             oracle,
+            bifrost_storage: Some(bifrost_storage),
             transport,
             token_verifier,
             query_forwarder,
@@ -1429,6 +1444,7 @@ impl Bifrost {
     #[must_use]
     pub fn test_shell(token_verifier: Arc<WyrdTokenVerifier>) -> Arc<Self> {
         Arc::new(Self {
+            bifrost_storage: None,
             gate: ServerGate::without_scribe(
                 vala_bifrost_redux::gate::auth::ingest_auth_interceptor(Arc::clone(
                     &token_verifier,
@@ -1460,6 +1476,7 @@ impl Bifrost {
         catalog: Arc<BifrostCatalog>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            bifrost_storage: None,
             gate: ServerGate::without_scribe(
                 vala_bifrost_redux::gate::auth::ingest_auth_interceptor(Arc::clone(
                     &token_verifier,
@@ -1551,6 +1568,17 @@ impl Bifrost {
         {
             selected
         }
+    }
+
+    /// Borrows this node's one Bifrost storage owner.
+    ///
+    /// `None` only for the ownerless unit-test shell. Every co-located role in a
+    /// composed process observes the identical pointer, which is what makes the
+    /// node-wide request ceiling and the single shutdown real rather than
+    /// per-role.
+    #[must_use]
+    pub fn bifrost_storage(&self) -> Option<&Arc<vala_bifrost_redux::storage::BifrostStorage>> {
+        self.bifrost_storage.as_ref()
     }
 
     /// Borrows the shared role-resource graph retained by the selected owners.

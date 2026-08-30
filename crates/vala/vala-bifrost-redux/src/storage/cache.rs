@@ -1039,9 +1039,27 @@ mod tests {
         oracle_role(memory_bytes).metadata()
     }
 
+    /// Builds a local-backed storage handle for the fixture owner.
+    ///
+    /// The suite never reads through the backend — every decode is driven by an
+    /// in-memory reader — but the owner holds a real handle in production, so
+    /// the fixture holds one too rather than making the field optional purely
+    /// for tests.
+    ///
+    /// # Panics
+    /// Panics when the temporary root or signer cannot be created.
+    fn local_handle() -> Arc<wyrd_storage::handle::StorageHandle> {
+        let root = tempfile::tempdir().expect("fixture storage root");
+        let signer = wyrd_storage::signer::BackendSigner::Local(
+            wyrd_storage::local::LocalSigner::new(root.keep()).expect("fixture local signer"),
+        );
+        Arc::new(wyrd_storage::handle::StorageHandle::new(signer))
+    }
+
     /// Builds an Oracle-serving owner with an explicit metadata-cache budget.
     fn storage_with_cache(cache_bytes: u64) -> BifrostStorage {
         BifrostStorage::new(
+            local_handle(),
             BifrostStoragePolicy::resolve(
                 crate::storage::policy::BifrostStorageConfig {
                     metadata_cache_bytes: Some(cache_bytes),

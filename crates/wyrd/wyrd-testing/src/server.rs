@@ -3374,7 +3374,6 @@ impl WyrdTestServerBuilder {
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
             (Some(Arc::new(root)), handle)
         };
-        let bifrost = test_catalog(&fixture, &storage).await?;
         if self.bifrost_roles.contains(&BifrostRuntimeRole::Oracle)
             && self.oracle_peer_credentials.is_none()
         {
@@ -3382,7 +3381,7 @@ impl WyrdTestServerBuilder {
                 Some(provision_oracle_peer_credentials(Arc::clone(&fixture)).await?);
         }
 
-        self.start_with_resources(fixture, storage, bifrost, storage_root)
+        self.start_with_resources(fixture, storage, storage_root)
             .await
     }
 
@@ -3402,7 +3401,6 @@ impl WyrdTestServerBuilder {
         self,
         fixture: Arc<PgFixture>,
         storage: Arc<wyrd_storage::StorageHandle>,
-        bifrost: Arc<BifrostCatalog>,
         storage_root: Option<Arc<tempfile::TempDir>>,
     ) -> Result<WyrdTestServer, WyrdTestServerError> {
         wyrd_tls::install_crypto_provider()
@@ -3565,6 +3563,19 @@ impl WyrdTestServerBuilder {
         let bifrost_resources = runtime_resources
             .compose_roles()
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        // Same boot order as production: resources, then the one storage owner,
+        // then the catalog that runs its Iceberg I/O through it.
+        let bifrost_storage = Arc::new(vala_bifrost_redux::storage::BifrostStorage::new(
+            Arc::clone(&storage),
+            vala_bifrost_redux::storage::BifrostStoragePolicy::resolve(
+                vala_bifrost_redux::storage::BifrostStorageConfig::default(),
+                u64::try_from(bifrost_resources.plan().managed_memory_bytes).unwrap_or(u64::MAX),
+                bifrost_resources.oracle().is_some(),
+            )
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
+            bifrost_resources.oracle().map(|oracle| oracle.metadata()),
+        ));
+        let bifrost = test_catalog(&fixture, Arc::clone(&bifrost_storage)).await?;
         let target = self.forge_process_role;
         let node_id = self.node_id.unwrap_or_else(|| NodeId::new(Uuid::now_v7()));
         let cluster_registry = Arc::new(if let Some(timing) = self.role_timing {
@@ -3631,6 +3642,7 @@ impl WyrdTestServerBuilder {
             deployment_profile: DeploymentProfile::Development,
             postgres: postgres.as_ref().clone(),
             storage: Arc::clone(&storage),
+            bifrost_storage: Arc::clone(&bifrost_storage),
             catalog: Arc::clone(&bifrost),
             resources: bifrost_resources,
             cluster: cluster_registry,
@@ -4147,11 +4159,11 @@ fn sql(error: impl std::fmt::Display) -> WyrdTestServerError {
 /// to its SQL catalog or construct its storage-backed Iceberg catalog.
 pub(crate) async fn test_catalog(
     fixture: &PgFixture,
-    storage: &Arc<wyrd_storage::StorageHandle>,
+    storage: Arc<vala_bifrost_redux::storage::BifrostStorage>,
 ) -> Result<Arc<BifrostCatalog>, WyrdTestServerError> {
     let catalog = BifrostCatalog::new(
         fixture.catalog_dsn().expose_secret(),
-        storage.backend_config(),
+        storage,
         fixture.vala_postgres().clone(),
     )
     .await
@@ -4164,6 +4176,32 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
         error,
         sqlx::Error::Database(db) if db.code().as_deref() == Some("23505")
     )
+}
+
+/// Builds a control-plane storage owner over one already-built backend handle.
+///
+/// Used by cluster and Forge harnesses that need a catalog handle before any
+/// node has composed its resources. It allocates no metadata cache, because a
+/// control-plane catalog reads no hot Parquet footer; each simulated node still
+/// constructs its own Oracle-funded owner when it starts.
+///
+/// # Panics
+/// Panics when the default storage policy does not resolve, which would mean
+/// the shipped defaults are themselves invalid.
+#[must_use]
+pub(crate) fn test_storage_owner(
+    storage: &Arc<wyrd_storage::StorageHandle>,
+) -> Arc<vala_bifrost_redux::storage::BifrostStorage> {
+    Arc::new(vala_bifrost_redux::storage::BifrostStorage::new(
+        Arc::clone(storage),
+        vala_bifrost_redux::storage::BifrostStoragePolicy::resolve(
+            vala_bifrost_redux::storage::BifrostStorageConfig::default(),
+            u64::from(u32::MAX),
+            false,
+        )
+        .expect("the default storage policy is valid"),
+        None,
+    ))
 }
 
 /// Build a [`ServerPostgres`] from an already-started [`PgFixture`].

@@ -1,18 +1,16 @@
-//! Redux Iceberg storage factory and warehouse URI derivation.
+//! Redux Iceberg catalog properties and warehouse URI derivation.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
-use iceberg::io::StorageFactory;
-use iceberg_storage_opendal::OpenDalResolvingStorageFactory;
 use wyrd_storage::settings::BackendConfig;
 
-/// Build the Iceberg storage factory and backend-specific catalog properties.
+/// Build the backend-specific properties the Iceberg catalog records.
+///
+/// These describe the warehouse for catalog bookkeeping only; they no longer
+/// select a client, because the storage factory is bound to this node's storage
+/// owner rather than resolved from properties.
 #[must_use]
-pub fn iceberg_storage_factory(
-    backend: &BackendConfig,
-) -> (Arc<dyn StorageFactory>, HashMap<String, String>) {
-    let factory = Arc::new(OpenDalResolvingStorageFactory::new()) as Arc<dyn StorageFactory>;
+pub fn iceberg_catalog_properties(backend: &BackendConfig) -> HashMap<String, String> {
     let mut properties = HashMap::new();
 
     match backend {
@@ -38,7 +36,7 @@ pub fn iceberg_storage_factory(
         }
     }
 
-    (factory, properties)
+    properties
 }
 
 /// Derive the base Iceberg warehouse URI for the active storage backend.

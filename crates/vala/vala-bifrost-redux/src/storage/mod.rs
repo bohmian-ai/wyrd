@@ -13,6 +13,7 @@ use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::file::metadata::ParquetMetaData;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
+use wyrd_storage::handle::StorageHandle;
 
 use crate::resources::OracleMetadataResources;
 pub use crate::storage::cache::{HotMetadataKey, RetainedMetadata};
@@ -34,6 +35,13 @@ use crate::storage::telemetry::BifrostStorageTelemetry;
 /// node-wide ceiling rather than one per role.
 #[derive(Debug)]
 pub struct BifrostStorage {
+    /// The already-built backend client every operation runs against.
+    ///
+    /// Owned rather than rebuilt: the handle carries the process's one
+    /// configured, credentialed, connection-pooled client, and constructing a
+    /// second one here would give Bifrost a different backend identity from the
+    /// rest of the server.
+    handle: Arc<StorageHandle>,
     /// Validated policy applied to every operation.
     policy: BifrostStoragePolicy,
     /// The single production owner of cache and storage lifecycle signals.
@@ -66,6 +74,7 @@ impl BifrostStorage {
     /// metadata-cache budget, because neither reads a hot Parquet footer.
     #[must_use]
     pub fn new(
+        handle: Arc<StorageHandle>,
         policy: BifrostStoragePolicy,
         metadata_resources: Option<OracleMetadataResources>,
     ) -> Self {
@@ -82,6 +91,7 @@ impl BifrostStorage {
             });
         let requests = Arc::new(Semaphore::new(policy.max_concurrent_requests()));
         Self {
+            handle,
             policy,
             telemetry,
             metadata_cache,
@@ -95,6 +105,26 @@ impl BifrostStorage {
     #[must_use]
     pub const fn policy(&self) -> BifrostStoragePolicy {
         self.policy
+    }
+
+    /// Returns the backend client handle this owner runs every operation on.
+    ///
+    /// Exposed so Scribe and Forge can use this node's one configured client
+    /// directly. They deliberately do not go through the owner's read path: a
+    /// publication write is not idempotent and must never be retried behind
+    /// their backs.
+    #[must_use]
+    pub fn handle(&self) -> &Arc<StorageHandle> {
+        &self.handle
+    }
+
+    /// Returns the object-store operator backing this owner.
+    ///
+    /// This is the exact operator the rest of the server uses, which is what
+    /// makes "one storage owner per node" true rather than merely stated.
+    #[must_use]
+    pub fn operator(&self) -> &opendal::Operator {
+        self.handle.operator()
     }
 
     /// Returns whether this composition retains decoded metadata at all.

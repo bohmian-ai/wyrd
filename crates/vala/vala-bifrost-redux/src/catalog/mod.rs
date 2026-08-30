@@ -4,6 +4,7 @@ mod bifrost_catalog;
 mod error;
 pub mod event_time;
 mod iceberg_sql;
+mod iceberg_storage;
 pub mod layout;
 mod logical_table_identity;
 mod storage;

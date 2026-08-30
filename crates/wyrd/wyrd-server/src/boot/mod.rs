@@ -188,6 +188,12 @@ struct BifrostExternalDependencies {
     postgres: Arc<ServerPostgres>,
     /// Shared object-storage handle.
     storage: Arc<StorageHandle>,
+    /// This node's one Bifrost storage owner.
+    ///
+    /// Retained so every co-located role shares one pointer-identical owner,
+    /// one request ceiling, and one shutdown, rather than each role composing
+    /// its own view of the same backend.
+    bifrost_storage: Arc<vala_bifrost_redux::storage::BifrostStorage>,
     /// Shared Bifrost catalog.
     catalog: Arc<BifrostCatalog>,
     /// One root-derived role resource graph.
@@ -429,15 +435,6 @@ async fn build_bifrost_external_dependencies(
     let postgres = Arc::new(ServerPostgres::connect_from_boot(boot).await?);
     let storage_settings = load_storage_settings()?;
     let storage = StorageHandle::from_settings(storage_settings).await?;
-    let catalog = Arc::new(
-        BifrostCatalog::new(
-            dsns.catalog_app.expose_secret(),
-            storage.backend_config(),
-            postgres.vala().clone(),
-        )
-        .await
-        .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
-    );
     let node_id = NodeId::generate();
     let advertise_addr = config.oracle.advertise_addr.clone();
     let cluster = Arc::new(ClusterRegistry::new(
@@ -495,9 +492,34 @@ async fn build_bifrost_external_dependencies(
     let resources = runtime_resources
         .compose_roles()
         .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
+    // Boot order is resources -> storage owner -> catalog. The owner's cache
+    // budget is a share of this node's managed memory and is allocated only for
+    // an Oracle-serving target, so it cannot be resolved before the resource
+    // plan exists, and the catalog cannot be built before the owner it must run
+    // its Iceberg I/O through.
+    let bifrost_storage = Arc::new(vala_bifrost_redux::storage::BifrostStorage::new(
+        Arc::clone(&storage),
+        vala_bifrost_redux::storage::BifrostStoragePolicy::resolve(
+            config.storage.to_storage_config(),
+            u64::try_from(resources.plan().managed_memory_bytes).unwrap_or(u64::MAX),
+            resources.oracle().is_some(),
+        )
+        .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
+        resources.oracle().map(|oracle| oracle.metadata()),
+    ));
+    let catalog = Arc::new(
+        BifrostCatalog::new(
+            dsns.catalog_app.expose_secret(),
+            Arc::clone(&bifrost_storage),
+            postgres.vala().clone(),
+        )
+        .await
+        .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
+    );
     Ok(BifrostExternalDependencies {
         postgres,
         storage,
+        bifrost_storage,
         catalog,
         resources,
         cluster,
@@ -521,6 +543,7 @@ pub async fn compose_bifrost(
         deployment_profile,
         postgres,
         storage,
+        bifrost_storage,
         catalog: bifrost,
         resources: bifrost_resources,
         cluster: cluster_registry,
@@ -1053,6 +1076,7 @@ pub async fn compose_bifrost(
             scribe,
             forge,
             oracle,
+            bifrost_storage,
             transport: bifrost_resources.transport_admission(),
             token_verifier,
             query_forwarder: Some(query_forwarder),
@@ -1199,6 +1223,7 @@ pub async fn build_state(
         deployment_profile: config.deployment_profile,
         postgres: external.postgres.as_ref().clone(),
         storage: Arc::clone(&external.storage),
+        bifrost_storage: Arc::clone(&external.bifrost_storage),
         catalog: Arc::clone(&external.catalog),
         resources: external.resources,
         cluster: Arc::clone(&external.cluster),

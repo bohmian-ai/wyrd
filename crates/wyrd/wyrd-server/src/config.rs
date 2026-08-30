@@ -1211,6 +1211,55 @@ pub struct BifrostRuntimeConfig {
     /// Oracle runtime bounds.
     #[serde(default)]
     pub oracle: OracleRuntimeConfig,
+    /// Storage I/O bounds applied by this node's one Bifrost storage owner.
+    #[serde(default)]
+    pub storage: BifrostStorageIoConfig,
+}
+
+/// Optional storage I/O bounds for this node's one Bifrost storage owner.
+///
+/// Every field is optional and resolved against the node's managed memory and
+/// selected roles at boot, so an unset deployment gets validated defaults and a
+/// stated one fails boot rather than clamping silently. Connect-time and
+/// HTTP-pool settings are deliberately absent: the already-built
+/// `StorageHandle` owns the client, and a second place to configure it would be
+/// a second answer to the same question.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BifrostStorageIoConfig {
+    /// Per-attempt backend request timeout in milliseconds.
+    #[serde(default)]
+    pub request_timeout_ms: Option<u64>,
+    /// Retries allowed after the first attempt of an idempotent read.
+    #[serde(default)]
+    pub max_retries: Option<u32>,
+    /// Total wall-clock ceiling across one read's attempts, in milliseconds.
+    #[serde(default)]
+    pub max_retry_elapsed_ms: Option<u64>,
+    /// Node-wide ceiling on concurrent backend requests.
+    #[serde(default)]
+    pub max_concurrent_requests: Option<usize>,
+    /// Decoded Parquet metadata cache budget in bytes; zero disables it.
+    #[serde(default)]
+    pub metadata_cache_bytes: Option<u64>,
+}
+
+impl BifrostStorageIoConfig {
+    /// Projects this configuration onto the Bifrost storage owner's own shape.
+    ///
+    /// The server config is the operator-facing surface; the validated policy
+    /// lives with the owner that enforces it, and this is the single conversion
+    /// between them.
+    #[must_use]
+    pub const fn to_storage_config(self) -> vala_bifrost_redux::storage::BifrostStorageConfig {
+        vala_bifrost_redux::storage::BifrostStorageConfig {
+            request_timeout_ms: self.request_timeout_ms,
+            max_retries: self.max_retries,
+            max_retry_elapsed_ms: self.max_retry_elapsed_ms,
+            max_concurrent_requests: self.max_concurrent_requests,
+            metadata_cache_bytes: self.metadata_cache_bytes,
+        }
+    }
 }
 
 /// Optional absolute caps for portable Bifrost resource discovery.

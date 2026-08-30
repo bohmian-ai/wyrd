@@ -195,6 +195,47 @@ pub struct MetadataCacheSnapshot {
     waiters: u64,
     /// The owner's retained lifecycle state.
     lifecycle: StorageLifecycle,
+    /// Settlements that had no matching admission, indexed by
+    /// `TelemetryTransition::index`.
+    ///
+    /// Always zero on a correct owner. A nonzero value means some path
+    /// reconciled twice or reconciled work it never admitted, which is exactly
+    /// the condition that would otherwise let a saturating gauge report a
+    /// truthful-looking zero over broken accounting.
+    anomalies: [u64; TelemetryTransition::ALL.len()],
+}
+
+/// One reconcilable live-count transition the owner can settle.
+///
+/// A closed, deliberately tiny domain: it labels the anomaly counter, so it
+/// must never carry a tenant, object, or any other unbounded value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelemetryTransition {
+    /// A terminal load settling the in-flight gauge.
+    LoadTerminal,
+    /// A waiter leaving the waiter gauge.
+    WaiterSettled,
+}
+
+impl TelemetryTransition {
+    /// Every transition, in index order.
+    pub(crate) const ALL: [Self; 2] = [Self::LoadTerminal, Self::WaiterSettled];
+
+    /// Returns this transition's dense index into the anomaly totals.
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::LoadTerminal => 0,
+            Self::WaiterSettled => 1,
+        }
+    }
+
+    /// Returns the stable metric label for this transition.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::LoadTerminal => "load_terminal",
+            Self::WaiterSettled => "waiter_settled",
+        }
+    }
 }
 
 impl MetadataCacheSnapshot {
@@ -267,6 +308,24 @@ impl MetadataCacheSnapshot {
         self.lifecycle
     }
 
+    /// Returns how many unmatched settlements one transition recorded.
+    #[must_use]
+    pub const fn anomaly(&self, transition: TelemetryTransition) -> u64 {
+        self.anomalies[transition.index()]
+    }
+
+    /// Returns every unmatched settlement summed.
+    #[must_use]
+    pub const fn anomalies(&self) -> u64 {
+        let mut total = 0;
+        let mut index = 0;
+        while index < self.anomalies.len() {
+            total += self.anomalies[index];
+            index += 1;
+        }
+        total
+    }
+
     /// Returns whether every live count has settled to zero.
     ///
     /// Deliberately independent of the lifecycle state so a caller can
@@ -277,6 +336,7 @@ impl MetadataCacheSnapshot {
             && self.resident_bytes == 0
             && self.inflight_loads == 0
             && self.waiters == 0
+            && self.anomalies() == 0
     }
 }
 
@@ -350,7 +410,11 @@ impl BifrostStorageTelemetry {
         let snapshot = self.mutate(|totals| {
             totals.load_terminals[outcome.index()] =
                 totals.load_terminals[outcome.index()].saturating_add(1);
-            totals.inflight_loads = totals.inflight_loads.saturating_sub(1);
+            settle(
+                &mut totals.inflight_loads,
+                TelemetryTransition::LoadTerminal,
+                &mut totals.anomalies,
+            );
         });
         Self::publish_gauges(&snapshot);
     }
@@ -371,7 +435,11 @@ impl BifrostStorageTelemetry {
         )
         .record(elapsed.as_secs_f64());
         let snapshot = self.mutate(|totals| {
-            totals.waiters = totals.waiters.saturating_sub(1);
+            settle(
+                &mut totals.waiters,
+                TelemetryTransition::WaiterSettled,
+                &mut totals.anomalies,
+            );
         });
         Self::publish_gauges(&snapshot);
     }
@@ -437,6 +505,35 @@ impl BifrostStorageTelemetry {
             .set(gauge_value(snapshot.inflight_loads()));
         metrics::gauge!("bifrost_storage_metadata_cache_waiters")
             .set(gauge_value(snapshot.waiters()));
+    }
+}
+
+/// Settles one live count by exactly one admission, checked rather than clamped.
+///
+/// A saturating decrement of a zero gauge is indistinguishable from a correct
+/// one, which is how a broken owner reports a clean drain. This records the
+/// mismatch as a bounded anomaly instead, so reconciliation failure is visible
+/// in both the totals and an emitted counter, and leaves the count at zero
+/// because that is still the only defensible value.
+fn settle(
+    count: &mut u64,
+    transition: TelemetryTransition,
+    anomalies: &mut [u64; TelemetryTransition::ALL.len()],
+) {
+    match count.checked_sub(1) {
+        Some(settled) => *count = settled,
+        None => {
+            anomalies[transition.index()] = anomalies[transition.index()].saturating_add(1);
+            metrics::counter!(
+                "bifrost_storage_metadata_cache_transition_anomalies_total",
+                "transition" => transition.as_str(),
+            )
+            .increment(1);
+            tracing::warn!(
+                transition = transition.as_str(),
+                "Bifrost storage metadata telemetry settled an unmatched transition"
+            );
+        }
     }
 }
 

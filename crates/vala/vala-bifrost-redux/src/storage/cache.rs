@@ -16,15 +16,25 @@
 //! descriptor *before* consulting the cache, and applies projection,
 //! predicates, residual filtering, and the tenant tripwire *after*. A warm
 //! entry is a decode that did not happen, never a check that did not happen.
-
-//! Concurrency is single-flight: the first caller for a key owns one retained
+//!
+//! Concurrency is single-flight: the first caller for a key elects one retained
 //! loader task and every later caller joins it, so N concurrent openings of one
 //! object cost one decode. The state mutex is never held across `.await`.
+//!
+//! One owner supervises every load. The elected loader task is the only writer
+//! of a terminal result: it races the election-fixed deadline and the
+//! cache-owned token against the caller's decode, catches a panic in that
+//! decode, retires its own in-flight entry, and publishes exactly one result to
+//! everyone joined to it. Neither a waiter nor close ever publishes, so no two
+//! paths can disagree about how one load ended.
 
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use futures_util::FutureExt as _;
 use futures_util::future::BoxFuture;
 use lru::LruCache;
 use parquet::file::metadata::ParquetMetaData;
@@ -53,6 +63,54 @@ pub(crate) type MetadataLoadResult = Result<Arc<ParquetMetaData>, Arc<BifrostSto
 /// cache free of any knowledge of memory accounting or storage layering.
 pub(crate) type MetadataLoadFuture =
     BoxFuture<'static, Result<Arc<ParquetMetaData>, BifrostStorageError>>;
+
+/// Why a cache-owned loader token was triggered.
+///
+/// Retained as an atomic beside the token because the token itself carries no
+/// reason, and the terminal a loader publishes must name the real cause rather
+/// than a single generic one: an operator distinguishing "every caller went
+/// away" from "the node is shutting down" is reading exactly this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelCause {
+    /// The token has not been triggered.
+    None,
+    /// Every waiter detached while the owner remained open.
+    Abandoned,
+    /// The owner is closing and admits no further work.
+    Closing,
+}
+
+impl CancelCause {
+    /// Returns the stable atomic encoding of this cause.
+    const fn code(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Abandoned => 1,
+            Self::Closing => 2,
+        }
+    }
+
+    /// Recovers one cause from its atomic encoding.
+    ///
+    /// An unrecognized code decodes to [`Self::Closing`], the most
+    /// conservative reading: it never reports work as merely abandoned when the
+    /// owner may in fact be shutting down.
+    const fn from_code(code: u8) -> Self {
+        match code {
+            0 => Self::None,
+            1 => Self::Abandoned,
+            _ => Self::Closing,
+        }
+    }
+
+    /// Returns the terminal error this cause publishes.
+    fn terminal(self) -> BifrostStorageError {
+        match self {
+            Self::Abandoned => BifrostStorageError::Cancelled,
+            Self::None | Self::Closing => BifrostStorageError::Closed,
+        }
+    }
+}
 
 /// The complete identity of one immutable hot object's decoded metadata.
 ///
@@ -129,18 +187,34 @@ struct CachedMetadata {
     weight: u64,
 }
 
-/// One load with an owner and zero or more joined waiters.
+/// One elected load with its fixed bound, its own token, and its live waiters.
 #[derive(Debug)]
 struct InFlight {
-    /// Publishes the single terminal result to the owner and every waiter.
+    /// Absolute deadline chosen at election and never revised.
+    ///
+    /// Fixed because the load is shared: letting a later joiner widen it would
+    /// let one query extend work every other joiner is waiting on, and letting
+    /// one shorten it would let a caller with a tight budget end work the
+    /// others still need. Each waiter still detaches on its own earlier
+    /// deadline or token without touching this one.
+    deadline: Instant,
+    /// Cache-owned token for this key's loader alone.
+    cancel: CancellationToken,
+    /// Why [`Self::cancel`] was triggered, as a [`CancelCause`] code.
+    cause: Arc<AtomicU8>,
+    /// Callers currently depending on this load, including the elector.
+    ///
+    /// Reaching zero while the load is still running means nobody wants the
+    /// result any more, which is the only condition under which one waiter's
+    /// departure may cancel shared work.
+    waiters: u64,
+    /// Publishes the single terminal result to everyone joined.
     ///
     /// `watch` rather than a broadcast channel because the value is retained:
     /// a waiter that subscribes after the publish still observes the terminal
     /// result instead of missing it or observing lag.
     publisher: watch::Sender<Option<MetadataLoadResult>>,
-    /// Cancels this loader's own work without affecting any other key.
-    cancel: CancellationToken,
-    /// Retained loader task, joined or aborted at owner close.
+    /// Retained loader task, awaited and if necessary aborted at close.
     task: JoinHandle<()>,
 }
 
@@ -177,10 +251,56 @@ impl CacheState {
 enum Registration {
     /// A resident entry satisfied the lookup with no load at all.
     Resident(Arc<ParquetMetaData>),
-    /// This caller installed and owns the load.
-    Owner(watch::Receiver<Option<MetadataLoadResult>>),
-    /// This caller joined an existing owner's load.
-    Joined(watch::Receiver<Option<MetadataLoadResult>>),
+    /// This caller is joined to a load, under the election-fixed deadline.
+    ///
+    /// The elector and a later joiner are deliberately not distinguished here:
+    /// both wait the same way, on the same publication, under the same shared
+    /// bound, and both are counted the same way by the waiter guard.
+    Joined {
+        /// Receives the single terminal result.
+        receiver: watch::Receiver<Option<MetadataLoadResult>>,
+        /// The shared load's fixed absolute bound.
+        deadline: Instant,
+    },
+}
+
+/// Live membership of one shared load, settled exactly once.
+///
+/// Holding a guard is what makes a caller a waiter. Settling it on return, on
+/// an early error, and on drop — including the drop of a cancelled future — is
+/// what keeps the waiter gauge honest, and it is what lets the cache notice
+/// that the last interested caller has gone so it can stop work nobody wants.
+struct WaiterGuard {
+    /// The cache whose accounting this guard settles.
+    cache: Arc<ParquetMetadataCache>,
+    /// The load this guard is joined to.
+    key: HotMetadataKey,
+    /// When this caller joined, for the wait-latency histogram.
+    joined: Instant,
+    /// Whether [`Self::settle`] already reconciled this membership.
+    settled: bool,
+}
+
+impl WaiterGuard {
+    /// Settles this membership with the outcome the caller actually observed.
+    fn settle(mut self, outcome: MetadataLoadOutcome) {
+        self.settled = true;
+        self.cache.release_waiter(&self.key, outcome, self.joined);
+    }
+}
+
+impl Drop for WaiterGuard {
+    /// Settles an abandoned membership as cancelled.
+    ///
+    /// Reached when the caller's future is dropped mid-wait, which is the
+    /// ordinary shape of a cancelled query: nothing returned a result, so the
+    /// only truthful outcome is that this caller stopped waiting.
+    fn drop(&mut self) {
+        if !self.settled {
+            self.cache
+                .release_waiter(&self.key, MetadataLoadOutcome::Cancelled, self.joined);
+        }
+    }
 }
 
 /// The bounded, single-flight decoded-metadata cache for one node.
@@ -190,6 +310,12 @@ pub(crate) struct ParquetMetadataCache {
     state: Mutex<CacheState>,
     /// Configured ceiling on charged resident bytes; always positive.
     budget_bytes: u64,
+    /// Serializes close and shares its single completion with every caller.
+    ///
+    /// `Some(clean)` once a close has finished, so a repeated or concurrent
+    /// caller observes that same terminal lifecycle rather than running a
+    /// second close over state the first one already reconciled.
+    closing: tokio::sync::Mutex<Option<bool>>,
     /// The owner's production telemetry facade.
     telemetry: Arc<BifrostStorageTelemetry>,
 }
@@ -205,26 +331,29 @@ impl ParquetMetadataCache {
                 lifecycle: StorageLifecycle::Open,
             }),
             budget_bytes,
+            closing: tokio::sync::Mutex::new(None),
             telemetry,
         }
     }
 
     /// Returns decoded metadata for `key`, loading it at most once per node.
     ///
-    /// A resident entry returns immediately. Otherwise the first caller becomes
-    /// the load's owner and retains one loader task; every later caller for the
-    /// same key joins that task and receives a clone of its single terminal
-    /// result.
+    /// A resident entry returns immediately. Otherwise the first caller elects
+    /// one retained loader task under an immutable deadline, and every later
+    /// caller for the same key joins that task and receives a clone of its
+    /// single terminal result.
     ///
-    /// Cancelling one waiter detaches only that waiter — the owner's load
-    /// continues for everyone else — while owner shutdown cancels the load
-    /// itself and publishes one closed terminal to all of them.
+    /// This caller's own `deadline` and `cancel` bound only this caller: they
+    /// end its interest in the load, which is what makes a cancelled query
+    /// cheap for everyone still waiting on the same object. Shared work stops
+    /// only when the last waiter leaves or the owner closes.
     ///
     /// # Errors
     /// Returns the loader's closed failure, [`BifrostStorageError::Cancelled`]
-    /// when this caller's token fires, [`BifrostStorageError::Deadline`] when
-    /// its deadline elapses first, or [`BifrostStorageError::Closed`] when the
-    /// owner no longer admits loads.
+    /// when this caller's token fires or the load was abandoned by all of its
+    /// waiters, [`BifrostStorageError::Deadline`] when a deadline elapses
+    /// first, or [`BifrostStorageError::Closed`] when the owner no longer
+    /// admits loads.
     ///
     /// # Panics
     /// Does not panic. A poisoned state lock is surfaced as
@@ -237,31 +366,34 @@ impl ParquetMetadataCache {
         deadline: Instant,
         cancel: CancellationToken,
     ) -> MetadataLoadResult {
-        let started = Instant::now();
-        match self.register(&key, load)? {
-            Registration::Resident(metadata) => Ok(metadata),
-            Registration::Owner(mut receiver) => {
-                let result = Self::await_publication(&mut receiver, deadline, &cancel).await;
-                self.telemetry
-                    .record_waiter_settled(Self::wait_outcome(&result), started.elapsed());
-                result
-            }
-            Registration::Joined(mut receiver) => {
-                self.telemetry.record_waiter_joined();
-                let result = Self::await_publication(&mut receiver, deadline, &cancel).await;
-                self.telemetry
-                    .record_waiter_settled(Self::wait_outcome(&result), started.elapsed());
-                result
-            }
-        }
+        let (mut receiver, shared_deadline) = match self.register(&key, load, deadline)? {
+            Registration::Resident(metadata) => return Ok(metadata),
+            Registration::Joined { receiver, deadline } => (receiver, deadline),
+        };
+        let guard = WaiterGuard {
+            cache: Arc::clone(self),
+            key,
+            joined: Instant::now(),
+            settled: false,
+        };
+        // The caller waits under whichever bound expires first. Its own
+        // deadline only ever detaches it; the shared one is what the loader
+        // itself is racing, and is repeated here so a waiter is never left
+        // holding a membership past the load's own bound.
+        let bound = deadline.min(shared_deadline);
+        let result = Self::await_publication(&mut receiver, bound, &cancel).await;
+        guard.settle(Self::wait_outcome(&result));
+        result
     }
 
-    /// Records the decision for one lookup and installs a loader when needed.
+    /// Records the decision for one lookup and elects a loader when needed.
     ///
     /// Everything that touches shared state happens here, under one
     /// acquisition, so a concurrent second caller either sees the resident
     /// entry or the in-flight registration the first caller just installed —
-    /// never a window where both start a load.
+    /// never a window where both start a load. The waiter count is raised here
+    /// too, before the lock is released, so a load can never look abandoned
+    /// between its election and its elector's first await.
     ///
     /// # Errors
     /// Returns [`BifrostStorageError::Closed`] when the owner is closing,
@@ -270,6 +402,7 @@ impl ParquetMetadataCache {
         self: &Arc<Self>,
         key: &HotMetadataKey,
         load: MetadataLoadFuture,
+        requested_deadline: Instant,
     ) -> Result<Registration, Arc<BifrostStorageError>> {
         let Ok(mut state) = self.state.lock() else {
             return Err(Arc::new(BifrostStorageError::Closed));
@@ -287,59 +420,128 @@ impl ParquetMetadataCache {
                 .record_cache_effect(CacheEffect::Hit, CacheEffectReason::None);
             return Ok(Registration::Resident(metadata));
         }
-        if let Some(inflight) = state.inflight.get(key) {
+        if let Some(inflight) = state.inflight.get_mut(key) {
             let receiver = inflight.publisher.subscribe();
+            let deadline = inflight.deadline;
+            inflight.waiters = inflight.waiters.saturating_add(1);
             drop(state);
             self.telemetry
                 .record_cache_effect(CacheEffect::Join, CacheEffectReason::None);
-            return Ok(Registration::Joined(receiver));
+            self.telemetry.record_waiter_joined();
+            return Ok(Registration::Joined { receiver, deadline });
         }
         let (publisher, receiver) = watch::channel(None);
         let cancel = CancellationToken::new();
-        let task = self.spawn_loader(key.clone(), load, publisher.clone(), cancel.clone());
+        let cause = Arc::new(AtomicU8::new(CancelCause::None.code()));
+        // Recorded before the task can be scheduled, so a load that settles
+        // immediately can never publish a terminal the totals have no start
+        // for.
+        self.telemetry
+            .record_cache_effect(CacheEffect::Miss, CacheEffectReason::None);
+        self.telemetry.record_load_start();
+        self.telemetry.record_waiter_joined();
+        let task = self.spawn_loader(
+            key.clone(),
+            load,
+            publisher.clone(),
+            cancel.clone(),
+            Arc::clone(&cause),
+            requested_deadline,
+        );
         state.inflight.insert(
             key.clone(),
             InFlight {
-                publisher,
+                deadline: requested_deadline,
                 cancel,
+                cause,
+                waiters: 1,
+                publisher,
                 task,
             },
         );
         drop(state);
-        self.telemetry
-            .record_cache_effect(CacheEffect::Miss, CacheEffectReason::None);
-        self.telemetry.record_load_start();
-        Ok(Registration::Owner(receiver))
+        Ok(Registration::Joined {
+            receiver,
+            deadline: requested_deadline,
+        })
     }
 
-    /// Spawns the one retained loader task for `key`.
+    /// Spawns the one retained, supervised loader task for `key`.
     ///
-    /// The task, not the calling future, owns the load: that is what lets a
-    /// cancelled caller detach without cancelling the work every other waiter
-    /// is depending on, and what gives close something concrete to join or
-    /// abort.
+    /// The task, not any calling future, owns the load and its terminal. That
+    /// is what lets a cancelled caller detach without ending work every other
+    /// waiter depends on, what gives close something concrete to await, and
+    /// what guarantees the key is retired and the result published exactly
+    /// once — including when the caller's decode panics, which is caught here
+    /// rather than left to poison the key.
     fn spawn_loader(
         self: &Arc<Self>,
         key: HotMetadataKey,
         load: MetadataLoadFuture,
         publisher: watch::Sender<Option<MetadataLoadResult>>,
         cancel: CancellationToken,
+        cause: Arc<AtomicU8>,
+        deadline: Instant,
     ) -> JoinHandle<()> {
         let cache = Arc::clone(self);
         tokio::spawn(async move {
             let started = Instant::now();
-            let result = tokio::select! {
+            let result: MetadataLoadResult = tokio::select! {
                 biased;
-                () = cancel.cancelled() => Err(Arc::new(BifrostStorageError::Closed)),
-                loaded = load => loaded.map_err(Arc::new),
+                () = cancel.cancelled() => Err(Arc::new(
+                    CancelCause::from_code(cause.load(Ordering::Acquire)).terminal(),
+                )),
+                () = tokio::time::sleep_until(deadline.into()) => {
+                    Err(Arc::new(BifrostStorageError::Deadline))
+                }
+                loaded = AssertUnwindSafe(load).catch_unwind() => match loaded {
+                    Ok(loaded) => loaded.map_err(Arc::new),
+                    // A panicking decode is undecodable bytes as far as every
+                    // waiter is concerned, and turning it into a terminal here
+                    // is what stops one bad object from leaving its key
+                    // permanently in flight.
+                    Err(_) => Err(Arc::new(BifrostStorageError::InvalidData {
+                        detail: "parquet metadata decode panicked".to_owned(),
+                    })),
+                },
             };
             cache.settle(&key, &result, started.elapsed());
             // A publish failure means every receiver was already dropped, which
-            // is the ordinary outcome when the last caller cancelled. The
+            // is the ordinary outcome when the last caller detached. The
             // terminal accounting above has already happened, so there is
             // nothing further to do.
             let _ = publisher.send(Some(result));
         })
+    }
+
+    /// Settles one waiter's membership and stops abandoned work.
+    ///
+    /// Called exactly once per admitted waiter, from the guard's normal path or
+    /// its drop. When the departing waiter was the last one and the load is
+    /// still running under an open owner, its token is triggered with
+    /// [`CancelCause::Abandoned`]: the loader then publishes `Cancelled`,
+    /// retires its own key, and a later request is free to elect a fresh load.
+    fn release_waiter(&self, key: &HotMetadataKey, outcome: MetadataLoadOutcome, joined: Instant) {
+        let abandoned = {
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            let open = state.lifecycle == StorageLifecycle::Open;
+            state.inflight.get_mut(key).and_then(|inflight| {
+                inflight.waiters = inflight.waiters.saturating_sub(1);
+                (open && inflight.waiters == 0).then(|| {
+                    inflight
+                        .cause
+                        .store(CancelCause::Abandoned.code(), Ordering::Release);
+                    inflight.cancel.clone()
+                })
+            })
+        };
+        if let Some(cancel) = abandoned {
+            cancel.cancel();
+        }
+        self.telemetry
+            .record_waiter_settled(outcome, joined.elapsed());
     }
 
     /// Applies one terminal load result to the resident state and telemetry.
@@ -387,8 +589,8 @@ impl ParquetMetadataCache {
         };
         if let Some(inflight) = state.inflight.remove(key) {
             // The task is finishing right now; dropping the handle detaches it
-            // rather than cancelling it, which is correct — the publish below
-            // is the last thing it does.
+            // rather than cancelling it, which is correct — the publish that
+            // follows this call is the last thing it does.
             drop(inflight);
         }
         let Some(metadata) = metadata else {
@@ -434,11 +636,11 @@ impl ParquetMetadataCache {
         None
     }
 
-    /// Awaits one publication under this caller's own cancellation and deadline.
+    /// Awaits one publication under this caller's own bound and token.
     ///
-    /// Neither the token nor the deadline touches the load: they end this
-    /// caller's interest in it, which is what makes a cancelled query cheap for
-    /// everyone still waiting on the same object.
+    /// Neither the token nor the bound touches the load itself: they end this
+    /// caller's interest in it, and the cache decides separately whether the
+    /// work still has anyone waiting for it.
     async fn await_publication(
         receiver: &mut watch::Receiver<Option<MetadataLoadResult>>,
         deadline: Instant,
@@ -480,10 +682,12 @@ impl ParquetMetadataCache {
         }
     }
 
-    /// Stops admitting loads and cancels every retained loader.
+    /// Stops admitting loads, triggers every loader token, and takes the tasks.
     ///
-    /// Returns the retained task handles so the caller can join them under one
-    /// absolute deadline without holding the state lock across an await.
+    /// The tokens are triggered with [`CancelCause::Closing`] so each loader
+    /// publishes `Closed` itself. Close deliberately publishes nothing: two
+    /// writers of one terminal could disagree about how a load ended, and the
+    /// loader is the one that actually knows.
     fn begin_close(&self) -> Vec<JoinHandle<()>> {
         let Ok(mut state) = self.state.lock() else {
             return Vec::new();
@@ -495,14 +699,10 @@ impl ParquetMetadataCache {
         inflight
             .into_values()
             .map(|entry| {
+                entry
+                    .cause
+                    .store(CancelCause::Closing.code(), Ordering::Release);
                 entry.cancel.cancel();
-                // Waking every waiter here rather than relying on the loader's
-                // own publish is what bounds shutdown: a loader blocked in a
-                // backend call may not observe its token until its request
-                // timeout, and no waiter should have to wait that long.
-                let _ = entry
-                    .publisher
-                    .send(Some(Err(Arc::new(BifrostStorageError::Closed))));
                 entry.task
             })
             .collect()
@@ -521,29 +721,53 @@ impl ParquetMetadataCache {
 
     /// Drains the cache within one absolute deadline.
     ///
-    /// Returns `true` when every retained loader settled in time. Idempotent:
-    /// a second call finds no loaders and no entries and reports clean.
+    /// Returns `true` when every retained loader settled on its own before the
+    /// deadline. A loader that did not is aborted *and awaited*, so `Closed` is
+    /// never observable while a task is still running: the difference between
+    /// clean and unclean is whether shutdown had to force the issue, not
+    /// whether anything is still outstanding afterwards.
+    ///
+    /// Close is serialized behind one shared completion. Concurrent callers
+    /// wait for the same close, and a repeated caller observes that same
+    /// terminal lifecycle instead of running a second close over state the
+    /// first one already reconciled.
     pub(crate) async fn close(&self, deadline: Instant) -> bool {
-        let tasks = self.begin_close();
+        let mut closing = self.closing.lock().await;
+        if let Some(clean) = *closing {
+            return clean;
+        }
         let mut clean = true;
-        for task in tasks {
+        for mut task in self.begin_close() {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            if tokio::time::timeout(remaining, task).await.is_err() {
+            if tokio::time::timeout(remaining, &mut task).await.is_err() {
+                // The loader did not settle within the shutdown budget. Abort
+                // it and await the abort, so the owner never reports `Closed`
+                // while a task is still touching its state.
                 clean = false;
+                task.abort();
+                if task.await.is_err() {
+                    // The loader was cancelled before it could publish its own
+                    // terminal, so close reconciles that one load itself.
+                    // Without this the in-flight gauge would keep a start no
+                    // terminal will ever settle, and a forced shutdown would
+                    // look like a leak forever.
+                    self.telemetry
+                        .record_load_terminal(MetadataLoadOutcome::Cancelled, Duration::ZERO);
+                }
             }
         }
         self.finish_close();
+        *closing = Some(clean);
         clean
     }
 
-    /// Drains the cache immediately, aborting every retained loader.
+    /// Drains the cache immediately, aborting and awaiting every loader.
     ///
-    /// Idempotent, and safe to call after [`Self::close`].
-    pub(crate) fn abort(&self) {
-        for task in self.begin_close() {
-            task.abort();
-        }
-        self.finish_close();
+    /// Idempotent, and safe to call after [`Self::close`]: both share the same
+    /// single completion, so the second caller observes the first one's result
+    /// rather than reopening a settled lifecycle.
+    pub(crate) async fn abort(&self) {
+        self.close(Instant::now()).await;
     }
 }
 
@@ -566,7 +790,9 @@ mod tests {
     use super::*;
     use crate::storage::BifrostStorage;
     use crate::storage::policy::BifrostStoragePolicy;
-    use crate::storage::telemetry::{CacheEffect, CacheEffectReason, MetadataLoadOutcome};
+    use crate::storage::telemetry::{
+        CacheEffect, CacheEffectReason, MetadataCacheSnapshot, MetadataLoadOutcome,
+    };
 
     /// Writes one real Parquet object whose footer the cache will decode.
     ///
@@ -904,5 +1130,430 @@ mod tests {
         assert_eq!(snapshot.reason(CacheEffectReason::Oversized), 1);
         assert_eq!(snapshot.resident_entries(), 0);
         assert_eq!(snapshot.resident_bytes(), 0);
+    }
+
+    /// Decodes the fixture object's real footer for use as a load result.
+    ///
+    /// # Panics
+    /// Panics when the fixture object does not decode.
+    async fn decode_fixture(object: &Bytes) -> Arc<ParquetMetaData> {
+        let size = u64::try_from(object.len()).expect("fixture object fits u64");
+        let mut reader = CountingReader::new(object, &Arc::new(AtomicUsize::new(0)), None);
+        parquet::file::metadata::ParquetMetaDataReader::new()
+            .load_and_finish(&mut reader, size)
+            .await
+            .map(Arc::new)
+            .expect("fixture footer decodes")
+    }
+
+    /// Waits until the owner's totals satisfy `reached`.
+    ///
+    /// A barrier, not a timed assumption: no assertion below depends on how
+    /// long this takes, only on the state it waits for, so a slow machine
+    /// makes the test slower rather than flaky. It yields first and only backs
+    /// off when yielding is not enough, which is the case when the task it is
+    /// waiting on runs on another worker thread. Bounded so a design
+    /// regression fails the test instead of hanging it.
+    ///
+    /// # Panics
+    /// Panics when the condition is not reached within the yield budget.
+    async fn settled_to(
+        telemetry: &Arc<BifrostStorageTelemetry>,
+        reached: impl Fn(&MetadataCacheSnapshot) -> bool,
+    ) {
+        for attempt in 0..2_000_u32 {
+            if reached(&telemetry.snapshot()) {
+                return;
+            }
+            if attempt % 32 == 31 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            } else {
+                tokio::task::yield_now().await;
+            }
+        }
+        panic!(
+            "the owner never reached the awaited state: {:?}",
+            telemetry.snapshot()
+        );
+    }
+
+    /// Builds a load future that fails the test if it is ever polled.
+    ///
+    /// A joiner supplies one of these, so the assertion that N callers cost one
+    /// decode is proven by the joiners' own work never starting, not only by a
+    /// count the cache itself reports.
+    fn unused_load() -> MetadataLoadFuture {
+        async { panic!("a joined caller's load future must never be polled") }.boxed()
+    }
+
+    /// The elected loader task owns every terminal: one failure, one panic, and
+    /// one shutdown each settle exactly once for every joined caller, retire
+    /// their key, and leave the owner free to elect a fresh load.
+    ///
+    /// Asserted as one scenario because the supervision property is a single
+    /// one seen from three sides: a load that ends badly, a load that ends
+    /// violently, and the state left behind. A per-caller loader would pass a
+    /// success-only test while still leaving a panicked key permanently in
+    /// flight, so the negative terminals are the proof.
+    ///
+    /// # Panics
+    /// Panics when a waiter task, terminal, or reconciliation assertion fails.
+    #[tokio::test]
+    async fn one_supervised_terminal_settles_every_caller_and_frees_the_key() {
+        let object = parquet_object(32);
+        let decoded = decode_fixture(&object).await;
+        let tenant = DataTenantId::new_v7();
+        let telemetry = Arc::new(BifrostStorageTelemetry::default());
+        let cache = Arc::new(ParquetMetadataCache::new(
+            64 * 1024 * 1024,
+            Arc::clone(&telemetry),
+        ));
+        let far = Instant::now() + Duration::from_secs(3_600);
+
+        let failing = test_key(tenant, "failing.parquet", 0x11, 1);
+        let gate = Arc::new(Notify::new());
+        let elector = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            let key = failing.clone();
+            let gate = Arc::clone(&gate);
+            async move {
+                cache
+                    .get_or_load(
+                        key,
+                        async move {
+                            gate.notified().await;
+                            Err(BifrostStorageError::NotFound {
+                                detail: "the fixture object is absent".to_owned(),
+                            })
+                        }
+                        .boxed(),
+                        far,
+                        CancellationToken::new(),
+                    )
+                    .await
+            }
+        });
+        settled_to(&telemetry, |snapshot| snapshot.load_starts() == 1).await;
+        let joiners = (0..2)
+            .map(|_| {
+                tokio::spawn({
+                    let cache = Arc::clone(&cache);
+                    let key = failing.clone();
+                    async move {
+                        cache
+                            .get_or_load(key, unused_load(), far, CancellationToken::new())
+                            .await
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        settled_to(&telemetry, |snapshot| snapshot.waiters() == 3).await;
+        gate.notify_waiters();
+
+        let elected = elector.await.expect("the elector task completes");
+        assert!(matches!(
+            elected.expect_err("the elected load fails"),
+            ref error if matches!(**error, BifrostStorageError::NotFound { .. })
+        ));
+        for joiner in joiners {
+            let joined = joiner.await.expect("a joined task completes");
+            assert!(matches!(
+                joined.expect_err("a joined caller observes the same failure"),
+                ref error if matches!(**error, BifrostStorageError::NotFound { .. })
+            ));
+        }
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.effect(CacheEffect::Miss), 1);
+        assert_eq!(snapshot.effect(CacheEffect::Join), 2);
+        assert_eq!(snapshot.load_starts(), 1);
+        assert_eq!(snapshot.load_terminal(MetadataLoadOutcome::Failed), 1);
+        assert_eq!(snapshot.inflight_loads(), 0);
+        assert_eq!(snapshot.waiters(), 0);
+
+        // The failed key is retired, not poisoned: a later caller elects a
+        // fresh load and its success is retained.
+        let retried = cache
+            .get_or_load(
+                failing.clone(),
+                {
+                    let decoded = Arc::clone(&decoded);
+                    async move { Ok(decoded) }.boxed()
+                },
+                far,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the retried load succeeds");
+        assert_eq!(retried.memory_size(), decoded.memory_size());
+        assert_eq!(telemetry.snapshot().effect(CacheEffect::Miss), 2);
+        assert_eq!(telemetry.snapshot().resident_entries(), 1);
+
+        // A panicking decode is a terminal like any other: it settles every
+        // caller and releases the key rather than stranding it in flight.
+        let panicking = test_key(tenant, "panicking.parquet", 0x22, 1);
+        let observed = cache
+            .get_or_load(
+                panicking.clone(),
+                async { panic!("the fixture decode panics") }.boxed(),
+                far,
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("a panicking decode fails its caller");
+        assert!(matches!(*observed, BifrostStorageError::InvalidData { .. }));
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.load_terminal(MetadataLoadOutcome::Failed), 2);
+        assert_eq!(snapshot.load_starts(), snapshot.load_terminals());
+        assert_eq!(snapshot.inflight_loads(), 0);
+        assert_eq!(snapshot.waiters(), 0);
+        assert_eq!(snapshot.anomalies(), 0);
+        assert!(cache.close(far).await);
+    }
+
+    /// One caller's cancellation or deadline never ends work another caller is
+    /// still waiting on, the shared deadline is fixed at election, and the last
+    /// waiter's departure stops abandoned work with a truthful cause.
+    ///
+    /// Asserted together because they are the two halves of one bound: a
+    /// per-caller bound that only detaches, and a shared bound that actually
+    /// ends the load. Testing either alone would accept an implementation where
+    /// the first cancelled query kills a load six others still need, or where a
+    /// long-deadline joiner keeps abandoned work alive.
+    ///
+    /// # Panics
+    /// Panics when a waiter task, terminal cause, or reconciliation assertion
+    /// fails.
+    #[tokio::test]
+    async fn a_shared_load_outlives_one_caller_and_ends_when_all_of_them_leave() {
+        let tenant = DataTenantId::new_v7();
+        let telemetry = Arc::new(BifrostStorageTelemetry::default());
+        let cache = Arc::new(ParquetMetadataCache::new(
+            64 * 1024 * 1024,
+            Arc::clone(&telemetry),
+        ));
+        let far = Instant::now() + Duration::from_secs(3_600);
+
+        let abandoned = test_key(tenant, "abandoned.parquet", 0x31, 1);
+        let cancel = CancellationToken::new();
+        let elector = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            let key = abandoned.clone();
+            let cancel = cancel.clone();
+            async move {
+                cache
+                    .get_or_load(key, std::future::pending().boxed(), far, cancel)
+                    .await
+            }
+        });
+        settled_to(&telemetry, |snapshot| snapshot.load_starts() == 1).await;
+        let joiner = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            let key = abandoned.clone();
+            async move {
+                cache
+                    .get_or_load(key, unused_load(), far, CancellationToken::new())
+                    .await
+            }
+        });
+        settled_to(&telemetry, |snapshot| snapshot.waiters() == 2).await;
+
+        // The elector detaches on its own token. The load keeps running because
+        // the joiner still wants the result.
+        cancel.cancel();
+        let elected = elector.await.expect("the elector task completes");
+        assert!(matches!(
+            *elected.expect_err("the cancelled elector fails"),
+            BifrostStorageError::Cancelled
+        ));
+        settled_to(&telemetry, |snapshot| snapshot.waiters() == 1).await;
+        assert_eq!(telemetry.snapshot().inflight_loads(), 1);
+
+        // The last waiter's departure is what ends work nobody wants, and the
+        // published cause says so.
+        joiner.abort();
+        settled_to(&telemetry, |snapshot| snapshot.inflight_loads() == 0).await;
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.load_terminal(MetadataLoadOutcome::Cancelled), 1);
+        assert_eq!(snapshot.waiters(), 0);
+        assert_eq!(snapshot.resident_entries(), 0);
+
+        // A later joiner accepts the election-fixed deadline and cannot widen
+        // it: both callers observe the same deadline terminal at the elected
+        // bound, not at the joiner's own far later one. The elected bound is
+        // already spent, so the proof needs no timer to advance.
+        let bounded = test_key(tenant, "bounded.parquet", 0x32, 1);
+        let short = Instant::now();
+        let elector = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            let key = bounded.clone();
+            async move {
+                cache
+                    .get_or_load(
+                        key,
+                        std::future::pending().boxed(),
+                        short,
+                        CancellationToken::new(),
+                    )
+                    .await
+            }
+        });
+        settled_to(&telemetry, |snapshot| snapshot.load_starts() == 2).await;
+        let joiner = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            let key = bounded.clone();
+            async move {
+                cache
+                    .get_or_load(key, unused_load(), far, CancellationToken::new())
+                    .await
+            }
+        });
+        settled_to(&telemetry, |snapshot| snapshot.waiters() == 2).await;
+        for task in [elector, joiner] {
+            let observed = task.await.expect("a bounded task completes");
+            assert!(matches!(
+                *observed.expect_err("the bounded load fails"),
+                BifrostStorageError::Deadline
+            ));
+        }
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.load_terminal(MetadataLoadOutcome::Deadline), 1);
+        assert_eq!(snapshot.load_starts(), snapshot.load_terminals());
+        assert!(snapshot.is_quiescent());
+        assert!(cache.close(far).await);
+    }
+
+    /// Close is serialized, repeatable, and never reports a settled owner while
+    /// a loader task is still running.
+    ///
+    /// Asserted as one scenario because "closed" is a single claim: a graceful
+    /// close that settles its loaders is clean, a close whose budget elapsed is
+    /// unclean but still leaves nothing running, and every concurrent or later
+    /// caller observes that same one outcome rather than re-closing state the
+    /// first close already reconciled.
+    ///
+    /// # Panics
+    /// Panics when a close, terminal, or reconciliation assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_settles_every_loader_once_and_shares_that_one_outcome() {
+        let tenant = DataTenantId::new_v7();
+        let telemetry = Arc::new(BifrostStorageTelemetry::default());
+        let cache = Arc::new(ParquetMetadataCache::new(
+            64 * 1024 * 1024,
+            Arc::clone(&telemetry),
+        ));
+        let far = Instant::now() + Duration::from_secs(3_600);
+
+        let graceful = test_key(tenant, "graceful.parquet", 0x41, 1);
+        let waiter = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            let key = graceful.clone();
+            async move {
+                cache
+                    .get_or_load(
+                        key,
+                        std::future::pending().boxed(),
+                        far,
+                        CancellationToken::new(),
+                    )
+                    .await
+            }
+        });
+        settled_to(&telemetry, |snapshot| snapshot.load_starts() == 1).await;
+
+        // Two closers race one close. Both observe the same completion, and the
+        // loader settles itself inside the budget, so the close is clean.
+        let concurrent = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            async move { cache.close(far).await }
+        });
+        assert!(cache.close(far).await);
+        assert!(concurrent.await.expect("the concurrent closer completes"));
+        assert!(
+            cache.close(Instant::now()).await,
+            "a repeated close observes the first close's outcome"
+        );
+
+        let observed = waiter.await.expect("the waiter task completes");
+        assert!(matches!(
+            *observed.expect_err("a load outstanding at close fails"),
+            BifrostStorageError::Closed
+        ));
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.load_terminal(MetadataLoadOutcome::Cancelled), 1);
+        assert_eq!(snapshot.load_starts(), snapshot.load_terminals());
+        assert_eq!(snapshot.lifecycle(), StorageLifecycle::Closed);
+        assert!(snapshot.is_quiescent());
+
+        // Admission is closed for good: a later caller is refused, and the
+        // refusal is published rather than silently treated as a miss.
+        let refused = cache
+            .get_or_load(graceful, unused_load(), far, CancellationToken::new())
+            .await
+            .expect_err("a request after close is refused");
+        assert!(matches!(*refused, BifrostStorageError::Closed));
+        assert_eq!(
+            telemetry.snapshot().reason(CacheEffectReason::Closing),
+            1,
+            "the refusal is recorded, not silent"
+        );
+
+        // A decode is CPU-bound, so a loader can be somewhere the cancellation
+        // token cannot reach it. A close whose budget has already elapsed
+        // cannot wait for such a loader out: it reports unclean, and still
+        // returns only once nothing is running.
+        // Its own telemetry, so "this owner has begun closing" is a fact about
+        // this owner rather than one inherited from the cache closed above.
+        let forced_telemetry = Arc::new(BifrostStorageTelemetry::default());
+        let forced = Arc::new(ParquetMetadataCache::new(
+            64 * 1024 * 1024,
+            Arc::clone(&forced_telemetry),
+        ));
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let stuck = tokio::spawn({
+            let cache = Arc::clone(&forced);
+            let key = test_key(tenant, "stuck.parquet", 0x42, 1);
+            async move {
+                cache
+                    .get_or_load(
+                        key,
+                        async move {
+                            // Blocks its worker rather than awaiting, exactly
+                            // as a synchronous footer decode does.
+                            let _ = blocked.recv();
+                            Err(BifrostStorageError::Cancelled)
+                        }
+                        .boxed(),
+                        far,
+                        CancellationToken::new(),
+                    )
+                    .await
+            }
+        });
+        settled_to(&forced_telemetry, |snapshot| snapshot.load_starts() == 1).await;
+        let closing = tokio::spawn({
+            let cache = Arc::clone(&forced);
+            async move { cache.close(Instant::now()).await }
+        });
+        settled_to(&forced_telemetry, |snapshot| {
+            snapshot.lifecycle() != StorageLifecycle::Open
+        })
+        .await;
+        let _ = release.send(());
+        assert!(
+            !closing.await.expect("the forced closer completes"),
+            "a close with no budget left cannot settle its loaders gracefully"
+        );
+        let observed = stuck.await.expect("the stuck waiter completes");
+        assert!(
+            observed.is_err(),
+            "a load the owner had to force never returns metadata"
+        );
+        let snapshot = forced_telemetry.snapshot();
+        assert_eq!(
+            snapshot.load_starts(),
+            snapshot.load_terminals(),
+            "a forced close reconciles the loads it could not wait out"
+        );
+        assert!(snapshot.is_quiescent());
     }
 }

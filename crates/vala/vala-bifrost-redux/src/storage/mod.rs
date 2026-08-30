@@ -17,6 +17,7 @@ pub use crate::storage::error::BifrostStorageError;
 pub use crate::storage::policy::BifrostStoragePolicy;
 pub use crate::storage::telemetry::{
     CacheEffect, CacheEffectReason, MetadataCacheSnapshot, MetadataLoadOutcome, StorageLifecycle,
+    TelemetryTransition,
 };
 
 use crate::storage::cache::ParquetMetadataCache;
@@ -161,10 +162,14 @@ impl BifrostStorage {
 
     /// Closes cache admission immediately, aborting every retained loader.
     ///
-    /// Idempotent, and safe after [`Self::close`].
-    pub fn abort(&self) {
+    /// Idempotent, and safe after [`Self::close`]: both share the cache's one
+    /// close completion, so a second caller observes the first one's outcome.
+    ///
+    /// Awaits every aborted loader, so once this returns no retained task is
+    /// still running against the owner's state.
+    pub async fn abort(&self) {
         if let Some(cache) = self.metadata_cache.as_ref() {
-            cache.abort();
+            cache.abort().await;
         }
     }
 }

@@ -314,9 +314,10 @@ impl FollowerSourceResolver for OracleCatalogResolver {
     /// Builds one tenant-qualified leaf for an Oracle assignment and rejects
     /// Scribe assignments.
     ///
-    /// Which leaf depends on the assignment's own scan id. A `:hot` assignment
+    /// Which leaf depends on the validated variant of the assignment's own
+    /// descriptors, never on its scan id. A hot assignment
     /// reads sealed Scribe output directly through [`super::exec::HotParquetExec`],
-    /// which takes `assignment.predicates` as its own filter; every other
+    /// which takes `assignment.predicates` as its own filter; an Iceberg
     /// assignment reads compacted output through the catalog provider's scan,
     /// which takes the same predicates as logical filters. Both leaves therefore
     /// prune from the closure the leader signed, but only one of them is built
@@ -380,6 +381,14 @@ impl FollowerSourceResolver for OracleCatalogResolver {
             })
             .map_err(|_| "authenticated Oracle empty provider failed".to_owned());
         }
+        // Classified before any location resolution or object I/O. The scan id
+        // is a leader-chosen label on the wire; the descriptor variant is what
+        // preflight validated and what the assignment-authority digest covers,
+        // so it is the only thing this dispatch may read. A mixed list has no
+        // single correct reader and is refused here as well as in preflight,
+        // because this resolver is reachable from any authenticated fragment.
+        let source = super::AssignedPersistedSource::classify(&assignment.persisted.files)
+            .map_err(|_| "authenticated Oracle assignment names mixed sources".to_owned())?;
         let catalog_binding =
             CatalogTableBinding::resolve((assignment.binding.tenant_id, table))
                 .map_err(|_| "authenticated Oracle assignment binding failed".to_owned())?;
@@ -400,7 +409,7 @@ impl FollowerSourceResolver for OracleCatalogResolver {
                     .map_err(|_| "authenticated Oracle assignment location failed".to_owned())
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if assignment.scan_id.ends_with(":hot") {
+        if source == super::AssignedPersistedSource::Hot {
             let mut files = Vec::with_capacity(assigned_locations.len());
             for (_, _, location) in &assigned_locations {
                 let input = self
@@ -1180,7 +1189,8 @@ where
     /// Validates one authenticated assignment beyond its identity and binding.
     ///
     /// Runs the checks that are about the assignment's *content* rather than
-    /// its identity: the persisted file list must be unique and ordered, the
+    /// its identity: the persisted file list must be unique, ordered, and name
+    /// exactly one persisted source, the
     /// signed projection closure must retain the hidden tenant column, every
     /// closed predicate must reference a column inside that closure, the role
     /// must match the presence or absence of a Scribe provider cut, and a cut
@@ -1202,6 +1212,13 @@ where
                 "persisted assignment is not unique and ordered".to_owned(),
             ));
         }
+        // Refused here, before any provider resolution or object I/O, because
+        // hot and Iceberg descriptors are resolved by different readers under
+        // different authority: a mixed list has no single correct leaf, and
+        // whichever the resolver picked would silently drop the other source's
+        // rows from an otherwise valid, signed result.
+        super::AssignedPersistedSource::classify(&assignment.persisted.files)
+            .map_err(|error| PhysicalPlanFollowerError::Preflight(error.to_string()))?;
         // Defense in depth: the leader already refuses to sign an
         // assignment whose projection closure drops the hidden tenant
         // column (see `Oracle::ensure_required_columns_closure`), and the
@@ -1894,6 +1911,73 @@ pub(crate) mod tests {
     /// Follower sessions are shaped only by the admitted grant and assigned work.
     ///
     /// This is the follower half of the resource-parity contract: the session's
+    /// Preflight refuses a signed assignment whose file list names both hot and
+    /// Iceberg descriptors, before any provider resolution or object I/O.
+    ///
+    /// The two sources are resolved by different readers under different
+    /// authority — a `vala.file_list` row and decoded checksum for hot, the
+    /// pinned snapshot for Iceberg — so a mixed list has no single correct
+    /// leaf. Silently resolving one variant would return a signed, digest-clean
+    /// result that is missing the other source's rows, which is why this is a
+    /// refusal rather than a partition.
+    ///
+    /// # Panics
+    /// Panics when a mixed list is accepted or a uniform one is refused.
+    #[test]
+    fn preflight_refuses_an_assignment_naming_two_persisted_sources() {
+        let mut assignment = FollowerScanAssignment {
+            scan_id: "mixed-source-scan".to_owned(),
+            binding: TenantTableBinding {
+                tenant_id: DataTenantId::new_v7(),
+                namespace: "vala.bifrost".to_owned(),
+                table: "events".to_owned(),
+            },
+            persisted: PersistedFileAssignment {
+                files: vec![crate::oracle::test_persisted_descriptor("a.parquet")],
+            },
+            scribe_provider_cut: None,
+            schema_fingerprint: "mixed".to_owned(),
+            required_columns: vec![DATA_TENANT_ID.to_owned()],
+            predicates: Vec::new(),
+        };
+        let fence: wyrd_spec::vala::api::FencingToken = 1;
+        assert!(
+            PhysicalPlanFollower::<CountingResolver>::validate_assignment(
+                &assignment,
+                ClusterRole::Oracle,
+                fence,
+            )
+            .is_ok(),
+            "a uniform Iceberg assignment is accepted"
+        );
+
+        assignment
+            .persisted
+            .files
+            .push(PersistedFileDescriptor::Hot(
+                wyrd_spec::vala::api::HotFileDescriptor {
+                    path: "b.parquet".to_owned(),
+                    size_bytes: 4_096,
+                    row_count: 1,
+                    file_list_id: uuid::Uuid::now_v7(),
+                    sha256: [9_u8; 32],
+                    min_event_time_micros: None,
+                    max_event_time_micros: None,
+                },
+            ));
+        let refusal = PhysicalPlanFollower::<CountingResolver>::validate_assignment(
+            &assignment,
+            ClusterRole::Oracle,
+            fence,
+        )
+        .expect_err("a mixed persisted source is refused");
+        assert!(
+            matches!(&refusal, PhysicalPlanFollowerError::Preflight(detail)
+                if detail.contains("more than one persisted source")),
+            "{refusal:?}"
+        );
+    }
+
     /// partition count, batch size, and join preference all come from one
     /// [`OracleSessionShape`](crate::resources::OracleSessionShape) derived from
     /// the grant this node admitted, never from a fixed process constant and

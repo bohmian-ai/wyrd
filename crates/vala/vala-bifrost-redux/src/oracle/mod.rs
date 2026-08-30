@@ -205,6 +205,58 @@ fn follower_source_loss_degrades(
         && sources == [QuerySource::LiveTail]
 }
 
+/// The one persisted source an assignment's descriptors name.
+///
+/// A scan id is a leader-chosen label carried on the wire; it is not authority
+/// for what a follower opens. The descriptor variant is, because it is what
+/// preflight validated and what the assignment-authority digest covers, so it
+/// is the only thing either side classifies an assignment by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AssignedPersistedSource {
+    /// The assignment carries no persisted file and resolves to an empty leaf.
+    Empty,
+    /// Every descriptor names staged hot Parquet described by `vala.file_list`.
+    Hot,
+    /// Every descriptor names a data file in the pinned Iceberg snapshot.
+    Iceberg,
+}
+
+/// An assignment naming more than one persisted source in a single file list.
+///
+/// This is refused rather than split because the two sources are resolved by
+/// different readers under different authority — a `vala.file_list` row and
+/// decoded checksum for hot, a pinned snapshot for Iceberg — so a mixed list
+/// has no single correct leaf, and picking one would silently drop the other
+/// source's rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("assignment names more than one persisted source")]
+pub(crate) struct MixedPersistedSources;
+
+impl AssignedPersistedSource {
+    /// Classifies one assignment's ordered descriptor list.
+    ///
+    /// # Errors
+    /// Returns [`MixedPersistedSources`] when the list mixes hot and Iceberg
+    /// descriptors.
+    pub(crate) fn classify(
+        files: &[PersistedFileDescriptor],
+    ) -> Result<Self, MixedPersistedSources> {
+        let mut source = Self::Empty;
+        for file in files {
+            let observed = match file {
+                PersistedFileDescriptor::Hot(_) => Self::Hot,
+                PersistedFileDescriptor::Iceberg(_) => Self::Iceberg,
+            };
+            match source {
+                Self::Empty => source = observed,
+                existing if existing == observed => {}
+                _ => return Err(MixedPersistedSources),
+            }
+        }
+        Ok(source)
+    }
+}
+
 /// Derives the exact public source tiers represented by one role-local assignment set.
 fn follower_assignment_sources(
     role: wyrd_spec::vala::api::ClusterRole,
@@ -219,14 +271,15 @@ fn follower_assignment_sources(
             .collect();
     }
     let mut sources = Vec::new();
-    for assignment in assignments
-        .iter()
-        .filter(|assignment| !assignment.persisted.files.is_empty())
-    {
-        if assignment.scan_id.ends_with(":iceberg") {
-            sources.push(QuerySource::Iceberg);
-        } else if assignment.scan_id.ends_with(":hot") {
-            sources.push(QuerySource::HotSealed);
+    for assignment in assignments {
+        // Classified from the descriptors themselves. A mixed list never
+        // survives follower preflight, and reporting no tier for one is
+        // correct here: this function names the tiers a degraded result
+        // actually lost, and an assignment that cannot be resolved lost none.
+        match AssignedPersistedSource::classify(&assignment.persisted.files) {
+            Ok(AssignedPersistedSource::Iceberg) => sources.push(QuerySource::Iceberg),
+            Ok(AssignedPersistedSource::Hot) => sources.push(QuerySource::HotSealed),
+            Ok(AssignedPersistedSource::Empty) | Err(_) => {}
         }
     }
     sources.sort();
@@ -5543,11 +5596,76 @@ mod tests {
         }
     }
 
-    /// Assignment identity emits the exact degraded public source tier.
+    /// The persisted source of an assignment is its descriptors' variant, and a
+    /// list mixing both variants is refused rather than classified.
+    ///
+    /// A scan id is a leader-chosen label the wire carries; the descriptor
+    /// variant is what preflight validates and what the assignment-authority
+    /// digest covers. The label is deliberately made to disagree with the
+    /// descriptors here so that a classifier reading the label cannot pass.
+    ///
+    /// # Panics
+    /// Panics when classification disagrees with the descriptor variants.
+    #[test]
+    fn persisted_source_is_classified_from_descriptors_not_the_scan_id() {
+        let hot = PersistedFileDescriptor::Hot(wyrd_spec::vala::api::HotFileDescriptor {
+            path: "a.parquet".to_owned(),
+            size_bytes: 4_096,
+            row_count: 1,
+            file_list_id: uuid::Uuid::now_v7(),
+            sha256: [3_u8; 32],
+            min_event_time_micros: None,
+            max_event_time_micros: None,
+        });
+        let iceberg = test_persisted_descriptor("b.parquet");
+
+        assert_eq!(
+            AssignedPersistedSource::classify(&[]),
+            Ok(AssignedPersistedSource::Empty)
+        );
+        assert_eq!(
+            AssignedPersistedSource::classify(std::slice::from_ref(&hot)),
+            Ok(AssignedPersistedSource::Hot)
+        );
+        assert_eq!(
+            AssignedPersistedSource::classify(std::slice::from_ref(&iceberg)),
+            Ok(AssignedPersistedSource::Iceberg)
+        );
+        assert_eq!(
+            AssignedPersistedSource::classify(&[hot.clone(), iceberg]),
+            Err(MixedPersistedSources),
+            "a list resolved by two different readers has no single correct leaf"
+        );
+
+        // The scan id says Iceberg; the descriptors say hot. The descriptors win.
+        let mut mislabeled = test_persisted_assignment("oracle:spans:iceberg", &[]);
+        mislabeled.persisted.files = vec![hot];
+        assert_eq!(
+            follower_assignment_sources(
+                wyrd_spec::vala::api::ClusterRole::Oracle,
+                std::slice::from_ref(&mislabeled)
+            ),
+            vec![QuerySource::HotSealed]
+        );
+    }
+
+    /// A role-local assignment set emits the exact degraded public source tiers
+    /// its assignments actually carry.
     #[test]
     fn follower_assignment_sources_preserve_oracle_and_scribe_tiers() {
         let mut iceberg = test_persisted_assignment("oracle:spans:iceberg", &["a"]);
-        let hot = test_persisted_assignment("oracle:spans:hot", &["b"]);
+        let mut hot = test_persisted_assignment("oracle:spans:hot", &[]);
+        hot.persisted.files = vec![PersistedFileDescriptor::Hot(
+            wyrd_spec::vala::api::HotFileDescriptor {
+                path: "b.parquet".to_owned(),
+                size_bytes: 4_096,
+                row_count: 1,
+                file_list_id: uuid::Uuid::now_v7(),
+                sha256: [5_u8; 32],
+                min_event_time_micros: None,
+                max_event_time_micros: None,
+            },
+        )];
         assert_eq!(
             follower_assignment_sources(
                 wyrd_spec::vala::api::ClusterRole::Oracle,

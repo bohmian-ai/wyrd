@@ -1416,26 +1416,32 @@ impl OracleTableProvider {
     /// Builds one remote-source placeholder leaf for a dispatched scan id.
     ///
     /// The placeholder stands in for a subtree the splitter will hand to a
-    /// follower. It carries the physical schema fingerprint the follower
-    /// revalidates, the session's target partitions so the split boundary
-    /// lands on the exchange rather than a repartition, and the closed
-    /// predicate/projection closure `execute_distributed_session` later
-    /// recovers to overwrite that scan id's safe pre-planning default.
+    /// follower. It exposes the same closure schema every other leaf in this
+    /// union exposes, carries the *complete* physical schema fingerprint the
+    /// follower revalidates against its own catalog, advertises the session's
+    /// target partitions so the split boundary lands on the exchange rather
+    /// than a repartition, and carries the closed predicate/projection closure
+    /// `execute_distributed_session` later recovers to overwrite that scan id's
+    /// safe pre-planning default.
+    ///
+    /// The fingerprint deliberately does not narrow with the projection: it
+    /// identifies the table's canonical physical schema, and a follower derives
+    /// the closure schema from that schema plus the signed column names.
     fn remote_placeholder(
         &self,
         scan_id: &str,
         target_partitions: usize,
-        required_columns: &[String],
+        projection: &OracleScanProjection,
         predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
     ) -> Arc<dyn ExecutionPlan> {
         Arc::new(
             super::codec::RemoteSourcePlaceholderExec::new(
                 scan_id.to_owned(),
                 super::assignment_schema_fingerprint(self.physical_schema.as_ref()),
-                Arc::clone(&self.physical_schema),
+                Arc::clone(&projection.required_schema),
             )
             .with_partitions(target_partitions)
-            .with_closure(required_columns.to_vec(), predicates.to_vec()),
+            .with_closure(projection.required_columns.clone(), predicates.to_vec()),
         )
     }
 
@@ -1447,6 +1453,34 @@ impl OracleTableProvider {
         Ok(MemorySourceConfig::try_new_exec(
             std::slice::from_ref(batches),
             schema,
+            None,
+        )?)
+    }
+
+    /// Narrows already-validated in-memory batches to the scan's closure schema.
+    ///
+    /// Distributed and drained live rows arrive at the complete physical schema.
+    /// Shallow-projecting them by name before the memory source keeps every
+    /// union leaf on one schema, which is what lets the serialized plan's
+    /// `Column` indices be closure indices everywhere. An empty batch vector
+    /// still yields a source declaring the closure, so an empty branch is
+    /// schema-identical to a populated one.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `DataFusion` error when a batch is missing a closure column,
+    /// a cast fails, or Arrow rejects the projected batch.
+    fn projected_memory_source(
+        batches: &[RecordBatch],
+        schema: &SchemaRef,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let projected = batches
+            .iter()
+            .map(|batch| project_batch(batch, Arc::clone(schema)))
+            .collect::<DataFusionResult<Vec<_>>>()?;
+        Ok(MemorySourceConfig::try_new_exec(
+            std::slice::from_ref(&projected),
+            Arc::clone(schema),
             None,
         )?)
     }
@@ -1616,8 +1650,15 @@ impl TableProvider for OracleTableProvider {
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let (supported_predicates, supported_filters) = self.closed_pushdown(filters);
-        let required_columns =
-            required_columns_closure(&self.public_schema, projection, &supported_predicates);
+        // One closure, derived once, governs every leaf below and every
+        // operator above. Nothing downstream recomputes a column set or order.
+        let scan_projection = OracleScanProjection::try_new(
+            &self.physical_schema,
+            &self.public_schema,
+            projection,
+            &supported_predicates,
+        )?;
+        let required_schema = Arc::clone(&scan_projection.required_schema);
         let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
         // Every remote source advertises the session's target partitions so the
         // distributed split boundary lands on the exchange above the partial
@@ -1628,35 +1669,49 @@ impl TableProvider for OracleTableProvider {
             inputs.push(self.remote_placeholder(
                 scan_id,
                 target_partitions,
-                &required_columns,
+                &scan_projection,
                 &supported_predicates,
             ));
         } else if let Some(batches) = &self.distributed_iceberg_batches {
-            let published =
-                Self::validated_memory_source(batches, Arc::clone(&self.physical_schema))?;
+            let published = Self::projected_memory_source(batches, &required_schema)?;
             inputs.push(published);
         } else {
             // `limit` is forwarded only as a per-leaf upper bound; DataFusion's
-            // own global limit above this provider remains authoritative.
+            // own global limit above this provider remains authoritative. The
+            // closure's physical indices are what keep unrequested columns out
+            // of the Iceberg reader itself rather than merely out of the result.
             let published = self
                 .iceberg
-                .scan(state, None, &supported_filters, limit)
+                .scan(
+                    state,
+                    Some(&scan_projection.physical_indices),
+                    &supported_filters,
+                    limit,
+                )
                 .await?;
-            let published = Arc::new(OracleIcebergScanExec::from_plan(published.as_ref())?);
-            inputs.push(published);
+            let published: Arc<dyn ExecutionPlan> =
+                Arc::new(OracleIcebergScanExec::from_plan(published.as_ref())?);
+            // The dependency may return the projected columns in its own
+            // physical order. The signed closure is authoritative, so the plan
+            // is normalized to it here rather than the closure being reordered
+            // to match a source.
+            inputs.push(project_plan_by_name(
+                published,
+                &scan_projection.required_columns,
+            )?);
         }
         if let Some(scan_id) = &self.remote_sources.hot_scan_id {
             inputs.push(self.remote_placeholder(
                 scan_id,
                 target_partitions,
-                &required_columns,
+                &scan_projection,
                 &supported_predicates,
             ));
         } else if !self.hot_files.is_empty() {
             let hot = Arc::new(HotParquetExec::new(
                 self.hot_files.clone(),
                 self.file_io.clone(),
-                Arc::clone(&self.physical_schema),
+                Arc::clone(&required_schema),
                 HotParquetGovernance::Leader {
                     memory: self.memory.clone(),
                     memory_pool: Arc::clone(&self.query_pool),
@@ -1669,25 +1724,20 @@ impl TableProvider for OracleTableProvider {
             inputs.push(hot);
         }
         if !self.distributed_hot_batches.is_empty() {
-            let hot = Self::validated_memory_source(
-                &self.distributed_hot_batches,
-                Arc::clone(&self.physical_schema),
-            )?;
+            let hot =
+                Self::projected_memory_source(&self.distributed_hot_batches, &required_schema)?;
             inputs.push(hot);
         }
         for scan_id in &self.remote_sources.scribe_scan_ids {
             inputs.push(self.remote_placeholder(
                 scan_id,
                 target_partitions,
-                &required_columns,
+                &scan_projection,
                 &supported_predicates,
             ));
         }
         if !self.live_batches.is_empty() {
-            let live = Self::validated_memory_source(
-                &self.live_batches,
-                Arc::clone(&self.physical_schema),
-            )?;
+            let live = Self::projected_memory_source(&self.live_batches, &required_schema)?;
             inputs.push(live);
         }
         let union = UnionExec::try_new(inputs)?;
@@ -1712,7 +1762,10 @@ impl TableProvider for OracleTableProvider {
                 ),
                 None => tripwire,
             };
-        project_plan(filtered, projection)
+        // Resolved by name against the filter's actual output, which is the
+        // closure minus the tenant column — never against the original
+        // full-public-schema ordinals the caller supplied.
+        project_plan_by_name(filtered, &scan_projection.output_names)
     }
 }
 
@@ -2490,9 +2543,14 @@ fn hot_stream(
             if selection.excludes_file() {
                 continue;
             }
+            // Selective decode: only the closure's leaves leave storage. The
+            // post-decode `project_batch` below then normalizes exact order and
+            // types; it is a normalizer, not the thing that avoids the IO.
+            let mask = hot_projection_mask(builder.parquet_schema(), schema.as_ref());
             let mut batches = builder
                 .with_row_groups(selection.retained)
                 .with_batch_size(batch_size)
+                .with_projection(mask)
                 .build()
                 .map_err(|error| DataFusionError::External(Box::new(error)))?;
             while let Some(decoded) = batches.next().await {
@@ -2506,6 +2564,29 @@ fn hot_stream(
             }
         }
     }
+}
+
+/// Derives the Parquet projection mask that decodes exactly `schema`'s columns.
+///
+/// Matching is by name against the file's own root fields, because the closure
+/// is a name-based contract and a sealed hot file may order or extend its
+/// columns independently of the pinned table schema. A closure name the file
+/// does not carry is deliberately left out of the mask rather than refused
+/// here: [`project_batch`] raises that as a named missing-field error once the
+/// batch arrives, which keeps one diagnostic for the condition.
+fn hot_projection_mask(
+    parquet_schema: &parquet::schema::types::SchemaDescriptor,
+    schema: &Schema,
+) -> parquet::arrow::ProjectionMask {
+    let indices = parquet_schema
+        .root_schema()
+        .get_fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| schema.column_with_name(field.name()).is_some())
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    parquet::arrow::ProjectionMask::roots(parquet_schema, indices)
 }
 
 /// Returns the first tenant mismatch row, or `None` for a valid batch.
@@ -2721,32 +2802,56 @@ fn classify_literal(expr: &Expr) -> Option<wyrd_spec::vala::assignment_authority
     }
 }
 
-/// Computes the canonical `required_columns` closure: `DataFusion`'s requested
-/// scan output (by name, or every public column when `projection` is
-/// `None`), followed by the first occurrence of each predicate column in
-/// filter order, followed by the always-present hidden tenant column —
-/// stably deduplicated. Names resolve against the full physical schema.
-fn required_columns_closure(
+/// Resolves `DataFusion`'s requested scan output to public column names.
+///
+/// A repeated requested ordinal stays repeated: the caller's output shape is
+/// the caller's business, and only the leaf closure derived from these names is
+/// deduplicated. A `None` projection means every public column plus the hidden
+/// tenant column below it; it never means zero columns.
+///
+/// # Errors
+///
+/// Returns a `DataFusion` plan error when a requested ordinal falls outside the
+/// public schema, which is a planner contract failure rather than a column the
+/// scan may quietly drop.
+fn scan_output_names(
     public_schema: &Schema,
     projection: Option<&Vec<usize>>,
-    predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
-) -> Vec<String> {
-    let scan_output_names: Vec<String> = match projection {
-        Some(projection) => projection
-            .iter()
-            .filter_map(|index| public_schema.fields().get(*index))
-            .map(|field| field.name().clone())
-            .collect(),
-        None => public_schema
+) -> DataFusionResult<Vec<String>> {
+    let Some(projection) = projection else {
+        return Ok(public_schema
             .fields()
             .iter()
             .map(|field| field.name().clone())
-            .collect(),
+            .collect());
     };
+    projection
+        .iter()
+        .map(|index| {
+            public_schema
+                .fields()
+                .get(*index)
+                .map(|field| field.name().clone())
+                .ok_or_else(|| {
+                    DataFusionError::Plan("table projection ordinal is out of range".to_owned())
+                })
+        })
+        .collect()
+}
+
+/// Computes the canonical `required_columns` closure: the requested scan output
+/// names, followed by the first occurrence of each predicate column in filter
+/// order, followed by the always-present hidden tenant column — stably
+/// deduplicated.
+fn required_columns_closure(
+    output_names: &[String],
+    predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
+) -> Vec<String> {
     let mut required = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for name in scan_output_names
-        .into_iter()
+    for name in output_names
+        .iter()
+        .cloned()
         .chain(
             predicates
                 .iter()
@@ -2759,6 +2864,142 @@ fn required_columns_closure(
         }
     }
     required
+}
+
+/// Selects `names` out of one complete physical schema, by name, in order.
+///
+/// Returns the narrowed schema — complete `Field` values and the complete
+/// schema's own metadata preserved — together with each name's index in the
+/// complete schema. The leader's scan planning and every follower resolver
+/// derive their leaf schema through this one function, so a signed closure
+/// means exactly one Arrow schema everywhere it is validated.
+///
+/// # Errors
+///
+/// Returns a `DataFusion` plan error when `schema` contains duplicate field
+/// names, which makes name-based selection ambiguous, or when a requested name
+/// is absent from it. Neither is silently repaired: a follower that quietly
+/// deduplicated or reordered a signed assignment would read something other
+/// than what the leader signed.
+pub(super) fn select_schema_by_name(
+    schema: &Schema,
+    names: &[String],
+) -> DataFusionResult<(SchemaRef, Vec<usize>)> {
+    let mut indices = Vec::with_capacity(names.len());
+    let mut fields = Vec::with_capacity(names.len());
+    for name in names {
+        let matches = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| field.name() == name)
+            .collect::<Vec<_>>();
+        let [(index, field)] = matches.as_slice() else {
+            return Err(DataFusionError::Plan(if matches.is_empty() {
+                format!("physical schema is missing required column `{name}`")
+            } else {
+                format!("physical schema names column `{name}` more than once")
+            }));
+        };
+        indices.push(*index);
+        fields.push(Arc::clone(field));
+    }
+    Ok((
+        Arc::new(Schema::new_with_metadata(
+            arrow::datatypes::Fields::from(fields),
+            schema.metadata().clone(),
+        )),
+        indices,
+    ))
+}
+
+/// One leader-owned physical projection closure shared by every scan leaf.
+///
+/// [`OracleTableProvider::scan`] builds this once from the complete physical
+/// schema and the caller's request, then hands the same value to every union
+/// leaf, the remote placeholders, the tenant tripwire, the provider-local
+/// filter, and the final public projection. No leaf recomputes its own column
+/// set or order: a follower revalidates the signed closure against the schema
+/// its own catalog resolves, so two components deriving the same set in a
+/// different order would refuse each other's assignments.
+#[derive(Debug)]
+struct OracleScanProjection {
+    /// Public column names this scan outputs, in requested order, with a
+    /// repeated requested ordinal preserved.
+    output_names: Vec<String>,
+    /// Stable-deduplicated leaf closure: outputs, predicate columns, tenant.
+    required_columns: Vec<String>,
+    /// Complete-schema fields selected by `required_columns`, in that order.
+    required_schema: SchemaRef,
+    /// `required_columns` resolved to complete physical-schema indices.
+    physical_indices: Vec<usize>,
+}
+
+impl OracleScanProjection {
+    /// Derives the closure for one scan request.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `DataFusion` plan error when a requested ordinal is out of
+    /// range, when the complete physical schema is ambiguous, or when a closure
+    /// name is absent from it.
+    fn try_new(
+        physical_schema: &Schema,
+        public_schema: &Schema,
+        projection: Option<&Vec<usize>>,
+        predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
+    ) -> DataFusionResult<Self> {
+        let output_names = scan_output_names(public_schema, projection)?;
+        let required_columns = required_columns_closure(&output_names, predicates);
+        let (required_schema, physical_indices) =
+            select_schema_by_name(physical_schema, &required_columns)?;
+        Ok(Self {
+            output_names,
+            required_columns,
+            required_schema,
+            physical_indices,
+        })
+    }
+}
+
+/// Returns `plan`, or a name-resolved projection of it, exposing exactly
+/// `names` in that order.
+///
+/// Used at every boundary where a dependency may return the right columns in
+/// its own order: the closure is authoritative, so the plan is adapted to it
+/// rather than the closure being rewritten to match a source. A plan that
+/// already matches is returned untouched, which keeps an unprojected scan free
+/// of a no-op operator.
+///
+/// # Errors
+///
+/// Returns a `DataFusion` plan error when a name does not resolve against the
+/// plan's own output schema, or when `DataFusion` rejects the projection.
+fn project_plan_by_name(
+    plan: Arc<dyn ExecutionPlan>,
+    names: &[String],
+) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+    let schema = plan.schema();
+    if schema.fields().len() == names.len()
+        && schema
+            .fields()
+            .iter()
+            .zip(names)
+            .all(|(field, name)| field.name() == name)
+    {
+        return Ok(plan);
+    }
+    let expressions = names
+        .iter()
+        .map(|name| {
+            let column = Column::new_with_schema(name, &schema)?;
+            Ok((
+                Arc::new(column) as Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+                name.clone(),
+            ))
+        })
+        .collect::<DataFusionResult<Vec<_>>>()?;
+    Ok(Arc::new(ProjectionExec::try_new(expressions, plan)?))
 }
 
 /// Builds the physical predicate for one closed comparison/null-check leaf
@@ -3235,35 +3476,6 @@ fn remove_column(batch: &RecordBatch, name: &str) -> DataFusionResult<RecordBatc
         .map(|(_, column)| Arc::clone(column))
         .collect();
     RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
-}
-
-/// Applies the caller-visible projection after tenant validation/reconciliation.
-///
-/// # Errors
-///
-/// Returns a `DataFusion` plan error when a projected ordinal is invalid.
-fn project_plan(
-    input: Arc<dyn ExecutionPlan>,
-    projection: Option<&Vec<usize>>,
-) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-    let Some(projection) = projection else {
-        return Ok(input);
-    };
-    let schema = input.schema();
-    let expressions = projection
-        .iter()
-        .map(|index| {
-            let field = schema.fields().get(*index).ok_or_else(|| {
-                DataFusionError::Plan("table projection ordinal is out of range".to_owned())
-            })?;
-            Ok((
-                Arc::new(Column::new(field.name(), *index))
-                    as Arc<dyn datafusion::physical_expr::PhysicalExpr>,
-                field.name().clone(),
-            ))
-        })
-        .collect::<DataFusionResult<Vec<_>>>()?;
-    Ok(Arc::new(ProjectionExec::try_new(expressions, input)?))
 }
 
 /// Creates bounded cooperative properties for one single-partition operator.
@@ -4784,7 +4996,10 @@ mod tests {
             public_schema.index_of("duration_ms").unwrap(),
             public_schema.index_of("wyrd_event_time").unwrap(),
         ];
-        let closure = required_columns_closure(&public_schema, Some(&projection), &leaves);
+        let closure = required_columns_closure(
+            &scan_output_names(&public_schema, Some(&projection)).expect("valid ordinals"),
+            &leaves,
+        );
         assert_eq!(
             closure,
             vec![
@@ -4796,7 +5011,10 @@ mod tests {
         );
 
         // A `None` projection closes over every public column.
-        let full_closure = required_columns_closure(&public_schema, None, &[]);
+        let full_closure = required_columns_closure(
+            &scan_output_names(&public_schema, None).expect("full public projection"),
+            &[],
+        );
         assert_eq!(
             full_closure,
             vec![
@@ -5156,11 +5374,11 @@ mod tests {
     /// Panics if the fixture schema, metadata, or table cannot be constructed,
     /// which would mean the fixture no longer has the shape the owner asserts.
     fn projection_fixture_table() -> iceberg::table::Table {
+        use iceberg::spec::TableMetadataBuilder;
         use iceberg::spec::{
             FormatVersion, NestedField, PrimitiveType, Schema as IcebergSchema, SortOrder,
             Type as IcebergType, UnboundPartitionSpec,
         };
-        use iceberg::spec::TableMetadataBuilder;
         use iceberg::{TableIdent, io::FileIO};
 
         let optional = |id: i32, name: &str, kind: PrimitiveType| {
@@ -5361,7 +5579,11 @@ mod tests {
         // Every union child — the remote placeholder and the in-memory live
         // leaf alike — exposes exactly the closure, in closure order.
         let children = union_child_column_names(&union);
-        assert_eq!(children.len(), 2, "placeholder and live leaves both planned");
+        assert_eq!(
+            children.len(),
+            2,
+            "placeholder and live leaves both planned"
+        );
         for child in &children {
             assert_eq!(child, &closure);
         }
@@ -5381,10 +5603,11 @@ mod tests {
 
         // The predicate resolves `status_code` against the closure, not against
         // the original full physical schema.
-        let predicate_columns = datafusion::physical_expr::utils::collect_columns(filter.predicate())
-            .into_iter()
-            .map(|column| (column.name().to_string(), column.index()))
-            .collect::<Vec<_>>();
+        let predicate_columns =
+            datafusion::physical_expr::utils::collect_columns(filter.predicate())
+                .into_iter()
+                .map(|column| (column.name().to_string(), column.index()))
+                .collect::<Vec<_>>();
         assert_eq!(predicate_columns, vec![("status_code".to_string(), 1)]);
 
         // One ERROR row and one OK row in; only the ERROR duration out.
@@ -5405,5 +5628,4 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(durations, vec![41_i64]);
     }
-
 }

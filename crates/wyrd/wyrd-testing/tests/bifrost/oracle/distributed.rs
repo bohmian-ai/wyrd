@@ -33,9 +33,16 @@ enum PruningExpectation {
     RowGroupsOnly,
 }
 
-/// A selective predicate prunes physical local and distributed Oracle reads
-/// while preserving exact residual rows, and the tenant tripwire still fails
-/// closed once predicate and projection pushdown are in effect.
+/// A selective predicate and a narrow projection each prune physical local and
+/// distributed Oracle reads while preserving exact residual rows, and the
+/// tenant tripwire still fails closed once both are in effect.
+///
+/// This is the hot-Parquet owner of the projection half. The cut is asserted
+/// to hold hot files and no compacted file immediately before the queries run,
+/// so the broad/narrow byte difference is attributable to `HotParquetExec`'s
+/// column mask and to nothing else. Predicate, retained rows, retained row
+/// groups, and physical authority are identical across the two queries; only
+/// the requested column set differs.
 ///
 /// The two legs prove different halves. The `one_mixed` leg plans and scans on
 /// one node, so either physical granularity may move and the assertion accepts
@@ -46,7 +53,7 @@ enum PruningExpectation {
 /// requires it positively.
 #[tokio::test]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
-async fn pg_bifrost_selective_predicate_prunes_distributed_reads() {
+async fn pg_bifrost_selective_predicate_and_projection_prune_distributed_reads() {
     prove_selective_predicate_pruning(
         BifrostClusterSpec::one_mixed(),
         0,
@@ -96,6 +103,19 @@ async fn prove_selective_predicate_pruning(
     let reader = client(query_server, "predicate-reader").await?;
     let table_fqn = format!("vala.bifrost.{table}");
 
+    // Physical-authority precondition, asserted rather than assumed: the
+    // projection proof below is only a hot-Parquet proof if every file in the
+    // cut is still hot. A maintenance sweep that compacted the fixture would
+    // otherwise silently move the measurement onto the Iceberg leaf.
+    let (compacted_files, hot_files) = file_tier_counts(&cluster, tenant, &table).await?;
+    if hot_files == 0 || compacted_files != 0 {
+        return Err(format!(
+            "hot-only projection proof requires a hot-only cut: \
+             hot={hot_files} compacted={compacted_files}"
+        )
+        .into());
+    }
+
     let unfiltered_checkpoint = cluster
         .telemetry()
         .checkpoint()
@@ -124,20 +144,20 @@ async fn prove_selective_predicate_pruning(
         .telemetry()
         .checkpoint()
         .map_err(|error| error.to_string())?;
-    let (selective_rows, selective_outcome, selective_error) = query_statement(
+    // The broad selective read: same predicate, same cut, every column.
+    // `query_ids` refuses a non-success terminal, so a successful return is
+    // also the outcome assertion this leg used to make separately.
+    let broad_ids = query_ids(
         &reader,
-        format!("SELECT id, value FROM {table_fqn} WHERE value = 'target' ORDER BY id"),
+        format!(
+            "SELECT id, filter_key, unused_payload FROM {table_fqn} \
+             WHERE filter_key = 'target' ORDER BY id"
+        ),
     )
     .await?;
-    if selective_rows != 1 {
+    if broad_ids != vec![2_i64] {
         return Err(format!(
-            "selective predicate expected exactly one residual row, saw {selective_rows}"
-        )
-        .into());
-    }
-    if selective_outcome != QueryTerminalOutcome::Success || selective_error.is_some() {
-        return Err(format!(
-            "selective predicate query did not succeed: {selective_outcome:?} {selective_error:?}"
+            "selective predicate expected exactly the one target row, saw {broad_ids:?}"
         )
         .into());
     }
@@ -204,6 +224,55 @@ async fn prove_selective_predicate_pruning(
     ) {
         return Err(format!(
             "selective query must scan strictly fewer bytes: selective={selective_bytes} unfiltered={unfiltered_bytes}"
+        )
+        .into());
+    }
+
+    // The projection half. The narrow query differs from the broad one above
+    // in exactly one respect: it does not request `unused_payload`. Predicate,
+    // cut, retained rows, and retained row groups are identical, so a byte
+    // difference can only come from the physical reader declining to decode
+    // that column. On a hot-only cut that reader is `HotParquetExec`, and its
+    // name-derived `ProjectionMask` is the only mechanism that can produce it.
+    let narrow_checkpoint = cluster
+        .telemetry()
+        .checkpoint()
+        .map_err(|error| error.to_string())?;
+    let narrow_ids = query_ids(
+        &reader,
+        format!("SELECT id FROM {table_fqn} WHERE filter_key = 'target' ORDER BY id"),
+    )
+    .await?;
+    if narrow_ids != broad_ids {
+        return Err(format!(
+            "narrow projection must return the same target rows: narrow={narrow_ids:?} broad={broad_ids:?}"
+        )
+        .into());
+    }
+    let narrow_delta = cluster
+        .telemetry()
+        .delta_since(&narrow_checkpoint)
+        .map_err(|error| error.to_string())?;
+    let narrow_bytes = sum_metric(&narrow_delta, "oracle_query_bytes_scanned_total");
+    let narrow_row_groups = sum_metric(&narrow_delta, "oracle_query_row_groups_scanned_total");
+    // Strict `Less`, so an incomparable (NaN) metric fails rather than passes.
+    if !matches!(
+        narrow_bytes.partial_cmp(&selective_bytes),
+        Some(std::cmp::Ordering::Less)
+    ) {
+        return Err(format!(
+            "narrow projection must scan strictly fewer bytes than the broad query \
+             over the same predicate and cut: narrow={narrow_bytes} broad={selective_bytes}; \
+             row groups narrow={narrow_row_groups} broad={selective_row_groups}"
+        )
+        .into());
+    }
+    // Follower scan evidence on the distributed leg: a remote leaf that
+    // reported nothing would leave both byte counters at zero, which the
+    // strict comparison above would accept as "not less".
+    if narrow_bytes <= 0.0 {
+        return Err(format!(
+            "narrow projection reported no scanned bytes at all: narrow={narrow_bytes}"
         )
         .into());
     }
@@ -340,36 +409,43 @@ fn bifrost_terminal_code(error: &BifrostError) -> Option<QueryTerminalErrorCode>
     })
 }
 
-/// Send one Arrow IPC batch carrying a single row with an explicit `value`,
-/// used to build multiple statistically distinguishable published files.
+/// Send one Arrow IPC batch carrying a single row with an explicit
+/// `filter_key`, used to build multiple statistically distinguishable
+/// published files.
 async fn ingest_marked(
     client: &WyrdClient,
     table: &str,
     id: i64,
-    value: &str,
+    filter_key: &str,
 ) -> Result<(), JourneyError> {
     BifrostGrpcTransport::connect(client)
         .await?
         .insert_batch(
             table,
             uuid::Uuid::now_v7().into_bytes(),
-            ipc_marked(id, value),
+            ipc_marked(id, filter_key),
         )
         .await?;
     Ok(())
 }
 
-/// Encode one deterministic `(id, value)` journey row as one Arrow stream.
-fn ipc_marked(id: i64, value: &str) -> Vec<u8> {
+/// Encode one deterministic `(id, filter_key, unused_payload)` journey row as
+/// one Arrow stream.
+///
+/// `unused_payload` is the wide column no narrow query requests; it exists so
+/// a projection that reaches the physical reader is visible in scanned bytes.
+fn ipc_marked(id: i64, filter_key: &str) -> Vec<u8> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
-        Field::new("value", DataType::Utf8, false),
+        Field::new("filter_key", DataType::Utf8, false),
+        Field::new("unused_payload", DataType::Utf8, false),
     ]));
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
             Arc::new(Int64Array::from(vec![id])),
-            Arc::new(StringArray::from(vec![value])),
+            Arc::new(StringArray::from(vec![filter_key])),
+            Arc::new(StringArray::from(vec![unused_payload(id)])),
         ],
     )
     .expect("fixed marked journey arrays share a length");
@@ -470,6 +546,7 @@ async fn prove_hot_and_compacted_pruning() -> Result<(), JourneyError> {
         ingest_server.flush_bifrost().await?;
     }
     compact_sealed_batch(&cluster, tenant, &table, COMPACTED_BATCH_ROWS).await?;
+    prove_compacted_only_projection(&cluster, tenant, &table, &table_fqn).await?;
 
     for offset in 0..HOT_BATCH_ROWS {
         let id = HOT_BATCH_ID_BASE + offset;
@@ -500,7 +577,7 @@ async fn prove_hot_and_compacted_pruning() -> Result<(), JourneyError> {
         .map_err(|error| error.to_string())?;
     let unfiltered_ids = query_ids(
         &reader,
-        format!("SELECT id, value FROM {table_fqn} ORDER BY id"),
+        format!("SELECT id, filter_key, unused_payload FROM {table_fqn} ORDER BY id"),
     )
     .await?;
     if i64::try_from(unfiltered_ids.len())? != total_rows {
@@ -522,7 +599,10 @@ async fn prove_hot_and_compacted_pruning() -> Result<(), JourneyError> {
         .map_err(|error| error.to_string())?;
     let selective_ids = query_ids(
         &reader,
-        format!("SELECT id, value FROM {table_fqn} WHERE value = 'target' ORDER BY id"),
+        format!(
+            "SELECT id, filter_key, unused_payload FROM {table_fqn} \
+             WHERE filter_key = 'target' ORDER BY id"
+        ),
     )
     .await?;
     let expected_ids = expected_marked_ids();
@@ -586,6 +666,121 @@ async fn prove_hot_and_compacted_pruning() -> Result<(), JourneyError> {
     }
 
     cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Proves the Iceberg half of the projection contract on an isolated
+/// compacted-only cut, before the hot cohort is written.
+///
+/// This is the compacted owner: the tier counts are asserted first, so every
+/// file the query can reach is a published Iceberg data file and the byte
+/// difference below cannot be attributed to the hot leaf. The two queries share
+/// a predicate, a cut, and a residual row set; they differ only in whether they
+/// request the wide `unused_payload` column, so a strictly smaller narrow scan
+/// is the physical projection reaching `provider.scan`.
+///
+/// The hot-only journey owns the same proof for `HotParquetExec`. Neither is
+/// inferred from an aggregate reduction over the mixed-tier cut this journey
+/// later builds.
+///
+/// # Errors
+///
+/// Returns a client, Postgres, or telemetry error surfaced by any step, and a
+/// descriptive error when the cut is not compacted-only, when the two queries
+/// disagree on residual identity, or when the narrow query does not scan
+/// strictly fewer bytes.
+async fn prove_compacted_only_projection(
+    cluster: &WyrdTestCluster,
+    tenant: wyrd_spec::DataTenantId,
+    table: &str,
+    table_fqn: &str,
+) -> Result<(), JourneyError> {
+    cluster.refresh_oracle_snapshots().await?;
+    let (compacted_files, hot_files) = file_tier_counts(cluster, tenant, table).await?;
+    if compacted_files == 0 || hot_files != 0 {
+        return Err(format!(
+            "compacted-only projection proof requires a compacted-only cut: \
+             compacted={compacted_files} hot={hot_files}"
+        )
+        .into());
+    }
+
+    let query_server = cluster.server(2).ok_or("missing query node")?;
+    let reader = client(query_server, "compacted-projection-reader").await?;
+    let expected_ids: Vec<i64> = (1..=COMPACTED_BATCH_ROWS)
+        .filter(|id| marker_value(*id) == "target")
+        .collect();
+
+    let broad_checkpoint = cluster
+        .telemetry()
+        .checkpoint()
+        .map_err(|error| error.to_string())?;
+    let broad_ids = query_ids(
+        &reader,
+        format!(
+            "SELECT id, filter_key, unused_payload FROM {table_fqn} \
+             WHERE filter_key = 'target' ORDER BY id"
+        ),
+    )
+    .await?;
+    if broad_ids != expected_ids {
+        return Err(format!(
+            "compacted-only broad query returned the wrong residual rows: \
+             got {broad_ids:?} want {expected_ids:?}"
+        )
+        .into());
+    }
+    let broad_bytes = sum_metric(
+        &cluster
+            .telemetry()
+            .delta_since(&broad_checkpoint)
+            .map_err(|error| error.to_string())?,
+        "oracle_query_bytes_scanned_total",
+    );
+
+    let narrow_checkpoint = cluster
+        .telemetry()
+        .checkpoint()
+        .map_err(|error| error.to_string())?;
+    let narrow_ids = query_ids(
+        &reader,
+        format!("SELECT id FROM {table_fqn} WHERE filter_key = 'target' ORDER BY id"),
+    )
+    .await?;
+    if narrow_ids != broad_ids {
+        return Err(format!(
+            "compacted-only narrow projection must return the same rows: \
+             narrow={narrow_ids:?} broad={broad_ids:?}"
+        )
+        .into());
+    }
+    let narrow_bytes = sum_metric(
+        &cluster
+            .telemetry()
+            .delta_since(&narrow_checkpoint)
+            .map_err(|error| error.to_string())?,
+        "oracle_query_bytes_scanned_total",
+    );
+    // Positive follower scan evidence first: `sum_metric` reports an absent
+    // family as 0.0, so a leaf that recorded nothing must fail here rather
+    // than satisfy the comparison below by being small.
+    if narrow_bytes <= 0.0 {
+        return Err(format!(
+            "compacted-only narrow projection reported no scanned bytes: {narrow_bytes}"
+        )
+        .into());
+    }
+    // Strict `Less`, so an incomparable (NaN) metric fails this proof.
+    if !matches!(
+        narrow_bytes.partial_cmp(&broad_bytes),
+        Some(std::cmp::Ordering::Less)
+    ) {
+        return Err(format!(
+            "compacted-only narrow projection must scan strictly fewer bytes: \
+             narrow={narrow_bytes} broad={broad_bytes}"
+        )
+        .into());
+    }
     Ok(())
 }
 

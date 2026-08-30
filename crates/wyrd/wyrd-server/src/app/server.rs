@@ -714,13 +714,23 @@ impl BoundServer {
                 Ok(report) => (report, None),
                 Err(error) => {
                     tracing::warn!(%error, "Bifrost shutdown did not complete cleanly");
-                    bifrost.abort();
+                    bifrost.abort().await;
                     (BifrostShutdownReport::none_drained(), Some(error))
                 }
             }
         } else {
-            bifrost.abort();
-            (BifrostShutdownReport::none_drained(), None)
+            // The supervisor drain consumed the whole budget. That is a process
+            // lifecycle failure, not a clean teardown: nothing drained and the
+            // storage owner is only settled by the awaited abort below, so
+            // reporting success here would let a pod exit claiming a drain it
+            // never ran.
+            bifrost.abort().await;
+            (
+                BifrostShutdownReport::none_drained(),
+                Some(wyrd_spec::vala::error::BifrostError::Internal {
+                    detail: "Bifrost shutdown deadline elapsed before role drain".to_owned(),
+                }),
+            )
         };
 
         tracing::info!("wyrd-server shutdown complete");

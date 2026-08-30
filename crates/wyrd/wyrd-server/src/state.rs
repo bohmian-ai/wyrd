@@ -1677,15 +1677,64 @@ impl Bifrost {
         }
     }
 
-    /// Drains every selected subsystem against one absolute deadline.
+    /// Drains every selected subsystem and this node's storage owner against
+    /// one absolute deadline.
+    ///
+    /// The order is fixed and load-bearing: readiness and public admission
+    /// close first, Forge supervision must already be quiesced, the Oracle and
+    /// then the Scribe owner and registry drain, and only then is the storage
+    /// owner closed. Storage is last because work a role already admitted may
+    /// still need object I/O to finish; closing it first would fail that work
+    /// rather than let it complete.
+    ///
+    /// Any failure along the way — unquiesced Forge supervision, a role drain
+    /// error, or a storage owner that does not settle by the deadline — runs
+    /// the abort path for both roles *and* storage before returning, so a
+    /// failed shutdown never leaves the metadata cache open, decoded entries
+    /// retained, or object I/O admissible. A successful report is therefore
+    /// only ever produced when storage is closed and settled.
     ///
     /// # Errors
-    /// Returns a stable lifecycle failure when a selected role cannot remove readiness.
+    /// Returns a stable lifecycle failure when a selected role cannot remove
+    /// readiness, when Forge supervision has not joined, or
+    /// [`BifrostError::Internal`](wyrd_spec::vala::error::BifrostError::Internal)
+    /// with detail `"Bifrost storage did not settle before shutdown deadline"`
+    /// when the storage owner does not settle.
     pub async fn shutdown(
         &self,
         deadline: Instant,
     ) -> Result<BifrostShutdownReport, wyrd_spec::vala::error::BifrostError> {
         self.begin_shutdown();
+        match self.drain_selected_owners(deadline).await {
+            Ok(report) => Ok(report),
+            Err(error) => {
+                self.abort_selected_owners().await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Runs the ordered drain without owning the abort-on-failure decision.
+    ///
+    /// Split from [`Self::shutdown`] so every failure path leaves through one
+    /// abort rather than repeating it at each `?`.
+    ///
+    /// # Errors
+    /// Returns the first stable lifecycle failure the ordered drain reached.
+    async fn drain_selected_owners(
+        &self,
+        deadline: Instant,
+    ) -> Result<BifrostShutdownReport, wyrd_spec::vala::error::BifrostError> {
+        let forge_drained = if let Some(forge) = &self.forge {
+            if !forge.supervision_drained() {
+                return Err(wyrd_spec::vala::error::BifrostError::Internal {
+                    detail: "Forge supervision did not join before shutdown".to_owned(),
+                });
+            }
+            true
+        } else {
+            false
+        };
         let oracle_drained = if let Some(oracle) = &self.oracle {
             selected_owner_completion(oracle.begin_shutdown().await.map_err(|_| {
                 wyrd_spec::vala::error::BifrostError::RunningQueryControlUnavailable
@@ -1709,16 +1758,13 @@ impl Bifrost {
         } else {
             false
         };
-        let forge_drained = if let Some(forge) = &self.forge {
-            if !forge.supervision_drained() {
-                return Err(wyrd_spec::vala::error::BifrostError::Internal {
-                    detail: "Forge supervision did not join before shutdown".to_owned(),
-                });
-            }
-            true
-        } else {
-            false
-        };
+        if let Some(storage) = &self.bifrost_storage
+            && !storage.close(deadline).await
+        {
+            return Err(wyrd_spec::vala::error::BifrostError::Internal {
+                detail: "Bifrost storage did not settle before shutdown deadline".to_owned(),
+            });
+        }
         Ok(BifrostShutdownReport {
             scribe_drained,
             forge_drained,
@@ -1727,7 +1773,20 @@ impl Bifrost {
     }
 
     /// Closes public admission and aborts selected role owners without claiming a flush.
-    pub fn abort(&self) {
+    ///
+    /// Awaits the storage owner's abort, so once this returns no retained
+    /// loader and no governed operation is still running against the node's
+    /// backend. Repeated calls remain safe.
+    pub async fn abort(&self) {
+        self.abort_selected_owners().await;
+    }
+
+    /// Cancels every selected owner and settles the storage owner.
+    ///
+    /// The one abort path, shared by the public seam and by every failed
+    /// shutdown, so a failure can never take a cleanup route that skips
+    /// storage.
+    async fn abort_selected_owners(&self) {
         self.gate.close();
         if let Some(query) = &self.oracle {
             query.abort_shutdown();
@@ -1737,6 +1796,9 @@ impl Bifrost {
         }
         if let Some(forge) = &self.forge {
             forge.begin_shutdown();
+        }
+        if let Some(storage) = &self.bifrost_storage {
+            storage.abort().await;
         }
     }
 }

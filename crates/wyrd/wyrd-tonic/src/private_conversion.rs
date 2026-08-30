@@ -1001,21 +1001,43 @@ impl TryFrom<proto::PersistedFileDescriptor> for domain::PersistedFileDescriptor
     /// the source decides which reader and which cache identity the object
     /// gets, so it is never inferred from the path or from a `scan_id` suffix.
     ///
+    /// Every shape rule is enforced here rather than at the point of use: a
+    /// descriptor that survives this decode is one the follower may resolve
+    /// without consulting the catalog again, so a malformed one must never get
+    /// that far. A zero-row file is well-formed — an empty object still
+    /// participates in residual execution.
+    ///
     /// # Errors
-    /// Returns [`PrivateConversionError`] when the descriptor cannot be decoded.
+    /// Returns [`PrivateConversionError::Missing`] when the source oneof is
+    /// absent, [`PrivateConversionError::InvalidUuid`] when the file-list
+    /// identity is not exactly 16 bytes,
+    /// [`PrivateConversionError::Invalid`] with field `hot_object_checksum`
+    /// when the checksum does not decode to exactly 32 bytes, and
+    /// [`PrivateConversionError::Invalid`] with field
+    /// `persisted_file_descriptor` when the decoded descriptor has an empty
+    /// path, a zero size, a nonpositive pinned snapshot, or an event-time pair
+    /// that is half-present or reversed.
     fn try_from(value: proto::PersistedFileDescriptor) -> Result<Self, Self::Error> {
         use proto::persisted_file_descriptor::Source;
-        Ok(match value.source {
-            Some(Source::Hot(hot)) => Self::Hot(domain::HotFileDescriptor {
+        let descriptor = match value
+            .source
+            .ok_or(PrivateConversionError::Missing("persisted_file_source"))?
+        {
+            Source::Hot(hot) => Self::Hot(domain::HotFileDescriptor {
                 path: hot.path,
                 size_bytes: hot.size_bytes,
                 row_count: hot.row_count,
-                file_list_id: uuid::Uuid::from_slice(&hot.file_list_id).unwrap_or(uuid::Uuid::nil()),
-                sha256: <[u8; 32]>::try_from(hot.sha256.as_slice()).unwrap_or([0u8; 32]),
+                file_list_id: uuid::Uuid::from_slice(&hot.file_list_id)
+                    .map_err(|_| PrivateConversionError::InvalidUuid("hot_file_list_id"))?,
+                sha256: <[u8; 32]>::try_from(hot.sha256.as_slice()).map_err(|_| {
+                    PrivateConversionError::Invalid {
+                        field: "hot_object_checksum",
+                    }
+                })?,
                 min_event_time_micros: hot.min_event_time_micros,
                 max_event_time_micros: hot.max_event_time_micros,
             }),
-            Some(Source::Iceberg(iceberg)) => Self::Iceberg(domain::IcebergFileDescriptor {
+            Source::Iceberg(iceberg) => Self::Iceberg(domain::IcebergFileDescriptor {
                 path: iceberg.path,
                 size_bytes: iceberg.size_bytes,
                 row_count: iceberg.row_count,
@@ -1023,16 +1045,13 @@ impl TryFrom<proto::PersistedFileDescriptor> for domain::PersistedFileDescriptor
                 min_event_time_micros: iceberg.min_event_time_micros,
                 max_event_time_micros: iceberg.max_event_time_micros,
             }),
-            None => Self::Hot(domain::HotFileDescriptor {
-                path: String::new(),
-                size_bytes: 0,
-                row_count: 0,
-                file_list_id: uuid::Uuid::nil(),
-                sha256: [0u8; 32],
-                min_event_time_micros: None,
-                max_event_time_micros: None,
-            }),
-        })
+        };
+        if !descriptor.is_valid() {
+            return Err(PrivateConversionError::Invalid {
+                field: "persisted_file_descriptor",
+            });
+        }
+        Ok(descriptor)
     }
 }
 

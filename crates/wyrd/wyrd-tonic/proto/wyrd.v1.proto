@@ -129,7 +129,23 @@ message ReleaseNodeSlotsRequest { bytes reservation_id = 1; bytes query_id = 2; 
 message ReleaseNodeSlotsResponse {}
 message SignedPeerTicket { string key_id = 1; bytes claims_bytes = 2; bytes signature = 3; }
 message ForwardQueryRequest { SignedPeerTicket envelope = 1; }
-message PersistedFileAssignment { repeated string files = 1; }
+message PersistedFileAssignment {
+  reserved 1;
+  reserved "files";
+  repeated PersistedFileDescriptor descriptors = 2;
+}
+message PersistedFileDescriptor {
+  oneof source { HotFileDescriptor hot = 1; IcebergFileDescriptor iceberg = 2; }
+}
+message HotFileDescriptor {
+  string path = 1; uint64 size_bytes = 2; uint64 row_count = 3;
+  bytes file_list_id = 4; bytes sha256 = 5;
+  optional int64 min_event_time_micros = 6; optional int64 max_event_time_micros = 7;
+}
+message IcebergFileDescriptor {
+  string path = 1; uint64 size_bytes = 2; uint64 row_count = 3; int64 snapshot_id = 4;
+  optional int64 min_event_time_micros = 5; optional int64 max_event_time_micros = 6;
+}
 message ScribeProviderCut {
   uint64 writer_epoch = 1; TimePartition start_partition = 2; TimePartition end_partition = 3;
   reserved 4, 5, 6;

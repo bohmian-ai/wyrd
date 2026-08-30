@@ -958,7 +958,11 @@ impl TryFrom<proto::FollowerScanAssignment> for domain::FollowerScanAssignment {
                 .ok_or(PrivateConversionError::Missing("binding"))?
                 .try_into()?,
             persisted: domain::PersistedFileAssignment {
-                files: persisted.files,
+                files: persisted
+                    .descriptors
+                    .into_iter()
+                    .map(TryInto::try_into)
+                    .collect::<Result<Vec<_>, _>>()?,
             },
             scribe_provider_cut: value
                 .scribe_provider_cut
@@ -978,12 +982,87 @@ impl From<domain::FollowerScanAssignment> for proto::FollowerScanAssignment {
             scan_id: value.scan_id,
             binding: Some(value.binding.into()),
             persisted: Some(proto::PersistedFileAssignment {
-                files: value.persisted.files,
+                descriptors: value.persisted.files.into_iter().map(Into::into).collect(),
             }),
             scribe_provider_cut: value.scribe_provider_cut.map(Into::into),
             schema_fingerprint: value.schema_fingerprint,
             required_columns: value.required_columns,
             predicates: value.predicates.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl TryFrom<proto::PersistedFileDescriptor> for domain::PersistedFileDescriptor {
+    type Error = PrivateConversionError;
+
+    /// Decodes one signed persisted-file descriptor.
+    ///
+    /// The wire `source` oneof is the only authority for which variant this is:
+    /// the source decides which reader and which cache identity the object
+    /// gets, so it is never inferred from the path or from a `scan_id` suffix.
+    ///
+    /// # Errors
+    /// Returns [`PrivateConversionError`] when the descriptor cannot be decoded.
+    fn try_from(value: proto::PersistedFileDescriptor) -> Result<Self, Self::Error> {
+        use proto::persisted_file_descriptor::Source;
+        Ok(match value.source {
+            Some(Source::Hot(hot)) => Self::Hot(domain::HotFileDescriptor {
+                path: hot.path,
+                size_bytes: hot.size_bytes,
+                row_count: hot.row_count,
+                file_list_id: uuid::Uuid::from_slice(&hot.file_list_id).unwrap_or(uuid::Uuid::nil()),
+                sha256: <[u8; 32]>::try_from(hot.sha256.as_slice()).unwrap_or([0u8; 32]),
+                min_event_time_micros: hot.min_event_time_micros,
+                max_event_time_micros: hot.max_event_time_micros,
+            }),
+            Some(Source::Iceberg(iceberg)) => Self::Iceberg(domain::IcebergFileDescriptor {
+                path: iceberg.path,
+                size_bytes: iceberg.size_bytes,
+                row_count: iceberg.row_count,
+                snapshot_id: iceberg.snapshot_id,
+                min_event_time_micros: iceberg.min_event_time_micros,
+                max_event_time_micros: iceberg.max_event_time_micros,
+            }),
+            None => Self::Hot(domain::HotFileDescriptor {
+                path: String::new(),
+                size_bytes: 0,
+                row_count: 0,
+                file_list_id: uuid::Uuid::nil(),
+                sha256: [0u8; 32],
+                min_event_time_micros: None,
+                max_event_time_micros: None,
+            }),
+        })
+    }
+}
+
+impl From<domain::PersistedFileDescriptor> for proto::PersistedFileDescriptor {
+    /// Encodes one signed persisted-file descriptor onto the private wire.
+    fn from(value: domain::PersistedFileDescriptor) -> Self {
+        use proto::persisted_file_descriptor::Source;
+        let source = match value {
+            domain::PersistedFileDescriptor::Hot(hot) => Source::Hot(proto::HotFileDescriptor {
+                path: hot.path,
+                size_bytes: hot.size_bytes,
+                row_count: hot.row_count,
+                file_list_id: hot.file_list_id.as_bytes().to_vec(),
+                sha256: hot.sha256.to_vec(),
+                min_event_time_micros: hot.min_event_time_micros,
+                max_event_time_micros: hot.max_event_time_micros,
+            }),
+            domain::PersistedFileDescriptor::Iceberg(iceberg) => {
+                Source::Iceberg(proto::IcebergFileDescriptor {
+                    path: iceberg.path,
+                    size_bytes: iceberg.size_bytes,
+                    row_count: iceberg.row_count,
+                    snapshot_id: iceberg.snapshot_id,
+                    min_event_time_micros: iceberg.min_event_time_micros,
+                    max_event_time_micros: iceberg.max_event_time_micros,
+                })
+            }
+        };
+        Self {
+            source: Some(source),
         }
     }
 }
@@ -1341,6 +1420,141 @@ fn bounded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One well-formed hot descriptor for assignment round-trip fixtures.
+    fn test_hot_descriptor() -> domain::PersistedFileDescriptor {
+        domain::PersistedFileDescriptor::Hot(domain::HotFileDescriptor {
+            path: "s3://bucket/logs/a.parquet".to_owned(),
+            size_bytes: 4_194_304,
+            row_count: 128,
+            file_list_id: uuid::Uuid::parse_str("0f0e0d0c-0b0a-0908-0706-050403020100")
+                .expect("fixture file-list identity parses"),
+            sha256: [0x11; 32],
+            min_event_time_micros: Some(1_787_493_600_000_000),
+            max_event_time_micros: Some(1_787_497_200_000_000),
+        })
+    }
+
+    /// Builds one otherwise valid wire Iceberg descriptor for shape rejection.
+    fn wire_iceberg(
+        path: &str,
+        size_bytes: u64,
+        snapshot_id: i64,
+        bounds: (Option<i64>, Option<i64>),
+    ) -> proto::PersistedFileDescriptor {
+        proto::PersistedFileDescriptor {
+            source: Some(proto::persisted_file_descriptor::Source::Iceberg(
+                proto::IcebergFileDescriptor {
+                    path: path.to_owned(),
+                    size_bytes,
+                    row_count: 128,
+                    snapshot_id,
+                    min_event_time_micros: bounds.0,
+                    max_event_time_micros: bounds.1,
+                },
+            )),
+        }
+    }
+
+    /// A follower trusts the descriptor instead of re-querying the catalog, so
+    /// the private wire must round-trip every field of both variants exactly and
+    /// refuse every malformed shape rather than defaulting it.
+    ///
+    /// The rejections matter more than the round-trip: a defaulted source would
+    /// silently reclassify which reader and cache identity an object gets, and a
+    /// descriptor that passed shape validation with a zero size or a
+    /// half-present interval would reach the follower's resolution path.
+    #[test]
+    fn follower_assignment_descriptor_round_trips_and_rejects_malformed_variants() {
+        for descriptor in [
+            test_hot_descriptor(),
+            domain::PersistedFileDescriptor::Iceberg(domain::IcebergFileDescriptor {
+                path: "s3://bucket/logs/published.parquet".to_owned(),
+                size_bytes: 8_388_608,
+                row_count: 0,
+                snapshot_id: 8_675_309,
+                min_event_time_micros: None,
+                max_event_time_micros: None,
+            }),
+        ] {
+            let encoded = proto::PersistedFileDescriptor::from(descriptor.clone());
+            let decoded = domain::PersistedFileDescriptor::try_from(encoded)
+                .expect("a well-formed descriptor round-trips");
+            assert_eq!(
+                decoded, descriptor,
+                "a zero-row file is valid and must survive the round trip"
+            );
+        }
+
+        // An absent source oneof is rejected, never defaulted to a variant.
+        assert!(matches!(
+            domain::PersistedFileDescriptor::try_from(proto::PersistedFileDescriptor {
+                source: None
+            }),
+            Err(PrivateConversionError::Missing("persisted_file_source"))
+        ));
+
+        // A file-list identity that is not 16 bytes is rejected.
+        assert!(matches!(
+            domain::PersistedFileDescriptor::try_from(proto::PersistedFileDescriptor {
+                source: Some(proto::persisted_file_descriptor::Source::Hot(
+                    proto::HotFileDescriptor {
+                        path: "s3://bucket/logs/a.parquet".to_owned(),
+                        size_bytes: 1,
+                        row_count: 1,
+                        file_list_id: vec![0u8; 4],
+                        sha256: vec![0x11; 32],
+                        min_event_time_micros: None,
+                        max_event_time_micros: None,
+                    }
+                )),
+            }),
+            Err(PrivateConversionError::InvalidUuid("hot_file_list_id"))
+        ));
+
+        // A checksum that does not decode to exactly 32 bytes is a different
+        // identity domain, not a truncation to tolerate.
+        assert!(matches!(
+            domain::PersistedFileDescriptor::try_from(proto::PersistedFileDescriptor {
+                source: Some(proto::persisted_file_descriptor::Source::Hot(
+                    proto::HotFileDescriptor {
+                        path: "s3://bucket/logs/a.parquet".to_owned(),
+                        size_bytes: 1,
+                        row_count: 1,
+                        file_list_id: uuid::Uuid::from_u128(7).as_bytes().to_vec(),
+                        sha256: vec![0x11; 16],
+                        min_event_time_micros: None,
+                        max_event_time_micros: None,
+                    }
+                )),
+            }),
+            Err(PrivateConversionError::Invalid {
+                field: "hot_object_checksum"
+            })
+        ));
+
+        // Shape violations the digest cannot catch: an empty path, a zero size,
+        // a nonpositive pinned snapshot, and a half-present or reversed interval.
+        for malformed in [
+            wire_iceberg("", 1, 1, (None, None)),
+            wire_iceberg("s3://bucket/logs/a.parquet", 0, 1, (None, None)),
+            wire_iceberg("s3://bucket/logs/a.parquet", 1, 0, (None, None)),
+            wire_iceberg("s3://bucket/logs/a.parquet", 1, -1, (None, None)),
+            wire_iceberg("s3://bucket/logs/a.parquet", 1, 1, (Some(10), None)),
+            wire_iceberg("s3://bucket/logs/a.parquet", 1, 1, (None, Some(10))),
+            wire_iceberg("s3://bucket/logs/a.parquet", 1, 1, (Some(20), Some(10))),
+        ] {
+            assert!(
+                matches!(
+                    domain::PersistedFileDescriptor::try_from(malformed.clone()),
+                    Err(PrivateConversionError::Invalid {
+                        field: "persisted_file_descriptor"
+                    })
+                ),
+                "{malformed:?} must be refused"
+            );
+        }
+    }
 
     /// Required private enum zero values fail closed.
     #[test]
@@ -1849,7 +2063,7 @@ mod tests {
                 table: "records".into(),
             },
             persisted: domain::PersistedFileAssignment {
-                files: vec!["s3://bucket/logs/a.parquet".into()],
+                files: vec![test_hot_descriptor()],
             },
             scribe_provider_cut: None,
             schema_fingerprint: "0".repeat(64),
@@ -1938,7 +2152,7 @@ mod tests {
                 table: "records".into(),
             },
             persisted: domain::PersistedFileAssignment {
-                files: vec!["s3://bucket/logs/a.parquet".into()],
+                files: vec![test_hot_descriptor()],
             },
             scribe_provider_cut: None,
             schema_fingerprint: "0".repeat(64),

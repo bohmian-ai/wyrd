@@ -11,6 +11,7 @@ use sha2::{Digest as _, Sha256};
 use vala_sql::ValaPostgres;
 use vala_sql::queries::file_list::HotFileCatalog;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::vala::WYRD_EVENT_TIME;
 use wyrd_spec::vala::api::{
     AuditEvent, BifrostTableDescription, BifrostTableEntry, PhysicalLayoutWire,
 };
@@ -423,6 +424,15 @@ impl BifrostCatalog {
         let manifests = iceberg_table.manifest_list_reader(snapshot).load().await?;
         for manifest_file in manifests.entries() {
             let manifest = manifest_file.load_manifest(iceberg_table.file_io()).await?;
+            // Resolved from the manifest's own writer schema, once per manifest.
+            // A file committed under an older schema keeps that schema's field
+            // ids, so resolving against the table's current schema would read
+            // the bounds of whichever column now happens to hold that id.
+            let event_time_field_id = manifest
+                .metadata()
+                .schema()
+                .field_by_name(WYRD_EVENT_TIME)
+                .map(|field| field.id);
             for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
                 let path = entry.data_file().file_path().to_owned();
                 let canonical = path
@@ -446,7 +456,7 @@ impl BifrostCatalog {
                 let pinned = PinnedIcebergFile::from_manifest_entry(
                     canonical.clone(),
                     entry.data_file(),
-                    None,
+                    event_time_field_id,
                 );
                 if files
                     .insert(canonical.clone(), pinned.clone())
@@ -1335,6 +1345,11 @@ mod production_pin_tests {
     /// and reads back exactly what production derived. None of the four has a
     /// `vala.file_list` row, which is the Forge-rewrite shape.
     ///
+    /// The malformed case is an unrepresentable instant rather than a
+    /// wrong-typed datum: a manifest bound is stored as raw bytes and re-typed
+    /// from the writer schema on read, so the wrong-type class is unreachable
+    /// through a real manifest and is proven at the projection instead.
+    ///
     /// # Panics
     /// Panics when the fixture, registration, commit, or pin fails, or when a
     /// pinned file's derived statistics differ from its manifest evidence.
@@ -1407,8 +1422,13 @@ mod production_pin_tests {
                     expected: EventTimeStatistics::Unusable(EventTimeBoundsDefect::Missing),
                 },
                 ManifestCase {
+                    // A manifest bound is serialized as raw bytes and re-typed
+                    // from the writer schema on read, so a wrong-typed datum
+                    // cannot survive a real round trip; the projection test
+                    // above covers that class. What production *can* observe is
+                    // a well-typed value that names no representable instant.
                     name: "malformed.parquet",
-                    lower: Some(iceberg::spec::Datum::long(lower_micros)),
+                    lower: Some(timestamptz(i64::MAX)),
                     upper: Some(timestamptz(upper_micros)),
                     expected: EventTimeStatistics::Unusable(EventTimeBoundsDefect::Invalid),
                 },

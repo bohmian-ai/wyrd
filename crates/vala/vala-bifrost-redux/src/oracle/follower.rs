@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-#[cfg(any(test, feature = "test-support"))]
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -56,13 +55,68 @@ pub enum PhysicalPlanFollowerError {
     Execution(String),
 }
 
+/// One resolved role-local source and the authenticated schema it came from.
+///
+/// A follower has to keep two schemas distinct, and returning only the plan
+/// would collapse them. `full_schema` is the authenticated catalog schema whose
+/// fingerprint must equal `assignment.schema_fingerprint`; `plan` exposes the
+/// projection of that schema by the signed ordered `assignment.required_columns`
+/// and nothing wider. Pairing them makes it impossible for a resolver to
+/// publish a narrowed plan without also naming the schema its narrowing was
+/// derived from.
+pub struct ResolvedFollowerSource {
+    /// Role-local leaf exposing exactly the signed closure schema.
+    pub plan: Arc<dyn ExecutionPlan>,
+    /// Complete authenticated schema the closure was projected out of.
+    pub full_schema: SchemaRef,
+}
+
+impl std::fmt::Debug for ResolvedFollowerSource {
+    /// Renders only the two schemas' shapes, never catalog or storage internals.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResolvedFollowerSource")
+            .field("plan_schema", &self.plan.schema())
+            .field("full_schema", &self.full_schema)
+            .finish()
+    }
+}
+
+/// Projects one authenticated full schema by a signed ordered closure.
+///
+/// This is the single derivation of a follower's leaf schema. Both the resolver
+/// (before its own source IO) and [`PhysicalPlanFollower::decode`] (after every
+/// scan id resolves) call it, so the plan a follower publishes and the schema
+/// decode requires of it can never be derived two different ways.
+///
+/// # Errors
+///
+/// Returns a redacted message when a signed name is absent from the
+/// authenticated schema or names it ambiguously. Neither is repaired: silently
+/// deduplicating or reordering a signed assignment would read something other
+/// than what the leader signed.
+fn signed_closure_schema(
+    full_schema: &arrow::datatypes::Schema,
+    required_columns: &[String],
+) -> Result<SchemaRef, String> {
+    super::exec::select_schema_by_name(full_schema, required_columns)
+        .map(|(schema, _)| schema)
+        .map_err(|_| {
+            "assignment closure does not resolve against the authenticated schema".to_owned()
+        })
+}
+
 /// Async boundary that constructs one authenticated role-local scan provider.
 #[async_trait]
 pub trait FollowerSourceResolver: Send + Sync {
     /// Resolves exactly one validated assignment for the signed target role.
-    /// Cancellation may discard a locally acquired provider; no provider is
-    /// published to decode until this future returns successfully. Callers may
-    /// retry only by restarting the complete authenticated follower request.
+    ///
+    /// The returned plan must expose exactly the signed closure, and the
+    /// returned `full_schema` must be the authenticated schema that closure was
+    /// projected out of; `decode` revalidates both. Cancellation may discard a
+    /// locally acquired provider; no provider is published to decode until this
+    /// future returns successfully. Callers may retry only by restarting the
+    /// complete authenticated follower request.
     ///
     /// # Errors
     /// Returns a redacted message when catalog, storage, or Scribe snapshot IO fails.
@@ -71,7 +125,7 @@ pub trait FollowerSourceResolver: Send + Sync {
         target_role: ClusterRole,
         assignment: &FollowerScanAssignment,
         session: &SessionState,
-    ) -> Result<Arc<dyn ExecutionPlan>, String>;
+    ) -> Result<ResolvedFollowerSource, String>;
 }
 
 #[async_trait]
@@ -85,7 +139,7 @@ where
         target_role: ClusterRole,
         assignment: &FollowerScanAssignment,
         session: &SessionState,
-    ) -> Result<Arc<dyn ExecutionPlan>, String> {
+    ) -> Result<ResolvedFollowerSource, String> {
         self.as_ref()
             .resolve(target_role, assignment, session)
             .await
@@ -269,19 +323,25 @@ impl FollowerSourceResolver for OracleCatalogResolver {
     /// per call — the hot branch returns before the provider scan, so a hot
     /// assignment never plans a catalog scan it would discard.
     ///
+    /// Both leaves are also built at the signed closure schema rather than the
+    /// full catalog schema, so the physical read is narrowed here rather than
+    /// being narrowed by a projection above a leaf that already paid for the
+    /// wide columns.
+    ///
     /// Cancellation during catalog or scan IO drops all locally acquired state
     /// and exposes no provider; retry restarts the complete resolution.
     ///
     /// # Errors
     /// Returns a redacted resolution error for a role mismatch, invalid table binding,
-    /// catalog lookup failure, hot-file metadata failure, or physical scan
+    /// catalog lookup failure, a closure that does not resolve against the
+    /// authenticated schema, hot-file metadata failure, or physical scan
     /// construction failure.
     async fn resolve(
         &self,
         target_role: ClusterRole,
         assignment: &FollowerScanAssignment,
         session: &SessionState,
-    ) -> Result<Arc<dyn ExecutionPlan>, String> {
+    ) -> Result<ResolvedFollowerSource, String> {
         if target_role != ClusterRole::Oracle || assignment.scribe_provider_cut.is_some() {
             return Err("Oracle resolver received a non-Oracle assignment".to_owned());
         }
@@ -298,16 +358,27 @@ impl FollowerSourceResolver for OracleCatalogResolver {
         // once more after every scan id in the request resolves, but that
         // later check alone would let a mismatched hot assignment reach
         // storage first.
-        let actual = super::assignment_schema_fingerprint(provider.schema().as_ref());
+        let full_schema = provider.schema();
+        let actual = super::assignment_schema_fingerprint(full_schema.as_ref());
         if actual != assignment.schema_fingerprint {
             return Err("resolved provider schema fingerprint differs from assignment".to_owned());
         }
+        // Derived before any object I/O so an assignment naming a column this
+        // table does not have is refused rather than partially read.
+        let required_schema =
+            signed_closure_schema(full_schema.as_ref(), &assignment.required_columns)?;
         if assignment.persisted.files.is_empty() {
-            let schema = provider.schema();
-            let batch = arrow::record_batch::RecordBatch::new_empty(Arc::clone(&schema));
-            return MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None)
-                .map(|plan| plan as Arc<dyn ExecutionPlan>)
-                .map_err(|_| "authenticated Oracle empty provider failed".to_owned());
+            let batch = arrow::record_batch::RecordBatch::new_empty(Arc::clone(&required_schema));
+            return MemorySourceConfig::try_new_exec(
+                &[vec![batch]],
+                Arc::clone(&required_schema),
+                None,
+            )
+            .map(|plan| ResolvedFollowerSource {
+                plan: plan as Arc<dyn ExecutionPlan>,
+                full_schema,
+            })
+            .map_err(|_| "authenticated Oracle empty provider failed".to_owned());
         }
         let catalog_binding =
             CatalogTableBinding::resolve((assignment.binding.tenant_id, table))
@@ -350,34 +421,48 @@ impl FollowerSourceResolver for OracleCatalogResolver {
             // Every object identity, size, and assignment fence has been
             // validated above, so the shared hot leaf is constructed in
             // follower governance: its reservations are charged to the
-            // request-local pool backed by the retained worker lease.
-            return Ok(Arc::new(super::exec::HotParquetExec::new(
-                files,
-                self.catalog.file_io().clone(),
-                provider.schema(),
-                super::exec::HotParquetGovernance::Follower {
-                    memory_pool: session.runtime_env().memory_pool.clone(),
-                },
-                Arc::new(super::exec::OracleScanMetricsHandle::default()),
-                assignment.predicates.clone(),
-            )));
+            // request-local pool backed by the retained worker lease. It is
+            // built at the closure schema, so its Parquet column mask decodes
+            // only the signed columns.
+            return Ok(ResolvedFollowerSource {
+                plan: Arc::new(super::exec::HotParquetExec::new(
+                    files,
+                    self.catalog.file_io().clone(),
+                    required_schema,
+                    super::exec::HotParquetGovernance::Follower {
+                        memory_pool: session.runtime_env().memory_pool.clone(),
+                    },
+                    Arc::new(super::exec::OracleScanMetricsHandle::default()),
+                    assignment.predicates.clone(),
+                )),
+                full_schema,
+            });
         }
         // Compacted assignments keep the catalog's own scan. Rebuild the leaf
         // from the closure the leader signed: the follower resolves its own
         // provider, so `assignment.predicates` is the only description of what
         // this cut may skip, and handing it back as logical filters is what
-        // lets the Iceberg source prune files and row groups. Projection stays
-        // `None` on purpose — the caller verifies the resolved provider's
-        // schema fingerprint against the assignment immediately after this
-        // returns, so the leaf must keep the full physical schema and let the
-        // projection above it do the narrowing.
+        // lets the Iceberg source prune files and row groups. The signed names
+        // are translated to this provider's own indices and pushed as the scan
+        // projection, so unrequested columns are never read; the provider is
+        // free to return them in its own order, which the name-based
+        // normalization below corrects without touching the signed closure.
         let pushdown =
-            super::exec::scan_predicate_logical_exprs(&assignment.predicates, &provider.schema());
+            super::exec::scan_predicate_logical_exprs(&assignment.predicates, &full_schema);
+        let (_, indices) =
+            super::exec::select_schema_by_name(full_schema.as_ref(), &assignment.required_columns)
+                .map_err(|_| {
+                    "assignment closure does not resolve against the authenticated schema"
+                        .to_owned()
+                })?;
         let plan = provider
-            .scan(session, None, &pushdown, None)
+            .scan(session, Some(&indices), &pushdown, None)
             .await
             .map_err(|_| "authenticated Oracle physical scan failed".to_owned())?;
-        restrict_plan_to_assigned_files(plan, &assigned_locations)
+        let plan = restrict_plan_to_assigned_files(plan, &assigned_locations)?;
+        let plan = super::exec::project_plan_by_name(plan, &assignment.required_columns)
+            .map_err(|_| "authenticated Oracle closure normalization failed".to_owned())?;
+        Ok(ResolvedFollowerSource { plan, full_schema })
     }
 }
 
@@ -411,23 +496,53 @@ impl FixedCohortResolver {
 #[cfg(feature = "test-support")]
 #[async_trait]
 impl FollowerSourceResolver for FixedCohortResolver {
-    /// Returns the bound cohort as a single-partition in-memory source.
+    /// Returns the bound cohort, narrowed to the signed closure, as a
+    /// single-partition in-memory source.
+    ///
+    /// The cohort is bound at the complete schema, so it is projected here for
+    /// the same reason a real leaf is: the transport proofs this resolver
+    /// serves run the real decode, which requires the published plan to expose
+    /// exactly the signed closure.
     ///
     /// # Errors
-    /// Returns a redacted message when `DataFusion` rejects the cohort against
-    /// the bound schema.
+    /// Returns a redacted message when the signed closure does not resolve
+    /// against the bound schema, or when `DataFusion` rejects the cohort.
     async fn resolve(
         &self,
         _target_role: ClusterRole,
-        _assignment: &FollowerScanAssignment,
+        assignment: &FollowerScanAssignment,
         _session: &SessionState,
-    ) -> Result<Arc<dyn ExecutionPlan>, String> {
+    ) -> Result<ResolvedFollowerSource, String> {
+        let required_schema =
+            signed_closure_schema(self.schema.as_ref(), &assignment.required_columns)?;
+        let projected = self
+            .batches
+            .iter()
+            .map(|batch| {
+                batch
+                    .project(
+                        &required_schema
+                            .fields()
+                            .iter()
+                            .map(|field| {
+                                batch.schema().index_of(field.name()).map_err(|_| {
+                                    "fixed cohort is missing a signed closure column".to_owned()
+                                })
+                            })
+                            .collect::<Result<Vec<_>, String>>()?,
+                    )
+                    .map_err(|_| "fixed cohort rejected the signed closure".to_owned())
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         MemorySourceConfig::try_new_exec(
-            std::slice::from_ref(&self.batches),
-            Arc::clone(&self.schema),
+            std::slice::from_ref(&projected),
+            Arc::clone(&required_schema),
             None,
         )
-        .map(|plan| plan as Arc<dyn ExecutionPlan>)
+        .map(|plan| ResolvedFollowerSource {
+            plan: plan as Arc<dyn ExecutionPlan>,
+            full_schema: Arc::clone(&self.schema),
+        })
         .map_err(|_| "fixed cohort resolver rejected its bound cohort".to_owned())
     }
 }
@@ -579,14 +694,16 @@ where
     /// local cohort. A retry begins again from the authenticated assignment.
     ///
     /// # Errors
-    /// Returns a redacted resolution error for role/binding/range conversion,
-    /// live-tail snapshot, or Arrow provider construction failure.
+    /// Returns a redacted resolution error for role/binding/range conversion, a
+    /// schema fingerprint that differs from the assignment, a closure that does
+    /// not resolve against the authenticated schema, live-tail snapshot, or
+    /// Arrow provider construction failure.
     async fn resolve(
         &self,
         target_role: ClusterRole,
         assignment: &FollowerScanAssignment,
         _session: &SessionState,
-    ) -> Result<Arc<dyn ExecutionPlan>, String> {
+    ) -> Result<ResolvedFollowerSource, String> {
         if target_role != ClusterRole::Scribe || !assignment.persisted.files.is_empty() {
             return Err("Scribe resolver received a non-Scribe assignment".to_owned());
         }
@@ -603,7 +720,7 @@ where
             assignment_table(&assignment.binding)?,
         ))
         .map_err(|_| "Scribe tenant/table binding is invalid".to_owned())?;
-        let schema = match &self.schema_source {
+        let full_schema = match &self.schema_source {
             ScribeSchemaSource::Catalog(catalog) => catalog
                 .provider(
                     &assignment_table(&assignment.binding)?,
@@ -615,6 +732,15 @@ where
             #[cfg(test)]
             ScribeSchemaSource::Fixed(schema) => Arc::clone(schema),
         };
+        // Both checks run before the live-tail snapshot, not only in `decode`
+        // after it: a mismatched assignment must never reach the tail source.
+        if super::assignment_schema_fingerprint(full_schema.as_ref())
+            != assignment.schema_fingerprint
+        {
+            return Err("resolved provider schema fingerprint differs from assignment".to_owned());
+        }
+        let required_schema =
+            signed_closure_schema(full_schema.as_ref(), &assignment.required_columns)?;
         let table_name = format!(
             "{}.{}",
             assignment.binding.namespace, assignment.binding.table
@@ -625,10 +751,17 @@ where
             cut.writer_epoch,
         );
         if assignment.scan_id != local_scan_id {
-            let batch = RecordBatch::new_empty(Arc::clone(&schema));
-            return MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None)
-                .map(|plan| plan as Arc<dyn ExecutionPlan>)
-                .map_err(|_| "authenticated Scribe empty provider failed".to_owned());
+            let batch = RecordBatch::new_empty(Arc::clone(&required_schema));
+            return MemorySourceConfig::try_new_exec(
+                &[vec![batch]],
+                Arc::clone(&required_schema),
+                None,
+            )
+            .map(|plan| ResolvedFollowerSource {
+                plan: plan as Arc<dyn ExecutionPlan>,
+                full_schema,
+            })
+            .map_err(|_| "authenticated Scribe empty provider failed".to_owned());
         }
         let start_partition = TimePartition::from_wire(cut.start_partition);
         let end_partition = TimePartition::from_wire(cut.end_partition);
@@ -644,18 +777,12 @@ where
                 target_stream: stream,
                 start_partition,
                 end_partition,
-                // Empty means every column of the table schema. This leaf must
-                // produce the assignment's declared schema: the leader
-                // fingerprint-validates that full schema above, the empty-scan
-                // branch returns a full-schema batch, and the serialized plan's
-                // `Column` indices are full-schema indices. Narrowing the fetch
-                // to `required_columns` here would hand the memory source a
-                // projected batch under a full-schema declaration, and execution
-                // would then index past its end for every required column that
-                // is not already at ordinal zero. The signed closure still bounds
-                // the predicates below; the projection belongs to the plan above
-                // this leaf, not to the source.
-                required_columns: Vec::new(),
+                // The signed closure, byte for byte. Scribe projects the
+                // memtable and staged runs to exactly these names in exactly
+                // this order, so the wide columns are never materialized, and
+                // the declared leaf schema below is the same closure — the
+                // serialized plan's `Column` indices are closure indices.
+                required_columns: assignment.required_columns.clone(),
                 predicates: assignment.predicates.clone(),
                 max_batches,
                 max_retained_bytes,
@@ -684,8 +811,12 @@ where
             .into_iter()
             .map(|batch| batch.rows)
             .collect::<Vec<_>>();
-        super::exec::OracleTableProvider::validated_memory_source(&rows, schema)
-            .map_err(|_| "Scribe Arrow provider construction failed".to_owned())
+        super::exec::OracleTableProvider::validated_memory_source(
+            &rows,
+            Arc::clone(&required_schema),
+        )
+        .map(|plan| ResolvedFollowerSource { plan, full_schema })
+        .map_err(|_| "Scribe Arrow provider construction failed".to_owned())
     }
 }
 
@@ -918,18 +1049,34 @@ where
         let mut providers = HashMap::with_capacity(preflight.assignments.len());
         for (scan_id, assignment) in preflight.assignments {
             self.effects.resolver.fetch_add(1, Ordering::SeqCst);
-            let provider = self
+            let resolved = self
                 .resolver
                 .resolve(request.target_fence.role, &assignment, session)
                 .await
                 .map_err(PhysicalPlanFollowerError::Resolution)?;
-            let actual = super::assignment_schema_fingerprint(provider.schema().as_ref());
+            // Two distinct schemas, checked in order. The fingerprint identifies
+            // the table's complete canonical schema, so it is checked against
+            // `full_schema`; the leaf the plan will actually read from must then
+            // expose exactly the closure derived from that same schema and the
+            // signed names. Checking only the fingerprint would admit a leaf of
+            // any width, and deriving the closure from the leaf's own schema
+            // would make the check circular.
+            let actual = super::assignment_schema_fingerprint(resolved.full_schema.as_ref());
             if actual != assignment.schema_fingerprint {
                 return Err(PhysicalPlanFollowerError::Resolution(
                     "resolved provider schema fingerprint differs from assignment".to_owned(),
                 ));
             }
-            providers.insert(scan_id, provider);
+            let expected =
+                signed_closure_schema(resolved.full_schema.as_ref(), &assignment.required_columns)
+                    .map_err(PhysicalPlanFollowerError::Resolution)?;
+            if resolved.plan.schema() != expected {
+                return Err(PhysicalPlanFollowerError::Resolution(
+                    "resolved provider schema differs from the signed projection closure"
+                        .to_owned(),
+                ));
+            }
+            providers.insert(scan_id, resolved.plan);
         }
         // Re-read the immutable common plan after every source-resolution await.
         // This closes the same fail-closed boundary as the initial preflight:
@@ -1288,7 +1435,7 @@ pub fn authenticated_preflight(
             _target_role: ClusterRole,
             _assignment: &FollowerScanAssignment,
             _session: &SessionState,
-        ) -> Result<Arc<dyn ExecutionPlan>, String> {
+        ) -> Result<ResolvedFollowerSource, String> {
             Err("preflight resolver must not run".to_owned())
         }
     }
@@ -1522,13 +1669,18 @@ pub(crate) mod tests {
         async fn resolve(
             &self,
             _target_role: ClusterRole,
-            _assignment: &FollowerScanAssignment,
+            assignment: &FollowerScanAssignment,
             _session: &SessionState,
-        ) -> Result<Arc<dyn ExecutionPlan>, String> {
+        ) -> Result<ResolvedFollowerSource, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
-                Arc::clone(&self.schema),
-            )))
+            let required_schema =
+                signed_closure_schema(self.schema.as_ref(), &assignment.required_columns)?;
+            Ok(ResolvedFollowerSource {
+                plan: Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
+                    required_schema,
+                )),
+                full_schema: Arc::clone(&self.schema),
+            })
         }
     }
 
@@ -1544,11 +1696,12 @@ pub(crate) mod tests {
             namespace: "vala.logs".to_owned(),
             table: "records".to_owned(),
         };
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "value",
-            DataType::Int64,
-            true,
-        )]));
+        // The closure a leader would sign for `SELECT value FROM ...`: the
+        // requested column plus the hidden tenant column the tripwire needs.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, true),
+            Field::new(DATA_TENANT_ID, DataType::Utf8, false),
+        ]));
         let fingerprint = super::super::assignment_schema_fingerprint(schema.as_ref());
         let bytes = physical_plan_to_bytes_with_extension_codec(
             Arc::new(RemoteSourcePlaceholderExec::new(
@@ -1588,7 +1741,7 @@ pub(crate) mod tests {
                     },
                     scribe_provider_cut: None,
                     schema_fingerprint: fingerprint,
-                    required_columns: vec!["data_tenant_id".to_owned()],
+                    required_columns: vec!["value".to_owned(), DATA_TENANT_ID.to_owned()],
                     predicates: Vec::new(),
                 }],
                 plan_fingerprint: physical_plan_fingerprint(&bytes),
@@ -1625,11 +1778,11 @@ pub(crate) mod tests {
             requests: Arc::clone(&requests),
             batches: Vec::new(),
         });
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "wyrd_event_time",
-            DataType::Utf8,
-            true,
-        )]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("wyrd_event_time", DataType::Utf8, true),
+            Field::new(DATA_TENANT_ID, DataType::Utf8, false),
+        ]));
+        let fingerprint = super::super::assignment_schema_fingerprint(schema.as_ref());
         let resolver = ScribeTailResolver::with_schema(tail, schema);
         let binding = TenantTableBinding {
             tenant_id,
@@ -1641,8 +1794,8 @@ pub(crate) mod tests {
             binding: binding.clone(),
             persisted: PersistedFileAssignment { files: Vec::new() },
             scribe_provider_cut: Some(cut()),
-            schema_fingerprint: "schema".to_owned(),
-            required_columns: vec!["data_tenant_id".to_owned()],
+            schema_fingerprint: fingerprint.clone(),
+            required_columns: vec!["wyrd_event_time".to_owned(), DATA_TENANT_ID.to_owned()],
             predicates: Vec::new(),
         };
         let session = SessionContext::new().state();
@@ -1695,11 +1848,10 @@ pub(crate) mod tests {
         oracle_projection_is_exactly_the_authenticated_assignment();
         let (request, binding) = oracle_request().expect("valid Oracle request");
         let calls = Arc::new(AtomicUsize::new(0));
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "value",
-            DataType::Int64,
-            true,
-        )]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, true),
+            Field::new(DATA_TENANT_ID, DataType::Utf8, false),
+        ]));
         let follower = PhysicalPlanFollower::new(CountingResolver {
             calls: Arc::clone(&calls),
             schema,
@@ -1714,7 +1866,7 @@ pub(crate) mod tests {
             .expect("validated provider decodes and executes");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(follower.preflight_count(), 2);
-        assert_eq!(stream.split().0.schema().fields().len(), 1);
+        assert_eq!(stream.split().0.schema().fields().len(), 2);
     }
 
     /// Follower sessions are shaped only by the admitted grant and assigned work.
@@ -2049,7 +2201,7 @@ pub(crate) mod tests {
             )
             .await
             .expect("snapshot cohort resolves");
-        let rows = collect(provider, Arc::new(TaskContext::default()))
+        let rows = collect(provider.plan, Arc::new(TaskContext::default()))
             .await
             .expect("snapshot cohort executes");
         let mut cohort = rows
@@ -2068,7 +2220,6 @@ pub(crate) mod tests {
         cohort.sort();
         assert_eq!(cohort, vec!["active", "immutable-one", "immutable-two"]);
     }
-
 
     /// The four-column closure fixture schema shared by the Scribe follower owner.
     ///
@@ -2104,18 +2255,21 @@ pub(crate) mod tests {
         let table = TableRef::parse_fqn("vala.traces.spans").expect("canonical table");
         let key = SealKey::new(tenant_id, table, day);
         let memtable = Arc::new(Memtable::new());
-        let batch = RecordBatch::try_new(Arc::clone(schema), vec![
-            Arc::new(StringArray::from(vec!["wide-error", "wide-ok"])),
-            Arc::new(Int64Array::from(vec![41_i64, 97_i64])),
-            Arc::new(StringArray::from(vec![
-                "STATUS_CODE_ERROR",
-                "STATUS_CODE_OK",
-            ])),
-            Arc::new(StringArray::from(vec![
-                tenant_id.to_string(),
-                tenant_id.to_string(),
-            ])),
-        ])
+        let batch = RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![
+                Arc::new(StringArray::from(vec!["wide-error", "wide-ok"])),
+                Arc::new(Int64Array::from(vec![41_i64, 97_i64])),
+                Arc::new(StringArray::from(vec![
+                    "STATUS_CODE_ERROR",
+                    "STATUS_CODE_OK",
+                ])),
+                Arc::new(StringArray::from(vec![
+                    tenant_id.to_string(),
+                    tenant_id.to_string(),
+                ])),
+            ],
+        )
         .expect("closure fixture batch");
         let event = wyrd_spec::vala::api::AuditEvent {
             request_id: wyrd_spec::request_id::RequestId::now_v7(),
@@ -2168,14 +2322,12 @@ pub(crate) mod tests {
             scribe_provider_cut: Some(cut()),
             schema_fingerprint,
             required_columns,
-            predicates: vec![
-                wyrd_spec::vala::assignment_authority::ScanPredicate::Eq(
-                    "status_code".to_owned(),
-                    wyrd_spec::vala::assignment_authority::ScanLiteral::Utf8(
-                        "STATUS_CODE_ERROR".to_owned(),
-                    ),
+            predicates: vec![wyrd_spec::vala::assignment_authority::ScanPredicate::Eq(
+                "status_code".to_owned(),
+                wyrd_spec::vala::assignment_authority::ScanLiteral::Utf8(
+                    "STATUS_CODE_ERROR".to_owned(),
                 ),
-            ],
+            )],
         }
     }
 
@@ -2256,6 +2408,7 @@ pub(crate) mod tests {
             .expect("signed closure resolves");
         assert_eq!(
             owned
+                .plan
                 .schema()
                 .fields()
                 .iter()
@@ -2265,7 +2418,7 @@ pub(crate) mod tests {
             "the live-tail leaf exposes exactly the signed closure"
         );
 
-        let rows = collect(owned, Arc::new(TaskContext::default()))
+        let rows = collect(owned.plan, Arc::new(TaskContext::default()))
             .await
             .expect("closure cohort executes");
         let durations = rows
@@ -2304,6 +2457,7 @@ pub(crate) mod tests {
             .expect("a non-owning assignment resolves to an empty branch");
         assert_eq!(
             unowned
+                .plan
                 .schema()
                 .fields()
                 .iter()
@@ -2359,11 +2513,10 @@ pub(crate) mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let follower = PhysicalPlanFollower::new(CountingResolver {
             calls: Arc::clone(&calls),
-            schema: Arc::new(Schema::new(vec![Field::new(
-                "value",
-                DataType::Int64,
-                true,
-            )])),
+            schema: Arc::new(Schema::new(vec![
+                Field::new("value", DataType::Int64, true),
+                Field::new(DATA_TENANT_ID, DataType::Utf8, false),
+            ])),
         });
         let first = PhysicalPlanNode::decode(request.physical_plan_bytes.as_slice())
             .expect("first extension decodes");

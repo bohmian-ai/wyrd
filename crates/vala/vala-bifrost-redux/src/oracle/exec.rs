@@ -2975,7 +2975,7 @@ impl OracleScanProjection {
 ///
 /// Returns a `DataFusion` plan error when a name does not resolve against the
 /// plan's own output schema, or when `DataFusion` rejects the projection.
-fn project_plan_by_name(
+pub(super) fn project_plan_by_name(
     plan: Arc<dyn ExecutionPlan>,
     names: &[String],
 ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {

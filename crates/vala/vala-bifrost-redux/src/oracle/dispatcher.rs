@@ -3083,25 +3083,56 @@ mod tests {
         async fn resolve(
             &self,
             _target_role: ClusterRole,
-            _assignment: &FollowerScanAssignment,
+            assignment: &FollowerScanAssignment,
             _session: &datafusion::execution::session_state::SessionState,
-        ) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>, String> {
-            let schema = Arc::new(Schema::new(vec![Field::new(
-                "value",
-                DataType::Int64,
-                false,
-            )]));
+        ) -> Result<super::super::follower::ResolvedFollowerSource, String> {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("value", DataType::Int64, false),
+                Field::new(
+                    wyrd_spec::vala::managed_columns::DATA_TENANT_ID,
+                    DataType::Utf8,
+                    false,
+                ),
+            ]));
             let batch = RecordBatch::try_new(
                 Arc::clone(&schema),
-                vec![Arc::new(Int64Array::from(vec![1_i64]))],
+                vec![
+                    Arc::new(Int64Array::from(vec![1_i64])),
+                    Arc::new(arrow::array::StringArray::from(vec![
+                        assignment.binding.tenant_id.to_string(),
+                    ])),
+                ],
             )
             .map_err(|error| error.to_string())?;
+            let required_schema = super::super::exec::select_schema_by_name(
+                schema.as_ref(),
+                &assignment.required_columns,
+            )
+            .map(|(projected, _)| projected)
+            .map_err(|error| error.to_string())?;
+            let batch = batch
+                .project(
+                    &required_schema
+                        .fields()
+                        .iter()
+                        .map(|field| {
+                            batch
+                                .schema()
+                                .index_of(field.name())
+                                .map_err(|error| error.to_string())
+                        })
+                        .collect::<Result<Vec<_>, String>>()?,
+                )
+                .map_err(|error| error.to_string())?;
             datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
                 &[vec![batch]],
-                schema,
+                Arc::clone(&required_schema),
                 None,
             )
-            .map(|plan| plan as Arc<dyn datafusion::physical_plan::ExecutionPlan>)
+            .map(|plan| super::super::follower::ResolvedFollowerSource {
+                plan: plan as Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+                full_schema: schema,
+            })
             .map_err(|error| error.to_string())
         }
     }
@@ -3168,11 +3199,14 @@ mod tests {
 
     /// Builds the deterministic closure shared by every dispatcher request fixture.
     fn dispatcher_fixture() -> DispatcherFixture {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "value",
-            DataType::Int64,
-            false,
-        )]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, false),
+            Field::new(
+                wyrd_spec::vala::managed_columns::DATA_TENANT_ID,
+                DataType::Utf8,
+                false,
+            ),
+        ]));
         DispatcherFixture {
             schema_fingerprint: crate::oracle::assignment_schema_fingerprint(&schema),
             projection: vec!["value".to_owned()],
@@ -3262,11 +3296,14 @@ mod tests {
         } else {
             ClusterRole::Oracle
         };
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "value",
-            DataType::Int64,
-            false,
-        )]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, false),
+            Field::new(
+                wyrd_spec::vala::managed_columns::DATA_TENANT_ID,
+                DataType::Utf8,
+                false,
+            ),
+        ]));
         let physical_plan_bytes =
             datafusion_proto::bytes::physical_plan_to_bytes_with_extension_codec(
                 Arc::new(super::super::codec::RemoteSourcePlaceholderExec::new(
@@ -3299,7 +3336,10 @@ mod tests {
             persisted,
             scribe_provider_cut,
             schema_fingerprint: fragment.schema_fingerprint.clone(),
-            required_columns: vec!["data_tenant_id".to_owned()],
+            required_columns: vec![
+                "value".to_owned(),
+                wyrd_spec::vala::managed_columns::DATA_TENANT_ID.to_owned(),
+            ],
             predicates: Vec::new(),
         }];
         let claims = PeerTicketClaims {
@@ -3397,7 +3437,10 @@ mod tests {
                 // authority digest requires this shape even in fixtures that
                 // never exercise object storage.
                 schema_fingerprint: "0".repeat(64),
-                required_columns: vec!["data_tenant_id".to_owned()],
+                required_columns: vec![
+                    "value".to_owned(),
+                    wyrd_spec::vala::managed_columns::DATA_TENANT_ID.to_owned(),
+                ],
                 predicates: Vec::new(),
             }],
             binding,
@@ -4119,7 +4162,7 @@ mod tests {
             target_role: ClusterRole,
             assignment: &FollowerScanAssignment,
             session: &datafusion::execution::session_state::SessionState,
-        ) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>, String> {
+        ) -> Result<super::super::follower::ResolvedFollowerSource, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             TestFollowerResolver
                 .resolve(target_role, assignment, session)
@@ -4210,7 +4253,10 @@ mod tests {
             persisted: PersistedFileAssignment { files: Vec::new() },
             scribe_provider_cut: Some(cut),
             schema_fingerprint: fragment.schema_fingerprint.clone(),
-            required_columns: vec!["data_tenant_id".to_owned()],
+            required_columns: vec![
+                "value".to_owned(),
+                wyrd_spec::vala::managed_columns::DATA_TENANT_ID.to_owned(),
+            ],
             predicates: Vec::new(),
         };
         let digest_of = |cut: ScribeProviderCut| {

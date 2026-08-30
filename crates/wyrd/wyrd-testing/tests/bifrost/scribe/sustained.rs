@@ -305,8 +305,10 @@ async fn build_participants(server: &WyrdTestServer) -> Vec<Participant> {
 ///
 /// Each tenant runs one bounded task that alternates between its dynamic table
 /// and the built-in, placing consecutive batches in two adjacent hour
-/// partitions. Every attempt goes through the shared bounded retry, so the
-/// returned total is the number of times the pod applied typed capacity
+/// partitions. The tasks rendezvous on a barrier before their first append, so
+/// contention for the pod's single vector is structural rather than dependent
+/// on scheduling order. Every attempt goes through the shared bounded retry, so
+/// the returned total is the number of times the pod applied typed capacity
 /// pressure before admitting the work — never a measure of how long anything
 /// took.
 ///
@@ -316,14 +318,22 @@ async fn build_participants(server: &WyrdTestServer) -> Vec<Participant> {
 /// for a reason other than capacity pressure.
 async fn drive_sustained_ingest(participants: &mut [Participant]) -> usize {
     let base = super::support::hour_start(chrono::Utc::now());
+    // Every participant blocks here until all of them are ready, so the pod's
+    // single vector is contended by the first append of every tenant at once
+    // rather than whenever the runtime happens to schedule them. Without the
+    // barrier a skewed scheduling order can serialize the tenants and the run
+    // observes no refusal at all, which proves nothing about pressure.
+    let start = Arc::new(tokio::sync::Barrier::new(participants.len()));
     let mut tasks = Vec::with_capacity(participants.len());
     for (ordinal, participant) in participants.iter().enumerate() {
         let client = Arc::clone(&participant.client);
         let dynamic_table = participant.dynamic_table.clone();
+        let start = Arc::clone(&start);
         tasks.push(tokio::spawn(async move {
             let mut refusals = 0_usize;
             let mut dynamic = Vec::new();
             let mut system = Vec::new();
+            start.wait().await;
             for batch in 0..BATCHES_PER_TABLE {
                 let rows = batch_values(ordinal, batch);
                 // Consecutive batches alternate between two adjacent hours, so

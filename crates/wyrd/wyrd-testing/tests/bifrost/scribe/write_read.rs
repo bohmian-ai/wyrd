@@ -244,7 +244,10 @@ fn assert_parity(uncached: &ScribeProductionEvidenceV1, cached: &ScribeProductio
                     left.name
                 );
             }
-            _ => panic!("boundary {:?} carries drain evidence in only one run", left.name),
+            _ => panic!(
+                "boundary {:?} carries drain evidence in only one run",
+                left.name
+            ),
         }
     }
 }

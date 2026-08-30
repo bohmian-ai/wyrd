@@ -272,3 +272,139 @@ pub(crate) fn unused_payload(id: i64) -> String {
     out.truncate(UNUSED_PAYLOAD_CHARS);
     out
 }
+
+/// Bound on how many Forge planning passes the fixture will drive before it
+/// gives up on compacting its first batch. Generous, because a pass may claim
+/// nothing, retry, or lose a lease race; finite, because a stalled Forge must
+/// fail the journey rather than hang it.
+const COMPACTION_PASS_BUDGET: usize = 32;
+
+/// Number of rows written before compaction. Every one of them is sealed as
+/// its own Parquet file, so the Forge pass has `min_files` worth of real
+/// inputs to rewrite into a single published data file.
+/// Compacts every sealed file already written for `table`, so that a later
+/// query reads them through the Iceberg snapshot rather than the hot manifest.
+///
+/// Three things have to happen for that, and none of them are automatic:
+///
+/// * The event-day partition holding the batch has to close. Forge does not
+///   rewrite a partition it may still receive writes for, so the test clock is
+///   advanced past it first.
+/// * A planning pass has to run, and the worker it hands the task to has to
+///   finish. The supervisor's own ticker is a minute long, so passes are
+///   requested explicitly; the wait is on the worker completion observer,
+///   because a planning pass returns as soon as the task is claimed.
+/// * A task that lands in `retryable` has to become eligible again. Real
+///   backoff is minutes; `release_forge_retries` moves the durable
+///   `next_eligible_at` back instead of sleeping, leaving the failure
+///   classification untouched.
+///
+/// The loop is bounded and its exit condition is the durable `compacted` flag,
+/// not a pass or completion count: a pass that claimed nothing, and a
+/// completion that rewrote some other table, must not be mistaken for this
+/// batch having moved tiers.
+///
+/// # Errors
+///
+/// Returns an error when the observer is absent, when the clock cannot be
+/// advanced, when a Postgres probe fails, or when fewer than `expected` inputs
+/// are compacted before the loop's budget runs out.
+pub(crate) async fn compact_sealed_batch(
+    cluster: &WyrdTestCluster,
+    tenant: wyrd_spec::DataTenantId,
+    table: &str,
+    expected: i64,
+) -> Result<(), JourneyError> {
+    let observer = cluster
+        .forge_completion_observer()
+        .ok_or("cluster was started without a Forge completion observer")?;
+    for server in cluster.servers() {
+        server
+            .forge_clock()
+            .advance(chrono::Duration::days(1))
+            .map_err(|error| format!("close the written partition: {error}"))?;
+    }
+    for _ in 0..COMPACTION_PASS_BUDGET {
+        let (compacted, _) = file_tier_counts(cluster, tenant, table).await?;
+        if compacted >= expected {
+            return Ok(());
+        }
+        release_forge_retries(cluster, tenant, table).await?;
+        let target = observer.completed().saturating_add(1);
+        cluster.request_forge_scheduler_pass_for_test();
+        // A lapsed wait is not a failure on its own: the pass may legitimately
+        // have found nothing to claim on this iteration. The durable flag
+        // checked at the top of the next iteration is the real verdict.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            observer.wait_for_at_least(target),
+        )
+        .await;
+    }
+    let (compacted, hot) = file_tier_counts(cluster, tenant, table).await?;
+    Err(format!(
+        "Forge compacted {compacted} of {expected} sealed inputs within \
+         {COMPACTION_PASS_BUDGET} passes ({hot} still hot)"
+    )
+    .into())
+}
+/// Makes every `retryable` Forge task for one table immediately eligible.
+///
+/// Backoff between attempts is real production time, which a bounded journey
+/// cannot wait out. Only `next_eligible_at` and `ready_at` move; the attempt
+/// count and failure classification are left alone, so a task that is failing
+/// for a real reason still exhausts its attempts and still reports why.
+///
+/// # Errors
+///
+/// Returns the SQLx error when the eligibility update cannot be applied.
+pub(crate) async fn release_forge_retries(
+    cluster: &WyrdTestCluster,
+    tenant: wyrd_spec::DataTenantId,
+    table: &str,
+) -> Result<(), JourneyError> {
+    sqlx::query(
+        "UPDATE vala.forge_tasks \
+         SET ready_at = statement_timestamp(), \
+             next_eligible_at = statement_timestamp() - interval '15 minutes' \
+         WHERE data_tenant_id = $1 AND table_name = $2 AND state = 'retryable'",
+    )
+    .bind(tenant.as_uuid())
+    .bind(table)
+    .execute(cluster.pg_fixture().operator_pool().pool())
+    .await?;
+    Ok(())
+}
+
+/// Returns `(compacted, hot)` durable file counts for one tenant-owned table.
+///
+/// Reads `vala.file_list` through the operator pool because the split between
+/// the two tiers is durable server state the journey has no client-visible
+/// projection of; the query's own metrics report scan totals without naming
+/// which leaf produced them.
+///
+/// # Errors
+///
+/// Returns the SQLx error when either count cannot be read.
+pub(crate) async fn file_tier_counts(
+    cluster: &WyrdTestCluster,
+    tenant: wyrd_spec::DataTenantId,
+    table: &str,
+) -> Result<(i64, i64), JourneyError> {
+    let pool = cluster.pg_fixture().operator_pool().pool();
+    let compacted: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.file_list WHERE data_tenant_id = $1 AND table_name = $2 AND compacted",
+    )
+    .bind(tenant.as_uuid())
+    .bind(table)
+    .fetch_one(pool)
+    .await?;
+    let hot: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.file_list WHERE data_tenant_id = $1 AND table_name = $2 AND NOT compacted",
+    )
+    .bind(tenant.as_uuid())
+    .bind(table)
+    .fetch_one(pool)
+    .await?;
+    Ok((compacted, hot))
+}

@@ -744,9 +744,7 @@ pub struct ScribeStorageDrainObservationV1 {
 impl ScribeStorageDrainObservationV1 {
     /// Projects one production owner snapshot into the portable record.
     #[must_use]
-    pub fn from_snapshot(
-        snapshot: &vala_bifrost_redux::storage::MetadataCacheSnapshot,
-    ) -> Self {
+    pub fn from_snapshot(snapshot: &vala_bifrost_redux::storage::MetadataCacheSnapshot) -> Self {
         use vala_bifrost_redux::storage::{CacheEffect, CacheEffectReason};
         Self {
             lifecycle: snapshot.lifecycle().as_str().to_owned(),
@@ -989,12 +987,13 @@ impl ScribeProductionEvidenceV1 {
                 }
                 continue;
             }
-            let drained = observed
-                .drained
-                .as_ref()
-                .ok_or_else(|| ScribeWorkloadError::Evidence {
-                    detail: "the terminal boundary carries no drain evidence".to_owned(),
-                })?;
+            let drained =
+                observed
+                    .drained
+                    .as_ref()
+                    .ok_or_else(|| ScribeWorkloadError::Evidence {
+                        detail: "the terminal boundary carries no drain evidence".to_owned(),
+                    })?;
             if !drained.servers_stopped || !drained.listeners_stopped {
                 return Err(ScribeWorkloadError::Evidence {
                     detail: format!(
@@ -2153,7 +2152,10 @@ mod tests {
             ),
             (
                 "a leaked shard command",
-                ScribeDrainObservationV1 { queued: 1, ..clean.clone() },
+                ScribeDrainObservationV1 {
+                    queued: 1,
+                    ..clean.clone()
+                },
             ),
             (
                 "a leaked WAL stream",

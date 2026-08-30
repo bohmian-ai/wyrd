@@ -2395,11 +2395,23 @@ impl ForgeWorker {
     /// then runs against the objects that currently exist, and only the
     /// writer's own `DataFile` values reach the catalog.
     ///
+    /// A catalog refusal that is not retryable is a *definite* conflict: the
+    /// catalog answered, so the append certainly did not land. Exactly one
+    /// retry is permitted against it, and only after reloading the table and
+    /// revalidating the durable demand again — replaying the same plan against
+    /// a stale base is what would promote a file set that no longer exists.
+    /// The deadline is captured once, before the first attempt, so a slow
+    /// first attempt cannot buy the retry more time than the original commit
+    /// budget allowed. Every other failure, including an uncertain one, is
+    /// returned unchanged for evidence-based recovery.
+    ///
     /// # Errors
     ///
     /// Returns [`ForgeError::Invariant`] when the persisted parameters do not
-    /// decode into an exact plan, plus the audit, fence, object-store, and
-    /// catalog failures raised by preparation, revalidation, and the commit.
+    /// decode into an exact plan, [`ForgeError::InvalidConfig`] when the
+    /// configured Iceberg retry budget is not representable as a deadline, and
+    /// the audit, fence, object-store, and catalog failures raised by
+    /// preparation, revalidation, and the commit.
     async fn dispatch_scribe_promotion(
         &self,
         claim: &ForgeTaskClaim,
@@ -2410,31 +2422,78 @@ impl ForgeWorker {
         stop: &CancellationToken,
     ) -> Result<ForgeDispatchResult, ForgeError> {
         let plan = Self::promotion_plan(claim)?;
+        let operation_id = Self::promotion_operation_id(claim);
         self.forge
             .settle_promotion(
                 lease,
                 binding,
                 &plan,
                 ForgeScribePromotionPhase::Prepared,
-                Self::promotion_operation_id(claim),
+                operation_id,
                 claim.base_snapshot_id,
                 None,
             )
             .await?;
-        let data_files = self.forge.revalidate_promotion(binding, &plan).await?;
-        let committed = self
-            .forge
-            .commit_promotion(
-                lease,
-                table,
-                data_files,
-                claim.task_id,
-                attempt,
-                Self::promotion_operation_id(claim),
-                stop,
-            )
-            .await?;
-        Ok(ForgeDispatchResult::Committed(committed))
+        let deadline = self.forge.core.clock.now()?
+            + chrono::Duration::from_std(self.forge.core.config.iceberg_total_retry_timeout)
+                .map_err(|_| ForgeError::InvalidConfig {
+                    detail: "Forge Iceberg retry timeout is not representable".to_owned(),
+                })?;
+        let mut reloaded: Option<Table> = None;
+        let mut retried = false;
+        loop {
+            let base = reloaded.as_ref().unwrap_or(table);
+            let data_files = self.forge.revalidate_promotion(binding, &plan).await?;
+            let conflict = match self
+                .forge
+                .commit_promotion(
+                    lease,
+                    base,
+                    data_files,
+                    claim.task_id,
+                    attempt,
+                    operation_id,
+                    stop,
+                )
+                .await
+            {
+                Ok(committed) => return Ok(ForgeDispatchResult::Committed(committed)),
+                Err(ForgeError::Catalog(error)) if !error.retryable() => error,
+                Err(error) => return Err(error),
+            };
+            if retried || self.forge.core.clock.now()? >= deadline {
+                // A definite conflict is certain non-acceptance, so this
+                // operation is closed here rather than left open for a
+                // successor to reconcile a commit that never happened. No row
+                // is settled: `committed_snapshot_id` stays `None`.
+                self.forge
+                    .settle_promotion(
+                        lease,
+                        binding,
+                        &plan,
+                        ForgeScribePromotionPhase::Reset,
+                        operation_id,
+                        claim.base_snapshot_id,
+                        None,
+                    )
+                    .await?;
+                return Err(ForgeError::Catalog(conflict));
+            }
+            tracing::debug!(
+                task_id = %claim.task_id,
+                error = %conflict,
+                "revalidating one Scribe promotion after a definite catalog conflict"
+            );
+            retried = true;
+            reloaded = Some(
+                self.forge
+                    .core
+                    .catalog
+                    .load_table(&binding.table_ident())
+                    .await
+                    .map_err(ForgeError::Catalog)?,
+            );
+        }
     }
 
     /// Decodes one promotion claim's persisted plan.

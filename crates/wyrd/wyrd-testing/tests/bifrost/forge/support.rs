@@ -210,6 +210,40 @@ impl SupervisedForge {
         assert_eq!(self.worker_observer.completed(), expected);
     }
 
+    /// Schedule one pass and await exactly one *returned error* from the worker.
+    ///
+    /// The mirror of [`Self::run_one_success`], for the branches whose whole
+    /// point is that the attempt does not complete: the worker is stopped
+    /// while holding the attempt so the supervisor cannot retry it and blur
+    /// what the assertions observe.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the scheduler or worker misses its deterministic bound, or
+    /// when the attempt unexpectedly succeeded.
+    pub(crate) async fn run_one_failure(mut self) -> Self {
+        let expected_errors = self
+            .worker_observer
+            .returned_errors()
+            .len()
+            .saturating_add(1);
+        self.worker_observer.hold_after_next_attempt_for_test();
+        self.schedule_once().await;
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            self.worker_observer.wait_for_held_attempt_for_test(),
+        )
+        .await
+        .expect("production Forge worker attempt bound");
+        self.stop_worker().await;
+        assert_eq!(
+            self.worker_observer.returned_errors().len(),
+            expected_errors,
+            "the attempt was expected to return an error"
+        );
+        self
+    }
+
     /// Cancel and join the worker before it can retry a returned attempt.
     ///
     /// # Panics

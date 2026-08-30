@@ -513,3 +513,96 @@ async fn scribe_promotion_catalog_sql_window_preserves_exact_visibility() {
         "every sealed row settled exactly once"
     );
 }
+
+/// Reads the durable Forge operation phases for one tenant's promotions.
+///
+/// # Panics
+///
+/// Panics when the read-only diagnostic query fails.
+async fn promotion_phases(fixture: &ForgeFixture) -> Vec<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT phase FROM vala.forge_operation_state \
+         WHERE data_tenant_id = $1 AND family = 'scribe_promotion' \
+         ORDER BY prepared_at, operation_id",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .fetch_all(fixture.operator_pool.pool())
+    .await
+    .expect("Forge operation-state inspection")
+}
+
+/// One definite conflict is revalidated and retried; a second one resets.
+///
+/// A refusal before delegation is certain knowledge that nothing landed, so
+/// promotion is allowed exactly one revalidated retry against it. The retry
+/// must re-read the durable demand rather than replay a stale plan, and a
+/// conflict that survives the retry must leave the operation Reset with every
+/// row still hot — never half-settled.
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn scribe_promotion_conflict_revalidates_once_and_second_conflict_resets() {
+    let server = start_engine_fixture_server().await;
+    let fixture = seed_forge_group(&server, "promotion_conflict_once").await;
+    let catalog = CommitUncertaintyCatalog::new(Arc::clone(&fixture.catalog));
+    catalog.reject_next_commits(1);
+
+    let mut forge = SupervisedForge::start_with_seams(
+        &fixture,
+        fixture.config.clone(),
+        Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
+        Arc::clone(&fixture.object_store),
+    );
+    forge.run_one_success().await;
+    forge.shutdown().await;
+
+    assert_eq!(
+        catalog.update_attempts(),
+        2,
+        "one definite conflict is followed by exactly one retry"
+    );
+    let settled = file_rows(&fixture).await;
+    assert!(
+        settled
+            .iter()
+            .all(|row| row.committed_snapshot_id.is_some()),
+        "the revalidated retry promoted every row: {settled:?}"
+    );
+    assert_eq!(
+        promotion_phases(&fixture).await,
+        vec!["committed".to_owned()],
+        "the retried promotion settles once"
+    );
+
+    // A conflict that survives the single retry must not settle anything.
+    let server = start_engine_fixture_server().await;
+    let fixture = seed_forge_group(&server, "promotion_conflict_twice").await;
+    let catalog = CommitUncertaintyCatalog::new(Arc::clone(&fixture.catalog));
+    catalog.reject_next_commits(2);
+
+    let forge = SupervisedForge::start_with_seams(
+        &fixture,
+        fixture.config.clone(),
+        Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
+        Arc::clone(&fixture.object_store),
+    );
+    let forge = forge.run_one_failure().await;
+    forge.shutdown().await;
+
+    assert_eq!(
+        catalog.update_attempts(),
+        2,
+        "a second conflict is not retried again"
+    );
+    let unsettled = file_rows(&fixture).await;
+    assert!(
+        unsettled
+            .iter()
+            .all(|row| !row.compacted && row.committed_snapshot_id.is_none()),
+        "a reset promotion leaves every row hot: {unsettled:?}"
+    );
+    assert_eq!(
+        promotion_phases(&fixture).await,
+        vec!["reset".to_owned()],
+        "the failed promotion resets its operation"
+    );
+}

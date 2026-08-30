@@ -210,6 +210,8 @@ pub(crate) struct CommitUncertaintyControls {
     after_commit_drop_ready: tokio::sync::Notify,
     /// Arms a pause before a delegated commit.
     pause_before_commit: AtomicBool,
+    /// Remaining delegated commits to refuse outright as definite conflicts.
+    reject_commit_budget: AtomicUsize,
     /// Records that the pre-commit pause has been reached.
     before_commit_reached: AtomicBool,
     /// Selects a stale-worker response before delegation.
@@ -313,6 +315,7 @@ impl CommitUncertaintyControls {
             after_commit_dropped: AtomicBool::new(false),
             after_commit_drop_ready: tokio::sync::Notify::new(),
             pause_before_commit: AtomicBool::new(false),
+            reject_commit_budget: AtomicUsize::new(0),
             before_commit_reached: AtomicBool::new(false),
             reject_before_commit: AtomicBool::new(false),
             before_commit_ready: tokio::sync::Notify::new(),
@@ -413,6 +416,19 @@ impl CommitUncertaintyCatalog {
             &self.controls.after_commit_drop_ready,
         )
         .await;
+    }
+
+    /// Refuse the next `count` delegated commits as definite conflicts.
+    ///
+    /// The refusal happens before delegation and is non-retryable, so the
+    /// caller learns the commit certainly did not land. A budget rather than a
+    /// one-shot pause is what makes a retry proof deterministic: the retry
+    /// cannot race the test re-arming the seam between attempts.
+    pub fn reject_next_commits(&self, count: usize) {
+        self.controls.update_attempts.store(0, Ordering::Release);
+        self.controls
+            .reject_commit_budget
+            .store(count, Ordering::Release);
     }
 
     /// Release the paused post-acceptance response without injecting a fault.
@@ -577,6 +593,20 @@ impl Catalog for CommitUncertaintyCatalog {
                 "injected post-commit uncertainty remains unresolved",
             )
             .with_retryable(true));
+        }
+        if self
+            .controls
+            .reject_commit_budget
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |budget| {
+                budget.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(IcebergError::new(
+                IcebergErrorKind::Unexpected,
+                "injected definite Forge commit conflict",
+            )
+            .with_retryable(false));
         }
         if self
             .controls

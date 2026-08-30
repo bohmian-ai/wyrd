@@ -1629,6 +1629,38 @@ impl OracleTableProvider {
     fn classify_filter_for_table(&self, filter: &Expr) -> FilterClassification {
         classify_filter_for_schema(&self.physical_schema, filter)
     }
+
+    /// Returns the staged hot files this query can still read a row from.
+    ///
+    /// Staged hot Parquet is the only persisted source a leader-local scan
+    /// selects itself: the pinned Iceberg leaf hands its predicate to Iceberg's
+    /// own manifest planning, which already prunes on these same bounds and on
+    /// every other column's. Deciding here — before `HotParquetExec` is
+    /// constructed — is what keeps an excluded object's footer from ever being
+    /// opened, and every considered file emits exactly one bounded
+    /// `bifrost_oracle_file_pruning_total` observation.
+    ///
+    /// A file whose durable bounds are absent, unrepresentable, or reversed is
+    /// retained, so unusable statistics cost rows from nothing.
+    fn retained_hot_files(
+        &self,
+        predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
+    ) -> Vec<HotFileSource> {
+        let interval = crate::oracle::pruning::EventTimeQueryInterval::from_predicates(predicates);
+        if interval.is_unbounded() {
+            return self.hot_files.clone();
+        }
+        self.hot_files
+            .iter()
+            .filter(|file| {
+                interval.retains(
+                    crate::oracle::pruning::FilePruningSource::Hot,
+                    file.event_time,
+                )
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 /// Classifies one `DataFusion` filter for pushdown against `physical_schema`.
@@ -1764,29 +1796,8 @@ impl TableProvider for OracleTableProvider {
                 &supported_predicates,
             ));
         } else if !self.hot_files.is_empty() {
-            // Staged hot Parquet is the only persisted source a leader-local
-            // scan selects itself: the pinned Iceberg leaf hands its predicate
-            // to Iceberg's own manifest planning, which already prunes on these
-            // bounds and on every other column's. Deciding here — before the
-            // leaf is constructed — is what keeps an excluded object's footer
-            // from ever being opened.
-            let event_time_interval =
-                crate::oracle::pruning::EventTimeQueryInterval::from_predicates(
-                    &supported_predicates,
-                );
-            let retained = self
-                .hot_files
-                .iter()
-                .filter(|file| {
-                    event_time_interval.retains(
-                        crate::oracle::pruning::FilePruningSource::Hot,
-                        file.event_time,
-                    )
-                })
-                .cloned()
-                .collect::<Vec<_>>();
             let hot = Arc::new(HotParquetExec::new(
-                retained,
+                self.retained_hot_files(&supported_predicates),
                 self.file_io.clone(),
                 Arc::clone(&required_schema),
                 HotParquetGovernance::Leader {

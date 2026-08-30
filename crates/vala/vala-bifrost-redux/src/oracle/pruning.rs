@@ -72,8 +72,8 @@ pub(crate) enum FilePruningSource {
 }
 
 impl FilePruningSource {
-    /// Complete closed label domain, used by telemetry inventory contracts.
-    #[cfg(any(test, feature = "bench-support"))]
+    /// Complete closed label domain, used by the emitted-inventory contract.
+    #[cfg(test)]
     pub(crate) const ALL: [Self; 2] = [Self::Hot, Self::Iceberg];
 
     /// Returns the emitted `source` label for this persisted source.

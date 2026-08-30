@@ -48,8 +48,10 @@ use wyrd_spec::vala::api::{
 };
 use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
 
+use crate::catalog::event_time::{EventTimeBoundsDefect, EventTimeStatistics};
 use crate::catalog::{BifrostCatalog, BifrostCatalogError, PinnedSealedTable, TableRef};
 use crate::cluster::{ClusterRegistry, ClusterSnapshot, RegisteredRole};
+use crate::oracle::pruning::{EventTimeQueryInterval, FilePruningSource};
 use crate::schema::SchemaFingerprint;
 use crate::scribe::tail_rpc::{TAIL_PROTOCOL_VERSION, TailReadTransport};
 
@@ -3459,6 +3461,11 @@ impl Oracle {
                 }
             }
         }
+        // The recovered closure is the first authoritative statement of what
+        // each fragment will actually filter on, so it is the earliest point a
+        // file can be excluded — and it is still before partitioning, digest,
+        // and signing, which is what keeps an excluded file off the wire.
+        prune_assignments_by_event_time(&mut oracle_assignments);
         for assignment in oracle_assignments.values() {
             Self::ensure_required_columns_closure(assignment)?;
         }
@@ -4865,6 +4872,48 @@ where
     partitions
 }
 
+/// Drops every assigned file whose immutable event-time bounds cannot intersect
+/// the assignment's own signed predicates.
+///
+/// Runs after each assignment has recovered its real closure from the optimized
+/// physical plan and before partitioning, digest, and signing, so an excluded
+/// file is never named on the wire, never reserved against, never resolved by a
+/// follower, and never opened. The decision reads only the descriptor's own
+/// declared pair, which the leader minted from the catalog row or manifest
+/// entry the cut pinned.
+///
+/// This is a strict narrowing of an already-authorized set: a follower's
+/// `assigned ⊆ planned` drift check and its residual filter are unaffected,
+/// because removing a file can only remove rows the predicate would have
+/// discarded anyway. A descriptor whose pair is absent or unordered is retained
+/// with its exact defect, so an unusable statistic loses rows from nothing.
+///
+/// Each considered file emits exactly one `bifrost_oracle_file_pruning_total`
+/// observation under its own source label, which is what lets the emitted
+/// counts reconcile against the file count of the cut.
+fn prune_assignments_by_event_time(assignments: &mut HashMap<String, FollowerScanAssignment>) {
+    for assignment in assignments.values_mut() {
+        let interval = EventTimeQueryInterval::from_predicates(&assignment.predicates);
+        if interval.is_unbounded() {
+            continue;
+        }
+        assignment.persisted.files.retain(|descriptor| {
+            let source = match descriptor {
+                PersistedFileDescriptor::Hot(_) => FilePruningSource::Hot,
+                PersistedFileDescriptor::Iceberg(_) => FilePruningSource::Iceberg,
+            };
+            let statistics = match descriptor.event_time_micros() {
+                Some((min_micros, max_micros)) => EventTimeStatistics::Bounded {
+                    min_micros,
+                    max_micros,
+                },
+                None => EventTimeStatistics::Unusable(EventTimeBoundsDefect::Missing),
+            };
+            interval.retains(source, statistics)
+        });
+    }
+}
+
 fn partition_oracle_assignments(
     assignments: &[FollowerScanAssignment],
     workers: &[dispatcher::DispatchCandidate],
@@ -5140,6 +5189,131 @@ mod tests {
             required_columns: vec!["data_tenant_id".to_owned()],
             predicates: Vec::new(),
         }
+    }
+
+    /// A signed assignment loses every file whose declared event-time bounds
+    /// cannot intersect its own predicates, and keeps every file whose evidence
+    /// cannot support the exclusion.
+    ///
+    /// This runs before partitioning, digest, and signing, so an excluded file
+    /// is never named on the wire: proving the file list itself shrank is
+    /// proving no follower can resolve, reserve for, or open that object. Both
+    /// source variants are asserted in one owner because they carry their
+    /// bounds in different descriptor fields, and a version that read only one
+    /// of them would still pass a single-source test.
+    ///
+    /// # Panics
+    /// Panics when the retained file list or the emitted decisions violate the
+    /// pruning contract.
+    #[test]
+    fn distributed_assignments_drop_files_disjoint_from_their_signed_predicates() {
+        use wyrd_spec::vala::WYRD_EVENT_TIME;
+        use wyrd_spec::vala::assignment_authority::{ScanLiteral, ScanPredicate};
+
+        let lower_micros = 1_787_493_600_000_000_i64;
+        let upper_micros = 1_787_497_200_000_000_i64;
+        let iceberg = |path: &str, bounds: Option<(i64, i64)>| {
+            PersistedFileDescriptor::Iceberg(wyrd_spec::vala::api::IcebergFileDescriptor {
+                path: path.to_owned(),
+                size_bytes: 4_096,
+                row_count: 128,
+                snapshot_id: 1,
+                min_event_time_micros: bounds.map(|(min, _)| min),
+                max_event_time_micros: bounds.map(|(_, max)| max),
+            })
+        };
+        let hot = |path: &str, bounds: Option<(i64, i64)>| {
+            PersistedFileDescriptor::Hot(wyrd_spec::vala::api::HotFileDescriptor {
+                path: path.to_owned(),
+                size_bytes: 4_096,
+                row_count: 128,
+                file_list_id: uuid::Uuid::now_v7(),
+                sha256: [7_u8; 32],
+                min_event_time_micros: bounds.map(|(min, _)| min),
+                max_event_time_micros: bounds.map(|(_, max)| max),
+            })
+        };
+
+        let mut assignment = test_persisted_assignment("scan-1", &[]);
+        assignment.persisted.files = vec![
+            iceberg("overlapping.parquet", Some((lower_micros, upper_micros))),
+            iceberg("disjoint.parquet", Some((0, lower_micros - 1))),
+            // Bounds the leader could not decode reach the wire absent.
+            iceberg("unusable.parquet", None),
+            hot(
+                "hot-endpoint.parquet",
+                Some((upper_micros, upper_micros + 9)),
+            ),
+            hot(
+                "hot-disjoint.parquet",
+                Some((upper_micros + 1, upper_micros + 2)),
+            ),
+        ];
+        assignment.predicates = vec![
+            ScanPredicate::GtEq(
+                WYRD_EVENT_TIME.to_owned(),
+                ScanLiteral::TimestampMicros(lower_micros),
+            ),
+            ScanPredicate::LtEq(
+                WYRD_EVENT_TIME.to_owned(),
+                ScanLiteral::TimestampMicros(upper_micros),
+            ),
+        ];
+        let unconstrained = assignment.clone();
+        let mut assignments = HashMap::from([("scan-1".to_owned(), assignment)]);
+
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        let guard = metrics::set_default_local_recorder(&recorder);
+        prune_assignments_by_event_time(&mut assignments);
+        drop(guard);
+
+        assert_eq!(
+            assignments["scan-1"]
+                .persisted
+                .files
+                .iter()
+                .map(PersistedFileDescriptor::path)
+                .collect::<Vec<_>>(),
+            vec![
+                "overlapping.parquet",
+                "unusable.parquet",
+                "hot-endpoint.parquet",
+            ],
+            "only the provably disjoint files leave the assignment"
+        );
+        let snapshot = recorder.snapshot();
+        let count = |source: &str, outcome: &str| {
+            snapshot
+                .counters
+                .get(&format!(
+                    "bifrost_oracle_file_pruning_total{{outcome=\"{outcome}\",source=\"{source}\"}}"
+                ))
+                .copied()
+                .unwrap_or_default()
+        };
+        assert_eq!(count("iceberg", "included"), 1, "{snapshot:?}");
+        assert_eq!(count("iceberg", "excluded"), 1, "{snapshot:?}");
+        assert_eq!(
+            count("iceberg", "fail_open_missing_bounds"),
+            1,
+            "{snapshot:?}"
+        );
+        assert_eq!(count("hot", "included"), 1, "{snapshot:?}");
+        assert_eq!(count("hot", "excluded"), 1, "{snapshot:?}");
+
+        // A closure that constrains no event-time endpoint leaves every signed
+        // file in place rather than deciding it against an empty interval.
+        let mut unconstrained = HashMap::from([("scan-1".to_owned(), unconstrained)]);
+        unconstrained
+            .get_mut("scan-1")
+            .expect("fixture assignment")
+            .predicates = vec![ScanPredicate::IsNotNull(WYRD_EVENT_TIME.to_owned())];
+        prune_assignments_by_event_time(&mut unconstrained);
+        assert_eq!(
+            unconstrained["scan-1"].persisted.files.len(),
+            5,
+            "an unconstrained closure excludes no signed file"
+        );
     }
 
     /// A distributed assignment whose `required_columns` omits the hidden

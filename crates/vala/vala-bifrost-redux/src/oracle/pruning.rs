@@ -113,8 +113,29 @@ impl EventTimeQueryInterval {
     /// interval by taking the tighter endpoint.
     #[must_use]
     pub(crate) fn from_predicates(predicates: &[ScanPredicate]) -> Self {
-        let _ = predicates;
-        Self::default()
+        let mut interval = Self::default();
+        for predicate in predicates {
+            if predicate.column() != WYRD_EVENT_TIME {
+                continue;
+            }
+            let Some(ScanLiteral::TimestampMicros(value)) = predicate.literal() else {
+                continue;
+            };
+            match predicate {
+                ScanPredicate::Eq(..) => {
+                    interval.narrow_lower(Some(*value));
+                    interval.narrow_upper(Some(*value));
+                }
+                ScanPredicate::GtEq(..) => interval.narrow_lower(Some(*value)),
+                ScanPredicate::Gt(..) => interval.narrow_lower(value.checked_add(1)),
+                ScanPredicate::LtEq(..) => interval.narrow_upper(Some(*value)),
+                ScanPredicate::Lt(..) => interval.narrow_upper(value.checked_sub(1)),
+                ScanPredicate::NotEq(..)
+                | ScanPredicate::IsNull(_)
+                | ScanPredicate::IsNotNull(_) => {}
+            }
+        }
+        interval
     }
 
     /// Returns `true` when no predicate constrained the event-time axis.
@@ -126,6 +147,36 @@ impl EventTimeQueryInterval {
         self.lower_micros.is_none() && self.upper_micros.is_none()
     }
 
+    /// Tightens the lower endpoint to the larger of the two bounds.
+    ///
+    /// `None` means "this predicate contributes no lower bound" and leaves the
+    /// endpoint unchanged, which is why an overflowing `Gt` bound is safe to
+    /// drop rather than saturate.
+    fn narrow_lower(&mut self, candidate: Option<i64>) {
+        if let Some(candidate) = candidate {
+            self.lower_micros = Some(self.lower_micros.map_or(candidate, |current| {
+                if candidate > current {
+                    candidate
+                } else {
+                    current
+                }
+            }));
+        }
+    }
+
+    /// Tightens the upper endpoint to the smaller of the two bounds.
+    fn narrow_upper(&mut self, candidate: Option<i64>) {
+        if let Some(candidate) = candidate {
+            self.upper_micros = Some(self.upper_micros.map_or(candidate, |current| {
+                if candidate < current {
+                    candidate
+                } else {
+                    current
+                }
+            }));
+        }
+    }
+
     /// Decides one file from its normalized immutable statistics.
     ///
     /// Exclusion requires a validated file interval and a proven empty
@@ -134,7 +185,20 @@ impl EventTimeQueryInterval {
     /// unconstrained query interval includes unconditionally.
     #[must_use]
     pub(crate) fn decide(self, statistics: EventTimeStatistics) -> FilePruningDecision {
-        let _ = statistics;
+        let (min_micros, max_micros) = match statistics {
+            EventTimeStatistics::Unusable(defect) => {
+                return FilePruningDecision::FailOpen(defect);
+            }
+            EventTimeStatistics::Bounded {
+                min_micros,
+                max_micros,
+            } => (min_micros, max_micros),
+        };
+        if self.lower_micros.is_some_and(|lower| max_micros < lower)
+            || self.upper_micros.is_some_and(|upper| min_micros > upper)
+        {
+            return FilePruningDecision::Exclude;
+        }
         FilePruningDecision::Include
     }
 }

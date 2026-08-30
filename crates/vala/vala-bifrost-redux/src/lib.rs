@@ -23,6 +23,7 @@ pub mod provider;
 pub mod resources;
 pub mod schema;
 pub mod scribe;
+pub mod storage;
 pub mod tables;
 
 /// Exact-partition fixtures shared by unit, integration, and harness tests.

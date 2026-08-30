@@ -11,7 +11,9 @@ use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
 use wyrd_spec::vala::api::{BifrostQueryRequest, QueryTerminalErrorCode, VisibilityMode};
 use wyrd_testing::bifrost::{
-    BifrostClusterSpec, ScribeCacheMode, ScribeProductionWorkloadV1, WyrdTestCluster,
+    BifrostClusterSpec, ScribeCacheMode, ScribeCheckpointNameV1, ScribeProductionEvidenceV1,
+    ScribeProductionWorkloadV1, ScribePublishedHotFileV1, ScribeStorageDrainObservationV1,
+    WyrdTestCluster,
 };
 
 use super::support::{register_table, start_scribe_server, unique_table};
@@ -65,18 +67,239 @@ async fn scribe_write_flush_read_user_journey() {
         "the record's wire bytes must be stable across the round trip that consumers repeat"
     );
 
-    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed())
-        .await
-        .expect("the one-pod mixed cluster starts");
+    let cached: ScribeProductionWorkloadV1 =
+        serde_json::from_slice(&bytes).expect("the same bytes deserialize for the second run");
+
+    let cluster = WyrdTestCluster::start_spec(
+        BifrostClusterSpec::one_mixed().with_metadata_cache_mode(ScribeCacheMode::Disabled),
+    )
+    .await
+    .expect("the one-pod mixed cluster starts with the cache disabled");
     assert_empty_table_reads_cleanly(cluster.server(0).expect("the mixed pod is running")).await;
 
-    let run = cluster
+    let uncached_run = cluster
         .run_scribe_production_workload(&workload, ScribeCacheMode::Disabled)
         .await
-        .expect("the production workload runs on public routes");
-    run.evidence
+        .expect("the production workload runs on public routes with the cache disabled");
+    uncached_run
+        .evidence
         .assert_matches(&workload, ScribeCacheMode::Disabled)
-        .expect("the run satisfies every normative field of the record");
+        .expect("the uncached run satisfies every normative field of the record");
+
+    let cached_cluster = WyrdTestCluster::start_spec(
+        BifrostClusterSpec::one_mixed().with_metadata_cache_mode(ScribeCacheMode::Enabled),
+    )
+    .await
+    .expect("a fresh one-pod mixed cluster starts with the cache enabled");
+    let cached_run = cached_cluster
+        .run_scribe_production_workload(&cached, ScribeCacheMode::Enabled)
+        .await
+        .expect("the same record runs on public routes with the cache enabled");
+    cached_run
+        .evidence
+        .assert_matches(&cached, ScribeCacheMode::Enabled)
+        .expect("the cached run satisfies every normative field of the record");
+
+    assert_parity(&uncached_run.evidence, &cached_run.evidence);
+
+    let uncached_storage = terminal_storage(&uncached_run.evidence);
+    let cached_storage = terminal_storage(&cached_run.evidence);
+    assert_settled(&uncached_storage, "cache disabled");
+    assert_settled(&cached_storage, "cache enabled");
+    assert!(
+        uncached_storage.cache_bypasses > 0 && uncached_storage.cache_bypasses_disabled > 0,
+        "a disabled composition must positively record a bypass with reason disabled, observed {uncached_storage:?}"
+    );
+    assert_eq!(
+        (
+            uncached_storage.cache_hits,
+            uncached_storage.cache_misses,
+            uncached_storage.cache_joins
+        ),
+        (0, 0, 0),
+        "a disabled composition must record no hit, miss, or join, observed {uncached_storage:?}"
+    );
+}
+
+/// Returns the terminal boundary's storage-owner observation.
+///
+/// # Panics
+/// Panics when the terminal boundary carries no drain or no storage evidence.
+fn terminal_storage(evidence: &ScribeProductionEvidenceV1) -> ScribeStorageDrainObservationV1 {
+    evidence
+        .checkpoint(ScribeCheckpointNameV1::TerminalDrain)
+        .expect("the record reaches its terminal boundary")
+        .drained
+        .as_ref()
+        .expect("the terminal boundary carries drain evidence")
+        .storage
+        .clone()
+        .expect("a composed pod publishes its terminal storage-owner snapshot")
+}
+
+/// Asserts one run's storage owner closed and retained nothing.
+///
+/// # Panics
+/// Panics when the owner is not closed, its starts and terminals disagree, any
+/// live count is nonzero, or any settlement was unmatched.
+fn assert_settled(storage: &ScribeStorageDrainObservationV1, label: &str) {
+    assert_eq!(storage.lifecycle, "closed", "{label}: {storage:?}");
+    assert_eq!(
+        storage.load_starts, storage.load_terminals,
+        "{label}: every started metadata load must publish a terminal"
+    );
+    assert_eq!(
+        storage.request_starts, storage.request_terminals,
+        "{label}: every admitted governed request must publish a terminal"
+    );
+    assert_eq!(
+        (
+            storage.resident_entries,
+            storage.resident_bytes,
+            storage.inflight_loads,
+            storage.waiters,
+            storage.active_requests,
+            storage.anomalies,
+        ),
+        (0, 0, 0, 0, 0, 0),
+        "{label}: a drained owner must retain nothing, observed {storage:?}"
+    );
+}
+
+/// Requires two runs of the same bytes to have produced the same public result.
+///
+/// The comparison is deliberately over identity-free shape. Two runs happen on
+/// two fresh clusters, so their tenant UUIDs, SQL row UUIDs, object keys, file
+/// checksums, and encoded byte sizes are necessarily different and comparing
+/// them would only assert that two temporary directories differ. What must not
+/// differ is everything a caller can observe: the boundaries reached and their
+/// order, the rows acknowledged at each, the digest of the rows read back, how
+/// many objects each tenant published and the row and row-group shape of each,
+/// the recovery a restart produced, and the drain each pod completed. The
+/// intentional `cache_mode` field and the cache counters are the only other
+/// exclusions, because those are precisely what the two compositions differ in.
+///
+/// # Panics
+/// Panics on the first observable difference between the two runs.
+fn assert_parity(uncached: &ScribeProductionEvidenceV1, cached: &ScribeProductionEvidenceV1) {
+    assert_eq!(
+        uncached.version, cached.version,
+        "both runs execute the same contract version"
+    );
+    let names = |evidence: &ScribeProductionEvidenceV1| {
+        evidence
+            .checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.name)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        names(uncached),
+        names(cached),
+        "both runs must reach the same boundaries in the same order"
+    );
+    for (left, right) in uncached.checkpoints.iter().zip(&cached.checkpoints) {
+        assert_eq!(
+            left.acknowledged_rows, right.acknowledged_rows,
+            "boundary {:?} acknowledged different row counts",
+            left.name
+        );
+        assert_eq!(
+            left.observed_row_digest, right.observed_row_digest,
+            "boundary {:?} read back different rows",
+            left.name
+        );
+        assert_eq!(
+            left.recovered, right.recovered,
+            "boundary {:?} produced different recovery evidence",
+            left.name
+        );
+        assert_eq!(
+            publication_shape(left.published.values()),
+            publication_shape(right.published.values()),
+            "boundary {:?} published a different set of objects",
+            left.name
+        );
+        match (left.drained.as_ref(), right.drained.as_ref()) {
+            (None, None) => {}
+            (Some(left_drain), Some(right_drain)) => {
+                assert_eq!(
+                    (
+                        left_drain.servers_stopped,
+                        left_drain.listeners_stopped,
+                        left_drain.admitted,
+                        left_drain.queued,
+                        left_drain.wal_streams,
+                        left_drain.supervised_tasks,
+                    ),
+                    (
+                        right_drain.servers_stopped,
+                        right_drain.listeners_stopped,
+                        right_drain.admitted,
+                        right_drain.queued,
+                        right_drain.wal_streams,
+                        right_drain.supervised_tasks,
+                    ),
+                    "boundary {:?} drained differently",
+                    left.name
+                );
+            }
+            _ => panic!("boundary {:?} carries drain evidence in only one run", left.name),
+        }
+    }
+}
+
+/// Projects one boundary's publication into its identity-free shape.
+///
+/// Tenant slugs, object keys, checksums, and byte sizes are all fixture- or
+/// content-derived and cannot match across fresh clusters. What survives is the
+/// number of objects each tenant published and, per object, the logical table
+/// it belongs to, its Iceberg spec identities, its row count, its row-group
+/// count, and its per-field value and null counts — the shape a reader sees.
+fn publication_shape<'a>(
+    published: impl Iterator<Item = &'a Vec<ScribePublishedHotFileV1>>,
+) -> (Vec<usize>, Vec<PublishedFileShape>) {
+    let mut counts = Vec::new();
+    let mut shapes = Vec::new();
+    for files in published {
+        counts.push(files.len());
+        for file in files {
+            shapes.push(PublishedFileShape {
+                namespace: file.namespace.clone(),
+                table_name: file.table_name.clone(),
+                partition_spec_id: file.partition_spec_id,
+                sort_order_id: file.sort_order_id,
+                record_count: file.data_file.record_count,
+                row_groups: file.data_file.split_offsets.len(),
+                value_counts: file.data_file.value_counts.clone(),
+                null_value_counts: file.data_file.null_value_counts.clone(),
+            });
+        }
+    }
+    counts.sort_unstable();
+    shapes.sort();
+    (counts, shapes)
+}
+
+/// One published object's identity-free, cluster-independent shape.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PublishedFileShape {
+    /// Logical namespace the object belongs to.
+    namespace: String,
+    /// Logical table the object belongs to.
+    table_name: String,
+    /// Iceberg partition-spec identity the object was written under.
+    partition_spec_id: i32,
+    /// Iceberg sort-order identity the object was written under.
+    sort_order_id: i32,
+    /// Rows the object contains.
+    record_count: u64,
+    /// Row groups the object was sealed with.
+    row_groups: usize,
+    /// Values, including nulls, per Iceberg field id.
+    value_counts: std::collections::BTreeMap<i32, u64>,
+    /// Null values per Iceberg field id.
+    null_value_counts: std::collections::BTreeMap<i32, u64>,
 }
 
 /// Asserts an unwritten table's strict read reaches a clean empty terminal.

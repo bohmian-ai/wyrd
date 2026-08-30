@@ -443,15 +443,16 @@ mod tests {
         );
         let storage = Arc::new(BifrostStorage::new(
             Arc::new(wyrd_storage::handle::StorageHandle::new(signer)),
-            BifrostStoragePolicy::resolve(BifrostStorageConfig::default(), u64::from(u32::MAX), false)
-                .expect("the default storage policy is valid"),
+            BifrostStoragePolicy::resolve(
+                BifrostStorageConfig::default(),
+                u64::from(u32::MAX),
+                false,
+            )
+            .expect("the default storage policy is valid"),
             None,
         ));
         let warehouse = format!("file://{}", root.display());
-        (
-            BifrostIcebergStorage::new(storage, &warehouse),
-            warehouse,
-        )
+        (BifrostIcebergStorage::new(storage, &warehouse), warehouse)
     }
 
     /// The adapter admits only objects inside the warehouse it is bound to, and
@@ -478,7 +479,10 @@ mod tests {
             .await
             .expect("a location inside the warehouse is served");
         assert_eq!(
-            storage.read(&inside).await.expect("the written object reads"),
+            storage
+                .read(&inside)
+                .await
+                .expect("the written object reads"),
             Bytes::from_static(b"rows")
         );
         assert_eq!(

@@ -173,6 +173,8 @@ mod tests {
             file_checksum: None,
             file_size: 1,
             row_count: 1,
+            min_event_time: None,
+            max_event_time: None,
             partition_granularity: "hour".to_owned(),
             partition_start: chrono::DateTime::from_timestamp_micros(1_787_493_600_000_000)
                 .expect("fixture partition start"),
@@ -219,5 +221,78 @@ mod tests {
             is_unresolved_hot(&row(true, None, None), &path, Some(pinned)),
             (false, false)
         );
+    }
+}
+
+#[cfg(test)]
+mod pg_tests {
+    //! Database projection proof for the already-durable hot event-time bounds.
+
+    use std::collections::BTreeSet;
+
+    use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_sql::TenantConn;
+
+    use super::HotFileCatalog;
+
+    /// The tenant-scoped unresolved-hot read projects the durable
+    /// `min_event_time`/`max_event_time` interval and row count alongside the
+    /// identity columns, so Oracle can exclude a non-overlapping hot file
+    /// before it opens the object's footer.
+    ///
+    /// No migration is involved: both columns already exist on
+    /// `vala.file_list`; only the query projection and row mapping change.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the PostgreSQL fixture, insert, or tenant-scoped read fails.
+    #[tokio::test]
+    async fn unresolved_hot_cut_projects_bounds_without_migration() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let pool = fixture.superuser_pool().await.expect("superuser pool");
+        let tenant = fixture.data_tenant_id();
+        let lower = chrono::DateTime::from_timestamp_micros(1_787_493_600_000_000)
+            .expect("fixture lower bound is representable");
+        let upper = chrono::DateTime::from_timestamp_micros(1_787_497_199_000_000)
+            .expect("fixture upper bound is representable");
+        sqlx::query(
+            r#"
+            INSERT INTO vala.file_list (
+                id, data_tenant_id, namespace, table_name, file_path,
+                file_size, row_count, min_event_time, max_event_time,
+                partition_granularity, partition_start, node_id, writer_epoch,
+                wal_lsn_min, wal_lsn_max, promotion_record
+            ) VALUES (
+                $1, $2, 'vala.traces', 'spans', 'spans/a.parquet',
+                4096, 128, $3, $4,
+                'hour', $5,
+                $6, 1, 100, 200, '{"fixture": "hot-bounds"}'::jsonb
+            )
+            "#,
+        )
+        .bind(uuid::Uuid::now_v7())
+        .bind(tenant.as_uuid())
+        .bind(lower)
+        .bind(upper)
+        .bind(lower)
+        .bind(uuid::Uuid::now_v7())
+        .execute(&pool)
+        .await
+        .expect("insert unresolved hot row");
+
+        let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("tenant connection");
+        let cut = HotFileCatalog::new("vala.traces", "spans")
+            .unresolved_for_cut(&mut conn, &BTreeSet::new(), None)
+            .await
+            .expect("unresolved hot cut reads");
+
+        assert_eq!(cut.hot_files.len(), 1, "one unresolved hot row is returned");
+        let row = &cut.hot_files[0];
+        assert_eq!(row.min_event_time, Some(lower));
+        assert_eq!(row.max_event_time, Some(upper));
+        assert_eq!(row.row_count, 128);
+        assert!(row.row_count >= 0, "durable row count is nonnegative");
     }
 }

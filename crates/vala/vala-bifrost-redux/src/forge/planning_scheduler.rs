@@ -814,7 +814,9 @@ impl<'forge> ForgeScheduler<'forge> {
         )
         .await?;
         conn.commit().await.map_err(ForgeError::Sql)?;
-        let Some(super::scribe_promotion::ScribePromotionDemand { plan, total_bytes }) = demand
+        let Some(super::scribe_promotion::ScribePromotionDemand {
+            plan, total_bytes, ..
+        }) = demand
         else {
             return Ok(None);
         };

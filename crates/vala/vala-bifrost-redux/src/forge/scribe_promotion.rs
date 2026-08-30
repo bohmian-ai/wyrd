@@ -16,11 +16,21 @@
 use std::collections::BTreeSet;
 
 use serde_json::{Map, Value};
+use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
 use uuid::Uuid;
 use vala_sql::queries::file_list::HotFileCatalog;
-use wyrd_spec::vala::api::{ForgePromotedFile, ForgePromotedFileSetDigest, StoragePath};
+use vala_sql::queries::forge_operations::ForgeOperations;
+use vala_sql::row_types::forge_operations::{ForgeOperationFamily, ForgeOperationTransition};
+use wyrd_spec::vala::api::{
+    AuditDetail, ForgePromotedFile, ForgePromotedFileSetDigest, ForgeScribePromotionPhase,
+    StoragePath,
+};
 
+use super::Forge;
+use super::compact::{ForgeGroupKey, forge_transition_event};
 use super::error::ForgeError;
+use super::lease::ForgeLease;
 use crate::catalog::TenantTableBinding;
 use crate::scribe::promotion::ScribePublishedHotFileV1;
 
@@ -42,6 +52,13 @@ pub(super) struct ScribePromotionDemand {
     pub(super) plan: ScribePromotionPlan,
     /// Sum of the encoded sizes of every promoted object.
     pub(super) total_bytes: u64,
+    /// Each promoted object's writer evidence, aligned with `plan.files()`.
+    ///
+    /// The records are the only source of the `DataFile` values promotion
+    /// appends. They are carried alongside the plan rather than re-read later
+    /// so the group a worker revalidates and the group it appends are provably
+    /// the same read.
+    pub(super) records: Vec<ScribePublishedHotFileV1>,
 }
 
 /// One ordered, digest-bound group of hot objects promoted as a single unit.
@@ -248,6 +265,7 @@ pub(super) async fn read_promotion_demand(
         return Ok(None);
     }
     let mut files = Vec::with_capacity(rows.len());
+    let mut records = Vec::with_capacity(rows.len());
     let mut total_bytes = 0_u64;
     for row in &rows {
         total_bytes = total_bytes.saturating_add(u64::try_from(row.file_size).map_err(|_| {
@@ -289,9 +307,282 @@ pub(super) async fn read_promotion_demand(
                 }
             })?;
         files.push(file);
+        records.push(record);
     }
-    ScribePromotionPlan::new(branch, files)
-        .map(|plan| Some(ScribePromotionDemand { plan, total_bytes }))
+    ScribePromotionPlan::new(branch, files).map(|plan| {
+        Some(ScribePromotionDemand {
+            plan,
+            total_bytes,
+            records,
+        })
+    })
+}
+
+impl Forge {
+    /// Revalidates one prepared promotion group against the objects that exist.
+    ///
+    /// Revalidation is what makes the append safe to perform unchanged: the
+    /// durable demand is re-read under the worker's own fence, checked against
+    /// the plan the scheduler persisted, and then each object's evidence is
+    /// checked against the object itself. Only the object bytes are read; no
+    /// data object is written, and no `DataFile` value is recomputed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Sql`] when the demand cannot be re-read,
+    /// [`ForgeError::Reconciliation`] when the durable demand no longer matches
+    /// the prepared plan, [`ForgeError::ObjectStore`] when an object cannot be
+    /// read, and [`ForgeError::Invariant`] when an object contradicts its own
+    /// promotion evidence or its `DataFile` cannot be rebuilt.
+    pub(super) async fn revalidate_promotion(
+        &self,
+        binding: &TenantTableBinding,
+        plan: &ScribePromotionPlan,
+    ) -> Result<Vec<iceberg::spec::DataFile>, ForgeError> {
+        let mut conn = self
+            .core
+            .vala
+            .tenant_conn(binding.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let demand = read_promotion_demand(&mut conn, binding, plan.branch()).await?;
+        conn.commit().await.map_err(ForgeError::Sql)?;
+        let demand = demand.ok_or_else(|| ForgeError::Reconciliation {
+            detail: "prepared Scribe promotion has no durable demand left".to_owned(),
+        })?;
+        if &demand.plan != plan {
+            return Err(ForgeError::Reconciliation {
+                detail: "durable Scribe promotion demand diverged from the prepared plan"
+                    .to_owned(),
+            });
+        }
+        let mut data_files = Vec::with_capacity(demand.records.len());
+        for record in &demand.records {
+            let bytes = self
+                .core
+                .object_store
+                .read(&record.object_key)
+                .await
+                .map_err(ForgeError::ObjectStore)?;
+            let observed_checksum = {
+                use sha2::Digest as _;
+                hex::encode(sha2::Sha256::digest(bytes.to_bytes()))
+            };
+            let file_size = u64::try_from(bytes.len()).map_err(|_| ForgeError::Invariant {
+                detail: format!("hot object {} size exceeds u64", record.object_key),
+            })?;
+            record
+                .validate_object(&crate::scribe::promotion::ObservedHotObject {
+                    object_key: &record.object_key,
+                    file_size,
+                    file_checksum: &observed_checksum,
+                })
+                .map_err(|error| ForgeError::Invariant {
+                    detail: format!("hot object failed promotion revalidation: {error}"),
+                })?;
+            data_files.push(record.data_file().map_err(|error| ForgeError::Invariant {
+                detail: format!("promotion evidence does not rebuild a data file: {error}"),
+            })?);
+        }
+        Ok(data_files)
+    }
+
+    /// Fast-appends one revalidated promotion group under the publication fence.
+    ///
+    /// The commit carries the task and operation identities as snapshot summary
+    /// properties. Those two properties are the entire basis of recovery: a
+    /// worker that loses acceptance can prove the commit landed by finding its
+    /// own task identity on a retained snapshot, and Oracle closes the
+    /// catalog-to-SQL window by matching the operation identity on the snapshot
+    /// it pinned. Duplicate checking stays on, so a replayed append of an
+    /// already-promoted object is refused by the catalog rather than creating a
+    /// second reference to one file.
+    ///
+    /// Cancellation and timeout are raced against the in-flight commit and are
+    /// never read as proof of rejection: both surface as
+    /// [`ForgeError::Reconciliation`] so the caller's Prepared operation stays
+    /// open for evidence-based recovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::FenceLost`] when the lease cannot cover the commit
+    /// window, [`ForgeError::Catalog`] when the catalog refuses the append, and
+    /// [`ForgeError::Reconciliation`] when acceptance becomes unknown.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation after submission leaves acceptance unknown and is reported
+    /// as a reconciliation error, never as a clean stop.
+    pub(super) async fn commit_promotion(
+        &self,
+        lease: &mut ForgeLease,
+        table: &iceberg::table::Table,
+        data_files: Vec<iceberg::spec::DataFile>,
+        task_id: Uuid,
+        attempt_id: Uuid,
+        operation_id: Uuid,
+        stop: &CancellationToken,
+    ) -> Result<iceberg::table::Table, ForgeError> {
+        let span = super::metrics::ForgeTelemetry::catalog_commit_span(
+            super::metrics::ForgeCatalogCommitStrategy::ScribePromotion,
+            Some((task_id, attempt_id)),
+        );
+        if !lease.renew(&self.core.operator_pool).await?
+            || !lease.commit_window_fits(self.core.config.commit_window())
+        {
+            return Err(ForgeError::FenceLost {
+                lease_key: lease.lease_key.clone(),
+            });
+        }
+        let transaction = iceberg::transaction::Transaction::new(table);
+        let action = transaction
+            .fast_append()
+            .with_check_duplicate(true)
+            .add_data_files(data_files)
+            .set_snapshot_properties(std::collections::HashMap::from([
+                ("forge.task_id".to_owned(), task_id.to_string()),
+                ("forge.operation_id".to_owned(), operation_id.to_string()),
+            ]));
+        let transaction = iceberg::transaction::ApplyTransactionAction::apply(action, transaction)
+            .map_err(ForgeError::Catalog)?;
+        lease.require_fence(&self.core.operator_pool).await?;
+        if !lease.commit_window_fits(self.core.config.commit_window()) {
+            return Err(ForgeError::FenceLost {
+                lease_key: lease.lease_key.clone(),
+            });
+        }
+        if stop.is_cancelled() {
+            return Err(ForgeError::Shutdown);
+        }
+        let timeout = self.core.config.iceberg_total_retry_timeout;
+        let catalog = self.core.catalog.as_ref();
+        let outcome = async move {
+            let commit = transaction.commit(catalog);
+            tokio::pin!(commit);
+            tokio::select! {
+                response = tokio::time::timeout(timeout, &mut commit) => match response {
+                    Ok(Ok(committed)) => Ok(committed),
+                    Ok(Err(error)) => Err(ForgeError::Catalog(error)),
+                    Err(_) => Err(ForgeError::Reconciliation {
+                        detail: "Scribe promotion commit timed out with unknown acceptance"
+                            .to_owned(),
+                    }),
+                },
+                () = stop.cancelled() => Err(ForgeError::Reconciliation {
+                    detail: "Scribe promotion commit was cancelled with unknown acceptance"
+                        .to_owned(),
+                }),
+            }
+        }
+        .instrument(span.clone())
+        .await;
+        span.record(
+            "result",
+            if outcome.is_ok() {
+                "committed"
+            } else {
+                "failed"
+            },
+        );
+        outcome
+    }
+
+    /// Settles one promotion's audit transition and hot-row publication together.
+    ///
+    /// Audit evidence and the `file_list` publication columns become durable in
+    /// the same fenced tenant transaction, so the catalog-to-SQL window can end
+    /// in exactly one of two states: neither is written and Oracle keeps
+    /// scanning the objects as hot, or both are written and Oracle reads them
+    /// from the promoted snapshot. There is no interval in which a row is
+    /// counted twice or not at all.
+    ///
+    /// The settlement is idempotent by construction: the operation-state
+    /// transition collapses a repeated append, and the publication update
+    /// matches rows that are either unpublished or already published by this
+    /// exact operation. A takeover that repeats a settled promotion therefore
+    /// commits the same durable state rather than a second one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::FenceLost`] when the lease cannot be renewed or no
+    /// longer holds inside the transaction, and [`ForgeError::Sql`] when the
+    /// tenant transaction, audit append, publication update, or commit fails.
+    pub(super) async fn settle_promotion(
+        &self,
+        lease: &mut ForgeLease,
+        binding: &TenantTableBinding,
+        plan: &ScribePromotionPlan,
+        phase: ForgeScribePromotionPhase,
+        operation_id: Uuid,
+        base_snapshot_id: i64,
+        committed_snapshot_id: Option<i64>,
+    ) -> Result<(), ForgeError> {
+        if !lease.renew(&self.core.operator_pool).await? {
+            return Err(ForgeError::FenceLost {
+                lease_key: lease.lease_key.clone(),
+            });
+        }
+        let resource = ForgeGroupKey::table_audit_resource(binding.tenant, &binding.table_ref);
+        let detail = AuditDetail::ForgeScribePromotion {
+            operation_id,
+            phase,
+            group: resource.clone(),
+            base_snapshot_id,
+            committed_snapshot_id,
+            input_file_ids: plan.file_ids(),
+            input_paths: plan.paths(),
+            promoted_file_set_digest: plan.digest().clone(),
+        };
+        let operation = format!(
+            "{}.{}",
+            ForgeOperationFamily::ScribePromotion.operation_prefix(),
+            phase_suffix(phase)
+        );
+        let mut conn = self
+            .core
+            .vala
+            .tenant_conn(binding.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        lease.require_fence(&self.core.operator_pool).await?;
+        let event = forge_transition_event(&operation, resource.clone(), detail);
+        let operations = ForgeOperations::new(&resource, ForgeOperationFamily::ScribePromotion)
+            .map_err(ForgeError::Sql)?;
+        let transition = if phase == ForgeScribePromotionPhase::Prepared {
+            operations.append_prepared(&mut conn, &event).await
+        } else {
+            operations.append_terminal(&mut conn, &event).await
+        }
+        .map_err(ForgeError::Sql)?;
+        match transition {
+            ForgeOperationTransition::Applied { .. }
+            | ForgeOperationTransition::AlreadyApplied { .. } => {}
+        }
+        if let Some(snapshot_id) = committed_snapshot_id {
+            HotFileCatalog::new(
+                &binding.table_ref.namespace.to_string(),
+                &binding.table_ref.name,
+            )
+            .settle_promoted(&mut conn, &plan.file_ids(), snapshot_id, operation_id)
+            .await
+            .map_err(ForgeError::Sql)?;
+        }
+        lease.assert_transaction_fence(&mut conn).await?;
+        conn.commit().await.map_err(ForgeError::Sql)
+    }
+}
+
+/// Returns the operation-name suffix for one promotion phase.
+///
+/// The suffix completes the `forge.scribe_promotion` operation prefix, so the
+/// durable operation name and the audit detail's phase can never disagree.
+const fn phase_suffix(phase: ForgeScribePromotionPhase) -> &'static str {
+    match phase {
+        ForgeScribePromotionPhase::Prepared => "prepared",
+        ForgeScribePromotionPhase::Committed => "committed",
+        ForgeScribePromotionPhase::Recovered => "recovered",
+        ForgeScribePromotionPhase::Reset => "reset",
+    }
 }
 
 #[cfg(test)]

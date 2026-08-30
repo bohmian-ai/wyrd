@@ -31,6 +31,7 @@ use vala_sql::row_types::forge_tasks::{
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::request_id::RequestId;
+use wyrd_spec::vala::api::ForgeScribePromotionPhase;
 use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
 use super::error::{ForgeCapacityFailurePhase, ForgeError, ForgeFailureClass};
@@ -44,6 +45,7 @@ use super::metrics::{
     ForgeTaskMetricStrategy, ForgeTaskTerminalResult,
 };
 use super::path::catalog_path_to_object_key;
+use super::scribe_promotion::ScribePromotionPlan;
 use super::{Forge, ForgeCapacity};
 use crate::catalog::TenantTableBinding;
 
@@ -2111,6 +2113,35 @@ impl ForgeWorker {
         })?;
         heartbeat_result?;
         let (evidence, state) = completion?;
+        // Promotion's SQL publication and terminal audit settle together, under
+        // the same fence, for every path that produced evidence: a fresh
+        // append, a recovered commit discovered on a retained snapshot, and a
+        // restarted attempt that finds its own settlement already durable.
+        if matches!(
+            claim.strategy,
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::ScribePromotion)
+        ) {
+            let plan = Self::promotion_plan(claim)?;
+            self.forge
+                .settle_promotion(
+                    lease,
+                    binding,
+                    &plan,
+                    match state {
+                        ForgeExecutionEvidenceState::RecoveredCommit => {
+                            ForgeScribePromotionPhase::Recovered
+                        }
+                        ForgeExecutionEvidenceState::Fresh
+                        | ForgeExecutionEvidenceState::Prepared => {
+                            ForgeScribePromotionPhase::Committed
+                        }
+                    },
+                    Self::promotion_operation_id(claim),
+                    claim.base_snapshot_id,
+                    evidence.committed_snapshot_id,
+                )
+                .await?;
+        }
         self.record_rewrite_evidence(claim, &evidence);
         self.finish_claim_execution(claim, attempt, lease, &evidence, state)
             .await
@@ -2318,7 +2349,7 @@ impl ForgeWorker {
     ) -> Result<ForgeDispatchResult, ForgeError> {
         let ForgeDispatchRequest {
             claim,
-            attempt: _,
+            attempt,
             binding,
             lease,
             table,
@@ -2340,6 +2371,10 @@ impl ForgeWorker {
             });
         }
         match &claim.strategy {
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::ScribePromotion) => {
+                self.dispatch_scribe_promotion(claim, attempt, binding, lease, &table, stop)
+                    .await
+            }
             ForgeClaimStrategy::Known(
                 ForgeTaskStrategy::ManifestRewrite | ForgeTaskStrategy::SnapshotExpiry,
             ) => {
@@ -2350,6 +2385,84 @@ impl ForgeWorker {
                 detail: "unsupported task passed pre-effect validation".to_owned(),
             }),
         }
+    }
+
+    /// Prepares, revalidates, and fast-appends one Scribe promotion group.
+    ///
+    /// The Prepared audit transition is written before any catalog effect, so a
+    /// worker that dies during the append leaves durable evidence naming the
+    /// exact operation and file set a successor must reconcile. Revalidation
+    /// then runs against the objects that currently exist, and only the
+    /// writer's own `DataFile` values reach the catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Invariant`] when the persisted parameters do not
+    /// decode into an exact plan, plus the audit, fence, object-store, and
+    /// catalog failures raised by preparation, revalidation, and the commit.
+    async fn dispatch_scribe_promotion(
+        &self,
+        claim: &ForgeTaskClaim,
+        attempt: Uuid,
+        binding: &TenantTableBinding,
+        lease: &mut ForgeLease,
+        table: &Table,
+        stop: &CancellationToken,
+    ) -> Result<ForgeDispatchResult, ForgeError> {
+        let plan = Self::promotion_plan(claim)?;
+        self.forge
+            .settle_promotion(
+                lease,
+                binding,
+                &plan,
+                ForgeScribePromotionPhase::Prepared,
+                Self::promotion_operation_id(claim),
+                claim.base_snapshot_id,
+                None,
+            )
+            .await?;
+        let data_files = self.forge.revalidate_promotion(binding, &plan).await?;
+        let committed = self
+            .forge
+            .commit_promotion(
+                lease,
+                table,
+                data_files,
+                claim.task_id,
+                attempt,
+                Self::promotion_operation_id(claim),
+                stop,
+            )
+            .await?;
+        Ok(ForgeDispatchResult::Committed(committed))
+    }
+
+    /// Decodes one promotion claim's persisted plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Invariant`] when the parameters are not an object
+    /// or do not decode into an exact, digest-consistent promotion plan.
+    fn promotion_plan(claim: &ForgeTaskClaim) -> Result<ScribePromotionPlan, ForgeError> {
+        let parameters =
+            claim
+                .plan
+                .parameters
+                .as_object()
+                .ok_or_else(|| ForgeError::Invariant {
+                    detail: "Forge task parameters must be an object".to_owned(),
+                })?;
+        ScribePromotionPlan::from_parameters(parameters)
+    }
+
+    /// Returns the stable operation identity for one promotion task.
+    ///
+    /// The durable task identity *is* the operation identity. A task is
+    /// enqueued once per exact file set, so binding the operation to it makes
+    /// the identity survive every retry, restart, and takeover without a
+    /// second durable column to keep consistent.
+    const fn promotion_operation_id(claim: &ForgeTaskClaim) -> Uuid {
+        claim.task_id
     }
 
     /// Marks one claimed task running and extends its claim lease once.

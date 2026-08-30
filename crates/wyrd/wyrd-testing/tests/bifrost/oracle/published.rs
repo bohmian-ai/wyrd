@@ -83,6 +83,13 @@ async fn prove_published_governance() -> Result<(), JourneyError> {
     if !storage.metadata_cache_enabled() {
         return Err("this journey requires a retaining composition".into());
     }
+    // The production metric window opens before any governed phase and is read
+    // after teardown, so what it reports is the emitted stream this run
+    // produced rather than a retained total the owner also happens to keep. The
+    // capture handle is cloned because `shutdown_and_inspect` consumes the
+    // cluster, and the delta has to be taken after that.
+    let telemetry = cluster.telemetry().clone();
+    let production = telemetry.checkpoint()?;
     let owner_tenant = cluster.data_tenant_id();
     let neighbour_tenant = cluster.add_tenant("oracle-published-neighbour").await?;
     let table = unique_table("oracle_published");
@@ -270,6 +277,65 @@ async fn prove_published_governance() -> Result<(), JourneyError> {
         "the governed object requests this run issued ended in recorded terminals"
     );
 
+    // 7b. The production metric stream, not the retained totals. Everything
+    //     asserted above is read back out of what the node actually emitted,
+    //     because a retained snapshot proves only that the owner counted an
+    //     event — an owner that counted correctly and published nothing is
+    //     invisible to every operator, dashboard, and alert that consumes it.
+    let stream = telemetry.delta_since(&production)?;
+    for effect in [CacheEffect::Miss, CacheEffect::Join, CacheEffect::Hit] {
+        let emitted = counted(&stream, CACHE_EFFECTS, "effect", Some(effect.as_str()));
+        assert!(
+            emitted > 0.0,
+            "the emitted stream must carry the {} the retained snapshot recorded, saw {emitted}",
+            effect.as_str()
+        );
+    }
+    let loads = counted(&stream, CACHE_LOADS, "outcome", Some("success"));
+    assert!(
+        loads > 0.0,
+        "every successful decode must reach the emitted load-terminal counter, saw {loads}"
+    );
+    let starts = counted(&stream, REQUEST_STARTS, "operation", None);
+    let terminals = counted(&stream, REQUEST_TERMINALS, "outcome", None);
+    assert!(
+        starts > 0.0 && terminals > 0.0,
+        "the emitted stream must carry governed request starts and terminals, saw          {starts} starts and {terminals} terminals"
+    );
+    assert!(
+        terminals >= starts,
+        "no admitted request may leave the window without an emitted terminal, saw          {starts} starts and {terminals} terminals"
+    );
+    assert!(
+        counted(&stream, REQUEST_TERMINALS, "outcome", Some("success")) > 0.0,
+        "the emitted terminal breakdown must carry the successful reads this run made"
+    );
+    // The retry counter is asserted against the retained total rather than
+    // against zero: this fixture's objects are reachable on the first attempt,
+    // so the honest statement is that the emitted stream agrees with the owner,
+    // whatever number that is. Forcing a retry here to make the counter nonzero
+    // would prove only that the fixture can break a backend.
+    let retries = counted(&stream, REQUEST_RETRIES, "operation", None);
+    #[allow(clippy::cast_precision_loss)]
+    let retained_retries = terminal.request_retries() as f64;
+    assert!(
+        (retries - retained_retries).abs() < f64::EPSILON,
+        "the emitted retry counter must agree with the owner's retained total, saw          {retries} emitted and {retained_retries} retained"
+    );
+    // The lifecycle itself is retained state rather than a series, so `Closed`
+    // is asserted from the terminal snapshot above; what the stream can state
+    // is that the node ended with no governed request still admitted.
+    let active = gauge_at_end(&stream, ACTIVE_REQUESTS);
+    assert!(
+        active.abs() < f64::EPSILON,
+        "the emitted active-request gauge must end at zero, saw {active}"
+    );
+    let anomalies = counted(&stream, TRANSITION_ANOMALIES, "transition", None);
+    assert!(
+        anomalies.abs() < f64::EPSILON,
+        "the emitted stream must carry no unmatched settlement, saw {anomalies}"
+    );
+
     // 6. Unavailable backend cancellation. A governed read is stalled at the
     //    barrier so no cache hit can bypass it, the process is cancelled
     //    underneath it, and the read must end in a stable terminal — never in
@@ -304,6 +370,7 @@ async fn prove_cancelled_read_terminates() -> Result<(), JourneyError> {
 
     let barrier = StorageOperationBarrier::new(StorageOperation::ReadRange);
     storage.install_operation_barrier_for_test(Arc::clone(&barrier));
+    let before_cancellation = storage.telemetry_snapshot();
     let stalled = tokio::spawn({
         let client = reader.clone();
         let fqn = fqn.clone();
@@ -324,12 +391,98 @@ async fn prove_cancelled_read_terminates() -> Result<(), JourneyError> {
     );
 
     let snapshot = storage.telemetry_snapshot();
+    // The stalled read must end in a terminal the owner's cancellation contract
+    // authorizes. Reconciled totals alone are not that proof: a read that hit
+    // some unrelated backend failure would reconcile just as neatly while
+    // saying nothing about whether cancellation is bounded, which is the
+    // property this phase exists to establish.
+    let cancellation: Vec<(&str, u64)> = AUTHORIZED_CANCELLATION_TERMINALS
+        .iter()
+        .map(|outcome| {
+            (
+                outcome.as_str(),
+                snapshot
+                    .request_terminal(*outcome)
+                    .saturating_sub(before_cancellation.request_terminal(*outcome)),
+            )
+        })
+        .filter(|(_, delta)| *delta > 0)
+        .collect();
+    let authorized: u64 = cancellation.iter().map(|(_, delta)| *delta).sum();
+    assert_eq!(
+        authorized, 1,
+        "the stalled governed read must end in exactly one authorized cancellation \
+         terminal, observed {cancellation:?} against {snapshot:?}"
+    );
     assert_reconciled(&snapshot, "the cancelled server");
     server
         .shutdown()
         .await
         .map_err(|error| format!("the harness releases its fixtures: {error}"))?;
     Ok(())
+}
+
+/// Terminals the owner's cancellation contract permits for a stalled read.
+///
+/// Deliberately narrow: `Backend` is excluded because it is the outcome an
+/// unrelated failure also reaches, so accepting it would let this phase pass on
+/// a read that was never actually governed to a bounded stop.
+const AUTHORIZED_CANCELLATION_TERMINALS: [StorageRequestOutcome; 3] = [
+    StorageRequestOutcome::Closed,
+    StorageRequestOutcome::Cancelled,
+    StorageRequestOutcome::Deadline,
+];
+
+/// Emitted counter of decisions the metadata cache took.
+const CACHE_EFFECTS: &str = "bifrost_storage_metadata_cache_effects_total";
+/// Emitted counter of terminal metadata loads, by outcome.
+const CACHE_LOADS: &str = "bifrost_storage_metadata_cache_loads_total";
+/// Emitted counter of governed logical requests admitted.
+const REQUEST_STARTS: &str = "bifrost_storage_requests_total";
+/// Emitted counter of governed logical request terminals, by outcome.
+const REQUEST_TERMINALS: &str = "bifrost_storage_request_terminals_total";
+/// Emitted counter of attempts beyond a read's first.
+const REQUEST_RETRIES: &str = "bifrost_storage_request_retries_total";
+/// Emitted gauge of governed requests admitted and not yet settled.
+const ACTIVE_REQUESTS: &str = "bifrost_storage_active_requests";
+/// Emitted counter of settlements that had no matching admission.
+const TRANSITION_ANOMALIES: &str = "bifrost_storage_metadata_cache_transition_anomalies_total";
+
+/// Sums one production counter family in a delta, optionally by one label.
+///
+/// `label` of `None` sums every series in the family, which is how a total is
+/// read without enumerating a closed label domain the test would then have to
+/// keep in step with the owner.
+fn counted(
+    delta: &wyrd_testing::bifrost::telemetry::BifrostTelemetryDelta,
+    family: &str,
+    key: &str,
+    label: Option<&str>,
+) -> f64 {
+    delta
+        .metrics
+        .iter()
+        .filter(|sample| {
+            sample.family == family
+                && label.is_none_or(|expected| {
+                    sample.labels.get(key).map(String::as_str) == Some(expected)
+                })
+        })
+        .map(|sample| sample.value)
+        .sum()
+}
+
+/// Sums one production gauge family's value at the end of a delta window.
+fn gauge_at_end(
+    delta: &wyrd_testing::bifrost::telemetry::BifrostTelemetryDelta,
+    family: &str,
+) -> f64 {
+    delta
+        .gauge_final
+        .iter()
+        .filter(|sample| sample.family == family)
+        .map(|sample| sample.value)
+        .sum()
 }
 
 /// Requires one terminal owner snapshot to be closed and to retain nothing.

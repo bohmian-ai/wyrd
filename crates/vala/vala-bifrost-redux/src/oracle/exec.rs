@@ -5144,4 +5144,266 @@ mod tests {
             0
         );
     }
+
+    /// Builds one pinned, snapshot-free Iceberg table over the closure fixture
+    /// schema, backed entirely by in-memory storage.
+    ///
+    /// The table carries no snapshot, so no leaf in this fixture ever reaches
+    /// object storage; it exists only to give `OracleTableProvider` the exact
+    /// complete physical schema the projection closure is derived from.
+    ///
+    /// # Panics
+    /// Panics if the fixture schema, metadata, or table cannot be constructed,
+    /// which would mean the fixture no longer has the shape the owner asserts.
+    fn projection_fixture_table() -> iceberg::table::Table {
+        use iceberg::spec::{
+            FormatVersion, NestedField, PrimitiveType, Schema as IcebergSchema, SortOrder,
+            Type as IcebergType, UnboundPartitionSpec,
+        };
+        use iceberg::spec::TableMetadataBuilder;
+        use iceberg::{TableIdent, io::FileIO};
+
+        let optional = |id: i32, name: &str, kind: PrimitiveType| {
+            Arc::new(NestedField::optional(
+                id,
+                name,
+                IcebergType::Primitive(kind),
+            ))
+        };
+        let schema = IcebergSchema::builder()
+            .with_fields(vec![
+                optional(1, "unused_payload", PrimitiveType::String),
+                optional(2, "duration_ms", PrimitiveType::Long),
+                optional(3, "status_code", PrimitiveType::String),
+                Arc::new(NestedField::required(
+                    4,
+                    DATA_TENANT_ID,
+                    IcebergType::Primitive(PrimitiveType::String),
+                )),
+            ])
+            .build()
+            .expect("fixture Iceberg schema");
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            UnboundPartitionSpec::builder().build(),
+            SortOrder::unsorted_order(),
+            "memory:///projection-fixture".to_owned(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .expect("fixture table metadata builder")
+        .build()
+        .expect("fixture table metadata")
+        .metadata;
+        iceberg::table::Table::builder()
+            .file_io(FileIO::new_with_memory())
+            .metadata(metadata)
+            .identifier(TableIdent::from_strs(["traces", "spans"]).expect("fixture identifier"))
+            .runtime(iceberg::Runtime::current())
+            .build()
+            .expect("pinned fixture table")
+    }
+
+    /// Returns every union child's field names, in child and field order.
+    ///
+    /// # Panics
+    /// Panics if `plan` is not the `UnionExec` the fixture builds.
+    fn union_child_column_names(plan: &Arc<dyn ExecutionPlan>) -> Vec<Vec<String>> {
+        plan.downcast_ref::<UnionExec>()
+            .expect("scan builds a union over its disjoint leaves")
+            .children()
+            .into_iter()
+            .map(|child| {
+                child
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().clone())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Returns one plan's output field names in order.
+    fn column_names(plan: &Arc<dyn ExecutionPlan>) -> Vec<String> {
+        plan.schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect()
+    }
+
+    /// One leader-owned closure governs every leaf, the placeholder, the
+    /// tripwire, the provider-local filter, and the public result.
+    ///
+    /// This is the production Interactive leader path for
+    /// `SELECT duration_ms FROM ... WHERE status_code = 'STATUS_CODE_ERROR'`.
+    /// The closure is `[duration_ms, status_code, data_tenant_id]`: the
+    /// requested output, the predicate-only column that must survive to the
+    /// provider-local filter, and the hidden tenant column that must survive to
+    /// the tripwire. `unused_payload` is requested by nobody and must not
+    /// appear in any leaf. The remote placeholder still advertises the
+    /// *complete* four-column fingerprint, because that value identifies the
+    /// table's canonical schema rather than this query's projection.
+    ///
+    /// # Panics
+    /// Panics if provider construction, scan planning, or execution violates
+    /// the closure contract this owner pins.
+    #[tokio::test]
+    async fn projected_leaf_union_preserves_predicate_and_tenant_columns() {
+        use datafusion::execution::context::SessionContext;
+        use datafusion::logical_expr::{col, lit};
+        use datafusion::physical_plan::collect;
+        use datafusion::physical_plan::filter::FilterExec;
+
+        let tenant = wyrd_spec::DataTenantId::new_v7();
+        let principal = Principal {
+            id: PrincipalId::new(uuid::Uuid::now_v7()),
+            kind: wyrd_runtime::PrincipalKind::User,
+            tenant_id: tenant,
+            roles: Vec::new(),
+            effective_permissions: PermissionSet::default(),
+        };
+        let context = AuthorizedQueryContext::try_new(
+            principal,
+            tenant,
+            RequestId::now_v7(),
+            None,
+            AuthMethod::Internal,
+            "bifrost_query:read",
+        )
+        .expect("query context");
+        let roles = oracle_test_roles(2 * 1024 * 1024 * 1024);
+        let live_schema = Arc::new(Schema::new(vec![
+            Field::new("unused_payload", DataType::Utf8, true),
+            Field::new("duration_ms", DataType::Int64, true),
+            Field::new("status_code", DataType::Utf8, true),
+            Field::new(DATA_TENANT_ID, DataType::Utf8, false),
+        ]));
+        let live = RecordBatch::try_new(
+            Arc::clone(&live_schema),
+            vec![
+                Arc::new(StringArray::from(vec!["wide-a", "wide-b"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![41_i64, 97_i64])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    "STATUS_CODE_ERROR",
+                    "STATUS_CODE_OK",
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    tenant.to_string(),
+                    tenant.to_string(),
+                ])) as ArrayRef,
+            ],
+        )
+        .expect("live fixture batch");
+        let provider = OracleTableProvider::try_new_distributed(
+            OracleTableInputs {
+                table: projection_fixture_table(),
+                distributed_iceberg_batches: None,
+                hot_files: Vec::new(),
+                distributed_hot_batches: Vec::new(),
+                live_batches: vec![live],
+                context,
+                table_name: "vala.traces.spans".to_owned(),
+                audit: Arc::new(NoopAudit),
+                memory: oracle_memory_resources(&roles, 64 * 1024 * 1024),
+                query_pool: Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
+                    256 * 1024 * 1024,
+                )),
+                telemetry: Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1)))),
+                query_class: QueryClass::Interactive,
+            },
+            RemotePersistedSources {
+                iceberg_scan_id: Some("vala.traces.spans:iceberg".to_owned()),
+                hot_scan_id: None,
+                scribe_scan_ids: Vec::new(),
+            },
+        )
+        .await
+        .expect("pinned fixture provider");
+
+        let complete_fingerprint =
+            super::super::assignment_schema_fingerprint(provider.physical_schema.as_ref());
+        let public = provider.schema();
+        let projection = vec![public.index_of("duration_ms").expect("public duration_ms")];
+        let predicate = col("status_code").eq(lit("STATUS_CODE_ERROR"));
+        let session = SessionContext::new().state();
+        let plan = provider
+            .scan(&session, Some(&projection), &[predicate], None)
+            .await
+            .expect("closure scan plans");
+
+        // The public result is exactly the requested column.
+        assert_eq!(column_names(&plan), vec!["duration_ms".to_string()]);
+
+        let filtered = Arc::clone(&plan.children()[0]);
+        let filter = filtered
+            .downcast_ref::<FilterExec>()
+            .expect("provider keeps its local filter over the closed predicates");
+        let tripwire_plan = Arc::clone(&filter.children()[0]);
+        let tripwire = tripwire_plan
+            .downcast_ref::<TenantTripwireExec>()
+            .expect("tripwire sits directly under the provider-local filter");
+
+        // The tripwire consumes the tenant column and never emits it.
+        let union = Arc::clone(&tripwire.children()[0]);
+        let closure = vec![
+            "duration_ms".to_string(),
+            "status_code".to_string(),
+            DATA_TENANT_ID.to_string(),
+        ];
+        assert_eq!(column_names(&union), closure);
+        assert_eq!(
+            column_names(&tripwire_plan),
+            vec!["duration_ms".to_string(), "status_code".to_string()]
+        );
+
+        // Every union child — the remote placeholder and the in-memory live
+        // leaf alike — exposes exactly the closure, in closure order.
+        let children = union_child_column_names(&union);
+        assert_eq!(children.len(), 2, "placeholder and live leaves both planned");
+        for child in &children {
+            assert_eq!(child, &closure);
+        }
+
+        // The placeholder narrows its schema but not its fingerprint.
+        let placeholder = union
+            .downcast_ref::<UnionExec>()
+            .expect("union")
+            .children()
+            .into_iter()
+            .find_map(|child| {
+                child.downcast_ref::<super::super::codec::RemoteSourcePlaceholderExec>()
+            })
+            .expect("distributed Iceberg source planned as a placeholder");
+        assert_eq!(placeholder.required_columns(), closure.as_slice());
+        assert_eq!(placeholder.schema_fingerprint(), complete_fingerprint);
+
+        // The predicate resolves `status_code` against the closure, not against
+        // the original full physical schema.
+        let predicate_columns = datafusion::physical_expr::utils::collect_columns(filter.predicate())
+            .into_iter()
+            .map(|column| (column.name().to_string(), column.index()))
+            .collect::<Vec<_>>();
+        assert_eq!(predicate_columns, vec![("status_code".to_string(), 1)]);
+
+        // One ERROR row and one OK row in; only the ERROR duration out.
+        let rows = collect(plan, Arc::new(TaskContext::default()))
+            .await
+            .expect("closure plan executes");
+        let durations = rows
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("result preserves duration_ms as Int64")
+                    .iter()
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(durations, vec![41_i64]);
+    }
+
 }

@@ -187,6 +187,17 @@ impl RemoteSourcePlaceholderExec {
         &self.scan_id
     }
 
+    /// Returns the expected provider schema fingerprint carried to the follower.
+    ///
+    /// This identifies the table's *complete* canonical physical schema and
+    /// never narrows with the projection closure: a follower validates its own
+    /// resolved catalog schema against this value, then derives the leaf
+    /// closure schema from that schema plus the signed column names.
+    #[must_use]
+    pub fn schema_fingerprint(&self) -> &str {
+        &self.schema_fingerprint
+    }
+
     /// Returns the attached projection closure, or an empty slice when no
     /// closure was attached (the caller must treat that as "no update",
     /// never as "project nothing").

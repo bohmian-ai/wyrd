@@ -1639,9 +1639,12 @@ mod tests {
         // A later joiner accepts the election-fixed deadline and cannot widen
         // it: both callers observe the same deadline terminal at the elected
         // bound, not at the joiner's own far later one. The elected bound is
-        // already spent, so the proof needs no timer to advance.
+        // short but not already spent, because the joiner has to reach an
+        // open load for the claim to mean anything — an already-elapsed bound
+        // would let the elector settle and free the key first, and the joiner
+        // would then elect a load of its own instead of accepting this one's.
         let bounded = test_key(tenant, "bounded.parquet", 0x32, 1);
-        let short = Instant::now();
+        let short = Instant::now() + Duration::from_millis(500);
         let elector = tokio::spawn({
             let cache = Arc::clone(&cache);
             let key = bounded.clone();

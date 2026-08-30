@@ -421,3 +421,142 @@ impl StorageFactory for BifrostIcebergStorageFactory {
         Ok(Arc::new(self.storage.clone()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+    use crate::storage::{BifrostStorageConfig, BifrostStoragePolicy};
+
+    /// Builds an adapter over a real local backend rooted at `root`.
+    ///
+    /// A real handle rather than a stub: path authority is only meaningful
+    /// against the operator the warehouse is actually rooted at, and a fake one
+    /// would make every acceptance a statement about the fake.
+    ///
+    /// # Panics
+    /// Panics when the signer or the default storage policy is invalid.
+    fn adapter(root: &Path) -> (BifrostIcebergStorage, String) {
+        let signer = wyrd_storage::signer::BackendSigner::Local(
+            wyrd_storage::local::LocalSigner::new(root.to_path_buf()).expect("local signer"),
+        );
+        let storage = Arc::new(BifrostStorage::new(
+            Arc::new(wyrd_storage::handle::StorageHandle::new(signer)),
+            BifrostStoragePolicy::resolve(BifrostStorageConfig::default(), u64::from(u32::MAX), false)
+                .expect("the default storage policy is valid"),
+            None,
+        ));
+        let warehouse = format!("file://{}", root.display());
+        (
+            BifrostIcebergStorage::new(storage, &warehouse),
+            warehouse,
+        )
+    }
+
+    /// The adapter admits only objects inside the warehouse it is bound to, and
+    /// round-trips one that is.
+    ///
+    /// Path authority is the adapter's entire security contribution: it holds a
+    /// credentialed client for one warehouse, so any location it accepts is a
+    /// location that client will actually read or write. A foreign authority,
+    /// a query or fragment, and a traversing segment are all refused instead of
+    /// normalized, because normalization is what turns a path the caller was
+    /// never entitled to into one this client happily serves.
+    ///
+    /// # Panics
+    /// Panics when an admitted round trip fails or a refused location is
+    /// accepted.
+    #[tokio::test]
+    async fn the_adapter_serves_only_locations_inside_its_own_warehouse() {
+        let root = tempfile::tempdir().expect("warehouse root");
+        let (storage, warehouse) = adapter(root.path());
+
+        let inside = format!("{warehouse}/datasets/tenant/a.parquet");
+        storage
+            .write(&inside, Bytes::from_static(b"rows"))
+            .await
+            .expect("a location inside the warehouse is served");
+        assert_eq!(
+            storage.read(&inside).await.expect("the written object reads"),
+            Bytes::from_static(b"rows")
+        );
+        assert_eq!(
+            storage
+                .metadata(&inside)
+                .await
+                .expect("the written object stats")
+                .size,
+            4
+        );
+        assert!(storage.exists(&inside).await.expect("existence probes"));
+        let reader = storage.reader(&inside).await.expect("a reader opens");
+        assert_eq!(
+            reader.read(1..3).await.expect("a range reads"),
+            Bytes::from_static(b"ow")
+        );
+
+        for refused in [
+            "s3://other-bucket/datasets/a.parquet".to_owned(),
+            "file:///elsewhere/a.parquet".to_owned(),
+            format!("{warehouse}/../escape.parquet"),
+            format!("{warehouse}/datasets/../../escape.parquet"),
+            format!("{warehouse}//datasets/a.parquet"),
+            format!("{warehouse}/datasets/a.parquet?versionId=2"),
+            format!("{warehouse}/datasets/a.parquet#footer"),
+            warehouse.clone(),
+        ] {
+            assert!(
+                storage.read(&refused).await.is_err(),
+                "{refused} must not be served"
+            );
+            assert!(
+                storage.new_input(&refused).is_err(),
+                "{refused} must not become an input file"
+            );
+            assert!(
+                storage.new_output(&refused).is_err(),
+                "{refused} must not become an output file"
+            );
+        }
+    }
+
+    /// Neither the adapter nor its factory can leave or re-enter this process.
+    ///
+    /// Iceberg's storage trait objects are `typetag`-portable, so without this
+    /// refusal a distributed plan would serialize a live backend client and the
+    /// far side would silently rebuild one — a backend identity the sender
+    /// never authorized. Both directions are asserted for both types because
+    /// only refusing one of them still leaves a way through.
+    ///
+    /// # Panics
+    /// Panics when either direction of either type succeeds.
+    #[test]
+    fn the_adapter_and_its_factory_refuse_to_cross_a_process_boundary() {
+        let root = tempfile::tempdir().expect("warehouse root");
+        let (storage, warehouse) = adapter(root.path());
+        let factory = BifrostIcebergStorageFactory {
+            storage: storage.clone(),
+        };
+
+        let serialized = serde_json::to_string(&storage).expect_err("storage must not serialize");
+        assert!(serialized.to_string().contains(NOT_PORTABLE));
+        let serialized =
+            serde_json::to_string(&factory).expect_err("the factory must not serialize");
+        assert!(serialized.to_string().contains(NOT_PORTABLE));
+
+        let deserialized = serde_json::from_str::<BifrostIcebergStorage>("{}")
+            .expect_err("storage must not deserialize");
+        assert!(deserialized.to_string().contains(NOT_PORTABLE));
+        let deserialized = serde_json::from_str::<BifrostIcebergStorageFactory>("{}")
+            .expect_err("the factory must not deserialize");
+        assert!(deserialized.to_string().contains(NOT_PORTABLE));
+
+        // The trait-object forms are the ones a plan actually carries.
+        let boxed: Box<dyn Storage> = Box::new(storage);
+        assert!(serde_json::to_string(&boxed).is_err());
+        let boxed: Box<dyn StorageFactory> = Box::new(factory);
+        assert!(serde_json::to_string(&boxed).is_err());
+        assert!(warehouse.starts_with("file://"));
+    }
+}

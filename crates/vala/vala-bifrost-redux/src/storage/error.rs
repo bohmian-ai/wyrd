@@ -97,6 +97,49 @@ impl BifrostStorageError {
         )
     }
 
+    /// Maps one `OpenDAL` failure into this closed vocabulary.
+    ///
+    /// The owner is the only place backend errors are classified, so the
+    /// Iceberg adapter never has to reason about `OpenDAL` kinds to decide
+    /// whether another attempt is allowed. The detail is `OpenDAL`'s own kind
+    /// phrase rather than its rendered message: the message can embed the
+    /// object key it failed on, and a scrubbed detail is worth more here than a
+    /// specific one that leaks a path into a log line.
+    #[must_use]
+    pub fn from_opendal(error: &opendal::Error) -> Self {
+        let detail = || error.kind().to_string();
+        match error.kind() {
+            opendal::ErrorKind::NotFound => Self::NotFound { detail: detail() },
+            opendal::ErrorKind::PermissionDenied => Self::PermissionDenied { detail: detail() },
+            opendal::ErrorKind::RateLimited => Self::RateLimited { detail: detail() },
+            opendal::ErrorKind::ConfigInvalid => Self::InvalidConfiguration { detail: detail() },
+            opendal::ErrorKind::Unexpected => Self::Backend { detail: detail() },
+            _ => Self::InvalidData { detail: detail() },
+        }
+    }
+
+    /// Returns the bounded request-terminal outcome for this failure.
+    ///
+    /// One place maps the closed error vocabulary onto the closed telemetry
+    /// vocabulary, so a new error variant cannot quietly acquire a second,
+    /// divergent label.
+    #[must_use]
+    pub const fn request_outcome(&self) -> crate::storage::telemetry::StorageRequestOutcome {
+        use crate::storage::telemetry::StorageRequestOutcome as Outcome;
+        match self {
+            Self::NotFound { .. } => Outcome::NotFound,
+            Self::PermissionDenied { .. } => Outcome::PermissionDenied,
+            Self::Timeout { .. } => Outcome::Timeout,
+            Self::RateLimited { .. } => Outcome::RateLimited,
+            Self::InvalidData { .. } => Outcome::InvalidData,
+            Self::Backend { .. } => Outcome::Backend,
+            Self::Cancelled => Outcome::Cancelled,
+            Self::Deadline => Outcome::Deadline,
+            Self::Closed => Outcome::Closed,
+            Self::InvalidConfiguration { .. } => Outcome::InvalidConfiguration,
+        }
+    }
+
     /// Maps one Parquet decode failure into this closed vocabulary.
     ///
     /// Everything Parquet reports at this boundary is either a range read that

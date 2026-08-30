@@ -159,6 +159,175 @@ impl MetadataLoadOutcome {
     }
 }
 
+/// One governed object-store operation the storage owner admits.
+///
+/// The eleven members are the complete inventory of what any caller — the
+/// Iceberg adapter included — may ask the owner to perform, split by whether
+/// another attempt is allowed. The first five are idempotent reads of immutable
+/// objects; the remaining six are one-attempt effects whose replay could
+/// duplicate a durable write. The domain is closed and `'static` on purpose:
+/// it is emitted as a metric label, so it must never widen with a path, a
+/// tenant, or backend text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageOperation {
+    /// Probe whether one object exists.
+    Exists,
+    /// Read one object's size and modification metadata.
+    Stat,
+    /// Read one object in full.
+    Read,
+    /// Read one byte range of an object.
+    ReadRange,
+    /// List the entries beneath one prefix.
+    List,
+    /// Write one object's complete bytes in a single effect.
+    Write,
+    /// Open a streaming writer over one object.
+    OpenWriter,
+    /// Append one buffer through an already-open writer.
+    WriterWrite,
+    /// Finalize an already-open writer, publishing the object.
+    WriterClose,
+    /// Delete one object.
+    Delete,
+    /// Delete every object beneath one prefix.
+    DeletePrefix,
+}
+
+impl StorageOperation {
+    /// Complete closed inventory, in emission-label order.
+    pub const ALL: [Self; 11] = [
+        Self::Exists,
+        Self::Stat,
+        Self::Read,
+        Self::ReadRange,
+        Self::List,
+        Self::Write,
+        Self::OpenWriter,
+        Self::WriterWrite,
+        Self::WriterClose,
+        Self::Delete,
+        Self::DeletePrefix,
+    ];
+
+    /// Returns the emitted `operation` label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Exists => "exists",
+            Self::Stat => "stat",
+            Self::Read => "read",
+            Self::ReadRange => "read_range",
+            Self::List => "list",
+            Self::Write => "write",
+            Self::OpenWriter => "open_writer",
+            Self::WriterWrite => "writer_write",
+            Self::WriterClose => "writer_close",
+            Self::Delete => "delete",
+            Self::DeletePrefix => "delete_prefix",
+        }
+    }
+
+    /// Returns whether the owner may admit another attempt of this operation.
+    ///
+    /// Only the idempotent reads of immutable objects retry. Every effect is
+    /// one-attempt because a transparently replayed write, writer append,
+    /// close, or delete can publish or destroy an object twice, and the owner
+    /// cannot tell a request that never landed from one whose acknowledgement
+    /// was lost.
+    #[must_use]
+    pub const fn is_retryable(self) -> bool {
+        matches!(
+            self,
+            Self::Exists | Self::Stat | Self::Read | Self::ReadRange | Self::List
+        )
+    }
+}
+
+/// How one logical governed storage request ended.
+///
+/// Mirrors the closed [`BifrostStorageError`](crate::storage::BifrostStorageError)
+/// vocabulary plus success, so every admitted request publishes exactly one of
+/// these and a settled owner's terminals reconcile against its starts by
+/// equality rather than by judgement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageRequestOutcome {
+    /// The operation returned its result.
+    Success,
+    /// The object does not exist at the validated location.
+    NotFound,
+    /// The backend refused the request for authorization reasons.
+    PermissionDenied,
+    /// One attempt exceeded the per-attempt request timeout.
+    Timeout,
+    /// Node-wide admission or the backend refused for rate reasons.
+    RateLimited,
+    /// Bytes were returned but did not decode as the expected format.
+    InvalidData,
+    /// Any other backend failure, including a panicked attempt.
+    Backend,
+    /// A caller token fired before a terminal result.
+    Cancelled,
+    /// The fixed absolute read bound elapsed before a terminal result.
+    Deadline,
+    /// The owner is closing or closed and admitted no work.
+    Closed,
+    /// The configured policy or locator is not usable.
+    InvalidConfiguration,
+}
+
+impl StorageRequestOutcome {
+    /// Complete closed inventory, in emission-label order.
+    pub const ALL: [Self; 11] = [
+        Self::Success,
+        Self::NotFound,
+        Self::PermissionDenied,
+        Self::Timeout,
+        Self::RateLimited,
+        Self::InvalidData,
+        Self::Backend,
+        Self::Cancelled,
+        Self::Deadline,
+        Self::Closed,
+        Self::InvalidConfiguration,
+    ];
+
+    /// Returns this outcome's stable index into the retained totals.
+    const fn index(self) -> usize {
+        match self {
+            Self::Success => 0,
+            Self::NotFound => 1,
+            Self::PermissionDenied => 2,
+            Self::Timeout => 3,
+            Self::RateLimited => 4,
+            Self::InvalidData => 5,
+            Self::Backend => 6,
+            Self::Cancelled => 7,
+            Self::Deadline => 8,
+            Self::Closed => 9,
+            Self::InvalidConfiguration => 10,
+        }
+    }
+
+    /// Returns the emitted `outcome` label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::NotFound => "not_found",
+            Self::PermissionDenied => "permission_denied",
+            Self::Timeout => "timeout",
+            Self::RateLimited => "rate_limited",
+            Self::InvalidData => "invalid_data",
+            Self::Backend => "backend",
+            Self::Cancelled => "cancelled",
+            Self::Deadline => "deadline",
+            Self::Closed => "closed",
+            Self::InvalidConfiguration => "invalid_configuration",
+        }
+    }
+}
+
 /// The storage owner's lifecycle state, as retained for reconciliation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StorageLifecycle {
@@ -207,6 +376,20 @@ pub struct MetadataCacheSnapshot {
     inflight_loads: u64,
     /// Callers joined to another caller's in-flight load.
     waiters: u64,
+    /// Logical governed storage requests admitted by this owner.
+    ///
+    /// One per logical operation regardless of how many attempts it made, so a
+    /// retried read is one start, not three.
+    request_starts: u64,
+    /// Terminal request outcomes, indexed by `StorageRequestOutcome::index`.
+    request_terminals: [u64; StorageRequestOutcome::ALL.len()],
+    /// Logical requests admitted without a published terminal outcome.
+    active_requests: u64,
+    /// Attempts admitted after a logical read's first attempt.
+    ///
+    /// A one-attempt effect never contributes here, which is what makes a
+    /// nonzero value proof that only an idempotent read was replayed.
+    request_retries: u64,
     /// The owner's retained lifecycle state.
     lifecycle: StorageLifecycle,
     /// Settlements that had no matching admission, indexed by
@@ -229,17 +412,21 @@ pub enum TelemetryTransition {
     LoadTerminal,
     /// A waiter leaving the waiter gauge.
     WaiterSettled,
+    /// A terminal governed request settling the active-request gauge.
+    RequestTerminal,
 }
 
 impl TelemetryTransition {
     /// Every transition, in index order.
-    pub(crate) const ALL: [Self; 2] = [Self::LoadTerminal, Self::WaiterSettled];
+    pub(crate) const ALL: [Self; 3] =
+        [Self::LoadTerminal, Self::WaiterSettled, Self::RequestTerminal];
 
     /// Returns this transition's dense index into the anomaly totals.
     pub(crate) const fn index(self) -> usize {
         match self {
             Self::LoadTerminal => 0,
             Self::WaiterSettled => 1,
+            Self::RequestTerminal => 2,
         }
     }
 
@@ -248,6 +435,7 @@ impl TelemetryTransition {
         match self {
             Self::LoadTerminal => "load_terminal",
             Self::WaiterSettled => "waiter_settled",
+            Self::RequestTerminal => "request_terminal",
         }
     }
 }
@@ -316,6 +504,45 @@ impl MetadataCacheSnapshot {
         self.waiters
     }
 
+    /// Returns logical governed storage requests admitted by this owner.
+    #[must_use]
+    pub const fn request_starts(&self) -> u64 {
+        self.request_starts
+    }
+
+    /// Returns terminal governed requests recorded with one outcome.
+    #[must_use]
+    pub const fn request_terminal(&self, outcome: StorageRequestOutcome) -> u64 {
+        self.request_terminals[outcome.index()]
+    }
+
+    /// Returns every terminal governed request outcome summed.
+    ///
+    /// A settled owner has this equal to [`Self::request_starts`]; any
+    /// difference names logical requests still outstanding.
+    #[must_use]
+    pub const fn request_terminals(&self) -> u64 {
+        let mut total = 0;
+        let mut index = 0;
+        while index < self.request_terminals.len() {
+            total += self.request_terminals[index];
+            index += 1;
+        }
+        total
+    }
+
+    /// Returns logical requests admitted without a published terminal.
+    #[must_use]
+    pub const fn active_requests(&self) -> u64 {
+        self.active_requests
+    }
+
+    /// Returns attempts admitted after a logical read's first attempt.
+    #[must_use]
+    pub const fn request_retries(&self) -> u64 {
+        self.request_retries
+    }
+
     /// Returns the owner's retained lifecycle state.
     #[must_use]
     pub const fn lifecycle(&self) -> StorageLifecycle {
@@ -350,6 +577,7 @@ impl MetadataCacheSnapshot {
             && self.resident_bytes == 0
             && self.inflight_loads == 0
             && self.waiters == 0
+            && self.active_requests == 0
             && self.anomalies() == 0
     }
 }
@@ -471,6 +699,97 @@ impl BifrostStorageTelemetry {
         Self::publish_gauges(&snapshot);
     }
 
+    /// Records one logical governed storage request being admitted.
+    ///
+    /// Raises the active-request gauge until
+    /// [`Self::record_request_terminal`] settles it, so starts and terminals
+    /// reconcile exactly on a drained owner. Called once per logical
+    /// operation, never once per attempt.
+    pub(crate) fn record_request_start(&self, operation: StorageOperation) {
+        metrics::counter!(
+            "bifrost_storage_requests_total",
+            "operation" => operation.as_str(),
+        )
+        .increment(1);
+        let snapshot = self.mutate(|totals| {
+            totals.request_starts = totals.request_starts.saturating_add(1);
+            totals.active_requests = totals.active_requests.saturating_add(1);
+        });
+        Self::publish_gauges(&snapshot);
+    }
+
+    /// Records the one terminal outcome of a logical governed request.
+    ///
+    /// Both labels come from closed enums, so no path, tenant, table,
+    /// checksum, snapshot, query identifier, or backend error text can reach
+    /// the emitted cardinality through this boundary.
+    pub(crate) fn record_request_terminal(
+        &self,
+        operation: StorageOperation,
+        outcome: StorageRequestOutcome,
+        elapsed: Duration,
+    ) {
+        metrics::counter!(
+            "bifrost_storage_request_terminals_total",
+            "operation" => operation.as_str(),
+            "outcome" => outcome.as_str(),
+        )
+        .increment(1);
+        metrics::histogram!(
+            "bifrost_storage_request_seconds",
+            "operation" => operation.as_str(),
+            "outcome" => outcome.as_str(),
+        )
+        .record(elapsed.as_secs_f64());
+        let snapshot = self.mutate(|totals| {
+            totals.request_terminals[outcome.index()] =
+                totals.request_terminals[outcome.index()].saturating_add(1);
+            settle(
+                &mut totals.active_requests,
+                TelemetryTransition::RequestTerminal,
+                &mut totals.anomalies,
+            );
+        });
+        Self::publish_gauges(&snapshot);
+    }
+
+    /// Records one retried attempt of an idempotent governed read.
+    ///
+    /// Published at the moment the owner admits the attempt, so the total is
+    /// the count of attempts beyond the first rather than of retry decisions
+    /// that a deadline or cancellation then refused.
+    pub(crate) fn record_request_retry(&self, operation: StorageOperation) {
+        metrics::counter!(
+            "bifrost_storage_request_retries_total",
+            "operation" => operation.as_str(),
+        )
+        .increment(1);
+        self.mutate(|totals| {
+            totals.request_retries = totals.request_retries.saturating_add(1);
+        });
+    }
+
+    /// Records one settlement that had no matching admission.
+    ///
+    /// The request guard's escape hatch: a duplicate or unmatched settlement
+    /// must be visible as a bounded anomaly rather than silently reconciling a
+    /// broken owner's counts into a truthful-looking zero.
+    pub(crate) fn record_transition_anomaly(&self, transition: TelemetryTransition) {
+        self.mutate(|totals| {
+            totals.anomalies[transition.index()] =
+                totals.anomalies[transition.index()].saturating_add(1);
+        });
+        metrics::counter!(
+            "bifrost_storage_metadata_cache_transition_anomalies_total",
+            "transition" => transition.as_str(),
+        )
+        .increment(1);
+        tracing::warn!(
+            transition = transition.as_str(),
+            "Bifrost storage telemetry settled an unmatched transition"
+        );
+    }
+
     /// Records one lifecycle transition of the storage owner.
     pub(crate) fn record_lifecycle(&self, lifecycle: StorageLifecycle) {
         let snapshot = self.mutate(|totals| {
@@ -519,6 +838,8 @@ impl BifrostStorageTelemetry {
             .set(gauge_value(snapshot.inflight_loads()));
         metrics::gauge!("bifrost_storage_metadata_cache_waiters")
             .set(gauge_value(snapshot.waiters()));
+        metrics::gauge!("bifrost_storage_active_requests")
+            .set(gauge_value(snapshot.active_requests()));
     }
 }
 

@@ -25,12 +25,12 @@ use iceberg::io::{
     StorageFactory,
 };
 use iceberg::{Error as IcebergError, ErrorKind as IcebergErrorKind, Result as IcebergResult};
-use opendal::{EntryMode, Operator};
+use opendal::EntryMode;
 use serde::de::Error as _;
 use serde::ser::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::storage::BifrostStorage;
+use crate::storage::{BifrostStorage, BifrostStorageError};
 
 /// The one message every refused serialization of this adapter reports.
 ///
@@ -40,13 +40,17 @@ use crate::storage::BifrostStorage;
 const NOT_PORTABLE: &str =
     "the Bifrost Iceberg storage adapter is bound to this process and cannot be serialized";
 
-/// Maps one backend failure onto Iceberg's error type.
+/// Maps one governed owner failure onto Iceberg's error type.
 ///
-/// `NotFound` is preserved as `DataInvalid` because that is the only kind
-/// Iceberg's own storage implementations use for a missing object; everything
-/// else is `Unexpected`, which Iceberg treats as retryable at its own layer.
-fn backend_error(operation: &str, location: &str, error: &opendal::Error) -> IcebergError {
-    let kind = if error.kind() == opendal::ErrorKind::NotFound {
+/// This is the adapter's only error responsibility: classification already
+/// happened in the owner, which is the one place that sees the backend. A
+/// missing object is preserved as `DataInvalid` because that is the only kind
+/// Iceberg's own storage implementations use for it; every other closed owner
+/// failure — admission, cancellation, the elapsed retry bound, a closed owner,
+/// or a backend class — is `Unexpected`, which Iceberg treats as retryable at
+/// its own layer.
+fn owner_error(operation: &str, location: &str, error: &BifrostStorageError) -> IcebergError {
+    let kind = if matches!(error, BifrostStorageError::NotFound { .. }) {
         IcebergErrorKind::DataInvalid
     } else {
         IcebergErrorKind::Unexpected
@@ -78,11 +82,6 @@ impl BifrostIcebergStorage {
             storage,
             warehouse: Arc::from(warehouse.trim_end_matches('/')),
         }
-    }
-
-    /// Returns the operator this adapter delegates every operation to.
-    fn operator(&self) -> &Operator {
-        self.storage.operator()
     }
 
     /// Converts an Iceberg location into the operator-relative key it names.
@@ -166,37 +165,34 @@ impl<'de> Deserialize<'de> for BifrostIcebergStorage {
 impl Storage for BifrostIcebergStorage {
     async fn exists(&self, path: &str) -> IcebergResult<bool> {
         let key = self.relativize(path)?;
-        self.operator()
+        self.storage
             .exists(&key)
             .await
-            .map_err(|error| backend_error("probe", path, &error))
+            .map_err(|error| owner_error("probe", path, &error))
     }
 
     async fn metadata(&self, path: &str) -> IcebergResult<FileMetadata> {
         let key = self.relativize(path)?;
-        let stat = self
-            .operator()
+        let size = self
+            .storage
             .stat(&key)
             .await
-            .map_err(|error| backend_error("stat", path, &error))?;
-        Ok(FileMetadata {
-            size: stat.content_length(),
-        })
+            .map_err(|error| owner_error("stat", path, &error))?;
+        Ok(FileMetadata { size })
     }
 
     async fn read(&self, path: &str) -> IcebergResult<Bytes> {
         let key = self.relativize(path)?;
-        self.operator()
+        self.storage
             .read(&key)
             .await
-            .map(|buffer| buffer.to_bytes())
-            .map_err(|error| backend_error("read", path, &error))
+            .map_err(|error| owner_error("read", path, &error))
     }
 
     async fn reader(&self, path: &str) -> IcebergResult<Box<dyn FileRead>> {
         let key = self.relativize(path)?;
         Ok(Box::new(BifrostFileRead {
-            operator: self.operator().clone(),
+            storage: Arc::clone(&self.storage),
             location: path.to_owned(),
             key,
         }))
@@ -204,21 +200,21 @@ impl Storage for BifrostIcebergStorage {
 
     async fn write(&self, path: &str, bs: Bytes) -> IcebergResult<()> {
         let key = self.relativize(path)?;
-        self.operator()
-            .write(&key, bs)
+        self.storage
+            .write_once(&key, bs)
             .await
-            .map(|_| ())
-            .map_err(|error| backend_error("write", path, &error))
+            .map_err(|error| owner_error("write", path, &error))
     }
 
     async fn writer(&self, path: &str) -> IcebergResult<Box<dyn FileWrite>> {
         let key = self.relativize(path)?;
         let writer = self
-            .operator()
-            .writer(&key)
+            .storage
+            .open_writer_once(&key)
             .await
-            .map_err(|error| backend_error("open a writer for", path, &error))?;
+            .map_err(|error| owner_error("open a writer for", path, &error))?;
         Ok(Box::new(BifrostFileWrite {
+            storage: Arc::clone(&self.storage),
             writer: Some(writer),
             location: path.to_owned(),
         }))
@@ -226,19 +222,18 @@ impl Storage for BifrostIcebergStorage {
 
     async fn delete(&self, path: &str) -> IcebergResult<()> {
         let key = self.relativize(path)?;
-        self.operator()
-            .delete(&key)
+        self.storage
+            .delete_once(&key)
             .await
-            .map_err(|error| backend_error("delete", path, &error))
+            .map_err(|error| owner_error("delete", path, &error))
     }
 
     async fn delete_prefix(&self, path: &str) -> IcebergResult<()> {
         let key = self.relativize(path)?;
-        self.operator()
-            .delete_with(&key)
-            .recursive(true)
+        self.storage
+            .delete_prefix_once(&key)
             .await
-            .map_err(|error| backend_error("delete the prefix", path, &error))
+            .map_err(|error| owner_error("delete the prefix", path, &error))
     }
 
     async fn delete_stream(&self, mut paths: BoxStream<'static, String>) -> IcebergResult<()> {
@@ -256,11 +251,10 @@ impl Storage for BifrostIcebergStorage {
         let key = self.relativize(path)?;
         let prefix = format!("{}/", key.trim_end_matches('/'));
         let entries = self
-            .operator()
-            .list_with(&prefix)
-            .recursive(recursive)
+            .storage
+            .list(&prefix, recursive)
             .await
-            .map_err(|error| backend_error("list", path, &error))?;
+            .map_err(|error| owner_error("list", path, &error))?;
         let warehouse = Arc::clone(&self.warehouse);
         Ok(stream::iter(entries.into_iter().map(move |entry| {
             let metadata = entry.metadata();
@@ -290,26 +284,27 @@ impl Storage for BifrostIcebergStorage {
 /// A ranged reader over one validated warehouse object.
 ///
 /// Holds the already-relativized key so a range read repeats no validation and
-/// cannot drift onto a different object than the one `reader` admitted.
+/// cannot drift onto a different object than the one `reader` admitted, and the
+/// node's storage owner rather than a raw operator so a range read issued long
+/// after the reader was opened is still admitted, bounded, and refused by the
+/// same owner as every other Iceberg operation.
 #[derive(Debug)]
 struct BifrostFileRead {
-    /// The node's operator, cloned because Iceberg owns this reader.
-    operator: Operator,
+    /// The node's storage owner; the sole route to the backend.
+    storage: Arc<BifrostStorage>,
     /// Absolute location, retained only for error messages.
     location: String,
-    /// Operator-relative key validated once when the reader was opened.
+    /// Owner-relative key validated once when the reader was opened.
     key: String,
 }
 
 #[async_trait]
 impl FileRead for BifrostFileRead {
     async fn read(&self, range: Range<u64>) -> IcebergResult<Bytes> {
-        self.operator
-            .read_with(&self.key)
-            .range(range)
+        self.storage
+            .read_range(&self.key, range)
             .await
-            .map(|buffer| buffer.to_bytes())
-            .map_err(|error| backend_error("read a range of", &self.location, &error))
+            .map_err(|error| owner_error("read a range of", &self.location, &error))
     }
 }
 
@@ -319,6 +314,8 @@ impl FileRead for BifrostFileRead {
 /// can simply be attempted again, and a repeated publication is how a duplicate
 /// data file reaches a snapshot.
 struct BifrostFileWrite {
+    /// The node's storage owner that admits every append and the close.
+    storage: Arc<BifrostStorage>,
     /// The open writer, taken on close so a second close is an error.
     writer: Option<opendal::Writer>,
     /// Absolute location, retained only for error messages.
@@ -351,10 +348,10 @@ impl FileWrite for BifrostFileWrite {
                 ),
             )
         })?;
-        writer
-            .write(bs)
+        self.storage
+            .writer_write_once(writer, bs)
             .await
-            .map_err(|error| backend_error("write to", &self.location, &error))
+            .map_err(|error| owner_error("write to", &self.location, &error))
     }
 
     async fn close(&mut self) -> IcebergResult<()> {
@@ -364,11 +361,10 @@ impl FileWrite for BifrostFileWrite {
                 format!("Bifrost storage already closed {}", self.location),
             )
         })?;
-        writer
-            .close()
+        self.storage
+            .writer_close_once(&mut writer)
             .await
-            .map(|_| ())
-            .map_err(|error| backend_error("close", &self.location, &error))
+            .map_err(|error| owner_error("close", &self.location, &error))
     }
 }
 
@@ -438,6 +434,20 @@ mod tests {
     /// # Panics
     /// Panics when the signer or the default storage policy is invalid.
     fn adapter(root: &Path) -> (BifrostIcebergStorage, String) {
+        let (storage, warehouse, _owner) = adapter_with_owner(root);
+        (storage, warehouse)
+    }
+
+    /// Builds an adapter and also hands back the owner it is bound to.
+    ///
+    /// Lifecycle assertions need both halves: the adapter is the surface
+    /// Iceberg calls and the owner is the thing that closes, and the whole
+    /// point of the governed adapter is that closing the second one stops the
+    /// first one.
+    ///
+    /// # Panics
+    /// Panics when the signer or the default storage policy is invalid.
+    fn adapter_with_owner(root: &Path) -> (BifrostIcebergStorage, String, Arc<BifrostStorage>) {
         let signer = wyrd_storage::signer::BackendSigner::Local(
             wyrd_storage::local::LocalSigner::new(root.to_path_buf()).expect("local signer"),
         );
@@ -452,7 +462,113 @@ mod tests {
             None,
         ));
         let warehouse = format!("file://{}", root.display());
-        (BifrostIcebergStorage::new(storage, &warehouse), warehouse)
+        (
+            BifrostIcebergStorage::new(Arc::clone(&storage), &warehouse),
+            warehouse,
+            storage,
+        )
+    }
+
+    /// Closing the node's storage owner stops every Iceberg object operation.
+    ///
+    /// This is the whole claim of routing the adapter through the owner. If any
+    /// `Storage` method still reached `OpenDAL` directly, a closed owner would
+    /// be a statement about the metadata cache alone and a process could finish
+    /// shutting down while Iceberg reads, writes, and deletes were still in
+    /// flight against the backend. Every method is asserted, including the
+    /// already-open reader and writer handles, because refusing only the
+    /// entry points still leaves a live route to the backend.
+    ///
+    /// # Panics
+    /// Panics when any operation is served after the owner is closed, or when
+    /// the pre-close round trip fails.
+    #[tokio::test]
+    async fn iceberg_reads_refuse_after_owner_close() {
+        let root = tempfile::tempdir().expect("warehouse root");
+        let (storage, warehouse, owner) = adapter_with_owner(root.path());
+        let live = format!("{warehouse}/datasets/tenant/live.parquet");
+        storage
+            .write(&live, Bytes::from_static(b"rows"))
+            .await
+            .expect("the open owner admits a write");
+        let reader = match storage.reader(&live).await {
+            Ok(reader) => reader,
+            Err(error) => panic!("the open owner admits a reader: {error}"),
+        };
+        let mut writer = match storage
+            .writer(&format!("{warehouse}/datasets/tenant/staged.parquet"))
+            .await
+        {
+            Ok(writer) => writer,
+            Err(error) => panic!("the open owner admits a writer: {error}"),
+        };
+
+        assert!(
+            owner.close(std::time::Instant::now()).await,
+            "the owner settles"
+        );
+
+        assert!(
+            storage.exists(&live).await.is_err(),
+            "a closed owner admits no existence probe"
+        );
+        assert!(
+            storage.metadata(&live).await.is_err(),
+            "a closed owner admits no stat"
+        );
+        storage
+            .read(&live)
+            .await
+            .expect_err("a closed owner admits no read");
+        reader
+            .read(0..2)
+            .await
+            .expect_err("a closed owner admits no ranged read through an open reader");
+        assert!(
+            storage.list(&format!("{warehouse}/datasets"), true).await.is_err(),
+            "a closed owner admits no list"
+        );
+        storage
+            .write(&live, Bytes::from_static(b"more"))
+            .await
+            .expect_err("a closed owner admits no write");
+        assert!(
+            storage
+                .writer(&format!("{warehouse}/datasets/tenant/refused.parquet"))
+                .await
+                .is_err(),
+            "a closed owner opens no writer"
+        );
+        writer
+            .write(Bytes::from_static(b"more"))
+            .await
+            .expect_err("a closed owner admits no writer append");
+        writer
+            .close()
+            .await
+            .expect_err("a closed owner admits no writer close");
+        storage
+            .delete(&live)
+            .await
+            .expect_err("a closed owner admits no delete");
+        storage
+            .delete_prefix(&format!("{warehouse}/datasets"))
+            .await
+            .expect_err("a closed owner admits no recursive delete");
+
+        let snapshot = owner.telemetry_snapshot();
+        assert!(
+            snapshot.request_terminal(vala_storage_outcome()) >= 11,
+            "every refused Iceberg operation must publish a governed closed terminal"
+        );
+        assert_eq!(snapshot.request_starts(), snapshot.request_terminals());
+        assert_eq!(snapshot.active_requests(), 0);
+        assert_eq!(snapshot.anomalies(), 0);
+    }
+
+    /// Names the closed-owner request terminal the refusals above publish.
+    const fn vala_storage_outcome() -> crate::storage::StorageRequestOutcome {
+        crate::storage::StorageRequestOutcome::Closed
     }
 
     /// The adapter admits only objects inside the warehouse it is bound to, and

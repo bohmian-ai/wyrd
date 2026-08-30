@@ -3251,14 +3251,6 @@ impl Oracle {
             self.local_hot_sources(&cut)?
         };
         let provider_inputs = OracleTableInputs {
-            // A distributed cut reads nothing locally: its files travel to
-            // followers as signed assignments, and the leader's provider must
-            // not carry a second, unsigned copy of the same file list.
-            iceberg_files: if distributed {
-                Vec::new()
-            } else {
-                cut.iceberg_files
-            },
             table: cut.iceberg_table,
             distributed_iceberg_batches: None,
             hot_files: local_hot_files,

@@ -225,7 +225,6 @@ impl OraclePlanner {
             let table_name = cut.binding.table_ref.fqn();
             let hot_files = local_hot_sources(catalog, &cut)?;
             let provider = OracleTableProvider::try_new(OracleTableInputs {
-                iceberg_files: cut.iceberg_files,
                 table: cut.iceberg_table,
                 distributed_iceberg_batches: None,
                 hot_files,

@@ -1297,3 +1297,199 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, feature = "test-support"))]
+mod production_pin_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use iceberg::transaction::{ApplyTransactionAction, Transaction};
+    use secrecy::ExposeSecret as _;
+    use wyrd_spec::vala::WYRD_EVENT_TIME;
+
+    use super::BifrostCatalog;
+    use crate::catalog::TableRef;
+    use crate::catalog::event_time::{EventTimeBoundsDefect, EventTimeStatistics};
+    use crate::namespaces::BifrostNamespace;
+
+    /// One committed data file's canonical name and the bounds it carries.
+    struct ManifestCase {
+        /// Object file name committed under the tenant table's location.
+        name: &'static str,
+        /// Lower bound the writer recorded, if any.
+        lower: Option<iceberg::spec::Datum>,
+        /// Upper bound the writer recorded, if any.
+        upper: Option<iceberg::spec::Datum>,
+        /// Statistics the pinned cut must derive from that manifest evidence.
+        expected: EventTimeStatistics,
+    }
+
+    /// Real production pinning resolves `wyrd_event_time` from the manifest's
+    /// own writer schema and decodes each committed file's bounds.
+    ///
+    /// The helper-level projection test above supplies an artificial field id
+    /// and therefore cannot observe the production defect: production loads a
+    /// manifest and must find the field id itself. This test commits four real
+    /// data files — valid, missing-upper, wrong-type, and reversed — through an
+    /// Iceberg transaction against a real catalog, then pins the sealed table
+    /// and reads back exactly what production derived. None of the four has a
+    /// `vala.file_list` row, which is the Forge-rewrite shape.
+    ///
+    /// # Panics
+    /// Panics when the fixture, registration, commit, or pin fails, or when a
+    /// pinned file's derived statistics differ from its manifest evidence.
+    #[test]
+    fn pinned_snapshot_decodes_manifest_event_time_by_writer_field_id() {
+        wyrd_runtime::runtime().block_on(async {
+            let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
+                .await
+                .expect("postgres fixture starts");
+            let warehouse = tempfile::tempdir().expect("warehouse directory");
+            let catalog = BifrostCatalog::new(
+                fixture.catalog_dsn().expose_secret(),
+                &wyrd_storage::settings::BackendConfig::Local {
+                    root: warehouse.path().to_path_buf(),
+                },
+                fixture.vala_postgres().clone(),
+            )
+            .await
+            .expect("redux catalog builds over the fixture");
+
+            let tenant = fixture.data_tenant_id();
+            let table = TableRef::new(BifrostNamespace::Datasets, "pinned_bounds");
+            catalog
+                .register_dataset(
+                    tenant,
+                    table.clone(),
+                    vec![arrow::datatypes::Field::new(
+                        "value",
+                        arrow::datatypes::DataType::Int64,
+                        true,
+                    )],
+                    None,
+                    None,
+                )
+                .await
+                .expect("dataset registers");
+
+            let binding =
+                crate::catalog::TenantTableBinding::resolve((tenant, table.clone()))
+                    .expect("binding resolves");
+            let physical = catalog
+                .iceberg_catalog()
+                .load_table(&binding.table_ident())
+                .await
+                .expect("physical table loads");
+            let field_id = physical
+                .metadata()
+                .current_schema()
+                .field_by_name(WYRD_EVENT_TIME)
+                .expect("the physical schema carries the event-time column")
+                .id;
+
+            let lower_micros = 1_787_493_600_000_000_i64;
+            let upper_micros = 1_787_497_200_000_000_i64;
+            let timestamptz = iceberg::spec::Datum::timestamptz_micros;
+            let cases = [
+                ManifestCase {
+                    name: "valid.parquet",
+                    lower: Some(timestamptz(lower_micros)),
+                    upper: Some(timestamptz(upper_micros)),
+                    expected: EventTimeStatistics::Bounded {
+                        min_micros: lower_micros,
+                        max_micros: upper_micros,
+                    },
+                },
+                ManifestCase {
+                    name: "missing.parquet",
+                    lower: Some(timestamptz(lower_micros)),
+                    upper: None,
+                    expected: EventTimeStatistics::Unusable(EventTimeBoundsDefect::Missing),
+                },
+                ManifestCase {
+                    name: "malformed.parquet",
+                    lower: Some(iceberg::spec::Datum::long(lower_micros)),
+                    upper: Some(timestamptz(upper_micros)),
+                    expected: EventTimeStatistics::Unusable(EventTimeBoundsDefect::Invalid),
+                },
+                ManifestCase {
+                    name: "contradictory.parquet",
+                    lower: Some(timestamptz(upper_micros)),
+                    upper: Some(timestamptz(lower_micros)),
+                    expected: EventTimeStatistics::Unusable(
+                        EventTimeBoundsDefect::Contradictory,
+                    ),
+                },
+            ];
+
+            let partition = crate::catalog::layout::TimeGranularity::Hour
+                .bucket(
+                    chrono::DateTime::from_timestamp_micros(lower_micros)
+                        .expect("fixture instant is representable"),
+                )
+                .expect("fixture instant buckets");
+            let location = physical.metadata().location().to_owned();
+            let data_files = cases.iter().map(|case| {
+                let mut lower_bounds = HashMap::new();
+                let mut upper_bounds = HashMap::new();
+                if let Some(lower) = case.lower.clone() {
+                    lower_bounds.insert(field_id, lower);
+                }
+                if let Some(upper) = case.upper.clone() {
+                    upper_bounds.insert(field_id, upper);
+                }
+                iceberg::spec::DataFileBuilder::default()
+                    .content(iceberg::spec::DataContentType::Data)
+                    .file_path(format!("{location}/data/{}", case.name))
+                    .file_format(iceberg::spec::DataFileFormat::Parquet)
+                    .partition(iceberg::spec::Struct::from_iter([Some(
+                        partition.iceberg_partition_literal(),
+                    )]))
+                    .record_count(4_096)
+                    .file_size_in_bytes(2_097_152)
+                    .lower_bounds(lower_bounds)
+                    .upper_bounds(upper_bounds)
+                    .partition_spec_id(physical.metadata().default_partition_spec_id())
+                    .sort_order_id(
+                        i32::try_from(physical.metadata().default_sort_order_id())
+                            .expect("fixture sort order id fits i32"),
+                    )
+                    .build()
+                    .expect("fixture data file builds")
+            });
+
+            let transaction = Transaction::new(&physical);
+            let action = transaction.fast_append().add_data_files(data_files);
+            let applied =
+                ApplyTransactionAction::apply(action, transaction).expect("append applies");
+            applied
+                .commit(catalog.iceberg_catalog().as_ref())
+                .await
+                .expect("fast append commits");
+
+            let pinned = catalog
+                .pin_sealed_table(&table, tenant)
+                .await
+                .expect("the committed snapshot pins");
+            assert_eq!(
+                pinned.iceberg_files.len(),
+                cases.len(),
+                "every committed file must reach the pinned cut"
+            );
+            for case in &cases {
+                let file = pinned
+                    .iceberg_files
+                    .iter()
+                    .find(|file| file.file_path.ends_with(case.name))
+                    .unwrap_or_else(|| panic!("{} is pinned", case.name));
+                assert_eq!(file.row_count, 4_096, "{} row count", case.name);
+                assert_eq!(file.file_size, 2_097_152, "{} file size", case.name);
+                assert_eq!(
+                    file.event_time, case.expected,
+                    "{} event-time statistics",
+                    case.name
+                );
+            }
+        });
+    }
+}

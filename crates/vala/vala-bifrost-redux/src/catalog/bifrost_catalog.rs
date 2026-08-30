@@ -17,6 +17,7 @@ use wyrd_spec::vala::api::{
 use wyrd_storage::settings::BackendConfig;
 
 use crate::catalog::error::BifrostCatalogError;
+use crate::catalog::event_time::{EventTimeBoundsDefect, EventTimeStatistics};
 use crate::catalog::iceberg_sql;
 use crate::catalog::layout::PhysicalLayout;
 use crate::catalog::storage::{iceberg_storage_factory, warehouse_uri};
@@ -105,6 +106,11 @@ pub struct PinnedSealedTable {
 }
 
 /// Immutable file metadata retained from one pinned Iceberg manifest entry.
+///
+/// The committed manifest entry is the authority for a compacted or
+/// Forge-rewritten object: `vala.file_list` never receives a rewrite output, so
+/// a matching row is normal to be absent and is never required to establish
+/// this file's size, row count, or event-time interval.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PinnedIcebergFile {
     /// Canonical tenant-qualified object path.
@@ -113,6 +119,38 @@ pub struct PinnedIcebergFile {
     pub file_size: u64,
     /// Exact record count from the pinned manifest.
     pub row_count: u64,
+    /// Normalized `wyrd_event_time` interval decoded from the manifest entry's
+    /// typed lower/upper bounds, or the exact reason the file must be retained.
+    pub event_time: EventTimeStatistics,
+}
+
+impl PinnedIcebergFile {
+    /// Projects one pinned manifest entry into immutable pruning statistics.
+    ///
+    /// `event_time_field_id` is the `wyrd_event_time` field identity resolved
+    /// from the *manifest's own writer schema*, not the current table schema:
+    /// a rewrite output committed under an older schema keeps that schema's
+    /// field id, and resolving against the newest schema would read the wrong
+    /// bound. `None` means the writer schema had no such field at all, which is
+    /// a missing-bounds fail-open rather than an error.
+    ///
+    /// Decoding never fails the pin. Every defect normalizes into
+    /// [`EventTimeStatistics::Unusable`] so the file is retained and executed
+    /// through the residual predicate and tenant tripwire.
+    #[must_use]
+    fn from_manifest_entry(
+        file_path: String,
+        data_file: &iceberg::spec::DataFile,
+        event_time_field_id: Option<i32>,
+    ) -> Self {
+        let _ = event_time_field_id;
+        Self {
+            file_path,
+            file_size: data_file.file_size_in_bytes(),
+            row_count: data_file.record_count(),
+            event_time: EventTimeStatistics::Unusable(EventTimeBoundsDefect::Missing),
+        }
+    }
 }
 
 /// Immutable Iceberg snapshot metadata collected before hot-manifest reconciliation.
@@ -366,11 +404,11 @@ impl BifrostCatalog {
                             "sealed byte estimate overflow".to_owned(),
                         )
                     })?;
-                let pinned = PinnedIcebergFile {
-                    file_path: canonical.clone(),
-                    file_size: entry.data_file().file_size_in_bytes(),
-                    row_count: entry.data_file().record_count(),
-                };
+                let pinned = PinnedIcebergFile::from_manifest_entry(
+                    canonical.clone(),
+                    entry.data_file(),
+                    None,
+                );
                 if files
                     .insert(canonical.clone(), pinned.clone())
                     .is_some_and(|existing| existing != pinned)
@@ -1082,5 +1120,141 @@ mod schema_shape_tests {
 
         accepts_direct_provider_constructor(ReduxTableProvider::try_new);
         accepts_direct_catalog_provider(BifrostCatalog::provider);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::PinnedIcebergFile;
+    use crate::catalog::event_time::{EventTimeBoundsDefect, EventTimeStatistics};
+
+    /// Builds one Forge-style rewrite output's manifest `DataFile` with typed
+    /// `wyrd_event_time` bounds under the given field id.
+    ///
+    /// Only the fields the pinned projection reads are populated; the rest keep
+    /// their builder defaults so the fixture cannot accidentally supply
+    /// evidence the projection is supposed to derive.
+    fn rewrite_data_file(
+        field_id: i32,
+        lower: Option<iceberg::spec::Datum>,
+        upper: Option<iceberg::spec::Datum>,
+    ) -> iceberg::spec::DataFile {
+        let mut lower_bounds = HashMap::new();
+        let mut upper_bounds = HashMap::new();
+        if let Some(lower) = lower {
+            lower_bounds.insert(field_id, lower);
+        }
+        if let Some(upper) = upper {
+            upper_bounds.insert(field_id, upper);
+        }
+        iceberg::spec::DataFileBuilder::default()
+            .content(iceberg::spec::DataContentType::Data)
+            .file_path("s3://warehouse/tenant/logs/records/rewrite-0.parquet".to_owned())
+            .file_format(iceberg::spec::DataFileFormat::Parquet)
+            .partition(iceberg::spec::Struct::empty())
+            .record_count(4_096)
+            .file_size_in_bytes(2_097_152)
+            .lower_bounds(lower_bounds)
+            .upper_bounds(upper_bounds)
+            .partition_spec_id(0)
+            .build()
+            .expect("fixture rewrite data file builds")
+    }
+
+    /// A Forge rewrite output is discovered only through the committed Iceberg
+    /// manifest: it is never inserted into `vala.file_list`, so its size, row
+    /// count, and event-time interval must all come from the `DataFile` alone.
+    ///
+    /// The negative half is equally load-bearing: every defect class normalizes
+    /// to retained-with-a-reason rather than to an exclusion or an error, so a
+    /// rewrite output with unusable statistics is still scanned.
+    #[test]
+    fn forge_rewrite_manifest_bounds_survive_without_file_list_row() {
+        let field_id = 42;
+        let lower_micros = 1_787_493_600_000_000_i64;
+        let upper_micros = 1_787_497_200_000_000_i64;
+        let timestamptz = iceberg::spec::Datum::timestamptz_micros;
+
+        let pinned = PinnedIcebergFile::from_manifest_entry(
+            "tenant/logs/records/rewrite-0.parquet".to_owned(),
+            &rewrite_data_file(
+                field_id,
+                Some(timestamptz(lower_micros)),
+                Some(timestamptz(upper_micros)),
+            ),
+            Some(field_id),
+        );
+        assert_eq!(pinned.file_path, "tenant/logs/records/rewrite-0.parquet");
+        assert_eq!(pinned.file_size, 2_097_152);
+        assert_eq!(pinned.row_count, 4_096);
+        assert_eq!(
+            pinned.event_time,
+            EventTimeStatistics::Bounded {
+                min_micros: lower_micros,
+                max_micros: upper_micros,
+            }
+        );
+
+        // An absent upper bound is missing, not invalid: the writer recorded
+        // nothing to decode.
+        let half = PinnedIcebergFile::from_manifest_entry(
+            "tenant/logs/records/rewrite-0.parquet".to_owned(),
+            &rewrite_data_file(field_id, Some(timestamptz(lower_micros)), None),
+            Some(field_id),
+        );
+        assert_eq!(
+            half.event_time,
+            EventTimeStatistics::Unusable(EventTimeBoundsDefect::Missing)
+        );
+        assert_eq!(half.row_count, 4_096);
+
+        // A present bound of the wrong Iceberg type is invalid, and is still
+        // retained rather than refused.
+        let wrong_type = PinnedIcebergFile::from_manifest_entry(
+            "tenant/logs/records/rewrite-0.parquet".to_owned(),
+            &rewrite_data_file(
+                field_id,
+                Some(iceberg::spec::Datum::long(lower_micros)),
+                Some(timestamptz(upper_micros)),
+            ),
+            Some(field_id),
+        );
+        assert_eq!(
+            wrong_type.event_time,
+            EventTimeStatistics::Unusable(EventTimeBoundsDefect::Invalid)
+        );
+
+        // A reversed interval is contradictory.
+        let reversed = PinnedIcebergFile::from_manifest_entry(
+            "tenant/logs/records/rewrite-0.parquet".to_owned(),
+            &rewrite_data_file(
+                field_id,
+                Some(timestamptz(upper_micros)),
+                Some(timestamptz(lower_micros)),
+            ),
+            Some(field_id),
+        );
+        assert_eq!(
+            reversed.event_time,
+            EventTimeStatistics::Unusable(EventTimeBoundsDefect::Contradictory)
+        );
+
+        // Bounds recorded under a different field id must not be read: a
+        // manifest whose writer schema lacks the column fails open.
+        let other_field = PinnedIcebergFile::from_manifest_entry(
+            "tenant/logs/records/rewrite-0.parquet".to_owned(),
+            &rewrite_data_file(
+                field_id,
+                Some(timestamptz(lower_micros)),
+                Some(timestamptz(upper_micros)),
+            ),
+            Some(field_id + 1),
+        );
+        assert_eq!(
+            other_field.event_time,
+            EventTimeStatistics::Unusable(EventTimeBoundsDefect::Missing)
+        );
     }
 }

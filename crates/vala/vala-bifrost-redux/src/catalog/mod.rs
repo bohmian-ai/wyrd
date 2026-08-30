@@ -2,6 +2,7 @@
 
 mod bifrost_catalog;
 mod error;
+pub mod event_time;
 mod iceberg_sql;
 pub mod layout;
 mod logical_table_identity;

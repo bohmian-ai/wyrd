@@ -180,15 +180,16 @@ pub enum AssignmentDigestError {
     },
 }
 
-/// Domain separator for the v3 assignment-authority digest.
+/// Domain separator for the v4 assignment-authority digest.
 ///
-/// v3 replaced v2's two length-prefixed event-day strings with two fixed-width
-/// typed partitions, and carries the projection closure exactly once, on the
-/// assignment itself: the Scribe cut contributes only its epoch, partitions,
-/// cursor, ranges, and retention bounds. Every other count, length, option,
-/// predicate, file, projection, and numeric rule is unchanged from v2, and the
-/// domain differs so a v2 signature can never validate against v3 bytes.
-const ASSIGNMENT_AUTHORITY_DOMAIN: &[u8] = b"wyrd.oracle.assignment-authority.v3\0";
+/// v4 replaced v3's length-prefixed persisted path strings with typed
+/// [`crate::vala::api::PersistedFileDescriptor`] encodings: a source tag, the
+/// path, the object size, the record count, the hot source's `vala.file_list`
+/// identity and decoded checksum or the Iceberg source's pinned snapshot, and
+/// the declared event-time bounds. Every other count, length, option,
+/// predicate, projection, cut, and numeric rule is unchanged from v3, and the
+/// domain differs so a v3 signature can never validate against v4 bytes.
+const ASSIGNMENT_AUTHORITY_DOMAIN: &[u8] = b"wyrd.oracle.assignment-authority.v4\0";
 
 /// Appends a length-prefixed UTF-8 string: a big-endian `u32` byte length
 /// followed by the raw UTF-8 bytes.
@@ -253,6 +254,61 @@ fn push_predicate(
     push_option(buffer, predicate.literal(), push_literal)
 }
 
+/// Appends one optional big-endian `i64` as `option_tag:u8 || value:i64`.
+///
+/// The tag is what keeps an absent bound distinct from a zero one: without it,
+/// a file that declares no interval and a file that declares the epoch instant
+/// would sign identically.
+fn push_optional_i64(buffer: &mut Vec<u8>, value: Option<i64>) {
+    match value {
+        None => buffer.push(0),
+        Some(value) => {
+            buffer.push(1);
+            buffer.extend_from_slice(&value.to_be_bytes());
+        }
+    }
+}
+
+/// Appends one typed persisted-file descriptor.
+///
+/// The leading source tag is what makes the two variants unambiguous to the
+/// digest: `1` for hot, `2` for Iceberg. Tag `0` is deliberately unused so an
+/// all-zero or truncated buffer cannot decode as a valid descriptor. Every
+/// field except the path is fixed width, and the path keeps its `u32` length
+/// prefix, so no two distinct descriptors can encode to the same bytes.
+///
+/// # Errors
+/// Returns [`AssignmentDigestError::LengthOverflow`] when the path exceeds the
+/// `u32` length domain.
+fn push_file_descriptor(
+    buffer: &mut Vec<u8>,
+    descriptor: &crate::vala::api::PersistedFileDescriptor,
+) -> Result<(), AssignmentDigestError> {
+    use crate::vala::api::PersistedFileDescriptor;
+    match descriptor {
+        PersistedFileDescriptor::Hot(hot) => {
+            buffer.push(1);
+            push_string(buffer, &hot.path)?;
+            buffer.extend_from_slice(&hot.size_bytes.to_be_bytes());
+            buffer.extend_from_slice(&hot.row_count.to_be_bytes());
+            buffer.extend_from_slice(hot.file_list_id.as_bytes());
+            buffer.extend_from_slice(&hot.sha256);
+            push_optional_i64(buffer, hot.min_event_time_micros);
+            push_optional_i64(buffer, hot.max_event_time_micros);
+        }
+        PersistedFileDescriptor::Iceberg(iceberg) => {
+            buffer.push(2);
+            push_string(buffer, &iceberg.path)?;
+            buffer.extend_from_slice(&iceberg.size_bytes.to_be_bytes());
+            buffer.extend_from_slice(&iceberg.row_count.to_be_bytes());
+            buffer.extend_from_slice(&iceberg.snapshot_id.to_be_bytes());
+            push_optional_i64(buffer, iceberg.min_event_time_micros);
+            push_optional_i64(buffer, iceberg.max_event_time_micros);
+        }
+    }
+    Ok(())
+}
+
 /// Appends one typed partition as `granularity_tag:u8 || start_unix_micros:i64`
 /// big-endian.
 ///
@@ -314,7 +370,7 @@ fn push_assignment(
     buffer.extend_from_slice(&fingerprint);
     push_count(buffer, assignment.files.len(), "files")?;
     for file in assignment.files {
-        push_string(buffer, file.path())?;
+        push_file_descriptor(buffer, file)?;
     }
     push_option(buffer, assignment.scribe_cut, push_scribe_cut)?;
     push_count(
@@ -439,13 +495,18 @@ mod tests {
             .expect("fixture start is canonical")
     }
 
-    /// Normative v3 vector from the task packet: one assignment for tenant
+    /// Normative v4 vector: one assignment for tenant
     /// `00112233-4455-6677-8899-aabbccddeeff`, table `logs.records`, fingerprint
-    /// `00..1f`, one file, three required columns carried once on the
-    /// assignment, a single `Eq(service_name, "api")` predicate, and the
-    /// normative Scribe cut must encode to exactly 277 bytes and hash to the
+    /// `00..1f`, one typed hot descriptor, three required columns carried once
+    /// on the assignment, a single `Eq(service_name, "api")` predicate, and the
+    /// normative Scribe cut must encode to exactly 360 bytes and hash to the
     /// fixed digest below. Asserting both the byte length and the hash prevents
     /// a compensating pair of layout mistakes from passing.
+    ///
+    /// The 83-byte growth over v3's 277 is exactly the typed descriptor
+    /// replacing a bare 30-byte path string: 1 source tag + 30 path + 8 size +
+    /// 8 row count + 16 file-list uuid + 32 checksum + 9 + 9 optional bounds =
+    /// 113 bytes.
     #[test]
     fn normative_vector_encodes_to_fixed_length_and_digest() {
         let fingerprint: String = (0u8..32).map(|byte| format!("{byte:02x}")).collect();
@@ -476,14 +537,14 @@ mod tests {
         let bytes = encode_assignment_authority_bytes(std::slice::from_ref(&assignment)).unwrap();
         assert_eq!(
             bytes.len(),
-            277,
-            "normative vector must encode to exactly 277 bytes"
+            360,
+            "normative vector must encode to exactly 360 bytes"
         );
 
         let digest = assignment_authority_digest(std::slice::from_ref(&assignment)).unwrap();
         assert_eq!(
             digest,
-            "949a3d1c1e779d23e57fbd1569fab6cdbcd65dd30eac5a0dfa1ab5facd7b4394"
+            "af23f14ce2bd50c6e0fc1cb5c41c3f2108ee5863e8f0c3c1a72a01b1c3e8ec02"
         );
     }
 

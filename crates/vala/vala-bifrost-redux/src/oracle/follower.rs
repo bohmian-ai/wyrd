@@ -2328,6 +2328,27 @@ pub(crate) mod tests {
         }
     }
 
+    /// Returns the tenant-scoped binding the closure fixtures resolve against.
+    fn closure_fixture_binding(tenant_id: DataTenantId) -> TenantTableBinding {
+        TenantTableBinding {
+            tenant_id,
+            namespace: "vala.traces".to_owned(),
+            table: "spans".to_owned(),
+        }
+    }
+
+    /// Returns the signed closure for
+    /// `SELECT duration_ms ... WHERE status_code = 'STATUS_CODE_ERROR'`: the
+    /// requested output, the predicate-only column, and the hidden tenant
+    /// column, in closure order.
+    fn signed_closure() -> Vec<String> {
+        vec![
+            "duration_ms".to_owned(),
+            "status_code".to_owned(),
+            DATA_TENANT_ID.to_owned(),
+        ]
+    }
+
     /// Returns one plan's output field names in closure order.
     fn plan_column_names(plan: &Arc<dyn ExecutionPlan>) -> Vec<String> {
         plan.schema()
@@ -2409,16 +2430,8 @@ pub(crate) mod tests {
 
         let (tenant_id, schema, stream, resolver) = closure_fixture_resolver();
         let session = SessionContext::new().state();
-        let binding = TenantTableBinding {
-            tenant_id,
-            namespace: "vala.traces".to_owned(),
-            table: "spans".to_owned(),
-        };
-        let closure = vec![
-            "duration_ms".to_owned(),
-            "status_code".to_owned(),
-            DATA_TENANT_ID.to_owned(),
-        ];
+        let binding = closure_fixture_binding(tenant_id);
+        let closure = signed_closure();
         let fingerprint = super::super::assignment_schema_fingerprint(schema.as_ref());
 
         let owned = resolver
@@ -2539,16 +2552,8 @@ pub(crate) mod tests {
     async fn scribe_provider_refuses_a_mismatched_full_schema_fingerprint() {
         let (tenant_id, schema, stream, _resolver) = closure_fixture_resolver();
         let session = SessionContext::new().state();
-        let binding = TenantTableBinding {
-            tenant_id,
-            namespace: "vala.traces".to_owned(),
-            table: "spans".to_owned(),
-        };
-        let closure = vec![
-            "duration_ms".to_owned(),
-            "status_code".to_owned(),
-            DATA_TENANT_ID.to_owned(),
-        ];
+        let binding = closure_fixture_binding(tenant_id);
+        let closure = signed_closure();
 
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let counting = ScribeTailResolver::with_schema(

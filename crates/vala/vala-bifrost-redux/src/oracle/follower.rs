@@ -2483,6 +2483,43 @@ pub(crate) mod tests {
             closure,
             "the empty branch declares the same closure schema"
         );
+
+        // Property 1: the fetch request carries the signed closure and its
+        // predicates byte for byte, so the memtable projects and filters at the
+        // source instead of the plan above discarding wide columns later.
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recording = ScribeTailResolver::with_schema(
+            Arc::new(RecordingTail {
+                stream,
+                requests: Arc::clone(&requests),
+                batches: Vec::new(),
+            }),
+            Arc::clone(&schema),
+        );
+        let assignment = closure_assignment(
+            local_scribe_scan_id(&binding, stream),
+            binding,
+            schema.as_ref(),
+            closure.clone(),
+            fingerprint,
+        );
+        recording
+            .resolve(ClusterRole::Scribe, &assignment, &session)
+            .await
+            .expect("the recording source resolves the same signed closure");
+        let recorded = requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(recorded.len(), 1, "exactly one live-tail fetch is issued");
+        assert_eq!(
+            recorded[0].required_columns, closure,
+            "the fetch request forwards the signed closure unchanged"
+        );
+        assert_eq!(
+            recorded[0].predicates, assignment.predicates,
+            "the fetch request forwards the signed predicates unchanged"
+        );
     }
 
     /// A mismatched *full* schema fingerprint refuses before any source IO.

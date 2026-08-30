@@ -608,67 +608,6 @@ impl Forge {
         .map_err(ForgeError::Catalog)
     }
 
-/// Reject a staging batch containing a missing, malformed, or foreign tenant.
-pub(crate) fn validate_tenant_column(
-    batch: &RecordBatch,
-    tenant: DataTenantId,
-) -> Result<(), ForgeError> {
-    let index = batch
-        .schema()
-        .index_of("data_tenant_id")
-        .map_err(|_| ForgeError::Schema {
-            detail: "staging file lacks data_tenant_id".to_owned(),
-        })?;
-    let values = batch
-        .column(index)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| ForgeError::Schema {
-            detail: "data_tenant_id must be Utf8".to_owned(),
-        })?;
-    let expected = tenant.to_string();
-    if (0..values.len()).any(|index| values.is_null(index) || values.value(index) != expected) {
-        return Err(ForgeError::Schema {
-            detail: format!("staging file contains a row outside tenant `{tenant}`"),
-        });
-    }
-    Ok(())
-}
-
-/// Project source columns into the registered Iceberg schema by field name.
-///
-/// Matching types are reused; compatible differences are cast through Arrow.
-/// Missing fields and failed casts are schema errors rather than positional
-/// guesses.
-pub(crate) fn project_by_name(
-    source: &RecordBatch,
-    target: Arc<arrow::datatypes::Schema>,
-) -> Result<RecordBatch, ForgeError> {
-    let mut columns = Vec::with_capacity(target.fields().len());
-    for field in target.fields() {
-        let index = source
-            .schema()
-            .index_of(field.name())
-            .map_err(|_| ForgeError::Schema {
-                detail: format!("staging schema lacks Iceberg field `{}`", field.name()),
-            })?;
-        let column = source.column(index);
-        let column = if column.data_type() == field.data_type() {
-            column.clone()
-        } else {
-            cast(column, field.data_type()).map_err(|error| ForgeError::Schema {
-                detail: format!(
-                    "field `{}` cannot be cast to {:?}: {error}",
-                    field.name(),
-                    field.data_type()
-                ),
-            })?
-        };
-        columns.push(column);
-    }
-    RecordBatch::try_new(target, columns).map_err(|error| ForgeError::Schema {
-        detail: error.to_string(),
-    })
 }
 
 /// Construct system-owned metadata for one Forge transition event.

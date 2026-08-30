@@ -12,10 +12,6 @@ use super::error::ForgeError;
 /// Every hard ceiling used to classify exact Forge plans.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ForgeCapacity {
-    /// Maximum ordinary input files.
-    pub max_files: u32,
-    /// Maximum ordinary input bytes.
-    pub max_bytes: u64,
     /// Maximum planned parallelism.
     pub max_parallelism: u16,
     /// Maximum peak memory estimate.
@@ -28,20 +24,18 @@ pub struct ForgeCapacity {
 }
 
 impl ForgeCapacity {
-    /// Validates that every safety ceiling is positive and the large lane covers bytes.
+    /// Validates that every safety ceiling is positive.
     ///
     /// # Errors
-    /// Returns [`ForgeError::InvalidConfig`] for a zero ceiling or inverted byte lanes.
+    /// Returns [`ForgeError::InvalidConfig`] for a zero ceiling.
     pub fn validate(self) -> Result<Self, ForgeError> {
-        if self.max_files == 0
-            || self.max_bytes == 0
-            || self.max_parallelism == 0
+        if self.max_parallelism == 0
             || self.max_memory_bytes == 0
             || self.max_spill_bytes == 0
-            || self.max_large_task_bytes < self.max_bytes
+            || self.max_large_task_bytes == 0
         {
             return Err(ForgeError::InvalidConfig {
-                detail: "every Forge capacity must be positive and the large lane must cover the ordinary byte lane".to_owned(),
+                detail: "every Forge capacity ceiling must be positive".to_owned(),
             });
         }
         Ok(self)
@@ -95,6 +89,18 @@ pub struct ForgePlanCandidate {
     pub spill_bytes: u64,
     /// Stable strategy parameters.
     pub parameters: serde_json::Value,
+}
+
+/// Every deterministic candidate derived from one immutable table snapshot.
+///
+/// The snapshot identity travels with the candidates so a plan can never be
+/// persisted against a base the discovery pass did not actually observe.
+#[derive(Debug, Clone)]
+pub struct ForgeTableSnapshot {
+    /// Exact Iceberg snapshot identity shared by every emitted plan.
+    pub snapshot_id: i64,
+    /// Deterministically ordered candidates from that snapshot.
+    pub candidates: Vec<ForgePlanCandidate>,
 }
 
 /// Deterministic owner of Forge's capacity-scaled executable envelope policy.
@@ -290,6 +296,108 @@ impl ForgePlanner {
         Ok(())
     }
 
+    /// Plans every candidate discovered from one immutable snapshot.
+    ///
+    /// Candidates are already the exact work a discovery pass selected, so the
+    /// planner neither regroups nor splits them: it binds each one to the
+    /// snapshot identity, hashes its canonical payload, and assigns the single
+    /// capacity classification that decides its lane.
+    ///
+    /// # Errors
+    /// Returns [`ForgeError::Invariant`] when a candidate's inputs or estimates
+    /// are empty, unsorted, duplicated, or misaligned, and
+    /// [`ForgeError::Capacity`] when the executable envelope cannot be sized.
+    pub fn plan_table(
+        &self,
+        snapshot: &ForgeTableSnapshot,
+    ) -> Result<Vec<PlannedForgeTask>, ForgeError> {
+        snapshot
+            .candidates
+            .iter()
+            .map(|candidate| self.plan_candidate(snapshot.snapshot_id, candidate))
+            .collect()
+    }
+
+    /// Binds one candidate to its snapshot and classifies its capacity.
+    ///
+    /// The canonical hash covers exactly the persisted payload — inputs,
+    /// parameters, and payload version — so two discovery passes that select
+    /// the same work produce the same durable identity and the idempotent
+    /// enqueue collapses them.
+    ///
+    /// # Errors
+    /// Returns [`ForgeError::Invariant`] when the input count exceeds `u32`,
+    /// any estimate is zero, the per-input byte terms do not align with the
+    /// inputs, the inputs are not strictly sorted, or the payload cannot be
+    /// canonicalized; returns [`ForgeError::Capacity`] when the envelope for the
+    /// candidate cannot be sized within this planner's ceilings.
+    fn plan_candidate(
+        &self,
+        snapshot_id: i64,
+        candidate: &ForgePlanCandidate,
+    ) -> Result<PlannedForgeTask, ForgeError> {
+        let files = u32::try_from(candidate.inputs.len()).map_err(|_| ForgeError::Invariant {
+            detail: "Forge plan input count exceeds u32".to_owned(),
+        })?;
+        if files == 0
+            || candidate.bytes == 0
+            || candidate.parallelism == 0
+            || candidate.memory_bytes == 0
+            || candidate.spill_bytes == 0
+            || candidate.inputs.len() != candidate.input_bytes.len()
+            || candidate.inputs.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(ForgeError::Invariant {
+                detail: "Forge candidate inputs and estimates must be positive, sorted, and unique"
+                    .to_owned(),
+            });
+        }
+        let capacity_outcome = if candidate.bytes <= self.capacity.max_large_task_bytes
+            && candidate.parallelism <= self.capacity.max_parallelism
+            && candidate.memory_bytes <= self.capacity.max_memory_bytes
+            && candidate.spill_bytes <= self.capacity.max_spill_bytes
+        {
+            ForgePlanCapacity::Ordinary
+        } else {
+            ForgePlanCapacity::Unschedulable
+        };
+        let plan = ForgeTaskPlan {
+            version: FORGE_TASK_PAYLOAD_VERSION,
+            inputs: candidate.inputs.clone(),
+            parameters: candidate.parameters.clone(),
+        };
+        let canonical = serde_json::to_vec(&serde_json::json!({
+            "inputs": plan.inputs,
+            "parameters": plan.parameters,
+            "version": plan.version,
+        }))
+        .map_err(|error| ForgeError::Invariant {
+            detail: error.to_string(),
+        })?;
+        let plan_hash: [u8; 32] = Sha256::digest(canonical).into();
+        Ok(PlannedForgeTask {
+            strategy: candidate.strategy,
+            base_snapshot_id: snapshot_id,
+            plan,
+            plan_hash,
+            estimates: ForgeTaskEstimates {
+                files,
+                bytes: candidate.bytes,
+                parallelism: candidate.parallelism,
+                memory_bytes: candidate.memory_bytes,
+                spill_bytes: candidate.spill_bytes,
+                large_ceiling_bytes: self.capacity.max_large_task_bytes,
+                envelope: Some(ForgeEnvelopeSizer::size(
+                    candidate.bytes,
+                    candidate.inputs.len(),
+                    usize::from(candidate.parallelism),
+                    self.capacity,
+                )?),
+            },
+            capacity: capacity_outcome,
+        })
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -309,8 +417,6 @@ mod tests {
                 4,
                 4,
                 ForgeCapacity {
-                    max_files: 4,
-                    max_bytes: u64::MAX,
                     max_parallelism: 4,
                     max_memory_bytes: memory,
                     max_spill_bytes: 1024 * mib,
@@ -337,8 +443,6 @@ mod tests {
             1,
             1,
             ForgeCapacity {
-                max_files: 1,
-                max_bytes: u64::MAX,
                 max_parallelism: 1,
                 max_memory_bytes: 6 * mib,
                 max_spill_bytes: 2 * mib,
@@ -354,8 +458,6 @@ mod tests {
     fn envelope_scratch_terms_are_capacity_bounded() {
         let mib = 1024 * 1024;
         let capacity = ForgeCapacity {
-            max_files: 4,
-            max_bytes: u64::MAX,
             max_parallelism: 4,
             max_memory_bytes: 256 * mib,
             max_spill_bytes: 1024 * mib,

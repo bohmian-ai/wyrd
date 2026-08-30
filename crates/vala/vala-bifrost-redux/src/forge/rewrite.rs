@@ -317,9 +317,10 @@ impl ForgeRewriteRuntime {
     ///
     /// # Errors
     ///
-    /// Returns [`ForgeError::InvalidConfig`] for a zero scratch lease and
+    /// Returns [`ForgeError::InvalidConfig`] for a zero scratch lease,
     /// [`ForgeError::ScratchIo`] when the attempt's unique spill child cannot
-    /// be created beneath the pod root.
+    /// be created beneath the pod root, and [`ForgeError::Invariant`] when the
+    /// execution runtime cannot be built from the granted envelope.
     pub(crate) fn new_attempt(
         memory_pool: Arc<dyn MemoryPool>,
         pod_spill_root: &Path,
@@ -354,7 +355,9 @@ impl ForgeRewriteRuntime {
                 .with_temp_file_path(spill_dir.path())
                 .with_max_temp_directory_size(spill_limit_bytes)
                 .build()
-                .map_err(ForgeError::DataFusion)?,
+                .map_err(|error| ForgeError::Invariant {
+                    detail: format!("Forge attempt runtime construction failed: {error}"),
+                })?,
         );
         Ok(Self {
             runtime,

@@ -1159,8 +1159,6 @@ impl<'forge> ForgeScheduler<'forge> {
 #[must_use]
 fn governed_capacity(configured: ForgeCapacity, plan: &ResourcePlan) -> ForgeCapacity {
     ForgeCapacity {
-        max_files: configured.max_files,
-        max_bytes: configured.max_bytes,
         max_parallelism: configured
             .max_parallelism
             .min(u16::try_from(plan.effective_cpu).unwrap_or(u16::MAX)),
@@ -1188,13 +1186,17 @@ fn manifest_demand_must_remain(
 ///
 /// This preserves the exact planning envelope so status never marks a task
 /// unclaimable under a stricter memory interpretation than construction uses.
+///
+/// The promotion route carries no ordinary file-count ceiling, so the durable
+/// `max_files` filter is left fully open and the byte filter reuses the single
+/// configured byte ceiling that planning already classified against.
 #[must_use]
 fn status_claim_limits(capacity: ForgeCapacity) -> ForgeClaimLimits {
     ForgeClaimLimits {
         max_active_per_tenant: u32::MAX,
         lease_seconds: 1,
-        max_files: capacity.max_files,
-        max_bytes: capacity.max_bytes,
+        max_files: u32::MAX,
+        max_bytes: capacity.max_large_task_bytes,
         max_parallelism: capacity.max_parallelism,
         max_memory_bytes: capacity.max_memory_bytes,
         max_spill_bytes: capacity.max_spill_bytes,

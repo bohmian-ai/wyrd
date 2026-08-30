@@ -70,6 +70,8 @@ impl ForgeMetricSource {
 /// Closed maintenance stage inventory used by duration and failure series.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) enum ForgeMetricStage {
+    /// Promote already-published Scribe hot objects into the table unchanged.
+    ScribePromotion,
     /// Reconcile staging audit operations.
     ReconcileStaging,
     /// Reconcile current-snapshot replacement operations.
@@ -88,7 +90,8 @@ pub(super) enum ForgeMetricStage {
 
 impl ForgeMetricStage {
     /// Every stage label registered for Forge duration and failure series.
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
+        Self::ScribePromotion,
         Self::ReconcileStaging,
         Self::ReconcileIceberg,
         Self::ManifestDiscovery,
@@ -101,6 +104,7 @@ impl ForgeMetricStage {
     /// Returns the only metric label value emitted for this stage.
     pub(super) const fn as_str(self) -> &'static str {
         match self {
+            Self::ScribePromotion => "scribe_promotion",
             Self::ReconcileStaging => "reconcile_staging",
             Self::ReconcileIceberg => "reconcile_iceberg",
             Self::ManifestDiscovery => "manifest_discovery",
@@ -115,6 +119,8 @@ impl ForgeMetricStage {
 /// Closed strategy inventory for authoritative Forge catalog commits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ForgeCatalogCommitStrategy {
+    /// A promotion fast-appends already-published Scribe objects unchanged.
+    ScribePromotion,
     /// A live small-file rewrite replaces current Iceberg data files.
     SmallFiles,
 }
@@ -123,6 +129,7 @@ impl ForgeCatalogCommitStrategy {
     /// Return the stable span value for this catalog commit strategy.
     pub(super) const fn as_str(self) -> &'static str {
         match self {
+            Self::ScribePromotion => "scribe_promotion",
             Self::SmallFiles => "small_files",
         }
     }
@@ -201,6 +208,8 @@ impl ForgeLeaseResult {
 /// Closed strategy labels retained by the task-duration and spill metric schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) enum ForgeTaskMetricStrategy {
+    /// Promote already-published Scribe hot objects unchanged.
+    ScribePromotion,
     /// Compact current Iceberg small files.
     SmallFiles,
     /// Rewrite fragmented Iceberg manifests.
@@ -211,7 +220,8 @@ pub(super) enum ForgeTaskMetricStrategy {
 
 impl ForgeTaskMetricStrategy {
     /// Every strategy label eagerly registered for task-duration and spill series.
-    const ALL: [Self; 3] = [
+    const ALL: [Self; 4] = [
+        Self::ScribePromotion,
         Self::SmallFiles,
         Self::ManifestRewrite,
         Self::SnapshotExpiry,
@@ -220,6 +230,7 @@ impl ForgeTaskMetricStrategy {
     /// Returns the stable task metric label for this strategy.
     pub(super) const fn as_str(self) -> &'static str {
         match self {
+            Self::ScribePromotion => "scribe_promotion",
             Self::SmallFiles => "small_files",
             Self::ManifestRewrite => "manifest_rewrite",
             Self::SnapshotExpiry => "snapshot_expiry",
@@ -238,6 +249,7 @@ impl TryFrom<ForgeTaskStrategy> for ForgeTaskMetricStrategy {
     /// unexpected durable strategy.
     fn try_from(strategy: ForgeTaskStrategy) -> Result<Self, Self::Error> {
         match strategy {
+            ForgeTaskStrategy::ScribePromotion => Ok(Self::ScribePromotion),
             ForgeTaskStrategy::SmallFiles => Ok(Self::SmallFiles),
             ForgeTaskStrategy::ManifestRewrite => Ok(Self::ManifestRewrite),
             ForgeTaskStrategy::SnapshotExpiry => Ok(Self::SnapshotExpiry),

@@ -64,9 +64,9 @@ pub(super) const fn failure_is_terminal(class: ForgeFailureClass, completed_atte
 /// Exact external effect returned by strategy dispatch.
 /// Borrowed authority and exact payload for one dispatched task attempt.
 ///
-/// The attempt's rewrite pipeline, publication fence, and cancellation token
-/// all belong to the worker's fenced execution, so dispatch borrows them
-/// together instead of threading each through the strategy match.
+/// The attempt's publication fence and cancellation token both belong to the
+/// worker's fenced execution, so dispatch borrows them together instead of
+/// threading each through the strategy match.
 struct ForgeDispatchRequest<'a> {
     /// Durable claim whose persisted plan is authoritative.
     claim: &'a ForgeTaskClaim,
@@ -1994,8 +1994,9 @@ impl ForgeWorker {
         shutdown: &CancellationToken,
     ) -> Result<(), ForgeError> {
         lease.require_fence(&self.forge.core.operator_pool).await?;
-        let resources = self.acquire_rewrite_resources(claim, attempt, binding)?;
-        let rewrite = resources.pipeline(&self.forge.core.rewrite);
+        // Held for the whole fenced attempt: dropping the lease is what returns
+        // the granted memory and scratch counters to the root governor.
+        let _resources = self.acquire_rewrite_resources(claim, attempt, binding)?;
         let table = self.forge.load_table(&binding.table_ident()).await?;
         let base_matches = Self::base_snapshot_matches(&table, claim.base_snapshot_id);
         let committed_recovery = if base_matches {
@@ -2057,7 +2058,6 @@ impl ForgeWorker {
                         lease,
                         table,
                         stop: dispatch_stop,
-                        rewrite: &rewrite,
                     })
                     .await
                 {
@@ -2316,7 +2316,6 @@ impl ForgeWorker {
             lease,
             table,
             stop,
-            rewrite,
         } = request;
         if Self::current_snapshot_matches_task(&table, claim.task_id) {
             return Ok(ForgeDispatchResult::Committed(table));
@@ -3427,8 +3426,8 @@ impl ForgeWorker {
                     detail: "Forge claim TTL exceeds u32 seconds".to_owned(),
                 },
             )?,
-            max_files: self.capacity.max_files,
-            max_bytes: self.capacity.max_bytes,
+            max_files: u32::MAX,
+            max_bytes: self.capacity.max_large_task_bytes,
             max_parallelism: self
                 .capacity
                 .max_parallelism

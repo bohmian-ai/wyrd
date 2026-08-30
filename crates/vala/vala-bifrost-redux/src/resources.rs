@@ -2479,6 +2479,61 @@ pub struct ForgeRewriteRequest {
     pub reader_permits: u16,
 }
 
+impl ForgeRewriteRequest {
+    /// Forms the exact resource demand one durable claim already committed to.
+    ///
+    /// The persisted estimates and envelope are authoritative: this conversion
+    /// only re-validates them against the worker's own ceilings and projects
+    /// the envelope's resident and scratch totals into the governor's request
+    /// shape. It never clamps, inflates, or re-derives a demand, so a worker
+    /// can never execute an attempt against capacity the planner did not
+    /// persist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::forge::ForgeError::Invariant`] when the persisted
+    /// estimates or envelope are invalid or absent, and
+    /// [`crate::forge::ForgeError::Capacity`] when the demand exceeds this
+    /// worker's validated ceilings or the planned memory cannot be represented
+    /// on this platform.
+    pub(crate) fn from_claim(
+        estimates: &vala_sql::row_types::forge_tasks::ForgeTaskEstimates,
+        capacity: crate::forge::ForgeCapacity,
+    ) -> Result<Self, crate::forge::ForgeError> {
+        use crate::forge::ForgeError;
+        estimates
+            .validate()
+            .map_err(|error| ForgeError::Invariant {
+                detail: error.to_string(),
+            })?;
+        crate::forge::ForgePlanner::new(capacity)
+            .validate_candidate_estimates(estimates.memory_bytes, estimates.spill_bytes)?;
+        let envelope = estimates.envelope.ok_or_else(|| ForgeError::Invariant {
+            detail: "Forge task estimates carry no executable envelope".to_owned(),
+        })?;
+        envelope.validate().map_err(|error| ForgeError::Invariant {
+            detail: error.to_string(),
+        })?;
+        Ok(Self {
+            envelope,
+            memory_bytes: usize::try_from(envelope.memory_bytes().map_err(|error| {
+                ForgeError::Invariant {
+                    detail: error.to_string(),
+                }
+            })?)
+            .map_err(|_| ForgeError::Capacity {
+                detail: "planned memory bytes exceed this platform".to_owned(),
+            })?,
+            scratch_bytes: envelope
+                .scratch_bytes()
+                .map_err(|error| ForgeError::Invariant {
+                    detail: error.to_string(),
+                })?,
+            reader_permits: envelope.reader_permits,
+        })
+    }
+}
+
 /// Closed result of finalizing one exact Forge rewrite lease.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForgeResourceReleaseResult {

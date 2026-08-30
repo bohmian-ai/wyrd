@@ -68,7 +68,7 @@ impl HotFileCatalog {
         pinned_operation: Option<uuid::Uuid>,
     ) -> Result<HotFileCut, SqlError> {
         let rows = sqlx::query_as::<_, HotFileRow>(
-            "SELECT id, data_tenant_id, namespace, table_name, file_path, file_ordinal, file_checksum, file_size, row_count, partition_granularity, partition_start, compacted, committed_snapshot_id, forge_publication_operation_id, node_id, writer_epoch, wal_lsn_min, wal_lsn_max, created_at FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 ORDER BY partition_granularity, partition_start, created_at, file_ordinal, id",
+            "SELECT id, data_tenant_id, namespace, table_name, file_path, file_ordinal, file_checksum, file_size, row_count, min_event_time, max_event_time, partition_granularity, partition_start, compacted, committed_snapshot_id, forge_publication_operation_id, node_id, writer_epoch, wal_lsn_min, wal_lsn_max, created_at FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 ORDER BY partition_granularity, partition_start, created_at, file_ordinal, id",
         )
         .bind(uuid::Uuid::from(conn.data_tenant_id()))
         .bind(&self.namespace)

@@ -1881,6 +1881,10 @@ impl ForgeWorker {
             });
         }
         let (expected_kind, stage) = match &task.strategy {
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::ScribePromotion) => (
+                super::scribe_promotion::SCRIBE_PROMOTION_PARAMETER_KIND,
+                ForgeMetricStage::ScribePromotion,
+            ),
             ForgeClaimStrategy::Known(ForgeTaskStrategy::SmallFiles) => {
                 ("live_rewrite", ForgeMetricStage::IcebergRewrite)
             }
@@ -1909,6 +1913,9 @@ impl ForgeWorker {
                 detail: "Forge task parameters must be an object".to_owned(),
             })?;
         let valid_parameters = match task.strategy {
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::ScribePromotion) => {
+                super::scribe_promotion::ScribePromotionPlan::from_parameters(parameters).is_ok()
+            }
             ForgeClaimStrategy::Known(
                 ForgeTaskStrategy::ManifestRewrite | ForgeTaskStrategy::SnapshotExpiry,
             ) => ForgeMaintenanceIntent::parse(&task.strategy, parameters).is_some(),
@@ -2311,7 +2318,7 @@ impl ForgeWorker {
     ) -> Result<ForgeDispatchResult, ForgeError> {
         let ForgeDispatchRequest {
             claim,
-            attempt,
+            attempt: _,
             binding,
             lease,
             table,

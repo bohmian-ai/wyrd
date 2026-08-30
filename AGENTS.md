@@ -397,9 +397,9 @@ Then run the narrowest `mise` test/check tasks that cover the touched surface:
   (`test:wyrd`, `test:skald`, `test:vala`, `test:shared`, `test:sql`,
   `test:bifrost`, `test:storage:matrix`, etc.). Whole-crate tests should use `mise` when a task exists because some
   crates need external dependencies, migrations, generated artifacts, or
-  environment variables that the mise task sets up. Use raw `cargo test` only
-  when no relevant mise task exists or when narrowing to a single pure unit
-  test that does not need repository setup.
+  environment variables that the mise task sets up. When no relevant task
+  exists or when narrowing to one pure unit test that needs no repository
+  setup, invoke `cargo nextest` through `mise exec` as specified below.
 - Python package change: run `mise run py:test:unit`; add
   `mise run py:typecheck` when stubs, exports, or public Python typing changed.
 - Contract, schema, OpenAPI, or stub generation change: run
@@ -420,6 +420,31 @@ run it.
 Real cloud storage integration tests (`test:storage:*:cloud`) run against live
 infrastructure separately.
 
+### Rust Test Runner Standard
+
+`cargo-nextest` is the only Rust test runner for this repository. Its
+process-per-test isolation is a correctness requirement for process-global
+telemetry and shared test fixtures, not an optional speed improvement. Do not
+run repository tests with `cargo test`.
+
+- Invoke every Rust test through `mise`: use the owning `mise run test:...`
+  lane when one exists; otherwise use `mise exec -- cargo nextest run`.
+- Include `--locked` on direct `cargo nextest` invocations.
+- Run a whole integration or journey binary by Cargo target, for example
+  `--test <target>`. Do not use an unverified positional test-name filter;
+  nextest can exit successfully after selecting zero tests.
+- Select one test with an exact nextest filter expression. Prefer
+  `-E 'test(=fully::qualified::test_name)'`; when selecting by leaf name, use
+  the anchored form `-E 'test(/(^|::)<test_name>$/)'` and confirm discovery
+  with `mise exec -- cargo nextest list` before accepting the result.
+- Use repository profiles and ignored-test policy from `.config/nextest.toml`
+  and the owning `mise` lane. Tier-1 journeys use `-P journey
+  --run-ignored=all`; do not invent concurrency or ignored-test flags outside
+  the canonical lane.
+- Do not add `--all-features` by habit. Use the default or exact feature union
+  owned by the affected lane, consistent with §4 and the checked-in `mise`
+  task.
+
 ### Quick Iteration
 
 While working on a specific area:
@@ -428,8 +453,8 @@ While working on a specific area:
 ```bash
 # Rust only
 # Whole-crate tests should use a crate-specific mise task when one exists.
-# Raw cargo is acceptable for a narrow pure unit test that needs no repo setup.
-mise exec -- cargo test --locked -p <crate> <test_name> -- --nocapture --test-threads=1
+# A narrow pure unit test uses an exact nextest filter and needs no repo setup.
+mise exec -- cargo nextest run --locked -p <crate> -E 'test(=fully::qualified::test_name)'
 mise run test:sql      # runs all SQL-backed integration tests across wyrd-sql, wyrd-dev-fixtures, and vala-sql
 mise run test:unit     # all Rust tests including SQL and storage emulators
 
@@ -559,6 +584,20 @@ task packets, or documentation.
   `wyrd-plan` or the user.
 
 ## 15. Implementation Rules
+
+### Task-related issue ownership
+
+- Never investigate, reconstruct, or report whether an encountered issue is
+  pre-existing, inherited, baseline, or introduced by the current work. Do not
+  revert changes, restore earlier revisions, compare against a clean checkout,
+  or otherwise spend execution time establishing issue provenance.
+- If an issue is related to the active task's owned work, affected seams,
+  required tests, or required verification, or if it blocks any required
+  evidence, the active task owns it. Fix it and verify the fix before
+  completion, regardless of when or how it originated. Classify only task
+  relevance, never provenance.
+- Leave an encountered issue untouched only when it is outside the active
+  task's scope and does not block required proof.
 
 - `wyrd-spec` is foundational but it not a dumping grounds for all contracts. If it's not spec-related, it doesn't go in `wyrd-spec`. Find another place for it.
 - `wyrd-sql` is the durable Postgres layer.

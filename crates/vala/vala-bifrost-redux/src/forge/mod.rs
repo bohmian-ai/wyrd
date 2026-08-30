@@ -27,6 +27,7 @@ mod planner;
 mod planning_scheduler;
 pub(crate) mod rewrite;
 mod scheduler;
+pub(crate) mod scribe_promotion;
 mod worker;
 
 pub use clock::ForgeClock;

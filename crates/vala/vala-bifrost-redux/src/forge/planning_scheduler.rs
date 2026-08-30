@@ -24,8 +24,8 @@ use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
 use super::Forge;
-use super::error::ForgeError;
 use super::compact::ForgeGroupKey;
+use super::error::ForgeError;
 use super::identity::task_table_binding;
 use super::maintenance::{
     ManifestRewriteCandidate, manifest_rewrite_is_due, select_bounded_manifest_rewrite_paths,
@@ -749,18 +749,108 @@ impl<'forge> ForgeScheduler<'forge> {
             maintenance_candidate.is_some(),
             snapshot_expiry_due,
         );
-        if let Some(candidate) = maintenance_candidate {
-            candidates.insert(0, candidate);
-        }
+        let promotion_candidate = self.promotion_candidate(&binding).await?;
+        let promotion_debt_files = promotion_candidate
+            .as_ref()
+            .map_or(0, |candidate| candidate.inputs.len() as u64);
+        let promotion_debt_bytes = promotion_candidate
+            .as_ref()
+            .map_or(0, |candidate| candidate.bytes);
+        // Promotion precedes every other demand for the same table: an object
+        // Scribe already published must reach the catalog before any pass that
+        // reasons about the catalog's contents runs against it.
+        let candidates = promotion_candidate
+            .into_iter()
+            .chain(maintenance_candidate)
+            .collect::<Vec<_>>();
         Ok((
             ForgeTableSnapshot {
-                snapshot_id: discovered.base_snapshot_id(),
+                snapshot_id: table
+                    .metadata()
+                    .current_snapshot()
+                    .map_or(0, |snapshot| snapshot.snapshot_id()),
                 candidates,
             },
-            compaction_debt_files,
-            compaction_debt_bytes,
+            promotion_debt_files,
+            promotion_debt_bytes,
             demand_deferred,
         ))
+    }
+
+    /// Builds the exact promotion candidate one table currently owes, if any.
+    ///
+    /// The candidate is derived entirely from durable Scribe evidence, so it is
+    /// deterministic across schedulers: the same eligible rows in the same
+    /// production order produce the same inputs, the same parameters, and the
+    /// same promoted-file-set digest, which the idempotent enqueue then
+    /// collapses into one durable task.
+    ///
+    /// Promotion never opens the objects it publishes, so its admission working
+    /// set is the fixed metadata cost of one commit rather than the promoted
+    /// byte total; the byte total is still carried as the candidate's estimate
+    /// so telemetry and durable estimates report the real published volume.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Sql`] when the tenant-scoped demand read fails,
+    /// [`ForgeError::Invariant`] when a row's promotion evidence is absent or
+    /// contradictory, and [`ForgeError::Capacity`] when the fixed promotion
+    /// envelope does not fit this scheduler's ceilings.
+    async fn promotion_candidate(
+        &self,
+        binding: &crate::catalog::TenantTableBinding,
+    ) -> Result<Option<ForgePlanCandidate>, ForgeError> {
+        let mut conn = self
+            .forge
+            .core
+            .vala
+            .tenant_conn(binding.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let demand = super::scribe_promotion::read_promotion_demand(
+            &mut conn,
+            binding,
+            super::scribe_promotion::PROMOTION_BRANCH,
+        )
+        .await?;
+        conn.commit().await.map_err(ForgeError::Sql)?;
+        let Some(super::scribe_promotion::ScribePromotionDemand { plan, total_bytes }) = demand
+        else {
+            return Ok(None);
+        };
+        let mut inputs = plan
+            .files()
+            .iter()
+            .map(|file| file.path().as_str().to_owned())
+            .collect::<Vec<_>>();
+        inputs.sort_unstable();
+        let bytes = total_bytes;
+        let working_set_bytes = super::rewrite::REWRITE_WORKING_SET_FLOOR_BYTES;
+        let envelope = super::planner::ForgeEnvelopeSizer::size(
+            working_set_bytes,
+            inputs.len(),
+            1,
+            self.capacity,
+        )?;
+        Ok(Some(ForgePlanCandidate {
+            strategy: ForgeTaskStrategy::ScribePromotion,
+            input_bytes: vec![1; inputs.len()],
+            inputs,
+            bytes: bytes.max(1),
+            working_set_bytes,
+            parallelism: envelope.reader_permits,
+            memory_bytes: envelope
+                .memory_bytes()
+                .map_err(|error| ForgeError::Invariant {
+                    detail: error.to_string(),
+                })?,
+            spill_bytes: envelope
+                .scratch_bytes()
+                .map_err(|error| ForgeError::Invariant {
+                    detail: error.to_string(),
+                })?,
+            parameters: plan.to_parameters(),
+        }))
     }
 
     /// Evaluates the independent snapshot-expiry trigger for one table.
@@ -929,6 +1019,8 @@ impl<'forge> ForgeScheduler<'forge> {
             &candidates,
             self.forge.core.config.manifest_rewrite_target_size_bytes,
             self.forge.core.config.manifest_rewrite_min_count,
+            self.forge.core.config.max_maintenance_items_per_tick,
+            self.forge.core.config.max_maintenance_bytes_per_tick,
         )
     }
 
@@ -1055,6 +1147,7 @@ impl<'forge> ForgeScheduler<'forge> {
             inputs,
             input_bytes,
             bytes: estimate,
+            working_set_bytes: estimate,
             parallelism: envelope.reader_permits,
             memory_bytes: envelope
                 .memory_bytes()

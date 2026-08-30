@@ -186,16 +186,15 @@ impl ForgeAttemptResources {
             lease.memory_pool(),
             Arc::clone(&peak_memory_bytes),
         ));
-        let runtime =
-            ForgeRewriteRuntime::new_attempt(
-                Arc::clone(&pool),
-                pod_spill_root,
-                task_id,
-                attempt_id,
-                ForgeAttemptEnvelope {
-                    spill_limit: lease.scratch_bytes(),
-                },
-            )?;
+        let runtime = ForgeRewriteRuntime::new_attempt(
+            Arc::clone(&pool),
+            pod_spill_root,
+            task_id,
+            attempt_id,
+            ForgeAttemptEnvelope {
+                spill_limit: lease.scratch_bytes(),
+            },
+        )?;
         if !runtime.uses_memory_pool(&pool) {
             return Err(ForgeError::Invariant {
                 detail: "Forge rewrite runtime did not retain its operation lease pool".to_owned(),
@@ -333,8 +332,7 @@ impl ForgeRewriteRuntime {
         } = envelope;
         if spill_limit_bytes == 0 {
             return Err(ForgeError::InvalidConfig {
-                detail: "Forge scratch envelope must contain a positive sort-spill term"
-                    .to_owned(),
+                detail: "Forge scratch envelope must contain a positive sort-spill term".to_owned(),
             });
         }
         std::fs::create_dir_all(pod_spill_root).map_err(|error| ForgeError::ScratchIo {

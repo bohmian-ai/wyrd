@@ -81,6 +81,15 @@ pub struct ForgePlanCandidate {
     pub input_bytes: Vec<u64>,
     /// Estimated total input bytes.
     pub bytes: u64,
+    /// Bytes the executing attempt must actually hold resident.
+    ///
+    /// This is the admission quantity, and it is not always the input total.
+    /// A rewrite decodes every input, so its working set is its input bytes; a
+    /// promotion appends already-sealed objects unchanged and never opens
+    /// them, so its working set is the fixed metadata cost of the commit. The
+    /// capacity classification and the executable envelope are both derived
+    /// from this field so neither can charge a route for bytes it never holds.
+    pub working_set_bytes: u64,
     /// Planned bounded parallelism.
     pub parallelism: u16,
     /// Estimated peak memory.
@@ -327,7 +336,7 @@ impl ForgePlanner {
     ///
     /// # Errors
     /// Returns [`ForgeError::Invariant`] when the input count exceeds `u32`,
-    /// any estimate is zero, the per-input byte terms do not align with the
+    /// any estimate or working set is zero, the per-input byte terms do not align with the
     /// inputs, the inputs are not strictly sorted, or the payload cannot be
     /// canonicalized; returns [`ForgeError::Capacity`] when the envelope for the
     /// candidate cannot be sized within this planner's ceilings.
@@ -341,6 +350,7 @@ impl ForgePlanner {
         })?;
         if files == 0
             || candidate.bytes == 0
+            || candidate.working_set_bytes == 0
             || candidate.parallelism == 0
             || candidate.memory_bytes == 0
             || candidate.spill_bytes == 0
@@ -352,7 +362,7 @@ impl ForgePlanner {
                     .to_owned(),
             });
         }
-        let capacity_outcome = if candidate.bytes <= self.capacity.max_large_task_bytes
+        let capacity_outcome = if candidate.working_set_bytes <= self.capacity.max_large_task_bytes
             && candidate.parallelism <= self.capacity.max_parallelism
             && candidate.memory_bytes <= self.capacity.max_memory_bytes
             && candidate.spill_bytes <= self.capacity.max_spill_bytes
@@ -388,7 +398,7 @@ impl ForgePlanner {
                 spill_bytes: candidate.spill_bytes,
                 large_ceiling_bytes: self.capacity.max_large_task_bytes,
                 envelope: Some(ForgeEnvelopeSizer::size(
-                    candidate.bytes,
+                    candidate.working_set_bytes,
                     candidate.inputs.len(),
                     usize::from(candidate.parallelism),
                     self.capacity,

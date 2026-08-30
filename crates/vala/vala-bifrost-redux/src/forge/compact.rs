@@ -7,40 +7,19 @@
 //! Iceberg commits observable; the next Forge tick reconciles that state before
 //! selecting more files.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::{Array, StringArray};
-use arrow::compute::cast;
-use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use futures_util::future::ready;
 use futures_util::stream::{self, BoxStream};
-use iceberg::spec::DataFile;
-use iceberg::table::Table;
-use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use opendal::{Buffer, Entry, Metadata};
-use sqlx::{Row, postgres::PgRow};
-use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
-use vala_sql::queries::forge_operations::ForgeOperations;
-use vala_sql::row_types::forge_operations::{ForgeOperationFamily, ForgeOperationTransition};
-use vala_sql::row_types::forge_tasks::ForgeTaskStrategy;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{
-    AuditDecision, AuditDetail, AuditEvent, AuditResult, AuthMethod, StoragePath,
-};
+use wyrd_spec::vala::api::{AuditDecision, AuditDetail, AuditEvent, AuditResult, AuthMethod};
 
 use super::Forge;
 use super::error::ForgeError;
-use super::lease::ForgeLease;
-use super::metrics::ForgeTelemetry;
-use super::planner::ForgePlanCandidate;
-use crate::catalog::TenantTableBinding;
-use crate::catalog::layout::TimePartition;
 
 const DEFAULT_MAX_CONCURRENT_READS: usize = 4;
 const DEFAULT_SPILL_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -61,6 +40,14 @@ const DEFAULT_MAINTENANCE_TRIGGER_SNAPSHOT_COUNT: usize = 32;
 /// commit exists past `retain_last`. Bounds retained-history age for a
 /// low-commit table that never reaches the count trigger.
 const DEFAULT_MAINTENANCE_TRIGGER_INTERVAL: Duration = Duration::from_hours(1);
+/// Default cap on metadata records one maintenance pass visits. Retained from
+/// the per-tick bound that previously governed every Forge pass, so a single
+/// manifest rewrite or cleanup traversal stays bounded on a fragmented table.
+const DEFAULT_MAX_MAINTENANCE_ITEMS_PER_TICK: usize = 1_024;
+/// Default cap on declared metadata bytes one maintenance pass visits. Sized
+/// for manifest and path bytes, not table data, and retained from the same
+/// per-tick bound as [`DEFAULT_MAX_MAINTENANCE_ITEMS_PER_TICK`].
+const DEFAULT_MAX_MAINTENANCE_BYTES_PER_TICK: u64 = 1024 * 1024 * 1024;
 /// Default cap on listing pages walked by one orphan-GC candidate scan. Sized
 /// well above an ordinary table's orphan-prefix page count so steady-state runs
 /// complete in one pass, while still bounding a pathological prefix so one run
@@ -118,6 +105,18 @@ pub struct ForgeConfig {
     pub orphan_gc_ttl: Duration,
     /// Maximum orphan candidates considered in one GC batch.
     pub max_gc_candidates_per_batch: usize,
+    /// Maximum manifests or metadata records one maintenance pass may visit.
+    ///
+    /// Bounds both the manifest-rewrite bin admitted by one task and the
+    /// entries the catalog reads while rewriting it, so a fragmented table
+    /// cannot turn a single maintenance pass into unbounded metadata work.
+    pub max_maintenance_items_per_tick: usize,
+    /// Maximum declared metadata bytes one maintenance pass may visit.
+    ///
+    /// Applies to the manifest-rewrite bin, the catalog's own rewrite
+    /// traversal, and the post-expiry cleanup traversal, which all walk
+    /// declared manifest and path bytes rather than table data.
+    pub max_maintenance_bytes_per_tick: u64,
     /// Maximum concurrent staged-object reads during rewrite.
     pub max_concurrent_reads: usize,
     /// `DataFusion` spill ceiling for Forge rewrites.
@@ -173,6 +172,8 @@ impl Default for ForgeConfig {
             manifest_rewrite_min_count: DEFAULT_MANIFEST_REWRITE_MIN_COUNT,
             orphan_gc_ttl: Duration::from_hours(24),
             max_gc_candidates_per_batch: 256,
+            max_maintenance_items_per_tick: DEFAULT_MAX_MAINTENANCE_ITEMS_PER_TICK,
+            max_maintenance_bytes_per_tick: DEFAULT_MAX_MAINTENANCE_BYTES_PER_TICK,
             max_concurrent_reads: DEFAULT_MAX_CONCURRENT_READS,
             spill_limit_bytes: DEFAULT_SPILL_LIMIT_BYTES,
             max_hints_per_wake: 256,
@@ -212,6 +213,8 @@ impl ForgeConfig {
             || self.manifest_rewrite_min_count == 0
             || self.orphan_gc_ttl.is_zero()
             || self.max_gc_candidates_per_batch == 0
+            || self.max_maintenance_items_per_tick == 0
+            || self.max_maintenance_bytes_per_tick == 0
             || self.max_concurrent_reads == 0
             || self.spill_limit_bytes == 0
             || self.max_hints_per_wake == 0
@@ -607,7 +610,6 @@ impl Forge {
         })?
         .map_err(ForgeError::Catalog)
     }
-
 }
 
 /// Construct system-owned metadata for one Forge transition event.

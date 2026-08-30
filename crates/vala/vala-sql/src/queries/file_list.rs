@@ -24,6 +24,26 @@ pub struct HotFileCut {
     pub ambiguous_publication: bool,
 }
 
+/// One hot object that is eligible for unchanged Iceberg promotion.
+///
+/// The projection is deliberately narrow: promotion appends the writer's own
+/// `DataFile` unchanged, so it needs the durable identity, the canonical object
+/// path, the checksum it revalidates against, and the writer's promotion
+/// evidence — and nothing that would tempt a promoter to re-derive geometry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromotableHotFileRow {
+    /// Durable file-list identity carried into the promoted-file-set digest.
+    pub id: uuid::Uuid,
+    /// Canonical object-store path of the already-published hot object.
+    pub file_path: String,
+    /// Lowercase object checksum the promoter revalidates before appending.
+    pub file_checksum: String,
+    /// Encoded object size, carried so planning can report promoted volume.
+    pub file_size: i64,
+    /// The writer's `ScribePublishedHotFileV1` evidence for this exact object.
+    pub promotion_record: serde_json::Value,
+}
+
 /// Classifies one row against the pinned publication cut.
 fn is_unresolved_hot(
     row: &HotFileRow,
@@ -90,6 +110,117 @@ impl HotFileCatalog {
             sealed_manifest: rows,
             ambiguous_publication,
         })
+    }
+
+    /// Reads the exact hot rows this table owes an unchanged Iceberg promotion.
+    ///
+    /// Eligibility is the never-published state: not yet compacted, no
+    /// committed snapshot, and no Forge publication operation. Ordering is the
+    /// durable production order (`created_at`, then the writer's file ordinal,
+    /// then identity), so two schedulers observing the same manifest derive the
+    /// same ordered group and therefore the same promoted-file-set digest.
+    ///
+    /// The read fails closed rather than dropping a row: a hot object with no
+    /// durable checksum cannot be revalidated before it is appended unchanged,
+    /// so its presence invalidates the whole group instead of silently
+    /// shrinking it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::Query`] when the RLS-bound read fails and
+    /// [`SqlError::InvariantViolation`] when an eligible row carries no
+    /// durable object checksum.
+    pub async fn list_promotable(
+        &self,
+        conn: &mut TenantConn<'_>,
+    ) -> Result<Vec<PromotableHotFileRow>, SqlError> {
+        let rows: Vec<(uuid::Uuid, String, Option<String>, i64, serde_json::Value)> =
+            sqlx::query_as(
+                r#"
+            SELECT id, file_path, file_checksum, file_size, promotion_record
+              FROM vala.file_list
+             WHERE data_tenant_id = wyrd.current_tenant()
+               AND namespace = $1
+               AND table_name = $2
+               AND NOT compacted
+               AND committed_snapshot_id IS NULL
+               AND forge_publication_operation_id IS NULL
+             ORDER BY created_at, file_ordinal, id
+            "#,
+            )
+            .bind(&self.namespace)
+            .bind(&self.table_name)
+            .fetch_all(&mut **conn.transaction())
+            .await
+            .map_err(SqlError::from)?;
+        rows.into_iter()
+            .map(
+                |(id, file_path, file_checksum, file_size, promotion_record)| {
+                    let file_checksum =
+                        file_checksum.ok_or_else(|| SqlError::InvariantViolation {
+                            detail: format!(
+                                "promotable hot object {file_path} carries no durable checksum"
+                            ),
+                        })?;
+                    Ok(PromotableHotFileRow {
+                        id,
+                        file_path,
+                        file_checksum,
+                        file_size,
+                        promotion_record,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    /// Records that one committed promotion snapshot now represents these rows.
+    ///
+    /// The update is the SQL half of the catalog-to-SQL window: Oracle stops
+    /// scanning a row as hot only once it carries both the committed snapshot
+    /// and the Forge publication operation that placed it there. Replaying the
+    /// same settlement matches the already-settled rows and reports the same
+    /// count, so a takeover that repeats a settled promotion neither
+    /// double-writes nor reports a gap. Rows already settled by a *different*
+    /// operation are not matched and are therefore excluded from the count.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::Query`] when the RLS-bound update fails and
+    /// [`SqlError::InvariantViolation`] when the affected-row count exceeds the
+    /// durable identifier domain.
+    pub async fn settle_promoted(
+        &self,
+        conn: &mut TenantConn<'_>,
+        file_ids: &[uuid::Uuid],
+        committed_snapshot_id: i64,
+        operation_id: uuid::Uuid,
+    ) -> Result<u64, SqlError> {
+        sqlx::query(
+            r#"
+            UPDATE vala.file_list
+               SET compacted = true,
+                   committed_snapshot_id = $4,
+                   forge_publication_operation_id = $5
+             WHERE data_tenant_id = wyrd.current_tenant()
+               AND namespace = $1
+               AND table_name = $2
+               AND id = ANY($3)
+               AND (
+                     (committed_snapshot_id IS NULL AND forge_publication_operation_id IS NULL)
+                  OR (committed_snapshot_id = $4 AND forge_publication_operation_id = $5)
+               )
+            "#,
+        )
+        .bind(&self.namespace)
+        .bind(&self.table_name)
+        .bind(file_ids)
+        .bind(committed_snapshot_id)
+        .bind(operation_id)
+        .execute(&mut **conn.transaction())
+        .await
+        .map(|done| done.rows_affected())
+        .map_err(SqlError::from)
     }
 }
 
@@ -294,5 +425,135 @@ mod pg_tests {
         assert_eq!(row.max_event_time, Some(upper));
         assert_eq!(row.row_count, 128);
         assert!(row.row_count >= 0, "durable row count is nonnegative");
+    }
+
+    /// Promotion demand is exactly the hot rows that carry complete evidence and
+    /// have never been published, in deterministic promotion order, and the
+    /// settlement that follows a committed snapshot is idempotent.
+    ///
+    /// A row missing its object checksum cannot be promoted unchanged — the
+    /// promoter would have no durable value to revalidate the object against —
+    /// so the read fails closed rather than returning a partial group.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the PostgreSQL fixture, inserts, reads, or settlement fail.
+    #[tokio::test]
+    async fn promotable_hot_files_are_exact_and_settlement_is_idempotent() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let pool = fixture.superuser_pool().await.expect("superuser pool");
+        let tenant = fixture.data_tenant_id();
+        let start = chrono::DateTime::from_timestamp_micros(1_787_493_600_000_000)
+            .expect("fixture partition start is representable");
+        let mut ids = Vec::new();
+        for (ordinal, checksum, compacted, snapshot, operation) in [
+            (0_i16, "a".repeat(64), false, None, None),
+            (1, "b".repeat(64), false, None, None),
+            (
+                2,
+                "c".repeat(64),
+                true,
+                Some(41_i64),
+                Some(uuid::Uuid::now_v7()),
+            ),
+            (3, "d".repeat(64), false, Some(42), None),
+            (4, "e".repeat(64), false, None, Some(uuid::Uuid::now_v7())),
+        ] {
+            let id = uuid::Uuid::now_v7();
+            ids.push(id);
+            sqlx::query(
+                r#"
+                INSERT INTO vala.file_list (
+                    id, data_tenant_id, namespace, table_name, file_path, file_ordinal,
+                    file_checksum, file_size, row_count, min_event_time, max_event_time,
+                    partition_granularity, partition_start, compacted, committed_snapshot_id,
+                    forge_publication_operation_id, node_id, writer_epoch, wal_lsn_min,
+                    wal_lsn_max, promotion_record
+                ) VALUES (
+                    $1, $2, 'vala.bifrost', 'events', $3, $4,
+                    $5, 16, 4, $6, $6,
+                    'hour', $6, $7, $8,
+                    $9, $10, 1, $4, $4,
+                    '{"version": 1}'::jsonb
+                )
+                "#,
+            )
+            .bind(id)
+            .bind(tenant.as_uuid())
+            .bind(format!("events/{ordinal}.parquet"))
+            .bind(i64::from(ordinal))
+            .bind(&checksum)
+            .bind(start)
+            .bind(compacted)
+            .bind(snapshot)
+            .bind(operation)
+            .bind(uuid::Uuid::now_v7())
+            .execute(&pool)
+            .await
+            .expect("insert manifest row");
+        }
+
+        let catalog = HotFileCatalog::new("vala.bifrost", "events");
+        let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("tenant connection");
+        let promotable = catalog
+            .list_promotable(&mut conn)
+            .await
+            .expect("promotion demand reads");
+        assert_eq!(
+            promotable.iter().map(|row| row.id).collect::<Vec<_>>(),
+            ids[..2].to_vec(),
+            "only never-published rows with complete evidence are promotable"
+        );
+        assert_eq!(promotable[0].file_path, "events/0.parquet");
+        assert_eq!(promotable[0].file_checksum, "a".repeat(64));
+        assert_eq!(
+            promotable[0].promotion_record,
+            serde_json::json!({"version": 1})
+        );
+
+        let operation = uuid::Uuid::now_v7();
+        let settled = catalog
+            .settle_promoted(&mut conn, &ids[..2], 77, operation)
+            .await
+            .expect("first settlement applies");
+        assert_eq!(settled, 2, "both promoted rows settle exactly once");
+        let replayed = catalog
+            .settle_promoted(&mut conn, &ids[..2], 77, operation)
+            .await
+            .expect("replayed settlement is accepted");
+        assert_eq!(replayed, 2, "replaying the same settlement is idempotent");
+        assert!(
+            catalog
+                .list_promotable(&mut conn)
+                .await
+                .expect("post-settlement demand reads")
+                .is_empty(),
+            "settled rows leave no promotion demand"
+        );
+
+        sqlx::query("UPDATE vala.file_list SET file_checksum = NULL WHERE id = $1")
+            .bind(ids[0])
+            .execute(&pool)
+            .await
+            .expect("clear the durable checksum");
+        sqlx::query(
+            "UPDATE vala.file_list SET compacted = false, committed_snapshot_id = NULL, forge_publication_operation_id = NULL WHERE id = $1",
+        )
+        .bind(ids[0])
+        .execute(&pool)
+        .await
+        .expect("restore promotion eligibility");
+        let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("second tenant connection");
+        assert!(
+            matches!(
+                catalog.list_promotable(&mut conn).await,
+                Err(crate::SqlError::InvariantViolation { .. })
+            ),
+            "a hot row without its durable checksum fails the read closed"
+        );
     }
 }

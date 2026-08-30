@@ -12,7 +12,6 @@ pub mod table_ref;
 pub mod tenant_table;
 mod wire;
 
-pub(crate) use bifrost_catalog::schema_shape_matches;
 pub use bifrost_catalog::{
     BifrostCatalog, CreateTableRequest, PinnedIcebergFile, PinnedSealedTable, TableUid,
 };

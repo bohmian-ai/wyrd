@@ -16,6 +16,9 @@
 //! never metric labels. Scrubbed identity belongs on the caller's own span.
 
 use std::sync::Mutex;
+use std::time::Duration;
+
+use num_traits::ToPrimitive as _;
 
 /// What the metadata cache did with one lookup.
 ///
@@ -291,6 +294,115 @@ pub(crate) struct BifrostStorageTelemetry {
 }
 
 impl BifrostStorageTelemetry {
+    /// Publishes one cache decision as a counter, totals, and a trace event.
+    ///
+    /// A poisoned totals lock never fails the decision being observed: the
+    /// metric is still emitted and only the reconcilable totals stop advancing,
+    /// because losing observation is strictly better than refusing admitted
+    /// work.
+    pub(crate) fn record_cache_effect(&self, effect: CacheEffect, reason: CacheEffectReason) {
+        metrics::counter!(
+            "bifrost_storage_metadata_cache_effects_total",
+            "effect" => effect.as_str(),
+            "reason" => reason.as_str(),
+        )
+        .increment(1);
+        let snapshot = self.mutate(|totals| {
+            totals.effects[effect.index()] = totals.effects[effect.index()].saturating_add(1);
+            totals.reasons[reason.index()] = totals.reasons[reason.index()].saturating_add(1);
+        });
+        tracing::debug!(
+            effect = effect.as_str(),
+            reason = reason.as_str(),
+            resident_entries = snapshot.resident_entries(),
+            resident_bytes = snapshot.resident_bytes(),
+            inflight_loads = snapshot.inflight_loads(),
+            waiters = snapshot.waiters(),
+            lifecycle = snapshot.lifecycle().as_str(),
+            "Bifrost storage metadata lifecycle"
+        );
+    }
+
+    /// Records one owning caller taking a metadata load.
+    ///
+    /// Raises the in-flight gauge until [`Self::record_load_terminal`] settles
+    /// it, so starts and terminals reconcile exactly on a drained owner.
+    pub(crate) fn record_load_start(&self) {
+        let snapshot = self.mutate(|totals| {
+            totals.load_starts = totals.load_starts.saturating_add(1);
+            totals.inflight_loads = totals.inflight_loads.saturating_add(1);
+        });
+        Self::publish_gauges(&snapshot);
+    }
+
+    /// Records one terminal metadata load with its outcome and duration.
+    pub(crate) fn record_load_terminal(&self, outcome: MetadataLoadOutcome, elapsed: Duration) {
+        metrics::counter!(
+            "bifrost_storage_metadata_cache_loads_total",
+            "outcome" => outcome.as_str(),
+        )
+        .increment(1);
+        metrics::histogram!(
+            "bifrost_storage_metadata_load_seconds",
+            "outcome" => outcome.as_str(),
+        )
+        .record(elapsed.as_secs_f64());
+        let snapshot = self.mutate(|totals| {
+            totals.load_terminals[outcome.index()] =
+                totals.load_terminals[outcome.index()].saturating_add(1);
+            totals.inflight_loads = totals.inflight_loads.saturating_sub(1);
+        });
+        Self::publish_gauges(&snapshot);
+    }
+
+    /// Records one joined waiter attaching to an in-flight load.
+    pub(crate) fn record_waiter_joined(&self) {
+        let snapshot = self.mutate(|totals| {
+            totals.waiters = totals.waiters.saturating_add(1);
+        });
+        Self::publish_gauges(&snapshot);
+    }
+
+    /// Records one joined waiter leaving, whether settled or cancelled.
+    pub(crate) fn record_waiter_settled(&self, outcome: MetadataLoadOutcome, elapsed: Duration) {
+        metrics::histogram!(
+            "bifrost_storage_metadata_wait_seconds",
+            "outcome" => outcome.as_str(),
+        )
+        .record(elapsed.as_secs_f64());
+        let snapshot = self.mutate(|totals| {
+            totals.waiters = totals.waiters.saturating_sub(1);
+        });
+        Self::publish_gauges(&snapshot);
+    }
+
+    /// Republishes the resident-entry and resident-byte gauges.
+    ///
+    /// Called by the cache after every retention change so the gauges describe
+    /// the state the cache actually holds rather than a value derived by
+    /// counting decisions.
+    pub(crate) fn record_resident(&self, entries: u64, bytes: u64) {
+        let snapshot = self.mutate(|totals| {
+            totals.resident_entries = entries;
+            totals.resident_bytes = bytes;
+        });
+        Self::publish_gauges(&snapshot);
+    }
+
+    /// Records one lifecycle transition of the storage owner.
+    pub(crate) fn record_lifecycle(&self, lifecycle: StorageLifecycle) {
+        let snapshot = self.mutate(|totals| {
+            totals.lifecycle = lifecycle;
+        });
+        tracing::debug!(
+            lifecycle = lifecycle.as_str(),
+            resident_entries = snapshot.resident_entries(),
+            inflight_loads = snapshot.inflight_loads(),
+            waiters = snapshot.waiters(),
+            "Bifrost storage metadata lifecycle"
+        );
+    }
+
     /// Returns the retained totals and live state.
     ///
     /// A poisoned totals lock yields the default view rather than unwinding: a
@@ -300,4 +412,38 @@ impl BifrostStorageTelemetry {
             .lock()
             .map_or_else(|_| MetadataCacheSnapshot::default(), |totals| *totals)
     }
+
+    /// Applies one mutation to the retained totals and returns the new view.
+    ///
+    /// The mutation and the read happen under one acquisition so a published
+    /// gauge describes one consistent moment rather than two. A poisoned lock
+    /// yields the default view, which stops the totals advancing without
+    /// failing the transition being observed.
+    fn mutate(&self, apply: impl FnOnce(&mut MetadataCacheSnapshot)) -> MetadataCacheSnapshot {
+        let Ok(mut totals) = self.totals.lock() else {
+            return MetadataCacheSnapshot::default();
+        };
+        apply(&mut totals);
+        *totals
+    }
+
+    /// Publishes every live gauge from one consistent retained view.
+    fn publish_gauges(snapshot: &MetadataCacheSnapshot) {
+        metrics::gauge!("bifrost_storage_metadata_cache_resident_entries")
+            .set(gauge_value(snapshot.resident_entries()));
+        metrics::gauge!("bifrost_storage_metadata_cache_resident_bytes")
+            .set(gauge_value(snapshot.resident_bytes()));
+        metrics::gauge!("bifrost_storage_metadata_cache_inflight_loads")
+            .set(gauge_value(snapshot.inflight_loads()));
+        metrics::gauge!("bifrost_storage_metadata_cache_waiters")
+            .set(gauge_value(snapshot.waiters()));
+    }
+}
+
+/// Projects one retained count into a gauge value without silent truncation.
+///
+/// A count beyond `f64`'s exact integer range saturates to `f64::MAX` so an
+/// impossible value is visibly wrong rather than quietly rounded.
+fn gauge_value(value: u64) -> f64 {
+    value.to_f64().unwrap_or(f64::MAX)
 }

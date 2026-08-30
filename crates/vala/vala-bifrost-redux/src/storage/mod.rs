@@ -99,6 +99,8 @@ impl BifrostStorage {
     {
         let size = key.size_bytes();
         let Some(cache) = self.metadata_cache.as_ref() else {
+            self.telemetry
+                .record_cache_effect(CacheEffect::Bypass, CacheEffectReason::Disabled);
             return Self::decode_metadata(reader, size).await.map_err(Arc::new);
         };
         cache

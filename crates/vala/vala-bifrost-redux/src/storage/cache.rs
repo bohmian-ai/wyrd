@@ -17,16 +17,26 @@
 //! predicates, residual filtering, and the tenant tripwire *after*. A warm
 //! entry is a decode that did not happen, never a check that did not happen.
 
+//! Concurrency is single-flight: the first caller for a key owns one retained
+//! loader task and every later caller joins it, so N concurrent openings of one
+//! object cost one decode. The state mutex is never held across `.await`.
+
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use futures_util::future::BoxFuture;
+use lru::LruCache;
 use parquet::file::metadata::ParquetMetaData;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use wyrd_spec::ids::DataTenantId;
 
 use crate::storage::error::BifrostStorageError;
-use crate::storage::telemetry::{BifrostStorageTelemetry, StorageLifecycle};
+use crate::storage::telemetry::{
+    BifrostStorageTelemetry, CacheEffect, CacheEffectReason, MetadataLoadOutcome, StorageLifecycle,
+};
 
 /// One cloneable terminal load result publishable to every joined waiter.
 ///
@@ -110,14 +120,67 @@ impl HotMetadataKey {
     }
 }
 
+/// One retained successful decode and the bytes it is charged.
+#[derive(Debug)]
+struct CachedMetadata {
+    /// Immutable decoded metadata shared with every caller.
+    metadata: Arc<ParquetMetaData>,
+    /// Charged weight: decoded footprint plus the key's owned bytes.
+    weight: u64,
+}
+
+/// One load with an owner and zero or more joined waiters.
+#[derive(Debug)]
+struct InFlight {
+    /// Publishes the single terminal result to the owner and every waiter.
+    ///
+    /// `watch` rather than a broadcast channel because the value is retained:
+    /// a waiter that subscribes after the publish still observes the terminal
+    /// result instead of missing it or observing lag.
+    publisher: watch::Sender<Option<MetadataLoadResult>>,
+    /// Cancels this loader's own work without affecting any other key.
+    cancel: CancellationToken,
+    /// Retained loader task, joined or aborted at owner close.
+    task: JoinHandle<()>,
+}
+
 /// Everything the cache mutates under one narrow lock.
 ///
 /// The lock is never held across `.await`: a lookup takes it, decides, and
 /// releases it before waiting on the load it just registered.
 #[derive(Debug)]
 struct CacheState {
+    /// Successful entries in least-recently-used order.
+    ///
+    /// Holds no errors and no in-flight state, so its length and charged bytes
+    /// are exactly the resident entries a snapshot reports.
+    entries: LruCache<HotMetadataKey, CachedMetadata>,
+    /// Charged bytes currently resident in `entries`.
+    resident_bytes: u64,
+    /// Loads with an owner that has not yet published a terminal result.
+    inflight: HashMap<HotMetadataKey, InFlight>,
     /// Whether the owner still admits new loads.
     lifecycle: StorageLifecycle,
+}
+
+impl CacheState {
+    /// Returns the resident entry count and charged bytes as one pair.
+    fn resident_totals(&self) -> (u64, u64) {
+        (
+            u64::try_from(self.entries.len()).unwrap_or(u64::MAX),
+            self.resident_bytes,
+        )
+    }
+}
+
+/// What one lookup registration decided for its caller.
+enum Registration {
+    /// A resident entry satisfied the lookup with no load at all.
+    Resident(Arc<ParquetMetaData>),
+    /// This caller installed and owns the load.
+    Owner(watch::Receiver<Option<MetadataLoadResult>>),
+    /// This caller joined an existing owner's load.
+    Joined(watch::Receiver<Option<MetadataLoadResult>>),
 }
 
 /// The bounded, single-flight decoded-metadata cache for one node.
@@ -136,6 +199,9 @@ impl ParquetMetadataCache {
     pub(crate) fn new(budget_bytes: u64, telemetry: Arc<BifrostStorageTelemetry>) -> Self {
         Self {
             state: Mutex::new(CacheState {
+                entries: LruCache::unbounded(),
+                resident_bytes: 0,
+                inflight: HashMap::new(),
                 lifecycle: StorageLifecycle::Open,
             }),
             budget_bytes,
@@ -150,8 +216,20 @@ impl ParquetMetadataCache {
     /// same key joins that task and receives a clone of its single terminal
     /// result.
     ///
+    /// Cancelling one waiter detaches only that waiter — the owner's load
+    /// continues for everyone else — while owner shutdown cancels the load
+    /// itself and publishes one closed terminal to all of them.
+    ///
     /// # Errors
-    /// Returns the loader's closed failure.
+    /// Returns the loader's closed failure, [`BifrostStorageError::Cancelled`]
+    /// when this caller's token fires, [`BifrostStorageError::Deadline`] when
+    /// its deadline elapses first, or [`BifrostStorageError::Closed`] when the
+    /// owner no longer admits loads.
+    ///
+    /// # Panics
+    /// Does not panic. A poisoned state lock is surfaced as
+    /// [`BifrostStorageError::Closed`] rather than unwound, because a poisoned
+    /// cache cannot make a safe retention decision.
     pub(crate) async fn get_or_load(
         self: &Arc<Self>,
         key: HotMetadataKey,
@@ -159,26 +237,313 @@ impl ParquetMetadataCache {
         deadline: Instant,
         cancel: CancellationToken,
     ) -> MetadataLoadResult {
-        let _ = (&key, deadline, &cancel, self.budget_bytes, &self.telemetry);
-        load.await.map_err(Arc::new)
+        let started = Instant::now();
+        match self.register(&key, load)? {
+            Registration::Resident(metadata) => Ok(metadata),
+            Registration::Owner(mut receiver) => {
+                let result = Self::await_publication(&mut receiver, deadline, &cancel).await;
+                self.telemetry
+                    .record_waiter_settled(Self::wait_outcome(&result), started.elapsed());
+                result
+            }
+            Registration::Joined(mut receiver) => {
+                self.telemetry.record_waiter_joined();
+                let result = Self::await_publication(&mut receiver, deadline, &cancel).await;
+                self.telemetry
+                    .record_waiter_settled(Self::wait_outcome(&result), started.elapsed());
+                result
+            }
+        }
+    }
+
+    /// Records the decision for one lookup and installs a loader when needed.
+    ///
+    /// Everything that touches shared state happens here, under one
+    /// acquisition, so a concurrent second caller either sees the resident
+    /// entry or the in-flight registration the first caller just installed —
+    /// never a window where both start a load.
+    ///
+    /// # Errors
+    /// Returns [`BifrostStorageError::Closed`] when the owner is closing,
+    /// closed, or its state lock is poisoned.
+    fn register(
+        self: &Arc<Self>,
+        key: &HotMetadataKey,
+        load: MetadataLoadFuture,
+    ) -> Result<Registration, Arc<BifrostStorageError>> {
+        let Ok(mut state) = self.state.lock() else {
+            return Err(Arc::new(BifrostStorageError::Closed));
+        };
+        if state.lifecycle != StorageLifecycle::Open {
+            drop(state);
+            self.telemetry
+                .record_cache_effect(CacheEffect::Bypass, CacheEffectReason::Closing);
+            return Err(Arc::new(BifrostStorageError::Closed));
+        }
+        if let Some(entry) = state.entries.get(key) {
+            let metadata = Arc::clone(&entry.metadata);
+            drop(state);
+            self.telemetry
+                .record_cache_effect(CacheEffect::Hit, CacheEffectReason::None);
+            return Ok(Registration::Resident(metadata));
+        }
+        if let Some(inflight) = state.inflight.get(key) {
+            let receiver = inflight.publisher.subscribe();
+            drop(state);
+            self.telemetry
+                .record_cache_effect(CacheEffect::Join, CacheEffectReason::None);
+            return Ok(Registration::Joined(receiver));
+        }
+        let (publisher, receiver) = watch::channel(None);
+        let cancel = CancellationToken::new();
+        let task = self.spawn_loader(key.clone(), load, publisher.clone(), cancel.clone());
+        state.inflight.insert(
+            key.clone(),
+            InFlight {
+                publisher,
+                cancel,
+                task,
+            },
+        );
+        drop(state);
+        self.telemetry
+            .record_cache_effect(CacheEffect::Miss, CacheEffectReason::None);
+        self.telemetry.record_load_start();
+        Ok(Registration::Owner(receiver))
+    }
+
+    /// Spawns the one retained loader task for `key`.
+    ///
+    /// The task, not the calling future, owns the load: that is what lets a
+    /// cancelled caller detach without cancelling the work every other waiter
+    /// is depending on, and what gives close something concrete to join or
+    /// abort.
+    fn spawn_loader(
+        self: &Arc<Self>,
+        key: HotMetadataKey,
+        load: MetadataLoadFuture,
+        publisher: watch::Sender<Option<MetadataLoadResult>>,
+        cancel: CancellationToken,
+    ) -> JoinHandle<()> {
+        let cache = Arc::clone(self);
+        tokio::spawn(async move {
+            let started = Instant::now();
+            let result = tokio::select! {
+                biased;
+                () = cancel.cancelled() => Err(Arc::new(BifrostStorageError::Closed)),
+                loaded = load => loaded.map_err(Arc::new),
+            };
+            cache.settle(&key, &result, started.elapsed());
+            // A publish failure means every receiver was already dropped, which
+            // is the ordinary outcome when the last caller cancelled. The
+            // terminal accounting above has already happened, so there is
+            // nothing further to do.
+            let _ = publisher.send(Some(result));
+        })
+    }
+
+    /// Applies one terminal load result to the resident state and telemetry.
+    ///
+    /// Removes the in-flight registration first so a caller arriving after the
+    /// publish sees either the newly resident entry or a fresh miss, and never
+    /// joins a load that has already finished.
+    fn settle(&self, key: &HotMetadataKey, result: &MetadataLoadResult, elapsed: Duration) {
+        let outcome = match result {
+            Ok(_) => MetadataLoadOutcome::Success,
+            Err(error) if matches!(**error, BifrostStorageError::Deadline) => {
+                MetadataLoadOutcome::Deadline
+            }
+            Err(error)
+                if matches!(
+                    **error,
+                    BifrostStorageError::Cancelled | BifrostStorageError::Closed
+                ) =>
+            {
+                MetadataLoadOutcome::Cancelled
+            }
+            Err(_) => MetadataLoadOutcome::Failed,
+        };
+        let retention = self.retain(key, result.as_ref().ok());
+        self.telemetry.record_load_terminal(outcome, elapsed);
+        if let Some(reason) = retention {
+            self.telemetry
+                .record_cache_effect(CacheEffect::Bypass, reason);
+        }
+    }
+
+    /// Retires the in-flight registration and retains an eligible success.
+    ///
+    /// Returns the bypass reason when the metadata could not be retained, so
+    /// the caller can record that decision outside the lock. Only a successful
+    /// decode that fits the whole budget is retained; an oversized entry is
+    /// still returned to its callers, it is simply not kept.
+    fn retain(
+        &self,
+        key: &HotMetadataKey,
+        metadata: Option<&Arc<ParquetMetaData>>,
+    ) -> Option<CacheEffectReason> {
+        let Ok(mut state) = self.state.lock() else {
+            return None;
+        };
+        if let Some(inflight) = state.inflight.remove(key) {
+            // The task is finishing right now; dropping the handle detaches it
+            // rather than cancelling it, which is correct — the publish below
+            // is the last thing it does.
+            drop(inflight);
+        }
+        let Some(metadata) = metadata else {
+            let (entries, bytes) = state.resident_totals();
+            drop(state);
+            self.telemetry.record_resident(entries, bytes);
+            return None;
+        };
+        if state.lifecycle != StorageLifecycle::Open {
+            drop(state);
+            return Some(CacheEffectReason::Closing);
+        }
+        let weight = u64::try_from(metadata.memory_size())
+            .unwrap_or(u64::MAX)
+            .saturating_add(key.owned_bytes());
+        if weight > self.budget_bytes {
+            drop(state);
+            return Some(CacheEffectReason::Oversized);
+        }
+        let mut evicted = 0_u32;
+        while state.resident_bytes.saturating_add(weight) > self.budget_bytes {
+            let Some((_, removed)) = state.entries.pop_lru() else {
+                break;
+            };
+            state.resident_bytes = state.resident_bytes.saturating_sub(removed.weight);
+            evicted = evicted.saturating_add(1);
+        }
+        state.entries.put(
+            key.clone(),
+            CachedMetadata {
+                metadata: Arc::clone(metadata),
+                weight,
+            },
+        );
+        state.resident_bytes = state.resident_bytes.saturating_add(weight);
+        let (entries, bytes) = state.resident_totals();
+        drop(state);
+        for _ in 0..evicted {
+            self.telemetry
+                .record_cache_effect(CacheEffect::Evict, CacheEffectReason::None);
+        }
+        self.telemetry.record_resident(entries, bytes);
+        None
+    }
+
+    /// Awaits one publication under this caller's own cancellation and deadline.
+    ///
+    /// Neither the token nor the deadline touches the load: they end this
+    /// caller's interest in it, which is what makes a cancelled query cheap for
+    /// everyone still waiting on the same object.
+    async fn await_publication(
+        receiver: &mut watch::Receiver<Option<MetadataLoadResult>>,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> MetadataLoadResult {
+        loop {
+            if let Some(result) = receiver.borrow_and_update().clone() {
+                return result;
+            }
+            let changed = receiver.changed();
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Err(Arc::new(BifrostStorageError::Cancelled)),
+                () = tokio::time::sleep_until(deadline.into()) => {
+                    return Err(Arc::new(BifrostStorageError::Deadline));
+                }
+                changed = changed => {
+                    if changed.is_err() {
+                        // The loader dropped its publisher without sending,
+                        // which only happens if the task itself was aborted.
+                        return Err(Arc::new(BifrostStorageError::Closed));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Projects one awaited result into its waiter-latency outcome.
+    fn wait_outcome(result: &MetadataLoadResult) -> MetadataLoadOutcome {
+        match result {
+            Ok(_) => MetadataLoadOutcome::Success,
+            Err(error) => match **error {
+                BifrostStorageError::Cancelled | BifrostStorageError::Closed => {
+                    MetadataLoadOutcome::Cancelled
+                }
+                BifrostStorageError::Deadline => MetadataLoadOutcome::Deadline,
+                _ => MetadataLoadOutcome::Failed,
+            },
+        }
+    }
+
+    /// Stops admitting loads and cancels every retained loader.
+    ///
+    /// Returns the retained task handles so the caller can join them under one
+    /// absolute deadline without holding the state lock across an await.
+    fn begin_close(&self) -> Vec<JoinHandle<()>> {
+        let Ok(mut state) = self.state.lock() else {
+            return Vec::new();
+        };
+        state.lifecycle = StorageLifecycle::Closing;
+        let inflight = std::mem::take(&mut state.inflight);
+        drop(state);
+        self.telemetry.record_lifecycle(StorageLifecycle::Closing);
+        inflight
+            .into_values()
+            .map(|entry| {
+                entry.cancel.cancel();
+                // Waking every waiter here rather than relying on the loader's
+                // own publish is what bounds shutdown: a loader blocked in a
+                // backend call may not observe its token until its request
+                // timeout, and no waiter should have to wait that long.
+                let _ = entry
+                    .publisher
+                    .send(Some(Err(Arc::new(BifrostStorageError::Closed))));
+                entry.task
+            })
+            .collect()
+    }
+
+    /// Clears every resident entry and marks the owner settled.
+    fn finish_close(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.entries.clear();
+            state.resident_bytes = 0;
+            state.lifecycle = StorageLifecycle::Closed;
+        }
+        self.telemetry.record_resident(0, 0);
+        self.telemetry.record_lifecycle(StorageLifecycle::Closed);
     }
 
     /// Drains the cache within one absolute deadline.
     ///
-    /// Returns `true` when every retained loader settled in time.
+    /// Returns `true` when every retained loader settled in time. Idempotent:
+    /// a second call finds no loaders and no entries and reports clean.
     pub(crate) async fn close(&self, deadline: Instant) -> bool {
-        let _ = deadline;
-        if let Ok(mut state) = self.state.lock() {
-            state.lifecycle = StorageLifecycle::Closed;
+        let tasks = self.begin_close();
+        let mut clean = true;
+        for task in tasks {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if tokio::time::timeout(remaining, task).await.is_err() {
+                clean = false;
+            }
         }
-        true
+        self.finish_close();
+        clean
     }
 
     /// Drains the cache immediately, aborting every retained loader.
+    ///
+    /// Idempotent, and safe to call after [`Self::close`].
     pub(crate) fn abort(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.lifecycle = StorageLifecycle::Closed;
+        for task in self.begin_close() {
+            task.abort();
         }
+        self.finish_close();
     }
 }
 
@@ -453,29 +818,71 @@ mod tests {
         assert_eq!(snapshot.resident_bytes(), 0);
         assert!(snapshot.is_quiescent());
 
-        // Eviction: a budget that holds exactly one entry gives up the
-        // least-recently-used entry to admit the next one.
+        // Eviction is access-ordered, not insertion-ordered. Every fixture key
+        // below has the same table and the same object-name length, so all
+        // three entries weigh exactly the same and the budget is an exact
+        // multiple of that weight rather than an estimate.
         let metadata = Arc::clone(&settled[0]);
-        let weight =
-            u64::try_from(metadata.memory_size()).expect("footprint fits u64") + key.owned_bytes();
+        let evicting_key = |checksum: u8, object: &str| test_key(tenant, object, checksum, size);
+        let weight = u64::try_from(metadata.memory_size()).expect("footprint fits u64")
+            + evicting_key(0x31, "aaa.parquet").owned_bytes();
         let telemetry = Arc::new(BifrostStorageTelemetry::default());
-        let cache = Arc::new(ParquetMetadataCache::new(weight, Arc::clone(&telemetry)));
-        for checksum in [0x31_u8, 0x32] {
+        let cache = Arc::new(ParquetMetadataCache::new(
+            2 * weight,
+            Arc::clone(&telemetry),
+        ));
+        let resident = |cache: &Arc<ParquetMetadataCache>, key: HotMetadataKey| {
             let loaded = Arc::clone(&metadata);
-            cache
-                .get_or_load(
-                    test_key(tenant, "evicting.parquet", checksum, size),
-                    Box::pin(async move { Ok(loaded) }),
-                    deadline,
-                    CancellationToken::new(),
-                )
-                .await
-                .expect("both decodes succeed");
-        }
+            let cache = Arc::clone(cache);
+            async move {
+                cache
+                    .get_or_load(
+                        key,
+                        Box::pin(async move { Ok(loaded) }),
+                        deadline,
+                        CancellationToken::new(),
+                    )
+                    .await
+                    .expect("the fixture load always succeeds")
+            }
+        };
+        let key_a = evicting_key(0x31, "aaa.parquet");
+        let key_b = evicting_key(0x32, "bbb.parquet");
+        let key_c = evicting_key(0x33, "ccc.parquet");
+        resident(&cache, key_a.clone()).await;
+        resident(&cache, key_b.clone()).await;
         let snapshot = telemetry.snapshot();
-        assert_eq!(snapshot.effect(CacheEffect::Evict), 1);
-        assert_eq!(snapshot.resident_entries(), 1);
-        assert_eq!(snapshot.resident_bytes(), weight);
+        assert_eq!(snapshot.resident_entries(), 2, "the budget holds both");
+        assert_eq!(snapshot.resident_bytes(), 2 * weight);
+        assert_eq!(snapshot.effect(CacheEffect::Evict), 0);
+
+        // Touch A so B, not A, is least recently used.
+        resident(&cache, key_a.clone()).await;
+        assert_eq!(telemetry.snapshot().effect(CacheEffect::Hit), 1);
+
+        resident(&cache, key_c).await;
+        let snapshot = telemetry.snapshot();
+        assert_eq!(
+            snapshot.effect(CacheEffect::Evict),
+            1,
+            "admitting a third entry gives up exactly one"
+        );
+        assert_eq!(snapshot.resident_entries(), 2);
+        assert_eq!(snapshot.resident_bytes(), 2 * weight);
+
+        // A was touched most recently, so A survived and B is the one gone.
+        resident(&cache, key_a).await;
+        assert_eq!(
+            telemetry.snapshot().effect(CacheEffect::Hit),
+            2,
+            "the recently used entry survived eviction"
+        );
+        resident(&cache, key_b).await;
+        assert_eq!(
+            telemetry.snapshot().effect(CacheEffect::Hit),
+            2,
+            "the least recently used entry was the one evicted"
+        );
 
         // Oversized: metadata larger than the whole budget is still returned to
         // its caller and simply not retained.

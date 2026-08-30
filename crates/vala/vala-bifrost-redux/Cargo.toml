@@ -49,6 +49,7 @@ iceberg = { workspace = true }
 iceberg-datafusion = { workspace = true }
 iceberg-catalog-sql = { workspace = true }
 iceberg-storage-opendal = { workspace = true }
+lru = { workspace = true }
 datafusion-distributed = { workspace = true }
 url = { workspace = true }
 datafusion = { workspace = true }

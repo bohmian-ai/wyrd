@@ -190,6 +190,11 @@ opendal = { version = "0.57", default-features = false, features = [
   "services-fs", "services-s3", "services-gcs", "services-azblob",
   "reqwest-rustls-tls",
 ] }
+
+# Bounded least-recently-used map behind the Bifrost decoded-metadata cache's
+# byte ceiling. Pinned: the cache manages its own byte accounting against this
+# map's ordering, so a silent ordering or capacity change would alter eviction.
+lru = "=0.12.5"
 # =55.0.0 matches the managed iceberg-rust arrow-59.2 line. The four iceberg
 # crates share one immutable SCRIBE_ICEBERG_SHA so the analytical graph stays a
 # single native universe (no moving branch, no duplicate Arrow/Parquet package).

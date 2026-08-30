@@ -204,7 +204,9 @@ impl SupervisedForge {
         assert_eq!(self.worker_observer.attempts(), expected_attempt);
         assert_eq!(
             self.worker_observer.returned_errors().len(),
-            expected_errors
+            expected_errors,
+            "the attempt was expected to succeed: {:?}",
+            self.worker_observer.returned_errors()
         );
         self.stop_worker().await;
         assert_eq!(self.worker_observer.completed(), expected);
@@ -239,7 +241,8 @@ impl SupervisedForge {
         assert_eq!(
             self.worker_observer.returned_errors().len(),
             expected_errors,
-            "the attempt was expected to return an error"
+            "the attempt was expected to return exactly one error: {:?}",
+            self.worker_observer.returned_errors()
         );
         self
     }
@@ -258,6 +261,14 @@ impl SupervisedForge {
             .expect("production Forge worker shutdown bound")
             .expect("production Forge worker task")
             .expect("production Forge worker shutdown");
+    }
+
+    /// Borrows the errors production worker attempts returned so far.
+    ///
+    /// A scenario that deliberately fails an attempt asserts on *which* error
+    /// came back, not merely that one did.
+    pub(crate) fn returned_errors(&self) -> Vec<String> {
+        self.worker_observer.returned_errors()
     }
 
     /// Cancel and join both production supervisors.

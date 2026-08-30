@@ -2461,6 +2461,31 @@ impl ForgeWorker {
                 Err(ForgeError::Catalog(error)) if !error.retryable() => error,
                 Err(error) => return Err(error),
             };
+            let reloaded_after_conflict = self
+                .forge
+                .core
+                .catalog
+                .load_table(&binding.table_ident())
+                .await
+                .map_err(ForgeError::Catalog)?;
+            // A refusal is only *certain non-acceptance* if this operation's
+            // effect is absent from the table. A lost response looks identical
+            // from here — the commit landed, the answer did not — and the
+            // catalog's own duplicate check then refuses the resubmission of
+            // files it already references. Reading the operation identity back
+            // off the table separates the two, so an already-landed promotion
+            // is never reset and never re-appended: the operation stays open
+            // and a successor settles it from that same evidence.
+            if self
+                .find_retained_task_evidence(binding, &reloaded_after_conflict, claim.task_id)
+                .await?
+                .is_some()
+            {
+                return Err(ForgeError::Reconciliation {
+                    detail: "Scribe promotion commit was refused after its own effect landed"
+                        .to_owned(),
+                });
+            }
             if retried || self.forge.core.clock.now()? >= deadline {
                 // A definite conflict is certain non-acceptance, so this
                 // operation is closed here rather than left open for a
@@ -2485,14 +2510,7 @@ impl ForgeWorker {
                 "revalidating one Scribe promotion after a definite catalog conflict"
             );
             retried = true;
-            reloaded = Some(
-                self.forge
-                    .core
-                    .catalog
-                    .load_table(&binding.table_ident())
-                    .await
-                    .map_err(ForgeError::Catalog)?,
-            );
+            reloaded = Some(reloaded_after_conflict);
         }
     }
 
@@ -2517,9 +2535,10 @@ impl ForgeWorker {
     /// Returns the stable operation identity for one promotion task.
     ///
     /// The durable task identity *is* the operation identity. A task is
-    /// enqueued once per exact file set, so binding the operation to it makes
-    /// the identity survive every retry, restart, and takeover without a
-    /// second durable column to keep consistent.
+    /// enqueued once per exact file set and is retried in place rather than
+    /// re-planned, so binding the operation to it makes the identity survive
+    /// every retry, restart, and takeover without a second durable column to
+    /// keep consistent.
     const fn promotion_operation_id(claim: &ForgeTaskClaim) -> Uuid {
         claim.task_id
     }

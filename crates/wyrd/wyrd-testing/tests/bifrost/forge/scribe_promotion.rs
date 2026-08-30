@@ -606,3 +606,292 @@ async fn scribe_promotion_conflict_revalidates_once_and_second_conflict_resets()
         "the failed promotion resets its operation"
     );
 }
+
+/// A lost commit response is reconciled from evidence, never re-committed.
+///
+/// The catalog accepts the append and then loses the response, and refuses
+/// every later commit. The next attempt must therefore recognise its own
+/// committed snapshot by the task identity written into the snapshot summary
+/// and settle from that evidence. If it tried to append again the refused
+/// commit would fail the attempt, so a green run is itself the proof that no
+/// second append was made.
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn scribe_promotion_ambiguity_reconciles_without_recommit() {
+    let server = start_engine_fixture_server().await;
+    let fixture = seed_forge_group(&server, "promotion_ambiguity").await;
+    let sealed = file_rows(&fixture)
+        .await
+        .into_iter()
+        .map(|row| row.file_path)
+        .collect::<BTreeSet<_>>();
+    let catalog = CommitUncertaintyCatalog::new(Arc::clone(&fixture.catalog));
+    catalog.fail_after_next_commit();
+
+    let forge = SupervisedForge::start_with_seams(
+        &fixture,
+        fixture.config.clone(),
+        Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
+        Arc::clone(&fixture.object_store),
+    );
+    let forge = forge.run_one_failure().await;
+
+    assert_eq!(
+        promotion_phases(&fixture).await,
+        vec!["prepared".to_owned()],
+        "an uncertain commit leaves the operation open for recovery ({} catalog attempts, errors {:?})",
+        catalog.update_attempts(),
+        forge.returned_errors()
+    );
+    assert_eq!(
+        live_data_paths(&fixture, &fixture.binding).await,
+        sealed,
+        "the lost response still committed the append"
+    );
+    forge.shutdown().await;
+    release_retry_backoff(&fixture).await;
+
+    let mut forge = SupervisedForge::start_with_seams(
+        &fixture,
+        fixture.config.clone(),
+        Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
+        Arc::clone(&fixture.object_store),
+    );
+    forge.run_one_success().await;
+    forge.shutdown().await;
+
+    assert_eq!(
+        promotion_phases(&fixture).await,
+        vec!["recovered".to_owned()],
+        "the successor settles the operation from evidence"
+    );
+    assert_eq!(
+        live_data_paths(&fixture, &fixture.binding).await,
+        sealed,
+        "recovery appended nothing a second time"
+    );
+    let settled = file_rows(&fixture).await;
+    assert!(
+        settled
+            .iter()
+            .all(|row| row.compacted && row.committed_snapshot_id.is_some()),
+        "recovery settled every promoted row: {settled:?}"
+    );
+}
+
+/// Brings a retryable task's production backoff forward to now.
+///
+/// The durable retry delay is a fixed exponential interval computed in SQL, so
+/// there is no configuration or clock seam a journey can turn down. Only the
+/// two scheduling timestamps move; the task's identity, state, plan, base
+/// snapshot, and attempt count are exactly what the production failure path
+/// left behind, so the successor attempt this releases is the real retry.
+///
+/// # Panics
+///
+/// Panics when the update fails or moves no retryable task.
+async fn release_retry_backoff(fixture: &ForgeFixture) {
+    let moved = sqlx::query(
+        "UPDATE vala.forge_tasks SET ready_at = statement_timestamp(), \
+         next_eligible_at = statement_timestamp() \
+         WHERE data_tenant_id = $1 AND state = 'retryable'",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .execute(fixture.operator_pool.pool())
+    .await
+    .expect("Forge retry backoff release")
+    .rows_affected();
+    assert_eq!(
+        moved, 1,
+        "exactly one retryable task was waiting on backoff"
+    );
+}
+
+/// A promotion whose fence is stolen settles exactly once, by the successor.
+///
+/// The commit is held open after acceptance while the durable lease is taken
+/// over. The original worker therefore returns without settling — its fence is
+/// gone — and the successor reconciles the same operation identity. What must
+/// never happen is two settlements, or a settled row with no snapshot behind
+/// it.
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn scribe_promotion_lease_loss_and_takeover_settle_once() {
+    let server = start_engine_fixture_server().await;
+    let fixture = seed_forge_group(&server, "promotion_takeover").await;
+    let sealed = file_rows(&fixture)
+        .await
+        .into_iter()
+        .map(|row| row.file_path)
+        .collect::<BTreeSet<_>>();
+    let catalog = CommitUncertaintyCatalog::new(Arc::clone(&fixture.catalog));
+    catalog.pause_after_commit();
+
+    let forge = SupervisedForge::start_with_seams(
+        &fixture,
+        fixture.config.clone(),
+        Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
+        Arc::clone(&fixture.object_store),
+    );
+    let held = tokio::spawn(async move { forge.run_one_failure().await });
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        catalog.wait_for_commit(),
+    )
+    .await
+    .expect("promotion commit reached the catalog boundary");
+    let stolen = steal_forge_lease(&fixture).await;
+    catalog.reject_paused_commit();
+
+    let forge = tokio::time::timeout(std::time::Duration::from_secs(60), held)
+        .await
+        .expect("stolen promotion returns")
+        .expect("stolen promotion task");
+    forge.shutdown().await;
+
+    reclaim_stopped_claim(&fixture).await;
+    release_forge_lease(&fixture, stolen).await;
+    let mut forge = SupervisedForge::start_with_seams(
+        &fixture,
+        fixture.config.clone(),
+        Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
+        Arc::clone(&fixture.object_store),
+    );
+    forge.run_one_success().await;
+    forge.shutdown().await;
+
+    assert_eq!(
+        promotion_phases(&fixture).await.len(),
+        1,
+        "takeover settles the one operation identity, not a second"
+    );
+    assert_eq!(
+        live_data_paths(&fixture, &fixture.binding).await,
+        sealed,
+        "takeover appended nothing a second time"
+    );
+    let settled = file_rows(&fixture).await;
+    assert!(
+        settled
+            .iter()
+            .all(|row| row.compacted && row.committed_snapshot_id.is_some()),
+        "the successor settled every promoted row exactly once: {settled:?}"
+    );
+}
+
+/// Takes the fixture table's durable Forge lease away from its current holder.
+///
+/// Expiring the row and re-acquiring it through the production lease query is
+/// what makes the takeover real: the successor's fencing token is issued by
+/// the same transaction a second worker process would use, so the displaced
+/// worker's fence assertions fail for the production reason.
+///
+/// # Panics
+///
+/// Panics when the lease cannot be expired or re-acquired.
+async fn steal_forge_lease(fixture: &ForgeFixture) -> uuid::Uuid {
+    let lease_key = vala_bifrost_redux::forge::forge_lease_key(
+        fixture.tenant,
+        &fixture.binding.logical_namespace,
+        &fixture.binding.table_name,
+    );
+    sqlx::query(
+        "UPDATE vala.maintenance_leases SET expires_at = now() - interval '1 second' \
+         WHERE lease_key = $1",
+    )
+    .bind(&lease_key)
+    .execute(fixture.operator_pool.pool())
+    .await
+    .expect("expire the Forge lease for a deterministic takeover");
+    let successor = uuid::Uuid::now_v7();
+    vala_sql::queries::maintenance_leases::try_acquire_lease(
+        &fixture.operator_pool,
+        &lease_key,
+        successor,
+        i64::try_from(fixture.config.lease_ttl.as_secs()).expect("lease seconds"),
+    )
+    .await
+    .expect("successor lease acquisition")
+    .expect("successor owns the expired Forge lease");
+    successor
+}
+
+/// Releases a lease this test took, so a real worker can acquire it again.
+///
+/// The theft stands in for a second Forge process; once its point is made the
+/// lease has to go back, or the reconciling worker fails for the artificial
+/// reason instead of proving anything.
+///
+/// # Panics
+///
+/// Panics when the lease release query fails.
+async fn release_forge_lease(fixture: &ForgeFixture, owner: uuid::Uuid) {
+    let lease_key = vala_bifrost_redux::forge::forge_lease_key(
+        fixture.tenant,
+        &fixture.binding.logical_namespace,
+        &fixture.binding.table_name,
+    );
+    sqlx::query(
+        "UPDATE vala.maintenance_leases SET expires_at = now() - interval '1 second' \
+         WHERE lease_key = $1 AND owner = $2",
+    )
+    .bind(&lease_key)
+    .bind(owner)
+    .execute(fixture.operator_pool.pool())
+    .await
+    .expect("release the stolen Forge lease");
+}
+
+/// Returns the claim a fully stopped worker abandoned to a fresh attempt.
+///
+/// The deadline is expired only after the prior worker has joined, and the
+/// reclaim itself runs through the production bounded transaction, so the
+/// successor executes a real fresh attempt rather than a fabricated one. Only
+/// the persisted eligibility clock is then advanced, which keeps wall-clock
+/// sleeps out of the proof.
+///
+/// # Panics
+///
+/// Panics when no stopped claim or worker-settled retryable task is present.
+async fn reclaim_stopped_claim(fixture: &ForgeFixture) {
+    let running: Option<(uuid::Uuid, uuid::Uuid, uuid::Uuid)> = sqlx::query_as(
+        "SELECT task_id, attempt_id, claimed_by FROM vala.forge_tasks \
+         WHERE data_tenant_id = $1 AND state = 'running'",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .fetch_optional(fixture.operator_pool.pool())
+    .await
+    .expect("stopped running Forge claim query");
+    if let Some((task_id, attempt_id, owner)) = running {
+        sqlx::query(
+            "UPDATE vala.forge_tasks \
+             SET claim_expires_at = statement_timestamp() - interval '1 millisecond' \
+             WHERE task_id = $1 AND attempt_id = $2 AND claimed_by = $3 AND state = 'running'",
+        )
+        .bind(task_id)
+        .bind(attempt_id)
+        .bind(owner)
+        .execute(fixture.operator_pool.pool())
+        .await
+        .expect("expire the exact stopped Forge claim");
+        assert_eq!(
+            vala_sql::queries::forge_tasks::ForgeTasks::new(fixture.operator_pool.clone())
+                .reclaim_expired_attempts(1)
+                .await
+                .expect("production bounded reclaim"),
+            vec![(task_id, attempt_id)],
+            "reclaim returns the exact stopped attempt"
+        );
+    }
+    sqlx::query(
+        "UPDATE vala.forge_tasks \
+         SET next_eligible_at = statement_timestamp() - interval '1 millisecond', \
+             ready_at = statement_timestamp() - interval '1 millisecond' \
+         WHERE data_tenant_id = $1 AND state = 'retryable'",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .execute(fixture.operator_pool.pool())
+    .await
+    .expect("advance reclaimed task eligibility");
+}

@@ -1842,7 +1842,7 @@ impl BifrostRuntimeResources {
     ///
     /// Panics when the supplied observation cannot satisfy the policy, which in
     /// a unit test is an authoring error rather than a runtime condition.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub(crate) fn composed_for_test(
         memory_limit_bytes: usize,

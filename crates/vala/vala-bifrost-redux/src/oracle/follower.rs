@@ -2010,7 +2010,12 @@ pub(crate) mod tests {
             min_event_time_micros: Some(1),
             max_event_time_micros: Some(2),
         });
-        let source = signed_hot_source(&descriptor, "memory:///tenant/spans/a.parquet")
+        let binding = wyrd_spec::vala::api::TenantTableBinding {
+            tenant_id: wyrd_spec::DataTenantId::new_v7(),
+            namespace: "vala.traces".to_owned(),
+            table: "spans".to_owned(),
+        };
+        let source = signed_hot_source(&descriptor, "memory:///tenant/spans/a.parquet", &binding)
             .expect("signed descriptor builds a hot source");
         assert_eq!(source.size_bytes, 987_654);
         assert_eq!(source.location, "memory:///tenant/spans/a.parquet");

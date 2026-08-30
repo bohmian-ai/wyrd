@@ -3970,6 +3970,40 @@ mod tests {
     /// Unusable is the fail-open value, so a fixture built with it is retained
     /// by every query interval and cannot accidentally disappear from a test
     /// that is measuring something else.
+    /// Builds a fixture storage owner that retains decoded metadata.
+    ///
+    /// Every hot leaf now asks the owner for its metadata, so a leaf fixture
+    /// composes one just as a node does. Its backend is never read: the decode
+    /// is driven by the fixture's own reader factory.
+    ///
+    /// # Panics
+    /// Panics when the temporary root cannot be created.
+    fn fixture_storage() -> Arc<crate::storage::BifrostStorage> {
+        let root = tempfile::tempdir().expect("fixture storage root");
+        crate::storage::BifrostStorage::for_test(&root.keep(), true)
+    }
+
+    /// Builds one immutable metadata identity for a fixture object.
+    ///
+    /// The checksum is derived from the name so two differently named fixture
+    /// objects never share a cache entry, which is the same property the
+    /// durable writer checksum gives production.
+    fn fixture_metadata_key(name: &str, size_bytes: usize) -> crate::storage::HotMetadataKey {
+        let mut checksum = [0_u8; 32];
+        for (slot, byte) in checksum.iter_mut().zip(name.as_bytes()) {
+            *slot = *byte;
+        }
+        checksum[31] = 1;
+        crate::storage::HotMetadataKey::new(
+            wyrd_spec::DataTenantId::new_v7(),
+            "vala.traces.spans".to_owned(),
+            name.to_owned(),
+            uuid::Uuid::now_v7(),
+            checksum,
+            u64::try_from(size_bytes).unwrap_or(u64::MAX),
+        )
+    }
+
     fn unusable_event_time() -> crate::catalog::event_time::EventTimeStatistics {
         crate::catalog::event_time::EventTimeStatistics::Unusable(
             crate::catalog::event_time::EventTimeBoundsDefect::Missing,
@@ -4626,11 +4660,13 @@ mod tests {
             let metrics = Arc::new(OracleScanMetricsHandle::default());
             let exec = HotParquetExec::new(
                 vec![HotFileSource {
+                    metadata_key: fixture_metadata_key(&path.to_string_lossy(), size_bytes),
                     location: path.to_string_lossy().into_owned(),
                     size_bytes,
                     event_time: unusable_event_time(),
                 }],
                 FileIO::new_with_fs(),
+                fixture_storage(),
                 Arc::clone(&schema),
                 HotParquetGovernance::Leader {
                     memory: memory.clone(),
@@ -4765,11 +4801,11 @@ mod tests {
         let resources = roles.oracle().expect("composition must enable Oracle");
         let pool = crate::resources::bounded_memory_pool(1024 * 1024 * 1024);
         let reader = IcebergParquetReader::new(
-            Box::new(RecordingRangeReader {
+            HotObjectSource::Open(Arc::new(RecordingRangeReader {
                 bytes: fixture.bytes.clone(),
                 ranges,
                 short,
-            }),
+            })),
             u64::try_from(fixture.bytes.len()).expect("fixture size fits u64"),
             HotParquetGovernance::Leader {
                 memory: OracleMemoryResources {
@@ -4845,11 +4881,16 @@ mod tests {
         )]));
         let exec = HotParquetExec::new(
             vec![HotFileSource {
+                metadata_key: fixture_metadata_key(
+                    &fixture.path.to_string_lossy(),
+                    fixture.bytes.len(),
+                ),
                 location: fixture.path.to_string_lossy().into_owned(),
                 size_bytes: fixture.bytes.len(),
                 event_time: unusable_event_time(),
             }],
             FileIO::new_with_fs(),
+            fixture_storage(),
             Arc::clone(&projected),
             HotParquetGovernance::Leader {
                 memory: oracle_memory_resources(&governor, 1024),
@@ -5033,11 +5074,16 @@ mod tests {
         let query_pool = crate::resources::bounded_memory_pool(1024 * 1024 * 1024);
         let exec = HotParquetExec::new(
             vec![HotFileSource {
+                metadata_key: fixture_metadata_key(
+                    &fixture.path.to_string_lossy(),
+                    fixture.bytes.len(),
+                ),
                 location: fixture.path.to_string_lossy().into_owned(),
                 size_bytes: fixture.bytes.len(),
                 event_time: unusable_event_time(),
             }],
             FileIO::new_with_fs(),
+            fixture_storage(),
             Arc::clone(&fixture.schema),
             HotParquetGovernance::Leader {
                 memory: oracle_memory_resources(&governor, 1024),
@@ -5130,11 +5176,13 @@ mod tests {
             let metrics = Arc::new(OracleScanMetricsHandle::default());
             let exec = HotParquetExec::new(
                 vec![HotFileSource {
+                    metadata_key: fixture_metadata_key(&fixture.path.to_string_lossy(), size_bytes),
                     location: fixture.path.to_string_lossy().into_owned(),
                     size_bytes,
                     event_time: unusable_event_time(),
                 }],
                 FileIO::new_with_fs(),
+                fixture_storage(),
                 Arc::clone(&fixture.schema),
                 HotParquetGovernance::Leader {
                     memory: memory.clone(),
@@ -5507,11 +5555,13 @@ mod tests {
     ) -> HotParquetExec {
         HotParquetExec::new(
             vec![HotFileSource {
+                metadata_key: fixture_metadata_key(&fixture.path.to_string_lossy(), size_bytes),
                 location: fixture.path.to_string_lossy().into_owned(),
                 size_bytes,
                 event_time: unusable_event_time(),
             }],
             FileIO::new_with_fs(),
+            fixture_storage(),
             Arc::clone(&fixture.schema),
             governance,
             Arc::clone(metrics),
@@ -5803,6 +5853,7 @@ mod tests {
         let roles = oracle_test_roles(2 * 1024 * 1024 * 1024);
         OracleTableProvider::try_new(OracleTableInputs {
             table: pruning_fixture_table(),
+            storage: fixture_storage(),
             distributed_iceberg_batches: None,
             hot_files,
             distributed_hot_batches: Vec::new(),
@@ -5847,6 +5898,7 @@ mod tests {
         event_time: crate::catalog::event_time::EventTimeStatistics,
     ) -> HotFileSource {
         HotFileSource {
+            metadata_key: fixture_metadata_key(name, 4_096),
             location: format!("memory:///pruning-fixture/hot/{name}"),
             size_bytes: 4_096,
             event_time,
@@ -6106,6 +6158,7 @@ mod tests {
         OracleTableProvider::try_new_distributed(
             OracleTableInputs {
                 table: projection_fixture_table(),
+                storage: fixture_storage(),
                 distributed_iceberg_batches: None,
                 hot_files: Vec::new(),
                 distributed_hot_batches: Vec::new(),

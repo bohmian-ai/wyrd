@@ -258,6 +258,45 @@ impl BifrostStorage {
         self.metadata_cache.is_some()
     }
 
+    /// Builds an owner over one local root for a fixture.
+    ///
+    /// Composed the way production composes: a real local backend handle, the
+    /// default policy, and the same Oracle-serving decision that decides
+    /// whether this node retains decoded metadata at all. A fixture that needs
+    /// the cache asks for it here rather than by reaching into the owner.
+    ///
+    /// # Panics
+    /// Panics when the local signer or the default storage policy is invalid,
+    /// which would mean the fixture root itself is unusable.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn for_test(root: &std::path::Path, serves_oracle: bool) -> Arc<Self> {
+        let signer = wyrd_storage::signer::BackendSigner::Local(
+            wyrd_storage::local::LocalSigner::new(root.to_path_buf())
+                .expect("the fixture local signer is valid"),
+        );
+        let resources = serves_oracle.then(|| {
+            crate::resources::BifrostRuntimeResources::composed_for_test(
+                2 * 1024 * 1024 * 1024,
+                1024 * 1024 * 1024,
+                [crate::resources::BifrostRole::Oracle],
+            )
+            .oracle()
+            .expect("the fixture observation admits Oracle")
+            .metadata()
+        });
+        Arc::new(Self::new(
+            Arc::new(wyrd_storage::handle::StorageHandle::new(signer)),
+            BifrostStoragePolicy::resolve(
+                BifrostStorageConfig::default(),
+                2 * 1024 * 1024 * 1024,
+                serves_oracle,
+            )
+            .expect("the fixture storage policy is valid"),
+            resources,
+        ))
+    }
+
     /// Returns the latest instant a metadata load started now may still run.
     ///
     /// A caller that has no deadline of its own still must not hand

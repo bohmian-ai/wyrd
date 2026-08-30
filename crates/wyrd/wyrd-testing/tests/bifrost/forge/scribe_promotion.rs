@@ -5,10 +5,13 @@
 //! row, plans a task by hand, or calls a promotion owner directly: the route
 //! is only proven if the production supervisors reach it on their own.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use vala_bifrost_redux::catalog::TenantTableBinding;
-use wyrd_testing::bifrost::{ForgeFixture, seed_forge_group};
+use wyrd_testing::bifrost::{
+    CommitUncertaintyCatalog, ForgeFixture, ForgeObjectStoreControl, seed_forge_group,
+};
 
 use crate::support::{SupervisedForge, start_engine_fixture_server};
 
@@ -307,5 +310,206 @@ async fn forge_hot_object_promotes_unchanged_and_remains_exact() {
             ))
             .collect::<Vec<_>>(),
         "promotion rewrites no object"
+    );
+}
+
+/// Snapshots every object under one table's prefix with its exact content hash.
+///
+/// Comparing this map across a promotion is the direct proof that no data
+/// object was created, rewritten, or deleted: a PUT anywhere under the prefix
+/// changes either the key set or one object's digest.
+///
+/// # Panics
+///
+/// Panics when the staging operator cannot be listed or read.
+async fn object_digests(fixture: &ForgeFixture) -> BTreeMap<String, String> {
+    let prefix = format!("{}/", fixture.binding.object_prefix);
+    let entries = fixture
+        .staging
+        .list_with(&prefix)
+        .recursive(true)
+        .await
+        .expect("promotion object listing");
+    let mut digests = BTreeMap::new();
+    for entry in entries {
+        if entry.metadata().is_dir() {
+            continue;
+        }
+        let bytes = fixture
+            .staging
+            .read(entry.path())
+            .await
+            .expect("promotion object read");
+        digests.insert(entry.path().to_owned(), {
+            use sha2::Digest as _;
+            hex::encode(sha2::Sha256::digest(bytes.to_bytes()))
+        });
+    }
+    digests
+}
+
+/// Promotion reads every hot footer and writes no data object at all.
+///
+/// The proof is bidirectional. The object store is byte-identical across the
+/// whole route, so nothing was written; and the production object-store seam
+/// records reads but no output notification and no delete, so the reads that
+/// did happen are revalidation rather than a rewrite in disguise.
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn scribe_promotion_revalidates_footer_and_appends_without_data_put() {
+    let server = start_engine_fixture_server().await;
+    let fixture = seed_forge_group(&server, "promotion_no_put").await;
+    let before = object_digests(&fixture).await;
+    assert!(
+        before.keys().any(|path| !path.contains("/metadata/")),
+        "the fixture sealed real data objects"
+    );
+
+    let object_store = ForgeObjectStoreControl::new(Arc::clone(&fixture.staging));
+    let mut forge = SupervisedForge::start_with_seams(
+        &fixture,
+        fixture.config.clone(),
+        Arc::clone(&fixture.catalog),
+        Arc::clone(&object_store) as Arc<dyn vala_bifrost_redux::forge::ForgeObjectStore>,
+    );
+    forge.run_one_success().await;
+    forge.shutdown().await;
+
+    let sealed = file_rows(&fixture).await;
+    assert!(
+        sealed.iter().all(|row| row.committed_snapshot_id.is_some()),
+        "the promotion committed: {sealed:?}"
+    );
+    let after = object_digests(&fixture).await;
+    let data_object = |path: &str| !path.contains("/metadata/");
+    assert_eq!(
+        after
+            .iter()
+            .filter(|(path, _)| data_object(path))
+            .collect::<BTreeMap<_, _>>(),
+        before
+            .iter()
+            .filter(|(path, _)| data_object(path))
+            .collect::<BTreeMap<_, _>>(),
+        "promotion left every data object byte-identical"
+    );
+    assert!(
+        after
+            .keys()
+            .filter(|path| !before.contains_key(path.as_str()))
+            .all(|path| !data_object(path)),
+        "promotion added only catalog metadata, never a data object: {:?}",
+        after
+            .keys()
+            .filter(|path| !before.contains_key(path.as_str()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        object_store.output_put_calls(),
+        0,
+        "promotion produced no rewrite output"
+    );
+    assert_eq!(
+        object_store.delete_calls(),
+        0,
+        "promotion deleted no object"
+    );
+    assert!(
+        object_store.object_io_calls() >= before.len(),
+        "promotion revalidated every hot object it appended"
+    );
+}
+
+/// Every sealed row stays visible exactly once across the catalog-to-SQL window.
+///
+/// The catalog commit is held open after acceptance, which is the only interval
+/// in which a row could be counted twice — referenced by the new snapshot and
+/// still unsettled in SQL. The production `pin_sealed_table` cut is taken at
+/// that instant, and before and after it, and each cut must partition the
+/// sealed set exactly.
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn scribe_promotion_catalog_sql_window_preserves_exact_visibility() {
+    let server = start_engine_fixture_server().await;
+    let fixture = seed_forge_group(&server, "promotion_window").await;
+    let catalog_owner = server.bifrost_catalog();
+    let table_ref = fixture.binding.table_ref.clone();
+    let tenant = fixture.tenant;
+
+    let sealed = file_rows(&fixture)
+        .await
+        .into_iter()
+        .map(|row| row.file_path)
+        .collect::<BTreeSet<_>>();
+    assert!(!sealed.is_empty(), "the fixture sealed real objects");
+
+    /// Asserts one production cut sees every sealed path exactly once.
+    async fn assert_exact_cut(
+        catalog: &vala_bifrost_redux::catalog::BifrostCatalog,
+        table: &vala_bifrost_redux::catalog::TableRef,
+        tenant: wyrd_spec::DataTenantId,
+        sealed: &BTreeSet<String>,
+        label: &str,
+    ) {
+        let pinned = catalog
+            .pin_sealed_table(table, tenant)
+            .await
+            .unwrap_or_else(|error| panic!("{label} cut: {error}"));
+        let hot = pinned
+            .hot_files
+            .iter()
+            .map(|row| row.file_path.clone())
+            .collect::<BTreeSet<_>>();
+        let promoted = pinned.iceberg_file_paths;
+        assert!(
+            hot.is_disjoint(&promoted),
+            "{label}: a row is visible from both sources: hot={hot:?} promoted={promoted:?}"
+        );
+        assert_eq!(
+            hot.union(&promoted).cloned().collect::<BTreeSet<_>>(),
+            *sealed,
+            "{label}: the cut does not cover the sealed set exactly"
+        );
+    }
+
+    assert_exact_cut(&catalog_owner, &table_ref, tenant, &sealed, "before").await;
+
+    let catalog = CommitUncertaintyCatalog::new(Arc::clone(&fixture.catalog));
+    catalog.pause_after_commit();
+    let mut forge = SupervisedForge::start_with_seams(
+        &fixture,
+        fixture.config.clone(),
+        Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
+        Arc::clone(&fixture.object_store),
+    );
+    let held = tokio::spawn(async move {
+        forge.run_one_success().await;
+        forge
+    });
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        catalog.wait_for_commit(),
+    )
+    .await
+    .expect("promotion commit reached the catalog boundary");
+    assert_exact_cut(&catalog_owner, &table_ref, tenant, &sealed, "mid-window").await;
+    catalog.release_paused_commit();
+
+    let forge = tokio::time::timeout(std::time::Duration::from_secs(60), held)
+        .await
+        .expect("held promotion completes")
+        .expect("held promotion task");
+    forge.shutdown().await;
+
+    assert_exact_cut(&catalog_owner, &table_ref, tenant, &sealed, "after").await;
+    assert_eq!(
+        file_rows(&fixture)
+            .await
+            .into_iter()
+            .filter(|row| row.committed_snapshot_id.is_some())
+            .count(),
+        sealed.len(),
+        "every sealed row settled exactly once"
     );
 }

@@ -1948,6 +1948,17 @@ impl WyrdTestServer {
         })
     }
 
+    /// Return the Bifrost catalog this server's production surfaces read through.
+    ///
+    /// Exposing the owner rather than a projection is deliberate: a visibility
+    /// proof has to call the same `pin_sealed_table` an Oracle read calls, so
+    /// what it observes is the production cut and not a test reconstruction of
+    /// one.
+    #[must_use]
+    pub fn bifrost_catalog(&self) -> Arc<BifrostCatalog> {
+        Arc::clone(&self.inner.bifrost_catalog)
+    }
+
     /// Return the Scribe retained by this server's production ingest runtime.
     #[must_use]
     pub fn bifrost_scribe(&self) -> Option<Arc<ScribeImpl>> {

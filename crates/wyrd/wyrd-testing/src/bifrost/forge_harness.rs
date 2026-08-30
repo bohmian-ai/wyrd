@@ -415,6 +415,15 @@ impl CommitUncertaintyCatalog {
         .await;
     }
 
+    /// Release the paused post-acceptance response without injecting a fault.
+    ///
+    /// A visibility proof needs the commit to be held open while it observes
+    /// the catalog-to-SQL window, then to complete normally. Rejecting it
+    /// instead would prove recovery, not the window.
+    pub fn release_paused_commit(&self) {
+        self.controls.commit_release.notify_waiters();
+    }
+
     /// Mark the paused caller stale and let it observe the injected response.
     pub fn reject_paused_commit(&self) {
         self.controls

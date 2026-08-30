@@ -40,7 +40,11 @@ impl EventTimeBoundsDefect {
     /// inventory and must stay byte-identical to the emitted metric labels.
     #[must_use]
     pub const fn outcome_label(self) -> &'static str {
-        "fail_open"
+        match self {
+            Self::Missing => "fail_open_missing_bounds",
+            Self::Invalid => "fail_open_invalid_bounds",
+            Self::Contradictory => "fail_open_contradictory_bounds",
+        }
     }
 }
 
@@ -71,8 +75,15 @@ impl EventTimeStatistics {
     /// caller's to classify because only the caller knows whether a literal was
     /// the wrong Iceberg type or out of Chrono's representable range.
     #[must_use]
-    pub fn normalize(_min_micros: Option<i64>, _max_micros: Option<i64>) -> Self {
-        Self::Unusable(EventTimeBoundsDefect::Missing)
+    pub fn normalize(min_micros: Option<i64>, max_micros: Option<i64>) -> Self {
+        match (min_micros, max_micros) {
+            (Some(min_micros), Some(max_micros)) if min_micros <= max_micros => Self::Bounded {
+                min_micros,
+                max_micros,
+            },
+            (Some(_), Some(_)) => Self::Unusable(EventTimeBoundsDefect::Contradictory),
+            _ => Self::Unusable(EventTimeBoundsDefect::Missing),
+        }
     }
 
     /// Normalizes one durable `vala.file_list` timestamp pair.
@@ -86,8 +97,13 @@ impl EventTimeStatistics {
         min_event_time: Option<DateTime<Utc>>,
         max_event_time: Option<DateTime<Utc>>,
     ) -> Self {
-        let _ = (min_event_time, max_event_time);
-        Self::Unusable(EventTimeBoundsDefect::Missing)
+        match (
+            representable_micros(min_event_time),
+            representable_micros(max_event_time),
+        ) {
+            (Ok(min_micros), Ok(max_micros)) => Self::normalize(min_micros, max_micros),
+            _ => Self::Unusable(EventTimeBoundsDefect::Invalid),
+        }
     }
 
     /// Borrows the validated interval, or `None` when the file must be retained.
@@ -126,6 +142,27 @@ impl EventTimeStatistics {
             } => (Some(min_micros), Some(max_micros)),
             Self::Unusable(_) => (None, None),
         }
+    }
+}
+
+/// Converts one optional timestamp into epoch microseconds, rejecting a value
+/// outside the representable microsecond domain.
+///
+/// `chrono` saturates rather than failing on out-of-range microsecond
+/// conversion, so the result is round-tripped instead of trusted: a saturated
+/// bound would silently widen or narrow the interval a reader prunes with.
+///
+/// # Errors
+/// Returns `Err(())` when the timestamp does not round-trip through its
+/// microsecond representation.
+fn representable_micros(value: Option<DateTime<Utc>>) -> Result<Option<i64>, ()> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let micros = value.timestamp_micros();
+    match DateTime::from_timestamp_micros(micros) {
+        Some(round_trip) if round_trip == value => Ok(Some(micros)),
+        _ => Err(()),
     }
 }
 

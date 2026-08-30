@@ -143,13 +143,52 @@ impl PinnedIcebergFile {
         data_file: &iceberg::spec::DataFile,
         event_time_field_id: Option<i32>,
     ) -> Self {
-        let _ = event_time_field_id;
+        let event_time = match event_time_field_id {
+            None => EventTimeStatistics::Unusable(EventTimeBoundsDefect::Missing),
+            Some(field_id) => manifest_event_time_statistics(data_file, field_id),
+        };
         Self {
             file_path,
             file_size: data_file.file_size_in_bytes(),
             row_count: data_file.record_count(),
-            event_time: EventTimeStatistics::Unusable(EventTimeBoundsDefect::Missing),
+            event_time,
         }
+    }
+}
+
+/// Decodes one manifest entry's `wyrd_event_time` interval by field identity.
+///
+/// A bound that is absent is [`EventTimeBoundsDefect::Missing`]; one that is
+/// present but not a `timestamptz` long literal, or not representable as a UTC
+/// microsecond instant, is [`EventTimeBoundsDefect::Invalid`]. Both classes
+/// retain the file.
+fn manifest_event_time_statistics(
+    data_file: &iceberg::spec::DataFile,
+    field_id: i32,
+) -> EventTimeStatistics {
+    let decode = |bounds: &HashMap<i32, iceberg::spec::Datum>| match bounds.get(&field_id) {
+        None => Err(EventTimeBoundsDefect::Missing),
+        Some(datum) => {
+            if datum.data_type() != &iceberg::spec::PrimitiveType::Timestamptz {
+                return Err(EventTimeBoundsDefect::Invalid);
+            }
+            let iceberg::spec::PrimitiveLiteral::Long(micros) = datum.literal() else {
+                return Err(EventTimeBoundsDefect::Invalid);
+            };
+            if chrono::DateTime::from_timestamp_micros(*micros).is_none() {
+                return Err(EventTimeBoundsDefect::Invalid);
+            }
+            Ok(*micros)
+        }
+    };
+    match (
+        decode(data_file.lower_bounds()),
+        decode(data_file.upper_bounds()),
+    ) {
+        (Ok(min_micros), Ok(max_micros)) => {
+            EventTimeStatistics::normalize(Some(min_micros), Some(max_micros))
+        }
+        (Err(defect), _) | (_, Err(defect)) => EventTimeStatistics::Unusable(defect),
     }
 }
 

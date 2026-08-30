@@ -1336,12 +1336,25 @@ pub(crate) struct HotFileSource {
     pub(crate) location: String,
     /// Manifest size used to reserve parent memory before whole-file decode.
     pub(crate) size_bytes: usize,
+    /// Immutable `wyrd_event_time` interval this object declares, or the exact
+    /// reason it declares none.
+    ///
+    /// Carried from the durable `vala.file_list` row so a scan can decide the
+    /// file before it is opened. Unusable statistics retain the file.
+    pub(crate) event_time: crate::catalog::event_time::EventTimeStatistics,
 }
 
 /// Complete immutable inputs for constructing one authenticated table provider.
 pub(crate) struct OracleTableInputs {
     /// Pinned Iceberg table for the sealed cut.
     pub(crate) table: iceberg::table::Table,
+    /// Immutable statistics for every live file in the pinned snapshot.
+    ///
+    /// Empty when the caller has no pinned manifest to describe — a fixture
+    /// table, or a distributed cut whose files travel to followers — in which
+    /// case leader-local Iceberg pruning has nothing to decide and every file
+    /// the pinned scan plans is read.
+    pub(crate) iceberg_files: Vec<crate::catalog::PinnedIcebergFile>,
     /// Footer-validated distributed Iceberg batches, when peer dispatch was selected.
     pub(crate) distributed_iceberg_batches: Option<Vec<RecordBatch>>,
     /// Leader-local hot files absent from the pinned Iceberg snapshot.
@@ -1370,6 +1383,8 @@ pub(crate) struct OracleTableInputs {
 pub(crate) struct OracleTableProvider {
     /// Pinned Iceberg provider built from immutable table metadata.
     iceberg: IcebergStaticTableProvider,
+    /// Immutable statistics for every live file in the pinned snapshot.
+    iceberg_files: Vec<crate::catalog::PinnedIcebergFile>,
     /// Footer-validated distributed Iceberg batches, or `None` for leader-local scanning.
     distributed_iceberg_batches: Option<Vec<RecordBatch>>,
     /// Pinned hot files absent from the selected Iceberg manifest.
@@ -1544,6 +1559,7 @@ impl OracleTableProvider {
     pub(crate) async fn try_new(inputs: OracleTableInputs) -> DataFusionResult<Self> {
         let OracleTableInputs {
             table,
+            iceberg_files,
             distributed_iceberg_batches,
             hot_files,
             distributed_hot_batches,
@@ -1580,6 +1596,7 @@ impl OracleTableProvider {
             .collect::<DataFusionResult<Vec<_>>>()?;
         Ok(Self {
             iceberg,
+            iceberg_files,
             distributed_iceberg_batches,
             hot_files,
             distributed_hot_batches,
@@ -3793,6 +3810,18 @@ mod tests {
     }
 
     /// Composes one Oracle capability for hot-read resource tests.
+    /// Event-time statistics for a fixture whose pruning decision is not the
+    /// behavior under test.
+    ///
+    /// Unusable is the fail-open value, so a fixture built with it is retained
+    /// by every query interval and cannot accidentally disappear from a test
+    /// that is measuring something else.
+    fn unusable_event_time() -> crate::catalog::event_time::EventTimeStatistics {
+        crate::catalog::event_time::EventTimeStatistics::Unusable(
+            crate::catalog::event_time::EventTimeBoundsDefect::Missing,
+        )
+    }
+
     fn oracle_test_roles(memory_limit_bytes: usize) -> crate::resources::BifrostRoleResources {
         crate::resources::BifrostRuntimeResources::from_snapshot(
             crate::resources::SystemResourceSnapshot {
@@ -4445,6 +4474,7 @@ mod tests {
                 vec![HotFileSource {
                     location: path.to_string_lossy().into_owned(),
                     size_bytes,
+                    event_time: unusable_event_time(),
                 }],
                 FileIO::new_with_fs(),
                 Arc::clone(&schema),
@@ -4663,6 +4693,7 @@ mod tests {
             vec![HotFileSource {
                 location: fixture.path.to_string_lossy().into_owned(),
                 size_bytes: fixture.bytes.len(),
+                event_time: unusable_event_time(),
             }],
             FileIO::new_with_fs(),
             Arc::clone(&projected),
@@ -4850,6 +4881,7 @@ mod tests {
             vec![HotFileSource {
                 location: fixture.path.to_string_lossy().into_owned(),
                 size_bytes: fixture.bytes.len(),
+                event_time: unusable_event_time(),
             }],
             FileIO::new_with_fs(),
             Arc::clone(&fixture.schema),
@@ -4946,6 +4978,7 @@ mod tests {
                 vec![HotFileSource {
                     location: fixture.path.to_string_lossy().into_owned(),
                     size_bytes,
+                    event_time: unusable_event_time(),
                 }],
                 FileIO::new_with_fs(),
                 Arc::clone(&fixture.schema),
@@ -5322,6 +5355,7 @@ mod tests {
             vec![HotFileSource {
                 location: fixture.path.to_string_lossy().into_owned(),
                 size_bytes,
+                event_time: unusable_event_time(),
             }],
             FileIO::new_with_fs(),
             Arc::clone(&fixture.schema),
@@ -5527,6 +5561,317 @@ mod tests {
         );
     }
 
+    /// Builds one pinned, snapshot-free Iceberg table carrying the event-time
+    /// column the pruning closure is derived from.
+    ///
+    /// The table has no snapshot, so nothing in this fixture reaches object
+    /// storage; it exists to give `OracleTableProvider` the exact physical
+    /// schema an event-time predicate must classify against.
+    ///
+    /// # Panics
+    /// Panics if the fixture schema, metadata, or table cannot be constructed.
+    fn pruning_fixture_table() -> iceberg::table::Table {
+        use iceberg::spec::TableMetadataBuilder;
+        use iceberg::spec::{
+            FormatVersion, NestedField, PrimitiveType, Schema as IcebergSchema, SortOrder,
+            Type as IcebergType, UnboundPartitionSpec,
+        };
+        use iceberg::{TableIdent, io::FileIO};
+        use wyrd_spec::vala::WYRD_EVENT_TIME;
+
+        let schema = IcebergSchema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                Arc::new(NestedField::optional(
+                    1,
+                    WYRD_EVENT_TIME,
+                    IcebergType::Primitive(PrimitiveType::Timestamptz),
+                )),
+                Arc::new(NestedField::optional(
+                    2,
+                    "duration_ms",
+                    IcebergType::Primitive(PrimitiveType::Long),
+                )),
+                Arc::new(NestedField::required(
+                    3,
+                    DATA_TENANT_ID,
+                    IcebergType::Primitive(PrimitiveType::String),
+                )),
+            ])
+            .build()
+            .expect("fixture Iceberg schema");
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            UnboundPartitionSpec::builder().build(),
+            SortOrder::unsorted_order(),
+            "memory:///pruning-fixture".to_owned(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .expect("fixture table metadata builder")
+        .build()
+        .expect("fixture table metadata")
+        .metadata;
+        iceberg::table::Table::builder()
+            .file_io(FileIO::new_with_memory())
+            .metadata(metadata)
+            .identifier(TableIdent::from_strs(["traces", "spans"]).expect("fixture identifier"))
+            .runtime(iceberg::Runtime::current())
+            .build()
+            .expect("pinned fixture table")
+    }
+
+    /// Builds one leader-local provider over the pruning fixture's file lists.
+    ///
+    /// # Panics
+    /// Panics if the authorization context or the provider cannot be built,
+    /// since neither is the behavior under test.
+    async fn pruning_provider(
+        tenant: wyrd_spec::DataTenantId,
+        iceberg_files: Vec<crate::catalog::PinnedIcebergFile>,
+        hot_files: Vec<HotFileSource>,
+    ) -> OracleTableProvider {
+        let principal = Principal {
+            id: PrincipalId::new(uuid::Uuid::now_v7()),
+            kind: wyrd_runtime::PrincipalKind::User,
+            tenant_id: tenant,
+            roles: Vec::new(),
+            effective_permissions: PermissionSet::default(),
+        };
+        let context = AuthorizedQueryContext::try_new(
+            principal,
+            tenant,
+            RequestId::now_v7(),
+            None,
+            AuthMethod::Internal,
+            "bifrost_query:read",
+        )
+        .expect("query context");
+        let roles = oracle_test_roles(2 * 1024 * 1024 * 1024);
+        OracleTableProvider::try_new(OracleTableInputs {
+            table: pruning_fixture_table(),
+            iceberg_files,
+            distributed_iceberg_batches: None,
+            hot_files,
+            distributed_hot_batches: Vec::new(),
+            live_batches: Vec::new(),
+            context,
+            table_name: "vala.traces.spans".to_owned(),
+            audit: Arc::new(NoopAudit),
+            memory: oracle_memory_resources(&roles, 64 * 1024 * 1024),
+            query_pool: Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
+                256 * 1024 * 1024,
+            )),
+            telemetry: Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1)))),
+            query_class: QueryClass::Interactive,
+        })
+        .await
+        .expect("pruning fixture provider")
+    }
+
+    /// Returns the hot leaf's retained locations and the Iceberg leaf's
+    /// assignment, in the order `scan` built them.
+    ///
+    /// # Panics
+    /// Panics when the plan is not the union the provider builds.
+    fn retained_sources(
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> (Vec<String>, Option<std::collections::BTreeSet<String>>) {
+        let mut current = Arc::clone(plan);
+        loop {
+            if let Some(union) = current.downcast_ref::<UnionExec>() {
+                let mut hot = Vec::new();
+                let mut assigned = None;
+                for child in union.children() {
+                    let mut leaf = Arc::clone(child);
+                    // `scan` normalizes each leaf's column order with a
+                    // projection, so the source sits under it.
+                    while leaf.downcast_ref::<HotParquetExec>().is_none()
+                        && leaf.downcast_ref::<OracleIcebergScanExec>().is_none()
+                        && !leaf.children().is_empty()
+                    {
+                        leaf = Arc::clone(leaf.children()[0]);
+                    }
+                    if let Some(exec) = leaf.downcast_ref::<HotParquetExec>() {
+                        hot = exec
+                            .files
+                            .iter()
+                            .map(|file| file.location.clone())
+                            .collect();
+                    }
+                    if let Some(exec) = leaf.downcast_ref::<OracleIcebergScanExec>() {
+                        assigned = exec.assigned_files.clone();
+                    }
+                }
+                return (hot, assigned);
+            }
+            let children = current.children();
+            assert!(!children.is_empty(), "scan must build a union of leaves");
+            current = Arc::clone(children[0]);
+        }
+    }
+
+    /// Builds one pinned Iceberg file with the named bounds.
+    fn pinned_file(
+        name: &str,
+        event_time: crate::catalog::event_time::EventTimeStatistics,
+    ) -> crate::catalog::PinnedIcebergFile {
+        crate::catalog::PinnedIcebergFile {
+            file_path: format!("tenant/traces/spans/{name}"),
+            location: format!("memory:///pruning-fixture/data/{name}"),
+            file_size: 4_096,
+            row_count: 128,
+            event_time,
+        }
+    }
+
+    /// Builds one hot source with the named bounds.
+    fn hot_file(
+        name: &str,
+        event_time: crate::catalog::event_time::EventTimeStatistics,
+    ) -> HotFileSource {
+        HotFileSource {
+            location: format!("memory:///pruning-fixture/hot/{name}"),
+            size_bytes: 4_096,
+            event_time,
+        }
+    }
+
+    /// A supported closed event-time predicate excludes every provably
+    /// non-overlapping hot and pinned Iceberg file from the plan the provider
+    /// builds, and excludes nothing when the evidence cannot support it.
+    ///
+    /// This is the production seam: `HotParquetExec` opens exactly the files it
+    /// is given and `OracleIcebergScanExec` reads exactly its assignment, so a
+    /// file absent from those lists is a file whose footer is never opened and
+    /// whose data ranges never leave storage. The assertions therefore prove
+    /// exclusion *before* I/O rather than after it.
+    ///
+    /// Endpoint overlap, unusable bounds, and an unsupported predicate are
+    /// asserted in the same owner because they are the three ways this decision
+    /// must decline to exclude; splitting them would let a version that prunes
+    /// on a touching endpoint, or on a missing bound, still pass a
+    /// "non-overlapping file is excluded" test.
+    ///
+    /// # Panics
+    /// Panics when the provider, its scan, or the retained file lists violate
+    /// the pruning contract.
+    #[tokio::test]
+    async fn supported_event_time_predicate_excludes_files_before_any_footer_open() {
+        use datafusion::execution::context::SessionContext;
+        use datafusion::logical_expr::{col, lit};
+        use datafusion::scalar::ScalarValue;
+
+        let lower_micros = 1_787_493_600_000_000_i64;
+        let upper_micros = 1_787_497_200_000_000_i64;
+        let bounded =
+            |min_micros, max_micros| crate::catalog::event_time::EventTimeStatistics::Bounded {
+                min_micros,
+                max_micros,
+            };
+        let tenant = wyrd_spec::DataTenantId::new_v7();
+        let iceberg_files = vec![
+            // Overlaps the window outright.
+            pinned_file("overlapping.parquet", bounded(lower_micros, upper_micros)),
+            // Touches the lower endpoint exactly; closed intervals overlap.
+            pinned_file("endpoint.parquet", bounded(0, lower_micros)),
+            // Entirely after the window.
+            pinned_file(
+                "disjoint.parquet",
+                bounded(upper_micros + 1, upper_micros + 2),
+            ),
+            // A Forge rewrite output whose bounds did not decode.
+            pinned_file("rewrite.parquet", unusable_event_time()),
+        ];
+        let hot_files = vec![
+            hot_file("overlapping.parquet", bounded(lower_micros, upper_micros)),
+            hot_file("endpoint.parquet", bounded(upper_micros, upper_micros + 9)),
+            hot_file("disjoint.parquet", bounded(0, lower_micros - 1)),
+            hot_file("unusable.parquet", unusable_event_time()),
+        ];
+        let provider = pruning_provider(tenant, iceberg_files.clone(), hot_files.clone()).await;
+        let session = SessionContext::new().state();
+        let event_time = || col(wyrd_spec::vala::WYRD_EVENT_TIME);
+        let bound = |micros: i64| {
+            lit(ScalarValue::TimestampMicrosecond(
+                Some(micros),
+                Some("UTC".into()),
+            ))
+        };
+
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        let guard = metrics::set_default_local_recorder(&recorder);
+        let plan = provider
+            .scan(
+                &session,
+                None,
+                &[
+                    event_time().gt_eq(bound(lower_micros)),
+                    event_time().lt_eq(bound(upper_micros)),
+                ],
+                None,
+            )
+            .await
+            .expect("bounded scan plans");
+        drop(guard);
+        let (hot, assigned) = retained_sources(&plan);
+
+        assert_eq!(
+            hot,
+            vec![
+                "memory:///pruning-fixture/hot/overlapping.parquet".to_owned(),
+                "memory:///pruning-fixture/hot/endpoint.parquet".to_owned(),
+                "memory:///pruning-fixture/hot/unusable.parquet".to_owned(),
+            ],
+            "only the provably disjoint hot file is excluded"
+        );
+        assert_eq!(
+            assigned,
+            Some(
+                [
+                    "memory:///pruning-fixture/data/overlapping.parquet".to_owned(),
+                    "memory:///pruning-fixture/data/endpoint.parquet".to_owned(),
+                    "memory:///pruning-fixture/data/rewrite.parquet".to_owned(),
+                ]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+            ),
+            "the pinned scan is restricted to the files that can still match"
+        );
+
+        // Every considered file emits exactly one bounded outcome.
+        let snapshot = recorder.snapshot();
+        let count = |source: &str, outcome: &str| {
+            snapshot
+                .counters
+                .get(&format!(
+                    "bifrost_oracle_file_pruning_total{{outcome=\"{outcome}\",source=\"{source}\"}}"
+                ))
+                .copied()
+                .unwrap_or_default()
+        };
+        assert_eq!(count("hot", "included"), 2, "{snapshot:?}");
+        assert_eq!(count("hot", "excluded"), 1, "{snapshot:?}");
+        assert_eq!(count("hot", "bounds_missing"), 1, "{snapshot:?}");
+        assert_eq!(count("iceberg", "included"), 2, "{snapshot:?}");
+        assert_eq!(count("iceberg", "excluded"), 1, "{snapshot:?}");
+        assert_eq!(count("iceberg", "bounds_missing"), 1, "{snapshot:?}");
+
+        // An unsupported predicate constrains nothing, so nothing is excluded
+        // and the pinned scan keeps its own file selection.
+        let unconstrained = pruning_provider(tenant, iceberg_files, hot_files).await;
+        let plan = unconstrained
+            .scan(&session, None, &[col("duration_ms").gt(lit(1_i64))], None)
+            .await
+            .expect("unconstrained scan plans");
+        let (hot, assigned) = retained_sources(&plan);
+        assert_eq!(hot.len(), 4, "an unconstrained query excludes no hot file");
+        assert_eq!(
+            assigned, None,
+            "an unconstrained query leaves the pinned scan unrestricted"
+        );
+    }
+
     /// Builds one pinned, snapshot-free Iceberg table over the closure fixture
     /// schema, backed entirely by in-memory storage.
     ///
@@ -5669,6 +6014,7 @@ mod tests {
         OracleTableProvider::try_new_distributed(
             OracleTableInputs {
                 table: projection_fixture_table(),
+                iceberg_files: Vec::new(),
                 distributed_iceberg_batches: None,
                 hot_files: Vec::new(),
                 distributed_hot_batches: Vec::new(),

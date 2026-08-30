@@ -201,6 +201,31 @@ impl EventTimeQueryInterval {
         }
         FilePruningDecision::Include
     }
+
+    /// Decides one file, records its bounded outcome, and reports retention.
+    ///
+    /// Every considered physical file emits exactly one
+    /// `bifrost_oracle_file_pruning_total` observation, so the emitted counts
+    /// reconcile against the cut's file count and an exclusion is visible even
+    /// when the query returns the same rows it would have without pruning. Both
+    /// labels are closed enums, which is what bounds the series.
+    ///
+    /// Returns `true` when the file must still be assigned, opened, and read.
+    #[must_use]
+    pub(crate) fn retains(
+        self,
+        source: FilePruningSource,
+        statistics: EventTimeStatistics,
+    ) -> bool {
+        let decision = self.decide(statistics);
+        metrics::counter!(
+            "bifrost_oracle_file_pruning_total",
+            "source" => source.as_str(),
+            "outcome" => decision.outcome_label(),
+        )
+        .increment(1);
+        !decision.excludes()
+    }
 }
 
 #[cfg(test)]

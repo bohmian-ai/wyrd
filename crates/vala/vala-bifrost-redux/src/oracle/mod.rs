@@ -3251,6 +3251,14 @@ impl Oracle {
             self.local_hot_sources(&cut)?
         };
         let provider_inputs = OracleTableInputs {
+            // A distributed cut reads nothing locally: its files travel to
+            // followers as signed assignments, and the leader's provider must
+            // not carry a second, unsigned copy of the same file list.
+            iceberg_files: if distributed {
+                Vec::new()
+            } else {
+                cut.iceberg_files
+            },
             table: cut.iceberg_table,
             distributed_iceberg_batches: None,
             hot_files: local_hot_files,
@@ -3695,6 +3703,11 @@ impl Oracle {
                         .object_location(&cut.binding, &file.file_path)
                         .map_err(BifrostCatalogError::into_public)?,
                     size_bytes,
+                    event_time:
+                        crate::catalog::event_time::EventTimeStatistics::from_catalog_timestamps(
+                            file.min_event_time,
+                            file.max_event_time,
+                        ),
                 })
             })
             .collect()

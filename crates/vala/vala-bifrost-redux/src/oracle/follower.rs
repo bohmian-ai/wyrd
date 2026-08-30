@@ -417,6 +417,13 @@ impl FollowerSourceResolver for OracleCatalogResolver {
                 files.push(super::exec::HotFileSource {
                     location: location.clone(),
                     size_bytes,
+                    // A follower re-decides nothing: the leader already applied
+                    // the query interval to this file list and signed the
+                    // result, so every assigned file is retained by
+                    // construction and carries no local decision.
+                    event_time: crate::catalog::event_time::EventTimeStatistics::Unusable(
+                        crate::catalog::event_time::EventTimeBoundsDefect::Missing,
+                    ),
                 });
             }
             // Every object identity, size, and assignment fence has been

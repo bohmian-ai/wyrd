@@ -225,6 +225,7 @@ impl OraclePlanner {
             let table_name = cut.binding.table_ref.fqn();
             let hot_files = local_hot_sources(catalog, &cut)?;
             let provider = OracleTableProvider::try_new(OracleTableInputs {
+                iceberg_files: cut.iceberg_files,
                 table: cut.iceberg_table,
                 distributed_iceberg_batches: None,
                 hot_files,
@@ -532,6 +533,11 @@ fn local_hot_sources(
                     .object_location(&cut.binding, &file.file_path)
                     .map_err(BifrostCatalogError::into_public)?,
                 size_bytes,
+                event_time:
+                    crate::catalog::event_time::EventTimeStatistics::from_catalog_timestamps(
+                        file.min_event_time,
+                        file.max_event_time,
+                    ),
             })
         })
         .collect()

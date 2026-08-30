@@ -116,6 +116,14 @@ pub struct PinnedSealedTable {
 pub struct PinnedIcebergFile {
     /// Canonical tenant-qualified object path.
     pub file_path: String,
+    /// The manifest's own absolute object location, unaltered.
+    ///
+    /// Retained alongside the canonical path because Iceberg scan planning
+    /// names files by this exact string: pruning a file out of a leader-local
+    /// scan means naming it the way the planner will, and reconstructing that
+    /// location from the canonical form would reimplement, and could disagree
+    /// with, the table's own layout.
+    pub location: String,
     /// Exact object byte size from the pinned manifest.
     pub file_size: u64,
     /// Exact record count from the pinned manifest.
@@ -150,6 +158,7 @@ impl PinnedIcebergFile {
         };
         Self {
             file_path,
+            location: data_file.file_path().to_owned(),
             file_size: data_file.file_size_in_bytes(),
             row_count: data_file.record_count(),
             event_time,
@@ -1311,7 +1320,6 @@ mod tests {
 #[cfg(all(test, feature = "test-support"))]
 mod production_pin_tests {
     use std::collections::HashMap;
-    use std::sync::Arc;
 
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
     use secrecy::ExposeSecret as _;
@@ -1387,9 +1395,8 @@ mod production_pin_tests {
                 .await
                 .expect("dataset registers");
 
-            let binding =
-                crate::catalog::TenantTableBinding::resolve((tenant, table.clone()))
-                    .expect("binding resolves");
+            let binding = crate::catalog::TenantTableBinding::resolve((tenant, table.clone()))
+                .expect("binding resolves");
             let physical = catalog
                 .iceberg_catalog()
                 .load_table(&binding.table_ident())
@@ -1436,9 +1443,7 @@ mod production_pin_tests {
                     name: "contradictory.parquet",
                     lower: Some(timestamptz(upper_micros)),
                     upper: Some(timestamptz(lower_micros)),
-                    expected: EventTimeStatistics::Unusable(
-                        EventTimeBoundsDefect::Contradictory,
-                    ),
+                    expected: EventTimeStatistics::Unusable(EventTimeBoundsDefect::Contradictory),
                 },
             ];
 

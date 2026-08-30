@@ -205,7 +205,8 @@ fn follower_source_loss_degrades(
         && sources == [QuerySource::LiveTail]
 }
 
-/// The one persisted source an assignment's descriptors name.
+/// The one persisted source, and for Iceberg the one pinned snapshot, an
+/// assignment's descriptors name.
 ///
 /// A scan id is a leader-chosen label carried on the wire; it is not authority
 /// for what a follower opens. The descriptor variant is, because it is what
@@ -217,40 +218,57 @@ pub(crate) enum AssignedPersistedSource {
     Empty,
     /// Every descriptor names staged hot Parquet described by `vala.file_list`.
     Hot,
-    /// Every descriptor names a data file in the pinned Iceberg snapshot.
-    Iceberg,
+    /// Every descriptor names a data file in one pinned Iceberg snapshot.
+    Iceberg {
+        /// The snapshot every descriptor in the assignment was pinned to.
+        snapshot_id: i64,
+    },
 }
 
-/// An assignment naming more than one persisted source in a single file list.
+/// Why an assignment's descriptor list does not name one resolvable source.
 ///
-/// This is refused rather than split because the two sources are resolved by
-/// different readers under different authority — a `vala.file_list` row and
-/// decoded checksum for hot, a pinned snapshot for Iceberg — so a mixed list
-/// has no single correct leaf, and picking one would silently drop the other
-/// source's rows.
+/// Both refusals exist because the follower resolves the whole list through a
+/// single reader: there is no correct leaf for a list that needs two, and
+/// picking one would return a signed, digest-clean result missing the other's
+/// rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("assignment names more than one persisted source")]
-pub(crate) struct MixedPersistedSources;
+pub(crate) enum AssignedSourceRejection {
+    /// The list mixes hot and Iceberg descriptors, which are read under
+    /// different authority by different readers.
+    #[error("assignment names more than one persisted source")]
+    MixedSources,
+    /// The list pins more than one Iceberg snapshot, so no single snapshot
+    /// binding can serve it.
+    #[error("assignment names more than one pinned snapshot")]
+    MixedSnapshots,
+}
 
 impl AssignedPersistedSource {
     /// Classifies one assignment's ordered descriptor list.
     ///
     /// # Errors
-    /// Returns [`MixedPersistedSources`] when the list mixes hot and Iceberg
-    /// descriptors.
+    /// Returns [`AssignedSourceRejection`] when the list mixes hot and Iceberg
+    /// descriptors, or pins more than one Iceberg snapshot.
     pub(crate) fn classify(
         files: &[PersistedFileDescriptor],
-    ) -> Result<Self, MixedPersistedSources> {
+    ) -> Result<Self, AssignedSourceRejection> {
         let mut source = Self::Empty;
         for file in files {
             let observed = match file {
                 PersistedFileDescriptor::Hot(_) => Self::Hot,
-                PersistedFileDescriptor::Iceberg(_) => Self::Iceberg,
+                PersistedFileDescriptor::Iceberg(iceberg) => Self::Iceberg {
+                    snapshot_id: iceberg.snapshot_id,
+                },
             };
-            match source {
-                Self::Empty => source = observed,
-                existing if existing == observed => {}
-                _ => return Err(MixedPersistedSources),
+            match (source, observed) {
+                (Self::Empty, _) => source = observed,
+                (Self::Hot, Self::Hot) => {}
+                (Self::Iceberg { snapshot_id: seen }, Self::Iceberg { snapshot_id })
+                    if seen == snapshot_id => {}
+                (Self::Iceberg { .. }, Self::Iceberg { .. }) => {
+                    return Err(AssignedSourceRejection::MixedSnapshots);
+                }
+                _ => return Err(AssignedSourceRejection::MixedSources),
             }
         }
         Ok(source)
@@ -277,7 +295,7 @@ fn follower_assignment_sources(
         // correct here: this function names the tiers a degraded result
         // actually lost, and an assignment that cannot be resolved lost none.
         match AssignedPersistedSource::classify(&assignment.persisted.files) {
-            Ok(AssignedPersistedSource::Iceberg) => sources.push(QuerySource::Iceberg),
+            Ok(AssignedPersistedSource::Iceberg { .. }) => sources.push(QuerySource::Iceberg),
             Ok(AssignedPersistedSource::Hot) => sources.push(QuerySource::HotSealed),
             Ok(AssignedPersistedSource::Empty) | Err(_) => {}
         }
@@ -5629,12 +5647,23 @@ mod tests {
         );
         assert_eq!(
             AssignedPersistedSource::classify(std::slice::from_ref(&iceberg)),
-            Ok(AssignedPersistedSource::Iceberg)
+            Ok(AssignedPersistedSource::Iceberg { snapshot_id: 1 })
         );
         assert_eq!(
-            AssignedPersistedSource::classify(&[hot.clone(), iceberg]),
-            Err(MixedPersistedSources),
+            AssignedPersistedSource::classify(&[hot.clone(), iceberg.clone()]),
+            Err(AssignedSourceRejection::MixedSources),
             "a list resolved by two different readers has no single correct leaf"
+        );
+
+        // One assignment is one pinned cut, so two snapshots in one list have
+        // no single snapshot binding that can serve them.
+        let mut newer = test_persisted_descriptor("c.parquet");
+        if let PersistedFileDescriptor::Iceberg(file) = &mut newer {
+            file.snapshot_id = 2;
+        }
+        assert_eq!(
+            AssignedPersistedSource::classify(&[iceberg, newer]),
+            Err(AssignedSourceRejection::MixedSnapshots)
         );
 
         // The scan id says Iceberg; the descriptors say hot. The descriptors win.

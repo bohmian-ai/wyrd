@@ -52,6 +52,31 @@ impl ReduxTableProvider {
         Ok(Self { inner, tenant })
     }
 
+    /// Build a provider pinned to one exact published snapshot.
+    ///
+    /// A follower resolves its own catalog handle, so without this the leaf it
+    /// builds would read whatever snapshot is current when it happens to
+    /// resolve — a different set of files, and a different schema, from the one
+    /// the leader planned, digested, and signed. Pinning here makes the
+    /// follower's scan and its reported schema come from the snapshot the
+    /// assignment names, so a snapshot that has since been replaced fails to
+    /// resolve instead of quietly serving newer data.
+    ///
+    /// # Errors
+    /// Returns a `DataFusion` error when the named snapshot is absent from the
+    /// loaded table, or when the Iceberg scan provider cannot be constructed
+    /// over it.
+    pub async fn try_new_pinned(
+        table: Table,
+        tenant: DataTenantId,
+        snapshot_id: i64,
+    ) -> DfResult<Self> {
+        let inner = IcebergStaticTableProvider::try_new_from_table_snapshot(table, snapshot_id)
+            .await
+            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+        Ok(Self { inner, tenant })
+    }
+
     /// Remove the temporary tenant column after the physical filter.
     fn project_filtered_plan(
         &self,

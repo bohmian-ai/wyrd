@@ -347,11 +347,32 @@ impl FollowerSourceResolver for OracleCatalogResolver {
             return Err("Oracle resolver received a non-Oracle assignment".to_owned());
         }
         let table = assignment_table(&assignment.binding)?;
-        let provider = self
-            .catalog
-            .provider(&table, assignment.binding.tenant_id)
-            .await
-            .map_err(|_| "authenticated Oracle catalog provider failed".to_owned())?;
+        // Classified before any catalog or object I/O. The scan id is a
+        // leader-chosen label on the wire; the descriptor variant is what
+        // preflight validated and what the assignment-authority digest covers,
+        // so it is the only thing this dispatch may read. A list mixing sources
+        // or snapshots has no single correct reader and is refused here as well
+        // as in preflight, because this resolver is reachable from any
+        // authenticated fragment.
+        let source = super::AssignedPersistedSource::classify(&assignment.persisted.files)
+            .map_err(|_| "authenticated Oracle assignment names mixed sources".to_owned())?;
+        // An Iceberg assignment binds to the snapshot it names rather than to
+        // whichever one is current here, so a snapshot that has since been
+        // replaced fails to resolve instead of serving files and a schema the
+        // leader never planned, digested, or signed.
+        let provider = match source {
+            super::AssignedPersistedSource::Iceberg { snapshot_id } => {
+                self.catalog
+                    .pinned_provider(&table, assignment.binding.tenant_id, snapshot_id)
+                    .await
+            }
+            super::AssignedPersistedSource::Hot | super::AssignedPersistedSource::Empty => {
+                self.catalog
+                    .provider(&table, assignment.binding.tenant_id)
+                    .await
+            }
+        }
+        .map_err(|_| "authenticated Oracle catalog provider failed".to_owned())?;
         // Validates the full physical schema fingerprint against the
         // authenticated table's actual schema immediately after catalog
         // resolution and before any per-file object I/O (the hot-file branch
@@ -381,14 +402,6 @@ impl FollowerSourceResolver for OracleCatalogResolver {
             })
             .map_err(|_| "authenticated Oracle empty provider failed".to_owned());
         }
-        // Classified before any location resolution or object I/O. The scan id
-        // is a leader-chosen label on the wire; the descriptor variant is what
-        // preflight validated and what the assignment-authority digest covers,
-        // so it is the only thing this dispatch may read. A mixed list has no
-        // single correct reader and is refused here as well as in preflight,
-        // because this resolver is reachable from any authenticated fragment.
-        let source = super::AssignedPersistedSource::classify(&assignment.persisted.files)
-            .map_err(|_| "authenticated Oracle assignment names mixed sources".to_owned())?;
         let catalog_binding =
             CatalogTableBinding::resolve((assignment.binding.tenant_id, table))
                 .map_err(|_| "authenticated Oracle assignment binding failed".to_owned())?;

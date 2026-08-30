@@ -992,6 +992,38 @@ impl BifrostCatalog {
             .map_err(BifrostCatalogError::DataFusion)
     }
 
+    /// Resolves one registered tenant table pinned to an exact published
+    /// snapshot.
+    ///
+    /// A follower must read the snapshot the leader planned and signed, not
+    /// whichever one is current when the follower happens to resolve. Loading
+    /// the table and then pinning is what turns a replaced snapshot into a
+    /// resolution failure rather than a quiet read of newer files.
+    ///
+    /// # Errors
+    /// Returns [`BifrostCatalogError::TableNotFound`] when the tenant has no
+    /// such registered table, an invalid-binding error when the tenant-qualified
+    /// identity cannot be derived, a catalog error when the table cannot be
+    /// loaded, and [`BifrostCatalogError::DataFusion`] when the named snapshot
+    /// is absent or the provider cannot be constructed over it.
+    pub async fn pinned_provider(
+        &self,
+        table: &TableRef,
+        tenant: DataTenantId,
+        snapshot_id: i64,
+    ) -> Result<ReduxTableProvider, BifrostCatalogError> {
+        let fqn = table.fqn();
+        let Some(_row) = self.lookup_table_row(&fqn, tenant).await? else {
+            return Err(BifrostCatalogError::TableNotFound(fqn));
+        };
+        let binding = TenantTableBinding::resolve((tenant, table.clone()))
+            .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
+        let iceberg_table = self.catalog.load_table(&binding.table_ident()).await?;
+        ReduxTableProvider::try_new_pinned(iceberg_table, tenant, snapshot_id)
+            .await
+            .map_err(BifrostCatalogError::DataFusion)
+    }
+
     async fn ensure_namespace(
         &self,
         namespace: &iceberg::NamespaceIdent,
@@ -1331,6 +1363,115 @@ mod production_pin_tests {
         upper: Option<iceberg::spec::Datum>,
         /// Statistics the pinned cut must derive from that manifest evidence.
         expected: EventTimeStatistics,
+    }
+
+    /// A pinned provider resolves only against the snapshot it names.
+    ///
+    /// A follower resolves its own catalog handle, so without pinning its leaf
+    /// would read whatever snapshot is current when it happens to resolve —
+    /// a different file set, and a different schema, from the one the leader
+    /// planned, digested, and signed. Naming a snapshot that the table does not
+    /// publish must therefore fail to resolve rather than silently fall back to
+    /// the current one, which is what this asserts: the committed snapshot
+    /// resolves, and a neighbouring id does not.
+    ///
+    /// # Panics
+    /// Panics when the fixture, registration, or commit fails, when the
+    /// committed snapshot does not resolve, or when an unpublished snapshot id
+    /// resolves anyway.
+    #[test]
+    fn pinned_provider_refuses_a_snapshot_the_table_does_not_publish() {
+        wyrd_runtime::runtime().block_on(async {
+            let fixture = wyrd_dev_fixtures::pg::PgFixture::start()
+                .await
+                .expect("postgres fixture starts");
+            let warehouse = tempfile::tempdir().expect("warehouse directory");
+            let catalog = BifrostCatalog::new(
+                fixture.catalog_dsn().expose_secret(),
+                &wyrd_storage::settings::BackendConfig::Local {
+                    root: warehouse.path().to_path_buf(),
+                },
+                fixture.vala_postgres().clone(),
+            )
+            .await
+            .expect("redux catalog builds over the fixture");
+
+            let tenant = fixture.data_tenant_id();
+            let table = TableRef::new(BifrostNamespace::Datasets, "pinned_provider");
+            catalog
+                .register_dataset(
+                    tenant,
+                    table.clone(),
+                    vec![arrow::datatypes::Field::new(
+                        "value",
+                        arrow::datatypes::DataType::Int64,
+                        true,
+                    )],
+                    None,
+                    None,
+                )
+                .await
+                .expect("dataset registers");
+
+            let binding = crate::catalog::TenantTableBinding::resolve((tenant, table.clone()))
+                .expect("binding resolves");
+            let physical = catalog
+                .iceberg_catalog()
+                .load_table(&binding.table_ident())
+                .await
+                .expect("physical table loads");
+            let lower_micros = 1_787_493_600_000_000_i64;
+            let partition = crate::catalog::layout::TimeGranularity::Hour
+                .bucket(
+                    chrono::DateTime::from_timestamp_micros(lower_micros)
+                        .expect("fixture instant is representable"),
+                )
+                .expect("fixture instant buckets");
+            let location = physical.metadata().location().to_owned();
+            let data_file = iceberg::spec::DataFileBuilder::default()
+                .content(iceberg::spec::DataContentType::Data)
+                .file_path(format!("{location}/data/pinned.parquet"))
+                .file_format(iceberg::spec::DataFileFormat::Parquet)
+                .partition(iceberg::spec::Struct::from_iter([Some(
+                    partition.iceberg_partition_literal(),
+                )]))
+                .record_count(1)
+                .file_size_in_bytes(1_024)
+                .partition_spec_id(physical.metadata().default_partition_spec_id())
+                .sort_order_id(
+                    i32::try_from(physical.metadata().default_sort_order_id())
+                        .expect("fixture sort order id fits i32"),
+                )
+                .build()
+                .expect("fixture data file builds");
+            let transaction = Transaction::new(&physical);
+            let action = transaction.fast_append().add_data_files([data_file]);
+            let applied =
+                ApplyTransactionAction::apply(action, transaction).expect("append applies");
+            applied
+                .commit(catalog.iceberg_catalog().as_ref())
+                .await
+                .expect("fast append commits");
+
+            let pinned = catalog
+                .pin_sealed_table(&table, tenant)
+                .await
+                .expect("the committed snapshot pins");
+            let snapshot_id = pinned
+                .snapshot_id
+                .expect("a committed table has a snapshot");
+            catalog
+                .pinned_provider(&table, tenant, snapshot_id)
+                .await
+                .expect("the published snapshot resolves");
+            assert!(
+                catalog
+                    .pinned_provider(&table, tenant, snapshot_id.wrapping_add(1))
+                    .await
+                    .is_err(),
+                "an unpublished snapshot must fail to resolve rather than serve the current one"
+            );
+        });
     }
 
     /// Real production pinning resolves `wyrd_event_time` from the manifest's

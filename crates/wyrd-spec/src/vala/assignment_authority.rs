@@ -153,8 +153,11 @@ pub struct AssignmentDigestInput<'a> {
     pub table: &'a str,
     /// Canonical lowercase 64-hex physical schema fingerprint.
     pub schema_fingerprint_hex: &'a str,
-    /// Canonical persisted file paths assigned to this follower, in order.
-    pub files: &'a [String],
+    /// Signed typed persisted-file descriptors assigned to this follower, in
+    /// order. The descriptor's variant, size, row count, source identity, and
+    /// declared event-time bounds are all inside the digest, so a follower that
+    /// validates the signature has validated the object identity it will read.
+    pub files: &'a [crate::vala::api::PersistedFileDescriptor],
     /// Optional Scribe memory-provider cut for this assignment.
     pub scribe_cut: Option<&'a crate::vala::api::ScribeProviderCut>,
     /// Required output/predicate/hidden-tenant projection closure, in order.
@@ -311,7 +314,7 @@ fn push_assignment(
     buffer.extend_from_slice(&fingerprint);
     push_count(buffer, assignment.files.len(), "files")?;
     for file in assignment.files {
-        push_string(buffer, file)?;
+        push_string(buffer, file.path())?;
     }
     push_option(buffer, assignment.scribe_cut, push_scribe_cut)?;
     push_count(
@@ -387,6 +390,37 @@ mod tests {
     /// partitions `2026-08-23T14:00:00Z` and `2026-08-23T15:00:00Z`, 16 maximum
     /// batches, and 1 MiB maximum retained bytes. The projection closure lives
     /// on the enclosing assignment, never on the cut.
+    /// The normative v4 hot descriptor: the same object path v3 signed as a
+    /// bare string, now carrying its size, record count, `vala.file_list`
+    /// identity, decoded checksum, and declared event-time interval.
+    fn normative_hot_descriptor() -> crate::vala::api::PersistedFileDescriptor {
+        crate::vala::api::PersistedFileDescriptor::Hot(crate::vala::api::HotFileDescriptor {
+            path: "s3://bucket/logs/a.parquet".to_string(),
+            size_bytes: 4_194_304,
+            row_count: 128,
+            file_list_id: uuid::Uuid::parse_str("0f0e0d0c-0b0a-0908-0706-050403020100")
+                .expect("fixture file-list identity parses"),
+            sha256: [0x11; 32],
+            min_event_time_micros: Some(1_787_493_600_000_000),
+            max_event_time_micros: Some(1_787_497_200_000_000),
+        })
+    }
+
+    /// The normative v4 Iceberg descriptor, used to prove the source variant is
+    /// itself authoritative rather than inferred from the path.
+    fn normative_iceberg_descriptor() -> crate::vala::api::PersistedFileDescriptor {
+        crate::vala::api::PersistedFileDescriptor::Iceberg(
+            crate::vala::api::IcebergFileDescriptor {
+                path: "s3://bucket/logs/a.parquet".to_string(),
+                size_bytes: 4_194_304,
+                row_count: 128,
+                snapshot_id: 8_675_309,
+                min_event_time_micros: Some(1_787_493_600_000_000),
+                max_event_time_micros: Some(1_787_497_200_000_000),
+            },
+        )
+    }
+
     fn normative_scribe_cut() -> ScribeProviderCut {
         ScribeProviderCut {
             writer_epoch: 7,
@@ -416,7 +450,7 @@ mod tests {
     fn normative_vector_encodes_to_fixed_length_and_digest() {
         let fingerprint: String = (0u8..32).map(|byte| format!("{byte:02x}")).collect();
         let tenant_uuid = uuid::Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap();
-        let files = vec!["s3://bucket/logs/a.parquet".to_string()];
+        let files = vec![normative_hot_descriptor()];
         let required_columns = vec![
             "service_name".to_string(),
             "wyrd_event_time".to_string(),
@@ -450,6 +484,130 @@ mod tests {
         assert_eq!(
             digest,
             "949a3d1c1e779d23e57fbd1569fab6cdbcd65dd30eac5a0dfa1ab5facd7b4394"
+        );
+    }
+
+    /// Every descriptor field and the descriptor order are independently
+    /// authoritative.
+    ///
+    /// A follower trusts the descriptor instead of re-querying the catalog, so
+    /// any fact a leader could have signed differently — the source variant, the
+    /// path, the size, the record count, the `vala.file_list` identity, the
+    /// decoded checksum, the pinned snapshot, either event-time bound, or the
+    /// position in the list — must move the digest. If one did not, a peer could
+    /// substitute a different object, or the same object under different claimed
+    /// statistics, and still present a valid signature.
+    ///
+    /// The two variants deliberately share a path here: the source tag alone
+    /// must separate them, because a path is not publication authority.
+    #[test]
+    fn assignment_authority_v4_binds_every_descriptor_field_and_order() {
+        use crate::vala::api::PersistedFileDescriptor;
+
+        let (fingerprint, tenant_uuid, files, required_columns, predicates) = base_vector();
+        let cut = normative_scribe_cut();
+        let digest_with = |files: &[PersistedFileDescriptor]| {
+            digest_of(&AssignmentDigestInput {
+                scan_id: "scan-1",
+                tenant_uuid,
+                namespace: "logs",
+                table: "records",
+                schema_fingerprint_hex: &fingerprint,
+                files,
+                scribe_cut: Some(&cut),
+                required_columns: &required_columns,
+                predicates: &predicates,
+            })
+        };
+        let baseline = digest_with(&files);
+
+        // The source tag separates two descriptors that name the same path.
+        assert_ne!(
+            baseline,
+            digest_with(std::slice::from_ref(&normative_iceberg_descriptor())),
+            "the source variant is authoritative, not inferred from the path"
+        );
+
+        let hot_mutation = |mutate: fn(&mut crate::vala::api::HotFileDescriptor)| {
+            let mut descriptor = normative_hot_descriptor();
+            if let PersistedFileDescriptor::Hot(hot) = &mut descriptor {
+                mutate(hot);
+            }
+            vec![descriptor]
+        };
+        for (field, mutated) in [
+            (
+                "path",
+                hot_mutation(|hot| hot.path = "s3://bucket/logs/b.parquet".to_string()),
+            ),
+            ("size_bytes", hot_mutation(|hot| hot.size_bytes += 1)),
+            ("row_count", hot_mutation(|hot| hot.row_count += 1)),
+            (
+                "file_list_id",
+                hot_mutation(|hot| hot.file_list_id = uuid::Uuid::from_u128(9)),
+            ),
+            ("sha256", hot_mutation(|hot| hot.sha256[31] ^= 0x01)),
+            (
+                "min_event_time_micros value",
+                hot_mutation(|hot| hot.min_event_time_micros = Some(1_787_493_600_000_001)),
+            ),
+            (
+                "min_event_time_micros presence",
+                hot_mutation(|hot| {
+                    hot.min_event_time_micros = None;
+                    hot.max_event_time_micros = None;
+                }),
+            ),
+            (
+                "max_event_time_micros value",
+                hot_mutation(|hot| hot.max_event_time_micros = Some(1_787_497_200_000_001)),
+            ),
+        ] {
+            assert_ne!(baseline, digest_with(&mutated), "{field} must be bound");
+        }
+
+        let iceberg_mutation =
+            |mutate: fn(&mut crate::vala::api::IcebergFileDescriptor)| {
+                let mut descriptor = normative_iceberg_descriptor();
+                if let PersistedFileDescriptor::Iceberg(iceberg) = &mut descriptor {
+                    mutate(iceberg);
+                }
+                vec![descriptor]
+            };
+        let iceberg_baseline = digest_with(std::slice::from_ref(&normative_iceberg_descriptor()));
+        for (field, mutated) in [
+            ("size_bytes", iceberg_mutation(|file| file.size_bytes += 1)),
+            ("row_count", iceberg_mutation(|file| file.row_count += 1)),
+            (
+                "snapshot_id",
+                iceberg_mutation(|file| file.snapshot_id += 1),
+            ),
+            (
+                "max_event_time_micros",
+                iceberg_mutation(|file| file.max_event_time_micros = Some(1_787_497_200_000_001)),
+            ),
+        ] {
+            assert_ne!(
+                iceberg_baseline,
+                digest_with(&mutated),
+                "iceberg {field} must be bound"
+            );
+        }
+
+        // Order is authoritative: the same two descriptors in the other order
+        // must not produce the same digest.
+        let forward = vec![normative_hot_descriptor(), normative_iceberg_descriptor()];
+        let reversed = vec![normative_iceberg_descriptor(), normative_hot_descriptor()];
+        assert_ne!(
+            digest_with(&forward),
+            digest_with(&reversed),
+            "descriptor order must be bound"
+        );
+
+        // The v4 domain must separate the same logical assignment from v3.
+        assert_ne!(
+            baseline, "949a3d1c1e779d23e57fbd1569fab6cdbcd65dd30eac5a0dfa1ab5facd7b4394",
+            "a v3 signature must never validate against v4 bytes"
         );
     }
 
@@ -508,13 +666,13 @@ mod tests {
     fn base_vector() -> (
         String,
         uuid::Uuid,
-        Vec<String>,
+        Vec<crate::vala::api::PersistedFileDescriptor>,
         Vec<String>,
         Vec<ScanPredicate>,
     ) {
         let fingerprint: String = (0u8..32).map(|byte| format!("{byte:02x}")).collect();
         let tenant_uuid = uuid::Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap();
-        let files = vec!["s3://bucket/logs/a.parquet".to_string()];
+        let files = vec![normative_hot_descriptor()];
         let required_columns = vec![
             "service_name".to_string(),
             "wyrd_event_time".to_string(),
@@ -638,7 +796,13 @@ mod tests {
         );
 
         // file path bytes
-        let mutated_files = vec!["s3://bucket/logs/b.parquet".to_string()];
+        let mutated_files = vec![{
+            let mut descriptor = normative_hot_descriptor();
+            if let crate::vala::api::PersistedFileDescriptor::Hot(hot) = &mut descriptor {
+                hot.path = "s3://bucket/logs/b.parquet".to_string();
+            }
+            descriptor
+        }];
         assert_ne!(
             baseline,
             digest_of(&AssignmentDigestInput {

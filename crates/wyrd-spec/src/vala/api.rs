@@ -2463,12 +2463,200 @@ pub struct SignedPeerTicket {
     pub signature: Vec<u8>,
 }
 
+/// One signed persisted object a leader assigned to a follower.
+///
+/// A path string alone forces a follower to re-derive every other fact about
+/// the object — which source it came from, how large it is, whether it can be
+/// pruned — by querying the catalog a second time. That query is both a cost
+/// and a correctness hazard: it observes a catalog that may have moved since
+/// the leader pinned its cut.
+///
+/// The typed descriptor removes the re-query. The leader already resolved every
+/// fact a follower needs at pin time, and the descriptor carries exactly those
+/// facts inside the assignment-authority digest, so a follower that validates
+/// the signature has validated the object's identity with it. The variant, not
+/// a suffix on `scan_id`, is the authority for which source an object came from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum PersistedFileDescriptor {
+    /// A sealed object still unresolved in `vala.file_list`.
+    Hot(HotFileDescriptor),
+    /// A data file reachable from the pinned Iceberg snapshot's manifests.
+    Iceberg(IcebergFileDescriptor),
+}
+
+impl PersistedFileDescriptor {
+    /// Returns the catalog-pinned object path this descriptor names.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        match self {
+            Self::Hot(hot) => &hot.path,
+            Self::Iceberg(iceberg) => &iceberg.path,
+        }
+    }
+
+    /// Returns the object's exact size in bytes.
+    #[must_use]
+    pub const fn size_bytes(&self) -> u64 {
+        match self {
+            Self::Hot(hot) => hot.size_bytes,
+            Self::Iceberg(iceberg) => iceberg.size_bytes,
+        }
+    }
+
+    /// Returns the object's exact record count.
+    #[must_use]
+    pub const fn row_count(&self) -> u64 {
+        match self {
+            Self::Hot(hot) => hot.row_count,
+            Self::Iceberg(iceberg) => iceberg.row_count,
+        }
+    }
+
+    /// Returns the declared inclusive event-time bounds, when both are present.
+    ///
+    /// A half-present or reversed pair yields `None`, which is the descriptor's
+    /// only representation of "retain this file": a follower never invents an
+    /// interval from a partial one.
+    #[must_use]
+    pub const fn event_time_micros(&self) -> Option<(i64, i64)> {
+        let (min, max) = match self {
+            Self::Hot(hot) => (hot.min_event_time_micros, hot.max_event_time_micros),
+            Self::Iceberg(iceberg) => {
+                (iceberg.min_event_time_micros, iceberg.max_event_time_micros)
+            }
+        };
+        match (min, max) {
+            (Some(min), Some(max)) if min <= max => Some((min, max)),
+            _ => None,
+        }
+    }
+
+    /// Returns whether this descriptor carries a well-formed immutable identity.
+    ///
+    /// The minimal identity differs by source because the authorities differ: a
+    /// hot object is identified by its `vala.file_list` row and the writer's
+    /// decoded SHA-256, while a pinned Iceberg object is identified by the
+    /// snapshot its manifest belongs to. Both require a canonical nonempty path
+    /// and a positive size, and both require an event-time pair that is either
+    /// wholly absent or ordered.
+    ///
+    /// A zero-row file is valid: an empty object still participates in residual
+    /// execution. Whether the object exists, belongs to the tenant, or matches
+    /// the schema is decided by the binding and ticket checks that run before
+    /// this value is used, not here.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        let (min, max) = match self {
+            Self::Hot(hot) => {
+                if hot.file_list_id.is_nil() {
+                    return false;
+                }
+                (hot.min_event_time_micros, hot.max_event_time_micros)
+            }
+            Self::Iceberg(iceberg) => {
+                if iceberg.snapshot_id <= 0 {
+                    return false;
+                }
+                (iceberg.min_event_time_micros, iceberg.max_event_time_micros)
+            }
+        };
+        let bounds_valid = match (min, max) {
+            (None, None) => true,
+            (Some(min), Some(max)) => min <= max,
+            _ => false,
+        };
+        !self.path().is_empty() && self.size_bytes() > 0 && bounds_valid
+    }
+}
+
+/// One sealed hot object assigned from `vala.file_list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct HotFileDescriptor {
+    /// Catalog-pinned object location.
+    pub path: String,
+    /// Exact object size in bytes, always positive.
+    pub size_bytes: u64,
+    /// Exact record count the writer sealed into this object.
+    pub row_count: u64,
+    /// Identity of the `vala.file_list` row that declared this object.
+    pub file_list_id: uuid::Uuid,
+    /// Writer-recorded object checksum, already decoded from its durable hex
+    /// form. It is carried decoded because it is cache identity, not a display
+    /// value: two distinct objects that shared a cache key would return one
+    /// object's footer for the other's rows.
+    #[serde(with = "sha256_hex")]
+    #[schemars(with = "String")]
+    pub sha256: [u8; 32],
+    /// Inclusive lower `wyrd_event_time` bound in epoch microseconds.
+    pub min_event_time_micros: Option<i64>,
+    /// Inclusive upper `wyrd_event_time` bound in epoch microseconds.
+    pub max_event_time_micros: Option<i64>,
+}
+
+/// One pinned Iceberg data file assigned from the snapshot's manifests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct IcebergFileDescriptor {
+    /// Catalog-pinned object location.
+    pub path: String,
+    /// Exact object size in bytes from the pinned manifest, always positive.
+    pub size_bytes: u64,
+    /// Exact record count from the pinned manifest entry.
+    pub row_count: u64,
+    /// Pinned snapshot the manifest carrying this file belongs to, always
+    /// positive. It is the publication authority for the object: the same path
+    /// under a different snapshot is a different immutable file.
+    pub snapshot_id: i64,
+    /// Inclusive lower `wyrd_event_time` bound in epoch microseconds.
+    pub min_event_time_micros: Option<i64>,
+    /// Inclusive upper `wyrd_event_time` bound in epoch microseconds.
+    pub max_event_time_micros: Option<i64>,
+}
+
+/// Serializes a decoded object checksum as lowercase hex on the wire.
+///
+/// The durable `vala.file_list` column and every operator-facing surface use
+/// the 64-character hex form, so the wire keeps it; only in-memory identity
+/// comparisons use the decoded bytes.
+mod sha256_hex {
+    use serde::{Deserialize as _, Deserializer, Serializer};
+
+    /// Emits the 64-character lowercase hex form of a decoded checksum.
+    ///
+    /// # Errors
+    /// Returns the serializer's own error when the string cannot be emitted.
+    pub(super) fn serialize<S: Serializer>(
+        value: &[u8; 32],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&hex::encode(value))
+    }
+
+    /// Decodes exactly 32 bytes from the 64-character lowercase hex form.
+    ///
+    /// # Errors
+    /// Returns a deserializer error when the value is not valid hex or does not
+    /// decode to exactly 32 bytes; a shorter or longer checksum is a different
+    /// identity domain, never a truncation to tolerate.
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<[u8; 32], D::Error> {
+        let encoded = String::deserialize(deserializer)?;
+        let decoded = hex::decode(&encoded).map_err(serde::de::Error::custom)?;
+        <[u8; 32]>::try_from(decoded.as_slice())
+            .map_err(|_| serde::de::Error::custom("object checksum must decode to 32 bytes"))
+    }
+}
+
 /// Explicit persisted-file assignment for one physical-plan scan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct PersistedFileAssignment {
-    /// Catalog-pinned object locations assigned to this follower.
-    pub files: Vec<String>,
+    /// Signed typed descriptors assigned to this follower, in order.
+    pub files: Vec<PersistedFileDescriptor>,
 }
 
 /// Immutable Scribe memory-provider cut carried by the private follower wire.

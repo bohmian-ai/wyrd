@@ -3368,11 +3368,7 @@ fn validate_causal_metric_contract(
                 &["strategy", "le"],
                 &[(
                     "strategy",
-                    &[
-                        "small_files",
-                        "manifest_rewrite",
-                        "snapshot_expiry",
-                    ],
+                    &["small_files", "manifest_rewrite", "snapshot_expiry"],
                 )],
             ),
             "bifrost_forge_planning_demand_total" => {
@@ -3383,11 +3379,7 @@ fn validate_causal_metric_contract(
                 &[
                     (
                         "strategy",
-                        &[
-                                "small_files",
-                            "manifest_rewrite",
-                            "snapshot_expiry",
-                        ],
+                        &["small_files", "manifest_rewrite", "snapshot_expiry"],
                     ),
                     (
                         "result",
@@ -3917,11 +3909,7 @@ fn causal_spans(
                 if name == ForgeCausalSpanName::CatalogCommit {
                     &["small_files", "manifest_rewrite"]
                 } else {
-                    &[
-                        "small_files",
-                        "manifest_rewrite",
-                        "snapshot_expiry",
-                    ]
+                    &["small_files", "manifest_rewrite", "snapshot_expiry"]
                 },
             )?;
         } else if name == ForgeCausalSpanName::Cleanup {
@@ -4088,11 +4076,7 @@ fn validate_forge_span_contract(
                 validate_closed_span_attribute(
                     span,
                     "strategy",
-                    &[
-                        "small_files",
-                        "manifest_rewrite",
-                        "snapshot_expiry",
-                    ],
+                    &["small_files", "manifest_rewrite", "snapshot_expiry"],
                 )?;
                 validate_closed_span_attribute(
                     span,
@@ -4313,11 +4297,7 @@ fn validate_forge_label_contract(
                 &[
                     (
                         "strategy",
-                        &[
-                                "small_files",
-                            "manifest_rewrite",
-                            "snapshot_expiry",
-                        ],
+                        &["small_files", "manifest_rewrite", "snapshot_expiry"],
                     ),
                     (
                         "result",
@@ -4403,11 +4383,7 @@ fn validate_forge_label_contract(
                 &["strategy", "le"],
                 &[(
                     "strategy",
-                    &[
-                        "small_files",
-                        "manifest_rewrite",
-                        "snapshot_expiry",
-                    ],
+                    &["small_files", "manifest_rewrite", "snapshot_expiry"],
                 )],
             ),
             "bifrost_forge_conflicts_total" => (

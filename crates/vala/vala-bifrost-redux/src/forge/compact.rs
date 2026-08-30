@@ -641,7 +641,6 @@ pub(super) fn forge_transition_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::DateTime;
 
     /// Minimal object-store implementation used to exercise trait defaults.
     #[derive(Debug)]

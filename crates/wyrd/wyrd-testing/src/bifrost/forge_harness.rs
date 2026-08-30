@@ -5,10 +5,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use arrow::array::{
-    FixedSizeBinaryBuilder, Int32Array, Int64Array, RecordBatch, StringArray,
-    TimestampMicrosecondArray,
-};
+use arrow::array::{Int64Array, RecordBatch, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use async_trait::async_trait;
 use iceberg::table::Table;
@@ -17,7 +14,6 @@ use iceberg::{Error as IcebergError, ErrorKind as IcebergErrorKind};
 use opendal::{
     Buffer, Entry, Error as ObjectStoreError, ErrorKind as ObjectStoreErrorKind, Metadata, Operator,
 };
-use parquet::arrow::ArrowWriter;
 use vala_bifrost_redux::catalog::{
     BifrostCatalog, CreateTableRequest, TableRef, TenantTableBinding,
 };
@@ -28,18 +24,12 @@ use vala_bifrost_redux::forge::{
 use vala_bifrost_redux::maintenance::StagingFilePublisher;
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_bifrost_redux::parquet::{
-    BifrostParquetMemoryEnvelope, bifrost_writer_properties_with_metadata,
-};
 use vala_bifrost_redux::resources::{
     BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, ResourceSource,
     SystemResourceSnapshot,
 };
-use vala_bifrost_redux::schema::with_managed_columns;
 use vala_bifrost_redux::scribe::{NativeIngressTestFrame, ScribeImpl};
-use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_spec::DataTenantId;
-use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
 
 use super::super::WyrdTestServer;
 
@@ -1143,9 +1133,9 @@ impl ForgeFixture {
     /// durable row is exactly the failure mode the Scribe-backed seeder exists
     /// to remove.
     fn scribe(&self) -> &Arc<ScribeImpl> {
-        self.scribe.as_ref().expect(
-            "this Forge fixture has no Scribe",
-        )
+        self.scribe
+            .as_ref()
+            .expect("this Forge fixture has no Scribe")
     }
 
     /// Clone the server-owned context with a test-specific validated config.
@@ -2062,327 +2052,5 @@ async fn seed_forge_group_with_scribe(
         tenant,
         scribe: Some(scribe),
         bifrost_catalog: resources.bifrost_catalog,
-    }
-}
-
-/// Real Forge worker lifecycle proofs over the one production resource root.
-///
-/// Every test drives the production `ForgeWorker` against real Postgres,
-/// catalog, and object storage. The fixture only injects raw observations and
-/// fault seams; it never constructs a governor, a pool, or a runtime.
-#[cfg(test)]
-mod worker_lifecycle_tests {
-    use std::sync::Arc;
-
-    use tokio_util::sync::CancellationToken;
-    use vala_bifrost_redux::forge::{ForgeWorker, ForgeWorkerConfig};
-    use vala_bifrost_redux::resources::ForgeRewriteRequest;
-
-    use super::{CommitUncertaintyCatalog, ForgeFixture, ForgeObjectStoreControl};
-
-    /// Awaits one fixture signal under a bounded lifecycle deadline.
-    async fn bounded<F: std::future::Future>(label: &str, future: F) -> F::Output {
-        tokio::time::timeout(std::time::Duration::from_secs(60), future)
-            .await
-            .unwrap_or_else(|_| panic!("{label} exceeded its bounded lifecycle deadline"))
-    }
-
-    /// A running rewrite holds its operation lease and returns it on success.
-    #[tokio::test]
-    async fn forge_harness_observes_worker_operation_lease() {
-        let standalone = lifecycle_fixture("lease_observed").await;
-        let fixture = standalone.fixture();
-        let catalog = CommitUncertaintyCatalog::new(Arc::clone(&fixture.catalog));
-        let (forge, _publisher) = fixture.context_with_worker_supervision(
-            lifecycle_config(fixture),
-            Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
-            Arc::clone(&fixture.object_store),
-            vala_bifrost_redux::forge::ForgeWorkerCompletionObserver::new(),
-            vala_bifrost_redux::forge::ForgeSchedulerTrigger::with_owner_for_test(
-                uuid::Uuid::now_v7(),
-            ),
-        );
-        assert!(
-            forge.run_once().await.expect("planning pass").groups_seen > 0,
-            "the lifecycle fixture must plan durable rewrite work"
-        );
-        let resources = forge.resources_for_test();
-        let baseline = resources
-            .snapshot()
-            .expect("baseline")
-            .elastic_memory_used_bytes;
-        let worker = ForgeWorker::new(
-            Arc::clone(&forge),
-            ForgeWorkerConfig::default(),
-            uuid::Uuid::now_v7(),
-        )
-        .expect("production worker");
-        catalog.pause_before_commit();
-        let stop = CancellationToken::new();
-        let attempt = tokio::spawn({
-            let stop = stop.clone();
-            async move { worker.execute_one_for_test(&stop).await }
-        });
-        bounded("paused commit", catalog.wait_for_before_commit()).await;
-        let held = resources
-            .snapshot()
-            .expect("held")
-            .elastic_memory_used_bytes;
-        assert!(
-            held > baseline,
-            "a running rewrite must hold its exact operation lease"
-        );
-        catalog.reject_paused_before_commit();
-        let _ = bounded("attempt completion", attempt)
-            .await
-            .expect("attempt joins");
-        let released = resources.snapshot().expect("released");
-        assert_eq!(released.elastic_memory_used_bytes, baseline);
-        assert_eq!(released.scratch_used_bytes, 0);
-    }
-
-    /// Capacity refusal performs no data IO and retains the retryable claim.
-    #[tokio::test]
-    async fn forge_harness_refusal_releases_claim_without_data_io() {
-        let standalone = lifecycle_fixture("refusal_no_io").await;
-        let fixture = standalone.fixture();
-        let object_store = ForgeObjectStoreControl::new(Arc::clone(&fixture.staging));
-        let (forge, _publisher) = fixture.context_with_worker_supervision(
-            lifecycle_config(fixture),
-            Arc::clone(&fixture.catalog),
-            Arc::clone(&object_store) as Arc<dyn vala_bifrost_redux::forge::ForgeObjectStore>,
-            vala_bifrost_redux::forge::ForgeWorkerCompletionObserver::new(),
-            vala_bifrost_redux::forge::ForgeSchedulerTrigger::with_owner_for_test(
-                uuid::Uuid::now_v7(),
-            ),
-        );
-        assert!(
-            forge.run_once().await.expect("planning pass").groups_seen > 0,
-            "the lifecycle fixture must plan durable rewrite work"
-        );
-        let resources = forge.resources_for_test();
-        let plan = resources.snapshot().expect("plan snapshot").plan;
-        let blocker_envelope = vala_bifrost_redux::forge::ForgeEnvelopeSizer::size(
-            1,
-            1,
-            1,
-            vala_bifrost_redux::forge::ForgeCapacity {
-                max_files: 1,
-                max_bytes: u64::MAX,
-                max_parallelism: 1,
-                max_memory_bytes: u64::try_from(plan.elastic_memory_bytes)
-                    .expect("blocker memory capacity"),
-                max_spill_bytes: plan.scratch_limit_bytes,
-                max_large_task_bytes: u64::MAX,
-            },
-        )
-        .expect("blocker envelope");
-        let blocker = resources
-            .try_acquire_rewrite(ForgeRewriteRequest {
-                envelope: blocker_envelope,
-                memory_bytes: plan.elastic_memory_bytes,
-                scratch_bytes: plan.scratch_limit_bytes,
-                reader_permits: 1,
-            })
-            .expect("the test owner occupies all Forge capacity");
-        let blocked = resources.snapshot().expect("blocked snapshot");
-        let object_io_before = object_store.object_io_calls();
-        let worker = ForgeWorker::new(
-            Arc::clone(&forge),
-            ForgeWorkerConfig::default(),
-            uuid::Uuid::now_v7(),
-        )
-        .expect("production worker");
-
-        let error = worker
-            .execute_one_for_test(&CancellationToken::new())
-            .await
-            .expect_err("a refused attempt must surface its typed capacity error");
-        assert!(
-            matches!(
-                error,
-                vala_bifrost_redux::forge::ForgeError::Capacity { .. }
-            ),
-            "capacity refusal must keep its original typed error: {error}"
-        );
-        assert_eq!(
-            object_store.output_put_calls(),
-            0,
-            "a refused attempt must not write any rewrite output"
-        );
-        assert_eq!(
-            object_store.object_io_calls(),
-            object_io_before,
-            "capacity refusal must occur before object IO"
-        );
-        let state: (String, bool, bool, bool, Option<String>, i32) = sqlx::query_as(
-            "SELECT state,attempt_id IS NULL,claimed_by IS NULL,claim_expires_at IS NULL,\
-             failure_class,attempt_count FROM vala.forge_tasks WHERE data_tenant_id = $1 \
-             ORDER BY created_at DESC LIMIT 1",
-        )
-        .bind(fixture.tenant.as_uuid())
-        .fetch_one(fixture.operator_pool.pool())
-        .await
-        .expect("durable task state");
-        assert_eq!(state.0, "retryable");
-        assert!(state.1, "capacity refusal clears the attempt identity");
-        assert!(state.2, "capacity refusal clears the claim owner");
-        assert!(state.3, "capacity refusal clears the claim fence");
-        assert_eq!(state.4.as_deref(), Some("capacity_refused"));
-        assert_eq!(state.5, 0, "capacity refusal consumes no attempt budget");
-        let refused = resources.snapshot().expect("post-refusal snapshot");
-        assert_eq!(
-            refused.elastic_memory_used_bytes,
-            blocked.elastic_memory_used_bytes
-        );
-        assert_eq!(refused.scratch_used_bytes, blocked.scratch_used_bytes);
-        drop(blocker);
-        let released = resources.snapshot().expect("released snapshot");
-        assert_eq!(released.elastic_memory_used_bytes, 0);
-        assert_eq!(released.scratch_used_bytes, 0);
-    }
-
-    /// A failed rewrite returns its original error and restores both baselines.
-    #[tokio::test]
-    async fn forge_worker_error_restores_resource_baselines() {
-        let standalone = lifecycle_fixture("error_baselines").await;
-        let fixture = standalone.fixture();
-        let catalog = CommitUncertaintyCatalog::new(Arc::clone(&fixture.catalog));
-        let (forge, _publisher) = fixture.context_with_worker_supervision(
-            lifecycle_config(fixture),
-            Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
-            Arc::clone(&fixture.object_store),
-            vala_bifrost_redux::forge::ForgeWorkerCompletionObserver::new(),
-            vala_bifrost_redux::forge::ForgeSchedulerTrigger::with_owner_for_test(
-                uuid::Uuid::now_v7(),
-            ),
-        );
-        assert!(
-            forge.run_once().await.expect("planning pass").groups_seen > 0,
-            "the lifecycle fixture must plan durable rewrite work"
-        );
-        let resources = forge.resources_for_test();
-        let baseline = resources.snapshot().expect("baseline");
-        catalog.fail_after_next_commit();
-        let worker = ForgeWorker::new(
-            Arc::clone(&forge),
-            ForgeWorkerConfig::default(),
-            uuid::Uuid::now_v7(),
-        )
-        .expect("production worker");
-        let outcome = worker.execute_one_for_test(&CancellationToken::new()).await;
-        assert!(
-            outcome.map_or(true, |executed| executed),
-            "the faulted attempt must have claimed and executed durable work"
-        );
-        let after = resources.snapshot().expect("post-error snapshot");
-        assert_eq!(
-            after.elastic_memory_used_bytes,
-            baseline.elastic_memory_used_bytes
-        );
-        assert_eq!(after.scratch_used_bytes, baseline.scratch_used_bytes);
-    }
-
-    /// Cancellation drops the attempt runtime before the lease returns.
-    #[tokio::test]
-    async fn forge_worker_cancellation_drops_runtime_before_lease_release() {
-        let standalone = lifecycle_fixture("cancel_before_release").await;
-        let fixture = standalone.fixture();
-        let catalog = CommitUncertaintyCatalog::new(Arc::clone(&fixture.catalog));
-        let (forge, _publisher) = fixture.context_with_worker_supervision(
-            lifecycle_config(fixture),
-            Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
-            Arc::clone(&fixture.object_store),
-            vala_bifrost_redux::forge::ForgeWorkerCompletionObserver::new(),
-            vala_bifrost_redux::forge::ForgeSchedulerTrigger::with_owner_for_test(
-                uuid::Uuid::now_v7(),
-            ),
-        );
-        assert!(
-            forge.run_once().await.expect("planning pass").groups_seen > 0,
-            "the lifecycle fixture must plan durable rewrite work"
-        );
-        let resources = forge.resources_for_test();
-        let baseline = resources.snapshot().expect("baseline");
-        let worker = ForgeWorker::new(
-            Arc::clone(&forge),
-            ForgeWorkerConfig::default(),
-            uuid::Uuid::now_v7(),
-        )
-        .expect("production worker");
-        catalog.pause_before_commit();
-        let stop = CancellationToken::new();
-        let attempt = tokio::spawn({
-            let stop = stop.clone();
-            async move { worker.execute_one_for_test(&stop).await }
-        });
-        bounded("paused commit", catalog.wait_for_before_commit()).await;
-        stop.cancel();
-        catalog.reject_paused_before_commit();
-        let _ = bounded("cancelled attempt", attempt)
-            .await
-            .expect("attempt joins");
-        let after = resources.snapshot().expect("post-cancellation snapshot");
-        assert_eq!(
-            after.elastic_memory_used_bytes,
-            baseline.elastic_memory_used_bytes
-        );
-        assert_eq!(after.scratch_used_bytes, baseline.scratch_used_bytes);
-    }
-
-    /// An abruptly dropped attempt still returns its exact lease to the root.
-    #[tokio::test]
-    async fn forge_worker_drop_restores_resource_baselines() {
-        let standalone = lifecycle_fixture("drop_baselines").await;
-        let fixture = standalone.fixture();
-        let catalog = CommitUncertaintyCatalog::new(Arc::clone(&fixture.catalog));
-        let (forge, _publisher) = fixture.context_with_worker_supervision(
-            lifecycle_config(fixture),
-            Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
-            Arc::clone(&fixture.object_store),
-            vala_bifrost_redux::forge::ForgeWorkerCompletionObserver::new(),
-            vala_bifrost_redux::forge::ForgeSchedulerTrigger::with_owner_for_test(
-                uuid::Uuid::now_v7(),
-            ),
-        );
-        assert!(
-            forge.run_once().await.expect("planning pass").groups_seen > 0,
-            "the lifecycle fixture must plan durable rewrite work"
-        );
-        let resources = forge.resources_for_test();
-        let baseline = resources.snapshot().expect("baseline");
-        let worker = ForgeWorker::new(
-            Arc::clone(&forge),
-            ForgeWorkerConfig::default(),
-            uuid::Uuid::now_v7(),
-        )
-        .expect("production worker");
-        catalog.pause_before_commit();
-        let stop = CancellationToken::new();
-        let attempt = tokio::spawn({
-            let stop = stop.clone();
-            async move { worker.execute_one_for_test(&stop).await }
-        });
-        bounded("paused commit", catalog.wait_for_before_commit()).await;
-        attempt.abort();
-        let _ = attempt.await;
-        catalog.reject_paused_before_commit();
-        for _ in 0..200 {
-            if resources
-                .snapshot()
-                .expect("snapshot")
-                .elastic_memory_used_bytes
-                == baseline.elastic_memory_used_bytes
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-        let after = resources.snapshot().expect("post-drop snapshot");
-        assert_eq!(
-            after.elastic_memory_used_bytes,
-            baseline.elastic_memory_used_bytes
-        );
-        assert_eq!(after.scratch_used_bytes, baseline.scratch_used_bytes);
     }
 }

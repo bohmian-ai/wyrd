@@ -1380,8 +1380,6 @@ mod source_tests {
     #[test]
     fn scheduler_capacity_and_status_use_forge_floor_without_elastic_memory() {
         let configured = ForgeCapacity {
-            max_files: 8,
-            max_bytes: 128 * 1024 * 1024,
             max_parallelism: 2,
             max_memory_bytes: 128 * 1024 * 1024,
             max_spill_bytes: 256 * 1024 * 1024,

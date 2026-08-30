@@ -21,7 +21,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 use uuid::Uuid;
-use vala_bifrost_redux::catalog::{BifrostCatalog, TableRef, TenantTableBinding};
+use vala_bifrost_redux::catalog::{BifrostCatalog, TableRef};
 use vala_bifrost_redux::cluster::{ClusterRegistry, RoleTiming};
 use vala_bifrost_redux::forge::{
     ForgeClock, ForgeClockControl, ForgeConfig, ForgeSchedulerTrigger, ForgeWorker,
@@ -293,29 +293,6 @@ pub struct ForgeDataFileInspection {
     pub bytes: u64,
 }
 
-/// Authoritative current-snapshot and durable Forge state for one table.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForgeTableInspection {
-    /// Current Iceberg snapshot identity.
-    pub snapshot_id: i64,
-    /// Sorted, duplicate-free live data files.
-    pub live_data_files: Vec<ForgeDataFileInspection>,
-    /// Production Iceberg target file size.
-    pub target_file_size_bytes: u64,
-    /// Inclusive production lower healthy bound.
-    pub minimum_healthy_file_bytes: u64,
-    /// Inclusive production upper healthy bound.
-    pub maximum_healthy_file_bytes: u64,
-    /// Whether a durable planning demand remains for this table.
-    pub has_demand: bool,
-    /// Durable task states and strategies in creation order.
-    pub tasks: Vec<(String, String)>,
-    /// Tasks retaining an active claim.
-    pub active_claims: u64,
-    /// Distinct active attempt identities.
-    pub active_attempts: u64,
-}
-
 /// One `vala.file_list` row exactly as the publication columns store it.
 ///
 /// The decoding into [`PublishedHotFileInspection`] is deliberately separate:
@@ -387,27 +364,6 @@ pub struct ForgeWorkflowInspection {
     pub active_attempts: u64,
     /// Durable staging files not yet represented by an Iceberg fold.
     pub uncompacted_staging_files: u64,
-}
-
-impl ForgeTableInspection {
-    /// Return the exact current live-file count.
-    #[must_use]
-    pub fn data_file_count(&self) -> usize {
-        self.live_data_files.len()
-    }
-
-    /// Return the checked sum of current compressed file bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns an overflow error when manifest byte totals exceed `u64`.
-    pub fn total_data_file_bytes(&self) -> Result<u64, WyrdTestServerError> {
-        self.live_data_files.iter().try_fold(0_u64, |total, file| {
-            total.checked_add(file.bytes).ok_or_else(|| {
-                WyrdTestServerError::Start("Forge data-file bytes overflow".to_owned())
-            })
-        })
-    }
 }
 
 /// Exact baseline-derived files consumed and produced by one Forge rewrite.
@@ -1907,79 +1863,6 @@ impl WyrdTestServer {
         self.inner.forge_publisher.clone()
     }
 
-    /// Inspect one table through the production Forge discovery and durable state owners.
-    ///
-    /// # Errors
-    ///
-    /// Returns binding, catalog, manifest, metadata, or SQL inspection errors.
-    pub async fn inspect_forge_table_for_test(
-        &self,
-        tenant: DataTenantId,
-        table: &str,
-    ) -> Result<ForgeTableInspection, WyrdTestServerError> {
-        self.inspect_forge_table_ref_for_test(
-            tenant,
-            &TableRef::new(BifrostNamespace::Bifrost, table),
-        )
-        .await
-    }
-
-    /// Inspect one namespace-qualified table through the same production Forge
-    /// discovery and durable state owners.
-    ///
-    /// Journeys that register through the caller-owned HTTP route land in
-    /// `vala.datasets`, so the namespace cannot be assumed. This is the
-    /// authoritative body; the `&str` form above is the `vala.bifrost` shorthand.
-    ///
-    /// # Errors
-    ///
-    /// Returns binding, catalog, manifest, metadata, or SQL inspection errors.
-    pub async fn inspect_forge_table_ref_for_test(
-        &self,
-        tenant: DataTenantId,
-        table: &TableRef,
-    ) -> Result<ForgeTableInspection, WyrdTestServerError> {
-        let binding = TenantTableBinding::resolve((tenant, table.clone()))
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        let physical = self
-            .inner
-            .bifrost_catalog
-            .iceberg_catalog()
-            .load_table(&binding.table_ident())
-            .await
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        let forge = self
-            .inner
-            .state
-            .forge_coordinator()
-            .ok_or_else(|| WyrdTestServerError::Start("Forge is not composed".to_owned()))?;
-        let (snapshot_id, policy, candidates) = forge
-            .inspect_live_files_for_test(&binding, &physical)
-            .await
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        let live_data_files = candidates
-            .into_iter()
-            .map(|file| ForgeDataFileInspection {
-                path: file.catalog_path_for_test().to_owned(),
-                bytes: file.file_size_bytes_for_test(),
-            })
-            .collect();
-        let workflow = self
-            .inspect_forge_workflow_ref_for_test(tenant, table)
-            .await?;
-        Ok(ForgeTableInspection {
-            snapshot_id,
-            live_data_files,
-            target_file_size_bytes: policy.target_file_size_bytes(),
-            minimum_healthy_file_bytes: policy.minimum_file_size_bytes_for_test(),
-            maximum_healthy_file_bytes: policy.maximum_file_size_bytes_for_test(),
-            has_demand: workflow.has_demand,
-            tasks: workflow.tasks,
-            active_claims: workflow.active_claims,
-            active_attempts: workflow.active_attempts,
-        })
-    }
-
     /// Inspect durable Forge demand and task state without requiring an Iceberg snapshot.
     ///
     /// # Errors
@@ -2062,78 +1945,6 @@ impl WyrdTestServer {
             uncompacted_staging_files: u64::try_from(uncompacted_staging_files).map_err(|_| {
                 WyrdTestServerError::Start("negative uncompacted staging file count".to_owned())
             })?,
-        })
-    }
-
-    /// Compare exact pre/post snapshot file identities for one planned rewrite.
-    ///
-    /// # Errors
-    ///
-    /// Returns an invariant error for duplicate identities, retained inputs,
-    /// reused outputs, an unchanged snapshot, or an empty replacement.
-    pub fn compare_forge_rewrite_for_test(
-        before: &ForgeTableInspection,
-        after: &ForgeTableInspection,
-        planned_inputs: &[String],
-    ) -> Result<ForgeRewriteComparison, WyrdTestServerError> {
-        if before.snapshot_id == after.snapshot_id {
-            return Err(WyrdTestServerError::Start(
-                "Forge rewrite did not advance the snapshot".to_owned(),
-            ));
-        }
-        let before_by_path = before
-            .live_data_files
-            .iter()
-            .map(|file| (file.path.as_str(), file))
-            .collect::<std::collections::BTreeMap<_, _>>();
-        let after_paths = after
-            .live_data_files
-            .iter()
-            .map(|file| file.path.as_str())
-            .collect::<BTreeSet<_>>();
-        if before_by_path.len() != before.live_data_files.len()
-            || after_paths.len() != after.live_data_files.len()
-        {
-            return Err(WyrdTestServerError::Start(
-                "Forge inspection contains duplicate live paths".to_owned(),
-            ));
-        }
-        let mut input_files = Vec::with_capacity(planned_inputs.len());
-        for input in planned_inputs {
-            let file = before_by_path.get(input.as_str()).ok_or_else(|| {
-                WyrdTestServerError::Start("Forge planned input is absent from baseline".to_owned())
-            })?;
-            if after_paths.contains(input.as_str()) {
-                return Err(WyrdTestServerError::Start(
-                    "Forge planned input remains live after commit".to_owned(),
-                ));
-            }
-            input_files.push((*file).clone());
-        }
-        let before_paths = before_by_path.keys().copied().collect::<BTreeSet<_>>();
-        let output_files = after
-            .live_data_files
-            .iter()
-            .filter(|file| !before_paths.contains(file.path.as_str()))
-            .cloned()
-            .collect::<Vec<_>>();
-        if output_files.is_empty() {
-            return Err(WyrdTestServerError::Start(
-                "Forge rewrite produced no replacement file".to_owned(),
-            ));
-        }
-        let sum = |files: &[ForgeDataFileInspection]| {
-            files.iter().try_fold(0_u64, |total, file| {
-                total.checked_add(file.bytes).ok_or_else(|| {
-                    WyrdTestServerError::Start("Forge comparison bytes overflow".to_owned())
-                })
-            })
-        };
-        Ok(ForgeRewriteComparison {
-            input_bytes: sum(&input_files)?,
-            output_bytes: sum(&output_files)?,
-            input_files,
-            output_files,
         })
     }
 

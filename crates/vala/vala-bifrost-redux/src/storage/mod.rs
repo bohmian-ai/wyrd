@@ -8,13 +8,14 @@ pub(crate) mod telemetry;
 use std::ops::Range;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::FutureExt as _;
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::file::metadata::ParquetMetaData;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 use wyrd_storage::handle::StorageHandle;
 
@@ -38,6 +39,61 @@ use crate::storage::telemetry::BifrostStorageTelemetry;
 /// result of its own.
 const PANICKED_ATTEMPT: &str = "a governed storage attempt panicked";
 
+/// The owner's live governed-request count and the signal that teardown waits on.
+///
+/// Owned by [`BifrostStorage`] and driven exclusively by
+/// [`StorageRequestGuard`], so the count teardown observes is the same
+/// admission that publishes the request's start and terminal rather than a
+/// second, separately maintained tally that could disagree with it.
+///
+/// The wake is a notification rather than a poll: a request that settles while
+/// nobody is waiting notifies nothing, and a waiter registers before it reads
+/// the count, so neither side can miss the transition to idle.
+#[derive(Debug, Default)]
+struct RequestSettlement {
+    /// Logical requests admitted and not yet settled.
+    active: AtomicUsize,
+    /// Fires each time the active count reaches zero.
+    idle: Notify,
+}
+
+impl RequestSettlement {
+    /// Records one logical request entering the owner.
+    fn admit(&self) {
+        self.active.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Records one logical request leaving the owner, waking teardown at zero.
+    fn settle(&self) {
+        if self.active.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.idle.notify_waiters();
+        }
+    }
+
+    /// Reports whether no governed request is currently admitted.
+    fn is_idle(&self) -> bool {
+        self.active.load(Ordering::SeqCst) == 0
+    }
+
+    /// Waits until every admitted governed request has settled.
+    ///
+    /// The notification is enabled before the count is read so a settlement
+    /// that lands between the two still wakes this waiter; the loop re-reads
+    /// rather than trusting a single wake, because a later admission may raise
+    /// the count again before this future is polled.
+    async fn wait_for_idle(&self) {
+        loop {
+            let notified = self.idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_idle() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
 /// One admitted logical request, settled exactly once.
 ///
 /// Held by [`BifrostStorage::run_read`] and [`BifrostStorage::run_once`] for
@@ -48,6 +104,8 @@ const PANICKED_ATTEMPT: &str = "a governed storage attempt panicked";
 struct StorageRequestGuard<'telemetry> {
     /// The owner's one telemetry sink.
     telemetry: &'telemetry BifrostStorageTelemetry,
+    /// The owner's live request count, raised here and lowered on settlement.
+    settlement: &'telemetry RequestSettlement,
     /// Which governed operation this request performs.
     operation: StorageOperation,
     /// When the logical request was admitted, for the terminal histogram.
@@ -58,10 +116,20 @@ struct StorageRequestGuard<'telemetry> {
 
 impl<'telemetry> StorageRequestGuard<'telemetry> {
     /// Admits one logical request and raises the active-request count.
-    fn admit(telemetry: &'telemetry BifrostStorageTelemetry, operation: StorageOperation) -> Self {
+    ///
+    /// The owner's settlement count is raised alongside the published start, so
+    /// a teardown that begins between the two still observes this request as
+    /// outstanding and waits for it.
+    fn admit(
+        telemetry: &'telemetry BifrostStorageTelemetry,
+        settlement: &'telemetry RequestSettlement,
+        operation: StorageOperation,
+    ) -> Self {
+        settlement.admit();
         telemetry.record_request_start(operation);
         Self {
             telemetry,
+            settlement,
             operation,
             started: Instant::now(),
             settled: false,
@@ -81,6 +149,7 @@ impl<'telemetry> StorageRequestGuard<'telemetry> {
         self.settled = true;
         self.telemetry
             .record_request_terminal(self.operation, outcome, self.started.elapsed());
+        self.settlement.settle();
     }
 }
 
@@ -96,11 +165,7 @@ impl Drop for StorageRequestGuard<'_> {
     /// invariant was violated.
     fn drop(&mut self) {
         if !self.settled {
-            self.telemetry.record_request_terminal(
-                self.operation,
-                StorageRequestOutcome::Cancelled,
-                self.started.elapsed(),
-            );
+            self.settle(StorageRequestOutcome::Cancelled);
         }
     }
 }
@@ -181,6 +246,13 @@ pub struct BifrostStorage {
     requests: Arc<Semaphore>,
     /// Triggered once when this owner begins shutting down.
     owner: CancellationToken,
+    /// Live governed-request count that teardown waits on before reporting closed.
+    ///
+    /// Distinct from [`Self::requests`]: the semaphore bounds concurrent
+    /// *attempts*, while this tracks whole logical requests, so a read parked
+    /// in retry backoff between two attempts holds no permit but is still
+    /// outstanding work that a close or abort must wait for.
+    settlement: RequestSettlement,
     /// Deterministic attempt barrier installed by a test harness.
     ///
     /// Absent in a production build entirely: the field only exists when the
@@ -222,6 +294,7 @@ impl BifrostStorage {
             metadata_resources,
             requests,
             owner: CancellationToken::new(),
+            settlement: RequestSettlement::default(),
             #[cfg(any(test, feature = "test-support"))]
             test_barrier: std::sync::Mutex::new(None),
         }
@@ -666,7 +739,7 @@ impl BifrostStorage {
     where
         Fut: std::future::Future<Output = Result<T, opendal::Error>>,
     {
-        let mut guard = StorageRequestGuard::admit(&self.telemetry, operation);
+        let mut guard = StorageRequestGuard::admit(&self.telemetry, &self.settlement, operation);
         let result = self.read_attempts(operation, attempt).await;
         guard.settle(match &result {
             Ok(_) => StorageRequestOutcome::Success,
@@ -744,7 +817,7 @@ impl BifrostStorage {
     where
         Fut: std::future::Future<Output = Result<T, opendal::Error>>,
     {
-        let mut guard = StorageRequestGuard::admit(&self.telemetry, operation);
+        let mut guard = StorageRequestGuard::admit(&self.telemetry, &self.settlement, operation);
         let result = if self.owner.is_cancelled() {
             Err(BifrostStorageError::Closed)
         } else {
@@ -874,43 +947,64 @@ impl BifrostStorage {
         self.telemetry.snapshot()
     }
 
-    /// Closes cache admission and settles every retained loader by `deadline`.
+    /// Closes admission and settles every loader and governed request by `deadline`.
     ///
     /// Called only after public and query admission are closed and query owners
-    /// have drained, so a load still outstanding here belongs to work that was
-    /// already cancelled. Idempotent.
+    /// have drained, so a load or request still outstanding here belongs to work
+    /// that was already cancelled. Idempotent.
+    ///
+    /// Cancelling the owner is what makes the wait finite rather than hopeful:
+    /// every governed path races that token ahead of its own work, in an
+    /// attempt, in retry backoff, and before admitting another attempt, so each
+    /// outstanding request reaches its terminal on its own rather than being
+    /// abandoned. Both waits share the caller's one absolute `deadline`, and
+    /// the cache is settled first because a retained loader's own object read
+    /// is one of the governed requests the second wait then covers.
     ///
     /// The lifecycle transitions are published here rather than by the cache so
     /// a composition with no cache — a Scribe-only node, or an Oracle node
     /// booted with an explicit zero budget — still reports `Closed` on a clean
     /// teardown instead of remaining indistinguishable from a node that never
-    /// shut down.
+    /// shut down. `Closed` is published only when both the cache and every
+    /// governed request have settled, so the transition can never claim a drain
+    /// that live object I/O contradicts.
     pub async fn close(&self, deadline: Instant) -> bool {
         self.owner.cancel();
         self.telemetry.record_lifecycle(StorageLifecycle::Closing);
-        let settled = match self.metadata_cache.as_ref() {
+        let cache_settled = match self.metadata_cache.as_ref() {
             None => true,
             Some(cache) => cache.close(deadline).await,
         };
+        let requests_settled =
+            tokio::time::timeout_at(deadline.into(), self.settlement.wait_for_idle())
+                .await
+                .is_ok();
+        let settled = cache_settled && requests_settled;
         if settled {
             self.telemetry.record_lifecycle(StorageLifecycle::Closed);
         }
         settled
     }
 
-    /// Closes cache admission immediately, aborting every retained loader.
+    /// Closes admission immediately, aborting every retained loader.
     ///
     /// Idempotent, and safe after [`Self::close`]: both share the cache's one
-    /// close completion, so a second caller observes the first one's outcome.
+    /// close completion, so a second caller observes the first one's outcome,
+    /// and the request wait is satisfied immediately once the owner is already
+    /// idle.
     ///
-    /// Awaits every aborted loader, so once this returns no retained task is
-    /// still running against the owner's state.
+    /// Awaits every aborted loader *and* every governed request, so once this
+    /// returns no retained task and no admitted object operation is still
+    /// running against the owner's state. The wait is unbounded by design: an
+    /// abort exists to leave nothing behind, and a second grace period here
+    /// would just recreate the deadline `close` already owns.
     pub async fn abort(&self) {
         self.owner.cancel();
         self.telemetry.record_lifecycle(StorageLifecycle::Closing);
         if let Some(cache) = self.metadata_cache.as_ref() {
             cache.abort().await;
         }
+        self.settlement.wait_for_idle().await;
         self.telemetry.record_lifecycle(StorageLifecycle::Closed);
     }
 }
@@ -1321,6 +1415,238 @@ mod governed_request_tests {
         assert_eq!(snapshot.request_starts(), snapshot.request_terminals());
         assert_eq!(snapshot.active_requests(), 0);
         assert_eq!(snapshot.anomalies(), 0);
+    }
+
+    /// An abort cannot report a closed owner while governed work is still admitted.
+    ///
+    /// The property is about the *order* of teardown, not its eventual result:
+    /// an owner that cancels admission, publishes `Closed`, and returns while
+    /// two object operations are still running reports a drain its own backend
+    /// contradicts, and every downstream caller — process shutdown, a test
+    /// harness, an operator reading the lifecycle gauge — believes it. So the
+    /// assertions are taken immediately after `abort` returns and deliberately
+    /// before the caller tasks are joined: nothing but the owner's own wait can
+    /// have settled those requests by then.
+    ///
+    /// Both stalled shapes are covered because they leave the owner in
+    /// different places: one request is parked at the production barrier before
+    /// its backend call, the other is inside a backend future that never
+    /// returns, and only the second can prove the losing future was dropped
+    /// rather than merely abandoned.
+    ///
+    /// # Panics
+    /// Panics when a request is still admitted, a terminal is missing, a permit
+    /// leaked, the stalled backend future survived, the lifecycle is not
+    /// `Closed`, or any settlement was unmatched.
+    #[tokio::test]
+    async fn abort_settles_every_governed_request_before_reporting_closed() {
+        let root = tempfile::tempdir().expect("warehouse root");
+        let storage = owner(root.path(), patient_config());
+        let barrier = StorageOperationBarrier::new(StorageOperation::Exists);
+        storage.install_operation_barrier_for_test(Arc::clone(&barrier));
+
+        let parked = tokio::spawn({
+            let storage = Arc::clone(&storage);
+            async move {
+                storage
+                    .run_read(StorageOperation::Exists, || async { Ok(true) })
+                    .await
+            }
+        });
+        barrier.wait_until_reached().await;
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let sleeping = tokio::spawn({
+            let storage = Arc::clone(&storage);
+            let dropped = Arc::clone(&dropped);
+            async move {
+                storage
+                    .run_read(StorageOperation::Read, || {
+                        let dropped = Arc::clone(&dropped);
+                        async move {
+                            let _sentinel = DropSentinel(dropped);
+                            tokio::time::sleep(Duration::from_secs(600)).await;
+                            Ok::<Bytes, opendal::Error>(Bytes::new())
+                        }
+                    })
+                    .await
+            }
+        });
+        wait_until(&storage, |snapshot| snapshot.active_requests() == 2).await;
+
+        storage.abort().await;
+
+        let snapshot = storage.telemetry_snapshot();
+        assert_eq!(
+            snapshot.active_requests(),
+            0,
+            "abort returned while governed requests were still admitted"
+        );
+        assert_eq!(snapshot.request_starts(), 2);
+        assert_eq!(snapshot.request_starts(), snapshot.request_terminals());
+        assert_eq!(
+            snapshot.request_terminal(StorageRequestOutcome::Closed),
+            2,
+            "a request the owner cancelled settles as closed"
+        );
+        assert_eq!(
+            storage.available_request_permits(),
+            storage.policy().max_concurrent_requests(),
+            "every cancelled attempt must return its admission"
+        );
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the losing backend future must be dropped before abort returns"
+        );
+        assert_eq!(snapshot.lifecycle(), StorageLifecycle::Closed);
+        assert_eq!(snapshot.anomalies(), 0);
+
+        barrier.release();
+        assert_eq!(
+            parked
+                .await
+                .expect("the parked read joins")
+                .expect_err("owner cancellation terminates the attempt stalled at the barrier"),
+            BifrostStorageError::Closed
+        );
+        assert_eq!(
+            sleeping
+                .await
+                .expect("the sleeping read joins")
+                .expect_err("owner cancellation terminates the stalled backend future"),
+            BifrostStorageError::Closed
+        );
+
+        storage.abort().await;
+        let repeated = storage.telemetry_snapshot();
+        assert_eq!(repeated.active_requests(), 0);
+        assert_eq!(repeated.request_starts(), repeated.request_terminals());
+        assert_eq!(repeated.anomalies(), 0);
+    }
+
+    /// A close waits for governed requests under the same absolute deadline it
+    /// gives the cache, and never claims a drain it did not reach.
+    ///
+    /// The two branches are the whole point. A deadline with room left must
+    /// actually wait — a close that returned `true` the instant it cancelled
+    /// admission would be indistinguishable from one that waited, and process
+    /// shutdown reads that boolean as proof. An already-elapsed deadline must
+    /// report `false` and leave the lifecycle at `Closing`, because the caller
+    /// then has a real decision to make, and the awaited abort that follows is
+    /// what settles the request and earns `Closed`.
+    ///
+    /// # Panics
+    /// Panics when a close reports the wrong settlement, publishes `Closed`
+    /// with governed work still admitted, or leaves the totals unreconciled.
+    #[tokio::test]
+    async fn close_waits_for_governed_requests_within_its_absolute_deadline() {
+        let patient_root = tempfile::tempdir().expect("warehouse root");
+        let patient = owner(patient_root.path(), patient_config());
+        let patient_barrier = StorageOperationBarrier::new(StorageOperation::Exists);
+        patient.install_operation_barrier_for_test(Arc::clone(&patient_barrier));
+        let waited = tokio::spawn({
+            let patient = Arc::clone(&patient);
+            async move {
+                patient
+                    .run_read(StorageOperation::Exists, || async { Ok(true) })
+                    .await
+            }
+        });
+        patient_barrier.wait_until_reached().await;
+        assert!(
+            patient
+                .close(Instant::now() + Duration::from_secs(30))
+                .await,
+            "a deadline with room left must settle the cancelled request"
+        );
+        let settled = patient.telemetry_snapshot();
+        assert_eq!(settled.active_requests(), 0);
+        assert_eq!(settled.lifecycle(), StorageLifecycle::Closed);
+        assert_eq!(settled.anomalies(), 0);
+        patient_barrier.release();
+        assert_eq!(
+            waited
+                .await
+                .expect("the stalled read joins")
+                .expect_err("owner cancellation terminates the stalled attempt"),
+            BifrostStorageError::Closed
+        );
+
+        let expired_root = tempfile::tempdir().expect("warehouse root");
+        let expired = owner(expired_root.path(), patient_config());
+        let expired_barrier = StorageOperationBarrier::new(StorageOperation::Exists);
+        expired.install_operation_barrier_for_test(Arc::clone(&expired_barrier));
+        let mut outstanding =
+            Box::pin(expired.run_read(StorageOperation::Exists, || async { Ok(true) }));
+        assert!(
+            futures_util::poll!(outstanding.as_mut()).is_pending(),
+            "the first poll admits the request and parks it at the barrier"
+        );
+        assert!(expired_barrier.was_reached());
+        assert_eq!(expired.telemetry_snapshot().active_requests(), 1);
+
+        assert!(
+            !expired
+                .close(Instant::now() + Duration::from_millis(200))
+                .await,
+            "a deadline that elapses with a request still admitted cannot report settled"
+        );
+        let unsettled = expired.telemetry_snapshot();
+        assert_eq!(
+            unsettled.lifecycle(),
+            StorageLifecycle::Closing,
+            "a close that did not settle must not publish Closed"
+        );
+        assert_eq!(unsettled.active_requests(), 1);
+        assert_eq!(unsettled.anomalies(), 0);
+
+        drop(outstanding);
+        expired.abort().await;
+        let aborted = expired.telemetry_snapshot();
+        assert_eq!(aborted.active_requests(), 0);
+        assert_eq!(
+            aborted.request_terminal(StorageRequestOutcome::Cancelled),
+            1,
+            "an abandoned caller settles its request as cancelled"
+        );
+        assert_eq!(aborted.request_starts(), aborted.request_terminals());
+        assert_eq!(aborted.lifecycle(), StorageLifecycle::Closed);
+        assert_eq!(aborted.anomalies(), 0);
+        expired_barrier.release();
+    }
+
+    /// Returns a policy whose own timers cannot settle a stalled request.
+    ///
+    /// Every bound is far beyond the test's lifetime, so a request that does
+    /// settle can only have been settled by owner cancellation. A short
+    /// per-attempt timeout would settle it anyway and quietly prove nothing.
+    fn patient_config() -> BifrostStorageConfig {
+        BifrostStorageConfig {
+            request_timeout_ms: Some(300_000),
+            max_retries: Some(0),
+            max_retry_elapsed_ms: Some(300_000),
+            ..BifrostStorageConfig::default()
+        }
+    }
+
+    /// Waits until the owner's retained totals satisfy `reached`.
+    ///
+    /// Bounded so a never-satisfied condition fails the test with its own
+    /// message instead of hanging the lane.
+    ///
+    /// # Panics
+    /// Panics when the condition is not reached within the bound.
+    async fn wait_until(
+        storage: &BifrostStorage,
+        reached: impl Fn(&MetadataCacheSnapshot) -> bool,
+    ) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !reached(&storage.telemetry_snapshot()) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the owner reached the expected retained totals");
     }
 
     /// Asserts one owner published the expected terminal and reconciles.

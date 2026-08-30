@@ -2069,6 +2069,287 @@ pub(crate) mod tests {
         assert_eq!(cohort, vec!["active", "immutable-one", "immutable-two"]);
     }
 
+
+    /// The four-column closure fixture schema shared by the Scribe follower owner.
+    ///
+    /// `unused_payload` is the wide column no part of the query requests, so a
+    /// resolver that ignores the signed closure is visible in the resolved
+    /// schema rather than only in byte counters.
+    fn closure_fixture_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("unused_payload", DataType::Utf8, true),
+            Field::new("duration_ms", DataType::Int64, true),
+            Field::new("status_code", DataType::Utf8, true),
+            Field::new(DATA_TENANT_ID, DataType::Utf8, false),
+        ]))
+    }
+
+    /// Builds a memtable holding one ERROR row and one OK row at that schema.
+    ///
+    /// Both rows are inserted into the active generation: this owner is about
+    /// projection and predicate application, not generation retirement, which
+    /// [`scribe_provider_is_active_plus_all_unretired_immutable`] already pins.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the fixture rows cannot be built or inserted, which would mean
+    /// the memtable no longer has the shape this owner asserts against.
+    fn closure_fixture_memtable(
+        tenant_id: DataTenantId,
+        day: TimePartition,
+        schema: &Arc<Schema>,
+    ) -> (SealKey, Arc<Memtable>) {
+        use arrow::array::Int64Array;
+
+        let table = TableRef::parse_fqn("vala.traces.spans").expect("canonical table");
+        let key = SealKey::new(tenant_id, table, day);
+        let memtable = Arc::new(Memtable::new());
+        let batch = RecordBatch::try_new(Arc::clone(schema), vec![
+            Arc::new(StringArray::from(vec!["wide-error", "wide-ok"])),
+            Arc::new(Int64Array::from(vec![41_i64, 97_i64])),
+            Arc::new(StringArray::from(vec![
+                "STATUS_CODE_ERROR",
+                "STATUS_CODE_OK",
+            ])),
+            Arc::new(StringArray::from(vec![
+                tenant_id.to_string(),
+                tenant_id.to_string(),
+            ])),
+        ])
+        .expect("closure fixture batch");
+        let event = wyrd_spec::vala::api::AuditEvent {
+            request_id: wyrd_spec::request_id::RequestId::now_v7(),
+            trace_id: None,
+            operation: "test".to_owned(),
+            resource: "vala.traces.spans".to_owned(),
+            card_ref: None,
+            principal_id: wyrd_spec::auth::PrincipalId::new(uuid::Uuid::now_v7()),
+            principal_kind: wyrd_spec::auth::PrincipalKindTag::User,
+            auth_method: wyrd_spec::vala::api::AuthMethod::Jwt,
+            permission: "test".to_owned(),
+            decision: wyrd_spec::vala::api::AuditDecision::Allow,
+            result: wyrd_spec::vala::api::AuditResult::Success,
+            payload_summary: "test".to_owned(),
+            detail: None,
+        };
+        let meta = ScribeAppendMeta {
+            batch_id: *uuid::Uuid::now_v7().as_bytes(),
+            schema_fingerprint: [0; 32],
+            data_digest: [0; 32],
+            data_len: 0,
+            payload_digest: [0; 32],
+            payload_len: 0,
+            slice_index: 0,
+            slice_count: 1,
+            rows_accepted: 2,
+            wal_lsn_min: WalLsn::new(7),
+            wal_lsn_max: WalLsn::new(7),
+            seal_key: key.to_string(),
+        };
+        memtable
+            .insert(&key, event, meta, batch)
+            .expect("closure fixture rows insert");
+        (key, memtable)
+    }
+
+    /// Builds one Scribe assignment carrying the signed closure and predicate.
+    fn closure_assignment(
+        scan_id: String,
+        binding: TenantTableBinding,
+        schema: &Schema,
+        required_columns: Vec<String>,
+        schema_fingerprint: String,
+    ) -> FollowerScanAssignment {
+        let _ = schema;
+        FollowerScanAssignment {
+            scan_id,
+            binding,
+            persisted: PersistedFileAssignment { files: Vec::new() },
+            scribe_provider_cut: Some(cut()),
+            schema_fingerprint,
+            required_columns,
+            predicates: vec![
+                wyrd_spec::vala::assignment_authority::ScanPredicate::Eq(
+                    "status_code".to_owned(),
+                    wyrd_spec::vala::assignment_authority::ScanLiteral::Utf8(
+                        "STATUS_CODE_ERROR".to_owned(),
+                    ),
+                ),
+            ],
+        }
+    }
+
+    /// The Scribe follower fetches and exposes exactly the signed closure, at a
+    /// non-zero ordinal, and validates the full schema before any source IO.
+    ///
+    /// This is the production live-tail leaf for
+    /// `SELECT duration_ms ... WHERE status_code = 'STATUS_CODE_ERROR'`. Three
+    /// distinct properties are pinned together because they are one contract:
+    ///
+    /// 1. the fetch request copies `assignment.required_columns` byte-for-byte
+    ///    and retains `assignment.predicates`, so the memtable projects and
+    ///    filters rather than the plan above discarding wide columns later;
+    /// 2. the resolved leaf — and the non-owning empty branch, which produces
+    ///    no rows at all — declares that same closure schema, so the serialized
+    ///    plan's `Column` indices are closure indices on every branch;
+    /// 3. an assignment whose *full* schema fingerprint does not match refuses
+    ///    before the live-tail source is touched at all.
+    ///
+    /// `duration_ms` sits at closure ordinal 0 but complete-schema ordinal 1,
+    /// so a leaf that declares the closure while returning complete-schema rows
+    /// would read the wrong column rather than merely a wide one.
+    ///
+    /// # Panics
+    ///
+    /// Panics if resolution, execution, or the recorded request violates the
+    /// closure contract this owner pins.
+    #[tokio::test]
+    async fn scribe_provider_projects_and_filters_a_nonzero_ordinal() {
+        use arrow::array::Int64Array;
+
+        let tenant_id = DataTenantId::new_v7();
+        let schema = closure_fixture_schema();
+        let day = crate::test_support::day_partition(2026, 8, 19);
+        let (_key, memtable) = closure_fixture_memtable(tenant_id, day, &schema);
+        let role_resources = crate::resources::BifrostRuntimeResources::composed_for_test(
+            crate::resources::MIN_UNMANAGED_RESERVE_BYTES
+                + crate::resources::ROLE_MEMORY_FLOOR_BYTES,
+            crate::resources::MIN_SCRATCH_FREE_BYTES,
+            [crate::resources::BifrostRole::Scribe],
+        );
+        let stream = StreamIdentity::new(
+            crate::scribe::stream_identity::NodeId::new(uuid::Uuid::now_v7()),
+            WriterEpoch::new(2),
+        );
+        let service = Arc::new(FetchLiveTailService::new(
+            stream,
+            memtable,
+            role_resources.scribe().expect("Scribe capability"),
+        ));
+        let resolver = ScribeTailResolver::with_schema(service, Arc::clone(&schema));
+        let session = SessionContext::new().state();
+        let binding = TenantTableBinding {
+            tenant_id,
+            namespace: "vala.traces".to_owned(),
+            table: "spans".to_owned(),
+        };
+        let closure = vec![
+            "duration_ms".to_owned(),
+            "status_code".to_owned(),
+            DATA_TENANT_ID.to_owned(),
+        ];
+        let fingerprint = super::super::assignment_schema_fingerprint(schema.as_ref());
+
+        let owned = resolver
+            .resolve(
+                ClusterRole::Scribe,
+                &closure_assignment(
+                    local_scribe_scan_id(&binding, stream),
+                    binding.clone(),
+                    schema.as_ref(),
+                    closure.clone(),
+                    fingerprint.clone(),
+                ),
+                &session,
+            )
+            .await
+            .expect("signed closure resolves");
+        assert_eq!(
+            owned
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect::<Vec<_>>(),
+            closure,
+            "the live-tail leaf exposes exactly the signed closure"
+        );
+
+        let rows = collect(owned, Arc::new(TaskContext::default()))
+            .await
+            .expect("closure cohort executes");
+        let durations = rows
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("closure ordinal 0 is duration_ms")
+                    .iter()
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            durations,
+            vec![41_i64],
+            "only the ERROR row survives, with its duration preserved"
+        );
+
+        // The non-owning branch produces no rows but must still declare the
+        // same closure schema as the owning branch.
+        let unowned = resolver
+            .resolve(
+                ClusterRole::Scribe,
+                &closure_assignment(
+                    "vala.traces.spans:scribe:someone-else".to_owned(),
+                    binding.clone(),
+                    schema.as_ref(),
+                    closure.clone(),
+                    fingerprint.clone(),
+                ),
+                &session,
+            )
+            .await
+            .expect("a non-owning assignment resolves to an empty branch");
+        assert_eq!(
+            unowned
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect::<Vec<_>>(),
+            closure,
+            "the empty branch declares the same closure schema"
+        );
+
+        // A mismatched *full* schema fingerprint refuses before any source IO.
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let counting = ScribeTailResolver::with_schema(
+            Arc::new(RecordingTail {
+                stream,
+                requests: Arc::clone(&requests),
+                batches: Vec::new(),
+            }),
+            Arc::clone(&schema),
+        );
+        assert!(
+            counting
+                .resolve(
+                    ClusterRole::Scribe,
+                    &closure_assignment(
+                        local_scribe_scan_id(&binding, stream),
+                        binding,
+                        schema.as_ref(),
+                        closure,
+                        "sha256:wrong".to_owned(),
+                    ),
+                    &session,
+                )
+                .await
+                .is_err(),
+            "a mismatched full-schema fingerprint refuses resolution"
+        );
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            0,
+            "the live-tail source is never touched by a refused assignment"
+        );
+    }
+
     /// Every authenticated request-component contradiction fails before resolution.
     ///
     /// # Panics

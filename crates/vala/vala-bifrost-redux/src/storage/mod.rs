@@ -85,19 +85,20 @@ impl<'telemetry> StorageRequestGuard<'telemetry> {
 }
 
 impl Drop for StorageRequestGuard<'_> {
-    /// Records an anomaly for a request that left without a terminal outcome.
+    /// Settles a request whose caller went away before it could finish.
     ///
-    /// Unreachable on a correct owner: every governed path settles before
-    /// returning. Recording it keeps an unsettled request visible in the totals
-    /// rather than leaving the active-request count permanently raised with no
-    /// explanation.
+    /// Every governed path settles its own request before returning, so
+    /// reaching this branch means the whole future was dropped mid-request —
+    /// the caller's query was cancelled, its stream abandoned, or its task
+    /// aborted. That is cancellation, not a lost terminal, so it publishes a
+    /// [`StorageRequestOutcome::Cancelled`] terminal: the active-request count
+    /// comes back down and the totals still reconcile, without claiming an
+    /// invariant was violated.
     fn drop(&mut self) {
         if !self.settled {
-            self.telemetry
-                .record_transition_anomaly(TelemetryTransition::RequestTerminal);
             self.telemetry.record_request_terminal(
                 self.operation,
-                StorageRequestOutcome::Backend,
+                StorageRequestOutcome::Cancelled,
                 self.started.elapsed(),
             );
         }

@@ -147,6 +147,13 @@ async fn prove_published_governance() -> Result<(), JourneyError> {
         second_rows, first_rows,
         "two concurrent callers of one identity read the same exact rows"
     );
+    // Repeated once, unstalled: the identity is now resident, so this caller
+    // must be served from the cache rather than decode the object again.
+    let repeated = query_ids(&owner, &fqn, Some(since_phase_one)).await?;
+    assert_eq!(
+        repeated, first_rows,
+        "a cached read returns the same exact rows as the decode that filled it"
+    );
     let after = storage.telemetry_snapshot();
     assert_eq!(
         after.load_starts() - before.load_starts(),
@@ -360,17 +367,19 @@ fn assert_reconciled(snapshot: &MetadataCacheSnapshot, label: &str) {
     );
 }
 
-/// Waits until at least one caller is queued behind an in-flight decode.
+/// Waits until a second caller is queued behind one in-flight decode.
 ///
 /// The single-flight observation is only meaningful if the second caller
 /// provably arrives while the first load is still running, so the fixture waits
-/// for the owner to say so rather than for a duration.
+/// for the owner to say so rather than for a duration. The elected loader
+/// counts itself as a waiter, so two is the first count that means a caller
+/// actually joined rather than started.
 ///
 /// # Errors
-/// Returns an error when no caller queues within the bound.
+/// Returns an error when no second caller queues within the bound.
 async fn wait_for_waiter(storage: &Arc<BifrostStorage>) -> Result<(), JourneyError> {
     for _ in 0..600 {
-        if storage.telemetry_snapshot().waiters() > 0 {
+        if storage.telemetry_snapshot().waiters() > 1 {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(50)).await;

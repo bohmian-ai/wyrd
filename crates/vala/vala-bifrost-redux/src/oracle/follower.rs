@@ -307,6 +307,67 @@ impl OracleCatalogResolver {
     pub fn new(catalog: Arc<BifrostCatalog>) -> Self {
         Self { catalog }
     }
+
+    /// Resolves every assigned descriptor to its table-relative and absolute
+    /// object location.
+    ///
+    /// Kept separate from `resolve` because it is the one part of that workflow
+    /// that only needs the catalog binding: it turns signed paths into
+    /// locations this node can open, and refuses any path that does not live
+    /// under the authenticated table's own prefix.
+    ///
+    /// # Errors
+    /// Returns a scrubbed message when the binding does not resolve, when a
+    /// signed path is not under the table's prefix, or when the catalog cannot
+    /// place an object.
+    fn assigned_locations(
+        &self,
+        assignment: &FollowerScanAssignment,
+        table: TableRef,
+    ) -> Result<Vec<(PersistedFileDescriptor, String, String)>, String> {
+        let catalog_binding =
+            CatalogTableBinding::resolve((assignment.binding.tenant_id, table))
+                .map_err(|_| "authenticated Oracle assignment binding failed".to_owned())?;
+        assignment
+            .persisted
+            .files
+            .iter()
+            .map(|descriptor| {
+                let path = descriptor.path();
+                let table_relative = path
+                    .strip_prefix(&catalog_binding.object_prefix)
+                    .and_then(|suffix| suffix.strip_prefix('/'))
+                    .ok_or_else(|| "authenticated Oracle assignment binding failed".to_owned())?
+                    .to_owned();
+                self.catalog
+                    .object_location(&catalog_binding, path)
+                    .map(|location| (descriptor.clone(), table_relative, location))
+                    .map_err(|_| "authenticated Oracle assignment location failed".to_owned())
+            })
+            .collect()
+    }
+}
+
+/// Builds the leaf for an assignment that names no files at all.
+///
+/// A signed closure can legitimately select nothing once the leader has pruned
+/// it, and that is a correct empty result rather than an error: the follower
+/// still returns a plan at the closure schema so the union above it sees the
+/// same columns every other fragment produces.
+///
+/// # Errors
+/// Returns a scrubbed message when the empty in-memory source cannot be built.
+fn empty_assignment_leaf(
+    required_schema: &SchemaRef,
+    full_schema: SchemaRef,
+) -> Result<ResolvedFollowerSource, String> {
+    let batch = arrow::record_batch::RecordBatch::new_empty(Arc::clone(required_schema));
+    MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(required_schema), None)
+        .map(|plan| ResolvedFollowerSource {
+            plan: plan as Arc<dyn ExecutionPlan>,
+            full_schema,
+        })
+        .map_err(|_| "authenticated Oracle empty provider failed".to_owned())
 }
 
 #[async_trait]
@@ -390,38 +451,9 @@ impl FollowerSourceResolver for OracleCatalogResolver {
         let required_schema =
             signed_closure_schema(full_schema.as_ref(), &assignment.required_columns)?;
         if assignment.persisted.files.is_empty() {
-            let batch = arrow::record_batch::RecordBatch::new_empty(Arc::clone(&required_schema));
-            return MemorySourceConfig::try_new_exec(
-                &[vec![batch]],
-                Arc::clone(&required_schema),
-                None,
-            )
-            .map(|plan| ResolvedFollowerSource {
-                plan: plan as Arc<dyn ExecutionPlan>,
-                full_schema,
-            })
-            .map_err(|_| "authenticated Oracle empty provider failed".to_owned());
+            return empty_assignment_leaf(&required_schema, full_schema);
         }
-        let catalog_binding =
-            CatalogTableBinding::resolve((assignment.binding.tenant_id, table))
-                .map_err(|_| "authenticated Oracle assignment binding failed".to_owned())?;
-        let assigned_locations = assignment
-            .persisted
-            .files
-            .iter()
-            .map(|descriptor| {
-                let path = descriptor.path();
-                let table_relative = path
-                    .strip_prefix(&catalog_binding.object_prefix)
-                    .and_then(|suffix| suffix.strip_prefix('/'))
-                    .ok_or_else(|| "authenticated Oracle assignment binding failed".to_owned())?
-                    .to_owned();
-                self.catalog
-                    .object_location(&catalog_binding, path)
-                    .map(|location| (descriptor.clone(), table_relative, location))
-                    .map_err(|_| "authenticated Oracle assignment location failed".to_owned())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let assigned_locations = self.assigned_locations(assignment, table)?;
         if source == super::AssignedPersistedSource::Hot {
             let files = assigned_locations
                 .iter()

@@ -5703,7 +5703,7 @@ mod tests {
                         .collect(),
                 );
             }
-            plan.children().into_iter().find_map(|child| walk(child))
+            plan.children().into_iter().find_map(walk)
         }
         walk(plan).expect("the plan retains a hot Parquet leaf")
     }

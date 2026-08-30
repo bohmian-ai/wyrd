@@ -43,6 +43,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use wyrd_spec::ids::DataTenantId;
 
+use crate::resources::{MetadataReservation, OracleMetadataResources};
 use crate::storage::error::BifrostStorageError;
 use crate::storage::telemetry::{
     BifrostStorageTelemetry, CacheEffect, CacheEffectReason, MetadataLoadOutcome, StorageLifecycle,
@@ -53,7 +54,61 @@ use crate::storage::telemetry::{
 /// The error is `Arc`-wrapped because one loader's single closed failure is
 /// delivered to an unbounded number of waiters; cloning the error itself would
 /// duplicate its detail string per waiter for no benefit.
-pub(crate) type MetadataLoadResult = Result<Arc<ParquetMetaData>, Arc<BifrostStorageError>>;
+pub(crate) type MetadataLoadResult = Result<RetainedMetadata, Arc<BifrostStorageError>>;
+
+/// Decoded metadata together with the root memory ownership that funds it.
+///
+/// Returned to every caller rather than a bare `Arc<ParquetMetaData>` so that
+/// holding the metadata and owning its bytes are the same act. A borrower that
+/// outlives the cache entry keeps the reservation alive, so eviction can free
+/// the node's own reference without telling the Oracle memory root that bytes
+/// a running query is still reading have been returned.
+#[derive(Debug, Clone)]
+pub struct RetainedMetadata {
+    /// Immutable decoded metadata shared with every caller.
+    metadata: Arc<ParquetMetaData>,
+    /// Shared root-memory ownership, absent when the root declined to fund it.
+    ///
+    /// Absent metadata is served but never retained: the node hands the decode
+    /// to the caller that paid for it and keeps nothing it cannot account for.
+    reservation: Option<Arc<MetadataReservation>>,
+}
+
+impl RetainedMetadata {
+    /// Wraps a decode that no cache reservation funds.
+    ///
+    /// The shape a disabled composition returns: the decode belongs to the
+    /// query that asked for it and is accounted there, and the node retains
+    /// nothing, so there is no shared ownership to carry.
+    pub(crate) const fn unreserved(metadata: Arc<ParquetMetaData>) -> Self {
+        Self {
+            metadata,
+            reservation: None,
+        }
+    }
+
+    /// Returns the decoded metadata this borrower holds.
+    #[must_use]
+    pub fn metadata(&self) -> &Arc<ParquetMetaData> {
+        &self.metadata
+    }
+
+    /// Returns whether the Oracle root funds retaining these bytes.
+    #[must_use]
+    pub const fn is_funded(&self) -> bool {
+        self.reservation.is_some()
+    }
+}
+
+impl std::ops::Deref for RetainedMetadata {
+    type Target = ParquetMetaData;
+
+    /// Borrows the decoded metadata, so a caller reads it without unwrapping
+    /// the ownership it happens to travel with.
+    fn deref(&self) -> &Self::Target {
+        &self.metadata
+    }
+}
 
 /// A caller-supplied decode of one object's Parquet metadata.
 ///
@@ -181,9 +236,12 @@ impl HotMetadataKey {
 /// One retained successful decode and the bytes it is charged.
 #[derive(Debug)]
 struct CachedMetadata {
-    /// Immutable decoded metadata shared with every caller.
-    metadata: Arc<ParquetMetaData>,
+    /// Decoded metadata and the shared reservation funding it.
+    metadata: RetainedMetadata,
     /// Charged weight: decoded footprint plus the key's owned bytes.
+    ///
+    /// The same figure the reservation owns, kept here so the byte ceiling can
+    /// be enforced without reaching into the root ledger on every lookup.
     weight: u64,
 }
 
@@ -250,7 +308,7 @@ impl CacheState {
 /// What one lookup registration decided for its caller.
 enum Registration {
     /// A resident entry satisfied the lookup with no load at all.
-    Resident(Arc<ParquetMetaData>),
+    Resident(RetainedMetadata),
     /// This caller is joined to a load, under the election-fixed deadline.
     ///
     /// The elector and a later joiner are deliberately not distinguished here:
@@ -309,7 +367,13 @@ pub(crate) struct ParquetMetadataCache {
     /// Mutable resident and in-flight state.
     state: Mutex<CacheState>,
     /// Configured ceiling on charged resident bytes; always positive.
+    ///
+    /// A local ceiling on top of the root, not instead of it: the root bounds
+    /// what the node may own at all, and this bounds how much of that the cache
+    /// is willing to spend on retained footers.
     budget_bytes: u64,
+    /// The Oracle memory root every retained byte is charged against.
+    resources: OracleMetadataResources,
     /// Serializes close and shares its single completion with every caller.
     ///
     /// `Some(clean)` once a close has finished, so a repeated or concurrent
@@ -322,7 +386,11 @@ pub(crate) struct ParquetMetadataCache {
 
 impl ParquetMetadataCache {
     /// Builds one cache over a positive byte budget.
-    pub(crate) fn new(budget_bytes: u64, telemetry: Arc<BifrostStorageTelemetry>) -> Self {
+    pub(crate) fn new(
+        budget_bytes: u64,
+        telemetry: Arc<BifrostStorageTelemetry>,
+        resources: OracleMetadataResources,
+    ) -> Self {
         Self {
             state: Mutex::new(CacheState {
                 entries: LruCache::unbounded(),
@@ -331,6 +399,7 @@ impl ParquetMetadataCache {
                 lifecycle: StorageLifecycle::Open,
             }),
             budget_bytes,
+            resources,
             closing: tokio::sync::Mutex::new(None),
             telemetry,
         }
@@ -414,7 +483,7 @@ impl ParquetMetadataCache {
             return Err(Arc::new(BifrostStorageError::Closed));
         }
         if let Some(entry) = state.entries.get(key) {
-            let metadata = Arc::clone(&entry.metadata);
+            let metadata = entry.metadata.clone();
             drop(state);
             self.telemetry
                 .record_cache_effect(CacheEffect::Hit, CacheEffectReason::None);
@@ -486,7 +555,7 @@ impl ParquetMetadataCache {
         let cache = Arc::clone(self);
         tokio::spawn(async move {
             let started = Instant::now();
-            let result: MetadataLoadResult = tokio::select! {
+            let decoded: Result<Arc<ParquetMetaData>, Arc<BifrostStorageError>> = tokio::select! {
                 biased;
                 () = cancel.cancelled() => Err(Arc::new(
                     CancelCause::from_code(cause.load(Ordering::Acquire)).terminal(),
@@ -505,6 +574,7 @@ impl ParquetMetadataCache {
                     })),
                 },
             };
+            let result = decoded.map(|metadata| cache.fund(&key, metadata));
             cache.settle(&key, &result, started.elapsed());
             // A publish failure means every receiver was already dropped, which
             // is the ordinary outcome when the last caller detached. The
@@ -582,7 +652,7 @@ impl ParquetMetadataCache {
     fn retain(
         &self,
         key: &HotMetadataKey,
-        metadata: Option<&Arc<ParquetMetaData>>,
+        metadata: Option<&RetainedMetadata>,
     ) -> Option<CacheEffectReason> {
         let Ok(mut state) = self.state.lock() else {
             return None;
@@ -599,13 +669,17 @@ impl ParquetMetadataCache {
             self.telemetry.record_resident(entries, bytes);
             return None;
         };
+        if !metadata.is_funded() {
+            drop(state);
+            // The unfunded decision was already published when the root
+            // declined it; retention simply does not happen.
+            return None;
+        }
         if state.lifecycle != StorageLifecycle::Open {
             drop(state);
             return Some(CacheEffectReason::Closing);
         }
-        let weight = u64::try_from(metadata.memory_size())
-            .unwrap_or(u64::MAX)
-            .saturating_add(key.owned_bytes());
+        let weight = Self::weight_of(key, metadata);
         if weight > self.budget_bytes {
             drop(state);
             return Some(CacheEffectReason::Oversized);
@@ -621,7 +695,7 @@ impl ParquetMetadataCache {
         state.entries.put(
             key.clone(),
             CachedMetadata {
-                metadata: Arc::clone(metadata),
+                metadata: metadata.clone(),
                 weight,
             },
         );
@@ -634,6 +708,43 @@ impl ParquetMetadataCache {
         }
         self.telemetry.record_resident(entries, bytes);
         None
+    }
+
+    /// Returns the exact bytes retaining this decode would own.
+    ///
+    /// The key's own heap is included because the cache stores it beside the
+    /// metadata; charging only the footer would let a table full of long object
+    /// paths grow past both the local ceiling and the root's view of it.
+    fn weight_of(key: &HotMetadataKey, metadata: &RetainedMetadata) -> u64 {
+        u64::try_from(metadata.memory_size())
+            .unwrap_or(u64::MAX)
+            .saturating_add(key.owned_bytes())
+    }
+
+    /// Charges one successful decode to the Oracle root before it is shared.
+    ///
+    /// Reserving here, in the loader, is what makes the reservation shared: the
+    /// single result published to every joined caller carries the one
+    /// reservation, so N borrowers of one decode own one charge rather than
+    /// none or N. A root that declines still returns the metadata — the
+    /// elected query already paid for that decode and is entitled to it — but
+    /// the node keeps nothing it could not account for.
+    fn fund(&self, key: &HotMetadataKey, metadata: Arc<ParquetMetaData>) -> RetainedMetadata {
+        let unfunded = RetainedMetadata {
+            metadata,
+            reservation: None,
+        };
+        let bytes = usize::try_from(Self::weight_of(key, &unfunded)).unwrap_or(usize::MAX);
+        if let Ok(reservation) = self.resources.try_reserve_metadata(bytes) {
+            RetainedMetadata {
+                metadata: unfunded.metadata,
+                reservation: Some(Arc::new(reservation)),
+            }
+        } else {
+            self.telemetry
+                .record_cache_effect(CacheEffect::Bypass, CacheEffectReason::Unfunded);
+            unfunded
+        }
     }
 
     /// Awaits one publication under this caller's own bound and token.
@@ -901,31 +1012,63 @@ mod tests {
         )
     }
 
+    /// Builds the Oracle role capability these tests charge retained bytes to.
+    ///
+    /// # Panics
+    /// Panics when the fixture observation does not admit an Oracle role.
+    fn oracle_role(memory_bytes: usize) -> crate::resources::OracleResources {
+        crate::resources::BifrostRuntimeResources::composed_for_test(
+            memory_bytes,
+            1024 * 1024 * 1024,
+            [crate::resources::BifrostRole::Oracle],
+        )
+        .oracle()
+        .expect("the fixture observation admits Oracle")
+    }
+
+    /// Builds the Oracle memory root these tests charge retained bytes to.
+    ///
+    /// A real governor rather than a stub: the reservation coupling this suite
+    /// asserts is only meaningful against the ledger production uses, and a
+    /// fake root would make "the bytes stayed charged" a statement about the
+    /// fake.
+    ///
+    /// # Panics
+    /// Panics when the fixture observation does not admit an Oracle role.
+    fn oracle_metadata_resources(memory_bytes: usize) -> OracleMetadataResources {
+        oracle_role(memory_bytes).metadata()
+    }
+
     /// Builds an Oracle-serving owner with an explicit metadata-cache budget.
     fn storage_with_cache(cache_bytes: u64) -> BifrostStorage {
         BifrostStorage::new(
-            BifrostStoragePolicy::new(30_000, 3, 60_000, 128, cache_bytes),
-            true,
+            BifrostStoragePolicy::resolve(
+                crate::storage::policy::BifrostStorageConfig {
+                    metadata_cache_bytes: Some(cache_bytes),
+                    ..crate::storage::policy::BifrostStorageConfig::default()
+                },
+                2 * 1024 * 1024 * 1024,
+                true,
+            )
+            .expect("the fixture storage policy is valid"),
+            Some(oracle_metadata_resources(2 * 1024 * 1024 * 1024)),
         )
     }
 
     /// One node decodes one immutable object at most once, serves a repeat
     /// request with no backend load at all, keys on the object's identity
-    /// alone, records an explicit disabled bypass that retains nothing, refuses
-    /// to retain what its whole budget cannot hold, and evicts deterministically
-    /// in least-recently-used order.
+    /// alone, and records an explicit disabled bypass that retains nothing.
     ///
     /// These properties are asserted together because they are one invariant
     /// seen from several sides: the entry the cache decides to create, the load
-    /// it declines to repeat, the identity it creates entries under, the path a
-    /// disabled composition takes, the entry it declines to keep, and the entry
-    /// it gives up to stay inside the ceiling. Splitting them would let a key
-    /// that fragments per request still pass a single-flight test.
+    /// it declines to repeat, the identity it creates entries under, and the
+    /// path a disabled composition takes. Splitting them would let a key that
+    /// fragments per request still pass a single-flight test.
     ///
     /// # Panics
     /// Panics when a waiter task, decode, or reconciliation assertion fails.
     #[tokio::test]
-    async fn metadata_cache_reconciles_single_flight_identity_bypass_and_eviction() {
+    async fn metadata_cache_reconciles_single_flight_identity_and_bypass() {
         let object = parquet_object(64);
         let size = u64::try_from(object.len()).expect("fixture object fits u64");
         let tenant = DataTenantId::new_v7();
@@ -940,11 +1083,17 @@ mod tests {
         for index in 0..4 {
             let storage = Arc::clone(&storage);
             let waiter_key = key.clone();
-            let reader =
-                CountingReader::new(&object, &decodes, (index == 0).then(|| Arc::clone(&gate)));
+            let object = object.clone();
+            let decodes = Arc::clone(&decodes);
+            let gate = (index == 0).then(|| Arc::clone(&gate));
             waiters.push(tokio::spawn(async move {
                 storage
-                    .hot_metadata(waiter_key, reader, deadline, CancellationToken::new())
+                    .hot_metadata(
+                        waiter_key,
+                        move || CountingReader::new(&object, &decodes, gate.clone()),
+                        deadline,
+                        CancellationToken::new(),
+                    )
                     .await
             }));
             tokio::task::yield_now().await;
@@ -966,7 +1115,7 @@ mod tests {
         );
         for observed in &settled {
             assert!(
-                Arc::ptr_eq(observed, &settled[0]),
+                Arc::ptr_eq(observed.metadata(), settled[0].metadata()),
                 "every waiter must observe the one shared decode"
             );
         }
@@ -985,13 +1134,17 @@ mod tests {
         let warm = storage
             .hot_metadata(
                 key.clone(),
-                CountingReader::new(&object, &decodes, None),
+                {
+                    let object = object.clone();
+                    let decodes = Arc::clone(&decodes);
+                    move || CountingReader::new(&object, &decodes, None)
+                },
                 deadline,
                 CancellationToken::new(),
             )
             .await
             .expect("the warm entry is served");
-        assert!(Arc::ptr_eq(&warm, &settled[0]));
+        assert!(Arc::ptr_eq(warm.metadata(), settled[0].metadata()));
         assert_eq!(
             decodes.load(Ordering::SeqCst),
             1,
@@ -1006,22 +1159,42 @@ mod tests {
         let rewritten = storage
             .hot_metadata(
                 test_key(tenant, "a.parquet", 0x22, size),
-                CountingReader::new(&object, &decodes, None),
+                {
+                    let object = object.clone();
+                    let decodes = Arc::clone(&decodes);
+                    move || CountingReader::new(&object, &decodes, None)
+                },
                 deadline,
                 CancellationToken::new(),
             )
             .await
             .expect("the rewritten object decodes");
-        assert!(!Arc::ptr_eq(&rewritten, &settled[0]));
+        assert!(!Arc::ptr_eq(rewritten.metadata(), settled[0].metadata()));
         assert_eq!(decodes.load(Ordering::SeqCst), 2, "checksum is identity");
         assert_eq!(
             storage.telemetry_snapshot().effect(CacheEffect::Miss),
             2,
             "a changed checksum is a new object, not a hit"
         );
+    }
 
-        // Disabled composition: the read still succeeds, publishes positive
-        // bypass evidence, and retains nothing at all.
+    /// A composition with no metadata budget still serves every read, says so,
+    /// and retains nothing.
+    ///
+    /// Separate from the caching scenario because it is a different
+    /// composition: the point is that turning the cache off is a declared,
+    /// observable path rather than silence, so an operator reading telemetry
+    /// can tell "no cache" apart from "cache never consulted".
+    ///
+    /// # Panics
+    /// Panics when a decode or bypass assertion fails.
+    #[tokio::test]
+    async fn a_composition_with_no_budget_bypasses_and_retains_nothing() {
+        let object = parquet_object(64);
+        let size = u64::try_from(object.len()).expect("fixture object fits u64");
+        let tenant = DataTenantId::new_v7();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let key = test_key(tenant, "a.parquet", 0x11, size);
         let disabled = storage_with_cache(0);
         assert!(!disabled.metadata_cache_enabled());
         let disabled_decodes = Arc::new(AtomicUsize::new(0));
@@ -1029,7 +1202,11 @@ mod tests {
             disabled
                 .hot_metadata(
                     key.clone(),
-                    CountingReader::new(&object, &disabled_decodes, None),
+                    {
+                        let object = object.clone();
+                        let disabled_decodes = Arc::clone(&disabled_decodes);
+                        move || CountingReader::new(&object, &disabled_decodes, None)
+                    },
                     deadline,
                     CancellationToken::new(),
                 )
@@ -1043,12 +1220,29 @@ mod tests {
         assert_eq!(snapshot.resident_entries(), 0);
         assert_eq!(snapshot.resident_bytes(), 0);
         assert!(snapshot.is_quiescent());
+    }
 
+    /// The cache stays inside its byte ceiling by giving up its least recently
+    /// used entry, and refuses to keep what the whole ceiling cannot hold.
+    ///
+    /// Separate from the single-flight scenario because it is a different
+    /// decision made against a different cache: this one is deliberately sized
+    /// to exactly two entries so eviction order is observable rather than
+    /// incidental.
+    ///
+    /// # Panics
+    /// Panics when a decode or eviction assertion fails.
+    #[tokio::test]
+    async fn the_cache_evicts_in_least_recently_used_order_and_refuses_oversize() {
+        let object = parquet_object(64);
+        let size = u64::try_from(object.len()).expect("fixture object fits u64");
+        let tenant = DataTenantId::new_v7();
+        let metadata = decode_fixture(&object).await;
+        let deadline = Instant::now() + Duration::from_hours(1);
         // Eviction is access-ordered, not insertion-ordered. Every fixture key
         // below has the same table and the same object-name length, so all
         // three entries weigh exactly the same and the budget is an exact
         // multiple of that weight rather than an estimate.
-        let metadata = Arc::clone(&settled[0]);
         let evicting_key = |checksum: u8, object: &str| test_key(tenant, object, checksum, size);
         let weight = u64::try_from(metadata.memory_size()).expect("footprint fits u64")
             + evicting_key(0x31, "aaa.parquet").owned_bytes();
@@ -1056,6 +1250,7 @@ mod tests {
         let cache = Arc::new(ParquetMetadataCache::new(
             2 * weight,
             Arc::clone(&telemetry),
+            oracle_metadata_resources(2 * 1024 * 1024 * 1024),
         ));
         let resident = |cache: &Arc<ParquetMetadataCache>, key: HotMetadataKey| {
             let loaded = Arc::clone(&metadata);
@@ -1113,7 +1308,11 @@ mod tests {
         // Oversized: metadata larger than the whole budget is still returned to
         // its caller and simply not retained.
         let tiny_telemetry = Arc::new(BifrostStorageTelemetry::default());
-        let tiny = Arc::new(ParquetMetadataCache::new(1, Arc::clone(&tiny_telemetry)));
+        let tiny = Arc::new(ParquetMetadataCache::new(
+            1,
+            Arc::clone(&tiny_telemetry),
+            oracle_metadata_resources(2 * 1024 * 1024 * 1024),
+        ));
         let loaded = Arc::clone(&metadata);
         let bypassed = tiny
             .get_or_load(
@@ -1124,7 +1323,7 @@ mod tests {
             )
             .await
             .expect("an oversized decode still reaches its caller");
-        assert!(Arc::ptr_eq(&bypassed, &metadata));
+        assert!(Arc::ptr_eq(bypassed.metadata(), &metadata));
         let snapshot = tiny_telemetry.snapshot();
         assert_eq!(snapshot.effect(CacheEffect::Bypass), 1);
         assert_eq!(snapshot.reason(CacheEffectReason::Oversized), 1);
@@ -1186,29 +1385,27 @@ mod tests {
         async { panic!("a joined caller's load future must never be polled") }.boxed()
     }
 
-    /// The elected loader task owns every terminal: one failure, one panic, and
-    /// one shutdown each settle exactly once for every joined caller, retire
-    /// their key, and leave the owner free to elect a fresh load.
+    /// The elected loader task owns the terminal for every caller joined to it:
+    /// one failure settles all three exactly once and retires their key.
     ///
-    /// Asserted as one scenario because the supervision property is a single
-    /// one seen from three sides: a load that ends badly, a load that ends
-    /// violently, and the state left behind. A per-caller loader would pass a
-    /// success-only test while still leaving a panicked key permanently in
-    /// flight, so the negative terminals are the proof.
+    /// The fan-out is the proof: a per-caller loader would satisfy a
+    /// single-caller test while still letting three callers disagree about how
+    /// one load ended, and the joiners' own load futures never running is what
+    /// shows the work was genuinely shared rather than merely counted as
+    /// shared.
     ///
     /// # Panics
     /// Panics when a waiter task, terminal, or reconciliation assertion fails.
     #[tokio::test]
     async fn one_supervised_terminal_settles_every_caller_and_frees_the_key() {
-        let object = parquet_object(32);
-        let decoded = decode_fixture(&object).await;
         let tenant = DataTenantId::new_v7();
         let telemetry = Arc::new(BifrostStorageTelemetry::default());
         let cache = Arc::new(ParquetMetadataCache::new(
             64 * 1024 * 1024,
             Arc::clone(&telemetry),
+            oracle_metadata_resources(2 * 1024 * 1024 * 1024),
         ));
-        let far = Instant::now() + Duration::from_secs(3_600);
+        let far = Instant::now() + Duration::from_hours(1);
 
         let failing = test_key(tenant, "failing.parquet", 0x11, 1);
         let gate = Arc::new(Notify::new());
@@ -1270,6 +1467,49 @@ mod tests {
         assert_eq!(snapshot.inflight_loads(), 0);
         assert_eq!(snapshot.waiters(), 0);
 
+        assert_eq!(snapshot.anomalies(), 0);
+        assert!(cache.close(far).await);
+    }
+
+    /// A key whose load ended badly is retired rather than poisoned, and a
+    /// panicking decode settles its callers like any other terminal.
+    ///
+    /// Separate from the fan-out scenario because it asserts what happens
+    /// *after* a terminal: the failure a node saw once must not be the failure
+    /// it keeps returning, and a decode that panicked must not leave its key
+    /// permanently in flight.
+    ///
+    /// # Panics
+    /// Panics when a decode, terminal, or reconciliation assertion fails.
+    #[tokio::test]
+    async fn a_badly_ended_load_frees_its_key_for_a_later_caller() {
+        let object = parquet_object(32);
+        let decoded = decode_fixture(&object).await;
+        let tenant = DataTenantId::new_v7();
+        let telemetry = Arc::new(BifrostStorageTelemetry::default());
+        let cache = Arc::new(ParquetMetadataCache::new(
+            64 * 1024 * 1024,
+            Arc::clone(&telemetry),
+            oracle_metadata_resources(2 * 1024 * 1024 * 1024),
+        ));
+        let far = Instant::now() + Duration::from_hours(1);
+        let failing = test_key(tenant, "failing.parquet", 0x11, 1);
+        let observed = cache
+            .get_or_load(
+                failing.clone(),
+                async {
+                    Err(BifrostStorageError::NotFound {
+                        detail: "the fixture object is absent".to_owned(),
+                    })
+                }
+                .boxed(),
+                far,
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("the first load fails");
+        assert!(matches!(*observed, BifrostStorageError::NotFound { .. }));
+
         // The failed key is retired, not poisoned: a later caller elects a
         // fresh load and its success is retained.
         let retried = cache
@@ -1330,8 +1570,9 @@ mod tests {
         let cache = Arc::new(ParquetMetadataCache::new(
             64 * 1024 * 1024,
             Arc::clone(&telemetry),
+            oracle_metadata_resources(2 * 1024 * 1024 * 1024),
         ));
-        let far = Instant::now() + Duration::from_secs(3_600);
+        let far = Instant::now() + Duration::from_hours(1);
 
         let abandoned = test_key(tenant, "abandoned.parquet", 0x31, 1);
         let cancel = CancellationToken::new();
@@ -1440,8 +1681,9 @@ mod tests {
         let cache = Arc::new(ParquetMetadataCache::new(
             64 * 1024 * 1024,
             Arc::clone(&telemetry),
+            oracle_metadata_resources(2 * 1024 * 1024 * 1024),
         ));
-        let far = Instant::now() + Duration::from_secs(3_600);
+        let far = Instant::now() + Duration::from_hours(1);
 
         let graceful = test_key(tenant, "graceful.parquet", 0x41, 1);
         let waiter = tokio::spawn({
@@ -1496,17 +1738,27 @@ mod tests {
             1,
             "the refusal is recorded, not silent"
         );
+    }
 
-        // A decode is CPU-bound, so a loader can be somewhere the cancellation
-        // token cannot reach it. A close whose budget has already elapsed
-        // cannot wait for such a loader out: it reports unclean, and still
-        // returns only once nothing is running.
-        // Its own telemetry, so "this owner has begun closing" is a fact about
-        // this owner rather than one inherited from the cache closed above.
+    /// A close whose budget has already elapsed reports unclean and still
+    /// leaves nothing running.
+    ///
+    /// A decode is CPU-bound, so a loader can be somewhere its cancellation
+    /// token cannot reach it. Shutdown must still terminate: the owner aborts
+    /// such a loader, awaits the abort, and reconciles the load it could not
+    /// wait out, so `Closed` never means "probably finished".
+    ///
+    /// # Panics
+    /// Panics when the forced close, its terminal, or reconciliation fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_close_with_no_budget_left_aborts_and_awaits_its_loaders() {
+        let tenant = DataTenantId::new_v7();
+        let far = Instant::now() + Duration::from_hours(1);
         let forced_telemetry = Arc::new(BifrostStorageTelemetry::default());
         let forced = Arc::new(ParquetMetadataCache::new(
             64 * 1024 * 1024,
             Arc::clone(&forced_telemetry),
+            oracle_metadata_resources(2 * 1024 * 1024 * 1024),
         ));
         let (release, blocked) = std::sync::mpsc::channel::<()>();
         let stuck = tokio::spawn({
@@ -1555,5 +1807,280 @@ mod tests {
             "a forced close reconciles the loads it could not wait out"
         );
         assert!(snapshot.is_quiescent());
+    }
+
+    /// Retained metadata is owned against the Oracle memory root for as long as
+    /// anything holds it, an unfundable decode is served but never kept, and a
+    /// drained owner returns every byte.
+    ///
+    /// Asserted as one scenario because the three are one property: the cache
+    /// never owns bytes the root does not know about, and never tells the root
+    /// bytes are free while a query is still reading them. An eviction test
+    /// alone would pass an implementation that releases the charge the moment
+    /// the entry leaves the map, which is exactly the double-spend this
+    /// prevents.
+    ///
+    /// # Panics
+    /// Panics when a decode, reservation, or root assertion fails.
+    #[tokio::test]
+    async fn retained_metadata_stays_charged_to_the_root_until_its_last_borrower() {
+        let object = parquet_object(64);
+        let decoded = decode_fixture(&object).await;
+        let tenant = DataTenantId::new_v7();
+        let oracle = oracle_role(2 * 1024 * 1024 * 1024);
+        let baseline = oracle
+            .snapshot()
+            .expect("baseline snapshot")
+            .oracle_memory_used_bytes;
+        let telemetry = Arc::new(BifrostStorageTelemetry::default());
+        let key_a = test_key(tenant, "aaa.parquet", 0x51, 1);
+        let key_b = test_key(tenant, "bbb.parquet", 0x52, 1);
+        let weight =
+            u64::try_from(decoded.memory_size()).expect("footprint fits u64") + key_a.owned_bytes();
+        // Exactly one entry fits, so retaining the second must evict the first.
+        let cache = Arc::new(ParquetMetadataCache::new(
+            weight,
+            Arc::clone(&telemetry),
+            oracle.metadata(),
+        ));
+        let far = Instant::now() + Duration::from_hours(1);
+        let load = |metadata: &Arc<ParquetMetaData>| {
+            let metadata = Arc::clone(metadata);
+            async move { Ok(metadata) }.boxed()
+        };
+
+        let borrower = cache
+            .get_or_load(key_a.clone(), load(&decoded), far, CancellationToken::new())
+            .await
+            .expect("the first decode is retained");
+        assert!(borrower.is_funded());
+        let charged = |oracle: &crate::resources::OracleResources| {
+            oracle
+                .snapshot()
+                .expect("root snapshot")
+                .oracle_memory_used_bytes
+                - baseline
+        };
+        assert_eq!(charged(&oracle), usize::try_from(weight).expect("fits"));
+
+        // Evicting the entry does not free bytes the borrower is still reading.
+        let resident = cache
+            .get_or_load(key_b.clone(), load(&decoded), far, CancellationToken::new())
+            .await
+            .expect("the second decode is retained");
+        assert_eq!(telemetry.snapshot().effect(CacheEffect::Evict), 1);
+        assert_eq!(telemetry.snapshot().resident_entries(), 1);
+        assert_eq!(
+            charged(&oracle),
+            2 * usize::try_from(weight).expect("fits"),
+            "an evicted entry a borrower still holds stays charged"
+        );
+        drop(borrower);
+        assert_eq!(
+            charged(&oracle),
+            usize::try_from(weight).expect("fits"),
+            "the last borrower's release is what returns the bytes"
+        );
+
+        // A root with nothing left to give still serves the decode; it simply
+        // is not kept, and the decision is published rather than silent.
+        let exact = usize::try_from(weight).expect("fits");
+        let mut held = Vec::new();
+        // Coarse first, then exact, so the root is drained past the point where
+        // even one more entry's worth of bytes is available.
+        for bytes in [crate::resources::ORACLE_METADATA_MEMORY_BYTES, exact] {
+            while let Ok(reservation) = oracle.metadata().try_reserve_metadata(bytes) {
+                held.push(reservation);
+            }
+        }
+        let key_c = test_key(tenant, "ccc.parquet", 0x53, 1);
+        let unfunded = cache
+            .get_or_load(key_c, load(&decoded), far, CancellationToken::new())
+            .await
+            .expect("an unfundable decode still reaches its caller");
+        assert!(!unfunded.is_funded());
+        let snapshot = telemetry.snapshot();
+        assert_eq!(snapshot.reason(CacheEffectReason::Unfunded), 1);
+        assert_eq!(
+            snapshot.resident_entries(),
+            1,
+            "the node keeps only what the root funded"
+        );
+        drop(held);
+        drop(unfunded);
+
+        assert!(cache.close(far).await);
+        drop(resident);
+        assert_eq!(
+            charged(&oracle),
+            0,
+            "a drained owner returns every metadata byte it owned"
+        );
+        assert!(telemetry.snapshot().is_quiescent());
+    }
+
+    /// One reader that fails its first `failures` range reads from beneath
+    /// Parquet, then serves the real object.
+    ///
+    /// Models a transient object-store range failure, which is the only class
+    /// the owner is allowed to retry: an unreadable range may succeed on the
+    /// next attempt, whereas a footer that does not parse never will.
+    struct FlakyReader {
+        /// Complete object bytes served once the injected failures are spent.
+        data: Bytes,
+        /// Shared count of attempts across every reader this factory built.
+        attempts: Arc<AtomicUsize>,
+        /// How many attempts fail before the object is served.
+        failures: usize,
+        /// Whether this reader has already consumed an attempt.
+        counted: bool,
+    }
+
+    impl AsyncFileReader for FlakyReader {
+        fn get_bytes(
+            &mut self,
+            range: Range<u64>,
+        ) -> futures_util::future::BoxFuture<'_, Result<Bytes, ParquetError>> {
+            async move {
+                if !self.counted {
+                    self.counted = true;
+                    let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+                    if attempt < self.failures {
+                        return Err(ParquetError::External(
+                            "the fixture object store dropped the range".into(),
+                        ));
+                    }
+                }
+                let start = usize::try_from(range.start).expect("fixture range fits usize");
+                let end = usize::try_from(range.end).expect("fixture range fits usize");
+                Ok(self.data.slice(start..end))
+            }
+            .boxed()
+        }
+
+        fn get_metadata<'a>(
+            &'a mut self,
+            _options: Option<&'a ArrowReaderOptions>,
+        ) -> futures_util::future::BoxFuture<'a, Result<Arc<ParquetMetaData>, ParquetError>>
+        {
+            async move {
+                Err(ParquetError::General(
+                    "the fixture reader serves ranges, never cached metadata".to_owned(),
+                ))
+            }
+            .boxed()
+        }
+    }
+
+    /// A read whose range failed transiently is retried and succeeds; a footer
+    /// that cannot decode is returned on its first attempt.
+    ///
+    /// Asserted together because retry policy is only correct as a pair. Retry
+    /// everything and a corrupt object costs every attempt and every backoff
+    /// before failing anyway; retry nothing and one dropped connection fails a
+    /// query that would have succeeded immediately.
+    ///
+    /// # Panics
+    /// Panics when a decode, attempt count, or error class assertion fails.
+    #[tokio::test]
+    async fn a_transient_range_failure_is_retried_and_a_corrupt_footer_is_not() {
+        let object = parquet_object(32);
+        let size = u64::try_from(object.len()).expect("fixture object fits u64");
+        let tenant = DataTenantId::new_v7();
+        let storage = storage_with_cache(1 << 20);
+        let far = Instant::now() + Duration::from_hours(1);
+        let attempts = Arc::new(AtomicUsize::new(0));
+
+        let retried = storage
+            .hot_metadata(
+                test_key(tenant, "flaky.parquet", 0x61, size),
+                {
+                    let object = object.clone();
+                    let attempts = Arc::clone(&attempts);
+                    move || FlakyReader {
+                        data: object.clone(),
+                        attempts: Arc::clone(&attempts),
+                        failures: 2,
+                        counted: false,
+                    }
+                },
+                far,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("a transient range failure does not fail the read");
+        assert!(retried.is_funded());
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            3,
+            "the read is retried exactly as far as the policy allows"
+        );
+
+        let corrupt = Bytes::from_static(b"not a parquet footer at all");
+        let corrupt_attempts = Arc::new(AtomicUsize::new(0));
+        let failure = storage
+            .hot_metadata(
+                test_key(
+                    tenant,
+                    "corrupt.parquet",
+                    0x62,
+                    u64::try_from(corrupt.len()).expect("fixture fits u64"),
+                ),
+                {
+                    let corrupt = corrupt.clone();
+                    let corrupt_attempts = Arc::clone(&corrupt_attempts);
+                    move || FlakyReader {
+                        data: corrupt.clone(),
+                        attempts: Arc::clone(&corrupt_attempts),
+                        failures: 0,
+                        counted: false,
+                    }
+                },
+                far,
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("a footer that cannot decode fails the read");
+        assert!(matches!(*failure, BifrostStorageError::InvalidData { .. }));
+        assert_eq!(
+            corrupt_attempts.load(Ordering::SeqCst),
+            1,
+            "an undecodable footer is never retried"
+        );
+        assert!(storage.close(far).await);
+    }
+
+    /// A composition with no cache still honours its caller's cancellation.
+    ///
+    /// The disabled path has no loader task supervising it, so without an
+    /// explicit bound a cancelled query would keep a decode running against a
+    /// backend nobody is waiting on.
+    ///
+    /// # Panics
+    /// Panics when the cancelled read does not fail as cancelled.
+    #[tokio::test]
+    async fn a_disabled_composition_still_bounds_its_caller() {
+        let object = parquet_object(32);
+        let size = u64::try_from(object.len()).expect("fixture object fits u64");
+        let tenant = DataTenantId::new_v7();
+        let storage = storage_with_cache(0);
+        assert!(!storage.metadata_cache_enabled());
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let decodes = Arc::new(AtomicUsize::new(0));
+        let observed = storage
+            .hot_metadata(
+                test_key(tenant, "cancelled.parquet", 0x71, size),
+                {
+                    let object = object.clone();
+                    let decodes = Arc::clone(&decodes);
+                    move || CountingReader::new(&object, &decodes, None)
+                },
+                Instant::now() + Duration::from_hours(1),
+                cancel,
+            )
+            .await
+            .expect_err("a cancelled caller receives no metadata");
+        assert!(matches!(*observed, BifrostStorageError::Cancelled));
     }
 }

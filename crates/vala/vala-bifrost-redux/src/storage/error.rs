@@ -106,13 +106,25 @@ impl BifrostStorageError {
     /// object path can reach a log line through this path.
     #[must_use]
     pub fn from_parquet(error: &parquet::errors::ParquetError) -> Self {
-        Self::InvalidData {
-            detail: match error {
-                parquet::errors::ParquetError::EOF(_) => "unexpected end of parquet metadata",
-                parquet::errors::ParquetError::ArrowError(_) => "parquet metadata is not arrow",
-                _ => "parquet metadata did not decode",
-            }
-            .to_owned(),
+        // `External` is the only variant that did not come from the bytes: it
+        // is whatever the reader beneath Parquet failed with, which for a hot
+        // object is an object-store range read. Classifying it as a backend
+        // failure is what makes the read retryable, and classifying everything
+        // else as invalid data is what stops the owner retrying a footer that
+        // will never decode.
+        match error {
+            parquet::errors::ParquetError::External(_) => Self::Backend {
+                detail: "the object store failed a parquet metadata range read".to_owned(),
+            },
+            parquet::errors::ParquetError::EOF(_) => Self::InvalidData {
+                detail: "unexpected end of parquet metadata".to_owned(),
+            },
+            parquet::errors::ParquetError::ArrowError(_) => Self::InvalidData {
+                detail: "parquet metadata is not arrow".to_owned(),
+            },
+            _ => Self::InvalidData {
+                detail: "parquet metadata did not decode".to_owned(),
+            },
         }
     }
 }

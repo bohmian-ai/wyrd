@@ -4001,6 +4001,49 @@ impl OracleMetadataResources {
             .try_acquire_oracle_memory(ORACLE_METADATA_MEMORY_BYTES)?;
         Ok(OracleFooterSlotResources { lease })
     }
+
+    /// Reserves exact retained-metadata bytes against the same Oracle root.
+    ///
+    /// Distinct from [`Self::try_acquire_footer_slot`] in lifetime, not in
+    /// authority: the footer slot is the transient workspace one decode needs,
+    /// while this is the ownership of bytes the node intends to keep and share
+    /// after that decode returns. Both spend the one Oracle managed-memory
+    /// root, which is what stops a decoded-metadata cache from becoming a
+    /// second, ungoverned memory pool beside the queries it serves.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostResourceError::Occupied`] when the Oracle floor plus
+    /// free elastic memory cannot cover `bytes`, or a poison/invalid-plan error
+    /// when root accounting or role configuration is not trustworthy.
+    pub fn try_reserve_metadata(
+        &self,
+        bytes: usize,
+    ) -> Result<MetadataReservation, BifrostResourceError> {
+        let lease = self.governor.try_acquire_oracle_memory(bytes)?;
+        Ok(MetadataReservation { lease })
+    }
+}
+
+/// Non-cloneable ownership of retained decoded-metadata bytes.
+///
+/// Held by the cache entry and by every borrower of that entry's metadata
+/// through one shared `Arc`, so the charge returns to the Oracle root only when
+/// the last of them is gone. That coupling is the point: evicting an entry
+/// whose decoded metadata a running query still holds must not tell the root
+/// those bytes are free, because they are not.
+#[derive(Debug)]
+pub struct MetadataReservation {
+    /// Exact floor-first root-memory ownership for the retained bytes.
+    lease: OracleMemoryLease,
+}
+
+impl MetadataReservation {
+    /// Returns the exact bytes this reservation owns.
+    #[must_use]
+    pub const fn bytes(&self) -> usize {
+        self.lease.bytes
+    }
 }
 
 /// Non-cloneable owner of the fixed Oracle metadata-planning slot.

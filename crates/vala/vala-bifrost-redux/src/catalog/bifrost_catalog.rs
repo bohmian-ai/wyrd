@@ -1365,6 +1365,100 @@ mod production_pin_tests {
         expected: EventTimeStatistics,
     }
 
+    /// Builds the manifest evidence table one committed cut must reproduce.
+    ///
+    /// Extracted from its test so the scenario reads as commit-then-assert:
+    /// the cases are fixture data, not part of the behavior under test.
+    fn manifest_cases(lower_micros: i64, upper_micros: i64) -> [ManifestCase; 4] {
+        let timestamptz = iceberg::spec::Datum::timestamptz_micros;
+        [
+            ManifestCase {
+                name: "valid.parquet",
+                lower: Some(timestamptz(lower_micros)),
+                upper: Some(timestamptz(upper_micros)),
+                expected: EventTimeStatistics::Bounded {
+                    min_micros: lower_micros,
+                    max_micros: upper_micros,
+                },
+            },
+            ManifestCase {
+                name: "missing.parquet",
+                lower: Some(timestamptz(lower_micros)),
+                upper: None,
+                expected: EventTimeStatistics::Unusable(EventTimeBoundsDefect::Missing),
+            },
+            ManifestCase {
+                // A manifest bound is serialized as raw bytes and re-typed
+                // from the writer schema on read, so a wrong-typed datum
+                // cannot survive a real round trip; the projection test
+                // above covers that class. What production *can* observe is
+                // a well-typed value that names no representable instant.
+                name: "malformed.parquet",
+                lower: Some(timestamptz(i64::MAX)),
+                upper: Some(timestamptz(upper_micros)),
+                expected: EventTimeStatistics::Unusable(EventTimeBoundsDefect::Invalid),
+            },
+            ManifestCase {
+                name: "contradictory.parquet",
+                lower: Some(timestamptz(upper_micros)),
+                upper: Some(timestamptz(lower_micros)),
+                expected: EventTimeStatistics::Unusable(EventTimeBoundsDefect::Contradictory),
+            },
+        ]
+    }
+
+    /// Builds one committed data file per manifest case under the live table.
+    ///
+    /// Bounds are keyed by the physical writer field id rather than by name,
+    /// which is exactly the binding the pinned cut must resolve on read.
+    ///
+    /// # Panics
+    /// Panics when the fixture instant does not bucket or a data file does not
+    /// build, both of which mean the fixture itself is wrong.
+    fn manifest_data_files(
+        physical: &iceberg::table::Table,
+        field_id: i32,
+        cases: &[ManifestCase],
+        lower_micros: i64,
+    ) -> Vec<iceberg::spec::DataFile> {
+        let partition = crate::catalog::layout::TimeGranularity::Hour
+            .bucket(
+                chrono::DateTime::from_timestamp_micros(lower_micros)
+                    .expect("fixture instant is representable"),
+            )
+            .expect("fixture instant buckets");
+        let location = physical.metadata().location().to_owned();
+        let data_files = cases.iter().map(|case| {
+            let mut lower_bounds = HashMap::new();
+            let mut upper_bounds = HashMap::new();
+            if let Some(lower) = case.lower.clone() {
+                lower_bounds.insert(field_id, lower);
+            }
+            if let Some(upper) = case.upper.clone() {
+                upper_bounds.insert(field_id, upper);
+            }
+            iceberg::spec::DataFileBuilder::default()
+                .content(iceberg::spec::DataContentType::Data)
+                .file_path(format!("{location}/data/{}", case.name))
+                .file_format(iceberg::spec::DataFileFormat::Parquet)
+                .partition(iceberg::spec::Struct::from_iter([Some(
+                    partition.iceberg_partition_literal(),
+                )]))
+                .record_count(4_096)
+                .file_size_in_bytes(2_097_152)
+                .lower_bounds(lower_bounds)
+                .upper_bounds(upper_bounds)
+                .partition_spec_id(physical.metadata().default_partition_spec_id())
+                .sort_order_id(
+                    i32::try_from(physical.metadata().default_sort_order_id())
+                        .expect("fixture sort order id fits i32"),
+                )
+                .build()
+                .expect("fixture data file builds")
+        });
+        data_files.collect()
+    }
+
     /// A pinned provider resolves only against the snapshot it names.
     ///
     /// A follower resolves its own catalog handle, so without pinning its leaf
@@ -1543,77 +1637,8 @@ mod production_pin_tests {
 
             let lower_micros = 1_787_493_600_000_000_i64;
             let upper_micros = 1_787_497_200_000_000_i64;
-            let timestamptz = iceberg::spec::Datum::timestamptz_micros;
-            let cases = [
-                ManifestCase {
-                    name: "valid.parquet",
-                    lower: Some(timestamptz(lower_micros)),
-                    upper: Some(timestamptz(upper_micros)),
-                    expected: EventTimeStatistics::Bounded {
-                        min_micros: lower_micros,
-                        max_micros: upper_micros,
-                    },
-                },
-                ManifestCase {
-                    name: "missing.parquet",
-                    lower: Some(timestamptz(lower_micros)),
-                    upper: None,
-                    expected: EventTimeStatistics::Unusable(EventTimeBoundsDefect::Missing),
-                },
-                ManifestCase {
-                    // A manifest bound is serialized as raw bytes and re-typed
-                    // from the writer schema on read, so a wrong-typed datum
-                    // cannot survive a real round trip; the projection test
-                    // above covers that class. What production *can* observe is
-                    // a well-typed value that names no representable instant.
-                    name: "malformed.parquet",
-                    lower: Some(timestamptz(i64::MAX)),
-                    upper: Some(timestamptz(upper_micros)),
-                    expected: EventTimeStatistics::Unusable(EventTimeBoundsDefect::Invalid),
-                },
-                ManifestCase {
-                    name: "contradictory.parquet",
-                    lower: Some(timestamptz(upper_micros)),
-                    upper: Some(timestamptz(lower_micros)),
-                    expected: EventTimeStatistics::Unusable(EventTimeBoundsDefect::Contradictory),
-                },
-            ];
-
-            let partition = crate::catalog::layout::TimeGranularity::Hour
-                .bucket(
-                    chrono::DateTime::from_timestamp_micros(lower_micros)
-                        .expect("fixture instant is representable"),
-                )
-                .expect("fixture instant buckets");
-            let location = physical.metadata().location().to_owned();
-            let data_files = cases.iter().map(|case| {
-                let mut lower_bounds = HashMap::new();
-                let mut upper_bounds = HashMap::new();
-                if let Some(lower) = case.lower.clone() {
-                    lower_bounds.insert(field_id, lower);
-                }
-                if let Some(upper) = case.upper.clone() {
-                    upper_bounds.insert(field_id, upper);
-                }
-                iceberg::spec::DataFileBuilder::default()
-                    .content(iceberg::spec::DataContentType::Data)
-                    .file_path(format!("{location}/data/{}", case.name))
-                    .file_format(iceberg::spec::DataFileFormat::Parquet)
-                    .partition(iceberg::spec::Struct::from_iter([Some(
-                        partition.iceberg_partition_literal(),
-                    )]))
-                    .record_count(4_096)
-                    .file_size_in_bytes(2_097_152)
-                    .lower_bounds(lower_bounds)
-                    .upper_bounds(upper_bounds)
-                    .partition_spec_id(physical.metadata().default_partition_spec_id())
-                    .sort_order_id(
-                        i32::try_from(physical.metadata().default_sort_order_id())
-                            .expect("fixture sort order id fits i32"),
-                    )
-                    .build()
-                    .expect("fixture data file builds")
-            });
+            let cases = manifest_cases(lower_micros, upper_micros);
+            let data_files = manifest_data_files(&physical, field_id, &cases, lower_micros);
 
             let transaction = Transaction::new(&physical);
             let action = transaction.fast_append().add_data_files(data_files);

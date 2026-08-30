@@ -78,11 +78,23 @@ pub enum CacheEffectReason {
     Oversized,
     /// The owner is closing and admits no new retention.
     Closing,
+    /// The Oracle memory root would not fund retaining this metadata.
+    ///
+    /// The caller still receives the decode; the node simply declines to keep
+    /// bytes it cannot account for, which is what keeps the cache inside the
+    /// same managed-memory root as the queries it serves.
+    Unfunded,
 }
 
 impl CacheEffectReason {
     /// Complete closed inventory, in emission-label order.
-    pub const ALL: [Self; 4] = [Self::None, Self::Disabled, Self::Oversized, Self::Closing];
+    pub const ALL: [Self; 5] = [
+        Self::None,
+        Self::Disabled,
+        Self::Oversized,
+        Self::Closing,
+        Self::Unfunded,
+    ];
 
     /// Returns this reason's stable index into the retained totals.
     const fn index(self) -> usize {
@@ -91,6 +103,7 @@ impl CacheEffectReason {
             Self::Disabled => 1,
             Self::Oversized => 2,
             Self::Closing => 3,
+            Self::Unfunded => 4,
         }
     }
 
@@ -102,6 +115,7 @@ impl CacheEffectReason {
             Self::Disabled => "disabled",
             Self::Oversized => "oversized",
             Self::Closing => "closing",
+            Self::Unfunded => "unfunded",
         }
     }
 }
@@ -520,20 +534,19 @@ fn settle(
     transition: TelemetryTransition,
     anomalies: &mut [u64; TelemetryTransition::ALL.len()],
 ) {
-    match count.checked_sub(1) {
-        Some(settled) => *count = settled,
-        None => {
-            anomalies[transition.index()] = anomalies[transition.index()].saturating_add(1);
-            metrics::counter!(
-                "bifrost_storage_metadata_cache_transition_anomalies_total",
-                "transition" => transition.as_str(),
-            )
-            .increment(1);
-            tracing::warn!(
-                transition = transition.as_str(),
-                "Bifrost storage metadata telemetry settled an unmatched transition"
-            );
-        }
+    if let Some(settled) = count.checked_sub(1) {
+        *count = settled;
+    } else {
+        anomalies[transition.index()] = anomalies[transition.index()].saturating_add(1);
+        metrics::counter!(
+            "bifrost_storage_metadata_cache_transition_anomalies_total",
+            "transition" => transition.as_str(),
+        )
+        .increment(1);
+        tracing::warn!(
+            transition = transition.as_str(),
+            "Bifrost storage metadata telemetry settled an unmatched transition"
+        );
     }
 }
 

@@ -5002,7 +5002,7 @@ fn partition_oracle_assignments(
                 .map(|worker| worker.node_id.as_uuid().as_bytes().to_vec())
                 .collect::<Vec<_>>(),
             OraclePartitionStrategy::default(),
-            |descriptor| descriptor.size_bytes(),
+            wyrd_spec::vala::api::PersistedFileDescriptor::size_bytes,
             |descriptor| descriptor.path().as_bytes().to_vec(),
         );
         for (partition, files) in partitions.iter_mut().zip(specialized_files) {

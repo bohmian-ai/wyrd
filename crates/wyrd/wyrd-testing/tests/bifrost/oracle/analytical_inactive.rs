@@ -23,8 +23,10 @@ use arrow::record_batch::RecordBatch;
 use futures_util::StreamExt as _;
 use vala_bifrost_redux::oracle::QueryIpcDecoder;
 use vala_bifrost_redux::oracle::analytical::{
-    AnalyticalAttemptContext, DataFusionQueryId, PublicQueryId,
+    AnalyticalAttemptContext, AnalyticalLiveInspection, DataFusionQueryId, PublicQueryId,
 };
+use vala_bifrost_redux::oracle::analytical_supervisor::AnalyticalAttemptKey;
+use vala_bifrost_redux::oracle::telemetry::AnalyticalAttemptOutcome;
 use vala_sdk::BifrostGrpcTransport;
 use wyrd_client::WyrdClient;
 use wyrd_runtime::permission::PermissionSet;
@@ -279,6 +281,477 @@ async fn prove_join_and_aggregate() -> Result<(), JourneyError> {
         return Err("terminal row count differs from the decoded Arrow frames".into());
     }
 
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Returns every node's live Analytical ownership, leader and follower halves.
+///
+/// # Errors
+///
+/// Returns an error when a node composed no Oracle or its ownership lock is
+/// poisoned.
+fn live_ownership(
+    cluster: &WyrdTestCluster,
+) -> Result<Vec<AnalyticalLiveInspection>, JourneyError> {
+    cluster
+        .servers()
+        .map(|server| {
+            let engine = server
+                .state()
+                .bifrost_query()
+                .ok_or("query node composed no Oracle")?
+                .engine();
+            let handle = engine
+                .analytical_execution()
+                .ok_or("Oracle composed no Analytical handle")?;
+            Ok(handle.live()?)
+        })
+        .collect()
+}
+
+/// Waits, under a bound, for every node to retain no Analytical ownership.
+///
+/// A follower settles on its own stage-operation path rather than with the
+/// leader's stream, so the assertion is a bounded convergence rather than an
+/// instantaneous read. It is bounded because a node that never converges is a
+/// leak, and reporting it as a timeout is the point.
+///
+/// # Errors
+///
+/// Returns the first inspection error, or a description of what a node still
+/// retained when the bound expired.
+async fn await_clean_nodes(cluster: &WyrdTestCluster) -> Result<(), JourneyError> {
+    for _ in 0..CLEAN_NODE_POLLS {
+        let live = live_ownership(cluster)?;
+        if live.iter().all(AnalyticalLiveInspection::is_clean) {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Err(format!(
+        "nodes still retain Analytical ownership: {:?}",
+        live_ownership(cluster)?
+    )
+    .into())
+}
+
+/// Bound on how long terminal cleanup may take before it is called a leak.
+const CLEAN_NODE_POLLS: usize = 50;
+
+/// The one permitted retry is admitted only after its predecessor drains, is
+/// refused a second time, and is refused once result data has left the node.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn pg_inactive_analytical_retry_drains_attempt_zero_before_attempt_one() {
+    prove_bounded_retry()
+        .await
+        .expect("inactive analytical retry journey");
+}
+
+/// Drives the retry ordering, single-retry, and egress-fence proofs.
+///
+/// # Errors
+///
+/// Returns a cluster, lease, or assertion error.
+async fn prove_bounded_retry() -> Result<(), JourneyError> {
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::six_capacity()).await?;
+    let tenant = cluster.data_tenant_id();
+    let table = seed_table(&cluster, "analytical_retry").await?;
+    let query_server = cluster.server(0).ok_or("missing query node")?;
+    let engine = Arc::clone(
+        query_server
+            .state()
+            .bifrost_query()
+            .ok_or("query node composed no Oracle")?
+            .engine(),
+    );
+    let handle = Arc::clone(
+        engine
+            .analytical_execution()
+            .ok_or("Oracle composed no Analytical handle")?,
+    );
+    let grant = handle.attempt_grant();
+    let sql = format!("SELECT id FROM vala.bifrost.{table} ORDER BY id");
+
+    let attempt = attempt_context();
+    let (_session, ownership) = engine
+        .lease_inactive_analytical_attempt(query_context(tenant)?, request(&sql), &attempt)
+        .await?;
+    let zero = ownership.key();
+
+    // Ordering, proved against the supervisor rather than against the retry
+    // helper: while attempt zero is live, its successor is refused outright.
+    // A retry that could be admitted beside its predecessor would double-charge
+    // the graph's envelope and leave two graphs able to emit for one query.
+    let premature = handle
+        .supervisor()
+        .spawn_attempt(successor_key(zero), grant);
+    if premature.is_ok() {
+        return Err("a retry was admitted while its predecessor was still live".into());
+    }
+
+    let retried = ownership.retry_pre_egress(grant).await?;
+    if retried.key().attempt.as_u8() != 1 {
+        return Err(format!(
+            "retry expected attempt ordinal 1, saw {}",
+            retried.key().attempt.as_u8()
+        )
+        .into());
+    }
+    if handle.supervisor().live_attempts()? != 1 {
+        return Err("the retry did not replace its predecessor one-for-one".into());
+    }
+    if retried.retry_pre_egress(grant).await.is_ok() {
+        return Err("a second retry was admitted".into());
+    }
+
+    // The egress fence, on a fresh graph so the refusal cannot be the
+    // single-retry rule firing instead.
+    let attempt = attempt_context();
+    let (_session, ownership) = engine
+        .lease_inactive_analytical_attempt(query_context(tenant)?, request(&sql), &attempt)
+        .await?;
+    ownership.record_egress();
+    if !ownership.egressed() {
+        return Err("recorded egress was not observable on the attempt".into());
+    }
+    if ownership.retry_pre_egress(grant).await.is_ok() {
+        return Err("a retry was admitted after result-data egress".into());
+    }
+
+    await_clean_nodes(&cluster).await?;
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Names the successor of one attempt, used to prove the ordering refusal.
+fn successor_key(key: AnalyticalAttemptKey) -> AnalyticalAttemptKey {
+    AnalyticalAttemptKey::new(
+        key.public_query_id,
+        key.datafusion_query_id,
+        key.stage,
+        key.task,
+        key.attempt.retry().expect("attempt zero has a successor"),
+    )
+}
+
+/// Builds one published-only strict request with the journey's deadline.
+fn request(sql: &str) -> BifrostQueryRequest {
+    BifrostQueryRequest {
+        sql: sql.to_owned(),
+        visibility: VisibilityMode::PublishedOnly,
+        freshness: FreshnessPolicy::Strict,
+        deadline_ms: Some(30_000),
+    }
+}
+
+/// Cancellation, an expired deadline, and a consumer that walks away each leave
+/// all six nodes owning no Analytical graph, attempt, or reservation.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn pg_inactive_analytical_cancel_deadline_and_slow_consumer_leave_six_clean_nodes() {
+    prove_terminal_cleanup()
+        .await
+        .expect("inactive analytical terminal cleanup journey");
+}
+
+/// Drives the three abnormal terminals and asserts a clean cluster after each.
+///
+/// The assertion is made after every terminal rather than once at the end, so a
+/// leak is attributed to the terminal that caused it instead of to whichever
+/// one happened to run last.
+///
+/// # Errors
+///
+/// Returns a cluster, execution, or retained-ownership error.
+async fn prove_terminal_cleanup() -> Result<(), JourneyError> {
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::six_capacity()).await?;
+    let tenant = cluster.data_tenant_id();
+    let table = seed_table(&cluster, "analytical_cleanup").await?;
+    let query_server = cluster.server(0).ok_or("missing query node")?;
+    let engine = Arc::clone(
+        query_server
+            .state()
+            .bifrost_query()
+            .ok_or("query node composed no Oracle")?
+            .engine(),
+    );
+    let sql = format!("SELECT id, filter_key FROM vala.bifrost.{table} ORDER BY id");
+
+    // Explicit cancellation: the owner signals and drains under its own bound.
+    let stream = engine
+        .query_sql_inactive_analytical(query_context(tenant)?, request(&sql), attempt_context())
+        .await?;
+    stream.cancel().await;
+    await_clean_nodes(&cluster).await?;
+
+    // An expired deadline: the attempt never gets to produce a full result.
+    let expired = engine
+        .query_sql_inactive_analytical(
+            query_context(tenant)?,
+            BifrostQueryRequest {
+                deadline_ms: Some(1),
+                ..request(&sql)
+            },
+            attempt_context(),
+        )
+        .await;
+    if let Ok(mut stream) = expired {
+        while stream.frames.next().await.is_some() {}
+    }
+    await_clean_nodes(&cluster).await?;
+
+    // A consumer that walks away mid-stream: the frames owner is dropped
+    // without a terminal, which is the case a Drop-only cleanup would miss.
+    let mut stream = engine
+        .query_sql_inactive_analytical(query_context(tenant)?, request(&sql), attempt_context())
+        .await?;
+    let _first = stream.frames.next().await;
+    drop(stream);
+    await_clean_nodes(&cluster).await?;
+
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// A settled attempt and a sibling graph under the same public query can
+/// neither settle, cancel, nor attach work to a live attempt.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn pg_inactive_analytical_stale_attempt_and_sibling_graph_cannot_emit_or_cancel() {
+    prove_stale_and_sibling_fencing()
+        .await
+        .expect("inactive analytical fencing journey");
+}
+
+/// Drives the stale-attempt and sibling-graph refusals against a live attempt.
+///
+/// Every refusal here is asserted against a supervisor that is simultaneously
+/// holding one legitimately live attempt, so a refusal cannot be an artifact of
+/// an empty supervisor refusing everything.
+///
+/// # Errors
+///
+/// Returns a cluster, lease, or assertion error.
+async fn prove_stale_and_sibling_fencing() -> Result<(), JourneyError> {
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::six_capacity()).await?;
+    let tenant = cluster.data_tenant_id();
+    let table = seed_table(&cluster, "analytical_fencing").await?;
+    let query_server = cluster.server(0).ok_or("missing query node")?;
+    let engine = Arc::clone(
+        query_server
+            .state()
+            .bifrost_query()
+            .ok_or("query node composed no Oracle")?
+            .engine(),
+    );
+    let handle = Arc::clone(
+        engine
+            .analytical_execution()
+            .ok_or("Oracle composed no Analytical handle")?,
+    );
+    let supervisor = Arc::clone(handle.supervisor());
+    let sql = format!("SELECT id FROM vala.bifrost.{table} ORDER BY id");
+
+    let attempt = attempt_context();
+    let (_session, ownership) = engine
+        .lease_inactive_analytical_attempt(query_context(tenant)?, request(&sql), &attempt)
+        .await?;
+    let live = ownership.key();
+
+    // A stale attempt ordinal of this same graph: never admitted, so it can
+    // settle nothing and attach nothing.
+    let stale = successor_key(live);
+    if supervisor
+        .finish_attempt(stale, AnalyticalAttemptOutcome::Cancelled)
+        .await
+        .is_ok()
+    {
+        return Err("a stale attempt settled work it never owned".into());
+    }
+    if supervisor
+        .retain_driver(stale, tokio::spawn(async {}))
+        .is_ok()
+    {
+        return Err("a stale attempt attached a driver".into());
+    }
+
+    // A sibling graph under the same public query: a different private plan
+    // identity, which must not resolve, settle, or attach to this graph.
+    let sibling = AnalyticalAttemptKey::new(
+        live.public_query_id,
+        DataFusionQueryId::from_uuid(uuid::Uuid::now_v7()),
+        live.stage,
+        live.task,
+        live.attempt,
+    );
+    if supervisor.graph_runtime(sibling.graph()).is_ok() {
+        return Err("a sibling graph resolved this graph's query-owned runtime".into());
+    }
+    if supervisor
+        .finish_attempt(sibling, AnalyticalAttemptOutcome::Cancelled)
+        .await
+        .is_ok()
+    {
+        return Err("a sibling graph settled this graph's attempt".into());
+    }
+    if supervisor
+        .retain_driver(sibling, tokio::spawn(async {}))
+        .is_ok()
+    {
+        return Err("a sibling graph attached a driver to this graph".into());
+    }
+
+    // The refusals changed nothing: the real attempt is still live and still
+    // the only one, and its cancellation child was never signalled.
+    if supervisor.live_attempts()? != 1 {
+        return Err("a refused fencing attempt disturbed live supervision".into());
+    }
+    if ownership.attempt.cancellation().is_cancelled() {
+        return Err("a refused fencing attempt cancelled the live attempt".into());
+    }
+
+    ownership.settle(AnalyticalAttemptOutcome::Success).await?;
+    await_clean_nodes(&cluster).await?;
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// A selective predicate and a narrow projection prune the distributed physical
+/// read, the exchange carries real follower result data, and the attempt's spill
+/// is confined to this node's own bounded scratch.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn pg_inactive_analytical_raw_sql_proves_pushdown_exchange_and_qualified_spill() {
+    prove_pushdown_exchange_and_spill()
+        .await
+        .expect("inactive analytical pushdown, exchange, and spill journey");
+}
+
+/// Drives the pushdown, exchange, and qualified-spill proofs.
+///
+/// The spill half is exercised through the attempt's own disk manager rather
+/// than by starving a sort into spilling. That is deliberate: what this journey
+/// must prove is that a spilling operator's files are *qualified* — bounded by
+/// the query's admitted scratch share and confined to this node's disposable
+/// Oracle-owned child — and starving a sort proves only that some spill
+/// happened, on a threshold `DataFusion` owns and may retune. The exact-share
+/// refusal itself is proved in the spill owner's own tests.
+///
+/// # Errors
+///
+/// Returns a cluster, execution, telemetry, or assertion error.
+async fn prove_pushdown_exchange_and_spill() -> Result<(), JourneyError> {
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::six_capacity()).await?;
+    let tenant = cluster.data_tenant_id();
+    let table = seed_table(&cluster, "analytical_pushdown").await?;
+    let query_server = cluster.server(0).ok_or("missing query node")?;
+    let engine = Arc::clone(
+        query_server
+            .state()
+            .bifrost_query()
+            .ok_or("query node composed no Oracle")?
+            .engine(),
+    );
+
+    let broad_checkpoint = cluster
+        .telemetry()
+        .checkpoint()
+        .map_err(|e| e.to_string())?;
+    let broad = execute_inactive_analytical(
+        query_server,
+        tenant,
+        &format!("SELECT id, filter_key, unused_payload FROM vala.bifrost.{table}"),
+    )
+    .await?;
+    let broad_delta = cluster
+        .telemetry()
+        .delta_since(&broad_checkpoint)
+        .map_err(|e| e.to_string())?;
+    let broad_bytes = sum_metric(&broad_delta, "oracle_query_bytes_scanned_total");
+    let exchange_batches = sum_metric(
+        &broad_delta,
+        "bifrost_oracle_analytical_exchange_batches_total",
+    );
+    let exchange_bytes = sum_metric(
+        &broad_delta,
+        "bifrost_oracle_analytical_exchange_bytes_total",
+    );
+
+    let narrow_checkpoint = cluster
+        .telemetry()
+        .checkpoint()
+        .map_err(|e| e.to_string())?;
+    let narrow = execute_inactive_analytical(
+        query_server,
+        tenant,
+        &format!("SELECT id FROM vala.bifrost.{table} WHERE filter_key = 'group_0'"),
+    )
+    .await?;
+    let narrow_delta = cluster
+        .telemetry()
+        .delta_since(&narrow_checkpoint)
+        .map_err(|e| e.to_string())?;
+    let narrow_bytes = sum_metric(&narrow_delta, "oracle_query_bytes_scanned_total");
+
+    if i64::try_from(broad.rows())? != FIXTURE_ROWS {
+        return Err(format!(
+            "broad scan expected {FIXTURE_ROWS} rows, saw {}",
+            broad.rows()
+        )
+        .into());
+    }
+    let expected_narrow = FIXTURE_ROWS / FIXTURE_GROUPS;
+    if i64::try_from(narrow.rows())? != expected_narrow {
+        return Err(format!(
+            "selective scan expected {expected_narrow} rows, saw {}",
+            narrow.rows()
+        )
+        .into());
+    }
+    if narrow_bytes >= broad_bytes {
+        return Err(format!(
+            "predicate and projection pushdown moved no physical bytes: \
+             broad={broad_bytes} narrow={narrow_bytes}"
+        )
+        .into());
+    }
+    if exchange_batches <= 0.0 || exchange_bytes <= 0.0 {
+        return Err(format!(
+            "distributed exchange carried no follower result data: \
+             batches={exchange_batches} bytes={exchange_bytes}"
+        )
+        .into());
+    }
+
+    // Qualified spill: the attempt's own runtime, not a process default.
+    let attempt = attempt_context();
+    let sql = format!("SELECT id FROM vala.bifrost.{table} ORDER BY id");
+    let (session, ownership) = engine
+        .lease_inactive_analytical_attempt(query_context(tenant)?, request(&sql), &attempt)
+        .await?;
+    let spill_root = engine.analytical_spill_root().to_path_buf();
+    let scratch = session
+        .runtime_env()
+        .disk_manager
+        .create_tmp_file("analytical journey")?;
+    let path = scratch
+        .path()
+        .ok_or("attempt spill file reported no path")?
+        .to_path_buf();
+    if !path.starts_with(&spill_root) {
+        return Err(format!(
+            "attempt spill escaped this node's owned scratch: {} is not under {}",
+            path.display(),
+            spill_root.display()
+        )
+        .into());
+    }
+    drop(scratch);
+    ownership.settle(AnalyticalAttemptOutcome::Success).await?;
+
+    await_clean_nodes(&cluster).await?;
     cluster.shutdown().await?;
     Ok(())
 }

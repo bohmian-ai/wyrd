@@ -64,6 +64,7 @@ use datafusion_distributed::{
     ChannelResolver, CoordinatorToWorkerMsg, ExecuteTaskRequest, GetWorkerInfoRequest,
     GetWorkerInfoResponse, SetPlanRequest, TaskKey, WorkerChannel, WorkerToCoordinatorMsg,
 };
+use futures_util::StreamExt as _;
 use futures_util::stream::BoxStream;
 use tower::Layer as _;
 use url::Url;
@@ -78,6 +79,7 @@ use super::peer::{
     MAX_STAGE_BODY_BYTES, OracleStageAuthority, PeerSecurityError, StageBinding, StageOperationV1,
     StageTicketClaims, stage_body_digest,
 };
+use super::telemetry::record_exchange_transfer;
 
 /// gRPC path of the bidirectional coordinator channel this layer governs.
 ///
@@ -818,22 +820,40 @@ where
     /// replayed body is re-boxed into the transport's own body type, so the
     /// wrapped channel is the stock upstream client with nothing else changed.
     fn call(&mut self, request: Request<B>) -> Self::Future {
-        let mut inner = self.inner.clone();
+        // Tower's contract binds one `poll_ready` reservation to the *next*
+        // `call` on that exact service value. A `tonic::transport::Channel`
+        // enforces it: its buffered sender panics with "`send_item` called
+        // without first calling `poll_reserve`" when a request arrives on a
+        // clone that never reserved a slot. Because this layer's work is
+        // asynchronous, the future — not `self` — must own the readied service,
+        // so the readied value is moved out and an unreadied clone is left in
+        // its place for the next `poll_ready`.
+        let unreadied = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, unreadied);
         let minter = Arc::clone(&self.minter);
         Box::pin(async move {
             let Some(operation) = governed_operation(request.uri().path()) else {
                 return inner.call(forward(request, VecDeque::new())).await;
             };
+            let path = request.uri().path().to_owned();
             let (parts, mut body) = request.into_parts();
-            let Ok((framed, replay)) = read_first_message(&mut body, MAX_STAGE_BODY_BYTES).await
-            else {
-                return Ok(Response::refused());
+            let (framed, replay) = match read_first_message(&mut body, MAX_STAGE_BODY_BYTES).await {
+                Ok(bound) => bound,
+                Err(error) => {
+                    tracing::warn!(path = %path, error = %error, reason = "framing", "Oracle analytical stage egress refused a request");
+                    return Ok(Response::refused());
+                }
             };
             let mut request = Request::from_parts(parts, body);
-            let Ok(ticket) = minter.mint(operation, request.headers(), &framed, Utc::now()) else {
-                return Ok(Response::refused());
+            let ticket = match minter.mint(operation, request.headers(), &framed, Utc::now()) {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    tracing::warn!(path = %path, error = %error, reason = "mint", "Oracle analytical stage egress refused a request");
+                    return Ok(Response::refused());
+                }
             };
-            if write_ticket(request.headers_mut(), &ticket).is_err() {
+            if let Err(error) = write_ticket(request.headers_mut(), &ticket) {
+                tracing::warn!(path = %path, error = %error, reason = "header", "Oracle analytical stage egress refused a request");
                 return Ok(Response::refused());
             }
             inner.call(forward(request, replay)).await
@@ -965,22 +985,32 @@ where
 
     /// Authorizes the first raw message, then forwards it replayed and intact.
     fn call(&mut self, request: Request<B>) -> Self::Future {
-        let mut inner = self.inner.clone();
+        // Same Tower readiness contract as `AnalyticalStageMint::call`: the
+        // future must own the service value that was polled ready, so the
+        // readied value is moved out and an unreadied clone takes its place.
+        let unreadied = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, unreadied);
         let ingress = Arc::clone(&self.ingress);
         Box::pin(async move {
-            let Some(operation) = governed_operation(request.uri().path()) else {
+            let path = request.uri().path().to_owned();
+            let Some(operation) = governed_operation(&path) else {
+                tracing::warn!(path = %path, reason = "ungoverned_path", "Oracle analytical stage ingress refused a request");
                 return Ok(S::Response::refused());
             };
             let (parts, mut body) = request.into_parts();
-            let Ok((framed, replay)) = read_first_message(&mut body, MAX_STAGE_BODY_BYTES).await
-            else {
-                return Ok(S::Response::refused());
+            let framing = read_first_message(&mut body, MAX_STAGE_BODY_BYTES).await;
+            let (framed, replay) = match framing {
+                Ok(bound) => bound,
+                Err(error) => {
+                    tracing::warn!(path = %path, error = %error, reason = "framing", "Oracle analytical stage ingress refused a request");
+                    return Ok(S::Response::refused());
+                }
             };
-            if ingress
+            if let Err(error) = ingress
                 .authorize_stage_message(operation, &parts.headers, &framed, Utc::now())
                 .await
-                .is_err()
             {
+                tracing::warn!(path = %path, error = %error, reason = "authority", "Oracle analytical stage ingress refused a request");
                 return Ok(S::Response::refused());
             }
             inner
@@ -1107,9 +1137,11 @@ impl WorkerChannel for AnalyticalWorkerChannel {
     ) -> Result<Vec<BoxStream<'static, Result<RecordBatch, DataFusionError>>>, DataFusionError>
     {
         self.stamp(&mut headers, request.task_key)?;
-        self.inner
+        let partitions = self
+            .inner
             .execute_task(headers, request, metrics, task_ctx)
-            .await
+            .await?;
+        Ok(partitions.into_iter().map(measured_exchange).collect())
     }
 
     /// Delegates worker version discovery, which carries no stage identity.
@@ -1119,6 +1151,26 @@ impl WorkerChannel for AnalyticalWorkerChannel {
     ) -> Result<GetWorkerInfoResponse, DataFusionError> {
         self.inner.get_worker_info(request).await
     }
+}
+
+/// Counts one follower partition's batches and bytes as they cross the exchange.
+///
+/// This is the only place a coordinator sees follower result data arrive, so it
+/// is the only honest place to measure the exchange. The count is taken as each
+/// batch is yielded rather than by collecting the stream, so measurement does
+/// not change the stream's laziness, backpressure, or cancellation behavior.
+///
+/// Bytes are the batch's in-memory Arrow footprint, which is what the
+/// coordinator's exchange budget is actually charged for; it is deliberately not
+/// the encoded wire size, which no owner here bounds.
+fn measured_exchange(
+    partition: BoxStream<'static, Result<RecordBatch, DataFusionError>>,
+) -> BoxStream<'static, Result<RecordBatch, DataFusionError>> {
+    Box::pin(partition.inspect(|batch| {
+        if let Ok(batch) = batch {
+            record_exchange_transfer(1, batch.get_array_memory_size() as u64);
+        }
+    }))
 }
 
 /// Resolves worker clients that sign every governed stage operation they send.

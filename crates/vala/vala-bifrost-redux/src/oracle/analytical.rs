@@ -651,8 +651,7 @@ impl AnalyticalStageIngress {
     /// identity, or binding failure, [`BifrostError::QueryAuditUnavailable`]
     /// when the required refusal audit could not commit,
     /// [`BifrostError::QueryAdmissionRejected`] when this follower cannot admit
-    /// the graph's envelope, and [`BifrostError::QueryExecutionFailed`] when an
-    /// `ExecuteTask` names a graph that is not registered.
+    /// the graph's envelope.
     pub async fn authorize_stage_message(
         &self,
         operation: StageOperationV1,
@@ -668,9 +667,16 @@ impl AnalyticalStageIngress {
             .authority
             .authorize_stage(&ticket, &binding, framed_message, now)
             .await
-            .map_err(|error| match error {
-                PeerSecurityError::AuditUnavailable => BifrostError::QueryAuditUnavailable,
-                _ => BifrostError::QueryPeerSecurity,
+            .map_err(|error| {
+                tracing::warn!(
+                    operation = ?operation,
+                    error = %error,
+                    "Oracle analytical stage authority refused a stage message"
+                );
+                match error {
+                    PeerSecurityError::AuditUnavailable => BifrostError::QueryAuditUnavailable,
+                    _ => BifrostError::QueryPeerSecurity,
+                }
             })?;
         let key = attempt_key(&authorized)?;
         match operation {
@@ -680,7 +686,18 @@ impl AnalyticalStageIngress {
                 record_stage_operation(AnalyticalStageOperation::SetPlan);
             }
             StageOperationV1::ExecuteTask => {
-                self.supervisor.graph_runtime(key.graph())?;
+                // Graph admission, not attempt admission. Upstream sends its
+                // plan on a spawned coordinator-channel task and lets
+                // `Worker::execute_task` wait for that plan to arrive, so an
+                // `ExecuteTask` legitimately reaches this follower before the
+                // `SetPlan` that names the same graph. Requiring the graph to
+                // already be registered would turn upstream's documented
+                // ordering tolerance into a refusal race. The ticket has
+                // already bound this graph, tenant, fence, and reservation, so
+                // admitting the envelope here is the same authorized act
+                // `SetPlan` performs; the attempt guard still waits for
+                // `SetPlan`, which is the message that actually names one.
+                self.admit_graph(key.graph())?;
                 record_stage_operation(AnalyticalStageOperation::ExecuteTask);
             }
         }
@@ -722,6 +739,18 @@ impl AnalyticalStageIngress {
             release.release()?;
         }
         Ok(())
+    }
+
+    /// Reports what this follower still owns without releasing any of it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when an ownership lock is poisoned.
+    pub fn live(&self) -> Result<AnalyticalLiveOwnership, BifrostError> {
+        Ok(AnalyticalLiveOwnership {
+            attempts: self.attempts.lock().map_err(|_| poisoned_ingress())?.len(),
+            graphs: self.graphs.lock().map_err(|_| poisoned_ingress())?.len(),
+        })
     }
 
     /// Releases every graph and attempt this follower still owns.
@@ -1288,6 +1317,62 @@ pub struct AnalyticalWorkerResolver {
     urls: Vec<Url>,
 }
 
+/// Oracle's own answer to "how many tasks should this scan stage run on?".
+///
+/// Upstream's built-in estimator derives a task count from the total Parquet
+/// bytes a leaf will read, divided by a fixed per-partition byte budget. That
+/// heuristic is wrong for Bifrost: Oracle has already frozen a participant cut
+/// and already knows how many Oracle peers may legally execute this attempt and
+/// how many scannable units the pinned cut holds. A byte heuristic would make
+/// distribution a property of how much data happens to be in the table rather
+/// than a property of the cut, so a correctly-planned distributed query over a
+/// small table would silently collapse onto the leader.
+///
+/// The handler answers only for leaf nodes, matching the contract of upstream's
+/// built-in estimator: answering for an inner node would override the task
+/// count its children reconciled. Registered as a *custom* handler, it is
+/// consulted before the built-in byte estimator and therefore replaces it.
+struct AnalyticalCutTaskCount {
+    /// Tasks one scan stage of this attempt may occupy, at least one.
+    tasks: usize,
+}
+
+impl AnalyticalCutTaskCount {
+    /// Derives the per-stage task count from the frozen cut and its pinned work.
+    ///
+    /// Parallelism is capped at one task per scannable unit, because splitting
+    /// two fragments across six peers buys network hops and empty streams
+    /// rather than throughput, and at the participant count, because a task
+    /// cannot run on a peer that is not in the cut. A cut that pinned nothing
+    /// scannable still yields one task so the empty plan executes normally.
+    fn new(participants: usize, work_units: usize) -> Self {
+        Self {
+            tasks: participants.min(work_units).max(1),
+        }
+    }
+}
+
+#[async_trait]
+impl datafusion_distributed::DesiredTaskCountHandler for AnalyticalCutTaskCount {
+    /// Returns the cut-derived desired task count for every leaf node.
+    ///
+    /// # Errors
+    ///
+    /// Never fails: the count was validated when the attempt cut was frozen.
+    async fn handle(
+        &self,
+        ev: datafusion_distributed::DesiredTaskCountEvent<'_>,
+    ) -> Option<Result<datafusion_distributed::DesiredTaskCountEventResponse, DataFusionError>>
+    {
+        if !ev.plan.children().is_empty() {
+            return None;
+        }
+        Some(Ok(
+            datafusion_distributed::DesiredTaskCountEventResponse::desired(self.tasks),
+        ))
+    }
+}
+
 impl WorkerResolver for AnalyticalWorkerResolver {
     /// Returns the attempt's frozen worker set.
     ///
@@ -1468,6 +1553,43 @@ impl AnalyticalExecutionHandle {
     #[must_use]
     pub fn worker(&self) -> &Arc<AnalyticalStageIngress> {
         &self.worker
+    }
+
+    /// Returns this node's leader-side supervisor.
+    #[must_use]
+    pub fn supervisor(&self) -> &Arc<AnalyticalSupervisor> {
+        &self.supervisor
+    }
+
+    /// Returns the exact child grant every attempt of this node is admitted with.
+    ///
+    /// A retry must be admitted with the same grant its predecessor held, so
+    /// this is read from the node's configuration rather than chosen per call.
+    #[must_use]
+    pub const fn attempt_grant(&self) -> AnalyticalAttemptGrant {
+        AnalyticalAttemptGrant {
+            exchange_buffer_bytes: self.config.exchange_buffer_bytes,
+            scratch_bytes: self.config.scratch_bytes,
+        }
+    }
+
+    /// Reports what this node still owns, leader and follower, without releasing it.
+    ///
+    /// This is the terminal-cleanup probe: after every query on a node has
+    /// settled, both halves must read zero. Unlike [`Self::shutdown`] it takes
+    /// nothing away, so a journey can assert a clean node and then keep using it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when an ownership lock is poisoned.
+    pub fn live(&self) -> Result<AnalyticalLiveInspection, BifrostError> {
+        Ok(AnalyticalLiveInspection {
+            leader: AnalyticalLiveOwnership {
+                attempts: self.supervisor.live_attempts()?,
+                graphs: self.supervisor.live_graphs()?,
+            },
+            follower: self.worker.live()?,
+        })
     }
 
     /// Executes one distributed physical plan without being reachable from routing.
@@ -1704,6 +1826,10 @@ impl AnalyticalExecutionHandle {
             work_units,
         );
         let mut config = shape.session_config();
+        config.set_distributed_desired_task_count_handler(AnalyticalCutTaskCount::new(
+            urls.len(),
+            work_units,
+        ));
         config.set_distributed_worker_resolver(AnalyticalWorkerResolver { urls });
         config.set_distributed_channel_resolver(resolver);
         let state = datafusion::execution::session_state::SessionStateBuilder::new()
@@ -1715,7 +1841,16 @@ impl AnalyticalExecutionHandle {
         Ok(SessionContext::new_with_state(state))
     }
 
-    /// Maps each participant endpoint to the fenced identity a ticket binds to.
+    /// Maps each remote participant endpoint to the fenced identity a ticket binds to.
+    ///
+    /// The coordinator excludes itself. A leader is already an Oracle in its own
+    /// pinned cut, so keeping it in the worker set would make this node dispatch
+    /// stage operations to its own ingress — which would admit a *second*
+    /// Analytical query envelope for a query whose envelope this node already
+    /// holds, and would ask the supervisor to register a graph it has already
+    /// registered for the leader lease. A cut with no remote Oracle therefore
+    /// yields an empty worker set, and the attempt executes entirely on the
+    /// leader, which is the correct shape for a single-node deployment.
     ///
     /// # Errors
     ///
@@ -1727,6 +1862,7 @@ impl AnalyticalExecutionHandle {
     ) -> Result<HashMap<Url, (NodeId, u64)>, BifrostError> {
         cut.oracles()
             .iter()
+            .filter(|participant| participant.node_id != self.config.node_id)
             .map(|participant| {
                 let url =
                     Url::parse(&participant.endpoint).map_err(|error| BifrostError::Internal {

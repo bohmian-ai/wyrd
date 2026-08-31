@@ -305,7 +305,7 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
     let FrameBuildInput {
         schema_frame,
         mut ipc,
-        mut batches,
+        batches,
         first,
         admitted,
         deadline,
@@ -323,6 +323,13 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
     let frames = async_stream::stream! {
         let distributed_settlement = Arc::clone(&admitted.distributed_settlement);
         let mut admitted = Some(admitted);
+        // Re-bound after `admitted` on purpose. When a consumer walks away the
+        // generator state is dropped in reverse declaration order, so the plan's
+        // `RecordBatch` stream must be declared last to release its memory-pool
+        // reservations before the analytical envelope that granted them. The
+        // reverse order releases an Oracle query owner while a nested resource
+        // child is still reserved, which poisons the process resource governor.
+        let mut batches = batches;
         let mut next = first;
         let mut row_count = 0_u64;
         query_telemetry.record_payload(0, schema_frame.arrow_ipc_schema.len());

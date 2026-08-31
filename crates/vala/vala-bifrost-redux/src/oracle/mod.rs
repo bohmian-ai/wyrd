@@ -2308,6 +2308,17 @@ impl Oracle {
         .await
     }
 
+    /// Returns this node's process-owned Oracle spill directory.
+    ///
+    /// Terminal-cleanup and qualified-spill evidence needs to assert that an
+    /// attempt's temporary files landed inside the node's own disposable child
+    /// and nowhere else, which is only checkable against this root.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn analytical_spill_root(&self) -> &std::path::Path {
+        self.spill_runtime.spill_path()
+    }
+
     /// Leases one inactive Analytical attempt without executing anything.
     ///
     /// The cut, classification, and providers are prepared exactly as a real

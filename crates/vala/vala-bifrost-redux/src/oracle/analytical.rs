@@ -1498,8 +1498,10 @@ impl AnalyticalExecutionHandle {
         record_stage_operation(AnalyticalStageOperation::SetPlan);
         Ok(AnalyticalExecution {
             batches,
-            graph: graph_guard,
-            attempt,
+            ownership: AnalyticalAttemptOwnership {
+                graph: graph_guard,
+                attempt,
+            },
         })
     }
 
@@ -1632,6 +1634,20 @@ struct AnalyticalSessionInputs<'a> {
     target_partitions: usize,
 }
 
+/// Graph and attempt ownership retained for one inactive Analytical attempt.
+///
+/// The two guards are kept together because they release in a fixed order:
+/// the attempt returns its exchange-buffer and scratch children to the query
+/// envelope, and only then does the graph return the envelope itself. Dropping
+/// this value settles both, which is what makes a cancelled or abandoned
+/// attempt return capacity instead of stranding it.
+pub struct AnalyticalAttemptOwnership {
+    /// Graph ownership retained for as long as stages may be addressed.
+    pub graph: AnalyticalGraphGuard,
+    /// Attempt ownership retained for as long as stage work may run.
+    pub attempt: AnalyticalAttemptGuard,
+}
+
 /// One started Analytical execution and the owners that settle with it.
 ///
 /// The guards are returned rather than detached so the caller cannot drain the
@@ -1641,8 +1657,6 @@ struct AnalyticalSessionInputs<'a> {
 pub struct AnalyticalExecution {
     /// Lazy distributed batch stream produced by the attempt.
     pub batches: SendableRecordBatchStream,
-    /// Graph ownership retained for as long as stages may be addressed.
-    pub graph: AnalyticalGraphGuard,
-    /// Attempt ownership retained for as long as stage work may run.
-    pub attempt: AnalyticalAttemptGuard,
+    /// Graph and attempt ownership settling with the drained stream.
+    pub ownership: AnalyticalAttemptOwnership,
 }

@@ -765,6 +765,7 @@ impl OracleAdmission {
         }
         let query_id = attempt_id.unwrap_or_else(|| QueryId::new(uuid::Uuid::now_v7()));
         Ok(AdmittedQueryGuard {
+            analytical: None,
             query_id,
             leader: AdmittedLeader {
                 node_id: local_node,
@@ -1014,6 +1015,13 @@ pub(super) struct AdmittedQueryGuard {
     /// Canonical local slot-use gauge retained with the running permit.
     /// Parent reservations retaining drained live batches through stream cleanup.
     pub(super) live_reservations: Vec<AccountedMemoryReservation>,
+    /// Inactive Analytical graph and attempt ownership retained until cleanup.
+    ///
+    /// Present only on an attempt that the production-unreachable Analytical
+    /// path leased a session for. Dropping this guard drops those owners, which
+    /// is what returns the exchange-buffer and scratch children to the query
+    /// envelope and the envelope to the root capability.
+    pub(super) analytical: Option<super::analytical::AnalyticalAttemptOwnership>,
     /// Cancellation shared with stream and peer dispatch.
     pub(super) cancellation: CancellationToken,
     /// Caller/request cancellation retained for admission ownership.
@@ -1311,6 +1319,7 @@ pub(super) fn admitted_guard_for_test()
     let request_cancellation = CancellationToken::new();
     (
         AdmittedQueryGuard {
+            analytical: None,
             query_id: QueryId::new(uuid::Uuid::now_v7()),
             leader: AdmittedLeader {
                 node_id: NodeId::new(uuid::Uuid::now_v7()),

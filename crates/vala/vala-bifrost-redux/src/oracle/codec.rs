@@ -131,7 +131,7 @@ pub(crate) enum PreflightExtension {
 }
 
 /// Leaf placeholder substituted for one Wyrd-owned source before serialization.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RemoteSourcePlaceholderExec {
     /// Stable request-local identity.
     scan_id: String,
@@ -364,6 +364,8 @@ pub struct AnalyticalLeafBinding {
     role: wyrd_spec::vala::api::ClusterRole,
     /// Process resolver that turns a signed assignment into a local provider.
     resolver: Arc<dyn super::follower::FollowerSourceResolver>,
+    /// Audit owner the tenant tripwire above each source fails closed against.
+    audit: Arc<dyn super::OracleAudit>,
 }
 
 impl AnalyticalLeafBinding {
@@ -372,8 +374,13 @@ impl AnalyticalLeafBinding {
     pub fn new(
         role: wyrd_spec::vala::api::ClusterRole,
         resolver: Arc<dyn super::follower::FollowerSourceResolver>,
+        audit: Arc<dyn super::OracleAudit>,
     ) -> Self {
-        Self { role, resolver }
+        Self {
+            role,
+            resolver,
+            audit,
+        }
     }
 }
 
@@ -434,7 +441,7 @@ impl OraclePhysicalExtensionCodec {
     pub fn analytical(binding: AnalyticalLeafBinding) -> Self {
         Self {
             providers: Mutex::new(HashMap::new()),
-            audit: None,
+            audit: Some(Arc::clone(&binding.audit)),
             analytical: Some(binding),
         }
     }

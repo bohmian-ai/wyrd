@@ -1555,7 +1555,17 @@ mod tests {
                 leaf: crate::oracle::codec::AnalyticalLeafBinding::new(
                     wyrd_spec::vala::api::ClusterRole::Oracle,
                     Arc::new(crate::oracle::follower::UnresolvableSource),
+                    Arc::new(crate::oracle::AcceptingOracleAudit),
                 ),
+                egress: Arc::new(crate::oracle::analytical::AnalyticalStageEgress::new(
+                    Arc::new(FixtureAuthority {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                    }),
+                    Arc::new(|| Ok(std::collections::HashMap::new())),
+                    node_id,
+                    7,
+                    chrono::Duration::seconds(30),
+                )),
             }));
             let identity = StageWireIdentity {
                 source_node_id: NodeId::new(Uuid::from_u128(1)),

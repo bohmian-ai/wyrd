@@ -1322,11 +1322,11 @@ pub struct BifrostSecurityViolation {
 /// real fail-closed audit call on the path while removing the Postgres
 /// dependency those proofs do not need. Any test that asserts audit content
 /// must use a writer that actually records.
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AcceptingOracleAudit;
 
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 #[async_trait]
 impl OracleAudit for AcceptingOracleAudit {
     /// Accepts the read decision so the worker proceeds to serve rows.
@@ -2089,9 +2089,35 @@ impl Oracle {
             Arc::new(follower::OracleCatalogResolver::new(Arc::clone(
                 &config.catalog,
             ))),
+            Arc::clone(&config.audit),
         );
         let analytical = config.stage_authority.map(|authority| {
             let supervisor = Arc::new(analytical::AnalyticalSupervisor::new());
+            let peer_cluster = Arc::clone(&cluster);
+            let egress = Arc::new(analytical::AnalyticalStageEgress::new(
+                Arc::clone(&authority),
+                Arc::new(move || {
+                    peer_cluster
+                        .snapshot()
+                        .live_oracles()
+                        .iter()
+                        .filter(|lease| lease.key.node_id != analytical_node_id)
+                        .map(|lease| {
+                            let url = url::Url::parse(&lease.address).map_err(|error| {
+                                BifrostError::Internal {
+                                    detail: format!(
+                                        "Oracle analytical peer endpoint is not a valid URL: {error}"
+                                    ),
+                                }
+                            })?;
+                            Ok((url, (lease.key.node_id, lease.fencing_token)))
+                        })
+                        .collect()
+                }),
+                analytical_node_id,
+                analytical_fence,
+                chrono::Duration::seconds(30),
+            ));
             let worker = Arc::new(analytical::AnalyticalStageIngress::new(
                 analytical::AnalyticalStageIngressConfig {
                     node_id: analytical_node_id,
@@ -2102,6 +2128,7 @@ impl Oracle {
                     spill: Arc::clone(&config.spill_runtime),
                     exchange_buffer_bytes: config.config.analytical_exchange_buffer_bytes,
                     leaf: analytical_leaf.clone(),
+                    egress,
                 },
             ));
             Arc::new(analytical::AnalyticalExecutionHandle::new(

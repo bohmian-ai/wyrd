@@ -458,6 +458,8 @@ pub struct AnalyticalSessionBuilder {
     registry: Arc<AnalyticalRuntimeRegistry>,
     /// Capability an Analytical leaf needs to resolve its own source locally.
     leaf: super::codec::AnalyticalLeafBinding,
+    /// Outbound capability this node's own middle stages sign through.
+    egress: Arc<AnalyticalStageEgress>,
 }
 
 impl fmt::Debug for AnalyticalSessionBuilder {
@@ -475,8 +477,13 @@ impl AnalyticalSessionBuilder {
     pub fn new(
         registry: Arc<AnalyticalRuntimeRegistry>,
         leaf: super::codec::AnalyticalLeafBinding,
+        egress: Arc<AnalyticalStageEgress>,
     ) -> Self {
-        Self { registry, leaf }
+        Self {
+            registry,
+            leaf,
+            egress,
+        }
     }
 
     /// Resolves one graph's material from a stage operation's headers.
@@ -513,7 +520,12 @@ impl WorkerSessionBuilder for AnalyticalSessionBuilder {
         &self,
         ctx: WorkerQueryContext,
     ) -> Result<SessionState, DataFusionError> {
-        let graph = self.resolve_headers(&ctx.headers).map_err(|error| {
+        let key = AnalyticalGraphKey::from_headers(&ctx.headers).map_err(|error| {
+            DataFusionError::Execution(format!(
+                "Oracle analytical stage carries no graph identity: {error}"
+            ))
+        })?;
+        let graph = self.registry.resolve(key).map_err(|error| {
             DataFusionError::Execution(format!(
                 "Oracle analytical stage has no query-owned runtime: {error}"
             ))
@@ -530,10 +542,208 @@ impl WorkerSessionBuilder for AnalyticalSessionBuilder {
         config.set_distributed_user_codec(super::codec::OraclePhysicalExtensionCodec::analytical(
             self.leaf.clone(),
         ));
+        // A stage that only feeds the leader never opens a channel of its own.
+        // A stage in the middle of a deeper graph does: it pulls from another
+        // follower, so this session needs the same signed transport the leader
+        // uses. Installing it unconditionally keeps the two cases identical;
+        // an unrecorded graph resolves to no minter and refuses instead.
+        let resolver = self.egress.resolver(key).map_err(|error| {
+            DataFusionError::Execution(format!(
+                "Oracle analytical stage cannot address its peers: {error}"
+            ))
+        })?;
+        if let Some(resolver) = resolver {
+            let urls = self.egress.peer_urls().map_err(|error| {
+                DataFusionError::Execution(format!(
+                    "Oracle analytical stage cannot address its peers: {error}"
+                ))
+            })?;
+            config.set_distributed_worker_resolver(AnalyticalWorkerResolver { urls });
+            config.set_distributed_channel_resolver(resolver);
+        }
         builder = builder.with_config(config);
         Ok(builder
             .with_runtime_env(Arc::clone(graph.runtime()))
             .build())
+    }
+}
+
+/// Node-local capability a follower mints its own outbound stage tickets from.
+///
+/// A two-stage graph only ever pulls follower to leader, and the leader signs
+/// those as the client. A deeper graph does not: a middle stage runs on a
+/// follower and pulls from another follower, so that follower is itself a
+/// coordinator and must sign. Everything it signs with is already verified —
+/// the identity comes from the claims of the ticket that authorized its own
+/// stage, and the destination fence comes from this node's own membership view
+/// rather than from anything a caller supplied.
+pub struct AnalyticalStageEgress {
+    /// Server-owned authority holding this node's signing key.
+    authority: Arc<dyn OracleStageAuthority>,
+    /// Live peer directory: every addressable Oracle but this one, with the
+    /// fence each is currently serving under.
+    ///
+    /// A closure rather than the membership owner itself, because the fence a
+    /// ticket must carry is whatever the directory reports at send time, and
+    /// because the only thing this owner needs from membership is this map.
+    peers: AnalyticalPeerDirectory,
+    /// This node's own identity, signed as the source of every outbound ticket.
+    node_id: NodeId,
+    /// This node's own current Oracle role fence.
+    oracle_fence: u64,
+    /// Ticket lifetime, kept far shorter than the graph's own deadline.
+    ticket_ttl: chrono::Duration,
+    /// Per-graph outbound identity recorded when a stage was authorized.
+    identities: Mutex<HashMap<AnalyticalGraphKey, AnalyticalEgressIdentity>>,
+}
+
+/// Resolves this node's current Oracle peers to their fenced identities.
+type AnalyticalPeerDirectory =
+    Arc<dyn Fn() -> Result<HashMap<Url, (NodeId, u64)>, BifrostError> + Send + Sync>;
+
+/// One graph's verified outbound identity and deadline.
+struct AnalyticalEgressIdentity {
+    /// Coordinator identity this node signs its own stage operations under.
+    identity: Arc<AnalyticalCoordinatorIdentity>,
+    /// Absolute graph deadline carried unchanged into every outbound ticket.
+    deadline_ms: i64,
+}
+
+impl fmt::Debug for AnalyticalStageEgress {
+    /// Reports node identity without rendering the authority or live graphs.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AnalyticalStageEgress")
+            .field("node_id", &self.node_id.as_uuid())
+            .field("oracle_fence", &self.oracle_fence)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AnalyticalStageEgress {
+    /// Composes the egress owner over this node's authority and membership view.
+    #[must_use]
+    pub fn new(
+        authority: Arc<dyn OracleStageAuthority>,
+        peers: AnalyticalPeerDirectory,
+        node_id: NodeId,
+        oracle_fence: u64,
+        ticket_ttl: chrono::Duration,
+    ) -> Self {
+        Self {
+            authority,
+            peers,
+            node_id,
+            oracle_fence,
+            ticket_ttl,
+            identities: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Records the outbound identity a graph's own stages will sign under.
+    ///
+    /// Every field is taken from the verified claims rather than from headers,
+    /// so a follower can only ever re-emit the tenant, graph, attempt,
+    /// reservation, and permissions it was itself authorized for. The source
+    /// identity is this node's own, because this node is the coordinator of
+    /// whatever it sends next.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when the identity lock is poisoned.
+    fn record(
+        &self,
+        graph: AnalyticalGraphKey,
+        authorized: &AuthorizedStage,
+    ) -> Result<(), BifrostError> {
+        let claims = &authorized.claims;
+        let tenant_id = Uuid::from_slice(&claims.tenant_id)
+            .map_err(|_| BifrostError::QueryPeerSecurity)
+            .and_then(|uuid| {
+                wyrd_spec::DataTenantId::new(uuid).map_err(|_| BifrostError::QueryPeerSecurity)
+            })?;
+        let entry = AnalyticalEgressIdentity {
+            identity: Arc::new(AnalyticalCoordinatorIdentity {
+                source_node_id: self.node_id,
+                source_fence: self.oracle_fence,
+                tenant_id,
+                graph,
+                snapshot_digest: claims.snapshot_digest.clone(),
+                attempt: claims.attempt,
+                reservation_id: claims.reservation_id.clone(),
+                permission_digest: claims.permission_digest.clone(),
+            }),
+            deadline_ms: claims.absolute_deadline_ms,
+        };
+        self.identities
+            .lock()
+            .map_err(|_| poisoned_ingress())?
+            .insert(graph, entry);
+        Ok(())
+    }
+
+    /// Releases one graph's outbound identity once nothing on this node owns it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when the identity lock is poisoned.
+    fn release(&self, graph: AnalyticalGraphKey) -> Result<(), BifrostError> {
+        self.identities
+            .lock()
+            .map_err(|_| poisoned_ingress())?
+            .remove(&graph);
+        Ok(())
+    }
+
+    /// Builds the channel resolver one authorized graph's stages send through.
+    ///
+    /// Returns `None` when this node holds no recorded identity for `graph`,
+    /// which is the correct refusal: a stage that was never authorized here has
+    /// nothing to sign with, and upstream then fails to open a channel rather
+    /// than emitting an unsigned request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when the identity lock is poisoned or
+    /// a membership endpoint is not a valid URL.
+    fn resolver(
+        &self,
+        graph: AnalyticalGraphKey,
+    ) -> Result<Option<AnalyticalChannelResolver>, BifrostError> {
+        let (identity, deadline_ms) = {
+            let identities = self.identities.lock().map_err(|_| poisoned_ingress())?;
+            match identities.get(&graph) {
+                Some(entry) => (Arc::clone(&entry.identity), entry.deadline_ms),
+                None => return Ok(None),
+            }
+        };
+        let destinations = (self.peers)()?;
+        let authority = Arc::clone(&self.authority);
+        let ticket_ttl = self.ticket_ttl;
+        Ok(Some(AnalyticalChannelResolver::new(
+            identity,
+            Arc::new(move |url: &Url| {
+                destinations.get(url).map(|(node_id, fence)| {
+                    Arc::new(AnalyticalStageMinter::new(
+                        Arc::clone(&authority),
+                        *node_id,
+                        *fence,
+                        deadline_ms,
+                        ticket_ttl,
+                    ))
+                })
+            }),
+        )))
+    }
+
+    /// Returns every peer endpoint this node may address, for stage planning.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when a membership endpoint is not a
+    /// valid URL.
+    fn peer_urls(&self) -> Result<Vec<Url>, BifrostError> {
+        (self.peers)().map(|peers| peers.into_keys().collect())
     }
 }
 
@@ -560,6 +770,8 @@ pub struct AnalyticalStageIngressConfig {
     pub exchange_buffer_bytes: usize,
     /// Capability every Analytical leaf decoded on this node resolves through.
     pub leaf: super::codec::AnalyticalLeafBinding,
+    /// Outbound capability a middle stage on this node signs its peers with.
+    pub egress: Arc<AnalyticalStageEgress>,
 }
 
 /// Authenticated follower entry point for Analytical stage operations.
@@ -597,6 +809,8 @@ pub struct AnalyticalStageIngress {
     graphs: Mutex<HashMap<AnalyticalGraphKey, AnalyticalGraphGuard>>,
     /// Attempt ownership tokens held for as long as their stage work may run.
     attempts: Mutex<HashMap<AnalyticalAttemptKey, AnalyticalAttemptGuard>>,
+    /// Outbound capability this node's own middle stages sign through.
+    egress: Arc<AnalyticalStageEgress>,
 }
 
 impl fmt::Debug for AnalyticalStageIngress {
@@ -627,10 +841,12 @@ impl AnalyticalStageIngress {
             spill,
             exchange_buffer_bytes,
             leaf,
+            egress,
         } = config;
         let worker = Worker::from_session_builder(AnalyticalSessionBuilder::new(
             Arc::clone(supervisor.registry()),
             leaf,
+            Arc::clone(&egress),
         ));
         Self {
             node_id,
@@ -643,6 +859,7 @@ impl AnalyticalStageIngress {
             worker,
             graphs: Mutex::new(HashMap::new()),
             attempts: Mutex::new(HashMap::new()),
+            egress,
         }
     }
 
@@ -700,6 +917,10 @@ impl AnalyticalStageIngress {
                 }
             })?;
         let key = attempt_key(&authorized)?;
+        // Recorded from the verified claims, before any admission, so a stage
+        // that this node runs in the middle of a deeper graph can sign its own
+        // outbound pulls with exactly the authority it was granted.
+        self.egress.record(key.graph(), &authorized)?;
         match operation {
             StageOperationV1::SetPlan => {
                 self.admit_graph(key.graph())?;
@@ -758,6 +979,7 @@ impl AnalyticalStageIngress {
         };
         if let Some(release) = release {
             release.release()?;
+            self.egress.release(graph)?;
         }
         Ok(())
     }
@@ -1130,11 +1352,60 @@ mod tests {
         }
         rows
     }
+    /// Authority that signs and authorizes nothing, for egress-free fixtures.
+    #[derive(Debug)]
+    struct RefusingStageAuthority;
+
+    #[async_trait]
+    impl OracleStageAuthority for RefusingStageAuthority {
+        /// Refuses to mint, because no fixture here sends a stage operation.
+        ///
+        /// # Errors
+        /// Always returns [`PeerSecurityError::Operation`].
+        fn mint_stage(
+            &self,
+            _operation: StageOperationV1,
+            _claims: &super::super::peer::StageTicketClaims,
+        ) -> Result<wyrd_spec::vala::api::SignedPeerTicket, PeerSecurityError> {
+            Err(PeerSecurityError::Operation)
+        }
+
+        /// Refuses to authorize, because no fixture here receives one either.
+        ///
+        /// # Errors
+        /// Always returns [`PeerSecurityError::Operation`].
+        async fn authorize_stage(
+            &self,
+            _ticket: &wyrd_spec::vala::api::SignedPeerTicket,
+            _binding: &super::super::peer::StageBinding,
+            _body: &[u8],
+            _now: DateTime<Utc>,
+        ) -> Result<AuthorizedStage, PeerSecurityError> {
+            Err(PeerSecurityError::Operation)
+        }
+    }
+
+    /// Builds the egress owner a session fixture needs but never exercises.
+    ///
+    /// The peer directory is empty, so a fixture that unexpectedly opens an
+    /// outbound stage channel fails to resolve a minter rather than emitting an
+    /// unsigned request.
+    fn fixture_egress() -> Arc<AnalyticalStageEgress> {
+        Arc::new(AnalyticalStageEgress::new(
+            Arc::new(RefusingStageAuthority),
+            Arc::new(|| Ok(HashMap::new())),
+            NodeId::new(Uuid::from_u128(0)),
+            0,
+            chrono::Duration::seconds(30),
+        ))
+    }
+
     /// Builds the leaf binding a session fixture needs but never exercises.
     fn fixture_leaf_binding() -> super::super::codec::AnalyticalLeafBinding {
         super::super::codec::AnalyticalLeafBinding::new(
             wyrd_spec::vala::api::ClusterRole::Oracle,
             Arc::new(super::super::follower::UnresolvableSource),
+            Arc::new(crate::oracle::AcceptingOracleAudit),
         )
     }
 
@@ -1178,6 +1449,7 @@ mod tests {
         let worker = Worker::from_session_builder(AnalyticalSessionBuilder::new(
             Arc::clone(&registry),
             fixture_leaf_binding(),
+            fixture_egress(),
         ))
         .with_runtime_env(Arc::clone(&process_runtime));
 
@@ -1379,6 +1651,56 @@ impl AnalyticalCutTaskCount {
         Self {
             tasks: participants.min(work_units).max(1),
         }
+    }
+}
+
+/// Splits one Analytical leaf's signed files across its stage's final tasks.
+///
+/// Without this, every task of a leaf stage decodes the same plan and therefore
+/// the same complete assignment, so a fixture with one table read once per task
+/// returns each row `task_count` times. Upstream calls this after a stage's task
+/// count is final, which is the only point at which the split is knowable.
+struct AnalyticalLeafSplit;
+
+impl datafusion_distributed::ScaleUpLeafNodeHandler for AnalyticalLeafSplit {
+    /// Replaces an assignment-bearing placeholder with one variant per task.
+    ///
+    /// The variants share schema and partition count — upstream requires both —
+    /// and differ only in the slice of signed file descriptors each carries. A
+    /// placeholder with no assignment is not ours to split, and a leaf whose
+    /// files do not divide is left with empty slices on the trailing tasks
+    /// rather than a wider share on any of them.
+    fn handle(
+        &self,
+        ev: datafusion_distributed::ScaleUpLeafNodeEvent<'_>,
+    ) -> Option<Result<datafusion_distributed::ScaleUpLeafNodeEventResponse, DataFusionError>> {
+        let placeholder = ev
+            .plan
+            .downcast_ref::<super::codec::RemoteSourcePlaceholderExec>()?;
+        let assignment = placeholder.assignment()?;
+        let tasks = ev.task_count.max(1);
+        let variants = (0..tasks)
+            .map(|task| {
+                let mut narrowed = assignment.clone();
+                narrowed.persisted.files = assignment
+                    .persisted
+                    .files
+                    .iter()
+                    .skip(task)
+                    .step_by(tasks)
+                    .cloned()
+                    .collect();
+                Arc::new(placeholder.clone().with_assignment(narrowed)) as Arc<dyn ExecutionPlan>
+            })
+            .collect::<Vec<_>>();
+        Some(
+            datafusion_distributed::DistributedLeafExec::try_new(Arc::clone(ev.plan), variants)
+                .map(|exec| {
+                    datafusion_distributed::ScaleUpLeafNodeEventResponse::new(
+                        Arc::new(exec) as Arc<dyn ExecutionPlan>
+                    )
+                }),
+        )
     }
 }
 
@@ -1864,6 +2186,7 @@ impl AnalyticalExecutionHandle {
             urls.len(),
             work_units,
         ));
+        config.set_distributed_scale_up_leaf_node_handler(AnalyticalLeafSplit);
         config.set_distributed_worker_resolver(AnalyticalWorkerResolver { urls });
         config.set_distributed_channel_resolver(resolver);
         config.set_distributed_user_codec(super::codec::OraclePhysicalExtensionCodec::analytical(

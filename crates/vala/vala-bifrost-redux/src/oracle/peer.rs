@@ -68,6 +68,315 @@ pub struct PeerTicketClaims {
     pub assignment_authority_digest: String,
 }
 
+/// The closed set of private stage operations on the Analytical path.
+///
+/// Distributed execution has exactly two coordinator-to-follower operations,
+/// and they are not interchangeable: `SetPlan` installs a stage's subplan and
+/// opens its metrics channel, while `ExecuteTask` asks for a partition range of
+/// an already-installed plan. They carry different signing domains and separate
+/// single-use nonces, so a ticket minted for one can never authorize the other
+/// even if every other bound field matches.
+///
+/// The enum is deliberately closed. A third operation is a protocol change, not
+/// a value a peer may present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StageOperationV1 {
+    /// Install one stage subplan on a follower and open its metrics channel.
+    SetPlan,
+    /// Execute a partition range of an already-installed stage subplan.
+    ExecuteTask,
+}
+
+impl StageOperationV1 {
+    /// Returns the wire discriminant bound into the signed claims.
+    ///
+    /// Zero is deliberately unused so a zero-valued protobuf field — the value a
+    /// truncated or forged message decodes to — never names a real operation.
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        match self {
+            Self::SetPlan => 1,
+            Self::ExecuteTask => 2,
+        }
+    }
+
+    /// Recovers an operation from its wire discriminant.
+    ///
+    /// Returns `None` for any other value, including zero, so an unknown
+    /// operation is refused at the parsing boundary rather than defaulted.
+    #[must_use]
+    pub const fn from_u32(value: u32) -> Option<Self> {
+        match value {
+            1 => Some(Self::SetPlan),
+            2 => Some(Self::ExecuteTask),
+            _ => None,
+        }
+    }
+
+    /// Returns this operation's distinct signature domain separator.
+    ///
+    /// Domain separation is what makes the two operations cryptographically
+    /// distinct: a signature produced over the `SetPlan` domain does not verify
+    /// under the `ExecuteTask` domain, so the receiver's own expectation — not
+    /// anything in the presented message — selects which domain is checked.
+    #[must_use]
+    pub const fn domain(self) -> &'static [u8] {
+        match self {
+            Self::SetPlan => b"wyrd.oracle.stage.set-plan.v1\0",
+            Self::ExecuteTask => b"wyrd.oracle.stage.execute-task.v1\0",
+        }
+    }
+
+    /// Returns the closed telemetry label for this operation.
+    #[must_use]
+    pub const fn telemetry(self) -> crate::oracle::telemetry::AnalyticalStageOperation {
+        match self {
+            Self::SetPlan => crate::oracle::telemetry::AnalyticalStageOperation::SetPlan,
+            Self::ExecuteTask => crate::oracle::telemetry::AnalyticalStageOperation::ExecuteTask,
+        }
+    }
+}
+
+/// Typed claims signed for exactly one Analytical stage operation.
+///
+/// Every field is bound by the signature, and the receiver checks each one
+/// against state it derived itself rather than against anything in the
+/// presented message. Both query identities appear because they name different
+/// lifecycles: a sibling distributed graph under the same public query, or a
+/// replayed graph identity under a different public query, must both fail.
+#[derive(Clone, PartialEq, Message)]
+pub struct StageTicketClaims {
+    /// Fixed private protocol version.
+    #[prost(uint32, tag = "1")]
+    pub protocol_version: u32,
+    /// Stage operation discriminant; see [`StageOperationV1::as_u32`].
+    #[prost(uint32, tag = "2")]
+    pub operation: u32,
+    /// Coordinator node UUID bytes that issued this operation.
+    #[prost(bytes, tag = "3")]
+    pub source_node_id: Vec<u8>,
+    /// Coordinator role-incarnation fence at issue time.
+    #[prost(uint64, tag = "4")]
+    pub source_fence: u64,
+    /// Follower node UUID bytes this operation is addressed to.
+    #[prost(bytes, tag = "5")]
+    pub destination_node_id: Vec<u8>,
+    /// Follower role-incarnation fence preventing restart replay.
+    #[prost(uint64, tag = "6")]
+    pub destination_fence: u64,
+    /// Authenticated data-tenant UUID bytes.
+    #[prost(bytes, tag = "7")]
+    pub tenant_id: Vec<u8>,
+    /// Client-visible query UUID bytes owning the complete lifecycle.
+    #[prost(bytes, tag = "8")]
+    pub public_query_id: Vec<u8>,
+    /// Private distributed-graph UUID bytes naming exactly one physical plan.
+    #[prost(bytes, tag = "9")]
+    pub datafusion_query_id: Vec<u8>,
+    /// Pinned catalog snapshot or manifest digest for this attempt's cut.
+    #[prost(string, tag = "10")]
+    pub snapshot_digest: String,
+    /// Digest of the exact bounded raw body this ticket authorizes.
+    #[prost(string, tag = "11")]
+    pub body_digest: String,
+    /// Graph-local stage identifier, resolvable only under both parents.
+    #[prost(uint32, tag = "12")]
+    pub stage_id: u32,
+    /// Whether [`Self::task_id`] names a task; `SetPlan` carries none.
+    #[prost(bool, tag = "13")]
+    pub has_task: bool,
+    /// Graph-local task identifier, meaningful only when `has_task` is set.
+    #[prost(uint32, tag = "14")]
+    pub task_id: u32,
+    /// Attempt ordinal; zero, or the one permitted pre-egress retry.
+    #[prost(uint32, tag = "15")]
+    pub attempt: u32,
+    /// Follower reservation this operation charges its work against.
+    #[prost(string, tag = "16")]
+    pub reservation_id: String,
+    /// Digest of the leader-authorized permissions for this query.
+    #[prost(string, tag = "17")]
+    pub permission_digest: String,
+    /// Single-use random nonce, distinct per operation.
+    #[prost(bytes, tag = "18")]
+    pub nonce: Vec<u8>,
+    /// Absolute query deadline as Unix milliseconds, identical across attempts.
+    #[prost(int64, tag = "19")]
+    pub absolute_deadline_ms: i64,
+    /// Short ticket acceptance expiry, distinct from the query deadline.
+    #[prost(int64, tag = "20")]
+    pub expires_at_ms: i64,
+}
+
+/// The receiver-derived expectation one stage operation must match exactly.
+///
+/// Nothing here comes from the presented message. The follower assembles it
+/// from its own node identity and fence, the tenant its transport
+/// authenticated, the graph it has an authorized reservation for, and the exact
+/// bytes it received. Verification is then a field-by-field comparison against
+/// the signed claims, which is why a mismatch in any single identity is
+/// independently rejectable.
+#[derive(Debug, Clone)]
+pub struct StageBinding {
+    /// The operation the receiving entry point implements.
+    pub operation: StageOperationV1,
+    /// Coordinator node the receiver expects to be talking to.
+    pub source_node_id: NodeId,
+    /// Coordinator fence the receiver expects.
+    pub source_fence: u64,
+    /// This follower's own node identity.
+    pub destination_node_id: NodeId,
+    /// This follower's own current role fence.
+    pub destination_fence: u64,
+    /// The tenant the transport authenticated.
+    pub tenant_id: DataTenantId,
+    /// The client-visible query identity carried on the operation.
+    pub public_query_id: uuid::Uuid,
+    /// The private graph identity carried on the operation.
+    pub datafusion_query_id: uuid::Uuid,
+    /// The pinned snapshot digest the follower resolved for this cut.
+    pub snapshot_digest: String,
+    /// Graph-local stage identifier being addressed.
+    pub stage_id: u32,
+    /// Graph-local task identifier, absent for `SetPlan`.
+    pub task_id: Option<u32>,
+    /// Attempt ordinal being addressed.
+    pub attempt: u32,
+    /// Reservation the follower resolved for this graph.
+    pub reservation_id: String,
+    /// Permission digest the follower resolved for this query.
+    pub permission_digest: String,
+}
+
+/// Hard cap on a stage operation's raw body before any digest or decode.
+///
+/// A distributed subplan is protobuf, not user data, and a coordinator that
+/// needs more than this is misbehaving. The cap is checked before the digest is
+/// computed, so an oversized body is refused without hashing attacker-chosen
+/// bytes of unbounded length.
+pub const MAX_STAGE_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+/// Computes the canonical digest of one stage operation's raw body.
+///
+/// Both the coordinator (at mint time) and the follower (at verification time)
+/// call this over the same bytes, so a matching digest proves the follower is
+/// about to decode exactly the message the coordinator signed for.
+///
+/// # Errors
+///
+/// Returns [`PeerSecurityError::Body`] when the body is empty or exceeds
+/// [`MAX_STAGE_BODY_BYTES`], before any hashing occurs.
+pub fn stage_body_digest(body: &[u8]) -> Result<String, PeerSecurityError> {
+    if body.is_empty() || body.len() > MAX_STAGE_BODY_BYTES {
+        return Err(PeerSecurityError::Body);
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"wyrd.oracle.stage.body.v1\0");
+    hash.update((body.len() as u64).to_be_bytes());
+    hash.update(body);
+    Ok(hex::encode(hash.finalize()))
+}
+
+impl StageTicketClaims {
+    /// Builds signable claims from a receiver-shaped binding.
+    ///
+    /// The coordinator constructs the same [`StageBinding`] the follower will
+    /// derive, so both sides agree by construction on which fields are bound
+    /// rather than by two hand-maintained field lists that can drift apart.
+    #[must_use]
+    pub fn for_binding(
+        binding: &StageBinding,
+        body_digest: String,
+        nonce: Vec<u8>,
+        absolute_deadline_ms: i64,
+        expires_at_ms: i64,
+    ) -> Self {
+        Self {
+            protocol_version: STAGE_PROTOCOL_VERSION,
+            operation: binding.operation.as_u32(),
+            source_node_id: audience_bytes(binding.source_node_id),
+            source_fence: binding.source_fence,
+            destination_node_id: audience_bytes(binding.destination_node_id),
+            destination_fence: binding.destination_fence,
+            tenant_id: binding.tenant_id.as_uuid().as_bytes().to_vec(),
+            public_query_id: binding.public_query_id.as_bytes().to_vec(),
+            datafusion_query_id: binding.datafusion_query_id.as_bytes().to_vec(),
+            snapshot_digest: binding.snapshot_digest.clone(),
+            body_digest,
+            stage_id: binding.stage_id,
+            has_task: binding.task_id.is_some(),
+            task_id: binding.task_id.unwrap_or_default(),
+            attempt: binding.attempt,
+            reservation_id: binding.reservation_id.clone(),
+            permission_digest: binding.permission_digest.clone(),
+            nonce,
+            absolute_deadline_ms,
+            expires_at_ms,
+        }
+    }
+
+    /// Checks every bound field against the receiver's own expectation.
+    ///
+    /// This is a pure comparison with no IO, no cache access, and no plan
+    /// decoding, so an authority can run it between signature verification and
+    /// nonce consumption. Each mismatch is independently reachable, which is
+    /// what lets the authority test reject one identity at a time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerSecurityError::Operation`] for a protocol-version or
+    /// operation mismatch, [`PeerSecurityError::Audience`] for the wrong
+    /// coordinator or follower node, [`PeerSecurityError::Fence`] for a stale
+    /// fence on either side, [`PeerSecurityError::Body`] for a body digest that
+    /// does not match the presented bytes, and [`PeerSecurityError::Claims`] for
+    /// any other bound mismatch — tenant, either query identity, snapshot,
+    /// stage, task, attempt, reservation, or permission digest.
+    pub fn verify_binding(
+        &self,
+        binding: &StageBinding,
+        body_digest: &str,
+    ) -> Result<(), PeerSecurityError> {
+        if self.protocol_version != STAGE_PROTOCOL_VERSION
+            || StageOperationV1::from_u32(self.operation) != Some(binding.operation)
+        {
+            return Err(PeerSecurityError::Operation);
+        }
+        if self.source_node_id != audience_bytes(binding.source_node_id)
+            || self.destination_node_id != audience_bytes(binding.destination_node_id)
+        {
+            return Err(PeerSecurityError::Audience);
+        }
+        if self.source_fence != binding.source_fence
+            || self.destination_fence != binding.destination_fence
+        {
+            return Err(PeerSecurityError::Fence);
+        }
+        if self.body_digest != body_digest {
+            return Err(PeerSecurityError::Body);
+        }
+        let task_matches = match binding.task_id {
+            Some(task_id) => self.has_task && self.task_id == task_id,
+            None => !self.has_task,
+        };
+        if self.tenant_id != binding.tenant_id.as_uuid().as_bytes()
+            || self.public_query_id != binding.public_query_id.as_bytes()
+            || self.datafusion_query_id != binding.datafusion_query_id.as_bytes()
+            || self.snapshot_digest != binding.snapshot_digest
+            || self.stage_id != binding.stage_id
+            || !task_matches
+            || self.attempt != binding.attempt
+            || self.reservation_id != binding.reservation_id
+            || self.permission_digest != binding.permission_digest
+        {
+            return Err(PeerSecurityError::Claims);
+        }
+        Ok(())
+    }
+}
+
+/// Fixed private stage-protocol version bound into every stage ticket.
+pub const STAGE_PROTOCOL_VERSION: u32 = 1;
+
 /// Claims bytes accepted after signature and fence checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedClaimsBytes(pub Vec<u8>);
@@ -105,6 +414,12 @@ pub enum PeerSecurityError {
     /// A required durable security audit could not commit.
     #[error("peer security audit is unavailable")]
     AuditUnavailable,
+    /// The ticket authorizes a different stage operation than the one presented.
+    #[error("peer ticket authorizes a different stage operation")]
+    Operation,
+    /// The presented raw body does not match the signed digest or exceeds bounds.
+    #[error("peer stage body does not match its signed digest")]
+    Body,
 }
 
 /// Failure returned by the narrow durable peer-security audit collaborator.
@@ -341,6 +656,212 @@ mod tests {
     use std::thread;
 
     use super::*;
+
+    /// Builds one stage binding whose every field is distinguishable.
+    fn stage_binding() -> StageBinding {
+        StageBinding {
+            operation: StageOperationV1::ExecuteTask,
+            source_node_id: NodeId::new(uuid::Uuid::from_u128(1)),
+            source_fence: 11,
+            destination_node_id: NodeId::new(uuid::Uuid::from_u128(2)),
+            destination_fence: 22,
+            tenant_id: DataTenantId::new(uuid::Uuid::now_v7()).expect("a UUIDv7 fixture tenant"),
+            public_query_id: uuid::Uuid::from_u128(4),
+            datafusion_query_id: uuid::Uuid::from_u128(5),
+            snapshot_digest: "snapshot".to_owned(),
+            stage_id: 6,
+            task_id: Some(7),
+            attempt: 0,
+            reservation_id: "reservation".to_owned(),
+            permission_digest: "permission".to_owned(),
+        }
+    }
+
+    /// One named single-field mutation and the closed error it must produce.
+    type StageMutation = (
+        &'static str,
+        Box<dyn Fn(&mut StageTicketClaims)>,
+        PeerSecurityError,
+    );
+
+    /// Enumerates one mutation per bound claims field.
+    ///
+    /// Kept out of the assertion loop so binding a new field is a one-line
+    /// addition here rather than an edit inside a long test body.
+    fn stage_field_mutations() -> Vec<StageMutation> {
+        vec![
+            (
+                "protocol",
+                Box::new(|c: &mut StageTicketClaims| c.protocol_version += 1),
+                PeerSecurityError::Operation,
+            ),
+            (
+                "operation",
+                Box::new(|c: &mut StageTicketClaims| {
+                    c.operation = StageOperationV1::SetPlan.as_u32();
+                }),
+                PeerSecurityError::Operation,
+            ),
+            (
+                "source node",
+                Box::new(|c: &mut StageTicketClaims| c.source_node_id[0] ^= 1),
+                PeerSecurityError::Audience,
+            ),
+            (
+                "destination node",
+                Box::new(|c: &mut StageTicketClaims| c.destination_node_id[0] ^= 1),
+                PeerSecurityError::Audience,
+            ),
+            (
+                "source fence",
+                Box::new(|c: &mut StageTicketClaims| c.source_fence += 1),
+                PeerSecurityError::Fence,
+            ),
+            (
+                "destination fence",
+                Box::new(|c: &mut StageTicketClaims| c.destination_fence += 1),
+                PeerSecurityError::Fence,
+            ),
+            (
+                "body digest",
+                Box::new(|c: &mut StageTicketClaims| c.body_digest.push('0')),
+                PeerSecurityError::Body,
+            ),
+            (
+                "tenant",
+                Box::new(|c: &mut StageTicketClaims| c.tenant_id[0] ^= 1),
+                PeerSecurityError::Claims,
+            ),
+            (
+                "public query",
+                Box::new(|c: &mut StageTicketClaims| c.public_query_id[0] ^= 1),
+                PeerSecurityError::Claims,
+            ),
+            (
+                "datafusion query",
+                Box::new(|c: &mut StageTicketClaims| c.datafusion_query_id[0] ^= 1),
+                PeerSecurityError::Claims,
+            ),
+            (
+                "snapshot",
+                Box::new(|c: &mut StageTicketClaims| c.snapshot_digest.push('0')),
+                PeerSecurityError::Claims,
+            ),
+            (
+                "stage",
+                Box::new(|c: &mut StageTicketClaims| c.stage_id += 1),
+                PeerSecurityError::Claims,
+            ),
+            (
+                "task",
+                Box::new(|c: &mut StageTicketClaims| c.task_id += 1),
+                PeerSecurityError::Claims,
+            ),
+            (
+                "task presence",
+                Box::new(|c: &mut StageTicketClaims| c.has_task = false),
+                PeerSecurityError::Claims,
+            ),
+            (
+                "attempt",
+                Box::new(|c: &mut StageTicketClaims| c.attempt += 1),
+                PeerSecurityError::Claims,
+            ),
+            (
+                "reservation",
+                Box::new(|c: &mut StageTicketClaims| c.reservation_id.push('0')),
+                PeerSecurityError::Claims,
+            ),
+            (
+                "permission",
+                Box::new(|c: &mut StageTicketClaims| c.permission_digest.push('0')),
+                PeerSecurityError::Claims,
+            ),
+        ]
+    }
+
+    /// Every bound field is independently load-bearing.
+    ///
+    /// Signed claims are only as strong as the weakest field the receiver
+    /// actually compares, so this walks one mutation per field and asserts each
+    /// is refused with its own closed error. A field that stops being compared
+    /// would let a peer substitute that value while keeping a valid signature.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any single-field mutation is accepted.
+    #[test]
+    fn oracle_stage_claims_reject_every_single_field_mutation() {
+        let binding = stage_binding();
+        let digest = stage_body_digest(b"body").expect("a bounded body digests");
+        let claims =
+            StageTicketClaims::for_binding(&binding, digest.clone(), vec![0; 16], 1_000, 2_000);
+        claims
+            .verify_binding(&binding, &digest)
+            .expect("an unmutated binding verifies");
+
+        for (name, mutate, expected) in stage_field_mutations() {
+            let mut mutated = claims.clone();
+            mutate(&mut mutated);
+            assert_eq!(
+                mutated.verify_binding(&binding, &digest),
+                Err(expected),
+                "mutating the {name} field must be refused"
+            );
+        }
+    }
+
+    /// A `SetPlan` ticket cannot authorize an `ExecuteTask` operation.
+    ///
+    /// The two operations carry distinct signing domains, so this is belt and
+    /// braces at the claims layer: even if a signature somehow verified, the
+    /// operation field is compared against the receiving entry point's own
+    /// expectation rather than against anything in the message.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a cross-operation ticket is accepted.
+    #[test]
+    fn oracle_stage_operations_have_distinct_domains_and_are_not_interchangeable() {
+        assert_ne!(
+            StageOperationV1::SetPlan.domain(),
+            StageOperationV1::ExecuteTask.domain()
+        );
+        assert_eq!(StageOperationV1::from_u32(0), None);
+        assert_eq!(StageOperationV1::from_u32(3), None);
+
+        let mut binding = stage_binding();
+        binding.operation = StageOperationV1::SetPlan;
+        binding.task_id = None;
+        let digest = stage_body_digest(b"plan").expect("a bounded body digests");
+        let claims =
+            StageTicketClaims::for_binding(&binding, digest.clone(), vec![0; 16], 1_000, 2_000);
+
+        let mut executing = binding.clone();
+        executing.operation = StageOperationV1::ExecuteTask;
+        assert_eq!(
+            claims.verify_binding(&executing, &digest),
+            Err(PeerSecurityError::Operation)
+        );
+    }
+
+    /// The raw body is bounded before it is hashed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an empty or oversized body produces a digest.
+    #[test]
+    fn oracle_stage_body_digest_is_bounded_and_length_committed() {
+        assert_eq!(stage_body_digest(&[]), Err(PeerSecurityError::Body));
+        assert_eq!(
+            stage_body_digest(&vec![0_u8; MAX_STAGE_BODY_BYTES + 1]),
+            Err(PeerSecurityError::Body)
+        );
+        assert_ne!(
+            stage_body_digest(b"ab").expect("a bounded body digests"),
+            stage_body_digest(b"abc").expect("a bounded body digests")
+        );
+    }
 
     /// Concurrent duplicate nonce consumption admits exactly one caller.
     #[test]

@@ -456,6 +456,8 @@ fn poisoned_registry() -> BifrostError {
 pub struct AnalyticalSessionBuilder {
     /// Node-local graph material resolved per stage operation.
     registry: Arc<AnalyticalRuntimeRegistry>,
+    /// Capability an Analytical leaf needs to resolve its own source locally.
+    leaf: super::codec::AnalyticalLeafBinding,
 }
 
 impl fmt::Debug for AnalyticalSessionBuilder {
@@ -470,8 +472,11 @@ impl fmt::Debug for AnalyticalSessionBuilder {
 impl AnalyticalSessionBuilder {
     /// Binds the builder to one node-local runtime registry.
     #[must_use]
-    pub fn new(registry: Arc<AnalyticalRuntimeRegistry>) -> Self {
-        Self { registry }
+    pub fn new(
+        registry: Arc<AnalyticalRuntimeRegistry>,
+        leaf: super::codec::AnalyticalLeafBinding,
+    ) -> Self {
+        Self { registry, leaf }
     }
 
     /// Resolves one graph's material from a stage operation's headers.
@@ -513,8 +518,20 @@ impl WorkerSessionBuilder for AnalyticalSessionBuilder {
                 "Oracle analytical stage has no query-owned runtime: {error}"
             ))
         })?;
-        Ok(ctx
-            .builder
+        // Parquet pushdown, page indexes, and bloom filters are leader
+        // decisions that a follower must repeat: the leader planned the stage
+        // graph against them, and a follower that reads without them scans more
+        // than the plan says it does. The session's own codec is installed here
+        // too, because a leaf's assignment travels inside the plan and only
+        // this codec knows how to rebuild it.
+        let mut builder = ctx.builder;
+        let mut config = builder.config().clone().unwrap_or_default();
+        crate::resources::OracleSessionShape::apply(&mut config);
+        config.set_distributed_user_codec(super::codec::OraclePhysicalExtensionCodec::analytical(
+            self.leaf.clone(),
+        ));
+        builder = builder.with_config(config);
+        Ok(builder
             .with_runtime_env(Arc::clone(graph.runtime()))
             .build())
     }
@@ -541,6 +558,8 @@ pub struct AnalyticalStageIngressConfig {
     pub spill: Arc<OracleSpillRuntime>,
     /// Exchange-buffer child every attempt of a graph on this node charges.
     pub exchange_buffer_bytes: usize,
+    /// Capability every Analytical leaf decoded on this node resolves through.
+    pub leaf: super::codec::AnalyticalLeafBinding,
 }
 
 /// Authenticated follower entry point for Analytical stage operations.
@@ -607,10 +626,12 @@ impl AnalyticalStageIngress {
             oracle_resources,
             spill,
             exchange_buffer_bytes,
+            leaf,
         } = config;
-        let worker = Worker::from_session_builder(AnalyticalSessionBuilder::new(Arc::clone(
-            supervisor.registry(),
-        )));
+        let worker = Worker::from_session_builder(AnalyticalSessionBuilder::new(
+            Arc::clone(supervisor.registry()),
+            leaf,
+        ));
         Self {
             node_id,
             oracle_fence,
@@ -1109,6 +1130,13 @@ mod tests {
         }
         rows
     }
+    /// Builds the leaf binding a session fixture needs but never exercises.
+    fn fixture_leaf_binding() -> super::super::codec::AnalyticalLeafBinding {
+        super::super::codec::AnalyticalLeafBinding::new(
+            wyrd_spec::vala::api::ClusterRole::Oracle,
+            Arc::new(super::super::follower::UnresolvableSource),
+        )
+    }
 
     /// The pinned upstream worker retains all three seams Wyrd's handle needs.
     ///
@@ -1147,9 +1175,11 @@ mod tests {
             !Arc::ptr_eq(&process_runtime, &query_runtime),
             "the fixture must distinguish the process runtime from the query runtime"
         );
-        let worker =
-            Worker::from_session_builder(AnalyticalSessionBuilder::new(Arc::clone(&registry)))
-                .with_runtime_env(Arc::clone(&process_runtime));
+        let worker = Worker::from_session_builder(AnalyticalSessionBuilder::new(
+            Arc::clone(&registry),
+            fixture_leaf_binding(),
+        ))
+        .with_runtime_env(Arc::clone(&process_runtime));
 
         // Seam 1: Wyrd's own headers are the only thing that names the graph,
         // and they reach the worker before the plan is decoded.
@@ -1509,6 +1539,8 @@ pub struct AnalyticalExecutionHandle {
     oracle_resources: OracleResources,
     /// Node-scoped identity and budget configuration.
     config: AnalyticalExecutionConfig,
+    /// Capability every Analytical leaf this node encodes or decodes resolves through.
+    leaf: super::codec::AnalyticalLeafBinding,
 }
 
 impl fmt::Debug for AnalyticalExecutionHandle {
@@ -1532,6 +1564,7 @@ impl AnalyticalExecutionHandle {
         spill: Arc<OracleSpillRuntime>,
         oracle_resources: OracleResources,
         config: AnalyticalExecutionConfig,
+        leaf: super::codec::AnalyticalLeafBinding,
     ) -> Self {
         Self {
             worker,
@@ -1540,6 +1573,7 @@ impl AnalyticalExecutionHandle {
             spill,
             oracle_resources,
             config,
+            leaf,
         }
     }
 
@@ -1832,6 +1866,9 @@ impl AnalyticalExecutionHandle {
         ));
         config.set_distributed_worker_resolver(AnalyticalWorkerResolver { urls });
         config.set_distributed_channel_resolver(resolver);
+        config.set_distributed_user_codec(super::codec::OraclePhysicalExtensionCodec::analytical(
+            self.leaf.clone(),
+        ));
         let state = datafusion::execution::session_state::SessionStateBuilder::new()
             .with_default_features()
             .with_config(config)

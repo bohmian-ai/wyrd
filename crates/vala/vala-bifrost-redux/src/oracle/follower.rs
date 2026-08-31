@@ -106,6 +106,30 @@ pub(super) fn signed_closure_schema(
         })
 }
 
+/// Resolver that refuses every assignment, for fixtures that never scan.
+///
+/// Analytical decode needs a resolver to exist before a plan arrives, but a
+/// transport or session fixture proves ordering rather than data. Refusing is
+/// the honest behavior: a fixture that unexpectedly reaches source resolution
+/// fails loudly instead of silently reading nothing.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug, Default)]
+pub struct UnresolvableSource;
+
+#[cfg(any(test, feature = "test-support"))]
+#[async_trait]
+impl FollowerSourceResolver for UnresolvableSource {
+    /// Always refuses, naming the fixture rather than a catalog failure.
+    async fn resolve(
+        &self,
+        _target_role: ClusterRole,
+        _assignment: &FollowerScanAssignment,
+        _session: &SessionState,
+    ) -> Result<ResolvedFollowerSource, String> {
+        Err("fixture resolver refuses every assignment".to_owned())
+    }
+}
+
 /// Async boundary that constructs one authenticated role-local scan provider.
 #[async_trait]
 pub trait FollowerSourceResolver: Send + Sync {

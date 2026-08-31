@@ -1710,6 +1710,15 @@ struct SqlCutInput<'a> {
     logical_bytes_selected: u64,
     /// One ingress-captured, role-fenced participant cut used by every dispatch.
     participant_cut: &'a OracleQueryAttemptCut,
+    /// Whether this attempt executes through the Analytical stage graph.
+    ///
+    /// The two distributed paths are mutually exclusive: Interactive splits the
+    /// planned physical tree itself and signs one fragment per follower, while
+    /// Analytical hands the whole statement to the upstream distributed planner
+    /// and lets it form stages. Layering them would give the planner nothing to
+    /// distribute, because the Interactive splitter has already pushed the
+    /// entire query below a single remote scan.
+    analytical: bool,
 }
 
 /// Table-local facts needed to derive every pinned Scribe follower assignment.
@@ -2075,6 +2084,12 @@ impl Oracle {
         });
         let analytical_node_id = admission.local_role.key.node_id;
         let analytical_fence = admission.local_role.fencing_token;
+        let analytical_leaf = codec::AnalyticalLeafBinding::new(
+            wyrd_spec::vala::api::ClusterRole::Oracle,
+            Arc::new(follower::OracleCatalogResolver::new(Arc::clone(
+                &config.catalog,
+            ))),
+        );
         let analytical = config.stage_authority.map(|authority| {
             let supervisor = Arc::new(analytical::AnalyticalSupervisor::new());
             let worker = Arc::new(analytical::AnalyticalStageIngress::new(
@@ -2086,6 +2101,7 @@ impl Oracle {
                     oracle_resources: config.memory.resources.clone(),
                     spill: Arc::clone(&config.spill_runtime),
                     exchange_buffer_bytes: config.config.analytical_exchange_buffer_bytes,
+                    leaf: analytical_leaf.clone(),
                 },
             ));
             Arc::new(analytical::AnalyticalExecutionHandle::new(
@@ -2101,6 +2117,7 @@ impl Oracle {
                     exchange_buffer_bytes: config.config.analytical_exchange_buffer_bytes,
                     scratch_bytes: config.config.analytical_scratch_bytes,
                 },
+                analytical_leaf,
             ))
         });
         Ok(Self {
@@ -2673,6 +2690,7 @@ impl Oracle {
                 session,
                 deadline,
                 participant_cut,
+                analytical: analytical.is_some(),
             })
             .await
         {
@@ -3445,6 +3463,21 @@ impl Oracle {
             source_groups,
             scribe_assignments,
         } = assignments;
+        if input.analytical {
+            // The upstream distributed planner owns stage formation from here,
+            // so the leader plans and executes the statement whole. Every leaf
+            // already carries its signed assignment, and the stage ticket's
+            // digest over the serialized plan is what binds it.
+            let (schema, stream, stats) = self
+                .execute_session(&session, input.sql, input.logical_bytes_selected)
+                .await?;
+            return Ok((
+                schema,
+                stream,
+                stats,
+                Arc::new(std::sync::Mutex::new(Vec::new())),
+            ));
+        }
         if oracle_assignments.is_empty() && scribe_assignments.is_empty() {
             let (schema, stream, stats) = self
                 .execute_session(&session, input.sql, input.logical_bytes_selected)
@@ -3628,6 +3661,17 @@ impl Oracle {
                 assignment.scan_id.clone_from(scan_id);
                 node_assignments.insert(scan_id.clone(), assignment);
             }
+        }
+        if input.analytical {
+            remote_sources.analytical_assignments = common_scan_ids
+                .iter()
+                .filter_map(|scan_id| {
+                    assignments
+                        .oracle_assignments
+                        .get(scan_id)
+                        .map(|assignment| (scan_id.clone(), assignment.clone()))
+                })
+                .collect();
         }
         self.register_table_provider(cut, session, input, live_batches, remote_sources)
             .await?;

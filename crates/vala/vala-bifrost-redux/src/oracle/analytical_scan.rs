@@ -12,8 +12,8 @@
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
-use datafusion::common::{DataFusionError, Result};
 use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::common::{DataFusionError, Result};
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::TaskContext;
 use datafusion::execution::session_state::SessionStateBuilder;
@@ -24,8 +24,8 @@ use datafusion::physical_plan::{
     PlanProperties, SendableRecordBatchStream,
 };
 use futures_util::TryStreamExt as _;
-use wyrd_spec::vala::api::FollowerScanAssignment;
 use wyrd_spec::vala::api::ClusterRole;
+use wyrd_spec::vala::api::FollowerScanAssignment;
 
 use super::follower::{FollowerSourceResolver, signed_closure_schema};
 

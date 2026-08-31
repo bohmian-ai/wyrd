@@ -1468,6 +1468,15 @@ pub(crate) struct RemotePersistedSources {
     pub(crate) hot_scan_id: Option<String>,
     /// Disjoint Scribe live-tail identities selected for this table.
     pub(crate) scribe_scan_ids: Vec<String>,
+    /// Per-scan assignment templates carried inside an Analytical placeholder.
+    ///
+    /// Empty on the Interactive path, where the dispatcher signs assignments
+    /// beside the plan. On the Analytical path the plan is the only thing that
+    /// crosses a stage boundary, so the assignment has to be attached to the
+    /// leaf while the physical tree is still being built -- before the upstream
+    /// distributed planner forms stages over it.
+    pub(crate) analytical_assignments:
+        std::collections::HashMap<String, wyrd_spec::vala::api::FollowerScanAssignment>,
 }
 
 impl fmt::Debug for OracleTableProvider {
@@ -1545,15 +1554,32 @@ impl OracleTableProvider {
         projection: &OracleScanProjection,
         predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
     ) -> Arc<dyn ExecutionPlan> {
-        Arc::new(
-            super::codec::RemoteSourcePlaceholderExec::new(
-                scan_id.to_owned(),
-                super::assignment_schema_fingerprint(self.physical_schema.as_ref()),
-                Arc::clone(&projection.required_schema),
-            )
-            .with_partitions(target_partitions)
-            .with_closure(projection.required_columns.clone(), predicates.to_vec()),
+        let placeholder = super::codec::RemoteSourcePlaceholderExec::new(
+            scan_id.to_owned(),
+            super::assignment_schema_fingerprint(self.physical_schema.as_ref()),
+            Arc::clone(&projection.required_schema),
         )
+        .with_partitions(target_partitions)
+        .with_closure(projection.required_columns.clone(), predicates.to_vec());
+        // An Analytical leaf carries its own assignment, narrowed here to the
+        // closure this scan actually resolved. The template recorded before SQL
+        // planning holds the safe unpruned full-schema projection; overwriting
+        // it with the real closure is what keeps a selective query from
+        // shipping every column's worth of work to a follower.
+        let Some(template) = self
+            .remote_sources
+            .analytical_assignments
+            .get(scan_id)
+            .cloned()
+        else {
+            return Arc::new(placeholder);
+        };
+        let assignment = wyrd_spec::vala::api::FollowerScanAssignment {
+            required_columns: projection.required_columns.clone(),
+            predicates: predicates.to_vec(),
+            ..template
+        };
+        Arc::new(placeholder.with_assignment(assignment))
     }
 
     /// Narrows already-validated in-memory batches to the scan's closure schema.
@@ -6177,6 +6203,7 @@ mod tests {
                 iceberg_scan_id: Some("vala.traces.spans:iceberg".to_owned()),
                 hot_scan_id: None,
                 scribe_scan_ids: Vec::new(),
+                analytical_assignments: std::collections::HashMap::new(),
             },
         )
         .await

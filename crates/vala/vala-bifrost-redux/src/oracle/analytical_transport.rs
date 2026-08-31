@@ -1552,6 +1552,10 @@ mod tests {
                 oracle_resources,
                 spill: Arc::clone(&spill),
                 exchange_buffer_bytes: 64 * 1024,
+                leaf: crate::oracle::codec::AnalyticalLeafBinding::new(
+                    wyrd_spec::vala::api::ClusterRole::Oracle,
+                    Arc::new(crate::oracle::follower::UnresolvableSource),
+                ),
             }));
             let identity = StageWireIdentity {
                 source_node_id: NodeId::new(Uuid::from_u128(1)),

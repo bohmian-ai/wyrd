@@ -583,9 +583,11 @@ fn remote_scan_payload(scan: &RemoteSourcePlaceholderExec) -> Result<RemoteScanP
     let assignment_json = serde_json::to_vec(assignment).map_err(|error| {
         DataFusionError::Plan(format!("analytical assignment encoding failed: {error}"))
     })?;
-    let schema = datafusion_proto::protobuf::Schema::try_from(scan.schema().as_ref())
-        .map_err(|error| {
-            DataFusionError::Plan(format!("analytical closure schema encoding failed: {error}"))
+    let schema =
+        datafusion_proto::protobuf::Schema::try_from(scan.schema().as_ref()).map_err(|error| {
+            DataFusionError::Plan(format!(
+                "analytical closure schema encoding failed: {error}"
+            ))
         })?;
     Ok(RemoteScanPayload {
         scan_id: scan.scan_id.clone(),
@@ -605,7 +607,11 @@ fn remote_scan_payload(scan: &RemoteSourcePlaceholderExec) -> Result<RemoteScanP
 /// projected back into Arrow form.
 fn analytical_leaf_parts(
     payload: &RemoteScanPayload,
-) -> Result<(wyrd_spec::vala::api::FollowerScanAssignment, SchemaRef, usize)> {
+) -> Result<(
+    wyrd_spec::vala::api::FollowerScanAssignment,
+    SchemaRef,
+    usize,
+)> {
     if payload.assignment_json.is_empty() {
         return Err(DataFusionError::Plan(format!(
             "analytical remote scan {} carries no assignment",
@@ -894,6 +900,7 @@ mod tests {
             payload: RemoteScanPayload {
                 scan_id: scan_id.to_owned(),
                 schema_fingerprint: "sha256:schema".to_owned(),
+                ..RemoteScanPayload::default()
             }
             .encode_to_vec(),
         }

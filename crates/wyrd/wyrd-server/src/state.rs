@@ -2136,7 +2136,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use super::{AppState, LimitsConfig, ProductionValidationError};
+    use super::{AppState, LimitsConfig};
 
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use wyrd_auth_check::AuthzCheckContext;
@@ -2258,13 +2258,34 @@ mod tests {
         assert!(state.production_validate().is_ok());
     }
 
+    /// The production stub rule applies exactly to processes that serve the API.
+    ///
+    /// The shell fixture carries the stub policy hook the rule refuses, so the
+    /// only reason it validates on a production profile is the dedicated-worker
+    /// carve-out: a process with no Scribe and no Oracle exposes no public
+    /// surface for a stub hook to decide anything on. Asserting both halves is
+    /// what keeps the carve-out from silently becoming a hole — if `serves_api`
+    /// ever reports true for this shell, the stub hook must start failing it.
+    ///
+    /// The serving half of the rule needs a state with a real Scribe or Oracle
+    /// owner and is proven where such a state exists, not in this unit tier.
     #[tokio::test]
-    async fn production_validate_rejects_stub_on_production() {
+    async fn production_validate_applies_the_stub_rule_only_to_serving_processes() {
         let state = test_state()
             .await
             .with_deployment_profile(crate::config::DeploymentProfile::Production);
-        let err = state.production_validate().unwrap_err();
-        assert!(matches!(err, ProductionValidationError::StubPolicyHook));
+        assert!(
+            state.authz.policy_hook.is_stub_default(),
+            "the shell fixture carries the stub hook the production rule refuses"
+        );
+        assert!(
+            !state.bifrost.serves_api(),
+            "the shell composes no Scribe and no Oracle, so it serves no public surface"
+        );
+        assert!(
+            state.production_validate().is_ok(),
+            "a process that serves no public surface is not refused for a stub hook"
+        );
     }
 
     #[tokio::test]

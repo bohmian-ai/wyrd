@@ -163,6 +163,19 @@ fn non_empty_tail_batch() -> RecordBatch {
     .expect("private-tail fixture batch is valid")
 }
 
+/// The caller-owned dataset the private-tail fixture writes and reads.
+///
+/// The tail path needs a table that actually exists for the tenant, and the
+/// only registration a caller may perform is in `vala.datasets`: `vala.bifrost`
+/// is Bifrost-internal and every `vala.<domain>` built-in is provisioned from
+/// its own canonical definition, neither of which this fixture's single
+/// `value` column matches. Registering one dataset keeps the seeded frame, the
+/// signed ticket's canonical table, and the fence binding on one identity.
+const TAIL_TABLE_NAME: &str = "scribe_tail_smoke";
+
+/// The logical FQN of [`TAIL_TABLE_NAME`], as the signed ticket spells it.
+const TAIL_TABLE_FQN: &str = "vala.datasets.scribe_tail_smoke";
+
 /// Creates a metadata-only fence request matching the seeded logical schema.
 fn non_empty_tail_request(tenant: DataTenantId) -> DomainAcquireTailFenceRequest {
     let expected = ReduxSchemaFingerprint::from_arrow_schema(&Schema::new(vec![Field::new(
@@ -174,8 +187,8 @@ fn non_empty_tail_request(tenant: DataTenantId) -> DomainAcquireTailFenceRequest
         query_id: uuid::Uuid::now_v7(),
         binding: TenantTableBinding {
             tenant_id: tenant,
-            namespace: "bifrost".to_owned(),
-            table: "events".to_owned(),
+            namespace: "datasets".to_owned(),
+            table: TAIL_TABLE_NAME.to_owned(),
         },
         time_partition: vala_bifrost_redux::catalog::TimeGranularity::Hour
             .bucket(fixture_event_time())
@@ -207,7 +220,7 @@ fn mint_tail_ticket(state: &AppState, request: &DomainAcquireTailFenceRequest) -
         .mint_tail_ticket(&TailTicketClaims {
             query_id: request.query_id,
             tenant_id: request.binding.tenant_id,
-            canonical_table: "vala.bifrost.events".to_owned(),
+            canonical_table: TAIL_TABLE_FQN.to_owned(),
             node_id: stream.node_id.as_uuid(),
             writer_epoch: u64::try_from(stream.writer_epoch.as_i64())
                 .expect("fixture epoch is non-negative"),
@@ -238,7 +251,19 @@ fn test_principal(tenant: DataTenantId) -> Principal {
 async fn seed_tail_rows(state: &AppState, tenant: DataTenantId) {
     let rows = non_empty_tail_batch();
     let principal = test_principal(tenant);
-    let table = TableRef::new(BifrostNamespace::Bifrost, "events");
+    let table = TableRef::new(BifrostNamespace::Datasets, TAIL_TABLE_NAME);
+    state
+        .bifrost_catalog()
+        .expect("composed server exposes its Bifrost catalog")
+        .register_dataset(
+            tenant,
+            table.clone(),
+            vec![Field::new("value", DataType::Int64, false)],
+            None,
+            None,
+        )
+        .await
+        .expect("private-tail dataset registers for the seeding tenant");
     let request_id = RequestId::now_v7();
     let measured_wire_bytes = rows.get_array_memory_size();
     let audit_event = AuditEvent {
@@ -347,13 +372,21 @@ async fn connect_grpc(addr: SocketAddr) -> BifrostIngestServiceClient<Channel> {
     BifrostIngestServiceClient::new(connect_channel(addr).await)
 }
 
-/// Builds a valid resource whose encoded body approaches the OTLP message ceiling.
-fn near_cap_resource() -> Resource {
+/// Builds a valid resource whose encoded body is bulky but transport-admissible.
+///
+/// The size must clear two independent ceilings for this fixture to prove what
+/// it claims. Byte-weighted transport admission runs at the server edge, ahead
+/// of authentication, and refuses an encoded body larger than the composed
+/// aggregate reserve with `ResourceExhausted` — a refusal that would mask the
+/// authentication decision under test. Sizing the payload from the live
+/// admission bounds keeps the body large enough that decoding it would be
+/// visible work, while guaranteeing the request reaches the authenticator.
+fn near_cap_resource(payload_bytes: usize) -> Resource {
     Resource {
         attributes: vec![KeyValue {
             key: "payload".to_owned(),
             value: Some(AnyValue {
-                value: Some(any_value::Value::StringValue("x".repeat(31 * 1024 * 1024))),
+                value: Some(any_value::Value::StringValue("x".repeat(payload_bytes))),
             }),
         }],
         dropped_attributes_count: 0,
@@ -384,10 +417,16 @@ async fn otlp_unauthenticated_precedes_decode() {
     tokio::spawn(async move { serve_grpc(router, bind, token).await });
     let channel = connect_channel(bind).await;
     wyrd_server::grpc::reset_otlp_codec_activity();
+    let admission = state.bifrost.transport_admission();
+    let payload_bytes = admission.limit_bytes().min(admission.message_limit_bytes()) / 2;
+    assert!(
+        payload_bytes > 0,
+        "the composed transport reserve must admit a non-empty encoded body"
+    );
 
     let trace = ExportTraceServiceRequest {
         resource_spans: vec![ResourceSpans {
-            resource: Some(near_cap_resource()),
+            resource: Some(near_cap_resource(payload_bytes)),
             ..ResourceSpans::default()
         }],
     };
@@ -399,7 +438,7 @@ async fn otlp_unauthenticated_precedes_decode() {
 
     let metrics = ExportMetricsServiceRequest {
         resource_metrics: vec![ResourceMetrics {
-            resource: Some(near_cap_resource()),
+            resource: Some(near_cap_resource(payload_bytes)),
             ..ResourceMetrics::default()
         }],
     };
@@ -418,7 +457,7 @@ async fn otlp_unauthenticated_precedes_decode() {
 
     let logs = ExportLogsServiceRequest {
         resource_logs: vec![ResourceLogs {
-            resource: Some(near_cap_resource()),
+            resource: Some(near_cap_resource(payload_bytes)),
             ..ResourceLogs::default()
         }],
     };
@@ -594,13 +633,11 @@ async fn embedded_ingest_resolves_catalog_and_durably_acknowledges_arrow() {
         .into_inner();
     assert_eq!(response.wyrd_batch_id.as_ref(), batch_id.as_bytes());
 
-    state
-        .bifrost_ingest()
-        .expect("fixture retains Scribe")
-        .scribe()
-        .shutdown(Instant::now() + Duration::from_secs(1))
-        .await;
-    shutdown.cancel();
+    // The WAL is read before shutdown on purpose. The acknowledgement above is
+    // the durability claim under test: it is returned only once the record is
+    // fsynced into the WAL, so the segment must be replayable at this instant.
+    // Shutdown drains and persists the stream, which retires the very segments
+    // that carry the evidence, so a replay after it legitimately finds nothing.
     let replayed = replay_wal_directory(
         server
             .scribe_wal_root_for_test()
@@ -610,9 +647,24 @@ async fn embedded_ingest_resolves_catalog_and_durably_acknowledges_arrow() {
     let accepted = replayed
         .values()
         .find(|stream| stream.seal_key.table.name == TABLE_NAME)
-        .expect("catalog-resolved logical table has durable WAL state");
+        .unwrap_or_else(|| {
+            let replayed_tables = replayed
+                .values()
+                .map(|stream| stream.seal_key.table.fqn())
+                .collect::<Vec<_>>();
+            panic!(
+                "catalog-resolved logical table has durable WAL state; replayed: {replayed_tables:?}"
+            )
+        });
     assert_eq!(accepted.data_records.len(), 1);
 
+    state
+        .bifrost_ingest()
+        .expect("fixture retains Scribe")
+        .scribe()
+        .shutdown(Instant::now() + Duration::from_secs(1))
+        .await;
+    shutdown.cancel();
     server.shutdown().await.expect("server shuts down");
 }
 

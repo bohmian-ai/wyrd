@@ -638,6 +638,18 @@ fn bifrost_error_variants() -> Vec<BifrostError> {
         BifrostError::QueryStreamIncomplete,
         BifrostError::QueryAuditUnavailable,
         BifrostError::QueryExecutionFailed,
+        BifrostError::RunningQueryNotFound,
+        BifrostError::RunningQueryConflict,
+        BifrostError::RunningQueryControlUnavailable,
+        BifrostError::InvalidPhysicalLayout {
+            table: String::new(),
+            field: wyrd_spec::vala::error::PhysicalLayoutField::Partition,
+            violation: wyrd_spec::vala::error::PhysicalLayoutViolation::Missing,
+            column: None,
+        },
+        BifrostError::PhysicalLayoutMismatch {
+            table: String::new(),
+        },
         BifrostError::EventTimeOutOfRange {
             value: String::new(),
             past_bound: String::new(),
@@ -995,7 +1007,7 @@ mod bifrost_tools {
             500,
             "Query execution failed",
             "safe terminal detail",
-            "Inspect the retained terminal error and correct the query or source failure before retrying.",
+            "Inspect the scrubbed terminal error and server diagnostics before retrying.",
             Some(expected),
         );
     }

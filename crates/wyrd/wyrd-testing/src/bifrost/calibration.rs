@@ -422,17 +422,84 @@ fn proposal_value(key: &str, evidence: &OracleCalibrationCase) -> f64 {
 mod tests {
     use super::*;
 
-    /// Keeps the checked-in candidate derived from measured evidence and free of allocator policy.
+    /// Builds one complete, valid calibration matrix from fixed evidence.
+    ///
+    /// Every dimension `OracleCalibrationReport::validate` requires is present:
+    /// the three pod counts crossed with both visibilities and both query
+    /// classes, each case carrying the verified correctness, negative-flow,
+    /// terminal, audit, and cancellation flags plus ordered latency
+    /// percentiles. The numbers are fixed rather than measured because this
+    /// fixture proves how a report is *turned into* a candidate, not what the
+    /// hardware did; the measured matrix is produced by the Oracle
+    /// qualification bench and is not a checked-in source artifact.
+    fn complete_calibration_report() -> OracleCalibrationReport {
+        let mut cases = Vec::new();
+        for pods in [1_u8, 3, 6] {
+            for visibility in ["published_only", "fused"] {
+                for query_class in ["interactive", "analytical"] {
+                    cases.push(OracleCalibrationCase {
+                        case_id: format!("{pods}-{visibility}-{query_class}"),
+                        pods,
+                        visibility: visibility.to_owned(),
+                        query_class: query_class.to_owned(),
+                        tenants: 2,
+                        warmup_queries: 5,
+                        measurement_queries: 20,
+                        distributed: pods > 1,
+                        concurrency: 4,
+                        input_rows: 1_000,
+                        input_bytes: 64 * 1024,
+                        correctness_verified: true,
+                        negative_flows_verified: true,
+                        terminal_verified: true,
+                        audit_verified: true,
+                        p50_ms: 10.0,
+                        p95_ms: 20.0,
+                        p99_ms: f64::from(pods) * 30.0,
+                        p95_ttfb_ms: 5.0,
+                        p99_ttfb_ms: 9.0,
+                        rows_per_second: 5_000.0,
+                        peak_memory_bytes: 8 * 1024 * 1024,
+                        spill_bytes: 0,
+                        cpu_seconds: 1.5,
+                        object_store_ms: 12.0,
+                        tail_ms: 3.0,
+                        peak_slots: 4,
+                        rejection_rate: 0.0,
+                        retry_rate: 0.0,
+                        cancellation_verified: true,
+                    });
+                }
+            }
+        }
+        OracleCalibrationReport {
+            schema_version: 1,
+            environment: OracleCalibrationEnvironment {
+                source_revision: "fixture-revision".to_owned(),
+                platform: "fixture-platform".to_owned(),
+                logical_cpus: 8,
+                runtime: "fixture-runtime".to_owned(),
+            },
+            workload_hashes: BTreeMap::from([("rows".to_owned(), "digest".to_owned())]),
+            seeds: vec![7],
+            warmup_queries: 5,
+            measurement_queries: 20,
+            cases,
+        }
+    }
+
+    /// Keeps a derived candidate free of allocator policy and linked to its evidence.
+    ///
+    /// Resource allocation is the running process's decision, so a calibration
+    /// candidate must never propose slot memory, an Oracle memory limit, class
+    /// limits, or a spill limit no matter what the matrix measured. The
+    /// candidate must also stay traceable: every proposal it does make names
+    /// the case it came from, and that case must be the worst-observed p99 in
+    /// the matrix, which is the only case whose numbers are safe to generalize.
     #[test]
     fn oracle_candidate_excludes_allocator_proposals_and_preserves_observations() {
-        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("benches/oracle");
-        let report: OracleCalibrationReport = serde_json::from_slice(
-            &std::fs::read(directory.join("oracle-calibration.json"))
-                .expect("checked-in calibration report must be readable"),
-        )
-        .expect("checked-in calibration report must decode");
-        assert!(report.cases.iter().any(|case| case.peak_memory_bytes > 0));
-        assert!(report.cases.iter().all(|case| case.spill_bytes == 0));
+        let report = complete_calibration_report();
+        report.validate().expect("fixture matrix is complete");
         let candidate = OracleCalibrationProfile::from_report(&report)
             .expect("measured report must derive a candidate");
         for removed in [
@@ -441,16 +508,33 @@ mod tests {
             "memory.class_limits",
             "spill.limit_bytes",
         ] {
-            assert!(!candidate.proposal.contains_key(removed));
+            assert!(
+                !candidate.proposal.contains_key(removed),
+                "allocator policy {removed} must never enter a calibration candidate"
+            );
         }
-        let rendered = candidate.render_toml();
-        let path = directory.join("oracle-candidate.toml");
-        if std::env::var_os("WYRD_ORACLE_CALIBRATION_BLESS").is_some() {
-            std::fs::write(&path, &rendered).expect("candidate bless must write only TOML");
+        assert!(
+            !candidate.proposal.is_empty(),
+            "a valid matrix must yield at least one measured proposal"
+        );
+        let worst = report
+            .cases
+            .iter()
+            .max_by(|left, right| left.p99_ms.total_cmp(&right.p99_ms))
+            .expect("fixture matrix is non-empty");
+        for (key, evidence) in &candidate.proposal {
+            assert_eq!(
+                evidence.evidence_case_id, worst.case_id,
+                "proposal {key} must cite the worst-observed case"
+            );
         }
+        candidate
+            .validate(&report)
+            .expect("a derived candidate must validate against its own report");
+        assert_eq!(candidate.status, "candidate");
         assert_eq!(
-            std::fs::read_to_string(path).expect("checked-in candidate must be readable"),
-            rendered
+            candidate.source_revision,
+            report.environment.source_revision
         );
     }
 

@@ -218,12 +218,12 @@ mod tests {
         );
         let boot = include_str!("../boot/mod.rs");
         assert!(
-            boot.contains(".bifrost_node_id()"),
-            "normal worker composition must obtain configured physical identity from AppState"
+            boot.contains("let node_id = NodeId::generate();"),
+            "normal worker composition must establish one physical node identity per process"
         );
         assert!(
             boot.contains("node_id.as_uuid()"),
-            "normal ForgeWorker construction must use configured physical identity"
+            "normal ForgeWorker construction must use that process node identity"
         );
 
         let server = include_str!("server.rs");

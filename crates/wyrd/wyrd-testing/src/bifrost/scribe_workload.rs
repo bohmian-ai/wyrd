@@ -2124,20 +2124,30 @@ mod tests {
             .expect("the canonical record reads before its read-required boundary");
 
         // These cases append boundaries, so they build on the record's prefix
-        // up to the terminal drain: the drain destroys the pod, and a record
-        // that declares work after it is refused for that reason instead of
-        // for the read-reuse this owner is about.
+        // up to and including the restart-replay boundary. That cut is what
+        // makes the reuse visible: the reads the canonical record performs
+        // before the restart-replay checkpoint are consumed by it, and the
+        // reads it performs afterwards belong to the terminal drain and are
+        // dropped here. Cutting any later would hand the appended boundary a
+        // read of its own and prove nothing.
         let mut base = workload.clone();
-        let drain = base
+        let restart_replay = base
             .operations
             .iter()
-            .position(|operation| matches!(operation, ScribeWorkloadOperationV1::Drain))
-            .expect("the canonical record ends in a terminal drain");
-        base.operations.truncate(drain);
+            .position(|operation| {
+                matches!(
+                    operation,
+                    ScribeWorkloadOperationV1::Checkpoint {
+                        name: ScribeCheckpointNameV1::RestartReplay
+                    }
+                )
+            })
+            .expect("the canonical record checkpoints its restart replay");
+        base.operations.truncate(restart_replay + 1);
         base.required_checkpoints
             .retain(|name| *name != ScribeCheckpointNameV1::TerminalDrain);
         base.validate()
-            .expect("the record's pre-drain prefix is well formed on its own");
+            .expect("the record's prefix through restart replay is well formed on its own");
 
         // A read-required boundary with no read of its own is refused, even
         // though an earlier boundary in the same run was read for.

@@ -58,8 +58,8 @@ use wyrd_spec::vala::api::NodeId;
 pub use super::analytical_supervisor::AnalyticalSupervisor;
 
 use super::analytical_supervisor::{
-    AnalyticalAttemptGrant, AnalyticalAttemptGuard, AnalyticalAttemptKey, AnalyticalGraphGuard,
-    AnalyticalSupervisorInspection, StageId, TaskId,
+    AnalyticalAttemptGrant, AnalyticalAttemptGuard, AnalyticalAttemptKey, AnalyticalAttemptRelease,
+    AnalyticalGraphGuard, AnalyticalSupervisorInspection, StageId, TaskId,
 };
 use super::analytical_transport::{
     AnalyticalChannelResolver, AnalyticalCoordinatorIdentity, AnalyticalStageMinter,
@@ -1357,6 +1357,44 @@ pub struct AnalyticalExecutionEvidence {
     pub supervisor: AnalyticalSupervisorInspection,
 }
 
+/// Live Analytical ownership one half of a node still holds.
+///
+/// Both counts are read under their owners' locks at one instant. They are the
+/// terminal-cleanup assertion: a settled node reads zero for both, and a
+/// non-zero count names exactly which half stranded something.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnalyticalLiveOwnership {
+    /// Attempts still supervised.
+    pub attempts: usize,
+    /// Graphs still holding a query-owned runtime and admitted envelope.
+    pub graphs: usize,
+}
+
+impl AnalyticalLiveOwnership {
+    /// Reports whether this half of the node retains nothing.
+    #[must_use]
+    pub const fn is_clean(&self) -> bool {
+        self.attempts == 0 && self.graphs == 0
+    }
+}
+
+/// Live Analytical ownership across both halves of one node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnalyticalLiveInspection {
+    /// What this node still owns as a coordinator.
+    pub leader: AnalyticalLiveOwnership,
+    /// What this node still owns as a follower.
+    pub follower: AnalyticalLiveOwnership,
+}
+
+impl AnalyticalLiveInspection {
+    /// Reports whether the node retains no Analytical ownership at all.
+    #[must_use]
+    pub const fn is_clean(&self) -> bool {
+        self.leader.is_clean() && self.follower.is_clean()
+    }
+}
+
 /// What the handle owned at the moment it was shut down.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnalyticalShutdownInspection {
@@ -1544,7 +1582,10 @@ impl AnalyticalExecutionHandle {
         let graph = AnalyticalGraphKey::new(attempt.public_query_id, attempt.datafusion_query_id);
         let resources = self
             .oracle_resources
-            .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 1.0))
+            .try_acquire_query(OracleResourceRequest::for_class(
+                QueryClass::Analytical,
+                1.0,
+            ))
             .map_err(|_| BifrostError::QueryAdmissionRejected)?;
         let granted_memory_bytes = resources.granted_memory_bytes;
         let target_partitions = resources.target_partitions;
@@ -1750,10 +1791,116 @@ pub struct AnalyticalAttemptContext {
 /// this value settles both, which is what makes a cancelled or abandoned
 /// attempt return capacity instead of stranding it.
 pub struct AnalyticalAttemptOwnership {
+    /// Attempt ownership retained for as long as stage work may run.
+    ///
+    /// Declared before the graph on purpose: Rust drops struct fields in
+    /// declaration order, and a graph asked to release while one of its
+    /// attempts is still live refuses. Reversing these two fields is not a
+    /// style choice; it strands the query envelope.
+    pub attempt: AnalyticalAttemptGuard,
     /// Graph ownership retained for as long as stages may be addressed.
     pub graph: AnalyticalGraphGuard,
-    /// Attempt ownership retained for as long as stage work may run.
-    pub attempt: AnalyticalAttemptGuard,
+}
+
+impl AnalyticalAttemptOwnership {
+    /// Returns the exact attempt every descendant of this ownership binds to.
+    #[must_use]
+    pub fn key(&self) -> AnalyticalAttemptKey {
+        self.attempt.key()
+    }
+
+    /// Records that result data produced under this attempt left the node.
+    pub fn record_egress(&self) {
+        self.attempt.record_egress();
+    }
+
+    /// Reports whether result data already left the node under this attempt.
+    #[must_use]
+    pub fn egressed(&self) -> bool {
+        self.attempt.egressed()
+    }
+
+    /// Admits the one permitted retry, draining this attempt first.
+    ///
+    /// Three refusals are structural rather than advisory, and each is checked
+    /// before anything is torn down so a refused retry leaves the caller's
+    /// attempt exactly as it was:
+    ///
+    /// * a retry after result data has already egressed is refused, because a
+    ///   successor would re-emit rows the client has seen;
+    /// * a second retry is refused by [`AnalyticalAttemptNumber::retry`],
+    ///   which has no successor for the retry itself;
+    /// * the successor is admitted only after this attempt settles, and the
+    ///   supervisor independently refuses a second live attempt in the same
+    ///   slot, so the drain-before-admit ordering cannot be skipped by a
+    ///   caller that settles out of order.
+    ///
+    /// The graph is carried through untouched: the retry reuses the same
+    /// query-owned runtime, admitted envelope, cut, and deadline, which is what
+    /// makes it a retry rather than a second query.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when result data already egressed,
+    /// when this attempt is already the one permitted retry, or when the
+    /// supervisor refuses the successor, and the error reported by
+    /// [`AnalyticalAttemptGuard::finish`] when this attempt cannot settle.
+    pub async fn retry_pre_egress(
+        self,
+        grant: AnalyticalAttemptGrant,
+    ) -> Result<Self, BifrostError> {
+        if self.egressed() {
+            return Err(BifrostError::Internal {
+                detail: "Oracle analytical attempt cannot retry after result-data egress"
+                    .to_owned(),
+            });
+        }
+        let key = self.key();
+        let Some(next) = key.attempt.retry() else {
+            return Err(BifrostError::Internal {
+                detail: "Oracle analytical graph has already consumed its one permitted retry"
+                    .to_owned(),
+            });
+        };
+        let Self { attempt, graph } = self;
+        let supervisor = attempt.supervisor();
+        attempt.finish(AnalyticalAttemptOutcome::Retried).await?;
+        let attempt = supervisor.spawn_attempt(
+            AnalyticalAttemptKey::new(
+                key.public_query_id,
+                key.datafusion_query_id,
+                key.stage,
+                key.task,
+                next,
+            ),
+            grant,
+        )?;
+        Ok(Self { attempt, graph })
+    }
+
+    /// Settles the attempt and then releases its graph, in that order.
+    ///
+    /// Dropping this value also releases both, but only settling joins the
+    /// attempt's retained drivers first. A leader stream that ended — for any
+    /// reason — calls this so follower work is cancelled and joined before the
+    /// query envelope is returned, rather than leaving an abandoned attempt to
+    /// be swept by a drop.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error reported by
+    /// [`AnalyticalSupervisor::finish_attempt`] when the attempt is no longer
+    /// supervised or a lock is poisoned, and the error reported by
+    /// [`AnalyticalGraphGuard::release`] when the graph cannot be released.
+    pub async fn settle(
+        self,
+        outcome: AnalyticalAttemptOutcome,
+    ) -> Result<AnalyticalAttemptRelease, BifrostError> {
+        let Self { attempt, graph } = self;
+        let release = attempt.finish(outcome).await?;
+        graph.release()?;
+        Ok(release)
+    }
 }
 
 /// One started Analytical execution and the owners that settle with it.

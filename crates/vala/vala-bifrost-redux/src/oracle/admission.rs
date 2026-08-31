@@ -1121,6 +1121,29 @@ impl Drop for AdmittedQueryGuard {
 }
 
 impl AdmittedQueryGuard {
+    /// Takes the inactive Analytical ownership so the stream can settle it.
+    ///
+    /// Taking rather than borrowing is deliberate: settlement consumes the two
+    /// guards, and removing them here means a later drop of this admission
+    /// cannot settle or release the same attempt a second time.
+    pub(super) fn take_analytical(
+        &mut self,
+    ) -> Option<super::analytical::AnalyticalAttemptOwnership> {
+        self.analytical.take()
+    }
+
+    /// Records that result data left this query, fencing any later retry.
+    ///
+    /// A retry is only sound while nothing has been handed to the client. The
+    /// leader stream calls this immediately before its first batch frame is
+    /// yielded, so the fence is set by the act of egress rather than by a
+    /// caller remembering to set it.
+    pub(super) fn record_analytical_egress(&self) {
+        if let Some(ownership) = self.analytical.as_ref() {
+            ownership.record_egress();
+        }
+    }
+
     /// Retains the already-acquired delegated policy unit through stream settlement.
     pub(super) fn retain_delegated_grant(&mut self, grant: super::DelegatedOracleAdmissionGrant) {
         self.delegated_grant = Some(grant);

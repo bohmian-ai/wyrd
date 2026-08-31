@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 
+use super::telemetry::AnalyticalAttemptOutcome;
+
 use super::*;
 
 /// Owned query stream handle.  Frame production remains lazy and cancellation-aware.
@@ -352,6 +354,9 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
                         continue;
                     };
                     query_telemetry.first_batch();
+                    if let Some(admitted) = admitted.as_ref() {
+                        admitted.record_analytical_egress();
+                    }
                     row_count = row_count.saturating_add(batch_rows);
                     query_telemetry.record_payload(batch_rows, frame.arrow_ipc_batch.len());
                     yield Ok(QueryStreamFrame::Batch(frame));
@@ -384,6 +389,7 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
         drop(next);
         drop(batches);
         settle_distributed(&distributed_settlement, candidate.outcome, &stream_cancellation).await;
+        settle_analytical(&mut admitted, candidate.outcome).await;
         let candidate = close_ipc_stream(&mut ipc, candidate, visibility, row_count);
         let terminal = release_and_finish_terminal(
             &mut admitted,
@@ -532,6 +538,42 @@ async fn settle_distributed(
         settlement.cancel_and_join(stream_cancellation).await;
     } else {
         settlement.join().await;
+    }
+}
+
+/// Settles an inactive Analytical attempt before its admission is released.
+///
+/// Dropping the admission guard would release the attempt too, but only an
+/// explicit settlement cancels the attempt's cancellation child and joins the
+/// driver futures started beneath it. Doing that here — after the distributed
+/// join and before admission release — is what makes a leader stream's end,
+/// however it ended, the point at which follower work stops rather than the
+/// point at which it is merely no longer awaited.
+///
+/// A settlement failure is logged rather than propagated: the terminal frame is
+/// already chosen, and the guard's own drop still returns every reservation.
+async fn settle_analytical(
+    admitted: &mut Option<AdmittedQueryGuard>,
+    outcome: QueryTerminalOutcome,
+) {
+    let Some(ownership) = admitted
+        .as_mut()
+        .and_then(AdmittedQueryGuard::take_analytical)
+    else {
+        return;
+    };
+    let attempt_outcome = match outcome {
+        QueryTerminalOutcome::Failed => AnalyticalAttemptOutcome::Failed,
+        _ => AnalyticalAttemptOutcome::Success,
+    };
+    let key = ownership.key();
+    if let Err(error) = ownership.settle(attempt_outcome).await {
+        tracing::error!(
+            %error,
+            public_query_id = %key.public_query_id,
+            datafusion_query_id = %key.datafusion_query_id,
+            "Oracle analytical attempt could not settle with its leader stream"
+        );
     }
 }
 

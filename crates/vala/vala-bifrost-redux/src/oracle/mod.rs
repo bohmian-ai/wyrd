@@ -2308,6 +2308,42 @@ impl Oracle {
         .await
     }
 
+    /// Leases one inactive Analytical attempt without executing anything.
+    ///
+    /// The cut, classification, and providers are prepared exactly as a real
+    /// query would prepare them, and the returned session is the one a
+    /// distributed plan would execute through. Nothing is planned or run, so a
+    /// caller receives an attempt at rest — which is what makes the retry,
+    /// fencing, and settlement orderings observable without racing an
+    /// executing graph.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same stable query, catalog, visibility, and admission errors
+    /// as [`Self::query_sql`], plus [`BifrostError::OracleRoleUnavailable`]
+    /// when this node composed no Analytical handle.
+    #[cfg(feature = "test-support")]
+    pub async fn lease_inactive_analytical_attempt(
+        &self,
+        context: AuthorizedQueryContext,
+        request: BifrostQueryRequest,
+        attempt: &analytical::AnalyticalAttemptContext,
+    ) -> Result<
+        (
+            datafusion::prelude::SessionContext,
+            analytical::AnalyticalAttemptOwnership,
+        ),
+        BifrostError,
+    > {
+        let (cut, planned) = self.prepare_query_attempt(&context, &request).await?;
+        let handle = self
+            .analytical
+            .as_ref()
+            .ok_or(BifrostError::OracleRoleUnavailable)?;
+        let work_units = Self::scannable_work_units(&planned.cuts);
+        handle.lease_session(attempt, &cut, &context, work_units)
+    }
+
     /// Prepares the immutable local-leader participant cut before an attempt begins.
     ///
     /// Returns the pinned plan alongside the cut so a local leader can execute the

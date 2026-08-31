@@ -26,6 +26,7 @@
 //! helpers only it uses, so a journey can be read without reading the shared
 //! module first.
 
+mod analytical_inactive;
 mod capacity;
 mod convergence;
 mod distributed;

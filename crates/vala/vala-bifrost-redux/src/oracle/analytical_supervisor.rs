@@ -219,6 +219,12 @@ struct AnalyticalAttemptState {
     telemetry: AnalyticalAttemptTelemetry,
     /// Exact grant sizes retained so release evidence can restate them.
     grant: AnalyticalAttemptGrant,
+    /// Whether result data produced under this attempt already left the node.
+    ///
+    /// Shared with the attempt's guard so the fence survives into settlement
+    /// evidence: a retry admitted after egress would re-emit rows a client has
+    /// already seen, so the successor is refused rather than merely discouraged.
+    egressed: Arc<AtomicBool>,
 }
 
 /// Proof that one attempt released every resource it held.
@@ -238,6 +244,8 @@ pub struct AnalyticalAttemptRelease {
     pub exchange_buffer_bytes: usize,
     /// Scratch bytes returned to the query envelope.
     pub scratch_bytes: u64,
+    /// Whether result data left the node under this attempt.
+    pub egressed: bool,
 }
 
 /// Post-shutdown proof that a supervisor retains nothing.
@@ -488,6 +496,7 @@ impl AnalyticalSupervisor {
             .try_split_scratch(grant.scratch_bytes)
             .map_err(|_| BifrostError::QueryExecutionFailed)?;
         let cancel = self.root_cancel.child_token();
+        let egressed = Arc::new(AtomicBool::new(false));
         let telemetry = AnalyticalAttemptTelemetry::start(
             &key.public_query_id.to_string(),
             &key.datafusion_query_id.to_string(),
@@ -512,6 +521,7 @@ impl AnalyticalSupervisor {
                 scratch,
                 telemetry,
                 grant,
+                egressed: Arc::clone(&egressed),
             },
         );
         drop(attempts);
@@ -520,6 +530,7 @@ impl AnalyticalSupervisor {
             supervisor: Arc::clone(self),
             key,
             cancel,
+            egressed,
             settled: false,
         })
     }
@@ -594,6 +605,7 @@ impl AnalyticalSupervisor {
             drivers_joined,
             exchange_buffer_bytes: state.grant.exchange_buffer_bytes,
             scratch_bytes: state.grant.scratch_bytes,
+            egressed: state.egressed.load(Ordering::Acquire),
         };
         state.telemetry.finish(outcome);
         let AnalyticalAttemptState {
@@ -784,6 +796,8 @@ pub struct AnalyticalAttemptGuard {
     key: AnalyticalAttemptKey,
     /// The attempt's cancellation child, shared with every descendant.
     cancel: CancellationToken,
+    /// Egress fence shared with the supervisor's attempt state.
+    egressed: Arc<AtomicBool>,
     /// Whether an explicit terminal already released the attempt.
     settled: bool,
 }
@@ -810,6 +824,26 @@ impl AnalyticalAttemptGuard {
     #[must_use]
     pub const fn cancellation(&self) -> &CancellationToken {
         &self.cancel
+    }
+
+    /// Returns the supervisor that owns this attempt, for admitting its retry.
+    #[must_use]
+    pub fn supervisor(&self) -> Arc<AnalyticalSupervisor> {
+        Arc::clone(&self.supervisor)
+    }
+
+    /// Records that result data produced under this attempt left the node.
+    ///
+    /// Idempotent, and deliberately one-way: once an attempt has egressed, no
+    /// later observation can un-fence it.
+    pub fn record_egress(&self) {
+        self.egressed.store(true, Ordering::Release);
+    }
+
+    /// Reports whether result data already left the node under this attempt.
+    #[must_use]
+    pub fn egressed(&self) -> bool {
+        self.egressed.load(Ordering::Acquire)
     }
 
     /// Retains one driver future under this exact attempt.

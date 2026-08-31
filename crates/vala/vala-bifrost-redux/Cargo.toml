@@ -51,6 +51,7 @@ iceberg-catalog-sql = { workspace = true }
 typetag = { workspace = true }
 lru = { workspace = true }
 datafusion-distributed = { workspace = true }
+http = { workspace = true }
 url = { workspace = true }
 datafusion = { workspace = true }
 datafusion-proto = { workspace = true }

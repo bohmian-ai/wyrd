@@ -56,6 +56,7 @@ use crate::schema::SchemaFingerprint;
 use crate::scribe::tail_rpc::{TAIL_PROTOCOL_VERSION, TailReadTransport};
 
 mod admission;
+pub mod analytical;
 pub mod attempt;
 pub mod codec;
 pub mod dispatcher;

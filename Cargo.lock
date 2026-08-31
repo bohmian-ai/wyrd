@@ -9845,6 +9845,7 @@ dependencies = [
  "datafusion-proto",
  "futures-util",
  "hex",
+ "http 1.5.0",
  "iceberg",
  "iceberg-catalog-sql",
  "iceberg-datafusion",

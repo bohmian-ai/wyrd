@@ -247,6 +247,55 @@ impl SupervisedForge {
         self
     }
 
+    /// Run one failing attempt while `during` drives a seam it is blocked on.
+    ///
+    /// The variant exists because the deterministic scenarios pause the
+    /// production commit at a real catalog seam: the control that decides how
+    /// the attempt ends can only run *while* the worker is parked there, so it
+    /// cannot be applied before scheduling or after the attempt is held.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the scheduler or worker misses its deterministic bound, or
+    /// when the attempt unexpectedly succeeded.
+    pub(crate) async fn run_one_failure_while<F>(mut self, during: F) -> Self
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let expected_errors = self
+            .worker_observer
+            .returned_errors()
+            .len()
+            .saturating_add(1);
+        self.worker_observer.hold_after_next_attempt_for_test();
+        self.schedule_once().await;
+        tokio::time::timeout(Duration::from_secs(30), during)
+            .await
+            .expect("paused production commit seam bound");
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            self.worker_observer.wait_for_held_attempt_for_test(),
+        )
+        .await
+        .expect("production Forge worker attempt bound");
+        self.stop_worker().await;
+        assert_eq!(
+            self.worker_observer.returned_errors().len(),
+            expected_errors,
+            "the attempt was expected to return exactly one error: {:?}",
+            self.worker_observer.returned_errors()
+        );
+        self
+    }
+
+    /// Borrows the token production worker execution observes as shutdown.
+    ///
+    /// A drain proof has to cancel *while* an attempt is parked at a real seam
+    /// and then keep observing it, which joining the supervisor would prevent.
+    pub(crate) fn worker_stop(&self) -> CancellationToken {
+        self.worker_stop.clone()
+    }
+
     /// Cancel and join the worker before it can retry a returned attempt.
     ///
     /// # Panics

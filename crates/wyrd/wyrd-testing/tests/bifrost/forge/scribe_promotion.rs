@@ -679,6 +679,137 @@ async fn scribe_promotion_ambiguity_reconciles_without_recommit() {
     );
 }
 
+/// The operation deadline bounds the conflict retry to zero second attempts.
+///
+/// The commit is parked at the real catalog seam, the Forge clock is moved
+/// past the operation's own retry budget, and only then is the parked commit
+/// refused. The deadline captured before the first attempt must therefore
+/// already be spent, so the definite conflict closes the operation instead of
+/// buying a second catalog call. One delegated update — against two in the
+/// retry scenario — is what proves the barrier held.
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn scribe_promotion_deadline_expires_before_conflict_retry() {
+    let server = start_engine_fixture_server().await;
+    let clock = server.forge_clock();
+    let fixture = seed_forge_group(&server, "promotion_deadline").await;
+    let catalog = CommitUncertaintyCatalog::new(Arc::clone(&fixture.catalog));
+    catalog.pause_before_commit();
+
+    let forge = SupervisedForge::start_with_seams(
+        &fixture,
+        fixture.config.clone(),
+        Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
+        Arc::clone(&fixture.object_store),
+    );
+    let forge = forge
+        .run_one_failure_while(async {
+            catalog.wait_for_before_commit().await;
+            let expired = clock.now().expect("manual Forge clock")
+                + chrono::Duration::from_std(fixture.config.iceberg_total_retry_timeout)
+                    .expect("retry budget is representable")
+                + chrono::Duration::seconds(1);
+            clock.set(expired).expect("manual Forge clock advances");
+            catalog.reject_paused_before_commit();
+        })
+        .await;
+
+    assert_eq!(
+        catalog.update_attempts(),
+        1,
+        "the expired deadline permitted no second catalog call: {:?}",
+        forge.returned_errors()
+    );
+    assert_eq!(
+        promotion_phases(&fixture).await,
+        vec!["reset".to_owned()],
+        "a conflict past the deadline closes the operation"
+    );
+    let unsettled = file_rows(&fixture).await;
+    assert!(
+        unsettled
+            .iter()
+            .all(|row| !row.compacted && row.committed_snapshot_id.is_none()),
+        "nothing was settled by a refused promotion: {unsettled:?}"
+    );
+    forge.shutdown().await;
+}
+
+/// Cancellation drains a parked promotion without settling anything.
+///
+/// The worker is cancelled while its commit is parked before delegation, so
+/// acceptance is unknown by construction. Draining must therefore release the
+/// attempt and its lease while leaving the operation Prepared: settling it
+/// either way would claim knowledge the worker does not have.
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn scribe_promotion_cancellation_drains_without_settlement() {
+    let server = start_engine_fixture_server().await;
+    let fixture = seed_forge_group(&server, "promotion_cancellation").await;
+    let catalog = CommitUncertaintyCatalog::new(Arc::clone(&fixture.catalog));
+    catalog.pause_before_commit();
+
+    let forge = SupervisedForge::start_with_seams(
+        &fixture,
+        fixture.config.clone(),
+        Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
+        Arc::clone(&fixture.object_store),
+    );
+    let worker_stop = forge.worker_stop();
+    let forge = forge
+        .run_one_failure_while(async {
+            catalog.wait_for_before_commit().await;
+            worker_stop.cancel();
+            catalog.wait_for_before_commit_drop().await;
+        })
+        .await;
+
+    assert_eq!(
+        promotion_phases(&fixture).await,
+        vec!["prepared".to_owned()],
+        "a drained promotion stays open rather than claiming an outcome: {:?}",
+        forge.returned_errors()
+    );
+    let unsettled = file_rows(&fixture).await;
+    assert!(
+        unsettled
+            .iter()
+            .all(|row| !row.compacted && row.committed_snapshot_id.is_none()),
+        "a drained promotion settled nothing: {unsettled:?}"
+    );
+    assert_eq!(
+        live_forge_leases(&fixture).await,
+        0,
+        "the drained attempt released its lease"
+    );
+    forge.shutdown().await;
+}
+
+/// Counts unexpired Forge leases still held over the fixture's own table.
+///
+/// The lease key is derived through the production key builder, so a renamed
+/// or re-scoped lease identity fails this read rather than silently counting
+/// zero.
+///
+/// # Panics
+///
+/// Panics when the read-only diagnostic query fails.
+async fn live_forge_leases(fixture: &ForgeFixture) -> i64 {
+    let lease_key = vala_bifrost_redux::forge::forge_lease_key(
+        fixture.tenant,
+        &fixture.binding.logical_namespace,
+        &fixture.binding.table_name,
+    );
+    sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM vala.maintenance_leases \
+         WHERE lease_key = $1 AND expires_at > statement_timestamp()",
+    )
+    .bind(&lease_key)
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("Forge lease inspection")
+}
+
 /// Brings a retryable task's production backoff forward to now.
 ///
 /// The durable retry delay is a fixed exponential interval computed in SQL, so

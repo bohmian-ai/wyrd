@@ -192,6 +192,19 @@ pub struct AnalyticalAttemptGrant {
     pub scratch_bytes: u64,
 }
 
+/// Everything one live distributed graph owns for the whole plan's life.
+///
+/// The admitted query envelope lives here rather than at a call site because a
+/// follower learns about a graph on one stage operation and executes its tasks
+/// on later, separate ones. Nothing but this owner keeps the envelope alive
+/// between them, so releasing the graph is the single act that returns it.
+struct AnalyticalGraphState {
+    /// The admitted query envelope every attempt of this graph splits from.
+    resources: OracleQueryResources,
+    /// The query-owned runtime every follower of this graph installs.
+    runtime: AnalyticalGraphRuntime,
+}
+
 /// Everything one live attempt owns and must return exactly once.
 struct AnalyticalAttemptState {
     /// Cancellation child covering every descendant started under the attempt.
@@ -225,8 +238,6 @@ pub struct AnalyticalAttemptRelease {
     pub exchange_buffer_bytes: usize,
     /// Scratch bytes returned to the query envelope.
     pub scratch_bytes: u64,
-    /// Whether this settlement removed the graph's query-owned runtime.
-    pub graph_invalidated: bool,
 }
 
 /// Post-shutdown proof that a supervisor retains nothing.
@@ -234,6 +245,8 @@ pub struct AnalyticalAttemptRelease {
 pub struct AnalyticalSupervisorInspection {
     /// Attempts settled by the shutdown itself.
     pub attempts_settled: usize,
+    /// Graphs whose runtime and admitted envelope the shutdown released.
+    pub graphs_released: usize,
     /// Attempts still retained after shutdown. Terminal evidence asserts zero.
     pub attempts_retained: usize,
     /// Graphs still holding query-owned runtimes. Terminal evidence asserts zero.
@@ -251,6 +264,8 @@ pub struct AnalyticalSupervisorInspection {
 pub struct AnalyticalSupervisor {
     /// Query-owned runtimes resolvable by authenticated follower stage work.
     registry: Arc<AnalyticalRuntimeRegistry>,
+    /// Admitted query envelopes keyed by graph, one per live distributed plan.
+    graphs: Mutex<HashMap<AnalyticalGraphKey, AnalyticalGraphState>>,
     /// Live attempts keyed by complete two-identity attempt identity.
     attempts: Mutex<HashMap<AnalyticalAttemptKey, AnalyticalAttemptState>>,
     /// Node-scoped cancellation parent of every attempt's cancellation child.
@@ -276,6 +291,7 @@ impl AnalyticalSupervisor {
     pub fn new() -> Self {
         Self {
             registry: Arc::new(AnalyticalRuntimeRegistry::new()),
+            graphs: Mutex::new(HashMap::new()),
             attempts: Mutex::new(HashMap::new()),
             root_cancel: CancellationToken::new(),
             accepting: AtomicBool::new(true),
@@ -313,28 +329,132 @@ impl AnalyticalSupervisor {
             .len())
     }
 
-    /// Admits one attempt, installing its query-owned runtime and child grants.
+    /// Registers one distributed graph and the query envelope its attempts split.
     ///
-    /// The registration is complete before the guard is returned: the graph
-    /// resolves to `runtime` for authenticated follower session construction,
-    /// the exchange and scratch children are split from `resources`, a
+    /// Registration is what makes the graph resolvable to upstream session
+    /// construction, so an authenticated follower can install this query's own
+    /// `RuntimeEnv` instead of a process default. The returned guard owns the
+    /// admitted envelope: releasing it is the single act that returns the
+    /// query's memory, scratch, and slot units, and it refuses while any attempt
+    /// of the graph is still live.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when the supervisor is shutting down,
+    /// when the graph is already registered — a duplicate identity, which must
+    /// never silently replace a live plan — or when a lock is poisoned.
+    pub fn register_graph(
+        self: &Arc<Self>,
+        graph: AnalyticalGraphKey,
+        resources: OracleQueryResources,
+        runtime: AnalyticalGraphRuntime,
+    ) -> Result<AnalyticalGraphGuard, BifrostError> {
+        if !self.is_healthy() {
+            return Err(BifrostError::Internal {
+                detail: "Oracle analytical supervisor is shutting down".to_owned(),
+            });
+        }
+        let mut graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
+        if graphs.contains_key(&graph) {
+            return Err(BifrostError::Internal {
+                detail: "Oracle analytical graph is already registered".to_owned(),
+            });
+        }
+        self.registry.register(graph, runtime.clone())?;
+        graphs.insert(graph, AnalyticalGraphState { resources, runtime });
+        drop(graphs);
+        tracing::debug!(
+            public_query_id = %graph.public_query_id,
+            datafusion_query_id = %graph.datafusion_query_id,
+            "Oracle analytical graph registered"
+        );
+        Ok(AnalyticalGraphGuard {
+            supervisor: Arc::clone(self),
+            graph,
+            released: false,
+        })
+    }
+
+    /// Returns the number of registered graphs, for terminal-cleanup evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when the graph lock is poisoned.
+    pub fn live_graphs(&self) -> Result<usize, BifrostError> {
+        Ok(self.graphs.lock().map_err(|_| poisoned_supervisor())?.len())
+    }
+
+    /// Resolves the query-owned runtime one registered graph installs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::QueryExecutionFailed`] when the graph is not
+    /// registered, and [`BifrostError::Internal`] on lock poisoning.
+    pub fn graph_runtime(
+        &self,
+        graph: AnalyticalGraphKey,
+    ) -> Result<AnalyticalGraphRuntime, BifrostError> {
+        let graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
+        graphs
+            .get(&graph)
+            .map(|state| state.runtime.clone())
+            .ok_or(BifrostError::QueryExecutionFailed)
+    }
+
+    /// Releases one graph's runtime and admitted envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when an attempt of the graph is still
+    /// live — releasing the envelope beneath a running attempt would poison the
+    /// resource root — or when a lock is poisoned. Returns
+    /// [`BifrostError::QueryExecutionFailed`] when the graph is not registered.
+    pub fn release_graph(&self, graph: AnalyticalGraphKey) -> Result<(), BifrostError> {
+        {
+            let attempts = self.attempts.lock().map_err(|_| poisoned_supervisor())?;
+            if attempts.keys().any(|live| live.graph() == graph) {
+                return Err(BifrostError::Internal {
+                    detail: "Oracle analytical graph still owns a live attempt".to_owned(),
+                });
+            }
+        }
+        let removed = {
+            let mut graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
+            graphs.remove(&graph)
+        };
+        if removed.is_none() {
+            return Err(BifrostError::QueryExecutionFailed);
+        }
+        self.registry.invalidate(graph)?;
+        tracing::debug!(
+            public_query_id = %graph.public_query_id,
+            datafusion_query_id = %graph.datafusion_query_id,
+            "Oracle analytical graph released"
+        );
+        Ok(())
+    }
+
+    /// Admits one attempt of an already registered graph, with its child grants.
+    ///
+    /// The registration is complete before the guard is returned: the exchange
+    /// and scratch children are split from the graph's admitted envelope, a
     /// cancellation child is derived from the node root, and the in-flight gauge
     /// is raised. Every one of those is released together by
-    /// [`AnalyticalSupervisor::finish_attempt`] or by dropping the guard.
+    /// [`AnalyticalSupervisor::finish_attempt`] or by dropping the guard. The
+    /// graph itself must already be registered; its runtime and envelope
+    /// outlive individual attempts, including a retry.
     ///
     /// # Errors
     ///
     /// Returns [`BifrostError::Internal`] when the supervisor is shutting down,
     /// when a live attempt already occupies this stage/task slot — which is how
-    /// a retry is held until its predecessor drains — or when the attempt or
-    /// registry lock is poisoned. Returns
-    /// [`BifrostError::QueryExecutionFailed`] when the query envelope cannot
-    /// cover the requested exchange or scratch child.
+    /// a retry is held until its predecessor drains — or when a lock is
+    /// poisoned. Returns [`BifrostError::QueryExecutionFailed`] when the graph
+    /// is not registered, or when its admitted envelope cannot cover the
+    /// requested exchange or scratch child.
     pub fn spawn_attempt(
         self: &Arc<Self>,
         key: AnalyticalAttemptKey,
-        resources: &OracleQueryResources,
-        runtime: &AnalyticalGraphRuntime,
         grant: AnalyticalAttemptGrant,
     ) -> Result<AnalyticalAttemptGuard, BifrostError> {
         if !self.is_healthy() {
@@ -342,6 +462,10 @@ impl AnalyticalSupervisor {
                 detail: "Oracle analytical supervisor is shutting down".to_owned(),
             });
         }
+        let graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
+        let Some(graph) = graphs.get(&key.graph()) else {
+            return Err(BifrostError::QueryExecutionFailed);
+        };
         let mut attempts = self.attempts.lock().map_err(|_| poisoned_supervisor())?;
         if attempts.contains_key(&key) {
             return Err(BifrostError::Internal {
@@ -355,13 +479,14 @@ impl AnalyticalSupervisor {
                     .to_owned(),
             });
         }
-        let exchange_memory = resources
+        let exchange_memory = graph
+            .resources
             .try_split_memory(EXCHANGE_CONSUMER, grant.exchange_buffer_bytes)
             .map_err(|_| BifrostError::QueryExecutionFailed)?;
-        let scratch = resources
+        let scratch = graph
+            .resources
             .try_split_scratch(grant.scratch_bytes)
             .map_err(|_| BifrostError::QueryExecutionFailed)?;
-        self.registry.register(key.graph(), runtime.clone())?;
         let cancel = self.root_cancel.child_token();
         let telemetry = AnalyticalAttemptTelemetry::start(
             &key.public_query_id.to_string(),
@@ -390,6 +515,7 @@ impl AnalyticalSupervisor {
             },
         );
         drop(attempts);
+        drop(graphs);
         Ok(AnalyticalAttemptGuard {
             supervisor: Arc::clone(self),
             key,
@@ -462,14 +588,12 @@ impl AnalyticalSupervisor {
                 }
             }
         }
-        let graph_invalidated = self.invalidate_drained_graph(key)?;
         let release = AnalyticalAttemptRelease {
             key,
             outcome,
             drivers_joined,
             exchange_buffer_bytes: state.grant.exchange_buffer_bytes,
             scratch_bytes: state.grant.scratch_bytes,
-            graph_invalidated,
         };
         state.telemetry.finish(outcome);
         let AnalyticalAttemptState {
@@ -487,13 +611,13 @@ impl AnalyticalSupervisor {
             attempt = key.attempt.as_u8(),
             outcome = outcome.as_str(),
             drivers_joined,
-            graph_invalidated,
             "Oracle analytical attempt settled"
         );
         Ok(release)
     }
 
-    /// Stops admission, cancels the node root, and settles every live attempt.
+    /// Stops admission, cancels the node root, settles every live attempt, and
+    /// releases every registered graph's runtime and admitted envelope.
     ///
     /// # Errors
     ///
@@ -516,10 +640,21 @@ impl AnalyticalSupervisor {
                 attempts_settled += 1;
             }
         }
+        let graphs: Vec<AnalyticalGraphKey> = {
+            let graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
+            graphs.keys().copied().collect()
+        };
+        let mut graphs_released = 0;
+        for graph in graphs {
+            if self.release_graph(graph).is_ok() {
+                graphs_released += 1;
+            }
+        }
         Ok(AnalyticalSupervisorInspection {
             attempts_settled,
+            graphs_released,
             attempts_retained: self.live_attempts()?,
-            graphs_retained: self.registry.len()?,
+            graphs_retained: self.live_graphs()?,
         })
     }
 
@@ -534,22 +669,6 @@ impl AnalyticalSupervisor {
     ) -> Result<Option<AnalyticalAttemptState>, BifrostError> {
         let mut attempts = self.attempts.lock().map_err(|_| poisoned_supervisor())?;
         Ok(attempts.remove(&key))
-    }
-
-    /// Drops a graph's query-owned runtime once no attempt of it remains.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostError::Internal`] when the attempt or registry lock is
-    /// poisoned.
-    fn invalidate_drained_graph(&self, key: AnalyticalAttemptKey) -> Result<bool, BifrostError> {
-        let graph = key.graph();
-        let attempts = self.attempts.lock().map_err(|_| poisoned_supervisor())?;
-        if attempts.keys().any(|live| live.graph() == graph) {
-            return Ok(false);
-        }
-        drop(attempts);
-        self.registry.invalidate(graph)
     }
 
     /// Cancels and releases one attempt without awaiting its drivers.
@@ -572,9 +691,6 @@ impl AnalyticalSupervisor {
         for driver in &state.drivers {
             driver.abort();
         }
-        if let Err(error) = self.invalidate_drained_graph(key) {
-            tracing::error!(%error, "Oracle analytical graph invalidation failed");
-        }
         state.telemetry.finish(AnalyticalAttemptOutcome::Cancelled);
         tracing::warn!(
             public_query_id = %key.public_query_id,
@@ -590,6 +706,68 @@ impl Default for AnalyticalSupervisor {
     /// Creates an empty node-local supervisor.
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// RAII ownership of one registered distributed graph.
+///
+/// Holding the guard is what keeps the graph's admitted query envelope alive
+/// and its query-owned runtime resolvable to followers. Dropping it releases
+/// both, which is why a follower keeps it for as long as the coordinator may
+/// still address the graph rather than for the length of any one stage call.
+pub struct AnalyticalGraphGuard {
+    /// The supervisor that owns the graph's state.
+    supervisor: Arc<AnalyticalSupervisor>,
+    /// The two-identity graph this guard owns.
+    graph: AnalyticalGraphKey,
+    /// Whether an explicit release already returned the envelope.
+    released: bool,
+}
+
+impl fmt::Debug for AnalyticalGraphGuard {
+    /// Reports the graph identity without rendering supervisor internals.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AnalyticalGraphGuard")
+            .field("graph", &self.graph)
+            .field("released", &self.released)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AnalyticalGraphGuard {
+    /// Returns the graph identity every attempt of this plan must carry.
+    #[must_use]
+    pub const fn graph(&self) -> AnalyticalGraphKey {
+        self.graph
+    }
+
+    /// Releases the graph's runtime and admitted envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error reported by [`AnalyticalSupervisor::release_graph`],
+    /// notably a refusal while an attempt of the graph is still live.
+    pub fn release(mut self) -> Result<(), BifrostError> {
+        self.released = true;
+        self.supervisor.release_graph(self.graph)
+    }
+}
+
+impl Drop for AnalyticalGraphGuard {
+    /// Releases a graph whose owner vanished without an explicit release.
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        if let Err(error) = self.supervisor.release_graph(self.graph) {
+            tracing::error!(
+                %error,
+                public_query_id = %self.graph.public_query_id,
+                datafusion_query_id = %self.graph.datafusion_query_id,
+                "Oracle analytical graph release failed on drop"
+            );
+        }
     }
 }
 
@@ -796,7 +974,14 @@ mod tests {
                 0.0,
             ))
             .expect("an idle Oracle admits one analytical query");
-        let runtime = query_runtime(&resources, &spill);
+        let resources_b = oracle
+            .try_acquire_query(OracleResourceRequest::for_class(
+                QueryClass::Analytical,
+                0.0,
+            ))
+            .expect("an idle Oracle admits a second analytical query");
+        let runtime_a = query_runtime(&resources, &spill);
+        let runtime_b = query_runtime(&resources_b, &spill);
         let supervisor = Arc::new(AnalyticalSupervisor::new());
 
         let public_query_id = PublicQueryId::from_uuid(uuid::Uuid::now_v7());
@@ -815,11 +1000,17 @@ mod tests {
 
         let key_a = attempt_zero(graph_a, 1);
         let key_b = attempt_zero(graph_b, 1);
+        let graph_guard_a = supervisor
+            .register_graph(graph_a, resources, runtime_a)
+            .expect("graph A registers its own admitted envelope");
+        let graph_guard_b = supervisor
+            .register_graph(graph_b, resources_b, runtime_b)
+            .expect("a sibling graph registers its own admitted envelope");
         let guard_a = supervisor
-            .spawn_attempt(key_a, &resources, &runtime, fixture_grant())
+            .spawn_attempt(key_a, fixture_grant())
             .expect("graph A admits its first attempt");
         let guard_b = supervisor
-            .spawn_attempt(key_b, &resources, &runtime, fixture_grant())
+            .spawn_attempt(key_b, fixture_grant())
             .expect("an identically numbered stage under a sibling graph is a distinct slot");
         assert_eq!(
             supervisor.live_attempts().expect("live attempts"),
@@ -832,10 +1023,9 @@ mod tests {
             .await
             .expect("graph B settles its own attempt");
         assert_eq!(release_b.key, key_b);
-        assert!(
-            release_b.graph_invalidated,
-            "graph B's runtime is removed once its last attempt drains"
-        );
+        graph_guard_b
+            .release()
+            .expect("graph B releases once its last attempt has drained");
         assert!(
             !guard_a.cancellation().is_cancelled(),
             "settling a sibling graph must not cancel this graph's attempt"
@@ -865,13 +1055,13 @@ mod tests {
             .finish(AnalyticalAttemptOutcome::Success)
             .await
             .expect("graph A settles its own attempt");
+        drop(graph_guard_a);
         let inspection = supervisor
             .shutdown()
             .await
             .expect("shutdown inspects cleanly");
         assert_eq!(inspection.attempts_retained, 0);
         assert_eq!(inspection.graphs_retained, 0);
-        drop(resources);
     }
 
     /// One attempt installs the query's own runtime and releases it exactly once.
@@ -915,14 +1105,17 @@ mod tests {
             datafusion_query_id: DataFusionQueryId::allocate(),
         };
         let key = attempt_zero(graph, 0);
+        let graph_guard = supervisor
+            .register_graph(graph, resources, runtime.clone())
+            .expect("the graph registers its admitted envelope");
         let guard = supervisor
-            .spawn_attempt(key, &resources, &runtime, fixture_grant())
+            .spawn_attempt(key, fixture_grant())
             .expect("the admitted envelope covers the fixture grant");
 
         let resolved = supervisor
             .registry()
             .resolve(graph)
-            .expect("an admitted attempt makes its graph resolvable");
+            .expect("a registered graph is resolvable");
         assert!(
             Arc::ptr_eq(resolved.runtime(), runtime.runtime()),
             "a follower resolves this query's own RuntimeEnv, never a process default"
@@ -961,7 +1154,9 @@ mod tests {
             0,
             "a refused second settlement returns nothing"
         );
-        drop(resources);
+        graph_guard
+            .release()
+            .expect("the graph releases once its last attempt has drained");
         assert_eq!(
             oracle
                 .snapshot()

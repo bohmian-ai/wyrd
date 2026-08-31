@@ -10,8 +10,9 @@ use std::fmt;
 use std::sync::Arc;
 use vala_bifrost_redux::oracle::peer::PeerReplayCache;
 use vala_bifrost_redux::oracle::peer::{
-    PeerSecurityAudit, PeerSecurityError, PeerTicketClaims, PeerTicketMinter, PeerTicketVerifier,
-    StageBinding, StageOperationV1, StageTicketClaims, VerifiedClaimsBytes, stage_body_digest,
+    AuthorizedStage, OracleStageAuthority, PeerSecurityAudit, PeerSecurityError, PeerTicketClaims,
+    PeerTicketMinter, PeerTicketVerifier, StageBinding, StageOperationV1, StageTicketClaims,
+    VerifiedClaimsBytes, stage_body_digest,
 };
 use vala_bifrost_redux::oracle::telemetry::{
     AnalyticalStageAuthorityOutcome, record_stage_authority,
@@ -492,6 +493,38 @@ impl OraclePeerAuthority {
 }
 
 #[async_trait::async_trait]
+impl OracleStageAuthority for OraclePeerAuthority {
+    /// Signs one stage ticket through the server-owned Ed25519 authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns the closed operation-mismatch or encoding failure.
+    fn mint_stage(
+        &self,
+        operation: StageOperationV1,
+        claims: &StageTicketClaims,
+    ) -> Result<SignedPeerTicket, PeerSecurityError> {
+        self.mint_stage_inner(operation, claims)
+    }
+
+    /// Authorizes one stage operation before any decode, cache read, or I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns the closed failure for the first check that did not pass, or an
+    /// audit-unavailable refusal when the required durable row cannot commit.
+    async fn authorize_stage(
+        &self,
+        ticket: &SignedPeerTicket,
+        binding: &StageBinding,
+        body: &[u8],
+        now: DateTime<Utc>,
+    ) -> Result<AuthorizedStage, PeerSecurityError> {
+        self.authorize_stage_inner(ticket, binding, body, now).await
+    }
+}
+
+#[async_trait::async_trait]
 impl PeerTicketVerifier for OraclePeerAuthority {
     /// Verifies one raw ticket through the server-owned Ed25519 authority.
     ///
@@ -530,22 +563,6 @@ fn signing_input(key_id: &str, claims: &[u8]) -> Vec<u8> {
     signing_input_for(DOMAIN, key_id, claims)
 }
 
-/// One stage operation that passed every authority check.
-///
-/// Holding this value is the receiver's proof that it may now decode the
-/// operation's body, touch the task cache, construct providers, and issue I/O.
-/// Nothing downstream re-derives the tenant: it is the cryptographically
-/// verified one, carried here so a handler cannot accidentally resolve tenancy
-/// from an unverified field.
-#[derive(Debug, Clone)]
-pub struct AuthorizedStage {
-    /// The verified claims, already matched field-by-field to the receiver's
-    /// own [`StageBinding`].
-    pub claims: StageTicketClaims,
-    /// The tenant the signature actually bound.
-    pub tenant_id: DataTenantId,
-}
-
 impl OraclePeerAuthority {
     /// Signs one single-use ticket for exactly one Analytical stage operation.
     ///
@@ -560,7 +577,7 @@ impl OraclePeerAuthority {
     /// different operation than the one being signed, and
     /// [`PeerSecurityError::Encoding`] when the claims cannot be encoded or
     /// exceed [`MAX_STAGE_CLAIMS_BYTES`].
-    pub fn mint_stage(
+    fn mint_stage_inner(
         &self,
         operation: StageOperationV1,
         claims: &StageTicketClaims,
@@ -610,7 +627,7 @@ impl OraclePeerAuthority {
     /// `Operation`, `Audience`, `Fence`, `Claims`, `Expired`, `Replay`,
     /// `ReplayCapacity`, or [`PeerSecurityError::AuditUnavailable`] when the
     /// required audit row cannot commit. A rejection never returns claims.
-    pub async fn authorize_stage(
+    async fn authorize_stage_inner(
         &self,
         ticket: &SignedPeerTicket,
         binding: &StageBinding,

@@ -650,6 +650,68 @@ pub fn assignment_authority_digest_for(
         .map_err(|_| PeerSecurityError::Encoding)
 }
 
+/// One stage operation that passed every authority check.
+///
+/// Holding this value is the receiver's proof that it may now decode the
+/// operation's body, touch the task cache, construct providers, and issue I/O.
+/// Nothing downstream re-derives the tenant: it is the cryptographically
+/// verified one, carried here so a handler cannot accidentally resolve tenancy
+/// from an unverified field.
+#[derive(Debug, Clone)]
+pub struct AuthorizedStage {
+    /// The verified claims, already matched field-by-field to the receiver's
+    /// own [`StageBinding`].
+    pub claims: StageTicketClaims,
+    /// The tenant the signature actually bound.
+    pub tenant_id: DataTenantId,
+}
+
+/// The server-owned authority every Analytical stage operation passes through.
+///
+/// The contract lives here, next to the claims and binding it operates on, so
+/// the Oracle follower ingress can require authorization without depending on
+/// the server crate that owns the signing key. The server implements it on its
+/// existing peer authority; nothing else may.
+///
+/// Both directions are on one trait because they are one protocol: the leader
+/// mints exactly the ticket the follower will re-derive and check.
+#[async_trait]
+pub trait OracleStageAuthority: Send + Sync {
+    /// Signs one single-use ticket for exactly one stage operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerSecurityError::Operation`] when `claims` does not carry
+    /// `operation`, and [`PeerSecurityError::Encoding`] when the claims cannot
+    /// be encoded within the implementation's bound.
+    fn mint_stage(
+        &self,
+        operation: StageOperationV1,
+        claims: &StageTicketClaims,
+    ) -> Result<SignedPeerTicket, PeerSecurityError>;
+
+    /// Authorizes one stage operation before its body may be decoded or used.
+    ///
+    /// Holding the returned [`AuthorizedStage`] is the receiver's proof that
+    /// every check ran: signature over the operation's own domain, exact
+    /// body digest, field-by-field binding, deadline, expiry, and single-use
+    /// nonce consumption. A caller that decodes, reads a cache, constructs a
+    /// provider, or issues I/O before this returns has broken the contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns the closed [`PeerSecurityError`] for the first failed check, or
+    /// [`PeerSecurityError::AuditUnavailable`] when the required audit row
+    /// cannot commit. A rejection never returns claims.
+    async fn authorize_stage(
+        &self,
+        ticket: &SignedPeerTicket,
+        binding: &StageBinding,
+        body: &[u8],
+        now: DateTime<Utc>,
+    ) -> Result<AuthorizedStage, PeerSecurityError>;
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Barrier};

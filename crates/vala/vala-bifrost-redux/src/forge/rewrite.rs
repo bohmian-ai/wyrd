@@ -282,7 +282,10 @@ pub struct ForgeRewriteRuntime {
     /// Runtime environment sharing the host-provisioned memory pool.
     runtime: Arc<RuntimeEnv>,
     /// Current Forge-owned child removed automatically on clean shutdown.
-    spill_dir: tempfile::TempDir,
+    ///
+    /// Held, never read: dropping the runtime is what removes the directory,
+    /// so the field is the lifetime and nothing else consults it.
+    _spill_dir: tempfile::TempDir,
     /// Runtime-wide spill ceiling, equivalent to one operation under `tick`.
     ///
     /// Sort spill is the only consumer: rewrite output streams straight to the
@@ -359,19 +362,10 @@ impl ForgeRewriteRuntime {
         );
         Ok(Self {
             runtime,
-            spill_dir,
+            _spill_dir: spill_dir,
             spill_limit_bytes,
             scratch_peak_bytes: Arc::new(AtomicU64::new(0)),
         })
-    }
-
-    /// Shares the attempt's conservative sort-spill high-water counter.
-    ///
-    /// Batch state observes `DataFusion` spill progress between batches and
-    /// records it here, so final settlement reports the largest scratch the
-    /// attempt actually owned rather than its lease.
-    fn scratch_peak_handle(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.scratch_peak_bytes)
     }
 
     /// Returns the conservative attempt scratch peak used at final settlement.
@@ -390,12 +384,5 @@ impl ForgeRewriteRuntime {
     #[must_use]
     pub(crate) fn uses_memory_pool(&self, pool: &Arc<dyn MemoryPool>) -> bool {
         Arc::ptr_eq(&self.runtime.memory_pool, pool)
-    }
-
-    /// Return the owned `DataFusion` spill path for diagnostics and tests.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn spill_path(&self) -> &Path {
-        self.spill_dir.path()
     }
 }

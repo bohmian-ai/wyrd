@@ -318,6 +318,45 @@ pub(super) async fn read_promotion_demand(
     })
 }
 
+/// The complete input to one promotion fast-append.
+///
+/// The identities travel together because they are only meaningful together:
+/// the snapshot summary must carry the task and operation that produced this
+/// exact file set, and the attempt only labels the telemetry span. Grouping
+/// them also keeps the call site honest — a caller cannot silently transpose
+/// two `Uuid` arguments.
+pub(super) struct ForgePromotionCommit<'a> {
+    /// Table state the append is built against.
+    pub(super) table: &'a iceberg::table::Table,
+    /// Writer-owned `DataFile` values appended unchanged.
+    pub(super) data_files: Vec<iceberg::spec::DataFile>,
+    /// Durable task that owns this promotion.
+    pub(super) task_id: Uuid,
+    /// Attempt used only to label the commit span.
+    pub(super) attempt_id: Uuid,
+    /// Operation identity recovery and Oracle match on.
+    pub(super) operation_id: Uuid,
+}
+
+/// One promotion audit transition and the publication it settles with.
+///
+/// The phase, the snapshot it claims, and the plan it claims it for are one
+/// decision: a terminal phase carrying no snapshot means "nothing landed", and
+/// a committed snapshot without its plan cannot settle a row. Passing them as
+/// one value keeps the two halves from drifting apart at a call site.
+pub(super) struct ForgePromotionSettlement<'a> {
+    /// Exact ordered group this settlement is about.
+    pub(super) plan: &'a ScribePromotionPlan,
+    /// Durable phase this transition records.
+    pub(super) phase: ForgeScribePromotionPhase,
+    /// Operation identity shared by every phase of one promotion.
+    pub(super) operation_id: Uuid,
+    /// Snapshot the promotion was planned against.
+    pub(super) base_snapshot_id: i64,
+    /// Snapshot that now represents the group, when one landed.
+    pub(super) committed_snapshot_id: Option<i64>,
+}
+
 impl Forge {
     /// Revalidates one prepared promotion group against the objects that exist.
     ///
@@ -416,13 +455,16 @@ impl Forge {
     pub(super) async fn commit_promotion(
         &self,
         lease: &mut ForgeLease,
-        table: &iceberg::table::Table,
-        data_files: Vec<iceberg::spec::DataFile>,
-        task_id: Uuid,
-        attempt_id: Uuid,
-        operation_id: Uuid,
+        commit: ForgePromotionCommit<'_>,
         stop: &CancellationToken,
     ) -> Result<iceberg::table::Table, ForgeError> {
+        let ForgePromotionCommit {
+            table,
+            data_files,
+            task_id,
+            attempt_id,
+            operation_id,
+        } = commit;
         let span = super::metrics::ForgeTelemetry::catalog_commit_span(
             super::metrics::ForgeCatalogCommitStrategy::ScribePromotion,
             Some((task_id, attempt_id)),
@@ -511,12 +553,15 @@ impl Forge {
         &self,
         lease: &mut ForgeLease,
         binding: &TenantTableBinding,
-        plan: &ScribePromotionPlan,
-        phase: ForgeScribePromotionPhase,
-        operation_id: Uuid,
-        base_snapshot_id: i64,
-        committed_snapshot_id: Option<i64>,
+        settlement: ForgePromotionSettlement<'_>,
     ) -> Result<(), ForgeError> {
+        let ForgePromotionSettlement {
+            plan,
+            phase,
+            operation_id,
+            base_snapshot_id,
+            committed_snapshot_id,
+        } = settlement;
         if !lease.renew(&self.core.operator_pool).await? {
             return Err(ForgeError::FenceLost {
                 lease_key: lease.lease_key.clone(),

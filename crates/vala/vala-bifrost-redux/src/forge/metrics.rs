@@ -121,8 +121,6 @@ impl ForgeMetricStage {
 pub(super) enum ForgeCatalogCommitStrategy {
     /// A promotion fast-appends already-published Scribe objects unchanged.
     ScribePromotion,
-    /// A live small-file rewrite replaces current Iceberg data files.
-    SmallFiles,
 }
 
 impl ForgeCatalogCommitStrategy {
@@ -130,7 +128,6 @@ impl ForgeCatalogCommitStrategy {
     pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::ScribePromotion => "scribe_promotion",
-            Self::SmallFiles => "small_files",
         }
     }
 }
@@ -741,6 +738,18 @@ impl ForgeTelemetry {
     }
 
     /// Record final `DataFusion` spill accounting for one completed Forge attempt.
+    ///
+    /// No production caller exists while the rewrite route is dormant; the
+    /// telemetry contract tests are its only consumers.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the published `bifrost_forge_task_spill_bytes` family and its telemetry \
+                      binding stay registered while the rewrite route that produced it is \
+                      dormant; the expectation fails the moment a producer returns"
+        )
+    )]
     pub(super) fn record_task_spill(&self, strategy: ForgeTaskMetricStrategy, bytes: u64) {
         self.task_spill[&strategy].record(bytes.to_f64().unwrap_or(f64::MAX));
     }

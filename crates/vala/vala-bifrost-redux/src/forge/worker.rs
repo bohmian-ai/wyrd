@@ -45,7 +45,9 @@ use super::metrics::{
     ForgeTaskMetricStrategy, ForgeTaskTerminalResult,
 };
 use super::path::catalog_path_to_object_key;
-use super::scribe_promotion::ScribePromotionPlan;
+use super::scribe_promotion::{
+    ForgePromotionCommit, ForgePromotionSettlement, ScribePromotionPlan,
+};
 use super::{Forge, ForgeCapacity};
 use crate::catalog::TenantTableBinding;
 
@@ -2113,21 +2115,48 @@ impl ForgeWorker {
         })?;
         heartbeat_result?;
         let (evidence, state) = completion?;
-        // Promotion's SQL publication and terminal audit settle together, under
-        // the same fence, for every path that produced evidence: a fresh
-        // append, a recovered commit discovered on a retained snapshot, and a
-        // restarted attempt that finds its own settlement already durable.
-        if matches!(
+        self.settle_promotion_evidence(claim, binding, lease, &evidence, &state)
+            .await?;
+        self.record_rewrite_evidence(claim, &evidence);
+        self.finish_claim_execution(claim, attempt, lease, &evidence, state)
+            .await
+    }
+
+    /// Settles one promotion's publication and terminal audit for a finished attempt.
+    ///
+    /// Promotion's SQL publication and terminal audit settle together, under
+    /// the same fence, for every path that produced evidence: a fresh append, a
+    /// recovered commit discovered on a retained snapshot, and a restarted
+    /// attempt that finds its own settlement already durable. Non-promotion
+    /// strategies own no publication columns, so the call is a no-op for them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Invariant`] when the persisted promotion
+    /// parameters no longer decode, and the fence and SQL failures raised by
+    /// the settlement transaction.
+    async fn settle_promotion_evidence(
+        &self,
+        claim: &ForgeTaskClaim,
+        binding: &TenantTableBinding,
+        lease: &mut ForgeLease,
+        evidence: &ForgeTaskEvidence,
+        state: &ForgeExecutionEvidenceState,
+    ) -> Result<(), ForgeError> {
+        if !matches!(
             claim.strategy,
             ForgeClaimStrategy::Known(ForgeTaskStrategy::ScribePromotion)
         ) {
-            let plan = Self::promotion_plan(claim)?;
-            self.forge
-                .settle_promotion(
-                    lease,
-                    binding,
-                    &plan,
-                    match state {
+            return Ok(());
+        }
+        let plan = Self::promotion_plan(claim)?;
+        self.forge
+            .settle_promotion(
+                lease,
+                binding,
+                ForgePromotionSettlement {
+                    plan: &plan,
+                    phase: match state {
                         ForgeExecutionEvidenceState::RecoveredCommit => {
                             ForgeScribePromotionPhase::Recovered
                         }
@@ -2136,14 +2165,11 @@ impl ForgeWorker {
                             ForgeScribePromotionPhase::Committed
                         }
                     },
-                    Self::promotion_operation_id(claim),
-                    claim.base_snapshot_id,
-                    evidence.committed_snapshot_id,
-                )
-                .await?;
-        }
-        self.record_rewrite_evidence(claim, &evidence);
-        self.finish_claim_execution(claim, attempt, lease, &evidence, state)
+                    operation_id: Self::promotion_operation_id(claim),
+                    base_snapshot_id: claim.base_snapshot_id,
+                    committed_snapshot_id: evidence.committed_snapshot_id,
+                },
+            )
             .await
     }
 
@@ -2427,11 +2453,13 @@ impl ForgeWorker {
             .settle_promotion(
                 lease,
                 binding,
-                &plan,
-                ForgeScribePromotionPhase::Prepared,
-                operation_id,
-                claim.base_snapshot_id,
-                None,
+                ForgePromotionSettlement {
+                    plan: &plan,
+                    phase: ForgeScribePromotionPhase::Prepared,
+                    operation_id,
+                    base_snapshot_id: claim.base_snapshot_id,
+                    committed_snapshot_id: None,
+                },
             )
             .await?;
         let deadline = self.forge.core.clock.now()?
@@ -2448,11 +2476,13 @@ impl ForgeWorker {
                 .forge
                 .commit_promotion(
                     lease,
-                    base,
-                    data_files,
-                    claim.task_id,
-                    attempt,
-                    operation_id,
+                    ForgePromotionCommit {
+                        table: base,
+                        data_files,
+                        task_id: claim.task_id,
+                        attempt_id: attempt,
+                        operation_id,
+                    },
                     stop,
                 )
                 .await
@@ -2495,11 +2525,13 @@ impl ForgeWorker {
                     .settle_promotion(
                         lease,
                         binding,
-                        &plan,
-                        ForgeScribePromotionPhase::Reset,
-                        operation_id,
-                        claim.base_snapshot_id,
-                        None,
+                        ForgePromotionSettlement {
+                            plan: &plan,
+                            phase: ForgeScribePromotionPhase::Reset,
+                            operation_id,
+                            base_snapshot_id: claim.base_snapshot_id,
+                            committed_snapshot_id: None,
+                        },
                     )
                     .await?;
                 return Err(ForgeError::Catalog(conflict));

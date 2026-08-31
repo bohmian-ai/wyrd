@@ -1044,13 +1044,12 @@ impl<'forge> ForgeScheduler<'forge> {
     /// Returns [`ForgeError::Invariant`] when a manifest reports a negative
     /// length or when the byte estimate overflows.
     fn bound_maintenance_inputs(
-        &self,
         maintenance_inputs: Vec<&iceberg::spec::ManifestFile>,
     ) -> Result<(Vec<String>, Vec<u64>, u64), ForgeError> {
         let mut inputs = Vec::new();
         let mut input_bytes = Vec::new();
         let mut bytes = 0_u64;
-        for manifest in maintenance_inputs.into_iter() {
+        for manifest in maintenance_inputs {
             let size =
                 u64::try_from(manifest.manifest_length).map_err(|_| ForgeError::Invariant {
                     detail: "Iceberg manifest length is negative".to_owned(),
@@ -1114,7 +1113,7 @@ impl<'forge> ForgeScheduler<'forge> {
                 .collect::<Vec<_>>()
         };
         let (mut inputs, mut input_bytes, mut bytes) =
-            self.bound_maintenance_inputs(maintenance_inputs)?;
+            Self::bound_maintenance_inputs(maintenance_inputs)?;
         if inputs.is_empty() && reconciliation_due {
             inputs.push(format!("forge://reconcile/{}", snapshot.snapshot_id()));
             input_bytes.push(1);

@@ -41,10 +41,16 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use datafusion::error::DataFusionError;
-use datafusion::execution::SessionState;
 use datafusion::execution::runtime_env::RuntimeEnv;
+use datafusion::execution::{SendableRecordBatchStream, SessionState};
+use datafusion::physical_plan::{ExecutionPlan, execute_stream};
+use datafusion::prelude::SessionContext;
+use datafusion_distributed::SessionStateBuilderExt as _;
+use datafusion_distributed::{DistributedExt as _, WorkerResolver};
 use datafusion_distributed::{Worker, WorkerQueryContext, WorkerSessionBuilder};
 use http::HeaderMap;
+use std::time::Instant;
+use url::Url;
 use uuid::Uuid;
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::NodeId;
@@ -53,12 +59,18 @@ use super::analytical_supervisor::{
     AnalyticalAttemptGrant, AnalyticalAttemptGuard, AnalyticalAttemptKey, AnalyticalGraphGuard,
     AnalyticalSupervisor, AnalyticalSupervisorInspection, StageId, TaskId,
 };
-use super::analytical_transport::{StageWireIdentity, read_ticket};
+use super::analytical_transport::{
+    AnalyticalChannelResolver, AnalyticalCoordinatorIdentity, AnalyticalStageMinter,
+    StageWireIdentity, read_ticket,
+};
+use super::participant_cut::OracleQueryAttemptCut;
 use super::peer::{AuthorizedStage, OracleStageAuthority, PeerSecurityError, StageOperationV1};
 use super::spill::OracleSpillRuntime;
 use super::telemetry::{
     AnalyticalAttemptOutcome, AnalyticalStageOperation, record_stage_operation,
 };
+use super::{AuthorizedQueryContext, map_datafusion_error};
+use crate::resources::OracleQueryResources;
 use crate::resources::{OracleResourceRequest, OracleResources};
 use wyrd_spec::vala::api::QueryClass;
 
@@ -1259,4 +1271,376 @@ mod tests {
         assert_eq!(AnalyticalAttemptNumber::ONE.retry(), None);
         assert_eq!(AnalyticalAttemptNumber::from_u8(2), None);
     }
+}
+
+/// The exact worker set one Analytical attempt may place tasks on.
+///
+/// Upstream calls this during task-count assignment and again immediately
+/// before execution. Both calls must see the *same* set: the attempt's
+/// membership is the immutable [`OracleQueryAttemptCut`], never a live cluster
+/// view, so a topology change during the attempt cannot move work onto a node
+/// the attempt was never authorized to reach.
+#[derive(Debug)]
+pub struct AnalyticalWorkerResolver {
+    /// Private endpoints of the attempt's ready Oracle participants.
+    urls: Vec<Url>,
+}
+
+impl WorkerResolver for AnalyticalWorkerResolver {
+    /// Returns the attempt's frozen worker set.
+    ///
+    /// # Errors
+    ///
+    /// Never fails: the set was validated when the attempt cut was frozen.
+    fn get_urls(&self) -> Result<Vec<Url>, DataFusionError> {
+        Ok(self.urls.clone())
+    }
+}
+
+/// Node-scoped configuration for the inactive Analytical execution handle.
+pub struct AnalyticalExecutionConfig {
+    /// This node's own identity, minted as every ticket's source.
+    pub node_id: NodeId,
+    /// This node's own current Oracle role fence.
+    pub oracle_fence: u64,
+    /// Short acceptance window a minted stage ticket is valid for.
+    pub ticket_ttl: chrono::Duration,
+    /// Exchange-buffer child every attempt of a graph charges on this node.
+    pub exchange_buffer_bytes: usize,
+    /// Scratch child every attempt of a graph charges on this node.
+    pub scratch_bytes: u64,
+}
+
+/// Complete inputs for one inactive Analytical execution.
+///
+/// The plan is already physical and already distributed: classification,
+/// planning, and admission happened on the Interactive path before Analytical
+/// was selected, and this owner neither re-plans nor re-admits. Its digest
+/// travels with the request so a retry can prove it is re-executing the same
+/// plan rather than a newly planned one.
+pub struct AnalyticalExecutionRequest {
+    /// Authenticated principal, tenant, and audit correlation.
+    pub context: AuthorizedQueryContext,
+    /// The one client-visible identity of this query.
+    pub public_query_id: PublicQueryId,
+    /// The private distributed-graph identity of this attempt.
+    pub datafusion_query_id: DataFusionQueryId,
+    /// Immutable membership and deadline every stage of the attempt shares.
+    pub cut: OracleQueryAttemptCut,
+    /// The distributed physical plan to execute.
+    pub physical_plan: Arc<dyn ExecutionPlan>,
+    /// Digest pinning the exact plan, identical across the one allowed retry.
+    pub physical_plan_digest: [u8; 32],
+    /// The query envelope already admitted for this execution.
+    pub resources: OracleQueryResources,
+    /// Absolute execution deadline, identical across the one allowed retry.
+    pub deadline: Instant,
+    /// Pinned snapshot digest of the attempt's immutable cut.
+    pub snapshot_digest: String,
+    /// Reservation this graph's follower work charges against.
+    pub reservation_id: String,
+    /// Digest of the leader-authorized permissions for this query.
+    pub permission_digest: String,
+}
+
+/// What one inactive Analytical execution left behind once it drained.
+///
+/// Every field is observed *after* the attempt settled, so a nonzero retained
+/// count is a leak rather than work still in flight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnalyticalExecutionEvidence {
+    /// Attempt ordinal that produced the returned stream.
+    pub attempt: u32,
+    /// Supervisor state observed after the attempt settled.
+    pub supervisor: AnalyticalSupervisorInspection,
+}
+
+/// What the handle owned at the moment it was shut down.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnalyticalShutdownInspection {
+    /// Leader-side supervisor state released by shutdown.
+    pub leader: AnalyticalSupervisorInspection,
+    /// Follower-side ingress state released by shutdown.
+    pub follower: AnalyticalSupervisorInspection,
+}
+
+/// Production-unreachable owner of one node's distributed Analytical execution.
+///
+/// Nothing in Oracle's routing constructs or calls this owner; it exists so the
+/// distributed path can be proved end to end before it is ever selectable. It
+/// composes the owners that already exist — the follower ingress, the stage
+/// authority, the node supervisor, the spill owner, and Oracle telemetry — and
+/// adds only the leader-side session and channel composition.
+pub struct AnalyticalExecutionHandle {
+    /// This node's own follower ingress, so a leader can also serve stages.
+    worker: Arc<AnalyticalStageIngress>,
+    /// Server-owned authority that mints every outbound stage ticket.
+    authority: Arc<dyn OracleStageAuthority>,
+    /// Node-local supervisor owning leader-side graphs and attempts.
+    supervisor: Arc<AnalyticalSupervisor>,
+    /// Process spill owner bounding every query runtime this handle builds.
+    spill: Arc<OracleSpillRuntime>,
+    /// Node-scoped identity and budget configuration.
+    config: AnalyticalExecutionConfig,
+}
+
+impl fmt::Debug for AnalyticalExecutionHandle {
+    /// Reports node identity without rendering owned dependencies.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AnalyticalExecutionHandle")
+            .field("node_id", &self.config.node_id.as_uuid())
+            .field("oracle_fence", &self.config.oracle_fence)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AnalyticalExecutionHandle {
+    /// Composes the handle over this node's existing Analytical owners.
+    #[must_use]
+    pub fn new(
+        worker: Arc<AnalyticalStageIngress>,
+        authority: Arc<dyn OracleStageAuthority>,
+        supervisor: Arc<AnalyticalSupervisor>,
+        spill: Arc<OracleSpillRuntime>,
+        config: AnalyticalExecutionConfig,
+    ) -> Self {
+        Self {
+            worker,
+            authority,
+            supervisor,
+            spill,
+            config,
+        }
+    }
+
+    /// Reports whether this node can still admit Analytical work.
+    #[must_use]
+    pub fn is_healthy(&self) -> bool {
+        self.supervisor.is_healthy()
+    }
+
+    /// Returns the follower ingress this node serves stage operations through.
+    #[must_use]
+    pub fn worker(&self) -> &Arc<AnalyticalStageIngress> {
+        &self.worker
+    }
+
+    /// Executes one distributed physical plan without being reachable from routing.
+    ///
+    /// The whole point of this operation is what it installs before executing.
+    /// The graph is registered on the supervisor with a runtime built from
+    /// *this query's* admitted pool and scratch share, so every follower
+    /// descendant resolves that runtime rather than a process-lifetime one. The
+    /// attempt is then admitted, which splits the exchange-buffer and scratch
+    /// children from the same envelope, and the channel resolver is bound to
+    /// the attempt's frozen worker set so no stage can be placed on a node the
+    /// cut never authorized.
+    ///
+    /// The returned stream is lazy. The graph and attempt guards travel with it
+    /// and settle when it drains, so admission and the supervisor's accounting
+    /// outlive the last batch rather than the last call.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when the supervisor is shutting down
+    /// or a participant endpoint is not a valid URL,
+    /// [`BifrostError::QueryAdmissionRejected`] when the attempt's children
+    /// cannot be split from the admitted envelope, and
+    /// [`BifrostError::QueryExecutionFailed`] when `DataFusion` cannot build
+    /// the query runtime or start the plan.
+    pub async fn execute_inactive(
+        &self,
+        request: AnalyticalExecutionRequest,
+    ) -> Result<AnalyticalExecution, BifrostError> {
+        let graph = AnalyticalGraphKey::new(request.public_query_id, request.datafusion_query_id);
+        let runtime = self.spill.build_query_runtime(
+            request.resources.memory_pool(),
+            request.resources.scratch_bytes,
+        )?;
+        let granted_memory_bytes = request.resources.granted_memory_bytes;
+        let target_partitions = request.resources.target_partitions;
+        let graph_guard = self.supervisor.register_graph(
+            graph,
+            request.resources,
+            AnalyticalGraphRuntime::new(runtime, self.config.exchange_buffer_bytes),
+        )?;
+        let attempt_key = AnalyticalAttemptKey::new(
+            request.public_query_id,
+            request.datafusion_query_id,
+            StageId::new(0),
+            None,
+            AnalyticalAttemptNumber::ZERO,
+        );
+        let attempt = self.supervisor.spawn_attempt(
+            attempt_key,
+            AnalyticalAttemptGrant {
+                exchange_buffer_bytes: self.config.exchange_buffer_bytes,
+                scratch_bytes: self.config.scratch_bytes,
+            },
+        )?;
+        let session = self.leader_session(
+            AnalyticalSessionInputs {
+                context: &request.context,
+                cut: &request.cut,
+                snapshot_digest: &request.snapshot_digest,
+                reservation_id: &request.reservation_id,
+                permission_digest: &request.permission_digest,
+                granted_memory_bytes,
+                target_partitions,
+            },
+            graph,
+        )?;
+        let batches = execute_stream(Arc::clone(&request.physical_plan), session.task_ctx())
+            .map_err(|error| map_datafusion_error(&error))?;
+        record_stage_operation(AnalyticalStageOperation::SetPlan);
+        Ok(AnalyticalExecution {
+            batches,
+            graph: graph_guard,
+            attempt,
+        })
+    }
+
+    /// Releases every leader and follower owner this handle still holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when an ownership lock is poisoned.
+    pub async fn shutdown(self) -> Result<AnalyticalShutdownInspection, BifrostError> {
+        let follower = self.worker.shutdown().await?;
+        let leader = self.supervisor.shutdown().await?;
+        Ok(AnalyticalShutdownInspection { leader, follower })
+    }
+
+    /// Builds the leader session one attempt plans and executes through.
+    ///
+    /// The session carries three things nothing else installs: the query-owned
+    /// runtime resolved from the registered graph, the frozen worker set, and
+    /// the signing channel resolver bound to this query's coordinator identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when a participant endpoint is not a
+    /// valid URL or the graph's runtime is not registered.
+    fn leader_session(
+        &self,
+        inputs: AnalyticalSessionInputs<'_>,
+        graph: AnalyticalGraphKey,
+    ) -> Result<SessionContext, BifrostError> {
+        let AnalyticalSessionInputs {
+            context,
+            cut,
+            snapshot_digest,
+            reservation_id,
+            permission_digest,
+            granted_memory_bytes,
+            target_partitions,
+        } = inputs;
+        let runtime = self.supervisor.graph_runtime(graph)?;
+        let identity = Arc::new(AnalyticalCoordinatorIdentity {
+            source_node_id: self.config.node_id,
+            source_fence: self.config.oracle_fence,
+            tenant_id: context.data_tenant_id,
+            graph,
+            snapshot_digest: snapshot_digest.to_owned(),
+            attempt: u32::from(AnalyticalAttemptNumber::ZERO.as_u8()),
+            reservation_id: reservation_id.to_owned(),
+            permission_digest: permission_digest.to_owned(),
+        });
+        let destinations = self.destinations(cut)?;
+        let urls = destinations.keys().cloned().collect::<Vec<_>>();
+        let authority = Arc::clone(&self.authority);
+        let deadline_ms = cut.deadline().timestamp_millis();
+        let ticket_ttl = self.config.ticket_ttl;
+        let resolver = AnalyticalChannelResolver::new(
+            identity,
+            Arc::new(move |url: &Url| {
+                destinations.get(url).map(|(node_id, fence)| {
+                    Arc::new(AnalyticalStageMinter::new(
+                        Arc::clone(&authority),
+                        *node_id,
+                        *fence,
+                        deadline_ms,
+                        ticket_ttl,
+                    ))
+                })
+            }),
+        );
+        let shape = crate::resources::OracleSessionShape::for_grant(
+            granted_memory_bytes,
+            target_partitions,
+            urls.len(),
+        );
+        let mut config = shape.session_config();
+        config.set_distributed_worker_resolver(AnalyticalWorkerResolver { urls });
+        config.set_distributed_channel_resolver(resolver);
+        let state = datafusion::execution::session_state::SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(config)
+            .with_runtime_env(Arc::clone(runtime.runtime()))
+            .with_distributed_planner()
+            .build();
+        Ok(SessionContext::new_with_state(state))
+    }
+
+    /// Maps each participant endpoint to the fenced identity a ticket binds to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when a participant endpoint is not a
+    /// valid URL, which would otherwise leave a worker unreachable and unsigned.
+    fn destinations(
+        &self,
+        cut: &OracleQueryAttemptCut,
+    ) -> Result<HashMap<Url, (NodeId, u64)>, BifrostError> {
+        cut.oracles()
+            .iter()
+            .map(|participant| {
+                let url =
+                    Url::parse(&participant.endpoint).map_err(|error| BifrostError::Internal {
+                        detail: format!(
+                            "Oracle analytical participant endpoint is not a valid URL: {error}"
+                        ),
+                    })?;
+                Ok((url, (participant.node_id, participant.fencing_token)))
+            })
+            .collect()
+    }
+}
+
+/// The leader-session inputs one attempt composes its distributed session from.
+///
+/// These are read from the request before its admitted envelope is moved onto
+/// the supervisor, which is why they travel as a group rather than as a
+/// borrowed request.
+struct AnalyticalSessionInputs<'a> {
+    /// Authenticated principal, tenant, and audit correlation.
+    context: &'a AuthorizedQueryContext,
+    /// Immutable membership and deadline of the attempt.
+    cut: &'a OracleQueryAttemptCut,
+    /// Pinned snapshot digest of the attempt's cut.
+    snapshot_digest: &'a str,
+    /// Reservation the graph's follower work charges against.
+    reservation_id: &'a str,
+    /// Digest of the leader-authorized permissions for this query.
+    permission_digest: &'a str,
+    /// Ceiling this query's pool may grow to.
+    granted_memory_bytes: usize,
+    /// Query-local target partition count.
+    target_partitions: usize,
+}
+
+/// One started Analytical execution and the owners that settle with it.
+///
+/// The guards are returned rather than detached so the caller cannot drain the
+/// batches while the graph or attempt has already been released; dropping this
+/// value before draining abandons the attempt, which the supervisor records as
+/// cancelled rather than silently forgetting.
+pub struct AnalyticalExecution {
+    /// Lazy distributed batch stream produced by the attempt.
+    pub batches: SendableRecordBatchStream,
+    /// Graph ownership retained for as long as stages may be addressed.
+    pub graph: AnalyticalGraphGuard,
+    /// Attempt ownership retained for as long as stage work may run.
+    pub attempt: AnalyticalAttemptGuard,
 }

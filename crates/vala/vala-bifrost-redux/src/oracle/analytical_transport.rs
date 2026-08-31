@@ -107,6 +107,10 @@ pub(crate) fn governed_operation(path: &str) -> Option<StageOperationV1> {
     match path {
         COORDINATOR_CHANNEL_PATH => Some(StageOperationV1::SetPlan),
         EXECUTE_TASK_PATH => Some(StageOperationV1::ExecuteTask),
+        // Worker version discovery carries no stage identity and is refused
+        // rather than forwarded: Wyrd pins its own worker build, so a follower
+        // has nothing to tell a coordinator that the coordinator does not know.
+        WORKER_INFO_PATH => None,
         _ => None,
     }
 }
@@ -236,7 +240,7 @@ impl StageMessageReader {
 /// across the replay seam, which HTTP/2 does not require: message framing is
 /// independent of data-frame boundaries.
 #[derive(Debug)]
-pub(crate) struct ReplayBody<B> {
+pub struct ReplayBody<B> {
     /// Consumed chunks awaiting replay, in wire order.
     replay: VecDeque<Bytes>,
     /// The source body, resumed once every replayed chunk is delivered.
@@ -246,7 +250,7 @@ pub(crate) struct ReplayBody<B> {
 impl<B> ReplayBody<B> {
     /// Wraps `inner`, replaying `replay` in order before resuming it.
     #[must_use]
-    pub(crate) fn new(replay: VecDeque<Bytes>, inner: B) -> Self {
+    pub fn new(replay: VecDeque<Bytes>, inner: B) -> Self {
         Self { replay, inner }
     }
 }
@@ -875,14 +879,15 @@ impl<B: Default> RefusalResponse for Response<B> {
 /// the request while it is still raw HTTP: before tonic's decoder, before the
 /// worker's task cache, before provider construction, and before any I/O.
 #[derive(Clone)]
-pub(crate) struct AnalyticalStageAuthLayer {
+pub struct AnalyticalStageAuthLayer {
     /// Follower-owned admission and authority entry point for stage operations.
     ingress: Arc<AnalyticalStageIngress>,
 }
 
 impl AnalyticalStageAuthLayer {
     /// Builds the layer over the follower ingress that owns stage admission.
-    pub(crate) fn new(ingress: Arc<AnalyticalStageIngress>) -> Self {
+    #[must_use]
+    pub fn new(ingress: Arc<AnalyticalStageIngress>) -> Self {
         Self { ingress }
     }
 }
@@ -915,7 +920,7 @@ impl<S> tower::Layer<S> for AnalyticalStageAuthLayer {
 /// digest mismatch, a replayed nonce, or a refused admission — returns the closed
 /// `PermissionDenied` refusal without calling the inner service at all.
 #[derive(Clone)]
-pub(crate) struct AnalyticalStageAuth<S> {
+pub struct AnalyticalStageAuth<S> {
     /// Upstream's own unmodified worker service.
     inner: S,
     /// Follower-owned admission and authority entry point for stage operations.

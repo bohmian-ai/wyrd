@@ -95,7 +95,7 @@ impl std::fmt::Debug for ResolvedFollowerSource {
 /// authenticated schema or names it ambiguously. Neither is repaired: silently
 /// deduplicating or reordering a signed assignment would read something other
 /// than what the leader signed.
-fn signed_closure_schema(
+pub(super) fn signed_closure_schema(
     full_schema: &arrow::datatypes::Schema,
     required_columns: &[String],
 ) -> Result<SchemaRef, String> {

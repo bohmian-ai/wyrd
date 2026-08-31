@@ -79,6 +79,28 @@ pub(crate) struct RemoteScanPayload {
     /// Fingerprint of the expected provider schema.
     #[prost(string, tag = "2")]
     pub(crate) schema_fingerprint: String,
+    /// JSON-encoded [`FollowerScanAssignment`], present only for Analytical.
+    ///
+    /// The Interactive follower receives its assignments alongside the plan in
+    /// a separately signed `ExecuteFragmentRequest`, so its placeholders leave
+    /// this empty. An Analytical stage has no such envelope: upstream ships
+    /// only the serialized plan, and the stage ticket digests that plan, so
+    /// carrying the assignment *inside* the placeholder is what binds it to the
+    /// leader's signature. An empty value means "no assignment", never "an
+    /// assignment selecting nothing".
+    #[prost(bytes, tag = "3")]
+    pub(crate) assignment_json: Vec<u8>,
+    /// Closure schema the placeholder advertises, as `datafusion-proto` bytes.
+    ///
+    /// Only an Analytical placeholder needs this. Its Interactive counterpart
+    /// is replaced by a pre-resolved provider that already carries a schema,
+    /// while the Analytical decode has to publish plan properties before the
+    /// provider is resolved.
+    #[prost(bytes, tag = "4")]
+    pub(crate) closure_schema: Vec<u8>,
+    /// Output partitions the placeholder advertises. Zero is normalized to one.
+    #[prost(uint32, tag = "5")]
+    pub(crate) partitions: u32,
 }
 
 /// Serialized authenticated tripwire facts; its input remains a native extension child.
@@ -127,6 +149,13 @@ pub struct RemoteSourcePlaceholderExec {
     required_columns: Vec<String>,
     /// Closed leaf predicates computed by the same classifier, in filter order.
     predicates: Vec<wyrd_spec::vala::assignment_authority::ScanPredicate>,
+    /// Complete Analytical assignment this placeholder carries to its follower.
+    ///
+    /// `None` on the Interactive path, where the dispatcher signs and sends
+    /// assignments beside the plan. `Some` on the Analytical path, where the
+    /// placeholder is the only thing that crosses the wire and the stage
+    /// ticket's digest over the plan is what binds the assignment.
+    assignment: Option<Box<wyrd_spec::vala::api::FollowerScanAssignment>>,
 }
 
 impl RemoteSourcePlaceholderExec {
@@ -145,7 +174,35 @@ impl RemoteSourcePlaceholderExec {
             empty: datafusion::physical_plan::empty::EmptyExec::new(schema),
             required_columns: Vec::new(),
             predicates: Vec::new(),
+            assignment: None,
         }
+    }
+
+    /// Attaches the complete Analytical assignment this leaf carries.
+    ///
+    /// Only the Analytical leader calls this. The assignment names every file
+    /// the stage may read; upstream's scale-up handler narrows it to one task's
+    /// share before the plan is serialized, so what reaches a follower is that
+    /// follower's own slice and nothing wider.
+    #[must_use]
+    pub fn with_assignment(
+        mut self,
+        assignment: wyrd_spec::vala::api::FollowerScanAssignment,
+    ) -> Self {
+        self.assignment = Some(Box::new(assignment));
+        self
+    }
+
+    /// Returns the attached Analytical assignment, if this is an Analytical leaf.
+    #[must_use]
+    pub fn assignment(&self) -> Option<&wyrd_spec::vala::api::FollowerScanAssignment> {
+        self.assignment.as_deref()
+    }
+
+    /// Returns the partition count this placeholder advertises to planning.
+    #[must_use]
+    pub fn partitions(&self) -> usize {
+        self.empty.properties().partitioning.partition_count()
     }
 
     /// Advertises the session's target partition count for this source.
@@ -290,6 +347,44 @@ pub struct OraclePhysicalExtensionCodec {
     providers: Mutex<HashMap<String, Arc<dyn ExecutionPlan>>>,
     /// Exact follower audit owner used only when decoding a tenant tripwire.
     audit: Option<Arc<dyn super::OracleAudit>>,
+    /// Analytical leaf binding, present only on an Analytical follower session.
+    ///
+    /// Interactive followers resolve every provider before decode and register
+    /// them in `providers`. Analytical followers cannot: their plan arrives
+    /// through upstream's worker, which builds the session before it has the
+    /// plan bytes. This binding lets decode construct a lazily resolving leaf
+    /// instead of demanding a provider that could not yet exist.
+    analytical: Option<AnalyticalLeafBinding>,
+}
+
+/// Per-session capability an Analytical follower needs to build its own leaves.
+#[derive(Clone)]
+pub struct AnalyticalLeafBinding {
+    /// Role this node executes as, selecting the resolver's source family.
+    role: wyrd_spec::vala::api::ClusterRole,
+    /// Process resolver that turns a signed assignment into a local provider.
+    resolver: Arc<dyn super::follower::FollowerSourceResolver>,
+}
+
+impl AnalyticalLeafBinding {
+    /// Creates the Analytical decode binding for one follower session.
+    #[must_use]
+    pub fn new(
+        role: wyrd_spec::vala::api::ClusterRole,
+        resolver: Arc<dyn super::follower::FollowerSourceResolver>,
+    ) -> Self {
+        Self { role, resolver }
+    }
+}
+
+impl fmt::Debug for AnalyticalLeafBinding {
+    /// Renders only the non-secret role, never resolver internals.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AnalyticalLeafBinding")
+            .field("role", &self.role)
+            .finish_non_exhaustive()
+    }
 }
 
 impl std::fmt::Debug for OraclePhysicalExtensionCodec {
@@ -308,6 +403,7 @@ impl Default for OraclePhysicalExtensionCodec {
         Self {
             providers: Mutex::new(HashMap::new()),
             audit: None,
+            analytical: None,
         }
     }
 }
@@ -325,6 +421,21 @@ impl OraclePhysicalExtensionCodec {
         Self {
             providers: Mutex::new(providers),
             audit: None,
+            analytical: None,
+        }
+    }
+
+    /// Creates the Analytical codec used on both sides of a stage boundary.
+    ///
+    /// The same value encodes leaves on its way out and decodes them on its way
+    /// in, because upstream installs one user codec per session and a follower
+    /// running a middle stage does both.
+    #[must_use]
+    pub fn analytical(binding: AnalyticalLeafBinding) -> Self {
+        Self {
+            providers: Mutex::new(HashMap::new()),
+            audit: None,
+            analytical: Some(binding),
         }
     }
 
@@ -337,6 +448,7 @@ impl OraclePhysicalExtensionCodec {
         Self {
             providers: Mutex::new(providers),
             audit: Some(audit),
+            analytical: None,
         }
     }
 
@@ -446,6 +558,85 @@ impl OraclePhysicalExtensionCodec {
     }
 }
 
+/// Projects one placeholder into its wire payload.
+///
+/// An Interactive placeholder carries identity only; the follower already holds
+/// the signed assignment and a pre-resolved provider. An Analytical placeholder
+/// additionally carries its assignment, its closure schema, and its advertised
+/// partition count, because on that path the serialized plan is the *only*
+/// thing that crosses the wire.
+///
+/// # Errors
+///
+/// Returns [`DataFusionError::Plan`] when the assignment cannot be JSON-encoded
+/// or the closure schema cannot be projected into `datafusion-proto` form.
+fn remote_scan_payload(scan: &RemoteSourcePlaceholderExec) -> Result<RemoteScanPayload> {
+    let Some(assignment) = scan.assignment() else {
+        return Ok(RemoteScanPayload {
+            scan_id: scan.scan_id.clone(),
+            schema_fingerprint: scan.schema_fingerprint.clone(),
+            assignment_json: Vec::new(),
+            closure_schema: Vec::new(),
+            partitions: 0,
+        });
+    };
+    let assignment_json = serde_json::to_vec(assignment).map_err(|error| {
+        DataFusionError::Plan(format!("analytical assignment encoding failed: {error}"))
+    })?;
+    let schema = datafusion_proto::protobuf::Schema::try_from(scan.schema().as_ref())
+        .map_err(|error| {
+            DataFusionError::Plan(format!("analytical closure schema encoding failed: {error}"))
+        })?;
+    Ok(RemoteScanPayload {
+        scan_id: scan.scan_id.clone(),
+        schema_fingerprint: scan.schema_fingerprint.clone(),
+        assignment_json,
+        closure_schema: schema.encode_to_vec(),
+        partitions: u32::try_from(scan.partitions()).unwrap_or(u32::MAX),
+    })
+}
+
+/// Rebuilds the Analytical closure schema and assignment from one wire payload.
+///
+/// # Errors
+///
+/// Returns [`DataFusionError::Plan`] when the payload carries no assignment,
+/// when either encoded field is malformed, or when the closure schema cannot be
+/// projected back into Arrow form.
+fn analytical_leaf_parts(
+    payload: &RemoteScanPayload,
+) -> Result<(wyrd_spec::vala::api::FollowerScanAssignment, SchemaRef, usize)> {
+    if payload.assignment_json.is_empty() {
+        return Err(DataFusionError::Plan(format!(
+            "analytical remote scan {} carries no assignment",
+            payload.scan_id
+        )));
+    }
+    let assignment: wyrd_spec::vala::api::FollowerScanAssignment =
+        serde_json::from_slice(&payload.assignment_json).map_err(|error| {
+            DataFusionError::Plan(format!("invalid analytical assignment: {error}"))
+        })?;
+    if assignment.scan_id != payload.scan_id
+        || assignment.schema_fingerprint != payload.schema_fingerprint
+    {
+        return Err(DataFusionError::Plan(
+            "analytical assignment identity differs from its placeholder".to_owned(),
+        ));
+    }
+    let schema = datafusion_proto::protobuf::Schema::decode(payload.closure_schema.as_slice())
+        .map_err(|error| {
+            DataFusionError::Plan(format!("invalid analytical closure schema: {error}"))
+        })?;
+    let schema = arrow::datatypes::Schema::try_from(&schema).map_err(|error| {
+        DataFusionError::Plan(format!("invalid analytical closure schema: {error}"))
+    })?;
+    Ok((
+        assignment,
+        Arc::new(schema),
+        usize::try_from(payload.partitions).unwrap_or(1).max(1),
+    ))
+}
+
 impl PhysicalExtensionCodec for OraclePhysicalExtensionCodec {
     /// Reconstructs only a pre-resolved role-local provider for the authenticated scan.
     ///
@@ -471,16 +662,33 @@ impl PhysicalExtensionCodec for OraclePhysicalExtensionCodec {
                     RemoteScanPayload::decode(envelope.payload.as_slice()).map_err(|error| {
                         DataFusionError::Plan(format!("invalid remote scan payload: {error}"))
                     })?;
-                self.providers
+                let pre_resolved = self
+                    .providers
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&payload.scan_id)
-                    .ok_or_else(|| {
-                        DataFusionError::Plan(format!(
-                            "missing authenticated provider for scan {}",
-                            payload.scan_id
-                        ))
-                    })
+                    .remove(&payload.scan_id);
+                if let Some(provider) = pre_resolved {
+                    return Ok(provider);
+                }
+                // An Interactive follower has already registered every provider
+                // it was authorized to read, so an absent entry is a refusal.
+                // An Analytical follower has none: its assignment travels inside
+                // this payload, under the same ticket digest that authorized the
+                // raw message, and its provider is resolved on first execution.
+                let Some(binding) = self.analytical.as_ref() else {
+                    return Err(DataFusionError::Plan(format!(
+                        "missing authenticated provider for scan {}",
+                        payload.scan_id
+                    )));
+                };
+                let (assignment, schema, partitions) = analytical_leaf_parts(&payload)?;
+                Ok(Arc::new(super::analytical_scan::AnalyticalScanExec::new(
+                    assignment,
+                    binding.role,
+                    Arc::clone(&binding.resolver),
+                    schema,
+                    partitions,
+                )))
             }
             ORACLE_TENANT_TRIPWIRE_TAG => {
                 let [input] = inputs else {
@@ -525,11 +733,7 @@ impl PhysicalExtensionCodec for OraclePhysicalExtensionCodec {
         {
             (
                 ORACLE_REMOTE_SCAN_TAG,
-                RemoteScanPayload {
-                    scan_id: scan.scan_id.clone(),
-                    schema_fingerprint: scan.schema_fingerprint.clone(),
-                }
-                .encode_to_vec(),
+                remote_scan_payload(scan)?.encode_to_vec(),
             )
         } else if let Some(tripwire) = node.downcast_ref::<super::exec::TenantTripwireExec>() {
             (

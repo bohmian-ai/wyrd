@@ -57,6 +57,7 @@ use crate::scribe::tail_rpc::{TAIL_PROTOCOL_VERSION, TailReadTransport};
 
 mod admission;
 pub mod analytical;
+pub mod analytical_scan;
 pub mod analytical_supervisor;
 pub mod analytical_transport;
 pub mod attempt;

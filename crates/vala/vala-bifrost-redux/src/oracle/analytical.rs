@@ -1382,6 +1382,8 @@ pub struct AnalyticalExecutionHandle {
     supervisor: Arc<AnalyticalSupervisor>,
     /// Process spill owner bounding every query runtime this handle builds.
     spill: Arc<OracleSpillRuntime>,
+    /// Root Oracle capability this handle admits leader graph envelopes from.
+    oracle_resources: OracleResources,
     /// Node-scoped identity and budget configuration.
     config: AnalyticalExecutionConfig,
 }
@@ -1405,6 +1407,7 @@ impl AnalyticalExecutionHandle {
         authority: Arc<dyn OracleStageAuthority>,
         supervisor: Arc<AnalyticalSupervisor>,
         spill: Arc<OracleSpillRuntime>,
+        oracle_resources: OracleResources,
         config: AnalyticalExecutionConfig,
     ) -> Self {
         Self {
@@ -1412,6 +1415,7 @@ impl AnalyticalExecutionHandle {
             authority,
             supervisor,
             spill,
+            oracle_resources,
             config,
         }
     }
@@ -1490,6 +1494,7 @@ impl AnalyticalExecutionHandle {
                 permission_digest: &request.permission_digest,
                 granted_memory_bytes,
                 target_partitions,
+                work_units: request.cut.oracles().len(),
             },
             graph,
         )?;
@@ -1503,6 +1508,87 @@ impl AnalyticalExecutionHandle {
                 attempt,
             },
         })
+    }
+
+    /// Installs one inactive Analytical attempt and returns its leader session.
+    ///
+    /// This is the seam Oracle's raw-SQL harness leases through. Everything
+    /// before it — validation, classification, the participant cut, providers,
+    /// audit — is the production path unchanged; everything after it plans and
+    /// executes distributed because of the three things installed here: the
+    /// query-owned runtime resolved from the registered graph, the frozen
+    /// worker set, and the signing channel resolver.
+    ///
+    /// The leader admits its own Analytical query envelope here, exactly as a
+    /// follower does when it first sees a graph. The Interactive admission that
+    /// carried the query this far is left untouched, so an inactive Analytical
+    /// attempt charges a second envelope. That is deliberate for T1: the path
+    /// is unreachable from routing, and sharing one envelope across both would
+    /// mean reshaping production admission for a path production cannot select.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::QueryAdmissionRejected`] when the root
+    /// capability cannot admit an Analytical envelope,
+    /// [`BifrostError::Internal`] when the supervisor is shutting down or a
+    /// participant endpoint is not a valid URL, and
+    /// [`BifrostError::QueryExecutionFailed`] when `DataFusion` cannot build
+    /// the bounded query runtime.
+    pub fn lease_session(
+        &self,
+        attempt: &AnalyticalAttemptContext,
+        cut: &OracleQueryAttemptCut,
+        context: &AuthorizedQueryContext,
+        work_units: usize,
+    ) -> Result<(SessionContext, AnalyticalAttemptOwnership), BifrostError> {
+        let graph = AnalyticalGraphKey::new(attempt.public_query_id, attempt.datafusion_query_id);
+        let resources = self
+            .oracle_resources
+            .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 1.0))
+            .map_err(|_| BifrostError::QueryAdmissionRejected)?;
+        let granted_memory_bytes = resources.granted_memory_bytes;
+        let target_partitions = resources.target_partitions;
+        let runtime = self
+            .spill
+            .build_query_runtime(resources.memory_pool(), resources.scratch_bytes)?;
+        let graph_guard = self.supervisor.register_graph(
+            graph,
+            resources,
+            AnalyticalGraphRuntime::new(runtime, self.config.exchange_buffer_bytes),
+        )?;
+        let attempt_guard = self.supervisor.spawn_attempt(
+            AnalyticalAttemptKey::new(
+                attempt.public_query_id,
+                attempt.datafusion_query_id,
+                StageId::new(0),
+                None,
+                AnalyticalAttemptNumber::ZERO,
+            ),
+            AnalyticalAttemptGrant {
+                exchange_buffer_bytes: self.config.exchange_buffer_bytes,
+                scratch_bytes: self.config.scratch_bytes,
+            },
+        )?;
+        let session = self.leader_session(
+            AnalyticalSessionInputs {
+                context,
+                cut,
+                snapshot_digest: &attempt.snapshot_digest,
+                reservation_id: &attempt.reservation_id,
+                permission_digest: &attempt.permission_digest,
+                granted_memory_bytes,
+                target_partitions,
+                work_units,
+            },
+            graph,
+        )?;
+        Ok((
+            session,
+            AnalyticalAttemptOwnership {
+                graph: graph_guard,
+                attempt: attempt_guard,
+            },
+        ))
     }
 
     /// Releases every leader and follower owner this handle still holds.
@@ -1539,6 +1625,7 @@ impl AnalyticalExecutionHandle {
             permission_digest,
             granted_memory_bytes,
             target_partitions,
+            work_units,
         } = inputs;
         let runtime = self.supervisor.graph_runtime(graph)?;
         let identity = Arc::new(AnalyticalCoordinatorIdentity {
@@ -1573,7 +1660,7 @@ impl AnalyticalExecutionHandle {
         let shape = crate::resources::OracleSessionShape::for_grant(
             granted_memory_bytes,
             target_partitions,
-            urls.len(),
+            work_units,
         );
         let mut config = shape.session_config();
         config.set_distributed_worker_resolver(AnalyticalWorkerResolver { urls });
@@ -1632,6 +1719,27 @@ struct AnalyticalSessionInputs<'a> {
     granted_memory_bytes: usize,
     /// Query-local target partition count.
     target_partitions: usize,
+    /// Scannable work the pinned cut offers, used to shape parallelism.
+    work_units: usize,
+}
+
+/// The per-query identities one inactive Analytical attempt is leased under.
+///
+/// These are the parts of the coordinator identity that a caller allocates
+/// rather than the handle: the two query identities and the three digests the
+/// leader already resolved for the attempt.
+#[derive(Debug, Clone)]
+pub struct AnalyticalAttemptContext {
+    /// The one client-visible identity of this query.
+    pub public_query_id: PublicQueryId,
+    /// The private distributed-graph identity of this attempt.
+    pub datafusion_query_id: DataFusionQueryId,
+    /// Pinned snapshot digest of the attempt's immutable cut.
+    pub snapshot_digest: String,
+    /// Reservation this graph's follower work charges against.
+    pub reservation_id: String,
+    /// Digest of the leader-authorized permissions for this query.
+    pub permission_digest: String,
 }
 
 /// Graph and attempt ownership retained for one inactive Analytical attempt.

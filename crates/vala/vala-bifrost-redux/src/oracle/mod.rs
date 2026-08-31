@@ -1793,6 +1793,12 @@ struct SqlAttemptInput<'a> {
     /// transports cluster membership, not the file list, so a remote leader pins
     /// for itself.
     prepared: Option<PlannedSqlCut>,
+    /// Inactive Analytical lease, present only on the harness entry point.
+    ///
+    /// `None` on every production path, which is what keeps routing Interactive:
+    /// the attempt leases Oracle's own session and never installs a distributed
+    /// planner, worker set, or signing channel resolver.
+    analytical: Option<&'a analytical::AnalyticalAttemptContext>,
 }
 
 /// Retained local query engine owner.
@@ -2086,6 +2092,7 @@ impl Oracle {
                 authority,
                 supervisor,
                 Arc::clone(&config.spill_runtime),
+                config.memory.resources.clone(),
                 analytical::AnalyticalExecutionConfig {
                     node_id: analytical_node_id,
                     oracle_fence: analytical_fence,
@@ -2257,6 +2264,46 @@ impl Oracle {
             query_class,
             None,
             Some(planned),
+            None,
+        )
+        .await
+    }
+
+    /// Starts one raw-SQL query on the production-unreachable Analytical path.
+    ///
+    /// Everything up to the execution lease is the production path unchanged:
+    /// the same validation, classification, participant cut, providers, audit,
+    /// admission, and terminal stream owner. Only the leased session differs,
+    /// and that difference is what makes the plan distribute across followers
+    /// through the real signed private transport rather than execute on the
+    /// leader.
+    ///
+    /// Nothing in routing calls this. It exists so the distributed path can be
+    /// proved from raw SQL to drained result before it is ever selectable.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same stable query, catalog, admission, visibility, audit,
+    /// timeout, or execution errors as [`Self::query_sql`], plus
+    /// [`BifrostError::OracleRoleUnavailable`] when this node composed no
+    /// Analytical handle.
+    #[cfg(feature = "test-support")]
+    pub async fn query_sql_inactive_analytical(
+        &self,
+        context: AuthorizedQueryContext,
+        request: BifrostQueryRequest,
+        attempt: analytical::AnalyticalAttemptContext,
+    ) -> Result<OracleQueryStream, BifrostError> {
+        let (cut, planned) = self.prepare_query_attempt(&context, &request).await?;
+        let query_class = planned.query_class;
+        self.query_sql_with_cut_and_gate_lifecycle(
+            context,
+            request,
+            cut,
+            query_class,
+            None,
+            Some(planned),
+            Some(attempt),
         )
         .await
     }
@@ -2331,6 +2378,7 @@ impl Oracle {
             query_class,
             None,
             prepared,
+            None,
         )
         .await
     }
@@ -2363,6 +2411,7 @@ impl Oracle {
         query_class: QueryClass,
         gate_lifecycle: Option<Arc<crate::oracle::query_stream::QueryStreamLifecycle>>,
         mut prepared: Option<PlannedSqlCut>,
+        analytical: Option<analytical::AnalyticalAttemptContext>,
     ) -> Result<OracleQueryStream, BifrostError> {
         self.validate_query(&request)?;
         if !self.is_ready() {
@@ -2405,6 +2454,7 @@ impl Oracle {
                         // snapshot. A stale-Iceberg retry exists precisely to
                         // observe a newer catalog, so it must pin again.
                         prepared: prepared.take(),
+                        analytical: analytical.as_ref(),
                     },
                     &mut query_telemetry,
                 )
@@ -2459,6 +2509,7 @@ impl Oracle {
         participant_cut: &OracleQueryAttemptCut,
         deadline: Instant,
         phases: &mut AttemptPhaseTimer,
+        analytical: Option<&analytical::AnalyticalAttemptContext>,
     ) -> Result<
         (
             SessionContext,
@@ -2477,12 +2528,18 @@ impl Oracle {
             )
             .await?;
         phases.admitted();
-        let (session, mut admitted) = self.lease_session(
-            deadline,
-            admitted,
-            Self::scannable_work_units(&planned.cuts),
-            "lease rejection",
-        )?;
+        let work_units = Self::scannable_work_units(&planned.cuts);
+        let (session, mut admitted) = match analytical {
+            Some(attempt) => self.lease_analytical_session(
+                deadline,
+                admitted,
+                attempt,
+                participant_cut,
+                context,
+                work_units,
+            )?,
+            None => self.lease_session(deadline, admitted, work_units, "lease rejection")?,
+        };
         admitted.retain_physical_projections(&planned.cuts)?;
         let running_query =
             self.register_running_query(context, planned.query_class, &admitted, participant_cut)?;
@@ -2504,6 +2561,7 @@ impl Oracle {
             participant_cut,
             query_class: expected_query_class,
             prepared,
+            analytical,
         } = input;
         let stale_replacement = StaleReplacementGate::before_output(retry_ordinal);
         let planned = match prepared {
@@ -2525,7 +2583,14 @@ impl Oracle {
         self.ensure_query_telemetry(query_telemetry, request.visibility, planned.query_class);
         let mut phases = AttemptPhaseTimer::started();
         let (session, mut admitted, running_query) = self
-            .admit_and_lease_attempt(context, &planned, participant_cut, deadline, &mut phases)
+            .admit_and_lease_attempt(
+                context,
+                &planned,
+                participant_cut,
+                deadline,
+                &mut phases,
+                analytical,
+            )
             .await?;
         let mut drained = match self
             .audit_and_drain_cut(CutAuditInput {
@@ -3826,6 +3891,44 @@ impl Oracle {
         match self.execution_session(&admitted, work_units) {
             Ok(session) => Ok((session, admitted)),
             Err(error) => release_error(deadline, admitted, error, failure_phase),
+        }
+    }
+
+    /// Leases the inactive Analytical session for one attempt, or releases it.
+    ///
+    /// The returned session plans and executes distributed. Its graph and
+    /// attempt ownership is attached to the admitted guard rather than returned
+    /// separately, so it settles when the query stream drains and cannot be
+    /// dropped early by a caller that only holds the session.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable admission, supervisor, or runtime error after
+    /// synchronously releasing the supplied admission owner.
+    fn lease_analytical_session(
+        &self,
+        deadline: Instant,
+        admitted: AdmittedQueryGuard,
+        attempt: &analytical::AnalyticalAttemptContext,
+        participant_cut: &OracleQueryAttemptCut,
+        context: &AuthorizedQueryContext,
+        work_units: usize,
+    ) -> Result<(SessionContext, AdmittedQueryGuard), BifrostError> {
+        let Some(handle) = self.analytical.as_ref() else {
+            return release_error(
+                deadline,
+                admitted,
+                BifrostError::OracleRoleUnavailable,
+                "analytical lease without a composed handle",
+            );
+        };
+        match handle.lease_session(attempt, participant_cut, context, work_units) {
+            Ok((session, ownership)) => {
+                let mut admitted = admitted;
+                admitted.analytical = Some(ownership);
+                Ok((session, admitted))
+            }
+            Err(error) => release_error(deadline, admitted, error, "analytical lease rejection"),
         }
     }
 

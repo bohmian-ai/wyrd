@@ -52,6 +52,8 @@ typetag = { workspace = true }
 lru = { workspace = true }
 datafusion-distributed = { workspace = true }
 http = { workspace = true }
+http-body = { workspace = true }
+tower = { workspace = true }
 url = { workspace = true }
 datafusion = { workspace = true }
 datafusion-proto = { workspace = true }

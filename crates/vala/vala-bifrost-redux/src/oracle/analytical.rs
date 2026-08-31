@@ -41,25 +41,20 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use datafusion::error::DataFusionError;
+use datafusion::execution::SessionState;
 use datafusion::execution::runtime_env::RuntimeEnv;
-use datafusion::execution::{SendableRecordBatchStream, SessionState, TaskContext};
-use datafusion_distributed::{
-    CoordinatorToWorkerMsg, ExecuteTaskRequest, SetPlanRequest, Worker, WorkerQueryContext,
-    WorkerSessionBuilder, WorkerToCoordinatorMsg,
-};
-use futures_util::stream::BoxStream;
+use datafusion_distributed::{Worker, WorkerQueryContext, WorkerSessionBuilder};
 use http::HeaderMap;
 use uuid::Uuid;
 use wyrd_spec::vala::BifrostError;
-use wyrd_spec::vala::api::SignedPeerTicket;
+use wyrd_spec::vala::api::NodeId;
 
 use super::analytical_supervisor::{
     AnalyticalAttemptGrant, AnalyticalAttemptGuard, AnalyticalAttemptKey, AnalyticalGraphGuard,
     AnalyticalSupervisor, AnalyticalSupervisorInspection, StageId, TaskId,
 };
-use super::peer::{
-    AuthorizedStage, OracleStageAuthority, PeerSecurityError, StageBinding, StageOperationV1,
-};
+use super::analytical_transport::{StageWireIdentity, read_ticket};
+use super::peer::{AuthorizedStage, OracleStageAuthority, PeerSecurityError, StageOperationV1};
 use super::spill::OracleSpillRuntime;
 use super::telemetry::{
     AnalyticalAttemptOutcome, AnalyticalStageOperation, record_stage_operation,
@@ -518,6 +513,10 @@ impl WorkerSessionBuilder for AnalyticalSessionBuilder {
 /// the resource root and spill owner explicit rather than reachable through a
 /// process global.
 pub struct AnalyticalStageIngressConfig {
+    /// This follower's own node identity, bound as every ticket's audience.
+    pub node_id: NodeId,
+    /// This follower's own current Oracle role fence.
+    pub oracle_fence: u64,
     /// Server-owned authority every stage operation is checked against.
     pub authority: Arc<dyn OracleStageAuthority>,
     /// Node-local supervisor owning graphs, attempts, and the runtime registry.
@@ -545,6 +544,10 @@ pub struct AnalyticalStageIngressConfig {
 /// that names it and released when the graph is torn down, not when any one
 /// call returns.
 pub struct AnalyticalStageIngress {
+    /// This follower's own node identity, bound as every ticket's audience.
+    node_id: NodeId,
+    /// This follower's own current Oracle role fence.
+    oracle_fence: u64,
     /// Server-owned authority every stage operation is checked against.
     authority: Arc<dyn OracleStageAuthority>,
     /// Node-local supervisor owning graphs, attempts, and the runtime registry.
@@ -583,6 +586,8 @@ impl AnalyticalStageIngress {
     #[must_use]
     pub fn new(config: AnalyticalStageIngressConfig) -> Self {
         let AnalyticalStageIngressConfig {
+            node_id,
+            oracle_fence,
             authority,
             supervisor,
             oracle_resources,
@@ -593,6 +598,8 @@ impl AnalyticalStageIngress {
             supervisor.registry(),
         )));
         Self {
+            node_id,
+            oracle_fence,
             authority,
             supervisor,
             oracle_resources,
@@ -610,90 +617,60 @@ impl AnalyticalStageIngress {
         &self.worker
     }
 
-    /// Authorizes and installs one stage subplan, opening its coordinator channel.
+    /// Authorizes one governed stage message and admits the work it names.
     ///
-    /// `plan_bytes` are the exact encoded subplan the digest in `ticket` commits
-    /// to; they are the bytes upstream will decode, and they are not decoded
-    /// here. On the first authorized operation naming a graph this admits the
-    /// follower's own query envelope, builds the query-owned runtime bounded by
-    /// that envelope's scratch share, registers the graph, and admits the
-    /// attempt — all before any plan is touched.
+    /// `framed_message` is the complete encoded gRPC message — five-byte prefix
+    /// included — exactly as it arrived on the wire. It is the digest input and
+    /// nothing else: it is not decoded here, and it does not establish peer
+    /// identity, which peer mTLS and workload authentication already did.
+    ///
+    /// Everything downstream depends on this returning first. Nothing decodes a
+    /// plan, consults the task cache, constructs a provider, admits a resource,
+    /// or issues storage I/O until it has. On the first authorized `SetPlan`
+    /// naming a graph this admits the follower's own analytical query envelope,
+    /// builds a runtime whose disk manager is bounded by that envelope's scratch
+    /// share, registers the graph, and admits the attempt.
     ///
     /// # Errors
     ///
-    /// Returns [`BifrostError::QueryPeerSecurity`] when authorization fails for
-    /// any reason, [`BifrostError::QueryAuditUnavailable`] when the required
-    /// refusal audit could not commit, [`BifrostError::QueryAdmissionRejected`]
-    /// when this follower cannot admit the graph's envelope, and
-    /// [`BifrostError::QueryExecutionFailed`] when upstream refuses the plan.
-    pub async fn set_plan(
+    /// Returns [`BifrostError::QueryPeerSecurity`] for every authorization,
+    /// identity, or binding failure, [`BifrostError::QueryAuditUnavailable`]
+    /// when the required refusal audit could not commit,
+    /// [`BifrostError::QueryAdmissionRejected`] when this follower cannot admit
+    /// the graph's envelope, and [`BifrostError::QueryExecutionFailed`] when an
+    /// `ExecuteTask` names a graph that is not registered.
+    pub async fn authorize_stage_message(
         &self,
-        ticket: &SignedPeerTicket,
-        binding: &StageBinding,
-        request: SetPlanRequest,
-        plan_bytes: &[u8],
-        coordinator_stream: BoxStream<'static, Result<CoordinatorToWorkerMsg, DataFusionError>>,
+        operation: StageOperationV1,
+        headers: &HeaderMap,
+        framed_message: &[u8],
         now: DateTime<Utc>,
-    ) -> Result<BoxStream<'static, Result<WorkerToCoordinatorMsg, DataFusionError>>, BifrostError>
-    {
+    ) -> Result<AnalyticalAttemptKey, BifrostError> {
+        let identity =
+            StageWireIdentity::read(headers).map_err(|_| BifrostError::QueryPeerSecurity)?;
+        let ticket = read_ticket(headers).map_err(|_| BifrostError::QueryPeerSecurity)?;
+        let binding = identity.to_binding(operation, self.node_id, self.oracle_fence);
         let authorized = self
-            .authorize(StageOperationV1::SetPlan, ticket, binding, plan_bytes, now)
-            .await?;
-        let key = attempt_key(&authorized)?;
-        self.admit_graph(key.graph())?;
-        self.admit_attempt(key)?;
-        record_stage_operation(AnalyticalStageOperation::SetPlan);
-        self.worker
-            .coordinator_channel(key.graph().to_headers(), request, coordinator_stream)
+            .authority
+            .authorize_stage(&ticket, &binding, framed_message, now)
             .await
-            .map_err(|error| {
-                tracing::warn!(
-                    %error,
-                    public_query_id = %key.public_query_id,
-                    datafusion_query_id = %key.datafusion_query_id,
-                    stage = %key.stage,
-                    "Oracle analytical stage plan installation failed"
-                );
-                BifrostError::QueryExecutionFailed
-            })
-    }
-
-    /// Authorizes and executes one stage task's partition range.
-    ///
-    /// The returned streams and task context are the caller's to retain, cancel,
-    /// and join; nothing is detached here.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostError::QueryPeerSecurity`] when authorization fails,
-    /// [`BifrostError::QueryAuditUnavailable`] when the refusal audit could not
-    /// commit, and [`BifrostError::QueryExecutionFailed`] when the graph is not
-    /// registered or upstream refuses the partition range.
-    pub async fn execute_task(
-        &self,
-        ticket: &SignedPeerTicket,
-        binding: &StageBinding,
-        request: ExecuteTaskRequest,
-        body: &[u8],
-        now: DateTime<Utc>,
-    ) -> Result<(Vec<SendableRecordBatchStream>, Arc<TaskContext>), BifrostError> {
-        let authorized = self
-            .authorize(StageOperationV1::ExecuteTask, ticket, binding, body, now)
-            .await?;
+            .map_err(|error| match error {
+                PeerSecurityError::AuditUnavailable => BifrostError::QueryAuditUnavailable,
+                _ => BifrostError::QueryPeerSecurity,
+            })?;
         let key = attempt_key(&authorized)?;
-        self.supervisor.graph_runtime(key.graph())?;
-        record_stage_operation(AnalyticalStageOperation::ExecuteTask);
-        self.worker.execute_task(request).await.map_err(|error| {
-            tracing::warn!(
-                %error,
-                public_query_id = %key.public_query_id,
-                datafusion_query_id = %key.datafusion_query_id,
-                stage = %key.stage,
-                task = key.task.map(TaskId::as_usize),
-                "Oracle analytical stage task execution failed"
-            );
-            BifrostError::QueryExecutionFailed
-        })
+        match operation {
+            StageOperationV1::SetPlan => {
+                self.admit_graph(key.graph())?;
+                self.admit_attempt(key)?;
+                record_stage_operation(AnalyticalStageOperation::SetPlan);
+            }
+            StageOperationV1::ExecuteTask => {
+                self.supervisor.graph_runtime(key.graph())?;
+                record_stage_operation(AnalyticalStageOperation::ExecuteTask);
+            }
+        }
+        Ok(key)
     }
 
     /// Settles one attempt and releases the graph once its last attempt drains.
@@ -748,33 +725,6 @@ impl AnalyticalStageIngress {
             graphs.clear();
         }
         self.supervisor.shutdown().await
-    }
-
-    /// Runs the complete authority check for one stage operation.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostError::QueryAuditUnavailable`] when the durable refusal
-    /// record could not commit, and [`BifrostError::QueryPeerSecurity`] for
-    /// every other refusal. A refusal never returns claims.
-    async fn authorize(
-        &self,
-        operation: StageOperationV1,
-        ticket: &SignedPeerTicket,
-        binding: &StageBinding,
-        body: &[u8],
-        now: DateTime<Utc>,
-    ) -> Result<AuthorizedStage, BifrostError> {
-        if binding.operation != operation {
-            return Err(BifrostError::QueryPeerSecurity);
-        }
-        self.authority
-            .authorize_stage(ticket, binding, body, now)
-            .await
-            .map_err(|error| match error {
-                PeerSecurityError::AuditUnavailable => BifrostError::QueryAuditUnavailable,
-                _ => BifrostError::QueryPeerSecurity,
-            })
     }
 
     /// Admits this follower's own query envelope for a graph it has not seen.

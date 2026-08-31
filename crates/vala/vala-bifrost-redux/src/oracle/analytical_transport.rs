@@ -39,7 +39,7 @@
 //! preserving frame independence, trailers, body errors, cancellation, flow
 //! control, and backpressure.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -49,8 +49,24 @@ use std::task::{Context, Poll};
 use bytes::{Bytes, BytesMut};
 use http::{HeaderMap, HeaderValue, Request, Response};
 use http_body::{Body, Frame, SizeHint};
+use wyrd_tonic::tonic::body::Body as TonicBody;
 
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use datafusion::arrow::array::RecordBatch;
+use datafusion::common::DataFusionError;
+use datafusion::execution::TaskContext;
+use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
+use datafusion_distributed::grpc::{
+    BoxCloneSyncChannel, DefaultChannelResolver, create_worker_client,
+};
+use datafusion_distributed::{
+    ChannelResolver, CoordinatorToWorkerMsg, ExecuteTaskRequest, GetWorkerInfoRequest,
+    GetWorkerInfoResponse, SetPlanRequest, TaskKey, WorkerChannel, WorkerToCoordinatorMsg,
+};
+use futures_util::stream::BoxStream;
+use tower::Layer as _;
+use url::Url;
 use uuid::Uuid;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{NodeId, SignedPeerTicket};
@@ -338,7 +354,8 @@ impl StageHeaderNames {
     pub(crate) const SNAPSHOT_DIGEST: &'static str = "wyrd-oracle-stage-snapshot";
     /// Graph-local stage ordinal.
     pub(crate) const STAGE_ID: &'static str = "wyrd-oracle-stage-id";
-    /// Stage-local task ordinal, absent for plan installation.
+    /// Stage-local task ordinal, absent only for a stage-scoped operation
+    /// that addresses no single task.
     pub(crate) const TASK_ID: &'static str = "wyrd-oracle-stage-task-id";
     /// Attempt ordinal within the graph.
     pub(crate) const ATTEMPT: &'static str = "wyrd-oracle-stage-attempt";
@@ -773,13 +790,13 @@ pub(crate) struct AnalyticalStageMint<S> {
 
 impl<S, B> tower::Service<Request<B>> for AnalyticalStageMint<S>
 where
-    S: tower::Service<Request<ReplayBody<B>>> + Clone + Send + 'static,
+    S: tower::Service<Request<TonicBody>, Response = Response<TonicBody>> + Clone + Send + 'static,
     S::Future: Send,
-    S::Response: RefusalResponse,
     B: Body<Data = Bytes> + Unpin + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     /// The wrapped channel's response, unchanged on the success path.
-    type Response = S::Response;
+    type Response = Response<TonicBody>;
     /// The wrapped channel's error, unchanged.
     type Error = S::Error;
     /// Boxed because binding the first message requires reading the body.
@@ -793,29 +810,45 @@ where
     /// Signs the first message of a governed request, then forwards it.
     ///
     /// An ungoverned path is forwarded with an empty replay, which is a
-    /// structural no-op: the body is not read and its frames pass through.
+    /// structural no-op: the body is not read and its frames pass through. The
+    /// replayed body is re-boxed into the transport's own body type, so the
+    /// wrapped channel is the stock upstream client with nothing else changed.
     fn call(&mut self, request: Request<B>) -> Self::Future {
         let mut inner = self.inner.clone();
         let minter = Arc::clone(&self.minter);
         Box::pin(async move {
             let Some(operation) = governed_operation(request.uri().path()) else {
-                return inner.call(replay_request(request, VecDeque::new())).await;
+                return inner.call(forward(request, VecDeque::new())).await;
             };
             let (parts, mut body) = request.into_parts();
             let Ok((framed, replay)) = read_first_message(&mut body, MAX_STAGE_BODY_BYTES).await
             else {
-                return Ok(S::Response::refused());
+                return Ok(Response::refused());
             };
             let mut request = Request::from_parts(parts, body);
             let Ok(ticket) = minter.mint(operation, request.headers(), &framed, Utc::now()) else {
-                return Ok(S::Response::refused());
+                return Ok(Response::refused());
             };
             if write_ticket(request.headers_mut(), &ticket).is_err() {
-                return Ok(S::Response::refused());
+                return Ok(Response::refused());
             }
-            inner.call(replay_request(request, replay)).await
+            inner.call(forward(request, replay)).await
         })
     }
+}
+
+/// Rebuilds one outbound request over the transport's own body type.
+///
+/// The replayed head and the untouched remainder are re-boxed together, so the
+/// wrapped upstream client observes exactly the request it built plus the stage
+/// metadata this layer added.
+fn forward<B>(request: Request<B>, replay: VecDeque<Bytes>) -> Request<TonicBody>
+where
+    B: Body<Data = Bytes> + Unpin + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let (parts, body) = request.into_parts();
+    Request::from_parts(parts, TonicBody::new(ReplayBody::new(replay, body)))
 }
 
 /// A transport response that can carry a closed stage refusal.
@@ -929,6 +962,230 @@ where
                 .call(replay_request(Request::from_parts(parts, body), replay))
                 .await
         })
+    }
+}
+
+/// The query-invariant half of one coordinator's stage identity.
+///
+/// A leader resolves these once when it selects Analytical execution for a
+/// query: they name the graph, the tenant, the coordinator's own fenced
+/// identity, the pinned cut, the reservation the work charges, and the attempt.
+/// Only the stage and task ordinals vary between calls, and those are taken
+/// from upstream's own [`TaskKey`] rather than from anything a caller supplies.
+#[derive(Debug, Clone)]
+pub(crate) struct AnalyticalCoordinatorIdentity {
+    /// This coordinator's own node identity.
+    pub(crate) source_node_id: NodeId,
+    /// This coordinator's own current Oracle role fence.
+    pub(crate) source_fence: u64,
+    /// Authenticated data tenant of the query.
+    pub(crate) tenant_id: DataTenantId,
+    /// The two-identity graph every stage operation belongs to.
+    pub(crate) graph: AnalyticalGraphKey,
+    /// Pinned snapshot digest of the graph's immutable cut.
+    pub(crate) snapshot_digest: String,
+    /// Attempt ordinal, identical across every stage of one attempt.
+    pub(crate) attempt: u32,
+    /// Reservation the graph's work charges against.
+    pub(crate) reservation_id: String,
+    /// Digest of the leader-authorized permissions for this query.
+    pub(crate) permission_digest: String,
+}
+
+impl AnalyticalCoordinatorIdentity {
+    /// Projects the full wire identity for one addressed stage task.
+    #[must_use]
+    fn for_task(&self, task_key: TaskKey) -> StageWireIdentity {
+        StageWireIdentity {
+            source_node_id: self.source_node_id,
+            source_fence: self.source_fence,
+            tenant_id: self.tenant_id,
+            graph: self.graph,
+            snapshot_digest: self.snapshot_digest.clone(),
+            stage_id: u32::try_from(task_key.stage_id).unwrap_or(u32::MAX),
+            task_id: Some(u32::try_from(task_key.task_number).unwrap_or(u32::MAX)),
+            attempt: self.attempt,
+            reservation_id: self.reservation_id.clone(),
+            permission_digest: self.permission_digest.clone(),
+        }
+    }
+}
+
+/// Adds the Wyrd stage identity to every call on one upstream worker client.
+///
+/// The identity cannot be recovered from the raw bytes by the signing layer
+/// without decoding upstream's protobuf, which would be a second serialization
+/// bridge. It is instead written here, where upstream has already told us the
+/// [`TaskKey`] it is addressing, and the mint layer beneath then signs the
+/// headers together with the exact message they accompany.
+pub(crate) struct AnalyticalWorkerChannel {
+    /// The stock upstream client for the target worker.
+    inner: Box<dyn WorkerChannel>,
+    /// Query-invariant identity every call on this channel carries.
+    identity: Arc<AnalyticalCoordinatorIdentity>,
+}
+
+impl AnalyticalWorkerChannel {
+    /// Wraps one upstream client in this query's coordinator identity.
+    #[must_use]
+    pub(crate) fn new(
+        inner: Box<dyn WorkerChannel>,
+        identity: Arc<AnalyticalCoordinatorIdentity>,
+    ) -> Self {
+        Self { inner, identity }
+    }
+
+    /// Writes this query's stage identity for `task_key` onto `headers`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataFusionError::Execution`] when a component of the identity
+    /// cannot be represented on the transport, refusing to send a partial
+    /// binding that the follower would reject anyway.
+    fn stamp(&self, headers: &mut HeaderMap, task_key: TaskKey) -> Result<(), DataFusionError> {
+        self.identity
+            .for_task(task_key)
+            .write(headers)
+            .map_err(|_| {
+                DataFusionError::Execution(
+                    "Oracle analytical stage identity could not be encoded".to_owned(),
+                )
+            })
+    }
+}
+
+#[async_trait]
+impl WorkerChannel for AnalyticalWorkerChannel {
+    /// Stamps and delegates the stage's plan installation.
+    async fn coordinator_channel(
+        &mut self,
+        mut headers: HeaderMap,
+        set_plan_request: SetPlanRequest,
+        c2w_stream: BoxStream<'static, CoordinatorToWorkerMsg>,
+        metrics: ExecutionPlanMetricsSet,
+        task_ctx: &Arc<TaskContext>,
+    ) -> Result<BoxStream<'static, Result<WorkerToCoordinatorMsg, DataFusionError>>, DataFusionError>
+    {
+        self.stamp(&mut headers, set_plan_request.task_key)?;
+        self.inner
+            .coordinator_channel(headers, set_plan_request, c2w_stream, metrics, task_ctx)
+            .await
+    }
+
+    /// Stamps and delegates one task execution.
+    async fn execute_task(
+        &mut self,
+        mut headers: HeaderMap,
+        request: ExecuteTaskRequest,
+        metrics: ExecutionPlanMetricsSet,
+        task_ctx: &Arc<TaskContext>,
+    ) -> Result<Vec<BoxStream<'static, Result<RecordBatch, DataFusionError>>>, DataFusionError>
+    {
+        self.stamp(&mut headers, request.task_key)?;
+        self.inner
+            .execute_task(headers, request, metrics, task_ctx)
+            .await
+    }
+
+    /// Delegates worker version discovery, which carries no stage identity.
+    async fn get_worker_info(
+        &mut self,
+        request: GetWorkerInfoRequest,
+    ) -> Result<GetWorkerInfoResponse, DataFusionError> {
+        self.inner.get_worker_info(request).await
+    }
+}
+
+/// Resolves worker clients that sign every governed stage operation they send.
+///
+/// Connection establishment and reuse stay with upstream's own
+/// [`DefaultChannelResolver`]; this owner adds exactly two things over it — the
+/// signing layer beneath the client, and the identity stamp above it — so a
+/// coordinator cannot reach a follower with an unsigned stage operation.
+pub(crate) struct AnalyticalChannelResolver {
+    /// Upstream's own connection cache, reused unchanged.
+    channels: DefaultChannelResolver,
+    /// Query-invariant identity every call through this resolver carries.
+    identity: Arc<AnalyticalCoordinatorIdentity>,
+    /// Per-follower minters, keyed by the follower each one is bound to.
+    minters: Arc<std::sync::Mutex<HashMap<Url, Arc<AnalyticalStageMinter>>>>,
+    /// Builds the minter for a follower this resolver has not yet reached.
+    mint_for: Arc<dyn Fn(&Url) -> Option<Arc<AnalyticalStageMinter>> + Send + Sync>,
+}
+
+impl fmt::Debug for AnalyticalChannelResolver {
+    /// Reports the graph without rendering owned dependencies.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AnalyticalChannelResolver")
+            .field("graph", &self.identity.graph)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AnalyticalChannelResolver {
+    /// Builds the resolver for one query's coordinator identity.
+    ///
+    /// `mint_for` resolves the follower-bound minter for a worker URL. It
+    /// returns `None` for a URL this coordinator has no authorized destination
+    /// identity for, which fails the resolution closed rather than sending an
+    /// unsigned operation.
+    #[must_use]
+    pub(crate) fn new(
+        identity: Arc<AnalyticalCoordinatorIdentity>,
+        mint_for: Arc<dyn Fn(&Url) -> Option<Arc<AnalyticalStageMinter>> + Send + Sync>,
+    ) -> Self {
+        Self {
+            channels: DefaultChannelResolver::default(),
+            identity,
+            minters: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            mint_for,
+        }
+    }
+
+    /// Returns the minter bound to `url`, resolving it once and caching it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataFusionError::Execution`] when the cache lock is poisoned
+    /// or this coordinator has no authorized destination identity for `url`.
+    fn minter(&self, url: &Url) -> Result<Arc<AnalyticalStageMinter>, DataFusionError> {
+        let mut minters = self.minters.lock().map_err(|_| {
+            DataFusionError::Execution("Oracle analytical minter cache is poisoned".to_owned())
+        })?;
+        if let Some(minter) = minters.get(url) {
+            return Ok(Arc::clone(minter));
+        }
+        let minter = (self.mint_for)(url).ok_or_else(|| {
+            DataFusionError::Execution(format!(
+                "Oracle analytical execution has no authorized destination identity for {url}"
+            ))
+        })?;
+        minters.insert(url.clone(), Arc::clone(&minter));
+        Ok(minter)
+    }
+}
+
+#[async_trait]
+impl ChannelResolver for AnalyticalChannelResolver {
+    /// Builds a signing, identity-stamping client for one follower URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns upstream's own connection error, or
+    /// [`DataFusionError::Execution`] when no authorized destination identity
+    /// exists for `url`.
+    async fn get_worker_client_for_url(
+        &self,
+        url: &Url,
+    ) -> Result<Box<dyn WorkerChannel>, DataFusionError> {
+        let minter = self.minter(url)?;
+        let channel = self.channels.get_channel(url).await?;
+        let signed = BoxCloneSyncChannel::new(AnalyticalStageMintLayer::new(minter).layer(channel));
+        Ok(Box::new(AnalyticalWorkerChannel::new(
+            create_worker_client(signed),
+            Arc::clone(&self.identity),
+        )))
     }
 }
 

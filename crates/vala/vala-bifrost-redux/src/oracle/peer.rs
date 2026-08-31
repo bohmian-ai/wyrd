@@ -238,7 +238,8 @@ pub struct StageBinding {
     pub snapshot_digest: String,
     /// Graph-local stage identifier being addressed.
     pub stage_id: u32,
-    /// Graph-local task identifier, absent for `SetPlan`.
+    /// Graph-local task identifier, absent only for a stage-scoped operation
+    /// that addresses no single task.
     pub task_id: Option<u32>,
     /// Attempt ordinal being addressed.
     pub attempt: u32,

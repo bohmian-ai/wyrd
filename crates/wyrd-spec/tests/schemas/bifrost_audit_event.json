@@ -1256,6 +1256,13 @@
           ]
         },
         {
+          "description": "Private stage-operation binding mismatch: a signed Analytical stage ticket did not match the receiving follower's own expectation for the operation, either query identity, the pinned snapshot, the stage, the task, the attempt, the reservation, or the authorized permissions, so the operation was refused before any plan decode, task-cache lookup, provider construction, or object I/O.",
+          "type": "string",
+          "enum": [
+            "peer_stage_binding"
+          ]
+        },
+        {
           "description": "Invalid Scribe-tail ticket audience.",
           "type": "string",
           "enum": [

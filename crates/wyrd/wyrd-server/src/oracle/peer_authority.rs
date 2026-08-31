@@ -11,7 +11,10 @@ use std::sync::Arc;
 use vala_bifrost_redux::oracle::peer::PeerReplayCache;
 use vala_bifrost_redux::oracle::peer::{
     PeerSecurityAudit, PeerSecurityError, PeerTicketClaims, PeerTicketMinter, PeerTicketVerifier,
-    VerifiedClaimsBytes,
+    StageBinding, StageOperationV1, StageTicketClaims, VerifiedClaimsBytes, stage_body_digest,
+};
+use vala_bifrost_redux::oracle::telemetry::{
+    AnalyticalStageAuthorityOutcome, record_stage_authority,
 };
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
@@ -25,6 +28,10 @@ const DOMAIN: &[u8] = b"wyrd.oracle.peer.v1\0";
 const FORWARD_QUERY_DOMAIN: &[u8] = b"wyrd.oracle.forward-query.v1\0";
 /// Hard cap applied before any claims bytes are decoded.
 const MAX_CLAIMS_BYTES: usize = 16 * 1024;
+/// Hard cap applied to stage claims before decoding; stage claims are wider
+/// than fragment claims because they bind two query identities, a stage, a
+/// task, an attempt, and a reservation on top of the peer fields.
+const MAX_STAGE_CLAIMS_BYTES: usize = 32 * 1024;
 /// Query envelopes include the bounded public SQL request and immutable participant cut.
 const MAX_FORWARD_QUERY_BYTES: usize = 128 * 1024;
 /// Default bound on unexpired single-use ticket identities.
@@ -523,6 +530,313 @@ fn signing_input(key_id: &str, claims: &[u8]) -> Vec<u8> {
     signing_input_for(DOMAIN, key_id, claims)
 }
 
+/// One stage operation that passed every authority check.
+///
+/// Holding this value is the receiver's proof that it may now decode the
+/// operation's body, touch the task cache, construct providers, and issue I/O.
+/// Nothing downstream re-derives the tenant: it is the cryptographically
+/// verified one, carried here so a handler cannot accidentally resolve tenancy
+/// from an unverified field.
+#[derive(Debug, Clone)]
+pub struct AuthorizedStage {
+    /// The verified claims, already matched field-by-field to the receiver's
+    /// own [`StageBinding`].
+    pub claims: StageTicketClaims,
+    /// The tenant the signature actually bound.
+    pub tenant_id: DataTenantId,
+}
+
+impl OraclePeerAuthority {
+    /// Signs one single-use ticket for exactly one Analytical stage operation.
+    ///
+    /// The signature is produced over the operation's own domain separator, so
+    /// a `SetPlan` ticket cannot be presented as an `ExecuteTask` ticket even
+    /// with identical claims bytes: the receiver checks the domain its own
+    /// entry point implements, not one named in the message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerSecurityError::Operation`] when the claims name a
+    /// different operation than the one being signed, and
+    /// [`PeerSecurityError::Encoding`] when the claims cannot be encoded or
+    /// exceed [`MAX_STAGE_CLAIMS_BYTES`].
+    pub fn mint_stage(
+        &self,
+        operation: StageOperationV1,
+        claims: &StageTicketClaims,
+    ) -> Result<SignedPeerTicket, PeerSecurityError> {
+        if StageOperationV1::from_u32(claims.operation) != Some(operation) {
+            return Err(PeerSecurityError::Operation);
+        }
+        let mut claims_bytes = Vec::new();
+        Message::encode(claims, &mut claims_bytes).map_err(|_| PeerSecurityError::Encoding)?;
+        if claims_bytes.is_empty() || claims_bytes.len() > MAX_STAGE_CLAIMS_BYTES {
+            return Err(PeerSecurityError::Encoding);
+        }
+        let signature = self.signing.sign(&signing_input_for(
+            operation.domain(),
+            &self.key_id,
+            &claims_bytes,
+        ));
+        Ok(SignedPeerTicket {
+            key_id: self.key_id.clone(),
+            claims_bytes,
+            signature: signature.to_bytes().to_vec(),
+        })
+    }
+
+    /// Authorizes one stage operation before any decode, cache access, or I/O.
+    ///
+    /// The order here is the security property, not an implementation detail:
+    ///
+    /// 1. key identity, signature length, and the claims-byte bound — no
+    ///    attacker-controlled length reaches a parser;
+    /// 2. the Ed25519 signature over this operation's own domain;
+    /// 3. the bounded raw body's digest, so the bytes about to be decoded are
+    ///    exactly the bytes that were signed for;
+    /// 4. claims decode, then tenant extraction from the *verified* bytes;
+    /// 5. a field-by-field match against the receiver's own [`StageBinding`];
+    /// 6. the absolute query deadline and the ticket's own short expiry; and
+    /// 7. single-use nonce consumption, last, so a request that fails any
+    ///    earlier check cannot burn a nonce a legitimate retry still needs.
+    ///
+    /// Only after all seven does the caller learn the operation is authorized.
+    /// Every refusal commits a durable audit row before it returns, and emits
+    /// closed-label stage-authority telemetry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerSecurityError::UnknownKey`], `InvalidSignature`, `Body`,
+    /// `Operation`, `Audience`, `Fence`, `Claims`, `Expired`, `Replay`,
+    /// `ReplayCapacity`, or [`PeerSecurityError::AuditUnavailable`] when the
+    /// required audit row cannot commit. A rejection never returns claims.
+    pub async fn authorize_stage(
+        &self,
+        ticket: &SignedPeerTicket,
+        binding: &StageBinding,
+        body: &[u8],
+        now: DateTime<Utc>,
+    ) -> Result<AuthorizedStage, PeerSecurityError> {
+        if ticket.key_id != self.key_id {
+            return self
+                .reject_stage_unverified(
+                    binding.operation,
+                    BifrostSecurityViolationKind::PeerUnknownKey,
+                    PeerSecurityError::UnknownKey,
+                    AnalyticalStageAuthorityOutcome::Signature,
+                )
+                .await;
+        }
+        if ticket.signature.len() != 64
+            || ticket.claims_bytes.is_empty()
+            || ticket.claims_bytes.len() > MAX_STAGE_CLAIMS_BYTES
+        {
+            return self
+                .reject_stage_unverified(
+                    binding.operation,
+                    BifrostSecurityViolationKind::PeerSignature,
+                    PeerSecurityError::InvalidSignature,
+                    AnalyticalStageAuthorityOutcome::Signature,
+                )
+                .await;
+        }
+        let Ok(signature) = Signature::from_slice(&ticket.signature) else {
+            return self
+                .reject_stage_unverified(
+                    binding.operation,
+                    BifrostSecurityViolationKind::PeerSignature,
+                    PeerSecurityError::InvalidSignature,
+                    AnalyticalStageAuthorityOutcome::Signature,
+                )
+                .await;
+        };
+        if self
+            .verifying
+            .verify(
+                &signing_input_for(
+                    binding.operation.domain(),
+                    &ticket.key_id,
+                    &ticket.claims_bytes,
+                ),
+                &signature,
+            )
+            .is_err()
+        {
+            return self
+                .reject_stage_unverified(
+                    binding.operation,
+                    BifrostSecurityViolationKind::PeerSignature,
+                    PeerSecurityError::InvalidSignature,
+                    AnalyticalStageAuthorityOutcome::Signature,
+                )
+                .await;
+        }
+        let body_digest = match stage_body_digest(body) {
+            Ok(digest) => digest,
+            Err(error) => {
+                return self
+                    .reject_stage_unverified(
+                        binding.operation,
+                        BifrostSecurityViolationKind::PeerFragment,
+                        error,
+                        AnalyticalStageAuthorityOutcome::Body,
+                    )
+                    .await;
+            }
+        };
+        let Ok(claims) = StageTicketClaims::decode(ticket.claims_bytes.as_slice()) else {
+            return self
+                .reject_stage_unverified(
+                    binding.operation,
+                    BifrostSecurityViolationKind::PeerSignature,
+                    PeerSecurityError::InvalidSignature,
+                    AnalyticalStageAuthorityOutcome::Signature,
+                )
+                .await;
+        };
+        let Some(tenant_id) = uuid::Uuid::from_slice(&claims.tenant_id)
+            .ok()
+            .and_then(|tenant| DataTenantId::new(tenant).ok())
+        else {
+            return self
+                .reject_stage_unverified(
+                    binding.operation,
+                    BifrostSecurityViolationKind::PeerTenant,
+                    PeerSecurityError::Claims,
+                    AnalyticalStageAuthorityOutcome::Binding,
+                )
+                .await;
+        };
+        if let Err(error) = claims.verify_binding(binding, &body_digest) {
+            let (violation, outcome) = stage_binding_violation(&error);
+            return self
+                .reject_stage_verified(binding.operation, tenant_id, violation, error, outcome)
+                .await;
+        }
+        if claims.absolute_deadline_ms <= now.timestamp_millis() {
+            return self
+                .reject_stage_verified(
+                    binding.operation,
+                    tenant_id,
+                    BifrostSecurityViolationKind::PeerStageBinding,
+                    PeerSecurityError::Expired,
+                    AnalyticalStageAuthorityOutcome::Expired,
+                )
+                .await;
+        }
+        let max_expiry = now
+            .checked_add_signed(self.max_ticket_ttl)
+            .ok_or(PeerSecurityError::Expired)?;
+        if claims.expires_at_ms <= now.timestamp_millis()
+            || claims.expires_at_ms > max_expiry.timestamp_millis()
+            || claims.nonce.len() < 16
+        {
+            return self
+                .reject_stage_verified(
+                    binding.operation,
+                    tenant_id,
+                    BifrostSecurityViolationKind::PeerReplay,
+                    PeerSecurityError::Expired,
+                    AnalyticalStageAuthorityOutcome::Expired,
+                )
+                .await;
+        }
+        let expires = chrono::DateTime::from_timestamp_millis(claims.expires_at_ms)
+            .ok_or(PeerSecurityError::Expired)?;
+        if let Err(error) = self
+            .replay
+            .consume(&ticket.key_id, &claims.nonce, expires, now)
+        {
+            return self
+                .reject_stage_verified(
+                    binding.operation,
+                    tenant_id,
+                    BifrostSecurityViolationKind::PeerReplay,
+                    error,
+                    AnalyticalStageAuthorityOutcome::Replay,
+                )
+                .await;
+        }
+        record_stage_authority(
+            binding.operation.telemetry(),
+            AnalyticalStageAuthorityOutcome::Authorized,
+        );
+        Ok(AuthorizedStage { claims, tenant_id })
+    }
+
+    /// Audits and counts a stage rejection with no cryptographically known tenant.
+    ///
+    /// # Errors
+    /// Returns [`PeerSecurityError::AuditUnavailable`] when the system-chain row
+    /// cannot commit; otherwise returns the original closed rejection.
+    async fn reject_stage_unverified(
+        &self,
+        operation: StageOperationV1,
+        violation: BifrostSecurityViolationKind,
+        error: PeerSecurityError,
+        outcome: AnalyticalStageAuthorityOutcome,
+    ) -> Result<AuthorizedStage, PeerSecurityError> {
+        record_stage_authority(operation.telemetry(), outcome);
+        self.security_audit
+            .append_unverified_ticket_rejection(violation)
+            .await
+            .map_err(|_| PeerSecurityError::AuditUnavailable)?;
+        Err(error)
+    }
+
+    /// Audits and counts a stage rejection against the verified tenant chain.
+    ///
+    /// # Errors
+    /// Returns [`PeerSecurityError::AuditUnavailable`] when the tenant-scoped row
+    /// cannot commit; otherwise returns the original closed rejection.
+    async fn reject_stage_verified(
+        &self,
+        operation: StageOperationV1,
+        tenant_id: DataTenantId,
+        violation: BifrostSecurityViolationKind,
+        error: PeerSecurityError,
+        outcome: AnalyticalStageAuthorityOutcome,
+    ) -> Result<AuthorizedStage, PeerSecurityError> {
+        record_stage_authority(operation.telemetry(), outcome);
+        self.security_audit
+            .append_verified_ticket_violation(tenant_id, violation)
+            .await
+            .map_err(|_| PeerSecurityError::AuditUnavailable)?;
+        Err(error)
+    }
+}
+
+/// Projects one binding failure onto its audit class and telemetry outcome.
+///
+/// Kept as a free function because it is a pure closed-set mapping with no
+/// authority state; the audit kind and the metric label are chosen together so
+/// the two surfaces can never disagree about why a stage was refused.
+fn stage_binding_violation(
+    error: &PeerSecurityError,
+) -> (
+    BifrostSecurityViolationKind,
+    AnalyticalStageAuthorityOutcome,
+) {
+    match *error {
+        PeerSecurityError::Audience => (
+            BifrostSecurityViolationKind::PeerAudience,
+            AnalyticalStageAuthorityOutcome::Binding,
+        ),
+        PeerSecurityError::Fence => (
+            BifrostSecurityViolationKind::PeerFence,
+            AnalyticalStageAuthorityOutcome::Binding,
+        ),
+        PeerSecurityError::Body => (
+            BifrostSecurityViolationKind::PeerFragment,
+            AnalyticalStageAuthorityOutcome::Body,
+        ),
+        _ => (
+            BifrostSecurityViolationKind::PeerStageBinding,
+            AnalyticalStageAuthorityOutcome::Binding,
+        ),
+    }
+}
+
 /// Builds a signing preimage for one closed private protocol domain.
 fn signing_input_for(domain: &[u8], key_id: &str, claims: &[u8]) -> Vec<u8> {
     [domain, key_id.as_bytes(), claims].concat()
@@ -532,6 +846,7 @@ fn signing_input_for(domain: &[u8], key_id: &str, claims: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use vala_bifrost_redux::oracle::peer::{PeerSecurityAudit, PeerSecurityAuditError};
 
     /// Fixed PKCS#8 fixture used to lock the public-key digest vector.
@@ -645,6 +960,301 @@ mod tests {
             permission_digest: "permission".to_owned(),
             assignment_authority_digest: "assignment-authority".to_owned(),
         }
+    }
+
+    /// Records the three post-authorization effects a stage operation has.
+    ///
+    /// The ordering property `authorize_stage` exists to guarantee is that a
+    /// refused operation performs none of these. The probe stands in for the
+    /// real follower entry point, which decodes the subplan, reads or writes
+    /// the upstream task cache, and then issues object I/O — in that order,
+    /// and only after the authority returns.
+    #[derive(Debug, Default)]
+    struct StageEffectProbe {
+        /// Subplan decodes performed.
+        decoded: AtomicUsize,
+        /// Task-cache accesses performed.
+        cache_hits: AtomicUsize,
+        /// Object-store reads issued.
+        io_reads: AtomicUsize,
+    }
+
+    impl StageEffectProbe {
+        /// Runs the authority, then the effects it gates, in production order.
+        ///
+        /// # Errors
+        /// Returns the authority's closed rejection, having performed no effect.
+        async fn authorize_then_execute(
+            &self,
+            authority: &OraclePeerAuthority,
+            ticket: &SignedPeerTicket,
+            binding: &StageBinding,
+            body: &[u8],
+            now: DateTime<Utc>,
+        ) -> Result<AuthorizedStage, PeerSecurityError> {
+            let authorized = authority
+                .authorize_stage(ticket, binding, body, now)
+                .await?;
+            self.decoded.fetch_add(1, Ordering::SeqCst);
+            self.cache_hits.fetch_add(1, Ordering::SeqCst);
+            self.io_reads.fetch_add(1, Ordering::SeqCst);
+            Ok(authorized)
+        }
+
+        /// Returns the three effect counts as one comparable tuple.
+        fn counts(&self) -> (usize, usize, usize) {
+            (
+                self.decoded.load(Ordering::SeqCst),
+                self.cache_hits.load(Ordering::SeqCst),
+                self.io_reads.load(Ordering::SeqCst),
+            )
+        }
+    }
+
+    /// One named single-field claims mutation and the closed error it forces.
+    type StageMutation = (
+        &'static str,
+        Box<dyn Fn(&mut StageTicketClaims)>,
+        PeerSecurityError,
+    );
+
+    /// Builds the follower-derived binding every stage test compares against.
+    fn stage_binding(tenant_id: DataTenantId) -> StageBinding {
+        StageBinding {
+            operation: StageOperationV1::ExecuteTask,
+            source_node_id: NodeId::new(uuid::Uuid::from_u128(11)),
+            source_fence: 3,
+            destination_node_id: NodeId::new(uuid::Uuid::from_u128(12)),
+            destination_fence: 5,
+            tenant_id,
+            public_query_id: uuid::Uuid::from_u128(21),
+            datafusion_query_id: uuid::Uuid::from_u128(22),
+            snapshot_digest: "snapshot".to_owned(),
+            stage_id: 2,
+            task_id: Some(1),
+            attempt: 0,
+            reservation_id: "reservation".to_owned(),
+            permission_digest: "permission".to_owned(),
+        }
+    }
+
+    /// Builds claims for one binding with a fresh single-use nonce.
+    fn stage_claims(
+        binding: &StageBinding,
+        body: &[u8],
+        nonce: uuid::Uuid,
+        now: DateTime<Utc>,
+    ) -> StageTicketClaims {
+        StageTicketClaims::for_binding(
+            binding,
+            stage_body_digest(body).expect("a bounded fixture body digests"),
+            nonce.as_bytes().to_vec(),
+            (now + chrono::Duration::seconds(20)).timestamp_millis(),
+            (now + chrono::Duration::seconds(10)).timestamp_millis(),
+        )
+    }
+
+    /// A stage operation is refused before any decode, cache access, or I/O.
+    ///
+    /// This is the ordering gate for the whole Analytical path. Each negative
+    /// binding is exercised independently — including the public and DataFusion
+    /// query identities separately, which is what stops a sibling distributed
+    /// graph under the same public query from borrowing another graph's ticket.
+    ///
+    /// Nonce consumption is asserted to happen *last* by a production-observable
+    /// route rather than by inspecting private state: after every refusal, a
+    /// correct ticket reusing that same nonce still authorizes. If nonce
+    /// consumption moved ahead of the signature, body, or binding checks, a
+    /// single forged request would burn a nonce a legitimate operation needs,
+    /// and this assertion would fail.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any negative binding is accepted, when a refusal performs a
+    /// gated effect, or when a refusal consumes the nonce.
+    #[tokio::test]
+    async fn stage_authority_rejects_before_decode_cache_or_io() {
+        let (authority, audit) = authority();
+        let tenant_id = DataTenantId::new_v7();
+        let binding = stage_binding(tenant_id);
+        let body = b"stage-operation-body".as_slice();
+        let now = Utc::now();
+        let probe = StageEffectProbe::default();
+
+        let mutations: Vec<StageMutation> = vec![
+            (
+                "public query identity",
+                Box::new(|c: &mut StageTicketClaims| {
+                    c.public_query_id = uuid::Uuid::from_u128(99).as_bytes().to_vec();
+                }),
+                PeerSecurityError::Claims,
+            ),
+            (
+                "datafusion query identity",
+                Box::new(|c: &mut StageTicketClaims| {
+                    c.datafusion_query_id = uuid::Uuid::from_u128(98).as_bytes().to_vec();
+                }),
+                PeerSecurityError::Claims,
+            ),
+            (
+                "coordinator node",
+                Box::new(|c: &mut StageTicketClaims| c.source_node_id[0] ^= 1),
+                PeerSecurityError::Audience,
+            ),
+            (
+                "follower fence",
+                Box::new(|c: &mut StageTicketClaims| c.destination_fence += 1),
+                PeerSecurityError::Fence,
+            ),
+            (
+                "snapshot digest",
+                Box::new(|c: &mut StageTicketClaims| c.snapshot_digest.push('x')),
+                PeerSecurityError::Claims,
+            ),
+            (
+                "stage",
+                Box::new(|c: &mut StageTicketClaims| c.stage_id += 1),
+                PeerSecurityError::Claims,
+            ),
+            (
+                "task",
+                Box::new(|c: &mut StageTicketClaims| c.task_id += 1),
+                PeerSecurityError::Claims,
+            ),
+            (
+                "attempt",
+                Box::new(|c: &mut StageTicketClaims| c.attempt += 1),
+                PeerSecurityError::Claims,
+            ),
+            (
+                "reservation",
+                Box::new(|c: &mut StageTicketClaims| c.reservation_id.push('x')),
+                PeerSecurityError::Claims,
+            ),
+            (
+                "permission digest",
+                Box::new(|c: &mut StageTicketClaims| c.permission_digest.push('x')),
+                PeerSecurityError::Claims,
+            ),
+            (
+                "expired deadline",
+                Box::new(|c: &mut StageTicketClaims| c.absolute_deadline_ms = 0),
+                PeerSecurityError::Expired,
+            ),
+        ];
+
+        // The nonce is shared across every refusal below, so a refusal that
+        // consumed it would break the final authorization.
+        let nonce = uuid::Uuid::new_v4();
+        for (name, mutate, expected) in mutations {
+            let mut claims = stage_claims(&binding, body, nonce, now);
+            mutate(&mut claims);
+            let ticket = authority
+                .mint_stage(StageOperationV1::ExecuteTask, &claims)
+                .expect("the fixture coordinator signs its own claims");
+            assert_eq!(
+                probe
+                    .authorize_then_execute(&authority, &ticket, &binding, body, now)
+                    .await
+                    .err(),
+                Some(expected),
+                "a stage operation with a wrong {name} must be refused"
+            );
+            assert_eq!(
+                probe.counts(),
+                (0, 0, 0),
+                "a refused {name} must not decode, touch the cache, or issue I/O"
+            );
+        }
+
+        // A body that does not match the signed digest is refused even though
+        // every claims field is correct.
+        let claims = stage_claims(&binding, body, nonce, now);
+        let ticket = authority
+            .mint_stage(StageOperationV1::ExecuteTask, &claims)
+            .expect("the fixture coordinator signs its own claims");
+        assert_eq!(
+            probe
+                .authorize_then_execute(&authority, &ticket, &binding, b"other-body", now)
+                .await
+                .err(),
+            Some(PeerSecurityError::Body),
+            "a body that does not match its signed digest must be refused"
+        );
+        assert_eq!(probe.counts(), (0, 0, 0));
+
+        // An oversized body is refused before it is hashed or decoded.
+        assert_eq!(
+            probe
+                .authorize_then_execute(
+                    &authority,
+                    &ticket,
+                    &binding,
+                    &vec![0_u8; 8 * 1024 * 1024 + 1],
+                    now
+                )
+                .await
+                .err(),
+            Some(PeerSecurityError::Body)
+        );
+        assert_eq!(probe.counts(), (0, 0, 0));
+
+        // A ticket minted for the sibling operation does not verify here: the
+        // receiver checks the domain its own entry point implements.
+        let mut set_plan_binding = binding.clone();
+        set_plan_binding.operation = StageOperationV1::SetPlan;
+        set_plan_binding.task_id = None;
+        let set_plan_claims = stage_claims(&set_plan_binding, body, nonce, now);
+        let set_plan_ticket = authority
+            .mint_stage(StageOperationV1::SetPlan, &set_plan_claims)
+            .expect("the fixture coordinator signs its own claims");
+        assert_eq!(
+            probe
+                .authorize_then_execute(&authority, &set_plan_ticket, &binding, body, now)
+                .await
+                .err(),
+            Some(PeerSecurityError::InvalidSignature),
+            "a set-plan ticket must not authorize an execute-task operation"
+        );
+        assert_eq!(probe.counts(), (0, 0, 0));
+
+        // A tampered signature is refused before anything is decoded.
+        let mut tampered = ticket.clone();
+        tampered.signature[0] ^= 1;
+        assert_eq!(
+            probe
+                .authorize_then_execute(&authority, &tampered, &binding, body, now)
+                .await
+                .err(),
+            Some(PeerSecurityError::InvalidSignature)
+        );
+        assert_eq!(probe.counts(), (0, 0, 0));
+
+        // Every refusal above committed exactly one durable audit row.
+        let rejections = audit.calls.lock().expect("audit mutex").len();
+        assert_eq!(rejections, 15, "each refusal audits exactly once");
+
+        // The shared nonce survived every refusal: consumption is last.
+        let authorized = probe
+            .authorize_then_execute(&authority, &ticket, &binding, body, now)
+            .await
+            .expect("a correct stage operation authorizes on the reused nonce");
+        assert_eq!(authorized.tenant_id, tenant_id);
+        assert_eq!(probe.counts(), (1, 1, 1));
+
+        // And it is single-use: the same ticket cannot be replayed.
+        assert_eq!(
+            probe
+                .authorize_then_execute(&authority, &ticket, &binding, body, now)
+                .await
+                .err(),
+            Some(PeerSecurityError::Replay)
+        );
+        assert_eq!(
+            probe.counts(),
+            (1, 1, 1),
+            "a replayed operation must not decode, touch the cache, or issue I/O"
+        );
     }
 
     /// The pinned fixture derives the exact lowercase raw-public-key digest.

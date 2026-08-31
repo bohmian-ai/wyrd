@@ -190,6 +190,13 @@ pub enum BifrostSecurityViolationKind {
     /// digest signed into the ticket claims, so the closed predicate and
     /// projection closure cannot be trusted.
     PeerAssignmentAuthority,
+    /// Private stage-operation binding mismatch: a signed Analytical stage
+    /// ticket did not match the receiving follower's own expectation for the
+    /// operation, either query identity, the pinned snapshot, the stage, the
+    /// task, the attempt, the reservation, or the authorized permissions, so
+    /// the operation was refused before any plan decode, task-cache lookup,
+    /// provider construction, or object I/O.
+    PeerStageBinding,
     /// Invalid Scribe-tail ticket audience.
     TailAudience,
     /// Scribe-tail tenant or table binding mismatch.

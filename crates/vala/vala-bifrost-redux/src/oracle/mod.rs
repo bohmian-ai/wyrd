@@ -57,6 +57,7 @@ use crate::scribe::tail_rpc::{TAIL_PROTOCOL_VERSION, TailReadTransport};
 
 mod admission;
 pub mod analytical;
+pub mod analytical_supervisor;
 pub mod attempt;
 pub mod codec;
 pub mod dispatcher;
@@ -6216,7 +6217,12 @@ mod tests {
         );
     }
 
-    /// Oracle construction publishes every closed idle query and slot gauge series.
+    /// Oracle construction publishes every closed idle query, slot, and
+    /// Analytical in-flight gauge series.
+    ///
+    /// The Analytical attempt and exchange gauges are registered at zero by the
+    /// same owner, so a scrape taken before any distributed work exists still
+    /// carries the series a terminal-cleanup alert compares against.
     #[test]
     fn oracle_telemetry_registers_closed_idle_gauges() {
         let recorder = wyrd_bench::BenchmarkRecorder::new();
@@ -6229,6 +6235,8 @@ mod tests {
             "oracle_queries_queued{class=\"analytical\"}",
             "oracle_tenant_budget_pressure{class=\"interactive\"}",
             "oracle_tenant_budget_pressure{class=\"analytical\"}",
+            "bifrost_oracle_analytical_attempts_active",
+            "bifrost_oracle_analytical_exchanges_active",
         ];
         let initial = recorder.snapshot();
         assert_eq!(initial.gauges.len(), expected.len());

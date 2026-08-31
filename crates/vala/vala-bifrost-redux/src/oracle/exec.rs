@@ -37,7 +37,9 @@ use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_plan::execution_plan::{
     Boundedness, EmissionType, PlanProperties, SchedulingType,
 };
-use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricValue};
+use datafusion::physical_plan::metrics::{
+    Count, ExecutionPlanMetricsSet, Metric, MetricValue, MetricsSet,
+};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::union::UnionExec;
@@ -45,6 +47,7 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
     SendableRecordBatchStream,
 };
+use datafusion_distributed::NetworkBoundaryExt as _;
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
 use futures_util::{Stream, StreamExt, TryStreamExt};
@@ -894,6 +897,175 @@ impl OracleQueryScanStats {
         for child in plan.children() {
             Self::visit(child.as_ref(), stats);
         }
+    }
+}
+
+impl OracleQueryScanStats {
+    /// Opens one participant-reported accumulator for a distributed plan.
+    ///
+    /// The Analytical leader's own plan tree contains no executed scan: every
+    /// leaf below a stage boundary runs on a follower. This accumulator is the
+    /// same one an Interactive remote scan reports through, so terminal
+    /// aggregation stays a single path; only the transport that fills it
+    /// differs.
+    pub(crate) fn open_distributed_scan(&mut self) -> Arc<RemoteScanMetrics> {
+        let handle = Arc::new(RemoteScanMetrics::default());
+        self.remote_handles.push(Arc::clone(&handle));
+        handle
+    }
+}
+
+/// Wyrd's own scan-evidence metric names, carried over upstream's metric wire.
+///
+/// A Wyrd scan does not report physical bytes through a `DataFusion` metric: an
+/// Iceberg or hot-Parquet source accounts them in its own
+/// [`OracleScanMetricsHandle`], which never leaves the node that owns it. An
+/// Analytical follower therefore republishes its terminal scan evidence under
+/// these names so the coordinator can read it back from the same metric
+/// transport upstream already uses for every other stage metric.
+pub(crate) const WYRD_BYTES_SCANNED_METRIC: &str = "wyrd_bytes_scanned";
+/// Files a follower leaf actually opened, published as [`WYRD_BYTES_SCANNED_METRIC`] is.
+pub(crate) const WYRD_FILES_SCANNED_METRIC: &str = "wyrd_files_scanned";
+/// File partitions a follower leaf actually read.
+pub(crate) const WYRD_PARTITIONS_SCANNED_METRIC: &str = "wyrd_partitions_scanned";
+/// Row groups a follower leaf retained after statistics pruning.
+pub(crate) const WYRD_ROW_GROUPS_SCANNED_METRIC: &str = "wyrd_row_groups_scanned";
+/// Row groups a follower leaf skipped by statistics pruning.
+pub(crate) const WYRD_ROW_GROUPS_PRUNED_METRIC: &str = "wyrd_row_groups_pruned";
+
+/// Publishes one resolved follower leaf's terminal scan evidence as metrics.
+///
+/// The evidence is read through the same collector the leader uses on its own
+/// plan, so an Analytical follower reports exactly what an Interactive leader
+/// would have reported for the identical scan. Bytes are omitted rather than
+/// zeroed when the source never reported them, preserving absent-versus-zero.
+pub(crate) fn analytical_leaf_scan_metrics(plan: &dyn ExecutionPlan) -> MetricsSet {
+    let mut stats = OracleQueryScanStats::from_plan(plan, 0);
+    stats.finalize();
+    let mut published = MetricsSet::new();
+    let mut publish = |name: &'static str, value: u64| {
+        let count = Count::new();
+        count.add(usize::try_from(value).unwrap_or(usize::MAX));
+        published.push(Arc::new(Metric::new(
+            MetricValue::Count {
+                name: name.into(),
+                count,
+            },
+            None,
+        )));
+    };
+    if let Some(bytes) = stats.physical_bytes_scanned {
+        publish(WYRD_BYTES_SCANNED_METRIC, bytes);
+    }
+    publish(WYRD_FILES_SCANNED_METRIC, stats.files_scanned);
+    publish(WYRD_PARTITIONS_SCANNED_METRIC, stats.partitions_scanned);
+    publish(WYRD_ROW_GROUPS_SCANNED_METRIC, stats.row_groups_scanned);
+    publish(WYRD_ROW_GROUPS_PRUNED_METRIC, stats.row_groups_pruned);
+    published
+}
+
+/// Reports whether one physical plan root is an upstream distributed plan.
+///
+/// Only a distributed root has follower-side metrics to wait for; every other
+/// plan's scans are already visible in the leader's own metric sets.
+pub(crate) fn is_distributed_plan(plan: &dyn ExecutionPlan) -> bool {
+    plan.downcast_ref::<datafusion_distributed::DistributedExec>()
+        .is_some()
+}
+
+/// Folds a completed distributed plan's follower scan metrics into `sink`.
+///
+/// Upstream ships each task's metrics back to the coordinator over its own
+/// coordinator channel once that task finishes, and
+/// `rewrite_distributed_plan_with_metrics` waits for all of them before
+/// attaching them to the coordinator's plan tree. Reading them here is what
+/// lets the leader stay the single emitter of a leader-owned physical-scan
+/// metric while the reads themselves happened elsewhere.
+///
+/// A plan that is not distributed, or whose metrics never arrive, contributes
+/// nothing rather than a fabricated zero.
+pub(crate) async fn record_distributed_scan_metrics(
+    plan: Arc<dyn ExecutionPlan>,
+    sink: &RemoteScanMetrics,
+) {
+    let Ok(with_metrics) = datafusion_distributed::rewrite_distributed_plan_with_metrics(
+        plan,
+        datafusion_distributed::DistributedMetricsFormat::Aggregated,
+    )
+    .await
+    else {
+        return;
+    };
+    let mut totals = wyrd_spec::vala::api::WorkerScanStats::default();
+    fold_distributed_scan_metrics(&with_metrics, &mut totals);
+    sink.record_footer(totals);
+}
+
+/// Accumulates one rewritten plan node's scan metrics, then its whole subtree.
+///
+/// A distributed plan is not one tree. Each stage below a network boundary
+/// hangs off that boundary's input stage rather than off its children, so a
+/// plain child walk sees only the coordinator's own stage and reports a query
+/// that scanned nothing. Descending both edges is what reaches the follower
+/// leaves where the reads actually happened.
+fn fold_distributed_scan_metrics(
+    node: &Arc<dyn ExecutionPlan>,
+    totals: &mut wyrd_spec::vala::api::WorkerScanStats,
+) {
+    if let Some(metrics) = node.metrics() {
+        let metrics = metrics.aggregate_by_name();
+        for name in ["bytes_scanned", WYRD_BYTES_SCANNED_METRIC] {
+            if let Some(bytes) = sum_named_count(&metrics, name) {
+                totals.bytes_scanned =
+                    Some(totals.bytes_scanned.unwrap_or(0).saturating_add(bytes));
+            }
+        }
+        totals.files_scanned = totals
+            .files_scanned
+            .saturating_add(sum_named_count(&metrics, WYRD_FILES_SCANNED_METRIC).unwrap_or(0));
+        totals.partitions_scanned = totals
+            .partitions_scanned
+            .saturating_add(sum_named_count(&metrics, WYRD_PARTITIONS_SCANNED_METRIC).unwrap_or(0));
+        for name in ROW_GROUPS_MATCHED_METRICS {
+            totals.row_groups_scanned = totals
+                .row_groups_scanned
+                .saturating_add(sum_named_count(&metrics, name).unwrap_or(0));
+        }
+        for name in ROW_GROUPS_PRUNED_METRICS {
+            totals.row_groups_pruned = totals
+                .row_groups_pruned
+                .saturating_add(sum_named_count(&metrics, name).unwrap_or(0));
+        }
+    }
+    if let Some(boundary) = node.as_network_boundary()
+        && let datafusion_distributed::Stage::Local(stage) = boundary.input_stage()
+    {
+        fold_distributed_scan_metrics(&stage.plan, totals);
+    }
+    for child in node.children() {
+        fold_distributed_scan_metrics(child, totals);
+    }
+}
+
+/// `DataFusion` Parquet metrics naming row groups a scan actually read.
+const ROW_GROUPS_MATCHED_METRICS: [&str; 3] = [
+    "row_groups_matched_statistics",
+    "row_groups_matched_bloom_filter",
+    WYRD_ROW_GROUPS_SCANNED_METRIC,
+];
+
+/// `DataFusion` Parquet metrics naming row groups a scan skipped.
+const ROW_GROUPS_PRUNED_METRICS: [&str; 3] = [
+    "row_groups_pruned_statistics",
+    "row_groups_pruned_bloom_filter",
+    WYRD_ROW_GROUPS_PRUNED_METRIC,
+];
+
+/// Reads one named counter from an aggregated metric set.
+fn sum_named_count(metrics: &MetricsSet, name: &str) -> Option<u64> {
+    match metrics.sum_by_name(name) {
+        Some(MetricValue::Count { count, .. }) => Some(count.value() as u64),
+        _ => None,
     }
 }
 

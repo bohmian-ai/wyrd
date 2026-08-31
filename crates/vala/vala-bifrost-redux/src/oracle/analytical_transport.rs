@@ -1321,7 +1321,6 @@ mod tests {
     use async_trait::async_trait;
     use prost::Message as _;
     use tower::{Layer as _, Service as _};
-    use wyrd_spec::vala::api::QueryClass;
 
     use super::super::analytical::{
         AnalyticalStageIngressConfig, DataFusionQueryId, PublicQueryId,

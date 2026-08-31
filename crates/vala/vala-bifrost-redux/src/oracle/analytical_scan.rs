@@ -12,12 +12,13 @@
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
-use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::common::tree_node::{TreeNode as _, TreeNodeRecursion};
 use datafusion::common::{DataFusionError, Result};
 use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::TaskContext;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties as _, Partitioning,
@@ -207,6 +208,39 @@ impl ExecutionPlan for AnalyticalScanExec {
                 "analytical scan must remain a leaf".to_owned(),
             ))
         }
+    }
+
+    /// Reports the resolved provider's own physical scan metrics as this leaf's.
+    ///
+    /// The resolved plan is not a child of this node — it lives behind the
+    /// memoized cell, so nothing that walks the plan tree can see it. Upstream
+    /// collects a follower's metrics by walking exactly that tree and ships
+    /// them back to the coordinator, so without this the leader would observe a
+    /// distributed query that scanned nothing. Merging the subtree's metric
+    /// sets here reports the bytes, row groups, and rows this leaf actually
+    /// read, attributed to the node that owns the read.
+    ///
+    /// Returns `None` before the first execution resolves a provider, which is
+    /// the honest answer: no scan has happened yet.
+    fn metrics(&self) -> Option<MetricsSet> {
+        let resolved = self.resolved.get()?;
+        let mut merged = MetricsSet::new();
+        let mut collect = |plan: &Arc<dyn ExecutionPlan>| {
+            if let Some(metrics) = plan.metrics() {
+                for metric in metrics.iter() {
+                    merged.push(Arc::clone(metric));
+                }
+            }
+        };
+        collect(resolved);
+        let _ = resolved.apply(|plan| {
+            collect(plan);
+            Ok(TreeNodeRecursion::Continue)
+        });
+        for metric in super::exec::analytical_leaf_scan_metrics(resolved.as_ref()).iter() {
+            merged.push(Arc::clone(metric));
+        }
+        Some(merged.aggregate_by_name())
     }
 
     /// Streams one partition, resolving the authenticated provider on first use.

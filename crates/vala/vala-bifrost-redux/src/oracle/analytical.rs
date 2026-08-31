@@ -39,13 +39,33 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use datafusion::error::DataFusionError;
-use datafusion::execution::SessionState;
 use datafusion::execution::runtime_env::RuntimeEnv;
-use datafusion_distributed::{WorkerQueryContext, WorkerSessionBuilder};
+use datafusion::execution::{SendableRecordBatchStream, SessionState, TaskContext};
+use datafusion_distributed::{
+    CoordinatorToWorkerMsg, ExecuteTaskRequest, SetPlanRequest, Worker, WorkerQueryContext,
+    WorkerSessionBuilder, WorkerToCoordinatorMsg,
+};
+use futures_util::stream::BoxStream;
 use http::HeaderMap;
 use uuid::Uuid;
 use wyrd_spec::vala::BifrostError;
+use wyrd_spec::vala::api::SignedPeerTicket;
+
+use super::analytical_supervisor::{
+    AnalyticalAttemptGrant, AnalyticalAttemptGuard, AnalyticalAttemptKey, AnalyticalGraphGuard,
+    AnalyticalSupervisor, AnalyticalSupervisorInspection, StageId, TaskId,
+};
+use super::peer::{
+    AuthorizedStage, OracleStageAuthority, PeerSecurityError, StageBinding, StageOperationV1,
+};
+use super::spill::OracleSpillRuntime;
+use super::telemetry::{
+    AnalyticalAttemptOutcome, AnalyticalStageOperation, record_stage_operation,
+};
+use crate::resources::{OracleResourceRequest, OracleResources};
+use wyrd_spec::vala::api::QueryClass;
 
 /// Header carrying the client-visible query identity on every stage operation.
 pub(crate) const PUBLIC_QUERY_ID_HEADER: &str = "wyrd-oracle-public-query-id";
@@ -488,6 +508,373 @@ impl WorkerSessionBuilder for AnalyticalSessionBuilder {
             .builder
             .with_runtime_env(Arc::clone(graph.runtime()))
             .build())
+    }
+}
+
+/// Complete construction inputs for one follower [`AnalyticalStageIngress`].
+///
+/// Naming the dependencies keeps the two shared owners — the server authority
+/// and the node supervisor — from being transposable at a call site, and keeps
+/// the resource root and spill owner explicit rather than reachable through a
+/// process global.
+pub struct AnalyticalStageIngressConfig {
+    /// Server-owned authority every stage operation is checked against.
+    pub authority: Arc<dyn OracleStageAuthority>,
+    /// Node-local supervisor owning graphs, attempts, and the runtime registry.
+    pub supervisor: Arc<AnalyticalSupervisor>,
+    /// Root Oracle capability this follower admits query envelopes from.
+    pub oracle_resources: OracleResources,
+    /// Process spill owner that bounds each query runtime's disk manager.
+    pub spill: Arc<OracleSpillRuntime>,
+    /// Exchange-buffer child every attempt of a graph on this node charges.
+    pub exchange_buffer_bytes: usize,
+}
+
+/// Authenticated follower entry point for Analytical stage operations.
+///
+/// This is the node-local owner that turns an authenticated stage operation
+/// into supervised distributed work. The ordering it enforces is the whole
+/// point of the type: nothing decodes a plan, reads the task cache, constructs
+/// a provider, or touches storage until
+/// [`OracleStageAuthority::authorize_stage`] has returned, and the headers the
+/// upstream worker resolves its runtime from are derived from the *verified*
+/// claims rather than from anything the caller supplied.
+///
+/// The ingress owns the follower's graph and attempt guards because a graph
+/// spans several separate stage calls: it is registered on the first `SetPlan`
+/// that names it and released when the graph is torn down, not when any one
+/// call returns.
+pub struct AnalyticalStageIngress {
+    /// Server-owned authority every stage operation is checked against.
+    authority: Arc<dyn OracleStageAuthority>,
+    /// Node-local supervisor owning graphs, attempts, and the runtime registry.
+    supervisor: Arc<AnalyticalSupervisor>,
+    /// Root Oracle capability this follower admits query envelopes from.
+    oracle_resources: OracleResources,
+    /// Process spill owner that bounds each query runtime's disk manager.
+    spill: Arc<OracleSpillRuntime>,
+    /// Exchange-buffer child every attempt of a graph on this node charges.
+    exchange_buffer_bytes: usize,
+    /// Upstream worker whose sessions install this node's query-owned runtimes.
+    worker: Worker,
+    /// Graph ownership tokens held for as long as the coordinator may address them.
+    graphs: Mutex<HashMap<AnalyticalGraphKey, AnalyticalGraphGuard>>,
+    /// Attempt ownership tokens held for as long as their stage work may run.
+    attempts: Mutex<HashMap<AnalyticalAttemptKey, AnalyticalAttemptGuard>>,
+}
+
+impl fmt::Debug for AnalyticalStageIngress {
+    /// Reports the configured budget without rendering owned dependencies.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AnalyticalStageIngress")
+            .field("exchange_buffer_bytes", &self.exchange_buffer_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AnalyticalStageIngress {
+    /// Builds the follower ingress over the supervisor's own runtime registry.
+    ///
+    /// The upstream worker is constructed from [`AnalyticalSessionBuilder`] over
+    /// that exact registry, so a stage whose graph is not registered — an
+    /// invalidated attempt, a sibling graph, a forged identity — fails to build
+    /// a session rather than silently falling back to a process runtime.
+    #[must_use]
+    pub fn new(config: AnalyticalStageIngressConfig) -> Self {
+        let AnalyticalStageIngressConfig {
+            authority,
+            supervisor,
+            oracle_resources,
+            spill,
+            exchange_buffer_bytes,
+        } = config;
+        let worker = Worker::from_session_builder(AnalyticalSessionBuilder::new(Arc::clone(
+            supervisor.registry(),
+        )));
+        Self {
+            authority,
+            supervisor,
+            oracle_resources,
+            spill,
+            exchange_buffer_bytes,
+            worker,
+            graphs: Mutex::new(HashMap::new()),
+            attempts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Returns the upstream worker for local-worker context composition.
+    #[must_use]
+    pub fn worker(&self) -> &Worker {
+        &self.worker
+    }
+
+    /// Authorizes and installs one stage subplan, opening its coordinator channel.
+    ///
+    /// `plan_bytes` are the exact encoded subplan the digest in `ticket` commits
+    /// to; they are the bytes upstream will decode, and they are not decoded
+    /// here. On the first authorized operation naming a graph this admits the
+    /// follower's own query envelope, builds the query-owned runtime bounded by
+    /// that envelope's scratch share, registers the graph, and admits the
+    /// attempt — all before any plan is touched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::QueryPeerSecurity`] when authorization fails for
+    /// any reason, [`BifrostError::QueryAuditUnavailable`] when the required
+    /// refusal audit could not commit, [`BifrostError::QueryAdmissionRejected`]
+    /// when this follower cannot admit the graph's envelope, and
+    /// [`BifrostError::QueryExecutionFailed`] when upstream refuses the plan.
+    pub async fn set_plan(
+        &self,
+        ticket: &SignedPeerTicket,
+        binding: &StageBinding,
+        request: SetPlanRequest,
+        plan_bytes: &[u8],
+        coordinator_stream: BoxStream<'static, Result<CoordinatorToWorkerMsg, DataFusionError>>,
+        now: DateTime<Utc>,
+    ) -> Result<BoxStream<'static, Result<WorkerToCoordinatorMsg, DataFusionError>>, BifrostError>
+    {
+        let authorized = self
+            .authorize(StageOperationV1::SetPlan, ticket, binding, plan_bytes, now)
+            .await?;
+        let key = attempt_key(&authorized)?;
+        self.admit_graph(key.graph())?;
+        self.admit_attempt(key)?;
+        record_stage_operation(AnalyticalStageOperation::SetPlan);
+        self.worker
+            .coordinator_channel(key.graph().to_headers(), request, coordinator_stream)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    %error,
+                    public_query_id = %key.public_query_id,
+                    datafusion_query_id = %key.datafusion_query_id,
+                    stage = %key.stage,
+                    "Oracle analytical stage plan installation failed"
+                );
+                BifrostError::QueryExecutionFailed
+            })
+    }
+
+    /// Authorizes and executes one stage task's partition range.
+    ///
+    /// The returned streams and task context are the caller's to retain, cancel,
+    /// and join; nothing is detached here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::QueryPeerSecurity`] when authorization fails,
+    /// [`BifrostError::QueryAuditUnavailable`] when the refusal audit could not
+    /// commit, and [`BifrostError::QueryExecutionFailed`] when the graph is not
+    /// registered or upstream refuses the partition range.
+    pub async fn execute_task(
+        &self,
+        ticket: &SignedPeerTicket,
+        binding: &StageBinding,
+        request: ExecuteTaskRequest,
+        body: &[u8],
+        now: DateTime<Utc>,
+    ) -> Result<(Vec<SendableRecordBatchStream>, Arc<TaskContext>), BifrostError> {
+        let authorized = self
+            .authorize(StageOperationV1::ExecuteTask, ticket, binding, body, now)
+            .await?;
+        let key = attempt_key(&authorized)?;
+        self.supervisor.graph_runtime(key.graph())?;
+        record_stage_operation(AnalyticalStageOperation::ExecuteTask);
+        self.worker.execute_task(request).await.map_err(|error| {
+            tracing::warn!(
+                %error,
+                public_query_id = %key.public_query_id,
+                datafusion_query_id = %key.datafusion_query_id,
+                stage = %key.stage,
+                task = key.task.map(TaskId::as_usize),
+                "Oracle analytical stage task execution failed"
+            );
+            BifrostError::QueryExecutionFailed
+        })
+    }
+
+    /// Settles one attempt and releases the graph once its last attempt drains.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when an ownership lock is poisoned,
+    /// and the supervisor's refusal when `key` names no live attempt.
+    pub async fn finish_attempt(
+        &self,
+        key: AnalyticalAttemptKey,
+        outcome: AnalyticalAttemptOutcome,
+    ) -> Result<(), BifrostError> {
+        let guard = {
+            let mut attempts = self.attempts.lock().map_err(|_| poisoned_ingress())?;
+            attempts.remove(&key)
+        };
+        match guard {
+            Some(guard) => {
+                guard.finish(outcome).await?;
+            }
+            None => return Err(BifrostError::QueryExecutionFailed),
+        }
+        let graph = key.graph();
+        let release = {
+            let mut graphs = self.graphs.lock().map_err(|_| poisoned_ingress())?;
+            let attempts = self.attempts.lock().map_err(|_| poisoned_ingress())?;
+            if attempts.keys().any(|live| live.graph() == graph) {
+                None
+            } else {
+                graphs.remove(&graph)
+            }
+        };
+        if let Some(release) = release {
+            release.release()?;
+        }
+        Ok(())
+    }
+
+    /// Releases every graph and attempt this follower still owns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when an ownership lock is poisoned.
+    pub async fn shutdown(&self) -> Result<AnalyticalSupervisorInspection, BifrostError> {
+        {
+            let mut attempts = self.attempts.lock().map_err(|_| poisoned_ingress())?;
+            attempts.clear();
+        }
+        {
+            let mut graphs = self.graphs.lock().map_err(|_| poisoned_ingress())?;
+            graphs.clear();
+        }
+        self.supervisor.shutdown().await
+    }
+
+    /// Runs the complete authority check for one stage operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::QueryAuditUnavailable`] when the durable refusal
+    /// record could not commit, and [`BifrostError::QueryPeerSecurity`] for
+    /// every other refusal. A refusal never returns claims.
+    async fn authorize(
+        &self,
+        operation: StageOperationV1,
+        ticket: &SignedPeerTicket,
+        binding: &StageBinding,
+        body: &[u8],
+        now: DateTime<Utc>,
+    ) -> Result<AuthorizedStage, BifrostError> {
+        if binding.operation != operation {
+            return Err(BifrostError::QueryPeerSecurity);
+        }
+        self.authority
+            .authorize_stage(ticket, binding, body, now)
+            .await
+            .map_err(|error| match error {
+                PeerSecurityError::AuditUnavailable => BifrostError::QueryAuditUnavailable,
+                _ => BifrostError::QueryPeerSecurity,
+            })
+    }
+
+    /// Admits this follower's own query envelope for a graph it has not seen.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::QueryAdmissionRejected`] when the root capability
+    /// cannot admit an analytical query envelope, [`BifrostError::Internal`] on
+    /// a poisoned ownership lock or when the graph runtime cannot be built.
+    fn admit_graph(&self, graph: AnalyticalGraphKey) -> Result<(), BifrostError> {
+        let mut graphs = self.graphs.lock().map_err(|_| poisoned_ingress())?;
+        if graphs.contains_key(&graph) {
+            return Ok(());
+        }
+        let resources = self
+            .oracle_resources
+            .try_acquire_query(OracleResourceRequest::for_class(
+                QueryClass::Analytical,
+                0.0,
+            ))
+            .map_err(|_| BifrostError::QueryAdmissionRejected)?;
+        let runtime = self
+            .spill
+            .build_query_runtime(resources.memory_pool(), resources.scratch_bytes)?;
+        let guard = self.supervisor.register_graph(
+            graph,
+            resources,
+            AnalyticalGraphRuntime::new(runtime, self.exchange_buffer_bytes),
+        )?;
+        graphs.insert(graph, guard);
+        Ok(())
+    }
+
+    /// Admits one attempt of an already registered graph and retains its guard.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] on a poisoned ownership lock, and the
+    /// supervisor's refusal when the slot is occupied or the graph is unknown.
+    fn admit_attempt(&self, key: AnalyticalAttemptKey) -> Result<(), BifrostError> {
+        let mut attempts = self.attempts.lock().map_err(|_| poisoned_ingress())?;
+        if attempts.contains_key(&key) {
+            return Ok(());
+        }
+        let guard = self.supervisor.spawn_attempt(
+            key,
+            AnalyticalAttemptGrant {
+                exchange_buffer_bytes: self.exchange_buffer_bytes,
+                scratch_bytes: 0,
+            },
+        )?;
+        attempts.insert(key, guard);
+        Ok(())
+    }
+}
+
+/// Projects the supervised attempt identity from one authorized stage operation.
+///
+/// Every field comes from the verified claims, never from the wire framing, so
+/// a graph, stage, task, or attempt the signature did not cover cannot be
+/// addressed.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::QueryPeerSecurity`] when the verified claims carry an
+/// identity or attempt ordinal that is not representable — a forged third
+/// attempt among them.
+fn attempt_key(authorized: &AuthorizedStage) -> Result<AnalyticalAttemptKey, BifrostError> {
+    let claims = &authorized.claims;
+    let public_query_id =
+        Uuid::from_slice(&claims.public_query_id).map_err(|_| BifrostError::QueryPeerSecurity)?;
+    let datafusion_query_id = Uuid::from_slice(&claims.datafusion_query_id)
+        .map_err(|_| BifrostError::QueryPeerSecurity)?;
+    let attempt = u8::try_from(claims.attempt)
+        .ok()
+        .and_then(AnalyticalAttemptNumber::from_u8)
+        .ok_or(BifrostError::QueryPeerSecurity)?;
+    let stage = StageId::new(
+        usize::try_from(claims.stage_id).map_err(|_| BifrostError::QueryPeerSecurity)?,
+    );
+    let task = if claims.has_task {
+        Some(TaskId::new(
+            usize::try_from(claims.task_id).map_err(|_| BifrostError::QueryPeerSecurity)?,
+        ))
+    } else {
+        None
+    };
+    Ok(AnalyticalAttemptKey::new(
+        PublicQueryId::from_uuid(public_query_id),
+        DataFusionQueryId::from_uuid(datafusion_query_id),
+        stage,
+        task,
+        attempt,
+    ))
+}
+
+/// Builds the stable internal error for a poisoned ingress ownership lock.
+fn poisoned_ingress() -> BifrostError {
+    BifrostError::Internal {
+        detail: "Oracle analytical stage ingress lock is poisoned".to_owned(),
     }
 }
 

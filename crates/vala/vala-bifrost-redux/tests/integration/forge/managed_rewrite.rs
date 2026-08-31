@@ -11,24 +11,63 @@ use std::sync::atomic::AtomicUsize;
 
 use iceberg::spec::DataContentType;
 use vala_bifrost_redux::forge::{
-    ForgeError, ForgeObjectStore, ForgeRewriteAttempt, ForgeRewriteOutcome,
+    ForgeError, ForgeObjectStore, ForgeRewriteAttempt, ForgeRewriteEvidence, ForgeRewriteOutcome,
+    ForgeUnsettledOutput, RewriteHandoff,
 };
 use vala_bifrost_redux::resources::ForgeRewriteRequest;
 
-use super::rewrite_support::PromotedRewriteFixture;
+use super::rewrite_support::{PromotedRewriteFixture, RewriteOutputBreak};
 use super::support::{CountingObjectStore, PromotionCatalogSeam};
+
+/// Runs one whole non-committing rewrite attempt under an exact plan budget.
+///
+/// The budget is set on the fixture's config, which is what the managed core
+/// reads when it selects, so a caller varies only the number of groups the
+/// *core* is allowed to plan. Everything else — catalog, object store, resource
+/// governor — stays the production owner over the same promoted snapshot.
+///
+/// # Panics
+///
+/// Panics if the attempt fails or reports no progress; every caller here runs
+/// against a promoted small-file set that must select.
+async fn rewrite_under_plan_budget(
+    fixture: &mut PromotedRewriteFixture,
+    budget: usize,
+) -> (ForgeRewriteEvidence, Box<RewriteHandoff>) {
+    fixture.fixture.config.rewrite_max_plans_per_attempt = budget;
+    let object_store = CountingObjectStore::new(Arc::clone(&fixture.fixture.staging));
+    let outcome = fixture
+        .forge(
+            fixture.fixture.catalog.iceberg_catalog(),
+            Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
+        )
+        .execute_rewrite_attempt(
+            &fixture.fixture.binding,
+            fixture.attempt(uuid::Uuid::now_v7()).await,
+        )
+        .await
+        .expect("the promoted snapshot is rewritable under any budget of at least one plan");
+    let ForgeRewriteOutcome::Rewritten { evidence, handoff } = outcome else {
+        panic!("a promoted small-file set must select under a budget of {budget}: {outcome:?}");
+    };
+    (evidence, handoff)
+}
 
 /// The adapter's plan is the core's report, unedited.
 ///
-/// The core is asked once and its selection is compared against the handoff the
-/// adapter derived from it: the consumed data paths must be exactly the paths
-/// the core's own plans named, in no fewer and no greater number. Trimming,
-/// reordering into a different grouping, or recomputing a total locally would
-/// break the equality, which is what makes this a call-path proof rather than a
-/// count check.
+/// The promoted set is more eligible groups than a one-plan budget admits, so
+/// the two passes below differ only in the budget the core was configured with
+/// and run against the same unchanged snapshot. Three things then have to hold
+/// together. The budgeted pass consumes exactly the leading group, so no local
+/// trim, reorder, or regroup happened. Its produced rows are exactly the rows
+/// of the objects it consumed, so the plan it executed is the plan it reported
+/// consuming. And its *selection receipt differs* from the unbudgeted one,
+/// which is what a local `.take` could not produce: trimming the returned plans
+/// would leave the report describing the whole pre-cap selection, so both
+/// passes would receipt identically.
 #[tokio::test]
 async fn managed_rewrite_plan_matches_core_report_on_promoted_snapshot() {
-    let fixture = PromotedRewriteFixture::start("rewrite_plan").await;
+    let mut fixture = PromotedRewriteFixture::start("rewrite_plan").await;
     let live = fixture
         .live_data_files()
         .await
@@ -36,6 +75,10 @@ async fn managed_rewrite_plan_matches_core_report_on_promoted_snapshot() {
         .filter(|file| file.content_type() == DataContentType::Data)
         .map(|file| file.file_path().to_owned())
         .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        live.len() > 1,
+        "the fixture must offer more eligible groups than the budget under test: {live:?}"
+    );
     let table = fixture.load_table().await;
     let base = table
         .metadata()
@@ -43,28 +86,19 @@ async fn managed_rewrite_plan_matches_core_report_on_promoted_snapshot() {
         .expect("a promoted snapshot")
         .snapshot_id();
 
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.fixture.staging));
-    let forge = fixture.forge(
-        fixture.fixture.catalog.iceberg_catalog(),
-        Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
-    );
-    let outcome = forge
-        .execute_rewrite_attempt(
-            &fixture.fixture.binding,
-            fixture.attempt(uuid::Uuid::now_v7()).await,
-        )
-        .await
-        .expect("the promoted snapshot is rewritable");
+    let (budgeted_evidence, budgeted_handoff) = rewrite_under_plan_budget(&mut fixture, 1).await;
+    let (whole_evidence, whole_handoff) = rewrite_under_plan_budget(&mut fixture, live.len()).await;
 
-    let ForgeRewriteOutcome::Rewritten { evidence, handoff } = outcome else {
-        panic!("a promoted small-file set must select: {outcome:?}");
-    };
     assert_eq!(
-        evidence.base_snapshot_id, base,
-        "the plan is bound to the promoted snapshot"
+        (
+            budgeted_evidence.base_snapshot_id,
+            whole_evidence.base_snapshot_id
+        ),
+        (base, base),
+        "both passes are bound to the same promoted snapshot"
     );
     assert_eq!(
-        handoff
+        whole_handoff
             .rewritten_data_files
             .iter()
             .cloned()
@@ -72,14 +106,53 @@ async fn managed_rewrite_plan_matches_core_report_on_promoted_snapshot() {
         live,
         "the adapter consumed exactly the core's selected data files"
     );
-    assert!(
-        !handoff.output_data_files.is_empty(),
-        "a selected plan produced at least one object"
+    assert_eq!(
+        whole_handoff.rewritten_data_files.len(),
+        live.len(),
+        "no live data file is consumed twice"
+    );
+    assert_eq!(
+        budgeted_handoff.rewritten_data_files,
+        whole_handoff.rewritten_data_files[..1].to_vec(),
+        "the budgeted pass executed the core's leading group unchanged"
+    );
+    assert_eq!(
+        budgeted_handoff.output_data_files.len(),
+        1,
+        "one admitted plan produced one object"
+    );
+    assert_eq!(
+        whole_handoff.output_data_files.len(),
+        live.len(),
+        "each admitted plan produced its own object"
+    );
+    assert_eq!(
+        fixture
+            .object_values(
+                &budgeted_handoff
+                    .output_data_files
+                    .iter()
+                    .map(|file| file.file_path().to_owned())
+                    .collect::<Vec<_>>()
+            )
+            .await,
+        fixture
+            .object_values(&budgeted_handoff.rewritten_data_files)
+            .await,
+        "the budgeted pass carried forward exactly the rows of the files it reported consuming"
+    );
+    assert_ne!(
+        budgeted_evidence.selection_fingerprint, whole_evidence.selection_fingerprint,
+        "the budget is a selection decision: a capped pass receipts less work than an uncapped one"
+    );
+    assert_ne!(
+        budgeted_evidence.debt_fingerprint, whole_evidence.debt_fingerprint,
+        "a capped pass also summarizes less outstanding debt"
     );
     assert!(
-        !evidence.selection_fingerprint.is_empty()
-            && !evidence.debt_fingerprint.is_empty()
-            && !evidence.policy_fingerprint.is_empty(),
+        !budgeted_evidence.selection_fingerprint.is_empty()
+            && !budgeted_evidence.debt_fingerprint.is_empty()
+            && !budgeted_evidence.policy_fingerprint.is_empty(),
         "every planned attempt records its three canonical fingerprints"
     );
 }
@@ -136,13 +209,73 @@ async fn managed_rewrite_refuses_resources_before_object_io() {
     );
 }
 
-/// Produced objects are distinguishable, and the next pass keeps them.
+/// Drives one attempt to cancellation at the moment its Nth output opens.
 ///
-/// The path grammar carries a per-writer ordinal, which resets, and a writer
-/// UUID, which does not; the pair is what makes two concurrently produced
-/// objects distinct. The second half is the reclassification proof: a produced
-/// object carries the current writer recipe, so re-running selection against a
-/// live set that now contains it must not name it again.
+/// The seam counts rewrite-output opens and trips the attempt's own token on
+/// the `ordinal`-th, so the attempt is live and already producing when it is
+/// cancelled — never cancelled up front. The returned pair is the attempt id
+/// and the possible-output set the drain reported, which is what a caller
+/// inspects for attempt-global ordinal behavior.
+///
+/// # Panics
+///
+/// Panics if the attempt errors or reports anything but a cancellation, or if
+/// the seam did not observe exactly `ordinal` output opens.
+async fn drain_at_output(
+    fixture: &PromotedRewriteFixture,
+    ordinal: usize,
+) -> (uuid::Uuid, Vec<ForgeUnsettledOutput>) {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let (catalog, store) = fixture.breaking_catalog(RewriteOutputBreak::CancelAtOpen {
+        ordinal,
+        token: cancel.clone(),
+    });
+    let object_store = CountingObjectStore::new(Arc::clone(&fixture.fixture.staging));
+    let attempt_id = uuid::Uuid::now_v7();
+    let outcome = fixture
+        .forge(
+            Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
+            Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
+        )
+        .execute_rewrite_attempt(
+            &fixture.fixture.binding,
+            ForgeRewriteAttempt {
+                cancel,
+                ..fixture.attempt(attempt_id).await
+            },
+        )
+        .await
+        .expect("a drained attempt is an outcome, not a failure");
+    let ForgeRewriteOutcome::Cancelled {
+        possible_outputs, ..
+    } = outcome
+    else {
+        panic!("a cancelled attempt must report its possible outputs: {outcome:?}");
+    };
+    assert_eq!(
+        store.opened_outputs(),
+        ordinal,
+        "the drain was tripped by the {ordinal}th output open"
+    );
+    (attempt_id, possible_outputs)
+}
+
+/// Produced objects are distinguishable across plans, and the next pass keeps them.
+///
+/// One attempt executes every eligible group, so the objects it produces come
+/// from different plan calls. The filename ordinal resets to zero for each of
+/// them — it is per-writer — so the writer UUID is the only thing in the path
+/// that separates two objects, which is why the path assertions below are about
+/// the pair rather than either half.
+///
+/// The logical ordinals are the other half and are not in a path at all. They
+/// are read back from a drained attempt over the same table: they must be the
+/// attempt-global sequence `0, 1`, strictly increasing across the two plan
+/// calls, never restarting per plan and never colliding.
+///
+/// The last section is the reclassification proof: a produced object carries
+/// the current writer recipe, so re-running selection against a live set that
+/// now contains it must not name it again.
 #[tokio::test]
 async fn managed_rewrite_output_identity_is_unique_across_concurrent_writers() {
     let fixture = PromotedRewriteFixture::start("rewrite_identity").await;
@@ -165,6 +298,10 @@ async fn managed_rewrite_output_identity_is_unique_across_concurrent_writers() {
         .iter()
         .map(|file| file.file_path().to_owned())
         .collect::<Vec<_>>();
+    assert!(
+        paths.len() > 1,
+        "the attempt must execute more than one plan for this to say anything: {paths:?}"
+    );
     let distinct = paths
         .iter()
         .cloned()
@@ -180,21 +317,45 @@ async fn managed_rewrite_output_identity_is_unique_across_concurrent_writers() {
             "a produced object carries the current writer recipe: {path}"
         );
         assert!(
-            path.contains(&attempt_id.to_string()),
-            "a produced object names its attempt: {path}"
+            path.contains(&format!("{attempt_id}-00000-")),
+            "the filename ordinal is per-writer and restarts for each plan: {path}"
         );
     }
+
+    let (drain_id, possible_outputs) = drain_at_output(&fixture, 2).await;
+    assert_eq!(
+        possible_outputs
+            .iter()
+            .map(|output| output.logical_ordinal)
+            .collect::<Vec<_>>(),
+        vec![0, 1],
+        "logical ordinals are attempt-global and strictly increasing across plan calls: \
+         {possible_outputs:?}"
+    );
+    for output in &possible_outputs {
+        assert!(
+            output.path.contains(&format!("{drain_id}-00000-")),
+            "each plan's own writer restarted its filename ordinal: {}",
+            output.path
+        );
+    }
+    assert_eq!(
+        possible_outputs
+            .iter()
+            .map(|output| output.path.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        possible_outputs.len(),
+        "no two attempt-global ordinals name the same object: {possible_outputs:?}"
+    );
 
     let repeat = forge
         .execute_rewrite_attempt(
             &fixture.fixture.binding,
-            ForgeRewriteAttempt {
-                attempt_id: uuid::Uuid::now_v7(),
-                ..fixture.attempt(uuid::Uuid::now_v7()).await
-            },
+            fixture.attempt(uuid::Uuid::now_v7()).await,
         )
         .await
-        .expect("a second pass is executable");
+        .expect("a further pass is executable");
     if let ForgeRewriteOutcome::Rewritten { handoff, .. } = repeat {
         for produced in &paths {
             assert!(
@@ -207,59 +368,183 @@ async fn managed_rewrite_output_identity_is_unique_across_concurrent_writers() {
 
 /// Cancellation drains and reports every object it may have produced.
 ///
-/// The attempt is cancelled before it is executed, so the core stops without
-/// settling. What the seam must not do is claim a result: it returns the
-/// cancellation with its possible-output set intact and leaves the catalog
-/// alone, which is what lets a later reconciliation reclaim whatever landed.
+/// The attempt is not cancelled up front — that would refuse before any IO and
+/// prove nothing about draining. It is cancelled at the moment a *later* plan's
+/// output opens, after an earlier plan already settled one. The core decides
+/// cancellation only after draining its writers, so both objects exist, and the
+/// seam has to report both: the earlier plan's object is the one a
+/// plan-scoped report would lose.
+///
+/// The rest is what makes the drain safe to act on. No commit crossed the
+/// catalog, the live set still names no rewrite output, both reported objects
+/// are in storage, and the attempt's scratch child is gone, so the lease was
+/// returned rather than leaked. `NoProgress` is not an acceptable answer here:
+/// the attempt did open objects, and reporting no progress would strand them.
 #[tokio::test]
 async fn managed_rewrite_cancellation_drains_and_preserves_possible_outputs() {
     let fixture = PromotedRewriteFixture::start("rewrite_drain").await;
+    let live_before = fixture.fixture.live_data_paths().await;
     let object_store = CountingObjectStore::new(Arc::clone(&fixture.fixture.staging));
-    let catalog = PromotionCatalogSeam::new(
-        fixture.fixture.catalog.iceberg_catalog(),
-        Arc::new(AtomicUsize::new(0)),
-    );
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let (catalog, store) = fixture.breaking_catalog(RewriteOutputBreak::CancelAtOpen {
+        ordinal: 2,
+        token: cancel.clone(),
+    });
     let forge = fixture.forge(
         Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
     );
-    let attempt = fixture.attempt(uuid::Uuid::now_v7()).await;
-    attempt.cancel.cancel();
-
+    let attempt_id = uuid::Uuid::now_v7();
     let outcome = forge
-        .execute_rewrite_attempt(&fixture.fixture.binding, attempt)
-        .await;
+        .execute_rewrite_attempt(
+            &fixture.fixture.binding,
+            ForgeRewriteAttempt {
+                cancel,
+                ..fixture.attempt(attempt_id).await
+            },
+        )
+        .await
+        .expect("a drained attempt is an outcome, not a failure");
 
-    match outcome {
-        Ok(ForgeRewriteOutcome::Cancelled {
-            possible_outputs, ..
-        }) => {
-            let paths = possible_outputs
-                .iter()
-                .map(|output| output.path.clone())
-                .collect::<std::collections::BTreeSet<_>>();
-            assert_eq!(
-                paths.len(),
-                possible_outputs.len(),
-                "a drained attempt reports each possible object once"
-            );
-        }
-        Ok(ForgeRewriteOutcome::NoProgress { .. }) => {}
-        other => panic!("a cancelled attempt must not claim a rewrite: {other:?}"),
+    let ForgeRewriteOutcome::Cancelled {
+        base_snapshot_id,
+        possible_outputs,
+    } = outcome
+    else {
+        panic!("a cancelled attempt must report its possible outputs: {outcome:?}");
+    };
+    assert_eq!(
+        base_snapshot_id,
+        fixture
+            .load_table()
+            .await
+            .metadata()
+            .current_snapshot()
+            .expect("a promoted snapshot")
+            .snapshot_id(),
+        "the drain names the snapshot it was planned against"
+    );
+    assert_eq!(
+        store.opened_outputs(),
+        2,
+        "two plan calls opened two objects"
+    );
+    assert_eq!(
+        possible_outputs.len(),
+        2,
+        "the drain reports the whole attempt, not the plan that was cancelled: {possible_outputs:?}"
+    );
+    assert_eq!(
+        possible_outputs
+            .iter()
+            .map(|output| output.logical_ordinal)
+            .collect::<Vec<_>>(),
+        vec![0, 1],
+        "cumulative ordinals stay attempt-global across the drain"
+    );
+    assert!(
+        possible_outputs.iter().all(|output| output.settled),
+        "cancellation is decided after the drain, so every writer had closed: {possible_outputs:?}"
+    );
+    let objects = fixture.object_digests().await;
+    for output in &possible_outputs {
+        assert!(
+            objects
+                .keys()
+                .any(|object| output.path.ends_with(object.as_str())),
+            "each reported object exists and can be reclaimed: {}",
+            output.path
+        );
     }
     assert_eq!(
         catalog.attempts(),
         0,
         "a drained attempt issued no catalog commit"
     );
+    assert_eq!(
+        fixture.fixture.live_data_paths().await,
+        live_before,
+        "a drained attempt published nothing"
+    );
     assert!(
         fixture
-            .fixture
-            .live_data_paths()
-            .await
+            .scratch_children()
             .iter()
-            .all(|path| { !path.contains("/data/forge/") }),
-        "a drained attempt published nothing"
+            .all(|child| !child.contains(&attempt_id.to_string())),
+        "the drained attempt returned its scratch lease: {:?}",
+        fixture.scratch_children()
+    );
+}
+
+/// A failure after an output opened still reports the whole attempt's objects.
+///
+/// The earlier plan settles one object, then the later plan's output is opened
+/// and its close refused. That ordering is the point: the failing object was
+/// reported as opened, so a correct failure names *both* it and the earlier
+/// plan's settled object. Losing either is losing an object nothing can
+/// afterwards name, because the attempt that named it has ended.
+///
+/// The refusal is still a refusal — it is an error, not an outcome — and it
+/// still classifies as the transient object-store failure the underlying
+/// boundary declared, so wrapping the evidence did not move the failure into a
+/// different retry class. Nothing was committed and nothing was published.
+#[tokio::test]
+async fn managed_rewrite_failure_preserves_attempt_global_possible_outputs() {
+    let fixture = PromotedRewriteFixture::start("rewrite_failure").await;
+    let live_before = fixture.fixture.live_data_paths().await;
+    let object_store = CountingObjectStore::new(Arc::clone(&fixture.fixture.staging));
+    let (catalog, store) = fixture.breaking_catalog(RewriteOutputBreak::FailAtClose { ordinal: 2 });
+    let forge = fixture.forge(
+        Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
+        Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
+    );
+    let attempt_id = uuid::Uuid::now_v7();
+    let error = forge
+        .execute_rewrite_attempt(&fixture.fixture.binding, fixture.attempt(attempt_id).await)
+        .await
+        .expect_err("a refused output settlement fails the attempt");
+
+    assert!(
+        matches!(error, ForgeError::RewriteUnsettled { .. }),
+        "a failure after an object may exist carries that object: {error:?}"
+    );
+    assert_eq!(
+        error.failure_class(),
+        vala_sql::row_types::forge_tasks::ForgeFailureClass::TransientObjectStore,
+        "carrying evidence did not reclassify the failure: {error:?}"
+    );
+    assert_eq!(
+        store.opened_outputs(),
+        2,
+        "two plan calls opened two objects"
+    );
+    let possible_outputs = error.possible_rewrite_outputs();
+    assert_eq!(
+        possible_outputs
+            .iter()
+            .map(|output| (output.logical_ordinal, output.settled))
+            .collect::<Vec<_>>(),
+        vec![(0, true), (1, false)],
+        "the failure retains the earlier plan's settled object and the later plan's \
+         unsettled one: {possible_outputs:?}"
+    );
+    let objects = fixture.object_digests().await;
+    assert!(
+        objects
+            .keys()
+            .any(|object| possible_outputs[0].path.ends_with(object.as_str())),
+        "the settled object is in storage and reclaimable: {}",
+        possible_outputs[0].path
+    );
+    assert_eq!(
+        catalog.attempts(),
+        0,
+        "a failed attempt issued no catalog commit"
+    );
+    assert_eq!(
+        fixture.fixture.live_data_paths().await,
+        live_before,
+        "a failed attempt published nothing"
     );
 }
 

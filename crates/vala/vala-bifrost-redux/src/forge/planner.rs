@@ -100,6 +100,30 @@ pub struct ForgePlanCandidate {
     pub parameters: serde_json::Value,
 }
 
+/// Computes the durable identity digest of one exact task plan.
+///
+/// The digest is a column in the `forge_tasks` idempotency index, so it is what
+/// makes replanning the same work recognize its own already-enqueued task
+/// instead of creating a second one. Publication recomputes it from the claimed
+/// plan to bind a committed snapshot back to the durable row that authorized
+/// it, which only works while both sides derive it here.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::Invariant`] when the plan's parameters do not
+/// serialize, which no validated plan can do.
+pub(super) fn plan_hash(plan: &ForgeTaskPlan) -> Result<[u8; 32], ForgeError> {
+    let canonical = serde_json::to_vec(&serde_json::json!({
+        "inputs": plan.inputs,
+        "parameters": plan.parameters,
+        "version": plan.version,
+    }))
+    .map_err(|error| ForgeError::Invariant {
+        detail: error.to_string(),
+    })?;
+    Ok(Sha256::digest(canonical).into())
+}
+
 /// Every deterministic candidate derived from one immutable table snapshot.
 ///
 /// The snapshot identity travels with the candidates so a plan can never be
@@ -376,15 +400,7 @@ impl ForgePlanner {
             inputs: candidate.inputs.clone(),
             parameters: candidate.parameters.clone(),
         };
-        let canonical = serde_json::to_vec(&serde_json::json!({
-            "inputs": plan.inputs,
-            "parameters": plan.parameters,
-            "version": plan.version,
-        }))
-        .map_err(|error| ForgeError::Invariant {
-            detail: error.to_string(),
-        })?;
-        let plan_hash: [u8; 32] = Sha256::digest(canonical).into();
+        let plan_hash = plan_hash(&plan)?;
         Ok(PlannedForgeTask {
             strategy: candidate.strategy,
             base_snapshot_id: snapshot_id,

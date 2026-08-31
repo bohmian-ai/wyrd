@@ -8,12 +8,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use vala_bifrost_redux::catalog::TenantTableBinding;
 use wyrd_testing::bifrost::{
     CommitUncertaintyCatalog, ForgeFixture, ForgeObjectStoreControl, seed_forge_group,
 };
 
-use crate::support::{SupervisedForge, start_engine_fixture_server};
+use crate::support::{
+    SupervisedForge, live_data_paths, reclaim_stopped_claim, start_engine_fixture_server,
+};
 
 /// One durable Forge task row as the promotion proofs read it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,46 +99,6 @@ async fn file_rows(fixture: &ForgeFixture) -> Vec<FileRow> {
         },
     )
     .collect()
-}
-
-/// Collects the live data-file paths of one table's current snapshot.
-///
-/// The projection mirrors the catalog's own pinning rule — table-relative
-/// suffix rewritten onto the tenant object prefix — so a path here is directly
-/// comparable to a `vala.file_list` path.
-///
-/// # Panics
-///
-/// Panics when the table, its manifest list, or a manifest cannot be read.
-async fn live_data_paths(fixture: &ForgeFixture, binding: &TenantTableBinding) -> BTreeSet<String> {
-    let table = iceberg::Catalog::load_table(fixture.catalog.as_ref(), &binding.table_ident())
-        .await
-        .expect("promotion table load");
-    let mut paths = BTreeSet::new();
-    let Some(snapshot) = table.metadata().current_snapshot() else {
-        return paths;
-    };
-    let manifests = table
-        .manifest_list_reader(snapshot)
-        .load()
-        .await
-        .expect("promotion manifest list");
-    for manifest_file in manifests.entries() {
-        let manifest = manifest_file
-            .load_manifest(table.file_io())
-            .await
-            .expect("promotion manifest");
-        for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
-            let path = entry.data_file().file_path().to_owned();
-            let canonical = path
-                .strip_prefix(table.metadata().location())
-                .and_then(|suffix| suffix.strip_prefix('/'))
-                .map(|suffix| format!("{}/{suffix}", binding.object_prefix))
-                .unwrap_or(path);
-            paths.insert(canonical);
-        }
-    }
-    paths
 }
 
 /// Borrows the ordered promoted file identities from one persisted plan.
@@ -972,57 +933,4 @@ async fn release_forge_lease(fixture: &ForgeFixture, owner: uuid::Uuid) {
     .execute(fixture.operator_pool.pool())
     .await
     .expect("release the stolen Forge lease");
-}
-
-/// Returns the claim a fully stopped worker abandoned to a fresh attempt.
-///
-/// The deadline is expired only after the prior worker has joined, and the
-/// reclaim itself runs through the production bounded transaction, so the
-/// successor executes a real fresh attempt rather than a fabricated one. Only
-/// the persisted eligibility clock is then advanced, which keeps wall-clock
-/// sleeps out of the proof.
-///
-/// # Panics
-///
-/// Panics when no stopped claim or worker-settled retryable task is present.
-async fn reclaim_stopped_claim(fixture: &ForgeFixture) {
-    let running: Option<(uuid::Uuid, uuid::Uuid, uuid::Uuid)> = sqlx::query_as(
-        "SELECT task_id, attempt_id, claimed_by FROM vala.forge_tasks \
-         WHERE data_tenant_id = $1 AND state = 'running'",
-    )
-    .bind(fixture.tenant.as_uuid())
-    .fetch_optional(fixture.operator_pool.pool())
-    .await
-    .expect("stopped running Forge claim query");
-    if let Some((task_id, attempt_id, owner)) = running {
-        sqlx::query(
-            "UPDATE vala.forge_tasks \
-             SET claim_expires_at = statement_timestamp() - interval '1 millisecond' \
-             WHERE task_id = $1 AND attempt_id = $2 AND claimed_by = $3 AND state = 'running'",
-        )
-        .bind(task_id)
-        .bind(attempt_id)
-        .bind(owner)
-        .execute(fixture.operator_pool.pool())
-        .await
-        .expect("expire the exact stopped Forge claim");
-        assert_eq!(
-            vala_sql::queries::forge_tasks::ForgeTasks::new(fixture.operator_pool.clone())
-                .reclaim_expired_attempts(1)
-                .await
-                .expect("production bounded reclaim"),
-            vec![(task_id, attempt_id)],
-            "reclaim returns the exact stopped attempt"
-        );
-    }
-    sqlx::query(
-        "UPDATE vala.forge_tasks \
-         SET next_eligible_at = statement_timestamp() - interval '1 millisecond', \
-             ready_at = statement_timestamp() - interval '1 millisecond' \
-         WHERE data_tenant_id = $1 AND state = 'retryable'",
-    )
-    .bind(fixture.tenant.as_uuid())
-    .execute(fixture.operator_pool.pool())
-    .await
-    .expect("advance reclaimed task eligibility");
 }

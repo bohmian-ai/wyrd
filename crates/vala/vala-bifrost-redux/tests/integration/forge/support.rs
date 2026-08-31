@@ -214,6 +214,13 @@ pub(crate) struct PromotionCatalogSeam {
     parked_dropped: AtomicBool,
     /// Wakes tests waiting for that cancellation.
     parked_drop_ready: tokio::sync::Notify,
+    /// Storage adapter every loaded table is rebound to, once one is installed.
+    ///
+    /// The managed core reads inputs and writes rewrite outputs through the
+    /// [`FileIO`] carried by the table it was handed, so replacing it here is
+    /// the one place a scenario can observe or refuse an individual output
+    /// without reimplementing the production write path.
+    file_io: std::sync::OnceLock<iceberg::io::FileIO>,
 }
 
 impl PromotionCatalogSeam {
@@ -233,7 +240,24 @@ impl PromotionCatalogSeam {
             parked_release: tokio::sync::Notify::new(),
             parked_dropped: AtomicBool::new(false),
             parked_drop_ready: tokio::sync::Notify::new(),
+            file_io: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Rebinds every table this seam loads onto `file_io`.
+    ///
+    /// Installed once per seam: a second install would leave earlier and later
+    /// loads of the same table reading through different adapters, which is a
+    /// scenario nothing needs and every assertion would have to reason about.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an adapter is already installed.
+    pub(crate) fn intercept_file_io(&self, file_io: iceberg::io::FileIO) {
+        assert!(
+            self.file_io.set(file_io).is_ok(),
+            "one seam installs at most one storage adapter"
+        );
     }
 
     /// Refuse the next `count` commits as definite, non-retryable conflicts.
@@ -337,7 +361,19 @@ impl Catalog for PromotionCatalogSeam {
 
     async fn load_table(&self, table: &TableIdent) -> iceberg::Result<Table> {
         self.loads.fetch_add(1, Ordering::AcqRel);
-        self.inner.load_table(table).await
+        let loaded = self.inner.load_table(table).await?;
+        let Some(file_io) = self.file_io.get() else {
+            return Ok(loaded);
+        };
+        let mut builder = Table::builder()
+            .identifier(loaded.identifier().clone())
+            .metadata(loaded.metadata_ref())
+            .file_io(file_io.clone())
+            .runtime(iceberg::Runtime::current());
+        if let Some(location) = loaded.metadata_location() {
+            builder = builder.metadata_location(location.to_owned());
+        }
+        builder.build()
     }
 
     async fn drop_table(&self, table: &TableIdent) -> iceberg::Result<()> {
@@ -421,6 +457,23 @@ pub(crate) struct FileRow {
 /// tier-2 test cannot start one. What it composes is nonetheless the production
 /// graph — the same catalog owner, the same Scribe, and the same Forge
 /// scheduler and worker a server would build.
+/// One durable `vala.forge_tasks` row as the scheduler persisted it.
+#[derive(Debug)]
+pub(crate) struct ForgeTaskRow {
+    /// Durable identity of the task.
+    pub(crate) task_id: uuid::Uuid,
+    /// Persisted strategy discriminator.
+    pub(crate) strategy: String,
+    /// Persisted scheduling state.
+    pub(crate) state: String,
+    /// Snapshot the task was bound to at enqueue.
+    pub(crate) base_snapshot_id: i64,
+    /// Immutable plan payload bound at enqueue.
+    pub(crate) plan: serde_json::Value,
+    /// Canonical hash of that plan payload.
+    pub(crate) plan_hash: Vec<u8>,
+}
+
 pub(crate) struct PromotionIntegrationFixture {
     /// Real catalog owner used for registration, cuts, and Forge commits.
     pub(crate) catalog: Arc<BifrostCatalog>,
@@ -438,8 +491,10 @@ pub(crate) struct PromotionIntegrationFixture {
     pub(crate) config: ForgeConfig,
     /// Narrow Forge capability issued by this fixture's resource composition.
     forge_resources: vala_bifrost_redux::resources::ForgeResources,
-    /// Real Scribe retained so its owned WAL and workers outlive the seals.
-    _scribe: Arc<ScribeImpl>,
+    /// Real Scribe retained so its owned WAL and workers outlive the seals,
+    /// and reused by [`PromotionIntegrationFixture::seal_more`] to publish
+    /// further hot objects through the same writer.
+    scribe: Arc<ScribeImpl>,
     /// Database retained for the fixture lifetime.
     _database: wyrd_dev_fixtures::pg::PgFixture,
     /// Warehouse root retained for the fixture lifetime.
@@ -521,7 +576,7 @@ impl PromotionIntegrationFixture {
             binding,
             config: ForgeConfig::default(),
             forge_resources,
-            _scribe: scribe,
+            scribe,
             _database: database,
             _warehouse: warehouse,
             _wal_root: wal_root,
@@ -599,6 +654,184 @@ impl PromotionIntegrationFixture {
             },
         )
         .collect()
+    }
+
+    /// Reads every durable promotion record of the fixture table, in durable order.
+    ///
+    /// The raw JSON is returned rather than the decoded record so a scenario
+    /// can mutate one field of the persisted evidence exactly as a corrupted or
+    /// tampered row would carry it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the read-only diagnostic query fails.
+    pub(crate) async fn promotion_records(&self) -> Vec<(uuid::Uuid, serde_json::Value)> {
+        sqlx::query_as::<_, (uuid::Uuid, serde_json::Value)>(
+            "SELECT id, promotion_record FROM vala.file_list \
+             WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 \
+             ORDER BY created_at, file_ordinal, id",
+        )
+        .bind(self.tenant.as_uuid())
+        .bind(&self.binding.logical_namespace)
+        .bind(&self.binding.table_name)
+        .fetch_all(self.operator_pool.pool())
+        .await
+        .expect("fixture promotion-record inspection")
+    }
+
+    /// Replaces one row's durable promotion record.
+    ///
+    /// Writing the evidence directly is the only way to separate what Forge
+    /// proves about the object from what Scribe happened to record: the object
+    /// itself stays untouched, so any refusal comes from re-deriving the
+    /// object's own footer rather than from re-reading the same row twice.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the update fails or does not name exactly one row.
+    pub(crate) async fn set_promotion_record(&self, id: uuid::Uuid, record: &serde_json::Value) {
+        let updated = sqlx::query("UPDATE vala.file_list SET promotion_record = $2 WHERE id = $1")
+            .bind(id)
+            .bind(record)
+            .execute(self.operator_pool.pool())
+            .await
+            .expect("fixture promotion-record update")
+            .rows_affected();
+        assert_eq!(updated, 1, "one promotion record is replaced at a time");
+    }
+
+    /// Seals `count` more hot objects through the same real Scribe.
+    ///
+    /// Existing rows are already aged into promotion eligibility, so a second
+    /// seal is the only way to put a table into the one state the scheduler
+    /// ordering rule is about: live promoted data the rewrite route wants and
+    /// unpublished hot data the promotion route owes, at the same time.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a seal publishes no new `vala.file_list` row.
+    pub(crate) async fn seal_more(&self, count: usize) {
+        let before = self.file_rows().await.len();
+        let first = i64::try_from(before).expect("fixture row counts stay representable");
+        let seeded_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar("SELECT now()")
+            .fetch_one(self.operator_pool.pool())
+            .await
+            .expect("fixture seed marker");
+        let schema = ingress_schema();
+        for file_number in 0..i64::try_from(count).expect("fixture seal counts stay representable")
+        {
+            append_and_seal(
+                &self.scribe,
+                &self.catalog,
+                self.tenant,
+                &self.binding,
+                &ingress_batch(&schema, first + file_number),
+            )
+            .await;
+        }
+        age_files(&self.operator_pool, self.tenant, &self.binding, seeded_at).await;
+        assert_eq!(
+            self.file_rows().await.len(),
+            before + count,
+            "a real Scribe seal publishes one row per batch"
+        );
+    }
+
+    /// Reads every durable Forge task of this fixture's table, in durable order.
+    ///
+    /// The rows are returned untyped so a scenario asserts on the exact durable
+    /// values the scheduler wrote — strategy, state, bound base snapshot, and
+    /// bound plan — rather than on a decoded shape that could normalize a
+    /// mistake away.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the read-only diagnostic query fails.
+    pub(crate) async fn forge_tasks(&self) -> Vec<ForgeTaskRow> {
+        sqlx::query_as::<_, (uuid::Uuid, String, String, i64, serde_json::Value, Vec<u8>)>(
+            "SELECT task_id, strategy, state, base_snapshot_id, plan, plan_hash \
+             FROM vala.forge_tasks \
+             WHERE data_tenant_id = $1 AND namespace_name = $2 AND table_name = $3 \
+             ORDER BY created_at, task_id",
+        )
+        .bind(self.tenant.as_uuid())
+        .bind(&self.binding.logical_namespace)
+        .bind(&self.binding.table_name)
+        .fetch_all(self.operator_pool.pool())
+        .await
+        .expect("fixture Forge task inspection")
+        .into_iter()
+        .map(
+            |(task_id, strategy, state, base_snapshot_id, plan, plan_hash)| ForgeTaskRow {
+                task_id,
+                strategy,
+                state,
+                base_snapshot_id,
+                plan,
+                plan_hash,
+            },
+        )
+        .collect()
+    }
+
+    /// Reads the durable Iceberg-rewrite operation phases for this tenant.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the read-only diagnostic query fails.
+    pub(crate) async fn rewrite_phases(&self) -> Vec<String> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT phase FROM vala.forge_operation_state \
+             WHERE data_tenant_id = $1 AND family = 'iceberg_rewrite' \
+             ORDER BY prepared_at, operation_id",
+        )
+        .bind(self.tenant.as_uuid())
+        .fetch_all(self.operator_pool.pool())
+        .await
+        .expect("fixture operation-state inspection")
+    }
+
+    /// Ages every live claim deadline past due for this fixture's tenant.
+    ///
+    /// A worker that dies mid-attempt leaves its claim held until the deadline
+    /// lapses, and that lapse is wall-clock time no test can wait for. Moving
+    /// the stored deadline into the past is the same kind of aging the file
+    /// helpers do: it makes time pass, and leaves the production reclaim
+    /// transaction to decide what that means.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the update fails.
+    pub(crate) async fn expire_claims(&self) {
+        sqlx::query(
+            "UPDATE vala.forge_tasks SET claim_expires_at = statement_timestamp() - interval '1 minute' \
+             WHERE data_tenant_id = $1 AND state IN ('claimed', 'running')",
+        )
+        .bind(self.tenant.as_uuid())
+        .execute(self.operator_pool.pool())
+        .await
+        .expect("fixture claim aging");
+    }
+
+    /// Retires the retry backoff the production reclaim path just imposed.
+    ///
+    /// Reclaim deliberately holds a reclaimed task back for tens of seconds so
+    /// a failing task cannot spin. That interval is wall-clock time, so a
+    /// scenario proving what the *takeover* does has to age past it rather than
+    /// sleep through it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the update fails.
+    pub(crate) async fn clear_task_backoff(&self) {
+        sqlx::query(
+            "UPDATE vala.forge_tasks SET ready_at = statement_timestamp(), \
+             next_eligible_at = statement_timestamp() WHERE data_tenant_id = $1",
+        )
+        .bind(self.tenant.as_uuid())
+        .execute(self.operator_pool.pool())
+        .await
+        .expect("fixture backoff aging");
     }
 
     /// Reads the durable promotion operation phases for this fixture's tenant.
@@ -684,6 +917,16 @@ impl PromotionIntegrationFixture {
         paths
     }
 
+    /// Returns the pod-wide scratch root every attempt takes its child from.
+    ///
+    /// An admitted attempt creates one `forge-runtime-{task}-{attempt}-*` child
+    /// beneath this root and removes it when its lease is finalized, so the
+    /// absence of a child naming an attempt is the direct evidence that the
+    /// attempt's scratch was released rather than leaked.
+    pub(crate) fn rewrite_spill_root(&self) -> std::path::PathBuf {
+        self.scratch_root.path().join("forge")
+    }
+
     /// Snapshots every object under the table prefix with its exact content hash.
     ///
     /// Comparing the map across a promotion is the direct proof that no data
@@ -740,7 +983,12 @@ pub(crate) struct SupervisedPromotion {
     /// Running production worker supervisor.
     worker_task: Option<JoinHandle<Result<(), ForgeError>>>,
     /// Forge graph kept alive for the supervised lifetime.
-    _forge: Arc<Forge>,
+    ///
+    /// Retaining it is what lets a scenario stop and restart the worker over
+    /// one scheduler generation: the singleton planning fence is TTL-bound and
+    /// is never released on shutdown, so a second supervisor in one test would
+    /// stand by and plan nothing.
+    forge: Arc<Forge>,
 }
 
 impl SupervisedPromotion {
@@ -788,8 +1036,66 @@ impl SupervisedPromotion {
             worker_stop,
             scheduler_task,
             worker_task: Some(worker_task),
-            _forge: forge,
+            forge,
         }
+    }
+
+    /// Runs the production reclaim transaction once, outside the worker loop.
+    ///
+    /// The supervised loop reclaims and then claims in one iteration, so a
+    /// scenario that must observe the reclaim *before* the next claim cannot
+    /// get there through a tick. This calls the same reclaim the loop calls,
+    /// on a worker built from the same retained graph.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the worker cannot be built or the reclaim fails.
+    pub(crate) async fn reclaim_expired_claims(&self) {
+        let worker = ForgeWorker::new(
+            Arc::clone(&self.forge),
+            ForgeWorkerConfig::default(),
+            uuid::Uuid::now_v7(),
+        )
+        .expect("fixture Forge worker");
+        worker
+            .reclaim_expired_attempts_for_test(16)
+            .await
+            .expect("fixture reclaim pass");
+    }
+
+    /// Start a replacement worker over the same scheduler generation.
+    ///
+    /// Every `run_one_*` helper stops the worker so the caller's assertions
+    /// cannot race a retry. A scenario that needs a second attempt therefore
+    /// restarts the worker rather than building a second supervisor, which
+    /// would stand by behind the first one's unexpired planning fence.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a worker is already running or the graph is unusable.
+    pub(crate) fn restart_worker(&mut self) {
+        assert!(
+            self.worker_task.is_none(),
+            "a supervisor runs one worker at a time"
+        );
+        let worker = ForgeWorker::new(
+            Arc::clone(&self.forge),
+            ForgeWorkerConfig::default(),
+            uuid::Uuid::now_v7(),
+        )
+        .expect("fixture Forge worker");
+        self.worker_stop = CancellationToken::new();
+        let stop = self.worker_stop.clone();
+        self.worker_task = Some(tokio::spawn(async move { worker.run(stop).await }));
+    }
+
+    /// Request and await one production planning pass without running work.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the scheduler misses its deterministic bound.
+    pub(crate) async fn schedule_only(&self) {
+        self.schedule_once().await;
     }
 
     /// Request and await one pass from the running production scheduler.
@@ -876,6 +1182,37 @@ impl SupervisedPromotion {
             self.worker_observer.returned_errors()
         );
         self
+    }
+
+    /// Schedule one pass and await exactly one returned worker error.
+    ///
+    /// Unlike [`Self::run_one_failure_while`] no seam is parked, because the
+    /// refusal under test happens before the attempt ever reaches the catalog.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a deterministic bound is missed or the attempt succeeded.
+    pub(crate) async fn run_one_failure(&mut self) -> String {
+        let before = self.worker_observer.returned_errors();
+        self.worker_observer.hold_after_next_attempt_for_test();
+        self.schedule_once().await;
+        tokio::time::timeout(
+            FIXTURE_BOUND,
+            self.worker_observer.wait_for_held_attempt_for_test(),
+        )
+        .await
+        .expect("production Forge worker attempt bound");
+        self.stop_worker().await;
+        let after = self.worker_observer.returned_errors();
+        assert_eq!(
+            after.len(),
+            before.len().saturating_add(1),
+            "the attempt was expected to return exactly one error: {after:?}"
+        );
+        after
+            .last()
+            .expect("one error was just returned")
+            .to_owned()
     }
 
     /// Borrows the token production worker execution observes as shutdown.
@@ -1298,4 +1635,79 @@ async fn age_files(
 /// Panics when the manual clock cannot be initialized.
 pub(crate) fn manual_clock() -> (ForgeClock, ForgeClockControl) {
     ForgeClock::manual(chrono::Utc::now())
+}
+
+/// The one Tier-2 telemetry observer every Forge integration test installs.
+///
+/// A Forge integration test that only proves durable state cannot distinguish
+/// "the route ran" from "the route ran and reported what it did", and the
+/// production route is the *only* thing allowed to report. This owner installs
+/// the real metrics recorder and the production-shaped OpenTelemetry pipeline
+/// once per test process, then exposes deltas relative to the moment it was
+/// installed, so a test asserts on production emission rather than on a
+/// test-only signal. It exists here, centrally, so no test grows a private
+/// telemetry path of its own.
+///
+/// Installation is process-wide and happens exactly once. Nextest runs every
+/// test in its own process, so a checkpoint per test is a checkpoint per
+/// process; a second installation in one process is a fixture defect and
+/// panics rather than silently observing nothing.
+pub(crate) struct ForgeTelemetryCheckpoint {
+    /// Process-wide metrics recorder every production counter writes into.
+    recorder: Arc<wyrd_bench::BenchmarkRecorder>,
+    /// Handle over spans exported by the production tracing pipeline.
+    capture: wyrd_telemetry::TestTraceCapture,
+    /// Number of spans finished before the workload started.
+    span_checkpoint: usize,
+    /// Keeps the installed provider alive for the lifetime of the test.
+    _telemetry: wyrd_telemetry::TelemetryGuard,
+}
+
+impl ForgeTelemetryCheckpoint {
+    /// Installs the production telemetry pipeline and marks a starting point.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a global metrics recorder or tracing subscriber is already
+    /// installed in this process, which means two fixtures are competing for
+    /// one process-wide seam and no delta would be trustworthy.
+    pub(crate) fn install() -> Self {
+        let recorder = wyrd_bench::BenchmarkRecorder::new()
+            .install()
+            .expect("no other global metrics recorder is installed in this test process");
+        let (telemetry, capture) =
+            wyrd_telemetry::init_test_capture(wyrd_telemetry::TelemetryConfig {
+                filter: "info".to_owned(),
+                service_name: Some("forge-integration".to_owned()),
+                sample_ratio: Some(1.0),
+                ..wyrd_telemetry::TelemetryConfig::default()
+            })
+            .expect("no other global tracing subscriber is installed in this test process");
+        Self {
+            span_checkpoint: capture.checkpoint(),
+            recorder,
+            capture,
+            _telemetry: telemetry,
+        }
+    }
+
+    /// Returns the production spans finished since installation, by name.
+    pub(crate) fn spans_named(&self, name: &str) -> Vec<wyrd_telemetry::CapturedSpan> {
+        self.capture
+            .finished_since(self.span_checkpoint)
+            .into_iter()
+            .filter(|span| span.name == name)
+            .collect()
+    }
+
+    /// Asserts every named production metric family was registered and used.
+    ///
+    /// # Panics
+    ///
+    /// Panics naming the missing families when the route did not emit them.
+    pub(crate) fn require_metrics(&self, families: &[&str]) {
+        self.recorder
+            .require_metrics(families)
+            .expect("the production route emits its declared metric families");
+    }
 }

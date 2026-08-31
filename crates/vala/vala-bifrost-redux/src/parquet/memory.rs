@@ -69,11 +69,14 @@ pub fn validate_encoded_footer_bytes(encoded_bytes: u64) -> Result<(), String> {
     Ok(())
 }
 
-const KEY_RECIPE: &str = "wyrd.bifrost.writer_recipe";
-const KEY_ENVELOPE_VERSION: &str = "wyrd.bifrost.memory_envelope_version";
+/// Footer key naming the writer recipe that sealed an object.
+pub const KEY_RECIPE: &str = "wyrd.bifrost.writer_recipe";
+/// Footer key naming the memory-envelope version an object was sealed under.
+pub const KEY_ENVELOPE_VERSION: &str = "wyrd.bifrost.memory_envelope_version";
 const KEY_ROW_GROUP_LOGICAL: &str = "wyrd.bifrost.row_group_logical_bytes";
 const KEY_DECODE_WORKSPACE: &str = "wyrd.bifrost.decode_workspace_bytes";
-const KEY_SCHEMA: &str = "wyrd.bifrost.schema_fingerprint";
+/// Footer key carrying the Wyrd schema fingerprint an object was sealed against.
+pub const KEY_SCHEMA: &str = "wyrd.bifrost.schema_fingerprint";
 const KEY_OBJECT: &str = "wyrd.bifrost.object_identity";
 const KEY_MAX_ROW: &str = "wyrd.bifrost.max_logical_row_bytes";
 const KEY_LEAF_PROFILE: &str = "wyrd.bifrost.leaf_width_profile";

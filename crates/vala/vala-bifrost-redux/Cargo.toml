@@ -80,6 +80,7 @@ tempfile = { workspace = true }
 [dev-dependencies]
 wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
 wyrd-bench = { workspace = true }
+wyrd-telemetry = { workspace = true, features = ["test-support"] }
 iceberg-catalog-sql = { workspace = true }
 datafusion-distributed = { workspace = true }
 url = { workspace = true }

@@ -749,7 +749,23 @@ impl<'forge> ForgeScheduler<'forge> {
             maintenance_candidate.is_some(),
             snapshot_expiry_due,
         );
+        // Discovery runs to completion above so the due predicates, the bounded
+        // manifest selection, and the candidate bound stay exercised and their
+        // debt stays recorded; admission is where this phase stops. Filtering
+        // here rather than earlier also keeps demand retention identical to an
+        // activated phase: a manifest demand that did not fit is still held for
+        // the pass that will execute it.
+        let maintenance_candidate = maintenance_candidate
+            .filter(|candidate| super::phase::admits_new_effect(candidate.strategy));
         let promotion_candidate = self.promotion_candidate(&binding).await?;
+        // The rewrite candidate is derived unconditionally so its debt is
+        // recorded even on a pass that will not admit it, but it is ordered
+        // behind promotion below: a table that still owes Scribe a publication
+        // must not start a rewrite against a live set that is about to change.
+        let rewrite_candidate = self
+            .rewrite_candidate(&table)
+            .await?
+            .filter(|candidate| super::phase::admits_new_effect(candidate.strategy));
         let promotion_debt_files = promotion_candidate
             .as_ref()
             .map_or(0, |candidate| candidate.inputs.len() as u64);
@@ -761,6 +777,7 @@ impl<'forge> ForgeScheduler<'forge> {
         // reasons about the catalog's contents runs against it.
         let candidates = promotion_candidate
             .into_iter()
+            .chain(rewrite_candidate)
             .chain(maintenance_candidate)
             .collect::<Vec<_>>();
         Ok((
@@ -852,6 +869,94 @@ impl<'forge> ForgeScheduler<'forge> {
                     detail: error.to_string(),
                 })?,
             parameters: plan.to_parameters(),
+        }))
+    }
+
+    /// Builds the small-file rewrite candidate one table currently owes, if any.
+    ///
+    /// Candidacy is decided from the base snapshot's own live data files and
+    /// the configured small-file threshold, so the same snapshot always yields
+    /// the same inputs, the same parameters, and therefore the same plan hash —
+    /// which is what lets the idempotent enqueue collapse repeated passes over
+    /// an unchanged table into one durable task rather than a queue of them.
+    ///
+    /// A single small file is not debt: rewriting one file into one file
+    /// changes nothing a reader can observe and would spend a commit to do it.
+    /// The candidate therefore requires at least two, which is also the
+    /// smallest input set the managed core can produce a smaller live set from.
+    ///
+    /// Selection here is a *bound*, not the execution plan. The managed core
+    /// performs its own selection inside the admitted envelope and reports what
+    /// it actually consumed; this candidate exists to size the attempt, to bind
+    /// the durable task to one immutable base, and to name the inputs recovery
+    /// will look for.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Catalog`] when the base snapshot's manifest list
+    /// or one of its manifests cannot be read, [`ForgeError::Capacity`] when
+    /// the derived working set does not fit this scheduler's ceilings, and
+    /// [`ForgeError::Invariant`] when that envelope reports an unusable total.
+    async fn rewrite_candidate(
+        &self,
+        table: &iceberg::table::Table,
+    ) -> Result<Option<ForgePlanCandidate>, ForgeError> {
+        let Some(snapshot) = table.metadata().current_snapshot() else {
+            return Ok(None);
+        };
+        let threshold = self.forge.core.config.small_file_threshold_bytes;
+        let manifests = table
+            .manifest_list_reader(snapshot)
+            .load()
+            .await
+            .map_err(ForgeError::Catalog)?;
+        let mut selected = BTreeMap::new();
+        for manifest_file in manifests.entries() {
+            let manifest = manifest_file
+                .load_manifest(table.file_io())
+                .await
+                .map_err(ForgeError::Catalog)?;
+            for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
+                let file = entry.data_file();
+                if file.content_type() != iceberg::spec::DataContentType::Data
+                    || file.file_size_in_bytes() >= threshold
+                {
+                    continue;
+                }
+                selected.insert(file.file_path().to_owned(), file.file_size_in_bytes());
+            }
+        }
+        if selected.len() < 2 {
+            return Ok(None);
+        }
+        let inputs = selected.keys().cloned().collect::<Vec<_>>();
+        let input_bytes = selected.values().copied().collect::<Vec<_>>();
+        let bytes = input_bytes.iter().copied().fold(0_u64, u64::saturating_add);
+        let working_set_bytes = bytes.max(super::rewrite::REWRITE_WORKING_SET_FLOOR_BYTES);
+        let envelope = super::planner::ForgeEnvelopeSizer::size(
+            working_set_bytes,
+            inputs.len(),
+            self.forge.core.config.max_concurrent_reads,
+            self.capacity,
+        )?;
+        Ok(Some(ForgePlanCandidate {
+            strategy: ForgeTaskStrategy::SmallFiles,
+            input_bytes,
+            inputs,
+            bytes: bytes.max(1),
+            working_set_bytes,
+            parallelism: envelope.reader_permits,
+            memory_bytes: envelope
+                .memory_bytes()
+                .map_err(|error| ForgeError::Invariant {
+                    detail: error.to_string(),
+                })?,
+            spill_bytes: envelope
+                .scratch_bytes()
+                .map_err(|error| ForgeError::Invariant {
+                    detail: error.to_string(),
+                })?,
+            parameters: serde_json::json!({ "kind": super::worker::LIVE_REWRITE_PARAMETER_KIND }),
         }))
     }
 
@@ -1372,6 +1477,8 @@ mod source_tests {
         DemandPlanningResult, ForgeScheduleOutcome, governed_capacity, maintenance_trigger_due,
         manifest_demand_must_remain, should_publish_gauges, status_claim_limits,
     };
+    use vala_sql::row_types::forge_tasks::ForgeTaskStrategy;
+
     use crate::forge::planner::ForgeCapacity;
     use crate::resources::ResourcePlan;
 
@@ -1478,6 +1585,47 @@ mod source_tests {
         assert_eq!(result.tasks_enqueued, 0);
         assert_eq!(result.compaction_debt_files, 7);
         assert_eq!(result.compaction_debt_bytes, 11);
+    }
+
+    /// Due maintenance is discovered and recorded but never admitted this phase.
+    ///
+    /// `maintenance_candidate` emits exactly two strategies: `SnapshotExpiry`
+    /// when expiry or open-rewrite reconciliation is due, and `ManifestRewrite`
+    /// otherwise. Neither crosses the phase activation boundary, so a due
+    /// expiry, a fragmented manifest list, and outstanding rewrite debt all
+    /// reach discovery and record their debt without producing a schedulable
+    /// effect. The source assertion pins the one property the filter's
+    /// placement carries: retention is computed from the unfiltered candidate,
+    /// so a manifest demand that did not fit is still held exactly as an
+    /// activated phase would hold it.
+    #[test]
+    fn due_maintenance_is_discovered_but_never_admitted() {
+        for strategy in [
+            ForgeTaskStrategy::SnapshotExpiry,
+            ForgeTaskStrategy::ManifestRewrite,
+        ] {
+            assert!(
+                !crate::forge::phase::admits_new_effect(strategy),
+                "{strategy:?} is discovered and recorded but may not become a new effect"
+            );
+        }
+        assert!(
+            crate::forge::phase::admits_new_effect(ForgeTaskStrategy::ScribePromotion),
+            "promotion is the one demand this phase admits"
+        );
+
+        let source = include_str!("planning_scheduler.rs");
+        let retention = source
+            .find("let demand_deferred = manifest_demand_must_remain(")
+            .expect("discovery computes manifest demand retention");
+        let admission = source
+            .find("super::phase::admits_new_effect(candidate.strategy)")
+            .expect("discovery filters the candidate through the phase boundary");
+        assert!(
+            retention < admission,
+            "demand retention must be derived before admission filtering so a \
+             non-fitting manifest demand is retained identically to an activated phase"
+        );
     }
 
     /// The supervised scheduler path contains no direct execution or commit call.

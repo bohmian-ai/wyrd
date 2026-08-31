@@ -114,15 +114,35 @@ impl ForgeRewriteObserver {
         self.peak_scratch_bytes.load(Ordering::Acquire)
     }
 
-    /// Retains the possibly-produced output set carried by a terminal event.
+    /// Merges the possibly-produced output set carried by a terminal event.
     ///
-    /// Terminal events carry the complete set, so the accumulator is replaced
-    /// rather than extended: appending would double-count the objects already
-    /// recorded from their `OutputOpened` events.
-    fn retain_outputs(&self, outputs: &[OutputIdentity]) {
+    /// One attempt runs every admitted plan under one observer, so each plan
+    /// contributes its own terminal event. The accumulator is therefore merged
+    /// rather than replaced: replacing it would let a later cancelled or failed
+    /// plan erase the objects an earlier successful plan already produced,
+    /// leaving unreclaimable orphans behind.
+    ///
+    /// `logical_ordinal` is the attempt-global reservation the core issues
+    /// before an object opens, so it is the merge key. An identity already
+    /// recorded from its `OutputOpened` event is updated in place, and `settled`
+    /// is sticky: once the core reports an object closed it never reverts, so a
+    /// later terminal report cannot unsettle it. Entries stay ordered by
+    /// ordinal, which is open order.
+    fn merge_outputs(&self, outputs: &[OutputIdentity]) {
         if let Ok(mut retained) = self.outputs.lock() {
-            retained.clear();
-            retained.extend_from_slice(outputs);
+            for output in outputs {
+                match retained
+                    .iter_mut()
+                    .find(|existing| existing.logical_ordinal == output.logical_ordinal)
+                {
+                    Some(existing) => {
+                        existing.path.clone_from(&output.path);
+                        existing.settled |= output.settled;
+                    }
+                    None => retained.push(output.clone()),
+                }
+            }
+            retained.sort_by_key(|output| output.logical_ordinal);
         }
     }
 }
@@ -130,8 +150,8 @@ impl ForgeRewriteObserver {
 impl RewriteObserver for ForgeRewriteObserver {
     /// Counts one physical event and folds any measurement it carries.
     ///
-    /// Every branch is O(1) and lock-free apart from the terminal output swap,
-    /// which happens exactly once per attempt.
+    /// Every branch is O(1) and lock-free apart from the terminal output merge,
+    /// which happens once per plan the attempt executes.
     fn on_event(&self, event: RewriteEvent) {
         self.telemetry.record_rewrite_event(Self::project(&event));
         match event {
@@ -160,7 +180,7 @@ impl RewriteObserver for ForgeRewriteObserver {
             }
             RewriteEvent::Succeeded { outputs, .. }
             | RewriteEvent::Failed { outputs, .. }
-            | RewriteEvent::Cancelled { outputs, .. } => self.retain_outputs(&outputs),
+            | RewriteEvent::Cancelled { outputs, .. } => self.merge_outputs(&outputs),
             RewriteEvent::RollDecided { .. }
             | RewriteEvent::OutputClosed { .. }
             | RewriteEvent::OperatorSpill { .. } => {}
@@ -230,12 +250,21 @@ mod tests {
             },
             RewriteEvent::Cancelled {
                 attempt_id,
-                outputs: Vec::new(),
+                outputs: vec![OutputIdentity {
+                    logical_ordinal: 1,
+                    path: "out-1.parquet".to_owned(),
+                    settled: false,
+                }],
             },
         ]
     }
 
     /// The projection is total, bounded, reachable, and cannot alter a rewrite.
+    ///
+    /// *Cumulative*: the terminal events of one attempt describe different
+    /// plans, so their possibly-produced sets are merged by attempt-global
+    /// logical ordinal rather than replaced — the observer projects one
+    /// attempt, not one plan.
     ///
     /// *Total and reachable*: every one of the core's nine events maps to a
     /// distinct Forge label, and the nine labels are exactly the registered
@@ -289,9 +318,19 @@ mod tests {
             512,
             "the leased scratch peak is folded from the core's own measurement"
         );
-        assert!(
-            observer.outputs().is_empty(),
-            "the last terminal event owns the possibly-produced set"
+        assert_eq!(
+            observer
+                .outputs()
+                .into_iter()
+                .map(|output| (output.logical_ordinal, output.path, output.settled))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, "out-0.parquet".to_owned(), true),
+                (1, "out-1.parquet".to_owned(), false),
+            ],
+            "possibly-produced outputs accumulate across every terminal event of \
+             the attempt, ordered by the attempt-global logical ordinal: a later \
+             cancelled plan must not hide an earlier succeeded plan's objects"
         );
 
         let body = SOURCE

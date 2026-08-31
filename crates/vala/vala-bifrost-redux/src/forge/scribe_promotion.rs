@@ -171,10 +171,11 @@ impl ScribePromotionPlan {
     ///
     /// # Errors
     ///
-    /// Returns [`ForgeError::Invariant`] when the `kind` is not
-    /// `scribe_promotion`, a required field is absent or not the expected
-    /// type, the three arrays differ in length, a field fails its own
-    /// validation, or the recomputed digest differs from the persisted one.
+    /// Returns [`ForgeError::Invariant`] when the key set is not exactly the
+    /// six declared fields, the `kind` is not `scribe_promotion`, the branch is
+    /// not [`PROMOTION_BRANCH`], a required field is not the expected type, the
+    /// three arrays differ in length, a field fails its own validation, or the
+    /// recomputed digest differs from the persisted one.
     pub(super) fn from_parameters(parameters: &Map<String, Value>) -> Result<Self, ForgeError> {
         fn invariant(detail: &str) -> ForgeError {
             ForgeError::Invariant {
@@ -198,6 +199,24 @@ impl ScribePromotionPlan {
                 })
                 .collect()
         }
+        // The parameter object is closed. A digest computed from the fields
+        // this decoder reads cannot speak for a field it does not read, so an
+        // unknown key is an undecodable shape rather than harmless noise.
+        const DECLARED_KEYS: [&str; 6] = [
+            "kind",
+            "branch",
+            "file_ids",
+            "paths",
+            "checksums",
+            "promoted_file_set_digest",
+        ];
+        if parameters.len() != DECLARED_KEYS.len()
+            || parameters
+                .keys()
+                .any(|key| !DECLARED_KEYS.contains(&key.as_str()))
+        {
+            return Err(invariant("are not the exact declared six-field set"));
+        }
         if parameters.get("kind").and_then(Value::as_str) != Some(SCRIBE_PROMOTION_PARAMETER_KIND) {
             return Err(invariant("do not name the promotion kind"));
         }
@@ -205,6 +224,12 @@ impl ScribePromotionPlan {
             .get("branch")
             .and_then(Value::as_str)
             .ok_or_else(|| invariant("lack a branch"))?;
+        // The digest proves which files are promoted, never where. Forge owns
+        // exactly one branch, so any other destination is a demand this worker
+        // must not act on however self-consistent it looks.
+        if branch != PROMOTION_BRANCH {
+            return Err(invariant("name a branch Forge does not promote to"));
+        }
         let file_ids = strings(parameters, "file_ids")?;
         let paths = strings(parameters, "paths")?;
         let checksums = strings(parameters, "checksums")?;
@@ -233,6 +258,171 @@ impl ScribePromotionPlan {
         }
         Ok(plan)
     }
+}
+
+/// Names the first persisted metric that disagrees with the object's own footer.
+///
+/// Returning the field rather than a boolean is what makes a refusal
+/// actionable: the operator learns which dimension of the evidence is wrong,
+/// which is the difference between "this object cannot be promoted" and a
+/// diagnosis.
+fn first_metric_disagreement(
+    physical: &crate::scribe::promotion::ScribeDataFileV1,
+    claimed: &crate::scribe::promotion::ScribeDataFileV1,
+) -> Option<&'static str> {
+    if physical.record_count != claimed.record_count {
+        return Some("record count");
+    }
+    if physical.file_size_in_bytes != claimed.file_size_in_bytes {
+        return Some("file size");
+    }
+    if physical.column_sizes != claimed.column_sizes {
+        return Some("column sizes");
+    }
+    if physical.value_counts != claimed.value_counts {
+        return Some("value counts");
+    }
+    if physical.null_value_counts != claimed.null_value_counts {
+        return Some("null value counts");
+    }
+    if physical.nan_value_counts != claimed.nan_value_counts {
+        return Some("NaN value counts");
+    }
+    if physical.lower_bounds != claimed.lower_bounds {
+        return Some("lower bounds");
+    }
+    if physical.upper_bounds != claimed.upper_bounds {
+        return Some("upper bounds");
+    }
+    if physical.split_offsets != claimed.split_offsets {
+        return Some("split offsets");
+    }
+    None
+}
+
+/// Reads one event-time bound of the object's own footer as epoch microseconds.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::Invariant`] when the bound is absent or is not the
+/// timestamp literal the partitioned column must produce, either of which means
+/// the object cannot be placed in a time partition at all.
+fn event_time_bound_micros(
+    bounds: &std::collections::HashMap<i32, iceberg::spec::Datum>,
+    field_id: i32,
+    edge: &str,
+) -> Result<i64, ForgeError> {
+    let datum = bounds.get(&field_id).ok_or_else(|| ForgeError::Invariant {
+        detail: format!("promoted object footer carries no {edge} event-time bound"),
+    })?;
+    match datum.literal() {
+        iceberg::spec::PrimitiveLiteral::Long(micros) => Ok(*micros),
+        other => Err(ForgeError::Invariant {
+            detail: format!(
+                "promoted object {edge} event-time bound is not a timestamp: {other:?}"
+            ),
+        }),
+    }
+}
+
+/// Proves one immutable object physically agrees with the evidence promoting it.
+///
+/// The checks run cheapest-and-most-decisive first: table policy identity needs
+/// no IO at all, the footer decode needs one bounded parse, and the partition
+/// containment check needs the projection the decode already produced. Every
+/// one of them fails before the caller reaches the catalog.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::Invariant`] when the record names a partition spec or
+/// sort order the table no longer carries, the footer cannot be decoded under
+/// the writer's bounds, the footer's schema fingerprint differs from the
+/// record's, any persisted metric disagrees with the footer, or the object's own
+/// event-time bounds fall outside the partition the record claims.
+fn validate_promoted_object(
+    record: &ScribePublishedHotFileV1,
+    bytes: &bytes::Bytes,
+    file_size: u64,
+    table: &iceberg::table::Table,
+) -> Result<(), ForgeError> {
+    let metadata = table.metadata();
+    if record.partition_spec_id != metadata.default_partition_spec_id() {
+        return Err(ForgeError::Invariant {
+            detail: format!(
+                "promotion evidence names partition spec {} but the table now writes {}",
+                record.partition_spec_id,
+                metadata.default_partition_spec_id()
+            ),
+        });
+    }
+    let table_sort_order = i32::try_from(metadata.default_sort_order().order_id).map_err(|_| {
+        ForgeError::Invariant {
+            detail: "table sort order id is not representable".to_owned(),
+        }
+    })?;
+    if record.sort_order_id != table_sort_order {
+        return Err(ForgeError::Invariant {
+            detail: format!(
+                "promotion evidence names sort order {} but the table now writes {table_sort_order}",
+                record.sort_order_id
+            ),
+        });
+    }
+
+    let schema = metadata.current_schema();
+    let footer = crate::parquet::PromotedObjectFooter::decode(
+        bytes,
+        &record.object_key,
+        std::sync::Arc::clone(schema),
+        file_size,
+    )
+    .map_err(|detail| ForgeError::Invariant { detail })?;
+    if footer.schema_fingerprint() != record.schema_fingerprint {
+        return Err(ForgeError::Invariant {
+            detail: format!(
+                "promoted object {} was sealed against another schema than its evidence claims",
+                record.object_key
+            ),
+        });
+    }
+    let physical = footer
+        .metrics()
+        .map_err(|detail| ForgeError::Invariant { detail })?;
+    if let Some(field) = first_metric_disagreement(&physical, &record.data_file) {
+        return Err(ForgeError::Invariant {
+            detail: format!(
+                "promoted object {} disagrees with its evidence on {field}",
+                record.object_key
+            ),
+        });
+    }
+
+    let partition = crate::catalog::TimePartition::from_durable_columns(
+        &record.partition.granularity,
+        record.partition.start_utc,
+    )
+    .map_err(|error| ForgeError::Invariant {
+        detail: format!("promotion evidence names a non-canonical partition: {error}"),
+    })?;
+    let field_id = schema
+        .field_by_name(wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME)
+        .ok_or_else(|| ForgeError::Invariant {
+            detail: "table schema carries no event-time column to partition on".to_owned(),
+        })?
+        .id;
+    let lowest = event_time_bound_micros(footer.data_file().lower_bounds(), field_id, "lower")?;
+    let highest = event_time_bound_micros(footer.data_file().upper_bounds(), field_id, "upper")?;
+    let start = partition.start_utc().timestamp_micros();
+    let end = partition.end_utc().timestamp_micros();
+    if lowest < start || highest >= end {
+        return Err(ForgeError::Invariant {
+            detail: format!(
+                "promoted object {} holds event times outside the partition its evidence claims",
+                record.object_key
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Reads and validates the exact promotion demand one table currently owes.
@@ -362,9 +552,22 @@ impl Forge {
     ///
     /// Revalidation is what makes the append safe to perform unchanged: the
     /// durable demand is re-read under the worker's own fence, checked against
-    /// the plan the scheduler persisted, and then each object's evidence is
-    /// checked against the object itself. Only the object bytes are read; no
-    /// data object is written, and no `DataFile` value is recomputed.
+    /// the plan the scheduler persisted, and then each object is checked
+    /// against its own evidence — physically. The order matters. The durable
+    /// demand is settled first because a diverged demand makes every later
+    /// check meaningless; then the object's identity (key, size, checksum);
+    /// then the object's own footer, re-derived into the same `DataFile`
+    /// projection Scribe recorded and compared field for field; then the
+    /// identity the table's current policy requires (schema fingerprint,
+    /// partition spec, sort order); and finally the partition value, which is
+    /// checked against the object's own event-time bounds so a record cannot
+    /// claim a window its rows do not fall in.
+    ///
+    /// A size-and-checksum check alone would accept every one of those
+    /// contradictions: the bytes are unchanged in all of them, and only the
+    /// evidence about the bytes is wrong. Only the object bytes are read; no
+    /// data object is written, and the appended `DataFile` is still the value
+    /// Scribe recorded rather than one recomputed here.
     ///
     /// # Errors
     ///
@@ -372,11 +575,13 @@ impl Forge {
     /// [`ForgeError::Reconciliation`] when the durable demand no longer matches
     /// the prepared plan, [`ForgeError::ObjectStore`] when an object cannot be
     /// read, and [`ForgeError::Invariant`] when an object contradicts its own
-    /// promotion evidence or its `DataFile` cannot be rebuilt.
+    /// promotion evidence, disagrees with its own footer, names identity the
+    /// table no longer carries, or its `DataFile` cannot be rebuilt.
     pub(super) async fn revalidate_promotion(
         &self,
         binding: &TenantTableBinding,
         plan: &ScribePromotionPlan,
+        table: &iceberg::table::Table,
     ) -> Result<Vec<iceberg::spec::DataFile>, ForgeError> {
         let mut conn = self
             .core
@@ -419,6 +624,7 @@ impl Forge {
                 .map_err(|error| ForgeError::Invariant {
                     detail: format!("hot object failed promotion revalidation: {error}"),
                 })?;
+            validate_promoted_object(record, &bytes.to_bytes(), file_size, table)?;
             data_files.push(record.data_file().map_err(|error| ForgeError::Invariant {
                 detail: format!("promotion evidence does not rebuild a data file: {error}"),
             })?);
@@ -428,8 +634,11 @@ impl Forge {
 
     /// Fast-appends one revalidated promotion group under the publication fence.
     ///
-    /// The commit carries the task and operation identities as snapshot summary
-    /// properties. Those two properties are the entire basis of recovery: a
+    /// The commit carries the workflow, task, and operation identities as
+    /// snapshot summary properties. The workflow name is what keeps rewrite
+    /// reconciliation off these snapshots: it scans every retained snapshot on
+    /// the table and would otherwise read a promotion's bare operation identity
+    /// as a malformed rewrite identity rather than as another workflow's. Those two properties are the entire basis of recovery: a
     /// worker that loses acceptance can prove the commit landed by finding its
     /// own task identity on a retained snapshot, and Oracle closes the
     /// catalog-to-SQL window by matching the operation identity on the snapshot
@@ -482,6 +691,7 @@ impl Forge {
             .with_check_duplicate(true)
             .add_data_files(data_files)
             .set_snapshot_properties(std::collections::HashMap::from([
+                ("forge.workflow".to_owned(), "scribe-promotion".to_owned()),
                 ("forge.task_id".to_owned(), task_id.to_string()),
                 ("forge.operation_id".to_owned(), operation_id.to_string()),
             ]));
@@ -665,6 +875,24 @@ mod tests {
             |object: &mut Map<String, Value>| {
                 object.insert("kind".to_owned(), Value::from("promotion_v2"));
             },
+            // An unknown key is a parameter shape this decoder does not
+            // understand. Ignoring it would let a writer smuggle a directive
+            // past a digest that only covers the fields the decoder reads.
+            |object: &mut Map<String, Value>| {
+                object.insert("expire_snapshots".to_owned(), Value::from(true));
+            },
+            // A foreign branch with a self-consistent digest: the digest proves
+            // the file set, never the destination, so only an exact branch
+            // check keeps a promotion off a ref Forge does not own.
+            |object: &mut Map<String, Value>| {
+                let plan = ScribePromotionPlan::new("audit", vec![file(1, "a"), file(2, "b")])
+                    .expect("canonical plan on another branch");
+                *object = plan
+                    .to_parameters()
+                    .as_object()
+                    .expect("parameters are an object")
+                    .clone();
+            },
             |object: &mut Map<String, Value>| {
                 object.insert("checksums".to_owned(), serde_json::json!(["a".repeat(64)]));
             },
@@ -691,6 +919,24 @@ mod tests {
             assert!(
                 ScribePromotionPlan::from_parameters(&altered).is_err(),
                 "an altered promotion parameter shape must be refused"
+            );
+        }
+
+        // Every declared key is load-bearing: dropping any one of them leaves
+        // parameters that cannot be proven to describe the planned group.
+        for field in [
+            "kind",
+            "branch",
+            "file_ids",
+            "paths",
+            "checksums",
+            "promoted_file_set_digest",
+        ] {
+            let mut absent = object.clone();
+            absent.remove(field);
+            assert!(
+                ScribePromotionPlan::from_parameters(&absent).is_err(),
+                "promotion parameters missing {field} must be refused"
             );
         }
     }

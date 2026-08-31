@@ -83,6 +83,25 @@ pub(crate) struct ForgeTablePolicy {
     pub(crate) max_plans_per_attempt: usize,
 }
 
+/// Reads the target output size one table declares for its data files.
+///
+/// Exposed separately from [`ForgeTablePolicy::extract`] because the audit row
+/// for a publication records the same target the writer used, and reconstructing
+/// the whole policy there would demand an admitted memory grant the publication
+/// no longer holds. Both paths read the one property, so they cannot disagree.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::InvalidConfig`] when the declared value is not a
+/// positive integer byte count.
+pub(crate) fn declared_target_file_size_bytes(metadata: &TableMetadata) -> Result<u64, ForgeError> {
+    declared_bytes(
+        metadata.properties(),
+        FILE_TARGET_PROPERTY,
+        FILE_TARGET_DEFAULT,
+    )
+}
+
 impl ForgeTablePolicy {
     /// Derives one attempt's policy from a loaded table and validated limits.
     ///
@@ -274,9 +293,10 @@ impl ForgeTablePolicy {
                 detail: format!("Forge rewrite execution configuration is incomplete: {error}"),
             })?;
         Ok(Arc::new(CompactionConfig::new(
-            CompactionPlanningConfig::WyrdIdentityAware(WyrdIdentityAwareConfig::new(
-                self.to_selection_policy(),
-            )),
+            CompactionPlanningConfig::WyrdIdentityAware(
+                WyrdIdentityAwareConfig::new(self.to_selection_policy())
+                    .with_max_selection_plans(self.max_plans_per_attempt),
+            ),
             execution,
         )))
     }

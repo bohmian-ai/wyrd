@@ -149,12 +149,39 @@ pub enum ForgeError {
     /// An internal invariant failed before a durable transition could proceed.
     #[error("Forge invariant failed: {detail}")]
     Invariant { detail: String },
+    /// An admitted managed rewrite failed after it may have produced objects.
+    ///
+    /// Wraps the typed failure rather than replacing it, so classification and
+    /// the capacity phase stay exactly what the underlying boundary declared.
+    /// What the wrapper adds is the attempt-global possible-output set: once any
+    /// object may exist, discarding that set would leave objects nothing can
+    /// name, because the attempt that could have named them has ended. A caller
+    /// must treat an unsettled entry as possibly-existing and tolerate its
+    /// absence when reclaiming it.
+    #[error("{source} (leaving {} possible rewrite output(s) behind)", possible_outputs.len())]
+    RewriteUnsettled {
+        /// The typed failure that ended the attempt.
+        #[source]
+        source: Box<ForgeError>,
+        /// Every object the failed attempt produced or may have produced.
+        possible_outputs: Vec<crate::forge::managed::ForgeUnsettledOutput>,
+    },
     /// A second long-lived scheduler attempted to use the same owner.
     #[error("Forge scheduler is already running")]
     AlreadyRunning,
 }
 
 impl ForgeError {
+    /// Reports whether a catalog failure is worth retrying as-is.
+    ///
+    /// Only [`Self::Catalog`] can answer yes: every other variant either did
+    /// not reach the catalog or left acceptance unknown, and neither is a
+    /// retryable answer.
+    #[must_use]
+    pub(crate) fn is_retryable_catalog(&self) -> bool {
+        matches!(self, Self::Catalog(error) if error.retryable())
+    }
+
     /// Builds a grouping failure from a borrowed diagnostic.
     ///
     /// This exists so row-decoding helpers can be parameterized by the variant
@@ -177,6 +204,7 @@ impl ForgeError {
     #[must_use]
     pub fn failure_class(&self) -> ForgeFailureClass {
         match self {
+            Self::RewriteUnsettled { source, .. } => source.failure_class(),
             Self::ScratchIo { .. } => ForgeFailureClass::StorageHealth,
             Self::Capacity { .. } | Self::ExecutionEnvelopeExceeded { .. } => {
                 ForgeFailureClass::CapacityRefused
@@ -203,12 +231,33 @@ impl ForgeError {
     }
 
     /// Returns the capacity phase for typed capacity failures.
+    ///
+    /// [`Self::RewriteUnsettled`] delegates to the failure it wraps: the
+    /// possible-output set is evidence carried alongside a refusal, never a
+    /// refusal of its own, so wrapping must not move a capacity failure out of
+    /// the phase its own boundary declared.
     #[must_use]
-    pub const fn capacity_failure_phase(&self) -> Option<ForgeCapacityFailurePhase> {
+    pub fn capacity_failure_phase(&self) -> Option<ForgeCapacityFailurePhase> {
         match self {
             Self::Capacity { .. } => Some(ForgeCapacityFailurePhase::Admission),
             Self::ExecutionEnvelopeExceeded { .. } => Some(ForgeCapacityFailurePhase::Execution),
+            Self::RewriteUnsettled { source, .. } => source.capacity_failure_phase(),
             _ => None,
+        }
+    }
+
+    /// Returns the possible-output set a failed rewrite left behind, if any.
+    ///
+    /// Every other variant returns an empty slice, so a reclaiming caller can
+    /// ask any Forge failure what it may have produced without matching on the
+    /// wrapper first.
+    #[must_use]
+    pub fn possible_rewrite_outputs(&self) -> &[crate::forge::managed::ForgeUnsettledOutput] {
+        match self {
+            Self::RewriteUnsettled {
+                possible_outputs, ..
+            } => possible_outputs,
+            _ => &[],
         }
     }
 }

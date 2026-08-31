@@ -78,7 +78,10 @@ impl Forge {
     /// its manifests cannot be read, [`ForgeError::Invariant`] when the core
     /// produced an object this attempt cannot attribute to itself or a handoff
     /// that contradicts itself, and [`ForgeError::ExecutionEnvelopeExceeded`]
-    /// when an admitted attempt exhausted its leased scratch.
+    /// when an admitted attempt exhausted its leased scratch. Any of those
+    /// raised after the attempt may already have produced an object arrives
+    /// wrapped in [`ForgeError::RewriteUnsettled`], which carries the complete
+    /// attempt-global possible-output set so nothing becomes unreclaimable.
     ///
     /// # Panics
     ///
@@ -255,15 +258,16 @@ impl<'attempt> ForgeManagedRewrite<'attempt> {
             });
         }
 
-        let admitted = plans
-            .into_iter()
-            .take(policy.max_plans_per_attempt)
-            .collect::<Vec<_>>();
-        self.execute_admitted_plans(&compaction, &table, &policy, evidence, admitted)
+        self.execute_admitted_plans(&compaction, &table, &policy, evidence, plans)
             .await
     }
 
     /// Executes the admitted plans and assembles the publication-free handoff.
+    ///
+    /// The admitted set is exactly the plan set the core returned alongside its
+    /// selection report; the per-attempt plan budget is applied inside the core
+    /// so plans and report can never describe different selections. This owner
+    /// never narrows that set.
     ///
     /// One plan at a time, in the order the core produced them: the plan's
     /// consumed inputs are recorded before the rewrite runs so a failure still
@@ -275,6 +279,9 @@ impl<'attempt> ForgeManagedRewrite<'attempt> {
     /// Returns [`ForgeError::Invariant`] when two objects share one writer
     /// identity, the classified drain or failure from [`Self::drain_or_fail`]
     /// when the core fails, and the handoff's own consistency error otherwise.
+    /// Every failing path is routed through [`Self::attach_possible_outputs`],
+    /// so a failure that follows a produced object carries the attempt-global
+    /// set inside [`ForgeError::RewriteUnsettled`] rather than dropping it.
     async fn execute_admitted_plans(
         &mut self,
         compaction: &NonCommittingCompaction,
@@ -303,18 +310,25 @@ impl<'attempt> ForgeManagedRewrite<'attempt> {
                 }
             };
             for file in result.output_data_files {
-                let identity = ForgeOutputIdentity::validate(
+                let identity = match ForgeOutputIdentity::validate(
                     file.file_path(),
                     &policy.data_location,
                     self.attempt.attempt_id,
-                )?;
+                ) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        self.fold_peaks();
+                        return Err(self.attach_possible_outputs(error));
+                    }
+                };
                 if !writer_keys.insert(identity.writer_key()) {
-                    return Err(ForgeError::Invariant {
+                    self.fold_peaks();
+                    return Err(self.attach_possible_outputs(ForgeError::Invariant {
                         detail: format!(
                             "Forge attempt produced two objects with the same writer identity: {}",
                             file.file_path()
                         ),
-                    });
+                    }));
                 }
                 output_data_files.push(file);
             }
@@ -326,7 +340,8 @@ impl<'attempt> ForgeManagedRewrite<'attempt> {
             applied_position_delete_files.into_iter().collect(),
             applied_equality_delete_files.into_iter().collect(),
             output_data_files,
-        )?;
+        )
+        .map_err(|error| self.attach_possible_outputs(error))?;
         Ok(ForgeRewriteOutcome::Rewritten {
             evidence,
             handoff: Box::new(handoff),
@@ -347,17 +362,24 @@ impl<'attempt> ForgeManagedRewrite<'attempt> {
 
     /// Classifies a core failure as a drain or a real failure.
     ///
-    /// A cancelled attempt is not an error — it did what it was told — so it
-    /// returns the objects it may have produced rather than a failure the
-    /// scheduler would have to interpret. Anything else is surfaced as an
-    /// error, and the objects an attempt left behind stay reclaimable through
-    /// their attempt-named paths.
+    /// The attempt-global possible-output set is read once, before either
+    /// branch, because both branches need it. A cancelled attempt is not an
+    /// error — it did what it was told — so it returns that set as an outcome
+    /// rather than a failure the scheduler would have to interpret. A real
+    /// failure is still a failure, but once any object may exist the set
+    /// travels with it inside [`ForgeError::RewriteUnsettled`]: the attempt
+    /// that could name those objects is over, so discarding the set here is
+    /// what would make them unreclaimable, not the failure itself. A failure
+    /// with no possible outputs is returned bare, so the wrapper only ever
+    /// appears when it carries something.
     ///
     /// # Errors
     ///
     /// Returns [`ForgeError::ExecutionEnvelopeExceeded`] when the leased
     /// scratch was exhausted, and [`ForgeError::Catalog`] for every other core
-    /// failure, whose cause is a manifest, scan, or writer operation.
+    /// failure, whose cause is a manifest, scan, or writer operation. Either is
+    /// wrapped in [`ForgeError::RewriteUnsettled`] when the attempt may already
+    /// have produced an object.
     fn drain_or_fail(
         &self,
         base_snapshot_id: i64,
@@ -366,28 +388,54 @@ impl<'attempt> ForgeManagedRewrite<'attempt> {
         if self.attempt.cancel.is_cancelled() {
             return Ok(ForgeRewriteOutcome::Cancelled {
                 base_snapshot_id,
-                possible_outputs: self
-                    .observer
-                    .outputs()
-                    .into_iter()
-                    .map(|output| ForgeUnsettledOutput {
-                        logical_ordinal: output.logical_ordinal,
-                        path: output.path,
-                        settled: output.settled,
-                    })
-                    .collect(),
+                possible_outputs: self.possible_outputs(),
             });
         }
-        if self.observer.peak_scratch_bytes() >= self.resources.scratch_bytes() {
-            return Err(ForgeError::ExecutionEnvelopeExceeded {
+        let failure = if self.observer.peak_scratch_bytes() >= self.resources.scratch_bytes() {
+            ForgeError::ExecutionEnvelopeExceeded {
                 resource: "scratch",
                 detail: format!("Forge managed rewrite exhausted its scratch lease: {error}"),
-            });
+            }
+        } else {
+            ForgeError::Catalog(iceberg::Error::new(
+                iceberg::ErrorKind::Unexpected,
+                format!("Forge managed rewrite failed: {error}"),
+            ))
+        };
+        Err(self.attach_possible_outputs(failure))
+    }
+
+    /// Projects the observer's attempt-global accumulator onto public evidence.
+    ///
+    /// Read from the one observer this attempt installed, so the set spans
+    /// every plan the attempt executed rather than the plan that happened to
+    /// fail.
+    fn possible_outputs(&self) -> Vec<ForgeUnsettledOutput> {
+        self.observer
+            .outputs()
+            .into_iter()
+            .map(|output| ForgeUnsettledOutput {
+                logical_ordinal: output.logical_ordinal,
+                path: output.path,
+                settled: output.settled,
+            })
+            .collect()
+    }
+
+    /// Attaches the attempt-global possible-output set to a failure.
+    ///
+    /// Returns `failure` unchanged when the attempt cannot have produced
+    /// anything, so [`ForgeError::RewriteUnsettled`] only ever appears when it
+    /// carries objects a caller has to reclaim.
+    fn attach_possible_outputs(&self, failure: ForgeError) -> ForgeError {
+        let possible_outputs = self.possible_outputs();
+        if possible_outputs.is_empty() {
+            return failure;
         }
-        Err(ForgeError::Catalog(iceberg::Error::new(
-            iceberg::ErrorKind::Unexpected,
-            format!("Forge managed rewrite failed: {error}"),
-        )))
+        ForgeError::RewriteUnsettled {
+            source: Box::new(failure),
+            possible_outputs,
+        }
     }
 }
 

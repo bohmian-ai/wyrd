@@ -31,9 +31,12 @@ use vala_sql::row_types::forge_tasks::{
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::ForgeScribePromotionPhase;
-use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
+use wyrd_spec::vala::api::{
+    AuditDecision, AuditDetail, AuditEvent, AuditResult, AuthMethod, ForgeIcebergRewritePhase,
+    ForgeScribePromotionPhase, StoragePath,
+};
 
+use super::compact::ForgeGroupKey;
 use super::error::{ForgeCapacityFailurePhase, ForgeError, ForgeFailureClass};
 use super::expire::{PendingExpiryTerminal, derive_recovered_files, table_resource_for_key};
 use super::identity::task_table_binding;
@@ -50,6 +53,95 @@ use super::scribe_promotion::{
 };
 use super::{Forge, ForgeCapacity};
 use crate::catalog::TenantTableBinding;
+
+/// Parameter discriminator every durable small-file rewrite task carries.
+///
+/// The scheduler writes it and pre-effect validation requires it, so a durable
+/// row whose parameters describe a different workflow cannot be executed as a
+/// rewrite even if its strategy column says otherwise.
+pub(super) const LIVE_REWRITE_PARAMETER_KIND: &str = "live_rewrite";
+
+/// Everything one rewrite publication holds constant across its attempts.
+///
+/// The derivation, the commit, and the three audit transitions all read the
+/// same identity, group, partition, policy, and deadline. Owning them here is
+/// what keeps a retried attempt provably bound to the same operation as the
+/// first one: nothing in the retry loop can recompute a deadline, re-derive a
+/// partition, or open a second operation identity.
+struct RewritePublication<'publication> {
+    /// Durable task this publication is settling.
+    claim: &'publication ForgeTaskClaim,
+    /// Tenant-qualified table the publication commits against.
+    binding: &'publication TenantTableBinding,
+    /// Attempt-scoped identity every published snapshot and audit row carries.
+    identity: super::publication::RewriteCommitIdentity,
+    /// Audit group and time partition the transitions are recorded under.
+    key: ForgeGroupKey,
+    /// Partition spec the base table declared when the attempt started.
+    partition_spec_id: i32,
+    /// Target file size the table's own property declared.
+    target_file_size_bytes: u64,
+    /// Schema, spec, and sort identities the plan was authorized against.
+    planned_policy: (i32, i32, i64),
+    /// One commit budget, captured before the first attempt.
+    deadline: chrono::DateTime<chrono::Utc>,
+}
+
+impl RewritePublication<'_> {
+    /// Builds the durable audit detail for one transition of this publication.
+    ///
+    /// Every field but the phase and the committed snapshot is fixed by the
+    /// publication, so a Prepared row and the terminal row that settles it
+    /// describe the same operation over the same objects — which is exactly
+    /// what recovery compares them for.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Invariant`] when a catalog file path in the
+    /// request is not a representable storage path.
+    fn audit(
+        &self,
+        phase: ForgeIcebergRewritePhase,
+        committed_snapshot_id: Option<i64>,
+        request: &super::publication::RewriteCommitRequest,
+    ) -> Result<AuditDetail, ForgeError> {
+        Ok(AuditDetail::ForgeIcebergRewrite {
+            operation_id: self.identity.operation_id,
+            phase,
+            group: self.identity.group.clone(),
+            base_snapshot_id: request.base_snapshot_id,
+            committed_snapshot_id,
+            partition_spec_id: self.partition_spec_id,
+            time_partition: self.key.partition.to_wire(),
+            target_file_size_bytes: self.target_file_size_bytes,
+            input_paths: ForgeWorker::rewrite_audit_paths(
+                request
+                    .removed_data_files
+                    .iter()
+                    .chain(&request.removed_delete_files),
+            )?,
+            output_paths: ForgeWorker::rewrite_audit_paths(request.added_data_files.iter())?,
+        })
+    }
+}
+
+/// Renders the durable operation name for one live-rewrite audit transition.
+///
+/// The family prefix and the phase suffix are the two halves the durable
+/// `vala.forge_operation_state` row is keyed by, so composing them here keeps
+/// every rewrite transition on one spelling.
+fn rewrite_operation(phase: ForgeIcebergRewritePhase) -> String {
+    format!(
+        "{}.{}",
+        ForgeOperationFamily::IcebergRewrite.operation_prefix(),
+        match phase {
+            ForgeIcebergRewritePhase::Prepared => "prepared",
+            ForgeIcebergRewritePhase::Committed => "committed",
+            ForgeIcebergRewritePhase::Recovered => "recovered",
+            ForgeIcebergRewritePhase::Reset => "reset",
+        }
+    )
+}
 
 /// Maximum number of attempt-consuming failures before audited terminalization.
 const ATTEMPT_BOUND: u32 = 5;
@@ -1872,12 +1964,21 @@ impl ForgeWorker {
         Ok(matching)
     }
 
-    /// Validates the closed T13 strategy and payload contract without IO.
+    /// Validates the closed strategy, payload contract, and phase without IO.
+    ///
+    /// This is the worker's pre-effect gate. It runs before the publication
+    /// lease, the table load, and every dispatch arm, so a claim it refuses has
+    /// touched no catalog, no object store, and no durable transition. Each
+    /// retained strategy keeps its own parameter contract here even while the
+    /// activation boundary refuses it, because a strategy whose contract stops
+    /// being checked is a strategy whose contract has quietly rotted by the
+    /// time its own activation task arrives.
     ///
     /// # Errors
     ///
     /// Returns an invariant error for an unknown or reserved strategy,
-    /// maintenance strategy, malformed parameters, or an empty exact input set.
+    /// malformed parameters, an empty exact input set, or a strategy this
+    /// implementation phase has not activated.
     fn validate_payload(task: &ForgeTaskClaim) -> Result<ForgeMetricStage, ForgeError> {
         if task.plan.inputs.is_empty() {
             return Err(ForgeError::Invariant {
@@ -1889,9 +1990,10 @@ impl ForgeWorker {
                 super::scribe_promotion::SCRIBE_PROMOTION_PARAMETER_KIND,
                 ForgeMetricStage::ScribePromotion,
             ),
-            ForgeClaimStrategy::Known(ForgeTaskStrategy::SmallFiles) => {
-                ("live_rewrite", ForgeMetricStage::IcebergRewrite)
-            }
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::SmallFiles) => (
+                LIVE_REWRITE_PARAMETER_KIND,
+                ForgeMetricStage::IcebergRewrite,
+            ),
             ForgeClaimStrategy::Known(ForgeTaskStrategy::ManifestRewrite) => {
                 ("maintenance", ForgeMetricStage::ManifestRewrite)
             }
@@ -1931,6 +2033,24 @@ impl ForgeWorker {
         if !valid_parameters {
             return Err(ForgeError::Invariant {
                 detail: "Forge task parameters do not match the strategy contract".to_owned(),
+            });
+        }
+        // The phase boundary is the last check rather than the first: a claim
+        // is refused for being malformed before it is refused for being early,
+        // so widening the phase later cannot turn a contract violation into a
+        // silently accepted task. This runs before the lease, the table load,
+        // and every dispatch arm, so a claim that reached durable state without
+        // passing the scheduler's admission gate still cannot produce a catalog
+        // or object-store effect.
+        if !matches!(
+            task.strategy,
+            ForgeClaimStrategy::Known(strategy) if super::phase::admits_new_effect(strategy)
+        ) {
+            return Err(ForgeError::Invariant {
+                detail: format!(
+                    "Forge task strategy {} is not activated in this phase",
+                    task.strategy.as_str()
+                ),
             });
         }
         Ok(stage)
@@ -2006,8 +2126,15 @@ impl ForgeWorker {
     ) -> Result<(), ForgeError> {
         lease.require_fence(&self.forge.core.operator_pool).await?;
         // Held for the whole fenced attempt: dropping the lease is what returns
-        // the granted memory and scratch counters to the root governor.
-        let _resources = self.acquire_rewrite_resources(claim, attempt, binding)?;
+        // the granted memory and scratch counters to the root governor. A live
+        // rewrite is the exception: the managed core leases the identical
+        // envelope for itself around the only phase that actually holds bytes,
+        // so acquiring here as well would charge the root governor twice for
+        // one attempt and refuse rewrites the cluster has room for.
+        let _resources = match claim.strategy {
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::SmallFiles) => None,
+            _ => Some(self.acquire_rewrite_resources(claim, attempt, binding)?),
+        };
         let table = self.forge.load_table(&binding.table_ident()).await?;
         let base_matches = Self::base_snapshot_matches(&table, claim.base_snapshot_id);
         let committed_recovery = if base_matches {
@@ -2117,9 +2244,67 @@ impl ForgeWorker {
         let (evidence, state) = completion?;
         self.settle_promotion_evidence(claim, binding, lease, &evidence, &state)
             .await?;
+        self.settle_rewrite_recovery(claim, binding, lease, &state, shutdown)
+            .await?;
         self.record_rewrite_evidence(claim, &evidence);
         self.finish_claim_execution(claim, attempt, lease, &evidence, state)
             .await
+    }
+
+    /// Settles a rewrite whose commit was discovered rather than observed.
+    ///
+    /// A rewrite that lost its answer and then proved it landed never reaches
+    /// its own dispatcher again, so the Prepared operation it left open would
+    /// stay open forever. Routing that one case back through live
+    /// reconciliation settles it from the retained snapshot — the same evidence
+    /// and the same writer a takeover would have used — instead of adding a
+    /// second terminal audit writer that could disagree with it.
+    ///
+    /// Every other strategy and every other evidence state is a no-op: their
+    /// terminal transition was already written by the owner that produced it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the fence, SQL, catalog, and object-store failures live
+    /// reconciliation raises, and [`ForgeError::Reconciliation`] when the
+    /// operation cannot be settled from retained evidence.
+    async fn settle_rewrite_recovery(
+        &self,
+        claim: &ForgeTaskClaim,
+        binding: &TenantTableBinding,
+        lease: &mut ForgeLease,
+        state: &ForgeExecutionEvidenceState,
+        stop: &CancellationToken,
+    ) -> Result<(), ForgeError> {
+        if !matches!(
+            claim.strategy,
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::SmallFiles)
+        ) || !matches!(state, ForgeExecutionEvidenceState::RecoveredCommit)
+        {
+            return Ok(());
+        }
+        let outcome = self
+            .forge
+            .reconcile_live_replacements(
+                lease,
+                &super::compact::ForgeTableKey {
+                    tenant: claim.data_tenant_id,
+                    table_ref: binding.table_ref.clone(),
+                },
+                binding,
+                stop,
+                self.forge.core.clock.now()?,
+            )
+            .await?;
+        if outcome.pending > 0 || outcome.unresolved > 0 {
+            return Err(ForgeError::Reconciliation {
+                detail: format!(
+                    "a recovered rewrite left {} pending and {} unresolved live operations",
+                    outcome.pending, outcome.unresolved
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Settles one promotion's publication and terminal audit for a finished attempt.
@@ -2407,10 +2592,529 @@ impl ForgeWorker {
                 self.dispatch_maintenance(claim, binding, lease, table, stop)
                     .await
             }
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::SmallFiles) => {
+                self.dispatch_iceberg_rewrite(claim, attempt, binding, lease, &table, stop)
+                    .await
+            }
             _ => Err(ForgeError::Invariant {
                 detail: "unsupported task passed pre-effect validation".to_owned(),
             }),
         }
+    }
+
+    /// Executes, prepares, and publishes one managed live rewrite.
+    ///
+    /// The ordering is the whole safety argument. The managed core runs first
+    /// and publishes nothing, so the objects exist in storage while belonging
+    /// to no snapshot and no reader can observe them. Only then is the exact
+    /// replacement derived — from the immutable base this attempt read, never
+    /// from the core's own applied-delete evidence — and only then is the
+    /// Prepared audit written, before any catalog effect, naming the exact
+    /// inputs and outputs a successor must reconcile.
+    ///
+    /// A catalog refusal that is not retryable is a *definite* conflict: the
+    /// catalog answered, so the replacement certainly did not land. Exactly one
+    /// retry is permitted against it, and only after reloading the table and
+    /// re-deriving the base and the request against it — replaying the same
+    /// replacement against a stale base is what would delete files a concurrent
+    /// writer has already replaced. The deadline is captured once, before the
+    /// first attempt, so a slow first attempt cannot buy the retry more time
+    /// than the original commit budget allowed. Every other failure, including
+    /// an uncertain one, is returned unchanged so the Prepared operation stays
+    /// open for evidence-based recovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Shutdown`] when the managed attempt drains before
+    /// producing a publishable handoff, [`ForgeError::Reconciliation`] when the
+    /// core made no progress, when the touched files do not share one time
+    /// partition, or when acceptance becomes unknown,
+    /// [`ForgeError::InvalidConfig`] when the configured Iceberg retry budget
+    /// is not representable as a deadline, and the capacity, audit, fence,
+    /// object-store, and catalog failures raised by execution, preparation, and
+    /// the commit.
+    async fn dispatch_iceberg_rewrite(
+        &self,
+        claim: &ForgeTaskClaim,
+        attempt: Uuid,
+        binding: &TenantTableBinding,
+        lease: &mut ForgeLease,
+        table: &Table,
+        stop: &CancellationToken,
+    ) -> Result<ForgeDispatchResult, ForgeError> {
+        self.rewrite_settlement_barrier(claim, binding, lease, stop)
+            .await?;
+        let (evidence, handoff) = self
+            .execute_rewrite_handoff(claim, attempt, binding, table, stop)
+            .await?;
+        let metadata = table.metadata();
+        let context = RewritePublication {
+            claim,
+            binding,
+            // The operation identity is the *attempt*, not the task. A rewrite
+            // task retried after an ambiguous drain produces different objects
+            // than the attempt before it, and a durable operation's Prepared
+            // detail is immutable — so one operation per task would either have
+            // to lie about its outputs or refuse the retry. Recovery does not
+            // depend on it: a landed snapshot is found by its task identity,
+            // which is stable.
+            identity: super::publication::RewriteCommitIdentity {
+                task_id: claim.task_id,
+                attempt_id: attempt,
+                operation_id: attempt,
+                group: ForgeGroupKey::table_audit_resource(binding.tenant, &binding.table_ref),
+                plan_hash: super::planner::plan_hash(&claim.plan)?,
+                evidence,
+            },
+            key: ForgeGroupKey {
+                tenant: binding.tenant,
+                table_ref: binding.table_ref.clone(),
+                partition: super::publication::rewrite_group_partition(
+                    metadata.default_partition_spec(),
+                    handoff.output_data_files.iter(),
+                )?,
+            },
+            partition_spec_id: metadata.default_partition_spec_id(),
+            target_file_size_bytes: super::managed::policy::declared_target_file_size_bytes(
+                metadata,
+            )?,
+            planned_policy: (
+                metadata.current_schema_id(),
+                metadata.default_partition_spec_id(),
+                metadata.default_sort_order().order_id,
+            ),
+            deadline: self.forge.core.clock.now()?
+                + chrono::Duration::from_std(self.forge.core.config.iceberg_total_retry_timeout)
+                    .map_err(|_| ForgeError::InvalidConfig {
+                        detail: "Forge Iceberg retry timeout is not representable".to_owned(),
+                    })?,
+        };
+        self.publish_rewrite(&context, &handoff, table, lease, stop)
+            .await
+    }
+
+    /// Settles every live replacement this table still owes, before any effect.
+    ///
+    /// The ordering is what makes ambiguity block fresh work rather than
+    /// accumulate it: a rewrite planned while an earlier one may or may not
+    /// have landed would be planned against a live set nobody can describe yet.
+    /// Reconciliation settles a landed effect as Recovered and a provably
+    /// absent one as Reset; anything it cannot settle keeps this attempt out of
+    /// the catalog and the object store entirely.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Reconciliation`] when a live operation remains
+    /// pending or unresolved, and the clock, fence, audit, and catalog failures
+    /// reconciliation itself raises.
+    async fn rewrite_settlement_barrier(
+        &self,
+        claim: &ForgeTaskClaim,
+        binding: &TenantTableBinding,
+        lease: &mut ForgeLease,
+        stop: &CancellationToken,
+    ) -> Result<(), ForgeError> {
+        let reconciled = self
+            .forge
+            .reconcile_live_replacements(
+                lease,
+                &super::compact::ForgeTableKey {
+                    tenant: claim.data_tenant_id,
+                    table_ref: binding.table_ref.clone(),
+                },
+                binding,
+                stop,
+                self.forge.core.clock.now()?,
+            )
+            .await?;
+        if reconciled.pending > 0 || reconciled.unresolved > 0 {
+            return Err(ForgeError::Reconciliation {
+                detail: format!(
+                    "{} pending and {} unresolved live operations block a fresh rewrite",
+                    reconciled.pending, reconciled.unresolved
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Runs the managed core once and returns its publishable handoff.
+    ///
+    /// The core writes its outputs to storage and commits nothing, so a handoff
+    /// that comes back describes objects that exist and belong to no snapshot.
+    /// Anything other than a rewritten outcome is a failure of this attempt,
+    /// not a publication with fewer files.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Shutdown`] when the attempt drained,
+    /// [`ForgeError::Reconciliation`] when the core made no progress,
+    /// [`ForgeError::InvalidConfig`] when the table's bloom-column property is
+    /// unusable, and the capacity, object-store, and execution failures the
+    /// managed core raises.
+    async fn execute_rewrite_handoff(
+        &self,
+        claim: &ForgeTaskClaim,
+        attempt: Uuid,
+        binding: &TenantTableBinding,
+        table: &Table,
+        stop: &CancellationToken,
+    ) -> Result<
+        (
+            super::managed::ForgeRewriteEvidence,
+            super::managed::RewriteHandoff,
+        ),
+        ForgeError,
+    > {
+        let bloom_columns = crate::catalog::layout::PhysicalLayout::bloom_columns_from_property(
+            table
+                .metadata()
+                .properties()
+                .get(crate::catalog::layout::BLOOM_COLUMNS_PROPERTY),
+        )
+        .map_err(|detail| ForgeError::InvalidConfig { detail })?;
+        let outcome = self
+            .forge
+            .execute_rewrite_attempt(
+                binding,
+                super::managed::ForgeRewriteAttempt {
+                    task_id: claim.task_id,
+                    attempt_id: attempt,
+                    request: crate::resources::ForgeRewriteRequest::from_claim(
+                        &claim.estimates,
+                        self.capacity,
+                    )?,
+                    bloom_columns: &bloom_columns,
+                    previous: None,
+                    cancel: stop.clone(),
+                },
+            )
+            .await?;
+        match outcome {
+            super::managed::ForgeRewriteOutcome::Rewritten { evidence, handoff } => {
+                Ok((evidence, *handoff))
+            }
+            super::managed::ForgeRewriteOutcome::Cancelled { .. } => Err(ForgeError::Shutdown),
+            super::managed::ForgeRewriteOutcome::NoProgress {
+                debt_fingerprint, ..
+            } => Err(ForgeError::Reconciliation {
+                detail: format!(
+                    "managed rewrite produced no publishable work for debt {debt_fingerprint}"
+                ),
+            }),
+        }
+    }
+
+    /// Derives, prepares, and commits one handoff, retrying at most once.
+    ///
+    /// Each pass re-derives the replacement from the base it is about to commit
+    /// against, because replaying a request derived against a stale base is
+    /// what would delete files a concurrent writer has already replaced. The
+    /// Prepared audit is written exactly once, before the first catalog effect,
+    /// naming the inputs and outputs a successor must reconcile.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Reconciliation`] when authority is refused before
+    /// the commit, when the catalog answer is unknown, or when a refusal
+    /// arrives after this task's own effect landed, and the derivation, audit,
+    /// fence, and catalog failures the boundary raises.
+    async fn publish_rewrite(
+        &self,
+        context: &RewritePublication<'_>,
+        handoff: &super::managed::RewriteHandoff,
+        table: &Table,
+        lease: &mut ForgeLease,
+        stop: &CancellationToken,
+    ) -> Result<ForgeDispatchResult, ForgeError> {
+        let mut reloaded: Option<Table> = None;
+        let mut prepared = false;
+        let mut retried = false;
+        loop {
+            let base_table = reloaded.as_ref().unwrap_or(table);
+            let base = self.forge.rewrite_base(base_table).await?;
+            let request = super::publication::RewriteCommitRequest::derive(
+                super::publication::RewriteCommitInputs {
+                    handoff,
+                    base: &base,
+                    selected_inputs: &context.claim.plan.inputs,
+                    identity: &context.identity,
+                },
+            )?;
+            let authority = self
+                .rewrite_authority(
+                    lease,
+                    base_table,
+                    &request,
+                    context.planned_policy,
+                    context.deadline,
+                    stop,
+                )
+                .await?;
+            if let super::publication::RewriteCommitDecision::Refuse(refusal) = authority.decide() {
+                return Err(ForgeError::Reconciliation {
+                    detail: format!("Forge rewrite publication refused before commit: {refusal:?}"),
+                });
+            }
+            if !prepared {
+                self.forge
+                    .append_live_audit(
+                        lease,
+                        &context.key,
+                        &rewrite_operation(ForgeIcebergRewritePhase::Prepared),
+                        context.audit(ForgeIcebergRewritePhase::Prepared, None, &request)?,
+                    )
+                    .await?;
+                prepared = true;
+            }
+            let (acceptance, conflict) = match self
+                .forge
+                .commit_rewrite(
+                    lease,
+                    super::publication::ForgeRewriteCommit {
+                        table: base_table,
+                        request: &request,
+                    },
+                    stop,
+                )
+                .await
+            {
+                Ok(committed) => {
+                    return self
+                        .settle_committed_rewrite(context, &request, committed, lease)
+                        .await;
+                }
+                Err(error @ ForgeError::Catalog(_)) if !error.is_retryable_catalog() => (
+                    super::publication::RewriteAcceptance::DefiniteConflict,
+                    error,
+                ),
+                Err(error @ ForgeError::Reconciliation { .. }) => {
+                    (super::publication::RewriteAcceptance::Ambiguous, error)
+                }
+                Err(error) => return Err(error),
+            };
+            let (action, reloaded_after_conflict) = self
+                .rewrite_follow_up(context, acceptance, &request, retried, lease, stop)
+                .await?;
+            match action {
+                super::publication::RewriteConflictAction::ReconcileWithoutRecommit => {
+                    return Err(conflict);
+                }
+                super::publication::RewriteConflictAction::ResetDefinitelyUncommitted => {
+                    // Certain non-acceptance, so this operation is closed here
+                    // rather than left open for a successor to reconcile a
+                    // commit that never happened. The outputs stay unreferenced
+                    // and are reclaimed as orphans.
+                    self.forge
+                        .append_live_audit(
+                            lease,
+                            &context.key,
+                            &rewrite_operation(ForgeIcebergRewritePhase::Reset),
+                            context.audit(ForgeIcebergRewritePhase::Reset, None, &request)?,
+                        )
+                        .await?;
+                    return Err(conflict);
+                }
+                super::publication::RewriteConflictAction::RevalidateAndRecommit => {}
+            }
+            tracing::debug!(
+                task_id = %context.claim.task_id,
+                error = %conflict,
+                "re-deriving one Forge rewrite after a definite catalog conflict"
+            );
+            retried = true;
+            reloaded = reloaded_after_conflict;
+        }
+    }
+
+    /// Records the terminal audit for a rewrite the catalog accepted.
+    ///
+    /// The committed snapshot identity is read off the table the commit
+    /// returned rather than predicted, so the audit row names the snapshot a
+    /// successor would find if it had to reconcile this operation instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Invariant`] when the request cannot render its
+    /// audit paths, and the fence and SQL failures the audit append raises.
+    async fn settle_committed_rewrite(
+        &self,
+        context: &RewritePublication<'_>,
+        request: &super::publication::RewriteCommitRequest,
+        committed: Table,
+        lease: &mut ForgeLease,
+    ) -> Result<ForgeDispatchResult, ForgeError> {
+        let committed_snapshot_id = committed
+            .metadata()
+            .current_snapshot()
+            .map(|snapshot| snapshot.snapshot_id());
+        self.forge
+            .append_live_audit(
+                lease,
+                &context.key,
+                &rewrite_operation(ForgeIcebergRewritePhase::Committed),
+                context.audit(
+                    ForgeIcebergRewritePhase::Committed,
+                    committed_snapshot_id,
+                    request,
+                )?,
+            )
+            .await?;
+        Ok(ForgeDispatchResult::Committed(committed))
+    }
+
+    /// Decides what one non-success catalog outcome permits next.
+    ///
+    /// A refusal is only *certain non-acceptance* if this operation's effect is
+    /// absent from the table. A lost response looks identical from here — the
+    /// replacement landed, the answer did not — and a resubmission would then
+    /// delete files the landed snapshot already replaced. Reading the task
+    /// identity back off the table separates the two, so an already-landed
+    /// rewrite is never reset and never re-committed: the operation stays open
+    /// and a successor settles it from that same evidence. Ambiguity is never
+    /// given that chance; it reconciles without loading anything, because no
+    /// observation made after a lost answer can make resubmitting it safe.
+    ///
+    /// Returns the action together with the reloaded table a revalidated retry
+    /// must derive against, which is `None` for every terminal action.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Reconciliation`] when the refusal arrived after
+    /// this task's own effect landed, and the catalog, object-store, clock, and
+    /// fence failures the reload and the authority read raise.
+    async fn rewrite_follow_up(
+        &self,
+        context: &RewritePublication<'_>,
+        acceptance: super::publication::RewriteAcceptance,
+        request: &super::publication::RewriteCommitRequest,
+        retried: bool,
+        lease: &mut ForgeLease,
+        stop: &CancellationToken,
+    ) -> Result<(super::publication::RewriteConflictAction, Option<Table>), ForgeError> {
+        match acceptance {
+            super::publication::RewriteAcceptance::Ambiguous => Ok((
+                acceptance.next_action(
+                    retried,
+                    false,
+                    super::publication::RewriteCommitDecision::Proceed,
+                ),
+                None,
+            )),
+            super::publication::RewriteAcceptance::DefiniteConflict => {
+                let refreshed = self
+                    .forge
+                    .core
+                    .catalog
+                    .load_table(&context.binding.table_ident())
+                    .await
+                    .map_err(ForgeError::Catalog)?;
+                if self
+                    .find_retained_task_evidence(context.binding, &refreshed, context.claim.task_id)
+                    .await?
+                    .is_some()
+                {
+                    return Err(ForgeError::Reconciliation {
+                        detail: "Forge rewrite commit was refused after its own effect landed"
+                            .to_owned(),
+                    });
+                }
+                let authority = self
+                    .rewrite_authority(
+                        lease,
+                        &refreshed,
+                        request,
+                        context.planned_policy,
+                        context.deadline,
+                        stop,
+                    )
+                    .await?;
+                let action = acceptance.next_action(
+                    retried,
+                    self.forge.core.clock.now()? >= context.deadline,
+                    authority.decide(),
+                );
+                Ok((action, Some(refreshed)))
+            }
+        }
+    }
+
+    /// Collects every knowable authority for one publication at the boundary.
+    ///
+    /// Nothing here decides anything: each field is answered by the owner that
+    /// actually knows it — the lease, the clock, the loaded table — and the
+    /// ordering and completeness of the verdict belong to
+    /// [`super::publication::RewriteCommitAuthority::decide`]. Reading them all
+    /// before any of them is acted on is what keeps a refusal free of partial
+    /// effects.
+    ///
+    /// `inputs_all_live` and `delete_scope_safe` are recorded as held because
+    /// [`super::publication::RewriteCommitRequest::derive`] is their owner and
+    /// already refused the request otherwise: the caller derives against this
+    /// exact base immediately before calling, so a live request is the proof.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Sql`] when the lease cannot be renewed against the
+    /// operator pool, and the clock failures the deadline comparison raises.
+    async fn rewrite_authority(
+        &self,
+        lease: &mut ForgeLease,
+        table: &Table,
+        request: &super::publication::RewriteCommitRequest,
+        planned_policy: (i32, i32, i64),
+        deadline: chrono::DateTime<chrono::Utc>,
+        stop: &CancellationToken,
+    ) -> Result<super::publication::RewriteCommitAuthority, ForgeError> {
+        let metadata = table.metadata();
+        Ok(super::publication::RewriteCommitAuthority {
+            fence: super::publication::RewriteFenceAuthority {
+                lease_held: lease.renew(&self.forge.core.operator_pool).await?,
+                fence_held: !lease.remaining().is_zero(),
+                commit_window_fits: lease
+                    .commit_window_fits(self.forge.core.config.commit_window()),
+            },
+            attempt: super::publication::RewriteAttemptAuthority {
+                cancelled: stop.is_cancelled(),
+                deadline_passed: self.forge.core.clock.now()? >= deadline,
+            },
+            table: super::publication::RewriteTableAuthority {
+                branch_head_is_base: metadata
+                    .snapshot_for_ref(super::scribe_promotion::PROMOTION_BRANCH)
+                    .is_some_and(|snapshot| snapshot.snapshot_id() == request.base_snapshot_id),
+                base_is_retained: metadata.snapshot_by_id(request.base_snapshot_id).is_some(),
+                policy_unchanged: planned_policy
+                    == (
+                        metadata.current_schema_id(),
+                        metadata.default_partition_spec_id(),
+                        metadata.default_sort_order().order_id,
+                    ),
+            },
+            files: super::publication::RewriteFileAuthority {
+                inputs_all_live: true,
+                delete_scope_safe: true,
+            },
+        })
+    }
+
+    /// Converts catalog file paths into the audit row's storage paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Invariant`] when a catalog path is not a valid
+    /// storage path, which would leave an audit row that cannot name the object
+    /// it settled.
+    fn rewrite_audit_paths<'file>(
+        files: impl IntoIterator<Item = &'file iceberg::spec::DataFile>,
+    ) -> Result<Vec<StoragePath>, ForgeError> {
+        files
+            .into_iter()
+            .map(|file| {
+                StoragePath::new(file.file_path()).map_err(|error| ForgeError::Invariant {
+                    detail: format!("rewrite file path is not a storage path: {error}"),
+                })
+            })
+            .collect()
     }
 
     /// Prepares, revalidates, and fast-appends one Scribe promotion group.
@@ -2471,7 +3175,10 @@ impl ForgeWorker {
         let mut retried = false;
         loop {
             let base = reloaded.as_ref().unwrap_or(table);
-            let data_files = self.forge.revalidate_promotion(binding, &plan).await?;
+            let data_files = self
+                .forge
+                .revalidate_promotion(binding, &plan, base)
+                .await?;
             let conflict = match self
                 .forge
                 .commit_promotion(
@@ -3811,6 +4518,11 @@ fn task_progress_effect(
 
 #[cfg(test)]
 mod tests {
+    use vala_sql::row_types::forge_tasks::{
+        FORGE_TASK_PAYLOAD_VERSION, ForgeTaskEstimates, ForgeTaskLane, ForgeTaskPlan,
+        ForgeTaskTableIdentity,
+    };
+
     use super::*;
 
     /// A protected Forge floor remains a positive bounded claim without elasticity.
@@ -3972,6 +4684,113 @@ mod tests {
             )
             .is_none(),
             "legacy expiry rows cannot acquire manifest-rewrite authority"
+        );
+    }
+
+    /// Builds one claimed task carrying `strategy` and its own valid payload.
+    ///
+    /// Every field is the shape the claim transaction would have produced, so a
+    /// refusal this returns comes from the validation under test rather than
+    /// from a malformed fixture.
+    fn claimed_task(strategy: ForgeTaskStrategy, parameters: Value) -> ForgeTaskClaim {
+        let tenant = DataTenantId::new(Uuid::now_v7()).expect("a fixture tenant identity");
+        ForgeTaskClaim {
+            execution_tenant_id: tenant,
+            task_id: Uuid::now_v7(),
+            data_tenant_id: tenant,
+            table_ref: ForgeTaskTableIdentity {
+                catalog: "bifrost".to_owned(),
+                namespace: "observations".to_owned(),
+                table: "activation".to_owned(),
+            },
+            strategy: ForgeClaimStrategy::Known(strategy),
+            lane: ForgeTaskLane::Ordinary,
+            base_snapshot_id: 1,
+            plan: ForgeTaskPlan {
+                version: FORGE_TASK_PAYLOAD_VERSION,
+                inputs: vec!["data/one.parquet".to_owned()],
+                parameters,
+            },
+            estimates: ForgeTaskEstimates {
+                files: 1,
+                bytes: 1,
+                parallelism: 1,
+                memory_bytes: 1,
+                spill_bytes: 1,
+                large_ceiling_bytes: 1,
+                envelope: None,
+            },
+            state: ForgeTaskState::Claimed,
+            attempt_id: Some(Uuid::now_v7()),
+            claimed_by: Some(Uuid::now_v7()),
+            claim_expires_at: None,
+            watermark: None,
+            evidence: None,
+            attempt_count: 0,
+            failure_class: None,
+            next_eligible_at: chrono::Utc::now(),
+            failed_volume_identity: None,
+            ready_at: chrono::Utc::now(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Only promotion and live rewrite cross this phase's activation boundary.
+    ///
+    /// Each maintenance claim below carries the payload its own strategy
+    /// contract accepts, so it passes every earlier check and is refused only
+    /// by the phase. That ordering is the point: the refusal is what the
+    /// worker answers with, and it answers before the publication lease, the
+    /// table load, and every dispatch arm — so an injected claim that never
+    /// passed the scheduler's admission gate still reaches no catalog, no
+    /// object store, and no durable effect.
+    ///
+    /// The retained dispatch, execution, reconciliation, and cleanup owners for
+    /// these strategies stay compiled and statically reachable; this test pins
+    /// that they cannot be *entered*, not that they are gone. Live rewrite is
+    /// the counterpart: it is inside the boundary in this phase, so the same
+    /// gate must let its exact payload through.
+    #[test]
+    fn forge_activation_boundary_admits_live_rewrite_and_refuses_maintenance() {
+        let maintenance = |manifest_rewrite_due: bool| {
+            serde_json::json!({
+                "kind": "maintenance",
+                "trigger_commit_count": 0,
+                "manifest_rewrite_due": manifest_rewrite_due,
+                "snapshot_expiry_due": !manifest_rewrite_due,
+                "reconciliation_due": false,
+            })
+        };
+        for (strategy, manifest_rewrite_due) in [
+            (ForgeTaskStrategy::ManifestRewrite, true),
+            (ForgeTaskStrategy::SnapshotExpiry, false),
+        ] {
+            let task = claimed_task(strategy, maintenance(manifest_rewrite_due));
+            let error = ForgeWorker::validate_payload(&task)
+                .expect_err("a disabled strategy is refused before any effect");
+            assert!(
+                error.to_string().contains("not activated in this phase"),
+                "{strategy:?} must be refused by the activation boundary, saw {error}"
+            );
+        }
+
+        ForgeWorker::validate_payload(&claimed_task(
+            ForgeTaskStrategy::SmallFiles,
+            serde_json::json!({ "kind": LIVE_REWRITE_PARAMETER_KIND }),
+        ))
+        .expect("live rewrite is activated in this phase");
+        let mislabelled = ForgeWorker::validate_payload(&claimed_task(
+            ForgeTaskStrategy::SmallFiles,
+            serde_json::json!({ "kind": "maintenance" }),
+        ))
+        .expect_err("a rewrite row describing another workflow is still refused");
+        assert!(
+            !mislabelled
+                .to_string()
+                .contains("not activated in this phase"),
+            "the refusal must come from the payload, not the activation boundary, \
+             saw {mislabelled}"
         );
     }
 

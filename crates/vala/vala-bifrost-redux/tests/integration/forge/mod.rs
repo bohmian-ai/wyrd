@@ -7,5 +7,6 @@
 
 mod managed_rewrite;
 mod promotion;
+mod publication;
 mod rewrite_support;
 mod support;

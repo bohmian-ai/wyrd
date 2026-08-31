@@ -180,7 +180,7 @@ impl Default for ForgeConfig {
             audit_page_size: 256,
             snapshot_retention: Duration::from_hours(24),
             retain_last: 1,
-            snapshot_expiry_enabled: true,
+            snapshot_expiry_enabled: false,
             manifest_rewrite_enabled: false,
             small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
             manifest_rewrite_target_size_bytes: DEFAULT_MANIFEST_REWRITE_TARGET_SIZE_BYTES,

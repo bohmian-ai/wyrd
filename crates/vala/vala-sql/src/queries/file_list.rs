@@ -532,6 +532,11 @@ mod pg_tests {
                 .is_empty(),
             "settled rows leave no promotion demand"
         );
+        // The promotion read claims its rows for the caller, so the settlement
+        // transaction still holds them here. Committing before the fail-closed
+        // setup below is what the production promoter does too, and without it
+        // the out-of-band update would wait on this very transaction.
+        conn.commit().await.expect("settlement commits");
 
         sqlx::query("UPDATE vala.file_list SET file_checksum = NULL WHERE id = $1")
             .bind(ids[0])

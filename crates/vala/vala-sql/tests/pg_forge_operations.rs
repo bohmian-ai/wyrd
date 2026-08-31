@@ -452,25 +452,29 @@ mod pg_tests {
         // Iceberg rewrite family
         // -----------------------------------------------------------------------
 
-        /// Verifies Iceberg rewrite Prepared-to-Committed persistence.
+        /// Builds one Iceberg-rewrite detail for the fixed test resource.
+        ///
+        /// The production route stamps a distinct `operation_id` per rewrite
+        /// *attempt*, because a retried attempt produces different output
+        /// objects and a Prepared detail is immutable. Building the detail from
+        /// that identity here keeps the durable proofs below aligned with what
+        /// the publication owner actually writes.
         ///
         /// # Panics
         ///
-        /// Panics when setup, typed detail construction, transitions, or exact
-        /// persisted phase/sequence/cardinality assertions fail.
-        #[tokio::test]
-        async fn iceberg_rewrite_prepare_and_commit() {
-            let TestFixtures { fixture, .. } = setup().await;
-            let pool = fixture.app_pool();
-            let tenant = fixture.data_tenant_id();
-            let family = ForgeOperationFamily::IcebergRewrite;
-
-            let detail = AuditDetail::ForgeIcebergRewrite {
-                operation_id: Uuid::now_v7(),
-                phase: ForgeIcebergRewritePhase::Prepared,
+        /// Panics when the fixed partition instant or object paths are invalid.
+        fn rewrite_detail(
+            operation_id: Uuid,
+            phase: ForgeIcebergRewritePhase,
+            committed_snapshot_id: Option<i64>,
+            output: &str,
+        ) -> AuditDetail {
+            AuditDetail::ForgeIcebergRewrite {
+                operation_id,
+                phase,
                 group: resource().to_owned(),
                 base_snapshot_id: 100,
-                committed_snapshot_id: None,
+                committed_snapshot_id,
                 partition_spec_id: 3,
                 time_partition: wyrd_spec::vala::api::TimePartitionWire::new(
                     wyrd_spec::vala::api::TimeGranularityWire::Day,
@@ -479,69 +483,116 @@ mod pg_tests {
                 .expect("fixture instant is an exact day boundary"),
                 target_file_size_bytes: 1024,
                 input_paths: vec![StoragePath::new("table/live-a.parquet").expect("valid path")],
-                output_paths: vec![
-                    StoragePath::new("table/rewrite-a.parquet").expect("valid path"),
-                ],
-            };
-            let prepared_event = event("forge.iceberg_rewrite.prepared", resource(), Some(detail));
+                output_paths: vec![StoragePath::new(output).expect("valid path")],
+            }
+        }
 
-            let prepared_seq =
-                match append_prepared(pool, tenant, resource(), family, &prepared_event)
-                    .await
-                    .expect("iceberg prepared")
-                {
-                    ForgeOperationTransition::Applied { audit_seq } => audit_seq,
-                    other => panic!("expected prepared application, got {other:?}"),
-                };
-            let prepared_detail = prepared_event.detail.as_ref().expect("prepared detail");
-            let operation_id = forge_operation_id(prepared_detail);
-            let committed_detail = match prepared_detail {
-                AuditDetail::ForgeIcebergRewrite {
-                    base_snapshot_id,
-                    partition_spec_id,
-                    time_partition,
-                    target_file_size_bytes,
-                    input_paths,
-                    output_paths,
-                    ..
-                } => AuditDetail::ForgeIcebergRewrite {
+        /// Verifies every terminal the Iceberg-rewrite route can persist.
+        ///
+        /// The production publication owner settles a rewrite three ways and
+        /// only three ways: `Committed` when the catalog answered, `Recovered`
+        /// when a successor found its predecessor's own snapshot on the table,
+        /// and `Reset` when a refusal proved nothing landed. All three are
+        /// asserted against one resource, each under its own attempt-scoped
+        /// operation identity, because that is exactly the durable shape one
+        /// table accumulates across a retried publication.
+        ///
+        /// # Panics
+        ///
+        /// Panics when setup, typed detail construction, transitions, or exact
+        /// persisted phase/sequence/cardinality assertions fail.
+        #[tokio::test]
+        async fn iceberg_rewrite_settles_every_terminal_under_attempt_identities() {
+            let TestFixtures { fixture, .. } = setup().await;
+            let pool = fixture.app_pool();
+            let tenant = fixture.data_tenant_id();
+            let family = ForgeOperationFamily::IcebergRewrite;
+
+            let terminals = [
+                (
+                    ForgeIcebergRewritePhase::Committed,
+                    "forge.iceberg_rewrite.committed",
+                    Some(101),
+                    "committed",
+                ),
+                (
+                    ForgeIcebergRewritePhase::Recovered,
+                    "forge.iceberg_rewrite.recovered",
+                    Some(102),
+                    "recovered",
+                ),
+                (
+                    ForgeIcebergRewritePhase::Reset,
+                    "forge.iceberg_rewrite.reset",
+                    None,
+                    "reset",
+                ),
+            ];
+
+            for (index, (phase, operation, committed_snapshot_id, persisted)) in
+                terminals.into_iter().enumerate()
+            {
+                let operation_id = Uuid::now_v7();
+                let output = format!("table/rewrite-{index}.parquet");
+                let prepared_event = event(
+                    "forge.iceberg_rewrite.prepared",
+                    resource(),
+                    Some(rewrite_detail(
+                        operation_id,
+                        ForgeIcebergRewritePhase::Prepared,
+                        None,
+                        &output,
+                    )),
+                );
+                let prepared_seq =
+                    match append_prepared(pool, tenant, resource(), family, &prepared_event)
+                        .await
+                        .expect("iceberg prepared")
+                    {
+                        ForgeOperationTransition::Applied { audit_seq } => audit_seq,
+                        other => panic!("expected prepared application, got {other:?}"),
+                    };
+                assert_eq!(
+                    forge_operation_id(prepared_event.detail.as_ref().expect("prepared detail")),
                     operation_id,
-                    phase: ForgeIcebergRewritePhase::Committed,
-                    group: resource().to_owned(),
-                    base_snapshot_id: *base_snapshot_id,
-                    committed_snapshot_id: Some(101),
-                    partition_spec_id: *partition_spec_id,
-                    time_partition: *time_partition,
-                    target_file_size_bytes: *target_file_size_bytes,
-                    input_paths: input_paths.clone(),
-                    output_paths: output_paths.clone(),
-                },
-                _ => panic!("expected Iceberg rewrite detail"),
-            };
-            let committed_event = event(
-                "forge.iceberg_rewrite.committed",
-                resource(),
-                Some(committed_detail),
-            );
-            let terminal_seq =
-                match append_terminal(pool, tenant, resource(), family, &committed_event)
-                    .await
-                    .expect("iceberg committed")
-                {
-                    ForgeOperationTransition::Applied { audit_seq } => audit_seq,
-                    other => panic!("expected terminal application, got {other:?}"),
-                };
+                    "the persisted operation identity is the attempt's own"
+                );
+
+                let terminal_event = event(
+                    operation,
+                    resource(),
+                    Some(rewrite_detail(
+                        operation_id,
+                        phase,
+                        committed_snapshot_id,
+                        &output,
+                    )),
+                );
+                let terminal_seq =
+                    match append_terminal(pool, tenant, resource(), family, &terminal_event)
+                        .await
+                        .expect("iceberg terminal")
+                    {
+                        ForgeOperationTransition::Applied { audit_seq } => audit_seq,
+                        other => panic!("expected terminal application, got {other:?}"),
+                    };
+
+                assert_eq!(
+                    state_snapshot(pool, tenant, family, operation_id).await,
+                    StateSnapshot {
+                        phase: persisted.to_owned(),
+                        prepared_audit_seq: prepared_seq,
+                        terminal_audit_seq: Some(terminal_seq),
+                    }
+                );
+            }
 
             assert_eq!(
-                state_snapshot(pool, tenant, family, operation_id).await,
-                StateSnapshot {
-                    phase: "committed".to_owned(),
-                    prepared_audit_seq: prepared_seq,
-                    terminal_audit_seq: Some(terminal_seq),
-                }
+                count_state(pool, tenant).await,
+                3,
+                "one resource carries one durable row per attempt identity"
             );
-            assert_eq!(count_state(pool, tenant).await, 1);
-            assert_eq!(count_audit(pool, tenant).await, 2);
+            assert_eq!(count_audit(pool, tenant).await, 6);
         }
 
         // -----------------------------------------------------------------------

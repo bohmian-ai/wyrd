@@ -121,6 +121,8 @@ impl ForgeMetricStage {
 pub(super) enum ForgeCatalogCommitStrategy {
     /// A promotion fast-appends already-published Scribe objects unchanged.
     ScribePromotion,
+    /// A rewrite replaces live data files with the objects a managed attempt produced.
+    IcebergRewrite,
 }
 
 impl ForgeCatalogCommitStrategy {
@@ -128,6 +130,7 @@ impl ForgeCatalogCommitStrategy {
     pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::ScribePromotion => "scribe_promotion",
+            Self::IcebergRewrite => "iceberg_rewrite",
         }
     }
 }

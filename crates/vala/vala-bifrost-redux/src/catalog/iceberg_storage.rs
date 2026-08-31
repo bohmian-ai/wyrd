@@ -95,10 +95,19 @@ impl BifrostIcebergStorage {
     /// reconstruction is exactly how a foreign path becomes a legitimate-looking
     /// read.
     ///
+    /// Two spellings reach this boundary and both are already warehouse-local.
+    /// Iceberg metadata carries absolute locations, which must live under the
+    /// active warehouse. Scribe registers a promoted object by its operator key,
+    /// which names no authority at all: it has no scheme and no leading `/`, so
+    /// it cannot denote a different backend, and it is passed through unchanged
+    /// rather than re-prefixed. Everything else — a foreign scheme, a
+    /// filesystem-absolute path, a traversing segment — is refused.
+    ///
     /// # Errors
     /// Returns [`IcebergErrorKind::DataInvalid`] when the location carries a
-    /// query or fragment, does not live under the active warehouse, is the
-    /// warehouse root itself, or contains an empty or `.`/`..` path segment.
+    /// query or fragment, names an authority outside the active warehouse, is
+    /// filesystem-absolute, is the warehouse root itself, or contains an empty
+    /// or `.`/`..` path segment.
     fn relativize(&self, location: &str) -> IcebergResult<String> {
         let refuse = |reason: &str| {
             Err(IcebergError::new(
@@ -112,11 +121,18 @@ impl BifrostIcebergStorage {
         if location.contains('?') || location.contains('#') {
             return refuse("a location carries a query or fragment");
         }
-        let Some(relative) = location.strip_prefix(&*self.warehouse) else {
-            return refuse("the location is outside the active warehouse");
-        };
-        let Some(relative) = relative.strip_prefix('/') else {
-            return refuse("the location is the warehouse root itself");
+        let relative = match location.strip_prefix(&*self.warehouse) {
+            Some(under_warehouse) => match under_warehouse.strip_prefix('/') {
+                Some(relative) => relative,
+                None => return refuse("the location is the warehouse root itself"),
+            },
+            None if location.contains("://") => {
+                return refuse("the location is outside the active warehouse");
+            }
+            None if location.starts_with('/') => {
+                return refuse("the location is outside the active warehouse");
+            }
+            None => location,
         };
         if relative.is_empty() {
             return refuse("the location names no object");

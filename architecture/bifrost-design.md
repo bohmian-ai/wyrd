@@ -487,14 +487,22 @@ the Iceberg commit so an applied delete does not reapply to replacement rows.
 Missing target evidence, mixed sequence semantics, or an unproven surviving
 scope fails commit validation.
 
-Attempt output paths are flat and table-bound:
+Attempt output paths are table-bound and retain the managed core's recipe
+segment:
 
 ```text
-{table}/data/forge/{attempt_uuidv7}-{ordinal:05}.parquet
+{table}/data/forge/{recipe}/{attempt_uuidv7}-{writer_ordinal:05}-{writer_uuidv7}.parquet
 ```
 
-One attempt-global `u64` ordinal is reserved before each open across all
-concurrent writers. Cancellation drains every writer and retains exact
+The recipe segment is the managed core's canonical writer-recipe identity and
+keeps completed Forge outputs recognizable as current on the next selection
+pass. Each physical writer owns its filename counter and UUIDv7 suffix;
+`writer_ordinal` is minimum-width five-digit canonical decimal and may restart
+for another writer because `writer_uuidv7` provides cross-writer uniqueness.
+Forge separately assigns each opened output one attempt-global
+`OutputIdentity.logical_ordinal` for observer, drain, reconciliation, and
+cleanup evidence. The logical ordinal is not encoded into or reconstructed
+from the object path. Cancellation drains every writer and retains exact
 produced-or-possible output evidence. Forge renews and verifies the lease and
 fence immediately before the initial `commit_once`. The commit adapter removes
 the exact rewritten data files, adds the exact outputs, preserves delete

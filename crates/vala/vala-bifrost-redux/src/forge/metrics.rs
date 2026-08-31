@@ -446,6 +446,66 @@ pub(crate) struct ForgeResourceObservation {
     pub(crate) peak_scratch: u64,
 }
 
+/// Closed physical events one managed rewrite attempt can report.
+///
+/// The inventory mirrors the pinned core's own closed event set one-for-one, so
+/// a core that gained an event would stop compiling here rather than silently
+/// emitting nothing. Every variant is a *physical* fact — an object opened, a
+/// roll decided, memory peaked — and none of them carries an identity, a path,
+/// or a tenant, which is what keeps this family fixed-cardinality no matter how
+/// many tables Forge maintains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ForgeRewriteEventKind {
+    /// A rewrite output object was opened and given its logical ordinal.
+    OutputOpened,
+    /// The rolling writer decided to close an output.
+    RollDecided,
+    /// A close finished, successfully or not.
+    OutputClosed,
+    /// The attempt reported its peak reservation against the leased pool.
+    PeakMemory,
+    /// A query operator spilled under memory pressure.
+    OperatorSpill,
+    /// The leased scratch root was re-measured.
+    ScratchSpill,
+    /// The attempt produced its complete output set.
+    Succeeded,
+    /// The attempt failed after producing zero or more objects.
+    Failed,
+    /// The attempt was cancelled and drained.
+    Cancelled,
+}
+
+impl ForgeRewriteEventKind {
+    /// Every rewrite event registered in the fixed metric inventory.
+    pub(crate) const ALL: [Self; 9] = [
+        Self::OutputOpened,
+        Self::RollDecided,
+        Self::OutputClosed,
+        Self::PeakMemory,
+        Self::OperatorSpill,
+        Self::ScratchSpill,
+        Self::Succeeded,
+        Self::Failed,
+        Self::Cancelled,
+    ];
+
+    /// Returns the stable metric label for this rewrite event.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::OutputOpened => "output_opened",
+            Self::RollDecided => "roll_decided",
+            Self::OutputClosed => "output_closed",
+            Self::PeakMemory => "peak_memory",
+            Self::OperatorSpill => "operator_spill",
+            Self::ScratchSpill => "scratch_spill",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
 /// Closed execution phase for a typed Forge capacity refusal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum ForgeCapacityRefusalPhase {
@@ -564,6 +624,8 @@ pub struct ForgeTelemetry {
     terminal_poisons: BTreeMap<super::error::ForgeFailureClass, Counter>,
     /// Capacity refusals split between admission and execution.
     capacity_refusals: BTreeMap<ForgeCapacityRefusalPhase, Counter>,
+    /// Managed-rewrite physical events by closed event kind.
+    rewrite_events: BTreeMap<ForgeRewriteEventKind, Counter>,
     /// Current durable compaction debt by files and bytes.
     compaction_debt: BTreeMap<&'static str, Gauge>,
     /// Successful task progress effects by closed outcome.
@@ -638,6 +700,7 @@ impl ForgeTelemetry {
             retries: failure_class_counters("bifrost_forge_retries_total"),
             terminal_poisons: failure_class_counters("bifrost_forge_terminal_poisons_total"),
             capacity_refusals: capacity_refusal_counters(),
+            rewrite_events: rewrite_event_counters(),
             compaction_debt: compaction_debt_gauges(),
             progress_effects: progress_effect_counters(),
             quarantine_state: metrics::gauge!("bifrost_forge_worker_quarantined"),
@@ -911,6 +974,15 @@ impl ForgeTelemetry {
     }
 
     /// Records one typed capacity refusal at its actual phase boundary.
+    /// Record one physical event projected from the managed rewrite core.
+    ///
+    /// Called inline on the writer path, so it does exactly one map lookup and
+    /// one counter increment: a slower projection would apply backpressure the
+    /// core's writer does not model.
+    pub(crate) fn record_rewrite_event(&self, kind: ForgeRewriteEventKind) {
+        self.rewrite_events[&kind].increment(1);
+    }
+
     pub(super) fn record_capacity_refusal(&self, phase: ForgeCapacityRefusalPhase) {
         self.capacity_refusals[&phase].increment(1);
     }
@@ -1200,8 +1272,8 @@ mod tests {
     use super::{
         ForgeAttemptResource, ForgeCapacityRefusalPhase, ForgeCleanupKind, ForgeConflictKind,
         ForgeHintPersistenceResult, ForgeMetricSource, ForgeProgressEffect,
-        ForgeResourceObservation, ForgeResourceObservationKind, ForgeTaskMetricStrategy,
-        ForgeTaskTerminalResult, ForgeTelemetry, OrphanGcOutcome,
+        ForgeResourceObservation, ForgeResourceObservationKind, ForgeRewriteEventKind,
+        ForgeTaskMetricStrategy, ForgeTaskTerminalResult, ForgeTelemetry, OrphanGcOutcome,
     };
     #[cfg(test)]
     use datafusion::execution::memory_pool::GreedyMemoryPool;
@@ -1421,6 +1493,12 @@ mod tests {
             ForgeAttemptResource::ALL.len() * ForgeResourceObservationKind::ALL.len()
         );
         assert_eq!(resource_releases, ForgeAttemptResource::ALL.len() * 2);
+        let rewrite_events = snapshot
+            .counters
+            .keys()
+            .filter(|name| name.starts_with("bifrost_forge_rewrite_events_total{"))
+            .count();
+        assert_eq!(rewrite_events, ForgeRewriteEventKind::ALL.len());
     }
 
     /// Asserts each owner-emitted family moves when its owner records again.
@@ -1512,6 +1590,9 @@ mod tests {
             ] {
                 telemetry.record_retry(class);
                 telemetry.record_terminal_poison(class);
+            }
+            for kind in ForgeRewriteEventKind::ALL {
+                telemetry.record_rewrite_event(kind);
             }
             telemetry.record_capacity_refusal(ForgeCapacityRefusalPhase::Admission);
             telemetry.record_capacity_refusal(ForgeCapacityRefusalPhase::Execution);
@@ -1706,5 +1787,21 @@ fn source_counters(name: &'static str) -> BTreeMap<ForgeMetricSource, Counter> {
     ForgeMetricSource::ALL
         .into_iter()
         .map(|source| (source, metrics::counter!(name, "source" => source.as_str())))
+        .collect()
+}
+
+/// Registers one counter handle for each closed managed-rewrite event.
+fn rewrite_event_counters() -> BTreeMap<ForgeRewriteEventKind, Counter> {
+    ForgeRewriteEventKind::ALL
+        .into_iter()
+        .map(|kind| {
+            (
+                kind,
+                metrics::counter!(
+                    "bifrost_forge_rewrite_events_total",
+                    "event" => kind.as_str()
+                ),
+            )
+        })
         .collect()
 }

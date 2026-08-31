@@ -22,6 +22,14 @@ use super::Forge;
 use super::error::ForgeError;
 
 const DEFAULT_MAX_CONCURRENT_READS: usize = 4;
+/// Core rewrite plans one admitted attempt may execute before it must yield.
+///
+/// One attempt holds one exact memory and scratch lease for its whole
+/// lifetime, so an unbounded plan count would let a single fragmented table
+/// hold that lease indefinitely while other tables wait. Four is the smallest
+/// budget that still lets a multi-partition table make visible progress in one
+/// attempt.
+const DEFAULT_REWRITE_MAX_PLANS_PER_ATTEMPT: usize = 4;
 const DEFAULT_SPILL_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const DEFAULT_MAX_OPEN_OPERATIONS_PER_TABLE: usize = 256;
 const DEFAULT_MAX_RETAINED_SNAPSHOTS_PER_TABLE: usize = 256;
@@ -119,6 +127,13 @@ pub struct ForgeConfig {
     pub max_maintenance_bytes_per_tick: u64,
     /// Maximum concurrent staged-object reads during rewrite.
     pub max_concurrent_reads: usize,
+    /// Maximum core rewrite plans one admitted attempt may execute.
+    ///
+    /// Bounds how long a single attempt can hold its exact resource lease on a
+    /// heavily fragmented table. An attempt that reaches the budget returns its
+    /// completed plans and yields; the remaining plans are a later attempt's
+    /// work. Operator-tunable via `forge.rewrite_max_plans_per_attempt`.
+    pub rewrite_max_plans_per_attempt: usize,
     /// `DataFusion` spill ceiling for Forge rewrites.
     pub spill_limit_bytes: u64,
     /// Maximum staging hints drained by one wake-up.
@@ -175,6 +190,7 @@ impl Default for ForgeConfig {
             max_maintenance_items_per_tick: DEFAULT_MAX_MAINTENANCE_ITEMS_PER_TICK,
             max_maintenance_bytes_per_tick: DEFAULT_MAX_MAINTENANCE_BYTES_PER_TICK,
             max_concurrent_reads: DEFAULT_MAX_CONCURRENT_READS,
+            rewrite_max_plans_per_attempt: DEFAULT_REWRITE_MAX_PLANS_PER_ATTEMPT,
             spill_limit_bytes: DEFAULT_SPILL_LIMIT_BYTES,
             max_hints_per_wake: 256,
             max_open_operations_per_table: DEFAULT_MAX_OPEN_OPERATIONS_PER_TABLE,
@@ -216,6 +232,7 @@ impl ForgeConfig {
             || self.max_maintenance_items_per_tick == 0
             || self.max_maintenance_bytes_per_tick == 0
             || self.max_concurrent_reads == 0
+            || self.rewrite_max_plans_per_attempt == 0
             || self.spill_limit_bytes == 0
             || self.max_hints_per_wake == 0
             || self.max_open_operations_per_table == 0

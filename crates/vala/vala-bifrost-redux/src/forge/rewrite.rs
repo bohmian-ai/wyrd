@@ -218,6 +218,65 @@ impl ForgeAttemptResources {
         })
     }
 
+    /// Returns the attempt-local pool the leased runtime was built over.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the attempt has already been finalized, which is a caller
+    /// sequencing error rather than a runtime condition.
+    pub(crate) fn memory_pool(&self) -> Arc<dyn MemoryPool> {
+        self.runtime
+            .as_ref()
+            .expect("invariant: an unfinished attempt retains its runtime")
+            .memory_pool()
+    }
+
+    /// Returns the exact resident memory this attempt was granted, in bytes.
+    pub(crate) fn memory_bytes(&self) -> u64 {
+        self.observation.acquired_memory
+    }
+
+    /// Returns the exact scratch this attempt was granted, in bytes.
+    pub(crate) fn scratch_bytes(&self) -> u64 {
+        self.observation.acquired_scratch
+    }
+
+    /// Returns the attempt-owned scratch root the compaction core may spill into.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the attempt has already been finalized, which is a caller
+    /// sequencing error rather than a runtime condition.
+    pub(crate) fn spill_root(&self) -> &Path {
+        self.runtime
+            .as_ref()
+            .expect("invariant: an unfinished attempt retains its runtime")
+            .spill_root()
+    }
+
+    /// Folds the core's own scratch measurement into this attempt's peak.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the attempt has already been finalized, which is a caller
+    /// sequencing error rather than a runtime condition.
+    pub(crate) fn observe_scratch_peak(&self, bytes: u64) {
+        self.runtime
+            .as_ref()
+            .expect("invariant: an unfinished attempt retains its runtime")
+            .observe_scratch_peak(bytes);
+    }
+
+    /// Folds the core's own resident measurement into this attempt's peak.
+    ///
+    /// The attempt's own pool wrapper already tracks growth it mediated; the
+    /// core measures the same pool through its own wrapper, and taking the
+    /// maximum of the two keeps the finalized observation conservative rather
+    /// than dependent on which wrapper saw the peak first.
+    pub(crate) fn observe_memory_peak(&self, bytes: u64) {
+        self.peak_memory_bytes.fetch_max(bytes, Ordering::AcqRel);
+    }
+
     /// Drops runtime ownership before explicitly releasing or poisoning the lease.
     fn finish(&mut self) -> crate::resources::ForgeResourceReleaseResult {
         if let Some(result) = self.release_result {
@@ -283,9 +342,10 @@ pub struct ForgeRewriteRuntime {
     runtime: Arc<RuntimeEnv>,
     /// Current Forge-owned child removed automatically on clean shutdown.
     ///
-    /// Held, never read: dropping the runtime is what removes the directory,
-    /// so the field is the lifetime and nothing else consults it.
-    _spill_dir: tempfile::TempDir,
+    /// Owns the directory's lifetime — dropping the runtime is what removes it —
+    /// and names the exact root an attempt leases to the managed compaction
+    /// core, so both spillers write beneath one accounted directory.
+    spill_dir: tempfile::TempDir,
     /// Runtime-wide spill ceiling, equivalent to one operation under `tick`.
     ///
     /// Sort spill is the only consumer: rewrite output streams straight to the
@@ -362,7 +422,7 @@ impl ForgeRewriteRuntime {
         );
         Ok(Self {
             runtime,
-            _spill_dir: spill_dir,
+            spill_dir,
             spill_limit_bytes,
             scratch_peak_bytes: Arc::new(AtomicU64::new(0)),
         })
@@ -378,6 +438,29 @@ impl ForgeRewriteRuntime {
         self.scratch_peak_bytes
             .load(Ordering::Acquire)
             .min(self.spill_limit_bytes)
+    }
+
+    /// Returns the pool this runtime was built over.
+    pub(crate) fn memory_pool(&self) -> Arc<dyn MemoryPool> {
+        Arc::clone(&self.runtime.memory_pool)
+    }
+
+    /// Returns the attempt-owned scratch root leased to the compaction core.
+    ///
+    /// The core measures its own usage beneath this root and reports it back;
+    /// the directory itself stays this runtime's to create and remove.
+    pub(crate) fn spill_root(&self) -> &Path {
+        self.spill_dir.path()
+    }
+
+    /// Folds one scratch measurement into this attempt's conservative peak.
+    ///
+    /// The core re-measures the leased root as it spills, so the highest value
+    /// it ever reports is the attempt's true high-water mark. Recording it here
+    /// is what makes the finalized resource observation an account of what the
+    /// attempt used rather than only of what it was granted.
+    pub(crate) fn observe_scratch_peak(&self, bytes: u64) {
+        self.scratch_peak_bytes.fetch_max(bytes, Ordering::AcqRel);
     }
 
     /// Reports whether this runtime retained the exact leased memory pool.

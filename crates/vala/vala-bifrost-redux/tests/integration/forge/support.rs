@@ -192,6 +192,8 @@ pub(crate) struct PromotionCatalogSeam {
     inner: Arc<dyn Catalog>,
     /// Count of delegated and refused commit attempts.
     attempts: AtomicUsize,
+    /// Count of delegated table loads, used to prove pre-IO refusal.
+    loads: AtomicUsize,
     /// Remaining commits to refuse outright as definite conflicts.
     reject_budget: AtomicUsize,
     /// Object-store read count observed when the last conflict was issued.
@@ -220,6 +222,7 @@ impl PromotionCatalogSeam {
         Arc::new(Self {
             inner,
             attempts: AtomicUsize::new(0),
+            loads: AtomicUsize::new(0),
             reject_budget: AtomicUsize::new(0),
             reads_at_conflict: AtomicUsize::new(0),
             reads,
@@ -242,6 +245,11 @@ impl PromotionCatalogSeam {
     /// Return how many commit attempts crossed this seam.
     pub(crate) fn attempts(&self) -> usize {
         self.attempts.load(Ordering::Acquire)
+    }
+
+    /// Return how many table loads crossed this seam.
+    pub(crate) fn loads(&self) -> usize {
+        self.loads.load(Ordering::Acquire)
     }
 
     /// Return the object-store read count sampled at the last refusal.
@@ -328,6 +336,7 @@ impl Catalog for PromotionCatalogSeam {
     }
 
     async fn load_table(&self, table: &TableIdent) -> iceberg::Result<Table> {
+        self.loads.fetch_add(1, Ordering::AcqRel);
         self.inner.load_table(table).await
     }
 
@@ -532,7 +541,7 @@ impl PromotionIntegrationFixture {
     /// # Panics
     ///
     /// Panics when the fixture cannot produce a validated Forge graph.
-    fn build_forge(
+    pub(crate) fn build_forge_for_test(
         &self,
         catalog: Arc<dyn Catalog>,
         object_store: Arc<dyn ForgeObjectStore>,
@@ -748,7 +757,7 @@ impl SupervisedPromotion {
     ) -> Self {
         let scheduler_trigger = ForgeSchedulerTrigger::with_owner_for_test(uuid::Uuid::now_v7());
         let worker_observer = ForgeWorkerCompletionObserver::new();
-        let forge = fixture.build_forge(
+        let forge = fixture.build_forge_for_test(
             catalog,
             object_store,
             clock,

@@ -1,0 +1,273 @@
+//! The object-path grammar every Forge rewrite output must satisfy.
+//!
+//! A produced object's path is load-bearing in three separate ways, and this
+//! module is where all three are checked at once. It carries the writer recipe,
+//! which a later selection pass resolves back out of the path to decide whether
+//! the object is still current. It carries the attempt identity, which is what
+//! makes an abandoned attempt's objects reclaimable without consulting any
+//! durable state. And it carries a per-writer ordinal plus a per-writer UUID,
+//! which together keep concurrent writers inside one attempt from colliding.
+//!
+//! The grammar is the pinned core's, not this repository's invention:
+//!
+//! ```text
+//! {table}/data/forge/{recipe}/[{partition}/]{attempt}-{ordinal:05}-{writer}.parquet
+//! ```
+//!
+//! The optional partition segment is inserted by Iceberg's own location
+//! generator for a partitioned table and is accepted, not required. The
+//! attempt-global ordinal reported by the core's ledger is deliberately *not*
+//! in the path: it is drain and reconciliation evidence, and reconstructing it
+//! from a filename that carries a resettable per-writer counter would be wrong.
+
+use uuid::Uuid;
+
+use crate::forge::error::ForgeError;
+
+/// Minimum width the core's file-name generator pads its ordinal to.
+const ORDINAL_WIDTH: usize = 5;
+
+/// Object suffix every rewrite output carries.
+const OUTPUT_SUFFIX: &str = ".parquet";
+
+/// One produced object path, decomposed after it was proven well-formed.
+///
+/// Borrowed from the path it describes: every field is a view into the original
+/// string, so validating a path costs no allocation and the result cannot drift
+/// from its source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ForgeOutputIdentity<'path> {
+    /// Partition segments between the recipe root and the file name, if any.
+    pub(crate) partition_path: &'path str,
+    /// Attempt that opened the writer which produced this object.
+    pub(crate) attempt_id: Uuid,
+    /// Per-writer sequence number, which resets for each new writer.
+    pub(crate) writer_ordinal: u64,
+    /// Per-writer identity that keeps concurrent writers from colliding.
+    pub(crate) writer_uuid: Uuid,
+}
+
+impl<'path> ForgeOutputIdentity<'path> {
+    /// Proves one produced path belongs to this attempt under the recipe root.
+    ///
+    /// `data_location` is the exact recipe root the policy resolved, so a path
+    /// that merely looks plausible but sits outside it — a different table, a
+    /// superseded recipe, or the table's default data root — is refused rather
+    /// than accepted with a warning. `attempt_id` is checked because an object
+    /// attributed to another attempt inside this attempt's result set is either
+    /// a leaked handle or a reused writer, and both are unrecoverable
+    /// ambiguities about who may reclaim the object.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Invariant`] when the path does not sit under
+    /// `data_location`, when the file name is not
+    /// `{attempt}-{ordinal}-{writer}.parquet`, when the attempt does not match,
+    /// when the ordinal is not a canonical decimal of at least
+    /// [`ORDINAL_WIDTH`] digits, or when either UUID is unparseable.
+    pub(crate) fn validate(
+        path: &'path str,
+        data_location: &str,
+        attempt_id: Uuid,
+    ) -> Result<Self, ForgeError> {
+        let invariant = |detail: String| ForgeError::Invariant { detail };
+        let root = data_location.trim_end_matches('/');
+        let relative = path
+            .strip_prefix(root)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .ok_or_else(|| {
+                invariant(format!(
+                    "rewrite output {path} is not under the recipe root {root}"
+                ))
+            })?;
+        let (partition_path, file_name) = match relative.rsplit_once('/') {
+            Some((partition, name)) => (partition, name),
+            None => ("", relative),
+        };
+        if !partition_path.is_empty()
+            && partition_path
+                .split('/')
+                .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+        {
+            return Err(invariant(format!(
+                "rewrite output {path} carries a non-canonical partition segment"
+            )));
+        }
+        let stem = file_name.strip_suffix(OUTPUT_SUFFIX).ok_or_else(|| {
+            invariant(format!(
+                "rewrite output {path} is not a {OUTPUT_SUFFIX} object"
+            ))
+        })?;
+        let attempt_text = attempt_id.to_string();
+        let remainder = stem
+            .strip_prefix(&attempt_text)
+            .and_then(|rest| rest.strip_prefix('-'));
+        let Some(remainder) = remainder else {
+            return Err(invariant(format!(
+                "rewrite output {path} is not attributed to attempt {attempt_id}"
+            )));
+        };
+        let (ordinal_text, writer_text) = remainder.split_once('-').ok_or_else(|| {
+            invariant(format!(
+                "rewrite output {path} carries no per-writer identity"
+            ))
+        })?;
+        let writer_uuid = Uuid::parse_str(writer_text).map_err(|error| {
+            invariant(format!(
+                "rewrite output {path} carries an unreadable writer identity: {error}"
+            ))
+        })?;
+        let writer_ordinal = canonical_ordinal(ordinal_text).ok_or_else(|| {
+            invariant(format!(
+                "rewrite output {path} carries a non-canonical ordinal {ordinal_text:?}"
+            ))
+        })?;
+        Ok(Self {
+            partition_path,
+            attempt_id,
+            writer_ordinal,
+            writer_uuid,
+        })
+    }
+
+    /// Returns the key that makes two produced objects distinguishable.
+    ///
+    /// A per-writer ordinal resets, so it identifies nothing on its own; paired
+    /// with the writer UUID it is unique across every writer in the attempt.
+    pub(crate) fn writer_key(&self) -> (Uuid, u64) {
+        (self.writer_uuid, self.writer_ordinal)
+    }
+}
+
+/// Parses one zero-padded decimal ordinal, rejecting every other spelling.
+///
+/// Canonical means: at least [`ORDINAL_WIDTH`] ASCII digits, and no extra
+/// leading zero once the value has outgrown that width. Accepting a loose
+/// spelling would let two different strings name the same ordinal, which is
+/// exactly the ambiguity the ordinal exists to remove.
+fn canonical_ordinal(text: &str) -> Option<u64> {
+    if text.len() < ORDINAL_WIDTH || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    if text.len() > ORDINAL_WIDTH && text.starts_with('0') {
+        return None;
+    }
+    let value = text.parse::<u64>().ok()?;
+    (format!("{value:0ORDINAL_WIDTH$}") == text).then_some(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The recipe root the fixture table would have registered.
+    fn root() -> String {
+        crate::catalog::layout::forge_data_location("file:///warehouse/tenant/table")
+    }
+
+    /// The recipe path is accepted, and per-writer ordinals stay per-writer.
+    ///
+    /// Two writers inside one attempt both start at ordinal `00000`, which is
+    /// correct: the ordinal is a writer-local counter and the writer UUID is
+    /// what separates them. The test pins both halves of that — the ordinals
+    /// genuinely collide, and the identities do not — because treating the
+    /// reset as a collision would fail every real concurrent rewrite, while
+    /// dropping the writer UUID would let two writers overwrite each other.
+    ///
+    /// The refusals cover the other direction: a missing or superseded recipe
+    /// root, a foreign attempt, a missing writer identity, and a non-canonical
+    /// ordinal are each unrecoverable ambiguities about which attempt owns an
+    /// object, so each is refused rather than normalized.
+    #[test]
+    fn forge_output_identity_accepts_recipe_path_and_per_writer_ordinals() {
+        let root = root();
+        let attempt = Uuid::now_v7();
+        let first_writer = Uuid::now_v7();
+        let second_writer = Uuid::now_v7();
+        let path = |writer: Uuid, ordinal: &str, partition: &str| {
+            format!("{root}/{partition}{attempt}-{ordinal}-{writer}.parquet")
+        };
+
+        let first_path = path(first_writer, "00000", "wyrd_event_time_day=2026-08-29/");
+        let first = ForgeOutputIdentity::validate(&first_path, &root, attempt)
+            .expect("a partitioned recipe path is well-formed");
+        assert_eq!(first.partition_path, "wyrd_event_time_day=2026-08-29");
+        assert_eq!(first.writer_ordinal, 0);
+        assert_eq!(first.writer_uuid, first_writer);
+
+        let flat = path(first_writer, "00001", "");
+        let unpartitioned = ForgeOutputIdentity::validate(&flat, &root, attempt)
+            .expect("an unpartitioned recipe path is well-formed");
+        assert_eq!(unpartitioned.partition_path, "");
+        assert_eq!(unpartitioned.writer_ordinal, 1);
+
+        let second_path = path(second_writer, "00000", "wyrd_event_time_day=2026-08-29/");
+        let second = ForgeOutputIdentity::validate(&second_path, &root, attempt)
+            .expect("a concurrent writer restarts its own ordinal");
+        assert_eq!(
+            second.writer_ordinal, first.writer_ordinal,
+            "per-writer ordinals reset, so a collision here is expected"
+        );
+        assert_ne!(
+            second.writer_key(),
+            first.writer_key(),
+            "the writer identity is what keeps concurrent outputs distinct"
+        );
+
+        let wide = path(first_writer, "123456", "");
+        assert_eq!(
+            ForgeOutputIdentity::validate(&wide, &root, attempt)
+                .expect("an ordinal past five digits is still canonical")
+                .writer_ordinal,
+            123_456
+        );
+
+        for (bad, why) in [
+            (
+                format!(
+                    "file:///warehouse/tenant/table/data/{attempt}-00000-{first_writer}.parquet"
+                ),
+                "an object outside the recipe root can never resolve to a recipe",
+            ),
+            (
+                format!(
+                    "file:///warehouse/tenant/table/data/forge/v0/{attempt}-00000-{first_writer}.parquet"
+                ),
+                "a superseded recipe root is not this policy's root",
+            ),
+            (
+                path(first_writer, "00000", "")
+                    .replace(&attempt.to_string(), &Uuid::now_v7().to_string()),
+                "an object from another attempt is not this attempt's to reclaim",
+            ),
+            (
+                format!("{root}/{attempt}-00000.parquet"),
+                "without a writer identity two writers would collide",
+            ),
+            (
+                path(first_writer, "0", ""),
+                "a short ordinal is a second spelling of the same value",
+            ),
+            (
+                path(first_writer, "0000012", ""),
+                "an over-padded ordinal is a second spelling of the same value",
+            ),
+            (
+                path(first_writer, "0000a", ""),
+                "a non-decimal ordinal is not an ordinal",
+            ),
+            (
+                format!("{root}/{attempt}-00000-{first_writer}.avro"),
+                "a rewrite output is always Parquet",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    ForgeOutputIdentity::validate(&bad, &root, attempt),
+                    Err(ForgeError::Invariant { .. })
+                ),
+                "{why}: {bad}"
+            );
+        }
+    }
+}

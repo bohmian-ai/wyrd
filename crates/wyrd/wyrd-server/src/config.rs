@@ -230,6 +230,12 @@ pub struct ForgeRuntimeConfig {
     /// Partial. Must be positive when set. Default 120 (2 minutes).
     #[serde(default)]
     pub orphan_gc_run_budget_secs: Option<u64>,
+    /// Maximum canonical rewrite plans one admitted Forge attempt executes
+    /// before it yields the remainder to a successor attempt. Bounds one
+    /// attempt's leased resource hold; the untouched plans stay selectable on
+    /// the next pass. Must be at least 1 when set. Default 4.
+    #[serde(default)]
+    pub rewrite_max_plans_per_attempt: Option<usize>,
     /// Interval (seconds) between Forge maintenance scheduler ticks. Must be
     /// positive when set. Default 60.
     #[serde(default)]
@@ -252,6 +258,7 @@ impl Default for ForgeRuntimeConfig {
             maintenance_trigger_interval_secs: None,
             orphan_gc_max_list_pages: None,
             orphan_gc_run_budget_secs: None,
+            rewrite_max_plans_per_attempt: None,
             maintenance_interval_secs: None,
         }
     }
@@ -3086,6 +3093,7 @@ mod tests {
         assert_eq!(forge.maintenance_trigger_interval_secs, None);
         assert_eq!(forge.orphan_gc_max_list_pages, None);
         assert_eq!(forge.orphan_gc_run_budget_secs, None);
+        assert_eq!(forge.rewrite_max_plans_per_attempt, None);
         assert_eq!(forge.maintenance_interval_secs, None);
     }
 
@@ -3104,6 +3112,7 @@ maintenance_trigger_snapshot_count = 8
 maintenance_trigger_interval_secs = 900
 orphan_gc_max_list_pages = 64
 orphan_gc_run_budget_secs = 30
+rewrite_max_plans_per_attempt = 2
 maintenance_interval_secs = 45
 "#;
         let config = from_toml_str_with_dev_oracle_opt_in(toml).expect("forge section parses");
@@ -3117,6 +3126,7 @@ maintenance_interval_secs = 45
         assert_eq!(forge.maintenance_trigger_interval_secs, Some(900));
         assert_eq!(forge.orphan_gc_max_list_pages, Some(64));
         assert_eq!(forge.orphan_gc_run_budget_secs, Some(30));
+        assert_eq!(forge.rewrite_max_plans_per_attempt, Some(2));
         assert_eq!(forge.maintenance_interval_secs, Some(45));
     }
 

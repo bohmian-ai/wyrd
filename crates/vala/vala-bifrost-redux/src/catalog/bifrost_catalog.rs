@@ -716,33 +716,7 @@ impl BifrostCatalog {
             let physical = self.catalog.load_table(&table_ident).await?;
             self.validate_physical_table(&physical, &binding, &arrow_schema, &layout)?;
         } else {
-            let iceberg_schema =
-                iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&arrow_schema)?;
-            let partition_spec = layout
-                .iceberg_partition_spec(&iceberg_schema)
-                .map_err(BifrostCatalogError::MetadataMismatch)?;
-            let sort_order = layout
-                .iceberg_sort_order(&iceberg_schema)
-                .map_err(BifrostCatalogError::MetadataMismatch)?;
-            let location = format!(
-                "{}/{}",
-                self.warehouse.trim_end_matches('/'),
-                binding.object_prefix
-            );
-            let creation = TableCreation::builder()
-                .name(binding.table_name.clone())
-                .location(location)
-                .schema(iceberg_schema)
-                .format_version(FormatVersion::V2)
-                .partition_spec(partition_spec)
-                .sort_order(sort_order)
-                .properties(std::collections::HashMap::from([(
-                    crate::catalog::layout::BLOOM_COLUMNS_PROPERTY.to_owned(),
-                    layout.bloom_columns_property(),
-                )]))
-                .build();
-            self.catalog
-                .create_table(binding.physical_namespace(), creation)
+            self.create_physical_table(&binding, &arrow_schema, &layout)
                 .await?;
         }
 
@@ -767,6 +741,64 @@ impl BifrostCatalog {
         }
         conn.commit().await?;
         Ok(table_uid)
+    }
+
+    /// Create the physical Iceberg table for one canonical layout.
+    ///
+    /// Called only when registration has established that no physical table
+    /// exists yet. Every physical decision — schema ids, partition spec, sort
+    /// order, location, and the Bloom and Forge data-path properties — is
+    /// derived from `layout` and `binding`, so the canonical layout stays the
+    /// single authority for the table's shape. The Forge data path is written
+    /// as `write.data.path` so the managed rewrite core roots its outputs under
+    /// the recipe segment instead of the default data root.
+    ///
+    /// # Errors
+    ///
+    /// Returns a metadata mismatch when the layout cannot produce a partition
+    /// spec or sort order, and an Iceberg error when schema conversion or the
+    /// catalog create fails.
+    async fn create_physical_table(
+        &self,
+        binding: &TenantTableBinding,
+        arrow_schema: &Schema,
+        layout: &PhysicalLayout,
+    ) -> Result<(), BifrostCatalogError> {
+        let iceberg_schema = iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(arrow_schema)?;
+        let partition_spec = layout
+            .iceberg_partition_spec(&iceberg_schema)
+            .map_err(BifrostCatalogError::MetadataMismatch)?;
+        let sort_order = layout
+            .iceberg_sort_order(&iceberg_schema)
+            .map_err(BifrostCatalogError::MetadataMismatch)?;
+        let location = format!(
+            "{}/{}",
+            self.warehouse.trim_end_matches('/'),
+            binding.object_prefix
+        );
+        let forge_data_location = crate::catalog::layout::forge_data_location(&location);
+        let creation = TableCreation::builder()
+            .name(binding.table_name.clone())
+            .location(location)
+            .schema(iceberg_schema)
+            .format_version(FormatVersion::V2)
+            .partition_spec(partition_spec)
+            .sort_order(sort_order)
+            .properties(std::collections::HashMap::from([
+                (
+                    crate::catalog::layout::BLOOM_COLUMNS_PROPERTY.to_owned(),
+                    layout.bloom_columns_property(),
+                ),
+                (
+                    crate::catalog::layout::WRITE_DATA_PATH_PROPERTY.to_owned(),
+                    forge_data_location,
+                ),
+            ]))
+            .build();
+        self.catalog
+            .create_table(binding.physical_namespace(), creation)
+            .await?;
+        Ok(())
     }
 
     /// Verify that a registered table still carries Bifrost's complete physical recipe.

@@ -20,6 +20,7 @@ pub(crate) mod lease;
 mod live_reconcile;
 mod live_replace;
 mod maintenance;
+pub(crate) mod managed;
 mod metrics;
 pub(crate) mod orphan_gc;
 mod path;
@@ -35,6 +36,10 @@ pub use clock::ForgeClock;
 pub use clock::ForgeClockControl;
 pub use compact::{ForgeConfig, ForgeObjectPages, ForgeObjectStore, ForgeTickOutcome};
 pub use error::ForgeError;
+pub use managed::{
+    ForgeRewriteAttempt, ForgeRewriteEvidence, ForgeRewriteOutcome, ForgeUnsettledOutput,
+    RewriteHandoff,
+};
 pub use metrics::ForgeTelemetry;
 pub use planner::{
     ForgeCapacity, ForgeEnvelopeSizer, ForgePlanCandidate, ForgePlanCapacity, ForgePlanner,

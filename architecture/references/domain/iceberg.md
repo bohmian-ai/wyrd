@@ -71,11 +71,13 @@ data sequence number cannot apply to a surviving unselected data file. Output
 sequence numbers prevent applied deletes from reapplying to replacement rows.
 Reject duplicate identities or unproven delete scope before publication.
 
-Physical writers may execute concurrently inside one attempt. They reserve one
-attempt-global ordinal before each output open and use deterministic
-attempt-bound object identity. One fenced owner constructs the final rewrite
-transaction and calls `commit_once`; the managed core never mutates the
-catalog.
+Physical writers may execute concurrently inside one attempt. Their physical
+paths retain the managed core's recipe segment and use an attempt prefix,
+per-writer canonical decimal ordinal, and writer UUIDv7 for uniqueness. Forge
+assigns a separate attempt-global logical ordinal to each opened output for
+observer and recovery evidence; that logical ordinal is not a filename field.
+One fenced owner constructs the final rewrite transaction and calls
+`commit_once`; the managed core never mutates the catalog.
 
 ## Optimistic commit and reconciliation
 

@@ -48,6 +48,7 @@ parquet = { workspace = true, features = ["async"] }
 iceberg = { workspace = true }
 iceberg-datafusion = { workspace = true }
 iceberg-catalog-sql = { workspace = true }
+iceberg-compaction-core = { workspace = true }
 typetag = { workspace = true }
 lru = { workspace = true }
 datafusion-distributed = { workspace = true }

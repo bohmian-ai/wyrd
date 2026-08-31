@@ -333,6 +333,263 @@ pub fn record_security(event_class: SecurityEventClass) {
     let _ = event_class;
 }
 
+/// Closed private stage-operation label for the Analytical execution path.
+///
+/// Both halves of the distributed protocol are separately observable: a stage
+/// that fails to set its plan and a stage that fails to execute its task are
+/// different operational problems, and their tickets carry different signing
+/// domains and nonces, so their telemetry must not collapse into one series.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalyticalStageOperation {
+    /// The coordinator installed a stage's subplan on a follower.
+    SetPlan,
+    /// The coordinator asked a follower to execute a partition range.
+    ExecuteTask,
+}
+
+impl AnalyticalStageOperation {
+    /// Every stage operation, used to pre-register series at zero.
+    pub(crate) const ALL: [Self; 2] = [Self::SetPlan, Self::ExecuteTask];
+
+    /// Returns the canonical low-cardinality metric label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SetPlan => "set_plan",
+            Self::ExecuteTask => "execute_task",
+        }
+    }
+}
+
+/// Closed outcome of one stage-operation authority decision.
+///
+/// `Authorized` is emitted only after every binding, body digest, deadline, and
+/// replay check has passed, so the ratio of these series is what tells an
+/// operator whether follower work is being refused before it can decode a plan,
+/// touch the task cache, or issue object I/O.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalyticalStageAuthorityOutcome {
+    /// The stage operation is authorized to proceed to decode and execution.
+    Authorized,
+    /// The ticket did not authenticate against the deployment key.
+    Signature,
+    /// A bound identity, node, fence, stage, task, attempt, or digest mismatched.
+    Binding,
+    /// The bounded raw body did not match its signed digest, or exceeded bounds.
+    Body,
+    /// The absolute deadline or the ticket's own expiry had elapsed.
+    Expired,
+    /// The single-use nonce had already been consumed.
+    Replay,
+}
+
+impl AnalyticalStageAuthorityOutcome {
+    /// Every authority outcome, used to pre-register series at zero.
+    pub(crate) const ALL: [Self; 6] = [
+        Self::Authorized,
+        Self::Signature,
+        Self::Binding,
+        Self::Body,
+        Self::Expired,
+        Self::Replay,
+    ];
+
+    /// Returns the canonical low-cardinality metric label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Authorized => "authorized",
+            Self::Signature => "signature",
+            Self::Binding => "binding",
+            Self::Body => "body",
+            Self::Expired => "expired",
+            Self::Replay => "replay",
+        }
+    }
+}
+
+/// Closed terminal outcome of one Analytical attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnalyticalAttemptOutcome {
+    /// The attempt drained and produced its complete result.
+    Success,
+    /// The attempt was superseded by the one permitted pre-egress retry.
+    Retried,
+    /// The attempt was cancelled, by client drop, deadline, or shutdown.
+    Cancelled,
+    /// The attempt failed terminally.
+    Failed,
+}
+
+impl AnalyticalAttemptOutcome {
+    /// Every attempt outcome, used to pre-register series at zero.
+    pub(crate) const ALL: [Self; 4] = [Self::Success, Self::Retried, Self::Cancelled, Self::Failed];
+
+    /// Returns the canonical low-cardinality metric label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Retried => "retried",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Pre-registers every Analytical series at zero.
+///
+/// Wyrd's convention is that a closed-label family exists in the registry
+/// before it is first incremented, so a dashboard panel and a contract test can
+/// both distinguish "no Analytical work happened" from "this build does not
+/// emit Analytical telemetry at all". Called once from Oracle telemetry
+/// construction, alongside the Interactive families.
+pub(crate) fn register_analytical_series() {
+    for operation in AnalyticalStageOperation::ALL {
+        for outcome in AnalyticalStageAuthorityOutcome::ALL {
+            metrics::counter!(
+                "bifrost_oracle_analytical_stage_authority_total",
+                "operation" => operation.as_str(),
+                "outcome" => outcome.as_str()
+            )
+            .increment(0);
+        }
+        metrics::counter!(
+            "bifrost_oracle_analytical_stage_operations_total",
+            "operation" => operation.as_str()
+        )
+        .increment(0);
+    }
+    for outcome in AnalyticalAttemptOutcome::ALL {
+        metrics::counter!(
+            "bifrost_oracle_analytical_attempts_total",
+            "outcome" => outcome.as_str()
+        )
+        .increment(0);
+    }
+    metrics::gauge!("bifrost_oracle_analytical_attempts_active").set(0.0);
+    metrics::gauge!("bifrost_oracle_analytical_exchanges_active").set(0.0);
+    metrics::counter!("bifrost_oracle_analytical_exchange_batches_total").increment(0);
+    metrics::counter!("bifrost_oracle_analytical_exchange_bytes_total").increment(0);
+}
+
+/// Records one stage-operation authority decision with closed labels.
+///
+/// Emits `bifrost_oracle_analytical_stage_authority_total{operation,outcome}`
+/// and, for a refusal, one `bifrost_oracle_security_events_total` observation on
+/// the same family Oracle's tenant tripwire already uses, so a stage refusal is
+/// visible on the existing Bifrost security panel without a new family. Every
+/// label is a closed enum, so a forged identity cannot expand the label space.
+pub fn record_stage_authority(
+    operation: AnalyticalStageOperation,
+    outcome: AnalyticalStageAuthorityOutcome,
+) {
+    metrics::counter!(
+        "bifrost_oracle_analytical_stage_authority_total",
+        "operation" => operation.as_str(),
+        "outcome" => outcome.as_str()
+    )
+    .increment(1);
+    if !matches!(outcome, AnalyticalStageAuthorityOutcome::Authorized) {
+        metrics::counter!(
+            "bifrost_oracle_security_events_total",
+            "event_class" => "analytical_stage"
+        )
+        .increment(1);
+        tracing::warn!(
+            operation = operation.as_str(),
+            outcome = outcome.as_str(),
+            "Oracle analytical stage operation refused before decode, cache, or IO"
+        );
+    }
+}
+
+/// Records one accepted stage operation reaching decode and execution.
+pub fn record_stage_operation(operation: AnalyticalStageOperation) {
+    metrics::counter!(
+        "bifrost_oracle_analytical_stage_operations_total",
+        "operation" => operation.as_str()
+    )
+    .increment(1);
+}
+
+/// Attempt-scoped Analytical metrics released on every terminal path.
+///
+/// Mirrors [`FragmentTelemetry`]: the in-flight gauge and duration histogram are
+/// owned by the guard, and `Drop` records a terminal outcome when a caller exits
+/// through cancellation, a deadline, an error, or a panic. That is what makes
+/// "zero retained attempts" an assertion a journey can make about the gauge
+/// rather than about a caller's discipline.
+pub struct AnalyticalAttemptTelemetry {
+    /// Attempt start used by the canonical duration histogram.
+    started_at: Instant,
+    /// Whether a terminal outcome has already been recorded.
+    finished: bool,
+}
+
+impl AnalyticalAttemptTelemetry {
+    /// Starts in-flight and duration accounting for one Analytical attempt.
+    ///
+    /// The attempt's identities are recorded as structured `tracing` fields
+    /// rather than metric labels: both are UUIDs, and putting them in the label
+    /// space would make the series cardinality unbounded.
+    #[must_use]
+    pub fn start(public_query_id: &str, datafusion_query_id: &str, attempt: u8) -> Self {
+        metrics::gauge!("bifrost_oracle_analytical_attempts_active").increment(1.0);
+        tracing::debug!(
+            public_query_id,
+            datafusion_query_id,
+            attempt,
+            "Oracle analytical attempt started"
+        );
+        Self {
+            started_at: Instant::now(),
+            finished: false,
+        }
+    }
+
+    /// Records one terminal attempt outcome exactly once.
+    ///
+    /// Repeat calls after the first terminal outcome are ignored, so the `Drop`
+    /// fallback never double-counts an attempt a caller already finished.
+    pub fn finish(&mut self, outcome: AnalyticalAttemptOutcome) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        metrics::counter!(
+            "bifrost_oracle_analytical_attempts_total",
+            "outcome" => outcome.as_str()
+        )
+        .increment(1);
+        metrics::histogram!(
+            "bifrost_oracle_analytical_attempt_duration_seconds",
+            "outcome" => outcome.as_str()
+        )
+        .record(self.started_at.elapsed().as_secs_f64());
+    }
+}
+
+impl Drop for AnalyticalAttemptTelemetry {
+    /// Records a failed terminal attempt and closes the in-flight gauge.
+    fn drop(&mut self) {
+        if !self.finished {
+            self.finish(AnalyticalAttemptOutcome::Failed);
+        }
+        metrics::gauge!("bifrost_oracle_analytical_attempts_active").decrement(1.0);
+    }
+}
+
+/// Records one streamed exchange observation for the Analytical path.
+///
+/// Exchange volume is the evidence that follower stages actually exchanged data
+/// rather than collapsing onto the leader, so it is counted separately from
+/// query-level row and byte families.
+pub fn record_exchange_transfer(batches: u64, bytes: u64) {
+    metrics::counter!("bifrost_oracle_analytical_exchange_batches_total").increment(batches);
+    metrics::counter!("bifrost_oracle_analytical_exchange_bytes_total").increment(bytes);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,6 +664,89 @@ mod tests {
                 .get(
                     "bifrost_oracle_peer_attempts_total{error_class=\"availability\",outcome=\"failed\"}"
                 )
+                .copied(),
+            Some(1),
+            "{snapshot:?}",
+        );
+    }
+    /// A refused stage operation lands on both the closed authority family and
+    /// the existing Bifrost security family.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either series is missing its single increment.
+    #[test]
+    fn record_stage_authority_emits_closed_and_security_counters() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        let guard = metrics::set_default_local_recorder(&recorder);
+        record_stage_authority(
+            AnalyticalStageOperation::ExecuteTask,
+            AnalyticalStageAuthorityOutcome::Binding,
+        );
+        drop(guard);
+
+        let snapshot = recorder.snapshot();
+        assert_eq!(
+            snapshot
+                .counters
+                .get(
+                    "bifrost_oracle_analytical_stage_authority_total{operation=\"execute_task\",outcome=\"binding\"}"
+                )
+                .copied(),
+            Some(1),
+            "{snapshot:?}",
+        );
+        assert_eq!(
+            snapshot
+                .counters
+                .get("bifrost_oracle_security_events_total{event_class=\"analytical_stage\"}")
+                .copied(),
+            Some(1),
+            "{snapshot:?}",
+        );
+    }
+
+    /// An authorized stage operation raises no security event.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an accepted operation is counted as a security event.
+    #[test]
+    fn record_stage_authority_authorized_raises_no_security_event() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        let guard = metrics::set_default_local_recorder(&recorder);
+        record_stage_authority(
+            AnalyticalStageOperation::SetPlan,
+            AnalyticalStageAuthorityOutcome::Authorized,
+        );
+        drop(guard);
+
+        let snapshot = recorder.snapshot();
+        assert!(
+            !snapshot.counters.contains_key(
+                "bifrost_oracle_security_events_total{event_class=\"analytical_stage\"}"
+            ),
+            "{snapshot:?}",
+        );
+    }
+
+    /// An attempt guard dropped without a terminal outcome records a failure.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the `Drop` fallback does not record exactly one failure.
+    #[test]
+    fn analytical_attempt_drop_without_finish_records_failure_once() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        let guard = metrics::set_default_local_recorder(&recorder);
+        drop(AnalyticalAttemptTelemetry::start("public", "private", 0));
+        drop(guard);
+
+        let snapshot = recorder.snapshot();
+        assert_eq!(
+            snapshot
+                .counters
+                .get("bifrost_oracle_analytical_attempts_total{outcome=\"failed\"}")
                 .copied(),
             Some(1),
             "{snapshot:?}",

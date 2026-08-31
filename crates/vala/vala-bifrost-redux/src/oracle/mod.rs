@@ -601,6 +601,7 @@ impl OracleTelemetry {
             metrics::counter!("oracle_query_cancellations_total", "reason" => reason.as_str())
                 .increment(0);
         }
+        telemetry::register_analytical_series();
         Self {
             slots,
             memory_bytes: AtomicU64::new(0),

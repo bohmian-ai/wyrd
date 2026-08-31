@@ -951,7 +951,8 @@ fn restrict_plan_to_assigned_files(
                 file_leaves = file_leaves.saturating_add(1);
                 observed.extend(assigned.iter().cloned());
                 return Ok(Transformed::yes(Arc::new(
-                    exec.clone().with_assigned_files(assigned.clone()),
+                    exec.clone()
+                        .with_assigned_files(assigned.clone(), relative_assignments.clone()),
                 )));
             }
             if node.is::<IcebergTableScan>() {
@@ -961,7 +962,7 @@ fn restrict_plan_to_assigned_files(
                             "authenticated Oracle Iceberg source failed".to_owned(),
                         )
                     })?
-                    .with_assigned_files(assigned.clone());
+                    .with_assigned_files(assigned.clone(), relative_assignments.clone());
                 file_leaves = file_leaves.saturating_add(1);
                 observed.extend(assigned.iter().cloned());
                 return Ok(Transformed::yes(Arc::new(restricted)));

@@ -203,6 +203,27 @@ where
     } else {
         router
     };
+    // The inactive Analytical worker service. It is mounted on the same
+    // already-authenticated peer listener as every other east-west surface, and
+    // every governed method on it is refused unless the stage-authority layer
+    // authorizes the exact raw message first. Production routing never selects
+    // Analytical execution, so nothing reaches this service in a normal query.
+    let router = match state
+        .bifrost_query()
+        .and_then(|query| query.engine().analytical_worker())
+    {
+        Some(ingress) => {
+            let worker = ingress.worker().clone().into_worker_server();
+            router.add_service(GrpcTransportAdmissionService::new(
+                vala_bifrost_redux::oracle::analytical_transport::AnalyticalStageAuthLayer::new(
+                    ingress,
+                )
+                .layer_service(worker),
+                transport.clone(),
+            ))
+        }
+        None => router,
+    };
     let router = if let Some(query) = state.bifrost_query() {
         router.add_service(GrpcTransportAdmissionService::new(
             crate::oracle::OracleLifecycleGrpc::new(

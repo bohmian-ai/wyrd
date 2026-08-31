@@ -892,6 +892,18 @@ impl AnalyticalStageAuthLayer {
     }
 }
 
+impl AnalyticalStageAuthLayer {
+    /// Wraps one upstream worker service without importing [`tower::Layer`].
+    ///
+    /// The trait method is the same thing; this inherent alias exists so a
+    /// mounting crate does not have to bring the trait into scope for a single
+    /// call site.
+    #[must_use]
+    pub fn layer_service<S>(&self, inner: S) -> AnalyticalStageAuth<S> {
+        <Self as tower::Layer<S>>::layer(self, inner)
+    }
+}
+
 impl<S> tower::Layer<S> for AnalyticalStageAuthLayer {
     type Service = AnalyticalStageAuth<S>;
 
@@ -925,6 +937,14 @@ pub struct AnalyticalStageAuth<S> {
     inner: S,
     /// Follower-owned admission and authority entry point for stage operations.
     ingress: Arc<AnalyticalStageIngress>,
+}
+
+impl<S> wyrd_tonic::tonic::server::NamedService for AnalyticalStageAuth<S>
+where
+    S: wyrd_tonic::tonic::server::NamedService,
+{
+    /// The layer is transparent to routing: it serves upstream's own service name.
+    const NAME: &'static str = S::NAME;
 }
 
 impl<S, B> tower::Service<Request<B>> for AnalyticalStageAuth<S>

@@ -1485,13 +1485,20 @@ pub struct OracleBuildConfig {
     /// Parent memory and spill resources.
     pub memory: OracleMemoryResources,
     /// Process-lifetime owner of pod-local Oracle query scratch.
-    pub spill_runtime: OracleSpillRuntime,
+    pub spill_runtime: Arc<OracleSpillRuntime>,
     /// Table-local tail transports.
     pub tails: Arc<TailTransportDirectory>,
     /// Read/security audit collaborator.
     pub audit: Arc<dyn OracleAudit>,
     /// Server-owned narrow peer-ticket authority.
     pub peer_ticket_minter: Arc<dyn peer::PeerTicketMinter>,
+    /// Server-owned east-west stage authority for the inactive Analytical path.
+    ///
+    /// Absent on a deployment whose Oracle role cannot serve stage operations.
+    /// The inactive Analytical owners are only composed when it is present, so
+    /// a node without it has no follower ingress to mount and no leader handle
+    /// to execute through.
+    pub stage_authority: Option<Arc<dyn peer::OracleStageAuthority>>,
     /// Server-owned domain-separated Scribe-tail ticket signer.
     pub tail_ticket_minter: Option<Arc<dyn crate::scribe::tail_rpc::TailTicketMinter>>,
     /// Query-scoped live Scribe discovery owner.
@@ -1537,6 +1544,10 @@ pub struct OracleConfig {
     pub queue_capacity: u32,
     /// Absolute queue wait cap.
     pub max_queue_wait: Duration,
+    /// Bytes one Analytical attempt may retain in live exchange buffers.
+    pub analytical_exchange_buffer_bytes: usize,
+    /// Bytes one Analytical attempt may retain as spill scratch.
+    pub analytical_scratch_bytes: u64,
 }
 
 impl Default for OracleConfig {
@@ -1557,6 +1568,8 @@ impl Default for OracleConfig {
             multi_tenant_ceiling: 4,
             queue_capacity: 64,
             max_queue_wait: Duration::from_millis(250),
+            analytical_exchange_buffer_bytes: 16 * 1024 * 1024,
+            analytical_scratch_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -1805,7 +1818,7 @@ pub struct Oracle {
     /// Parent-governed query memory and spill configuration.
     memory: OracleMemoryResources,
     /// Process-lifetime owner used to construct bounded query disk managers.
-    spill_runtime: OracleSpillRuntime,
+    spill_runtime: Arc<OracleSpillRuntime>,
     /// Table-local Scribe tail transport directory.
     tails: Arc<TailTransportDirectory>,
     /// Query-scoped Scribe-tail ticket signer, when the server has a Scribe role.
@@ -1819,6 +1832,12 @@ pub struct Oracle {
     audit: Arc<dyn OracleAudit>,
     /// Optional distributed fragment owner assembled from server capabilities.
     fragment_dispatcher: Option<Arc<dispatcher::FragmentDispatcher>>,
+    /// Production-unreachable Analytical owners, composed but never routed to.
+    ///
+    /// Present only when the server supplied a stage authority. Nothing in the
+    /// query path reads this field; it exists so the distributed path can be
+    /// mounted and exercised before it is ever selectable.
+    analytical: Option<Arc<analytical::AnalyticalExecutionHandle>>,
     /// Production metrics owner shared by query execution and admission.
     telemetry: Arc<OracleTelemetry>,
     /// Lifecycle cancellation token.
@@ -2047,6 +2066,35 @@ impl Oracle {
                 transports,
             ))
         });
+        let analytical_node_id = admission.local_role.key.node_id;
+        let analytical_fence = admission.local_role.fencing_token;
+        let analytical = config.stage_authority.map(|authority| {
+            let supervisor = Arc::new(analytical::AnalyticalSupervisor::new());
+            let worker = Arc::new(analytical::AnalyticalStageIngress::new(
+                analytical::AnalyticalStageIngressConfig {
+                    node_id: analytical_node_id,
+                    oracle_fence: analytical_fence,
+                    authority: Arc::clone(&authority),
+                    supervisor: Arc::clone(&supervisor),
+                    oracle_resources: config.memory.resources.clone(),
+                    spill: Arc::clone(&config.spill_runtime),
+                    exchange_buffer_bytes: config.config.analytical_exchange_buffer_bytes,
+                },
+            ));
+            Arc::new(analytical::AnalyticalExecutionHandle::new(
+                worker,
+                authority,
+                supervisor,
+                Arc::clone(&config.spill_runtime),
+                analytical::AnalyticalExecutionConfig {
+                    node_id: analytical_node_id,
+                    oracle_fence: analytical_fence,
+                    ticket_ttl: chrono::Duration::seconds(30),
+                    exchange_buffer_bytes: config.config.analytical_exchange_buffer_bytes,
+                    scratch_bytes: config.config.analytical_scratch_bytes,
+                },
+            ))
+        });
         Ok(Self {
             planner,
             admission,
@@ -2065,6 +2113,7 @@ impl Oracle {
             prefer_local_tail_routes: std::sync::atomic::AtomicBool::new(false),
             audit: config.audit,
             fragment_dispatcher,
+            analytical,
             telemetry,
             shutdown,
             ready,
@@ -2161,6 +2210,31 @@ impl Oracle {
             .table(TableReference::bare(fqn))
             .await
             .map_err(|error| map_datafusion_error(&error))
+    }
+
+    /// Returns this node's inactive Analytical follower ingress, when composed.
+    ///
+    /// The server mounts the upstream worker service behind
+    /// [`AnalyticalStageAuthLayer`] over this owner. It is `None` on a
+    /// deployment that supplied no stage authority, in which case no worker
+    /// service is mounted at all and the node cannot serve stage operations.
+    ///
+    /// [`AnalyticalStageAuthLayer`]: analytical_transport::AnalyticalStageAuthLayer
+    #[must_use]
+    pub fn analytical_worker(&self) -> Option<Arc<analytical::AnalyticalStageIngress>> {
+        self.analytical
+            .as_ref()
+            .map(|handle| Arc::clone(handle.worker()))
+    }
+
+    /// Returns this node's inactive Analytical execution handle, when composed.
+    ///
+    /// Nothing in the query path calls this. It exists so test-support can
+    /// drive the distributed path that production routing never selects.
+    #[must_use]
+    #[cfg(feature = "test-support")]
+    pub fn analytical_execution(&self) -> Option<&Arc<analytical::AnalyticalExecutionHandle>> {
+        self.analytical.as_ref()
     }
 
     /// Starts a query through the retained owner.

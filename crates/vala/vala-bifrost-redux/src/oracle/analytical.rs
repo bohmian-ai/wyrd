@@ -55,9 +55,11 @@ use uuid::Uuid;
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::NodeId;
 
+pub use super::analytical_supervisor::AnalyticalSupervisor;
+
 use super::analytical_supervisor::{
     AnalyticalAttemptGrant, AnalyticalAttemptGuard, AnalyticalAttemptKey, AnalyticalGraphGuard,
-    AnalyticalSupervisor, AnalyticalSupervisorInspection, StageId, TaskId,
+    AnalyticalSupervisorInspection, StageId, TaskId,
 };
 use super::analytical_transport::{
     AnalyticalChannelResolver, AnalyticalCoordinatorIdentity, AnalyticalStageMinter,

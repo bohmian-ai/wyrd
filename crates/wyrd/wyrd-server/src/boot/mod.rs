@@ -1684,6 +1684,8 @@ impl<'a> OracleRoleBuilder<'a> {
         ));
         let verifier: Arc<dyn vala_bifrost_redux::oracle::peer::PeerTicketVerifier> =
             authority.clone();
+        let stage_authority: Arc<dyn vala_bifrost_redux::oracle::peer::OracleStageAuthority> =
+            authority.clone();
         let peer_ticket_minter: Arc<dyn vala_bifrost_redux::oracle::peer::PeerTicketMinter> =
             authority;
         let role = cluster
@@ -1739,10 +1741,11 @@ impl<'a> OracleRoleBuilder<'a> {
                 resources,
                 reconciliation_limit_bytes,
             },
-            spill_runtime,
+            spill_runtime: Arc::new(spill_runtime),
             tails: Arc::new(TailTransportDirectory::default()),
             audit: audit.clone(),
             peer_ticket_minter,
+            stage_authority: Some(stage_authority),
             tail_ticket_minter: Some(tail_authority),
             tail_discovery: Some(tail_discovery),
             peer_transports: Some(peer_transports),

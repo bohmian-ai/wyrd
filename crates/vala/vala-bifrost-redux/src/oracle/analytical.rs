@@ -49,7 +49,7 @@ use datafusion_distributed::SessionStateBuilderExt as _;
 use datafusion_distributed::{DistributedExt as _, WorkerResolver};
 use datafusion_distributed::{Worker, WorkerQueryContext, WorkerSessionBuilder};
 use http::HeaderMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use url::Url;
 use uuid::Uuid;
 use wyrd_spec::vala::BifrostError;
@@ -441,6 +441,16 @@ fn poisoned_registry() -> BifrostError {
     }
 }
 
+/// Interval between two checks that a released graph's children are gone.
+const GRAPH_DRAIN_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Maximum number of drain checks before a graph is released regardless.
+///
+/// Ten milliseconds apart, this bounds the wait at five seconds: long enough
+/// for upstream's own post-EOS task-cache eviction, short enough that a genuine
+/// leak still surfaces inside one query's lifetime.
+const GRAPH_DRAIN_POLLS: usize = 500;
+
 /// Installs the query-owned runtime on every follower session for a graph.
 ///
 /// This is Wyrd's implementation of the upstream [`WorkerSessionBuilder`] seam.
@@ -811,6 +821,13 @@ pub struct AnalyticalStageIngress {
     attempts: Mutex<HashMap<AnalyticalAttemptKey, AnalyticalAttemptGuard>>,
     /// Outbound capability this node's own middle stages sign through.
     egress: Arc<AnalyticalStageEgress>,
+    /// Live coordinator connections per graph, used to release follower ownership.
+    ///
+    /// A follower owns a graph for exactly as long as its coordinator is still
+    /// connected for it. Counting the open governed calls is what turns "the
+    /// leader went away" — a cancellation, an expired deadline, a consumer that
+    /// walked off, or a dead leader — into one release path instead of four.
+    connections: Mutex<HashMap<AnalyticalGraphKey, usize>>,
 }
 
 impl fmt::Debug for AnalyticalStageIngress {
@@ -860,6 +877,7 @@ impl AnalyticalStageIngress {
             graphs: Mutex::new(HashMap::new()),
             attempts: Mutex::new(HashMap::new()),
             egress,
+            connections: Mutex::new(HashMap::new()),
         }
     }
 
@@ -967,21 +985,133 @@ impl AnalyticalStageIngress {
             }
             None => return Err(BifrostError::QueryExecutionFailed),
         }
-        let graph = key.graph();
+        self.release_graph_if_idle(key.graph()).await
+    }
+
+    /// Releases one graph once no attempt and no connection still holds it.
+    ///
+    /// Both halves matter. An attempt still admitted means work may still run;
+    /// a connection still open means the coordinator may still address the
+    /// graph, including with the retry of an attempt that just drained.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when an ownership lock is poisoned,
+    /// and the supervisor's or egress owner's refusal when the release itself
+    /// fails.
+    async fn release_graph_if_idle(&self, graph: AnalyticalGraphKey) -> Result<(), BifrostError> {
         let release = {
             let mut graphs = self.graphs.lock().map_err(|_| poisoned_ingress())?;
             let attempts = self.attempts.lock().map_err(|_| poisoned_ingress())?;
-            if attempts.keys().any(|live| live.graph() == graph) {
+            let connections = self.connections.lock().map_err(|_| poisoned_ingress())?;
+            if attempts.keys().any(|live| live.graph() == graph) || connections.contains_key(&graph)
+            {
                 None
             } else {
                 graphs.remove(&graph)
             }
         };
-        if let Some(release) = release {
-            release.release()?;
-            self.egress.release(graph)?;
-        }
+        let Some(release) = release else {
+            return Ok(());
+        };
+        self.drain_graph(graph).await?;
+        release.release()?;
+        self.egress.release(graph)?;
         Ok(())
+    }
+
+    /// Waits out a teardown this node started but cannot observe finishing.
+    ///
+    /// Upstream drops a follower's stage plan from its own task cache after the
+    /// coordinator channel ends, so the query envelope can still carry live
+    /// `DataFusion` reservations for a short moment after every governed call
+    /// for the graph has closed. Releasing into that moment would poison the
+    /// process governor for a teardown that is merely in progress. Waiting
+    /// keeps the poison meaning what it says: a child that outlived its owner.
+    ///
+    /// The wait is bounded. A graph that never drains is released anyway, which
+    /// surfaces the real leak instead of hiding it behind an unbounded wait.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when the supervisor's ownership state
+    /// is poisoned.
+    async fn drain_graph(&self, graph: AnalyticalGraphKey) -> Result<(), BifrostError> {
+        for _ in 0..GRAPH_DRAIN_POLLS {
+            if self.supervisor.graph_children_idle(graph)? {
+                return Ok(());
+            }
+            tokio::time::sleep(GRAPH_DRAIN_INTERVAL).await;
+        }
+        tracing::warn!(
+            public_query_id = %graph.public_query_id,
+            datafusion_query_id = %graph.datafusion_query_id,
+            "Oracle analytical graph did not drain before its follower release"
+        );
+        Ok(())
+    }
+
+    /// Retains this graph for as long as one coordinator call stays open.
+    ///
+    /// The returned lease is meant to be carried by the call's own request
+    /// body, so the follower's ownership ends exactly when the coordinator's
+    /// connection does. Nested calls for the same graph share one release.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when the connection lock is poisoned.
+    pub fn retain_connection(
+        self: &Arc<Self>,
+        graph: AnalyticalGraphKey,
+    ) -> Result<AnalyticalConnectionLease, BifrostError> {
+        *self
+            .connections
+            .lock()
+            .map_err(|_| poisoned_ingress())?
+            .entry(graph)
+            .or_insert(0) += 1;
+        Ok(AnalyticalConnectionLease {
+            ingress: Arc::clone(self),
+            graph,
+        })
+    }
+
+    /// Releases every attempt and the graph itself once nothing holds it.
+    ///
+    /// Called only from a dropped [`AnalyticalConnectionLease`]. Attempts are
+    /// settled `Cancelled` because a coordinator that disconnected never
+    /// reported a terminal, and treating that as success would let a partial
+    /// stage look complete.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when an ownership lock is poisoned,
+    /// or the supervisor's refusal when an attempt cannot settle.
+    async fn release_connection(&self, graph: AnalyticalGraphKey) -> Result<(), BifrostError> {
+        {
+            let mut connections = self.connections.lock().map_err(|_| poisoned_ingress())?;
+            let Some(open) = connections.get_mut(&graph) else {
+                return Ok(());
+            };
+            *open = open.saturating_sub(1);
+            if *open > 0 {
+                return Ok(());
+            }
+            connections.remove(&graph);
+        }
+        let stale = {
+            let attempts = self.attempts.lock().map_err(|_| poisoned_ingress())?;
+            attempts
+                .keys()
+                .filter(|key| key.graph() == graph)
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        for key in stale {
+            self.finish_attempt(key, AnalyticalAttemptOutcome::Cancelled)
+                .await?;
+        }
+        self.release_graph_if_idle(graph).await
     }
 
     /// Reports what this follower still owns without releasing any of it.
@@ -1064,6 +1194,50 @@ impl AnalyticalStageIngress {
         )?;
         attempts.insert(key, guard);
         Ok(())
+    }
+}
+
+/// Follower ownership of one graph, held for one open coordinator call.
+///
+/// Dropping it is the release signal. The release itself is asynchronous — an
+/// attempt settles through the supervisor — so the drop spawns it onto the
+/// current runtime rather than blocking whatever dropped the connection.
+pub struct AnalyticalConnectionLease {
+    /// Follower ingress that owns the graph this lease keeps alive.
+    ingress: Arc<AnalyticalStageIngress>,
+    /// Graph this lease is one open connection for.
+    graph: AnalyticalGraphKey,
+}
+
+impl fmt::Debug for AnalyticalConnectionLease {
+    /// Reports the graph without rendering the ingress.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AnalyticalConnectionLease")
+            .field("graph", &self.graph)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for AnalyticalConnectionLease {
+    /// Releases this connection's share of the graph's follower ownership.
+    fn drop(&mut self) {
+        let ingress = Arc::clone(&self.ingress);
+        let graph = self.graph;
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(
+                "Oracle analytical follower dropped a stage connection outside a runtime"
+            );
+            return;
+        };
+        handle.spawn(async move {
+            if let Err(error) = ingress.release_connection(graph).await {
+                tracing::warn!(
+                    error = %error,
+                    "Oracle analytical follower could not release a closed stage connection"
+                );
+            }
+        });
     }
 }
 

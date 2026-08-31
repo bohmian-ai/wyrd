@@ -4157,6 +4157,29 @@ impl OracleQueryResources {
         Arc::clone(&self.memory_pool)
     }
 
+    /// Reports whether every nested child of this query envelope is gone.
+    ///
+    /// [`OracleQueryResources::release`] poisons the process governor when a
+    /// child outlives its owner, which is correct for a leak but wrong for a
+    /// teardown that is merely still in progress. An owner that cannot observe
+    /// its consumers directly — a follower whose stage plan is dropped by
+    /// upstream's own task cache — asks this first and waits, so the poison
+    /// keeps its meaning.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostResourceError::Poisoned`] when the scratch attribution
+    /// lock is poisoned.
+    pub fn nested_idle(&self) -> Result<bool, BifrostResourceError> {
+        let nested_scratch =
+            self.nested_scratch_used_bytes
+                .lock()
+                .map_err(|_| BifrostResourceError::Poisoned {
+                    detail: "Oracle query scratch attribution lock is poisoned".to_owned(),
+                })?;
+        Ok(*nested_scratch == 0 && self.memory_pool.reserved() == 0)
+    }
+
     /// Splits one named memory child from the already admitted query pool.
     ///
     /// # Errors

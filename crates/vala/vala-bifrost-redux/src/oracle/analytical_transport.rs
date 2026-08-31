@@ -73,7 +73,8 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{NodeId, SignedPeerTicket};
 
 use super::analytical::{
-    AnalyticalGraphKey, AnalyticalStageIngress, DATAFUSION_QUERY_ID_HEADER, PUBLIC_QUERY_ID_HEADER,
+    AnalyticalConnectionLease, AnalyticalGraphKey, AnalyticalStageIngress,
+    DATAFUSION_QUERY_ID_HEADER, PUBLIC_QUERY_ID_HEADER,
 };
 use super::peer::{
     MAX_STAGE_BODY_BYTES, OracleStageAuthority, PeerSecurityError, StageBinding, StageOperationV1,
@@ -247,13 +248,31 @@ pub struct ReplayBody<B> {
     replay: VecDeque<Bytes>,
     /// The source body, resumed once every replayed chunk is delivered.
     inner: B,
+    /// Follower ownership held for exactly as long as this request body lives.
+    ///
+    /// Present only on the bidirectional coordinator channel, whose request
+    /// stream tonic holds for the whole call. Dropping this body is therefore
+    /// the single honest signal that the coordinator is gone, whatever removed
+    /// it, and it is what releases the graph this call admitted.
+    lease: Option<AnalyticalConnectionLease>,
 }
 
 impl<B> ReplayBody<B> {
     /// Wraps `inner`, replaying `replay` in order before resuming it.
     #[must_use]
     pub fn new(replay: VecDeque<Bytes>, inner: B) -> Self {
-        Self { replay, inner }
+        Self {
+            replay,
+            inner,
+            lease: None,
+        }
+    }
+
+    /// Attaches follower graph ownership to this body's lifetime.
+    #[must_use]
+    pub fn with_lease(mut self, lease: AnalyticalConnectionLease) -> Self {
+        self.lease = Some(lease);
+        self
     }
 }
 
@@ -406,9 +425,15 @@ pub(crate) fn header_value(value: &str) -> Result<HeaderValue, PeerSecurityError
 pub(crate) fn replay_request<B>(
     request: Request<B>,
     replay: VecDeque<Bytes>,
+    lease: Option<AnalyticalConnectionLease>,
 ) -> Request<ReplayBody<B>> {
     let (parts, body) = request.into_parts();
-    Request::from_parts(parts, ReplayBody::new(replay, body))
+    let body = ReplayBody::new(replay, body);
+    let body = match lease {
+        Some(lease) => body.with_lease(lease),
+        None => body,
+    };
+    Request::from_parts(parts, body)
 }
 
 /// Builds the closed gRPC refusal returned for any stage authority failure.
@@ -1006,15 +1031,36 @@ where
                     return Ok(S::Response::refused());
                 }
             };
-            if let Err(error) = ingress
+            let authorized = ingress
                 .authorize_stage_message(operation, &parts.headers, &framed, Utc::now())
-                .await
-            {
-                tracing::warn!(path = %path, error = %error, reason = "authority", "Oracle analytical stage ingress refused a request");
-                return Ok(S::Response::refused());
-            }
+                .await;
+            let key = match authorized {
+                Ok(key) => key,
+                Err(error) => {
+                    tracing::warn!(path = %path, error = %error, reason = "authority", "Oracle analytical stage ingress refused a request");
+                    return Ok(S::Response::refused());
+                }
+            };
+            // Only the coordinator channel carries ownership. Its request stream
+            // lives for the whole call, so its drop is the coordinator's
+            // departure; a unary `ExecuteTask` body is consumed and dropped long
+            // before the stage it started has finished producing rows.
+            let lease = match operation {
+                StageOperationV1::SetPlan => match ingress.retain_connection(key.graph()) {
+                    Ok(lease) => Some(lease),
+                    Err(error) => {
+                        tracing::warn!(path = %path, error = %error, reason = "ownership", "Oracle analytical stage ingress refused a request");
+                        return Ok(S::Response::refused());
+                    }
+                },
+                StageOperationV1::ExecuteTask => None,
+            };
             inner
-                .call(replay_request(Request::from_parts(parts, body), replay))
+                .call(replay_request(
+                    Request::from_parts(parts, body),
+                    replay,
+                    lease,
+                ))
                 .await
         })
     }

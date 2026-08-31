@@ -383,6 +383,27 @@ impl AnalyticalSupervisor {
         })
     }
 
+    /// Reports whether one registered graph's envelope has no nested child left.
+    ///
+    /// An unregistered graph is idle by definition: there is no envelope left to
+    /// outlive. Callers use this to wait out a teardown they cannot observe
+    /// directly before releasing the graph, so a poison still means a leak.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when the graph lock or the envelope's
+    /// own scratch attribution lock is poisoned.
+    pub fn graph_children_idle(&self, graph: AnalyticalGraphKey) -> Result<bool, BifrostError> {
+        let graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
+        let Some(state) = graphs.get(&graph) else {
+            return Ok(true);
+        };
+        state
+            .resources
+            .nested_idle()
+            .map_err(|_| poisoned_supervisor())
+    }
+
     /// Returns the number of registered graphs, for terminal-cleanup evidence.
     ///
     /// # Errors

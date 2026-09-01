@@ -75,6 +75,51 @@ impl PgFixture {
         Self::start_seeded(DataTenantId::new_v7(), slug.into()).await
     }
 
+    /// Binds to a fixture database another process created and seeded.
+    ///
+    /// Multi-process harnesses need every child to reach the same database as
+    /// its parent without recreating, re-migrating, or re-seeding it, and
+    /// without dropping it when the child exits. The caller supplies the
+    /// database name, tenant identity, and slug the creating process published.
+    ///
+    /// # Errors
+    /// Returns [`FixtureError`] when DSN resolution or pool construction fails,
+    /// or the platform-admin capability is unavailable.
+    pub async fn attach(
+        database_name: String,
+        data_tenant_id: DataTenantId,
+        tenant_slug: String,
+    ) -> Result<Self, FixtureError> {
+        let test_db = TestDatabase::attach(database_name).map_err(FixtureError::from)?;
+        let handles = test_db.connect_handles().await?;
+        let resolved = test_db.resolved_dsns()?;
+        let assertion_pool = build_pool(
+            resolved.migrator.expose_secret(),
+            PoolConfig::migrator_defaults(),
+        )
+        .await
+        .map_err(SqlError::Connect)?;
+        Ok(Self {
+            operator_pool: handles.operator_pool,
+            wyrd: handles.wyrd,
+            vala: handles.vala,
+            catalog_dsn: resolved.catalog_app,
+            data_tenant_id,
+            tenant_slug,
+            assertion_pool,
+            _test_db: test_db,
+        })
+    }
+
+    /// Returns the name of the database this fixture is bound to.
+    ///
+    /// Multi-process harnesses publish it to their children so every replica
+    /// attaches to the same database rather than creating its own.
+    #[must_use]
+    pub fn database_name(&self) -> &str {
+        &self._test_db.name
+    }
+
     /// Open a tenant-scoped transaction bound to the seeded tenant.
     ///
     /// # Errors
@@ -266,6 +311,12 @@ struct TestDatabase {
     name: String,
     /// Neutral cluster-admin DSN used only for database lifecycle operations.
     admin_dsn: SecretString,
+    /// Whether dropping this handle also drops the database.
+    ///
+    /// A multi-process fixture has one creator and several attached readers of
+    /// the same database. Only the creator may drop it; an attached handle that
+    /// dropped the database would pull it out from under its siblings.
+    owned: bool,
 }
 
 struct TestDbHandles {
@@ -304,9 +355,27 @@ impl TestDatabase {
         .map_err(SqlError::from)?;
         admin_pool.close().await;
 
-        let test_db = Self { name, admin_dsn };
+        let test_db = Self {
+            name,
+            admin_dsn,
+            owned: true,
+        };
         test_db.migrate(&base).await?;
         Ok(test_db)
+    }
+
+    /// Binds to an already-created, already-migrated fixture database.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] when the admin DSN cannot be resolved from the
+    /// environment.
+    fn attach(name: String) -> Result<Self, SqlError> {
+        let admin_dsn = test_database_admin_dsn("wyrd")?;
+        Ok(Self {
+            name,
+            admin_dsn,
+            owned: false,
+        })
     }
 
     /// Connect the typed runtime handles used by a migrated fixture database.
@@ -365,7 +434,13 @@ impl TestDatabase {
 
 impl Drop for TestDatabase {
     /// Drops the owned ephemeral database through the neutral admin connection.
+    ///
+    /// An attached handle owns nothing and returns immediately, leaving the
+    /// database to the process that created it.
     fn drop(&mut self) {
+        if !self.owned {
+            return;
+        }
         let database_name = self.name.clone();
         let admin_dsn = self.admin_dsn.clone();
         let handle = thread::spawn(move || {

@@ -1150,7 +1150,7 @@ mod governed_request_tests {
                         return Err::<Bytes, _>(transient());
                     }
                     let _sentinel = DropSentinel(dropped);
-                    tokio::time::sleep(Duration::from_secs(600)).await;
+                    tokio::time::sleep(Duration::from_mins(10)).await;
                     Err(transient())
                 }
             })
@@ -1202,7 +1202,7 @@ mod governed_request_tests {
                 let attempts = Arc::clone(&attempts);
                 async move {
                     attempts.fetch_add(1, Ordering::SeqCst);
-                    tokio::time::sleep(Duration::from_secs(600)).await;
+                    tokio::time::sleep(Duration::from_mins(10)).await;
                     Err::<Bytes, _>(transient())
                 }
             })
@@ -1275,19 +1275,22 @@ mod governed_request_tests {
         assert_eq!(snapshot.anomalies(), 0);
     }
 
-    /// Every terminal a governed request can reach settles its own accounting.
+    /// Every attempt-level terminal settles its own request accounting.
     ///
     /// Asserted as one matrix because the property under test is not any single
     /// outcome but the invariant across all of them: one logical request
     /// publishes one start and one terminal, active work returns to zero, and
     /// no settlement is unmatched. An owner that leaked exactly one path would
-    /// still look correct from every other path's side.
+    /// still look correct from every other path's side. The admission-level
+    /// terminals — timeout, refusal, and owner closure — are asserted by
+    /// [`storage_request_telemetry_reconciles_admission_terminals`], which needs
+    /// a differently configured owner to reach them.
     ///
     /// # Panics
     /// Panics when an expected terminal is not published or the totals do not
     /// reconcile after a case.
     #[tokio::test]
-    async fn storage_request_telemetry_reconciles_terminal_matrix() {
+    async fn storage_request_telemetry_reconciles_attempt_terminals() {
         let root = tempfile::tempdir().expect("warehouse root");
 
         let storage = owner(root.path(), BifrostStorageConfig::default());
@@ -1341,7 +1344,20 @@ mod governed_request_tests {
             }
         );
         assert_reconciled(&storage, StorageRequestOutcome::Backend, 1);
+    }
 
+    /// Timeout, refusal, and owner closure each settle their own accounting.
+    ///
+    /// Split from the attempt-level matrix because every terminal here needs an
+    /// owner configured to reach it — a short request timeout, a single request
+    /// slot, and no retries — and because the refusal and closure cases must be
+    /// observed while another request is deliberately held mid-flight.
+    ///
+    /// # Panics
+    /// Panics when an expected terminal is not published or the totals do not
+    /// reconcile after a case.
+    #[tokio::test]
+    async fn storage_request_telemetry_reconciles_admission_terminals() {
         let timeout_root = tempfile::tempdir().expect("warehouse root");
         let timing = owner(
             timeout_root.path(),
@@ -1355,7 +1371,7 @@ mod governed_request_tests {
         );
         let error = timing
             .run_read(StorageOperation::Read, || async {
-                tokio::time::sleep(Duration::from_secs(600)).await;
+                tokio::time::sleep(Duration::from_mins(10)).await;
                 Ok::<Bytes, opendal::Error>(Bytes::new())
             })
             .await
@@ -1465,7 +1481,7 @@ mod governed_request_tests {
                         let dropped = Arc::clone(&dropped);
                         async move {
                             let _sentinel = DropSentinel(dropped);
-                            tokio::time::sleep(Duration::from_secs(600)).await;
+                            tokio::time::sleep(Duration::from_mins(10)).await;
                             Ok::<Bytes, opendal::Error>(Bytes::new())
                         }
                     })

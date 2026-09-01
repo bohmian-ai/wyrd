@@ -90,13 +90,6 @@ pub(crate) const COORDINATOR_CHANNEL_PATH: &str = "/worker.WorkerService/Coordin
 /// gRPC path of the unary task execution call this layer governs.
 pub(crate) const EXECUTE_TASK_PATH: &str = "/worker.WorkerService/ExecuteTask";
 
-/// gRPC path of upstream's worker metadata call.
-///
-/// It carries no graph identity and no query work, so it takes no stage ticket.
-/// It still reaches the follower only through peer mTLS and workload
-/// authentication like every other east-west call.
-pub(crate) const WORKER_INFO_PATH: &str = "/worker.WorkerService/GetWorkerInfo";
-
 /// Bytes of the gRPC length-prefix that precede every message payload.
 const GRPC_PREFIX_BYTES: usize = 5;
 
@@ -110,10 +103,10 @@ pub(crate) fn governed_operation(path: &str) -> Option<StageOperationV1> {
     match path {
         COORDINATOR_CHANNEL_PATH => Some(StageOperationV1::SetPlan),
         EXECUTE_TASK_PATH => Some(StageOperationV1::ExecuteTask),
-        // Worker version discovery carries no stage identity and is refused
-        // rather than forwarded: Wyrd pins its own worker build, so a follower
-        // has nothing to tell a coordinator that the coordinator does not know.
-        WORKER_INFO_PATH => None,
+        // Every other path, worker version discovery included, carries no
+        // stage identity and is refused rather than forwarded: Wyrd pins its
+        // own worker build, so a follower has nothing to tell a coordinator
+        // that the coordinator does not already know.
         _ => None,
     }
 }
@@ -1219,6 +1212,14 @@ fn measured_exchange(
     }))
 }
 
+/// Resolves the follower-bound stage minter for one worker URL.
+///
+/// Named because it appears both as a resolver field and as its constructor
+/// argument: a coordinator hands in the closure that knows which destination
+/// identities it was authorized for, and the resolver caches what it returns.
+pub(crate) type StageMinterFactory =
+    Arc<dyn Fn(&Url) -> Option<Arc<AnalyticalStageMinter>> + Send + Sync>;
+
 /// Resolves worker clients that sign every governed stage operation they send.
 ///
 /// Connection establishment and reuse stay with upstream's own
@@ -1233,7 +1234,7 @@ pub(crate) struct AnalyticalChannelResolver {
     /// Per-follower minters, keyed by the follower each one is bound to.
     minters: Arc<std::sync::Mutex<HashMap<Url, Arc<AnalyticalStageMinter>>>>,
     /// Builds the minter for a follower this resolver has not yet reached.
-    mint_for: Arc<dyn Fn(&Url) -> Option<Arc<AnalyticalStageMinter>> + Send + Sync>,
+    mint_for: StageMinterFactory,
 }
 
 impl fmt::Debug for AnalyticalChannelResolver {
@@ -1256,7 +1257,7 @@ impl AnalyticalChannelResolver {
     #[must_use]
     pub(crate) fn new(
         identity: Arc<AnalyticalCoordinatorIdentity>,
-        mint_for: Arc<dyn Fn(&Url) -> Option<Arc<AnalyticalStageMinter>> + Send + Sync>,
+        mint_for: StageMinterFactory,
     ) -> Self {
         Self {
             channels: DefaultChannelResolver::default(),
@@ -1328,6 +1329,38 @@ mod tests {
     use super::super::peer::AuthorizedStage;
     use super::super::spill::OracleSpillRuntime;
     use super::*;
+
+    /// gRPC path of upstream's worker metadata call.
+    ///
+    /// Named here rather than in production code because nothing in production
+    /// dispatches on it: it carries no graph identity and no query work, so it
+    /// takes no stage ticket and falls through the governed-path table's
+    /// fail-closed arm like any other unrecognized method.
+    const WORKER_INFO_PATH: &str = "/worker.WorkerService/GetWorkerInfo";
+
+    /// Only the two stage-carrying gRPC paths are governed; every other path,
+    /// upstream's worker-metadata call included, is refused.
+    ///
+    /// Pins the fail-closed direction of the path table: a method this layer
+    /// does not understand must resolve to no operation, because an
+    /// unrecognized path cannot be bound to a stage ticket and therefore
+    /// cannot be authorized. Worker metadata is named explicitly because it is
+    /// the one real upstream method that legitimately carries no graph
+    /// identity; it still reaches a follower only through peer mTLS and
+    /// workload authentication, like every other east-west call.
+    #[test]
+    fn governed_operation_names_only_the_two_stage_paths() {
+        assert_eq!(
+            governed_operation(COORDINATOR_CHANNEL_PATH),
+            Some(StageOperationV1::SetPlan)
+        );
+        assert_eq!(
+            governed_operation(EXECUTE_TASK_PATH),
+            Some(StageOperationV1::ExecuteTask)
+        );
+        assert_eq!(governed_operation(WORKER_INFO_PATH), None);
+        assert_eq!(governed_operation("/unknown.Service/Method"), None);
+    }
     use crate::resources::{
         BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, ResourceSource,
         SystemResourceSnapshot,
@@ -1689,7 +1722,8 @@ mod tests {
     fn framed(payload: &[u8]) -> Bytes {
         let mut message = Vec::with_capacity(payload.len() + GRPC_PREFIX_BYTES);
         message.push(0);
-        message.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        let length = u32::try_from(payload.len()).expect("test payloads are far below 4 GiB");
+        message.extend_from_slice(&length.to_be_bytes());
         message.extend_from_slice(payload);
         Bytes::from(message)
     }
@@ -1869,7 +1903,10 @@ mod tests {
         let fixture = Fixture::new();
         let (mut service, probe) = fixture.service();
         let mut oversized = vec![0_u8];
-        oversized.extend_from_slice(&(MAX_STAGE_BODY_BYTES as u32 + 1).to_be_bytes());
+        let over_limit = u32::try_from(MAX_STAGE_BODY_BYTES)
+            .expect("the stage body bound is far below 4 GiB")
+            + 1;
+        oversized.extend_from_slice(&over_limit.to_be_bytes());
         let request = fixture.request(
             &framed(b"plan"),
             ChunkBody::new(vec![Bytes::from(oversized)]),

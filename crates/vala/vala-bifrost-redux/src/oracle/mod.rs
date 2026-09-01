@@ -1788,8 +1788,6 @@ struct SqlAttemptInput<'a> {
     deadline: Instant,
     /// Zero-based stale-replan attempt ordinal.
     retry_ordinal: u8,
-    /// Optional Gate request lifecycle transferred into a returned stream.
-    gate_lifecycle: Option<Arc<crate::oracle::query_stream::QueryStreamLifecycle>>,
     /// One signed ingress-captured participant cut reused by every retry phase.
     participant_cut: &'a OracleQueryAttemptCut,
     /// Server-derived class signed into the forwarding envelope.
@@ -1973,6 +1971,214 @@ fn validate_oracle_config(config: OracleConfig) -> Result<(), BifrostError> {
     Ok(())
 }
 
+/// One node's composed delegated-admission owner and its maintenance task.
+///
+/// Returned together because the worker only means anything alongside the
+/// admission owner it drains for, and the loss receiver only alongside the
+/// channel that owner was built with.
+struct ComposedDelegatedAdmission {
+    /// Delegated admission owner shared with the rest of Oracle.
+    delegated_admission: Arc<DelegatedOracleAdmission>,
+    /// Background worker draining this node's delegated demand.
+    delegated_maintenance: tokio::task::JoinHandle<()>,
+    /// Receiver signalling that delegated leadership was lost.
+    loss_rx: tokio::sync::mpsc::Receiver<wyrd_spec::vala::api::OracleAdmissionContinuityLost>,
+}
+
+/// Builds this node's delegated-admission owner and starts its worker.
+///
+/// The demand channel is sized from the queue capacity so a node cannot buffer
+/// more delegated demand than it would ever admit, and the worker is spawned on
+/// the caller's runtime rather than an ad hoc one so it shuts down with the
+/// process that composed it.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::Internal`] when the delegated owner rejects its
+/// configuration, or when Oracle is being constructed outside a Tokio runtime.
+fn compose_delegated_admission(
+    admission: &Arc<OracleAdmission>,
+    delegated_config: DelegatedOracleAdmissionConfig,
+    operator_pool: vala_sql::OperatorPool,
+    queue_capacity: u32,
+    shutdown: &CancellationToken,
+) -> Result<ComposedDelegatedAdmission, BifrostError> {
+    let (demand_tx, demand_rx) = tokio::sync::mpsc::channel(queue_capacity.max(1) as usize);
+    let (loss_tx, loss_rx) = tokio::sync::mpsc::channel(1);
+    let delegated_admission = Arc::new(
+        DelegatedOracleAdmission::new(
+            admission.local_role.key.node_id,
+            admission.local_role.fencing_token,
+            delegated_config,
+            demand_tx,
+            loss_tx,
+        )
+        .map_err(|error| BifrostError::Internal {
+            detail: error.to_string(),
+        })?,
+    );
+    let delegated_maintenance = tokio::runtime::Handle::try_current()
+        .map_err(|_| BifrostError::Internal {
+            detail: "Oracle construction requires an active Tokio runtime".to_owned(),
+        })?
+        .spawn(
+            DelegatedOracleAdmissionWorker::new(
+                operator_pool,
+                Arc::clone(&delegated_admission),
+                demand_rx,
+                shutdown.clone(),
+            )
+            .run(),
+        );
+    Ok(ComposedDelegatedAdmission {
+        delegated_admission,
+        delegated_maintenance,
+        loss_rx,
+    })
+}
+
+/// Everything needed to pin or reuse one SQL attempt's plan.
+///
+/// Grouped because the plan, the tables it may touch, the deadline it must fit,
+/// and the cut it is checked against are only meaningful together: a plan
+/// resolved against a different cut or deadline is not the plan this attempt
+/// was admitted for.
+struct AttemptPlanInputs<'a> {
+    /// Authenticated principal, tenant, and audit correlation.
+    context: &'a AuthorizedQueryContext,
+    /// Raw SQL replanned when this attempt carries no prepared plan.
+    sql: &'a str,
+    /// Tables the caller's visibility already authorized.
+    tables: &'a [TableRef],
+    /// Absolute whole-query deadline shared across retry attempts.
+    deadline: Instant,
+    /// Signed participant cut this plan's class is checked against.
+    participant_cut: &'a OracleQueryAttemptCut,
+    /// Classification snapshot the first attempt may reuse.
+    prepared: Option<PlannedSqlCut>,
+    /// Class signed into the cut; a replan may not change it.
+    expected_query_class: QueryClass,
+}
+
+/// Everything one node needs to compose its Analytical execution handle.
+///
+/// Grouped rather than passed positionally because every field is either an
+/// identity this node signs with or a resource owner the handle must share with
+/// the rest of Oracle; naming them at the call site is what keeps the
+/// composition auditable.
+struct AnalyticalCompositionInputs {
+    /// Signing and verifying authority for every stage ticket this node uses.
+    authority: Arc<dyn peer::OracleStageAuthority>,
+    /// Live membership, read to resolve the authorized follower endpoints.
+    cluster: Arc<ClusterRegistry>,
+    /// This node's Oracle identity.
+    node_id: NodeId,
+    /// This node's Oracle fencing token.
+    fence: u64,
+    /// Catalog the follower leaf binding resolves sources through.
+    catalog: Arc<BifrostCatalog>,
+    /// Audit owner every refused stage message records through.
+    audit: Arc<dyn OracleAudit>,
+    /// Process-level Oracle resource governor shared with admission.
+    resources: crate::resources::OracleResources,
+    /// Process-owned spill runtime every query-owned runtime is built from.
+    spill: Arc<OracleSpillRuntime>,
+    /// Per-attempt exchange buffer share.
+    exchange_buffer_bytes: usize,
+    /// Per-attempt scratch share.
+    scratch_bytes: u64,
+}
+
+/// Builds one node's Analytical execution handle from its composed owners.
+///
+/// The egress resolver, the follower ingress, and the leader handle all need
+/// the same identity, authority, and resource owners, so they are composed in
+/// one place rather than threaded through `Oracle::new`. Nothing here starts
+/// work: the returned handle is unreachable from routing until a caller leases
+/// an attempt through it.
+fn compose_analytical_handle(
+    inputs: AnalyticalCompositionInputs,
+) -> Arc<analytical::AnalyticalExecutionHandle> {
+    let AnalyticalCompositionInputs {
+        authority,
+        cluster,
+        node_id,
+        fence,
+        catalog,
+        audit,
+        resources,
+        spill,
+        exchange_buffer_bytes,
+        scratch_bytes,
+    } = inputs;
+    let supervisor = Arc::new(analytical::AnalyticalSupervisor::new());
+    let leaf = codec::AnalyticalLeafBinding::new(
+        wyrd_spec::vala::api::ClusterRole::Oracle,
+        Arc::new(follower::OracleCatalogResolver::new(catalog)),
+        audit,
+    );
+    let egress = Arc::new(analytical::AnalyticalStageEgress::new(
+        Arc::clone(&authority),
+        Arc::new(move || {
+            cluster
+                .snapshot()
+                .live_oracles()
+                .iter()
+                .filter(|lease| lease.key.node_id != node_id)
+                .map(|lease| {
+                    let url = url::Url::parse(&lease.address).map_err(|error| {
+                        BifrostError::Internal {
+                            detail: format!(
+                                "Oracle analytical peer endpoint is not a valid URL: {error}"
+                            ),
+                        }
+                    })?;
+                    Ok((url, (lease.key.node_id, lease.fencing_token)))
+                })
+                .collect()
+        }),
+        node_id,
+        fence,
+        ANALYTICAL_STAGE_TICKET_TTL,
+    ));
+    let worker = Arc::new(analytical::AnalyticalStageIngress::new(
+        analytical::AnalyticalStageIngressConfig {
+            node_id,
+            oracle_fence: fence,
+            authority: Arc::clone(&authority),
+            supervisor: Arc::clone(&supervisor),
+            oracle_resources: resources.clone(),
+            spill: Arc::clone(&spill),
+            exchange_buffer_bytes,
+            leaf: leaf.clone(),
+            egress,
+        },
+    ));
+    Arc::new(analytical::AnalyticalExecutionHandle::new(
+        worker,
+        authority,
+        supervisor,
+        spill,
+        resources,
+        analytical::AnalyticalExecutionConfig {
+            node_id,
+            oracle_fence: fence,
+            ticket_ttl: ANALYTICAL_STAGE_TICKET_TTL,
+            exchange_buffer_bytes,
+            scratch_bytes,
+        },
+        leaf,
+    ))
+}
+
+/// Lifetime of every Analytical stage ticket this node mints.
+///
+/// Short enough that a captured ticket is useless long before a query's own
+/// deadline, and long enough to cover one coordinator-to-follower dispatch on a
+/// loaded cluster. Ticket expiry is checked in addition to the query deadline,
+/// never instead of it.
+const ANALYTICAL_STAGE_TICKET_TTL: chrono::Duration = chrono::Duration::seconds(30);
+
 impl Oracle {
     /// Reports whether the injected process shutdown token reached the engine.
     #[cfg(feature = "test-support")]
@@ -2046,34 +2252,17 @@ impl Oracle {
         let initial_snapshot = cluster.snapshot();
         admission.refresh(&initial_snapshot);
         let shutdown = config.shutdown;
-        let (demand_tx, demand_rx) =
-            tokio::sync::mpsc::channel(config.config.queue_capacity.max(1) as usize);
-        let (loss_tx, loss_rx) = tokio::sync::mpsc::channel(1);
-        let delegated_admission = Arc::new(
-            DelegatedOracleAdmission::new(
-                admission.local_role.key.node_id,
-                admission.local_role.fencing_token,
-                config.delegated_admission_config,
-                demand_tx,
-                loss_tx,
-            )
-            .map_err(|error| BifrostError::Internal {
-                detail: error.to_string(),
-            })?,
-        );
-        let delegated_maintenance = tokio::runtime::Handle::try_current()
-            .map_err(|_| BifrostError::Internal {
-                detail: "Oracle construction requires an active Tokio runtime".to_owned(),
-            })?
-            .spawn(
-                DelegatedOracleAdmissionWorker::new(
-                    config.operator_pool,
-                    Arc::clone(&delegated_admission),
-                    demand_rx,
-                    shutdown.clone(),
-                )
-                .run(),
-            );
+        let ComposedDelegatedAdmission {
+            delegated_admission,
+            delegated_maintenance,
+            loss_rx,
+        } = compose_delegated_admission(
+            &admission,
+            config.delegated_admission_config,
+            config.operator_pool,
+            config.config.queue_capacity,
+            &shutdown,
+        )?;
         let ready = Arc::new(AtomicBool::new(false));
         let (maintenance, startup_result) =
             OracleAdmission::start_maintenance(shutdown.clone(), Arc::clone(&ready))?;
@@ -2083,70 +2272,19 @@ impl Oracle {
                 transports,
             ))
         });
-        let analytical_node_id = admission.local_role.key.node_id;
-        let analytical_fence = admission.local_role.fencing_token;
-        let analytical_leaf = codec::AnalyticalLeafBinding::new(
-            wyrd_spec::vala::api::ClusterRole::Oracle,
-            Arc::new(follower::OracleCatalogResolver::new(Arc::clone(
-                &config.catalog,
-            ))),
-            Arc::clone(&config.audit),
-        );
         let analytical = config.stage_authority.map(|authority| {
-            let supervisor = Arc::new(analytical::AnalyticalSupervisor::new());
-            let peer_cluster = Arc::clone(&cluster);
-            let egress = Arc::new(analytical::AnalyticalStageEgress::new(
-                Arc::clone(&authority),
-                Arc::new(move || {
-                    peer_cluster
-                        .snapshot()
-                        .live_oracles()
-                        .iter()
-                        .filter(|lease| lease.key.node_id != analytical_node_id)
-                        .map(|lease| {
-                            let url = url::Url::parse(&lease.address).map_err(|error| {
-                                BifrostError::Internal {
-                                    detail: format!(
-                                        "Oracle analytical peer endpoint is not a valid URL: {error}"
-                                    ),
-                                }
-                            })?;
-                            Ok((url, (lease.key.node_id, lease.fencing_token)))
-                        })
-                        .collect()
-                }),
-                analytical_node_id,
-                analytical_fence,
-                chrono::Duration::seconds(30),
-            ));
-            let worker = Arc::new(analytical::AnalyticalStageIngress::new(
-                analytical::AnalyticalStageIngressConfig {
-                    node_id: analytical_node_id,
-                    oracle_fence: analytical_fence,
-                    authority: Arc::clone(&authority),
-                    supervisor: Arc::clone(&supervisor),
-                    oracle_resources: config.memory.resources.clone(),
-                    spill: Arc::clone(&config.spill_runtime),
-                    exchange_buffer_bytes: config.config.analytical_exchange_buffer_bytes,
-                    leaf: analytical_leaf.clone(),
-                    egress,
-                },
-            ));
-            Arc::new(analytical::AnalyticalExecutionHandle::new(
-                worker,
+            compose_analytical_handle(AnalyticalCompositionInputs {
                 authority,
-                supervisor,
-                Arc::clone(&config.spill_runtime),
-                config.memory.resources.clone(),
-                analytical::AnalyticalExecutionConfig {
-                    node_id: analytical_node_id,
-                    oracle_fence: analytical_fence,
-                    ticket_ttl: chrono::Duration::seconds(30),
-                    exchange_buffer_bytes: config.config.analytical_exchange_buffer_bytes,
-                    scratch_bytes: config.config.analytical_scratch_bytes,
-                },
-                analytical_leaf,
-            ))
+                cluster: Arc::clone(&cluster),
+                node_id: admission.local_role.key.node_id,
+                fence: admission.local_role.fencing_token,
+                catalog: Arc::clone(&config.catalog),
+                audit: Arc::clone(&config.audit),
+                resources: config.memory.resources.clone(),
+                spill: Arc::clone(&config.spill_runtime),
+                exchange_buffer_bytes: config.config.analytical_exchange_buffer_bytes,
+                scratch_bytes: config.config.analytical_scratch_bytes,
+            })
         });
         Ok(Self {
             planner,
@@ -2303,16 +2441,8 @@ impl Oracle {
     ) -> Result<OracleQueryStream, BifrostError> {
         let (cut, planned) = self.prepare_query_attempt(&context, &request).await?;
         let query_class = planned.query_class;
-        self.query_sql_with_cut_and_gate_lifecycle(
-            context,
-            request,
-            cut,
-            query_class,
-            None,
-            Some(planned),
-            None,
-        )
-        .await
+        self.run_sql_query_attempt_loop(context, request, cut, query_class, Some(planned), None)
+            .await
     }
 
     /// Starts one raw-SQL query on the production-unreachable Analytical path.
@@ -2342,12 +2472,11 @@ impl Oracle {
     ) -> Result<OracleQueryStream, BifrostError> {
         let (cut, planned) = self.prepare_query_attempt(&context, &request).await?;
         let query_class = planned.query_class;
-        self.query_sql_with_cut_and_gate_lifecycle(
+        self.run_sql_query_attempt_loop(
             context,
             request,
             cut,
             query_class,
-            None,
             Some(planned),
             Some(attempt),
         )
@@ -2464,23 +2593,24 @@ impl Oracle {
         query_class: QueryClass,
         prepared: Option<PlannedSqlCut>,
     ) -> Result<OracleQueryStream, BifrostError> {
-        self.query_sql_with_cut_and_gate_lifecycle(
+        self.run_sql_query_attempt_loop(
             context,
             request,
             participant_cut,
             query_class,
-            None,
             prepared,
             None,
         )
         .await
     }
 
-    /// Starts a SQL query while retaining an optional Gate lifecycle owner.
+    /// Runs one SQL query's bounded stale-replan attempt loop.
     ///
-    /// The lifecycle owner is attached before the first frame is emitted, so
-    /// Gate duration and active-stream accounting remain truthful through
-    /// terminal consumption or client cancellation.
+    /// Every public raw-SQL entry point converges here: the participant cut and
+    /// class are already fixed, and this owner is what decides whether an
+    /// attempt may be replaced by exactly one stale-Iceberg replan before any
+    /// result data leaves the node. Gate attaches its own request lifecycle to
+    /// the returned stream afterwards rather than through this path.
     ///
     /// # Errors
     /// Returns the same stable query, catalog, admission, visibility, audit,
@@ -2496,13 +2626,12 @@ impl Oracle {
             search_role = "oracle"
         )
     )]
-    async fn query_sql_with_cut_and_gate_lifecycle(
+    async fn run_sql_query_attempt_loop(
         &self,
         context: AuthorizedQueryContext,
         request: BifrostQueryRequest,
         participant_cut: OracleQueryAttemptCut,
         query_class: QueryClass,
-        gate_lifecycle: Option<Arc<crate::oracle::query_stream::QueryStreamLifecycle>>,
         mut prepared: Option<PlannedSqlCut>,
         analytical: Option<analytical::AnalyticalAttemptContext>,
     ) -> Result<OracleQueryStream, BifrostError> {
@@ -2540,7 +2669,6 @@ impl Oracle {
                         tables: &tables,
                         deadline,
                         retry_ordinal,
-                        gate_lifecycle: gate_lifecycle.as_ref().map(Arc::clone),
                         participant_cut: &participant_cut,
                         query_class,
                         // Only the first attempt may reuse the classification
@@ -2639,6 +2767,71 @@ impl Oracle {
         Ok((session, admitted, running_query))
     }
 
+    /// Reuses this attempt's already-pinned plan, or pins a fresh one.
+    ///
+    /// Only the first attempt may reuse the classification snapshot taken
+    /// during admission; a stale-Iceberg retry exists precisely to observe a
+    /// newer catalog, so it arrives with no prepared plan and pins again. The
+    /// resulting class is checked against the class the participant cut was
+    /// signed for, because a replan that changed class would execute a query
+    /// under an envelope that was never admitted for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the planner's stable catalog, visibility, or timeout errors, and
+    /// [`BifrostError::QueryPeerSecurity`] when the pinned plan's class differs
+    /// from the class signed into the cut.
+    async fn plan_or_reuse_attempt(
+        &self,
+        inputs: AttemptPlanInputs<'_>,
+    ) -> Result<PlannedSqlCut, BifrostError> {
+        let AttemptPlanInputs {
+            context,
+            sql,
+            tables,
+            deadline,
+            participant_cut,
+            prepared,
+            expected_query_class,
+        } = inputs;
+        let planned = match prepared {
+            Some(planned) => planned,
+            None => {
+                self.plan_sql_attempt(
+                    context,
+                    sql,
+                    tables,
+                    deadline,
+                    oracle_cut_cpu_cores(participant_cut),
+                )
+                .await?
+            }
+        };
+        if planned.query_class == expected_query_class {
+            Ok(planned)
+        } else {
+            Err(BifrostError::QueryPeerSecurity)
+        }
+    }
+
+    /// Runs one complete SQL attempt from plan to a settled query stream.
+    ///
+    /// The order here is the whole contract: the plan is pinned or reused and
+    /// its class checked against the signed cut, the envelope is admitted and
+    /// leased, the cut is audited and its live tails drained, the physical plan
+    /// executes, and only then is the first batch awaited and the stream
+    /// settled. An attempt that fails before output may be replaced once by its
+    /// caller's stale-replan loop; one that has produced output may not.
+    ///
+    /// Returns `Ok(None)` when this attempt was refused for a reason its caller
+    /// may retry, which is the signal the attempt loop replans on.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable planning, admission, audit, visibility, timeout, or
+    /// execution error that terminated the attempt, and
+    /// [`BifrostError::QueryPeerSecurity`] when the pinned class disagrees with
+    /// the class signed into the participant cut.
     async fn run_sql_attempt(
         &self,
         input: SqlAttemptInput<'_>,
@@ -2650,29 +2843,22 @@ impl Oracle {
             tables,
             deadline,
             retry_ordinal,
-            gate_lifecycle,
             participant_cut,
             query_class: expected_query_class,
             prepared,
             analytical,
         } = input;
-        let stale_replacement = StaleReplacementGate::before_output(retry_ordinal);
-        let planned = match prepared {
-            Some(planned) => planned,
-            None => {
-                self.plan_sql_attempt(
-                    context,
-                    &request.sql,
-                    tables,
-                    deadline,
-                    oracle_cut_cpu_cores(participant_cut),
-                )
-                .await?
-            }
-        };
-        if planned.query_class != expected_query_class {
-            return Err(BifrostError::QueryPeerSecurity);
-        }
+        let planned = self
+            .plan_or_reuse_attempt(AttemptPlanInputs {
+                context,
+                sql: &request.sql,
+                tables,
+                deadline,
+                participant_cut,
+                prepared,
+                expected_query_class,
+            })
+            .await?;
         self.ensure_query_telemetry(query_telemetry, request.visibility, planned.query_class);
         let mut phases = AttemptPhaseTimer::started();
         let (session, mut admitted, running_query) = self
@@ -2703,7 +2889,6 @@ impl Oracle {
         };
         phases.drained();
         admitted.live_reservations = std::mem::take(&mut drained.reservations);
-        let degraded_tails = drained.degraded;
         let (schema, batches, scan_stats, degraded_sources) = match self
             .execute_sql_cut(SqlCutInput {
                 context,
@@ -2730,7 +2915,7 @@ impl Oracle {
                 return release_error(deadline, admitted, error, "execution rejection");
             }
         };
-        record_degraded_live_tail(&degraded_sources, degraded_tails);
+        record_degraded_live_tail(&degraded_sources, drained.degraded);
         settle_attempt_output(
             AttemptOutput {
                 schema,
@@ -2743,10 +2928,9 @@ impl Oracle {
             AttemptSettlement {
                 deadline,
                 retry_ordinal,
-                stale_replacement,
+                stale_replacement: StaleReplacementGate::before_output(retry_ordinal),
                 visibility: request.visibility,
                 freshness: request.freshness,
-                gate_lifecycle,
             },
             query_telemetry,
         )
@@ -4666,8 +4850,6 @@ struct AttemptSettlement {
     visibility: VisibilityMode,
     /// Caller-selected source-loss policy retained on the returned stream.
     freshness: wyrd_spec::vala::api::FreshnessPolicy,
-    /// Optional Gate request lifecycle transferred into the returned stream.
-    gate_lifecycle: Option<Arc<crate::oracle::query_stream::QueryStreamLifecycle>>,
 }
 
 /// Awaits the first batch and converts one executed attempt into a query stream.
@@ -4706,7 +4888,6 @@ async fn settle_attempt_output(
         stale_replacement,
         visibility,
         freshness,
-        gate_lifecycle,
     } = settle;
     let Ok(first) =
         tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), batches.next()).await
@@ -4778,7 +4959,9 @@ async fn settle_attempt_output(
         stale_replanned: retry_ordinal == 1,
         query_telemetry,
         scan_stats,
-        gate_lifecycle,
+        // Gate attaches its own lifecycle to the returned stream through
+        // `with_gate_lifecycle`; nothing on the attempt path owns one.
+        gate_lifecycle: None,
         running_query: Some(running_query),
     })))
 }

@@ -387,29 +387,23 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
                 }
             }
         };
-        let failed_outcome = settle_failed_cancellation(
-            candidate.outcome,
-            &stream_telemetry_cancelled,
-            &request_cancellation,
-            &stream_cancellation,
-        );
         drop(next);
         drop(batches);
-        settle_distributed(&distributed_settlement, candidate.outcome, &stream_cancellation).await;
-        settle_analytical(&mut admitted, candidate.outcome).await;
-        let candidate = close_ipc_stream(&mut ipc, candidate, visibility, row_count);
-        let terminal = release_and_finish_terminal(
-            &mut admitted,
-            &mut query_telemetry,
-            gate_lifecycle.as_ref(),
+        let terminal = settle_and_finish_stream(StreamSettlementInputs {
             candidate,
-            failed_outcome,
+            stream_telemetry_cancelled: &stream_telemetry_cancelled,
+            request_cancellation: &request_cancellation,
+            stream_cancellation: &stream_cancellation,
+            distributed_settlement: &distributed_settlement,
+            admitted: &mut admitted,
+            ipc: &mut ipc,
+            query_telemetry: &mut query_telemetry,
+            gate_lifecycle: gate_lifecycle.as_ref(),
+            running_query: &mut running_query,
             visibility,
             row_count,
-        );
-        if let Some(owner) = &mut running_query {
-            owner.finish(terminal.outcome);
-        }
+        })
+        .await;
         yield Ok(QueryStreamFrame::Terminal(terminal));
     };
     Box::pin(frames)
@@ -457,6 +451,88 @@ fn collect_degraded_sources(
             ObservedDegradation { sources, reasons }
         },
     )
+}
+
+/// Everything one drained query stream must settle before it reports a terminal.
+///
+/// Grouped because settlement and terminal assembly are one ordered act: the
+/// cancellation signals, the distributed fan-out, the Analytical ownership, the
+/// IPC writer, admission, telemetry, and the running-query registry are all
+/// closed in a fixed order, and none of them is meaningful apart from it.
+struct StreamSettlementInputs<'a> {
+    /// Terminal frame candidate the batch loop broke with.
+    candidate: QueryTerminalFrame,
+    /// Whether stream telemetry already recorded an explicit cancellation.
+    stream_telemetry_cancelled: &'a Arc<AtomicBool>,
+    /// Request-scoped cancellation, signalled on a failed terminal.
+    request_cancellation: &'a CancellationToken,
+    /// Stream-scoped cancellation, signalled on a failed terminal.
+    stream_cancellation: &'a CancellationToken,
+    /// Distributed fan-out this query must join before it settles.
+    distributed_settlement: &'a Arc<super::admission::DistributedQuerySettlement>,
+    /// Admission guard whose Analytical ownership settles with the stream.
+    admitted: &'a mut Option<AdmittedQueryGuard>,
+    /// Arrow IPC writer closed after the last batch frame.
+    ipc: &'a mut QueryIpcEncoder,
+    /// Query telemetry guard that emits this stream's terminal outcome.
+    query_telemetry: &'a mut super::QueryTelemetryGuard,
+    /// Gate lifecycle notified of the terminal, when this query has one.
+    gate_lifecycle: Option<&'a Arc<QueryStreamLifecycle>>,
+    /// Running-query registry entry retired with the terminal outcome.
+    running_query: &'a mut Option<RunningQueryTerminalOwner>,
+    /// Visibility mode governing what a failed terminal may disclose.
+    visibility: VisibilityMode,
+    /// Rows emitted before the terminal, reported on every outcome.
+    row_count: u64,
+}
+
+/// Settles every owner the drained stream holds and assembles its terminal.
+///
+/// Cancellation is projected first so a failed terminal signals both tokens
+/// before anything waits on them; the distributed fan-out is joined next so no
+/// peer work outlives the stream; the Analytical attempt settles after that,
+/// because its ownership is what releases the query envelope the fan-out
+/// charged against. Only then is the IPC stream closed, admission released,
+/// telemetry finished, and the registry entry retired — so a terminal frame is
+/// never emitted while any owner it accounts for is still live.
+async fn settle_and_finish_stream(inputs: StreamSettlementInputs<'_>) -> QueryTerminalFrame {
+    let StreamSettlementInputs {
+        candidate,
+        stream_telemetry_cancelled,
+        request_cancellation,
+        stream_cancellation,
+        distributed_settlement,
+        admitted,
+        ipc,
+        query_telemetry,
+        gate_lifecycle,
+        running_query,
+        visibility,
+        row_count,
+    } = inputs;
+    let outcome = candidate.outcome;
+    let failed_outcome = settle_failed_cancellation(
+        outcome,
+        stream_telemetry_cancelled,
+        request_cancellation,
+        stream_cancellation,
+    );
+    settle_distributed(distributed_settlement, outcome, stream_cancellation).await;
+    settle_analytical(admitted, outcome).await;
+    let candidate = close_ipc_stream(ipc, candidate, visibility, row_count);
+    let terminal = release_and_finish_terminal(
+        admitted,
+        query_telemetry,
+        gate_lifecycle,
+        candidate,
+        failed_outcome,
+        visibility,
+        row_count,
+    );
+    if let Some(owner) = running_query {
+        owner.finish(terminal.outcome);
+    }
+    terminal
 }
 
 /// Cancels the request and stream on a failed terminal and names the outcome.

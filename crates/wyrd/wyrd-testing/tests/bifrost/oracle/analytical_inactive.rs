@@ -755,3 +755,211 @@ async fn prove_pushdown_exchange_and_spill() -> Result<(), JourneyError> {
     cluster.shutdown().await?;
     Ok(())
 }
+
+/// Production telemetry covers the whole Analytical hot path, and every
+/// in-flight gauge returns to its baseline on both a drained and a cancelled
+/// terminal.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn pg_inactive_analytical_production_telemetry_covers_every_hot_path() {
+    prove_production_telemetry()
+        .await
+        .expect("inactive analytical production telemetry journey");
+}
+
+/// Drives one drained and one cancelled attempt and reads the production
+/// telemetry both left behind.
+///
+/// Every assertion here is made against the production `BifrostTelemetryCapture`
+/// reading the server's own Prometheus handle and trace capture — there is no
+/// test-only recorder and no Analytical-specific telemetry owner. Identities
+/// stay in scrubbed spans rather than metric labels, so the journey asserts
+/// closed label domains on the metrics and identity on the spans.
+///
+/// # Errors
+///
+/// Returns a cluster, execution, telemetry, or assertion error.
+async fn prove_production_telemetry() -> Result<(), JourneyError> {
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::six_capacity()).await?;
+    let tenant = cluster.data_tenant_id();
+    let table = seed_table(&cluster, "analytical_telemetry").await?;
+    let query_server = cluster.server(0).ok_or("missing query node")?;
+    let engine = Arc::clone(
+        query_server
+            .state()
+            .bifrost_query()
+            .ok_or("query node composed no Oracle")?
+            .engine(),
+    );
+    let sql = format!(
+        "SELECT filter_key, count(*) AS rows FROM vala.bifrost.{table} GROUP BY filter_key"
+    );
+
+    let checkpoint = cluster
+        .telemetry()
+        .checkpoint()
+        .map_err(|e| e.to_string())?;
+    let drained = execute_inactive_analytical(query_server, tenant, &sql).await?;
+    if i64::try_from(drained.rows())? != FIXTURE_GROUPS {
+        return Err(format!(
+            "grouped aggregate expected {FIXTURE_GROUPS} rows, saw {}",
+            drained.rows()
+        )
+        .into());
+    }
+    let mut cancelled = engine
+        .query_sql_inactive_analytical(query_context(tenant)?, request(&sql), attempt_context())
+        .await?;
+    let _first = cancelled.frames.next().await;
+    cancelled.cancel().await;
+    await_clean_nodes(&cluster).await?;
+    let delta = cluster
+        .telemetry()
+        .delta_since(&checkpoint)
+        .map_err(|e| e.to_string())?;
+
+    // Stage authorization and dispatch: both halves of the protocol are
+    // separately observable, and nothing was refused.
+    for operation in ["set_plan", "execute_task"] {
+        let authorized = labelled_metric(
+            &delta,
+            "bifrost_oracle_analytical_stage_authority_total",
+            &[("operation", operation), ("outcome", "authorized")],
+        );
+        if authorized <= 0.0 {
+            return Err(format!("no authorized {operation} stage operation was observed").into());
+        }
+        let dispatched = labelled_metric(
+            &delta,
+            "bifrost_oracle_analytical_stage_operations_total",
+            &[("operation", operation)],
+        );
+        if dispatched <= 0.0 {
+            return Err(format!("no dispatched {operation} stage operation was observed").into());
+        }
+        for outcome in ["signature", "binding", "body", "expired", "replay"] {
+            let refused = labelled_metric(
+                &delta,
+                "bifrost_oracle_analytical_stage_authority_total",
+                &[("operation", operation), ("outcome", outcome)],
+            );
+            if refused != 0.0 {
+                return Err(format!(
+                    "an authorized journey recorded a {outcome} refusal on {operation}"
+                )
+                .into());
+            }
+        }
+    }
+
+    // Exchange: follower result data actually crossed the network.
+    if sum_metric(&delta, "bifrost_oracle_analytical_exchange_batches_total") <= 0.0
+        || sum_metric(&delta, "bifrost_oracle_analytical_exchange_bytes_total") <= 0.0
+    {
+        return Err("the distributed exchange published no transfer telemetry".into());
+    }
+
+    // Terminal settlement: both terminals are attributed to their own outcome,
+    // and no attempt settled as an unexplained failure.
+    let succeeded = labelled_metric(
+        &delta,
+        "bifrost_oracle_analytical_attempts_total",
+        &[("outcome", "success")],
+    );
+    let cancelled_attempts = labelled_metric(
+        &delta,
+        "bifrost_oracle_analytical_attempts_total",
+        &[("outcome", "cancelled")],
+    );
+    if succeeded <= 0.0 || cancelled_attempts <= 0.0 {
+        return Err(format!(
+            "attempt terminals were not attributed: success={succeeded} cancelled={cancelled_attempts}"
+        )
+        .into());
+    }
+
+    // Resource release: every in-flight gauge is back at its baseline.
+    for gauge in [
+        "bifrost_oracle_analytical_attempts_active",
+        "bifrost_oracle_analytical_exchanges_active",
+        "oracle_queries_active",
+        "oracle_queries_queued",
+    ] {
+        let retained = final_gauge(&delta, gauge);
+        if retained != 0.0 {
+            return Err(format!("{gauge} did not return to baseline, saw {retained}").into());
+        }
+    }
+
+    // Correlated traces: the leader query span and the attempt span are both
+    // published, and the attempt span carries its identities as scrubbed span
+    // fields rather than as metric labels.
+    let attempts = delta
+        .spans
+        .iter()
+        .filter(|span| span.name == "bifrost.oracle.analytical.attempt")
+        .collect::<Vec<_>>();
+    if attempts.is_empty() {
+        return Err("no Analytical attempt span reached the production trace capture".into());
+    }
+    if !attempts.iter().any(|span| {
+        span.attributes.contains_key("public_query_id")
+            && span.attributes.contains_key("datafusion_query_id")
+            && span
+                .attributes
+                .get("outcome")
+                .is_some_and(|o| o == "success")
+    }) {
+        return Err("no attempt span carried both identities and a success outcome".into());
+    }
+    if !delta
+        .spans
+        .iter()
+        .any(|span| span.name == "bifrost.oracle.query")
+    {
+        return Err("the Analytical journey published no leader query span".into());
+    }
+
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Sums one production metric family restricted to an exact label set.
+///
+/// Analytical telemetry keeps every label closed, so a journey asserting on a
+/// specific operation or outcome must select by label rather than by family
+/// alone; a family-wide sum would let a refusal masquerade as an authorization.
+fn labelled_metric(
+    delta: &wyrd_testing::bifrost::telemetry::BifrostTelemetryDelta,
+    family: &str,
+    labels: &[(&str, &str)],
+) -> f64 {
+    delta
+        .metrics
+        .iter()
+        .filter(|sample| sample.family == family)
+        .filter(|sample| {
+            labels
+                .iter()
+                .all(|(key, value)| sample.labels.get(*key).is_some_and(|held| held == value))
+        })
+        .map(|sample| sample.value)
+        .sum()
+}
+
+/// Sums one production gauge family's closing values across every label set.
+///
+/// Read from the render that closed the capture window rather than from the
+/// sampled maxima: what a terminal-cleanup assertion needs is where the gauge
+/// came to rest, not how high it went while the query was in flight.
+fn final_gauge(
+    delta: &wyrd_testing::bifrost::telemetry::BifrostTelemetryDelta,
+    family: &str,
+) -> f64 {
+    delta
+        .gauge_final
+        .iter()
+        .filter(|sample| sample.family == family)
+        .map(|sample| sample.value)
+        .sum()
+}

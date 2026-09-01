@@ -332,7 +332,7 @@ impl std::fmt::Debug for BifrostFileWrite {
             .debug_struct("BifrostFileWrite")
             .field("location", &self.location)
             .field("open", &self.writer.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

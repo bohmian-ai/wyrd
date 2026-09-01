@@ -525,6 +525,14 @@ pub struct AnalyticalAttemptTelemetry {
     started_at: Instant,
     /// Whether a terminal outcome has already been recorded.
     finished: bool,
+    /// Production span carrying this attempt's scrubbed identity and outcome.
+    ///
+    /// Held rather than entered: the attempt outlives any single `await`, so
+    /// what the span provides is a correlatable record of one attempt's
+    /// lifetime and terminal outcome, not an ambient context for the work.
+    /// It closes when the guard drops, which is the same moment the in-flight
+    /// gauge returns to its baseline.
+    span: tracing::Span,
 }
 
 impl AnalyticalAttemptTelemetry {
@@ -536,7 +544,15 @@ impl AnalyticalAttemptTelemetry {
     #[must_use]
     pub fn start(public_query_id: &str, datafusion_query_id: &str, attempt: u8) -> Self {
         metrics::gauge!("bifrost_oracle_analytical_attempts_active").increment(1.0);
+        let span = tracing::info_span!(
+            "bifrost.oracle.analytical.attempt",
+            public_query_id,
+            datafusion_query_id,
+            attempt,
+            outcome = tracing::field::Empty
+        );
         tracing::debug!(
+            parent: &span,
             public_query_id,
             datafusion_query_id,
             attempt,
@@ -545,6 +561,7 @@ impl AnalyticalAttemptTelemetry {
         Self {
             started_at: Instant::now(),
             finished: false,
+            span,
         }
     }
 
@@ -557,6 +574,7 @@ impl AnalyticalAttemptTelemetry {
             return;
         }
         self.finished = true;
+        let elapsed = self.started_at.elapsed();
         metrics::counter!(
             "bifrost_oracle_analytical_attempts_total",
             "outcome" => outcome.as_str()
@@ -566,7 +584,14 @@ impl AnalyticalAttemptTelemetry {
             "bifrost_oracle_analytical_attempt_duration_seconds",
             "outcome" => outcome.as_str()
         )
-        .record(self.started_at.elapsed().as_secs_f64());
+        .record(elapsed.as_secs_f64());
+        self.span.record("outcome", outcome.as_str());
+        tracing::info!(
+            parent: &self.span,
+            outcome = outcome.as_str(),
+            duration_ms = elapsed.as_millis(),
+            "Oracle analytical attempt settled"
+        );
     }
 }
 

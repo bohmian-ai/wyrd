@@ -136,6 +136,10 @@ impl AnalyticalScanExec {
 
 impl std::fmt::Debug for AnalyticalScanExec {
     /// Renders only the non-secret scan identity and shape.
+    ///
+    /// The follower source resolver and the plan it resolves to are
+    /// deliberately omitted: neither is `Debug`, and a plan tree rendered
+    /// inside an operator's own `Debug` would recurse through the whole stage.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("AnalyticalScanExec")
@@ -145,7 +149,7 @@ impl std::fmt::Debug for AnalyticalScanExec {
                 "partitions",
                 &self.properties.partitioning.partition_count(),
             )
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

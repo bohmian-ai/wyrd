@@ -917,6 +917,11 @@ async fn assert_held_authority_change_refuses(
     let span_mark = telemetry.mark();
     supervisor.restart_worker();
     let worker_stop = supervisor.worker_stop();
+    // Filled only by the branch-moved phase, from inside the held window: the
+    // cut the concurrent writer left is captured after its own commit and
+    // before publication is released, so it is an expectation this attempt
+    // cannot have influenced.
+    let concurrent_cut = std::sync::Mutex::new(None::<LiveCut>);
     let error = supervisor
         .run_one_failure_holding_handoff(async {
             match mutation {
@@ -936,6 +941,10 @@ async fn assert_held_authority_change_refuses(
                 HeldAuthorityMutation::BranchMovedByAnotherWriter => {
                     let target = planned.data.iter().next().expect("a delete target").clone();
                     promoted.publish_deletes(&target, Some(0), None).await;
+                    *concurrent_cut
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(live_cut(&promoted).await);
                 }
             }
         })
@@ -984,6 +993,9 @@ async fn assert_held_authority_change_refuses(
         mutation,
         span_mark,
         planned: &planned,
+        concurrent: concurrent_cut
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
         objects_before: &objects_before,
         possible_outputs,
         error: &error,
@@ -1007,6 +1019,13 @@ struct HeldAuthorityAftermath<'a> {
     span_mark: usize,
     /// Live cut the promotion left, before the mutation was applied.
     planned: &'a LiveCut,
+    /// Cut a concurrent writer committed inside the held window, when the
+    /// phase's mutation was such a commit.
+    ///
+    /// `Some` only for [`HeldAuthorityMutation::BranchMovedByAnotherWriter`],
+    /// where it is the independent expectation the post-refusal cut must equal.
+    /// Every other phase expects [`Self::planned`] unchanged, so it is `None`.
+    concurrent: Option<LiveCut>,
     /// Object digests taken immediately before the held attempt began.
     objects_before: &'a std::collections::BTreeMap<String, String>,
     /// Typed unsettled-output evidence the refusal carried, if it was typed.
@@ -1029,6 +1048,7 @@ async fn assert_refused_publication_left_no_trace(aftermath: HeldAuthorityAfterm
         mutation,
         span_mark,
         planned,
+        concurrent,
         objects_before,
         possible_outputs,
         error,
@@ -1039,10 +1059,25 @@ async fn assert_refused_publication_left_no_trace(aftermath: HeldAuthorityAfterm
     let after = live_cut(promoted).await;
     let expected = match mutation {
         // This phase's mutation *is* a real commit by another writer, so the
-        // authoritative cut is the one that writer left, read back directly.
-        HeldAuthorityMutation::BranchMovedByAnotherWriter => after.clone(),
+        // authoritative cut is the one that writer left — captured inside the
+        // held window, never re-read from the table after the refusal.
+        HeldAuthorityMutation::BranchMovedByAnotherWriter => concurrent
+            .unwrap_or_else(|| panic!("the branch-moved phase retained the concurrent cut")),
         _ => planned.clone(),
     };
+    if matches!(mutation, HeldAuthorityMutation::BranchMovedByAnotherWriter) {
+        // The concurrent commit has to have really attached something, or the
+        // equality below would be satisfied by a branch that never moved.
+        let attached = expected
+            .deletes
+            .difference(&planned.deletes)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert!(
+            !attached.is_empty(),
+            "the concurrent writer attached the delete this phase committed: {expected:?}"
+        );
+    }
     assert_eq!(
         after, expected,
         "a refused publication leaves the published cut exactly as it was ({mutation:?})"

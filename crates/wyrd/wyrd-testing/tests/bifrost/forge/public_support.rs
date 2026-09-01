@@ -5,6 +5,8 @@
 //! reads over the public strict fused query route — so a journey that uses them
 //! is exercising the shipped surface rather than an in-process engine.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef, TenantTableBinding};
@@ -13,6 +15,20 @@ use wyrd_spec::DataTenantId;
 use wyrd_testing::WyrdTestServer;
 
 use arrow::datatypes::{DataType, Field};
+
+/// Rows every strict fused public read in this process has really returned.
+///
+/// Counted where the result batches are decoded, so a journey reconciling
+/// Oracle's own returned-row counter compares it against what the public route
+/// actually streamed back rather than against the fixture rows it expected.
+/// Process-global because the runner gives each test its own process, so the
+/// count belongs to exactly one journey.
+static PUBLIC_ROWS_RETURNED: AtomicU64 = AtomicU64::new(0);
+
+/// Returns the rows strict fused public reads have returned in this process.
+pub(crate) fn public_rows_returned() -> u64 {
+    PUBLIC_ROWS_RETURNED.load(Ordering::Acquire)
+}
 
 /// Domain tag and version for the journey's canonical row digest.
 ///
@@ -250,6 +266,10 @@ pub(crate) async fn read_managed_rows(
 ///
 /// Panics when the batch does not carry the three columns in their declared
 /// managed Arrow types, which would mean the public projection changed shape.
+///
+/// Every decoded row is added to [`PUBLIC_ROWS_RETURNED`]. Both public read
+/// paths funnel through here, so the tally counts exactly the rows the server
+/// streamed back and nothing a caller merely expected.
 fn decode_managed_rows(batch: &arrow::record_batch::RecordBatch) -> Vec<ManagedRow> {
     let batch_ids = batch
         .column_by_name("wyrd_batch_id")
@@ -269,6 +289,7 @@ fn decode_managed_rows(batch: &arrow::record_batch::RecordBatch) -> Vec<ManagedR
         .as_any()
         .downcast_ref::<arrow::array::Int64Array>()
         .expect("the user column stays Int64");
+    PUBLIC_ROWS_RETURNED.fetch_add(batch.num_rows() as u64, Ordering::AcqRel);
     (0..batch.num_rows())
         .map(|row| {
             let raw: [u8; 16] = batch_ids

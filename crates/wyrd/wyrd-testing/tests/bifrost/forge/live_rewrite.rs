@@ -11,7 +11,8 @@ use wyrd_testing::bifrost::{WyrdTestCluster, shared_process_telemetry_for_test};
 
 use crate::public_support::{
     JourneyTable, ManagedRow, append_values, assert_tenant_scoped_not_found, canonical_order,
-    read_managed_rows, register_table, rows_digest, tenant_client, unique_table,
+    public_rows_returned, read_managed_rows, register_table, rows_digest, tenant_client,
+    unique_table,
 };
 
 /// Longest a journey waits for one production Forge attempt to return.
@@ -818,6 +819,10 @@ struct RecoveryTelemetry {
     input_bytes: u64,
     /// Byte volume the landed snapshot recorded as added.
     output_bytes: u64,
+    /// Rows public appends acknowledged inside the journey window.
+    acknowledged_rows: u64,
+    /// Rows strict fused public reads really returned inside the window.
+    returned_rows: u64,
 }
 
 /// Reads one numeric Iceberg snapshot summary property.
@@ -1000,17 +1005,37 @@ fn assert_recovery_telemetry(
     }
 
     // 6. The rest of the shipped route reported itself in the same window.
-    let families = journey
-        .metrics
-        .iter()
-        .map(|sample| sample.family.clone())
-        .collect::<BTreeSet<_>>();
-    for prefix in ["bifrost_scribe_", "oracle_", "bifrost_forge_"] {
-        assert!(
-            families.iter().any(|family| family.starts_with(prefix)),
-            "the production route reported its {prefix}* telemetry: {families:?}"
-        );
-    }
+    // Scribe and Oracle are proved by the quantity they moved, not by the
+    // presence of their metric families: a registered family carrying only
+    // zero-valued samples would satisfy a presence check while proving that
+    // this journey never traversed either production owner.
+    let accepted = counter_delta(
+        journey,
+        "bifrost_scribe_rows_total",
+        &[("status", "accepted")],
+    );
+    assert!(
+        (accepted - facts.acknowledged_rows as f64).abs() < f64::EPSILON,
+        "the production Scribe accepted exactly the rows public ingest acknowledged: \
+         {accepted} vs {}",
+        facts.acknowledged_rows
+    );
+    let returned = ["interactive", "analytical"]
+        .into_iter()
+        .map(|class| counter_delta(journey, "oracle_query_rows_total", &[("class", class)]))
+        .sum::<f64>();
+    assert!(
+        (returned - facts.returned_rows as f64).abs() < f64::EPSILON,
+        "the production Oracle returned exactly the rows the public reads streamed: \
+         {returned} vs {}",
+        facts.returned_rows
+    );
+    assert!(
+        facts.acknowledged_rows > 0 && facts.returned_rows > 0,
+        "the journey really drove both production owners: {} acknowledged, {} returned",
+        facts.acknowledged_rows,
+        facts.returned_rows
+    );
 
     // 7. Forge series stay fixed-cardinality: no durable identity leaks into a
     //    label key or value.
@@ -1661,6 +1686,10 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
             output_files: landed.added_data.len() as u64,
             input_bytes: landed.removed_bytes,
             output_bytes: landed.added_bytes,
+            acknowledged_rows: (owner_expected.len()
+                + neighbour_shared_expected.len()
+                + neighbour_only_expected.len()) as u64,
+            returned_rows: public_rows_returned(),
         },
     );
 }

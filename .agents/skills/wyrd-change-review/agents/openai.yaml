@@ -1,0 +1,4 @@
+interface:
+  display_name: "Wyrd Change Review"
+  short_description: "Verify an integrated Wyrd change"
+  default_prompt: "Use $wyrd-change-review to verify this immutable integrated Wyrd change against its approved spec, tasks, architecture, journeys, and evidence."

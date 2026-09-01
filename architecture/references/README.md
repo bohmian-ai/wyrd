@@ -43,6 +43,7 @@ references/
 | `doctrine/positioning-and-vocabulary.md` | Card vocabulary, envelope, `CardRef`, v1 kinds, or removed concepts |
 | `doctrine/architecture-constraints.md` | Wyrd/Vala/Skald boundaries, deployment, tenant isolation, or observation identity |
 | `architecture/patterns.md` | Ownership, contract placement, server/client/storage/provider/audit structure |
+| `languages/spec-driven-development.md` | Approved change specs, task decomposition, TDD execution, remediation, or final evidence mapping |
 | `languages/implementation-execution.md` | Execution authority, adaptation, verification recovery, or completion evidence |
 | `languages/rust-core.md` | Rust ownership, async, traits, allocation, or API shape |
 | `languages/pyo3-boundaries.md` | PyO3 classes, GIL, lifetimes, conversion, or module registration |
@@ -74,6 +75,7 @@ Use the smallest complete set; compound concerns should load each named slice:
 | “When should compaction refresh the catalog, and what can fail?” | `domain/iceberg.md` + `domain/datafusion.md` + `domain/analytical-operations-reliability.md` + `domain/olap-serving.md` |
 | “How do Python callers receive analytical data without copies or hidden IO?” | `domain/arrow-analytical-interop.md` + `languages/pyo3-boundaries.md` + `languages/python-api-and-stubs.md` |
 | “How should an MCP or HTTP surface expose this capability?” | `languages/agent-harness.md` + `doctrine/positioning-and-vocabulary.md` + `domain/vala-architecture.md` |
+| “How should this change move from approved behavior to TDD tasks and evidence?” | `languages/spec-driven-development.md` + `languages/implementation-execution.md` + `languages/testing-workflows.md` |
 | “This is a non-Vala Card, SDK, Rust, or server question.” | Start with the matching `doctrine/`, `architecture/`, or `languages/` slice; do not load domain references unless the evidence crosses into Vala. |
 
 ## Reading rules

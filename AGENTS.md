@@ -391,15 +391,33 @@ mise run py:format     # if Python files changed
 mise run py:lints      # if Python files changed
 ```
 
-Then run the narrowest `mise` test/check tasks that cover the touched surface:
+Then run the narrowest `mise` test/check tasks that cover the touched surface.
+`mise run <task>` is for module-, crate-, family-, environment-, or
+aggregate-level coverage. Every specifically named Rust, Python, or TypeScript
+test in a task artifact or implementation report must also include and run its
+exact focused command via `mise exec --`. Rust normally uses
+`cargo nextest run` with an explicit package, target, and exact test expression:
+
+```bash
+mise exec -- cargo nextest run --locked -p <crate> --lib \
+  -E 'test(=module::tests::test_name)'
+mise exec -- cargo nextest run --locked -p <crate> --test <target> \
+  -E 'test(=test_name)'
+```
+
+Inspect source and `mise exec -- cargo nextest list` when needed to confirm the
+exact name.
+Tests requiring Postgres or another repository-managed environment include the
+owning setup wrapper or use the narrowest environment-owning `mise` task. Do
+not use a positional filter that can pass after selecting no test.
 
 - Rust crate change: prefer the nearest crate-specific `mise run ...` task
   (`test:wyrd`, `test:skald`, `test:vala`, `test:shared`, `test:sql`,
   `test:bifrost`, `test:storage:matrix`, etc.). Whole-crate tests should use `mise` when a task exists because some
   crates need external dependencies, migrations, generated artifacts, or
-  environment variables that the mise task sets up. Use raw `cargo test` only
-  when no relevant mise task exists or when narrowing to a single pure unit
-  test that does not need repository setup.
+  environment variables that the mise task sets up. Specifically named Rust
+  tests use the exact `mise exec -- cargo nextest run` form above; include the
+  repository-managed setup wrapper when the test needs it.
 - Python package change: run `mise run py:test:unit`; add
   `mise run py:typecheck` when stubs, exports, or public Python typing changed.
 - Contract, schema, OpenAPI, or stub generation change: run
@@ -428,8 +446,9 @@ While working on a specific area:
 ```bash
 # Rust only
 # Whole-crate tests should use a crate-specific mise task when one exists.
-# Raw cargo is acceptable for a narrow pure unit test that needs no repo setup.
-mise exec -- cargo test --locked -p <crate> <test_name> -- --nocapture --test-threads=1
+# Named Rust tests use exact nextest expressions through the mise toolchain.
+mise exec -- cargo nextest run --locked -p <crate> --lib \
+  -E 'test(=module::tests::test_name)'
 mise run test:sql      # runs all SQL-backed integration tests across wyrd-sql, wyrd-dev-fixtures, and vala-sql
 mise run test:unit     # all Rust tests including SQL and storage emulators
 
@@ -506,8 +525,11 @@ failing — that is circumventing a gate, which the previous rule prohibits.
 
 ## 14. Planning
 
-Planning lives in the [`wyrd`](https://github.com/wyrd-ai/wyrd) repo. Additional/older planning files live in the [`wyrd-plan`](https://github.com/wyrd-ai/wyrd-plan) repo.
-Code in this repo lands one session at a time, via dialogue-locked decisions.
+Planning lives in the [`wyrd`](https://github.com/wyrd-ai/wyrd) repo.
+Additional historical planning lives in the
+[`wyrd-plan`](https://github.com/wyrd-ai/wyrd-plan) repo. Active changes follow
+the human-approved spec-driven workflow in
+`architecture/references/languages/spec-driven-development.md`.
 
 ### Agent skill bindings
 
@@ -515,48 +537,52 @@ Skills are referenced by name; each harness resolves a named skill from its
 own skill directory. Do not hard-code harness-specific skill paths in plans,
 task packets, or documentation.
 
-- The plan orchestrator reads this file, `architecture/wyrd-design.md`,
-  `architecture/wyrd-doctrine.mdx`, and the applicable repo-local skill before
-  decomposing work.
+The shared workflow skill source is `.agents/skills`; `.claude/skills` is its
+generated Claude discovery mirror. Run `mise run skills:sync` after editing a
+shared workflow skill and `mise run check:skills-sync` to detect drift. Codex
+`agents/openai.yaml` metadata remains only in the canonical source.
+
+- `$wyrd-spec` turns human intent into a decision-complete behavioral
+  specification. Only explicit human approval makes a revision authoritative.
+- `$wyrd-plan` decomposes an approved specification into cohesive TDD tasks or
+  creates bounded remediation tasks from validated `$wyrd-task-review`
+  findings. It never rewrites an approved spec to fit implementation.
+- `$wyrd-task-readiness` reviews one or more proposed tasks before
+  implementation. It is distinct from post-implementation task review.
 - Wyrd Rust, Python, TypeScript, server, CLI, MCP, storage, Vala, and contract
-  implementors must receive the `wyrd-implement` skill in their task packet.
-  It accepts actionable direct instructions and semantically complete task
-  artifacts; it does not require a dedicated plan controller or
-  planner-specific serialization.
+  implementors must receive the `$wyrd-implement` skill in their task packet.
+  It executes one ready task through scenario-by-scenario Red-Green-Refactor
+  cycles, then runs the broader focused verification required here.
 - Wyrd UI implementors additionally receive the `wyrd-ui` skill when their
   write set enters the UI tree.
 - Complete-plan execution uses the global `wyrd-implement-plan` controller in
   a dedicated clean worktree only when the user or plan explicitly invokes that
   global workflow. Do not substitute it automatically for another retired or
   absent controller.
-- Planning and implementation use a semantic claim-and-evidence contract.
-  `wyrd-plan` defines source-grounded outcomes, material decisions, cohesive
-  owners, direct dependencies, required claims, accepted evidence classes, and
-  credible proof. Its preferred packet sections are guidance, not a parser
-  contract. `wyrd-plan-review` reviews readiness without requiring an exact
-  handoff string, YAML shape, digest envelope, or scheduling strategy.
+- `$wyrd-task-review` performs read-only review of one immutable cumulative
+  task candidate. `REMEDIATE` findings return to `$wyrd-plan`;
+  behavior-changing conflicts return to `$wyrd-spec` and require renewed human
+  approval.
+- `$wyrd-change-review` performs the final immutable integrated review and maps
+  every required specification obligation to credible evidence, including
+  cross-task seams and user journeys.
 - There is no repo-local complete-plan controller. The calling agent or
   active execution harness owns transient scheduling, worktree choice, task
   sequencing, commits, integration, and resource management. Those mechanics
   must not become Wyrd `Change` lifecycle state, skill protocol metadata, or a
   renamed controller. Plans declare real dependencies and integrated evidence;
   the caller chooses how to execute them.
-- `wyrd-implement` owns one actionable task's complete implement, evidence,
-  and fix loop. It may accept direct instructions, task packets, or bounded
-  review findings. It reports claim-aligned evidence but does not verify or
-  authorize a Wyrd `Change`, finalize an `EvidenceManifest`, or imply merge.
-- `wyrd-review` supports read-only `CHECKPOINT` review of ongoing mutable
-  work and `FINAL` review of an immutable candidate. Checkpoint findings are
-  provisional and never approve completion. Final review owns candidate-local
-  correctness, task alignment, required-claim closure, and focused evidence.
-- The complete integration review runs the global `review-and-plan` skill; its
-  repo-specific review binding is the `wyrd-review` skill.
-  A plan may instead explicitly request repo-local `wyrd-review-and-plan` for terminal
-  integrated claim, seam, journey, and drift review. It accepts an immutable
-  base/target plus plan/task authority and available evidence; controller
-  manifests and generations are never required. Reversible findings return to
-  bounded implementation; only material decisions route through
-  `wyrd-plan` or the user.
+- Active spec and task artifacts have working durability on one
+  change/integration branch under `.dev/changes/<slug>`. Task branches fork
+  from and merge back into that branch. Before final review, the temporary
+  artifact tree is removed from the merge candidate; final review reads it
+  from a pinned authority commit. Main does not accumulate completed change
+  folders.
+- Skills and task packets reference architecture authorities and focused
+  references by repository-relative path. They never substitute skill prose
+  for `architecture/wyrd-design.md`, `architecture/bifrost-design.md`,
+  `architecture/agent-rules.md`, security/operations authorities, or the
+  canonical `architecture/references/` router.
 
 ## 15. Implementation Rules
 

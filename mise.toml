@@ -13,7 +13,8 @@
 #   mise run test:wyrd/skald/vala/shared   Family lanes (skip pg_tests, no docker needed).
 #   mise run py:test:unit   Python suite (builds the extension, then pytest).
 #
-#   cargo nextest run -p <crate> <name> --all-features    Iterate on one crate/test.
+#   mise exec -- cargo nextest run --locked -p <crate> --lib \
+#     -E 'test(=module::tests::name)'                     Iterate on one named test.
 #
 # Need a hidden task? `mise run <name>` still works; `mise tasks --hidden` lists all.
 # ============================================================================
@@ -1014,6 +1015,15 @@ cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-features --all-targets -- -D warnings
 """
 
+[tasks."skills:sync"]
+description = "Regenerate Claude workflow-skill mirrors from canonical .agents skills"
+run = "bash scripts/sync-agent-skills.sh --write"
+
+[tasks."check:skills-sync"]
+hide = true
+description = "Fail when Claude workflow-skill mirrors drift or retired skills reappear"
+run = "bash scripts/sync-agent-skills.sh --check"
+
 [tasks."codegen:regen"]
 description = "Regenerate OpenAPI / JSON schemas / MCP tool list / pyi stubs from source"
 run = """
@@ -1189,6 +1199,7 @@ run = "bash scripts/checks/fixtures-no-server.sh"
 description = "CI aggregate. Broad and slow — CI runs this. The local bar is `mise run check` plus the narrow tasks for what you touched (AGENTS.md §11)."
 depends = [
   "check",
+  "check:skills-sync",
   "test:unit",
   "test:bifrost",
   "codegen:check",
@@ -1348,4 +1359,3 @@ run = "bash scripts/postgres/test-roles.sh"
 hide = true
 description = "Validate the TOML-aware database task lifecycle inventory and regression fixture"
 run = "python3 scripts/postgres/check-inventory.py && python3 scripts/postgres/check-inventory.py --negative-test"
-

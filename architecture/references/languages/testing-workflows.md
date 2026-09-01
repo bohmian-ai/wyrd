@@ -57,9 +57,10 @@ aggregate for a default-feature-only workspace pass.
 
 ### Rust crate changes
 
-Prefer crate-family `mise` tasks (they set up env, migrations, and
-fixtures). Use raw `cargo test` only for narrow pure unit tests with no
-repo setup.
+Use crate-family `mise run` tasks for crate-, module-, family-, environment-,
+and aggregate-level coverage; they set up required env, migrations, and
+fixtures. Every specifically named Rust test uses an exact task-recorded
+`mise exec -- cargo nextest run` command.
 
 ```bash
 mise run test:wyrd            # wyrd/* family (no DB)
@@ -74,9 +75,19 @@ mise run test:bifrost:journey # Rust bifrost user-journey tests/multi-pod distri
 mise run test:e2e             # server-level e2e (wyrd-auth, wyrd-server, wyrd-testing, wyrd-client, vala-sdk)
 mise run test:storage:matrix  # storage emulator matrix (S3/GCS/Azure)
 
-# Narrow single-test iteration:
-mise exec -- cargo test --locked -p <crate> <test_name> -- --nocapture --test-threads=1
+# Narrow named lib test:
+mise exec -- cargo nextest run --locked -p <crate> --lib \
+  -E 'test(=module::tests::test_name)'
+
+# Narrow named integration-test target:
+mise exec -- cargo nextest run --locked -p <crate> --test <target> \
+  -E 'test(=test_name)'
 ```
+
+Confirm exact target and test names from source and, when needed,
+`mise exec -- cargo nextest list`. Include repository-managed setup in the
+command for tests that require Postgres, storage emulators, or a live server.
+Do not use a positional filter that can pass after selecting no test.
 
 `--all-features` in test commands forces the heavy feature union to recompile
 and defeats artifact reuse. Prefer default features or the exact feature set

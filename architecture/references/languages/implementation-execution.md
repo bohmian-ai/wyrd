@@ -25,9 +25,12 @@ Apply instructions in this order:
 
 1. current user instructions and explicitly locked outcomes;
 2. applicable `AGENTS.md` files and repository architecture authorities;
-3. the request's requirements, constraints, claims, and accepted evidence;
-4. repository conventions and established owner patterns;
-5. local implementation preferences.
+3. the approved change specification revision when the work belongs to a
+   spec-driven change;
+4. the ready implementation or remediation task derived from that revision;
+5. tests that express the mapped specification obligations;
+6. repository conventions and established owner patterns;
+7. local implementation preferences.
 
 The request fixes required behavior, acceptance outcomes, explicitly approved
 public or persisted contracts, prohibited changes, and safety boundaries.
@@ -47,13 +50,10 @@ Before editing, establish:
 - tests, focused verification, and completion evidence;
 - material stop conditions.
 
-Direct instructions, issues, Markdown, structured packets, and bounded review
-findings are all valid inputs. No YAML shape, section name, ID, digest, clean
-worktree, fixed write set, or predeclared command is required. When explicit
-claims are absent, derive a concise working checklist from the requested
-behavior and repository completion rules. A stale private name, defective
-command recipe, or missing local test setup does not make an otherwise clear
-behavioral contract malformed.
+An approved task is the normal input for a spec-driven change. Bounded direct
+instructions remain valid outside that workflow when they are already
+decision-complete and the caller explicitly requests implementation. Do not use
+that exception to bypass an approved spec or unresolved material design.
 
 Keep the checklist live until every actionable requirement and required proof
 is complete.
@@ -206,7 +206,9 @@ Follow `AGENTS.md` and the applicable language references. In particular:
   cancellation, side effects, errors, and invariants;
 - prefer existing concrete owners and repository patterns;
 - avoid speculative abstractions, dependencies, features, and cleanup;
-- write tests alongside changed behavior;
+- execute behavioral scenarios through the Red-Green-Refactor loop defined in
+  [spec-driven development](spec-driven-development.md), one scenario at a
+  time;
 - map every test to an acceptance criterion;
 - preserve the repository's required rustdoc and struct-centered Rust style.
 - keep tenant SQL behind `TenantConn` or the explicitly authorized
@@ -235,7 +237,8 @@ is a material blocker.
 
 Run the smallest complete affected surface sequentially:
 
-1. narrow test or reproduction;
+1. each named narrow test or reproduction through its exact
+   `mise exec -- cargo nextest run ... -E 'test(=...)'` command;
 2. broader affected owner or package task;
 3. applicable integration, contract, codegen, typing, migration, docs, or
    boundary checks;
@@ -243,9 +246,11 @@ Run the smallest complete affected surface sequentially:
 5. `git diff --check`;
 6. final diff inspection.
 
-Prefer repository `mise` tasks after inspecting their implementation and setup.
-Use direct Cargo for a narrow pure test or focused filter when no suitable task
-exists. Run Cargo-backed work sequentially across agents sharing a target.
+Use repository `mise run` tasks for module-, crate-, family-, environment-, and
+aggregate-level coverage after inspecting their implementation and setup. Use
+`mise exec --` with `cargo nextest run` for a specifically named Rust test,
+including its explicit package, target, features, and exact test expression.
+Run Cargo-backed work sequentially across agents sharing a target.
 
 Use default features unless the affected behavior explicitly requires optional
 features. Do not use `--all-features` for focused verification unless the

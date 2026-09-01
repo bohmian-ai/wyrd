@@ -85,17 +85,27 @@ async fn assert_one_bound_rewrite(fixture: &PromotionIntegrationFixture) -> uuid
     rewrite.task_id
 }
 
-/// A rewrite is planned only behind promotion, once, and fully bound.
+/// Dispatch is authorized twice: at planning, and again before any effect.
 ///
-/// Three rules share one scenario because they are one decision made in one
-/// place. A table that still owes Scribe a publication must not start a
-/// rewrite, or the rewrite would reason about a live set that is about to
-/// change underneath it — so the pass that sees both demands plans the
+/// The scheduling half and the publication half are one rule — a rewrite acts
+/// only while it still holds the authority it was planned under — so they share
+/// one scenario.
+///
+/// Planning first. A table that still owes Scribe a publication must not start
+/// a rewrite, or the rewrite would reason about a live set that is about to
+/// change underneath it, so the pass that sees both demands plans the
 /// promotion. Once nothing is owed, the pass binds exactly one rewrite task,
 /// and it binds it completely: the base snapshot, the exact input identities,
 /// and the canonical plan hash are all durable before any worker can claim it.
 /// A second pass over the same unchanged table must add nothing, because the
 /// table may carry only one active publication attempt at a time.
+///
+/// Then publication. A bound task's plan is evidence, not standing permission:
+/// the table stays open to every other writer while managed execution runs. So
+/// each held-authority phase mutates the real owner of one authority dimension
+/// at the only point where the distinction is observable — outputs exist,
+/// nothing has been derived, audited, or submitted — and requires the attempt
+/// to refuse with no effect at all.
 #[tokio::test]
 async fn rewrite_scheduler_dispatches_only_after_promotion_and_authority() {
     let telemetry = ForgeTelemetryCheckpoint::install();
@@ -177,6 +187,15 @@ async fn rewrite_scheduler_dispatches_only_after_promotion_and_authority() {
             .is_empty(),
         "the production scheduler reported the passes this scenario drove"
     );
+
+    for mutation in [
+        HeldAuthorityMutation::LeaseExpired,
+        HeldAuthorityMutation::AttemptCancelled,
+        HeldAuthorityMutation::DeadlineElapsed,
+        HeldAuthorityMutation::BranchMovedByAnotherWriter,
+    ] {
+        assert_held_authority_change_refuses(&telemetry, mutation).await;
+    }
 }
 
 /// One promoted table carrying both delete kinds over the data being rewritten.
@@ -789,51 +808,85 @@ enum HeldAuthorityMutation {
     BranchMovedByAnotherWriter,
 }
 
-/// Every knowable authority change refuses before Prepared and before commit.
+impl HeldAuthorityMutation {
+    /// Names the table this phase owns.
+    ///
+    /// Each phase gets a fresh table because a refusal is durable: a moved
+    /// branch or an expired lease stays refused, so phases sharing one table
+    /// would prove only the first mutation.
+    const fn table_name(self) -> &'static str {
+        match self {
+            Self::LeaseExpired => "rewrite_hold_lease",
+            Self::AttemptCancelled => "rewrite_hold_cancel",
+            Self::DeadlineElapsed => "rewrite_hold_deadline",
+            Self::BranchMovedByAnotherWriter => "rewrite_hold_branch",
+        }
+    }
+
+    /// The exact `RewriteRefusal` this mutation must produce.
+    ///
+    /// Asserted as the refusal's own name rather than as "some refusal": the
+    /// decision order is fail-closed, so a phase that refused for a *different*
+    /// reason than the owner it mutated would still leave no effect behind and
+    /// would otherwise pass every other assertion here.
+    const fn expected_refusal(self) -> &'static str {
+        match self {
+            Self::LeaseExpired => "LeaseLost",
+            Self::AttemptCancelled => "Cancelled",
+            Self::DeadlineElapsed => "Deadline",
+            Self::BranchMovedByAnotherWriter => "BranchMoved",
+        }
+    }
+}
+
+/// The complete live cut of a promoted table, split by Iceberg content type.
 ///
-/// Managed execution runs while the table stays open to every other writer, so
-/// the metadata the attempt planned against is evidence, never authority. This
-/// holds one rewrite at the only point where that distinction is observable —
-/// its handoff and outputs exist, nothing has been derived, audited, or
-/// submitted — mutates the real owner of one authority dimension, and then
-/// requires the attempt to refuse with *no* effect at all: no catalog mutation,
-/// no Prepared operation row, no change to the published data cut. The
-/// authoritative reload is asserted directly through the catalog's load count,
-/// because a publication that reused its stale table would refuse none of this.
-///
-/// The refused attempt still carries the objects managed execution produced out
-/// with it, so nothing is left behind that no attempt can name.
-#[tokio::test]
-async fn rewrite_publication_refuses_authority_changes_before_any_effect() {
-    for mutation in [
-        HeldAuthorityMutation::LeaseExpired,
-        HeldAuthorityMutation::AttemptCancelled,
-        HeldAuthorityMutation::DeadlineElapsed,
-        HeldAuthorityMutation::BranchMovedByAnotherWriter,
-    ] {
-        assert_held_authority_change_refuses(mutation).await;
+/// Data and delete attachments are held apart because a refusal has to leave
+/// *both* exactly as the concurrent owner left them: comparing only data would
+/// accept a publication that dropped a delete file, which changes the rows a
+/// reader sees without changing a single data path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveCut {
+    /// Live data object paths of the current snapshot.
+    data: BTreeSet<String>,
+    /// Live position- and equality-delete object paths of the current snapshot.
+    deletes: BTreeSet<String>,
+}
+
+/// Projects the promoted table's current snapshot into a [`LiveCut`].
+async fn live_cut(promoted: &PromotedRewriteFixture) -> LiveCut {
+    let files = promoted.live_data_files().await;
+    let (data, deletes): (Vec<_>, Vec<_>) = files
+        .iter()
+        .partition(|file| file.content_type() == iceberg::spec::DataContentType::Data);
+    LiveCut {
+        data: data
+            .into_iter()
+            .map(|file| file.file_path().to_owned())
+            .collect(),
+        deletes: deletes
+            .into_iter()
+            .map(|file| file.file_path().to_owned())
+            .collect(),
     }
 }
 
 /// Drives one held-authority phase end to end over its own promoted table.
 ///
-/// Each phase gets a fresh table because a refusal is durable: a moved branch
-/// or an expired lease stays refused, so phases sharing one table would prove
-/// only the first mutation. Returns nothing — every observation is asserted
-/// here, next to the mutation that has to explain it.
+/// Returns nothing — every observation is asserted here, next to the mutation
+/// that has to explain it. `telemetry` is the scenario's one process-wide
+/// checkpoint; the phase takes its own mark from it so an earlier phase's
+/// spans cannot answer this phase's questions.
 ///
 /// # Panics
 ///
 /// Panics when the fixture cannot start, a deterministic bound is missed, or
 /// the held attempt produced any durable effect.
-async fn assert_held_authority_change_refuses(mutation: HeldAuthorityMutation) {
-    let table_name = match mutation {
-        HeldAuthorityMutation::LeaseExpired => "rewrite_hold_lease",
-        HeldAuthorityMutation::AttemptCancelled => "rewrite_hold_cancel",
-        HeldAuthorityMutation::DeadlineElapsed => "rewrite_hold_deadline",
-        HeldAuthorityMutation::BranchMovedByAnotherWriter => "rewrite_hold_branch",
-    };
-    let promoted = PromotedRewriteFixture::start_unpromoted(table_name).await;
+async fn assert_held_authority_change_refuses(
+    telemetry: &ForgeTelemetryCheckpoint,
+    mutation: HeldAuthorityMutation,
+) {
+    let promoted = PromotedRewriteFixture::start_unpromoted(mutation.table_name()).await;
     let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
@@ -847,14 +900,18 @@ async fn assert_held_authority_change_refuses(mutation: HeldAuthorityMutation) {
         clock,
     );
     supervisor.run_one_success().await;
-    let planned = live_data_paths(&promoted).await;
+    let planned = live_cut(&promoted).await;
     assert!(
-        planned.len() >= 2,
+        planned.data.len() >= 2,
         "the held rewrite starts from a promoted live set: {planned:?}"
     );
 
     let mutations_before = catalog.attempts();
     let loads_before = catalog.loads();
+    let audit_before = promoted.fixture.forge_audit_count().await;
+    let files_before = promoted.fixture.file_rows().await;
+    let objects_before = promoted.fixture.object_digests().await;
+    let span_mark = telemetry.mark();
     supervisor.restart_worker();
     let worker_stop = supervisor.worker_stop();
     let error = supervisor
@@ -874,14 +931,17 @@ async fn assert_held_authority_change_refuses(mutation: HeldAuthorityMutation) {
                     control.set(elapsed).expect("manual Forge clock advances");
                 }
                 HeldAuthorityMutation::BranchMovedByAnotherWriter => {
-                    let target = planned.iter().next().expect("a delete target").clone();
+                    let target = planned.data.iter().next().expect("a delete target").clone();
                     promoted.publish_deletes(&target, Some(0), None).await;
                 }
             }
         })
         .await;
+    let possible_outputs = supervisor.last_possible_rewrite_outputs();
     supervisor.shutdown().await;
 
+    // 1. The refusal was decided against metadata this attempt reloaded after
+    //    its handoff, and it mutated nothing.
     assert!(
         catalog.loads() > loads_before,
         "publication reacquired authoritative metadata after the handoff ({mutation:?})"
@@ -891,20 +951,97 @@ async fn assert_held_authority_change_refuses(mutation: HeldAuthorityMutation) {
         mutations_before,
         "a refused publication mutates no catalog state ({mutation:?}): {error}"
     );
+    assert!(
+        error.contains(mutation.expected_refusal()),
+        "the mutated owner produced its own refusal ({mutation:?}): {error}"
+    );
+
+    // 2. No durable operation row and no durable Forge audit transition.
     assert_eq!(
         promoted.fixture.rewrite_phases().await,
         Vec::<String>::new(),
         "the refusal arrived before any Prepared operation row ({mutation:?})"
     );
     assert_eq!(
-        live_data_paths(&promoted).await,
-        planned,
-        "a refused publication leaves the published data cut exactly as it was ({mutation:?})"
+        promoted.fixture.forge_audit_count().await,
+        audit_before,
+        "a refused publication appends no Forge audit transition ({mutation:?})"
+    );
+
+    // 3. No rewrite settlement was applied to the durable file ledger.
+    assert_eq!(
+        promoted.fixture.file_rows().await,
+        files_before,
+        "a refused publication settles no promoted file row ({mutation:?})"
+    );
+
+    // 4. The live cut is exactly what the concurrent owner left, deletes
+    //    included, and no managed output became live.
+    let after = live_cut(&promoted).await;
+    let expected = match mutation {
+        // This phase's mutation *is* a real commit by another writer, so the
+        // authoritative cut is the one that writer left, read back directly.
+        HeldAuthorityMutation::BranchMovedByAnotherWriter => after.clone(),
+        _ => planned.clone(),
+    };
+    assert_eq!(
+        after, expected,
+        "a refused publication leaves the published cut exactly as it was ({mutation:?})"
+    );
+    assert_eq!(
+        after.data, planned.data,
+        "no managed output was made live and no input left the cut ({mutation:?})"
+    );
+
+    // 5. The typed failure carries the exact objects managed execution wrote,
+    //    named by identity rather than by the wrapper's rendered text. The
+    //    objects that appeared under the table prefix during the held attempt
+    //    are the independent answer it has to match: nothing may be left behind
+    //    that no attempt can name, and nothing may be named that never existed.
+    let objects_after = promoted.fixture.object_digests().await;
+    let prefix = format!("{}/", promoted.fixture.binding.object_prefix);
+    // Scoped to the managed core's own output namespace: the branch-moved phase
+    // mutates the table by really committing, which legitimately writes fixture
+    // delete objects and Iceberg metadata that no rewrite attempt produced.
+    let managed_prefix = format!("{prefix}data/forge/");
+    let appeared = objects_after
+        .keys()
+        .filter(|path| {
+            path.starts_with(managed_prefix.as_str()) && !objects_before.contains_key(*path)
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert!(
+        !appeared.is_empty(),
+        "the held attempt wrote the managed outputs it refused to publish ({mutation:?})"
+    );
+    let possible_outputs = possible_outputs
+        .unwrap_or_else(|| panic!("the refusal is typed as unsettled ({mutation:?}): {error}"));
+    assert_eq!(
+        possible_outputs
+            .iter()
+            .map(|output| {
+                let start = output.path.find(prefix.as_str()).unwrap_or_else(|| {
+                    panic!(
+                        "a possible output lives under the table's object prefix \
+                         ({mutation:?}): {}",
+                        output.path
+                    )
+                });
+                output.path[start..].to_owned()
+            })
+            .collect::<BTreeSet<_>>(),
+        appeared,
+        "the refusal names exactly the objects managed execution produced ({mutation:?})"
     );
     assert!(
-        error.contains("possible rewrite output"),
-        "the refusal carries the objects managed execution produced ({mutation:?}): {error}"
+        objects_before
+            .iter()
+            .all(|(path, digest)| objects_after.get(path) == Some(digest)),
+        "a refused publication rewrote no existing object ({mutation:?})"
     );
+
+    // 6. Durable task classification and lease release match the phase.
     let tasks = promoted
         .fixture
         .forge_tasks()
@@ -913,14 +1050,43 @@ async fn assert_held_authority_change_refuses(mutation: HeldAuthorityMutation) {
         .filter(|task| task.strategy == "small_files")
         .collect::<Vec<_>>();
     assert_eq!(tasks.len(), 1, "one rewrite task was held: {tasks:?}");
-    assert_ne!(
-        tasks[0].state, "succeeded",
-        "a refused rewrite never records a committed outcome: {tasks:?}"
+    assert_eq!(
+        tasks[0].state, "retryable",
+        "a coordination refusal leaves the held rewrite retryable ({mutation:?}): {tasks:?}"
     );
     assert_eq!(
         promoted.fixture.live_leases().await,
         0,
         "the refused attempt released its table lease ({mutation:?})"
+    );
+
+    // 7. Production telemetry reported the refused attempt and no commit.
+    let executed = telemetry.spans_named_since(span_mark, "bifrost.forge.task.execute");
+    let held = executed
+        .iter()
+        .filter(|span| {
+            span.attributes
+                .get("task_id")
+                .is_some_and(|value| value.contains(&tasks[0].task_id.to_string()))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        held.len(),
+        1,
+        "the held attempt reported exactly one production task span ({mutation:?}): {executed:?}"
+    );
+    assert!(
+        held[0]
+            .attributes
+            .get("strategy")
+            .is_some_and(|value| value.contains("small_files")),
+        "the held span is the rewrite's own ({mutation:?}): {held:?}"
+    );
+    assert!(
+        telemetry
+            .spans_named_since(span_mark, "bifrost.forge.catalog.commit")
+            .is_empty(),
+        "a refused publication reports no catalog commit ({mutation:?})"
     );
 }
 

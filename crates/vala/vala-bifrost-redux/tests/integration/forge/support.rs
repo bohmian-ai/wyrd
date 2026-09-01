@@ -806,6 +806,33 @@ impl PromotionIntegrationFixture {
         .expect("fixture operation-state inspection")
     }
 
+    /// Counts the Forge audit rows this tenant's hash-chained outbox holds.
+    ///
+    /// Every durable Forge transition appends exactly one row, so an unchanged
+    /// count across a held attempt is the direct evidence that the attempt
+    /// recorded no Prepared, Reset, Committed, or Recovered transition — a
+    /// stronger statement than the absence of an operation-state row, which a
+    /// transition could in principle write without.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the read-only diagnostic query fails.
+    pub(crate) async fn forge_audit_count(&self) -> i64 {
+        let mut conn = self
+            .vala
+            .tenant_conn(self.tenant)
+            .await
+            .expect("fixture tenant connection");
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM vala.audit_outbox WHERE operation LIKE 'forge.%'",
+        )
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("fixture Forge audit inspection");
+        conn.commit().await.expect("fixture audit read commit");
+        count
+    }
+
     /// Ages every live claim deadline past due for this fixture's tenant.
     ///
     /// A worker that dies mid-attempt leaves its claim held until the deadline
@@ -1355,6 +1382,22 @@ impl SupervisedPromotion {
         self.worker_observer.returned_errors()
     }
 
+    /// Borrows the possible-output set the most recent returned failure carried.
+    ///
+    /// `None` when no attempt has returned an error yet, or when the newest one
+    /// was not an unsettled rewrite. The evidence is taken typed off the
+    /// production observer rather than parsed out of the rendered error,
+    /// because the object identities are exactly what a refusal has to preserve
+    /// and the wrapper's text carries only their count.
+    pub(crate) fn last_possible_rewrite_outputs(
+        &self,
+    ) -> Option<Vec<vala_bifrost_redux::forge::ForgeUnsettledOutput>> {
+        self.worker_observer
+            .returned_unsettled_outputs()
+            .pop()
+            .flatten()
+    }
+
     /// Cancel and join the worker before it can retry a returned attempt.
     ///
     /// # Panics
@@ -1823,8 +1866,28 @@ impl ForgeTelemetryCheckpoint {
 
     /// Returns the production spans finished since installation, by name.
     pub(crate) fn spans_named(&self, name: &str) -> Vec<wyrd_telemetry::CapturedSpan> {
+        self.spans_named_since(self.span_checkpoint, name)
+    }
+
+    /// Marks the current end of the finished-span stream.
+    ///
+    /// Installation is once per process, so a scenario that drives several
+    /// independent phases in one process needs a moving origin: a phase that
+    /// asserts "no catalog commit was reported" must not be answered by a
+    /// commit an earlier phase legitimately made. Pass the returned mark to
+    /// [`Self::spans_named_since`].
+    pub(crate) fn mark(&self) -> usize {
+        self.capture.checkpoint()
+    }
+
+    /// Returns the production spans finished since `mark`, by name.
+    pub(crate) fn spans_named_since(
+        &self,
+        mark: usize,
+        name: &str,
+    ) -> Vec<wyrd_telemetry::CapturedSpan> {
         self.capture
-            .finished_since(self.span_checkpoint)
+            .finished_since(mark)
             .into_iter()
             .filter(|span| span.name == name)
             .collect()

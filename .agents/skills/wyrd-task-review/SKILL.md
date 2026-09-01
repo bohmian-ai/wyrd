@@ -12,10 +12,11 @@ only the latest fix diff.
 
 ## Establish the review subject
 
-Require repository root, unambiguous base and candidate commits, the pinned
-approved spec revision, original task, available execution evidence, and any
-remediation tasks or prior findings. If the subject changes during review,
-return `BLOCKED` rather than implying the new candidate was reviewed.
+Require repository root, unambiguous base and candidate commits, the approved
+`changes/active/<slug>/spec.md` revision, the original active task, available
+execution evidence, and any remediation tasks or prior findings. If the subject
+changes during review, return `BLOCKED` rather than implying the new candidate
+was reviewed.
 
 Read `AGENTS.md`, [agent rules](../../../architecture/agent-rules.md),
 [spec-driven development](../../../architecture/references/languages/spec-driven-development.md),
@@ -71,5 +72,5 @@ Lead with the verdict, then findings, spec-obligation trace, prior-finding
 closure, verification limits, and reviewed commit identity. `REMEDIATE` routes
 validated findings to `$wyrd-plan`, not directly to ad hoc implementation.
 `APPROVE` approves only this task candidate; it does not merge, push, deploy, or
-replace final `$wyrd-change-review`.
-
+replace final `$wyrd-change-review`. The review phase does not edit the active
+packet; the caller or execution harness may record the returned verdict there.

@@ -10,12 +10,13 @@ Implementation reasoning belongs here; approved behavioral authority does not.
 
 ## Establish the task contract
 
-Read the approved spec revision, one ready task, its dependencies, and any
-parent task or validated findings. Confirm mapped `REQ-*`, `INV-*`, and `AC-*`
-obligations. A bounded direct instruction may be implemented outside the
-spec-driven workflow only when the caller explicitly requests it and no
-material design decision is unresolved; never use that exception to bypass an
-active approved spec.
+Read the approved spec revision at `changes/active/<slug>/spec.md`, one ready
+task under `changes/active/<slug>/tasks/`, its dependencies, and any parent task
+or validated findings. Confirm mapped `REQ-*`, `INV-*`, and `AC-*` obligations.
+A bounded direct instruction may be implemented outside the spec-driven
+workflow only when the caller explicitly requests it and no material design
+decision is unresolved; never use that exception to bypass an active approved
+spec.
 
 Read `AGENTS.md`, [agent rules](../../../architecture/agent-rules.md),
 [spec-driven development](../../../architecture/references/languages/spec-driven-development.md),
@@ -93,9 +94,9 @@ recovery path remains. Failed or missing proof is never success.
 
 ## Record and hand off
 
-When the task artifact is present, append compact execution evidence without
-rewriting its objective, mapped spec obligations, or accepted behavior. Record
-each scenario's expected RED failure, GREEN result, any refactor, broader
+Append compact execution evidence to the active task without rewriting its
+objective, mapped spec obligations, or accepted behavior. Record each
+scenario's expected RED failure, GREEN result, any refactor, broader
 verification, command corrections, and material limitations.
 
 Return `COMPLETE`, `SPEC_REVISION_REQUIRED`, or `BLOCKED`, followed by the

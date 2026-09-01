@@ -2,7 +2,15 @@
  * Source of truth: brand/palette.json. Regenerate with `pnpm tokens`.
  * Token names are identical to ./wyrd-ui-source-of-truth-v2.html. */
 
-[data-mode="light"] {
+[data-theme='wyrd'].theme-light,
+[data-theme='wyrd']:not(.theme-dark) {
+  /* fonts */
+  --font-sans: "Archivo", system-ui, sans-serif;
+  --font-display: "Archivo Black", sans-serif;
+  --font-mono: "JetBrains Mono", monospace;
+  --font-arcade: "Press Start 2P", monospace;
+  --font-pixel: "VT323", monospace;
+
   /* surface */
   --bg: #f4f4f5;
   --surface: #ffffff;
@@ -56,7 +64,14 @@
   /* geometry */
   --r: 5px;
 }
-[data-mode="dark"] {
+[data-theme='wyrd'].theme-dark {
+  /* fonts */
+  --font-sans: "Archivo", system-ui, sans-serif;
+  --font-display: "Archivo Black", sans-serif;
+  --font-mono: "JetBrains Mono", monospace;
+  --font-arcade: "Press Start 2P", monospace;
+  --font-pixel: "VT323", monospace;
+
   /* surface */
   --bg: #0e0e0e;
   --surface: #17171b;
@@ -110,3 +125,125 @@
   /* geometry */
   --r: 5px;
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   BRUTALIST UTILITY CLASSES — ported forward, re-pointed at canonical tokens.
+   Token VALUES come from the generated blocks above (brand/palette.json).
+   The Never-rule layers (glow, gradients, CRT scanlines/vignette, phosphor
+   text-shadow) are intentionally absent.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* Zero-radius enforcement — overrides every Tailwind .rounded-* in both modes. */
+[data-theme='wyrd'] .rounded,
+[data-theme='wyrd'] .rounded-none,
+[data-theme='wyrd'] .rounded-sm,
+[data-theme='wyrd'] .rounded-md,
+[data-theme='wyrd'] .rounded-lg,
+[data-theme='wyrd'] .rounded-xl,
+[data-theme='wyrd'] .rounded-2xl,
+[data-theme='wyrd'] .rounded-3xl,
+[data-theme='wyrd'] .rounded-t,
+[data-theme='wyrd'] .rounded-b,
+[data-theme='wyrd'] .rounded-l,
+[data-theme='wyrd'] .rounded-r {
+  border-radius: 0 !important;
+}
+/* Exception: true circles (avatars, status dots that should stay round). */
+[data-theme='wyrd'] .rounded-full {
+  border-radius: 9999px !important;
+}
+
+/* neo-card: canonical card surface */
+[data-theme='wyrd'] .neo-card {
+  background: var(--surface);
+  border: 2px solid var(--border);
+  box-shadow: 6px 6px 0 0 var(--shadow);
+  border-radius: 0;
+  transition: transform 0.12s ease, box-shadow 0.12s ease;
+}
+[data-theme='wyrd'] .neo-card:hover {
+  transform: translate(-2px, -2px);
+  box-shadow: 8px 8px 0 0 var(--shadow);
+}
+
+/* neo-btn: brutalist button with press-in animation */
+[data-theme='wyrd'] .neo-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.5rem 1.1rem;
+  background: var(--rune-btn);
+  color: var(--rune-btn-ink);
+  border: 2px solid var(--border);
+  box-shadow: 3px 3px 0 0 var(--shadow);
+  border-radius: 0;
+  font-family: var(--font-sans);
+  font-weight: 700;
+  font-size: 0.875rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  cursor: pointer;
+  user-select: none;
+  transition: transform 0.08s ease, box-shadow 0.08s ease;
+}
+[data-theme='wyrd'] .neo-btn:hover {
+  transform: translate(-1px, -1px);
+  box-shadow: 4px 4px 0 0 var(--shadow);
+}
+[data-theme='wyrd'] .neo-btn:active {
+  transform: translate(3px, 3px);
+  box-shadow: 0 0 0 0 var(--shadow);
+}
+[data-theme='wyrd'] .neo-btn--secondary {
+  background: var(--surface);
+  color: var(--text);
+}
+[data-theme='wyrd'] .neo-btn--dark {
+  background: var(--border);
+  color: var(--bg);
+}
+
+/* pixel-text: VT323 accents for IDs, version strings, timestamps */
+[data-theme='wyrd'] .pixel-text {
+  font-family: var(--font-pixel);
+  font-size: 1.4em;
+  line-height: 1;
+  letter-spacing: 0.05em;
+}
+
+/* mono-tag: uppercase JetBrains Mono pill/label (canonical pill surface) */
+[data-theme='wyrd'] .mono-tag {
+  display: inline-block;
+  padding: 3px 8px;
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  font-weight: 700;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  border: 2px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  border-radius: 0;
+}
+
+/* card-type pills — mapped onto The Line + canonical accents (per token role) */
+[data-theme='wyrd'] .card-tag--data       { background: var(--control);     color: var(--ink-on-fill);  border: 2px solid var(--border); }
+[data-theme='wyrd'] .card-tag--model      { background: var(--rune);        color: var(--rune-btn-ink); border: 2px solid var(--border); }
+[data-theme='wyrd'] .card-tag--experiment { background: var(--warn);        color: var(--ink-on-fill);  border: 2px solid var(--border); }
+[data-theme='wyrd'] .card-tag--prompt     { background: var(--rune-strong); color: var(--rune-btn-ink); border: 2px solid var(--border); }
+[data-theme='wyrd'] .card-tag--agent      { background: var(--client);      color: var(--ink-on-fill);  border: 2px solid var(--border); }
+[data-theme='wyrd'] .card-tag--service    { background: var(--server);      color: var(--ink-on-fill);  border: 2px solid var(--border); }
+
+/* status dots (drift/health indicators) */
+[data-theme='wyrd'] .status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  background: var(--ok);
+  border: 1.5px solid var(--border);
+  margin-right: 6px;
+  vertical-align: middle;
+  border-radius: 0;
+}
+[data-theme='wyrd'] .status-dot--warn  { background: var(--warn); }
+[data-theme='wyrd'] .status-dot--alert { background: var(--danger); }

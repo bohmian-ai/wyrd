@@ -10,7 +10,8 @@ without inventing or changing a material decision.
 
 ## Establish authority
 
-Read the approved spec revision and every proposed task. Read `AGENTS.md`,
+Read the approved spec revision at `changes/active/<slug>/spec.md` and every
+proposed task under `changes/active/<slug>/tasks/`. Read `AGENTS.md`,
 [agent rules](../../../architecture/agent-rules.md),
 [spec-driven development](../../../architecture/references/languages/spec-driven-development.md),
 [implementation execution](../../../architecture/references/languages/implementation-execution.md),
@@ -61,5 +62,5 @@ required task correction.
 Return one verdict: `READY`, `REVISE_TASKS`, `SPEC_REVISION_REQUIRED`, or
 `BLOCKED`. Lead with the verdict, summarize the nine axes, and list only
 blocking findings. For `READY`, state `No blocking readiness findings.` This
-review does not edit tasks, implement code, approve an implementation
-candidate, or authorize task branches.
+review does not edit the active packet, implement code, approve an
+implementation candidate, or authorize task branches.

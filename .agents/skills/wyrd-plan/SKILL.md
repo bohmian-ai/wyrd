@@ -79,10 +79,10 @@ runner, path, selector, and required setup.
 
 ## Write tasks
 
-Write tasks under `.dev/changes/<slug>/tasks/` on the active change branch.
-Task branches inherit them from the approved change branch and merge results
-back. Do not encode branch scheduling, worktrees, leases, or controller state
-in task artifacts.
+Write tasks under `changes/active/<slug>/tasks/` on the active change branch.
+Task branches inherit the complete packet from the approved change branch and
+merge results back. Do not encode branch scheduling, worktrees, leases, or
+controller state in task artifacts.
 
 Use proportionate Markdown containing:
 

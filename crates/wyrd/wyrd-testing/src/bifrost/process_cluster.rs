@@ -170,17 +170,120 @@ pub enum ControlRequest {
         /// Table name inside the `vala.bifrost` namespace.
         table: String,
     },
-    /// Dial another pod's private peer socket as this pod's own identity.
+    /// Dial another pod's private peer socket and report the wire outcome.
     ///
-    /// The child uses its configured peer TLS material and its peer Service
-    /// credential, so a success proves the destination admitted this exact
-    /// process — not that the parent could reach the socket.
-    DialPeer {
-        /// Advertised address of the destination pod.
-        address: String,
-    },
+    /// The child always presents its configured peer TLS material, so a
+    /// success proves the destination admitted this exact process rather than
+    /// that the parent could reach the socket. The plan selects which private
+    /// adapter is addressed, which workload credential is presented, and how
+    /// the first gRPC frame is laid out on the wire.
+    PeerProbe(PeerProbePlan),
+    /// Report how many request bodies this child's peer plane has polled.
+    PeerBodyPolls,
     /// Begin ordered shutdown and exit.
     Shutdown,
+}
+
+/// One private-plane wire probe a child performs against another pod.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerProbePlan {
+    /// Advertised address of the destination pod.
+    pub address: String,
+    /// Private adapter the probe addresses.
+    pub service: PeerProbeService,
+    /// Workload credential the probe presents.
+    pub credential: PeerProbeCredential,
+    /// How the probe lays the first gRPC frame onto the wire.
+    pub framing: PeerProbeFraming,
+}
+
+impl PeerProbePlan {
+    /// Builds the ordinary probe: this pod's own identity, one whole frame.
+    #[must_use]
+    pub fn own(address: &str) -> Self {
+        Self {
+            address: address.to_owned(),
+            service: PeerProbeService::OraclePeer,
+            credential: PeerProbeCredential::Own,
+            framing: PeerProbeFraming::Whole,
+        }
+    }
+
+    /// Addresses the upstream DataFusion worker adapter instead.
+    #[must_use]
+    pub fn against(mut self, service: PeerProbeService) -> Self {
+        self.service = service;
+        self
+    }
+
+    /// Presents `credential` instead of this pod's own peer identity.
+    #[must_use]
+    pub fn presenting(mut self, credential: PeerProbeCredential) -> Self {
+        self.credential = credential;
+        self
+    }
+
+    /// Lays the first gRPC frame out as `framing` describes.
+    #[must_use]
+    pub fn framed(mut self, framing: PeerProbeFraming) -> Self {
+        self.framing = framing;
+        self
+    }
+}
+
+/// Which private adapter a peer probe addresses.
+///
+/// Both adapters are mounted on the same private listener behind the same
+/// authentication layer, so a claim about peer authentication is only proved
+/// when it holds for both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PeerProbeService {
+    /// `wyrd.v1.OraclePeerService/ReserveSlots`.
+    OraclePeer,
+    /// Upstream `worker.WorkerService/ExecuteTask`.
+    AnalyticalWorker,
+}
+
+impl PeerProbeService {
+    /// Returns the gRPC path this adapter answers on.
+    #[must_use]
+    pub const fn path(self) -> &'static str {
+        match self {
+            Self::OraclePeer => "/wyrd.v1.OraclePeerService/ReserveSlots",
+            Self::AnalyticalWorker => "/worker.WorkerService/ExecuteTask",
+        }
+    }
+}
+
+/// Which workload credential a peer probe presents.
+///
+/// The token variant carries a parent-minted API key for a deliberately wrong
+/// principal; the child exchanges it exactly as it would its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PeerProbeCredential {
+    /// This pod's own configured peer Service credential.
+    Own,
+    /// No `x-wyrd-access-token` metadata at all.
+    Absent,
+    /// A syntactically invalid bearer that no verifier can accept.
+    Invalid,
+    /// A parent-supplied API key exchanged for a real access token.
+    ApiKey(String),
+}
+
+/// How a peer probe lays its first gRPC frame onto the wire.
+///
+/// HTTP/2 does not align DATA frames to gRPC message boundaries, so a private
+/// listener must admit a header split across frames and must not overread a
+/// frame carrying more than one message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PeerProbeFraming {
+    /// One DATA frame carrying exactly one complete message.
+    Whole,
+    /// The five-byte header split across two DATA frames.
+    SplitHeader,
+    /// Two complete messages coalesced into one DATA frame.
+    Coalesced,
 }
 
 /// One response a child sends to the parent over its stdout.
@@ -200,10 +303,15 @@ pub enum ControlResponse {
     },
     /// Answer to [`ControlRequest::RegisterTable`].
     Registered,
-    /// Answer to [`ControlRequest::DialPeer`].
-    Dialed {
-        /// Non-secret gRPC outcome the destination returned.
+    /// Answer to [`ControlRequest::PeerProbe`].
+    Probed {
+        /// Non-secret gRPC status code name the destination returned.
         outcome: String,
+    },
+    /// Answer to [`ControlRequest::PeerBodyPolls`].
+    BodyPolls {
+        /// Request bodies this child's peer plane has polled since start.
+        count: u64,
     },
     /// The request could not be served.
     ///
@@ -690,13 +798,44 @@ impl ProcessNode {
     /// Returns the same errors as [`Self::request`], and
     /// [`ProcessClusterError::Child`] when the dial itself failed.
     pub fn dial_peer(&mut self, address: &str) -> Result<String, ProcessClusterError> {
-        match self.request(&ControlRequest::DialPeer {
-            address: address.to_owned(),
-        })? {
-            ControlResponse::Dialed { outcome } => Ok(outcome),
+        self.peer_probe(&PeerProbePlan::own(address))
+    }
+
+    /// Asks this child to perform one shaped private-plane probe.
+    ///
+    /// Returns the destination's non-secret gRPC outcome. A refusal is an
+    /// outcome, not an error: only a failure to reach the destination at all
+    /// is reported as an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::request`], and
+    /// [`ProcessClusterError::Child`] when the probe itself failed.
+    pub fn peer_probe(&mut self, plan: &PeerProbePlan) -> Result<String, ProcessClusterError> {
+        match self.request(&ControlRequest::PeerProbe(plan.clone()))? {
+            ControlResponse::Probed { outcome } => Ok(outcome),
             ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
             other => Err(ProcessClusterError::Protocol(format!(
-                "expected a dial outcome, received {other:?}"
+                "expected a probe outcome, received {other:?}"
+            ))),
+        }
+    }
+
+    /// Reads how many request bodies this child's peer plane has polled.
+    ///
+    /// The counter is the evidence that authentication precedes body
+    /// admission: a refused request must leave it unchanged, and an admitted
+    /// one must advance it, so the probe proves itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::request`].
+    pub fn peer_body_polls(&mut self) -> Result<u64, ProcessClusterError> {
+        match self.request(&ControlRequest::PeerBodyPolls)? {
+            ControlResponse::BodyPolls { count } => Ok(count),
+            ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
+            other => Err(ProcessClusterError::Protocol(format!(
+                "expected a body-poll count, received {other:?}"
             ))),
         }
     }

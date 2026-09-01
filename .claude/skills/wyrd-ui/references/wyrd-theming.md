@@ -1,58 +1,50 @@
 # Wyrd Theming
 
-**Canonical source:** the app's `brand/` directory (`DESIGN.md`, `palette.json`,
-`components.json`). If this summary ever disagrees with `brand/`, `brand/` wins.
+## Tailwind v4 and Skeleton
 
-## Tailwind v4 (no Skeleton)
+Wyrd uses Tailwind v4's CSS-first setup and Skeleton. Global styling belongs in `src/app.css` and Wyrd theme files. Keep component styling token-based so light and dark modes can resolve cleanly.
 
-Wyrd uses Tailwind v4's CSS-first setup with bespoke tokens — there is no Skeleton or other
-component library. `src/app.css` imports Tailwind then the generated theme:
+Typical import shape:
 
 ```css
 @import 'tailwindcss';
-@import '../brand/theme.css';
+@import '@skeletonlabs/skeleton';
 ```
 
-Do not introduce a parallel CSS system or a UI component library for one component.
+Add Wyrd tokens through `@theme` or the dedicated Wyrd theme CSS. Do not introduce a parallel CSS system for one component.
 
-## Tokens
+## Token usage
 
-- All color/geometry values are tokens in `brand/palette.json`. Edit there, then run
-  `pnpm tokens` to regenerate `brand/theme.css` (GENERATED — never hand-edit it).
-- Reference tokens via `var(--surface)`, `var(--text)`, etc., or the generated Tailwind
-  utilities (`bg-surface`, `text-text`, `border-border`) which resolve per mode.
-- Never hardcode hex in a component.
+- Use `--color-wyrd-*` and Wyrd theme tokens for brand surfaces.
+- Use semantic tokens for status: success, warning, error, info.
+- Reserve status colors for actual state, risk, or feedback.
+- Use card-type colors only for card identity, not arbitrary accents.
+- Avoid hardcoded hex in components unless editing the theme itself.
 
 ## Brutalist geometry
 
-- Radius: `var(--r)` = **5px** (true circles only for dots/avatars).
-- Border: `2px` default, `3px` hero/feature, `2px dashed` for in-card dividers — always
-  `var(--border)`.
-- Shadow: hard-offset, zero blur, `var(--shadow)`; altitude dial 3px (quiet) / 6px (raised) /
-  10px (loud).
-- Button interaction: press-in movement aligned with the shadow offset.
+- Radius: `0`.
+- Border: `2px` default.
+- Shadow: hard-offset, zero blur.
+- Button interaction: press-in movement that aligns with the shadow offset.
+- Dividers inside cards: `2px dashed`.
 
-## Modes
+## Dark mode
 
-- Light and dark share identical geometry; only the palette changes. Dark mode is flat
-  near-black — **no CRT, scanlines, vignette, glow, or phosphor.**
-- Mode is set by a `data-mode="light|dark"` attribute (`ModeProvider.svelte`); it cascades,
-  so a subtree can pin a mode.
-- Foreground locked for readability: `--text` `#14141a` light / `#d6d6dc` dark.
+Dark mode preserves the same brutalist geometry. Swap palette and atmosphere, not component structure. Borders and shadows must remain visible against near-black surfaces.
 
-## Semantic colors
+## Icons and charts
 
-- Brand violet (rune): identity, links, big stats, selection wash, `llm` span kind, and all
-  heat/sequential ramps (lime can't darken on white — never ramp with it).
-- The Line: `--client` (lime, runtime), `--server` (amber, enterprise), `--control` (blue,
-  deploy); `*-bar` variants darkened on light.
-- Status (`--ok`/`--warn`/`--danger`) is state, not decoration; status overrides kind for
-  panel top-bars in alert states.
-- Accent is signal: lime = the one primary action, never default text.
+- Use the existing icon library when available.
+- Prefer recognizable icons for common actions.
+- Keep icon strokes visually strong enough for the brutalist UI.
+- Charts should use theme-aware colors and remain legible in both modes.
 
 ## Anti-patterns
 
-- Blurred shadows, glassmorphism, soft elevation, glow, CRT/phosphor.
-- Zero or large radius (it's 5px), or rounding that fights the system.
-- Gray hairline borders; inline styles that bypass tokens.
-- A UI component library or one-off per-feature palettes.
+- Blurred shadows.
+- Rounded cards, pills, or buttons.
+- Gray hairline borders.
+- Inline styles that bypass tokens.
+- Component-library defaults that override Wyrd geometry.
+- One-off color palettes per feature.

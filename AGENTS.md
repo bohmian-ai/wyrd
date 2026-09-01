@@ -33,10 +33,7 @@ for the user workflow.
 
 ## 2. Current Decisions
 
-Design dialogue, predecessor research, and older session history live in the
-[`wyrd-plan`](https://github.com/wyrd-ai/wyrd-plan) repo (private,
-org-internal). Active implementation authority now lives in this repo.
-`PLAN.md` remains the pointer back to planning history.
+Active design, planning, and implementation authority lives in this repository.
 
 Locked cross-cutting decisions that any contributor must honor:
 
@@ -525,9 +522,7 @@ failing — that is circumventing a gate, which the previous rule prohibits.
 
 ## 14. Planning
 
-Planning lives in the [`wyrd`](https://github.com/wyrd-ai/wyrd) repo.
-Additional historical planning lives in the
-[`wyrd-plan`](https://github.com/wyrd-ai/wyrd-plan) repo. Active changes follow
+Planning for every Wyrd change lives in this repository. Active changes follow
 the human-approved spec-driven workflow in
 `architecture/references/languages/spec-driven-development.md`.
 
@@ -555,29 +550,34 @@ shared workflow skill and `mise run check:skills-sync` to detect drift. Codex
   cycles, then runs the broader focused verification required here.
 - Wyrd UI implementors additionally receive the `wyrd-ui` skill when their
   write set enters the UI tree.
-- Complete-plan execution uses the global `wyrd-implement-plan` controller in
-  a dedicated clean worktree only when the user or plan explicitly invokes that
-  global workflow. Do not substitute it automatically for another retired or
-  absent controller.
 - `$wyrd-task-review` performs read-only review of one immutable cumulative
   task candidate. `REMEDIATE` findings return to `$wyrd-plan`;
   behavior-changing conflicts return to `$wyrd-spec` and require renewed human
   approval.
 - `$wyrd-change-review` performs the final immutable integrated review and maps
   every required specification obligation to credible evidence, including
-  cross-task seams and user journeys.
+  cross-task seams and user journeys. Its review phase remains read-only. An
+  `APPROVE` verdict automatically invokes `$wyrd-complete` in the same workflow
+  turn.
+- `$wyrd-complete` requires that approved review, writes one compact durable
+  record under `changes/completed/<year>/<slug>.md`, and removes the full
+  `changes/active/<slug>` packet. It does not merge, push, deploy, modify
+  production code, or invent missing architecture updates.
 - There is no repo-local complete-plan controller. The calling agent or
   active execution harness owns transient scheduling, worktree choice, task
   sequencing, commits, integration, and resource management. Those mechanics
   must not become Wyrd `Change` lifecycle state, skill protocol metadata, or a
   renamed controller. Plans declare real dependencies and integrated evidence;
   the caller chooses how to execute them.
-- Active spec and task artifacts have working durability on one
-  change/integration branch under `.dev/changes/<slug>`. Task branches fork
-  from and merge back into that branch. Before final review, the temporary
-  artifact tree is removed from the merge candidate; final review reads it
-  from a pinned authority commit. Main does not accumulate completed change
-  folders.
+- Active specifications, tasks, and verification live in the normally tracked
+  `changes/active/<slug>` packet on the change/integration branch. Task branches
+  inherit that packet and merge back into the change branch. Final review reads
+  the complete active packet from its immutable candidate. On approval,
+  automatic completion condenses it to one historical record under
+  `changes/completed/<year>/<slug>.md` and deletes the active packet. Current
+  architecture documents remain authoritative; completed records preserve
+  context rather than competing with them. No workflow step force-stages
+  ignored files or depends on a particular merge strategy.
 - Skills and task packets reference architecture authorities and focused
   references by repository-relative path. They never substitute skill prose
   for `architecture/wyrd-design.md`, `architecture/bifrost-design.md`,

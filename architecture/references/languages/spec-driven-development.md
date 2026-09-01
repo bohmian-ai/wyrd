@@ -23,12 +23,14 @@ invariant, public behavior, material constraint, or required system boundary,
 stop and route the conflict through a specification revision and renewed human
 approval.
 
-## Artifact durability
+## Change artifact lifecycle
 
-Change artifacts need working durability across sessions and task branches, not
-permanent residence on the repository's main branch.
+Use one tracked, repository-local change packet while work is active. Keep the
+packet with the implementation so ordinary branches, worktrees, pull requests,
+and task branches all see the same approved authority without ignored files,
+forced staging, or cross-branch retrieval.
 
-Use one change/integration branch as the temporary authority owner:
+The normal branch shape is:
 
 ```text
 <base branch>
@@ -38,46 +40,54 @@ Use one change/integration branch as the temporary authority owner:
        `-- task/<slug>/TASK-001-R1  remediation branch when needed
 ```
 
-Store active artifacts on the change branch under:
+Store the active packet under:
 
 ```text
-.dev/changes/<slug>/
+changes/active/<slug>/
 |-- spec.md
 `-- tasks/
     |-- TASK-001-<name>.md
     `-- TASK-001-R1-<name>.md
 ```
 
-`.dev/` is ignored in the ordinary working tree. An active change explicitly
-tracks only its own `.dev/changes/<slug>` files on the change branch. Do not
-unignore the entire `.dev/` tree. Git staging and commits still require the
-caller's authorization. When authorized, stage only the inspected subtree with
-`git add -f -- .dev/changes/<slug>`.
+The directory is tracked normally. Git staging and commits still require the
+caller's authorization; no workflow step uses force-staging. After explicit
+spec approval, record the approved revision before task branches fork. Each
+task branch starts from the change branch and merges back into it. Dependent or
+remediation branches start from the updated change branch. Branch names,
+worktrees, scheduling, and merge mechanics remain caller-owned execution
+choices rather than Wyrd lifecycle metadata.
 
-After explicit spec approval, record the approved spec revision in a commit
-before task branches fork. Each task branch starts from the change branch and
-merges back into it. Dependent or remediation branches start from the updated
-change branch. Branch names, worktrees, scheduling, and merge mechanics remain
-caller-owned execution choices; they are not Wyrd product lifecycle state or
-task metadata.
+Keep the complete packet present through final immutable change review. This
+lets reviewers read the approved spec, tasks, and task evidence directly from
+the reviewed candidate. If review requires remediation, append remediation
+tasks to the same active packet and review the new immutable target.
 
-Before the final immutable change review, remove the active change-artifact
-directory from the merge candidate and commit that cleanup when authorized.
-Pass the last commit that contained the approved spec and tasks as the pinned
-authority reference to final review. Preserve a compact requirement-to-evidence
-summary in the pull request or equivalent delivery record. The main branch
-therefore retains code, tests, architecture, and product documentation rather
-than an accumulating planning archive.
+An `APPROVE` verdict from `$wyrd-change-review` automatically invokes
+`$wyrd-complete` in the same workflow turn. Completion condenses durable context
+to one tracked record and removes the active packet:
 
-A squash merge of the cleaned candidate also omits the temporary artifact
-commits from the main branch's history. A merge-commit or rebase strategy keeps
-those small historical blobs even though the final tree is clean. Use the
-repository's chosen merge policy; do not rewrite published history merely to
-remove Markdown artifacts.
+```text
+changes/completed/<year>/<slug>.md
+```
 
-If final review requires remediation, restore the active artifact subtree from
-the pinned authority commit onto the change branch, create and execute the
-remediation tasks, remove the subtree again, and review a new immutable target.
+The completion record preserves intent, shipped behavior, lasting invariants
+and constraints, material decisions and rationale, approved revisions or
+deviations, requirement-to-evidence closure, delivery references, and links to
+the current architecture authority. It does not preserve task checklists,
+Red-Green mechanics, review conversation, command transcripts, worktree state,
+or agent scheduling.
+
+Current architecture remains authoritative. Completion verifies that every
+lasting contract or material design change is already reflected in its owning
+architecture or product documentation; it never invents those updates during
+cleanup. A missing or contradictory authority update routes to remediation.
+
+The completed record and active-packet deletion are ordinary reviewed changes
+and do not depend on squash merging. Merge-commit and rebase workflows retain
+the deleted Markdown blobs in Git history; squash workflows may not. Optimize
+for a clean current tree and use the repository's chosen merge policy rather
+than rewriting history to remove small text artifacts.
 
 ## Specification contract
 
@@ -160,9 +170,9 @@ security, tenancy, migration, rollout, or acceptance decision.
 
 Task status moves through `proposed`, `ready`, `in_progress`, `review`, and
 `approved`; use `superseded` when an approved spec revision or replacement task
-invalidates it. Review skills remain read-only. The caller or active execution
-harness records a review verdict in the artifact or delivery system when that
-durability is needed.
+invalidates it. Review phases remain read-only. The caller or active execution
+harness records a task-review verdict in the active packet or delivery system
+when that durability is needed.
 
 ## Test command precision
 
@@ -244,11 +254,13 @@ material constraint, route it to `SPEC_REVISION_REQUIRED` instead.
 After all tasks are approved and integrated, final review maps every required
 specification obligation to the strongest applicable evidence, checks
 cross-task seams and required user journeys, and inspects the complete immutable
-base-to-target range. It returns `CLEAN`, `REMEDIATION_REQUIRED`,
+base-to-target range. It returns `APPROVE`, `REMEDIATE`,
 `SPEC_REVISION_REQUIRED`, or `BLOCKED`.
 
-Review approval contributes evidence. It does not merge, push, deploy, or grant
-product authorization.
+The review phase never edits its subject. `APPROVE` immediately hands its
+validated completion payload to `$wyrd-complete`, which writes the compact
+record and removes the active packet. Completion does not merge, push, deploy,
+or grant product authorization.
 
 ## Primary grounding
 
@@ -261,4 +273,9 @@ These sources inform the workflow but do not override Wyrd authority:
 - [W3C, A Method for Writing Testable Conformance Requirements](https://www.w3.org/TR/test-methodology/)
   — stable requirements and requirement-to-test traceability; and
 - [GitHub Spec Kit](https://github.github.com/spec-kit/) — separation of
-  specification, technical planning, tasks, and implementation.
+  specification, technical planning, tasks, and implementation;
+- [GitHub Spec Kit, Spec Persistence](https://github.github.com/spec-kit/concepts/spec-persistence.html)
+  — explicit separation of durable specifications from disposable derived
+  plans and tasks; and
+- [Michael Nygard, Documenting Architecture Decisions](https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions)
+  — concise durable records for material decisions and rationale.

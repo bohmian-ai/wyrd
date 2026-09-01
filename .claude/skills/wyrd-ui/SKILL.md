@@ -1,6 +1,6 @@
 ---
 name: wyrd-ui
-description: "Use this repo-level skill when building, editing, debugging, styling, or extending the Wyrd SvelteKit UI in `crates/wyrd/wyrd-server/wyrd-ui`. Trigger for Svelte 5 components, SvelteKit routes and load functions, Tailwind v4 styling, theme/token work, frontend UX, visual changes, and any request mentioning Wyrd UI, the design system, brand tokens, brutalism, dark mode, or Wyrd frontend patterns. Wyrd UI is the styling source of truth, not the product or workflow source of truth."
+description: "Use this repo-level skill when building, editing, debugging, styling, or extending the Wyrd SvelteKit UI in `crates/wyrd/wyrd-server/wyrd-ui`. Trigger for Svelte 5 components, SvelteKit routes and load functions, Tailwind v4 or Skeleton styling, theme work, frontend UX, visual changes, and any request mentioning Wyrd UI, wyrd-theme.css, brutalism, dark mode, or Wyrd frontend patterns. Wyrd UI is the styling source of truth, not the product or workflow source of truth."
 ---
 
 # Wyrd UI
@@ -40,60 +40,69 @@ Do not import product-specific naming, routes, client wrappers, visual tokens, o
 
 ## What Wyrd UI Is
 
-Wyrd is brutalist in both light and dark modes. Same geometry across modes (5px radius, 2px ink borders, hard-offset zero-blur shadows); only the palette changes.
+Wyrd is brutalist in both light and dark modes. Same geometry across modes; palette and atmosphere change.
 
-- Light mode: parchment background, white card surfaces, ink borders, brand violet (rune) accent, acid lime for primary action, calm near-black text (`#14141a`).
-- Dark mode: flat near-black surfaces, the same borders and hard-offset shadows, brand violet + lime accents, calm off-white text (`#d6d6dc`). **No CRT, scanlines, vignette, glow, or phosphor** — dark mode is the same system on darker surfaces, nothing more.
+- Light mode: parchment, rune-purple, ink-black brutalism. White card surfaces, 2px black borders, hard-offset black shadows, semantic card colors.
+- Dark mode: brutalist phosphor terminal. Same 2px borders and hard-offset shadows, rendered in dim phosphor green against near-black surfaces with CRT atmosphere.
 
-The canonical specification lives in the app's `brand/` directory — read those first (see Required References). They override anything in this skill if they ever disagree.
+The dark mode is not just the light UI with darker colors. It is the same physical brutalist system rendered as vintage terminal hardware.
 
 ## Non-Negotiable Styling Rules
 
-### 5px radius — locked
+### Zero rounded corners
 
-Use `border-radius: var(--r)` (5px) for Wyrd UI surfaces and controls. Not zero, not larger. Do not add inline radii or component-library defaults that fight this. Use true circles only for elements that must be circular, such as avatars or status dots.
+Use `border-radius: 0` for Wyrd UI surfaces and controls. Do not add inline radii or component-library defaults that fight this. Use true circles only for elements that must be circular, such as avatars or status dots.
 
 ### Hard-offset shadows only
 
-Use solid, zero-blur shadows in the altitude dial (quiet / raised / loud):
+Use solid, zero-blur shadows:
 
 ```css
-box-shadow: 3px 3px 0 0 var(--shadow);   /* quiet — workbench default */
-box-shadow: 6px 6px 0 0 var(--shadow);   /* raised — panels, stat blocks */
-box-shadow: 10px 10px 0 0 var(--shadow); /* loud — hero only */
+box-shadow: 3px 3px 0 0 var(--shadow);
+box-shadow: 6px 6px 0 0 var(--shadow);
+box-shadow: 10px 10px 0 0 var(--shadow);
 ```
 
 Do not use blurred shadows, glassmorphism, soft elevation, or `filter: drop-shadow(...)`.
 
 ### Two-pixel borders
 
-Use 2px borders for normal UI, 3px for major hero or feature containers, and 2px dashed dividers inside cards. Always `var(--border)` — never gray, hairline, or low-contrast.
+Use 2px borders for normal UI, 3px for major hero or feature containers, and 2px dashed dividers inside cards. Avoid gray, hairline, or low-contrast borders.
 
 ### Tokens over raw colors
 
-Use Wyrd tokens (`var(--surface)`, `var(--text)`, …) or the generated Tailwind utilities (`bg-surface`, `text-text`, `border-border`). Never hardcode hex in a component. Tokens are defined in `brand/palette.json` and generated into `brand/theme.css` via `pnpm tokens` — edit the JSON, never the generated CSS.
+Use Wyrd theme tokens and Tailwind classes that resolve through the Wyrd theme. Avoid hardcoded hex values in components unless editing the theme itself.
 
 ## Required References
 
-The design system is **locked in the app's `brand/` directory** — that is the canonical
-source of truth and overrides this skill. For any styling or visual change, read these first:
+For any styling or visual change, read:
 
-- `crates/wyrd/wyrd-server/wyrd-ui/brand/DESIGN.md` — rules doctrine (geometry, altitude, the Line, signal rules)
-- `crates/wyrd/wyrd-server/wyrd-ui/brand/palette.json` — canonical tokens (edit here, then `pnpm tokens`)
-- `crates/wyrd/wyrd-server/wyrd-ui/brand/components.json` — per-component contracts (built + specced)
-- `crates/wyrd/wyrd-server/wyrd-ui/brand/wyrd-ui-source-of-truth-v2.html` — the rendered visual reference
+- `references/wyrd-light-mode-style-guide.md`
+- `references/wyrd-dark-mode-style-guide.md`
+- `references/wyrd-theme.css`
 
-The bundled `references/wyrd-light-mode-style-guide.md`, `references/wyrd-dark-mode-style-guide.md`,
-and `references/wyrd-theme.css` are portable summaries; if they ever disagree with `brand/`, `brand/` wins.
+`references/wyrd-theme.css` is a **generated artifact**, not a hand-authored
+file. Its color/token layer (the `[data-theme='wyrd'].theme-light` /
+`.theme-dark` blocks) is emitted from `crates/wyrd/wyrd-server/wyrd-ui/brand/palette.json`
+by `brand/gen-theme.mjs`; the brutalist utility classes below the token blocks
+(`.neo-card`, `.neo-btn`, `.mono-tag`, `.pixel-text`, `.card-tag--*`,
+`.status-dot*`, and the zero-radius overrides) are ported forward and reference
+those canonical tokens via `var(--*)`. Do not edit it by hand — change
+`palette.json` (for token values) or the `codexUtilities` block in
+`gen-theme.mjs` (for the utilities), then run `pnpm tokens`. A CI drift lock
+(`gen-theme.mjs --check`) fails if the file diverges from the palette. The old
+oklch fork — glow (`.neo-glow`, `--neo-glow-color`), gradient helpers,
+`--retro-*`, `.grain`, and the CRT scanline/vignette/phosphor `text-shadow`
+layers — has been removed; do not reintroduce it (it violates the Never rules).
 
 Also inspect the current app files:
 
-- `crates/wyrd/wyrd-server/wyrd-ui/src/app.css` (imports `brand/theme.css`)
-- `crates/wyrd/wyrd-server/wyrd-ui/brand/theme.css` (GENERATED — do not hand-edit)
-- `crates/wyrd/wyrd-server/wyrd-ui/src/lib/components/` (built primitives + `ModeProvider`)
-- `crates/wyrd/wyrd-server/wyrd-ui/src/lib/registry.ts` (name → component bridge)
-- `crates/wyrd/wyrd-server/wyrd-ui/src/routes/styleguide/+page.svelte` (living catalog, light + dark)
+- `crates/wyrd/wyrd-server/wyrd-ui/src/app.css`
 - `crates/wyrd/wyrd-server/wyrd-ui/src/routes/+layout.svelte`
+- `crates/wyrd/wyrd-server/wyrd-ui/src/routes/+page.svelte`
+- `crates/wyrd/wyrd-server/wyrd-ui/brand/brand-skill.md`
+- `crates/wyrd/wyrd-server/wyrd-ui/brand/theme.css`
+- `crates/wyrd/wyrd-server/wyrd-ui/brand/palette.json`
 
 ## Standalone References
 
@@ -104,19 +113,31 @@ Load these only when relevant. They are Wyrd-native and should be enough to use 
 - Svelte 5 runes, snippets, effects, `.svelte.ts` modules, and TypeScript patterns: `references/wyrd-svelte5-patterns.md`
 - Large tables, trace-style views, files, charts, pagination, virtualization, search/filtering, and payload budgets: `references/wyrd-data-performance.md`
 - Developer workflow UX, filters, drilldowns, empty/loading/error states: `references/wyrd-developer-ux.md`
-- Tailwind v4, token usage, data-mode dark mode, semantic colors: `references/wyrd-theming.md`
+- Tailwind v4, Skeleton, token usage, dark mode, icons, semantic colors: `references/wyrd-theming.md`
 - Vitest, Svelte Testing Library, build checks, accessibility, and performance verification: `references/wyrd-testing-verification.md`
 
 ## Frontend Rules
 
 - Work inside the existing SvelteKit app instead of treating this as a generic Svelte project.
 - Keep the app dense, scannable, and task-oriented. Wyrd is a developer tool, not a marketing site.
-- Prefer existing local patterns and package choices before adding abstractions or dependencies. Styling is bespoke tokens + Tailwind v4 — there is no Skeleton/component library to lean on.
+- Prefer existing local patterns and package choices before adding abstractions or dependencies.
 - Keep data fetching server-side by default when server boundaries exist. Prefer SvelteKit server load functions and route handlers over browser-direct backend calls.
 - Use Svelte 5 runes deliberately: `$derived` for pure derived state, `$effect` for external side effects.
 - Do not add new UI libraries unless the user explicitly asks.
 - Use icons from the existing enabled icon stack when available; do not invent custom inline icons for common actions.
 - Preserve accessibility basics: semantic elements, keyboard behavior, visible focus, useful empty/loading/error states, and responsive layouts.
+
+## Plan Remediation
+
+When `$wyrd-implement-plan` resumes UI work after review, require an active
+orchestrator-owned `Remediation revision RR<N>` in the canonical task. Treat
+the original task plus that revision as the executable assignment. It must be
+decision-complete at the same density as the original task: exact correction,
+owners and symbols, interfaces, consequential control flow, UI states and edge
+behavior, tests and critical assertions, verification, allowed/prohibited
+scope, escalation boundaries, and finding closure. Reviewer findings, a diff,
+or a desired visual outcome alone are not implementation instructions. Stop
+before editing rather than choosing a material fix that the revision omits.
 
 ## Editing Order
 

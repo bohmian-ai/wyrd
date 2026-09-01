@@ -52,10 +52,10 @@ durability, security, ownership, or externally observable invariant.
 
 ## Draft the specification
 
-For an active change, write `.dev/changes/<slug>/spec.md` on the caller's
-change/integration branch. `.dev/` is normally ignored; track only the active
-change subtree when the caller authorizes staging or a commit. Do not create a
-permanent archive on the main branch.
+For an active change, write `changes/active/<slug>/spec.md` on the caller's
+change/integration branch. The change packet is normally tracked and travels
+with task branches; never force-stage an ignored path or create a separate
+planning branch.
 
 Use proportionate Markdown with stable local IDs:
 
@@ -103,4 +103,3 @@ Report the spec path, revision, status, locked behavioral obligations, retained
 implementation freedoms, selected authority links, and any exact approval or
 blocking decision needed. Never claim task or implementation readiness merely
 because the spec is approved.
-

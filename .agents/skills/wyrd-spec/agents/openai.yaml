@@ -2,4 +2,3 @@ interface:
   display_name: "Wyrd Spec"
   short_description: "Design an approved Wyrd change spec"
   default_prompt: "Use $wyrd-spec to turn this Wyrd change intent into a decision-complete behavioral specification for my approval."
-

@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod bootstrap;
 pub mod issuer;
+pub mod node_identity;
 
 use std::sync::Arc;
 
@@ -435,7 +436,20 @@ async fn build_bifrost_external_dependencies(
     let postgres = Arc::new(ServerPostgres::connect_from_boot(boot).await?);
     let storage_settings = load_storage_settings()?;
     let storage = StorageHandle::from_settings(storage_settings).await?;
-    let node_id = NodeId::generate();
+    let wal_dir = std::env::var_os("WYRD_SCRIBE_WAL_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(".wyrd/scribe-wal"));
+    // A Scribe-bearing target owns durable state keyed by its own node, so it
+    // reclaims the identity stored beside that state; a target with no Scribe
+    // role owns no volume and is free to be a new node each incarnation.
+    let node_id =
+        if crate::config::BifrostRoles::for_target(target).contains(&BifrostRuntimeRole::Scribe) {
+            node_identity::ScribeNodeIdentityStore::new(wal_dir.clone())
+                .load_or_create()
+                .map_err(|error| ServerBootError::Scribe(error.to_string()))?
+        } else {
+            NodeId::generate()
+        };
     let advertise_addr = config
         .peer
         .advertise_addr
@@ -445,9 +459,6 @@ async fn build_bifrost_external_dependencies(
         postgres.vala().clone(),
         ClusterNodeId::new(node_id.as_uuid()),
     ));
-    let wal_dir = std::env::var_os("WYRD_SCRIBE_WAL_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(".wyrd/scribe-wal"));
     let oracle_scratch = prepare_oracle_spill_root(Some(wal_dir.clone()))?;
     let scribe_stage = wal_dir.join("scribe-stage");
     let scribe_output_scratch = wal_dir.join("scribe-output-scratch");

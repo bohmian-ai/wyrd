@@ -12,6 +12,135 @@ use wyrd_spec::vala::api::NodeId;
 use wyrd_spec::vala::api::SignedPeerTicket;
 use wyrd_tonic::prost::Message;
 
+/// The verified workload identity behind one admitted private-plane request.
+///
+/// Produced once per request by the server's peer authentication layer, before
+/// the request body is polled, and attached to the request extensions as the
+/// only identity input an admitted peer handler may read. Both private
+/// adapters — the Oracle peer service and the upstream worker service — take
+/// their caller identity from this one value, so neither can grow a second
+/// authentication path or a synthetic principal of its own.
+///
+/// The context is deliberately narrow. It answers "which configured platform
+/// service is calling, proved how" and nothing else. A data tenant, a space, a
+/// source `NodeId`, and a fence are *operation* authority: they are carried by
+/// a purpose ticket and resolved after this context exists, never asserted by
+/// the caller alongside its credential.
+#[derive(Clone)]
+pub struct AuthenticatedPeerContext {
+    /// Control-plane tenant the peer principal belongs to; always the owner.
+    control_tenant: DataTenantId,
+    /// Stable identity of the verified peer Service principal.
+    principal_id: wyrd_spec::auth::PrincipalId,
+    /// Service card the verified principal is bound to.
+    service_card: wyrd_spec::reference::CardRef,
+    /// Peer permissions the verified token resolved to.
+    permissions: wyrd_runtime::PermissionSet,
+    /// Stable digest of the presented workload credential.
+    credential_digest: String,
+    /// Stable digest of the accepted peer certificate, when the transport
+    /// exposed one.
+    certificate_digest: Option<String>,
+    /// Correlator carried or minted for this request.
+    request_id: wyrd_spec::request_id::RequestId,
+    /// When the credential was verified.
+    authenticated_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for AuthenticatedPeerContext {
+    /// Renders identity without rendering the credential it was proved with.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthenticatedPeerContext")
+            .field("principal_id", &self.principal_id)
+            .field("service_card", &self.service_card)
+            .field("request_id", &self.request_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AuthenticatedPeerContext {
+    /// Builds one context from values the authentication layer has verified.
+    ///
+    /// Every argument is already proved: the caller must not construct this
+    /// from wire-asserted values.
+    #[must_use]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each field is a distinct verified fact and collapsing them \
+                  into a struct literal would only move the same arity"
+    )]
+    pub fn new(
+        control_tenant: DataTenantId,
+        principal_id: wyrd_spec::auth::PrincipalId,
+        service_card: wyrd_spec::reference::CardRef,
+        permissions: wyrd_runtime::PermissionSet,
+        credential_digest: String,
+        certificate_digest: Option<String>,
+        request_id: wyrd_spec::request_id::RequestId,
+        authenticated_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            control_tenant,
+            principal_id,
+            service_card,
+            permissions,
+            credential_digest,
+            certificate_digest,
+            request_id,
+            authenticated_at,
+        }
+    }
+
+    /// Returns the control-plane tenant this peer principal belongs to.
+    #[must_use]
+    pub const fn control_tenant(&self) -> DataTenantId {
+        self.control_tenant
+    }
+
+    /// Returns the verified peer Service principal's stable identity.
+    #[must_use]
+    pub const fn principal_id(&self) -> wyrd_spec::auth::PrincipalId {
+        self.principal_id
+    }
+
+    /// Returns the Service card the verified principal is bound to.
+    #[must_use]
+    pub const fn service_card(&self) -> &wyrd_spec::reference::CardRef {
+        &self.service_card
+    }
+
+    /// Returns the peer permissions the verified token resolved to.
+    #[must_use]
+    pub const fn permissions(&self) -> &wyrd_runtime::PermissionSet {
+        &self.permissions
+    }
+
+    /// Returns the stable digest of the presented workload credential.
+    #[must_use]
+    pub fn credential_digest(&self) -> &str {
+        &self.credential_digest
+    }
+
+    /// Returns the accepted peer certificate's digest, when one was exposed.
+    #[must_use]
+    pub fn certificate_digest(&self) -> Option<&str> {
+        self.certificate_digest.as_deref()
+    }
+
+    /// Returns the correlator this request is audited and traced under.
+    #[must_use]
+    pub const fn request_id(&self) -> &wyrd_spec::request_id::RequestId {
+        &self.request_id
+    }
+
+    /// Returns when the credential behind this request was verified.
+    #[must_use]
+    pub const fn authenticated_at(&self) -> DateTime<Utc> {
+        self.authenticated_at
+    }
+}
+
 /// Typed claims signed for one worker attempt.
 #[derive(Clone, PartialEq, Message)]
 pub struct PeerTicketClaims {

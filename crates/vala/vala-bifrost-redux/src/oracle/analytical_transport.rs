@@ -47,7 +47,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use bytes::{Bytes, BytesMut};
-use http::{HeaderMap, HeaderValue, Request, Response};
+use http::{HeaderMap, HeaderName, HeaderValue, Request, Response};
 use http_body::{Body, Frame, SizeHint};
 use wyrd_tonic::tonic::body::Body as TonicBody;
 
@@ -74,7 +74,7 @@ use super::analytical::{
     AnalyticalConnectionLease, AnalyticalGraphKey, AnalyticalStageIngress,
     DATAFUSION_QUERY_ID_HEADER, PUBLIC_QUERY_ID_HEADER,
 };
-use super::dispatcher::BifrostPeerTls;
+use super::dispatcher::{BifrostPeerTls, OraclePeerCredentials};
 use super::peer::{
     MAX_STAGE_BODY_BYTES, OracleStageAuthority, PeerSecurityError, StageBinding, StageOperationV1,
     StageTicketClaims, stage_body_digest,
@@ -1010,6 +1010,20 @@ where
         let ingress = Arc::clone(&self.ingress);
         Box::pin(async move {
             let path = request.uri().path().to_owned();
+            // The peer plane's authentication layer runs before any body is
+            // polled and attaches exactly one context. Its absence means this
+            // adapter was reached outside that boundary, so the request is
+            // refused rather than authorized on stage identity alone: workload
+            // identity and stage authority are separate checks and the second
+            // never substitutes for the first.
+            if request
+                .extensions()
+                .get::<crate::oracle::peer::AuthenticatedPeerContext>()
+                .is_none()
+            {
+                tracing::warn!(path = %path, reason = "unauthenticated_peer", "Oracle analytical stage ingress refused a request");
+                return Ok(S::Response::refused());
+            }
             let Some(operation) = governed_operation(&path) else {
                 tracing::warn!(path = %path, reason = "ungoverned_path", "Oracle analytical stage ingress refused a request");
                 return Ok(S::Response::refused());
@@ -1219,6 +1233,109 @@ fn measured_exchange(
 pub(crate) type StageMinterFactory =
     Arc<dyn Fn(&Url) -> Option<Arc<AnalyticalStageMinter>> + Send + Sync>;
 
+/// Tower layer that presents this node's peer workload credential outbound.
+///
+/// The private listener authenticates the workload credential before it polls
+/// a request body, so an east-west Analytical channel that carried only a peer
+/// certificate and a stage ticket would be refused before its ticket was ever
+/// read. Transport identity, workload identity, and operation authority are
+/// three separate proofs, and this layer supplies the second one.
+#[derive(Clone)]
+pub(crate) struct AnalyticalPeerCredentialLayer {
+    /// Source of this node's short-lived peer workload bearer.
+    credentials: Arc<dyn OraclePeerCredentials>,
+}
+
+impl AnalyticalPeerCredentialLayer {
+    /// Creates the layer over this node's own peer credentials.
+    #[must_use]
+    pub(crate) fn new(credentials: Arc<dyn OraclePeerCredentials>) -> Self {
+        Self { credentials }
+    }
+}
+
+impl<S> tower::Layer<S> for AnalyticalPeerCredentialLayer {
+    /// The credential-presenting service wrapping one worker channel.
+    type Service = AnalyticalPeerCredential<S>;
+
+    /// Wraps `inner` so every request leaves carrying the peer credential.
+    fn layer(&self, inner: S) -> Self::Service {
+        AnalyticalPeerCredential {
+            inner,
+            credentials: Arc::clone(&self.credentials),
+        }
+    }
+}
+
+/// Stamps this node's peer workload credential onto every outbound request.
+#[derive(Clone)]
+pub(crate) struct AnalyticalPeerCredential<S> {
+    /// The channel this layer wraps.
+    inner: S,
+    /// Source of this node's short-lived peer workload bearer.
+    credentials: Arc<dyn OraclePeerCredentials>,
+}
+
+impl<S, B> tower::Service<Request<B>> for AnalyticalPeerCredential<S>
+where
+    S: tower::Service<Request<B>, Response = Response<TonicBody>> + Clone + Send + 'static,
+    S::Future: Send,
+    B: Send + 'static,
+{
+    /// The wrapped channel's response, unchanged on the success path.
+    type Response = Response<TonicBody>;
+    /// The wrapped channel's error, unchanged.
+    type Error = S::Error;
+    /// Boxed because acquiring the bearer is asynchronous.
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    /// Delegates readiness to the wrapped channel.
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    /// Acquires the current bearer, stamps it, and forwards the request.
+    ///
+    /// A credential this node cannot acquire or render as metadata refuses the
+    /// request by responding, exactly as the stage layers do: the wrapped
+    /// channel's error type is opaque here, and a closed refusal is what the
+    /// caller can interpret. Refusing before sending is also correct on its own
+    /// terms, since the destination would refuse the unauthenticated request.
+    fn call(&mut self, mut request: Request<B>) -> Self::Future {
+        // Same Tower readiness contract as `AnalyticalStageMint::call`: the
+        // future owns the service value that was polled ready, and an unreadied
+        // clone takes its place.
+        let unreadied = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, unreadied);
+        let credentials = Arc::clone(&self.credentials);
+        Box::pin(async move {
+            let bearer = match credentials.bearer(false).await {
+                Ok(bearer) => bearer,
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        reason = "credential",
+                        "Oracle analytical peer egress refused a request"
+                    );
+                    return Ok(Response::refused());
+                }
+            };
+            let Ok(value) = HeaderValue::from_str(&format!("Bearer {bearer}")) else {
+                tracing::warn!(
+                    reason = "credential_metadata",
+                    "Oracle analytical peer egress refused a request"
+                );
+                return Ok(Response::refused());
+            };
+            request.headers_mut().insert(PEER_CREDENTIAL_HEADER, value);
+            inner.call(request).await
+        })
+    }
+}
+
+/// Metadata key the Wyrd workload bearer travels in on every peer request.
+const PEER_CREDENTIAL_HEADER: HeaderName = HeaderName::from_static("x-wyrd-access-token");
+
 /// Establishes and reuses mutually authenticated channels to Analytical peers.
 ///
 /// Every east-west channel Wyrd opens is dialed through the Bifrost peer
@@ -1233,15 +1350,18 @@ pub(crate) type StageMinterFactory =
 struct AnalyticalPeerChannels {
     /// Immutable peer transport identity every dial presents.
     tls: BifrostPeerTls,
+    /// Workload credential every request on a dialed channel presents.
+    credentials: Arc<dyn OraclePeerCredentials>,
     /// Connected channels, keyed by the worker URL they were dialed for.
     channels: tokio::sync::Mutex<HashMap<Url, BoxCloneSyncChannel>>,
 }
 
 impl AnalyticalPeerChannels {
     /// Builds an empty channel cache bound to one peer identity.
-    fn new(tls: BifrostPeerTls) -> Self {
+    fn new(tls: BifrostPeerTls, credentials: Arc<dyn OraclePeerCredentials>) -> Self {
         Self {
             tls,
+            credentials,
             channels: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -1269,7 +1389,9 @@ impl AnalyticalPeerChannels {
                 "Oracle analytical peer connection to {url} failed: {error}"
             ))
         })?;
-        let channel = BoxCloneSyncChannel::new(channel);
+        let channel = BoxCloneSyncChannel::new(
+            AnalyticalPeerCredentialLayer::new(Arc::clone(&self.credentials)).layer(channel),
+        );
         channels.insert(url.clone(), channel.clone());
         Ok(channel)
     }
@@ -1313,10 +1435,11 @@ impl AnalyticalChannelResolver {
     pub(crate) fn new(
         identity: Arc<AnalyticalCoordinatorIdentity>,
         tls: BifrostPeerTls,
+        credentials: Arc<dyn OraclePeerCredentials>,
         mint_for: StageMinterFactory,
     ) -> Self {
         Self {
-            channels: AnalyticalPeerChannels::new(tls),
+            channels: AnalyticalPeerChannels::new(tls, credentials),
             identity,
             minters: Arc::new(std::sync::Mutex::new(HashMap::new())),
             mint_for,
@@ -1700,6 +1823,9 @@ mod tests {
                     7,
                     chrono::Duration::seconds(30),
                     BifrostPeerTls::unreachable_for_test(),
+                    Arc::new(super::super::dispatcher::StaticOraclePeerCredentials::new(
+                        secrecy::SecretString::from("fixture-bearer"),
+                    )),
                 )),
             }));
             let identity = StageWireIdentity {
@@ -1760,7 +1886,30 @@ mod tests {
             .mint_stage(StageOperationV1::SetPlan, &claims)
             .expect("fixture ticket must mint");
             write_ticket(request.headers_mut(), &ticket).expect("fixture ticket must encode");
+            request.extensions_mut().insert(Self::authenticated_peer());
             request
+        }
+
+        /// Builds the peer context the private listener attaches upstream of
+        /// this adapter.
+        ///
+        /// Every fixture request carries one because in production every
+        /// request that reaches this adapter has already been authenticated;
+        /// the one test that omits it is the one asserting that fact.
+        fn authenticated_peer() -> crate::oracle::peer::AuthenticatedPeerContext {
+            crate::oracle::peer::AuthenticatedPeerContext::new(
+                DataTenantId::SYSTEM_OWNER,
+                wyrd_spec::auth::PrincipalId::new(uuid::Uuid::nil()),
+                <wyrd_spec::reference::CardRef as std::str::FromStr>::from_str(
+                    "system/Service/bifrost-peer@1.0.0",
+                )
+                .expect("static card reference is valid"),
+                wyrd_runtime::PermissionSet::default(),
+                "fixture-credential".to_owned(),
+                None,
+                wyrd_spec::request_id::RequestId::now_v7(),
+                Utc::now(),
+            )
         }
 
         /// Builds the layered service under test over a recording upstream.
@@ -1904,6 +2053,46 @@ mod tests {
         assert_eq!(response.status(), http::StatusCode::OK);
         assert!(probe.reached.load(Ordering::SeqCst));
         assert_eq!(fixture.authority_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A stage ticket alone cannot substitute for peer workload authentication.
+    ///
+    /// The two checks answer different questions — which platform service is
+    /// calling, and which stage it was authorized for — so a request that
+    /// somehow reaches this adapter outside the peer boundary is refused even
+    /// when its stage ticket is perfectly valid.
+    #[tokio::test]
+    async fn stage_auth_refuses_a_request_with_no_authenticated_peer() {
+        let fixture = Fixture::new();
+        let message = framed(b"authorized-subplan");
+        let (mut service, probe) = fixture.service();
+        let mut request = fixture.request(&message, ChunkBody::new(vec![message.clone()]));
+        request
+            .extensions_mut()
+            .remove::<crate::oracle::peer::AuthenticatedPeerContext>();
+
+        let response = service
+            .call(request)
+            .await
+            .expect("the fixture upstream is infallible");
+
+        assert_eq!(
+            response
+                .headers()
+                .get("grpc-status")
+                .map(|value| value.to_str().unwrap_or_default().to_owned()),
+            Some("7".to_owned()),
+            "an unauthenticated peer must be refused as permission denied"
+        );
+        assert!(
+            !probe.reached.load(Ordering::SeqCst),
+            "refusal must precede upstream entirely"
+        );
+        assert_eq!(
+            fixture.authority_calls.load(Ordering::SeqCst),
+            0,
+            "stage authority must not be consulted for an unauthenticated peer"
+        );
     }
 
     /// A valid ticket over different bytes cannot authorize the bytes sent.

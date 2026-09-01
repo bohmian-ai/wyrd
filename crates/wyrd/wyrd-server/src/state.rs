@@ -1365,6 +1365,9 @@ pub struct Bifrost {
     transport: vala_bifrost_redux::gate::limits::BifrostTransportAdmission,
     /// Verifier shared by public Gate work and the private peer service.
     token_verifier: Arc<WyrdTokenVerifier>,
+    /// The one peer Service principal this process admits, when it serves the
+    /// private plane. Absent for targets that open no peer listener.
+    peer_identity: Option<crate::grpc::PeerWorkloadIdentity>,
     /// Retained forwarder, reachable by the private peer inbound handler.
     query_forwarder: Option<Arc<crate::oracle::ReadyOracleForwarder>>,
     /// Read-only proof handle for test-tier inspection of the production graph.
@@ -1401,6 +1404,9 @@ pub(crate) struct BifrostComposition {
     pub(crate) transport: vala_bifrost_redux::gate::limits::BifrostTransportAdmission,
     /// Verifier shared by public Gate work and the private peer service.
     pub(crate) token_verifier: Arc<WyrdTokenVerifier>,
+    /// The one peer Service principal this process admits, when it serves the
+    /// private plane.
+    pub(crate) peer_identity: Option<crate::grpc::PeerWorkloadIdentity>,
     /// Canonical ready-Oracle selector and authenticated private forwarder.
     pub(crate) query_forwarder: Option<Arc<crate::oracle::ReadyOracleForwarder>>,
     /// Already-composed production resources exposed only to the test tier.
@@ -1419,6 +1425,7 @@ impl Bifrost {
             bifrost_storage,
             transport,
             token_verifier,
+            peer_identity,
             query_forwarder,
             #[cfg(feature = "test-support")]
             resources,
@@ -1431,6 +1438,7 @@ impl Bifrost {
             bifrost_storage: Some(bifrost_storage),
             transport,
             token_verifier,
+            peer_identity,
             query_forwarder,
             #[cfg(feature = "test-support")]
             test_resources: resources,
@@ -1456,6 +1464,7 @@ impl Bifrost {
             oracle: None,
             transport: vala_bifrost_redux::gate::limits::BifrostTransportAdmission::for_tests(),
             token_verifier,
+            peer_identity: None,
             query_forwarder: None,
             test_resources: None,
             test_catalog: None,
@@ -1488,6 +1497,7 @@ impl Bifrost {
             oracle: None,
             transport: vala_bifrost_redux::gate::limits::BifrostTransportAdmission::for_tests(),
             token_verifier,
+            peer_identity: None,
             query_forwarder: None,
             test_resources: None,
             test_catalog: Some(catalog),
@@ -1514,6 +1524,21 @@ impl Bifrost {
     #[must_use]
     pub fn token_verifier(&self) -> &WyrdTokenVerifier {
         &self.token_verifier
+    }
+
+    /// Borrows the shared verifier as an owner the peer boundary can retain.
+    #[must_use]
+    pub fn shared_token_verifier(&self) -> Arc<WyrdTokenVerifier> {
+        Arc::clone(&self.token_verifier)
+    }
+
+    /// Borrows the one peer Service principal this process admits.
+    ///
+    /// `None` on a target that opens no peer listener, which is why composing
+    /// a peer router without it is a boot error rather than a silent default.
+    #[must_use]
+    pub fn peer_identity(&self) -> Option<&crate::grpc::PeerWorkloadIdentity> {
+        self.peer_identity.as_ref()
     }
 
     /// Borrows the retained ready-Oracle forwarder, when this process has one.

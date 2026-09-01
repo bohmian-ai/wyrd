@@ -82,6 +82,14 @@ use crate::bifrost::ForgeObjectStoreControl;
 struct TestOraclePeerCredentials {
     /// Shared real Postgres fixture containing the credential record.
     fixture: Arc<PgFixture>,
+    /// Control tenant that owns the credential record.
+    ///
+    /// An API key is exchanged on a connection scoped to the tenant the key
+    /// embeds; presenting it on any other tenant's connection is refused as a
+    /// cross-tenant key. A peer journey seeds near-miss principals inside an
+    /// ordinary data tenant too, so the tenant travels with the key rather
+    /// than being assumed to be the control tenant.
+    tenant_id: DataTenantId,
     /// Durable API key retained only for the cluster lifetime.
     api_key: SecretString,
     /// Production exchange service used for each access-token acquisition.
@@ -108,7 +116,7 @@ impl OraclePeerCredentials for TestOraclePeerCredentials {
         }
         let mut conn = self
             .fixture
-            .tenant_conn_for(DataTenantId::SYSTEM_OWNER)
+            .tenant_conn_for(self.tenant_id)
             .await
             .map_err(|_| DispatchError::Terminal)?;
         let exchanged = self
@@ -4301,10 +4309,14 @@ pub(crate) async fn provision_bifrost_peer_principal(
 
 /// Builds refreshing peer credentials for an already-seeded principal key.
 ///
+/// The key's embedded tenant selects the connection every exchange runs on, so
+/// a journey can present a data-tenant principal's key and still reach the peer
+/// plane's authorization verdict rather than failing the exchange itself.
+///
 /// # Errors
 ///
-/// Returns an error when the issuing key cannot be constructed or the first
-/// bearer exchange fails.
+/// Returns an error when the key is malformed, the issuing key cannot be
+/// constructed, or the first bearer exchange fails.
 pub(crate) async fn oracle_peer_credentials_from_key(
     fixture: Arc<PgFixture>,
     api_key: SecretString,
@@ -4317,8 +4329,12 @@ pub(crate) async fn oracle_peer_credentials_from_key(
         )
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
     );
+    let tenant_id = WyrdApiKey::parse(api_key.expose_secret())
+        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?
+        .tenant_id;
     let credentials = Arc::new(TestOraclePeerCredentials {
         fixture,
+        tenant_id,
         api_key,
         exchange: ExchangeApiKey {
             issuing_key,

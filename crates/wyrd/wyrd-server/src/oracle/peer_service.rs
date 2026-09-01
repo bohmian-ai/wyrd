@@ -11,7 +11,6 @@ use vala_bifrost_redux::oracle::follower::{
     AuthenticatedFollowerContext, PhysicalPlanFollowerError, authenticated_preflight,
 };
 use vala_bifrost_redux::oracle::peer::{PeerSecurityAudit, PeerTicketClaims, PeerTicketVerifier};
-use wyrd_runtime::{Permission, Principal, PrincipalKind};
 use wyrd_spec::vala::api::BifrostSecurityViolationKind;
 use wyrd_spec::vala::api::{ClusterRole, ExecuteFragmentRequest};
 use wyrd_tonic::private_conversion::PrivateConversionError;
@@ -53,41 +52,17 @@ impl OraclePeerGrpc {
         OraclePeerServiceServer::new(self)
     }
 
-    /// Requires a verified service workload before peer state is touched.
+    /// Appends one scrubbed denial and fails closed if audit storage is unavailable.
     ///
     /// # Errors
-    /// Returns an authentication or authorization status for missing/invalid workload identity.
-    async fn authenticate(
-        &self,
-        metadata: &wyrd_tonic::tonic::metadata::MetadataMap,
-    ) -> Result<Principal, Status> {
-        let auth = match vala_bifrost_redux::gate::auth::authenticate(
-            self.bifrost.token_verifier(),
-            metadata,
-        )
-        .await
-        {
-            Ok(auth) => auth,
-            Err(error) => {
-                self.audit_denial(BifrostSecurityViolationKind::PeerAudience)
-                    .await?;
-                return Err(Status::unauthenticated(error.to_string()));
-            }
-        };
-        if let Some(violation) = peer_authority_violation(&auth.principal) {
-            tracing::error!(?violation, "Oracle peer workload authority denied");
-            self.audit_denial(violation).await?;
-            return Err(Status::permission_denied("Oracle peer authority denied"));
-        }
-        Ok(auth.principal)
-    }
-
-    /// Appends one scrubbed denial and fails closed if audit storage is unavailable.
+    ///
+    /// Returns `Unavailable` when the record cannot be persisted, because a
+    /// refusal Wyrd cannot account for is not a refusal it may forget.
     async fn audit_denial(&self, violation: BifrostSecurityViolationKind) -> Result<(), Status> {
         self.security_audit()?
             .append_unverified_ticket_rejection(violation)
             .await
-            .map_err(|_| Status::unavailable("Oracle peer security audit unavailable"))
+            .map_err(|_| Status::unavailable("Bifrost peer security audit unavailable"))
     }
 
     /// Selects the exact role-owned peer security audit without constructing an aggregate.
@@ -281,18 +256,24 @@ impl OraclePeerGrpc {
     }
 }
 
-/// Classifies platform-service peer authority without exposing identity detail.
-fn peer_authority_violation(principal: &Principal) -> Option<BifrostSecurityViolationKind> {
-    if !matches!(principal.kind, PrincipalKind::Service { .. }) {
-        return Some(BifrostSecurityViolationKind::PeerAudience);
-    }
-    if principal.tenant_id != wyrd_spec::DataTenantId::SYSTEM_OWNER {
-        return Some(BifrostSecurityViolationKind::PeerTenant);
-    }
-    (!principal
-        .effective_permissions
-        .contains(&Permission::bifrost_peer_invoke()))
-    .then_some(BifrostSecurityViolationKind::PeerAudience)
+/// Reads the peer identity the authentication layer established for a request.
+///
+/// The layer runs before the body is polled, so an admitted handler always
+/// finds this present. Its absence means the service was mounted outside the
+/// peer boundary, which is refused rather than reconstructed here: a handler
+/// that could rebuild identity from metadata would be a second authentication
+/// path, and the plane is required to have exactly one.
+///
+/// # Errors
+///
+/// Returns `Unauthenticated` when no context is attached.
+fn peer_context<T>(
+    request: &Request<T>,
+) -> Result<&vala_bifrost_redux::oracle::peer::AuthenticatedPeerContext, Status> {
+    request
+        .extensions()
+        .get::<vala_bifrost_redux::oracle::peer::AuthenticatedPeerContext>()
+        .ok_or_else(|| Status::unauthenticated("Bifrost peer identity is absent"))
 }
 
 #[wyrd_tonic::tonic::async_trait]
@@ -311,7 +292,7 @@ impl OraclePeerService for OraclePeerGrpc {
         &self,
         request: Request<ReserveNodeSlotsRequest>,
     ) -> Result<Response<proto::ReserveNodeSlotsResponse>, Status> {
-        self.authenticate(request.metadata()).await?;
+        peer_context(&request)?;
         let request = wyrd_spec::vala::api::ReserveNodeSlotsRequest::try_from(request.into_inner())
             .map_err(conversion_status)?;
         if self
@@ -343,7 +324,7 @@ impl OraclePeerService for OraclePeerGrpc {
         &self,
         request: Request<ReleaseNodeSlotsRequest>,
     ) -> Result<Response<proto::ReleaseNodeSlotsResponse>, Status> {
-        self.authenticate(request.metadata()).await?;
+        peer_context(&request)?;
         let request = wyrd_spec::vala::api::ReleaseNodeSlotsRequest::try_from(request.into_inner())
             .map_err(conversion_status)?;
         self.bifrost
@@ -362,7 +343,7 @@ impl OraclePeerService for OraclePeerGrpc {
         &self,
         request: Request<proto::ExecuteFragmentRequest>,
     ) -> Result<Response<Self::ExecuteFragmentStream>, Status> {
-        self.authenticate(request.metadata()).await?;
+        peer_context(&request)?;
         let request =
             ExecuteFragmentRequest::try_from(request.into_inner()).map_err(conversion_status)?;
         let WorkerExecution { mut stream } = match request.target_fence.role {
@@ -390,7 +371,7 @@ impl OraclePeerService for OraclePeerGrpc {
         &self,
         request: Request<ForwardQueryRequest>,
     ) -> Result<Response<Self::ForwardQueryStream>, Status> {
-        self.authenticate(request.metadata()).await?;
+        peer_context(&request)?;
         let envelope = request
             .into_inner()
             .envelope
@@ -443,12 +424,6 @@ mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
     use vala_bifrost_redux::oracle::attempt::AttemptBuffer;
-    use wyrd_runtime::permission::PermissionSet;
-    use wyrd_semver::VersionBlock;
-    use wyrd_spec::auth::PrincipalId;
-    use wyrd_spec::envelope::CardKind;
-    use wyrd_spec::ids::{CardName, SpaceName};
-    use wyrd_spec::reference::{CardRef, CardRefScope};
 
     /// The Scribe follower session is shaped by the lease this node charged.
     ///
@@ -536,60 +511,5 @@ mod tests {
         let validated = attempt.finish().expect("zero-row footer validates");
         assert_eq!(validated.footer.row_count, 0);
         assert_eq!(validated.batches.count(), 0);
-    }
-
-    /// Peer authority rejects users, tenant mismatch, and missing permission before mutation.
-    #[test]
-    fn reserve_requires_oracle_peer_authority() {
-        let card_ref = CardRef {
-            kind: CardKind::Service,
-            name: CardName::new("oracle-peer").expect("name"),
-            version: VersionBlock::parse("1.0.0").expect("version"),
-            space: SpaceName::new("system").expect("space"),
-            uid: None,
-        };
-        let service_kind = PrincipalKind::Service {
-            card_ref: card_ref.clone(),
-            card_ref_scope: CardRefScope::own(&card_ref),
-        };
-        let principal = |kind, tenant_id, permissions| Principal {
-            id: PrincipalId::new(uuid::Uuid::now_v7()),
-            kind,
-            tenant_id,
-            roles: Vec::new(),
-            effective_permissions: permissions,
-        };
-        assert_eq!(
-            peer_authority_violation(&principal(
-                PrincipalKind::User,
-                wyrd_spec::DataTenantId::SYSTEM_OWNER,
-                PermissionSet::from_iter([Permission::bifrost_peer_invoke()]),
-            )),
-            Some(BifrostSecurityViolationKind::PeerAudience)
-        );
-        assert_eq!(
-            peer_authority_violation(&principal(
-                service_kind.clone(),
-                wyrd_spec::DataTenantId::new_v7(),
-                PermissionSet::from_iter([Permission::bifrost_peer_invoke()]),
-            )),
-            Some(BifrostSecurityViolationKind::PeerTenant)
-        );
-        assert_eq!(
-            peer_authority_violation(&principal(
-                service_kind.clone(),
-                wyrd_spec::DataTenantId::SYSTEM_OWNER,
-                PermissionSet::new(),
-            )),
-            Some(BifrostSecurityViolationKind::PeerAudience)
-        );
-        assert_eq!(
-            peer_authority_violation(&principal(
-                service_kind,
-                wyrd_spec::DataTenantId::SYSTEM_OWNER,
-                PermissionSet::from_iter([Permission::bifrost_peer_invoke()]),
-            )),
-            None
-        );
     }
 }

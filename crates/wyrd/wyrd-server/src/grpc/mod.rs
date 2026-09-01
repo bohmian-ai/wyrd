@@ -14,8 +14,11 @@ mod otlp;
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub use otlp::{OtlpCodecActivity, reset_otlp_codec_activity, snapshot_otlp_codec_activity};
+mod peer_auth;
 pub(crate) mod query;
 mod scribe_tail;
+
+pub use peer_auth::{PeerWorkloadAuth, PeerWorkloadAuthLayer, PeerWorkloadIdentity};
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -343,6 +346,22 @@ where
         )))
 }
 
+/// Selects the role-owned peer security audit for this process.
+///
+/// Deliberately not an aggregate: a process owns exactly one peer plane, and
+/// whichever role composed it owns the record of what that plane refused.
+fn peer_security_audit(
+    state: &AppState,
+) -> Option<Arc<dyn vala_bifrost_redux::oracle::peer::PeerSecurityAudit>> {
+    if let Some(oracle) = state.bifrost.oracle() {
+        return Some(oracle.peer().security_audit());
+    }
+    state
+        .bifrost
+        .scribe()
+        .map(|scribe| scribe.fragment_security_audit())
+}
+
 /// Build the **private** Bifrost peer router served on the mutually
 /// authenticated peer listener.
 ///
@@ -363,6 +382,7 @@ where
 pub fn build_peer_grpc(
     state: &AppState,
     tls: wyrd_tonic::server::MutualTlsServerConfig,
+    denial_audit_concurrency: usize,
 ) -> Result<Option<TonicRouter>, GrpcError> {
     let serves_ingest = state.bifrost_ingest().is_some();
     let serves_query = state.bifrost_query().is_some();
@@ -370,31 +390,45 @@ pub fn build_peer_grpc(
         return Ok(None);
     }
     let transport = state.bifrost.transport_admission();
+    // One boundary, composed once and cloned into every mounted service, so no
+    // private adapter can acquire an authentication path of its own.
+    let auth = PeerWorkloadAuthLayer::new(
+        state.bifrost.shared_token_verifier(),
+        state
+            .bifrost
+            .peer_identity()
+            .cloned()
+            .ok_or(GrpcError::MissingPeerIdentity)?,
+        peer_security_audit(state).ok_or(GrpcError::MissingPeerIdentity)?,
+        denial_audit_concurrency,
+    );
     // `OraclePeerService` is the one adapter every peer-bearing target mounts:
     // a Scribe answers fragment operations on it and an Oracle answers query
     // control, so it anchors the router and later services extend it. The
     // protobuf service is never forked by role; an operation whose local
     // capability is absent fails closed after authentication instead.
-    let router = wyrd_tonic::server::mutual_tls_server(tls)?.add_service(
+    let router = wyrd_tonic::server::mutual_tls_server(tls)?.add_service(auth.wrap(
         GrpcTransportAdmissionService::new_peer(
             crate::oracle::OraclePeerGrpc::new(Arc::clone(&state.bifrost)).into_server(),
             transport.clone(),
         ),
-    );
+    ));
     let router = match state.bifrost_ingest() {
-        Some(scribe) => router.add_service(GrpcTransportAdmissionService::new_peer(
-            match scribe.tail_authority() {
-                Some(authority) => scribe_tail::ScribeTailGrpc::new_with_authority(
-                    state.clone(),
-                    scribe.tail_reader(),
-                    authority,
-                )
-                .into_server(),
-                None => scribe_tail::ScribeTailGrpc::new(state.clone(), scribe.tail_reader())
+        Some(scribe) => router.add_service(
+            auth.wrap(GrpcTransportAdmissionService::new_peer(
+                match scribe.tail_authority() {
+                    Some(authority) => scribe_tail::ScribeTailGrpc::new_with_authority(
+                        state.clone(),
+                        scribe.tail_reader(),
+                        authority,
+                    )
                     .into_server(),
-            },
-            transport.clone(),
-        )),
+                    None => scribe_tail::ScribeTailGrpc::new(state.clone(), scribe.tail_reader())
+                        .into_server(),
+                },
+                transport.clone(),
+            )),
+        ),
         None => router,
     };
     let router = match state
@@ -403,29 +437,31 @@ pub fn build_peer_grpc(
     {
         Some(ingress) => {
             let worker = ingress.worker().clone().into_worker_server();
-            router.add_service(GrpcTransportAdmissionService::new_peer(
+            router.add_service(auth.wrap(GrpcTransportAdmissionService::new_peer(
                 vala_bifrost_redux::oracle::analytical_transport::AnalyticalStageAuthLayer::new(
                     ingress,
                 )
                 .layer_service(worker),
                 transport.clone(),
-            ))
+            )))
         }
         None => router,
     };
     let router = match state.bifrost_query() {
-        Some(query) => router.add_service(GrpcTransportAdmissionService::new_peer(
-            crate::oracle::OracleLifecycleGrpc::new(
-                state
-                    .auth
-                    .token_verifier
-                    .clone()
-                    .ok_or(GrpcError::MissingTokenVerifier)?,
-                Arc::clone(query),
-            )
-            .into_server(),
-            transport,
-        )),
+        Some(query) => router.add_service(
+            auth.wrap(GrpcTransportAdmissionService::new_peer(
+                crate::oracle::OracleLifecycleGrpc::new(
+                    state
+                        .auth
+                        .token_verifier
+                        .clone()
+                        .ok_or(GrpcError::MissingTokenVerifier)?,
+                    Arc::clone(query),
+                )
+                .into_server(),
+                transport,
+            )),
+        ),
         None => router,
     };
     Ok(Some(router))

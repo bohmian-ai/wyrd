@@ -2902,7 +2902,7 @@ mod tests {
             "SELECT r.name, r.permissions FROM wyrd.auth_service_accounts sa \
              JOIN wyrd.auth_service_account_roles sar ON sar.data_tenant_id = sa.data_tenant_id AND sar.service_account_id = sa.id \
              JOIN wyrd.auth_roles r ON r.data_tenant_id = sar.data_tenant_id AND r.id = sar.role_id \
-             WHERE sa.name = 'bifrost-oracle-peer' ORDER BY r.name",
+             WHERE sa.name = 'bifrost-peer' ORDER BY r.name",
         )
         .fetch_all(&mut **system_conn.transaction())
         .await

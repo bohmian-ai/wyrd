@@ -1065,7 +1065,7 @@ pub async fn compose_bifrost(
             local_fence: oracle
                 .as_ref()
                 .map(|runtime| runtime.registered_role().fencing_token),
-            credentials: peer_credentials,
+            credentials: Arc::clone(&peer_credentials),
             tls: peer_tls,
             authority: forwarding_authority,
             config: OracleConfig::default(),
@@ -1085,6 +1085,21 @@ pub async fn compose_bifrost(
     .with_query_dispatch(
         Arc::clone(&query_forwarder) as Arc<dyn vala_bifrost_redux::contracts::OracleQueryDispatch>
     );
+    // Resolved from the process's own credential, so the identity a replica
+    // presents on the peer plane and the identity it admits are the same
+    // principal. A peer-serving target that cannot prove it fails to boot.
+    let peer_identity = if target.serves_peer() {
+        Some(
+            crate::grpc::PeerWorkloadIdentity::resolve(
+                peer_credentials.as_ref(),
+                token_verifier.as_ref(),
+            )
+            .await
+            .map_err(ServerBootError::OraclePeer)?,
+        )
+    } else {
+        None
+    };
     Ok(crate::state::ComposedBifrost {
         bifrost: crate::state::Bifrost::assembled(crate::state::BifrostComposition {
             gate,
@@ -1094,6 +1109,7 @@ pub async fn compose_bifrost(
             bifrost_storage,
             transport: bifrost_resources.transport_admission(),
             token_verifier,
+            peer_identity,
             query_forwarder: Some(query_forwarder),
             #[cfg(feature = "test-support")]
             resources: Some(bifrost_resources.clone()),
@@ -1748,6 +1764,7 @@ impl<'a> OracleRoleBuilder<'a> {
             peer_ticket_minter,
             stage_authority: Some(stage_authority),
             peer_tls,
+            peer_credentials: Some(Arc::clone(&peer_credentials)),
             tail_ticket_minter: Some(tail_authority),
             tail_discovery: Some(tail_discovery),
             peer_transports: Some(peer_transports),

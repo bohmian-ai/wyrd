@@ -33,9 +33,16 @@ async fn peer_authentication_precedes_body_admission() {
 ///
 /// Returns the first scenario failure, which names the claim that broke.
 async fn prove_peer_authentication_precedes_body_admission() -> Result<(), PeerJourneyError> {
+    // Two Oracles so one pod probes another over the real peer listener, and
+    // one Scribe so the topology owns a catalog and a tail source exactly as a
+    // deployment that serves queries does.
     let mut cluster = BifrostProcessCluster::start(
         NODE_BINARY,
-        &[ProcessNodeTarget::Oracle, ProcessNodeTarget::Oracle],
+        &[
+            ProcessNodeTarget::Oracle,
+            ProcessNodeTarget::Oracle,
+            ProcessNodeTarget::Scribe,
+        ],
     )
     .await?;
 
@@ -187,9 +194,12 @@ fn refused_identities_never_reach_a_body(
 
 /// The one configured peer Service principal is admitted on both adapters.
 ///
-/// Admission is observed as the absence of an authentication verdict plus a
-/// body poll the refused cases never produce: the request reached the plane
-/// that decodes it.
+/// Admission is observed as a body poll the refused cases never produce: the
+/// request reached the plane that decodes it. The verdict itself only carries
+/// the claim on the Oracle adapter; the worker adapter applies a separate
+/// stage-authority check to the decoded message, and this probe deliberately
+/// carries no purpose ticket, so its refusal there is authorization of the
+/// operation rather than of the workload.
 ///
 /// # Errors
 ///
@@ -201,9 +211,17 @@ fn the_configured_principal_is_admitted_on_both_adapters(
     for adapter in ADAPTERS {
         let before = body_polls(cluster)?;
         let outcome = probe(cluster, &PeerProbePlan::own(destination).against(adapter))?;
-        if outcome == "Unauthenticated" || outcome == "PermissionDenied" {
+        if adapter == PeerProbeService::OraclePeer
+            && (outcome == "Unauthenticated" || outcome == "PermissionDenied")
+        {
             return Err(format!(
                 "{adapter:?} refused the configured peer principal with {outcome}"
+            )
+            .into());
+        }
+        if outcome == "Unauthenticated" {
+            return Err(format!(
+                "{adapter:?} refused the configured peer principal as unauthenticated"
             )
             .into());
         }

@@ -174,7 +174,11 @@ impl WyrdServer {
             },
         )?;
         let peer_router = match load_peer_tls(&config)? {
-            Some(peer_tls) => build_peer_grpc(&state, peer_tls)?,
+            Some(peer_tls) => build_peer_grpc(
+                &state,
+                peer_tls,
+                config.bifrost.peer.denial_audit_concurrency,
+            )?,
             None => None,
         };
         // Declared from the composed router rather than from the target alone,

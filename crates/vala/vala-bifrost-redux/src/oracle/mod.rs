@@ -1508,6 +1508,13 @@ pub struct OracleBuildConfig {
     /// coordinator that cannot present the peer client identity cannot reach a
     /// follower at all.
     pub peer_tls: Option<dispatcher::BifrostPeerTls>,
+    /// Workload credential this node presents on every east-west peer request.
+    ///
+    /// Absent only on a deployment whose target does not serve the peer plane.
+    /// The private listener authenticates the workload credential before it
+    /// polls a request body, so a coordinator without one cannot reach a
+    /// follower even when it holds a valid peer certificate.
+    pub peer_credentials: Option<Arc<dyn dispatcher::OraclePeerCredentials>>,
     /// Server-owned domain-separated Scribe-tail ticket signer.
     pub tail_ticket_minter: Option<Arc<dyn crate::scribe::tail_rpc::TailTicketMinter>>,
     /// Query-scoped live Scribe discovery owner.
@@ -2096,6 +2103,8 @@ struct AnalyticalCompositionInputs {
     scratch_bytes: u64,
     /// Immutable peer identity every east-west channel is dialed through.
     peer_tls: dispatcher::BifrostPeerTls,
+    /// Workload credential every east-west request presents.
+    peer_credentials: Arc<dyn dispatcher::OraclePeerCredentials>,
 }
 
 /// Builds one node's Analytical execution handle from its composed owners.
@@ -2120,6 +2129,7 @@ fn compose_analytical_handle(
         exchange_buffer_bytes,
         scratch_bytes,
         peer_tls,
+        peer_credentials,
     } = inputs;
     let supervisor = Arc::new(analytical::AnalyticalSupervisor::new());
     let leaf = codec::AnalyticalLeafBinding::new(
@@ -2151,6 +2161,7 @@ fn compose_analytical_handle(
         fence,
         ANALYTICAL_STAGE_TICKET_TTL,
         peer_tls.clone(),
+        Arc::clone(&peer_credentials),
     ));
     let worker = Arc::new(analytical::AnalyticalStageIngress::new(
         analytical::AnalyticalStageIngressConfig {
@@ -2178,6 +2189,7 @@ fn compose_analytical_handle(
             exchange_buffer_bytes,
             scratch_bytes,
             peer_tls,
+            peer_credentials,
         },
         leaf,
     ))
@@ -2286,25 +2298,26 @@ impl Oracle {
         });
         // Both owners are required together: the authority proves a stage
         // operation, and the peer identity is the only way to deliver one.
-        let analytical =
-            config
-                .stage_authority
-                .zip(config.peer_tls)
-                .map(|(authority, peer_tls)| {
-                    compose_analytical_handle(AnalyticalCompositionInputs {
-                        authority,
-                        peer_tls,
-                        cluster: Arc::clone(&cluster),
-                        node_id: admission.local_role.key.node_id,
-                        fence: admission.local_role.fencing_token,
-                        catalog: Arc::clone(&config.catalog),
-                        audit: Arc::clone(&config.audit),
-                        resources: config.memory.resources.clone(),
-                        spill: Arc::clone(&config.spill_runtime),
-                        exchange_buffer_bytes: config.config.analytical_exchange_buffer_bytes,
-                        scratch_bytes: config.config.analytical_scratch_bytes,
-                    })
-                });
+        let analytical = config
+            .stage_authority
+            .zip(config.peer_tls)
+            .zip(config.peer_credentials)
+            .map(|((authority, peer_tls), peer_credentials)| {
+                compose_analytical_handle(AnalyticalCompositionInputs {
+                    authority,
+                    peer_tls,
+                    peer_credentials,
+                    cluster: Arc::clone(&cluster),
+                    node_id: admission.local_role.key.node_id,
+                    fence: admission.local_role.fencing_token,
+                    catalog: Arc::clone(&config.catalog),
+                    audit: Arc::clone(&config.audit),
+                    resources: config.memory.resources.clone(),
+                    spill: Arc::clone(&config.spill_runtime),
+                    exchange_buffer_bytes: config.config.analytical_exchange_buffer_bytes,
+                    scratch_bytes: config.config.analytical_scratch_bytes,
+                })
+            });
         Ok(Self {
             planner,
             admission,

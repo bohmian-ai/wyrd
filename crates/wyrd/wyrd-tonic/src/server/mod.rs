@@ -120,6 +120,12 @@ pub enum GrpcError {
     /// Building the incoming stream from a pre-bound listener failed.
     #[error("gRPC incoming listener setup failed: {0}")]
     IncomingSetup(String),
+    /// A private peer router was requested without the resolved peer Service
+    /// identity or the role-owned security audit it authenticates against.
+    /// Serving the peer plane without either would mean admitting traffic the
+    /// process cannot authorize or refuse on the record, so it is a boot error.
+    #[error("Bifrost peer plane identity or security audit is unavailable")]
+    MissingPeerIdentity,
     /// Ingest mount was requested but no token verifier is configured. Ingest is
     /// never mounted unauthenticated, so a missing verifier is a hard boot error.
     #[error("gRPC ingest requires a token verifier but none is configured")]

@@ -66,7 +66,7 @@ use super::analytical_transport::{
     AnalyticalChannelResolver, AnalyticalCoordinatorIdentity, AnalyticalStageMinter,
     StageWireIdentity, read_ticket,
 };
-use super::dispatcher::BifrostPeerTls;
+use super::dispatcher::{BifrostPeerTls, OraclePeerCredentials};
 use super::participant_cut::OracleQueryAttemptCut;
 use super::peer::{AuthorizedStage, OracleStageAuthority, PeerSecurityError, StageOperationV1};
 use super::spill::OracleSpillRuntime;
@@ -605,6 +605,8 @@ pub struct AnalyticalStageEgress {
     ticket_ttl: chrono::Duration,
     /// Immutable peer identity every outbound channel is dialed through.
     peer_tls: BifrostPeerTls,
+    /// Workload credential every outbound peer request presents.
+    peer_credentials: Arc<dyn OraclePeerCredentials>,
     /// Per-graph outbound identity recorded when a stage was authorized.
     identities: Mutex<HashMap<AnalyticalGraphKey, AnalyticalEgressIdentity>>,
 }
@@ -642,6 +644,7 @@ impl AnalyticalStageEgress {
         oracle_fence: u64,
         ticket_ttl: chrono::Duration,
         peer_tls: BifrostPeerTls,
+        peer_credentials: Arc<dyn OraclePeerCredentials>,
     ) -> Self {
         Self {
             authority,
@@ -650,6 +653,7 @@ impl AnalyticalStageEgress {
             oracle_fence,
             ticket_ttl,
             peer_tls,
+            peer_credentials,
             identities: Mutex::new(HashMap::new()),
         }
     }
@@ -737,6 +741,7 @@ impl AnalyticalStageEgress {
         Ok(Some(AnalyticalChannelResolver::new(
             identity,
             self.peer_tls.clone(),
+            Arc::clone(&self.peer_credentials),
             Arc::new(move |url: &Url| {
                 destinations.get(url).map(|(node_id, fence)| {
                     Arc::new(AnalyticalStageMinter::new(
@@ -1587,6 +1592,9 @@ mod tests {
             0,
             chrono::Duration::seconds(30),
             BifrostPeerTls::unreachable_for_test(),
+            Arc::new(super::super::dispatcher::StaticOraclePeerCredentials::new(
+                secrecy::SecretString::from("fixture-bearer"),
+            )),
         ))
     }
 
@@ -1940,6 +1948,8 @@ pub struct AnalyticalExecutionConfig {
     pub scratch_bytes: u64,
     /// Immutable peer identity every leader-side channel is dialed through.
     pub peer_tls: BifrostPeerTls,
+    /// Workload credential every leader-side peer request presents.
+    pub peer_credentials: Arc<dyn OraclePeerCredentials>,
 }
 
 /// What one inactive Analytical execution left behind once it drained.
@@ -2247,6 +2257,7 @@ impl AnalyticalExecutionHandle {
         let resolver = AnalyticalChannelResolver::new(
             identity,
             self.config.peer_tls.clone(),
+            Arc::clone(&self.config.peer_credentials),
             Arc::new(move |url: &Url| {
                 destinations.get(url).map(|(node_id, fence)| {
                     Arc::new(AnalyticalStageMinter::new(

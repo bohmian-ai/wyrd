@@ -42,7 +42,11 @@ tonic-prost-build = { workspace = true }
 
 [features]
 default = []
-server = ["dep:tonic-reflection", "dep:tonic-health", "tonic/server", "tonic/router", "dep:opentelemetry-proto"]
+# `tls-connect-info` publishes the accepted peer certificate chain into request
+# extensions. The private Bifrost peer listener authenticates a workload
+# credential against the certificate that carried it, so the server surface
+# needs the connection's verified identity, not only its bytes.
+server = ["dep:tonic-reflection", "dep:tonic-health", "tonic/server", "tonic/router", "tonic/tls-connect-info", "dep:opentelemetry-proto"]
 # Marker feature: opts the generated `wyrd::v1` client stub into codegen (see
 # build.rs). No extra tonic surface needed — the client rides the default
 # `channel` transport already enabled above.

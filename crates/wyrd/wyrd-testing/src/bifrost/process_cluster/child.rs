@@ -128,15 +128,13 @@ async fn serve() -> Result<(), ProcessClusterError> {
                     count: wyrd_server::grpc::peer_body_polls(),
                 })?;
             }
-            ControlRequest::ExecuteInactiveSql { .. } => {
-                // The inactive Analytical execution seam is restored by the
-                // Analytical slices of this remediation. Until then the control
-                // verb exists and refuses explicitly, rather than silently
-                // succeeding against a path that is not wired.
-                emit(&ControlResponse::Failed {
-                    detail: "inactive Analytical execution is not yet mounted on this node"
-                        .to_owned(),
-                })?;
+            ControlRequest::ExecuteInactiveSql { sql } => {
+                match config.execute_inactive_sql(&server, &sql).await {
+                    Ok(rows) => emit(&ControlResponse::Executed { rows })?,
+                    Err(error) => emit(&ControlResponse::Failed {
+                        detail: error.to_string(),
+                    })?,
+                }
             }
             ControlRequest::Shutdown => {
                 emit(&ControlResponse::ShuttingDown)?;
@@ -401,6 +399,101 @@ impl ChildConfig {
             .await
             .map(|_| ())
             .map_err(|error| ProcessClusterError::Child(error.to_string()))
+    }
+
+    /// Runs one statement through this node's inactive Analytical path.
+    ///
+    /// The stream is drained to its terminal frame rather than dropped early,
+    /// so the graph and attempt guards it carries settle before the parent
+    /// inspects the node. Nothing in routing reaches this seam; the child
+    /// authenticates the same way the public query service does and hands
+    /// Oracle the identical context its own gRPC surface would have built.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProcessClusterError::Child`] when this target composes no
+    /// Oracle, the context cannot be authorized, or the attempt fails at
+    /// admission, planning, execution, or decode.
+    async fn execute_inactive_sql(
+        &self,
+        server: &WyrdTestServer,
+        sql: &str,
+    ) -> Result<usize, ProcessClusterError> {
+        let child = |detail: String| ProcessClusterError::Child(detail);
+        let engine = Arc::clone(
+            server
+                .state()
+                .bifrost_query()
+                .ok_or_else(|| child("this target composes no Oracle".to_owned()))?
+                .engine(),
+        );
+        let permission = wyrd_runtime::Permission::bifrost_query_read();
+        let principal = wyrd_runtime::Principal::new(
+            wyrd_spec::auth::PrincipalId::new(uuid::Uuid::now_v7()),
+            wyrd_runtime::PrincipalKind::User,
+            self.tenant_id,
+            Vec::new(),
+            wyrd_runtime::permission::PermissionSet::from_iter([permission.clone()]),
+        );
+        let context = vala_bifrost_redux::oracle::AuthorizedQueryContext::try_new(
+            principal,
+            self.tenant_id,
+            wyrd_spec::request_id::RequestId::now_v7(),
+            None,
+            wyrd_spec::vala::api::AuthMethod::Internal,
+            permission.to_string(),
+        )
+        .map_err(|error| child(error.to_string()))?;
+        // Both query identities are allocated independently on purpose: a
+        // leaked public identity into the distributed graph, or the reverse,
+        // is exactly what the stage authority's isolation exists to refuse.
+        let attempt = vala_bifrost_redux::oracle::analytical::AnalyticalAttemptContext {
+            public_query_id: vala_bifrost_redux::oracle::analytical::PublicQueryId::from_uuid(
+                uuid::Uuid::now_v7(),
+            ),
+            datafusion_query_id:
+                vala_bifrost_redux::oracle::analytical::DataFusionQueryId::from_uuid(
+                    uuid::Uuid::now_v7(),
+                ),
+            snapshot_digest: format!("snapshot-{}", uuid::Uuid::now_v7().simple()),
+            reservation_id: format!("reservation-{}", uuid::Uuid::now_v7().simple()),
+            permission_digest: format!("permission-{}", uuid::Uuid::now_v7().simple()),
+        };
+        let mut stream = engine
+            .query_sql_inactive_analytical(
+                context,
+                wyrd_spec::vala::api::BifrostQueryRequest {
+                    sql: sql.to_owned(),
+                    visibility: wyrd_spec::vala::api::VisibilityMode::PublishedOnly,
+                    freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
+                    deadline_ms: Some(30_000),
+                },
+                attempt,
+            )
+            .await
+            .map_err(|error| child(error.to_string()))?;
+        let mut decoder = vala_bifrost_redux::oracle::QueryIpcDecoder::new();
+        let mut rows = 0;
+        let mut terminal = None;
+        while let Some(frame) = futures_util::StreamExt::next(&mut stream.frames).await {
+            match frame.map_err(|error| child(error.to_string()))? {
+                wyrd_spec::vala::api::QueryStreamFrame::Schema(schema) => {
+                    decoder
+                        .accept_schema(&schema.arrow_ipc_schema)
+                        .map_err(|error| child(error.to_string()))?;
+                }
+                wyrd_spec::vala::api::QueryStreamFrame::Batch(batch) => {
+                    rows += decoder
+                        .accept_batch(&batch.arrow_ipc_batch)
+                        .map_err(|error| child(error.to_string()))?
+                        .num_rows();
+                }
+                wyrd_spec::vala::api::QueryStreamFrame::Terminal(frame) => terminal = Some(frame),
+            }
+        }
+        terminal
+            .ok_or_else(|| child("the inactive attempt emitted no terminal frame".to_owned()))?;
+        Ok(rows)
     }
 
     /// Performs one shaped private-plane probe and returns its gRPC outcome.

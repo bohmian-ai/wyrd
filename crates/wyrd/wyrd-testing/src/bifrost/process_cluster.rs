@@ -361,8 +361,6 @@ pub enum ControlResponse {
     Executed {
         /// Rows the statement produced.
         rows: usize,
-        /// Attempt ordinal that produced them.
-        attempt: u32,
     },
     /// Answer to [`ControlRequest::RegisterTable`].
     Registered,
@@ -846,6 +844,30 @@ impl ProcessNode {
             ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
             other => Err(ProcessClusterError::Protocol(format!(
                 "expected a registration, received {other:?}"
+            ))),
+        }
+    }
+
+    /// Asks this child to run one statement through inactive Analytical.
+    ///
+    /// Returns the row count the attempt produced. Nothing in production
+    /// routing reaches this seam; the child builds the same authorized
+    /// context its public query surface would have built and drives the
+    /// stream to its terminal frame, so the caller observes a settled
+    /// attempt rather than an abandoned one.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::request`], and
+    /// [`ProcessClusterError::Child`] when the attempt itself failed.
+    pub fn execute_inactive_sql(&mut self, sql: &str) -> Result<usize, ProcessClusterError> {
+        match self.request(&ControlRequest::ExecuteInactiveSql {
+            sql: sql.to_owned(),
+        })? {
+            ControlResponse::Executed { rows } => Ok(rows),
+            ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
+            other => Err(ProcessClusterError::Protocol(format!(
+                "expected an execution, received {other:?}"
             ))),
         }
     }

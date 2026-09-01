@@ -339,6 +339,26 @@ pub struct ForgeWorkerConfig {
     pub per_tenant_active_cap: usize,
 }
 
+/// One admitted rewrite attempt's publication evidence, keyed by its identities.
+///
+/// Compiled only under `test-support`. The evidence itself is the immutable set
+/// managed execution produced; the three identities are the ones the published
+/// snapshot carries in its `forge.task_id`, `forge.attempt_id`, and
+/// `forge.operation_id` properties, which is what lets a journey correlate a
+/// landed snapshot to the exact attempt that derived it.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgeRewriteEvidenceRecord {
+    /// Durable task the attempt was claimed for.
+    pub task_id: Uuid,
+    /// Attempt identity the evidence was produced under.
+    pub attempt_id: Uuid,
+    /// Operation identity publication will Prepare under.
+    pub operation_id: Uuid,
+    /// Exact planning evidence the attempt produced.
+    pub evidence: crate::forge::managed::ForgeRewriteEvidence,
+}
+
 /// Observes successful durable task completion from supervised worker roles.
 ///
 /// The observer is an optional test-support seam. It records only after the
@@ -366,6 +386,16 @@ pub struct ForgeWorkerCompletionObserver {
     /// neither holds the vector nor clones an unsettled attempt's paths into it.
     #[cfg(feature = "test-support")]
     returned_unsettled: Arc<Mutex<Vec<Option<Vec<crate::forge::managed::ForgeUnsettledOutput>>>>>,
+    /// Publication evidence each admitted rewrite attempt produced, in order.
+    ///
+    /// Compiled only under `test-support`. Recorded at the production dispatch
+    /// boundary once managed execution has produced the immutable evidence and
+    /// before publication consumes it, so a journey can compare a landed
+    /// snapshot's fingerprint properties against the attempt's own values
+    /// without recomputing a fingerprint or reading a persisted column that
+    /// does not carry them.
+    #[cfg(feature = "test-support")]
+    rewrite_evidence: Arc<Mutex<Vec<ForgeRewriteEvidenceRecord>>>,
     /// Number of successful task executions observed after their durable path returned.
     completed: Arc<AtomicUsize>,
     /// Stable production worker identities that completed each observed task.
@@ -569,6 +599,34 @@ impl ForgeWorkerCompletionObserver {
         &self,
     ) -> Vec<Option<Vec<crate::forge::managed::ForgeUnsettledOutput>>> {
         self.returned_unsettled
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Record one admitted rewrite attempt's publication evidence.
+    ///
+    /// Passive: the record is appended after the evidence already exists and
+    /// is never read by any durable path, so it cannot affect scheduling,
+    /// publication, or settlement.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn record_rewrite_evidence_for_test(&self, record: ForgeRewriteEvidenceRecord) {
+        self.rewrite_evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(record);
+        self.ready.notify_waiters();
+    }
+
+    /// Return the publication evidence every admitted rewrite attempt produced.
+    ///
+    /// Ordered by observation. A journey selects the entry whose identities
+    /// match the snapshot it is inspecting rather than assuming a position,
+    /// because one pod legitimately runs rewrites for several tables.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn rewrite_evidence_for_test(&self) -> Vec<ForgeRewriteEvidenceRecord> {
+        self.rewrite_evidence
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -1383,6 +1441,27 @@ impl ForgeWorker {
     fn record_attempt(&self, error: Option<&ForgeError>) {
         if let Some(observer) = &self.completion_observer {
             observer.record_attempt(error);
+        }
+    }
+
+    /// Publish the passive publication-evidence event for one admitted rewrite.
+    ///
+    /// Called once managed execution has produced the attempt's immutable
+    /// evidence and before publication consumes it, which is the only point
+    /// where the evidence and all three durable identities are known together.
+    /// Test-support only and side-effect free.
+    #[cfg(feature = "test-support")]
+    fn record_rewrite_evidence_for_test(
+        &self,
+        identity: &super::publication::RewriteCommitIdentity,
+    ) {
+        if let Some(observer) = &self.completion_observer {
+            observer.record_rewrite_evidence_for_test(ForgeRewriteEvidenceRecord {
+                task_id: identity.task_id,
+                attempt_id: identity.attempt_id,
+                operation_id: identity.operation_id,
+                evidence: identity.evidence.clone(),
+            });
         }
     }
 
@@ -2804,6 +2883,8 @@ impl ForgeWorker {
                 self.forge.core.config.iceberg_total_retry_timeout,
             )?,
         };
+        #[cfg(feature = "test-support")]
+        self.record_rewrite_evidence_for_test(&context.identity);
         self.publish_rewrite(&context, &handoff, lease, stop).await
     }
 

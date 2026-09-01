@@ -244,6 +244,10 @@ struct LiveCut {
 /// Everything here is read from the catalog the pod actually published
 /// through, never from `vala.file_list`: the question a recovery journey has
 /// to answer is what the *table* says happened, and only the manifests say it.
+/// The byte volumes are summed from the same complete live maps the path sets
+/// are differenced from, so a snapshot summary property is only ever an
+/// *actual* value under test here and never the expectation it is checked
+/// against.
 #[derive(Debug, Clone)]
 struct RewriteSnapshot {
     /// Identity of the snapshot the rewrite published.
@@ -258,6 +262,73 @@ struct RewriteSnapshot {
     removed_data: BTreeSet<String>,
     /// Delete paths this snapshot removed, in canonical storage form.
     removed_deletes: BTreeSet<String>,
+    /// Manifest-recorded byte volume of every data path this snapshot added.
+    added_bytes: u64,
+    /// Manifest-recorded byte volume of every data path this snapshot removed.
+    removed_bytes: u64,
+}
+
+/// One live manifest entry, with every fact the rewrite algebra reasons about.
+///
+/// Held instead of a bare path because the volume claims a rewrite makes are
+/// about bytes, not names: a summary that reported the right file *count* with
+/// the wrong byte total would otherwise be indistinguishable from a correct
+/// one. Content type and the sequence numbers travel with it so a delete
+/// attachment is never counted as data and a replacement's inherited sequence
+/// stays inspectable from the same projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveFile {
+    /// Iceberg content type the manifest entry declared for the object.
+    content_type: iceberg::spec::DataContentType,
+    /// Physical size in bytes the manifest recorded for the object.
+    size_bytes: u64,
+    /// Data sequence number the live entry carries, when the manifest has one.
+    sequence_number: Option<i64>,
+    /// File sequence number the live entry carries, when the manifest has one.
+    file_sequence_number: Option<i64>,
+}
+
+/// Every file one snapshot holds live, split by content and keyed by path.
+///
+/// This is the journey's single manifest projection: every path set and every
+/// byte total below is derived from two of these, so the two can never
+/// disagree about which entries they described.
+#[derive(Debug, Clone, Default)]
+struct SnapshotFiles {
+    /// Live data entries of the snapshot, keyed by canonical storage path.
+    data: BTreeMap<String, LiveFile>,
+    /// Live position- and equality-delete entries, keyed by canonical path.
+    deletes: BTreeMap<String, LiveFile>,
+}
+
+impl SnapshotFiles {
+    /// Returns the canonical paths of every live data entry.
+    fn data_paths(&self) -> BTreeSet<String> {
+        self.data.keys().cloned().collect()
+    }
+
+    /// Returns the canonical paths of every live delete attachment.
+    fn delete_paths(&self) -> BTreeSet<String> {
+        self.deletes.keys().cloned().collect()
+    }
+
+    /// Sums the manifest-recorded size of the named data entries.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a named path is not a live data entry of this snapshot,
+    /// which would mean the caller differenced two unrelated projections.
+    fn data_bytes(&self, paths: &BTreeSet<String>) -> u64 {
+        paths
+            .iter()
+            .map(|path| {
+                self.data
+                    .get(path)
+                    .unwrap_or_else(|| panic!("{path} is a live data entry of this snapshot"))
+                    .size_bytes
+            })
+            .sum()
+    }
 }
 
 /// Rewrites one file path into the tenant-object-prefix form.
@@ -292,9 +363,8 @@ async fn snapshot_files(
     table: &iceberg::table::Table,
     snapshot: &iceberg::spec::SnapshotRef,
     binding: &TenantTableBinding,
-) -> (BTreeSet<String>, BTreeSet<String>) {
-    let mut data = BTreeSet::new();
-    let mut deletes = BTreeSet::new();
+) -> SnapshotFiles {
+    let mut files = SnapshotFiles::default();
     let manifests = table
         .manifest_list_reader(snapshot)
         .load()
@@ -306,15 +376,23 @@ async fn snapshot_files(
             .await
             .expect("the journey manifest");
         for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
-            let path = canonical_path(entry.data_file().file_path(), binding);
-            if entry.data_file().content_type() == iceberg::spec::DataContentType::Data {
-                data.insert(path);
+            let data_file = entry.data_file();
+            let path = canonical_path(data_file.file_path(), binding);
+            let content_type = data_file.content_type();
+            let live = LiveFile {
+                content_type,
+                size_bytes: data_file.file_size_in_bytes(),
+                sequence_number: entry.sequence_number(),
+                file_sequence_number: entry.file_sequence_number,
+            };
+            if content_type == iceberg::spec::DataContentType::Data {
+                files.data.insert(path, live);
             } else {
-                deletes.insert(path);
+                files.deletes.insert(path, live);
             }
         }
     }
-    (data, deletes)
+    files
 }
 
 /// Reads one table's current live cut through the pod's production catalog.
@@ -337,11 +415,11 @@ async fn live_cut(cluster: &WyrdTestCluster, binding: &TenantTableBinding) -> Li
         .current_snapshot()
         .expect("a published journey table has a current snapshot")
         .clone();
-    let (data, deletes) = snapshot_files(&table, &snapshot, binding).await;
+    let files = snapshot_files(&table, &snapshot, binding).await;
     LiveCut {
         snapshot_id: snapshot.snapshot_id(),
-        data,
-        deletes,
+        data: files.data_paths(),
+        deletes: files.delete_paths(),
     }
 }
 
@@ -391,15 +469,31 @@ async fn rewrite_snapshots(
                     snapshot.snapshot_id()
                 )
             });
-        let (own_data, own_deletes) = snapshot_files(&table, snapshot, binding).await;
-        let (base_data, base_deletes) = snapshot_files(&table, parent, binding).await;
+        let own = snapshot_files(&table, snapshot, binding).await;
+        let base = snapshot_files(&table, parent, binding).await;
+        let own_data = own.data_paths();
+        let base_data = base.data_paths();
+        let added_data = own_data
+            .difference(&base_data)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let removed_data = base_data
+            .difference(&own_data)
+            .cloned()
+            .collect::<BTreeSet<_>>();
         found.push(RewriteSnapshot {
             snapshot_id: snapshot.snapshot_id(),
             parent_snapshot_id,
             summary,
-            added_data: own_data.difference(&base_data).cloned().collect(),
-            removed_data: base_data.difference(&own_data).cloned().collect(),
-            removed_deletes: base_deletes.difference(&own_deletes).cloned().collect(),
+            added_bytes: own.data_bytes(&added_data),
+            removed_bytes: base.data_bytes(&removed_data),
+            added_data,
+            removed_data,
+            removed_deletes: base
+                .delete_paths()
+                .difference(&own.delete_paths())
+                .cloned()
+                .collect(),
         });
     }
     found
@@ -504,6 +598,66 @@ async fn rewrite_task_plan(
             )
         })
         .collect()
+}
+
+/// Reads the durable canonical plan hash of one small-files Forge task.
+///
+/// Returned hex-encoded, which is exactly how publication renders it into the
+/// snapshot's `forge.rewrite.plan_hash` property, so the comparison is against
+/// the persisted bytes rather than against a hash this journey recomputed.
+///
+/// # Panics
+///
+/// Panics when the read-only diagnostic query fails or the task is absent.
+async fn durable_plan_hash(cluster: &WyrdTestCluster, task_id: Uuid) -> String {
+    let plan_hash = sqlx::query_scalar::<_, Vec<u8>>(
+        "SELECT plan_hash FROM vala.forge_tasks WHERE task_id = $1 AND strategy = 'small_files'",
+    )
+    .bind(task_id)
+    .fetch_one(cluster.pg_fixture().operator_pool().pool())
+    .await
+    .expect("Forge rewrite-task plan-hash inspection");
+    assert_eq!(
+        plan_hash.len(),
+        32,
+        "the durable rewrite task carries its canonical plan hash"
+    );
+    hex::encode(plan_hash)
+}
+
+/// Selects the publication evidence one named attempt produced.
+///
+/// The three remaining rewrite fingerprints are execution evidence rather than
+/// persisted task columns, so the only authority on their expected values is
+/// the immutable evidence the production dispatch boundary recorded for this
+/// exact task, attempt, and operation. Selecting by all three identities is
+/// what stops an unrelated rewrite the same pod ran from answering.
+///
+/// # Panics
+///
+/// Panics when no evidence, or more than one, was recorded for the identities.
+fn attempt_evidence(
+    observer: &vala_bifrost_redux::forge::ForgeWorkerCompletionObserver,
+    task_id: Uuid,
+    attempt_id: Uuid,
+    operation_id: Uuid,
+) -> vala_bifrost_redux::forge::ForgeRewriteEvidence {
+    let recorded = observer.rewrite_evidence_for_test();
+    let mine = recorded
+        .iter()
+        .filter(|record| {
+            record.task_id == task_id
+                && record.attempt_id == attempt_id
+                && record.operation_id == operation_id
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        mine.len(),
+        1,
+        "exactly one admitted attempt produced evidence for \
+         task {task_id}/attempt {attempt_id}/operation {operation_id}: {recorded:?}"
+    );
+    mine[0].evidence.clone()
 }
 
 /// Counts the durable transitions one named rewrite operation has recorded.
@@ -1122,6 +1276,35 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
     // attempt re-derived against the live cut and wrote down before calling
     // the catalog; the snapshot is what actually happened. Each must be
     // contained by the one before it, and the last two must be identical.
+    // The snapshot's plan hash is the durable task's own bytes, and the other
+    // three rewrite fingerprints are the exact evidence this attempt produced.
+    let plan_hash = durable_plan_hash(&cluster, landed_task).await;
+    assert_eq!(
+        landed.summary.get("forge.rewrite.plan_hash"),
+        Some(&plan_hash),
+        "the landed snapshot carries the durable task's canonical plan hash: {landed:?}"
+    );
+    let evidence = attempt_evidence(&observer, landed_task, uncertain, uncertain);
+    assert_eq!(
+        landed.summary.get("forge.rewrite.selection_fingerprint"),
+        Some(&evidence.selection_fingerprint),
+        "the landed snapshot carries the attempt's own selection receipt: {landed:?}"
+    );
+    assert_eq!(
+        landed.summary.get("forge.rewrite.debt_fingerprint"),
+        Some(&evidence.debt_fingerprint),
+        "the landed snapshot carries the attempt's own debt summary: {landed:?}"
+    );
+    assert_eq!(
+        landed.summary.get("forge.rewrite.policy_fingerprint"),
+        Some(&evidence.policy_fingerprint),
+        "the landed snapshot carries the attempt's own policy identity: {landed:?}"
+    );
+    assert_eq!(
+        evidence.base_snapshot_id, prepared.base_snapshot_id,
+        "the attempt's evidence was resolved against the base it promised"
+    );
+
     let selected = rewrite_task_plan(&cluster, landed_task, &shared.binding).await;
     assert!(
         selected.is_subset(&pre_rewrite.data),
@@ -1191,6 +1374,22 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
             .and_then(|value| value.parse::<usize>().ok()),
         Some(0),
         "the snapshot retained no delete attachment because there was none"
+    );
+    assert!(
+        landed.removed_bytes > 0 && landed.added_bytes > 0,
+        "the rewrite really moved volume: {} removed, {} added",
+        landed.removed_bytes,
+        landed.added_bytes
+    );
+    assert_eq!(
+        summary_u64(&landed.summary, "forge.rewrite.removed_bytes"),
+        landed.removed_bytes,
+        "the snapshot's removed byte volume matches its own parent manifests"
+    );
+    assert_eq!(
+        summary_u64(&landed.summary, "forge.rewrite.added_bytes"),
+        landed.added_bytes,
+        "the snapshot's added byte volume matches its own manifests"
     );
 
     // The live cut is exactly the algebra the snapshot describes.
@@ -1340,10 +1539,10 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
         &RecoveryTelemetry {
             task_id: landed_task,
             attempt_id: uncertain,
-            input_files: prepared.input_paths.len() as u64,
-            output_files: prepared.output_paths.len() as u64,
-            input_bytes: summary_u64(&landed.summary, "forge.rewrite.removed_bytes"),
-            output_bytes: summary_u64(&landed.summary, "forge.rewrite.added_bytes"),
+            input_files: landed.removed_data.len() as u64,
+            output_files: landed.added_data.len() as u64,
+            input_bytes: landed.removed_bytes,
+            output_bytes: landed.added_bytes,
         },
     );
 }

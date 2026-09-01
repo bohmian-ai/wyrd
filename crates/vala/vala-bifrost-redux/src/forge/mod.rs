@@ -62,6 +62,8 @@ pub use live_reconcile::LiveReconciliationTestOutcome;
 pub use maintenance::MaintenanceTestControls;
 #[cfg(feature = "test-support")]
 pub use orphan_gc::{OrphanGcReport, current_gc_gate_for_test};
+#[cfg(feature = "test-support")]
+pub use worker::ForgeRewriteEvidenceRecord;
 
 /// Construction-time dependency graph for one Forge maintenance handle.
 pub struct ForgeBuildConfig {

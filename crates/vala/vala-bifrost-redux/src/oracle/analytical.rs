@@ -66,6 +66,7 @@ use super::analytical_transport::{
     AnalyticalChannelResolver, AnalyticalCoordinatorIdentity, AnalyticalStageMinter,
     StageWireIdentity, read_ticket,
 };
+use super::dispatcher::BifrostPeerTls;
 use super::participant_cut::OracleQueryAttemptCut;
 use super::peer::{AuthorizedStage, OracleStageAuthority, PeerSecurityError, StageOperationV1};
 use super::spill::OracleSpillRuntime;
@@ -602,6 +603,8 @@ pub struct AnalyticalStageEgress {
     oracle_fence: u64,
     /// Ticket lifetime, kept far shorter than the graph's own deadline.
     ticket_ttl: chrono::Duration,
+    /// Immutable peer identity every outbound channel is dialed through.
+    peer_tls: BifrostPeerTls,
     /// Per-graph outbound identity recorded when a stage was authorized.
     identities: Mutex<HashMap<AnalyticalGraphKey, AnalyticalEgressIdentity>>,
 }
@@ -638,6 +641,7 @@ impl AnalyticalStageEgress {
         node_id: NodeId,
         oracle_fence: u64,
         ticket_ttl: chrono::Duration,
+        peer_tls: BifrostPeerTls,
     ) -> Self {
         Self {
             authority,
@@ -645,6 +649,7 @@ impl AnalyticalStageEgress {
             node_id,
             oracle_fence,
             ticket_ttl,
+            peer_tls,
             identities: Mutex::new(HashMap::new()),
         }
     }
@@ -731,6 +736,7 @@ impl AnalyticalStageEgress {
         let ticket_ttl = self.ticket_ttl;
         Ok(Some(AnalyticalChannelResolver::new(
             identity,
+            self.peer_tls.clone(),
             Arc::new(move |url: &Url| {
                 destinations.get(url).map(|(node_id, fence)| {
                     Arc::new(AnalyticalStageMinter::new(
@@ -1580,6 +1586,7 @@ mod tests {
             NodeId::new(Uuid::from_u128(0)),
             0,
             chrono::Duration::seconds(30),
+            BifrostPeerTls::unreachable_for_test(),
         ))
     }
 
@@ -1931,6 +1938,8 @@ pub struct AnalyticalExecutionConfig {
     pub exchange_buffer_bytes: usize,
     /// Scratch child every attempt of a graph charges on this node.
     pub scratch_bytes: u64,
+    /// Immutable peer identity every leader-side channel is dialed through.
+    pub peer_tls: BifrostPeerTls,
 }
 
 /// What one inactive Analytical execution left behind once it drained.
@@ -2010,7 +2019,7 @@ pub struct AnalyticalExecutionHandle {
     spill: Arc<OracleSpillRuntime>,
     /// Root Oracle capability this handle admits leader graph envelopes from.
     oracle_resources: OracleResources,
-    /// Node-scoped identity and budget configuration.
+    /// Node-scoped identity, budget, and peer-transport configuration.
     config: AnalyticalExecutionConfig,
     /// Capability every Analytical leaf this node encodes or decodes resolves through.
     leaf: super::codec::AnalyticalLeafBinding,
@@ -2237,6 +2246,7 @@ impl AnalyticalExecutionHandle {
         let ticket_ttl = self.config.ticket_ttl;
         let resolver = AnalyticalChannelResolver::new(
             identity,
+            self.config.peer_tls.clone(),
             Arc::new(move |url: &Url| {
                 destinations.get(url).map(|(node_id, fence)| {
                     Arc::new(AnalyticalStageMinter::new(

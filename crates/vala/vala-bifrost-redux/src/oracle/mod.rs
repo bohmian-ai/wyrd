@@ -1501,6 +1501,13 @@ pub struct OracleBuildConfig {
     /// a node without it has no follower ingress to mount and no leader handle
     /// to execute through.
     pub stage_authority: Option<Arc<dyn peer::OracleStageAuthority>>,
+    /// Immutable Bifrost peer identity every east-west Oracle channel dials with.
+    ///
+    /// Absent only on a deployment whose target does not serve the peer plane.
+    /// The Analytical owners are composed only when it is present, because a
+    /// coordinator that cannot present the peer client identity cannot reach a
+    /// follower at all.
+    pub peer_tls: Option<dispatcher::BifrostPeerTls>,
     /// Server-owned domain-separated Scribe-tail ticket signer.
     pub tail_ticket_minter: Option<Arc<dyn crate::scribe::tail_rpc::TailTicketMinter>>,
     /// Query-scoped live Scribe discovery owner.
@@ -2087,6 +2094,8 @@ struct AnalyticalCompositionInputs {
     exchange_buffer_bytes: usize,
     /// Per-attempt scratch share.
     scratch_bytes: u64,
+    /// Immutable peer identity every east-west channel is dialed through.
+    peer_tls: dispatcher::BifrostPeerTls,
 }
 
 /// Builds one node's Analytical execution handle from its composed owners.
@@ -2110,6 +2119,7 @@ fn compose_analytical_handle(
         spill,
         exchange_buffer_bytes,
         scratch_bytes,
+        peer_tls,
     } = inputs;
     let supervisor = Arc::new(analytical::AnalyticalSupervisor::new());
     let leaf = codec::AnalyticalLeafBinding::new(
@@ -2140,6 +2150,7 @@ fn compose_analytical_handle(
         node_id,
         fence,
         ANALYTICAL_STAGE_TICKET_TTL,
+        peer_tls.clone(),
     ));
     let worker = Arc::new(analytical::AnalyticalStageIngress::new(
         analytical::AnalyticalStageIngressConfig {
@@ -2166,6 +2177,7 @@ fn compose_analytical_handle(
             ticket_ttl: ANALYTICAL_STAGE_TICKET_TTL,
             exchange_buffer_bytes,
             scratch_bytes,
+            peer_tls,
         },
         leaf,
     ))
@@ -2272,20 +2284,27 @@ impl Oracle {
                 transports,
             ))
         });
-        let analytical = config.stage_authority.map(|authority| {
-            compose_analytical_handle(AnalyticalCompositionInputs {
-                authority,
-                cluster: Arc::clone(&cluster),
-                node_id: admission.local_role.key.node_id,
-                fence: admission.local_role.fencing_token,
-                catalog: Arc::clone(&config.catalog),
-                audit: Arc::clone(&config.audit),
-                resources: config.memory.resources.clone(),
-                spill: Arc::clone(&config.spill_runtime),
-                exchange_buffer_bytes: config.config.analytical_exchange_buffer_bytes,
-                scratch_bytes: config.config.analytical_scratch_bytes,
-            })
-        });
+        // Both owners are required together: the authority proves a stage
+        // operation, and the peer identity is the only way to deliver one.
+        let analytical =
+            config
+                .stage_authority
+                .zip(config.peer_tls)
+                .map(|(authority, peer_tls)| {
+                    compose_analytical_handle(AnalyticalCompositionInputs {
+                        authority,
+                        peer_tls,
+                        cluster: Arc::clone(&cluster),
+                        node_id: admission.local_role.key.node_id,
+                        fence: admission.local_role.fencing_token,
+                        catalog: Arc::clone(&config.catalog),
+                        audit: Arc::clone(&config.audit),
+                        resources: config.memory.resources.clone(),
+                        spill: Arc::clone(&config.spill_runtime),
+                        exchange_buffer_bytes: config.config.analytical_exchange_buffer_bytes,
+                        scratch_bytes: config.config.analytical_scratch_bytes,
+                    })
+                });
         Ok(Self {
             planner,
             admission,

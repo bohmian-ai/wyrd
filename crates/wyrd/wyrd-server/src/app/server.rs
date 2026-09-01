@@ -795,6 +795,61 @@ impl BoundServer {
     }
 }
 
+/// Loads this process's private peer TLS material, when it serves the peer plane.
+///
+/// Returns `None` for a target that mounts no private service, so a Forge
+/// worker neither reads certificate files nor opens a peer socket.
+///
+/// # Errors
+///
+/// Returns [`ServerBootError::OraclePeer`] when a peer-bearing target has an
+/// incomplete peer configuration or a PEM file cannot be read.
+fn load_peer_tls(
+    config: &WyrdServerConfig,
+) -> Result<Option<wyrd_tonic::server::MutualTlsServerConfig>, ServerBootError> {
+    let peer = &config.bifrost.peer;
+    if !peer.is_complete() {
+        if config.role.serves_peer() {
+            return Err(ServerBootError::OraclePeer(
+                "Scribe- and Oracle-bearing targets require the complete bifrost.peer identity"
+                    .to_owned(),
+            ));
+        }
+        return Ok(None);
+    }
+    let read = |path: &std::path::Path, label: &str| -> Result<Vec<u8>, ServerBootError> {
+        std::fs::read(path).map_err(|error| {
+            ServerBootError::OraclePeer(format!(
+                "failed to read Bifrost peer {label} {}: {error}",
+                path.display()
+            ))
+        })
+    };
+    let certificate = read(
+        peer.certificate_chain_path
+            .as_ref()
+            .expect("peer completeness guarantees a certificate chain path"),
+        "certificate chain",
+    )?;
+    let key = read(
+        peer.private_key_path
+            .as_ref()
+            .expect("peer completeness guarantees a private key path"),
+        "private key",
+    )?;
+    let ca = read(
+        peer.ca_certificate_path
+            .as_ref()
+            .expect("peer completeness guarantees a CA path"),
+        "CA certificate",
+    )?;
+    Ok(Some(wyrd_tonic::server::MutualTlsServerConfig::from_pem(
+        &certificate,
+        &key,
+        &ca,
+    )))
+}
+
 #[cfg(test)]
 mod pg_tests {
     use std::collections::HashMap;
@@ -945,59 +1000,4 @@ mod pg_tests {
         };
         assert_eq!(error.to_string(), "Scribe role unavailable");
     }
-}
-
-/// Loads this process's private peer TLS material, when it serves the peer plane.
-///
-/// Returns `None` for a target that mounts no private service, so a Forge
-/// worker neither reads certificate files nor opens a peer socket.
-///
-/// # Errors
-///
-/// Returns [`ServerBootError::OraclePeer`] when a peer-bearing target has an
-/// incomplete peer configuration or a PEM file cannot be read.
-fn load_peer_tls(
-    config: &WyrdServerConfig,
-) -> Result<Option<wyrd_tonic::server::MutualTlsServerConfig>, ServerBootError> {
-    let peer = &config.bifrost.peer;
-    if !peer.is_complete() {
-        if config.role.serves_peer() {
-            return Err(ServerBootError::OraclePeer(
-                "Scribe- and Oracle-bearing targets require the complete bifrost.peer identity"
-                    .to_owned(),
-            ));
-        }
-        return Ok(None);
-    }
-    let read = |path: &std::path::Path, label: &str| -> Result<Vec<u8>, ServerBootError> {
-        std::fs::read(path).map_err(|error| {
-            ServerBootError::OraclePeer(format!(
-                "failed to read Bifrost peer {label} {}: {error}",
-                path.display()
-            ))
-        })
-    };
-    let certificate = read(
-        peer.certificate_chain_path
-            .as_ref()
-            .expect("peer completeness guarantees a certificate chain path"),
-        "certificate chain",
-    )?;
-    let key = read(
-        peer.private_key_path
-            .as_ref()
-            .expect("peer completeness guarantees a private key path"),
-        "private key",
-    )?;
-    let ca = read(
-        peer.ca_certificate_path
-            .as_ref()
-            .expect("peer completeness guarantees a CA path"),
-        "CA certificate",
-    )?;
-    Ok(Some(wyrd_tonic::server::MutualTlsServerConfig::from_pem(
-        &certificate,
-        &key,
-        &ca,
-    )))
 }

@@ -1468,10 +1468,13 @@ impl<'a> OracleRoleBuilder<'a> {
             advertise_addr,
             spill_root,
             peer_credentials,
-            peer_tls: tail_tls,
+            peer_tls,
             audit,
             shutdown,
         } = self;
+        // The same immutable identity serves Scribe-tail discovery and the
+        // Analytical east-west plane; naming it twice would let the two drift.
+        let tail_tls = peer_tls.clone();
         let audit = audit.ok_or_else(|| {
             ServerBootError::OraclePeer("selected Oracle role has no query audit owner".to_owned())
         })?;
@@ -1733,6 +1736,7 @@ impl<'a> OracleRoleBuilder<'a> {
             audit: audit.clone(),
             peer_ticket_minter,
             stage_authority: Some(stage_authority),
+            peer_tls,
             tail_ticket_minter: Some(tail_authority),
             tail_discovery: Some(tail_discovery),
             peer_transports: Some(peer_transports),

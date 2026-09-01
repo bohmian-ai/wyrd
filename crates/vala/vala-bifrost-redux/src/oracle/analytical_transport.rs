@@ -57,9 +57,7 @@ use datafusion::arrow::array::RecordBatch;
 use datafusion::common::DataFusionError;
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
-use datafusion_distributed::grpc::{
-    BoxCloneSyncChannel, DefaultChannelResolver, create_worker_client,
-};
+use datafusion_distributed::grpc::{BoxCloneSyncChannel, create_worker_client};
 use datafusion_distributed::{
     ChannelResolver, CoordinatorToWorkerMsg, ExecuteTaskRequest, GetWorkerInfoRequest,
     GetWorkerInfoResponse, SetPlanRequest, TaskKey, WorkerChannel, WorkerToCoordinatorMsg,
@@ -76,6 +74,7 @@ use super::analytical::{
     AnalyticalConnectionLease, AnalyticalGraphKey, AnalyticalStageIngress,
     DATAFUSION_QUERY_ID_HEADER, PUBLIC_QUERY_ID_HEADER,
 };
+use super::dispatcher::BifrostPeerTls;
 use super::peer::{
     MAX_STAGE_BODY_BYTES, OracleStageAuthority, PeerSecurityError, StageBinding, StageOperationV1,
     StageTicketClaims, stage_body_digest,
@@ -1220,15 +1219,71 @@ fn measured_exchange(
 pub(crate) type StageMinterFactory =
     Arc<dyn Fn(&Url) -> Option<Arc<AnalyticalStageMinter>> + Send + Sync>;
 
+/// Establishes and reuses mutually authenticated channels to Analytical peers.
+///
+/// Every east-west channel Wyrd opens is dialed through the Bifrost peer
+/// identity, so a follower sees a client certificate chaining to the peer CA
+/// before it sees a request. Upstream's own connection cache is deliberately
+/// not used: it dials each worker URL with an anonymous channel, which the
+/// private peer listener refuses at the TLS handshake.
+///
+/// Connections are cached for the lifetime of the resolver, which is one
+/// query's coordinator side. A dial that fails is not cached, so a transient
+/// peer outage does not poison the rest of the query.
+struct AnalyticalPeerChannels {
+    /// Immutable peer transport identity every dial presents.
+    tls: BifrostPeerTls,
+    /// Connected channels, keyed by the worker URL they were dialed for.
+    channels: tokio::sync::Mutex<HashMap<Url, BoxCloneSyncChannel>>,
+}
+
+impl AnalyticalPeerChannels {
+    /// Builds an empty channel cache bound to one peer identity.
+    fn new(tls: BifrostPeerTls) -> Self {
+        Self {
+            tls,
+            channels: tokio::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Returns the mutually authenticated channel for `url`, dialing it once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataFusionError::Execution`] when the peer endpoint cannot be
+    /// built from the configured identity or the connection cannot be
+    /// established. Cancelling the returned future abandons an in-progress dial
+    /// without caching it.
+    async fn channel(&self, url: &Url) -> Result<BoxCloneSyncChannel, DataFusionError> {
+        let mut channels = self.channels.lock().await;
+        if let Some(channel) = channels.get(url) {
+            return Ok(channel.clone());
+        }
+        let endpoint = self.tls.endpoint(url.to_string()).map_err(|error| {
+            DataFusionError::Execution(format!(
+                "Oracle analytical peer endpoint for {url} is invalid: {error}"
+            ))
+        })?;
+        let channel = endpoint.connect().await.map_err(|error| {
+            DataFusionError::Execution(format!(
+                "Oracle analytical peer connection to {url} failed: {error}"
+            ))
+        })?;
+        let channel = BoxCloneSyncChannel::new(channel);
+        channels.insert(url.clone(), channel.clone());
+        Ok(channel)
+    }
+}
+
 /// Resolves worker clients that sign every governed stage operation they send.
 ///
-/// Connection establishment and reuse stay with upstream's own
-/// [`DefaultChannelResolver`]; this owner adds exactly two things over it — the
-/// signing layer beneath the client, and the identity stamp above it — so a
-/// coordinator cannot reach a follower with an unsigned stage operation.
+/// This owner is the coordinator's complete outbound authority for one query:
+/// it dials each follower through the Bifrost peer identity, signs beneath the
+/// client, and stamps the coordinator identity above it, so a follower cannot
+/// be reached anonymously or with an unsigned stage operation.
 pub(crate) struct AnalyticalChannelResolver {
-    /// Upstream's own connection cache, reused unchanged.
-    channels: DefaultChannelResolver,
+    /// Mutually authenticated connection cache for this query's followers.
+    channels: AnalyticalPeerChannels,
     /// Query-invariant identity every call through this resolver carries.
     identity: Arc<AnalyticalCoordinatorIdentity>,
     /// Per-follower minters, keyed by the follower each one is bound to.
@@ -1257,10 +1312,11 @@ impl AnalyticalChannelResolver {
     #[must_use]
     pub(crate) fn new(
         identity: Arc<AnalyticalCoordinatorIdentity>,
+        tls: BifrostPeerTls,
         mint_for: StageMinterFactory,
     ) -> Self {
         Self {
-            channels: DefaultChannelResolver::default(),
+            channels: AnalyticalPeerChannels::new(tls),
             identity,
             minters: Arc::new(std::sync::Mutex::new(HashMap::new())),
             mint_for,
@@ -1296,15 +1352,15 @@ impl ChannelResolver for AnalyticalChannelResolver {
     ///
     /// # Errors
     ///
-    /// Returns upstream's own connection error, or
-    /// [`DataFusionError::Execution`] when no authorized destination identity
-    /// exists for `url`.
+    /// Returns [`DataFusionError::Execution`] when no authorized destination
+    /// identity exists for `url`, or when the mutually authenticated channel to
+    /// `url` cannot be established.
     async fn get_worker_client_for_url(
         &self,
         url: &Url,
     ) -> Result<Box<dyn WorkerChannel>, DataFusionError> {
         let minter = self.minter(url)?;
-        let channel = self.channels.get_channel(url).await?;
+        let channel = self.channels.channel(url).await?;
         let signed = BoxCloneSyncChannel::new(AnalyticalStageMintLayer::new(minter).layer(channel));
         Ok(Box::new(AnalyticalWorkerChannel::new(
             create_worker_client(signed),
@@ -1643,6 +1699,7 @@ mod tests {
                     node_id,
                     7,
                     chrono::Duration::seconds(30),
+                    BifrostPeerTls::unreachable_for_test(),
                 )),
             }));
             let identity = StageWireIdentity {

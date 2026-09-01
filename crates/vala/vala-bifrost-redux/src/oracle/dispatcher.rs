@@ -1873,7 +1873,7 @@ impl std::fmt::Debug for BifrostPeerTls {
                 &self.client_certificate_chain_pem.len(),
             )
             .field("client_private_key", &"[REDACTED]")
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -1896,6 +1896,23 @@ impl BifrostPeerTls {
             server_name,
             client_certificate_chain_pem,
             client_private_key_pem,
+        }
+    }
+
+    /// Builds a peer identity that carries no usable certificate material.
+    ///
+    /// Only for in-crate unit fixtures that construct an owner requiring a peer
+    /// identity but never dial through it. Any endpoint built from it fails to
+    /// connect, which is the correct outcome for a fixture that must not reach
+    /// the network.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn unreachable_for_test() -> Self {
+        Self {
+            ca_certificate_pem: Vec::new(),
+            server_name: "unreachable.invalid".to_owned(),
+            client_certificate_chain_pem: Vec::new(),
+            client_private_key_pem: secrecy::SecretString::from(String::new()),
         }
     }
 

@@ -1756,7 +1756,7 @@ pub struct TonicOraclePeerTransport {
     /// Optional authenticated service credential attached to private calls.
     credentials: Arc<dyn OraclePeerCredentials>,
     /// Optional immutable CA and DNS identity; absent only for local development tests.
-    tls: Option<OraclePeerTls>,
+    tls: Option<BifrostPeerTls>,
 }
 
 /// Membership source used by production and feature-gated transport fixtures.
@@ -1848,22 +1848,54 @@ fn resolve_snapshot_candidate<'a>(
     Ok(lease.address.as_str())
 }
 
-/// Immutable trust material for authenticating remote Oracle peers.
+/// Immutable role-neutral trust and client identity for the Bifrost peer plane.
 #[derive(Clone)]
-pub struct OraclePeerTls {
-    /// PEM-encoded CA certificate accepted for peer servers.
+pub struct BifrostPeerTls {
+    /// PEM-encoded dedicated Bifrost peer CA accepted for peer servers.
     ca_certificate_pem: Vec<u8>,
     /// DNS name required on the authenticated peer certificate.
     server_name: String,
+    /// PEM leaf chain this process presents as its client identity.
+    client_certificate_chain_pem: Vec<u8>,
+    /// PEM private key paired with `client_certificate_chain_pem`.
+    client_private_key_pem: secrecy::SecretString,
 }
 
-impl OraclePeerTls {
-    /// Creates one immutable peer trust policy from boot-loaded PEM bytes.
+impl std::fmt::Debug for BifrostPeerTls {
+    /// Formats only non-secret trust identity; key bytes never reach logs.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BifrostPeerTls")
+            .field("server_name", &self.server_name)
+            .field("ca_certificate_bytes", &self.ca_certificate_pem.len())
+            .field(
+                "client_certificate_bytes",
+                &self.client_certificate_chain_pem.len(),
+            )
+            .field("client_private_key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl BifrostPeerTls {
+    /// Creates one immutable role-neutral peer identity from boot-loaded PEM bytes.
+    ///
+    /// The same material serves both directions of the peer plane: the private
+    /// listener presents it to accept inbound connections, and every outbound
+    /// dial presents it as the client identity. There is no role-specific
+    /// variant, so a Scribe-only peer cannot skip a check an Oracle applies.
     #[must_use]
-    pub fn new(ca_certificate_pem: Vec<u8>, server_name: String) -> Self {
+    pub fn new(
+        ca_certificate_pem: Vec<u8>,
+        server_name: String,
+        client_certificate_chain_pem: Vec<u8>,
+        client_private_key_pem: secrecy::SecretString,
+    ) -> Self {
         Self {
             ca_certificate_pem,
             server_name,
+            client_certificate_chain_pem,
+            client_private_key_pem,
         }
     }
 
@@ -1877,6 +1909,38 @@ impl OraclePeerTls {
     #[must_use]
     pub fn server_name(&self) -> &str {
         &self.server_name
+    }
+
+    /// Returns the leaf chain this process presents on the peer plane.
+    #[must_use]
+    pub fn client_certificate_chain_pem(&self) -> &[u8] {
+        &self.client_certificate_chain_pem
+    }
+
+    /// Builds the one mutually authenticated peer endpoint for `address`.
+    ///
+    /// Every private caller — Oracle dispatch, query forwarding, Scribe tail
+    /// discovery, and lifecycle control — resolves its channel here, so no peer
+    /// role can reach a weaker or plaintext transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`wyrd_tonic::transport::EndpointBuildError`] when the process
+    /// Rustls provider conflicts or the address, trust root, or client identity
+    /// is rejected by tonic.
+    pub fn endpoint(
+        &self,
+        address: String,
+    ) -> Result<wyrd_tonic::tonic::transport::Endpoint, wyrd_tonic::transport::EndpointBuildError>
+    {
+        use secrecy::ExposeSecret as _;
+        wyrd_tonic::transport::mutually_authenticated_tls_endpoint(
+            address,
+            &self.ca_certificate_pem,
+            self.server_name.clone(),
+            &self.client_certificate_chain_pem,
+            self.client_private_key_pem.expose_secret().as_bytes(),
+        )
     }
 }
 
@@ -1954,7 +2018,7 @@ impl TonicOraclePeerTransport {
     pub fn with_credentials_and_tls(
         registry: Arc<ClusterRegistry>,
         credentials: Arc<dyn OraclePeerCredentials>,
-        tls: OraclePeerTls,
+        tls: BifrostPeerTls,
     ) -> Self {
         Self {
             topology: OraclePeerTopology::Registry(registry),
@@ -1969,7 +2033,7 @@ impl TonicOraclePeerTransport {
     pub fn with_test_credentials_and_tls(
         addresses: HashMap<NodeId, String>,
         credentials: Arc<dyn OraclePeerCredentials>,
-        tls: OraclePeerTls,
+        tls: BifrostPeerTls,
     ) -> Self {
         Self {
             topology: OraclePeerTopology::TestAddresses(addresses),
@@ -2072,17 +2136,12 @@ impl TonicOraclePeerTransport {
         candidate: &DispatchCandidate,
     ) -> Result<OraclePeerServiceClient<Channel>, DispatchError> {
         let address = self.resolve_candidate(candidate)?;
-        let endpoint = if let Some(tls) = &self.tls {
-            wyrd_tonic::transport::authenticated_tls_endpoint(
-                address,
-                &tls.ca_certificate_pem,
-                tls.server_name.clone(),
-            )
-            .map_err(|_| DispatchError::Unavailable)?
-        } else {
-            wyrd_tonic::transport::plaintext_endpoint(address)
-                .map_err(|_| DispatchError::Unavailable)?
-        };
+        let endpoint = self
+            .tls
+            .as_ref()
+            .ok_or(DispatchError::Unavailable)?
+            .endpoint(address)
+            .map_err(|_| DispatchError::Unavailable)?;
         let channel = endpoint
             .connect()
             .await

@@ -178,7 +178,7 @@ pub struct WyrdTestServer {
     /// Optional fixed HTTP/gRPC addresses reserved by a multi-node harness.
     requested_bind: Option<(std::net::SocketAddr, std::net::SocketAddr)>,
     /// Optional TLS material applied when this in-process server binds.
-    requested_oracle_peer_tls: Option<TestOraclePeerTls>,
+    requested_oracle_peer_tls: Option<TestBifrostPeerTls>,
     /// Test-only readiness failure requested by the builder.
     readiness_failure: bool,
     /// Optional test-only serve task that ignores cancellation until aborted.
@@ -499,7 +499,7 @@ pub struct WyrdTestServerBuilder {
     /// Optional cluster-scoped Oracle peer credential injected by the harness.
     oracle_peer_credentials: Option<Arc<dyn OraclePeerCredentials>>,
     /// Optional production-shaped Oracle server identity and peer trust paths.
-    oracle_peer_tls: Option<TestOraclePeerTls>,
+    oracle_peer_tls: Option<TestBifrostPeerTls>,
     /// Production Forge process role used by bound test servers.
     forge_process_role: BifrostTarget,
     /// Optional observer of successful supervised worker completions.
@@ -528,17 +528,20 @@ pub struct WyrdTestServerBuilder {
     serve_task_panic_for_test: bool,
 }
 
-/// Test-only file paths for a shared Oracle TLS identity and trust root.
-#[derive(Clone)]
-pub(crate) struct TestOraclePeerTls {
-    /// Server certificate chain PEM path.
-    pub(crate) certificate_path: std::path::PathBuf,
-    /// Server private-key PEM path.
-    pub(crate) private_key_path: std::path::PathBuf,
+/// Test-only file paths for one replica's Bifrost peer identity and trust root.
+///
+/// The certificate is dual-EKU: the same paths back the private listener's
+/// server identity and the client identity presented on outbound peer dials.
+#[derive(Clone, Debug)]
+pub struct TestBifrostPeerTls {
+    /// Dual-EKU certificate chain PEM path.
+    pub certificate_path: std::path::PathBuf,
+    /// Private-key PEM path paired with the certificate chain.
+    pub private_key_path: std::path::PathBuf,
     /// Peer CA certificate PEM path.
-    pub(crate) ca_path: std::path::PathBuf,
-    /// Certificate DNS identity expected by clients.
-    pub(crate) server_name: String,
+    pub ca_path: std::path::PathBuf,
+    /// Certificate DNS identity every peer dial verifies.
+    pub server_name: String,
 }
 
 impl Default for WyrdTestServerBuilder {
@@ -3389,7 +3392,7 @@ impl WyrdTestServerBuilder {
 
     /// Enable TLS on the bound gRPC listener and Oracle peer transport.
     #[must_use]
-    pub(crate) fn with_oracle_peer_tls(mut self, tls: TestOraclePeerTls) -> Self {
+    pub(crate) fn with_oracle_peer_tls(mut self, tls: TestBifrostPeerTls) -> Self {
         self.oracle_peer_tls = Some(tls);
         self
     }
@@ -3681,11 +3684,21 @@ impl WyrdTestServerBuilder {
             None => provision_oracle_peer_credentials(Arc::clone(&fixture)).await?,
         };
         let peer_tls = match &self.oracle_peer_tls {
-            Some(tls) => Some(vala_bifrost_redux::oracle::dispatcher::OraclePeerTls::new(
-                std::fs::read(&tls.ca_path)
-                    .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
-                tls.server_name.clone(),
-            )),
+            Some(tls) => {
+                let read = |path: &std::path::Path| {
+                    std::fs::read(path)
+                        .map_err(|error| WyrdTestServerError::Start(error.to_string()))
+                };
+                let key = String::from_utf8(read(&tls.private_key_path)?).map_err(|error| {
+                    WyrdTestServerError::Start(format!("peer private key is not PEM text: {error}"))
+                })?;
+                Some(vala_bifrost_redux::oracle::dispatcher::BifrostPeerTls::new(
+                    read(&tls.ca_path)?,
+                    tls.server_name.clone(),
+                    read(&tls.certificate_path)?,
+                    SecretString::from(key),
+                ))
+            }
             None => None,
         };
         let mut bifrost_config = BifrostRuntimeConfig::default();

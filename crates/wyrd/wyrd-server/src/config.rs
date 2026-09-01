@@ -507,15 +507,6 @@ impl BifrostRoles {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OracleRuntimeConfig {
-    /// Private peer advertisement address.
-    #[serde(default = "default_oracle_advertise_addr")]
-    pub advertise_addr: String,
-    /// CA certificate used to authenticate remote Oracle gRPC servers.
-    #[serde(default)]
-    pub peer_ca_certificate_path: Option<PathBuf>,
-    /// DNS name expected on every remote Oracle server certificate.
-    #[serde(default)]
-    pub peer_server_name: Option<String>,
     /// CPU budget used for admission calibration.
     #[serde(default = "default_oracle_cpu_cores")]
     pub cpu_cores: f64,
@@ -580,15 +571,6 @@ pub struct OracleRuntimeConfig {
     pub audit_relay_shutdown_timeout_ms: u64,
 }
 
-/// Default loopback peer advertisement used by single-node development boots.
-///
-/// The scheme is mandatory: this value is published into `vala.cluster_nodes`
-/// and later dialed through `Endpoint::from_shared`, which cannot parse a
-/// schemeless authority. Production boots reject this default because
-/// [`WyrdServerConfig::validate`] requires `https://` under that profile.
-fn default_oracle_advertise_addr() -> String {
-    "http://127.0.0.1:50052".to_owned()
-}
 fn default_oracle_cpu_cores() -> f64 {
     1.0
 }
@@ -662,9 +644,6 @@ fn default_audit_relay_shutdown_timeout_ms() -> u64 {
 impl Default for OracleRuntimeConfig {
     fn default() -> Self {
         Self {
-            advertise_addr: default_oracle_advertise_addr(),
-            peer_ca_certificate_path: None,
-            peer_server_name: None,
             cpu_cores: default_oracle_cpu_cores(),
             planning_permits: default_oracle_planning_permits(),
             admission_waiters: default_oracle_admission_waiters(),
@@ -2837,29 +2816,35 @@ impl WyrdServerConfig {
                     message: "auth.allow_preview must be false in production profile".to_string(),
                 });
             }
-            if self.bifrost_roles().contains(&BifrostRuntimeRole::Oracle) {
-                match (
-                    &self.grpc.certificate_chain_path,
-                    &self.grpc.private_key_path,
-                    &self.bifrost.oracle.peer_ca_certificate_path,
-                    &self.bifrost.oracle.peer_server_name,
-                ) {
-                    (Some(certificate), Some(key), Some(ca), Some(server_name))
-                        if !certificate.as_os_str().is_empty()
-                            && !key.as_os_str().is_empty()
-                            && !ca.as_os_str().is_empty()
-                            && !server_name.trim().is_empty() => {}
+            if self.role.serves_peer() {
+                match (&self.grpc.certificate_chain_path, &self.grpc.private_key_path) {
+                    (Some(certificate), Some(key))
+                        if !certificate.as_os_str().is_empty() && !key.as_os_str().is_empty() => {}
                     _ => {
                         return Err(ConfigError::Invalid {
-                            message: "production Oracle requires grpc certificate_chain_path/private_key_path and bifrost.oracle peer_ca_certificate_path/peer_server_name".to_owned(),
+                            message: "production peer-bearing targets require grpc \
+                                      certificate_chain_path and private_key_path"
+                                .to_owned(),
                         });
                     }
                 }
-                if !self.bifrost.oracle.advertise_addr.starts_with("https://") {
+                if !self.bifrost.peer.is_complete() {
                     return Err(ConfigError::Invalid {
-                        message:
-                            "production Oracle bifrost.oracle.advertise_addr must use https://"
-                                .to_owned(),
+                        message: "production peer-bearing targets require the complete \
+                                  bifrost.peer identity, credential, and ticket keyring"
+                            .to_owned(),
+                    });
+                }
+                if !self
+                    .bifrost
+                    .peer
+                    .advertise_addr
+                    .as_ref()
+                    .is_some_and(|value| value.starts_with("https://"))
+                {
+                    return Err(ConfigError::Invalid {
+                        message: "production bifrost.peer.advertise_addr must use https://"
+                            .to_owned(),
                     });
                 }
             }

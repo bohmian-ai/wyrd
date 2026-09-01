@@ -30,6 +30,8 @@ pub mod cluster;
 mod deployment_contract;
 pub mod forge_harness;
 pub mod harness;
+/// One in-memory certificate authority minting dual-EKU Bifrost peer leaves.
+pub mod peer_ca;
 pub mod query_fixture;
 pub mod scribe_workload;
 pub mod telemetry;

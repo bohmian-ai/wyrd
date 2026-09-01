@@ -30,7 +30,7 @@ pub use lifecycle_transport::{
 };
 pub use peer_audit::PostgresPeerSecurityAudit;
 pub use peer_authority::OraclePeerAuthority;
-pub use peer_credentials::ServerOraclePeerCredentials;
+pub use peer_credentials::ServerBifrostPeerCredentials;
 pub use peer_service::OraclePeerGrpc;
 #[cfg(feature = "test-support")]
 pub use query_audit::{

@@ -14,7 +14,7 @@ use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::cluster::RoleTiming;
 use vala_bifrost_redux::forge::{ForgeConfig, ForgeWorkerCompletionObserver};
 use vala_bifrost_redux::oracle::dispatcher::{
-    OraclePeerCredentials, OraclePeerTls, TonicOraclePeerTransport,
+    OraclePeerCredentials, BifrostPeerTls, TonicOraclePeerTransport,
 };
 use vala_bifrost_redux::resources::SystemResourceSnapshot;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
@@ -33,7 +33,7 @@ use wyrd_telemetry::{CapturedSpan, TelemetryConfig, TelemetryGuard, TestTraceCap
 use crate::bifrost::forge_harness::CommitUncertaintyCatalog;
 use crate::bifrost::telemetry::BifrostTelemetryCapture;
 use crate::server::{
-    OracleRuntimeInspection, TestOraclePeerTls, WyrdTestServer, WyrdTestServerBuilder,
+    OracleRuntimeInspection, TestBifrostPeerTls, WyrdTestServer, WyrdTestServerBuilder,
     WyrdTestServerError, provision_oracle_peer_credentials, reserve_loopback_addr, test_catalog,
 };
 
@@ -820,7 +820,7 @@ pub struct WyrdTestCluster {
     /// Valid SYSTEM_OWNER Service credential retained across node restarts.
     oracle_peer_credentials: Arc<dyn OraclePeerCredentials>,
     /// Optional retained TLS fixture directory and paths for real peer transport.
-    oracle_peer_tls: Option<(Arc<tempfile::TempDir>, TestOraclePeerTls)>,
+    oracle_peer_tls: Option<(Arc<tempfile::TempDir>, TestBifrostPeerTls)>,
     /// Shared observer for supervised Forge worker completions.
     forge_completion_observer: Option<ForgeWorkerCompletionObserver>,
     /// Shared uncertainty-injection catalog wrapper, when enabled.
@@ -1172,9 +1172,8 @@ impl WyrdTestCluster {
             .server(index)
             .and_then(WyrdTestServer::grpc_url)
             .ok_or_else(|| ClusterError::Resource("Oracle peer endpoint is absent".to_owned()))?;
-        let ca = std::fs::read(&tls.ca_path)
-            .map_err(|error| ClusterError::Resource(error.to_string()))?;
-        wyrd_tonic::transport::authenticated_tls_endpoint(address, &ca, tls.server_name.clone())
+        peer_tls_from_paths(tls)?
+            .endpoint(address)
             .map_err(|error| ClusterError::Resource(error.to_string()))?
             .connect()
             .await
@@ -1208,15 +1207,13 @@ impl WyrdTestCluster {
         let server = self
             .server(leader_index)
             .ok_or_else(|| ClusterError::Resource("Oracle leader is absent".to_owned()))?;
-        let ca = std::fs::read(&tls.ca_path)
-            .map_err(|error| ClusterError::Resource(error.to_string()))?;
         Ok(TonicOraclePeerTransport::with_credentials_and_tls(
             server
                 .state()
                 .oracle_cluster()
                 .ok_or_else(|| ClusterError::Resource("Oracle cluster is absent".to_owned()))?,
             Arc::clone(&self.oracle_peer_credentials),
-            OraclePeerTls::new(ca, tls.server_name.clone()),
+            peer_tls_from_paths(tls)?,
         ))
     }
 
@@ -1777,30 +1774,15 @@ impl WyrdTestCluster {
             let root = Arc::new(
                 tempfile::tempdir().map_err(|error| ClusterError::Resource(error.to_string()))?,
             );
-            let certificate_path = root.path().join("oracle-peer-cert.pem");
-            let private_key_path = root.path().join("oracle-peer-key.pem");
-            let ca_path = root.path().join("oracle-peer-ca.pem");
-            std::fs::write(
-                &certificate_path,
-                include_bytes!("fixtures/oracle-peer-cert.pem"),
-            )
-            .map_err(|error| ClusterError::Resource(error.to_string()))?;
-            std::fs::write(
-                &private_key_path,
-                include_bytes!("fixtures/oracle-peer-key.pem"),
-            )
-            .map_err(|error| ClusterError::Resource(error.to_string()))?;
-            std::fs::write(&ca_path, include_bytes!("fixtures/oracle-peer-ca.pem"))
+            // One authority per cluster, one distinct dual-EKU leaf per node:
+            // the same shape a deployment has, so a test can distinguish
+            // "trusted by the peer CA" from "is this exact replica".
+            let authority = crate::bifrost::peer_ca::BifrostPeerCa::generate("localhost")
                 .map_err(|error| ClusterError::Resource(error.to_string()))?;
-            Some((
-                root,
-                TestOraclePeerTls {
-                    certificate_path,
-                    private_key_path,
-                    ca_path,
-                    server_name: "localhost".to_owned(),
-                },
-            ))
+            let tls = authority
+                .materialize(root.path(), "cluster")
+                .map_err(|error| ClusterError::Resource(error.to_string()))?;
+            Some((root, tls))
         } else {
             None
         };
@@ -2790,6 +2772,31 @@ fn parse_metric_sample(series: &str, value: f64) -> Result<OracleMetricSample, C
         labels: parsed_labels,
         value,
     })
+}
+
+
+/// Loads one runtime peer identity from the harness-written PEM paths.
+///
+/// Tests hold the material as files because that is how a deployment supplies
+/// it; this is the single place the harness turns those paths back into the
+/// production [`BifrostPeerTls`] owner.
+///
+/// # Errors
+///
+/// Returns [`ClusterError::Resource`] when a PEM file is unreadable or the
+/// private key is not valid PEM text.
+fn peer_tls_from_paths(tls: &TestBifrostPeerTls) -> Result<BifrostPeerTls, ClusterError> {
+    let read = |path: &std::path::Path| {
+        std::fs::read(path).map_err(|error| ClusterError::Resource(error.to_string()))
+    };
+    let key = String::from_utf8(read(&tls.private_key_path)?)
+        .map_err(|error| ClusterError::Resource(error.to_string()))?;
+    Ok(BifrostPeerTls::new(
+        read(&tls.ca_path)?,
+        tls.server_name.clone(),
+        read(&tls.certificate_path)?,
+        secrecy::SecretString::from(key),
+    ))
 }
 
 #[cfg(test)]

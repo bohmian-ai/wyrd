@@ -19,7 +19,7 @@ use vala_bifrost_redux::forge::{
 };
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::oracle::dispatcher::{
-    LocalOraclePeerTransport, OraclePeerCredentials, OraclePeerTls, OraclePeerTransportDirectory,
+    LocalOraclePeerTransport, OraclePeerCredentials, BifrostPeerTls, OraclePeerTransportDirectory,
     OraclePeerWorker, OraclePeerWorkerConfig, ReservationRegistry, TonicOraclePeerTransport,
 };
 use vala_bifrost_redux::oracle::{
@@ -58,7 +58,7 @@ use crate::components::eval::EvalAuditWriter;
 use crate::config::{BifrostRuntimeRole, WorkloadBindingEntry};
 use crate::oracle::{
     OracleAuditPublisher, OraclePeerAuthority, PostgresPeerSecurityAudit,
-    ServerOraclePeerCredentials,
+    ServerBifrostPeerCredentials,
 };
 use crate::postgres::ServerPostgres;
 use crate::state::{
@@ -436,7 +436,11 @@ async fn build_bifrost_external_dependencies(
     let storage_settings = load_storage_settings()?;
     let storage = StorageHandle::from_settings(storage_settings).await?;
     let node_id = NodeId::generate();
-    let advertise_addr = config.oracle.advertise_addr.clone();
+    let advertise_addr = config
+        .peer
+        .advertise_addr
+        .clone()
+        .unwrap_or_else(|| format!("https://{}", config.peer.bind));
     let cluster = Arc::new(ClusterRegistry::new(
         postgres.vala().clone(),
         ClusterNodeId::new(node_id.as_uuid()),
@@ -1193,28 +1197,11 @@ pub async fn build_state(
         .token_verifier
         .clone()
         .ok_or_else(|| ServerBootError::Scribe("Gate requires a token verifier".to_owned()))?;
-    let peer_credentials: Arc<dyn OraclePeerCredentials> =
-        Arc::new(ServerOraclePeerCredentials::from_env().map_err(ServerBootError::OraclePeer)?);
-    let peer_tls = match (
-        &config.bifrost.oracle.peer_ca_certificate_path,
-        &config.bifrost.oracle.peer_server_name,
-    ) {
-        (Some(path), Some(server_name)) => Some(OraclePeerTls::new(
-            std::fs::read(path).map_err(|error| {
-                ServerBootError::OraclePeer(format!(
-                    "failed to read Oracle peer CA certificate {}: {error}",
-                    path.display()
-                ))
-            })?,
-            server_name.clone(),
-        )),
-        _ if config.role.serves_api() => {
-            return Err(ServerBootError::OraclePeer(
-                "API-serving Bifrost targets require Oracle peer TLS CA and server name".to_owned(),
-            ));
-        }
-        _ => None,
-    };
+    let peer_credentials: Arc<dyn OraclePeerCredentials> = Arc::new(
+        ServerBifrostPeerCredentials::from_configured_key(config.bifrost.peer.api_key.clone())
+            .map_err(ServerBootError::OraclePeer)?,
+    );
+    let peer_tls = build_bifrost_peer_tls(&config.bifrost.peer, config.role)?;
     let crate::state::ComposedBifrost {
         bifrost,
         coordination_runtime,
@@ -1437,7 +1424,7 @@ struct OracleRoleBuilder<'a> {
     /// Shared outbound peer bearer owner.
     peer_credentials: Arc<dyn OraclePeerCredentials>,
     /// Immutable peer TLS trust policy, present only when CA material is configured.
-    peer_tls: Option<OraclePeerTls>,
+    peer_tls: Option<BifrostPeerTls>,
     /// Shared query audit used by the leader and role-local tenant tripwires.
     audit: Option<Arc<OracleAuditPublisher>>,
     /// One process-wide shutdown token injected into every Oracle owner.
@@ -2124,6 +2111,71 @@ pub fn spawn_maintenance_scheduler(
         return Ok(None);
     };
     Ok(Some(async move { forge.run(shutdown).await }))
+}
+
+
+/// Loads the one role-neutral Bifrost peer identity for this process.
+///
+/// A peer-bearing target fails closed here: an absent or unreadable CA, leaf
+/// chain, or private key is a boot failure rather than a listener that starts
+/// and refuses every connection later. Non-peer targets (Forge workers) load
+/// nothing and return `None`.
+///
+/// # Errors
+///
+/// Returns [`ServerBootError::OraclePeer`] when a peer-bearing target has an
+/// incomplete peer configuration or any PEM file cannot be read.
+fn build_bifrost_peer_tls(
+    peer: &crate::config::BifrostPeerConfig,
+    target: crate::config::BifrostTarget,
+) -> Result<Option<BifrostPeerTls>, ServerBootError> {
+    if !peer.is_complete() {
+        if target.serves_peer() {
+            return Err(ServerBootError::OraclePeer(
+                "Scribe- and Oracle-bearing targets require the complete bifrost.peer identity"
+                    .to_owned(),
+            ));
+        }
+        return Ok(None);
+    }
+    let read = |path: &std::path::Path, label: &str| -> Result<Vec<u8>, ServerBootError> {
+        std::fs::read(path).map_err(|error| {
+            ServerBootError::OraclePeer(format!(
+                "failed to read Bifrost peer {label} {}: {error}",
+                path.display()
+            ))
+        })
+    };
+    let ca = read(
+        peer.ca_certificate_path
+            .as_ref()
+            .expect("peer completeness guarantees a CA path"),
+        "CA certificate",
+    )?;
+    let chain = read(
+        peer.certificate_chain_path
+            .as_ref()
+            .expect("peer completeness guarantees a certificate chain path"),
+        "certificate chain",
+    )?;
+    let key = read(
+        peer.private_key_path
+            .as_ref()
+            .expect("peer completeness guarantees a private key path"),
+        "private key",
+    )?;
+    let key = String::from_utf8(key).map_err(|_| {
+        ServerBootError::OraclePeer("Bifrost peer private key is not valid PEM text".to_owned())
+    })?;
+    Ok(Some(BifrostPeerTls::new(
+        ca,
+        peer.server_name
+            .as_ref()
+            .expect("peer completeness guarantees a server name")
+            .clone(),
+        chain,
+        secrecy::SecretString::from(key),
+    )))
 }
 
 #[cfg(test)]

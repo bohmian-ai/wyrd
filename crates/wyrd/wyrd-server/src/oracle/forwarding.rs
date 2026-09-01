@@ -8,7 +8,7 @@ use futures_util::StreamExt;
 use rand::RngCore as _;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::cluster::{ClusterRegistry, ClusterSnapshot};
-use vala_bifrost_redux::oracle::dispatcher::{OraclePeerCredentials, OraclePeerTls};
+use vala_bifrost_redux::oracle::dispatcher::{OraclePeerCredentials, BifrostPeerTls};
 use vala_bifrost_redux::oracle::{
     AuthorizedQueryContext, Oracle, OracleConfig, OraclePlanner, OracleQueryAttemptCut,
     OracleQueryStream, QueryIpcDecoder,
@@ -51,7 +51,7 @@ pub struct ReadyOracleForwarder {
     /// Private service credential owner; never contains the public bearer.
     credentials: Arc<dyn OraclePeerCredentials>,
     /// Optional production TLS trust policy.
-    tls: Option<OraclePeerTls>,
+    tls: Option<BifrostPeerTls>,
     /// Domain-separated signed-envelope authority.
     authority: Arc<OraclePeerAuthority>,
     /// Side-effect-free ingress classification owner.
@@ -95,7 +95,7 @@ pub struct ReadyOracleForwarderInputs {
     /// Private service credential owner.
     pub credentials: Arc<dyn OraclePeerCredentials>,
     /// Optional production TLS trust policy.
-    pub tls: Option<OraclePeerTls>,
+    pub tls: Option<BifrostPeerTls>,
     /// Domain-separated signed-envelope authority.
     pub authority: Arc<OraclePeerAuthority>,
     /// Query floor and classification configuration.
@@ -269,17 +269,12 @@ impl ReadyOracleForwarder {
         &self,
         address: String,
     ) -> Result<OraclePeerServiceClient<Channel>, BifrostError> {
-        let endpoint = if let Some(tls) = &self.tls {
-            wyrd_tonic::transport::authenticated_tls_endpoint(
-                address,
-                tls.ca_certificate_pem(),
-                tls.server_name().to_owned(),
-            )
-            .map_err(|_| BifrostError::QueryPeerSecurity)?
-        } else {
-            wyrd_tonic::transport::plaintext_endpoint(address)
-                .map_err(|_| BifrostError::OracleRoleUnavailable)?
-        };
+        let endpoint = self
+            .tls
+            .as_ref()
+            .ok_or(BifrostError::QueryPeerSecurity)?
+            .endpoint(address)
+            .map_err(|_| BifrostError::QueryPeerSecurity)?;
         endpoint
             .connect()
             .await

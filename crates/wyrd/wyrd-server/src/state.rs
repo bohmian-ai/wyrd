@@ -17,7 +17,7 @@ use vala_bifrost_redux::forge::Forge as ForgeCoordinator;
 use vala_bifrost_redux::forge::ForgeWorker;
 use vala_bifrost_redux::gate::limits::IngestLimits;
 use vala_bifrost_redux::oracle::Oracle as OracleEngine;
-use vala_bifrost_redux::oracle::dispatcher::{OraclePeerCredentials, OraclePeerTls};
+use vala_bifrost_redux::oracle::dispatcher::{OraclePeerCredentials, BifrostPeerTls};
 use vala_bifrost_redux::oracle::follower::{PhysicalPlanFollower, ScribeTailResolver};
 use vala_bifrost_redux::oracle::peer::{PeerSecurityAudit, PeerTicketVerifier};
 use vala_bifrost_redux::oracle::{
@@ -80,7 +80,7 @@ pub struct BifrostBuildInputs {
     /// predicate deciding whether outbound peer transports use TLS, matching
     /// what `TonicOraclePeerTransport` already requires of advertised
     /// addresses; it is deliberately not keyed on the deployment profile.
-    pub peer_tls: Option<OraclePeerTls>,
+    pub peer_tls: Option<BifrostPeerTls>,
     /// Existing boot-loaded signing authority used to mint peer and tail tickets.
     pub signing_key: SecretString,
     /// Immutable role configuration snapshot.

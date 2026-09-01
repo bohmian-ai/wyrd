@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use vala_bifrost_redux::cluster::ClusterRegistry;
-use vala_bifrost_redux::oracle::dispatcher::{OraclePeerCredentials, OraclePeerTls};
+use vala_bifrost_redux::oracle::dispatcher::{OraclePeerCredentials, BifrostPeerTls};
 use vala_bifrost_redux::oracle::{DiscoveredTailRoute, TailStreamDiscovery};
 use vala_bifrost_redux::scribe::tail_rpc::{
     TailReadError, TailReadTransport, TailTicketAudience, TailTicketClaims, TailTicketMinter,
@@ -20,7 +20,7 @@ pub struct RegistryTailStreamDiscovery {
     /// Short-lived private service credential provider.
     credentials: Arc<dyn OraclePeerCredentials>,
     /// Shared Oracle/Scribe private-service trust material.
-    tls: Option<OraclePeerTls>,
+    tls: Option<BifrostPeerTls>,
     /// Server-owned domain-separated ticket signer.
     minter: Arc<dyn TailTicketMinter>,
     /// Local node identity used to select an optional zero-copy transport.
@@ -38,7 +38,7 @@ impl RegistryTailStreamDiscovery {
     pub fn new(
         cluster: Arc<ClusterRegistry>,
         credentials: Arc<dyn OraclePeerCredentials>,
-        tls: Option<OraclePeerTls>,
+        tls: Option<BifrostPeerTls>,
         minter: Arc<dyn TailTicketMinter>,
         local_node: NodeId,
         local_transport: Option<Arc<dyn TailReadTransport>>,
@@ -65,22 +65,16 @@ impl RegistryTailStreamDiscovery {
         address: &str,
         deadline: Instant,
     ) -> Result<Arc<dyn TailReadTransport>, TailReadError> {
-        let endpoint = if let Some(tls) = &self.tls {
-            wyrd_tonic::transport::authenticated_tls_endpoint(
-                address.to_owned(),
-                tls.ca_certificate_pem(),
-                tls.server_name().to_owned(),
-            )
+        let endpoint = self
+            .tls
+            .as_ref()
+            .ok_or_else(|| TailReadError::State {
+                detail: "tail transport requires the Bifrost peer identity".to_owned(),
+            })?
+            .endpoint(address.to_owned())
             .map_err(|_| TailReadError::State {
                 detail: "tail TLS endpoint is invalid".to_owned(),
-            })?
-        } else {
-            wyrd_tonic::transport::plaintext_endpoint(address.to_owned()).map_err(|_| {
-                TailReadError::State {
-                    detail: "tail endpoint is invalid".to_owned(),
-                }
-            })?
-        };
+            })?;
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .ok_or(TailReadError::DeadlineElapsed)?;

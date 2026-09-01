@@ -6,7 +6,7 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
 use vala_bifrost_redux::cluster::ClusterRegistry;
-use vala_bifrost_redux::oracle::dispatcher::{OraclePeerCredentials, OraclePeerTls};
+use vala_bifrost_redux::oracle::dispatcher::{OraclePeerCredentials, BifrostPeerTls};
 use wyrd_spec::vala::api::NodeId;
 use wyrd_spec::vala::api::{
     CancelOracleLifecycleRequest, CancelOracleLifecycleResponse, ListOracleLifecyclesRequest,
@@ -53,7 +53,7 @@ pub struct OracleLifecycleTransport {
     /// Stable local node excluded from remote fanout.
     local_node_id: NodeId,
     /// Optional immutable peer TLS trust policy.
-    tls: Option<OraclePeerTls>,
+    tls: Option<BifrostPeerTls>,
 }
 
 impl OracleLifecycleTransport {
@@ -78,7 +78,7 @@ impl OracleLifecycleTransport {
         cluster: Arc<ClusterRegistry>,
         credentials: Arc<dyn OraclePeerCredentials>,
         local_node_id: NodeId,
-        tls: OraclePeerTls,
+        tls: BifrostPeerTls,
     ) -> Self {
         Self {
             cluster,
@@ -190,16 +190,12 @@ impl OracleLifecycleTransport {
         &self,
         address: String,
     ) -> Result<OracleLifecycleServiceClient<wyrd_tonic::tonic::transport::Channel>, ()> {
-        let endpoint = if let Some(tls) = &self.tls {
-            wyrd_tonic::transport::authenticated_tls_endpoint(
-                address,
-                tls.ca_certificate_pem(),
-                tls.server_name().to_owned(),
-            )
-            .map_err(|_| ())?
-        } else {
-            wyrd_tonic::transport::plaintext_endpoint(address).map_err(|_| ())?
-        };
+        let endpoint = self
+            .tls
+            .as_ref()
+            .ok_or(())?
+            .endpoint(address)
+            .map_err(|_| ())?;
         let channel = endpoint.connect().await.map_err(|_| ())?;
         Ok(OracleLifecycleServiceClient::new(channel))
     }

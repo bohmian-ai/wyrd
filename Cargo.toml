@@ -75,6 +75,10 @@ clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = { version = "2.2", features = ["pkcs8"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "form", "query", "rustls-no-provider", "gzip", "brotli", "stream", "blocking"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+# Test-only certificate authority used by the Bifrost peer harnesses to mint a
+# CA plus one distinct dual-EKU leaf per simulated replica. Never a production
+# dependency: Wyrd does not issue certificates.
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 axum = "0.8"
 http = "1"
 http-body = "1"

@@ -34,6 +34,7 @@ mod grpc_surface;
 mod layout;
 mod observability;
 mod peer;
+mod peer_network;
 mod published;
 mod recovery;
 mod spill;

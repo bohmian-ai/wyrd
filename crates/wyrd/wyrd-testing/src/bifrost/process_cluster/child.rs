@@ -25,7 +25,8 @@ use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_server::config::BifrostTarget;
 
 use super::{
-    ControlRequest, ControlResponse, NodeReport, ProcessClusterError, ProcessNodeTarget, env,
+    ControlRequest, ControlResponse, MembershipEntry, NodeReport, ProcessClusterError,
+    ProcessNodeTarget, env,
 };
 use crate::server::{TestBifrostPeerTls, WyrdTestServer};
 
@@ -67,7 +68,7 @@ pub fn run_peer_test_node() -> ExitCode {
 async fn serve() -> Result<(), ProcessClusterError> {
     let config = ChildConfig::from_env()?;
     let fingerprint = config.certificate_fingerprint()?;
-    let server = config.start().await?;
+    let (server, credentials) = config.start().await?;
     let report = await_ready(&server, &config, fingerprint).await?;
     emit(&ControlResponse::Ready(report.clone()))?;
 
@@ -97,8 +98,25 @@ async fn serve() -> Result<(), ProcessClusterError> {
                     &server,
                     &config,
                     report.peer_certificate_fingerprint.clone(),
-                );
+                )
+                .await;
                 emit(&ControlResponse::Inspection(report))?;
+            }
+            ControlRequest::RegisterTable { table } => {
+                match config.register_table(&server, &table).await {
+                    Ok(()) => emit(&ControlResponse::Registered)?,
+                    Err(error) => emit(&ControlResponse::Failed {
+                        detail: error.to_string(),
+                    })?,
+                }
+            }
+            ControlRequest::DialPeer { address } => {
+                match config.dial_peer(&address, credentials.as_ref()).await {
+                    Ok(outcome) => emit(&ControlResponse::Dialed { outcome })?,
+                    Err(error) => emit(&ControlResponse::Failed {
+                        detail: error.to_string(),
+                    })?,
+                }
             }
             ControlRequest::ExecuteInactiveSql { .. } => {
                 // The inactive Analytical execution seam is restored by the
@@ -249,7 +267,15 @@ impl ChildConfig {
     /// Returns [`ProcessClusterError::Resource`] when the fixture, storage, or
     /// peer credentials cannot be attached, and [`ProcessClusterError::Child`]
     /// when the server cannot be composed or bound.
-    async fn start(&self) -> Result<WyrdTestServer, ProcessClusterError> {
+    async fn start(
+        &self,
+    ) -> Result<
+        (
+            WyrdTestServer,
+            Arc<dyn vala_bifrost_redux::oracle::dispatcher::OraclePeerCredentials>,
+        ),
+        ProcessClusterError,
+    > {
         let fixture = Arc::new(
             PgFixture::attach(
                 self.database.clone(),
@@ -281,28 +307,131 @@ impl ChildConfig {
         })
         .await
         .map_err(|error| ProcessClusterError::Resource(error.to_string()))?;
-        WyrdTestServer::builder()
+        let server = WyrdTestServer::builder()
             .with_bifrost_target_for_test(self.server_target())
             .with_forge_process_role_for_test(self.server_target())
             .with_peer_tls(self.peer_tls.clone())
             .with_peer_bind(self.peer_bind)
             .with_bind_addrs_for_test(self.http_bind, self.grpc_bind)
             .with_durable_bifrost_roots(self.wal_root.clone(), self.spill_root.clone())
-            .with_oracle_peer_credentials(credentials)
+            .with_oracle_peer_credentials(Arc::clone(&credentials))
             .with_storage_handle(Arc::clone(&storage))
             .start_with_resources(fixture, Arc::clone(&storage), None)
             .await
             .map_err(|error| ProcessClusterError::Child(error.to_string()))?
             .bind()
             .await
+            .map_err(|error| ProcessClusterError::Child(error.to_string()))?;
+        Ok((server, credentials))
+    }
+
+    /// Registers one Bifrost table through this child's own catalog.
+    ///
+    /// The table is created by a real pod against the shared catalog, so a
+    /// journey can then query it through any pod's public listener without the
+    /// parent holding a server of its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProcessClusterError::Child`] when this target composes no
+    /// catalog or the catalog refuses the table.
+    async fn register_table(
+        &self,
+        server: &WyrdTestServer,
+        table: &str,
+    ) -> Result<(), ProcessClusterError> {
+        let catalog = server.state().bifrost_catalog().ok_or_else(|| {
+            ProcessClusterError::Child("this target composes no Bifrost catalog".to_owned())
+        })?;
+        catalog
+            .create_table(vala_bifrost_redux::catalog::CreateTableRequest {
+                table: vala_bifrost_redux::catalog::TableRef::new(
+                    vala_bifrost_redux::namespaces::BifrostNamespace::Bifrost,
+                    table,
+                ),
+                user_fields: vec![
+                    arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+                    arrow::datatypes::Field::new(
+                        "filter_key",
+                        arrow::datatypes::DataType::Utf8,
+                        false,
+                    ),
+                ],
+                tenant: self.tenant_id,
+                physical_layout: None,
+                audit: None,
+            })
+            .await
+            .map(|_| ())
             .map_err(|error| ProcessClusterError::Child(error.to_string()))
+    }
+
+    /// Dials another pod's peer socket as this pod, returning the gRPC outcome.
+    ///
+    /// Uses this child's own certificate and its peer Service bearer, so the
+    /// result answers whether the destination admits this process at the
+    /// transport and authorizes it at the application layer. A refused
+    /// operation is still a successful dial and is reported as its status code.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProcessClusterError::Child`] when the endpoint cannot be
+    /// built, the handshake fails, or the bearer cannot be obtained.
+    async fn dial_peer(
+        &self,
+        address: &str,
+        credentials: &dyn vala_bifrost_redux::oracle::dispatcher::OraclePeerCredentials,
+    ) -> Result<String, ProcessClusterError> {
+        let child = |error: String| ProcessClusterError::Child(error);
+        let read = |path: &std::path::Path| -> Result<Vec<u8>, ProcessClusterError> {
+            std::fs::read(path).map_err(|error| ProcessClusterError::Resource(error.to_string()))
+        };
+        let endpoint = wyrd_tonic::transport::mutually_authenticated_tls_endpoint(
+            address.to_owned(),
+            &read(&self.peer_tls.ca_path)?,
+            self.peer_tls.server_name.clone(),
+            &read(&self.peer_tls.certificate_path)?,
+            &read(&self.peer_tls.private_key_path)?,
+        )
+        .map_err(|error| child(error.to_string()))?;
+        let channel = endpoint
+            .connect()
+            .await
+            .map_err(|error| child(error.to_string()))?;
+        let bearer = credentials
+            .bearer(false)
+            .await
+            .map_err(|error| child(error.to_string()))?;
+        let metadata =
+            wyrd_tonic::tonic::metadata::MetadataValue::try_from(format!("Bearer {bearer}"))
+                .map_err(|error| child(error.to_string()))?;
+        let mut client =
+            wyrd_tonic::wyrd::v1::oracle_peer_service_client::OraclePeerServiceClient::with_interceptor(
+                channel,
+                move |mut request: wyrd_tonic::tonic::Request<()>| {
+                    request
+                        .metadata_mut()
+                        .insert("authorization", metadata.clone());
+                    Ok(request)
+                },
+            );
+        Ok(
+            match client
+                .reserve_slots(wyrd_tonic::wyrd::v1::ReserveNodeSlotsRequest::default())
+                .await
+            {
+                Ok(_) => "ok".to_owned(),
+                Err(status) => status.code().to_string(),
+            },
+        )
     }
 }
 
 /// Polls this child until every readiness probe passes.
 ///
-/// Readiness includes the private peer listener, so a child that bound only
-/// its public sockets never announces `Ready`.
+/// Readiness includes the private peer listener whenever this target composes
+/// one, so a peer-bearing child that bound only its public sockets never
+/// announces `Ready`. A target that owns no peer plane is not held back by it.
 ///
 /// # Errors
 ///
@@ -315,7 +444,7 @@ async fn await_ready(
 ) -> Result<NodeReport, ProcessClusterError> {
     let deadline = Instant::now() + READY_DEADLINE;
     loop {
-        let report = describe(server, config, fingerprint.clone());
+        let report = describe(server, config, fingerprint.clone()).await;
         if report.ready {
             return Ok(report);
         }
@@ -330,19 +459,45 @@ async fn await_ready(
 }
 
 /// Builds this child's current self-description.
-fn describe(server: &WyrdTestServer, config: &ChildConfig, fingerprint: String) -> NodeReport {
+///
+/// The advertised address is read back from the composed runtime rather than
+/// recomputed from configuration, so a journey observes what this node actually
+/// published. Membership is refreshed from Postgres first, because the point of
+/// the report is what this pod can currently see of its peers, not what its
+/// background refresh happened to cache.
+async fn describe(
+    server: &WyrdTestServer,
+    config: &ChildConfig,
+    fingerprint: String,
+) -> NodeReport {
     let state = server.state();
     let snapshot = state.readiness.load();
+    let membership = match state.bifrost_cluster_for_test() {
+        Some(cluster) => {
+            let _ = cluster.refresh_snapshot().await;
+            MembershipEntry::project(&cluster.snapshot())
+        }
+        None => Vec::new(),
+    };
+    let node_id = server.node_id().as_uuid();
+    // The advertised address is whatever this node actually published into
+    // membership, so a node that registered the wrong endpoint reports it.
+    let advertise_addr = membership
+        .iter()
+        .find(|entry| entry.node_id == node_id)
+        .map(|entry| entry.address.clone())
+        .unwrap_or_default();
     NodeReport {
         pid: std::process::id(),
         target: config.target,
-        node_id: server.node_id().as_uuid(),
+        node_id,
         http_addr: config.http_bind.to_string(),
         grpc_addr: config.grpc_bind.to_string(),
         peer_addr: config.peer_bind.to_string(),
-        advertise_addr: format!("https://{}", config.peer_bind),
+        advertise_addr,
         peer_certificate_fingerprint: fingerprint,
-        ready: snapshot.all_ok() && state.peer_plane.is_serving(),
+        ready: snapshot.all_ok() && state.peer_plane.is_satisfied(),
         wal_root: config.wal_root.display().to_string(),
+        membership,
     }
 }

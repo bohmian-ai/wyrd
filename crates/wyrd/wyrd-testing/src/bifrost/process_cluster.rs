@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use wyrd_dev_fixtures::pg::PgFixture;
 
 use crate::bifrost::peer_ca::BifrostPeerCa;
+use crate::server::TestBifrostPeerTls;
 
 /// Canonical private peer port every simulated pod binds.
 ///
@@ -164,6 +165,20 @@ pub enum ControlRequest {
         /// Statement to execute.
         sql: String,
     },
+    /// Register one Bifrost table through this child's own catalog.
+    RegisterTable {
+        /// Table name inside the `vala.bifrost` namespace.
+        table: String,
+    },
+    /// Dial another pod's private peer socket as this pod's own identity.
+    ///
+    /// The child uses its configured peer TLS material and its peer Service
+    /// credential, so a success proves the destination admitted this exact
+    /// process — not that the parent could reach the socket.
+    DialPeer {
+        /// Advertised address of the destination pod.
+        address: String,
+    },
     /// Begin ordered shutdown and exit.
     Shutdown,
 }
@@ -182,6 +197,13 @@ pub enum ControlResponse {
         rows: usize,
         /// Attempt ordinal that produced them.
         attempt: u32,
+    },
+    /// Answer to [`ControlRequest::RegisterTable`].
+    Registered,
+    /// Answer to [`ControlRequest::DialPeer`].
+    Dialed {
+        /// Non-secret gRPC outcome the destination returned.
+        outcome: String,
     },
     /// The request could not be served.
     ///
@@ -222,6 +244,62 @@ pub struct NodeReport {
     pub ready: bool,
     /// Durable Scribe root this child mounted.
     pub wal_root: String,
+    /// Live role membership this child could observe when it answered.
+    pub membership: Vec<MembershipEntry>,
+}
+
+/// One live role lease as observed by the child that reported it.
+///
+/// Projected out of the runtime snapshot rather than read from Postgres by the
+/// parent, because the claim under test is what a pod can see and dial, not
+/// what a row says.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MembershipEntry {
+    /// Runtime node identity holding the lease.
+    pub node_id: uuid::Uuid,
+    /// Independently fenced role, rendered as its wire name.
+    pub role: String,
+    /// Exact private address the role published.
+    pub address: String,
+    /// Whether the role advertised readiness.
+    pub ready: bool,
+    /// Monotonic fence this role incarnation holds.
+    pub fencing_token: u64,
+}
+
+impl MembershipEntry {
+    /// Projects every live Scribe and Oracle lease in one snapshot.
+    ///
+    /// The result is sorted by role then address so two children observing the
+    /// same membership produce comparable reports.
+    #[must_use]
+    pub fn project(snapshot: &vala_bifrost_redux::cluster::ClusterSnapshot) -> Vec<Self> {
+        let mut entries: Vec<Self> = snapshot
+            .live_scribes()
+            .into_iter()
+            .map(|lease| Self::from_lease("scribe", lease))
+            .chain(
+                snapshot
+                    .live_oracles()
+                    .into_iter()
+                    .map(|lease| Self::from_lease("oracle", lease)),
+            )
+            .collect();
+        entries
+            .sort_by(|left, right| (&left.role, &left.address).cmp(&(&right.role, &right.address)));
+        entries
+    }
+
+    /// Renders one lease under an already resolved role name.
+    fn from_lease(role: &str, lease: &wyrd_spec::vala::api::ClusterRoleLease) -> Self {
+        Self {
+            node_id: lease.key.node_id.as_uuid(),
+            role: role.to_owned(),
+            address: lease.address.clone(),
+            ready: lease.ready,
+            fencing_token: lease.fencing_token,
+        }
+    }
 }
 
 /// Why a process-cluster operation failed.
@@ -355,6 +433,90 @@ impl StderrTail {
     }
 }
 
+/// A deliberate flaw injected into one child's peer identity material.
+///
+/// The peer plane is mandatory for a peer-bearing target, so each defect must
+/// stop that child from starting at all. A journey uses these to prove the
+/// server refuses to serve without complete mutual-TLS material rather than
+/// silently degrading to a server-authenticated or plaintext listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerTlsDefect {
+    /// Complete, correctly issued material.
+    None,
+    /// The configured trust root is absent, so no client can be verified.
+    MissingCa,
+    /// The configured certificate chain is absent.
+    MissingCertificate,
+    /// The configured private key is absent.
+    MissingPrivateKey,
+}
+
+impl PeerTlsDefect {
+    /// Applies this defect to already materialized peer identity files.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProcessClusterError::Resource`] when the targeted file cannot
+    /// be removed.
+    fn apply(self, tls: &TestBifrostPeerTls) -> Result<(), ProcessClusterError> {
+        let removed = match self {
+            Self::None => return Ok(()),
+            Self::MissingCa => &tls.ca_path,
+            Self::MissingCertificate => &tls.certificate_path,
+            Self::MissingPrivateKey => &tls.private_key_path,
+        };
+        std::fs::remove_file(removed)
+            .map_err(|error| ProcessClusterError::Resource(error.to_string()))
+    }
+}
+
+/// What happens to a child's durable Scribe volume before it is relaunched.
+///
+/// A Scribe's runtime `NodeId` lives on that volume, so these are exactly the
+/// operational events that decide whether a restarted pod is the same node, a
+/// new node, or a node that must refuse to start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeAction {
+    /// Keep the volume, reproducing an ordinary pod restart.
+    Retain,
+    /// Replace the volume, reproducing node loss or a fresh claim.
+    Reset,
+    /// Leave unparseable bytes where the identity document belongs.
+    Malformed,
+    /// Leave a structurally valid but incomplete identity document.
+    Partial,
+}
+
+impl VolumeAction {
+    /// Prepares `wal_root` for the relaunch this action describes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProcessClusterError::Resource`] when the volume cannot be
+    /// recreated or the identity document cannot be written.
+    fn apply(self, wal_root: &Path) -> Result<(), ProcessClusterError> {
+        let identity = wal_root.join(IDENTITY_FILE_NAME);
+        let resource = |error: std::io::Error| ProcessClusterError::Resource(error.to_string());
+        match self {
+            Self::Retain => Ok(()),
+            Self::Reset => {
+                std::fs::remove_dir_all(wal_root).map_err(resource)?;
+                std::fs::create_dir_all(wal_root).map_err(resource)
+            }
+            Self::Malformed => {
+                std::fs::write(&identity, b"{ this is not identity state").map_err(resource)
+            }
+            Self::Partial => std::fs::write(&identity, br#"{"version":1}"#).map_err(resource),
+        }
+    }
+}
+
+/// File the server persists a Scribe's runtime node identity into.
+///
+/// Mirrored here rather than imported so the harness can damage the document
+/// without the production store offering a way to write a broken one.
+const IDENTITY_FILE_NAME: &str = "node-identity.json";
+
 /// Command sent to a child's reaper thread.
 enum ReaperCommand {
     /// Terminate the child, then wait for and reap it.
@@ -367,6 +529,8 @@ enum ReaperCommand {
 /// reader, and its stderr drain. Teardown joins all three threads, so no work
 /// outlives the node and no child outlives its test.
 pub struct ProcessNode {
+    /// Stable pod label naming this child's private root and certificate.
+    label: String,
     /// Bifrost target this child serves.
     target: ProcessNodeTarget,
     /// Report captured when this child announced readiness.
@@ -423,6 +587,12 @@ impl ProcessNode {
     #[must_use]
     pub fn target(&self) -> ProcessNodeTarget {
         self.target
+    }
+
+    /// Returns the stable pod label this child was launched under.
+    #[must_use]
+    pub fn label(&self) -> &str {
+        &self.label
     }
 
     /// Returns the private peer socket this child bound.
@@ -487,6 +657,46 @@ impl ProcessNode {
             ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
             other => Err(ProcessClusterError::Protocol(format!(
                 "expected an inspection, received {other:?}"
+            ))),
+        }
+    }
+
+    /// Asks this child to register one Bifrost table through its own catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::request`], and
+    /// [`ProcessClusterError::Child`] when the child could not register it.
+    pub fn register_table(&mut self, table: &str) -> Result<(), ProcessClusterError> {
+        match self.request(&ControlRequest::RegisterTable {
+            table: table.to_owned(),
+        })? {
+            ControlResponse::Registered => Ok(()),
+            ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
+            other => Err(ProcessClusterError::Protocol(format!(
+                "expected a registration, received {other:?}"
+            ))),
+        }
+    }
+
+    /// Asks this child to dial another pod as its own peer identity.
+    ///
+    /// Returns the destination's non-secret gRPC outcome. A refusal is an
+    /// outcome, not an error: only a failure to reach or be admitted by the
+    /// destination is reported as an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::request`], and
+    /// [`ProcessClusterError::Child`] when the dial itself failed.
+    pub fn dial_peer(&mut self, address: &str) -> Result<String, ProcessClusterError> {
+        match self.request(&ControlRequest::DialPeer {
+            address: address.to_owned(),
+        })? {
+            ControlResponse::Dialed { outcome } => Ok(outcome),
+            ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
+            other => Err(ProcessClusterError::Protocol(format!(
+                "expected a dial outcome, received {other:?}"
             ))),
         }
     }
@@ -649,6 +859,24 @@ impl std::fmt::Debug for BifrostProcessCluster {
     }
 }
 
+/// Everything that decides how one child is launched.
+///
+/// Kept as one value because a relaunch must reproduce a pod exactly — same
+/// label, root, target, and sockets — while varying only the two things a
+/// journey deliberately perturbs.
+struct LaunchPlan {
+    /// Stable pod label naming the private root and certificate.
+    label: String,
+    /// Bifrost target this child serves.
+    target: ProcessNodeTarget,
+    /// Sockets the parent assigned this pod.
+    sockets: PodSockets,
+    /// Deliberate flaw injected into the peer identity material.
+    defect: PeerTlsDefect,
+    /// What happens to the durable volume before launch.
+    volume: VolumeAction,
+}
+
 impl BifrostProcessCluster {
     /// Launches one child per requested target over freshly shared resources.
     ///
@@ -705,7 +933,14 @@ impl BifrostProcessCluster {
             binary: binary.into(),
         };
         for (index, target) in targets.iter().copied().enumerate() {
-            match cluster.launch(index, target) {
+            let plan = LaunchPlan {
+                label: format!("pod-{index}"),
+                target,
+                sockets: address_plan.sockets(index)?,
+                defect: PeerTlsDefect::None,
+                volume: VolumeAction::Retain,
+            };
+            match cluster.launch(&plan) {
                 Ok(node) => cluster.nodes.push(node),
                 Err(error) => {
                     cluster.shutdown();
@@ -750,6 +985,117 @@ impl BifrostProcessCluster {
         self.nodes.clear();
     }
 
+    /// Returns the authority every child's peer leaf chains to.
+    ///
+    /// A journey needs it to dial the peer plane itself: to present a trusted
+    /// client certificate, to present one from a foreign authority, and to
+    /// verify a served certificate under the wrong name.
+    #[must_use]
+    pub fn peer_ca(&self) -> &BifrostPeerCa {
+        &self.shared.peer_ca
+    }
+
+    /// Seeds one public Service principal in the shared fixture tenant.
+    ///
+    /// Returns its API key, which a journey uses to drive a real public query
+    /// against any child's public listener. The principal lives in the shared
+    /// database, so one key works against every pod, exactly as a deployment's
+    /// caller credential does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProcessClusterError::Resource`] when the principal cannot be
+    /// provisioned.
+    pub async fn provision_public_api_key(
+        &self,
+        name: &str,
+    ) -> Result<secrecy::SecretString, ProcessClusterError> {
+        crate::server::provision_tenant_service_principal(
+            &self.shared.fixture,
+            self.shared.fixture.data_tenant_id(),
+            name,
+            &["admin"],
+        )
+        .await
+        .map_err(|error| ProcessClusterError::Resource(error.to_string()))
+    }
+
+    /// Launches a throwaway child with damaged peer material and expects it to fail.
+    ///
+    /// Returns the failure the child reported, joined with its retained stderr,
+    /// so the caller can assert on the cause rather than merely on the absence
+    /// of a running process. The child gets its own label, root, and ephemeral
+    /// sockets, so a failed probe never disturbs the live topology.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProcessClusterError::Child`] when the damaged child
+    /// nevertheless started and reported readiness, because that is the exact
+    /// negative claim under test.
+    pub fn probe_startup_failure(
+        &self,
+        label: &str,
+        target: ProcessNodeTarget,
+        defect: PeerTlsDefect,
+    ) -> Result<String, ProcessClusterError> {
+        let plan = LaunchPlan {
+            label: label.to_owned(),
+            target,
+            // Always ephemeral: a probe must never contend for a live pod's
+            // canonical socket, and it is never dialed.
+            sockets: AddressPlan::DistinctPortsOnLocalhost.sockets(0)?,
+            defect,
+            volume: VolumeAction::Retain,
+        };
+        match self.launch(&plan) {
+            Ok(mut node) => {
+                let report = node.ready_report().clone();
+                let _ = node.shutdown();
+                Err(ProcessClusterError::Child(format!(
+                    "child started with {defect:?} peer material and reported {report:?}"
+                )))
+            }
+            Err(error) => Ok(error.to_string()),
+        }
+    }
+
+    /// Stops the child at `index` and launches its replacement over `volume`.
+    ///
+    /// The replacement keeps the original label, root, target, and sockets, so
+    /// it is the same pod coming back rather than a new one. `volume` decides
+    /// whether it finds its durable state, a fresh disk, or a damaged identity
+    /// document.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the relaunch fails with. On failure the slot is
+    /// removed, so later indices shift; a journey that expects a failed
+    /// relaunch must not address earlier nodes by index afterwards.
+    pub fn restart(
+        &mut self,
+        index: usize,
+        volume: VolumeAction,
+    ) -> Result<&NodeReport, ProcessClusterError> {
+        if index >= self.nodes.len() {
+            return Err(ProcessClusterError::Resource(format!(
+                "no process node at index {index}"
+            )));
+        }
+        let mut previous = self.nodes.remove(index);
+        let plan = LaunchPlan {
+            label: previous.label.clone(),
+            target: previous.target,
+            sockets: previous.sockets,
+            defect: PeerTlsDefect::None,
+            volume,
+        };
+        let _ = previous.shutdown();
+        drop(previous);
+        let node = self.launch(&plan)?;
+        self.nodes.insert(index, node);
+        Ok(self.nodes[index].ready_report())
+    }
+
     /// Launches one child and waits for its readiness report.
     ///
     /// # Errors
@@ -758,12 +1104,8 @@ impl BifrostProcessCluster {
     /// or certificate cannot be created, [`ProcessClusterError::Child`] when
     /// the process cannot be spawned or its pipes are missing, and
     /// [`ProcessClusterError::Timeout`] when it does not report readiness.
-    fn launch(
-        &self,
-        index: usize,
-        target: ProcessNodeTarget,
-    ) -> Result<ProcessNode, ProcessClusterError> {
-        let label = format!("pod-{index}");
+    fn launch(&self, plan: &LaunchPlan) -> Result<ProcessNode, ProcessClusterError> {
+        let label = plan.label.clone();
         let root = self.shared.node_roots.path().join(&label);
         let wal_root = root.join("wal");
         let spill_root = root.join("spill");
@@ -771,6 +1113,7 @@ impl BifrostProcessCluster {
             std::fs::create_dir_all(directory)
                 .map_err(|error| ProcessClusterError::Resource(error.to_string()))?;
         }
+        plan.volume.apply(&wal_root)?;
         // The leaf lands under this child's own private root, and only its path
         // is passed on. No key material enters the child's argv or environment
         // value set beyond a filesystem path.
@@ -779,6 +1122,7 @@ impl BifrostProcessCluster {
             .peer_ca
             .materialize(&root, &label)
             .map_err(|error| ProcessClusterError::Resource(error.to_string()))?;
+        plan.defect.apply(&tls)?;
         // Same reasoning as the certificate: the secret lands in a file under
         // this child's private root and only the path is published.
         let peer_api_key_path = root.join("peer-api-key");
@@ -787,7 +1131,7 @@ impl BifrostProcessCluster {
             secrecy::ExposeSecret::expose_secret(&self.shared.peer_api_key),
         )
         .map_err(|error| ProcessClusterError::Resource(error.to_string()))?;
-        let sockets = self.address_plan.sockets(index)?;
+        let sockets = plan.sockets;
 
         let mut command = Command::new(&self.binary);
         command
@@ -798,7 +1142,7 @@ impl BifrostProcessCluster {
             )
             .env(env::TENANT_SLUG, self.shared.fixture.tenant_slug())
             .env(env::STORAGE_ROOT, self.shared.storage_root.path())
-            .env(env::TARGET, target.as_str())
+            .env(env::TARGET, plan.target.as_str())
             .env(env::WAL_ROOT, &wal_root)
             .env(env::SPILL_ROOT, &spill_root)
             .env(env::HTTP_BIND, sockets.http.to_string())
@@ -871,10 +1215,11 @@ impl BifrostProcessCluster {
         let reaper_thread = std::thread::spawn(move || reap(child, &command_rx, &exit_tx));
 
         let mut node = ProcessNode {
-            target,
+            label: plan.label.clone(),
+            target: plan.target,
             ready: NodeReport {
                 pid,
-                target,
+                target: plan.target,
                 node_id: uuid::Uuid::nil(),
                 http_addr: sockets.http.to_string(),
                 grpc_addr: sockets.grpc.to_string(),
@@ -883,6 +1228,7 @@ impl BifrostProcessCluster {
                 peer_certificate_fingerprint: String::new(),
                 ready: false,
                 wal_root: wal_root.display().to_string(),
+                membership: Vec::new(),
             },
             sockets,
             root,

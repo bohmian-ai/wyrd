@@ -4064,6 +4064,85 @@ pub(crate) async fn provision_oracle_peer_credentials(
     oracle_peer_credentials_from_key(fixture, api_key).await
 }
 
+/// Seeds one tenant-scoped Service principal directly against a fixture.
+///
+/// The multi-process harness has no in-process `WyrdTestServer` to bootstrap
+/// through, but a peer-network journey still has to drive a real public query
+/// against a child's public listener. This is the fixture-level equivalent of
+/// [`WyrdTestServer::bootstrap_service_in_tenant`]: it seeds the tenant's
+/// built-in roles, ensures the fixture admin exists, and returns the new
+/// principal's API key.
+///
+/// # Errors
+///
+/// Returns an error when role seeding, principal or key persistence, hashing,
+/// or the role grant fails.
+pub(crate) async fn provision_tenant_service_principal(
+    fixture: &PgFixture,
+    tenant_id: DataTenantId,
+    name: &str,
+    roles: &[&str],
+) -> Result<SecretString, WyrdTestServerError> {
+    let creator_id = fixture_admin_id(tenant_id);
+    let principal_id = Uuid::now_v7();
+    let service_ref = card_ref(CardKind::Service, name)?;
+    let api_key = WyrdApiKey::generate(tenant_id);
+    let raw = api_key.secret.clone();
+    let key_hash = tokio::task::spawn_blocking(move || wyrd_auth_issue::hash_api_key(&raw))
+        .await
+        .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?
+        .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
+    let mut conn = fixture.tenant_conn_for(tenant_id).await.map_err(sql)?;
+    seed_builtin_roles_for_tenant(&mut conn, tenant_id)
+        .await
+        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+    let email = format!("fixture-admin-{}@test.wyrd", creator_id.simple());
+    insert_user(&mut conn, creator_id, Some(&email), "password", None)
+        .await
+        .or_else(|error| {
+            if is_unique_violation(&error) {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        })
+        .map_err(sql)?;
+    seed_machine_card(&mut conn, &service_ref, creator_id).await?;
+    insert_service_account(
+        &mut conn,
+        principal_id,
+        "service",
+        &service_ref,
+        name,
+        None,
+        creator_id,
+    )
+    .await
+    .map_err(sql)?;
+    insert_api_key(
+        &mut conn,
+        Uuid::now_v7(),
+        principal_id,
+        &api_key.prefix,
+        &key_hash,
+        creator_id,
+        chrono::Utc::now() + chrono::Duration::days(1),
+    )
+    .await
+    .map_err(sql)?;
+    for role in roles {
+        grant_role(
+            &mut conn,
+            principal_id,
+            PrincipalTable::ServiceAccount,
+            role,
+        )
+        .await?;
+    }
+    conn.commit().await.map_err(sql)?;
+    Ok(api_key.secret)
+}
+
 /// Seeds the shared Bifrost peer Service principal and returns its API key.
 ///
 /// Separated from credential construction because the seeding is not

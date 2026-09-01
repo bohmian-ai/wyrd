@@ -2072,6 +2072,19 @@ impl AppState {
             .map(|owner| Arc::clone(&owner.cluster))
     }
 
+    /// Borrow whichever fenced role owns this node's membership registry.
+    ///
+    /// A peer-bearing node registers under Oracle, Scribe, or both, and every
+    /// co-located role shares one registry, so either owner answers the same
+    /// membership. Returns `None` only when this process selected neither
+    /// fenced role.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn bifrost_cluster_for_test(&self) -> Option<Arc<ClusterRegistry>> {
+        self.oracle_cluster()
+            .or_else(|| self.bifrost.scribe().map(|owner| owner.cluster()))
+    }
+
     /// Borrow the retained Bifrost Scribe for test-tier harness inspection.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]

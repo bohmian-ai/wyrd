@@ -352,6 +352,15 @@ pub struct ForgeWorkerCompletionObserver {
     attempts: Arc<AtomicUsize>,
     /// Errors returned by supervised execution attempts in observation order.
     returned_errors: Arc<Mutex<Vec<String>>>,
+    /// Typed unsettled-output evidence carried by each returned error.
+    ///
+    /// Index-aligned with [`Self::returned_errors`]. An entry is `None` when
+    /// the returned failure was not a [`ForgeError::RewriteUnsettled`], and
+    /// otherwise holds the attempt-global possible-output set exactly as the
+    /// wrapper carried it. Retaining it typed is what lets a refusal scenario
+    /// assert the exact object identities a failed attempt left behind instead
+    /// of matching the wrapper's rendered text.
+    returned_unsettled: Arc<Mutex<Vec<Option<Vec<crate::forge::managed::ForgeUnsettledOutput>>>>>,
     /// Number of successful task executions observed after their durable path returned.
     completed: Arc<AtomicUsize>,
     /// Stable production worker identities that completed each observed task.
@@ -535,6 +544,22 @@ impl ForgeWorkerCompletionObserver {
     #[must_use]
     pub fn returned_errors(&self) -> Vec<String> {
         self.returned_errors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Return the typed unsettled-output evidence each returned error carried.
+    ///
+    /// Index-aligned with [`Self::returned_errors`]: entry `i` is `Some` only
+    /// when that attempt ended as [`ForgeError::RewriteUnsettled`], in which
+    /// case it is the exact possible-output set the wrapper preserved. Passive
+    /// diagnostic evidence; recording it cannot affect any durable transition.
+    #[must_use]
+    pub fn returned_unsettled_outputs(
+        &self,
+    ) -> Vec<Option<Vec<crate::forge::managed::ForgeUnsettledOutput>>> {
+        self.returned_unsettled
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -828,6 +853,15 @@ impl ForgeWorkerCompletionObserver {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(error.to_string());
+            self.returned_unsettled
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(match error {
+                    ForgeError::RewriteUnsettled {
+                        possible_outputs, ..
+                    } => Some(possible_outputs.clone()),
+                    _ => None,
+                });
         }
         self.attempts.fetch_add(1, Ordering::AcqRel);
         self.ready.notify_waiters();
@@ -3025,6 +3059,80 @@ impl ForgeWorker {
         Ok(request)
     }
 
+    /// Publishes one immutable managed handoff and settles its operation.
+    ///
+    /// This is the sole boundary between managed execution and the catalog. It
+    /// receives outputs that already exist in object storage and nothing that
+    /// references them, and it leaves behind either a live replacement whose
+    /// operation is settled, or a refusal whose operation is settled, or —
+    /// exactly once, for one honest reason — an open Prepared operation a
+    /// successor must reconcile from retained evidence.
+    ///
+    /// The order is load-decide-prepare-commit-settle, and each step exists
+    /// because the table stayed open to every other writer while managed
+    /// execution ran:
+    ///
+    /// 1. [`Self::acquire_publication_authority`] reloads the table *after* the
+    ///    handoff and decides every knowable authority — lease and fence,
+    ///    cancellation, the absolute deadline, branch, base, ancestry, and the
+    ///    planned schema/spec/sort policy — against that fresh metadata. The
+    ///    pre-execution table is evidence, never authority, so a refusal here
+    ///    arrives before any Prepared row and before any catalog mutation.
+    /// 2. [`Self::prepare_rewrite_request`] re-derives the replacement against
+    ///    the base it is about to commit against, which is what carries the
+    ///    file-level authorities (selected inputs still live, delete scope), and
+    ///    writes the Prepared audit exactly once — on the first pass only —
+    ///    naming the inputs and outputs a successor would reconcile.
+    /// 3. The commit is submitted under `context.deadline`, one absolute budget
+    ///    shared by every pass. A definite conflict — the catalog *answered*,
+    ///    so nothing landed — buys at most one revalidated retry against the
+    ///    reloaded table, and only while that same deadline still has budget;
+    ///    the retry never renews it.
+    /// 4. A committed submission settles the operation terminally through
+    ///    [`Self::settle_committed_rewrite`], which writes the SQL settlement
+    ///    and the terminal audit in the same transition.
+    ///
+    /// The distinction the return value carries is the point of the whole
+    /// method. *Definitely unsubmitted* — a refusal, a not-submitted transport
+    /// failure, or a definite conflict with the retry spent — closes the
+    /// operation here as Reset, because asking a successor to reconcile a
+    /// commit that never started would block that table's fresh work forever.
+    /// *Submitted but acceptance unknown* claims nothing: the operation is left
+    /// Prepared and the error propagates, so the successor that takes the table
+    /// over settles it as Recovered or Reset from the catalog's own snapshots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Catalog`] when the post-handoff metadata load
+    /// fails; [`ForgeError::Reconciliation`] wrapping the refusal when
+    /// [`Self::rewrite_publication_refusal`] denies authority;
+    /// [`ForgeError::RewriteUnsettled`] when the fresh base cannot re-derive
+    /// the replacement or when a definite non-acceptance closes the operation,
+    /// carrying the possible outputs as unsettled evidence;
+    /// [`ForgeError::Shutdown`] or [`ForgeError::ShutdownRetained`] for a
+    /// cancelled attempt, returned bare so `run_slot` can release the claim;
+    /// [`ForgeError::Timeout`] when the absolute deadline expires with a call
+    /// in flight; [`ForgeError::Invariant`] when a revalidated retry has no
+    /// reloaded table; and the lease, fence, audit, and SQL failures raised by
+    /// the authority decision, the Prepared transition, and the terminal
+    /// settlement. An audit or settlement failure replaces the originating
+    /// reason, because a transition that was not recorded is the more severe
+    /// fact.
+    ///
+    /// # Cancellation and partial progress
+    ///
+    /// Cancellation observed before submission has zero effect: no Prepared
+    /// row, no catalog mutation, and the live cut is exactly as it was.
+    /// Cancellation observed while a call is in flight is *not* an answer — the
+    /// commit may already have been accepted — so the operation stays Prepared
+    /// and the managed outputs stay in object storage, unreferenced, until a
+    /// successor settles that operation or the objects are reclaimed as
+    /// orphans. Every returned error carries the attempt's possible output
+    /// identities for that reason.
+    ///
+    /// A caller must therefore never read an error as "the catalog rejected the
+    /// commit". Only a Reset settlement means that. An error alone means only
+    /// that this attempt did not learn of an acceptance.
     async fn publish_rewrite(
         &self,
         context: &RewritePublication<'_>,

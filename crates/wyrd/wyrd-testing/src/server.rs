@@ -490,8 +490,15 @@ pub struct WyrdTestServerBuilder {
     bifrost_roles: BTreeSet<BifrostRuntimeRole>,
     /// Cluster-retained Scribe WAL root reused across restarts.
     scribe_wal_root: Option<Arc<tempfile::TempDir>>,
+    /// Caller-owned durable Scribe root that outlives this process.
+    ///
+    /// A multi-process harness needs a root a restarted child re-mounts, which
+    /// a process-local [`tempfile::TempDir`] cannot be.
+    scribe_wal_path: Option<std::path::PathBuf>,
     /// Cluster-retained Forge/Oracle spill root reused across restarts.
     oracle_spill_root: Option<Arc<tempfile::TempDir>>,
+    /// Caller-owned durable spill root that outlives this process.
+    oracle_spill_path: Option<std::path::PathBuf>,
     /// Complete process observations injected into the production resource policy.
     system_resources: Option<SystemResourceSnapshot>,
     /// Cluster-retained Oracle audit WAL root reused across restarts.
@@ -583,7 +590,9 @@ impl Default for WyrdTestServerBuilder {
             .into_iter()
             .collect(),
             scribe_wal_root: None,
+            scribe_wal_path: None,
             oracle_spill_root: None,
+            oracle_spill_path: None,
             system_resources: None,
             oracle_audit_wal_root: None,
             telemetry: None,
@@ -3377,6 +3386,22 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Mount caller-owned durable WAL and spill roots that outlive the process.
+    ///
+    /// A simulated pod in a multi-process cluster is restarted by launching a
+    /// new child over the same directories, which is what makes a Scribe's
+    /// volume-coupled identity observable across restart.
+    #[must_use]
+    pub fn with_durable_bifrost_roots(
+        mut self,
+        scribe_wal: std::path::PathBuf,
+        oracle_spill: std::path::PathBuf,
+    ) -> Self {
+        self.scribe_wal_path = Some(scribe_wal);
+        self.oracle_spill_path = Some(oracle_spill);
+        self
+    }
+
     /// Reuse cluster-owned local WAL and spill directories for this node.
     #[must_use]
     pub(crate) fn with_bifrost_roots(
@@ -3627,14 +3652,21 @@ impl WyrdTestServerBuilder {
         let spill_root = self.oracle_spill_root.clone().unwrap_or(Arc::new(
             tempfile::tempdir().map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
         ));
-        let scratch_root = spill_root.path().to_owned();
+        let scratch_root = match &self.oracle_spill_path {
+            Some(path) => path.clone(),
+            None => spill_root.path().to_owned(),
+        };
         let wal_root = self.scribe_wal_root.clone().unwrap_or(Arc::new(
             tempfile::tempdir().map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
         ));
+        let durable_wal_root = match &self.scribe_wal_path {
+            Some(path) => path.clone(),
+            None => wal_root.path().to_owned(),
+        };
         let volume_roots = if self.bifrost_roles.is_empty() {
             None
         } else {
-            let wal_volume_root = wal_root.path().to_owned();
+            let wal_volume_root = durable_wal_root.clone();
             let scribe_stage = wal_volume_root.join("scribe-stage");
             let scribe_output = scratch_root.join("scribe-output");
             let forge_scratch = scratch_root.join("forge");
@@ -3698,7 +3730,21 @@ impl WyrdTestServerBuilder {
         ));
         let bifrost = test_catalog(&fixture, Arc::clone(&bifrost_storage)).await?;
         let target = self.forge_process_role;
-        let node_id = self.node_id.unwrap_or_else(|| NodeId::new(Uuid::now_v7()));
+        // Mirrors production: a Scribe-bearing node reclaims the identity stored
+        // beside its durable volume, so a restarted child is the same node
+        // rather than a new one holding another node's WAL.
+        let node_id = match self.node_id {
+            Some(node_id) => node_id,
+            None if self.bifrost_roles.contains(&BifrostRuntimeRole::Scribe) => {
+                let stored = wyrd_server::boot::node_identity::ScribeNodeIdentityStore::new(
+                    durable_wal_root.clone(),
+                )
+                .load_or_create()
+                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+                NodeId::new(Uuid::from_bytes(*stored.as_bytes()))
+            }
+            None => NodeId::new(Uuid::now_v7()),
+        };
         let cluster_registry = Arc::new(if let Some(timing) = self.role_timing {
             ClusterRegistry::new_with_role_timing(postgres.vala().clone(), node_id, timing)
         } else {
@@ -4014,6 +4060,24 @@ async fn grant_role(
 pub(crate) async fn provision_oracle_peer_credentials(
     fixture: Arc<PgFixture>,
 ) -> Result<Arc<dyn OraclePeerCredentials>, WyrdTestServerError> {
+    let api_key = provision_oracle_peer_principal(&fixture).await?;
+    oracle_peer_credentials_from_key(fixture, api_key).await
+}
+
+/// Seeds the shared Bifrost peer Service principal and returns its API key.
+///
+/// Separated from credential construction because the seeding is not
+/// idempotent: a multi-process cluster provisions the principal once in the
+/// parent and hands every child the resulting key, rather than having each
+/// child insert another principal for the same plane.
+///
+/// # Errors
+///
+/// Returns an error when role seeding, principal/key persistence, or hashing
+/// fails.
+pub(crate) async fn provision_oracle_peer_principal(
+    fixture: &Arc<PgFixture>,
+) -> Result<SecretString, WyrdTestServerError> {
     let tenant_id = DataTenantId::SYSTEM_OWNER;
     let creator_id = fixture_admin_id(tenant_id);
     let principal_id = Uuid::now_v7();
@@ -4075,6 +4139,19 @@ pub(crate) async fn provision_oracle_peer_credentials(
     )
     .await?;
     conn.commit().await.map_err(sql)?;
+    Ok(api_key.secret)
+}
+
+/// Builds refreshing peer credentials for an already-seeded principal key.
+///
+/// # Errors
+///
+/// Returns an error when the issuing key cannot be constructed or the first
+/// bearer exchange fails.
+pub(crate) async fn oracle_peer_credentials_from_key(
+    fixture: Arc<PgFixture>,
+    api_key: SecretString,
+) -> Result<Arc<dyn OraclePeerCredentials>, WyrdTestServerError> {
     let issuing_key = Arc::new(
         IssuingKey::from_ed_pem(
             crate::keys::private_key_pem(),
@@ -4085,7 +4162,7 @@ pub(crate) async fn provision_oracle_peer_credentials(
     );
     let credentials = Arc::new(TestOraclePeerCredentials {
         fixture,
-        api_key: api_key.secret,
+        api_key,
         exchange: ExchangeApiKey {
             issuing_key,
             settings: TokenExchangeSettings::default(),

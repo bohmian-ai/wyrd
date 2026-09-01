@@ -1869,6 +1869,8 @@ pub struct AppState {
     pub grpc_health: HealthReporter,
     /// Cached readiness snapshot from the background readiness_loop task.
     pub readiness: Arc<ArcSwap<ReadinessSnapshot>>,
+    /// Retained status of this process's private Bifrost peer listener.
+    pub peer_plane: Arc<crate::app::peer_plane::PeerPlaneStatus>,
     /// Tenant-keyed in-memory eval run/lease/session map. Ephemeral, single-replica.
     pub eval_runs: EvalRuns,
     /// Audit sink for eval run open/complete events.
@@ -1905,6 +1907,7 @@ impl AppState {
             limits: LimitsConfig::default(),
             grpc_health: reporter,
             readiness: Arc::new(ArcSwap::from_pointee(ReadinessSnapshot::initial())),
+            peer_plane: Arc::new(crate::app::peer_plane::PeerPlaneStatus::default()),
             eval_runs: new_run_map(),
             eval_audit: Arc::new(TracingEvalAuditWriter),
             #[cfg(feature = "test-support")]

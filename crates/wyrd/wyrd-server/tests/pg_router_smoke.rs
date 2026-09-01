@@ -324,7 +324,8 @@ async fn readyz_returns_ok_when_all_probes_pass() {
         postgres: ok_probe.clone(),
         storage: ok_probe.clone(),
         scribe: ok_probe.clone(),
-        oracle: ok_probe,
+        oracle: ok_probe.clone(),
+        peer: ok_probe,
     }));
 
     let response = server

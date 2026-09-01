@@ -177,6 +177,12 @@ impl WyrdServer {
             Some(peer_tls) => build_peer_grpc(&state, peer_tls)?,
             None => None,
         };
+        // Declared from the composed router rather than from the target alone,
+        // so a target that should serve the peer plane but composed no private
+        // router is reported unready instead of quietly serving nothing.
+        if config.role.serves_peer() {
+            state.peer_plane.require();
+        }
         let http_router = crate::http::build_router(state.clone());
 
         Ok(Self {
@@ -664,8 +670,14 @@ impl BoundServer {
                 .take()
                 .expect("a bound peer listener always carries its peer router");
             let token = shutdown.clone();
+            // Published here rather than at bind time, so readiness reports the
+            // plane as up only while the serving task actually holds it.
+            let peer_plane = Arc::clone(&self.state.peer_plane);
+            peer_plane.mark_serving();
             set.spawn(fallible_task(TaskId::BifrostPeer, async move {
-                serve_grpc_with_listener(router, listener, token).await
+                let served = serve_grpc_with_listener(router, listener, token).await;
+                peer_plane.mark_stopped();
+                served
             }));
         }
         if let Some(listener) = self.metrics_listener.take() {

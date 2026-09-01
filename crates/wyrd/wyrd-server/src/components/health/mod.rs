@@ -51,6 +51,8 @@ pub enum ProbeReason {
     ScribeRecovery,
     /// Oracle role registration, coordination, or worker startup has not completed.
     OracleStartup,
+    /// This target must serve the private Bifrost peer listener and does not.
+    PeerPlaneDown,
 }
 
 /// Snapshot published by the background readiness_loop task.
@@ -64,6 +66,8 @@ pub struct ReadinessSnapshot {
     pub scribe: ProbeOutcome,
     /// Oracle registration and query-path readiness result.
     pub oracle: ProbeOutcome,
+    /// Private Bifrost peer listener readiness result.
+    pub peer: ProbeOutcome,
 }
 
 /// Per-dependency probe result.
@@ -100,13 +104,18 @@ impl ReadinessSnapshot {
                 reason: ProbeReason::Warmup,
                 elapsed_ms: 0,
             },
+            peer: ProbeOutcome {
+                ok: false,
+                reason: ProbeReason::Warmup,
+                elapsed_ms: 0,
+            },
         }
     }
 
     /// True when all probes passed in the most recent tick.
     #[must_use]
     pub fn all_ok(&self) -> bool {
-        self.postgres.ok && self.storage.ok && self.scribe.ok && self.oracle.ok
+        self.postgres.ok && self.storage.ok && self.scribe.ok && self.oracle.ok && self.peer.ok
     }
 }
 
@@ -138,7 +147,37 @@ async fn compute_snapshot(state: &AppState, probe_timeout: Duration) -> Readines
         storage,
         scribe: probe_scribe(state),
         oracle: probe_oracle(state),
+        peer: probe_peer(state),
     }
+}
+
+/// Reads the retained peer-listener bit without opening a connection.
+///
+/// A node that serves the public listener while its private listener is absent
+/// is reachable by clients and unreachable by its peers, which is worse than
+/// being plainly unready: tail discovery and Analytical stage delivery both
+/// fail against it while a load balancer keeps sending it work.
+fn probe_peer(state: &AppState) -> ProbeOutcome {
+    let required = state.peer_plane.is_required();
+    let outcome = if state.peer_plane.is_satisfied() {
+        ProbeOutcome {
+            ok: true,
+            reason: ProbeReason::Ok,
+            elapsed_ms: 0,
+        }
+    } else {
+        ProbeOutcome {
+            ok: false,
+            reason: ProbeReason::PeerPlaneDown,
+            elapsed_ms: 0,
+        }
+    };
+    metrics::gauge!("bifrost_role_ready", "role" => "peer").set(if required && outcome.ok {
+        1.0
+    } else {
+        0.0
+    });
+    outcome
 }
 
 /// Reads retained Oracle readiness without executing a query or touching storage.
@@ -377,7 +416,7 @@ pub async fn readyz(State(state): State<AppState>) -> Response {
 
 impl wyrd_tonic::health::HealthSnapshot for ReadinessSnapshot {
     fn all_ok(&self) -> bool {
-        self.postgres.ok && self.storage.ok && self.scribe.ok && self.oracle.ok
+        ReadinessSnapshot::all_ok(self)
     }
 }
 
@@ -407,6 +446,11 @@ mod tests {
                 reason: ProbeReason::Ok,
                 elapsed_ms: 1,
             },
+            peer: ProbeOutcome {
+                ok: true,
+                reason: ProbeReason::Ok,
+                elapsed_ms: 1,
+            },
         }
     }
 
@@ -428,6 +472,11 @@ mod tests {
                 elapsed_ms: 1,
             },
             oracle: ProbeOutcome {
+                ok: true,
+                reason: ProbeReason::Ok,
+                elapsed_ms: 1,
+            },
+            peer: ProbeOutcome {
                 ok: true,
                 reason: ProbeReason::Ok,
                 elapsed_ms: 1,

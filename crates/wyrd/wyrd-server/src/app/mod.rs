@@ -17,6 +17,7 @@ use crate::config::{ServeMode, WyrdServerConfig};
 use crate::state::AppState;
 
 pub mod metrics;
+pub mod peer_plane;
 pub mod serve;
 pub mod server;
 pub mod shutdown;

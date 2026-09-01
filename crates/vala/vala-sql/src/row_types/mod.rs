@@ -15,3 +15,4 @@ pub mod olap_catalog;
 pub mod oracle_admission;
 pub mod profiles;
 pub mod queues;
+pub mod reader_watermarks;

@@ -380,9 +380,9 @@ impl Forge {
     ///
     /// # Errors
     ///
-    /// Returns SQL or identity failures from the durable watermark read, and
-    /// [`ForgeError::SnapshotExpiry`] when the bounded watermark query
-    /// overflowed, which means the protected set is not provably complete.
+    /// Returns SQL or identity failures from the durable watermark reads, and
+    /// [`ForgeError::SnapshotExpiry`] when either bounded query overflowed,
+    /// which means the protected set is not provably complete.
     async fn snapshot_protection_roots(
         &self,
         key: &ForgeTableKey,
@@ -406,19 +406,30 @@ impl Forge {
             .tenant_conn(key.tenant)
             .await
             .map_err(ForgeError::Sql)?;
-        let (attempt_watermarks, overflowed) = ForgeTasks::new(self.core.operator_pool.clone())
-            .watermarks(&mut conn, &identity, cap)
-            .await
-            .map_err(ForgeError::Sql)?;
+        let (attempt_watermarks, attempts_overflowed) =
+            ForgeTasks::new(self.core.operator_pool.clone())
+                .watermarks(&mut conn, &identity, cap)
+                .await
+                .map_err(ForgeError::Sql)?;
+        let (reader_watermarks, readers_overflowed) =
+            vala_sql::queries::reader_watermarks::BifrostReaderWatermarks::new(&mut conn)
+                .list_active(
+                    key.table_ref.namespace.as_str(),
+                    key.table_ref.name.as_str(),
+                    self.core.clock.now()?,
+                    cap,
+                )
+                .await
+                .map_err(ForgeError::Sql)?;
         conn.commit().await.map_err(ForgeError::Sql)?;
-        if overflowed {
+        if attempts_overflowed || readers_overflowed {
             return Err(ForgeError::SnapshotExpiry {
-                detail: "active Forge watermark set exceeded its bounded query".to_owned(),
+                detail: "active Forge protection set exceeded its bounded query".to_owned(),
             });
         }
         Ok(SnapshotProtectionRoots {
             attempt_watermarks,
-            reader_watermarks: Vec::new(),
+            reader_watermarks,
             lineage_snapshot_id: head_lineage_snapshot_id(table),
             destructive_maintenance,
         })

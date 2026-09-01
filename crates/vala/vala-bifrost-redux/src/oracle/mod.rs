@@ -78,6 +78,7 @@ pub mod peer;
 mod planner;
 pub(crate) mod pruning;
 mod query_stream;
+pub(crate) mod reader_pins;
 mod running;
 mod spill;
 mod splitter;
@@ -1718,6 +1719,13 @@ pub struct PlannedSqlCut {
     pub(crate) query_class: QueryClass,
     /// Fraction of pinned sealed bytes in the local hot tier.
     pub(crate) local_ratio: f64,
+    /// This node's claim on the snapshots these cuts named.
+    ///
+    /// Carried by the plan rather than taken and released around execution so
+    /// that the claim's lifetime is the cut's lifetime by construction: a plan
+    /// that is abandoned before execution, or dropped on a retry, releases its
+    /// snapshots without anyone remembering to.
+    pub(crate) reader_pin: Option<reader_pins::ReaderPinGuard>,
 }
 
 impl PlannedSqlCut {
@@ -1794,6 +1802,8 @@ pub struct Oracle {
     cluster: Arc<ClusterRegistry>,
     /// One process-local lifecycle registry shared with private controls.
     running_queries: Arc<RunningQueryRegistry>,
+    /// Snapshots this node's in-flight cuts still need Forge to retain.
+    reader_pins: Arc<reader_pins::ReaderPinLedger>,
     /// Tenant-qualified catalog and SQL owners retained for query execution.
     catalog: Arc<BifrostCatalog>,
     /// Tenant SQL handle retained for the Oracle lifecycle boundary.
@@ -1827,6 +1837,8 @@ pub struct Oracle {
     maintenance: Mutex<Option<JoinHandle<()>>>,
     /// Background-only `PostgreSQL` allocator and renewal task.
     delegated_maintenance: Mutex<Option<JoinHandle<()>>>,
+    /// Cancellation-bound task republishing this node's reader watermarks.
+    reader_watermarks: Mutex<Option<JoinHandle<()>>>,
     /// Test-tier one-shot pause after immutable worker selection.
     #[cfg(feature = "test-support")]
     topology_probe: Mutex<Option<Arc<OracleTopologyProbe>>>,
@@ -2037,6 +2049,13 @@ impl Oracle {
         let ready = Arc::new(AtomicBool::new(false));
         let (maintenance, startup_result) =
             OracleAdmission::start_maintenance(shutdown.clone(), Arc::clone(&ready))?;
+        let reader_pins = Arc::new(reader_pins::ReaderPinLedger::new());
+        let reader_watermarks = reader_pins::ReaderWatermarkPublisher::spawn(
+            Arc::clone(&reader_pins),
+            config.vala.clone(),
+            admission.local_role.key.node_id.into(),
+            shutdown.clone(),
+        )?;
         let fragment_dispatcher = config.peer_transports.map(|transports| {
             Arc::new(dispatcher::FragmentDispatcher::new(
                 Arc::clone(&config.peer_ticket_minter),
@@ -2050,6 +2069,7 @@ impl Oracle {
             delegated_loss: Mutex::new(Some(loss_rx)),
             cluster,
             running_queries,
+            reader_pins,
             catalog: config.catalog,
             vala: config.vala,
             memory: config.memory,
@@ -2067,6 +2087,7 @@ impl Oracle {
             startup_result: Mutex::new(Some(startup_result)),
             maintenance: Mutex::new(Some(maintenance)),
             delegated_maintenance: Mutex::new(Some(delegated_maintenance)),
+            reader_watermarks: Mutex::new(Some(reader_watermarks)),
             #[cfg(feature = "test-support")]
             topology_probe: Mutex::new(None),
         })
@@ -2631,7 +2652,8 @@ impl Oracle {
         deadline: Instant,
         live_oracle_cpu: f64,
     ) -> Result<PlannedSqlCut, BifrostError> {
-        self.planner
+        let mut planned = self
+            .planner
             .pin_and_classify(
                 context,
                 sql,
@@ -2640,7 +2662,15 @@ impl Oracle {
                 &self.catalog,
                 live_oracle_cpu,
             )
-            .await
+            .await?;
+        planned.reader_pin = Some(self.reader_pins.pin(&planned.cuts));
+        Ok(planned)
+    }
+
+    /// Borrows this node's live reader-pin ledger for durable publication.
+    #[must_use]
+    pub fn reader_pins(&self) -> &Arc<reader_pins::ReaderPinLedger> {
+        &self.reader_pins
     }
 
     /// Acquires live fences, commits the read decision, and drains authorized tails.
@@ -3189,6 +3219,22 @@ impl Oracle {
                 .is_err()
             {
                 delegated.abort();
+            }
+        }
+        let watermarks = self
+            .reader_watermarks
+            .lock()
+            .ok()
+            .and_then(|mut handle| handle.take());
+        if let Some(mut watermarks) = watermarks {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or(Duration::ZERO);
+            if tokio::time::timeout(remaining, &mut watermarks)
+                .await
+                .is_err()
+            {
+                watermarks.abort();
             }
         }
         let _ = deadline;

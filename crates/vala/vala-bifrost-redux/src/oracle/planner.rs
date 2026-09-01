@@ -398,6 +398,7 @@ impl OraclePlanner {
             cuts,
             query_class: classification.query_class,
             local_ratio,
+            reader_pin: None,
         })
     }
 

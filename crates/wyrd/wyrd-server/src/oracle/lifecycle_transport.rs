@@ -6,7 +6,7 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
 use vala_bifrost_redux::cluster::ClusterRegistry;
-use vala_bifrost_redux::oracle::dispatcher::{OraclePeerCredentials, BifrostPeerTls};
+use vala_bifrost_redux::oracle::dispatcher::{BifrostPeerTls, OraclePeerCredentials};
 use wyrd_spec::vala::api::NodeId;
 use wyrd_spec::vala::api::{
     CancelOracleLifecycleRequest, CancelOracleLifecycleResponse, ListOracleLifecyclesRequest,

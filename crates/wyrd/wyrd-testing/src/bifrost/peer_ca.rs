@@ -147,13 +147,14 @@ impl BifrostPeerCa {
         let key = KeyPair::generate().map_err(|error| PeerCaError::Generate(error.to_string()))?;
         let mut params = CertificateParams::new(Vec::<String>::new())
             .map_err(|error| PeerCaError::Generate(error.to_string()))?;
-        params.distinguished_name.push(DnType::CommonName, common_name);
+        params
+            .distinguished_name
+            .push(DnType::CommonName, common_name);
         params.is_ca = IsCa::NoCa;
         params.subject_alt_names = vec![SanType::DnsName(
-            self.server_name
-                .clone()
-                .try_into()
-                .map_err(|_| PeerCaError::Generate("peer server name is not a DNS name".to_owned()))?,
+            self.server_name.clone().try_into().map_err(|_| {
+                PeerCaError::Generate("peer server name is not a DNS name".to_owned())
+            })?,
         )];
         params.key_usages = vec![
             KeyUsagePurpose::DigitalSignature,
@@ -218,7 +219,9 @@ mod tests {
     fn issued_leaves_are_distinct_under_one_authority() {
         let authority = BifrostPeerCa::generate("bifrost-peer.test").expect("authority generates");
         let first = authority.issue_leaf("oracle-0").expect("first leaf issues");
-        let second = authority.issue_leaf("oracle-1").expect("second leaf issues");
+        let second = authority
+            .issue_leaf("oracle-1")
+            .expect("second leaf issues");
 
         assert_ne!(first.certificate_pem(), second.certificate_pem());
         assert_ne!(first.private_key_pem(), second.private_key_pem());

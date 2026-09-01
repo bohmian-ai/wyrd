@@ -19,7 +19,7 @@ use vala_bifrost_redux::forge::{
 };
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::oracle::dispatcher::{
-    LocalOraclePeerTransport, OraclePeerCredentials, BifrostPeerTls, OraclePeerTransportDirectory,
+    BifrostPeerTls, LocalOraclePeerTransport, OraclePeerCredentials, OraclePeerTransportDirectory,
     OraclePeerWorker, OraclePeerWorkerConfig, ReservationRegistry, TonicOraclePeerTransport,
 };
 use vala_bifrost_redux::oracle::{
@@ -2112,7 +2112,6 @@ pub fn spawn_maintenance_scheduler(
     };
     Ok(Some(async move { forge.run(shutdown).await }))
 }
-
 
 /// Loads the one role-neutral Bifrost peer identity for this process.
 ///

@@ -91,9 +91,8 @@ mod tests {
     /// Production configuration fails closed when the peer key is missing.
     #[test]
     fn configured_key_rejects_missing_value() {
-        let error =
-            ServerBifrostPeerCredentials::from_resolved_key(None, &ClientConfig::default())
-                .expect_err("missing key is rejected");
+        let error = ServerBifrostPeerCredentials::from_resolved_key(None, &ClientConfig::default())
+            .expect_err("missing key is rejected");
 
         assert_eq!(error, "bifrost.peer.api_key is required");
     }

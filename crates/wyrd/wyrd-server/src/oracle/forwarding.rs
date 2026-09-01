@@ -8,7 +8,7 @@ use futures_util::StreamExt;
 use rand::RngCore as _;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::cluster::{ClusterRegistry, ClusterSnapshot};
-use vala_bifrost_redux::oracle::dispatcher::{OraclePeerCredentials, BifrostPeerTls};
+use vala_bifrost_redux::oracle::dispatcher::{BifrostPeerTls, OraclePeerCredentials};
 use vala_bifrost_redux::oracle::{
     AuthorizedQueryContext, Oracle, OracleConfig, OraclePlanner, OracleQueryAttemptCut,
     OracleQueryStream, QueryIpcDecoder,

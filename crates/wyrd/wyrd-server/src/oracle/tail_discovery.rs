@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use vala_bifrost_redux::cluster::ClusterRegistry;
-use vala_bifrost_redux::oracle::dispatcher::{OraclePeerCredentials, BifrostPeerTls};
+use vala_bifrost_redux::oracle::dispatcher::{BifrostPeerTls, OraclePeerCredentials};
 use vala_bifrost_redux::oracle::{DiscoveredTailRoute, TailStreamDiscovery};
 use vala_bifrost_redux::scribe::tail_rpc::{
     TailReadError, TailReadTransport, TailTicketAudience, TailTicketClaims, TailTicketMinter,

@@ -2932,7 +2932,8 @@ impl WyrdTestServer {
         config.bifrost.peer.server_name = Some(peer_tls.server_name.clone());
         config.bifrost.peer.advertise_addr = Some(format!(
             "https://{}",
-            self.peer_bind.expect("peer bind is reserved during composition")
+            self.peer_bind
+                .expect("peer bind is reserved during composition")
         ));
         config.bifrost.peer.api_key = Some("harness-peer-api-key".to_owned());
         config.bifrost.peer.ticket.active_key_id = Some("harness-peer-key".to_owned());
@@ -3745,7 +3746,8 @@ impl WyrdTestServerBuilder {
         // reject. A caller that already minted cluster-wide material keeps it.
         if self.peer_tls.is_none() {
             let root = Arc::new(
-                tempfile::tempdir().map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
+                tempfile::tempdir()
+                    .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
             );
             let authority = crate::bifrost::peer_ca::BifrostPeerCa::generate("localhost")
                 .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
@@ -3817,7 +3819,8 @@ impl WyrdTestServerBuilder {
             // point so the advertised value is the address the listener holds.
             advertise_addr: format!(
                 "https://{}",
-                self.peer_bind.expect("peer bind is reserved before composition")
+                self.peer_bind
+                    .expect("peer bind is reserved before composition")
             ),
             wal_dir: wal_root.path().to_owned(),
             shutdown: shutdown.clone(),

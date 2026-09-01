@@ -14,7 +14,7 @@ use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::cluster::RoleTiming;
 use vala_bifrost_redux::forge::{ForgeConfig, ForgeWorkerCompletionObserver};
 use vala_bifrost_redux::oracle::dispatcher::{
-    OraclePeerCredentials, BifrostPeerTls, TonicOraclePeerTransport,
+    BifrostPeerTls, OraclePeerCredentials, TonicOraclePeerTransport,
 };
 use vala_bifrost_redux::resources::SystemResourceSnapshot;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
@@ -1252,29 +1252,19 @@ impl WyrdTestCluster {
     /// installation failure, or node bind failure. Nodes already started are
     /// shut down before the error returns.
     pub async fn start_spec(spec: BifrostClusterSpec) -> Result<Self, ClusterError> {
-        Self::start_spec_with_options(spec, Duration::ZERO, None, false, false).await
+        Self::start_spec_with_options(spec, Duration::ZERO, None, false).await
     }
 
-    /// Start real Wyrd servers whose Oracle membership and gRPC listeners use TLS.
+    /// Starts a topology while retaining the final node as an unbooted slot.
     ///
-    /// # Errors
-    /// Returns the same topology, resource, TLS-fixture, or server boot errors as
-    /// [`Self::start_spec`].
-    pub async fn start_spec_with_oracle_peer_tls(
-        spec: BifrostClusterSpec,
-    ) -> Result<Self, ClusterError> {
-        Self::start_spec_with_options(spec, Duration::ZERO, None, true, false).await
-    }
-
-    /// Starts a TLS topology while retaining the final node as an unbooted slot.
+    /// The reserved slot lets a journey observe the cluster before the last
+    /// replica joins, then boot it through [`Self::restart_node`].
     ///
     /// # Errors
     /// Returns the same resource, topology, and boot errors as
-    /// [`Self::start_spec_with_oracle_peer_tls`].
-    pub async fn start_spec_with_oracle_peer_tls_delayed_last(
-        spec: BifrostClusterSpec,
-    ) -> Result<Self, ClusterError> {
-        Self::start_spec_with_options(spec, Duration::ZERO, None, true, true).await
+    /// [`Self::start_spec`].
+    pub async fn start_spec_delayed_last(spec: BifrostClusterSpec) -> Result<Self, ClusterError> {
+        Self::start_spec_with_options(spec, Duration::ZERO, None, true).await
     }
 
     /// Start a named topology with an explicit WAL fsync delay.
@@ -1288,7 +1278,7 @@ impl WyrdTestCluster {
         wal_sync_delay: Duration,
     ) -> Result<Self, ClusterError> {
         topology.validate(pods)?;
-        Self::start_spec_with_options(topology.spec(), wal_sync_delay, None, false, false).await
+        Self::start_spec_with_options(topology.spec(), wal_sync_delay, None, false).await
     }
 
     /// Start a named topology with deterministic Scribe admission bounds.
@@ -1302,14 +1292,7 @@ impl WyrdTestCluster {
         admission: AdmissionConfig,
     ) -> Result<Self, ClusterError> {
         topology.validate(pods)?;
-        Self::start_spec_with_options(
-            topology.spec(),
-            Duration::ZERO,
-            Some(admission),
-            false,
-            false,
-        )
-        .await
+        Self::start_spec_with_options(topology.spec(), Duration::ZERO, Some(admission), false).await
     }
 
     /// Start an explicit descriptor with admission pressure on one Server.
@@ -1327,7 +1310,6 @@ impl WyrdTestCluster {
             Duration::ZERO,
             Some(admission),
             Some(node_index),
-            false,
             false,
             (
                 ForgeHarnessOptions::default(),
@@ -1356,7 +1338,6 @@ impl WyrdTestCluster {
             None,
             None,
             false,
-            false,
             (
                 ForgeHarnessOptions {
                     completion_observer: Some(ForgeWorkerCompletionObserver::new()),
@@ -1384,7 +1365,6 @@ impl WyrdTestCluster {
             Duration::ZERO,
             None,
             None,
-            false,
             false,
             (
                 ForgeHarnessOptions {
@@ -1415,7 +1395,6 @@ impl WyrdTestCluster {
             Duration::ZERO,
             None,
             None,
-            false,
             false,
             (
                 ForgeHarnessOptions {
@@ -1455,7 +1434,6 @@ impl WyrdTestCluster {
             None,
             None,
             false,
-            false,
             (
                 ForgeHarnessOptions {
                     completion_observer: Some(ForgeWorkerCompletionObserver::new()),
@@ -1488,7 +1466,6 @@ impl WyrdTestCluster {
             Duration::ZERO,
             Some(admission),
             Some(node_index),
-            false,
             false,
             (
                 ForgeHarnessOptions {
@@ -1542,7 +1519,6 @@ impl WyrdTestCluster {
             None,
             None,
             false,
-            false,
             (
                 ForgeHarnessOptions {
                     completion_observer: Some(observer),
@@ -1568,7 +1544,6 @@ impl WyrdTestCluster {
             Duration::ZERO,
             None,
             None,
-            false,
             false,
             (
                 ForgeHarnessOptions {
@@ -1596,7 +1571,6 @@ impl WyrdTestCluster {
             Duration::ZERO,
             None,
             None,
-            false,
             false,
             (
                 ForgeHarnessOptions {
@@ -1637,7 +1611,6 @@ impl WyrdTestCluster {
         spec: BifrostClusterSpec,
         wal_sync_delay: Duration,
         scribe_admission: Option<AdmissionConfig>,
-        enable_oracle_peer_tls: bool,
         delay_last_node: bool,
     ) -> Result<Self, ClusterError> {
         Self::start_spec_with_all_options(
@@ -1645,7 +1618,6 @@ impl WyrdTestCluster {
             wal_sync_delay,
             scribe_admission,
             None,
-            enable_oracle_peer_tls,
             delay_last_node,
             (
                 ForgeHarnessOptions::default(),
@@ -1684,7 +1656,6 @@ impl WyrdTestCluster {
         wal_sync_delay: Duration,
         scribe_admission: Option<AdmissionConfig>,
         scribe_admission_node: Option<usize>,
-        enable_oracle_peer_tls: bool,
         delay_last_node: bool,
         harness: (ForgeHarnessOptions, ClusterResourceSource),
     ) -> Result<Self, ClusterError> {
@@ -1770,21 +1741,20 @@ impl WyrdTestCluster {
             Some(credentials) => credentials,
             None => provision_oracle_peer_credentials(Arc::clone(&fixture)).await?,
         };
-        let oracle_peer_tls = if enable_oracle_peer_tls {
+        // Every replica in one topology must chain to the same peer CA, so the
+        // authority is minted once per cluster and shared. The peer plane is
+        // mandatory for a Scribe- or Oracle-bearing target, so this is
+        // unconditional rather than gated on a per-test flag.
+        let oracle_peer_tls = {
             let root = Arc::new(
                 tempfile::tempdir().map_err(|error| ClusterError::Resource(error.to_string()))?,
             );
-            // One authority per cluster, one distinct dual-EKU leaf per node:
-            // the same shape a deployment has, so a test can distinguish
-            // "trusted by the peer CA" from "is this exact replica".
             let authority = crate::bifrost::peer_ca::BifrostPeerCa::generate("localhost")
                 .map_err(|error| ClusterError::Resource(error.to_string()))?;
             let tls = authority
                 .materialize(root.path(), "cluster")
                 .map_err(|error| ClusterError::Resource(error.to_string()))?;
             Some((root, tls))
-        } else {
-            None
         };
         let topology = classify_topology(&spec);
         let scribe_admission_node =
@@ -2773,7 +2743,6 @@ fn parse_metric_sample(series: &str, value: f64) -> Result<OracleMetricSample, C
         value,
     })
 }
-
 
 /// Loads one runtime peer identity from the harness-written PEM paths.
 ///

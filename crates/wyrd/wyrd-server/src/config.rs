@@ -2689,7 +2689,8 @@ impl WyrdServerConfig {
         }
         if self.role.serves_peer()
             && serves_api
-            && (self.bifrost.peer.bind == self.http.bind || self.bifrost.peer.bind == self.grpc.bind)
+            && (self.bifrost.peer.bind == self.http.bind
+                || self.bifrost.peer.bind == self.grpc.bind)
         {
             return Err(ConfigError::BindCollision {
                 bind: self.bifrost.peer.bind,
@@ -2817,7 +2818,10 @@ impl WyrdServerConfig {
                 });
             }
             if self.role.serves_peer() {
-                match (&self.grpc.certificate_chain_path, &self.grpc.private_key_path) {
+                match (
+                    &self.grpc.certificate_chain_path,
+                    &self.grpc.private_key_path,
+                ) {
                     (Some(certificate), Some(key))
                         if !certificate.as_os_str().is_empty() && !key.as_os_str().is_empty() => {}
                     _ => {
@@ -3552,7 +3556,10 @@ minimum_slots = 2
                     "WYRD_BIFROST_PEER_ADVERTISE_ADDR",
                     Some("https://oracle-0.peers.svc:50052"),
                 ),
-                ("WYRD_BIFROST_PEER_CA_CERTIFICATE_PATH", Some("/peer/ca.pem")),
+                (
+                    "WYRD_BIFROST_PEER_CA_CERTIFICATE_PATH",
+                    Some("/peer/ca.pem"),
+                ),
                 (
                     "WYRD_BIFROST_PEER_CERTIFICATE_CHAIN_PATH",
                     Some("/peer/cert.pem"),
@@ -3575,9 +3582,7 @@ minimum_slots = 2
             ],
             || {
                 let mut config = WyrdServerConfig::default();
-                config
-                    .apply_env_overrides()
-                    .expect("peer overrides apply");
+                config.apply_env_overrides().expect("peer overrides apply");
                 let peer = &config.bifrost.peer;
                 assert_eq!(
                     peer.bind,

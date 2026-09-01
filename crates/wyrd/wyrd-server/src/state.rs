@@ -17,7 +17,7 @@ use vala_bifrost_redux::forge::Forge as ForgeCoordinator;
 use vala_bifrost_redux::forge::ForgeWorker;
 use vala_bifrost_redux::gate::limits::IngestLimits;
 use vala_bifrost_redux::oracle::Oracle as OracleEngine;
-use vala_bifrost_redux::oracle::dispatcher::{OraclePeerCredentials, BifrostPeerTls};
+use vala_bifrost_redux::oracle::dispatcher::{BifrostPeerTls, OraclePeerCredentials};
 use vala_bifrost_redux::oracle::follower::{PhysicalPlanFollower, ScribeTailResolver};
 use vala_bifrost_redux::oracle::peer::{PeerSecurityAudit, PeerTicketVerifier};
 use vala_bifrost_redux::oracle::{

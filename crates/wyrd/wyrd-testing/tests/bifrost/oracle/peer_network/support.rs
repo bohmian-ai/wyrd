@@ -177,6 +177,15 @@ pub(crate) async fn probe_oracle_lifecycle(channel: Channel) -> Result<(), tonic
         .map(|_| ())
 }
 
+/// Reports whether a target composes a public serving listener.
+///
+/// A dedicated Forge worker composes neither HTTP nor public gRPC: it pulls
+/// work from Postgres and object storage and answers no caller.
+#[must_use]
+pub(crate) fn target_serves_public_listener(target: ProcessNodeTarget) -> bool {
+    target != ProcessNodeTarget::ForgeWorker
+}
+
 /// Reports whether a target composes a private peer plane at all.
 ///
 /// A Forge worker owns neither a Scribe nor an Oracle, so it has nothing to

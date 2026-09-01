@@ -14,7 +14,7 @@ use wyrd_tonic::tonic::Code;
 
 use super::support::{
     DialIdentity, PeerDial, PeerJourneyError, probe_oracle_lifecycle, probe_oracle_peer,
-    probe_scribe_tail, target_serves_peer_plane,
+    probe_scribe_tail, target_serves_peer_plane, target_serves_public_listener,
 };
 
 /// Path of the compiled child every simulated pod runs.
@@ -102,7 +102,12 @@ fn one_lifecycle_owns_two_isolated_listeners(
         if !roots.insert(node.root().to_path_buf()) {
             return Err(format!("pod {} shares its root with another pod", node.label()).into());
         }
-        for socket in [node.http_addr(), node.grpc_addr(), node.peer_addr()] {
+        let bound = if target_serves_public_listener(node.target()) {
+            vec![node.http_addr(), node.grpc_addr(), node.peer_addr()]
+        } else {
+            Vec::new()
+        };
+        for socket in bound {
             if !sockets.insert(socket) {
                 return Err(format!("socket {socket} is bound by two pods").into());
             }
@@ -135,6 +140,9 @@ async fn peer_services_are_absent_from_the_public_listener(
     cluster: &BifrostProcessCluster,
 ) -> Result<(), PeerJourneyError> {
     for node in cluster.nodes() {
+        if !target_serves_public_listener(node.target()) {
+            continue;
+        }
         let address = format!("http://{}", node.grpc_addr());
         let channel = wyrd_tonic::transport::plaintext_endpoint(address)?
             .connect()
@@ -196,10 +204,16 @@ fn incomplete_peer_material_refuses_to_start(
 
 /// Only a leaf from the configured authority, under the configured name, joins.
 ///
+/// TLS 1.3 reports a rejected client certificate after the client's own
+/// handshake completes, so a refusal is proved by driving one real RPC rather
+/// than by whether `connect` returned. A member is expected to reach the
+/// application layer and be answered there; an anonymous or foreign identity is
+/// expected to lose the connection instead.
+///
 /// # Errors
 ///
-/// Returns a failure when an anonymous, foreign, or misnamed dial completes a
-/// handshake, or when a member dial does not.
+/// Returns a failure when an anonymous, foreign, or misnamed client reaches the
+/// application layer, or when a member cannot.
 async fn only_a_member_certificate_completes_the_handshake(
     cluster: &BifrostProcessCluster,
 ) -> Result<(), PeerJourneyError> {
@@ -210,10 +224,21 @@ async fn only_a_member_certificate_completes_the_handshake(
         .ok_or("no peer-bearing pod in the topology")?;
     let address = node.peer_addr();
 
-    PeerDial::member(cluster.peer_ca(), address)
+    let member = PeerDial::member(cluster.peer_ca(), address)
         .connect()
         .await
         .map_err(|error| format!("a member identity was refused: {error}"))?;
+    match probe_oracle_peer(member).await {
+        Ok(()) => {}
+        Err(status) if reached_the_application(&status) => {}
+        Err(status) => {
+            return Err(format!(
+                "a member identity was dropped by the transport as {:?}",
+                status.code()
+            )
+            .into());
+        }
+    }
 
     for (name, dial) in [
         (
@@ -230,11 +255,41 @@ async fn only_a_member_certificate_completes_the_handshake(
                 .expecting_server_name("not-the-peer-plane.invalid"),
         ),
     ] {
-        if dial.connect().await.is_ok() {
-            return Err(format!("{name} completed the peer handshake").into());
+        let Ok(channel) = dial.connect().await else {
+            continue;
+        };
+        match probe_oracle_peer(channel).await {
+            Err(status) if !reached_the_application(&status) => {}
+            Ok(()) => return Err(format!("{name} executed a peer operation").into()),
+            Err(status) => {
+                return Err(format!(
+                    "{name} reached the application layer and was answered {:?}",
+                    status.code()
+                )
+                .into());
+            }
         }
     }
     Ok(())
+}
+
+/// Reports whether a status was produced by the service rather than the transport.
+///
+/// A peer that was admitted is answered by Wyrd — authenticated, refused, or
+/// told the operation is not mounted here. A peer whose certificate was
+/// rejected never gets that far and sees the connection break instead.
+fn reached_the_application(status: &wyrd_tonic::tonic::Status) -> bool {
+    matches!(
+        status.code(),
+        Code::Unauthenticated
+            | Code::PermissionDenied
+            | Code::Unimplemented
+            | Code::InvalidArgument
+            | Code::NotFound
+            | Code::FailedPrecondition
+            | Code::ResourceExhausted
+            | Code::Internal
+    )
 }
 
 /// Transport admission is not node identity and is not operation authority.

@@ -249,6 +249,24 @@ impl ChildConfig {
         Ok(hex::encode(Sha256::digest(&bytes)))
     }
 
+    /// Reports whether this child has finished coming up.
+    ///
+    /// A serving target is ready when every readiness probe passes and its peer
+    /// plane obligation is met. A dedicated Forge worker composes no listener
+    /// and runs no readiness loop at all, so its own composition returning is
+    /// the whole of its startup; holding it to the serving probes would wait
+    /// forever on a loop that was never spawned.
+    fn is_ready(
+        &self,
+        snapshot: &wyrd_server::components::health::ReadinessSnapshot,
+        state: &wyrd_server::state::AppState,
+    ) -> bool {
+        if self.target == ProcessNodeTarget::ForgeWorker {
+            return true;
+        }
+        snapshot.all_ok() && state.peer_plane.is_satisfied()
+    }
+
     /// Maps this child's target onto the server's own target enum.
     fn server_target(&self) -> BifrostTarget {
         match self.target {
@@ -449,9 +467,21 @@ async fn await_ready(
             return Ok(report);
         }
         if Instant::now() >= deadline {
+            let snapshot = server.state().readiness.load();
+            // Naming the probes is what makes a readiness timeout actionable:
+            // without them the parent only learns that some dependency of some
+            // role never came up.
             return Err(ProcessClusterError::Timeout(format!(
-                "child pid {} readiness",
-                std::process::id()
+                "child pid {} readiness: postgres={:?} storage={:?} scribe={:?} oracle={:?} \
+                 peer={:?} peer_required={} peer_serving={}",
+                std::process::id(),
+                snapshot.postgres.reason,
+                snapshot.storage.reason,
+                snapshot.scribe.reason,
+                snapshot.oracle.reason,
+                snapshot.peer.reason,
+                server.state().peer_plane.is_required(),
+                server.state().peer_plane.is_serving(),
             )));
         }
         tokio::time::sleep(READY_POLL).await;
@@ -496,7 +526,7 @@ async fn describe(
         peer_addr: config.peer_bind.to_string(),
         advertise_addr,
         peer_certificate_fingerprint: fingerprint,
-        ready: snapshot.all_ok() && state.peer_plane.is_satisfied(),
+        ready: config.is_ready(&snapshot, state),
         wal_root: config.wal_root.display().to_string(),
         membership,
     }

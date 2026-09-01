@@ -660,26 +660,112 @@ fn attempt_evidence(
     mine[0].evidence.clone()
 }
 
-/// Counts the durable transitions one named rewrite operation has recorded.
+/// The canonical Forge audit resource one tenant-owned table is audited under.
 ///
-/// Returns `(phase, settled)`: the operation's current phase and whether a
-/// terminal audit row exists for it. A settled operation has exactly one, and
-/// a second settlement would have to overwrite the first, so the pair is the
-/// exactly-once evidence.
+/// Derived from the binding the journey registered rather than read off the
+/// snapshot being inspected, so correlating an audit row to this table is an
+/// independent statement and not a restatement of what the snapshot claims.
+fn forge_audit_resource(binding: &TenantTableBinding) -> String {
+    format!(
+        "bifrost://{}/{}/{}",
+        binding.tenant, binding.table_ref.namespace, binding.table_ref.name
+    )
+}
+
+/// The complete durable settlement record of one named rewrite operation.
+///
+/// Holds the operation row's own claim and every `forge.iceberg_rewrite.*`
+/// audit row the canonical tenant outbox carries for that exact operation
+/// under that exact resource. Cardinality is the point: an operation row that
+/// merely *names* a terminal sequence proves neither that a Prepared row
+/// exists, nor that only one terminal row does, nor that no sibling
+/// settlement was appended for the same operation.
+#[derive(Debug, Clone)]
+struct RewriteAuditFacts {
+    /// Durable phase the operation row currently claims.
+    phase: String,
+    /// Terminal outbox sequence the operation row points at, when settled.
+    terminal_audit_seq: Option<i64>,
+    /// Outbox sequences of the rows this operation appended, by audit name.
+    rows: BTreeMap<String, Vec<i64>>,
+}
+
+impl RewriteAuditFacts {
+    /// Returns the outbox sequences recorded under one audit operation name.
+    fn sequences(&self, operation: &str) -> &[i64] {
+        self.rows.get(operation).map_or(&[], Vec::as_slice)
+    }
+}
+
+/// Reads one named rewrite operation's durable settlement and audit rows.
+///
+/// The outbox is queried by authenticated tenant, Forge resource, and the
+/// rewrite audit-name prefix; rows are then narrowed to the named operation by
+/// the `operation_id` its canonical audit detail carries. Read-only: the
+/// journey inspects the ledger the production owners wrote and never appends
+/// to it.
 ///
 /// # Panics
 ///
-/// Panics when the read-only diagnostic query fails or the operation is absent.
-async fn rewrite_settlement(cluster: &WyrdTestCluster, operation: Uuid) -> (String, bool) {
-    sqlx::query_as::<_, (String, Option<i64>)>(
+/// Panics when a read-only diagnostic query fails, when the operation row is
+/// absent, or when an audit row carries no canonical detail naming its
+/// operation, which would mean a Forge audit row lost its identity.
+///
+/// The outbox is read through the fixture's privileged inspection pool rather
+/// than the operator pool, because the operator role is granted `INSERT` and
+/// deliberately not `SELECT` on the canonical audit ledger. Both queries are
+/// read-only; the journey never appends an audit row.
+async fn rewrite_audit_facts(
+    cluster: &WyrdTestCluster,
+    tenant: DataTenantId,
+    resource: &str,
+    operation: Uuid,
+) -> RewriteAuditFacts {
+    let (phase, terminal_audit_seq) = sqlx::query_as::<_, (String, Option<i64>)>(
         "SELECT phase, terminal_audit_seq FROM vala.forge_operation_state \
          WHERE operation_id = $1",
     )
     .bind(operation)
     .fetch_one(cluster.pg_fixture().operator_pool().pool())
     .await
-    .map(|(phase, terminal)| (phase, terminal.is_some()))
-    .expect("Forge settlement inspection")
+    .expect("Forge settlement inspection");
+    let appended = sqlx::query_as::<_, (i64, String, Option<String>)>(
+        "SELECT seq, operation, detail FROM vala.audit_outbox \
+         WHERE data_tenant_id = $1 AND resource = $2 \
+           AND operation LIKE 'forge.iceberg_rewrite.%' \
+         ORDER BY seq",
+    )
+    .bind(tenant.as_uuid())
+    .bind(resource)
+    .fetch_all(
+        &cluster
+            .pg_fixture()
+            .superuser_pool()
+            .await
+            .expect("the read-only audit-outbox inspection pool"),
+    )
+    .await
+    .expect("Forge audit-outbox inspection");
+    let mut rows: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+    for (seq, name, detail) in appended {
+        let detail = detail
+            .unwrap_or_else(|| panic!("the {name} audit row at {seq} carries canonical detail"));
+        let parsed = serde_json::from_str::<serde_json::Value>(&detail)
+            .unwrap_or_else(|error| panic!("the {name} audit detail is canonical JSON: {error}"));
+        let named = parsed
+            .get("operation_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .unwrap_or_else(|| panic!("the {name} audit detail names its operation: {detail}"));
+        if named == operation {
+            rows.entry(name).or_default().push(seq);
+        }
+    }
+    RewriteAuditFacts {
+        phase,
+        terminal_audit_seq,
+        rows,
+    }
 }
 
 /// Asserts one tenant's public read returns exactly the rows it acknowledged.
@@ -1477,14 +1563,46 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
     )
     .await;
 
-    let (phase, terminal) = rewrite_settlement(&cluster, uncertain).await;
+    let audit_resource = forge_audit_resource(&shared.binding);
     assert_eq!(
-        phase, "recovered",
+        landed.summary.get("forge.group"),
+        Some(&audit_resource),
+        "the landed snapshot is audited under this table's own resource: {landed:?}"
+    );
+    let audit = rewrite_audit_facts(&cluster, owner, &audit_resource, uncertain).await;
+    assert_eq!(
+        audit.phase, "recovered",
         "the successor settles its predecessor's own operation as recovered"
     );
+    let prepared_rows = audit.sequences("forge.iceberg_rewrite.prepared");
+    let recovered_rows = audit.sequences("forge.iceberg_rewrite.recovered");
+    assert_eq!(
+        prepared_rows.len(),
+        1,
+        "the operation appended exactly one Prepared audit row: {audit:?}"
+    );
+    assert_eq!(
+        recovered_rows.len(),
+        1,
+        "the operation appended exactly one Recovered audit row: {audit:?}"
+    );
+    for sibling in [
+        "forge.iceberg_rewrite.committed",
+        "forge.iceberg_rewrite.reset",
+    ] {
+        assert!(
+            audit.sequences(sibling).is_empty(),
+            "a recovered operation appended no {sibling} sibling: {audit:?}"
+        );
+    }
     assert!(
-        terminal,
-        "the recovered operation carries exactly one terminal settlement"
+        prepared_rows[0] < recovered_rows[0],
+        "the Prepared row precedes the terminal row it was settled by: {audit:?}"
+    );
+    assert_eq!(
+        audit.terminal_audit_seq,
+        Some(recovered_rows[0]),
+        "the operation's terminal sequence names its one Recovered row: {audit:?}"
     );
     let recovered = rewrite_snapshots(&cluster, &shared.binding).await;
     assert_eq!(

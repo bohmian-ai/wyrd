@@ -360,6 +360,11 @@ pub struct ForgeWorkerCompletionObserver {
     /// wrapper carried it. Retaining it typed is what lets a refusal scenario
     /// assert the exact object identities a failed attempt left behind instead
     /// of matching the wrapper's rendered text.
+    ///
+    /// Compiled only under `test-support`: retaining the wrapper's outputs is
+    /// diagnostic evidence for refusal scenarios, so a default production build
+    /// neither holds the vector nor clones an unsettled attempt's paths into it.
+    #[cfg(feature = "test-support")]
     returned_unsettled: Arc<Mutex<Vec<Option<Vec<crate::forge::managed::ForgeUnsettledOutput>>>>>,
     /// Number of successful task executions observed after their durable path returned.
     completed: Arc<AtomicUsize>,
@@ -555,6 +560,10 @@ impl ForgeWorkerCompletionObserver {
     /// when that attempt ended as [`ForgeError::RewriteUnsettled`], in which
     /// case it is the exact possible-output set the wrapper preserved. Passive
     /// diagnostic evidence; recording it cannot affect any durable transition.
+    ///
+    /// Available only under `test-support`, alongside the field it reads: the
+    /// default production surface of this observer does not expose it.
+    #[cfg(feature = "test-support")]
     #[must_use]
     pub fn returned_unsettled_outputs(
         &self,
@@ -853,6 +862,10 @@ impl ForgeWorkerCompletionObserver {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(error.to_string());
+            // Test-support only: the typed retention below is the sole place
+            // an unsettled attempt's output paths are cloned, so a default
+            // production build performs none of that work.
+            #[cfg(feature = "test-support")]
             self.returned_unsettled
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)

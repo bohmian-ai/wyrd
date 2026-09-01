@@ -1,11 +1,9 @@
 //! Domain-separated authority for private Scribe live-tail tickets.
 
+use crate::oracle::peer_keyring::PeerTicketKeyring;
 use chrono::{DateTime, Utc};
-use ed25519_dalek::pkcs8::DecodePrivateKey;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use vala_bifrost_redux::scribe::tail_rpc::{
@@ -83,12 +81,12 @@ struct SignedWire {
 
 /// Server-owned Scribe-tail signer/verifier with bounded replay retention.
 pub struct ScribeTailAuthority {
-    /// Ed25519 signing key retained by the server process.
-    signing: Arc<SigningKey>,
-    /// Public verification key used for inbound private tickets.
-    verifying: VerifyingKey,
-    /// Stable digest identifying the active signing key.
-    key_id: String,
+    /// Independent peer-ticket keyring this authority signs and verifies with.
+    ///
+    /// Tail tickets travel the same private plane as every other peer purpose
+    /// ticket, so they are signed by the same independent keyring and never by
+    /// the north-south workload key, and they rotate with it.
+    keyring: Arc<PeerTicketKeyring>,
     /// Nonce replay set retained only through ticket expiry.
     replay: Mutex<HashMap<Vec<u8>, DateTime<Utc>>>,
     /// Maximum replay entries derived from the tail fence capacity.
@@ -101,7 +99,7 @@ impl std::fmt::Debug for ScribeTailAuthority {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ScribeTailAuthority")
-            .field("key_id", &self.key_id)
+            .field("key_id", &self.keyring.active_key_id())
             .finish_non_exhaustive()
     }
 }
@@ -115,20 +113,29 @@ impl ScribeTailAuthority {
         pem: &SecretString,
         audit: Arc<dyn TailSecurityAudit>,
     ) -> Result<Self, TailReadError> {
-        let signing = SigningKey::from_pkcs8_pem(pem.expose_secret()).map_err(|_| {
+        let keyring = PeerTicketKeyring::from_signing_key_pem(pem).map_err(|_| {
             TailReadError::Authorization {
                 detail: "tail signing key is invalid".to_owned(),
             }
         })?;
-        let verifying = signing.verifying_key();
-        Ok(Self {
-            key_id: hex::encode(Sha256::digest(verifying.to_bytes())),
-            signing: Arc::new(signing),
-            verifying,
+        Ok(Self::from_keyring(Arc::new(keyring), audit))
+    }
+
+    /// Composes the tail authority over this plane's independent keyring.
+    ///
+    /// This is the production constructor; [`Self::from_pem`] remains for a
+    /// caller holding only single-key material.
+    #[must_use]
+    pub fn from_keyring(
+        keyring: Arc<PeerTicketKeyring>,
+        audit: Arc<dyn TailSecurityAudit>,
+    ) -> Self {
+        Self {
+            keyring,
             replay: Mutex::new(HashMap::new()),
             replay_capacity: TailFenceConfig::default().max_fences.max(1),
             audit,
-        })
+        }
     }
 
     /// Clears nonce replay state during ordered Scribe shutdown.
@@ -143,13 +150,14 @@ impl ScribeTailAuthority {
     /// # Errors
     /// Returns authorization failure when the signed envelope cannot be encoded.
     fn sign(&self, payload: Vec<u8>) -> Result<Vec<u8>, TailReadError> {
+        let key_id = self.keyring.active_key_id().to_owned();
         let signature = self
-            .signing
-            .sign(&[DOMAIN, self.key_id.as_bytes(), &payload].concat());
+            .keyring
+            .sign(&[DOMAIN, key_id.as_bytes(), &payload].concat());
         serde_json::to_vec(&SignedWire {
-            key_id: self.key_id.clone(),
+            key_id,
             payload,
-            signature: signature.to_bytes().to_vec(),
+            signature,
         })
         .map_err(|_| TailReadError::Authorization {
             detail: "tail ticket encoding failed".to_owned(),
@@ -166,22 +174,17 @@ impl ScribeTailAuthority {
             serde_json::from_slice(encoded).map_err(|_| TailReadError::Authorization {
                 detail: "tail ticket encoding is invalid".to_owned(),
             })?;
-        if wire.key_id != self.key_id
-            || wire.payload.len() > MAX_CLAIMS_BYTES
-            || wire.signature.len() != 64
-        {
+        if wire.payload.len() > MAX_CLAIMS_BYTES || wire.signature.len() != 64 {
             return Err(TailReadError::Authorization {
                 detail: "tail ticket signature is invalid".to_owned(),
             });
         }
-        let signature =
-            Signature::from_slice(&wire.signature).map_err(|_| TailReadError::Authorization {
-                detail: "tail ticket signature is invalid".to_owned(),
-            })?;
-        self.verifying
+        self.keyring
             .verify(
+                &wire.key_id,
                 &[DOMAIN, wire.key_id.as_bytes(), &wire.payload].concat(),
-                &signature,
+                &wire.signature,
+                Utc::now(),
             )
             .map_err(|_| TailReadError::Authorization {
                 detail: "tail ticket signature is invalid".to_owned(),

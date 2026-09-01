@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use secrecy::SecretString;
 use tokio::sync::Mutex;
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::timeout_at;
@@ -81,8 +80,13 @@ pub struct BifrostBuildInputs {
     /// what `TonicOraclePeerTransport` already requires of advertised
     /// addresses; it is deliberately not keyed on the deployment profile.
     pub peer_tls: Option<BifrostPeerTls>,
-    /// Existing boot-loaded signing authority used to mint peer and tail tickets.
-    pub signing_key: SecretString,
+    /// Independent Bifrost peer ticket keyring used to mint and verify peer
+    /// and tail tickets.
+    ///
+    /// This is deliberately not the north-south workload signing key: a user
+    /// or API token must never validate as a peer-purpose ticket, and the peer
+    /// keyring rotates on its own schedule.
+    pub peer_keyring: Arc<crate::oracle::PeerTicketKeyring>,
     /// Immutable role configuration snapshot.
     pub config: BifrostRuntimeConfig,
     /// Immutable Forge configuration snapshot.

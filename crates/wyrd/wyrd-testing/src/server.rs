@@ -189,6 +189,8 @@ pub struct WyrdTestServer {
     peer_tls: Option<TestBifrostPeerTls>,
     /// Retains generated peer PEM files for as long as this server exists.
     _peer_tls_root: Option<Arc<tempfile::TempDir>>,
+    /// Peer ticket keyring paths this server loads its peer authority from.
+    peer_keyring_paths: Option<crate::bifrost::peer_keyring::TestPeerKeyringPaths>,
     /// Exact private peer address this server binds and advertises.
     peer_bind: Option<std::net::SocketAddr>,
     /// Test-only readiness failure requested by the builder.
@@ -522,6 +524,10 @@ pub struct WyrdTestServerBuilder {
     peer_tls: Option<TestBifrostPeerTls>,
     /// Temporary root retaining generated peer PEM files for this server's life.
     peer_tls_root: Option<Arc<tempfile::TempDir>>,
+    /// Optional topology-wide peer ticket keyring shared by every replica.
+    peer_keyring: Option<Arc<crate::bifrost::peer_keyring::TestPeerKeyring>>,
+    /// Materialized keyring paths resolved during composition.
+    peer_keyring_paths: Option<crate::bifrost::peer_keyring::TestPeerKeyringPaths>,
     /// Exact private peer address this server binds and advertises.
     peer_bind: Option<std::net::SocketAddr>,
     /// Production Forge process role used by bound test servers.
@@ -608,6 +614,8 @@ impl Default for WyrdTestServerBuilder {
             oracle_peer_credentials: None,
             peer_tls: None,
             peer_tls_root: None,
+            peer_keyring: None,
+            peer_keyring_paths: None,
             peer_bind: None,
             forge_process_role: BifrostTarget::All,
             forge_completion_observer: None,
@@ -2953,9 +2961,11 @@ impl WyrdTestServer {
                 .expect("peer bind is reserved during composition")
         ));
         config.bifrost.peer.api_key = Some("harness-peer-api-key".to_owned());
-        config.bifrost.peer.ticket.active_key_id = Some("harness-peer-key".to_owned());
-        config.bifrost.peer.ticket.signing_key_path = Some(peer_tls.private_key_path.clone());
-        config.bifrost.peer.ticket.verifying_keyring_path = Some(peer_tls.ca_path.clone());
+        config.bifrost.peer.ticket = peer_keyring_config(
+            self.peer_keyring_paths
+                .as_ref()
+                .expect("peer ticket keyring is materialized during composition"),
+        );
         config.metrics.enabled = false;
         config.serve.mode = ServeMode::Both;
         if let Some(drain) = self.shutdown_drain_for_test {
@@ -3476,6 +3486,36 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Share one topology-wide peer ticket keyring with this server.
+    ///
+    /// Peer tickets are verified against a published manifest, so every replica
+    /// that must accept another's tickets loads the same keyring. A multi-node
+    /// harness generates it once and hands it to each server through this seat;
+    /// a solitary server generates its own.
+    #[must_use]
+    pub fn with_peer_keyring(
+        mut self,
+        keyring: Arc<crate::bifrost::peer_keyring::TestPeerKeyring>,
+    ) -> Self {
+        self.peer_keyring = Some(keyring);
+        self
+    }
+
+    /// Load peer ticket material a harness already wrote to disk.
+    ///
+    /// A multi-process topology materializes one shared keyring per child root
+    /// and passes only paths across the process boundary, so this seat takes
+    /// the paths rather than the generated keys. Setting it suppresses
+    /// generation.
+    #[must_use]
+    pub fn with_peer_keyring_paths(
+        mut self,
+        paths: crate::bifrost::peer_keyring::TestPeerKeyringPaths,
+    ) -> Self {
+        self.peer_keyring_paths = Some(paths);
+        self
+    }
+
     /// Pin the exact private peer address this server binds and advertises.
     ///
     /// A multi-process harness gives each simulated pod a distinct loopback
@@ -3812,6 +3852,36 @@ impl WyrdTestServerBuilder {
             );
             self.peer_tls_root = Some(root);
         }
+        // The peer ticket keyring is independent of the workload signing key
+        // and of the peer certificate: a journey rotates it, presents retired
+        // and unpublished identifiers against it, and proves a user token
+        // never validates as a peer ticket. It is materialized beside the peer
+        // PEMs so a child process mounts one private root.
+        if self.peer_keyring_paths.is_none() {
+            let keyring = match self.peer_keyring.take() {
+                Some(keyring) => keyring,
+                None => Arc::new(crate::bifrost::peer_keyring::TestPeerKeyring::generate()),
+            };
+            let root = match &self.peer_tls_root {
+                Some(root) => root.path().to_owned(),
+                None => self
+                    .peer_tls
+                    .as_ref()
+                    .and_then(|tls| tls.private_key_path.parent().map(std::path::Path::to_owned))
+                    .ok_or_else(|| {
+                        WyrdTestServerError::Start(
+                            "peer identity has no directory to hold ticket keyring material"
+                                .to_owned(),
+                        )
+                    })?,
+            };
+            self.peer_keyring_paths = Some(
+                keyring
+                    .materialize(&root, "node")
+                    .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
+            );
+            self.peer_keyring = Some(keyring);
+        }
         // Reserving the port here — before composition — is what lets the node
         // advertise the exact address its listener will hold. Binding and
         // dropping an ephemeral socket is the only way to learn a free port
@@ -3844,6 +3914,17 @@ impl WyrdTestServerBuilder {
             maintenance_interval_secs: Some(self.forge_interval.as_secs()),
             ..ForgeRuntimeConfig::default()
         };
+        // Composition loads the peer keyring from the same files a deployment
+        // mounts, so the in-process graph and a child process reach identical
+        // peer authority.
+        let peer_keyring = Arc::new(
+            wyrd_server::oracle::PeerTicketKeyring::load(&peer_keyring_config(
+                self.peer_keyring_paths
+                    .as_ref()
+                    .expect("peer ticket keyring is materialized during composition"),
+            ))
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
+        );
         let shutdown = CancellationToken::new();
         let ComposedBifrost {
             bifrost: bifrost_runtime,
@@ -3860,7 +3941,7 @@ impl WyrdTestServerBuilder {
             token_verifier: Arc::clone(&verifier),
             peer_credentials,
             peer_tls,
-            signing_key: SecretString::from(crate::keys::private_key_pem().to_owned()),
+            peer_keyring,
             config: bifrost_config,
             forge_config: forge_runtime,
             node_id,
@@ -3949,6 +4030,7 @@ impl WyrdTestServerBuilder {
             requested_bind: self.bind_addrs,
             peer_tls: self.peer_tls,
             _peer_tls_root: self.peer_tls_root,
+            peer_keyring_paths: self.peer_keyring_paths,
             peer_bind: self.peer_bind,
             readiness_failure: self.readiness_failure,
             stalled_drain_for_test: self.stalled_drain_for_test,
@@ -3981,6 +4063,21 @@ impl WyrdTestServerBuilder {
         }
         let srv = self.start_in_process().await?;
         srv.bind().await
+    }
+}
+
+/// Projects materialized keyring paths onto the production configuration shape.
+///
+/// The harness deliberately goes through the same configuration struct a
+/// deployment fills from `WYRD_BIFROST_PEER_TICKET_*`, so a test cannot load
+/// keyring material by a path production has no way to express.
+fn peer_keyring_config(
+    paths: &crate::bifrost::peer_keyring::TestPeerKeyringPaths,
+) -> wyrd_server::config::PeerTicketKeyringConfig {
+    wyrd_server::config::PeerTicketKeyringConfig {
+        active_key_id: Some(paths.active_key_id.clone()),
+        signing_key_path: Some(paths.signing_key_path.clone()),
+        verifying_keyring_path: Some(paths.verifying_keyring_path.clone()),
     }
 }
 

@@ -504,6 +504,226 @@ impl StageTicketClaims {
     }
 }
 
+/// The closed set of private reservation operations on the peer plane.
+///
+/// A leader reserves capacity on a follower and later releases it. The two are
+/// not interchangeable: a replayed release must never cancel a reservation the
+/// leader has since re-taken, and a replayed reserve must never charge a
+/// follower twice. They therefore carry different signing domains and separate
+/// single-use nonces, exactly as the two stage operations do.
+///
+/// The enum is deliberately closed. A third reservation operation is a protocol
+/// change, not a value a peer may present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReservationOperationV1 {
+    /// Take bounded pending capacity on one follower for one query.
+    ReserveSlots,
+    /// Release one previously taken reservation on the same follower.
+    ReleaseSlots,
+}
+
+impl ReservationOperationV1 {
+    /// Returns the wire discriminant bound into the signed claims.
+    ///
+    /// Zero is deliberately unused so a zero-valued protobuf field — the value
+    /// a truncated or forged message decodes to — never names a real operation.
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        match self {
+            Self::ReserveSlots => 1,
+            Self::ReleaseSlots => 2,
+        }
+    }
+
+    /// Recovers an operation from its wire discriminant.
+    ///
+    /// Returns `None` for any other value, including zero, so an unknown
+    /// operation is refused at the parsing boundary rather than defaulted.
+    #[must_use]
+    pub const fn from_u32(value: u32) -> Option<Self> {
+        match value {
+            1 => Some(Self::ReserveSlots),
+            2 => Some(Self::ReleaseSlots),
+            _ => None,
+        }
+    }
+
+    /// Returns this operation's distinct signature domain separator.
+    ///
+    /// Domain separation is what makes the two operations cryptographically
+    /// distinct: a signature produced over the reserve domain does not verify
+    /// under the release domain, so the receiver's own expectation — not
+    /// anything in the presented message — selects which domain is checked.
+    #[must_use]
+    pub const fn domain(self) -> &'static [u8] {
+        match self {
+            Self::ReserveSlots => b"wyrd.oracle.peer.reserve-slots.v1\0",
+            Self::ReleaseSlots => b"wyrd.oracle.peer.release-slots.v1\0",
+        }
+    }
+}
+
+/// Typed claims signed for exactly one reservation operation.
+///
+/// Every field is bound by the signature and checked against state the receiver
+/// derived itself. The follower's own node identity and fence appear because a
+/// reservation is charged against one incarnation of one node: a ticket minted
+/// for a follower that has since restarted must not be honoured by its
+/// successor.
+#[derive(Clone, PartialEq, Message)]
+pub struct ReservationTicketClaims {
+    /// Fixed private protocol version.
+    #[prost(uint32, tag = "1")]
+    pub protocol_version: u32,
+    /// Reservation operation discriminant; see [`ReservationOperationV1::as_u32`].
+    #[prost(uint32, tag = "2")]
+    pub operation: u32,
+    /// Leader node UUID bytes that issued this operation.
+    #[prost(bytes, tag = "3")]
+    pub source_node_id: Vec<u8>,
+    /// Leader role-incarnation fence at issue time.
+    #[prost(uint64, tag = "4")]
+    pub source_fence: u64,
+    /// Follower node UUID bytes this operation is addressed to.
+    #[prost(bytes, tag = "5")]
+    pub destination_node_id: Vec<u8>,
+    /// Follower role-incarnation fence preventing restart replay.
+    #[prost(uint64, tag = "6")]
+    pub destination_fence: u64,
+    /// Client-visible query UUID bytes owning this reservation.
+    #[prost(bytes, tag = "7")]
+    pub query_id: Vec<u8>,
+    /// Digest of the exact bounded raw request body this ticket authorizes.
+    #[prost(string, tag = "8")]
+    pub body_digest: String,
+    /// Single-use random nonce, distinct per operation.
+    #[prost(bytes, tag = "9")]
+    pub nonce: Vec<u8>,
+    /// Short ticket acceptance expiry.
+    #[prost(int64, tag = "10")]
+    pub expires_at_ms: i64,
+}
+
+/// The receiver-derived expectation one reservation operation must match.
+///
+/// Nothing here comes from the presented message: the follower assembles it
+/// from its own identity and fence, the leader identity the request names and
+/// the cluster confirms live, and the exact bytes it received.
+#[derive(Debug, Clone)]
+pub struct ReservationBinding {
+    /// The operation the receiving entry point implements.
+    pub operation: ReservationOperationV1,
+    /// Leader node the receiver expects to be talking to.
+    pub source_node_id: NodeId,
+    /// Leader fence the receiver expects.
+    pub source_fence: u64,
+    /// This follower's own node identity.
+    pub destination_node_id: NodeId,
+    /// This follower's own current role fence.
+    pub destination_fence: u64,
+    /// The client-visible query identity carried on the operation.
+    pub query_id: uuid::Uuid,
+}
+
+/// Hard cap on a reservation request's raw body before any digest or decode.
+///
+/// A reservation request carries a handful of identifiers and no user data, so
+/// this bound is generous by orders of magnitude; it exists so an oversized
+/// body is refused without hashing attacker-chosen bytes of unbounded length.
+pub const MAX_RESERVATION_BODY_BYTES: usize = 64 * 1024;
+
+/// Computes the canonical digest of one reservation request's raw body.
+///
+/// Both the leader (at mint time) and the follower (at verification time) call
+/// this over the encoded request with its ticket field cleared, so a matching
+/// digest proves the follower is acting on exactly the request the leader
+/// signed for and not on a substituted one carrying a valid ticket.
+///
+/// # Errors
+///
+/// Returns [`PeerSecurityError::Body`] when the body is empty or exceeds
+/// [`MAX_RESERVATION_BODY_BYTES`], before any hashing occurs.
+pub fn reservation_body_digest(body: &[u8]) -> Result<String, PeerSecurityError> {
+    if body.is_empty() || body.len() > MAX_RESERVATION_BODY_BYTES {
+        return Err(PeerSecurityError::Body);
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"wyrd.oracle.peer.reservation.body.v1\0");
+    hash.update((body.len() as u64).to_be_bytes());
+    hash.update(body);
+    Ok(hex::encode(hash.finalize()))
+}
+
+impl ReservationTicketClaims {
+    /// Builds signable claims from a receiver-shaped binding.
+    ///
+    /// The leader constructs the same [`ReservationBinding`] the follower will
+    /// derive, so both sides agree by construction on which fields are bound
+    /// rather than through two hand-maintained field lists that can drift.
+    #[must_use]
+    pub fn for_binding(
+        binding: &ReservationBinding,
+        body_digest: String,
+        nonce: Vec<u8>,
+        expires_at_ms: i64,
+    ) -> Self {
+        Self {
+            protocol_version: STAGE_PROTOCOL_VERSION,
+            operation: binding.operation.as_u32(),
+            source_node_id: audience_bytes(binding.source_node_id),
+            source_fence: binding.source_fence,
+            destination_node_id: audience_bytes(binding.destination_node_id),
+            destination_fence: binding.destination_fence,
+            query_id: binding.query_id.as_bytes().to_vec(),
+            body_digest,
+            nonce,
+            expires_at_ms,
+        }
+    }
+
+    /// Checks every bound field against the receiver's own expectation.
+    ///
+    /// A pure comparison with no IO and no request decoding, so an authority
+    /// runs it between signature verification and nonce consumption.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerSecurityError::Operation`] for a protocol-version or
+    /// operation mismatch, [`PeerSecurityError::Audience`] for the wrong leader
+    /// or follower node, [`PeerSecurityError::Fence`] for a stale fence on
+    /// either side, [`PeerSecurityError::Body`] for a body digest that does not
+    /// match the presented bytes, and [`PeerSecurityError::Claims`] for a
+    /// query identity mismatch.
+    pub fn verify_binding(
+        &self,
+        binding: &ReservationBinding,
+        body_digest: &str,
+    ) -> Result<(), PeerSecurityError> {
+        if self.protocol_version != STAGE_PROTOCOL_VERSION
+            || ReservationOperationV1::from_u32(self.operation) != Some(binding.operation)
+        {
+            return Err(PeerSecurityError::Operation);
+        }
+        if self.source_node_id != audience_bytes(binding.source_node_id)
+            || self.destination_node_id != audience_bytes(binding.destination_node_id)
+        {
+            return Err(PeerSecurityError::Audience);
+        }
+        if self.source_fence != binding.source_fence
+            || self.destination_fence != binding.destination_fence
+        {
+            return Err(PeerSecurityError::Fence);
+        }
+        if self.body_digest != body_digest {
+            return Err(PeerSecurityError::Body);
+        }
+        if self.query_id != binding.query_id.as_bytes() {
+            return Err(PeerSecurityError::Claims);
+        }
+        Ok(())
+    }
+}
+
 /// Fixed private stage-protocol version bound into every stage ticket.
 pub const STAGE_PROTOCOL_VERSION: u32 = 1;
 

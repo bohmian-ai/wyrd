@@ -32,6 +32,8 @@ pub mod forge_harness;
 pub mod harness;
 /// One in-memory certificate authority minting dual-EKU Bifrost peer leaves.
 pub mod peer_ca;
+/// Peer ticket keyring material for rotation and independence journeys.
+pub mod peer_keyring;
 /// Multi-process peer network used by the Tier-2 peer-network journeys.
 pub mod process_cluster;
 pub mod query_fixture;

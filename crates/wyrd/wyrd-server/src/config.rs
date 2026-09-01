@@ -1232,7 +1232,7 @@ pub struct PeerTicketKeyringConfig {
 impl PeerTicketKeyringConfig {
     /// Reports whether every keyring input is present.
     #[must_use]
-    fn is_complete(&self) -> bool {
+    pub(crate) fn is_complete(&self) -> bool {
         self.active_key_id
             .as_ref()
             .is_some_and(|value| !value.trim().is_empty())

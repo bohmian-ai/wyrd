@@ -821,6 +821,12 @@ pub struct WyrdTestCluster {
     oracle_peer_credentials: Arc<dyn OraclePeerCredentials>,
     /// Optional retained TLS fixture directory and paths for real peer transport.
     oracle_peer_tls: Option<(Arc<tempfile::TempDir>, TestBifrostPeerTls)>,
+    /// Peer ticket keyring material every replica in this cluster loads.
+    ///
+    /// Peer tickets verify against a published manifest, so replicas that must
+    /// accept one another's tickets share one keyring; a per-node keyring would
+    /// make every east-west call an unknown-key refusal.
+    oracle_peer_keyring: Option<crate::bifrost::peer_keyring::TestPeerKeyringPaths>,
     /// Shared observer for supervised Forge worker completions.
     forge_completion_observer: Option<ForgeWorkerCompletionObserver>,
     /// Shared uncertainty-injection catalog wrapper, when enabled.
@@ -1756,6 +1762,16 @@ impl WyrdTestCluster {
                 .map_err(|error| ClusterError::Resource(error.to_string()))?;
             Some((root, tls))
         };
+        // Materialized beside the peer PEMs, in the same once-per-cluster root,
+        // for the same reason: one topology, one published peer authority.
+        let oracle_peer_keyring = match &oracle_peer_tls {
+            Some((root, _)) => Some(
+                crate::bifrost::peer_keyring::TestPeerKeyring::generate()
+                    .materialize(root.path(), "cluster")
+                    .map_err(|error| ClusterError::Resource(error.to_string()))?,
+            ),
+            None => None,
+        };
         let topology = classify_topology(&spec);
         let scribe_admission_node =
             scribe_admission_node.and_then(|index| spec.nodes.get(index).map(|node| node.node_id));
@@ -1824,6 +1840,7 @@ impl WyrdTestCluster {
             telemetry: process.forge_capture.clone(),
             oracle_peer_credentials,
             oracle_peer_tls,
+            oracle_peer_keyring,
             forge_completion_observer: options.completion_observer.clone(),
             commit_uncertainty_catalog: commit_uncertainty_catalog.clone(),
             forge_config: options.config.clone(),
@@ -1895,6 +1912,9 @@ impl WyrdTestCluster {
         }
         if let Some((_, tls)) = &self.oracle_peer_tls {
             builder = builder.with_peer_tls(tls.clone());
+        }
+        if let Some(keyring) = &self.oracle_peer_keyring {
+            builder = builder.with_peer_keyring_paths(keyring.clone());
         }
         Ok(builder
             .start_with_resources(Arc::clone(&self.fixture), Arc::clone(&self.storage), None)

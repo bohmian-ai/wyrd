@@ -1,11 +1,7 @@
 //! Domain-separated Ed25519 authority for opaque Oracle peer tickets.
 
 use chrono::{DateTime, Utc};
-use ed25519_dalek::pkcs8::DecodePrivateKey;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use secrecy::ExposeSecret;
 use secrecy::SecretString;
-use sha2::{Digest, Sha256};
 use std::fmt;
 use std::sync::Arc;
 use vala_bifrost_redux::oracle::peer::PeerReplayCache;
@@ -22,6 +18,8 @@ use wyrd_spec::vala::api::{
     BifrostQueryRequest, BifrostSecurityViolationKind, NodeId, QueryClass, SignedPeerTicket,
 };
 use wyrd_tonic::prost::Message;
+
+use crate::oracle::peer_keyring::PeerTicketKeyring;
 
 /// Domain separator preventing peer signatures from crossing protocol boundaries.
 const DOMAIN: &[u8] = b"wyrd.oracle.peer.v1\0";
@@ -69,12 +67,13 @@ pub struct ForwardQueryClaims {
 
 /// Server-owned Ed25519 authority for the private peer protocol.
 pub struct OraclePeerAuthority {
-    /// Pinned private key retained only by the server authority.
-    signing: Arc<SigningKey>,
-    /// Public key used to authenticate raw claim bytes.
-    verifying: VerifyingKey,
-    /// Lowercase SHA-256 digest of the raw public key.
-    key_id: String,
+    /// Independent peer-ticket keyring this authority signs and verifies with.
+    ///
+    /// Verification resolves the key the presented ticket names rather than
+    /// pinning this process's own active key, which is what allows a rotation
+    /// to publish a new key before switching issuance without refusing tickets
+    /// a peer minted moments earlier under the retiring key.
+    keyring: Arc<PeerTicketKeyring>,
     /// Role-local bounded single-use nonce owner.
     replay: Arc<PeerReplayCache>,
     /// Upper ticket lifetime bound checked after signature verification.
@@ -89,7 +88,7 @@ impl fmt::Debug for OraclePeerAuthority {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("OraclePeerAuthority")
-            .field("key_id", &self.key_id)
+            .field("key_id", &self.keyring.active_key_id())
             .finish_non_exhaustive()
     }
 }
@@ -107,15 +106,15 @@ impl OraclePeerAuthority {
         if claims_bytes.is_empty() || claims_bytes.len() > MAX_FORWARD_QUERY_BYTES {
             return Err(PeerSecurityError::Encoding);
         }
-        let signature = self.signing.sign(&signing_input_for(
+        let signature = self.keyring.sign(&signing_input_for(
             FORWARD_QUERY_DOMAIN,
-            &self.key_id,
+            self.keyring.active_key_id(),
             &claims_bytes,
         ));
         Ok(SignedPeerTicket {
-            key_id: self.key_id.clone(),
+            key_id: self.keyring.active_key_id().to_owned(),
             claims_bytes,
-            signature: signature.to_bytes().to_vec(),
+            signature,
         })
     }
 
@@ -130,8 +129,7 @@ impl OraclePeerAuthority {
         expected_fence: u64,
         now: DateTime<Utc>,
     ) -> Result<ForwardQueryClaims, PeerSecurityError> {
-        if ticket.key_id != self.key_id
-            || ticket.signature.len() != 64
+        if ticket.signature.len() != 64
             || ticket.claims_bytes.is_empty()
             || ticket.claims_bytes.len() > MAX_FORWARD_QUERY_BYTES
         {
@@ -143,23 +141,13 @@ impl OraclePeerAuthority {
                 )
                 .await);
         }
-        let signature = match Signature::from_slice(&ticket.signature) {
-            Ok(signature) => signature,
-            Err(_) => {
-                return Err(self
-                    .forwarding_rejection(
-                        None,
-                        BifrostSecurityViolationKind::PeerSignature,
-                        PeerSecurityError::InvalidSignature,
-                    )
-                    .await);
-            }
-        };
         if self
-            .verifying
+            .keyring
             .verify(
+                &ticket.key_id,
                 &signing_input_for(FORWARD_QUERY_DOMAIN, &ticket.key_id, &ticket.claims_bytes),
-                &signature,
+                &ticket.signature,
+                now,
             )
             .is_err()
         {
@@ -284,17 +272,55 @@ impl OraclePeerAuthority {
         max_ticket_ttl: chrono::Duration,
         security_audit: Arc<dyn PeerSecurityAudit>,
     ) -> Result<Self, PeerSecurityError> {
+        let keyring = PeerTicketKeyring::from_signing_key_pem(pem)
+            .map_err(|_| PeerSecurityError::InvalidSignature)?;
+        Self::from_keyring_with_limits(
+            Arc::new(keyring),
+            replay_capacity,
+            max_ticket_ttl,
+            security_audit,
+        )
+    }
+
+    /// Composes the authority over this plane's independent ticket keyring.
+    ///
+    /// This is the production constructor. The keyring is loaded from the peer
+    /// plane's own configured material, which is what keeps peer authority and
+    /// north-south workload authority on separate keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerSecurityError::Claims`] when the replay or lifetime bound
+    /// is not positive.
+    pub fn from_keyring(
+        keyring: Arc<PeerTicketKeyring>,
+        security_audit: Arc<dyn PeerSecurityAudit>,
+    ) -> Result<Self, PeerSecurityError> {
+        Self::from_keyring_with_limits(
+            keyring,
+            DEFAULT_REPLAY_CAPACITY,
+            DEFAULT_MAX_TICKET_TTL,
+            security_audit,
+        )
+    }
+
+    /// Composes the authority over a keyring with explicit bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerSecurityError::Claims`] when the replay capacity is zero
+    /// or the maximum ticket lifetime is not positive.
+    pub fn from_keyring_with_limits(
+        keyring: Arc<PeerTicketKeyring>,
+        replay_capacity: usize,
+        max_ticket_ttl: chrono::Duration,
+        security_audit: Arc<dyn PeerSecurityAudit>,
+    ) -> Result<Self, PeerSecurityError> {
         if replay_capacity == 0 || max_ticket_ttl <= chrono::Duration::zero() {
             return Err(PeerSecurityError::Claims);
         }
-        let signing = SigningKey::from_pkcs8_pem(pem.expose_secret())
-            .map_err(|_| PeerSecurityError::InvalidSignature)?;
-        let verifying = signing.verifying_key();
-        let key_id = hex::encode(Sha256::digest(verifying.to_bytes()));
         Ok(Self {
-            signing: Arc::new(signing),
-            verifying,
-            key_id,
+            keyring,
             replay: Arc::new(PeerReplayCache::new(replay_capacity)),
             max_ticket_ttl,
             security_audit,
@@ -309,19 +335,19 @@ impl OraclePeerAuthority {
         let mut claims_bytes = Vec::new();
         Message::encode(claims, &mut claims_bytes).map_err(|_| PeerSecurityError::Encoding)?;
         let signature = self
-            .signing
-            .sign(&signing_input(&self.key_id, &claims_bytes));
+            .keyring
+            .sign(&signing_input(self.keyring.active_key_id(), &claims_bytes));
         Ok(SignedPeerTicket {
-            key_id: self.key_id.clone(),
+            key_id: self.keyring.active_key_id().to_owned(),
             claims_bytes,
-            signature: signature.to_bytes().to_vec(),
+            signature,
         })
     }
 
     /// Returns the public lowercase SHA-256 key identifier.
     #[must_use]
     pub fn key_id(&self) -> &str {
-        &self.key_id
+        self.keyring.active_key_id()
     }
 
     /// Verifies raw bytes before claims decoding or storage access.
@@ -335,14 +361,6 @@ impl OraclePeerAuthority {
         expected_fence: u64,
         now: DateTime<Utc>,
     ) -> Result<VerifiedClaimsBytes, PeerSecurityError> {
-        if ticket.key_id != self.key_id {
-            return self
-                .reject_unverified(
-                    BifrostSecurityViolationKind::PeerUnknownKey,
-                    PeerSecurityError::UnknownKey,
-                )
-                .await;
-        }
         if ticket.signature.len() != 64 {
             return self
                 .reject_unverified(
@@ -359,31 +377,17 @@ impl OraclePeerAuthority {
                 )
                 .await;
         }
-        let signature = match Signature::from_slice(&ticket.signature) {
-            Ok(signature) => signature,
-            Err(_) => {
-                return self
-                    .reject_unverified(
-                        BifrostSecurityViolationKind::PeerSignature,
-                        PeerSecurityError::InvalidSignature,
-                    )
-                    .await;
-            }
-        };
-        if self
-            .verifying
-            .verify(
-                &signing_input(&ticket.key_id, &ticket.claims_bytes),
-                &signature,
-            )
-            .is_err()
-        {
-            return self
-                .reject_unverified(
-                    BifrostSecurityViolationKind::PeerSignature,
-                    PeerSecurityError::InvalidSignature,
-                )
-                .await;
+        if let Err(error) = self.keyring.verify(
+            &ticket.key_id,
+            &signing_input(&ticket.key_id, &ticket.claims_bytes),
+            &ticket.signature,
+            now,
+        ) {
+            let violation = match error {
+                PeerSecurityError::UnknownKey => BifrostSecurityViolationKind::PeerUnknownKey,
+                _ => BifrostSecurityViolationKind::PeerSignature,
+            };
+            return self.reject_unverified(violation, error).await;
         }
         let claims = match PeerTicketClaims::decode(ticket.claims_bytes.as_slice()) {
             Ok(claims) => claims,
@@ -590,15 +594,15 @@ impl OraclePeerAuthority {
         if claims_bytes.is_empty() || claims_bytes.len() > MAX_STAGE_CLAIMS_BYTES {
             return Err(PeerSecurityError::Encoding);
         }
-        let signature = self.signing.sign(&signing_input_for(
+        let signature = self.keyring.sign(&signing_input_for(
             operation.domain(),
-            &self.key_id,
+            self.keyring.active_key_id(),
             &claims_bytes,
         ));
         Ok(SignedPeerTicket {
-            key_id: self.key_id.clone(),
+            key_id: self.keyring.active_key_id().to_owned(),
             claims_bytes,
-            signature: signature.to_bytes().to_vec(),
+            signature,
         })
     }
 
@@ -634,16 +638,6 @@ impl OraclePeerAuthority {
         body: &[u8],
         now: DateTime<Utc>,
     ) -> Result<AuthorizedStage, PeerSecurityError> {
-        if ticket.key_id != self.key_id {
-            return self
-                .reject_stage_unverified(
-                    binding.operation,
-                    BifrostSecurityViolationKind::PeerUnknownKey,
-                    PeerSecurityError::UnknownKey,
-                    AnalyticalStageAuthorityOutcome::Signature,
-                )
-                .await;
-        }
         if ticket.signature.len() != 64
             || ticket.claims_bytes.is_empty()
             || ticket.claims_bytes.len() > MAX_STAGE_CLAIMS_BYTES
@@ -657,33 +651,25 @@ impl OraclePeerAuthority {
                 )
                 .await;
         }
-        let Ok(signature) = Signature::from_slice(&ticket.signature) else {
+        if let Err(error) = self.keyring.verify(
+            &ticket.key_id,
+            &signing_input_for(
+                binding.operation.domain(),
+                &ticket.key_id,
+                &ticket.claims_bytes,
+            ),
+            &ticket.signature,
+            now,
+        ) {
+            let violation = match error {
+                PeerSecurityError::UnknownKey => BifrostSecurityViolationKind::PeerUnknownKey,
+                _ => BifrostSecurityViolationKind::PeerSignature,
+            };
             return self
                 .reject_stage_unverified(
                     binding.operation,
-                    BifrostSecurityViolationKind::PeerSignature,
-                    PeerSecurityError::InvalidSignature,
-                    AnalyticalStageAuthorityOutcome::Signature,
-                )
-                .await;
-        };
-        if self
-            .verifying
-            .verify(
-                &signing_input_for(
-                    binding.operation.domain(),
-                    &ticket.key_id,
-                    &ticket.claims_bytes,
-                ),
-                &signature,
-            )
-            .is_err()
-        {
-            return self
-                .reject_stage_unverified(
-                    binding.operation,
-                    BifrostSecurityViolationKind::PeerSignature,
-                    PeerSecurityError::InvalidSignature,
+                    violation,
+                    error,
                     AnalyticalStageAuthorityOutcome::Signature,
                 )
                 .await;

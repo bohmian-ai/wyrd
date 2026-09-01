@@ -565,7 +565,7 @@ pub async fn compose_bifrost(
         token_verifier,
         peer_credentials,
         peer_tls,
-        signing_key,
+        peer_keyring,
         config: bifrost_config,
         forge_config: forge_runtime,
         node_id,
@@ -992,8 +992,8 @@ pub async fn compose_bifrost(
                 .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
         );
         let fragment_authority = Arc::new(
-            crate::oracle::OraclePeerAuthority::from_pem(
-                &signing_key,
+            crate::oracle::OraclePeerAuthority::from_keyring(
+                Arc::clone(&peer_keyring),
                 fragment_security_audit.clone(),
             )
             .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
@@ -1020,8 +1020,10 @@ pub async fn compose_bifrost(
                 role_shutdown: shutdown.clone(),
             })
             .with_tail_authority(Arc::new(
-                crate::oracle::ScribeTailAuthority::from_pem(&signing_key, tail_audit)
-                    .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
+                crate::oracle::ScribeTailAuthority::from_keyring(
+                    Arc::clone(&peer_keyring),
+                    tail_audit,
+                ),
             )),
         ))
     } else {
@@ -1035,7 +1037,7 @@ pub async fn compose_bifrost(
         config: &bifrost_config,
         target,
         deployment_profile,
-        signing_key: &signing_key,
+        peer_keyring: Arc::clone(&peer_keyring),
         cluster: Arc::clone(&cluster_registry),
         node_id,
         advertise_addr: &advertise_addr,
@@ -1053,7 +1055,7 @@ pub async fn compose_bifrost(
             .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
     );
     let forwarding_authority = Arc::new(
-        OraclePeerAuthority::from_pem(&signing_key, forwarding_audit)
+        OraclePeerAuthority::from_keyring(Arc::clone(&peer_keyring), forwarding_audit)
             .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
     );
     let query_forwarder = Arc::new(crate::oracle::ReadyOracleForwarder::new(
@@ -1229,6 +1231,7 @@ pub async fn build_state(
             .map_err(ServerBootError::OraclePeer)?,
     );
     let peer_tls = build_bifrost_peer_tls(&config.bifrost.peer, config.role)?;
+    let peer_keyring = resolve_peer_ticket_keyring(config)?;
     let crate::state::ComposedBifrost {
         bifrost,
         coordination_runtime,
@@ -1244,7 +1247,7 @@ pub async fn build_state(
         token_verifier: verifier,
         peer_credentials,
         peer_tls,
-        signing_key,
+        peer_keyring,
         config: config.bifrost.clone(),
         forge_config: config.forge,
         node_id: external.node_id,
@@ -1307,11 +1310,12 @@ async fn rollback_state_roles(state: &AppState) {
     }
 }
 
-/// Resolves the one Wyrd signing authority shared by auth and Oracle peers.
+/// Resolves the north-south Wyrd workload signing authority used by auth.
 ///
 /// Development may generate an ephemeral key so the default mixed-role server
-/// still constructs a real local Oracle. Production requires configured key
-/// material and never falls back to an ephemeral authority.
+/// still issues real tokens. Production requires configured key material and
+/// never falls back to an ephemeral authority. This key never authorizes a
+/// Bifrost peer operation; see [`resolve_peer_ticket_keyring`].
 ///
 /// # Errors
 ///
@@ -1333,10 +1337,56 @@ fn resolve_signing_key(
         .map_err(|error| ServerBootError::SigningKey(error.to_string()))?;
     tracing::warn!(
         "APP_ENV=development and no signing key configured; generated an EPHEMERAL \
-         signing key shared by auth and the local Oracle peer. Tokens and peer tickets \
-         will not survive a restart and this key must never be used in production."
+         workload signing key. Tokens will not survive a restart and this key \
+         must never be used in production."
     );
     Ok(ephemeral)
+}
+
+/// Resolves the independent Bifrost peer ticket keyring for this process.
+///
+/// Peer authority is deliberately separate from the workload signing key: a
+/// user or API token must never validate as a peer-purpose ticket, and the
+/// peer keyring rotates on its own schedule with retired verification keys
+/// still accepted until their published instant. Configured material is
+/// required in production. Development without configured material generates
+/// an ephemeral single-key keyring so a default mixed-role server still
+/// constructs a real local Oracle; that key is distinct from the workload key
+/// and does not survive a restart.
+///
+/// # Errors
+///
+/// Returns [`ServerBootError::SigningKey`] when production has no complete
+/// peer ticket configuration, when the configured keyring cannot be loaded,
+/// or when development cannot generate an ephemeral Ed25519 key.
+fn resolve_peer_ticket_keyring(
+    config: &crate::config::WyrdServerConfig,
+) -> Result<Arc<crate::oracle::PeerTicketKeyring>, ServerBootError> {
+    let ticket = &config.bifrost.peer.ticket;
+    if ticket.is_complete() {
+        return crate::oracle::PeerTicketKeyring::load(ticket)
+            .map(Arc::new)
+            .map_err(|error| ServerBootError::SigningKey(error.to_string()));
+    }
+    if config.deployment_profile.is_production() {
+        return Err(ServerBootError::SigningKey(
+            "no Bifrost peer ticket keyring configured (set \
+             WYRD_BIFROST_PEER_TICKET_ACTIVE_KEY_ID, \
+             WYRD_BIFROST_PEER_TICKET_SIGNING_KEY_PATH, and \
+             WYRD_BIFROST_PEER_TICKET_VERIFYING_KEYRING_PATH)"
+                .to_owned(),
+        ));
+    }
+    let ephemeral = wyrd_auth_issue::IssuingKey::generate_ephemeral_pem()
+        .map_err(|error| ServerBootError::SigningKey(error.to_string()))?;
+    tracing::warn!(
+        "APP_ENV=development and no Bifrost peer ticket keyring configured; generated an \
+         EPHEMERAL peer keyring. Peer tickets will not survive a restart and this keyring \
+         must never be used in production."
+    );
+    crate::oracle::PeerTicketKeyring::from_signing_key_pem(&ephemeral)
+        .map(Arc::new)
+        .map_err(|error| ServerBootError::SigningKey(error.to_string()))
 }
 
 /// Apply caller overrides to a built state. Factored out for unit testing
@@ -1438,8 +1488,8 @@ struct OracleRoleBuilder<'a> {
     target: crate::config::BifrostTarget,
     /// Deployment posture used for remote TLS validation.
     deployment_profile: crate::config::DeploymentProfile,
-    /// Server signing authority used by peer tickets.
-    signing_key: &'a SecretString,
+    /// Independent Bifrost peer ticket keyring used to mint and verify tickets.
+    peer_keyring: Arc<crate::oracle::PeerTicketKeyring>,
     /// Cluster registry owning the role fence and readiness publication.
     cluster: Arc<ClusterRegistry>,
     /// Stable node identity advertised to peer services.
@@ -1489,7 +1539,7 @@ impl<'a> OracleRoleBuilder<'a> {
             config,
             target: _,
             deployment_profile,
-            signing_key,
+            peer_keyring,
             cluster,
             node_id,
             advertise_addr,
@@ -1511,7 +1561,7 @@ impl<'a> OracleRoleBuilder<'a> {
                 .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
         );
         let authority = Arc::new(
-            OraclePeerAuthority::from_pem(signing_key, security_audit.clone())
+            OraclePeerAuthority::from_keyring(Arc::clone(&peer_keyring), security_audit.clone())
                 .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
         );
         let resource_plan = roles.plan();
@@ -1687,8 +1737,7 @@ impl<'a> OracleRoleBuilder<'a> {
                 .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
         );
         let tail_authority = Arc::new(
-            crate::oracle::ScribeTailAuthority::from_pem(signing_key, tail_audit)
-                .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
+            crate::oracle::ScribeTailAuthority::from_keyring(Arc::clone(&peer_keyring), tail_audit),
         );
         let tail_discovery = Arc::new(crate::oracle::RegistryTailStreamDiscovery::new(
             Arc::clone(&cluster),

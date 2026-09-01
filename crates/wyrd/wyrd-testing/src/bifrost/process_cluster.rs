@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use wyrd_dev_fixtures::pg::PgFixture;
 
 use crate::bifrost::peer_ca::BifrostPeerCa;
+use crate::bifrost::peer_keyring::TestPeerKeyring;
 use crate::server::TestBifrostPeerTls;
 
 /// Canonical private peer port every simulated pod binds.
@@ -101,6 +102,12 @@ mod env {
     pub const PEER_SERVER_NAME: &str = "WYRD_PEER_TEST_PEER_SERVER_NAME";
     /// Path to the shared peer Service API key file.
     pub const PEER_API_KEY_PATH: &str = "WYRD_PEER_TEST_PEER_API_KEY_PATH";
+    /// Identifier of the peer ticket key this child signs with.
+    pub const PEER_TICKET_KEY_ID: &str = "WYRD_PEER_TEST_PEER_TICKET_KEY_ID";
+    /// Path to this child's peer ticket signing key.
+    pub const PEER_TICKET_KEY_PATH: &str = "WYRD_PEER_TEST_PEER_TICKET_KEY_PATH";
+    /// Path to the shared published peer ticket verifying manifest.
+    pub const PEER_TICKET_KEYRING_PATH: &str = "WYRD_PEER_TEST_PEER_TICKET_KEYRING_PATH";
 }
 
 /// Bifrost target one simulated pod serves.
@@ -960,6 +967,13 @@ struct SharedClusterResources {
     storage_root: tempfile::TempDir,
     /// Peer certificate authority every child's leaf chains to.
     peer_ca: BifrostPeerCa,
+    /// One peer ticket keyring published to every child in this topology.
+    ///
+    /// Peer authority is verified against a published manifest, so a cluster
+    /// whose children each generated their own keyring could not accept one
+    /// another's tickets. Generating it once here is what makes the topology a
+    /// peer plane rather than a set of strangers.
+    peer_keyring: TestPeerKeyring,
     /// Root holding each child's private directory.
     node_roots: tempfile::TempDir,
     /// API key of the one shared Bifrost peer Service principal.
@@ -1062,6 +1076,7 @@ impl BifrostProcessCluster {
             peer_api_key,
             storage_root: tempfile::tempdir()
                 .map_err(|error| ProcessClusterError::Resource(error.to_string()))?,
+            peer_keyring: TestPeerKeyring::generate(),
             peer_ca: BifrostPeerCa::generate("localhost")
                 .map_err(|error| ProcessClusterError::Resource(error.to_string()))?,
             node_roots: tempfile::tempdir()
@@ -1285,6 +1300,14 @@ impl BifrostProcessCluster {
             .materialize(&root, &label)
             .map_err(|error| ProcessClusterError::Resource(error.to_string()))?;
         plan.defect.apply(&tls)?;
+        // Same private-root discipline as the certificate: the active signing
+        // key is written under this child's own root and only its path is
+        // published.
+        let keyring = self
+            .shared
+            .peer_keyring
+            .materialize(&root, &label)
+            .map_err(|error| ProcessClusterError::Resource(error.to_string()))?;
         // Same reasoning as the certificate: the secret lands in a file under
         // this child's private root and only the path is published.
         let peer_api_key_path = root.join("peer-api-key");
@@ -1315,6 +1338,9 @@ impl BifrostProcessCluster {
             .env(env::PEER_KEY_PATH, &tls.private_key_path)
             .env(env::PEER_SERVER_NAME, &tls.server_name)
             .env(env::PEER_API_KEY_PATH, &peer_api_key_path)
+            .env(env::PEER_TICKET_KEY_ID, &keyring.active_key_id)
+            .env(env::PEER_TICKET_KEY_PATH, &keyring.signing_key_path)
+            .env(env::PEER_TICKET_KEYRING_PATH, &keyring.verifying_keyring_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

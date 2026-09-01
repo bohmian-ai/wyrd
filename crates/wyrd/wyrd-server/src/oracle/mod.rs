@@ -16,6 +16,7 @@ mod lifecycle_transport;
 mod peer_audit;
 mod peer_authority;
 mod peer_credentials;
+mod peer_keyring;
 mod peer_service;
 mod query_audit;
 mod tail_audit;
@@ -31,6 +32,7 @@ pub use lifecycle_transport::{
 pub use peer_audit::PostgresPeerSecurityAudit;
 pub use peer_authority::OraclePeerAuthority;
 pub use peer_credentials::ServerBifrostPeerCredentials;
+pub use peer_keyring::{PeerKeyringError, PeerTicketKeyring};
 pub use peer_service::OraclePeerGrpc;
 #[cfg(feature = "test-support")]
 pub use query_audit::{

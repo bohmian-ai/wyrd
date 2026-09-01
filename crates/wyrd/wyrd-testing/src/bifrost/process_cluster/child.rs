@@ -28,6 +28,7 @@ use super::{
     ControlRequest, ControlResponse, MembershipEntry, NodeReport, PeerProbeCredential,
     PeerProbeFraming, PeerProbePlan, ProcessClusterError, ProcessNodeTarget, env,
 };
+use crate::bifrost::peer_keyring::TestPeerKeyringPaths;
 use crate::server::{TestBifrostPeerTls, WyrdTestServer};
 
 /// How long a child waits for its own readiness before reporting failure.
@@ -196,6 +197,8 @@ struct ChildConfig {
     peer_tls: TestBifrostPeerTls,
     /// Path to the shared peer Service API key.
     peer_api_key_path: PathBuf,
+    /// Paths of the shared peer ticket keyring published to this child.
+    peer_keyring: TestPeerKeyringPaths,
 }
 
 impl ChildConfig {
@@ -239,6 +242,11 @@ impl ChildConfig {
                 server_name: read(env::PEER_SERVER_NAME)?,
             },
             peer_api_key_path: PathBuf::from(read(env::PEER_API_KEY_PATH)?),
+            peer_keyring: TestPeerKeyringPaths {
+                active_key_id: read(env::PEER_TICKET_KEY_ID)?,
+                signing_key_path: PathBuf::from(read(env::PEER_TICKET_KEY_PATH)?),
+                verifying_keyring_path: PathBuf::from(read(env::PEER_TICKET_KEYRING_PATH)?),
+            },
         })
     }
 
@@ -338,6 +346,7 @@ impl ChildConfig {
             .with_bifrost_target_for_test(self.server_target())
             .with_forge_process_role_for_test(self.server_target())
             .with_peer_tls(self.peer_tls.clone())
+            .with_peer_keyring_paths(self.peer_keyring.clone())
             .with_peer_bind(self.peer_bind)
             .with_bind_addrs_for_test(self.http_bind, self.grpc_bind)
             .with_durable_bifrost_roots(self.wal_root.clone(), self.spill_root.clone())

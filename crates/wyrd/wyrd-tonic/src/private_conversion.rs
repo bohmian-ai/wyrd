@@ -648,8 +648,24 @@ impl TryFrom<proto::ReserveNodeSlotsRequest> for domain::ReserveNodeSlotsRequest
             query_class: query_class(value.query_class)?,
             slot_units: value.slot_units,
             expires_at: datetime(value.expires_at_unix_ms, "expires_at_unix_ms")?,
+            graph: value.graph.map(analytical_graph_ref).transpose()?,
         })
     }
+}
+
+/// Decodes the two-identity name of one distributed Analytical graph.
+///
+/// # Errors
+///
+/// Returns [`PrivateConversionError`] when either identity is not a UUID, so a
+/// reservation can never be bound to a graph name the leader did not encode.
+fn analytical_graph_ref(
+    value: proto::AnalyticalGraphRef,
+) -> Result<domain::AnalyticalGraphRef, PrivateConversionError> {
+    Ok(domain::AnalyticalGraphRef {
+        public_query_id: uuid_bytes(&value.public_query_id, "public_query_id")?,
+        datafusion_query_id: uuid_bytes(&value.datafusion_query_id, "datafusion_query_id")?,
+    })
 }
 
 impl From<domain::ReserveNodeSlotsRequest> for proto::ReserveNodeSlotsRequest {
@@ -669,6 +685,10 @@ impl From<domain::ReserveNodeSlotsRequest> for proto::ReserveNodeSlotsRequest {
             },
             slot_units: value.slot_units,
             expires_at_unix_ms: unix_millis(value.expires_at),
+            graph: value.graph.map(|graph| proto::AnalyticalGraphRef {
+                public_query_id: graph.public_query_id.as_bytes().to_vec(),
+                datafusion_query_id: graph.datafusion_query_id.as_bytes().to_vec(),
+            }),
         }
     }
 }
@@ -1594,6 +1614,7 @@ mod tests {
             slot_units: 1,
             expires_at_unix_ms: 1,
             ticket: None,
+            graph: None,
         };
         assert!(matches!(
             domain::ReserveNodeSlotsRequest::try_from(request),
@@ -1680,6 +1701,10 @@ mod tests {
             query_class: domain::QueryClass::Analytical,
             slot_units: 3,
             expires_at: chrono::DateTime::from_timestamp_millis(99).expect("valid timestamp"),
+            graph: Some(domain::AnalyticalGraphRef {
+                public_query_id: uuid::Uuid::now_v7(),
+                datafusion_query_id: uuid::Uuid::now_v7(),
+            }),
         };
         let actual = domain::ReserveNodeSlotsRequest::try_from(
             proto::ReserveNodeSlotsRequest::from(expected.clone()),

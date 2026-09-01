@@ -704,7 +704,24 @@ pub(crate) struct AnalyticalParticipantCut {
     /// Signed wire form, stamped verbatim into every ticket minted from it.
     wire: Vec<StageParticipantV1>,
     /// Endpoint index every outbound channel resolves its audience through.
-    by_url: HashMap<Url, (NodeId, u64)>,
+    by_url: HashMap<Url, AnalyticalDestination>,
+}
+
+/// One frozen participant's identity and the reservation it executes under.
+///
+/// The reservation belongs to the destination, not to the coordinator: each
+/// node grants its own, and the leader takes one per participant before it
+/// freezes the cut. Carrying it here is what lets a follower that becomes a
+/// coordinator address its peers under the reservations their own leader
+/// granted rather than under an identity it made up.
+#[derive(Debug, Clone)]
+pub(crate) struct AnalyticalDestination {
+    /// Frozen node identity of this participant.
+    pub(crate) node_id: NodeId,
+    /// Role-incarnation fence this participant was frozen at.
+    pub(crate) fence: u64,
+    /// Reservation the leader took on this participant for the whole graph.
+    pub(crate) reservation_id: String,
 }
 
 impl fmt::Debug for AnalyticalParticipantCut {
@@ -729,10 +746,12 @@ impl AnalyticalParticipantCut {
     ///
     /// Returns [`BifrostError::Internal`] when the cut exceeds
     /// [`MAX_STAGE_PARTICIPANTS`] or names a non-TLS endpoint.
-    pub(crate) fn freeze(destinations: HashMap<Url, (NodeId, u64)>) -> Result<Self, BifrostError> {
+    pub(crate) fn freeze(
+        destinations: HashMap<Url, AnalyticalDestination>,
+    ) -> Result<Self, BifrostError> {
         let mut wire = destinations
             .iter()
-            .map(|(url, (node_id, fence))| {
+            .map(|(url, destination)| {
                 if url.scheme() != "https" {
                     return Err(BifrostError::Internal {
                         detail: "Oracle analytical participant endpoint is not mutually \
@@ -741,9 +760,10 @@ impl AnalyticalParticipantCut {
                     });
                 }
                 Ok(StageParticipantV1 {
-                    node_id: node_id.as_uuid().as_bytes().to_vec(),
-                    fence: *fence,
+                    node_id: destination.node_id.as_uuid().as_bytes().to_vec(),
+                    fence: destination.fence,
                     address: url.to_string(),
+                    reservation_id: destination.reservation_id.clone(),
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -802,7 +822,14 @@ impl AnalyticalParticipantCut {
                 .map_err(|error| BifrostError::Internal {
                     detail: format!("Oracle analytical stage cut names an invalid node: {error}"),
                 })?;
-            by_url.insert(url, (node_id, participant.fence));
+            by_url.insert(
+                url,
+                AnalyticalDestination {
+                    node_id,
+                    fence: participant.fence,
+                    reservation_id: participant.reservation_id.clone(),
+                },
+            );
         }
         Ok(Self {
             wire: wire.to_vec(),
@@ -813,8 +840,8 @@ impl AnalyticalParticipantCut {
     /// Returns the fenced identity frozen for `url`, or `None` when it is
     /// outside this attempt's cut.
     #[must_use]
-    pub(crate) fn destination(&self, url: &Url) -> Option<(NodeId, u64)> {
-        self.by_url.get(url).copied()
+    pub(crate) fn destination(&self, url: &Url) -> Option<AnalyticalDestination> {
+        self.by_url.get(url).cloned()
     }
 
     /// Returns every endpoint this attempt may address.
@@ -1245,6 +1272,25 @@ pub(crate) struct AnalyticalCoordinatorIdentity {
 }
 
 impl AnalyticalCoordinatorIdentity {
+    /// Rebinds this coordinator identity to one destination's own reservation.
+    ///
+    /// Everything else is query-invariant. Only the reservation differs per
+    /// follower, because each follower granted its own and will only honour
+    /// that one.
+    #[must_use]
+    fn for_destination(&self, reservation_id: String) -> Self {
+        Self {
+            reservation_id,
+            tenant_id: self.tenant_id,
+            graph: self.graph,
+            snapshot_digest: self.snapshot_digest.clone(),
+            permission_digest: self.permission_digest.clone(),
+            source_node_id: self.source_node_id,
+            source_fence: self.source_fence,
+            attempt: self.attempt,
+        }
+    }
+
     /// Projects the full wire identity for one addressed stage task.
     #[must_use]
     fn for_task(&self, task_key: TaskKey) -> StageWireIdentity {
@@ -1573,9 +1619,12 @@ pub(crate) struct AnalyticalChannelResolver {
     /// Mutually authenticated connection cache for this query's followers.
     channels: AnalyticalPeerChannels,
     /// Query-invariant identity every call through this resolver carries.
+    ///
+    /// Everything but the reservation: that is the destination's own, and is
+    /// substituted per follower when the channel to it is resolved.
     identity: Arc<AnalyticalCoordinatorIdentity>,
-    /// Per-follower minters, keyed by the follower each one is bound to.
-    minters: Arc<std::sync::Mutex<HashMap<Url, Arc<AnalyticalStageMinter>>>>,
+    /// Per-follower minter and identity, keyed by the follower each is bound to.
+    minters: Arc<std::sync::Mutex<HashMap<Url, AnalyticalDestinationChannel>>>,
     /// Frozen destination set this resolver may address, and nothing beyond it.
     cut: Arc<AnalyticalParticipantCut>,
     /// Authority and lifetimes every minted ticket is signed under.
@@ -1616,35 +1665,55 @@ impl AnalyticalChannelResolver {
         }
     }
 
-    /// Returns the minter bound to `url`, resolving it once and caching it.
+    /// Returns the minter and identity bound to `url`, resolving them once.
+    ///
+    /// The identity is per destination because the reservation is: this
+    /// coordinator charges each follower against that follower's own frozen
+    /// reservation, so one query's channels carry different reservation
+    /// identities and each stamps only the one its audience granted.
     ///
     /// # Errors
     ///
     /// Returns [`DataFusionError::Execution`] when the cache lock is poisoned
     /// or `url` is not a destination this attempt's frozen cut contains.
-    fn minter(&self, url: &Url) -> Result<Arc<AnalyticalStageMinter>, DataFusionError> {
+    fn resolve(&self, url: &Url) -> Result<AnalyticalDestinationChannel, DataFusionError> {
         let mut minters = self.minters.lock().map_err(|_| {
             DataFusionError::Execution("Oracle analytical minter cache is poisoned".to_owned())
         })?;
-        if let Some(minter) = minters.get(url) {
-            return Ok(Arc::clone(minter));
+        if let Some(resolved) = minters.get(url) {
+            return Ok(resolved.clone());
         }
-        let (node_id, fence) = self.cut.destination(url).ok_or_else(|| {
+        let destination = self.cut.destination(url).ok_or_else(|| {
             DataFusionError::Execution(format!(
                 "Oracle analytical execution has no authorized destination identity for {url}"
             ))
         })?;
-        let minter = Arc::new(AnalyticalStageMinter::new(
-            Arc::clone(&self.signing.authority),
-            node_id,
-            fence,
-            self.signing.absolute_deadline_ms,
-            self.signing.ticket_ttl,
-            Arc::clone(&self.cut),
-        ));
-        minters.insert(url.clone(), Arc::clone(&minter));
-        Ok(minter)
+        let resolved = AnalyticalDestinationChannel {
+            minter: Arc::new(AnalyticalStageMinter::new(
+                Arc::clone(&self.signing.authority),
+                destination.node_id,
+                destination.fence,
+                self.signing.absolute_deadline_ms,
+                self.signing.ticket_ttl,
+                Arc::clone(&self.cut),
+            )),
+            identity: Arc::new(
+                self.identity
+                    .for_destination(destination.reservation_id.clone()),
+            ),
+        };
+        minters.insert(url.clone(), resolved.clone());
+        Ok(resolved)
     }
+}
+
+/// The signing owners one coordinator uses for exactly one destination.
+#[derive(Clone)]
+pub(crate) struct AnalyticalDestinationChannel {
+    /// Ticket minter bound to that destination's node identity and fence.
+    minter: Arc<AnalyticalStageMinter>,
+    /// Coordinator identity carrying that destination's own reservation.
+    identity: Arc<AnalyticalCoordinatorIdentity>,
 }
 
 #[async_trait]
@@ -1660,12 +1729,13 @@ impl ChannelResolver for AnalyticalChannelResolver {
         &self,
         url: &Url,
     ) -> Result<Box<dyn WorkerChannel>, DataFusionError> {
-        let minter = self.minter(url)?;
+        let resolved = self.resolve(url)?;
         let channel = self.channels.channel(url).await?;
-        let signed = BoxCloneSyncChannel::new(AnalyticalStageMintLayer::new(minter).layer(channel));
+        let signed =
+            BoxCloneSyncChannel::new(AnalyticalStageMintLayer::new(resolved.minter).layer(channel));
         Ok(Box::new(AnalyticalWorkerChannel::new(
             create_worker_client(signed),
-            Arc::clone(&self.identity),
+            resolved.identity,
         )))
     }
 }
@@ -1673,7 +1743,6 @@ impl ChannelResolver for AnalyticalChannelResolver {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use async_trait::async_trait;
@@ -1688,11 +1757,27 @@ mod tests {
     use super::*;
 
     /// Builds one https destination entry for a cut fixture.
-    fn destination(port: u16, node: u128, fence: u64) -> (Url, (NodeId, u64)) {
+    fn destination(port: u16, node: u128, fence: u64) -> (Url, AnalyticalDestination) {
         (
             Url::parse(&format!("https://127.0.0.1:{port}/")).expect("fixture endpoint parses"),
-            (NodeId::new(Uuid::from_u128(node)), fence),
+            AnalyticalDestination {
+                node_id: NodeId::new(Uuid::from_u128(node)),
+                fence,
+                reservation_id: format!("reservation-{node}"),
+            },
         )
+    }
+
+    /// Reports whether two frozen destinations name the same identity.
+    fn same_destination(
+        left: Option<AnalyticalDestination>,
+        right: &AnalyticalDestination,
+    ) -> bool {
+        left.is_some_and(|left| {
+            left.node_id == right.node_id
+                && left.fence == right.fence
+                && left.reservation_id == right.reservation_id
+        })
     }
 
     /// A frozen cut is the complete and only addressable destination set.
@@ -1706,10 +1791,11 @@ mod tests {
     #[test]
     fn a_frozen_cut_is_the_only_addressable_destination_set() {
         let (url, identity) = destination(50052, 1, 4);
-        let cut = AnalyticalParticipantCut::freeze(HashMap::from([(url.clone(), identity)]))
-            .expect("an https cut freezes");
+        let cut =
+            AnalyticalParticipantCut::freeze(HashMap::from([(url.clone(), identity.clone())]))
+                .expect("an https cut freezes");
 
-        assert_eq!(cut.destination(&url), Some(identity));
+        assert!(same_destination(cut.destination(&url), &identity));
         assert_eq!(cut.urls(), vec![url.clone()]);
         let outside = Url::parse("https://127.0.0.1:50053/").expect("fixture endpoint parses");
         assert!(
@@ -1718,7 +1804,7 @@ mod tests {
         );
 
         let adopted = AnalyticalParticipantCut::adopt(cut.wire()).expect("a signed cut is adopted");
-        assert_eq!(adopted.destination(&url), Some(identity));
+        assert!(same_destination(adopted.destination(&url), &identity));
         assert!(
             adopted.destination(&outside).is_none(),
             "adoption must not widen the cut it received"
@@ -1727,7 +1813,8 @@ mod tests {
         let plaintext =
             Url::parse("http://127.0.0.1:50052/").expect("fixture plaintext endpoint parses");
         assert!(
-            AnalyticalParticipantCut::freeze(HashMap::from([(plaintext, identity)])).is_err(),
+            AnalyticalParticipantCut::freeze(HashMap::from([(plaintext, identity.clone())]))
+                .is_err(),
             "a plaintext endpoint must never enter a frozen cut"
         );
         assert!(
@@ -1735,6 +1822,7 @@ mod tests {
                 node_id: Uuid::from_u128(1).as_bytes().to_vec(),
                 fence: 4,
                 address: "http://127.0.0.1:50052/".to_owned(),
+                reservation_id: identity.reservation_id,
             }])
             .is_err(),
             "a plaintext endpoint must never be adopted from a ticket"
@@ -1783,9 +1871,10 @@ mod tests {
         );
         let wire = oversized
             .into_iter()
-            .map(|(url, (node_id, fence))| StageParticipantV1 {
-                node_id: node_id.as_uuid().as_bytes().to_vec(),
-                fence,
+            .map(|(url, destination)| StageParticipantV1 {
+                node_id: destination.node_id.as_uuid().as_bytes().to_vec(),
+                fence: destination.fence,
+                reservation_id: destination.reservation_id,
                 address: url.to_string(),
             })
             .collect::<Vec<_>>();
@@ -1826,11 +1915,6 @@ mod tests {
         assert_eq!(governed_operation(WORKER_INFO_PATH), None);
         assert_eq!(governed_operation("/unknown.Service/Method"), None);
     }
-    use crate::resources::{
-        BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, ResourceSource,
-        SystemResourceSnapshot,
-    };
-
     /// Body chunks a fixture request delivers before it ends.
     #[derive(Debug)]
     struct ChunkBody {
@@ -2052,30 +2136,6 @@ mod tests {
         /// Panics when the injected observation cannot compose an Oracle role or
         /// the pod spill owner cannot be created.
         fn new() -> Self {
-            let snapshot = SystemResourceSnapshot {
-                memory_limit_bytes: 4 * 1024 * 1024 * 1024,
-                effective_cpu: 8,
-                scratch_capacity_bytes: 2 * 1024 * 1024 * 1024,
-                scratch_available_bytes: 2 * 1024 * 1024 * 1024,
-                memory_source: ResourceSource::Injected,
-                cpu_source: ResourceSource::Injected,
-            };
-            let policy = BifrostResourcePolicy {
-                roles: [BifrostRole::Oracle].into_iter().collect(),
-                memory_limit_bytes: None,
-                unmanaged_reserve_bytes: None,
-                scratch_limit_bytes: None,
-                effective_cpu: None,
-                oracle_query_slot_limit: None,
-                scratch_root: PathBuf::new(),
-                volume_roots: None,
-            };
-            let oracle_resources = BifrostRuntimeResources::from_snapshot(snapshot, policy)
-                .expect("an injected Oracle observation composes the production root")
-                .compose_roles()
-                .expect("role composition is issued from an unpoisoned root")
-                .oracle()
-                .expect("the Oracle role is active in this policy");
             let root = tempfile::tempdir().expect("fixture scratch root must exist");
             let spill = Arc::new(
                 OracleSpillRuntime::new(root.path(), 2 * 1024 * 1024 * 1024)
@@ -2092,7 +2152,10 @@ mod tests {
                 supervisor: Arc::new(
                     super::super::analytical_supervisor::AnalyticalSupervisor::new(),
                 ),
-                oracle_resources,
+                reservations: Arc::new(super::super::dispatcher::ReservationRegistry::new(
+                    Arc::new(crate::oracle::OracleSlotManager::new(4, 4)),
+                    16,
+                )),
                 spill: Arc::clone(&spill),
                 exchange_buffer_bytes: 64 * 1024,
                 leaf: crate::oracle::codec::AnalyticalLeafBinding::new(

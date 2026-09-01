@@ -365,6 +365,15 @@ pub struct StageParticipantV1 {
     /// Private peer endpoint the participant advertised at freeze time.
     #[prost(string, tag = "3")]
     pub address: String,
+    /// Reservation the leader took on this participant for the whole graph.
+    ///
+    /// Signed with the rest of the cut, so a coordinator can charge a follower
+    /// only against the reservation that follower's own leader granted. It
+    /// travels per participant rather than per ticket because each node grants
+    /// its own reservation, and a follower that becomes a coordinator must
+    /// address its peers under their reservations, not its own.
+    #[prost(string, tag = "4")]
+    pub reservation_id: String,
 }
 
 /// Hard cap on the participants one stage ticket may carry.

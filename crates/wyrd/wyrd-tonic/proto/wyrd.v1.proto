@@ -124,7 +124,13 @@ message ReserveNodeSlotsRequest {
   // Single-use reservation purpose ticket. The follower verifies it over the
   // encoded request with this field cleared, before any capacity changes.
   SignedPeerTicket ticket = 7;
+  // Present only when the reservation is taken for one distributed Analytical
+  // graph. Absent for a fragment reservation, which charges a worker quantum
+  // rather than a whole query envelope.
+  AnalyticalGraphRef graph = 8;
 }
+// Two-identity name of one distributed Analytical graph.
+message AnalyticalGraphRef { bytes public_query_id = 1; bytes datafusion_query_id = 2; }
 message ReserveNodeSlotsResponse { oneof outcome { PendingNodeReservation pending = 1; ReservationRejected rejected = 2; } }
 message PendingNodeReservation { bytes reservation_id = 1; uint64 expires_at_unix_ms = 2; }
 message ReservationRejected { uint32 retry_after_ms = 1; }

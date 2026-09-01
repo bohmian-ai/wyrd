@@ -1494,6 +1494,12 @@ pub struct OracleBuildConfig {
     pub audit: Arc<dyn OracleAudit>,
     /// Server-owned narrow peer-ticket authority.
     pub peer_ticket_minter: Arc<dyn peer::PeerTicketMinter>,
+    /// Reservation owner this node's fragment and graph paths both charge against.
+    ///
+    /// One registry per node, shared with the peer worker that accepts
+    /// reservations, so a graph lease can only ever be activated from a
+    /// reservation this same node actually granted.
+    pub reservations: Arc<dispatcher::ReservationRegistry>,
     /// Server-owned east-west stage authority for the inactive Analytical path.
     ///
     /// Absent on a deployment whose Oracle role cannot serve stage operations.
@@ -1520,7 +1526,7 @@ pub struct OracleBuildConfig {
     /// Query-scoped live Scribe discovery owner.
     pub tail_discovery: Option<Arc<dyn tail_fence::TailStreamDiscovery>>,
     /// Optional node-aware local/tonic directory used for immutable sealed leaves.
-    pub peer_transports: Option<dispatcher::OraclePeerTransportDirectory>,
+    pub peer_transports: Option<Arc<dispatcher::OraclePeerTransportDirectory>>,
     /// Engine limits and lifecycle values.
     pub config: OracleConfig,
     /// Validated delegated policy-capacity lifecycle settings.
@@ -2091,6 +2097,10 @@ struct AnalyticalCompositionInputs {
     catalog: Arc<BifrostCatalog>,
     /// Audit owner every refused stage message records through.
     audit: Arc<dyn OracleAudit>,
+    /// Reservation owner both the fragment and graph paths charge against.
+    reservations: Arc<dispatcher::ReservationRegistry>,
+    /// Directory this leader reserves each graph participant's envelope through.
+    peer_transports: Option<Arc<dispatcher::OraclePeerTransportDirectory>>,
     /// Process-level Oracle resource governor shared with admission.
     resources: crate::resources::OracleResources,
     /// Process-owned spill runtime every query-owned runtime is built from.
@@ -2121,6 +2131,8 @@ fn compose_analytical_handle(
         fence,
         catalog,
         audit,
+        reservations,
+        peer_transports,
         resources,
         spill,
         exchange_buffer_bytes,
@@ -2148,7 +2160,7 @@ fn compose_analytical_handle(
             oracle_fence: fence,
             authority: Arc::clone(&authority),
             supervisor: Arc::clone(&supervisor),
-            oracle_resources: resources.clone(),
+            reservations,
             spill: Arc::clone(&spill),
             exchange_buffer_bytes,
             leaf: leaf.clone(),
@@ -2161,6 +2173,7 @@ fn compose_analytical_handle(
         supervisor,
         spill,
         resources,
+        peer_transports,
         analytical::AnalyticalExecutionConfig {
             node_id,
             oracle_fence: fence,
@@ -2269,10 +2282,10 @@ impl Oracle {
         let ready = Arc::new(AtomicBool::new(false));
         let (maintenance, startup_result) =
             OracleAdmission::start_maintenance(shutdown.clone(), Arc::clone(&ready))?;
-        let fragment_dispatcher = config.peer_transports.map(|transports| {
+        let fragment_dispatcher = config.peer_transports.as_ref().map(|transports| {
             Arc::new(dispatcher::FragmentDispatcher::new(
                 Arc::clone(&config.peer_ticket_minter),
-                transports,
+                Arc::clone(transports),
             ))
         });
         // Both owners are required together: the authority proves a stage
@@ -2290,6 +2303,8 @@ impl Oracle {
                     fence: admission.local_role.fencing_token,
                     catalog: Arc::clone(&config.catalog),
                     audit: Arc::clone(&config.audit),
+                    reservations: Arc::clone(&config.reservations),
+                    peer_transports: config.peer_transports.as_ref().map(Arc::clone),
                     resources: config.memory.resources.clone(),
                     spill: Arc::clone(&config.spill_runtime),
                     exchange_buffer_bytes: config.config.analytical_exchange_buffer_bytes,
@@ -2537,7 +2552,9 @@ impl Oracle {
             .as_ref()
             .ok_or(BifrostError::OracleRoleUnavailable)?;
         let work_units = Self::scannable_work_units(&planned.cuts);
-        handle.lease_session(attempt, &cut, &context, work_units)
+        handle
+            .lease_session(attempt, &cut, &context, work_units)
+            .await
     }
 
     /// Prepares the immutable local-leader participant cut before an attempt begins.
@@ -2761,14 +2778,17 @@ impl Oracle {
         phases.admitted();
         let work_units = Self::scannable_work_units(&planned.cuts);
         let (session, mut admitted) = match analytical {
-            Some(attempt) => self.lease_analytical_session(
-                deadline,
-                admitted,
-                attempt,
-                participant_cut,
-                context,
-                work_units,
-            )?,
+            Some(attempt) => {
+                self.lease_analytical_session(
+                    deadline,
+                    admitted,
+                    attempt,
+                    participant_cut,
+                    context,
+                    work_units,
+                )
+                .await?
+            }
             None => self.lease_session(deadline, admitted, work_units, "lease rejection")?,
         };
         admitted.retain_physical_projections(&planned.cuts)?;
@@ -4219,7 +4239,7 @@ impl Oracle {
     ///
     /// Returns the stable admission, supervisor, or runtime error after
     /// synchronously releasing the supplied admission owner.
-    fn lease_analytical_session(
+    async fn lease_analytical_session(
         &self,
         deadline: Instant,
         admitted: AdmittedQueryGuard,
@@ -4236,7 +4256,10 @@ impl Oracle {
                 "analytical lease without a composed handle",
             );
         };
-        match handle.lease_session(attempt, participant_cut, context, work_units) {
+        match handle
+            .lease_session(attempt, participant_cut, context, work_units)
+            .await
+        {
             Ok((session, ownership)) => {
                 let mut admitted = admitted;
                 admitted.analytical = Some(ownership);

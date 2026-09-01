@@ -62,11 +62,14 @@ use super::analytical_supervisor::{
     AnalyticalAttemptGrant, AnalyticalAttemptGuard, AnalyticalAttemptKey, AnalyticalAttemptRelease,
     AnalyticalGraphGuard, AnalyticalSupervisorInspection, StageId, TaskId,
 };
+use super::analytical_transport::AnalyticalDestination;
 use super::analytical_transport::{
     AnalyticalChannelResolver, AnalyticalCoordinatorIdentity, AnalyticalParticipantCut,
     AnalyticalStageSigning, StageWireIdentity, read_ticket,
 };
-use super::dispatcher::{BifrostPeerTls, OraclePeerCredentials};
+use super::dispatcher::{
+    BifrostPeerTls, GraphLeaseRequest, OraclePeerCredentials, ReservationRegistry,
+};
 use super::participant_cut::OracleQueryAttemptCut;
 use super::peer::{AuthorizedStage, OracleStageAuthority, PeerSecurityError, StageOperationV1};
 use super::spill::OracleSpillRuntime;
@@ -74,7 +77,9 @@ use super::telemetry::{
     AnalyticalAttemptOutcome, AnalyticalStageOperation, record_stage_operation,
 };
 use crate::resources::{OracleResourceRequest, OracleResources};
-use wyrd_spec::vala::api::QueryClass;
+use wyrd_spec::vala::api::{
+    AnalyticalGraphRef, QueryClass, QueryId, ReservationId, ReserveNodeSlotsRequest,
+};
 
 /// Header carrying the client-visible query identity on every stage operation.
 pub(crate) const PUBLIC_QUERY_ID_HEADER: &str = "wyrd-oracle-public-query-id";
@@ -802,8 +807,13 @@ pub struct AnalyticalStageIngressConfig {
     pub authority: Arc<dyn OracleStageAuthority>,
     /// Node-local supervisor owning graphs, attempts, and the runtime registry.
     pub supervisor: Arc<AnalyticalSupervisor>,
-    /// Root Oracle capability this follower admits query envelopes from.
-    pub oracle_resources: OracleResources,
+    /// Reservation owner this follower activates graph leases from.
+    ///
+    /// The same registry the fragment path reserves against. A graph does not
+    /// get its own capacity book: it takes the envelope the leader already
+    /// reserved on this node, which is what makes a follower's charge for a
+    /// distributed plan the one the leader was told it would be.
+    pub reservations: Arc<ReservationRegistry>,
     /// Process spill owner that bounds each query runtime's disk manager.
     pub spill: Arc<OracleSpillRuntime>,
     /// Exchange-buffer child every attempt of a graph on this node charges.
@@ -837,8 +847,8 @@ pub struct AnalyticalStageIngress {
     authority: Arc<dyn OracleStageAuthority>,
     /// Node-local supervisor owning graphs, attempts, and the runtime registry.
     supervisor: Arc<AnalyticalSupervisor>,
-    /// Root Oracle capability this follower admits query envelopes from.
-    oracle_resources: OracleResources,
+    /// Reservation owner this follower activates graph leases from.
+    reservations: Arc<ReservationRegistry>,
     /// Process spill owner that bounds each query runtime's disk manager.
     spill: Arc<OracleSpillRuntime>,
     /// Exchange-buffer child every attempt of a graph on this node charges.
@@ -884,7 +894,7 @@ impl AnalyticalStageIngress {
             oracle_fence,
             authority,
             supervisor,
-            oracle_resources,
+            reservations,
             spill,
             exchange_buffer_bytes,
             leaf,
@@ -900,7 +910,7 @@ impl AnalyticalStageIngress {
             oracle_fence,
             authority,
             supervisor,
-            oracle_resources,
+            reservations,
             spill,
             exchange_buffer_bytes,
             worker,
@@ -978,9 +988,10 @@ impl AnalyticalStageIngress {
         // that this node runs in the middle of a deeper graph can sign its own
         // outbound pulls with exactly the authority it was granted.
         self.egress.record(key.graph(), &authorized)?;
+        let lease = graph_lease_request(&authorized, key.graph())?;
         match operation {
             StageOperationV1::SetPlan => {
-                self.admit_graph(key.graph())?;
+                self.admit_graph(key.graph(), &lease, now)?;
                 self.admit_attempt(key)?;
                 record_stage_operation(AnalyticalStageOperation::SetPlan);
             }
@@ -996,7 +1007,7 @@ impl AnalyticalStageIngress {
                 // admitting the envelope here is the same authorized act
                 // `SetPlan` performs; the attempt guard still waits for
                 // `SetPlan`, which is the message that actually names one.
-                self.admit_graph(key.graph())?;
+                self.admit_graph(key.graph(), &lease, now)?;
                 record_stage_operation(AnalyticalStageOperation::ExecuteTask);
             }
         }
@@ -1057,6 +1068,13 @@ impl AnalyticalStageIngress {
         self.drain_graph(graph).await?;
         release.release()?;
         self.egress.release(graph)?;
+        // Exactly once, on every terminal path. The supervisor guard returned
+        // the envelope; this returns the reservation's running permit and the
+        // node's record that it still owed this graph anything at all.
+        self.reservations.release_graph(AnalyticalGraphRef {
+            public_query_id: graph.public_query_id.as_uuid(),
+            datafusion_query_id: graph.datafusion_query_id.as_uuid(),
+        });
         Ok(())
     }
 
@@ -1190,18 +1208,27 @@ impl AnalyticalStageIngress {
     /// Returns [`BifrostError::QueryAdmissionRejected`] when the root capability
     /// cannot admit an analytical query envelope, [`BifrostError::Internal`] on
     /// a poisoned ownership lock or when the graph runtime cannot be built.
-    fn admit_graph(&self, graph: AnalyticalGraphKey) -> Result<(), BifrostError> {
+    fn admit_graph(
+        &self,
+        graph: AnalyticalGraphKey,
+        lease: &GraphLeaseRequest,
+        now: DateTime<Utc>,
+    ) -> Result<(), BifrostError> {
         let mut graphs = self.graphs.lock().map_err(|_| poisoned_ingress())?;
         if graphs.contains_key(&graph) {
             return Ok(());
         }
-        let resources = self
-            .oracle_resources
-            .try_acquire_query(OracleResourceRequest::for_class(
-                QueryClass::Analytical,
-                0.0,
-            ))
+        // Activate, never self-grant. The envelope this graph executes under is
+        // the one the leader reserved on this node; taking a second one here
+        // would mean the leader's completed fan-out guaranteed capacity that
+        // nothing on this node was actually holding.
+        let lease = self
+            .reservations
+            .lease_graph(lease, now)
             .map_err(|_| BifrostError::QueryAdmissionRejected)?;
+        let resources = *lease
+            .take_resources()
+            .ok_or(BifrostError::QueryAdmissionRejected)?;
         let runtime = self
             .spill
             .build_query_runtime(resources.memory_pool(), resources.scratch_bytes)?;
@@ -1229,6 +1256,11 @@ impl AnalyticalStageIngress {
             key,
             AnalyticalAttemptGrant {
                 exchange_buffer_bytes: self.exchange_buffer_bytes,
+                // Spill attribution belongs to the graph, not the attempt. The
+                // graph runtime's disk manager was built from the leased
+                // envelope's exact scratch share, and every attempt of the
+                // graph spills through it; splitting a second per-attempt share
+                // off the same envelope would charge the same bytes twice.
                 scratch_bytes: 0,
             },
         )?;
@@ -1236,6 +1268,15 @@ impl AnalyticalStageIngress {
         Ok(())
     }
 }
+
+/// Slot units one distributed graph reserves on each participant.
+///
+/// A graph occupies a participant for the whole plan, not for one leaf, so it
+/// charges the Analytical class's full per-query demand. The receiving node
+/// clamps this to its own running capacity before charging, so a smaller peer
+/// still admits the graph rather than refusing a structurally unschedulable
+/// demand.
+const ANALYTICAL_GRAPH_SLOT_UNITS: u32 = 2;
 
 /// Follower ownership of one graph, held for one open coordinator call.
 ///
@@ -1319,6 +1360,35 @@ fn attempt_key(authorized: &AuthorizedStage) -> Result<AnalyticalAttemptKey, Bif
         task,
         attempt,
     ))
+}
+
+/// Projects the graph-lease ownership tuple from one authorized stage operation.
+///
+/// Every field comes from the verified claims. The reservation identity in
+/// particular is signed, so a coordinator cannot point a graph at a reservation
+/// it was not granted, and the query identity is derived from the same claims
+/// the graph key itself came from, so the reservation and the graph can only
+/// ever be checked against each other.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::QueryPeerSecurity`] when the claims carry a
+/// reservation identity that is not a well-formed reservation UUID.
+fn graph_lease_request(
+    authorized: &AuthorizedStage,
+    graph: AnalyticalGraphKey,
+) -> Result<GraphLeaseRequest, BifrostError> {
+    let reservation_id = Uuid::parse_str(&authorized.claims.reservation_id)
+        .map(ReservationId::new)
+        .map_err(|_| BifrostError::QueryPeerSecurity)?;
+    Ok(GraphLeaseRequest {
+        reservation_id,
+        graph: AnalyticalGraphRef {
+            public_query_id: graph.public_query_id.as_uuid(),
+            datafusion_query_id: graph.datafusion_query_id.as_uuid(),
+        },
+        query_id: QueryId::new(graph.public_query_id.as_uuid()),
+    })
 }
 
 /// Builds the stable internal error for a poisoned ingress ownership lock.
@@ -2048,6 +2118,12 @@ pub struct AnalyticalExecutionHandle {
     spill: Arc<OracleSpillRuntime>,
     /// Root Oracle capability this handle admits leader graph envelopes from.
     oracle_resources: OracleResources,
+    /// Directory this leader reserves each graph participant's envelope through.
+    ///
+    /// Absent only where no peer transport was composed, which is a node that
+    /// cannot address a participant at all; a leader without it can execute
+    /// nothing remote and refuses rather than freezing an unreserved cut.
+    peer_transports: Option<Arc<super::dispatcher::OraclePeerTransportDirectory>>,
     /// Node-scoped identity, budget, and peer-transport configuration.
     config: AnalyticalExecutionConfig,
     /// Capability every Analytical leaf this node encodes or decodes resolves through.
@@ -2074,6 +2150,7 @@ impl AnalyticalExecutionHandle {
         supervisor: Arc<AnalyticalSupervisor>,
         spill: Arc<OracleSpillRuntime>,
         oracle_resources: OracleResources,
+        peer_transports: Option<Arc<super::dispatcher::OraclePeerTransportDirectory>>,
         config: AnalyticalExecutionConfig,
         leaf: super::codec::AnalyticalLeafBinding,
     ) -> Self {
@@ -2083,6 +2160,7 @@ impl AnalyticalExecutionHandle {
             supervisor,
             spill,
             oracle_resources,
+            peer_transports,
             config,
             leaf,
         }
@@ -2161,7 +2239,7 @@ impl AnalyticalExecutionHandle {
     /// participant endpoint is not a valid URL, and
     /// [`BifrostError::QueryExecutionFailed`] when `DataFusion` cannot build
     /// the bounded query runtime.
-    pub fn lease_session(
+    pub async fn lease_session(
         &self,
         attempt: &AnalyticalAttemptContext,
         cut: &OracleQueryAttemptCut,
@@ -2169,6 +2247,10 @@ impl AnalyticalExecutionHandle {
         work_units: usize,
     ) -> Result<(SessionContext, AnalyticalAttemptOwnership), BifrostError> {
         let graph = AnalyticalGraphKey::new(attempt.public_query_id, attempt.datafusion_query_id);
+        // Reserved before anything is admitted locally. A participant that
+        // declines must fail the attempt while the leader still owns nothing,
+        // not after it has charged its own envelope and registered a graph.
+        let destinations = self.reserve_destinations(cut, graph).await?;
         let resources = self
             .oracle_resources
             .try_acquire_query(OracleResourceRequest::for_class(
@@ -2200,17 +2282,17 @@ impl AnalyticalExecutionHandle {
             },
         )?;
         let session = self.leader_session(
-            &AnalyticalSessionInputs {
+            AnalyticalSessionInputs {
                 context,
-                cut,
                 snapshot_digest: &attempt.snapshot_digest,
-                reservation_id: &attempt.reservation_id,
+                destinations,
                 permission_digest: &attempt.permission_digest,
                 granted_memory_bytes,
                 target_partitions,
                 work_units,
             },
             graph,
+            cut.deadline().timestamp_millis(),
         )?;
         Ok((
             session,
@@ -2244,14 +2326,14 @@ impl AnalyticalExecutionHandle {
     /// valid URL or the graph's runtime is not registered.
     fn leader_session(
         &self,
-        inputs: &AnalyticalSessionInputs<'_>,
+        inputs: AnalyticalSessionInputs<'_>,
         graph: AnalyticalGraphKey,
+        deadline_ms: i64,
     ) -> Result<SessionContext, BifrostError> {
-        let &AnalyticalSessionInputs {
+        let AnalyticalSessionInputs {
             context,
-            cut,
             snapshot_digest,
-            reservation_id,
+            destinations,
             permission_digest,
             granted_memory_bytes,
             target_partitions,
@@ -2265,14 +2347,17 @@ impl AnalyticalExecutionHandle {
             graph,
             snapshot_digest: snapshot_digest.to_owned(),
             attempt: u32::from(AnalyticalAttemptNumber::ZERO.as_u8()),
-            reservation_id: reservation_id.to_owned(),
+            // Placeholder only. The resolver substitutes each destination's own
+            // frozen reservation before any channel to it is built, because a
+            // follower honours only the reservation it granted itself.
+            reservation_id: String::new(),
             permission_digest: permission_digest.to_owned(),
         });
         // Frozen here, once, for the whole attempt: everything downstream —
         // this leader's own channels and every follower that becomes a
         // coordinator beneath it — addresses this exact set, so no membership
         // change can add, remove, or re-fence a destination mid-attempt.
-        let participants = Arc::new(AnalyticalParticipantCut::freeze(self.destinations(cut)?)?);
+        let participants = Arc::new(AnalyticalParticipantCut::freeze(destinations)?);
         let urls = participants.urls();
         let resolver = AnalyticalChannelResolver::new(
             identity,
@@ -2281,7 +2366,7 @@ impl AnalyticalExecutionHandle {
             Arc::clone(&participants),
             AnalyticalStageSigning {
                 authority: Arc::clone(&self.authority),
-                absolute_deadline_ms: cut.deadline().timestamp_millis(),
+                absolute_deadline_ms: deadline_ms,
                 ticket_ttl: self.config.ticket_ttl,
             },
         );
@@ -2310,7 +2395,12 @@ impl AnalyticalExecutionHandle {
         Ok(SessionContext::new_with_state(state))
     }
 
-    /// Maps each remote participant endpoint to the fenced identity a ticket binds to.
+    /// Reserves every remote participant's graph envelope and freezes their identities.
+    ///
+    /// One reservation per participant, taken before the leader admits anything
+    /// of its own, and carried into the frozen cut so each follower is later
+    /// charged against the reservation it granted rather than one the
+    /// coordinator invented.
     ///
     /// The coordinator excludes itself. A leader is already an Oracle in its own
     /// pinned cut, so keeping it in the worker set would make this node dispatch
@@ -2324,24 +2414,69 @@ impl AnalyticalExecutionHandle {
     /// # Errors
     ///
     /// Returns [`BifrostError::Internal`] when a participant endpoint is not a
-    /// valid URL, which would otherwise leave a worker unreachable and unsigned.
-    fn destinations(
+    /// valid URL — which would otherwise leave a worker unreachable and
+    /// unsigned — or when this node composed no peer transport, and
+    /// [`BifrostError::QueryAdmissionRejected`] when a participant declined its
+    /// reservation.
+    async fn reserve_destinations(
         &self,
         cut: &OracleQueryAttemptCut,
-    ) -> Result<HashMap<Url, (NodeId, u64)>, BifrostError> {
-        cut.oracles()
+        graph: AnalyticalGraphKey,
+    ) -> Result<HashMap<Url, AnalyticalDestination>, BifrostError> {
+        let remote = cut
+            .oracles()
             .iter()
             .filter(|participant| participant.node_id != self.config.node_id)
-            .map(|participant| {
-                let url =
-                    Url::parse(&participant.endpoint).map_err(|error| BifrostError::Internal {
-                        detail: format!(
-                            "Oracle analytical participant endpoint is not a valid URL: {error}"
-                        ),
-                    })?;
-                Ok((url, (participant.node_id, participant.fencing_token)))
-            })
-            .collect()
+            .collect::<Vec<_>>();
+        if remote.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let Some(transports) = self.peer_transports.as_ref() else {
+            return Err(BifrostError::Internal {
+                detail: "Oracle analytical leader has no peer transport to reserve participants                          through"
+                    .to_owned(),
+            });
+        };
+        let request = ReserveNodeSlotsRequest {
+            query_id: QueryId::new(graph.public_query_id.as_uuid()),
+            leader_node_id: self.config.node_id,
+            leader_fencing_token: self.config.oracle_fence,
+            query_class: QueryClass::Analytical,
+            slot_units: ANALYTICAL_GRAPH_SLOT_UNITS,
+            expires_at: cut.deadline(),
+            graph: Some(AnalyticalGraphRef {
+                public_query_id: graph.public_query_id.as_uuid(),
+                datafusion_query_id: graph.datafusion_query_id.as_uuid(),
+            }),
+        };
+        let mut destinations = HashMap::with_capacity(remote.len());
+        for participant in remote {
+            let url =
+                Url::parse(&participant.endpoint).map_err(|error| BifrostError::Internal {
+                    detail: format!(
+                        "Oracle analytical participant endpoint is not a valid URL: {error}"
+                    ),
+                })?;
+            let candidate = super::dispatcher::DispatchCandidate {
+                node_id: participant.node_id,
+                role: wyrd_spec::vala::api::ClusterRole::Oracle,
+                worker_fence: participant.fencing_token,
+                endpoint: Some(participant.endpoint.clone()),
+            };
+            let pending = transports
+                .reserve_graph(&candidate, request.clone())
+                .await
+                .map_err(|_| BifrostError::QueryAdmissionRejected)?;
+            destinations.insert(
+                url,
+                AnalyticalDestination {
+                    node_id: participant.node_id,
+                    fence: participant.fencing_token,
+                    reservation_id: pending.reservation_id.as_uuid().to_string(),
+                },
+            );
+        }
+        Ok(destinations)
     }
 }
 
@@ -2353,12 +2488,10 @@ impl AnalyticalExecutionHandle {
 struct AnalyticalSessionInputs<'a> {
     /// Authenticated principal, tenant, and audit correlation.
     context: &'a AuthorizedQueryContext,
-    /// Immutable membership and deadline of the attempt.
-    cut: &'a OracleQueryAttemptCut,
     /// Pinned snapshot digest of the attempt's cut.
     snapshot_digest: &'a str,
-    /// Reservation the graph's follower work charges against.
-    reservation_id: &'a str,
+    /// Reserved participants this attempt may address, and nothing beyond them.
+    destinations: HashMap<Url, AnalyticalDestination>,
     /// Digest of the leader-authorized permissions for this query.
     permission_digest: &'a str,
     /// Ceiling this query's pool may grow to.
@@ -2382,8 +2515,6 @@ pub struct AnalyticalAttemptContext {
     pub datafusion_query_id: DataFusionQueryId,
     /// Pinned snapshot digest of the attempt's immutable cut.
     pub snapshot_digest: String,
-    /// Reservation this graph's follower work charges against.
-    pub reservation_id: String,
     /// Digest of the leader-authorized permissions for this query.
     pub permission_digest: String,
 }

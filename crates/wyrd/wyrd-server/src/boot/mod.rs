@@ -1780,7 +1780,7 @@ impl<'a> OracleRoleBuilder<'a> {
                 oracle_fence: role.fencing_token,
                 verifier,
                 security_audit: security_audit.clone(),
-                reservations,
+                reservations: Arc::clone(&reservations),
                 oracle_resources: oracle_resources.clone(),
                 resolver: follower_resolver,
                 audit: audit.clone(),
@@ -1793,8 +1793,11 @@ impl<'a> OracleRoleBuilder<'a> {
             Arc::clone(&authority),
         ));
         let local_transport = Arc::new(LocalOraclePeerTransport::new(worker));
-        let peer_transports =
-            OraclePeerTransportDirectory::new(node_id, local_transport, remote_transport);
+        let peer_transports = Arc::new(OraclePeerTransportDirectory::new(
+            node_id,
+            local_transport,
+            remote_transport,
+        ));
         let oracle_spill_root = prepare_oracle_spill_root(spill_root)?;
         let spill_runtime =
             match OracleSpillRuntime::new(&oracle_spill_root, resource_plan.scratch_limit_bytes) {
@@ -1820,6 +1823,7 @@ impl<'a> OracleRoleBuilder<'a> {
             tails: Arc::new(TailTransportDirectory::default()),
             audit: audit.clone(),
             peer_ticket_minter,
+            reservations,
             stage_authority: Some(stage_authority),
             peer_tls,
             peer_credentials: Some(Arc::clone(&peer_credentials)),

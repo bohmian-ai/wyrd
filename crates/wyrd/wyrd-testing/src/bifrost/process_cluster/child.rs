@@ -567,7 +567,6 @@ impl ChildConfig {
                     uuid::Uuid::now_v7(),
                 ),
             snapshot_digest: format!("snapshot-{}", uuid::Uuid::now_v7().simple()),
-            reservation_id: format!("reservation-{}", uuid::Uuid::now_v7().simple()),
             permission_digest: format!("permission-{}", uuid::Uuid::now_v7().simple()),
         };
         let mut stream = engine

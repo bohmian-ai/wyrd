@@ -95,7 +95,6 @@ fn attempt_context() -> AnalyticalAttemptContext {
         public_query_id: PublicQueryId::from_uuid(uuid::Uuid::now_v7()),
         datafusion_query_id: DataFusionQueryId::from_uuid(uuid::Uuid::now_v7()),
         snapshot_digest: format!("snapshot-{}", uuid::Uuid::now_v7().simple()),
-        reservation_id: format!("reservation-{}", uuid::Uuid::now_v7().simple()),
         permission_digest: format!("permission-{}", uuid::Uuid::now_v7().simple()),
     }
 }

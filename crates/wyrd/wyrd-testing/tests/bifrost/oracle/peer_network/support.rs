@@ -325,6 +325,7 @@ impl ReservationPlane {
             )
             .unwrap_or_default(),
             ticket: None,
+            graph: None,
         }
     }
 }

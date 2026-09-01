@@ -2407,6 +2407,28 @@ pub struct ReserveNodeSlotsRequest {
     pub slot_units: u32,
     /// Reservation expiry.
     pub expires_at: DateTime<Utc>,
+    /// Distributed Analytical graph this reservation is taken for.
+    ///
+    /// Present only for a graph reservation. A fragment reservation leaves it
+    /// absent, which is what keeps the two purposes distinguishable on one
+    /// wire: a follower charges a whole query envelope for a graph and a
+    /// worker quantum for a fragment, and it must not charge either for the
+    /// other.
+    pub graph: Option<AnalyticalGraphRef>,
+}
+
+/// The two-identity name of one distributed Analytical graph.
+///
+/// Carried on the private peer wire so a follower can bind a reservation, and
+/// later a graph lease, to the exact graph the leader named rather than to
+/// whichever graph happens to arrive first under that reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct AnalyticalGraphRef {
+    /// Public query identity the graph answers.
+    pub public_query_id: uuid::Uuid,
+    /// `DataFusion` query identity the graph executes under.
+    pub datafusion_query_id: uuid::Uuid,
 }
 
 /// Accepted pending worker reservation.

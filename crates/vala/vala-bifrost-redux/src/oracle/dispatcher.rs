@@ -17,10 +17,10 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
-    BifrostSecurityViolationKind, ExecuteFragmentRequest, FencingToken, NodeId, OracleRoleFence,
-    PendingNodeReservation, QueryAuditDigest, QueryClass, QueryId, ReleaseNodeSlotsRequest,
-    ReservationId, ReservationRejected, ReserveNodeSlotsRequest, ReserveNodeSlotsResponse,
-    WorkerAttemptFrame, WorkerFooter, WorkerScanStats,
+    AnalyticalGraphRef, BifrostSecurityViolationKind, ExecuteFragmentRequest, FencingToken, NodeId,
+    OracleRoleFence, PendingNodeReservation, QueryAuditDigest, QueryClass, QueryId,
+    ReleaseNodeSlotsRequest, ReservationId, ReservationRejected, ReserveNodeSlotsRequest,
+    ReserveNodeSlotsResponse, WorkerAttemptFrame, WorkerFooter, WorkerScanStats,
 };
 use wyrd_tonic::prost::Message;
 use wyrd_tonic::tonic::metadata::MetadataValue;
@@ -197,16 +197,148 @@ struct PendingReservation {
     /// Leader-local work reuses the already-admitted query capacity and keeps
     /// this empty.
     permit: Option<OwnedSemaphorePermit>,
-    /// Remote-worker memory lease granted at reservation and held until execute
-    /// or release.
+    /// Memory this node charged when it accepted the reservation, and the
+    /// purpose it charged it for.
     ///
     /// The running-slot semaphore alone is not a sufficient capacity answer: it
-    /// counts peer fragments and is blind to the leader-side query envelopes
+    /// counts peer work and is blind to the leader-side query envelopes
     /// competing for the same node's Oracle memory budget. Charging the memory
     /// governor here is what makes an accepted reservation a real guarantee on a
     /// node that is simultaneously serving its own queries. Leader-local work
     /// reuses the admitted query's pool and keeps this empty.
-    worker_resources: Option<FollowerWorkerResources>,
+    capacity: Option<ReservedCapacity>,
+    /// Graph this reservation may only ever be leased to, when it names one.
+    graph: Option<AnalyticalGraphRef>,
+}
+
+/// What a follower charged when it accepted one reservation.
+///
+/// The two purposes are different quantities of the same budget, and neither
+/// may be spent as the other: a fragment charges one worker quantum released
+/// when its attempt stream ends, while a distributed Analytical graph charges a
+/// whole query envelope — pool, partitions, and scratch — owned by the graph
+/// lease for as long as the graph lives.
+#[derive(Debug)]
+pub(crate) enum ReservedCapacity {
+    /// Worker quantum a single dispatched fragment executes under.
+    Fragment(FollowerWorkerResources),
+    /// Query envelope one distributed Analytical graph executes under.
+    Graph(Box<crate::resources::OracleQueryResources>),
+}
+
+/// Everything a follower must prove before one reservation becomes a graph.
+///
+/// A graph lease is the largest thing a peer can be talked into charging, so
+/// the reservation must have been taken for exactly this query and exactly this
+/// graph before its envelope changes owner. Nothing here is read from the wire
+/// framing; the caller projects every field from verified stage claims.
+///
+/// The reservation's leader identity and fence are deliberately not re-derived
+/// here. They were checked when the reservation was accepted, and the
+/// coordinator that presents the first stage message for a graph is not always
+/// the leader — a follower running a middle stage is itself a coordinator and
+/// legitimately signs under its own identity. The stage ticket independently
+/// binds the presenting principal, this follower's node identity, and its
+/// current role fence before this is ever reached.
+#[derive(Debug, Clone, Copy)]
+pub struct GraphLeaseRequest {
+    /// Reservation the leader took on this node for this graph.
+    pub reservation_id: ReservationId,
+    /// Exact graph the reservation was taken for.
+    pub graph: AnalyticalGraphRef,
+    /// Query identity the reservation was bound to.
+    pub query_id: QueryId,
+}
+
+/// One follower's exact, graph-qualified ownership of a reserved query envelope.
+///
+/// A graph lease is activated once, by whichever authorized stage method for
+/// the graph arrives first, and is then reused by every coordinator channel,
+/// task, stream, cache entry, and the optional retry. Reuse is what makes it a
+/// lease rather than a grant: the envelope is charged exactly once no matter
+/// how many stage messages address the graph.
+///
+/// The lease holds the running permit for the graph's whole life. The admitted
+/// [`crate::resources::OracleQueryResources`] envelope is taken out exactly
+/// once, by the follower that registers the graph with its supervisor, because
+/// the supervisor's graph guard is what releases the envelope when the graph
+/// ends.
+#[derive(Debug)]
+pub struct GraphLease {
+    /// Graph this lease is the sole follower-local owner of.
+    graph: AnalyticalGraphRef,
+    /// Reservation this lease was atomically transferred from.
+    reservation_id: ReservationId,
+    /// Query identity every reusing caller must still match.
+    query_id: QueryId,
+    /// Leader identity the reservation was accepted under.
+    leader_node_id: NodeId,
+    /// Leader fence the reservation was accepted under.
+    leader_fencing_token: FencingToken,
+    /// Admission class this graph was charged under.
+    query_class: QueryClass,
+    /// Reserved query envelope, moved out once by the registering follower.
+    resources: Mutex<Option<Box<crate::resources::OracleQueryResources>>>,
+    /// Running permit charged at reservation and held for the graph's life.
+    permit: Mutex<Option<OwnedSemaphorePermit>>,
+}
+
+impl GraphLease {
+    /// Returns the graph this lease exclusively owns.
+    #[must_use]
+    pub fn graph(&self) -> AnalyticalGraphRef {
+        self.graph
+    }
+
+    /// Returns the reservation this lease was transferred from.
+    #[must_use]
+    pub fn reservation_id(&self) -> ReservationId {
+        self.reservation_id
+    }
+
+    /// Returns the admission class this graph's envelope was charged under.
+    #[must_use]
+    pub fn query_class(&self) -> QueryClass {
+        self.query_class
+    }
+
+    /// Takes the reserved query envelope, exactly once.
+    ///
+    /// Returns `None` on every later call. The first caller is the follower
+    /// that registers the graph with its supervisor, which then owns the
+    /// envelope's release; a second taker would mean two owners for one charge.
+    #[must_use]
+    pub fn take_resources(&self) -> Option<Box<crate::resources::OracleQueryResources>> {
+        self.resources.lock().ok().and_then(|mut held| held.take())
+    }
+
+    /// Returns the leader identity the reservation behind this lease was accepted under.
+    #[must_use]
+    pub fn leader_node_id(&self) -> NodeId {
+        self.leader_node_id
+    }
+
+    /// Returns the leader fence the reservation behind this lease was accepted under.
+    #[must_use]
+    pub fn leader_fencing_token(&self) -> FencingToken {
+        self.leader_fencing_token
+    }
+
+    /// Reports whether the ownership tuple of `request` matches this lease.
+    fn matches(&self, request: &GraphLeaseRequest) -> bool {
+        self.reservation_id == request.reservation_id
+            && self.graph == request.graph
+            && self.query_id == request.query_id
+    }
+}
+
+impl Drop for GraphLease {
+    /// Releases the graph's running permit when its last holder goes away.
+    fn drop(&mut self) {
+        if let Ok(mut permit) = self.permit.lock() {
+            drop(permit.take());
+        }
+    }
 }
 
 /// Running worker reservation retained through attempt-stream completion.
@@ -244,6 +376,15 @@ pub struct ReservationRegistry {
     capacity: usize,
     /// Role-scoped pending and running slot owner.
     slots: Arc<OracleSlotManager>,
+    /// Live graph leases keyed by the exact graph each one owns.
+    ///
+    /// Separate from `entries` because the two have different lifetimes: a
+    /// pending reservation is short-lived and expires, while a graph lease
+    /// lives for as long as the distributed plan does and is released only by
+    /// its owner. Keying by graph rather than by reservation is what makes
+    /// reuse work — every later stage message for the same graph finds the same
+    /// lease without knowing which message activated it.
+    graph_leases: Mutex<HashMap<AnalyticalGraphRef, Arc<GraphLease>>>,
     /// Cumulative count of successful pending-to-running admissions on this peer.
     ///
     /// Incremented only in `take_for_execute`'s success arm — the remote-worker
@@ -256,6 +397,15 @@ pub struct ReservationRegistry {
     /// field, cost, or behavior exists on the production path.
     #[cfg(feature = "test-support")]
     admitted_running_total: core::sync::atomic::AtomicU64,
+    /// Cumulative count of graph leases this node activated from a reservation.
+    ///
+    /// Incremented only on the first activation for a graph, never on reuse, so
+    /// an integration test can assert the exactness the lease claims: one
+    /// distributed plan charges one envelope on each follower regardless of how
+    /// many stage messages, tasks, or retries address it. `test-support`-gated;
+    /// no field, cost, or behavior exists on the production path.
+    #[cfg(feature = "test-support")]
+    graph_leases_activated_total: core::sync::atomic::AtomicU64,
 }
 
 impl ReservationRegistry {
@@ -266,8 +416,11 @@ impl ReservationRegistry {
             entries: Mutex::new(HashMap::new()),
             capacity,
             slots,
+            graph_leases: Mutex::new(HashMap::new()),
             #[cfg(feature = "test-support")]
             admitted_running_total: core::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "test-support")]
+            graph_leases_activated_total: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -296,7 +449,7 @@ impl ReservationRegistry {
         &self,
         request: &ReserveNodeSlotsRequest,
         now: DateTime<Utc>,
-        worker_resources: Option<FollowerWorkerResources>,
+        capacity: Option<ReservedCapacity>,
     ) -> Result<PendingNodeReservation, DispatchError> {
         if request.slot_units == 0 || request.expires_at <= now {
             return Err(DispatchError::Terminal);
@@ -322,7 +475,7 @@ impl ReservationRegistry {
             );
             return Err(DispatchError::Capacity);
         };
-        self.insert(request, now, Some(permit), worker_resources)
+        self.insert(request, now, Some(permit), capacity)
     }
 
     /// Reserves tuple-bound leader-local work under admitted query capacity.
@@ -352,7 +505,7 @@ impl ReservationRegistry {
         request: &ReserveNodeSlotsRequest,
         now: DateTime<Utc>,
         permit: Option<OwnedSemaphorePermit>,
-        worker_resources: Option<FollowerWorkerResources>,
+        capacity: Option<ReservedCapacity>,
     ) -> Result<PendingNodeReservation, DispatchError> {
         if request.slot_units == 0 || request.expires_at <= now {
             return Err(DispatchError::Terminal);
@@ -374,7 +527,7 @@ impl ReservationRegistry {
         let expires_at = request.expires_at.min(now + PENDING_TTL);
         entries.insert(
             reservation_id,
-            pending_reservation(request, expires_at, permit, worker_resources),
+            pending_reservation(request, expires_at, permit, capacity),
         );
         Ok(PendingNodeReservation {
             reservation_id,
@@ -439,10 +592,18 @@ impl ReservationRegistry {
         let mut entry = entries
             .remove(&reservation_id)
             .ok_or(DispatchError::Terminal)?;
+        // A graph reservation is not spendable here. Its envelope belongs to
+        // the graph lease, and letting a fragment consume it would leave the
+        // graph executing on capacity nothing owns.
+        let worker_resources = match entry.capacity.take() {
+            Some(ReservedCapacity::Fragment(resources)) => Some(resources),
+            Some(ReservedCapacity::Graph(_)) => return Err(DispatchError::Terminal),
+            None => None,
+        };
         let result = Ok(RunningReservation {
             query_class,
             permit: entry.permit.take(),
-            worker_resources: entry.worker_resources.take(),
+            worker_resources,
         });
         #[cfg(feature = "test-support")]
         self.admitted_running_total
@@ -499,6 +660,117 @@ impl ReservationRegistry {
         })
     }
 
+    /// Atomically transfers one reservation into ownership of its named graph.
+    ///
+    /// This is the only path from a reservation to a graph envelope. The first
+    /// authorized stage method for a graph activates the lease; every later
+    /// one — another coordinator channel, another task, a cached stream, the
+    /// optional retry — receives the same lease without reacquiring anything.
+    /// Reuse still re-checks the complete ownership tuple, so a second graph
+    /// cannot ride in on a lease the first one activated.
+    ///
+    /// Activation refuses before any worker, cache, or provider IO when the
+    /// reservation is missing, expired, or was taken for a different query,
+    /// leader, fence, or graph — or for no graph at all, which is a fragment
+    /// reservation whose worker quantum is far smaller than a graph envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DispatchError::Terminal`] for a missing, expired, mismatched,
+    /// or non-graph reservation, and [`DispatchError::Unavailable`] when an
+    /// ownership lock is poisoned.
+    #[tracing::instrument(name = "bifrost.oracle.graph_lease", skip_all)]
+    pub fn lease_graph(
+        &self,
+        request: &GraphLeaseRequest,
+        now: DateTime<Utc>,
+    ) -> Result<Arc<GraphLease>, DispatchError> {
+        let mut leases = self
+            .graph_leases
+            .lock()
+            .map_err(|_| DispatchError::Unavailable)?;
+        if let Some(live) = leases.get(&request.graph) {
+            if !live.matches(request) {
+                return Err(DispatchError::Terminal);
+            }
+            return Ok(Arc::clone(live));
+        }
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| DispatchError::Unavailable)?;
+        retain_live(&mut entries, now);
+        let entry = entries
+            .get(&request.reservation_id)
+            .ok_or(DispatchError::Terminal)?;
+        if entry.query_id != request.query_id || entry.graph != Some(request.graph) {
+            return Err(DispatchError::Terminal);
+        }
+        let leader_node_id = entry.leader_node_id;
+        let leader_fencing_token = entry.leader_fencing_token;
+        let mut entry = entries
+            .remove(&request.reservation_id)
+            .ok_or(DispatchError::Terminal)?;
+        // Only a graph reservation may become a graph. A fragment reservation
+        // charged one worker quantum, which cannot pay for a whole plan.
+        let Some(ReservedCapacity::Graph(resources)) = entry.capacity.take() else {
+            return Err(DispatchError::Terminal);
+        };
+        let lease = Arc::new(GraphLease {
+            graph: request.graph,
+            reservation_id: request.reservation_id,
+            query_id: request.query_id,
+            leader_node_id,
+            leader_fencing_token,
+            query_class: entry.query_class,
+            resources: Mutex::new(Some(resources)),
+            permit: Mutex::new(entry.permit.take()),
+        });
+        leases.insert(request.graph, Arc::clone(&lease));
+        #[cfg(feature = "test-support")]
+        self.graph_leases_activated_total
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        tracing::debug!(
+            public_query_id = %request.graph.public_query_id,
+            datafusion_query_id = %request.graph.datafusion_query_id,
+            "Oracle graph lease activated from its reservation"
+        );
+        Ok(lease)
+    }
+
+    /// Drops this node's lease on one graph, exactly once.
+    ///
+    /// Returns whether a lease was actually held, so a caller releasing on a
+    /// terminal, cancellation, timeout, or shutdown path can tell a real
+    /// release from a repeat and never double-release the same charge.
+    pub fn release_graph(&self, graph: AnalyticalGraphRef) -> bool {
+        self.graph_leases
+            .lock()
+            .is_ok_and(|mut leases| leases.remove(&graph).is_some())
+    }
+
+    /// Returns the cumulative count of graph leases activated on this node.
+    ///
+    /// Integration-only observable. Counts activations, never reuse, so a test
+    /// can assert that one distributed plan charged one envelope per follower.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn graph_leases_activated_total(&self) -> u64 {
+        self.graph_leases_activated_total
+            .load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Returns the number of graph leases this node still holds.
+    ///
+    /// Integration-only observable used to assert that success, mismatch,
+    /// expiry, cancellation, timeout, and shutdown all return the follower to
+    /// its baseline.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn live_graph_leases(&self) -> usize {
+        self.graph_leases.lock().map_or(0, |leases| leases.len())
+    }
+
     /// Reclaims expired pending reservations and returns the number still held.
     #[must_use]
     pub fn cleanup_expired(&self, now: DateTime<Utc>) -> usize {
@@ -514,7 +786,7 @@ fn pending_reservation(
     request: &ReserveNodeSlotsRequest,
     expires_at: DateTime<Utc>,
     permit: Option<OwnedSemaphorePermit>,
-    worker_resources: Option<FollowerWorkerResources>,
+    capacity: Option<ReservedCapacity>,
 ) -> PendingReservation {
     PendingReservation {
         query_id: request.query_id,
@@ -523,7 +795,8 @@ fn pending_reservation(
         query_class: request.query_class,
         expires_at,
         permit,
-        worker_resources,
+        capacity,
+        graph: request.graph,
     }
 }
 
@@ -728,11 +1001,10 @@ impl OraclePeerWorker {
             // Charge the memory governor here, alongside the running slot, so a
             // node already saturated by its own leader-side queries refuses
             // before the leader commits to this participant rather than after.
-            let attempt = match self.acquire_worker_resources(request.query_class) {
-                Ok(worker_resources) => {
-                    self.reservations
-                        .reserve(request, Utc::now(), Some(worker_resources))
-                }
+            let attempt = match self.acquire_reserved_capacity(request) {
+                Ok(capacity) => self
+                    .reservations
+                    .reserve(request, Utc::now(), Some(capacity)),
                 Err(error) => {
                     // The slot path emits its own structured rejection; without
                     // this arm a memory-bound refusal would be invisible, and the
@@ -1143,17 +1415,32 @@ impl OraclePeerWorker {
     ///
     /// Returns [`DispatchError::Capacity`] when the configured Oracle resources
     /// cannot admit the remote worker quantum.
-    fn acquire_worker_resources(
+    fn acquire_reserved_capacity(
         &self,
-        query_class: QueryClass,
-    ) -> Result<FollowerWorkerResources, DispatchError> {
-        let class = match query_class {
+        request: &ReserveNodeSlotsRequest,
+    ) -> Result<ReservedCapacity, DispatchError> {
+        if request.graph.is_some() {
+            // A graph runs a whole distributed plan on this node — several
+            // stages, their exchanges, and their spill — so it charges a query
+            // envelope, not the single-fragment quantum below. The local ratio
+            // is zero because none of the leader's own scan work runs here.
+            return self
+                .oracle_resources
+                .try_acquire_query(crate::resources::OracleResourceRequest::for_class(
+                    request.query_class,
+                    0.0,
+                ))
+                .map(|envelope| ReservedCapacity::Graph(Box::new(envelope)))
+                .map_err(|_| DispatchError::Capacity);
+        }
+        let class = match request.query_class {
             QueryClass::Interactive => crate::resources::OracleWorkerClass::Interactive,
             QueryClass::Analytical => crate::resources::OracleWorkerClass::Analytical,
         };
         self.oracle_resources
             .try_acquire_worker(class)
             .map(FollowerWorkerResources::Oracle)
+            .map(ReservedCapacity::Fragment)
             .map_err(|_| DispatchError::Capacity)
     }
 
@@ -2540,6 +2827,33 @@ impl OraclePeerTransportDirectory {
         }
     }
 
+    /// Reserves one participant's whole query envelope for a distributed graph.
+    ///
+    /// This is the Analytical leader's only reservation entry point. It refuses
+    /// a request that names no graph rather than silently taking a fragment's
+    /// worker quantum, because the two charges are different sizes and a graph
+    /// admitted on a fragment's quantum would execute a whole plan on capacity
+    /// sized for one leaf.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DispatchError::Terminal`] when `request` names no graph,
+    /// [`DispatchError::Capacity`] when the participant declined, and the
+    /// selected adapter's failure otherwise.
+    pub async fn reserve_graph(
+        &self,
+        candidate: &DispatchCandidate,
+        request: ReserveNodeSlotsRequest,
+    ) -> Result<PendingNodeReservation, DispatchError> {
+        if request.graph.is_none() {
+            return Err(DispatchError::Terminal);
+        }
+        match self.reserve(candidate, request).await? {
+            ReserveNodeSlotsResponse::Pending(pending) => Ok(pending),
+            ReserveNodeSlotsResponse::Rejected(_) => Err(DispatchError::Capacity),
+        }
+    }
+
     /// Releases through the same identity-selected adapter used for reserve.
     ///
     /// # Errors
@@ -2751,7 +3065,11 @@ pub struct FragmentDispatcher {
     /// Narrow server-owned authority used to mint a fresh ticket per attempt.
     ticket_minter: Arc<dyn PeerTicketMinter>,
     /// Node-aware directory enforcing in-process leader and tonic remote routing.
-    transports: OraclePeerTransportDirectory,
+    ///
+    /// Shared rather than owned: the Analytical leader reserves its graph
+    /// participants through the same directory, so both paths route through one
+    /// identity-selected set of adapters.
+    transports: Arc<OraclePeerTransportDirectory>,
 }
 
 impl FragmentDispatcher {
@@ -2759,7 +3077,7 @@ impl FragmentDispatcher {
     #[must_use]
     pub fn new(
         ticket_minter: Arc<dyn PeerTicketMinter>,
-        transports: OraclePeerTransportDirectory,
+        transports: Arc<OraclePeerTransportDirectory>,
     ) -> Self {
         Self {
             ticket_minter,
@@ -2845,6 +3163,9 @@ impl FragmentDispatcher {
                 query_class: context.query_class,
                 slot_units: context.slot_units,
                 expires_at,
+                // Fragment dispatch names no graph: it charges a worker
+                // quantum, not the whole query envelope a graph lease owns.
+                graph: None,
             };
             let Some(pending) = self.reserve_candidate(candidate, reserve, context).await? else {
                 continue;
@@ -3983,6 +4304,7 @@ mod tests {
             query_class: QueryClass::Interactive,
             slot_units: 1,
             expires_at,
+            graph: None,
         }
     }
 
@@ -4005,6 +4327,7 @@ mod tests {
             query_class: QueryClass::Analytical,
             slot_units: 2,
             expires_at,
+            graph: None,
         }
     }
 
@@ -4933,11 +5256,11 @@ mod tests {
             Arc::new(DeterministicTestSigner {
                 key_id: "test".to_owned(),
             }),
-            OraclePeerTransportDirectory::new_for_test(
+            Arc::new(OraclePeerTransportDirectory::new_for_test(
                 leader,
                 transport.clone(),
                 transport.clone(),
-            ),
+            )),
         );
         let first = NodeId::new(uuid::Uuid::from_u128(2));
         let second = NodeId::new(uuid::Uuid::from_u128(3));
@@ -4993,11 +5316,11 @@ mod tests {
         });
         let dispatcher = FragmentDispatcher::new(
             Arc::new(FailingTicketMinter),
-            OraclePeerTransportDirectory::new_for_test(
+            Arc::new(OraclePeerTransportDirectory::new_for_test(
                 leader,
                 transport.clone(),
                 transport.clone(),
-            ),
+            )),
         );
         let fragment = physical_dispatch_fragment("fragment");
         let context = DispatchContext {
@@ -5061,11 +5384,11 @@ mod tests {
             Arc::new(DeterministicTestSigner {
                 key_id: "test".to_owned(),
             }),
-            OraclePeerTransportDirectory::new_for_test(
+            Arc::new(OraclePeerTransportDirectory::new_for_test(
                 leader,
                 transport.clone(),
                 transport.clone(),
-            ),
+            )),
         );
         let fragment = physical_dispatch_fragment("stalled");
         let context = DispatchContext {

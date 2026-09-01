@@ -654,8 +654,12 @@ impl TryFrom<proto::ReserveNodeSlotsRequest> for domain::ReserveNodeSlotsRequest
 
 impl From<domain::ReserveNodeSlotsRequest> for proto::ReserveNodeSlotsRequest {
     /// Encodes a validated Oracle capacity-reservation request.
+    ///
+    /// The purpose ticket is deliberately absent here: it binds the digest of
+    /// this encoding, so the leader's transport stamps it after conversion.
     fn from(value: domain::ReserveNodeSlotsRequest) -> Self {
         Self {
+            ticket: None,
             query_id: value.query_id.as_uuid().as_bytes().to_vec(),
             leader_node_id: value.leader_node_id.as_uuid().to_string(),
             leader_fencing_token: value.leader_fencing_token,
@@ -751,8 +755,12 @@ impl TryFrom<proto::ReleaseNodeSlotsRequest> for domain::ReleaseNodeSlotsRequest
 
 impl From<domain::ReleaseNodeSlotsRequest> for proto::ReleaseNodeSlotsRequest {
     /// Encodes the complete fenced identity of a reservation release.
+    ///
+    /// The purpose ticket is stamped by the leader's transport after this
+    /// conversion, because it binds the digest of this encoding.
     fn from(value: domain::ReleaseNodeSlotsRequest) -> Self {
         Self {
+            ticket: None,
             reservation_id: value.reservation_id.as_uuid().as_bytes().to_vec(),
             query_id: value.query_id.as_uuid().as_bytes().to_vec(),
             leader_node_id: value.leader_node_id.as_uuid().to_string(),
@@ -1585,6 +1593,7 @@ mod tests {
             query_class: 0,
             slot_units: 1,
             expires_at_unix_ms: 1,
+            ticket: None,
         };
         assert!(matches!(
             domain::ReserveNodeSlotsRequest::try_from(request),
@@ -1600,6 +1609,7 @@ mod tests {
             query_id: uuid::Uuid::now_v7().as_bytes().to_vec(),
             leader_node_id: uuid::Uuid::now_v7().to_string(),
             leader_fencing_token: 1,
+            ticket: None,
         };
         assert!(matches!(
             domain::ReleaseNodeSlotsRequest::try_from(request),

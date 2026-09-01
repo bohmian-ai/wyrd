@@ -23,6 +23,7 @@ use vala_bifrost_redux::oracle::dispatcher::{
     BifrostPeerTls, LocalOraclePeerTransport, OraclePeerCredentials, OraclePeerTransportDirectory,
     OraclePeerWorker, OraclePeerWorkerConfig, ReservationRegistry, TonicOraclePeerTransport,
 };
+use vala_bifrost_redux::oracle::peer::ReservationTicketMinter;
 use vala_bifrost_redux::oracle::{
     Oracle as OracleEngine, OracleBuildConfig, OracleConfig, OracleMemoryResources,
     OracleSlotManager, OracleSpillRuntime, TailTransportDirectory,
@@ -1699,18 +1700,24 @@ impl<'a> OracleRoleBuilder<'a> {
                 "Oracle peer credential lacks platform service authority".to_owned(),
             ));
         }
-        let remote_transport = Arc::new(if let Some(tls) = tail_tls.clone() {
-            TonicOraclePeerTransport::with_credentials_and_tls(
-                Arc::clone(&cluster),
-                Arc::clone(&peer_credentials),
-                tls,
-            )
-        } else {
-            TonicOraclePeerTransport::with_credentials(
-                Arc::clone(&cluster),
-                Arc::clone(&peer_credentials),
-            )
-        });
+        let remote_transport = Arc::new(
+            if let Some(tls) = tail_tls.clone() {
+                TonicOraclePeerTransport::with_credentials_and_tls(
+                    Arc::clone(&cluster),
+                    Arc::clone(&peer_credentials),
+                    tls,
+                )
+            } else {
+                TonicOraclePeerTransport::with_credentials(
+                    Arc::clone(&cluster),
+                    Arc::clone(&peer_credentials),
+                )
+            }
+            // The same authority that verifies inbound reservation tickets
+            // signs the outbound ones, so a node cannot mint authority it would
+            // not itself accept.
+            .with_reservation_minter(Arc::clone(&authority) as Arc<dyn ReservationTicketMinter>),
+        );
         let lifecycle_transport = Arc::new(if let Some(tls) = tail_tls.clone() {
             crate::oracle::OracleLifecycleTransport::with_tls(
                 Arc::clone(&cluster),
@@ -1736,9 +1743,10 @@ impl<'a> OracleRoleBuilder<'a> {
                 .await
                 .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
         );
-        let tail_authority = Arc::new(
-            crate::oracle::ScribeTailAuthority::from_keyring(Arc::clone(&peer_keyring), tail_audit),
-        );
+        let tail_authority = Arc::new(crate::oracle::ScribeTailAuthority::from_keyring(
+            Arc::clone(&peer_keyring),
+            tail_audit,
+        ));
         let tail_discovery = Arc::new(crate::oracle::RegistryTailStreamDiscovery::new(
             Arc::clone(&cluster),
             Arc::clone(&peer_credentials),
@@ -1753,7 +1761,7 @@ impl<'a> OracleRoleBuilder<'a> {
         let stage_authority: Arc<dyn vala_bifrost_redux::oracle::peer::OracleStageAuthority> =
             authority.clone();
         let peer_ticket_minter: Arc<dyn vala_bifrost_redux::oracle::peer::PeerTicketMinter> =
-            authority;
+            authority.clone();
         let role = cluster
             .reserve_oracle(advertise_addr, capabilities)
             .await
@@ -1782,6 +1790,7 @@ impl<'a> OracleRoleBuilder<'a> {
             Arc::clone(&worker),
             Arc::clone(&security_audit),
             lifecycle_transport,
+            Arc::clone(&authority),
         ));
         let local_transport = Arc::new(LocalOraclePeerTransport::new(worker));
         let peer_transports =

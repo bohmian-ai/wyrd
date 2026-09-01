@@ -85,6 +85,8 @@ pub struct OraclePeerRuntime {
     security_audit: Arc<PostgresPeerSecurityAudit>,
     /// Canonical authenticated client retained for lifecycle control fanout.
     lifecycle_transport: Arc<OracleLifecycleTransport>,
+    /// Peer ticket authority verifying reservation purpose tickets.
+    authority: Arc<OraclePeerAuthority>,
 }
 
 impl OraclePeerRuntime {
@@ -94,12 +96,20 @@ impl OraclePeerRuntime {
         worker: Arc<OraclePeerWorker>,
         security_audit: Arc<PostgresPeerSecurityAudit>,
         lifecycle_transport: Arc<OracleLifecycleTransport>,
+        authority: Arc<OraclePeerAuthority>,
     ) -> Self {
         Self {
             worker,
             security_audit,
             lifecycle_transport,
+            authority,
         }
+    }
+
+    /// Returns the authority the private adapter verifies purpose tickets with.
+    #[must_use]
+    pub fn authority(&self) -> &Arc<OraclePeerAuthority> {
+        &self.authority
     }
 }
 

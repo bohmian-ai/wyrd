@@ -10,7 +10,10 @@ use vala_bifrost_redux::oracle::dispatcher::{
 use vala_bifrost_redux::oracle::follower::{
     AuthenticatedFollowerContext, PhysicalPlanFollowerError, authenticated_preflight,
 };
-use vala_bifrost_redux::oracle::peer::{PeerSecurityAudit, PeerTicketClaims, PeerTicketVerifier};
+use vala_bifrost_redux::oracle::peer::{
+    PeerSecurityAudit, PeerTicketClaims, PeerTicketVerifier, ReservationBinding,
+    ReservationOperationV1,
+};
 use wyrd_spec::vala::api::BifrostSecurityViolationKind;
 use wyrd_spec::vala::api::{ClusterRole, ExecuteFragmentRequest};
 use wyrd_tonic::private_conversion::PrivateConversionError;
@@ -74,6 +77,71 @@ impl OraclePeerGrpc {
             .scribe()
             .map(|scribe| scribe.fragment_security_audit())
             .ok_or_else(|| Status::unavailable("Bifrost peer capability is not configured"))
+    }
+
+    /// Authorizes one reservation operation before any capacity state changes.
+    ///
+    /// The ticket is detached from the request first, so the digest is taken
+    /// over exactly the encoding the leader signed: the request with its ticket
+    /// field cleared. Everything the follower compares against — its own node
+    /// identity, its own current fence, the leader identity the cluster
+    /// confirmed live — is derived here rather than read from the message.
+    ///
+    /// # Errors
+    ///
+    /// Returns `FailedPrecondition` when no Oracle role owns this node's
+    /// reservation authority, `Unauthenticated` when no ticket is presented,
+    /// and `PermissionDenied` for a ticket that is malformed, misbound,
+    /// expired, or replayed. The refusal is durably audited before it returns;
+    /// an audit that cannot commit surfaces as `Unavailable`.
+    async fn authorize_reservation<T: Message>(
+        &self,
+        operation: ReservationOperationV1,
+        ticket_free: &T,
+        ticket: Option<proto::SignedPeerTicket>,
+        leader_node_id: wyrd_spec::vala::api::NodeId,
+        leader_fence: u64,
+        query_id: uuid::Uuid,
+    ) -> Result<(), Status> {
+        let oracle = self
+            .bifrost
+            .oracle()
+            .ok_or_else(|| Status::failed_precondition("Oracle role is not configured"))?;
+        let Some(ticket) = ticket else {
+            self.audit_denial(BifrostSecurityViolationKind::PeerSignature)
+                .await?;
+            return Err(Status::unauthenticated(
+                "Bifrost peer reservation ticket is absent",
+            ));
+        };
+        let ticket = wyrd_spec::vala::api::SignedPeerTicket::try_from(ticket)
+            .map_err(|_| Status::permission_denied("Bifrost peer reservation ticket is invalid"))?;
+        let registered = oracle.registered_role();
+        let binding = ReservationBinding {
+            operation,
+            source_node_id: leader_node_id,
+            source_fence: leader_fence,
+            destination_node_id: registered.key.node_id,
+            destination_fence: registered.fencing_token,
+            query_id,
+        };
+        oracle
+            .peer()
+            .authority()
+            .verify_reservation(
+                &ticket,
+                &binding,
+                &ticket_free.encode_to_vec(),
+                chrono::Utc::now(),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| match error {
+                vala_bifrost_redux::oracle::peer::PeerSecurityError::AuditUnavailable => {
+                    Status::unavailable("Bifrost peer security audit unavailable")
+                }
+                _ => Status::permission_denied("Bifrost peer reservation is not authorized"),
+            })
     }
 
     /// Executes one Scribe-targeted physical fragment under Scribe's own fence and resources.
@@ -293,8 +361,13 @@ impl OraclePeerService for OraclePeerGrpc {
         request: Request<ReserveNodeSlotsRequest>,
     ) -> Result<Response<proto::ReserveNodeSlotsResponse>, Status> {
         peer_context(&request)?;
-        let request = wyrd_spec::vala::api::ReserveNodeSlotsRequest::try_from(request.into_inner())
+        let mut wire = request.into_inner();
+        let ticket = wire.ticket.take();
+        let request = wyrd_spec::vala::api::ReserveNodeSlotsRequest::try_from(wire.clone())
             .map_err(conversion_status)?;
+        // Fence liveness first, then the purpose ticket, and only then any
+        // capacity change: an unauthorized reserve must not charge the
+        // follower even transiently.
         if self
             .bifrost
             .oracle()
@@ -308,6 +381,15 @@ impl OraclePeerService for OraclePeerGrpc {
                 .await?;
             return Err(Status::permission_denied("Oracle peer fence is not live"));
         }
+        self.authorize_reservation(
+            ReservationOperationV1::ReserveSlots,
+            &wire,
+            ticket,
+            request.leader_node_id,
+            request.leader_fencing_token,
+            request.query_id.as_uuid(),
+        )
+        .await?;
         let worker = self
             .bifrost
             .oracle_peer_service()
@@ -325,8 +407,22 @@ impl OraclePeerService for OraclePeerGrpc {
         request: Request<ReleaseNodeSlotsRequest>,
     ) -> Result<Response<proto::ReleaseNodeSlotsResponse>, Status> {
         peer_context(&request)?;
-        let request = wyrd_spec::vala::api::ReleaseNodeSlotsRequest::try_from(request.into_inner())
+        let mut wire = request.into_inner();
+        let ticket = wire.ticket.take();
+        let request = wyrd_spec::vala::api::ReleaseNodeSlotsRequest::try_from(wire.clone())
             .map_err(conversion_status)?;
+        // A release is state-changing, so it is authorized on exactly the same
+        // terms as a reserve: a replayed release must not cancel capacity the
+        // leader has since re-taken.
+        self.authorize_reservation(
+            ReservationOperationV1::ReleaseSlots,
+            &wire,
+            ticket,
+            request.leader_node_id,
+            request.leader_fencing_token,
+            request.query_id.as_uuid(),
+        )
+        .await?;
         self.bifrost
             .oracle_peer_service()
             .ok_or_else(|| Status::failed_precondition("Oracle role is not configured"))?

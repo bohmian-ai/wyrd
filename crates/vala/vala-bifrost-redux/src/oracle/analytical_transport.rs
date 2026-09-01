@@ -1196,12 +1196,26 @@ impl WorkerChannel for AnalyticalWorkerChannel {
         Ok(partitions.into_iter().map(measured_exchange).collect())
     }
 
-    /// Delegates worker version discovery, which carries no stage identity.
+    /// Refuses worker version discovery, which Wyrd never performs.
+    ///
+    /// The call carries no graph identity, so it can be bound to no stage
+    /// ticket and authorized by nothing: the ingress path already refuses it as
+    /// an ungoverned method. Refusing it here too closes the other direction —
+    /// nothing inside Wyrd may originate it — so the method has no internal
+    /// caller rather than merely no successful one. Wyrd pins one worker build
+    /// across a topology, so there is nothing a follower could report that its
+    /// coordinator does not already know.
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`DataFusionError::Execution`].
     async fn get_worker_info(
         &mut self,
-        request: GetWorkerInfoRequest,
+        _request: GetWorkerInfoRequest,
     ) -> Result<GetWorkerInfoResponse, DataFusionError> {
-        self.inner.get_worker_info(request).await
+        Err(DataFusionError::Execution(
+            "Oracle analytical workers do not answer worker discovery".to_owned(),
+        ))
     }
 }
 

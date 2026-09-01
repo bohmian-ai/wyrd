@@ -7,8 +7,9 @@ use std::sync::Arc;
 use vala_bifrost_redux::oracle::peer::PeerReplayCache;
 use vala_bifrost_redux::oracle::peer::{
     AuthorizedStage, OracleStageAuthority, PeerSecurityAudit, PeerSecurityError, PeerTicketClaims,
-    PeerTicketMinter, PeerTicketVerifier, StageBinding, StageOperationV1, StageTicketClaims,
-    VerifiedClaimsBytes, stage_body_digest,
+    PeerTicketMinter, PeerTicketVerifier, ReservationBinding, ReservationOperationV1,
+    ReservationTicketClaims, StageBinding, StageOperationV1, StageTicketClaims,
+    VerifiedClaimsBytes, reservation_body_digest, stage_body_digest,
 };
 use vala_bifrost_redux::oracle::telemetry::{
     AnalyticalStageAuthorityOutcome, record_stage_authority,
@@ -27,6 +28,10 @@ const DOMAIN: &[u8] = b"wyrd.oracle.peer.v1\0";
 const FORWARD_QUERY_DOMAIN: &[u8] = b"wyrd.oracle.forward-query.v1\0";
 /// Hard cap applied before any claims bytes are decoded.
 const MAX_CLAIMS_BYTES: usize = 16 * 1024;
+/// Hard cap applied to reservation claims before decoding; a reservation ticket
+/// binds two fenced node identities, one query, and a body digest, so it is the
+/// narrowest of the private claim shapes.
+const MAX_RESERVATION_CLAIMS_BYTES: usize = 8 * 1024;
 /// Hard cap applied to stage claims before decoding; stage claims are wider
 /// than fragment claims because they bind two query identities, a stage, a
 /// task, an attempt, and a reservation on top of the peer fields.
@@ -465,11 +470,11 @@ impl OraclePeerAuthority {
     /// # Errors
     /// Returns [`PeerSecurityError::AuditUnavailable`] when the required row cannot commit;
     /// otherwise returns the original closed rejection.
-    async fn reject_unverified(
+    async fn reject_unverified<T>(
         &self,
         violation: BifrostSecurityViolationKind,
         error: PeerSecurityError,
-    ) -> Result<VerifiedClaimsBytes, PeerSecurityError> {
+    ) -> Result<T, PeerSecurityError> {
         self.security_audit
             .append_unverified_ticket_rejection(violation)
             .await
@@ -528,6 +533,22 @@ impl OracleStageAuthority for OraclePeerAuthority {
     }
 }
 
+impl vala_bifrost_redux::oracle::peer::ReservationTicketMinter for OraclePeerAuthority {
+    /// Signs one reservation ticket through the authority's own keyring.
+    ///
+    /// # Errors
+    ///
+    /// Returns the closed encoding or operation rejection from
+    /// [`OraclePeerAuthority::mint_reservation`].
+    fn mint_reservation_ticket(
+        &self,
+        operation: ReservationOperationV1,
+        claims: &ReservationTicketClaims,
+    ) -> Result<SignedPeerTicket, PeerSecurityError> {
+        self.mint_reservation(operation, claims)
+    }
+}
+
 #[async_trait::async_trait]
 impl PeerTicketVerifier for OraclePeerAuthority {
     /// Verifies one raw ticket through the server-owned Ed25519 authority.
@@ -568,6 +589,153 @@ fn signing_input(key_id: &str, claims: &[u8]) -> Vec<u8> {
 }
 
 impl OraclePeerAuthority {
+    /// Signs one single-use ticket for exactly one reservation operation.
+    ///
+    /// The signature is produced over the operation's own domain separator, so
+    /// a reserve ticket cannot be presented as a release ticket even with
+    /// identical claims bytes: the receiver checks the domain its own entry
+    /// point implements, not one named in the message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerSecurityError::Operation`] when the claims name a
+    /// different operation than the one being signed, and
+    /// [`PeerSecurityError::Encoding`] when the claims cannot be encoded or
+    /// exceed [`MAX_RESERVATION_CLAIMS_BYTES`].
+    pub fn mint_reservation(
+        &self,
+        operation: ReservationOperationV1,
+        claims: &ReservationTicketClaims,
+    ) -> Result<SignedPeerTicket, PeerSecurityError> {
+        if ReservationOperationV1::from_u32(claims.operation) != Some(operation) {
+            return Err(PeerSecurityError::Operation);
+        }
+        let mut claims_bytes = Vec::new();
+        Message::encode(claims, &mut claims_bytes).map_err(|_| PeerSecurityError::Encoding)?;
+        if claims_bytes.is_empty() || claims_bytes.len() > MAX_RESERVATION_CLAIMS_BYTES {
+            return Err(PeerSecurityError::Encoding);
+        }
+        let signature = self.keyring.sign(&signing_input_for(
+            operation.domain(),
+            self.keyring.active_key_id(),
+            &claims_bytes,
+        ));
+        Ok(SignedPeerTicket {
+            key_id: self.keyring.active_key_id().to_owned(),
+            claims_bytes,
+            signature,
+        })
+    }
+
+    /// Authorizes exactly one reservation operation before it changes state.
+    ///
+    /// The order is deliberate and is what makes the check meaningful: bounds,
+    /// then signature under the receiver's own operation domain, then the body
+    /// digest over the exact bytes received, then every bound identity against
+    /// the receiver-derived binding, then expiry, then single-use nonce
+    /// consumption. No reservation is taken or released before all of it
+    /// passes, so a replayed release cannot cancel capacity and a replayed
+    /// reserve cannot charge a follower twice.
+    ///
+    /// The body is the encoded request with its ticket field cleared, which is
+    /// what both sides digest; a substituted request carrying a valid ticket
+    /// therefore fails on the digest rather than on any downstream field.
+    ///
+    /// Rejections audit on the system chain: a reservation is a control-plane
+    /// operation between Oracles and binds no data tenant to attribute to.
+    ///
+    /// # Errors
+    ///
+    /// Returns the audited closed rejection for malformed, unknown-key,
+    /// wrong-domain, wrong-body, misbound, expired, or replayed tickets, and
+    /// [`PeerSecurityError::AuditUnavailable`] when the rejection itself cannot
+    /// be recorded.
+    pub async fn verify_reservation(
+        &self,
+        ticket: &SignedPeerTicket,
+        binding: &ReservationBinding,
+        body: &[u8],
+        now: DateTime<Utc>,
+    ) -> Result<ReservationTicketClaims, PeerSecurityError> {
+        if ticket.signature.len() != 64
+            || ticket.claims_bytes.is_empty()
+            || ticket.claims_bytes.len() > MAX_RESERVATION_CLAIMS_BYTES
+        {
+            return self
+                .reject_unverified(
+                    BifrostSecurityViolationKind::PeerSignature,
+                    PeerSecurityError::InvalidSignature,
+                )
+                .await;
+        }
+        if let Err(error) = self.keyring.verify(
+            &ticket.key_id,
+            &signing_input_for(
+                binding.operation.domain(),
+                &ticket.key_id,
+                &ticket.claims_bytes,
+            ),
+            &ticket.signature,
+            now,
+        ) {
+            let violation = match error {
+                PeerSecurityError::UnknownKey => BifrostSecurityViolationKind::PeerUnknownKey,
+                _ => BifrostSecurityViolationKind::PeerSignature,
+            };
+            return self.reject_unverified(violation, error).await;
+        }
+        let body_digest = match reservation_body_digest(body) {
+            Ok(digest) => digest,
+            Err(error) => {
+                return self
+                    .reject_unverified(BifrostSecurityViolationKind::PeerFragment, error)
+                    .await;
+            }
+        };
+        let Ok(claims) = ReservationTicketClaims::decode(ticket.claims_bytes.as_slice()) else {
+            return self
+                .reject_unverified(
+                    BifrostSecurityViolationKind::PeerSignature,
+                    PeerSecurityError::InvalidSignature,
+                )
+                .await;
+        };
+        if let Err(error) = claims.verify_binding(binding, &body_digest) {
+            let violation = match error {
+                PeerSecurityError::Audience => BifrostSecurityViolationKind::PeerAudience,
+                PeerSecurityError::Fence => BifrostSecurityViolationKind::PeerFence,
+                PeerSecurityError::Body => BifrostSecurityViolationKind::PeerFragment,
+                _ => BifrostSecurityViolationKind::PeerStageBinding,
+            };
+            return self.reject_unverified(violation, error).await;
+        }
+        let max_expiry = now
+            .checked_add_signed(self.max_ticket_ttl)
+            .ok_or(PeerSecurityError::Expired)?;
+        if claims.expires_at_ms <= now.timestamp_millis()
+            || claims.expires_at_ms > max_expiry.timestamp_millis()
+            || claims.nonce.len() < 16
+        {
+            return self
+                .reject_unverified(
+                    BifrostSecurityViolationKind::PeerReplay,
+                    PeerSecurityError::Expired,
+                )
+                .await;
+        }
+        let expires = chrono::DateTime::from_timestamp_millis(claims.expires_at_ms)
+            .ok_or(PeerSecurityError::Expired)?;
+        if let Err(error) = self
+            .replay
+            .consume(&ticket.key_id, &claims.nonce, expires, now)
+        {
+            return self
+                .reject_unverified(BifrostSecurityViolationKind::PeerReplay, error)
+                .await;
+        }
+        Ok(claims)
+    }
+
     /// Signs one single-use ticket for exactly one Analytical stage operation.
     ///
     /// The signature is produced over the operation's own domain separator, so
@@ -842,7 +1010,7 @@ fn stage_binding_violation(
 
 /// Builds a signing preimage for one closed private protocol domain.
 fn signing_input_for(domain: &[u8], key_id: &str, claims: &[u8]) -> Vec<u8> {
-    [domain, key_id.as_bytes(), claims].concat()
+    vala_bifrost_redux::oracle::peer::peer_signing_input(domain, key_id, claims)
 }
 
 #[cfg(test)]
@@ -937,6 +1105,84 @@ mod tests {
             OraclePeerAuthority::from_pem(&SecretString::from(PRIVATE_KEY_PEM), audit.clone())
                 .expect("authority");
         (authority, audit)
+    }
+
+    /// Builds the reservation binding every reservation test starts from.
+    fn reservation_binding() -> ReservationBinding {
+        ReservationBinding {
+            operation: ReservationOperationV1::ReserveSlots,
+            source_node_id: NodeId::new(uuid::Uuid::from_u128(31)),
+            source_fence: 7,
+            destination_node_id: NodeId::new(uuid::Uuid::from_u128(32)),
+            destination_fence: 9,
+            query_id: uuid::Uuid::from_u128(33),
+        }
+    }
+
+    /// Mints one correct reservation ticket over `body`.
+    fn reservation_ticket(
+        authority: &OraclePeerAuthority,
+        binding: &ReservationBinding,
+        body: &[u8],
+    ) -> SignedPeerTicket {
+        let claims = ReservationTicketClaims::for_binding(
+            binding,
+            vala_bifrost_redux::oracle::peer::reservation_body_digest(body)
+                .expect("reservation body digest"),
+            uuid::Uuid::new_v4().as_bytes().to_vec(),
+            (Utc::now() + chrono::Duration::seconds(5)).timestamp_millis(),
+        );
+        authority
+            .mint_reservation(binding.operation, &claims)
+            .expect("reservation ticket")
+    }
+
+    /// A reservation ticket authorizes one operation, one body, and one use.
+    ///
+    /// Locks the three properties a capacity change depends on: the release
+    /// domain does not verify at the reserve entry point even with identical
+    /// claims, a substituted request body is refused while every identity still
+    /// matches, and the same correct ticket is accepted exactly once.
+    #[tokio::test]
+    async fn reservation_tickets_are_operation_body_and_use_exact() {
+        let (authority, _audit) = authority();
+        let binding = reservation_binding();
+        let body = b"reserve-request".as_slice();
+        let ticket = reservation_ticket(&authority, &binding, body);
+
+        authority
+            .verify_reservation(&ticket, &binding, body, Utc::now())
+            .await
+            .expect("a correct reservation ticket is authorized");
+        assert_eq!(
+            authority
+                .verify_reservation(&ticket, &binding, body, Utc::now())
+                .await
+                .expect_err("a replayed reservation ticket is refused"),
+            PeerSecurityError::Replay
+        );
+
+        let fresh = reservation_ticket(&authority, &binding, body);
+        assert_eq!(
+            authority
+                .verify_reservation(&fresh, &binding, b"substituted-request", Utc::now())
+                .await
+                .expect_err("a substituted body is refused"),
+            PeerSecurityError::Body
+        );
+
+        let release = ReservationBinding {
+            operation: ReservationOperationV1::ReleaseSlots,
+            ..reservation_binding()
+        };
+        let released = reservation_ticket(&authority, &release, body);
+        assert_eq!(
+            authority
+                .verify_reservation(&released, &binding, body, Utc::now())
+                .await
+                .expect_err("a release ticket does not authorize a reserve"),
+            PeerSecurityError::InvalidSignature
+        );
     }
 
     /// Builds one fully bound v2 claim for authority tests.

@@ -724,6 +724,28 @@ impl ReservationTicketClaims {
     }
 }
 
+/// Server-owned capability minting one reservation purpose ticket.
+///
+/// The transport that dials a follower does not own signing material, and the
+/// authority that owns it does not own routing. This narrow seam is how a
+/// leader stamps an authorization onto a reservation call without the transport
+/// holding a key or the authority learning about endpoints.
+pub trait ReservationTicketMinter: Send + Sync {
+    /// Signs one single-use ticket for exactly one reservation operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeerSecurityError::Operation`] when the claims name a
+    /// different operation than the one requested and
+    /// [`PeerSecurityError::Encoding`] when the claims cannot be encoded within
+    /// their bound.
+    fn mint_reservation_ticket(
+        &self,
+        operation: ReservationOperationV1,
+        claims: &ReservationTicketClaims,
+    ) -> Result<SignedPeerTicket, PeerSecurityError>;
+}
+
 /// Fixed private stage-protocol version bound into every stage ticket.
 pub const STAGE_PROTOCOL_VERSION: u32 = 1;
 
@@ -946,6 +968,18 @@ impl PeerTicketMinter for DeterministicTestSigner {
             signature: bytes,
         })
     }
+}
+
+/// Builds the stable domain-separated signing preimage for one peer ticket.
+///
+/// The byte order is fixed as `DOMAIN || key_id || claims`. It lives here, next
+/// to the claim shapes, because both the signing authority and any harness that
+/// must produce a ticket under a retired or unpublished key have to agree on it
+/// exactly; two copies of this format would drift silently and only show up as
+/// an unexplained signature refusal.
+#[must_use]
+pub fn peer_signing_input(domain: &[u8], key_id: &str, claims: &[u8]) -> Vec<u8> {
+    [domain, key_id.as_bytes(), claims].concat()
 }
 
 /// Encodes a node identity for claims audience binding.

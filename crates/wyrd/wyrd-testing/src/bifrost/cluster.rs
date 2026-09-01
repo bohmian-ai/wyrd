@@ -1213,6 +1213,14 @@ impl WyrdTestCluster {
         let server = self
             .server(leader_index)
             .ok_or_else(|| ClusterError::Resource("Oracle leader is absent".to_owned()))?;
+        // The leader's own peer authority signs its reservation tickets, exactly
+        // as boot wires it, so a journey driving this transport exercises the
+        // production authorization path rather than an unticketed one.
+        let minter = server
+            .state()
+            .bifrost
+            .oracle_peer_service()
+            .ok_or_else(|| ClusterError::Resource("Oracle peer runtime is absent".to_owned()))?;
         Ok(TonicOraclePeerTransport::with_credentials_and_tls(
             server
                 .state()
@@ -1220,7 +1228,9 @@ impl WyrdTestCluster {
                 .ok_or_else(|| ClusterError::Resource("Oracle cluster is absent".to_owned()))?,
             Arc::clone(&self.oracle_peer_credentials),
             peer_tls_from_paths(tls)?,
-        ))
+        )
+        .with_reservation_minter(Arc::clone(minter.authority())
+            as Arc<dyn vala_bifrost_redux::oracle::peer::ReservationTicketMinter>))
     }
 
     /// Refreshes every running node's authoritative immutable membership cut.

@@ -292,10 +292,7 @@ impl PeerTicketKeyring {
 /// place to disclose where a private key lives.
 fn read_file(path: &Path) -> Result<String, PeerKeyringError> {
     std::fs::read_to_string(path).map_err(|error| {
-        tracing::error!(
-            ?error,
-            "Bifrost peer ticket keyring file could not be read"
-        );
+        tracing::error!(?error, "Bifrost peer ticket keyring file could not be read");
         PeerKeyringError::Unreadable
     })
 }
@@ -333,10 +330,8 @@ mod tests {
         let keys: Vec<String> = entries
             .iter()
             .map(|(key_id, key, until)| {
-                let retirement = until.map_or_else(
-                    || "null".to_owned(),
-                    |value| format!("\"{value}\""),
-                );
+                let retirement =
+                    until.map_or_else(|| "null".to_owned(), |value| format!("\"{value}\""));
                 format!(
                     "{{\"keyId\":\"{key_id}\",\"publicKeyPem\":{},\"verifyUntil\":{retirement}}}",
                     serde_json::to_string(&public_pem(key)).expect("a PEM renders as JSON")
@@ -383,12 +378,7 @@ mod tests {
         );
         assert!(
             keyring
-                .verify(
-                    "retiring",
-                    input,
-                    &retired.sign(input).to_bytes(),
-                    now()
-                )
+                .verify("retiring", input, &retired.sign(input).to_bytes(), now())
                 .is_ok(),
             "a key still inside its verification window is accepted"
         );

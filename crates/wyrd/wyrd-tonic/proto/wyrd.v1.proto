@@ -121,11 +121,19 @@ message CancelOracleLifecycleResponse { string request_id = 1; bool cancellation
 message ReserveNodeSlotsRequest {
   bytes query_id = 1; string leader_node_id = 2; uint64 leader_fencing_token = 3;
   QueryClass query_class = 4; uint32 slot_units = 5; uint64 expires_at_unix_ms = 6;
+  // Single-use reservation purpose ticket. The follower verifies it over the
+  // encoded request with this field cleared, before any capacity changes.
+  SignedPeerTicket ticket = 7;
 }
 message ReserveNodeSlotsResponse { oneof outcome { PendingNodeReservation pending = 1; ReservationRejected rejected = 2; } }
 message PendingNodeReservation { bytes reservation_id = 1; uint64 expires_at_unix_ms = 2; }
 message ReservationRejected { uint32 retry_after_ms = 1; }
-message ReleaseNodeSlotsRequest { bytes reservation_id = 1; bytes query_id = 2; string leader_node_id = 3; uint64 leader_fencing_token = 4; }
+message ReleaseNodeSlotsRequest {
+  bytes reservation_id = 1; bytes query_id = 2; string leader_node_id = 3; uint64 leader_fencing_token = 4;
+  // Single-use release purpose ticket, verified exactly as the reserve ticket
+  // is and under its own distinct signing domain.
+  SignedPeerTicket ticket = 5;
+}
 message ReleaseNodeSlotsResponse {}
 message SignedPeerTicket { string key_id = 1; bytes claims_bytes = 2; bytes signature = 3; }
 message ForwardQueryRequest { SignedPeerTicket envelope = 1; }

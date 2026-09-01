@@ -448,7 +448,7 @@ impl ChildConfig {
             request = request.header("x-wyrd-access-token", bearer);
         }
         let request = request
-            .body(probe_body(plan.framing))
+            .body(probe_body(plan.framing, plan.payload.as_deref()))
             .map_err(|error| child(error.to_string()))?;
         let response = tower::ServiceExt::oneshot(&mut channel, request)
             .await
@@ -502,11 +502,21 @@ impl ChildConfig {
 /// Every variant carries a well-formed first message; only the HTTP/2 frame
 /// boundaries differ, which is exactly the property a private listener must be
 /// indifferent to.
-fn probe_body(framing: PeerProbeFraming) -> wyrd_tonic::tonic::body::Body {
+fn probe_body(framing: PeerProbeFraming, payload: Option<&[u8]>) -> wyrd_tonic::tonic::body::Body {
     // An empty protobuf message is a valid `ReserveNodeSlotsRequest` and a
     // valid oversized-free first frame for the worker adapter, so the probe
-    // never depends on a decodable domain payload to reach the boundary.
-    let message = vec![0_u8, 0, 0, 0, 0];
+    // never depends on a decodable domain payload to reach the boundary. A
+    // parent-supplied payload replaces it verbatim, header included, because a
+    // ticket binds the digest of exactly those bytes.
+    let message = match payload {
+        Some(payload) => {
+            let mut framed = vec![0_u8];
+            framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            framed.extend_from_slice(payload);
+            framed
+        }
+        None => vec![0_u8, 0, 0, 0, 0],
+    };
     let chunks = match framing {
         PeerProbeFraming::Whole => vec![message],
         PeerProbeFraming::SplitHeader => vec![message[..2].to_vec(), message[2..].to_vec()],

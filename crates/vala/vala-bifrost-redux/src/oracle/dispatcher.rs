@@ -36,6 +36,8 @@ use super::follower::{
 };
 use super::peer::{
     PeerSecurityAudit, PeerSecurityError, PeerTicketClaims, PeerTicketMinter, PeerTicketVerifier,
+    ReservationBinding, ReservationOperationV1, ReservationTicketClaims, ReservationTicketMinter,
+    reservation_body_digest,
 };
 use super::telemetry::{
     FragmentLocality, FragmentOutcome, FragmentTelemetry, PeerErrorClass, SecurityEventClass,
@@ -1750,6 +1752,13 @@ impl OraclePeerTransport for LocalOraclePeerTransport {
 }
 
 /// Real tonic client transport resolving Oracle peers from live membership.
+/// Acceptance window for one reservation purpose ticket, in seconds.
+///
+/// Short by design: a reservation call is a single round trip on a local
+/// network, so the window only has to cover it. Anything longer widens the
+/// interval in which a captured ticket is still presentable.
+const RESERVATION_TICKET_TTL_SECONDS: i64 = 10;
+
 pub struct TonicOraclePeerTransport {
     /// Existing registry publishing immutable ready/live membership cuts.
     topology: OraclePeerTopology,
@@ -1757,6 +1766,12 @@ pub struct TonicOraclePeerTransport {
     credentials: Arc<dyn OraclePeerCredentials>,
     /// Optional immutable CA and DNS identity; absent only for local development tests.
     tls: Option<BifrostPeerTls>,
+    /// Server-owned signer stamping a purpose ticket onto reservation calls.
+    ///
+    /// Absent only where no reservation authority has been injected, in which
+    /// case reserving and releasing capacity fail closed rather than travelling
+    /// unauthorized.
+    reservation_minter: Option<Arc<dyn ReservationTicketMinter>>,
 }
 
 /// Membership source used by production and feature-gated transport fixtures.
@@ -2014,6 +2029,7 @@ impl TonicOraclePeerTransport {
                 secrecy::SecretString::from(bearer.to_owned()),
             )),
             tls: None,
+            reservation_minter: None,
         })
     }
 
@@ -2027,6 +2043,7 @@ impl TonicOraclePeerTransport {
             topology: OraclePeerTopology::Registry(registry),
             credentials,
             tls: None,
+            reservation_minter: None,
         }
     }
 
@@ -2041,7 +2058,19 @@ impl TonicOraclePeerTransport {
             topology: OraclePeerTopology::Registry(registry),
             credentials,
             tls: Some(tls),
+            reservation_minter: None,
         }
+    }
+
+    /// Attaches the server-owned signer for reservation purpose tickets.
+    ///
+    /// Kept a separate step because signing authority is owned by the server
+    /// and routing is owned here: a transport composed without it can still
+    /// dial peers, but every reservation call it makes fails closed.
+    #[must_use]
+    pub fn with_reservation_minter(mut self, minter: Arc<dyn ReservationTicketMinter>) -> Self {
+        self.reservation_minter = Some(minter);
+        self
     }
 
     /// Creates a TLS transport over an immutable endpoint fixture.
@@ -2056,6 +2085,7 @@ impl TonicOraclePeerTransport {
             topology: OraclePeerTopology::TestAddresses(addresses),
             credentials,
             tls: Some(tls),
+            reservation_minter: None,
         }
     }
 
@@ -2166,6 +2196,76 @@ impl TonicOraclePeerTransport {
         Ok(OraclePeerServiceClient::new(channel))
     }
 
+    /// Stamps a freshly minted reserve ticket onto one request copy.
+    ///
+    /// The digest is taken over the encoding with the ticket field cleared,
+    /// which is exactly what the follower recomputes, so the signed value
+    /// covers every routed identity in the request and nothing about the
+    /// signature itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DispatchError::Terminal`] when no reservation authority is
+    /// attached or the ticket cannot be minted; neither is retryable.
+    fn ticketed_reserve(
+        &self,
+        wire: &wyrd_tonic::wyrd::v1::ReserveNodeSlotsRequest,
+        binding: &ReservationBinding,
+    ) -> Result<wyrd_tonic::wyrd::v1::ReserveNodeSlotsRequest, DispatchError> {
+        let mut stamped = wire.clone();
+        stamped.ticket = None;
+        stamped.ticket = Some(self.reservation_ticket(&stamped, binding)?.into());
+        Ok(stamped)
+    }
+
+    /// Stamps a freshly minted release ticket onto one request copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DispatchError::Terminal`] when no reservation authority is
+    /// attached or the ticket cannot be minted.
+    fn ticketed_release(
+        &self,
+        wire: &wyrd_tonic::wyrd::v1::ReleaseNodeSlotsRequest,
+        binding: &ReservationBinding,
+    ) -> Result<wyrd_tonic::wyrd::v1::ReleaseNodeSlotsRequest, DispatchError> {
+        let mut stamped = wire.clone();
+        stamped.ticket = None;
+        stamped.ticket = Some(self.reservation_ticket(&stamped, binding)?.into());
+        Ok(stamped)
+    }
+
+    /// Mints one single-use ticket over an already ticket-free encoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DispatchError::Terminal`] when no reservation authority is
+    /// attached, the body exceeds its bound, or signing fails. A reservation
+    /// that cannot be authorized is never sent unauthorized.
+    fn reservation_ticket<T: wyrd_tonic::prost::Message>(
+        &self,
+        ticket_free: &T,
+        binding: &ReservationBinding,
+    ) -> Result<wyrd_spec::vala::api::SignedPeerTicket, DispatchError> {
+        let minter = self
+            .reservation_minter
+            .as_ref()
+            .ok_or(DispatchError::Terminal)?;
+        let body_digest = reservation_body_digest(&ticket_free.encode_to_vec())
+            .map_err(|_| DispatchError::Terminal)?;
+        let expires_at_ms = (Utc::now() + ChronoDuration::seconds(RESERVATION_TICKET_TTL_SECONDS))
+            .timestamp_millis();
+        let claims = ReservationTicketClaims::for_binding(
+            binding,
+            body_digest,
+            uuid::Uuid::new_v4().as_bytes().to_vec(),
+            expires_at_ms,
+        );
+        minter
+            .mint_reservation_ticket(binding.operation, &claims)
+            .map_err(|_| DispatchError::Terminal)
+    }
+
     /// Reserves capacity for one exact planned node/fence target.
     ///
     /// # Errors
@@ -2176,14 +2276,33 @@ impl TonicOraclePeerTransport {
         candidate: &DispatchCandidate,
         request: ReserveNodeSlotsRequest,
     ) -> Result<ReserveNodeSlotsResponse, DispatchError> {
+        let leader_node_id = request.leader_node_id;
+        let leader_fence = request.leader_fencing_token;
+        let query_id = request.query_id.as_uuid();
         let wire: wyrd_tonic::wyrd::v1::ReserveNodeSlotsRequest = request.into();
+        let binding = ReservationBinding {
+            operation: ReservationOperationV1::ReserveSlots,
+            source_node_id: leader_node_id,
+            source_fence: leader_fence,
+            destination_node_id: candidate.node_id,
+            destination_fence: candidate.worker_fence,
+            query_id,
+        };
         let mut client = self.client(candidate).await?;
+        // A ticket is single-use, so the one credential retry mints its own
+        // rather than replaying the first attempt's nonce.
         let response = match client
-            .reserve_slots(self.authenticated(wire.clone(), false).await?)
+            .reserve_slots(
+                self.authenticated(self.ticketed_reserve(&wire, &binding)?, false)
+                    .await?,
+            )
             .await
         {
             Err(status) if status.code() == wyrd_tonic::tonic::Code::Unauthenticated => client
-                .reserve_slots(self.authenticated(wire, true).await?)
+                .reserve_slots(
+                    self.authenticated(self.ticketed_reserve(&wire, &binding)?, true)
+                        .await?,
+                )
                 .await
                 .map_err(|status| status_error(&status))?,
             result => result.map_err(|status| status_error(&status))?,
@@ -2209,13 +2328,28 @@ impl TonicOraclePeerTransport {
         request: ReleaseNodeSlotsRequest,
     ) -> Result<(), DispatchError> {
         let mut client = self.client(candidate).await?;
+        let binding = ReservationBinding {
+            operation: ReservationOperationV1::ReleaseSlots,
+            source_node_id: request.leader_node_id,
+            source_fence: request.leader_fencing_token,
+            destination_node_id: candidate.node_id,
+            destination_fence: candidate.worker_fence,
+            query_id: request.query_id.as_uuid(),
+        };
         let wire: wyrd_tonic::wyrd::v1::ReleaseNodeSlotsRequest = request.into();
+        // Same single-use discipline as reserve: the retry mints a fresh nonce.
         match client
-            .release_slots(self.authenticated(wire.clone(), false).await?)
+            .release_slots(
+                self.authenticated(self.ticketed_release(&wire, &binding)?, false)
+                    .await?,
+            )
             .await
         {
             Err(status) if status.code() == wyrd_tonic::tonic::Code::Unauthenticated => client
-                .release_slots(self.authenticated(wire, true).await?)
+                .release_slots(
+                    self.authenticated(self.ticketed_release(&wire, &binding)?, true)
+                        .await?,
+                )
                 .await
                 .map_err(|status| execution_status_error(&status))?,
             result => result.map_err(|status| execution_status_error(&status))?,

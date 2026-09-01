@@ -202,6 +202,14 @@ pub struct PeerProbePlan {
     pub credential: PeerProbeCredential,
     /// How the probe lays the first gRPC frame onto the wire.
     pub framing: PeerProbeFraming,
+    /// Exact protobuf message bytes to send, when the probe carries a payload.
+    ///
+    /// A ticket binds the digest of the request it authorizes, so a journey
+    /// that mints tickets has to control the exact bytes on the wire. The
+    /// parent encodes the request and stamps the ticket; the child only frames
+    /// what it is given. `None` keeps the default empty first message, which is
+    /// what an admission probe wants.
+    pub payload: Option<Vec<u8>>,
 }
 
 impl PeerProbePlan {
@@ -213,7 +221,26 @@ impl PeerProbePlan {
             service: PeerProbeService::OraclePeer,
             credential: PeerProbeCredential::Own,
             framing: PeerProbeFraming::Whole,
+            payload: None,
         }
+    }
+
+    /// Sends `payload` as the probe's one gRPC message.
+    #[must_use]
+    pub fn carrying(mut self, payload: Vec<u8>) -> Self {
+        self.payload = Some(payload);
+        self
+    }
+
+    /// Addresses an arbitrary gRPC path on the private listener.
+    ///
+    /// Used by a journey that must prove a method is refused rather than
+    /// answered; the closed [`PeerProbeService`] set covers the methods Wyrd
+    /// deliberately serves.
+    #[must_use]
+    pub fn on_path(mut self, path: &str) -> Self {
+        self.service = PeerProbeService::Path(path.to_owned());
+        self
     }
 
     /// Addresses the upstream DataFusion worker adapter instead.
@@ -243,21 +270,27 @@ impl PeerProbePlan {
 /// Both adapters are mounted on the same private listener behind the same
 /// authentication layer, so a claim about peer authentication is only proved
 /// when it holds for both.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PeerProbeService {
     /// `wyrd.v1.OraclePeerService/ReserveSlots`.
     OraclePeer,
+    /// `wyrd.v1.OraclePeerService/ReleaseSlots`.
+    OraclePeerRelease,
     /// Upstream `worker.WorkerService/ExecuteTask`.
     AnalyticalWorker,
+    /// Any other private path, named verbatim.
+    Path(String),
 }
 
 impl PeerProbeService {
     /// Returns the gRPC path this adapter answers on.
     #[must_use]
-    pub const fn path(self) -> &'static str {
+    pub fn path(&self) -> &str {
         match self {
             Self::OraclePeer => "/wyrd.v1.OraclePeerService/ReserveSlots",
+            Self::OraclePeerRelease => "/wyrd.v1.OraclePeerService/ReleaseSlots",
             Self::AnalyticalWorker => "/worker.WorkerService/ExecuteTask",
+            Self::Path(path) => path.as_str(),
         }
     }
 }
@@ -1142,6 +1175,16 @@ impl BifrostProcessCluster {
         self.nodes.clear();
     }
 
+    /// Returns the peer ticket keyring every child in this cluster loads.
+    ///
+    /// A journey mints tickets with it directly — under the active key, a
+    /// retired one, or one no manifest publishes — which is the only way to
+    /// drive rotation and independence from outside the nodes.
+    #[must_use]
+    pub fn peer_keyring(&self) -> &TestPeerKeyring {
+        &self.shared.peer_keyring
+    }
+
     /// Returns the authority every child's peer leaf chains to.
     ///
     /// A journey needs it to dial the peer plane itself: to present a trusted
@@ -1340,7 +1383,10 @@ impl BifrostProcessCluster {
             .env(env::PEER_API_KEY_PATH, &peer_api_key_path)
             .env(env::PEER_TICKET_KEY_ID, &keyring.active_key_id)
             .env(env::PEER_TICKET_KEY_PATH, &keyring.signing_key_path)
-            .env(env::PEER_TICKET_KEYRING_PATH, &keyring.verifying_keyring_path)
+            .env(
+                env::PEER_TICKET_KEYRING_PATH,
+                &keyring.verifying_keyring_path,
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

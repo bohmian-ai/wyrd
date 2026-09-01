@@ -87,6 +87,7 @@ sqlx = { workspace = true, features = ["postgres"] }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "test-util", "time"] }
 tokio-stream = "0.1"
 tokio-util = { workspace = true }

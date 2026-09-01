@@ -31,16 +31,32 @@ async fn prove_graph_lease_owns_exact_resources() -> Result<(), PeerJourneyError
         &[
             ProcessNodeTarget::Oracle,
             ProcessNodeTarget::Oracle,
+            ProcessNodeTarget::Oracle,
             ProcessNodeTarget::Scribe,
         ],
     )
     .await?;
 
     let table = format!("graph_lease_{}", uuid::Uuid::now_v7().simple());
-    cluster.nodes_mut()[2].register_table(&table)?;
-    let rows = cluster.nodes_mut()[0]
-        .execute_inactive_sql(&format!("SELECT id FROM vala.bifrost.{table}"))?;
-    println!("SMOKE inactive analytical rows = {rows}");
+    cluster.nodes_mut()[3].register_table(&table)?;
+    cluster.nodes_mut()[3].ingest_rows(&table, 12, 3)?;
+    cluster.nodes_mut()[3].ingest_rows(&table, 12, 3)?;
+    for index in 0..4 {
+        cluster.nodes_mut()[index].refresh_snapshot()?;
+    }
+    let before = cluster.nodes_mut()[1].peer_body_polls()?;
+    let rows = cluster.nodes_mut()[0].execute_inactive_sql(&format!(
+        "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} \
+         GROUP BY filter_key ORDER BY filter_key"
+    ))?;
+    let after = cluster.nodes_mut()[1].peer_body_polls()?;
+    println!("SMOKE rows={rows} follower_body_polls {before} -> {after}");
+    for index in 0..2 {
+        println!(
+            "SMOKE stderr[{index}]:\n{}",
+            cluster.nodes()[index].stderr_tail()
+        );
+    }
 
     cluster.shutdown();
     Ok(())

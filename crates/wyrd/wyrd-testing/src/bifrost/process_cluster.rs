@@ -177,6 +177,17 @@ pub enum ControlRequest {
         /// Table name inside the `vala.bifrost` namespace.
         table: String,
     },
+    /// Write and publish deterministic fixture rows through this child's Scribe.
+    IngestRows {
+        /// Table name inside the `vala.bifrost` namespace.
+        table: String,
+        /// Number of rows to write.
+        rows: i64,
+        /// Distinct `filter_key` groups the rows fall into.
+        groups: i64,
+    },
+    /// Re-read the shared membership snapshot into this child's Oracle.
+    RefreshSnapshot,
     /// Dial another pod's private peer socket and report the wire outcome.
     ///
     /// The child always presents its configured peer TLS material, so a
@@ -364,6 +375,10 @@ pub enum ControlResponse {
     },
     /// Answer to [`ControlRequest::RegisterTable`].
     Registered,
+    /// Answer to [`ControlRequest::IngestRows`].
+    Ingested,
+    /// Answer to [`ControlRequest::RefreshSnapshot`].
+    Refreshed,
     /// Answer to [`ControlRequest::PeerProbe`].
     Probed {
         /// Non-secret gRPC status code name the destination returned.
@@ -844,6 +859,55 @@ impl ProcessNode {
             ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
             other => Err(ProcessClusterError::Protocol(format!(
                 "expected a registration, received {other:?}"
+            ))),
+        }
+    }
+
+    /// Asks this child to write and publish deterministic fixture rows.
+    ///
+    /// The rows are written through this pod's own Scribe and published, so a
+    /// later query observes durable state a real replica produced rather than
+    /// a fixture-authored file listing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::request`], and
+    /// [`ProcessClusterError::Child`] when the ingest or publication failed.
+    pub fn ingest_rows(
+        &mut self,
+        table: &str,
+        rows: i64,
+        groups: i64,
+    ) -> Result<(), ProcessClusterError> {
+        match self.request(&ControlRequest::IngestRows {
+            table: table.to_owned(),
+            rows,
+            groups,
+        })? {
+            ControlResponse::Ingested => Ok(()),
+            ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
+            other => Err(ProcessClusterError::Protocol(format!(
+                "expected an ingest, received {other:?}"
+            ))),
+        }
+    }
+
+    /// Asks this child to re-read the shared membership snapshot.
+    ///
+    /// Each pod caches its own view of the cluster, so a journey that changed
+    /// membership or published new data refreshes the pods it is about to
+    /// query rather than waiting on their background cadence.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::request`], and
+    /// [`ProcessClusterError::Child`] when the refresh failed.
+    pub fn refresh_snapshot(&mut self) -> Result<(), ProcessClusterError> {
+        match self.request(&ControlRequest::RefreshSnapshot)? {
+            ControlResponse::Refreshed => Ok(()),
+            ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
+            other => Err(ProcessClusterError::Protocol(format!(
+                "expected a refresh, received {other:?}"
             ))),
         }
     }

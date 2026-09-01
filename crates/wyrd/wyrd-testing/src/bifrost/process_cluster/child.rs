@@ -46,6 +46,7 @@ const READY_POLL: Duration = Duration::from_millis(100);
 /// pipe.
 #[must_use]
 pub fn run_peer_test_node() -> ExitCode {
+    install_child_tracing();
     let runtime = wyrd_runtime::runtime();
     match runtime.block_on(serve()) {
         Ok(()) => ExitCode::SUCCESS,
@@ -112,6 +113,22 @@ async fn serve() -> Result<(), ProcessClusterError> {
                     })?,
                 }
             }
+            ControlRequest::IngestRows {
+                table,
+                rows,
+                groups,
+            } => match config.ingest_rows(&server, &table, rows, groups).await {
+                Ok(()) => emit(&ControlResponse::Ingested)?,
+                Err(error) => emit(&ControlResponse::Failed {
+                    detail: error.to_string(),
+                })?,
+            },
+            ControlRequest::RefreshSnapshot => match refresh_snapshot(&server).await {
+                Ok(()) => emit(&ControlResponse::Refreshed)?,
+                Err(error) => emit(&ControlResponse::Failed {
+                    detail: error.to_string(),
+                })?,
+            },
             ControlRequest::PeerProbe(plan) => {
                 match config
                     .peer_probe(&plan, credentials.as_ref(), &fixture)
@@ -146,6 +163,26 @@ async fn serve() -> Result<(), ProcessClusterError> {
         .shutdown()
         .await
         .map_err(|error| ProcessClusterError::Child(error.to_string()))
+}
+
+/// Installs this child's log subscriber on stderr when `RUST_LOG` asks for one.
+///
+/// Stderr, never stdout: stdout carries the control protocol, and a log line
+/// written there would be read by the parent as a malformed response. The
+/// subscriber is installed only when `RUST_LOG` is set, so a lane run stays
+/// silent and a diagnosing run gets the child's own view of a multi-process
+/// failure, which the parent otherwise cannot see at all.
+fn install_child_tracing() {
+    let Ok(filter) = std::env::var("RUST_LOG") else {
+        return;
+    };
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+        .with_writer(std::io::stderr)
+        .finish();
+    // A child installs exactly one subscriber; a failure here means something
+    // already owns the global, which is not worth failing a journey over.
+    let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
 /// Writes one newline-delimited control response to stdout.
@@ -401,6 +438,80 @@ impl ChildConfig {
             .map_err(|error| ProcessClusterError::Child(error.to_string()))
     }
 
+    /// Writes and publishes deterministic fixture rows through this Scribe.
+    ///
+    /// The batch is admitted through the same logical ingress seam the public
+    /// write surface uses and then frozen and published, so the rows a later
+    /// query reads are files this pod's own Scribe encoded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProcessClusterError::Child`] when this target composes no
+    /// Scribe or catalog, the table is unregistered, or ingest, freeze, or
+    /// publication fails.
+    async fn ingest_rows(
+        &self,
+        server: &WyrdTestServer,
+        table: &str,
+        rows: i64,
+        groups: i64,
+    ) -> Result<(), ProcessClusterError> {
+        let child = ProcessClusterError::Child;
+        let scribe = server
+            .bifrost_scribe()
+            .ok_or_else(|| child("this target composes no Scribe".to_owned()))?;
+        let catalog = server
+            .state()
+            .bifrost_catalog()
+            .ok_or_else(|| child("this target composes no Bifrost catalog".to_owned()))?;
+        let table_ref = vala_bifrost_redux::catalog::TableRef::new(
+            vala_bifrost_redux::namespaces::BifrostNamespace::Bifrost,
+            table,
+        );
+        let (fingerprint, _) = catalog
+            .table_registration(&table_ref, self.tenant_id)
+            .await
+            .map_err(|error| child(error.to_string()))?;
+        let principal = wyrd_runtime::principal::Principal {
+            id: wyrd_spec::auth::PrincipalId::new(uuid::Uuid::now_v7()),
+            kind: wyrd_runtime::principal::PrincipalKind::User,
+            tenant_id: self.tenant_id,
+            roles: Vec::new(),
+            effective_permissions: wyrd_runtime::PermissionSet::new(),
+        };
+        let audit_event = wyrd_spec::vala::api::AuditEvent::new(
+            wyrd_spec::request_id::RequestId::now_v7(),
+            None,
+            "bifrost.write".to_owned(),
+            format!("bifrost://vala.bifrost/{table}"),
+            None,
+            principal.id,
+            wyrd_spec::auth::PrincipalKindTag::User,
+            wyrd_spec::vala::api::AuthMethod::Internal,
+            "bifrost_write:write".to_owned(),
+            wyrd_spec::vala::api::AuditDecision::Allow,
+            wyrd_spec::vala::api::AuditResult::Success,
+            "peer network fixture ingest".to_owned(),
+        );
+        scribe
+            .ingest_native_for_test(vala_bifrost_redux::scribe::NativeIngressTestFrame {
+                principal,
+                table: table_ref,
+                expected_schema_fingerprint: fingerprint,
+                request_id: wyrd_spec::request_id::RequestId::now_v7(),
+                batch_id: uuid::Uuid::now_v7(),
+                audit_event,
+                payload: fixture_rows_ipc(rows, groups)?,
+            })
+            .await
+            .map_err(|error| child(error.to_string()))?;
+        server
+            .flush_bifrost()
+            .await
+            .map_err(|error| child(error.to_string()))?;
+        Ok(())
+    }
+
     /// Runs one statement through this node's inactive Analytical path.
     ///
     /// The stream is drained to its terminal frame rather than dropped early,
@@ -491,8 +602,9 @@ impl ChildConfig {
                 wyrd_spec::vala::api::QueryStreamFrame::Terminal(frame) => terminal = Some(frame),
             }
         }
-        terminal
+        let terminal = terminal
             .ok_or_else(|| child("the inactive attempt emitted no terminal frame".to_owned()))?;
+        let _ = terminal;
         Ok(rows)
     }
 
@@ -756,4 +868,66 @@ async fn describe(
         wal_root: config.wal_root.display().to_string(),
         membership,
     }
+}
+
+/// Re-reads the shared membership snapshot into this pod's Oracle.
+///
+/// Each pod caches its own cluster view, so a journey that just changed
+/// membership or published data refreshes the pods it is about to query
+/// instead of waiting on their background cadence. A pod that composes no
+/// Oracle has nothing to refresh and reports success.
+///
+/// # Errors
+///
+/// Returns [`ProcessClusterError::Child`] when the snapshot cannot be read.
+async fn refresh_snapshot(server: &WyrdTestServer) -> Result<(), ProcessClusterError> {
+    let Some(cluster) = server.state().oracle_cluster() else {
+        return Ok(());
+    };
+    cluster
+        .refresh_snapshot()
+        .await
+        .map_err(|error| ProcessClusterError::Child(error.to_string()))
+}
+
+/// Encodes `rows` deterministic `(id, filter_key)` rows as one Arrow IPC stream.
+///
+/// The rows are spread over `groups` distinct keys so a grouped aggregate has
+/// more than one non-trivial group, which is what makes a distributed plan
+/// exchange partitions rather than collapse to a single stage.
+///
+/// # Errors
+///
+/// Returns [`ProcessClusterError::Child`] when the batch or its IPC encoding
+/// cannot be built.
+fn fixture_rows_ipc(rows: i64, groups: i64) -> Result<bytes::Bytes, ProcessClusterError> {
+    let child = ProcessClusterError::Child;
+    let groups = groups.max(1);
+    let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        arrow::datatypes::Field::new("filter_key", arrow::datatypes::DataType::Utf8, false),
+    ]));
+    let keys: Vec<String> = (0..rows)
+        .map(|id| format!("group_{}", id % groups))
+        .collect();
+    let batch = arrow::record_batch::RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(arrow::array::Int64Array::from(
+                (0..rows).collect::<Vec<_>>(),
+            )),
+            Arc::new(arrow::array::StringArray::from(keys)),
+        ],
+    )
+    .map_err(|error| child(error.to_string()))?;
+    let mut ipc = Vec::new();
+    {
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut ipc, schema.as_ref())
+            .map_err(|error| child(error.to_string()))?;
+        writer
+            .write(&batch)
+            .map_err(|error| child(error.to_string()))?;
+        writer.finish().map_err(|error| child(error.to_string()))?;
+    }
+    Ok(bytes::Bytes::from(ipc))
 }

@@ -11312,6 +11312,7 @@ dependencies = [
  "tokio-util",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "url",
  "uuid",
  "vala-bifrost-redux",

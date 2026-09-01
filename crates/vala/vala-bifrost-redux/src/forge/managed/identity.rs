@@ -30,6 +30,13 @@ const ORDINAL_WIDTH: usize = 5;
 /// Object suffix every rewrite output carries.
 const OUTPUT_SUFFIX: &str = ".parquet";
 
+/// Length of a hyphenated UUID in its canonical text form.
+///
+/// Both identities in a produced file name are UUIDs and the ordinal between
+/// them is unbounded, so the file name is split at the fixed identity widths
+/// rather than on hyphens, which appear inside the UUIDs themselves.
+const UUID_TEXT_LEN: usize = 36;
+
 /// One produced object path, decomposed after it was proven well-formed.
 ///
 /// Borrowed from the path it describes: every field is a view into the original
@@ -48,28 +55,22 @@ pub(crate) struct ForgeOutputIdentity<'path> {
 }
 
 impl<'path> ForgeOutputIdentity<'path> {
-    /// Proves one produced path belongs to this attempt under the recipe root.
+    /// Recovers the recipe identity a produced path carries, on its own terms.
     ///
-    /// `data_location` is the exact recipe root the policy resolved, so a path
-    /// that merely looks plausible but sits outside it — a different table, a
-    /// superseded recipe, or the table's default data root — is refused rather
-    /// than accepted with a warning. `attempt_id` is checked because an object
-    /// attributed to another attempt inside this attempt's result set is either
-    /// a leaked handle or a reused writer, and both are unrecoverable
-    /// ambiguities about who may reclaim the object.
+    /// Cleanup is the caller that has no prior identity to check against: it
+    /// finds an object under the recipe root and must decide who produced it
+    /// before it may decide whether that producer is finished. This is the one
+    /// grammar that answers that, so no cleanup-local compatibility parser can
+    /// drift away from what the writer actually emitted.
     ///
     /// # Errors
     ///
     /// Returns [`ForgeError::Invariant`] when the path does not sit under
-    /// `data_location`, when the file name is not
-    /// `{attempt}-{ordinal}-{writer}.parquet`, when the attempt does not match,
-    /// when the ordinal is not a canonical decimal of at least
-    /// [`ORDINAL_WIDTH`] digits, or when either UUID is unparseable.
-    pub(crate) fn validate(
-        path: &'path str,
-        data_location: &str,
-        attempt_id: Uuid,
-    ) -> Result<Self, ForgeError> {
+    /// `data_location`, when a partition segment is non-canonical, when the
+    /// file name is not `{attempt}-{ordinal}-{writer}.parquet`, when the
+    /// ordinal is not a canonical decimal of at least [`ORDINAL_WIDTH`]
+    /// digits, or when either UUID is unparseable.
+    pub(crate) fn parse(path: &'path str, data_location: &str) -> Result<Self, ForgeError> {
         let invariant = |detail: String| ForgeError::Invariant { detail };
         let root = data_location.trim_end_matches('/');
         let relative = path
@@ -98,20 +99,29 @@ impl<'path> ForgeOutputIdentity<'path> {
                 "rewrite output {path} is not a {OUTPUT_SUFFIX} object"
             ))
         })?;
-        let attempt_text = attempt_id.to_string();
-        let remainder = stem
-            .strip_prefix(&attempt_text)
-            .and_then(|rest| rest.strip_prefix('-'));
-        let Some(remainder) = remainder else {
-            return Err(invariant(format!(
-                "rewrite output {path} is not attributed to attempt {attempt_id}"
-            )));
-        };
-        let (ordinal_text, writer_text) = remainder.split_once('-').ok_or_else(|| {
+        let (attempt_text, remainder) = stem
+            .split_at_checked(UUID_TEXT_LEN)
+            .and_then(|(attempt, rest)| Some((attempt, rest.strip_prefix('-')?)))
+            .ok_or_else(|| {
+                invariant(format!(
+                    "rewrite output {path} does not begin with an attempt identity"
+                ))
+            })?;
+        let attempt_id = Uuid::parse_str(attempt_text).map_err(|error| {
             invariant(format!(
-                "rewrite output {path} carries no per-writer identity"
+                "rewrite output {path} carries an unreadable attempt identity: {error}"
             ))
         })?;
+        let (ordinal_text, writer_text) = remainder
+            .len()
+            .checked_sub(UUID_TEXT_LEN)
+            .and_then(|split| remainder.split_at_checked(split))
+            .and_then(|(ordinal, writer)| Some((ordinal.strip_suffix('-')?, writer)))
+            .ok_or_else(|| {
+                invariant(format!(
+                    "rewrite output {path} carries no per-writer identity"
+                ))
+            })?;
         let writer_uuid = Uuid::parse_str(writer_text).map_err(|error| {
             invariant(format!(
                 "rewrite output {path} carries an unreadable writer identity: {error}"
@@ -128,6 +138,32 @@ impl<'path> ForgeOutputIdentity<'path> {
             writer_ordinal,
             writer_uuid,
         })
+    }
+
+    /// Proves one produced path belongs to this attempt under the recipe root.
+    ///
+    /// This is [`Self::parse`] plus the one check the producing side can make
+    /// and cleanup cannot: that the recovered attempt is the attempt whose
+    /// result set the object arrived in. An object attributed to another
+    /// attempt there is either a leaked handle or a reused writer, and both are
+    /// unrecoverable ambiguities about who may reclaim the object.
+    ///
+    /// # Errors
+    ///
+    /// Returns every [`Self::parse`] failure, plus [`ForgeError::Invariant`]
+    /// when the recovered attempt is not `attempt_id`.
+    pub(crate) fn validate(
+        path: &'path str,
+        data_location: &str,
+        attempt_id: Uuid,
+    ) -> Result<Self, ForgeError> {
+        let identity = Self::parse(path, data_location)?;
+        if identity.attempt_id != attempt_id {
+            return Err(ForgeError::Invariant {
+                detail: format!("rewrite output {path} is not attributed to attempt {attempt_id}"),
+            });
+        }
+        Ok(identity)
     }
 
     /// Returns the key that makes two produced objects distinguishable.
@@ -264,6 +300,101 @@ mod tests {
             assert!(
                 matches!(
                     ForgeOutputIdentity::validate(&bad, &root, attempt),
+                    Err(ForgeError::Invariant { .. })
+                ),
+                "{why}: {bad}"
+            );
+        }
+    }
+
+    /// Cleanup resolves an attempt out of a path it has no prior identity for.
+    ///
+    /// Never-published orphan cleanup sees an object before it knows which
+    /// attempt produced it: that is the whole question it must answer before it
+    /// may delete. This pins that the answer comes from the same grammar the
+    /// writer used — `parse` recovers the attempt and `validate` is exactly
+    /// `parse` plus an attempt equality check — so no second, drifting
+    /// compatibility parser can appear in the cleanup owner. The refusals are
+    /// the cases where accepting a loose spelling would let cleanup attribute
+    /// an object to the wrong attempt, or to no attempt at all, and then delete
+    /// it while its real producer is still open.
+    #[test]
+    fn forge_output_path_parser_matches_recipe_identity_grammar_exactly() {
+        let root = root();
+        let attempt = Uuid::now_v7();
+        let writer = Uuid::now_v7();
+        let path = |ordinal: &str, partition: &str| {
+            format!("{root}/{partition}{attempt}-{ordinal}-{writer}.parquet")
+        };
+
+        for (case, partition, ordinal, expected_ordinal) in [
+            ("unpartitioned", "", "00000", 0_u64),
+            ("partitioned", "wyrd_event_time_day=2026-08-29/", "00007", 7),
+            ("wide ordinal", "", "123456", 123_456),
+        ] {
+            let object = path(ordinal, partition);
+            let parsed = ForgeOutputIdentity::parse(&object, &root)
+                .unwrap_or_else(|error| panic!("{case} path parses: {error}"));
+            assert_eq!(parsed.attempt_id, attempt, "{case} recovers its attempt");
+            assert_eq!(parsed.writer_ordinal, expected_ordinal, "{case} ordinal");
+            assert_eq!(parsed.writer_uuid, writer, "{case} writer identity");
+            assert_eq!(
+                parsed.partition_path,
+                partition.trim_end_matches('/'),
+                "{case} partition"
+            );
+            assert_eq!(
+                ForgeOutputIdentity::validate(&object, &root, attempt)
+                    .expect("validate accepts what parse accepted"),
+                parsed,
+                "{case}: validate is parse plus an attempt check, not a second grammar"
+            );
+            assert!(
+                ForgeOutputIdentity::validate(&object, &root, Uuid::now_v7()).is_err(),
+                "{case}: validate still refuses a foreign attempt"
+            );
+        }
+
+        for (bad, why) in [
+            (
+                format!("file:///warehouse/tenant/table/data/{attempt}-00000-{writer}.parquet"),
+                "an object outside the recipe root has no recipe identity to recover",
+            ),
+            (
+                format!(
+                    "file:///warehouse/tenant/table/data/forge/v0/{attempt}-00000-{writer}.parquet"
+                ),
+                "a superseded recipe root is not this policy's root",
+            ),
+            (
+                format!("{root}/{attempt}-00000.parquet"),
+                "without a writer identity the object names no unique producer",
+            ),
+            (
+                format!("{root}/not-a-uuid-00000-{writer}.parquet"),
+                "an unreadable attempt cannot be checked against open work",
+            ),
+            (
+                path("0", ""),
+                "a short ordinal is a second spelling of the same value",
+            ),
+            (
+                path("0000012", ""),
+                "an over-padded ordinal is a second spelling of the same value",
+            ),
+            (path("0000a", ""), "a non-decimal ordinal is not an ordinal"),
+            (
+                format!("{root}/{attempt}-00000-{writer}.avro"),
+                "a rewrite output is always Parquet",
+            ),
+            (
+                format!("{root}/../{attempt}-00000-{writer}.parquet"),
+                "a traversal segment escapes the recipe root",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    ForgeOutputIdentity::parse(&bad, &root),
                     Err(ForgeError::Invariant { .. })
                 ),
                 "{why}: {bad}"

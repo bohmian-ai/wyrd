@@ -1,14 +1,17 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use uuid::Uuid;
 
+use vala_bifrost_redux::catalog::TenantTableBinding;
 use vala_sql::row_types::forge_tasks::{ForgeClaimStrategy, ForgeTaskStrategy};
 use wyrd_spec::DataTenantId;
+use wyrd_testing::bifrost::telemetry::BifrostTelemetryDelta;
 use wyrd_testing::bifrost::{WyrdTestCluster, shared_process_telemetry_for_test};
 
 use crate::public_support::{
-    append_values, read_sorted_values, register_table, tenant_client, try_read, unique_table,
+    JourneyTable, ManagedRow, append_values, assert_tenant_scoped_not_found, canonical_order,
+    read_managed_rows, register_table, rows_digest, tenant_client, unique_table,
 };
 
 /// Longest a journey waits for one production Forge attempt to return.
@@ -220,6 +223,586 @@ async fn drain_forge_backlog(
     );
 }
 
+/// The complete live cut of one table's current snapshot.
+///
+/// Data and delete attachments are held apart because the rewrite algebra
+/// applies to them separately: a snapshot removes data files and *may* remove
+/// delete files whose scope it consumed, and a cut compared only on data would
+/// accept a publication that silently changed what a reader sees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveCut {
+    /// Snapshot the cut was read from.
+    snapshot_id: i64,
+    /// Live data object paths, in canonical storage form.
+    data: BTreeSet<String>,
+    /// Live position- and equality-delete object paths, in canonical storage form.
+    deletes: BTreeSet<String>,
+}
+
+/// One rewrite snapshot's identity, summary, and exact manifest algebra.
+///
+/// Everything here is read from the catalog the pod actually published
+/// through, never from `vala.file_list`: the question a recovery journey has
+/// to answer is what the *table* says happened, and only the manifests say it.
+#[derive(Debug, Clone)]
+struct RewriteSnapshot {
+    /// Identity of the snapshot the rewrite published.
+    snapshot_id: i64,
+    /// Snapshot this one was committed onto.
+    parent_snapshot_id: Option<i64>,
+    /// The snapshot's `forge.*` summary properties.
+    summary: BTreeMap<String, String>,
+    /// Data paths this snapshot added, in canonical storage form.
+    added_data: BTreeSet<String>,
+    /// Data paths this snapshot removed, in canonical storage form.
+    removed_data: BTreeSet<String>,
+    /// Delete paths this snapshot removed, in canonical storage form.
+    removed_deletes: BTreeSet<String>,
+}
+
+/// Rewrites one file path into the tenant-object-prefix form.
+///
+/// The same physical object is named two ways in this system: the catalog
+/// stores an absolute warehouse URI, while the durable Forge plan and Prepared
+/// detail store the storage-relative key. Both contain the binding's own
+/// object prefix verbatim, so anchoring on that prefix normalises either form
+/// without the journey reconstructing a storage layout it does not own. A path
+/// that does not contain the prefix is foreign to this table and is returned
+/// unchanged so a comparison against it fails loudly rather than silently.
+fn canonical_path(path: &str, binding: &TenantTableBinding) -> String {
+    let prefix = binding.object_prefix.as_str();
+    path.find(prefix)
+        .map_or_else(|| path.to_owned(), |start| path[start..].to_owned())
+}
+
+/// Reads every file one named snapshot holds live, partitioned by content.
+///
+/// This walks the snapshot's complete manifest list and keeps only alive
+/// entries, which is the one definition of "live" the catalog itself uses. It
+/// is deliberately not a diff: an Iceberg commit that empties a manifest drops
+/// that manifest from the new list rather than rewriting it with `DELETED`
+/// entries, so per-snapshot `ADDED`/`DELETED` scanning silently under-reports.
+/// Every algebraic claim in this journey is instead a difference of two of
+/// these complete live sets.
+///
+/// # Panics
+///
+/// Panics when the manifest list or any manifest it names cannot be read.
+async fn snapshot_files(
+    table: &iceberg::table::Table,
+    snapshot: &iceberg::spec::SnapshotRef,
+    binding: &TenantTableBinding,
+) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut data = BTreeSet::new();
+    let mut deletes = BTreeSet::new();
+    let manifests = table
+        .manifest_list_reader(snapshot)
+        .load()
+        .await
+        .expect("the journey manifest list");
+    for manifest_file in manifests.entries() {
+        let manifest = manifest_file
+            .load_manifest(table.file_io())
+            .await
+            .expect("the journey manifest");
+        for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
+            let path = canonical_path(entry.data_file().file_path(), binding);
+            if entry.data_file().content_type() == iceberg::spec::DataContentType::Data {
+                data.insert(path);
+            } else {
+                deletes.insert(path);
+            }
+        }
+    }
+    (data, deletes)
+}
+
+/// Reads one table's current live cut through the pod's production catalog.
+///
+/// # Panics
+///
+/// Panics when the table or its manifests cannot be read, or when the table
+/// carries no current snapshot, which a journey only reaches after a
+/// successful publication.
+async fn live_cut(cluster: &WyrdTestCluster, binding: &TenantTableBinding) -> LiveCut {
+    let server = cluster.server(0).expect("the embedded pod is running");
+    let table = server
+        .bifrost_catalog()
+        .iceberg_catalog()
+        .load_table(&binding.table_ident())
+        .await
+        .expect("the journey table loads through the production catalog");
+    let snapshot = table
+        .metadata()
+        .current_snapshot()
+        .expect("a published journey table has a current snapshot")
+        .clone();
+    let (data, deletes) = snapshot_files(&table, &snapshot, binding).await;
+    LiveCut {
+        snapshot_id: snapshot.snapshot_id(),
+        data,
+        deletes,
+    }
+}
+
+/// Projects every snapshot this table carries that a Forge rewrite published.
+///
+/// Identified by the production summary property rather than by position or
+/// timestamp, so an unrelated append between two rewrites cannot be miscounted
+/// as one and a rewrite cannot be missed because something committed after it.
+/// Each rewrite's algebra is the difference between its own complete live set
+/// and its parent's, which is what the table actually gained and lost at that
+/// commit regardless of how the catalog chose to encode it in manifests.
+///
+/// # Panics
+///
+/// Panics when the table or any manifest it names cannot be read, or when a
+/// rewrite snapshot names a parent the metadata does not carry, which would
+/// mean the rewrite committed onto a base the table has since forgotten.
+async fn rewrite_snapshots(
+    cluster: &WyrdTestCluster,
+    binding: &TenantTableBinding,
+) -> Vec<RewriteSnapshot> {
+    let server = cluster.server(0).expect("the embedded pod is running");
+    let table = server
+        .bifrost_catalog()
+        .iceberg_catalog()
+        .load_table(&binding.table_ident())
+        .await
+        .expect("the journey table loads through the production catalog");
+    let mut found = Vec::new();
+    for snapshot in table.metadata().snapshots() {
+        let summary = snapshot
+            .summary()
+            .additional_properties
+            .iter()
+            .filter(|(key, _)| key.starts_with("forge."))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>();
+        if summary.get("forge.workflow").map(String::as_str) != Some("iceberg-rewrite") {
+            continue;
+        }
+        let parent_snapshot_id = snapshot.parent_snapshot_id();
+        let parent = parent_snapshot_id
+            .and_then(|parent| table.metadata().snapshot_by_id(parent))
+            .unwrap_or_else(|| {
+                panic!(
+                    "a rewrite snapshot names a base the table still carries: {:?}",
+                    snapshot.snapshot_id()
+                )
+            });
+        let (own_data, own_deletes) = snapshot_files(&table, snapshot, binding).await;
+        let (base_data, base_deletes) = snapshot_files(&table, parent, binding).await;
+        found.push(RewriteSnapshot {
+            snapshot_id: snapshot.snapshot_id(),
+            parent_snapshot_id,
+            summary,
+            added_data: own_data.difference(&base_data).cloned().collect(),
+            removed_data: base_data.difference(&own_data).cloned().collect(),
+            removed_deletes: base_deletes.difference(&own_deletes).cloned().collect(),
+        });
+    }
+    found
+}
+
+/// The durable facts one Prepared rewrite operation committed to before its call.
+///
+/// This is the operation's own immutable promise: what it would remove, what
+/// it would add, and which base it derived them from. Correlating the Iceberg
+/// snapshot against *this* — rather than against whatever the table happens to
+/// hold — is what makes the landed effect provably the operation's own.
+#[derive(Debug, Clone)]
+struct PreparedRewrite {
+    /// Operation identity, which is also the publishing attempt's identity.
+    operation_id: Uuid,
+    /// Snapshot the replacement was derived against.
+    base_snapshot_id: i64,
+    /// Exact catalog paths the commit would delete, in storage form.
+    input_paths: BTreeSet<String>,
+    /// Exact rewritten object paths the commit would add, in storage form.
+    output_paths: BTreeSet<String>,
+}
+
+/// Reads the durable Prepared detail of one named rewrite operation.
+///
+/// # Panics
+///
+/// Panics when the read-only diagnostic query fails, or when the row does not
+/// carry the Prepared rewrite detail shape it is required to.
+async fn prepared_rewrite(
+    cluster: &WyrdTestCluster,
+    operation: Uuid,
+    binding: &TenantTableBinding,
+) -> PreparedRewrite {
+    let detail = sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT prepared_detail FROM vala.forge_operation_state WHERE operation_id = $1",
+    )
+    .bind(operation)
+    .fetch_one(cluster.pg_fixture().operator_pool().pool())
+    .await
+    .expect("Forge prepared-detail inspection");
+    let paths = |field: &str| {
+        detail
+            .get(field)
+            .and_then(serde_json::Value::as_array)
+            .unwrap_or_else(|| panic!("the Prepared detail carries {field}: {detail}"))
+            .iter()
+            .map(|value| {
+                canonical_path(
+                    value.as_str().expect("a Prepared detail path is a string"),
+                    binding,
+                )
+            })
+            .collect::<BTreeSet<_>>()
+    };
+    PreparedRewrite {
+        operation_id: detail
+            .get("operation_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .unwrap_or_else(|| panic!("the Prepared detail names its operation: {detail}")),
+        base_snapshot_id: detail
+            .get("base_snapshot_id")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or_else(|| panic!("the Prepared detail names its base: {detail}")),
+        input_paths: paths("input_paths"),
+        output_paths: paths("output_paths"),
+    }
+}
+
+/// Reads the durable small-files task the given rewrite attempt belongs to.
+///
+/// Returns the task identity and the exact selected input set its immutable
+/// plan bound, which is the only authority on what this rewrite was allowed to
+/// consume.
+///
+/// # Panics
+///
+/// Panics when the read-only diagnostic query fails or the task is absent.
+async fn rewrite_task_plan(
+    cluster: &WyrdTestCluster,
+    task_id: Uuid,
+    binding: &TenantTableBinding,
+) -> BTreeSet<String> {
+    let plan = sqlx::query_scalar::<_, serde_json::Value>(
+        "SELECT plan FROM vala.forge_tasks WHERE task_id = $1 AND strategy = 'small_files'",
+    )
+    .bind(task_id)
+    .fetch_one(cluster.pg_fixture().operator_pool().pool())
+    .await
+    .expect("Forge rewrite-task inspection");
+    plan.get("inputs")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("the durable rewrite plan binds its inputs: {plan}"))
+        .iter()
+        .map(|value| {
+            canonical_path(
+                value
+                    .as_str()
+                    .expect("a durable plan input is an object path"),
+                binding,
+            )
+        })
+        .collect()
+}
+
+/// Counts the durable transitions one named rewrite operation has recorded.
+///
+/// Returns `(phase, settled)`: the operation's current phase and whether a
+/// terminal audit row exists for it. A settled operation has exactly one, and
+/// a second settlement would have to overwrite the first, so the pair is the
+/// exactly-once evidence.
+///
+/// # Panics
+///
+/// Panics when the read-only diagnostic query fails or the operation is absent.
+async fn rewrite_settlement(cluster: &WyrdTestCluster, operation: Uuid) -> (String, bool) {
+    sqlx::query_as::<_, (String, Option<i64>)>(
+        "SELECT phase, terminal_audit_seq FROM vala.forge_operation_state \
+         WHERE operation_id = $1",
+    )
+    .bind(operation)
+    .fetch_one(cluster.pg_fixture().operator_pool().pool())
+    .await
+    .map(|(phase, terminal)| (phase, terminal.is_some()))
+    .expect("Forge settlement inspection")
+}
+
+/// Asserts one tenant's public read returns exactly the rows it acknowledged.
+///
+/// Both the ordered identity vector and its canonical digest are compared. The
+/// vector is what names the defect when this fails; the digest is what makes
+/// the comparison a single stable fact the completion record can quote, and
+/// what would still catch an encoding difference the vector comparison
+/// normalised away.
+///
+/// # Panics
+///
+/// Panics when the public read differs from the acknowledged rows in any way.
+async fn assert_public_rows(
+    client: &wyrd_client::WyrdClient,
+    table: &JourneyTable,
+    expected: &[ManagedRow],
+    cut: &str,
+) -> String {
+    let read = read_managed_rows(client, &table.qualified).await;
+    assert_eq!(
+        read, expected,
+        "{cut}: the public read returns exactly the acknowledged rows of {}",
+        table.qualified
+    );
+    let digest = rows_digest(&read);
+    assert_eq!(
+        digest,
+        rows_digest(expected),
+        "{cut}: the public read's canonical digest matches the acknowledged rows"
+    );
+    digest
+}
+
+/// Durable rewrite facts one recovered operation must be able to prove.
+///
+/// Every field is read out of Postgres or the Iceberg manifests before this
+/// struct is built, so the telemetry assertion compares production signals to
+/// independently established truth rather than to another telemetry reading.
+struct RecoveryTelemetry {
+    /// Durable Forge task the landed snapshot named as its owner.
+    task_id: Uuid,
+    /// Attempt identity the uncertain publication committed under.
+    attempt_id: Uuid,
+    /// Live data files the operation promised to remove.
+    input_files: u64,
+    /// Managed data files the operation promised to add.
+    output_files: u64,
+    /// Byte volume the landed snapshot recorded as removed.
+    input_bytes: u64,
+    /// Byte volume the landed snapshot recorded as added.
+    output_bytes: u64,
+}
+
+/// Reads one numeric Iceberg snapshot summary property.
+///
+/// # Panics
+///
+/// Panics when the property is absent or is not a `u64`, which would mean the
+/// versioned rewrite property set the snapshot claims is incomplete.
+fn summary_u64(summary: &BTreeMap<String, String>, key: &str) -> u64 {
+    summary
+        .get(key)
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("the landed snapshot carries a numeric {key}: {summary:?}"))
+}
+
+/// Sums the window delta of one production counter series.
+///
+/// Selection is by exact family plus exact label equality, so an unrelated
+/// series in the same family cannot contribute to the answer.
+fn counter_delta(delta: &BifrostTelemetryDelta, family: &str, labels: &[(&str, &str)]) -> f64 {
+    delta
+        .metrics
+        .iter()
+        .filter(|sample| {
+            sample.family == family
+                && labels
+                    .iter()
+                    .all(|(key, value)| sample.labels.get(*key).map(String::as_str) == Some(*value))
+        })
+        .map(|sample| sample.value)
+        .sum()
+}
+
+/// Reads one scrubbed span attribute.
+fn attribute<'a>(span: &'a wyrd_telemetry::CapturedSpan, key: &str) -> Option<&'a str> {
+    span.attributes.get(key).map(String::as_str)
+}
+
+/// Proves the production telemetry tells the same story the durable facts do.
+///
+/// The journey window carries every span the whole route emitted, so span
+/// selection is by durable identity: the catalog commit is found by the attempt
+/// the operation actually published under, and the executing task by the task
+/// the landed snapshot named. The recovery window is opened immediately before
+/// the reconciliation loop so the recovered operation's own counted volume is
+/// not contaminated by the rewrites earlier drain phases legitimately made.
+///
+/// Metric identity is also asserted negatively: production Forge series must
+/// stay fixed-cardinality, so no sample may carry a tenant, table, task,
+/// attempt, operation, or object-path label.
+///
+/// # Panics
+///
+/// Panics when a required stage is missing, when a stage carries an identity
+/// other than the durable one, when the recovered volume does not reconcile to
+/// the manifest-derived volume, or when a Forge sample carries an unbounded
+/// label.
+fn assert_recovery_telemetry(
+    journey: &BifrostTelemetryDelta,
+    recovery: &BifrostTelemetryDelta,
+    facts: &RecoveryTelemetry,
+) {
+    // 1. The pod's own scheduler drove the route and said so.
+    assert!(
+        journey.spans.iter().any(|span| {
+            span.name == "bifrost.forge.scheduler.pass"
+                && attribute(span, "result") == Some("succeeded")
+                && attribute(span, "role") == Some("server")
+        }),
+        "the production scheduler reported at least one successful pass: {:?}",
+        journey
+            .spans
+            .iter()
+            .map(|span| span.name.clone())
+            .collect::<BTreeSet<_>>()
+    );
+
+    // 2. Exactly one catalog commit was made under the published attempt, and
+    //    it reported the non-success the injected seam actually produced.
+    let commits = journey
+        .spans
+        .iter()
+        .filter(|span| {
+            span.name == "bifrost.forge.catalog.commit"
+                && attribute(span, "attempt_id") == Some(facts.attempt_id.to_string().as_str())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        commits.len(),
+        1,
+        "the uncertain attempt submitted exactly one catalog commit: {commits:?}"
+    );
+    let commit = commits[0];
+    assert_eq!(
+        attribute(commit, "task_id"),
+        Some(facts.task_id.to_string().as_str()),
+        "the commit span names the durable task the landed snapshot named: {commit:?}"
+    );
+    assert_eq!(
+        attribute(commit, "strategy"),
+        Some("iceberg_rewrite"),
+        "the commit span names the managed rewrite strategy: {commit:?}"
+    );
+    assert_eq!(
+        attribute(commit, "role"),
+        Some("forge_worker"),
+        "the commit span names the owning production role: {commit:?}"
+    );
+    assert_eq!(
+        attribute(commit, "result"),
+        Some("failed"),
+        "a submission whose acceptance was never learned reports no success: {commit:?}"
+    );
+
+    // 3. The uncertain attempt and its successor both executed the one durable
+    //    task, under the strategy the plan selected.
+    let executions = journey
+        .spans
+        .iter()
+        .filter(|span| {
+            span.name == "bifrost.forge.task.execute"
+                && attribute(span, "task_id") == Some(facts.task_id.to_string().as_str())
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        executions.len() >= 2,
+        "the uncertain attempt and its recovering successor both ran the task: {executions:?}"
+    );
+    assert_eq!(
+        executions
+            .iter()
+            .filter(
+                |span| attribute(span, "attempt_id") == Some(facts.attempt_id.to_string().as_str())
+            )
+            .count(),
+        1,
+        "exactly one execution ran under the published attempt: {executions:?}"
+    );
+    for span in &executions {
+        assert_eq!(
+            attribute(span, "role"),
+            Some("forge_worker"),
+            "every execution of the task named the owning role: {span:?}"
+        );
+        assert!(
+            attribute(span, "strategy").is_some_and(|value| value.contains("small_files")),
+            "every execution of the task named the planned rewrite strategy: {span:?}"
+        );
+    }
+
+    // 4. The terminal reconciliation counted itself as a recovery.
+    let recovered = counter_delta(
+        recovery,
+        "bifrost_forge_operations",
+        &[("source", "iceberg"), ("result", "recovered")],
+    );
+    assert!(
+        recovered >= 1.0,
+        "the reconciliation recorded a recovered Iceberg operation: {recovered}"
+    );
+
+    // 5. The counted recovery volume is the manifest-derived volume.
+    for (family, expected) in [
+        ("bifrost_forge_rewrite_input_files_total", facts.input_files),
+        ("bifrost_forge_rewrite_input_bytes_total", facts.input_bytes),
+        (
+            "bifrost_forge_rewrite_output_files_total",
+            facts.output_files,
+        ),
+        (
+            "bifrost_forge_rewrite_output_bytes_total",
+            facts.output_bytes,
+        ),
+    ] {
+        let observed = counter_delta(recovery, family, &[("source", "iceberg")]);
+        assert!(
+            (observed - expected as f64).abs() < f64::EPSILON,
+            "{family} counted the recovered operation's own volume: {observed} vs {expected}"
+        );
+    }
+
+    // 6. The rest of the shipped route reported itself in the same window.
+    let families = journey
+        .metrics
+        .iter()
+        .map(|sample| sample.family.clone())
+        .collect::<BTreeSet<_>>();
+    for prefix in ["bifrost_scribe_", "oracle_", "bifrost_forge_"] {
+        assert!(
+            families.iter().any(|family| family.starts_with(prefix)),
+            "the production route reported its {prefix}* telemetry: {families:?}"
+        );
+    }
+
+    // 7. Forge series stay fixed-cardinality: no durable identity leaks into a
+    //    label key or value.
+    let forbidden_keys = [
+        "tenant",
+        "data_tenant_id",
+        "table",
+        "task_id",
+        "attempt_id",
+        "operation_id",
+        "path",
+    ];
+    let forbidden_values = [facts.task_id.to_string(), facts.attempt_id.to_string()];
+    for sample in journey.metrics.iter().chain(recovery.metrics.iter()) {
+        if !sample.family.starts_with("bifrost_forge_") {
+            continue;
+        }
+        for (key, value) in &sample.labels {
+            assert!(
+                !forbidden_keys.contains(&key.as_str()),
+                "Forge metric {} carries an unbounded label {key}",
+                sample.family
+            );
+            assert!(
+                !forbidden_values.contains(value) && !value.contains('/'),
+                "Forge metric {} carries an unbounded label value for {key}",
+                sample.family
+            );
+        }
+    }
+}
+
 /// Promoted rows survive a rewrite whose acceptance the committer never learned.
 ///
 /// The route is the shipped one end to end: two tenants register the same table
@@ -232,16 +815,26 @@ async fn drain_forge_backlog(
 /// live. The successor recognises its predecessor's own snapshot from retained
 /// evidence, settles that one operation, and publishes nothing a second time.
 ///
-/// What must hold at every step — before promotion, after promotion, across the
-/// uncertain commit, and after recovery — is that a public read returns exactly
-/// the rows that tenant acknowledged, and that the neighbouring tenant's
-/// identically named table is neither read, rewritten, nor disturbed.
+/// The customer oracle is the public read, and it is exact: at every one of the
+/// four cuts — before promotion, after promotion, across the uncertain commit,
+/// and after recovery — each tenant's strict fused read must return the exact
+/// `(batch_id, row_ordinal, value)` multiset it acknowledged, with the matching
+/// canonical digest, and the neighbouring tenant's identically named table must
+/// be neither read, rewritten, nor disturbed.
+///
+/// Everything after that is correlated platform evidence for *why* the rows
+/// stayed exact: the one Iceberg snapshot the uncertain commit really landed,
+/// its manifest algebra against the operation's own Prepared promise, the
+/// durable Prepared→Recovered settlement of that same operation, and the
+/// production telemetry stages carrying those same identities.
 ///
 /// # Panics
 ///
 /// Panics when the cluster cannot start, a public append or read fails, a
 /// production attempt misses its diagnostic bound, a tenant observes another
-/// tenant's rows, or the uncertain commit is settled more than once.
+/// tenant's rows, the landed snapshot does not match the operation that
+/// promised it, or the uncertain commit is settled or republished more than
+/// once.
 #[tokio::test]
 #[ignore = "requires Postgres and object storage"]
 async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
@@ -275,46 +868,81 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
     let shared = register_table(server, owner, &shared_name).await;
     let neighbour_shared = register_table(server, neighbour, &shared_name).await;
     assert_eq!(
-        shared, neighbour_shared,
+        shared.qualified, neighbour_shared.qualified,
         "both tenants must be registering the identical table name"
+    );
+    assert_ne!(
+        shared.binding.object_prefix, neighbour_shared.binding.object_prefix,
+        "one logical name must resolve to two disjoint physical tables"
     );
     let neighbour_only = register_table(server, neighbour, &unique_table("neighbour_only")).await;
     let owner_client = tenant_client(server, owner).await;
     let neighbour_client = tenant_client(server, neighbour).await;
 
-    // Two sealed objects per tenant: one is the smallest set a rewrite can
-    // merge, and the sentinel ranges are disjoint so a crossed read is visible
-    // as a value rather than only as a count.
-    let owner_rows: Vec<i64> = (0..24).collect();
-    let neighbour_rows: Vec<i64> = (1_000..1_024).collect();
+    // Every batch identity is constructed here, before the server has said
+    // anything, so the expected rows are the caller's own facts rather than
+    // something read back out of the system under test.
+    let mut owner_expected: Vec<ManagedRow> = Vec::new();
+    let mut neighbour_shared_expected: Vec<ManagedRow> = Vec::new();
+    let mut neighbour_only_expected: Vec<ManagedRow> = Vec::new();
+    let owner_values: Vec<i64> = (0..24).collect();
+    let neighbour_values: Vec<i64> = (1_000..1_024).collect();
     for half in 0..2 {
         let span = 12 * half..12 * (half + 1);
-        append_values(&owner_client, &shared, &owner_rows[span.clone()]).await;
-        append_values(&neighbour_client, &shared, &neighbour_rows[span.clone()]).await;
-        append_values(&neighbour_client, &neighbour_only, &neighbour_rows[span]).await;
+        owner_expected.extend(
+            append_values(
+                &owner_client,
+                &shared.qualified,
+                Uuid::now_v7(),
+                &owner_values[span.clone()],
+            )
+            .await,
+        );
+        neighbour_shared_expected.extend(
+            append_values(
+                &neighbour_client,
+                &shared.qualified,
+                Uuid::now_v7(),
+                &neighbour_values[span.clone()],
+            )
+            .await,
+        );
+        neighbour_only_expected.extend(
+            append_values(
+                &neighbour_client,
+                &neighbour_only.qualified,
+                Uuid::now_v7(),
+                &neighbour_values[span],
+            )
+            .await,
+        );
         server
             .flush_bifrost()
             .await
             .expect("the pod publishes its staged rows");
     }
+    owner_expected = canonical_order(owner_expected);
+    neighbour_shared_expected = canonical_order(neighbour_shared_expected);
+    neighbour_only_expected = canonical_order(neighbour_only_expected);
 
-    assert_eq!(
-        read_sorted_values(&owner_client, &shared).await,
-        owner_rows,
-        "a public read before promotion returns exactly the accepted rows"
-    );
-    assert_eq!(
-        read_sorted_values(&neighbour_client, &shared).await,
-        neighbour_rows,
-        "the neighbouring tenant reads exactly its own rows from the shared name"
-    );
-    assert!(
-        try_read(&owner_client, &neighbour_only).await.is_err(),
-        "one tenant must not resolve a table only its neighbour registered"
-    );
+    // Cut 1 — before promotion.
+    let owner_digest =
+        assert_public_rows(&owner_client, &shared, &owner_expected, "before promotion").await;
+    assert_public_rows(
+        &neighbour_client,
+        &neighbour_shared,
+        &neighbour_shared_expected,
+        "before promotion",
+    )
+    .await;
+    assert_tenant_scoped_not_found(
+        &owner_client,
+        &neighbour_only.qualified,
+        neighbour,
+        "before promotion",
+    )
+    .await;
 
-    // Closing the written partition is what makes the pod's own planner see a
-    // compactable group; nothing durable is fabricated.
     server
         .forge_clock()
         .advance(chrono::Duration::days(1))
@@ -330,29 +958,39 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
         "the server-owned worker ran the production promotion strategy"
     );
 
+    // Cut 2 — after promotion.
     assert_eq!(
-        read_sorted_values(&owner_client, &shared).await,
-        owner_rows,
-        "a public read after promotion returns exactly the accepted rows"
+        assert_public_rows(&owner_client, &shared, &owner_expected, "after promotion").await,
+        owner_digest,
+        "promotion changed which tier owns the rows, not the rows"
     );
-    assert_eq!(
-        read_sorted_values(&neighbour_client, &shared).await,
-        neighbour_rows,
-        "promotion did not move a row across the tenant boundary"
-    );
-    let (owner_promoted, owner_hot) = file_tiers(&cluster, owner, &shared_name).await;
+    assert_public_rows(
+        &neighbour_client,
+        &neighbour_shared,
+        &neighbour_shared_expected,
+        "after promotion",
+    )
+    .await;
+    let (owner_promoted, owner_hot) = file_tiers(&cluster, owner, &shared.name).await;
     assert!(
         owner_promoted >= 2 && owner_hot == 0,
         "the owner's objects all moved to the promoted tier: {owner_promoted}/{owner_hot}"
     );
-    let neighbour_before = file_paths(&cluster, neighbour, &shared_name).await;
+    let neighbour_before = file_paths(&cluster, neighbour, &shared.name).await;
+    let neighbour_cut_before = live_cut(&cluster, &neighbour_shared.binding).await;
+    let neighbour_only_cut_before = live_cut(&cluster, &neighbour_only.binding).await;
 
-    // A third accepted round the owner alone writes. Draining it leaves that
-    // tenant owing exactly one rewrite over promoted files from two promotion
-    // generations, and leaves its neighbour owing nothing, so the next commit
-    // the pod makes is the one this journey is about to render uncertain.
-    let owner_rows: Vec<i64> = (0..36).collect();
-    append_values(&owner_client, &shared, &owner_rows[24..]).await;
+    // A third accepted round gives the rewrite more than one input to consume.
+    owner_expected.extend(
+        append_values(
+            &owner_client,
+            &shared.qualified,
+            Uuid::now_v7(),
+            &(24..36).collect::<Vec<i64>>(),
+        )
+        .await,
+    );
+    owner_expected = canonical_order(owner_expected);
     server
         .flush_bifrost()
         .await
@@ -362,14 +1000,19 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
         .advance(chrono::Duration::days(1))
         .expect("the third round's partition closes");
     drain_forge_backlog(&cluster, &observer, &[owner, neighbour]).await;
-    assert_eq!(
-        read_sorted_values(&owner_client, &shared).await,
-        owner_rows,
-        "the promoted cut returns every accepted row"
-    );
+    let promoted_digest = assert_public_rows(
+        &owner_client,
+        &shared,
+        &owner_expected,
+        "after the third promotion",
+    )
+    .await;
 
-    // The catalog accepts the replacement and then loses its answer, which is
-    // the one outcome a committer cannot resolve on its own.
+    // The complete promoted cut, captured before uncertainty is armed. Every
+    // statement about what the rewrite removed and added is made against this.
+    let pre_rewrite = live_cut(&cluster, &shared.binding).await;
+    let rewrites_before = rewrite_snapshots(&cluster, &shared.binding).await.len();
+
     uncertainty.fail_after_next_commit();
     let attempts = observer.attempts();
     release_retries(&cluster, owner).await;
@@ -397,20 +1040,194 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
         Some("prepared"),
         "the operation the pod could not settle is the one it just attempted"
     );
-    let rewritten = file_paths(&cluster, owner, &shared_name).await;
+
+    // Cut 3 — across the uncertain commit. The customer answer first; the
+    // catalog is only consulted once the rows have already been proven exact.
     assert_eq!(
-        read_sorted_values(&owner_client, &shared).await,
-        owner_rows,
-        "the rewritten cut reads exactly the rows the promoted cut did"
+        assert_public_rows(
+            &owner_client,
+            &shared,
+            &owner_expected,
+            "across the uncertain commit"
+        )
+        .await,
+        promoted_digest,
+        "a rewrite whose acceptance was never learned changed no row"
+    );
+    assert_public_rows(
+        &neighbour_client,
+        &neighbour_shared,
+        &neighbour_shared_expected,
+        "across the uncertain commit",
+    )
+    .await;
+
+    // The operation's own immutable promise, and the one snapshot that kept it.
+    let prepared = prepared_rewrite(&cluster, uncertain, &shared.binding).await;
+    assert_eq!(
+        prepared.operation_id, uncertain,
+        "the Prepared detail names the operation the pod could not settle"
+    );
+    let published = rewrite_snapshots(&cluster, &shared.binding).await;
+    let landed = published
+        .iter()
+        .filter(|snapshot| {
+            snapshot.summary.get("forge.operation_id") == Some(&uncertain.to_string())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        landed.len(),
+        1,
+        "the uncertain commit landed exactly one rewrite snapshot: {published:?}"
+    );
+    let landed = landed[0].clone();
+    assert_eq!(
+        landed.summary.get("forge.attempt_id"),
+        Some(&uncertain.to_string()),
+        "the landed snapshot carries the publishing attempt's identity: {landed:?}"
     );
     assert_eq!(
-        read_sorted_values(&neighbour_client, &shared).await,
-        neighbour_rows,
-        "an uncertain rewrite of one tenant leaves its neighbour's rows exact"
+        landed
+            .summary
+            .get("forge.rewrite.version")
+            .map(String::as_str),
+        Some("1"),
+        "the landed snapshot carries the versioned rewrite property set: {landed:?}"
+    );
+    assert_eq!(
+        landed
+            .summary
+            .get("forge.rewrite.base_snapshot_id")
+            .and_then(|value| value.parse::<i64>().ok()),
+        Some(prepared.base_snapshot_id),
+        "the snapshot's base is the base the operation derived against"
+    );
+    assert_eq!(
+        landed.parent_snapshot_id,
+        Some(prepared.base_snapshot_id),
+        "the rewrite committed directly onto its promised base"
+    );
+    assert_eq!(
+        pre_rewrite.snapshot_id, prepared.base_snapshot_id,
+        "the promised base is the cut the promotion left current"
+    );
+    let landed_task = landed
+        .summary
+        .get("forge.task_id")
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .unwrap_or_else(|| panic!("the landed snapshot names its durable task: {landed:?}"));
+
+    // Three authorities, narrowing: the durable plan bounds what the task was
+    // ever allowed to touch; the Prepared detail is the exact promise the
+    // attempt re-derived against the live cut and wrote down before calling
+    // the catalog; the snapshot is what actually happened. Each must be
+    // contained by the one before it, and the last two must be identical.
+    let selected = rewrite_task_plan(&cluster, landed_task, &shared.binding).await;
+    assert!(
+        selected.is_subset(&pre_rewrite.data),
+        "the rewrite planned only files the promoted cut held live: {selected:?}"
+    );
+    assert!(
+        !prepared.input_paths.is_empty() && prepared.input_paths.is_subset(&selected),
+        "the operation promised to remove a non-empty part of its durable plan: {:?} vs {selected:?}",
+        prepared.input_paths
+    );
+    assert!(
+        prepared.input_paths.is_subset(&pre_rewrite.data),
+        "the operation promised to remove only files the promoted cut held live: {:?}",
+        prepared.input_paths
+    );
+    assert!(
+        prepared.output_paths.is_disjoint(&pre_rewrite.data),
+        "the operation promised managed outputs no earlier cut already held: {:?}",
+        prepared.output_paths
+    );
+    assert_eq!(
+        landed.removed_data, prepared.input_paths,
+        "the snapshot removed exactly the operation's promised inputs"
+    );
+    assert_eq!(
+        landed.added_data, prepared.output_paths,
+        "the snapshot added exactly the operation's promised managed outputs"
+    );
+    assert_eq!(
+        landed.removed_deletes,
+        BTreeSet::new(),
+        "this journey's table carries no deletes, so the rewrite removed none"
+    );
+    assert_eq!(
+        pre_rewrite.deletes,
+        BTreeSet::new(),
+        "this journey's promoted cut carries no delete attachments"
+    );
+    assert_eq!(
+        landed
+            .summary
+            .get("forge.rewrite.removed_data_files")
+            .and_then(|value| value.parse::<usize>().ok()),
+        Some(landed.removed_data.len()),
+        "the snapshot's removed count matches its manifests"
+    );
+    assert_eq!(
+        landed
+            .summary
+            .get("forge.rewrite.added_data_files")
+            .and_then(|value| value.parse::<usize>().ok()),
+        Some(landed.added_data.len()),
+        "the snapshot's added count matches its manifests"
+    );
+    assert_eq!(
+        landed
+            .summary
+            .get("forge.rewrite.removed_delete_files")
+            .and_then(|value| value.parse::<usize>().ok()),
+        Some(0),
+        "the snapshot's removed-delete count matches its empty manifest set"
+    );
+    assert_eq!(
+        landed
+            .summary
+            .get("forge.rewrite.retained_delete_files")
+            .and_then(|value| value.parse::<usize>().ok()),
+        Some(0),
+        "the snapshot retained no delete attachment because there was none"
     );
 
-    // The successor settles its predecessor's own snapshot from retained
-    // evidence rather than publishing a second replacement.
+    // The live cut is exactly the algebra the snapshot describes.
+    let rewritten_cut = live_cut(&cluster, &shared.binding).await;
+    let expected_cut = pre_rewrite
+        .data
+        .difference(&landed.removed_data)
+        .chain(landed.added_data.iter())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        rewritten_cut.data, expected_cut,
+        "the live cut is the promoted cut minus the removals plus the additions"
+    );
+    assert_eq!(
+        rewritten_cut.deletes,
+        BTreeSet::new(),
+        "the rewrite left no delete attachment behind"
+    );
+    assert_eq!(
+        rewritten_cut.snapshot_id, landed.snapshot_id,
+        "the rewrite snapshot is the authoritative cut"
+    );
+
+    let rewrite_snapshot_id = landed.snapshot_id;
+    let rewrites_after_commit = published.len();
+    assert_eq!(
+        rewrites_after_commit,
+        rewrites_before + 1,
+        "the uncertain commit added exactly one rewrite snapshot"
+    );
+
+    // A second window opens here so the recovered outcome's own volume can be
+    // isolated from every rewrite the drain phases legitimately performed.
+    let recovery_mark = telemetry
+        .checkpoint()
+        .expect("production telemetry recovery checkpoint");
     let mut settled = false;
     for _ in 0..DRAIN_PASS_BUDGET {
         if rewrite_phase(&cluster, uncertain).await != "prepared" {
@@ -432,51 +1249,101 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
         "the pod never settled its one uncertain operation in {DRAIN_PASS_BUDGET} passes: {:?}",
         observer.returned_errors()
     );
+
+    // Cut 4 — after recovery. Customer answer first, again.
     assert_eq!(
-        rewrite_phase(&cluster, uncertain).await,
-        "recovered",
+        assert_public_rows(&owner_client, &shared, &owner_expected, "after recovery").await,
+        promoted_digest,
+        "recovery returned the rows to nobody's surprise: exactly the same ones"
+    );
+    assert_public_rows(
+        &neighbour_client,
+        &neighbour_shared,
+        &neighbour_shared_expected,
+        "after recovery",
+    )
+    .await;
+    assert_public_rows(
+        &neighbour_client,
+        &neighbour_only,
+        &neighbour_only_expected,
+        "after recovery",
+    )
+    .await;
+    assert_tenant_scoped_not_found(
+        &owner_client,
+        &neighbour_only.qualified,
+        neighbour,
+        "after recovery",
+    )
+    .await;
+
+    let (phase, terminal) = rewrite_settlement(&cluster, uncertain).await;
+    assert_eq!(
+        phase, "recovered",
         "the successor settles its predecessor's own operation as recovered"
     );
+    assert!(
+        terminal,
+        "the recovered operation carries exactly one terminal settlement"
+    );
+    let recovered = rewrite_snapshots(&cluster, &shared.binding).await;
     assert_eq!(
-        file_paths(&cluster, owner, &shared_name).await,
-        rewritten,
-        "recovery rewrote nothing a second time"
+        recovered.len(),
+        rewrites_after_commit,
+        "recovery published no second rewrite snapshot: {recovered:?}"
+    );
+    let still = recovered
+        .iter()
+        .find(|snapshot| snapshot.snapshot_id == rewrite_snapshot_id)
+        .expect("the recovered snapshot is the one the uncertain commit landed");
+    assert_eq!(
+        still.added_data, landed.added_data,
+        "recovery produced no new managed output"
     );
     assert_eq!(
-        read_sorted_values(&owner_client, &shared).await,
-        owner_rows,
-        "the public read after recovery still returns exactly the accepted rows"
+        live_cut(&cluster, &shared.binding).await,
+        rewritten_cut,
+        "recovery left the live cut exactly as the uncertain commit did"
     );
+
+    // Tenant isolation across the whole recovery, at the platform layer too.
     assert_eq!(
-        read_sorted_values(&neighbour_client, &shared).await,
-        neighbour_rows,
-        "recovery never touched the neighbouring tenant's identically named table"
-    );
-    assert_eq!(
-        file_paths(&cluster, neighbour, &shared_name).await,
+        file_paths(&cluster, neighbour, &shared.name).await,
         neighbour_before,
         "the neighbouring tenant's objects were never replaced"
     );
     assert_eq!(
-        read_sorted_values(&neighbour_client, &neighbour_only).await,
-        neighbour_rows,
-        "the neighbour-only table is unchanged by the owner's rewrite"
+        live_cut(&cluster, &neighbour_shared.binding).await,
+        neighbour_cut_before,
+        "the neighbour's identically named table kept its exact snapshot and cut"
+    );
+    assert_eq!(
+        live_cut(&cluster, &neighbour_only.binding).await,
+        neighbour_only_cut_before,
+        "the neighbour-only table kept its exact snapshot and cut"
     );
     assert!(
-        try_read(&owner_client, &neighbour_only).await.is_err(),
-        "the tenant boundary still refuses a neighbour-only table after recovery"
+        neighbour_cut_before.data.is_disjoint(&rewritten_cut.data),
+        "the two tenants' objects never overlap"
     );
 
-    let delta = telemetry
+    let recovery_window = telemetry
+        .delta_since(&recovery_mark)
+        .expect("production telemetry recovery delta");
+    let journey_window = telemetry
         .delta_since(&checkpoint)
         .expect("production telemetry delta");
-    let families = delta
-        .metrics
-        .iter()
-        .map(|sample| sample.family.clone())
-        .collect::<BTreeSet<_>>();
-    assert!(
-        families.contains("bifrost_forge_operations"),
-        "the production route reported its operation telemetry: {families:?}"
+    assert_recovery_telemetry(
+        &journey_window,
+        &recovery_window,
+        &RecoveryTelemetry {
+            task_id: landed_task,
+            attempt_id: uncertain,
+            input_files: prepared.input_paths.len() as u64,
+            output_files: prepared.output_paths.len() as u64,
+            input_bytes: summary_u64(&landed.summary, "forge.rewrite.removed_bytes"),
+            output_bytes: summary_u64(&landed.summary, "forge.rewrite.added_bytes"),
+        },
     );
 }

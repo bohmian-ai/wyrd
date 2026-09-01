@@ -25,7 +25,7 @@ use crate::boot::{ServerBootError, spawn_maintenance_scheduler, spawn_storage_sw
 use crate::components::health::readiness_loop;
 use crate::config::{BifrostTarget, ServeMode, WyrdServerConfig};
 use crate::grpc::{
-    GrpcRouterConfig, build_app_grpc, drive_health_status, publish_initial_health,
+    GrpcRouterConfig, build_app_grpc, build_peer_grpc, drive_health_status, publish_initial_health,
     serve_grpc_with_listener,
 };
 use crate::state::{AppState, BifrostShutdownReport};
@@ -94,6 +94,8 @@ pub struct WyrdServer {
     state: AppState,
     http_router: Router,
     grpc_router: TonicRouter,
+    /// Private Bifrost peer router, present only for a peer-bearing target.
+    peer_router: Option<TonicRouter>,
     reporter: HealthReporter,
     metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     extra_workers: Vec<(&'static str, BoxWorker)>,
@@ -171,6 +173,10 @@ impl WyrdServer {
                 tls_identity,
             },
         )?;
+        let peer_router = match load_peer_tls(&config)? {
+            Some(peer_tls) => build_peer_grpc(&state, peer_tls)?,
+            None => None,
+        };
         let http_router = crate::http::build_router(state.clone());
 
         Ok(Self {
@@ -178,6 +184,7 @@ impl WyrdServer {
             state,
             http_router,
             grpc_router,
+            peer_router,
             reporter,
             metrics_handle,
             extra_workers: Vec::new(),
@@ -353,11 +360,34 @@ impl WyrdServer {
             (None, None)
         };
 
+        // The peer socket is bound by the same owner, in the same call, as the
+        // public sockets. Binding it here is what lets a bind failure surface
+        // as a boot error and what lets readiness wait on the address the
+        // listener actually holds rather than the configured one.
+        let (peer_listener, peer_addr) = match self.peer_router.is_some() {
+            true => {
+                let bind = self.config.bifrost.peer.bind;
+                let listener = TcpListener::bind(bind).await.map_err(|e| {
+                    BootExit::Other(
+                        format!("Bifrost peer listener failed to bind {bind}: {e}").into(),
+                    )
+                })?;
+                let addr = listener
+                    .local_addr()
+                    .map_err(|e| BootExit::Other(Box::new(e)))?;
+                (Some(listener), Some(addr))
+            }
+            false => (None, None),
+        };
+
         Ok(BoundServer {
             config: self.config,
             state: self.state,
             http_router: self.http_router,
             grpc_router: self.grpc_router,
+            peer_router: self.peer_router,
+            peer_listener,
+            peer_addr,
             reporter: self.reporter,
             metrics_handle: self.metrics_handle,
             extra_workers: self.extra_workers,
@@ -384,6 +414,12 @@ pub struct BoundServer {
     state: AppState,
     http_router: Router,
     grpc_router: TonicRouter,
+    /// Private Bifrost peer router, present only for a peer-bearing target.
+    peer_router: Option<TonicRouter>,
+    /// Pre-bound private peer listener paired with `peer_router`.
+    peer_listener: Option<TcpListener>,
+    /// Exact address the private peer listener holds.
+    peer_addr: Option<SocketAddr>,
     reporter: HealthReporter,
     metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     extra_workers: Vec<(&'static str, BoxWorker)>,
@@ -465,6 +501,16 @@ impl BoundServer {
     #[must_use]
     pub fn metrics_addr(&self) -> Option<SocketAddr> {
         self.metrics_addr
+    }
+
+    /// The bound private Bifrost peer address, or `None` for a non-peer target.
+    ///
+    /// This is the address a peer-bearing role advertises into membership: a
+    /// selected `NodeId` and fence must reach this exact replica, so callers
+    /// publish it rather than the public gRPC address.
+    #[must_use]
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        self.peer_addr
     }
 
     /// Read-only access to core state.
@@ -608,6 +654,17 @@ impl BoundServer {
             let router = self.grpc_router;
             let token = shutdown.clone();
             set.spawn(fallible_task(TaskId::Grpc, async move {
+                serve_grpc_with_listener(router, listener, token).await
+            }));
+        }
+        if let Some(listener) = self.peer_listener.take() {
+            tracing::info!(addr = ?self.peer_addr, "Bifrost peer server listening");
+            let router = self
+                .peer_router
+                .take()
+                .expect("a bound peer listener always carries its peer router");
+            let token = shutdown.clone();
+            set.spawn(fallible_task(TaskId::BifrostPeer, async move {
                 serve_grpc_with_listener(router, listener, token).await
             }));
         }
@@ -888,4 +945,59 @@ mod pg_tests {
         };
         assert_eq!(error.to_string(), "Scribe role unavailable");
     }
+}
+
+/// Loads this process's private peer TLS material, when it serves the peer plane.
+///
+/// Returns `None` for a target that mounts no private service, so a Forge
+/// worker neither reads certificate files nor opens a peer socket.
+///
+/// # Errors
+///
+/// Returns [`ServerBootError::OraclePeer`] when a peer-bearing target has an
+/// incomplete peer configuration or a PEM file cannot be read.
+fn load_peer_tls(
+    config: &WyrdServerConfig,
+) -> Result<Option<wyrd_tonic::server::MutualTlsServerConfig>, ServerBootError> {
+    let peer = &config.bifrost.peer;
+    if !peer.is_complete() {
+        if config.role.serves_peer() {
+            return Err(ServerBootError::OraclePeer(
+                "Scribe- and Oracle-bearing targets require the complete bifrost.peer identity"
+                    .to_owned(),
+            ));
+        }
+        return Ok(None);
+    }
+    let read = |path: &std::path::Path, label: &str| -> Result<Vec<u8>, ServerBootError> {
+        std::fs::read(path).map_err(|error| {
+            ServerBootError::OraclePeer(format!(
+                "failed to read Bifrost peer {label} {}: {error}",
+                path.display()
+            ))
+        })
+    };
+    let certificate = read(
+        peer.certificate_chain_path
+            .as_ref()
+            .expect("peer completeness guarantees a certificate chain path"),
+        "certificate chain",
+    )?;
+    let key = read(
+        peer.private_key_path
+            .as_ref()
+            .expect("peer completeness guarantees a private key path"),
+        "private key",
+    )?;
+    let ca = read(
+        peer.ca_certificate_path
+            .as_ref()
+            .expect("peer completeness guarantees a CA path"),
+        "CA certificate",
+    )?;
+    Ok(Some(wyrd_tonic::server::MutualTlsServerConfig::from_pem(
+        &certificate,
+        &key,
+        &ca,
+    )))
 }

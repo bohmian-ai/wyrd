@@ -119,21 +119,22 @@ where
     }
 }
 
-/// Build the application gRPC router: health (unauthenticated) plus the C1
-/// ingest service with auth completed in the handler.
+/// Build the **public** application gRPC router.
+///
+/// The public listener carries client-facing traffic only: health, optional
+/// reflection, Scribe ingest, OTLP, and the Vala/Bifrost query services. Every
+/// private peer service lives on the separate peer router built by
+/// [`build_peer_grpc`], so a peer RPC is unreachable on this listener even with
+/// a valid client token.
 ///
 /// A role-absent topology returns the health-only router and does not mount
-/// Scribe ingest, OTLP, query, or tail services. Fallible: ingest is never mounted unauthenticated, so a `None`
-/// `AppState.token_verifier` is a hard [`GrpcError::MissingTokenVerifier`]. The
-/// verifier is the same `TokenVerifier` the HTTP `AuthenticatedPrincipal`
-/// extractor uses; `build_grpc_router` stays unchanged (health only,
-/// `NoopInterceptor`, no `.layer`) and ingest is attached via `add_service`.
+/// Scribe ingest, OTLP, or query services. Fallible: ingest is never mounted
+/// unauthenticated, so a `None` `AppState.token_verifier` is a hard
+/// [`GrpcError::MissingTokenVerifier`].
 ///
 /// # Errors
 /// Returns [`GrpcError::MissingTokenVerifier`] when no token verifier is
-/// configured, [`GrpcError::MissingScribe`] when only one of the paired Scribe
-/// gate/resource capabilities is present, or a router-assembly error from
-/// [`build_grpc_router`].
+/// configured, or a router-assembly error from [`build_grpc_router`].
 pub fn build_app_grpc<H>(
     state: &AppState,
     health_service: HealthServer<H>,
@@ -156,7 +157,7 @@ where
     let query = crate::vala_query::grpc::ValaQueryGrpc::new(state.clone());
     let bifrost_query = query::BifrostQueryGrpc::new(state.clone());
     let transport = state.bifrost.transport_admission();
-    let router = router
+    Ok(router
         .add_service(GrpcTransportAdmissionService::new(
             state.bifrost.gate().clone().into_server(),
             transport.clone(),
@@ -176,10 +177,50 @@ where
         ))
         .add_service(GrpcTransportAdmissionService::new(
             bifrost_query.into_server(),
+            transport,
+        )))
+}
+
+/// Build the **private** Bifrost peer router served on the mutually
+/// authenticated peer listener.
+///
+/// This router mounts exactly the closed set of private services this target's
+/// selected roles own: the Oracle peer service, the Scribe tail service, the
+/// upstream DataFusion worker adapter, and the Oracle lifecycle service. It
+/// deliberately mounts neither health nor reflection — a private listener
+/// advertises nothing to an unauthenticated caller.
+///
+/// Returns `Ok(None)` when this target selects no private service, which is the
+/// Forge-worker case: it keeps using its durable assignment path and opens no
+/// peer socket.
+///
+/// # Errors
+/// Returns [`GrpcError::MissingTokenVerifier`] when the Oracle lifecycle
+/// service is selected without a configured token verifier, or
+/// [`GrpcError::Transport`] when tonic rejects the peer TLS material.
+pub fn build_peer_grpc(
+    state: &AppState,
+    tls: wyrd_tonic::server::MutualTlsServerConfig,
+) -> Result<Option<TonicRouter>, GrpcError> {
+    let serves_ingest = state.bifrost_ingest().is_some();
+    let serves_query = state.bifrost_query().is_some();
+    if !state.bifrost.serves_api() || !(serves_ingest || serves_query) {
+        return Ok(None);
+    }
+    let transport = state.bifrost.transport_admission();
+    // `OraclePeerService` is the one adapter every peer-bearing target mounts:
+    // a Scribe answers fragment operations on it and an Oracle answers query
+    // control, so it anchors the router and later services extend it. The
+    // protobuf service is never forked by role; an operation whose local
+    // capability is absent fails closed after authentication instead.
+    let router = wyrd_tonic::server::mutual_tls_server(tls)?.add_service(
+        GrpcTransportAdmissionService::new(
+            crate::oracle::OraclePeerGrpc::new(Arc::clone(&state.bifrost)).into_server(),
             transport.clone(),
-        ));
-    let router = if let Some(scribe) = state.bifrost_ingest() {
-        router.add_service(GrpcTransportAdmissionService::new(
+        ),
+    );
+    let router = match state.bifrost_ingest() {
+        Some(scribe) => router.add_service(GrpcTransportAdmissionService::new(
             match scribe.tail_authority() {
                 Some(authority) => scribe_tail::ScribeTailGrpc::new_with_authority(
                     state.clone(),
@@ -191,23 +232,9 @@ where
                     .into_server(),
             },
             transport.clone(),
-        ))
-    } else {
-        router
+        )),
+        None => router,
     };
-    let router = if state.bifrost_query().is_some() || state.bifrost_ingest().is_some() {
-        router.add_service(GrpcTransportAdmissionService::new(
-            crate::oracle::OraclePeerGrpc::new(Arc::clone(&state.bifrost)).into_server(),
-            transport.clone(),
-        ))
-    } else {
-        router
-    };
-    // The inactive Analytical worker service. It is mounted on the same
-    // already-authenticated peer listener as every other east-west surface, and
-    // every governed method on it is refused unless the stage-authority layer
-    // authorizes the exact raw message first. Production routing never selects
-    // Analytical execution, so nothing reaches this service in a normal query.
     let router = match state
         .bifrost_query()
         .and_then(|query| query.engine().analytical_worker())
@@ -224,8 +251,8 @@ where
         }
         None => router,
     };
-    let router = if let Some(query) = state.bifrost_query() {
-        router.add_service(GrpcTransportAdmissionService::new(
+    let router = match state.bifrost_query() {
+        Some(query) => router.add_service(GrpcTransportAdmissionService::new(
             crate::oracle::OracleLifecycleGrpc::new(
                 state
                     .auth
@@ -236,11 +263,10 @@ where
             )
             .into_server(),
             transport,
-        ))
-    } else {
-        router
+        )),
+        None => router,
     };
-    Ok(router)
+    Ok(Some(router))
 }
 
 #[cfg(test)]

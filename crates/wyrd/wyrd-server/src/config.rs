@@ -3459,9 +3459,17 @@ minimum_slots = 2
         config.bifrost.oracle.calibration_profile = path.clone();
         config.grpc.certificate_chain_path = Some(directory.path().join("server.pem"));
         config.grpc.private_key_path = Some(directory.path().join("server-key.pem"));
-        config.bifrost.oracle.peer_ca_certificate_path = Some(directory.path().join("ca.pem"));
-        config.bifrost.oracle.peer_server_name = Some("oracle.test".to_owned());
-        config.bifrost.oracle.advertise_addr = "https://oracle.test:50052".to_owned();
+        config.bifrost.peer.ca_certificate_path = Some(directory.path().join("peer-ca.pem"));
+        config.bifrost.peer.certificate_chain_path = Some(directory.path().join("peer.pem"));
+        config.bifrost.peer.private_key_path = Some(directory.path().join("peer-key.pem"));
+        config.bifrost.peer.server_name = Some("bifrost-peer.test".to_owned());
+        config.bifrost.peer.advertise_addr = Some("https://oracle-0.peers.svc:50052".to_owned());
+        config.bifrost.peer.api_key = Some("peer-api-key".to_owned());
+        config.bifrost.peer.ticket.active_key_id = Some("peer-2026-09".to_owned());
+        config.bifrost.peer.ticket.signing_key_path =
+            Some(directory.path().join("peer-ticket-signing.pem"));
+        config.bifrost.peer.ticket.verifying_keyring_path =
+            Some(directory.path().join("peer-ticket-keyring.json"));
         config.bifrost.oracle.audit_wal_root = Some(directory.path().join("oracle-audit"));
         assert!(config.validate().is_err());
 
@@ -3472,9 +3480,13 @@ minimum_slots = 2
             .expect("approved production calibration validates");
     }
 
-    /// Proves production Oracle TLS configuration is complete and HTTPS-only.
+    /// Proves the production peer plane is complete, mutual, and HTTPS-only.
+    ///
+    /// Public gRPC TLS and the private peer identity are separate requirements:
+    /// a peer-bearing target needs both, and an incompletely configured peer
+    /// plane fails boot rather than starting a listener that cannot verify.
     #[test]
-    fn oracle_production_requires_complete_tls() {
+    fn peer_production_requires_complete_tls() {
         let directory = tempfile::tempdir().expect("calibration temp directory");
         let calibration = directory.path().join("oracle-calibration.toml");
         std::fs::write(&calibration, complete_oracle_calibration("approved"))
@@ -3489,48 +3501,96 @@ minimum_slots = 2
         config.grpc.certificate_chain_path = Some(directory.path().join("server.pem"));
         assert!(config.validate().is_err());
         config.grpc.private_key_path = Some(directory.path().join("server-key.pem"));
-        config.bifrost.oracle.peer_ca_certificate_path = Some(directory.path().join("ca.pem"));
         assert!(config.validate().is_err());
-        config.bifrost.oracle.peer_server_name = Some("oracle.test".to_owned());
+        config.bifrost.peer.ca_certificate_path = Some(directory.path().join("peer-ca.pem"));
         assert!(config.validate().is_err());
-        config.bifrost.oracle.advertise_addr = "https://oracle.test:50052".to_owned();
+        config.bifrost.peer.certificate_chain_path = Some(directory.path().join("peer.pem"));
+        assert!(config.validate().is_err());
+        config.bifrost.peer.private_key_path = Some(directory.path().join("peer-key.pem"));
+        assert!(config.validate().is_err());
+        config.bifrost.peer.server_name = Some("bifrost-peer.test".to_owned());
+        assert!(config.validate().is_err());
+        config.bifrost.peer.api_key = Some("peer-api-key".to_owned());
+        assert!(config.validate().is_err());
+        config.bifrost.peer.ticket.active_key_id = Some("peer-2026-09".to_owned());
+        config.bifrost.peer.ticket.signing_key_path =
+            Some(directory.path().join("peer-ticket-signing.pem"));
+        config.bifrost.peer.ticket.verifying_keyring_path =
+            Some(directory.path().join("peer-ticket-keyring.json"));
+        assert!(config.validate().is_err());
+        config.bifrost.peer.advertise_addr = Some("http://oracle-0.peers.svc:50052".to_owned());
+        assert!(
+            config.validate().is_err(),
+            "a plaintext advertisement is unroutable for a mutually authenticated peer plane"
+        );
+        config.bifrost.peer.advertise_addr = Some("https://oracle-0.peers.svc:50052".to_owned());
         config.bifrost.oracle.audit_wal_root = Some(directory.path().join("oracle-audit"));
         config
             .validate()
-            .expect("complete production Oracle TLS configuration validates");
+            .expect("complete production peer configuration validates");
     }
 
-    /// Proves the advertised peer address always carries a dialable scheme and
-    /// that the environment override lands on the same validated field.
+    /// Proves the canonical peer environment names land on the validated fields.
     ///
     /// The advertisement is published into `vala.cluster_nodes` and later dialed
     /// through `Endpoint::from_shared`, which rejects a schemeless authority, so
-    /// a missing scheme is unroutable rather than merely untidy. Routing the
-    /// environment override through `apply_env_overrides` keeps one validated
-    /// source of truth instead of a second unvalidated read at boot.
+    /// routing every peer input through `apply_env_overrides` keeps one
+    /// validated source of truth instead of unvalidated reads at boot.
     #[test]
-    fn oracle_advertise_addr_carries_scheme_and_honors_env_override() {
-        let default_addr = WyrdServerConfig::default().bifrost.oracle.advertise_addr;
-        assert!(
-            default_addr.starts_with("http://") || default_addr.starts_with("https://"),
-            "default advertisement must carry a dialable scheme, got {default_addr}"
+    fn peer_environment_names_land_on_validated_fields() {
+        assert_eq!(
+            WyrdServerConfig::default().bifrost.peer.bind,
+            std::net::SocketAddr::from(([0, 0, 0, 0], 50052)),
+            "the canonical deployed peer port is 50052"
         );
 
         let _guard = ENV_LOCK.lock().expect("environment test lock");
         temp_env::with_vars(
-            [(
-                "WYRD_ORACLE_ADVERTISE_ADDR",
-                Some("https://oracle-0.peers.svc:50052"),
-            )],
+            [
+                ("WYRD_BIFROST_PEER_BIND_ADDR", Some("127.0.0.1:50152")),
+                (
+                    "WYRD_BIFROST_PEER_ADVERTISE_ADDR",
+                    Some("https://oracle-0.peers.svc:50052"),
+                ),
+                ("WYRD_BIFROST_PEER_CA_CERTIFICATE_PATH", Some("/peer/ca.pem")),
+                (
+                    "WYRD_BIFROST_PEER_CERTIFICATE_CHAIN_PATH",
+                    Some("/peer/cert.pem"),
+                ),
+                ("WYRD_BIFROST_PEER_PRIVATE_KEY_PATH", Some("/peer/key.pem")),
+                ("WYRD_BIFROST_PEER_SERVER_NAME", Some("bifrost-peer.test")),
+                ("WYRD_BIFROST_PEER_API_KEY", Some("peer-api-key")),
+                (
+                    "WYRD_BIFROST_PEER_TICKET_ACTIVE_KEY_ID",
+                    Some("peer-2026-09"),
+                ),
+                (
+                    "WYRD_BIFROST_PEER_TICKET_SIGNING_KEY_PATH",
+                    Some("/peer/ticket-signing.pem"),
+                ),
+                (
+                    "WYRD_BIFROST_PEER_TICKET_VERIFYING_KEYRING_PATH",
+                    Some("/peer/ticket-keyring.json"),
+                ),
+            ],
             || {
                 let mut config = WyrdServerConfig::default();
                 config
                     .apply_env_overrides()
-                    .expect("advertisement override applies");
+                    .expect("peer overrides apply");
+                let peer = &config.bifrost.peer;
                 assert_eq!(
-                    config.bifrost.oracle.advertise_addr,
-                    "https://oracle-0.peers.svc:50052"
+                    peer.bind,
+                    "127.0.0.1:50152"
+                        .parse::<std::net::SocketAddr>()
+                        .expect("literal bind address parses")
                 );
+                assert_eq!(
+                    peer.advertise_addr.as_deref(),
+                    Some("https://oracle-0.peers.svc:50052")
+                );
+                assert_eq!(peer.server_name.as_deref(), Some("bifrost-peer.test"));
+                assert!(peer.is_complete());
             },
         );
     }

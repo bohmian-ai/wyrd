@@ -16,6 +16,12 @@ use tokio_util::sync::CancellationToken;
 pub enum TaskId {
     Http,
     Grpc,
+    /// The private mutually authenticated Bifrost peer listener.
+    ///
+    /// It is a distinct identity from [`TaskId::Grpc`] because an unexpected
+    /// peer-listener exit is terminal for a peer-bearing role even while the
+    /// public listener is healthy.
+    BifrostPeer,
     Metrics,
     Signal,
     Worker(&'static str),

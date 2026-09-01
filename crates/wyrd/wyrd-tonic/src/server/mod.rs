@@ -11,7 +11,7 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::server::Router as TonicRouter;
-use tonic::transport::{Identity, Server, ServerTlsConfig};
+use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tonic_health::pb::health_server::{Health, HealthServer};
 use tonic_health::server::HealthReporter;
 use tracing::warn;
@@ -31,6 +31,76 @@ impl tonic::service::Interceptor for NoopInterceptor {
     fn call(&mut self, request: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
         Ok(request)
     }
+}
+
+/// Server TLS material for a listener that requires a verified client certificate.
+///
+/// This is the transport half of a private Wyrd listener: it supplies the
+/// listener's own leaf identity and the single certificate authority every
+/// connecting client certificate must chain to. It carries no application
+/// policy — deciding which authenticated peers may call which operation stays
+/// with the owning server crate.
+pub struct MutualTlsServerConfig {
+    /// Leaf identity presented by this listener during the TLS handshake.
+    identity: Identity,
+    /// Trust root every accepted client certificate must chain to.
+    client_ca_root: Certificate,
+}
+
+impl std::fmt::Debug for MutualTlsServerConfig {
+    /// Formats only the presence of TLS material; key bytes never reach logs.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MutualTlsServerConfig")
+            .finish_non_exhaustive()
+    }
+}
+
+impl MutualTlsServerConfig {
+    /// Builds mutual-TLS material from PEM certificate, key, and CA bytes.
+    ///
+    /// The private key is moved directly into tonic's opaque [`Identity`] and is
+    /// never retained in a formattable field.
+    #[must_use]
+    pub fn from_pem(
+        certificate_chain_pem: &[u8],
+        private_key_pem: &[u8],
+        client_ca_root_pem: &[u8],
+    ) -> Self {
+        Self {
+            identity: Identity::from_pem(certificate_chain_pem, private_key_pem),
+            client_ca_root: Certificate::from_pem(client_ca_root_pem),
+        }
+    }
+
+    /// Converts the material into tonic's server TLS configuration.
+    ///
+    /// Client authentication is mandatory: tonic requires a client certificate
+    /// chaining to `client_ca_root` because `client_auth_optional` is left at
+    /// its `false` default.
+    fn into_tls_config(self) -> ServerTlsConfig {
+        ServerTlsConfig::new()
+            .identity(self.identity)
+            .client_ca_root(self.client_ca_root)
+    }
+}
+
+/// Builds a tonic server that only accepts mutually authenticated connections.
+///
+/// The caller mounts services on the returned builder. Nothing is mounted here
+/// — in particular no health or reflection service — so a private listener
+/// exposes exactly the services its owner chooses.
+///
+/// # Errors
+///
+/// Returns [`GrpcError::CryptoProvider`] when another Rustls provider already
+/// owns the process, or [`GrpcError::Transport`] when tonic rejects the
+/// certificate, key, or CA material.
+pub fn mutual_tls_server(tls: MutualTlsServerConfig) -> Result<Server, GrpcError> {
+    wyrd_tls::install_crypto_provider()?;
+    Server::builder()
+        .tls_config(tls.into_tls_config())
+        .map_err(GrpcError::Transport)
 }
 
 const HEALTH_CONSUMER_INTERVAL: Duration = Duration::from_secs(1);

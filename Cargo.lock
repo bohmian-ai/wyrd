@@ -11287,6 +11287,8 @@ dependencies = [
  "hdrhistogram",
  "hex",
  "http 1.5.0",
+ "http-body 1.1.0",
+ "http-body-util",
  "iceberg",
  "metrics",
  "metrics-exporter-prometheus",

@@ -146,7 +146,7 @@ use wyrd_storage::{BackendConfig, StorageSettings};
 use crate::time::ClockHandle;
 
 /// Dedicated least-privilege role assigned to the test Oracle Service.
-const ORACLE_PEER_ROLE: &str = "bifrost_peer";
+const BIFROST_PEER_ROLE: &str = "bifrost_peer";
 
 /// Separates a serve-task join failure from the server's own terminal outcome.
 ///
@@ -4060,7 +4060,7 @@ async fn grant_role(
 pub(crate) async fn provision_oracle_peer_credentials(
     fixture: Arc<PgFixture>,
 ) -> Result<Arc<dyn OraclePeerCredentials>, WyrdTestServerError> {
-    let api_key = provision_oracle_peer_principal(&fixture).await?;
+    let api_key = provision_bifrost_peer_principal(&fixture, PeerPrincipalShape::Canonical).await?;
     oracle_peer_credentials_from_key(fixture, api_key).await
 }
 
@@ -4143,57 +4143,135 @@ pub(crate) async fn provision_tenant_service_principal(
     Ok(api_key.secret)
 }
 
-/// Seeds the shared Bifrost peer Service principal and returns its API key.
+/// One Bifrost peer Service principal shape a journey can seed.
+///
+/// The private plane admits exactly one identity, so proving that requires
+/// seeding the near misses too: a different SYSTEM_OWNER service, a service
+/// without the peer permission, and a service that holds the permission inside
+/// an ordinary data tenant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerPrincipalShape {
+    /// The one principal every peer-bearing process authenticates as.
+    Canonical,
+    /// A different SYSTEM_OWNER service that also holds the peer permission.
+    AlternateService,
+    /// A SYSTEM_OWNER service that holds no peer permission.
+    WithoutPermission,
+    /// A data-tenant service that holds the peer permission.
+    TenantScoped,
+}
+
+impl PeerPrincipalShape {
+    /// Names the Service card and account this shape seeds.
+    const fn service_name(self) -> &'static str {
+        match self {
+            Self::Canonical => "bifrost-peer",
+            Self::AlternateService => "bifrost-peer-alternate",
+            Self::WithoutPermission => "bifrost-peer-unpermitted",
+            Self::TenantScoped => "bifrost-peer-tenant",
+        }
+    }
+
+    /// Names the role this shape grants.
+    const fn role_name(self) -> &'static str {
+        match self {
+            Self::Canonical => BIFROST_PEER_ROLE,
+            Self::AlternateService => "bifrost_peer_alternate",
+            Self::WithoutPermission => "bifrost_peer_unpermitted",
+            Self::TenantScoped => "bifrost_peer_tenant",
+        }
+    }
+
+    /// Returns the permissions the granted role carries.
+    fn permissions(self) -> Vec<Permission> {
+        match self {
+            Self::WithoutPermission => Vec::new(),
+            _ => vec![Permission::bifrost_peer_invoke()],
+        }
+    }
+
+    /// Returns the control tenant this shape's principal belongs to.
+    const fn tenant(self, data_tenant: DataTenantId) -> DataTenantId {
+        match self {
+            Self::TenantScoped => data_tenant,
+            _ => DataTenantId::SYSTEM_OWNER,
+        }
+    }
+}
+
+/// Ensures the tenant's fixture admin exists, tolerating a prior seeding.
+///
+/// The admin is per tenant while peer principals are per shape, so the second
+/// shape would otherwise collide on the primary key. The insert runs on its own
+/// transaction because a unique violation aborts the transaction it occurs in,
+/// which would poison every later statement of the caller's seeding.
+///
+/// # Errors
+///
+/// Returns the persistence failure unless it is the expected unique violation.
+async fn ensure_fixture_admin(
+    fixture: &PgFixture,
+    tenant_id: DataTenantId,
+    creator_id: Uuid,
+) -> Result<(), WyrdTestServerError> {
+    let email = format!("fixture-admin-{}@test.wyrd", creator_id.simple());
+    let mut conn = fixture.tenant_conn_for(tenant_id).await.map_err(sql)?;
+    match insert_user(&mut conn, creator_id, Some(&email), "password", None).await {
+        Ok(()) => conn.commit().await.map_err(sql),
+        Err(error) if is_unique_violation(&error) => Ok(()),
+        Err(error) => Err(sql(error)),
+    }
+}
+
+/// Seeds one Bifrost peer Service principal shape and returns its API key.
 ///
 /// Separated from credential construction because the seeding is not
-/// idempotent: a multi-process cluster provisions the principal once in the
-/// parent and hands every child the resulting key, rather than having each
-/// child insert another principal for the same plane.
+/// idempotent: a multi-process cluster provisions the canonical principal once
+/// in the parent and hands every child the resulting key, rather than having
+/// each child insert another principal for the same plane.
 ///
 /// # Errors
 ///
 /// Returns an error when role seeding, principal/key persistence, or hashing
 /// fails.
-pub(crate) async fn provision_oracle_peer_principal(
-    fixture: &Arc<PgFixture>,
+pub(crate) async fn provision_bifrost_peer_principal(
+    fixture: &PgFixture,
+    shape: PeerPrincipalShape,
 ) -> Result<SecretString, WyrdTestServerError> {
-    let tenant_id = DataTenantId::SYSTEM_OWNER;
+    let tenant_id = shape.tenant(fixture.data_tenant_id());
     let creator_id = fixture_admin_id(tenant_id);
     let principal_id = Uuid::now_v7();
-    let service_ref = card_ref(CardKind::Service, "bifrost-oracle-peer")?;
+    let service_ref = card_ref(CardKind::Service, shape.service_name())?;
     let api_key = WyrdApiKey::generate(tenant_id);
     let raw = api_key.secret.clone();
     let key_hash = tokio::task::spawn_blocking(move || wyrd_auth_issue::hash_api_key(&raw))
         .await
         .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?
         .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
+    ensure_fixture_admin(fixture, tenant_id, creator_id).await?;
     let mut conn = fixture.tenant_conn_for(tenant_id).await.map_err(sql)?;
     seed_builtin_roles_for_tenant(&mut conn, tenant_id)
         .await
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-    let permissions = vec![Permission::bifrost_peer_invoke()];
+    let permissions = shape.permissions();
     let permissions_json = serde_json::to_value(&permissions)
         .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
     insert_role(
         &mut conn,
         Uuid::now_v7(),
-        ORACLE_PEER_ROLE,
+        shape.role_name(),
         &permissions_json,
         false,
     )
     .await
     .map_err(sql)?;
-    let email = format!("fixture-admin-{}@test.wyrd", creator_id.simple());
-    insert_user(&mut conn, creator_id, Some(&email), "password", None)
-        .await
-        .map_err(sql)?;
     seed_machine_card(&mut conn, &service_ref, creator_id).await?;
     insert_service_account(
         &mut conn,
         principal_id,
         "service",
         &service_ref,
-        "bifrost-oracle-peer",
+        shape.service_name(),
         None,
         creator_id,
     )
@@ -4214,7 +4292,7 @@ pub(crate) async fn provision_oracle_peer_principal(
         &mut conn,
         principal_id,
         PrincipalTable::ServiceAccount,
-        ORACLE_PEER_ROLE,
+        shape.role_name(),
     )
     .await?;
     conn.commit().await.map_err(sql)?;

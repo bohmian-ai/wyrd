@@ -1046,9 +1046,12 @@ impl BifrostProcessCluster {
                 .await
                 .map_err(|error| ProcessClusterError::Resource(error.to_string()))?,
         );
-        let peer_api_key = crate::server::provision_oracle_peer_principal(&fixture)
-            .await
-            .map_err(|error| ProcessClusterError::Resource(error.to_string()))?;
+        let peer_api_key = crate::server::provision_bifrost_peer_principal(
+            &fixture,
+            crate::server::PeerPrincipalShape::Canonical,
+        )
+        .await
+        .map_err(|error| ProcessClusterError::Resource(error.to_string()))?;
         let fixture = Arc::into_inner(fixture).ok_or_else(|| {
             ProcessClusterError::Resource(
                 "peer principal provisioning retained the fixture".to_owned(),
@@ -1157,6 +1160,26 @@ impl BifrostProcessCluster {
         )
         .await
         .map_err(|error| ProcessClusterError::Resource(error.to_string()))
+    }
+
+    /// Seeds one deliberately wrong peer Service principal and returns its key.
+    ///
+    /// A journey uses these to prove the private plane admits exactly one
+    /// configured identity: a different SYSTEM_OWNER service, a service with no
+    /// peer permission, and a data-tenant service that holds it must all be
+    /// refused before the request body is touched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProcessClusterError::Resource`] when the principal cannot be
+    /// provisioned.
+    pub async fn provision_peer_principal(
+        &self,
+        shape: crate::server::PeerPrincipalShape,
+    ) -> Result<secrecy::SecretString, ProcessClusterError> {
+        crate::server::provision_bifrost_peer_principal(&self.shared.fixture, shape)
+            .await
+            .map_err(|error| ProcessClusterError::Resource(error.to_string()))
     }
 
     /// Launches a throwaway child with damaged peer material and expects it to fail.

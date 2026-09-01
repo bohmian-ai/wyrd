@@ -69,6 +69,8 @@ hex = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 iceberg = { workspace = true }
 http = { workspace = true }
+http-body = { workspace = true }
+http-body-util = "0.1"
 opendal = { workspace = true }
 parquet = { workspace = true }
 pyo3 = { workspace = true, optional = true }

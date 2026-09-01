@@ -138,6 +138,48 @@ impl GrpcFirstFrame {
     }
 }
 
+/// Which trust plane a transport-admission wrapper serves.
+///
+/// The two planes share one byte-weighted owner but not one boundary: only the
+/// private plane sits behind peer workload authentication, so only its first
+/// body poll is evidence that authentication already ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransportPlane {
+    /// The public client-facing listener.
+    Public,
+    /// The private mutually authenticated Bifrost peer listener.
+    Peer,
+}
+
+impl TransportPlane {
+    /// Records one private-plane body poll for multi-process probes.
+    ///
+    /// The counter exists only in test-support builds; a production binary
+    /// keeps this a no-op so the private path pays nothing for the evidence.
+    fn record_body_poll(self) {
+        #[cfg(feature = "test-support")]
+        if self == Self::Peer {
+            PEER_BODY_POLLS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+}
+
+/// Request bodies the private peer plane has polled since process start.
+#[cfg(feature = "test-support")]
+static PEER_BODY_POLLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Reads how many request bodies this process's peer plane has polled.
+///
+/// The private plane authenticates before it touches a body, so a refused peer
+/// request must leave this unchanged while an admitted one advances it. A
+/// multi-process journey reads it to prove that ordering from outside the
+/// process rather than by inspecting the layer stack.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn peer_body_polls() -> u64 {
+    PEER_BODY_POLLS.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Service wrapper that acquires encoded gRPC body capacity before decoding.
 #[derive(Clone)]
 struct GrpcTransportAdmissionService<S> {
@@ -145,15 +187,33 @@ struct GrpcTransportAdmissionService<S> {
     inner: S,
     /// Process-wide byte-weighted body owner shared with HTTP.
     admission: vala_bifrost_redux::gate::limits::BifrostTransportAdmission,
+    /// Trust plane this wrapper serves.
+    plane: TransportPlane,
 }
 
 impl<S> GrpcTransportAdmissionService<S> {
-    /// Wraps one generated service with the process transport owner.
+    /// Wraps one public-plane service with the process transport owner.
     fn new(
         inner: S,
         admission: vala_bifrost_redux::gate::limits::BifrostTransportAdmission,
     ) -> Self {
-        Self { inner, admission }
+        Self {
+            inner,
+            admission,
+            plane: TransportPlane::Public,
+        }
+    }
+
+    /// Wraps one private peer-plane service with the process transport owner.
+    fn new_peer(
+        inner: S,
+        admission: vala_bifrost_redux::gate::limits::BifrostTransportAdmission,
+    ) -> Self {
+        Self {
+            inner,
+            admission,
+            plane: TransportPlane::Peer,
+        }
     }
 }
 
@@ -182,9 +242,11 @@ where
 
     fn call(&mut self, request: Request<Body>) -> Self::Future {
         let admission = self.admission.clone();
+        let plane = self.plane;
         let mut inner = self.inner.clone();
         Box::pin(async move {
             let (parts, mut body) = request.into_parts();
+            plane.record_body_poll();
             let head = match GrpcFirstFrame::read(&mut body).await {
                 Ok(head) => head,
                 Err(error) => return Ok(error.into_http()),
@@ -314,13 +376,13 @@ pub fn build_peer_grpc(
     // protobuf service is never forked by role; an operation whose local
     // capability is absent fails closed after authentication instead.
     let router = wyrd_tonic::server::mutual_tls_server(tls)?.add_service(
-        GrpcTransportAdmissionService::new(
+        GrpcTransportAdmissionService::new_peer(
             crate::oracle::OraclePeerGrpc::new(Arc::clone(&state.bifrost)).into_server(),
             transport.clone(),
         ),
     );
     let router = match state.bifrost_ingest() {
-        Some(scribe) => router.add_service(GrpcTransportAdmissionService::new(
+        Some(scribe) => router.add_service(GrpcTransportAdmissionService::new_peer(
             match scribe.tail_authority() {
                 Some(authority) => scribe_tail::ScribeTailGrpc::new_with_authority(
                     state.clone(),
@@ -341,7 +403,7 @@ pub fn build_peer_grpc(
     {
         Some(ingress) => {
             let worker = ingress.worker().clone().into_worker_server();
-            router.add_service(GrpcTransportAdmissionService::new(
+            router.add_service(GrpcTransportAdmissionService::new_peer(
                 vala_bifrost_redux::oracle::analytical_transport::AnalyticalStageAuthLayer::new(
                     ingress,
                 )
@@ -352,7 +414,7 @@ pub fn build_peer_grpc(
         None => router,
     };
     let router = match state.bifrost_query() {
-        Some(query) => router.add_service(GrpcTransportAdmissionService::new(
+        Some(query) => router.add_service(GrpcTransportAdmissionService::new_peer(
             crate::oracle::OracleLifecycleGrpc::new(
                 state
                     .auth

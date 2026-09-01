@@ -25,8 +25,8 @@ use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_server::config::BifrostTarget;
 
 use super::{
-    ControlRequest, ControlResponse, MembershipEntry, NodeReport, ProcessClusterError,
-    ProcessNodeTarget, env,
+    ControlRequest, ControlResponse, MembershipEntry, NodeReport, PeerProbeCredential,
+    PeerProbeFraming, PeerProbePlan, ProcessClusterError, ProcessNodeTarget, env,
 };
 use crate::server::{TestBifrostPeerTls, WyrdTestServer};
 
@@ -68,7 +68,7 @@ pub fn run_peer_test_node() -> ExitCode {
 async fn serve() -> Result<(), ProcessClusterError> {
     let config = ChildConfig::from_env()?;
     let fingerprint = config.certificate_fingerprint()?;
-    let (server, credentials) = config.start().await?;
+    let (server, credentials, fixture) = config.start().await?;
     let report = await_ready(&server, &config, fingerprint).await?;
     emit(&ControlResponse::Ready(report.clone()))?;
 
@@ -110,13 +110,21 @@ async fn serve() -> Result<(), ProcessClusterError> {
                     })?,
                 }
             }
-            ControlRequest::DialPeer { address } => {
-                match config.dial_peer(&address, credentials.as_ref()).await {
-                    Ok(outcome) => emit(&ControlResponse::Dialed { outcome })?,
+            ControlRequest::PeerProbe(plan) => {
+                match config
+                    .peer_probe(&plan, credentials.as_ref(), &fixture)
+                    .await
+                {
+                    Ok(outcome) => emit(&ControlResponse::Probed { outcome })?,
                     Err(error) => emit(&ControlResponse::Failed {
                         detail: error.to_string(),
                     })?,
                 }
+            }
+            ControlRequest::PeerBodyPolls => {
+                emit(&ControlResponse::BodyPolls {
+                    count: wyrd_server::grpc::peer_body_polls(),
+                })?;
             }
             ControlRequest::ExecuteInactiveSql { .. } => {
                 // The inactive Analytical execution seam is restored by the
@@ -291,6 +299,7 @@ impl ChildConfig {
         (
             WyrdTestServer,
             Arc<dyn vala_bifrost_redux::oracle::dispatcher::OraclePeerCredentials>,
+            Arc<PgFixture>,
         ),
         ProcessClusterError,
     > {
@@ -334,13 +343,13 @@ impl ChildConfig {
             .with_durable_bifrost_roots(self.wal_root.clone(), self.spill_root.clone())
             .with_oracle_peer_credentials(Arc::clone(&credentials))
             .with_storage_handle(Arc::clone(&storage))
-            .start_with_resources(fixture, Arc::clone(&storage), None)
+            .start_with_resources(Arc::clone(&fixture), Arc::clone(&storage), None)
             .await
             .map_err(|error| ProcessClusterError::Child(error.to_string()))?
             .bind()
             .await
             .map_err(|error| ProcessClusterError::Child(error.to_string()))?;
-        Ok((server, credentials))
+        Ok((server, credentials, fixture))
     }
 
     /// Registers one Bifrost table through this child's own catalog.
@@ -384,65 +393,158 @@ impl ChildConfig {
             .map_err(|error| ProcessClusterError::Child(error.to_string()))
     }
 
-    /// Dials another pod's peer socket as this pod, returning the gRPC outcome.
+    /// Performs one shaped private-plane probe and returns its gRPC outcome.
     ///
-    /// Uses this child's own certificate and its peer Service bearer, so the
-    /// result answers whether the destination admits this process at the
-    /// transport and authorizes it at the application layer. A refused
-    /// operation is still a successful dial and is reported as its status code.
+    /// The probe is issued as a raw HTTP/2 request over this child's own
+    /// mutually authenticated channel rather than through a generated client,
+    /// because the claim under test is about the bytes on the wire: which
+    /// adapter is addressed, which workload credential accompanies it, and how
+    /// the first gRPC frame is split or coalesced. A refusal is an outcome, not
+    /// an error; only failing to reach the destination is an error.
     ///
     /// # Errors
     ///
     /// Returns [`ProcessClusterError::Child`] when the endpoint cannot be
-    /// built, the handshake fails, or the bearer cannot be obtained.
-    async fn dial_peer(
+    /// built, the handshake fails, the credential cannot be obtained, or the
+    /// destination never answered.
+    async fn peer_probe(
         &self,
-        address: &str,
-        credentials: &dyn vala_bifrost_redux::oracle::dispatcher::OraclePeerCredentials,
+        plan: &PeerProbePlan,
+        own: &dyn vala_bifrost_redux::oracle::dispatcher::OraclePeerCredentials,
+        fixture: &Arc<PgFixture>,
     ) -> Result<String, ProcessClusterError> {
         let child = |error: String| ProcessClusterError::Child(error);
         let read = |path: &std::path::Path| -> Result<Vec<u8>, ProcessClusterError> {
             std::fs::read(path).map_err(|error| ProcessClusterError::Resource(error.to_string()))
         };
         let endpoint = wyrd_tonic::transport::mutually_authenticated_tls_endpoint(
-            address.to_owned(),
+            plan.address.clone(),
             &read(&self.peer_tls.ca_path)?,
             self.peer_tls.server_name.clone(),
             &read(&self.peer_tls.certificate_path)?,
             &read(&self.peer_tls.private_key_path)?,
         )
         .map_err(|error| child(error.to_string()))?;
-        let channel = endpoint
+        let mut channel = endpoint
             .connect()
             .await
             .map_err(|error| child(error.to_string()))?;
-        let bearer = credentials
-            .bearer(false)
+        let bearer = self.probe_bearer(&plan.credential, own, fixture).await?;
+        let mut request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri(plan.service.path())
+            .header(http::header::CONTENT_TYPE, "application/grpc")
+            .header("te", "trailers");
+        if let Some(bearer) = bearer {
+            request = request.header("x-wyrd-access-token", bearer);
+        }
+        let request = request
+            .body(probe_body(plan.framing))
+            .map_err(|error| child(error.to_string()))?;
+        let response = tower::ServiceExt::oneshot(&mut channel, request)
             .await
             .map_err(|error| child(error.to_string()))?;
-        let metadata =
-            wyrd_tonic::tonic::metadata::MetadataValue::try_from(format!("Bearer {bearer}"))
-                .map_err(|error| child(error.to_string()))?;
-        let mut client =
-            wyrd_tonic::wyrd::v1::oracle_peer_service_client::OraclePeerServiceClient::with_interceptor(
-                channel,
-                move |mut request: wyrd_tonic::tonic::Request<()>| {
-                    request
-                        .metadata_mut()
-                        .insert("x-wyrd-access-token", metadata.clone());
-                    Ok(request)
-                },
-            );
-        Ok(
-            match client
-                .reserve_slots(wyrd_tonic::wyrd::v1::ReserveNodeSlotsRequest::default())
-                .await
-            {
-                Ok(_) => "ok".to_owned(),
-                Err(status) => status.code().to_string(),
-            },
-        )
+        Ok(probe_outcome(response).await)
     }
+
+    /// Resolves the bearer value a probe presents, if it presents one.
+    ///
+    /// An API-key credential is exchanged through the same middleware a real
+    /// peer uses, so a probe for a deliberately wrong principal is refused by
+    /// authorization rather than by a malformed token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProcessClusterError::Child`] when the exchange fails.
+    async fn probe_bearer(
+        &self,
+        credential: &PeerProbeCredential,
+        own: &dyn vala_bifrost_redux::oracle::dispatcher::OraclePeerCredentials,
+        fixture: &Arc<PgFixture>,
+    ) -> Result<Option<String>, ProcessClusterError> {
+        let child = |error: String| ProcessClusterError::Child(error);
+        match credential {
+            PeerProbeCredential::Absent => Ok(None),
+            PeerProbeCredential::Invalid => Ok(Some("Bearer not-a-real-token".to_owned())),
+            PeerProbeCredential::Own => own
+                .bearer(false)
+                .await
+                .map(|bearer| Some(format!("Bearer {bearer}")))
+                .map_err(|error| child(error.to_string())),
+            PeerProbeCredential::ApiKey(key) => {
+                let credentials = crate::server::oracle_peer_credentials_from_key(
+                    Arc::clone(fixture),
+                    SecretString::from(key.clone()),
+                )
+                .await
+                .map_err(|error| child(error.to_string()))?;
+                credentials
+                    .bearer(false)
+                    .await
+                    .map(|bearer| Some(format!("Bearer {bearer}")))
+                    .map_err(|error| child(error.to_string()))
+            }
+        }
+    }
+}
+
+/// Builds one probe request body laid out as `framing` describes.
+///
+/// Every variant carries a well-formed first message; only the HTTP/2 frame
+/// boundaries differ, which is exactly the property a private listener must be
+/// indifferent to.
+fn probe_body(framing: PeerProbeFraming) -> wyrd_tonic::tonic::body::Body {
+    // An empty protobuf message is a valid `ReserveNodeSlotsRequest` and a
+    // valid oversized-free first frame for the worker adapter, so the probe
+    // never depends on a decodable domain payload to reach the boundary.
+    let message = vec![0_u8, 0, 0, 0, 0];
+    let chunks = match framing {
+        PeerProbeFraming::Whole => vec![message],
+        PeerProbeFraming::SplitHeader => vec![message[..2].to_vec(), message[2..].to_vec()],
+        PeerProbeFraming::Coalesced => {
+            let mut coalesced = message.clone();
+            coalesced.extend_from_slice(&message);
+            vec![coalesced]
+        }
+    };
+    let frames = futures_util::stream::iter(chunks.into_iter().map(|chunk| {
+        Ok::<_, std::convert::Infallible>(http_body::Frame::data(
+            wyrd_tonic::tonic::codegen::Bytes::from(chunk),
+        ))
+    }));
+    wyrd_tonic::tonic::body::Body::new(http_body_util::StreamBody::new(frames))
+}
+
+/// Reduces one probe response to its non-secret gRPC status name.
+///
+/// gRPC reports its status in the response headers for a trailers-only
+/// refusal and in the trailers otherwise, so both are read before the outcome
+/// is decided.
+async fn probe_outcome(response: http::Response<wyrd_tonic::tonic::body::Body>) -> String {
+    let status = |headers: &http::HeaderMap| -> Option<String> {
+        headers
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<i32>().ok())
+            .map(|code| format!("{:?}", wyrd_tonic::tonic::Code::from_i32(code)))
+    };
+    if let Some(outcome) = status(response.headers()) {
+        return outcome;
+    }
+    let mut body = response.into_body();
+    while let Some(frame) = http_body_util::BodyExt::frame(&mut body).await {
+        match frame {
+            Ok(frame) => {
+                if let Some(trailers) = frame.trailers_ref()
+                    && let Some(outcome) = status(trailers)
+                {
+                    return outcome;
+                }
+            }
+            Err(error) => return format!("BodyError({error})"),
+        }
+    }
+    "Ok".to_owned()
 }
 
 /// Polls this child until every readiness probe passes.

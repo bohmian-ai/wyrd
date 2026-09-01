@@ -182,10 +182,49 @@ impl MaintenanceProtection {
         path: &str,
         evidence: ObjectEvidence<'_>,
     ) -> GcEligibility {
+        self.eligibility(binding, path, evidence, MaintenanceScope::AttemptGeneration)
+    }
+
+    /// Applies the same truth to one prepared expired-file cleanup candidate.
+    ///
+    /// The prepared candidate set is durable evidence of what was unreachable
+    /// when expiry committed, not permission to delete later. A successor owner
+    /// draining that set may be running long afterwards, so every proof is
+    /// re-taken here against refreshed catalog, SQL, and object evidence: the
+    /// candidate must still be inside this tenant's table binding, destructive
+    /// maintenance must still be permitted, no retained head may reach it
+    /// again, and it must still clear the object age floor.
+    ///
+    /// Unlike [`Self::gc_eligibility`] this admits any object the binding
+    /// accepts, because expiry legitimately strands manifests, manifest lists,
+    /// statistics, and metadata logs that no attempt-generation grammar covers.
+    #[must_use]
+    pub(crate) fn expired_cleanup_eligibility(
+        &self,
+        binding: &TenantTableBinding,
+        path: &str,
+        evidence: ObjectEvidence<'_>,
+    ) -> GcEligibility {
+        self.eligibility(binding, path, evidence, MaintenanceScope::ExpiredCandidate)
+    }
+
+    /// Decides one object under the scope-specific path rule.
+    ///
+    /// Scope changes only which paths are addressable at all. Every safety
+    /// proof after that — binding, destructive gate, live-set containment,
+    /// existence, object kind, and age — is shared, so the two destructive
+    /// protocols cannot diverge on what protects an object.
+    fn eligibility(
+        &self,
+        binding: &TenantTableBinding,
+        path: &str,
+        evidence: ObjectEvidence<'_>,
+        scope: MaintenanceScope,
+    ) -> GcEligibility {
         let Some(normalized) = binding.validate_object_path(path) else {
             return GcEligibility::InvalidPath;
         };
-        if !is_forge_attempt_generation(&normalized) {
+        if !scope.admits(&normalized) {
             return GcEligibility::InvalidPath;
         }
         if self.destructive_maintenance == DestructiveMaintenance::Blocked
@@ -206,6 +245,27 @@ impl MaintenanceProtection {
             return GcEligibility::TooYoung;
         }
         GcEligibility::Eligible
+    }
+}
+
+/// Which object paths one destructive maintenance protocol may address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaintenanceScope {
+    /// Never-published orphan collection: immutable Forge attempt generations
+    /// only, so no catalog-owned object can be reached by listing alone.
+    AttemptGeneration,
+    /// Expired-file cleanup: any object inside the binding, because expiry
+    /// strands catalog metadata that no attempt grammar describes.
+    ExpiredCandidate,
+}
+
+impl MaintenanceScope {
+    /// Reports whether this scope may consider the normalized object key.
+    fn admits(self, normalized: &str) -> bool {
+        match self {
+            Self::AttemptGeneration => is_forge_attempt_generation(normalized),
+            Self::ExpiredCandidate => true,
+        }
     }
 }
 
@@ -449,6 +509,37 @@ impl Forge {
         request: ProtectionRequest<'_>,
     ) -> Result<MaintenanceProtection, ForgeError> {
         self.load_maintenance_protection_inner(request).await
+    }
+
+    /// Loads refreshed protection for one prepared expired-cleanup drain.
+    ///
+    /// Expired cleanup takes this proof once per drain rather than once per
+    /// candidate: the table lease it runs under already excludes a concurrent
+    /// producer, so one refreshed catalog, SQL, and operation load covers every
+    /// candidate the drain will consider.
+    ///
+    /// # Errors
+    ///
+    /// Returns catalog, manifest, SQL, operation-state, path-validation, clock,
+    /// or cancellation failures.
+    pub(super) async fn load_expired_cleanup_protection(
+        &self,
+        key: &ForgeTableKey,
+        binding: &TenantTableBinding,
+        now: DateTime<Utc>,
+        stop: &CancellationToken,
+    ) -> Result<MaintenanceProtection, ForgeError> {
+        let table = GcTableContext {
+            key,
+            binding,
+            now,
+            stop,
+        };
+        self.load_maintenance_protection(ProtectionRequest {
+            table: &table,
+            current_gc_detail: None,
+        })
+        .await
     }
 
     /// Loads production maintenance protection for one integration fixture.
@@ -1617,6 +1708,120 @@ mod tests {
             GcEligibility::Missing
         );
         assert_eq!(protection.now.timestamp_millis(), 48 * 60 * 60 * 1_000);
+    }
+
+    /// Expired-file deletion needs every proof, and never the candidate list alone.
+    ///
+    /// The prepared candidate set is derived once, before the first delete, and
+    /// may be drained much later by a successor owner. Each case removes one
+    /// proof the durable set cannot supply on its own — the tenant/table
+    /// binding, the destructive-maintenance gate, fresh unreachability from
+    /// every retained head, the object age floor, and the object's own
+    /// existence and kind — and requires the deletion to be refused.
+    #[test]
+    fn forge_expired_cleanup_eligibility_matrix() {
+        use crate::catalog::TableRef;
+        use crate::namespaces::BifrostNamespace;
+
+        let old = Timestamp::from_millisecond(0).expect("timestamp");
+        let young = Timestamp::from_millisecond(47 * 60 * 60 * 1_000).expect("timestamp");
+        let cutoff = Timestamp::from_millisecond(24 * 60 * 60 * 1_000).expect("timestamp");
+        let binding = TenantTableBinding::resolve((
+            DataTenantId::new_v7(),
+            TableRef::new(BifrostNamespace::Traces, "spans"),
+        ))
+        .expect("binding");
+        let expired_manifest = format!("{}/metadata/snap-expired.avro", binding.object_prefix);
+        let rereferenced = format!("{}/metadata/snap-retained.avro", binding.object_prefix);
+        let young_manifest = format!("{}/metadata/snap-young.avro", binding.object_prefix);
+        let mut live = ProtectedLiveSet::default();
+        live.insert(rereferenced.clone());
+        let now = DateTime::<Utc>::from_timestamp_millis(48 * 60 * 60 * 1_000).expect("time");
+        let protection = MaintenanceProtection {
+            live_set: live,
+            destructive_maintenance: DestructiveMaintenance::Allowed,
+            now,
+            object_age_cutoff: cutoff,
+        };
+        let old_metadata = opendal::Metadata::new(EntryMode::FILE).with_last_modified(old);
+        let young_metadata = opendal::Metadata::new(EntryMode::FILE).with_last_modified(young);
+        let directory = opendal::Metadata::new(EntryMode::DIR);
+
+        assert_eq!(
+            protection.expired_cleanup_eligibility(
+                &binding,
+                &expired_manifest,
+                ObjectEvidence::Present(&old_metadata)
+            ),
+            GcEligibility::Eligible,
+            "an aged, unreachable expiry candidate is not a Forge attempt generation"
+        );
+        assert_eq!(
+            protection.expired_cleanup_eligibility(
+                &binding,
+                &rereferenced,
+                ObjectEvidence::Present(&old_metadata)
+            ),
+            GcEligibility::Protected,
+            "a candidate a retained head still reaches must survive its own prepared set"
+        );
+        let blocked = MaintenanceProtection {
+            live_set: ProtectedLiveSet::default(),
+            destructive_maintenance: DestructiveMaintenance::Blocked,
+            now,
+            object_age_cutoff: cutoff,
+        };
+        assert_eq!(
+            blocked.expired_cleanup_eligibility(
+                &binding,
+                &expired_manifest,
+                ObjectEvidence::Present(&old_metadata)
+            ),
+            GcEligibility::Protected,
+            "an open or unreconciled operation blocks the prepared set"
+        );
+        assert_eq!(
+            protection.expired_cleanup_eligibility(
+                &binding,
+                &young_manifest,
+                ObjectEvidence::Present(&young_metadata)
+            ),
+            GcEligibility::TooYoung
+        );
+        assert_eq!(
+            protection.expired_cleanup_eligibility(
+                &binding,
+                "other-tenant/spans/metadata/snap-expired.avro",
+                ObjectEvidence::Present(&old_metadata)
+            ),
+            GcEligibility::InvalidPath,
+            "a candidate outside the tenant table binding is never deletable"
+        );
+        assert_eq!(
+            protection.expired_cleanup_eligibility(
+                &binding,
+                &expired_manifest,
+                ObjectEvidence::Present(&directory)
+            ),
+            GcEligibility::NotFile
+        );
+        assert_eq!(
+            protection.expired_cleanup_eligibility(
+                &binding,
+                &expired_manifest,
+                ObjectEvidence::Missing
+            ),
+            GcEligibility::Missing
+        );
+        assert_eq!(
+            protection.gc_eligibility(
+                &binding,
+                &expired_manifest,
+                ObjectEvidence::Present(&old_metadata)
+            ),
+            GcEligibility::InvalidPath,
+            "the orphan collector still refuses every non-attempt-generation path"
+        );
     }
 
     /// A Forge attempt generation is recognized by the `/data/forge/` segment

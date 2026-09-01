@@ -21,6 +21,12 @@ pub(super) enum CleanupDeletion {
     Confirmed,
     /// The object was already absent when the deletion was attempted.
     AlreadyMissing,
+    /// Refreshed protection refused the candidate, so it was left in place.
+    ///
+    /// This is still a decided candidate: the drain re-took every proof and
+    /// concluded the object must survive, so the frontier advances past it
+    /// rather than blocking the remaining candidates behind it forever.
+    Retained,
 }
 
 /// The next action the cleanup drain owes its candidate set.

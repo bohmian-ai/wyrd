@@ -48,6 +48,7 @@ use super::metrics::{
     ForgeDemandTransitionResult, ForgeLeaseResult, ForgeMetricStage, ForgeProgressEffect,
     ForgeTaskMetricStrategy, ForgeTaskTerminalResult,
 };
+use super::orphan_gc::{GcEligibility, MaintenanceProtection, ObjectEvidence};
 use super::path::catalog_path_to_object_key;
 use super::scribe_promotion::{
     ForgePromotionCommit, ForgePromotionSettlement, ScribePromotionPlan,
@@ -4002,12 +4003,25 @@ impl ForgeWorker {
         mut cursor: ExpiredCleanupCursor,
         stop: &CancellationToken,
     ) -> Result<u32, ForgeError> {
+        let key = super::compact::ForgeTableKey {
+            tenant: attempt.tenant,
+            table_ref: attempt.binding.table_ref.clone(),
+        };
+        let protection = self
+            .forge
+            .load_expired_cleanup_protection(
+                &key,
+                attempt.binding,
+                self.forge.core.clock.now()?,
+                stop,
+            )
+            .await?;
         while let CleanupStep::Delete(index) = cursor.step() {
             let candidate = candidates.get(index).ok_or_else(|| ForgeError::Invariant {
                 detail: "expired cleanup cursor named an absent candidate".to_owned(),
             })?;
             let deletion = self
-                .delete_cleanup_object(attempt, lease, candidate, stop)
+                .delete_cleanup_object(attempt, lease, candidate, &protection, stop)
                 .await?;
             let commit = cursor.confirm(deletion)?;
             self.commit_cleanup_cursor(attempt, lease, commit, stop)
@@ -4016,7 +4030,13 @@ impl ForgeWorker {
         Ok(cursor.committed())
     }
 
-    /// Deletes one table-bound cleanup candidate from the object store.
+    /// Deletes one cleanup candidate after re-taking every safety proof.
+    ///
+    /// The prepared candidate set records what was unreachable when expiry
+    /// committed. A successor owner may drain it much later, so the candidate
+    /// is re-checked against refreshed protection here rather than trusted:
+    /// a candidate a retained head reaches again, one that no longer clears the
+    /// age floor, or one a reopened operation now protects is left in place.
     ///
     /// An object already absent is an idempotent success: the safety proof that
     /// admitted it has already been made, so a replayed deletion is exactly as
@@ -4024,22 +4044,44 @@ impl ForgeWorker {
     ///
     /// # Errors
     ///
-    /// Returns cancellation, path-binding, fencing, or object-store failures.
+    /// Returns cancellation, fencing, or object-store failures.
     async fn delete_cleanup_object(
         &self,
         attempt: &CleanupAttempt<'_>,
         lease: &mut ForgeLease,
         candidate: &ForgeCleanupCandidate,
+        protection: &MaintenanceProtection,
         stop: &CancellationToken,
     ) -> Result<CleanupDeletion, ForgeError> {
         require_running(stop)?;
         lease.require_fence(&self.forge.core.operator_pool).await?;
-        let path = attempt
-            .binding
-            .validate_object_path(candidate.path.as_str())
-            .ok_or_else(|| ForgeError::Reconciliation {
+        let path = candidate.path.as_str();
+        let metadata = match self.forge.core.object_store.stat(path).await {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == opendal::ErrorKind::NotFound => None,
+            Err(error) => return Err(ForgeError::ObjectDelete(error)),
+        };
+        let evidence = metadata
+            .as_ref()
+            .map_or(ObjectEvidence::Missing, ObjectEvidence::Present);
+        match protection.expired_cleanup_eligibility(attempt.binding, path, evidence) {
+            GcEligibility::Eligible => {}
+            GcEligibility::Missing => return Ok(CleanupDeletion::AlreadyMissing),
+            refusal => {
+                tracing::warn!(
+                    refusal = ?refusal,
+                    task_id = %attempt.task_id,
+                    attempt_id = %attempt.attempt,
+                    "refreshed protection retained a prepared expired-cleanup candidate"
+                );
+                return Ok(CleanupDeletion::Retained);
+            }
+        }
+        let path = attempt.binding.validate_object_path(path).ok_or_else(|| {
+            ForgeError::Reconciliation {
                 detail: "expired cleanup candidate escaped table binding".to_owned(),
-            })?;
+            }
+        })?;
         let deletion = self.forge.core.object_store.delete(&path);
         tokio::pin!(deletion);
         let deletion = tokio::select! {

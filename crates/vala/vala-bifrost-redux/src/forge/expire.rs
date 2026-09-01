@@ -29,6 +29,7 @@ use crate::namespaces::BifrostNamespace;
 use super::Forge;
 use super::compact::ForgeTableKey;
 use super::error::ForgeError;
+use super::expiry_policy::{SnapshotExpiryDecision, SnapshotExpiryPolicy, SnapshotProtectionRoots};
 use super::lease::ForgeLease;
 #[cfg(feature = "test-support")]
 use super::lease::forge_lease_key;
@@ -329,21 +330,28 @@ impl Forge {
         lease.require_fence(&self.core.operator_pool).await?;
         let table = self.load_table(&binding.table_ident()).await?;
         let retention_cutoff_ms = expiry_cutoff_ms(now, self.core.config.snapshot_retention)?;
-        let cutoff_ms = self
-            .validated_expiry_cutoff(key, &table, retention_cutoff_ms)
+        let roots = self
+            .snapshot_protection_roots(key, &table, outcome.destructive_maintenance)
             .await?;
         let (summaries, ref_heads) = snapshot_summaries(&table)?;
-        let selected = select_expirable_snapshots(
-            &summaries,
-            table.metadata().current_snapshot_id(),
-            &ref_heads,
-            cutoff_ms,
-            self.core.config.retain_last,
-        );
-        if selected.is_empty() {
-            return Ok(outcome);
+        let decision = SnapshotExpiryPolicy {
+            snapshots: &summaries,
+            current_snapshot_id: table.metadata().current_snapshot_id(),
+            ref_heads: &ref_heads,
+            roots: &roots,
+            retention_cutoff_ms,
+            retain_last: self.core.config.retain_last,
+            traversal_limit: self.core.config.max_retained_snapshots_per_table,
         }
-        let detail = expiry_detail(&table, key, cutoff_ms, selected, ref_heads)?;
+        .decide()?;
+        let SnapshotExpiryDecision::Expire {
+            snapshot_ids,
+            cutoff_ms,
+        } = decision
+        else {
+            return Ok(outcome);
+        };
+        let detail = expiry_detail(&table, key, cutoff_ms, snapshot_ids, ref_heads)?;
         require_running(stop)?;
         lease.require_fence(&self.core.operator_pool).await?;
         self.append_expiry_audit(lease, key.tenant, &detail, "forge.snapshot_expire.prepared")
@@ -362,22 +370,25 @@ impl Forge {
 }
 
 impl Forge {
-    /// Loads bounded active-task watermarks and derives the oldest safe expiry cutoff.
+    /// Gathers every non-catalog authority that protects a snapshot.
     ///
-    /// Every persisted ID must resolve to the exact persisted timestamp in the
-    /// currently retained ancestry. Missing, malformed, or overflowed state
-    /// fails closed before an expiry transaction is constructed.
+    /// The three roots are read together, under the fence this pass already
+    /// holds, because a decision made from two of them is not a smaller
+    /// decision — it is an unsafe one. Watermarks are returned unvalidated;
+    /// corroborating them against Iceberg belongs to the policy, which is the
+    /// owner that also knows the ancestry they must be reachable from.
     ///
     /// # Errors
     ///
-    /// Returns SQL, identity, or snapshot-expiry errors when active protection
-    /// cannot be proven complete and internally consistent.
-    async fn validated_expiry_cutoff(
+    /// Returns SQL or identity failures from the durable watermark read, and
+    /// [`ForgeError::SnapshotExpiry`] when the bounded watermark query
+    /// overflowed, which means the protected set is not provably complete.
+    async fn snapshot_protection_roots(
         &self,
         key: &ForgeTableKey,
         table: &iceberg::table::Table,
-        retention_cutoff_ms: i64,
-    ) -> Result<i64, ForgeError> {
+        destructive_maintenance: super::live_reconcile::DestructiveMaintenance,
+    ) -> Result<SnapshotProtectionRoots, ForgeError> {
         let identity = ForgeTaskTableIdentity::new(
             "wyrd-redux",
             key.table_ref.namespace.as_str(),
@@ -395,7 +406,7 @@ impl Forge {
             .tenant_conn(key.tenant)
             .await
             .map_err(ForgeError::Sql)?;
-        let (watermarks, overflowed) = ForgeTasks::new(self.core.operator_pool.clone())
+        let (attempt_watermarks, overflowed) = ForgeTasks::new(self.core.operator_pool.clone())
             .watermarks(&mut conn, &identity, cap)
             .await
             .map_err(ForgeError::Sql)?;
@@ -405,16 +416,33 @@ impl Forge {
                 detail: "active Forge watermark set exceeded its bounded query".to_owned(),
             });
         }
-        let (summaries, ref_heads) = snapshot_summaries(table)?;
-        validate_watermarks(
-            &summaries,
-            table.metadata().current_snapshot_id(),
-            &ref_heads,
-            &watermarks,
-            retention_cutoff_ms,
-            self.core.config.max_retained_snapshots_per_table,
-        )
+        Ok(SnapshotProtectionRoots {
+            attempt_watermarks,
+            reader_watermarks: Vec::new(),
+            lineage_snapshot_id: head_lineage_snapshot_id(table),
+            destructive_maintenance,
+        })
     }
+}
+
+/// Reads the base snapshot the branch head's rewrite lineage still references.
+///
+/// A head that is not a Forge rewrite snapshot protects no lineage, and a head
+/// whose properties do not parse as a complete rewrite identity is not lineage
+/// this owner wrote. Both are `None` rather than an error: neither is a reason
+/// to refuse expiry, only a reason not to protect an extra snapshot.
+fn head_lineage_snapshot_id(table: &iceberg::table::Table) -> Option<i64> {
+    let properties = table
+        .metadata()
+        .current_snapshot()?
+        .summary()
+        .additional_properties
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    super::publication::RewriteSnapshotProperties::validate(&properties)
+        .ok()
+        .map(|rewrite| rewrite.base_snapshot_id)
 }
 
 /// Validates watermark identity/timestamp parity and returns a timestamp cutoff.
@@ -427,7 +455,7 @@ impl Forge {
 /// Returns snapshot-expiry failure when a watermark is absent from retained
 /// ancestry, the ancestry graph is malformed or over its bound, or its
 /// persisted timestamp does not match Iceberg metadata.
-fn validate_watermarks(
+pub(super) fn validate_watermarks(
     snapshots: &[SnapshotSummary],
     current_snapshot_id: Option<i64>,
     ref_heads: &[i64],

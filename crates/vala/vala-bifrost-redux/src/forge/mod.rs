@@ -15,6 +15,7 @@ mod clock;
 pub(crate) mod compact;
 pub(crate) mod error;
 pub(crate) mod expire;
+mod expiry_policy;
 mod identity;
 pub(crate) mod lease;
 mod live_reconcile;

@@ -29,6 +29,7 @@ mod path;
 mod phase;
 mod planner;
 mod planning_scheduler;
+mod protection_roots;
 pub(crate) mod publication;
 pub(crate) mod rewrite;
 mod scheduler;

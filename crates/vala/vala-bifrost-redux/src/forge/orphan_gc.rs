@@ -36,6 +36,7 @@ use super::lease::ForgeLease;
 use super::lease::forge_lease_key;
 use super::live_reconcile::DestructiveMaintenance;
 use super::path::{catalog_path_to_object_key, validate_table_location};
+use super::protection_roots::OrphanProtectionRoots;
 
 const SYSTEM_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::nil());
 
@@ -333,12 +334,27 @@ struct GcBatchRequest<'context> {
     deadline: Option<Instant>,
 }
 
+/// Durable root classes read from one tenant transaction.
+#[derive(Default)]
+struct DurableProtectionRoots {
+    /// Committed Scribe objects without exact promotion evidence.
+    hot_unpromoted: Vec<String>,
+    /// Outputs produced or still producible by a nonterminal attempt.
+    open_outputs: Vec<String>,
+    /// Snapshots an Oracle cut or live-tail lease still depends on.
+    pinned_snapshot_ids: Vec<i64>,
+    /// Whether any open or unreconciled operation forbids destructive work.
+    blocked: bool,
+}
+
 /// Catalog-derived live paths and the validated table metadata location.
 struct CatalogProtection {
     /// Paths reachable from retained Iceberg catalog state.
     live: ProtectedLiveSet,
     /// Catalog location used to normalize SQL and audit paths.
     table_location: String,
+    /// Snapshot ids the traversal visited, so a reader pin can be corroborated.
+    traversed_snapshot_ids: Vec<i64>,
 }
 
 /// Returns output objects that nonterminal operations must retain.
@@ -822,20 +838,62 @@ impl Forge {
         request: ProtectionRequest<'_>,
     ) -> Result<MaintenanceProtection, ForgeError> {
         let table_context = request.table;
-        let key = table_context.key;
-        let binding = table_context.binding;
         require_running(table_context.stop)?;
         let CatalogProtection {
-            mut live,
+            live,
             table_location,
-        } = self.load_catalog_protection(binding).await?;
-        let mut add = |path: &str| self.add_path(&mut live, binding, &table_location, path);
+            traversed_snapshot_ids,
+        } = self.load_catalog_protection(table_context.binding).await?;
+        let durable = self
+            .load_durable_protection_roots(&request, &table_location)
+            .await?;
+        require_running(table_context.stop)?;
+
+        let composed = OrphanProtectionRoots {
+            catalog: live,
+            traversed_snapshot_ids,
+            hot_unpromoted: durable.hot_unpromoted,
+            open_outputs: durable.open_outputs,
+            pinned_snapshot_ids: durable.pinned_snapshot_ids,
+            blocked: durable.blocked,
+        }
+        .compose()?;
+        let object_age_cutoff = self.gc_object_age_cutoff(table_context.now)?;
+        Ok(MaintenanceProtection::new(
+            composed.live_set,
+            composed.blocked,
+            table_context.now,
+            object_age_cutoff,
+        ))
+    }
+
+    /// Reads every durable root class in one bounded tenant transaction.
+    ///
+    /// Catalog reachability is loaded separately because it needs manifest IO;
+    /// everything here is Postgres evidence, and it is read under one snapshot
+    /// so the classes cannot disagree about which operations were open.
+    ///
+    /// # Errors
+    ///
+    /// Returns SQL, operation-state, exemption-validation, path-normalization,
+    /// or bound-overflow failures.
+    async fn load_durable_protection_roots(
+        &self,
+        request: &ProtectionRequest<'_>,
+        table_location: &str,
+    ) -> Result<DurableProtectionRoots, ForgeError> {
+        let key = request.table.key;
+        let binding = request.table.binding;
+        let normalize = |path: &str| {
+            catalog_path_to_object_key(table_location, binding, &self.core.staging, path)
+        };
         let mut conn = self
             .core
             .vala
             .tenant_conn(key.tenant)
             .await
             .map_err(ForgeError::Sql)?;
+        let mut roots = DurableProtectionRoots::default();
         let rows = list_nonterminal_file_paths(
             &mut conn,
             key.table_ref.namespace.as_str(),
@@ -845,12 +903,11 @@ impl Forge {
         .await
         .map_err(ForgeError::Sql)?;
         for path in rows {
-            add(&path)?;
+            roots.hot_unpromoted.push(normalize(&path)?);
         }
 
         let resource = table_resource_for_key(key);
         let cap = self.core.config.max_open_operations_per_table;
-        let mut blocked = false;
         for family in [
             ForgeOperationFamily::IcebergRewrite,
             ForgeOperationFamily::SnapshotExpire,
@@ -860,10 +917,10 @@ impl Forge {
                 .list_open(&mut conn, cap)
                 .await
                 .map_err(ForgeError::Sql)?;
-            blocked |= page.overflowed || !page.operations.is_empty();
+            roots.blocked |= page.overflowed || !page.operations.is_empty();
             for row in &page.operations {
                 for path in operation_output_paths(&row.prepared_detail) {
-                    add(path.as_str())?;
+                    roots.open_outputs.push(normalize(path.as_str())?);
                 }
             }
         }
@@ -872,19 +929,12 @@ impl Forge {
             .list_open(&mut conn, cap)
             .await
             .map_err(ForgeError::Sql)?;
-        blocked |= open_gc.overflowed;
+        roots.blocked |= open_gc.overflowed;
         let exemption = current_gc_exemption(
             &resource,
             request.current_gc_detail,
             &open_gc.operations,
-            |path| {
-                catalog_path_to_object_key(
-                    &table_location,
-                    binding,
-                    &self.core.staging,
-                    path.as_str(),
-                )
-            },
+            |path| normalize(path.as_str()),
         )?;
         validate_gc_exemption(exemption.as_ref())?;
         for row in &open_gc.operations {
@@ -894,21 +944,31 @@ impl Forge {
             {
                 continue;
             }
-            blocked = true;
+            roots.blocked = true;
             for path in operation_output_paths(&row.prepared_detail) {
-                add(path.as_str())?;
+                roots.open_outputs.push(normalize(path.as_str())?);
             }
         }
+        let (reader_watermarks, readers_overflowed) =
+            vala_sql::queries::reader_watermarks::BifrostReaderWatermarks::new(&mut conn)
+                .list_active(
+                    key.table_ref.namespace.as_str(),
+                    key.table_ref.name.as_str(),
+                    request.table.now,
+                    u32::try_from(cap).map_err(|_| ForgeError::Invariant {
+                        detail: "open-operation cap exceeds the reader-watermark query bound"
+                            .to_owned(),
+                    })?,
+                )
+                .await
+                .map_err(ForgeError::Sql)?;
+        roots.blocked |= readers_overflowed;
+        roots.pinned_snapshot_ids = reader_watermarks
+            .iter()
+            .map(|watermark| watermark.snapshot_id)
+            .collect();
         conn.commit().await.map_err(ForgeError::Sql)?;
-        require_running(table_context.stop)?;
-
-        let object_age_cutoff = self.gc_object_age_cutoff(table_context.now)?;
-        Ok(MaintenanceProtection::new(
-            live,
-            blocked,
-            table_context.now,
-            object_age_cutoff,
-        ))
+        Ok(roots)
     }
 
     /// Loads bounded terminal Reset outputs for test inspection of durable lineage.
@@ -972,6 +1032,7 @@ impl Forge {
         }
         let mut live = ProtectedLiveSet::default();
         let table_location = table.metadata().location().to_owned();
+        let mut traversed_snapshot_ids = Vec::with_capacity(retained_snapshot_count);
         let mut add = |path: &str| self.add_path(&mut live, binding, &table_location, path);
         add(table
             .metadata_location_result()
@@ -980,6 +1041,7 @@ impl Forge {
             add(&metadata_log.metadata_file)?;
         }
         for snapshot in table.metadata().snapshots() {
+            traversed_snapshot_ids.push(snapshot.snapshot_id());
             add(snapshot.manifest_list())?;
             let manifest_list = table
                 .manifest_list_reader(snapshot)
@@ -1014,6 +1076,7 @@ impl Forge {
         Ok(CatalogProtection {
             live,
             table_location,
+            traversed_snapshot_ids,
         })
     }
 

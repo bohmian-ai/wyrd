@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use iceberg::Catalog;
 
+mod cleanup_cursor;
 mod clock;
 pub(crate) mod compact;
 pub(crate) mod error;

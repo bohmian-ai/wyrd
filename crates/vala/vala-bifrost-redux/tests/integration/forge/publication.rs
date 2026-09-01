@@ -141,9 +141,12 @@ async fn rewrite_scheduler_dispatches_only_after_promotion_and_authority() {
         "the outstanding promotion demand planned a schedulable task: {planned:?}"
     );
 
-    // Settle that promotion through the production worker.
+    // Settle that promotion through the production worker, without a planning
+    // pass: a pass taken while the promotion is still in flight can bind a
+    // rewrite against the pre-promotion snapshot, and the next statement is
+    // about exactly one rewrite bound to the settled cut.
     supervisor.restart_worker();
-    supervisor.run_one_success().await;
+    supervisor.settle_one_success().await;
     assert!(
         fixture.file_rows().await.iter().all(|row| row.compacted),
         "the table owes no further promotion"
@@ -975,9 +978,65 @@ async fn assert_held_authority_change_refuses(
         "a refused publication settles no promoted file row ({mutation:?})"
     );
 
+    assert_refused_publication_left_no_trace(HeldAuthorityAftermath {
+        promoted: &promoted,
+        telemetry,
+        mutation,
+        span_mark,
+        planned: &planned,
+        objects_before: &objects_before,
+        possible_outputs,
+        error: &error,
+    })
+    .await;
+}
+
+/// Everything one held-authority phase captured before it started asserting.
+///
+/// Grouping these keeps the phase's two halves — drive-and-refuse, then
+/// prove-nothing-happened — separately readable while still binding every
+/// later assertion to the exact state the mutation was applied against.
+struct HeldAuthorityAftermath<'a> {
+    /// Promoted table the held attempt ran over.
+    promoted: &'a PromotedRewriteFixture,
+    /// Scenario-wide production telemetry checkpoint.
+    telemetry: &'a ForgeTelemetryCheckpoint,
+    /// Held-authority change this phase applied.
+    mutation: HeldAuthorityMutation,
+    /// Span position taken immediately before the held attempt began.
+    span_mark: usize,
+    /// Live cut the promotion left, before the mutation was applied.
+    planned: &'a LiveCut,
+    /// Object digests taken immediately before the held attempt began.
+    objects_before: &'a std::collections::BTreeMap<String, String>,
+    /// Typed unsettled-output evidence the refusal carried, if it was typed.
+    possible_outputs: Option<Vec<vala_bifrost_redux::forge::ForgeUnsettledOutput>>,
+    /// Rendered refusal, retained for failure messages.
+    error: &'a str,
+}
+
+/// Proves a refused publication left no cut, object, task, or telemetry trace.
+///
+/// # Panics
+///
+/// Panics when the refused attempt changed the published cut, wrote or
+/// rewrote an object it cannot name, left its task or lease in the wrong
+/// durable state, or failed to report itself exactly once.
+async fn assert_refused_publication_left_no_trace(aftermath: HeldAuthorityAftermath<'_>) {
+    let HeldAuthorityAftermath {
+        promoted,
+        telemetry,
+        mutation,
+        span_mark,
+        planned,
+        objects_before,
+        possible_outputs,
+        error,
+    } = aftermath;
+
     // 4. The live cut is exactly what the concurrent owner left, deletes
     //    included, and no managed output became live.
-    let after = live_cut(&promoted).await;
+    let after = live_cut(promoted).await;
     let expected = match mutation {
         // This phase's mutation *is* a real commit by another writer, so the
         // authoritative cut is the one that writer left, read back directly.
@@ -1041,6 +1100,26 @@ async fn assert_held_authority_change_refuses(
         "a refused publication rewrote no existing object ({mutation:?})"
     );
 
+    assert_refused_attempt_settled_and_reported(promoted, telemetry, mutation, span_mark).await;
+}
+
+/// Proves the held rewrite's durable settlement and production telemetry.
+///
+/// Separated from the cut-and-object proof because it answers a different
+/// question: not "did the table change" but "did the owner classify and report
+/// its own refusal exactly once".
+///
+/// # Panics
+///
+/// Panics when the held rewrite is not left retryable, its lease is not
+/// released, it did not report exactly one task span, or a catalog commit span
+/// was reported for an attempt that never committed.
+async fn assert_refused_attempt_settled_and_reported(
+    promoted: &PromotedRewriteFixture,
+    telemetry: &ForgeTelemetryCheckpoint,
+    mutation: HeldAuthorityMutation,
+    span_mark: usize,
+) {
     // 6. Durable task classification and lease release match the phase.
     let tasks = promoted
         .fixture

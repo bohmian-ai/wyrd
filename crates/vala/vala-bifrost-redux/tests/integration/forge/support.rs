@@ -1242,6 +1242,40 @@ impl SupervisedPromotion {
         assert_eq!(self.worker_observer.completed(), expected);
     }
 
+    /// Await exactly one successful worker attempt without planning anything.
+    ///
+    /// The worker slot claims from Postgres on its own loop, so a caller whose
+    /// task is already `ready` does not need a planning pass to reach it — and
+    /// must not take one. A pass issued while a promotion is still in flight
+    /// observes the table mid-settlement and can bind a rewrite against the
+    /// pre-promotion snapshot, which makes any later "exactly one rewrite"
+    /// statement depend on scheduler and worker interleaving. This settles the
+    /// already-enqueued work and leaves planning to the caller's own pass.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a deterministic bound is missed or the attempt failed.
+    pub(crate) async fn settle_one_success(&mut self) {
+        let expected = self.worker_observer.completed().saturating_add(1);
+        let expected_errors = self.worker_observer.returned_errors().len();
+        self.worker_observer.hold_after_next_attempt_for_test();
+        self.start_armed_worker();
+        tokio::time::timeout(
+            FIXTURE_BOUND,
+            self.worker_observer.wait_for_held_attempt_for_test(),
+        )
+        .await
+        .expect("production Forge worker attempt bound");
+        assert_eq!(
+            self.worker_observer.returned_errors().len(),
+            expected_errors,
+            "the attempt was expected to succeed: {:?}",
+            self.worker_observer.returned_errors()
+        );
+        self.stop_worker().await;
+        assert_eq!(self.worker_observer.completed(), expected);
+    }
+
     /// Schedule one pass and await exactly one returned worker error while
     /// `during` drives the seam the attempt is parked on.
     ///

@@ -1014,6 +1014,15 @@ cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-features --all-targets -- -D warnings
 """
 
+[tasks."skills:sync"]
+description = "Regenerate Claude workflow-skill mirrors from canonical .agents skills"
+run = "bash scripts/sync-agent-skills.sh --write"
+
+[tasks."check:skills-sync"]
+hide = true
+description = "Fail when Claude workflow-skill mirrors drift or retired skills reappear"
+run = "bash scripts/sync-agent-skills.sh --check"
+
 [tasks."codegen:regen"]
 description = "Regenerate OpenAPI / JSON schemas / MCP tool list / pyi stubs from source"
 run = """
@@ -1348,4 +1357,3 @@ run = "bash scripts/postgres/test-roles.sh"
 hide = true
 description = "Validate the TOML-aware database task lifecycle inventory and regression fixture"
 run = "python3 scripts/postgres/check-inventory.py && python3 scripts/postgres/check-inventory.py --negative-test"
-

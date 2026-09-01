@@ -7,7 +7,7 @@ publish_timeout = "10m"
 git_tag_enable = false
 git_release_enable = false
 publish = false
-repo_url = "https://github.com/wyrd-ai/wyrd"
+repo_url = "https://github.com/bohmian-ai/wyrd"
 publish_no_verify = true
 
 # Opt-in crates for crates.io publishing.

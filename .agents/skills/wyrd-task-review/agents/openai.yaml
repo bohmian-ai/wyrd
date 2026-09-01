@@ -1,0 +1,4 @@
+interface:
+  display_name: "Wyrd Task Review"
+  short_description: "Review one implemented Wyrd task"
+  default_prompt: "Use $wyrd-task-review to review this immutable cumulative Wyrd task candidate against its approved spec, task authority, and evidence."

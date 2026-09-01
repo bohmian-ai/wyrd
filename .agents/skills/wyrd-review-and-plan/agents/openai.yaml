@@ -1,4 +1,0 @@
-interface:
-  display_name: "Wyrd Review and Plan"
-  short_description: "Review integrated Wyrd changes"
-  default_prompt: "Use $wyrd-review-and-plan to review an immutable integrated Wyrd change for aggregate claim closure, cross-task correctness, architecture and contract drift, journeys, evidence quality, and merge or push readiness."

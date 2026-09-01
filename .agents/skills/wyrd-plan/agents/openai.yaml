@@ -1,4 +1,4 @@
 interface:
   display_name: "Wyrd Plan"
-  short_description: "Plan actionable Wyrd claims and evidence"
-  default_prompt: "Use $wyrd-plan to create a source-grounded Wyrd plan with cohesive tasks, decision-complete claims, credible evidence expectations, and only real dependencies."
+  short_description: "Create TDD tasks from an approved spec"
+  default_prompt: "Use $wyrd-plan to decompose this approved Wyrd spec into cohesive test-driven tasks or plan bounded remediation from validated findings."

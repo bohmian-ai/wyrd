@@ -1,0 +1,4 @@
+interface:
+  display_name: "Wyrd Task Readiness"
+  short_description: "Review TDD tasks before implementation"
+  default_prompt: "Use $wyrd-task-readiness to review these Wyrd tasks for approved-spec traceability, executable TDD scenarios, real dependencies, and credible verification."

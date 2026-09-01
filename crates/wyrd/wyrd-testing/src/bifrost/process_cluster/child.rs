@@ -429,7 +429,7 @@ impl ChildConfig {
                 move |mut request: wyrd_tonic::tonic::Request<()>| {
                     request
                         .metadata_mut()
-                        .insert("authorization", metadata.clone());
+                        .insert("x-wyrd-access-token", metadata.clone());
                     Ok(request)
                 },
             );

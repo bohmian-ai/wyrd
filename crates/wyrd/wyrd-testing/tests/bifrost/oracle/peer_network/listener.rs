@@ -462,6 +462,13 @@ fn fence_of(report: &NodeReport, node_id: uuid::Uuid) -> Result<u64, PeerJourney
 
 /// Oracle pods are interchangeable at every replica count.
 ///
+/// One bullet of this claim is deliberately absent: every Oracle must also be
+/// able to coordinate an *inactive Analytical* query. That seam
+/// (`AnalyticalExecutionHandle::execute_inactive`) is restored by the retry
+/// slice, and `ControlRequest::ExecuteInactiveSql` is already wired through the
+/// harness for it. The assertion is added there rather than asserted against a
+/// seam that does not exist yet.
+///
 /// # Errors
 ///
 /// Returns a failure when membership omits a pod, publishes an address that is

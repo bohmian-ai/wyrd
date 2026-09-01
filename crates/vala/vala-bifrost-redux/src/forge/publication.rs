@@ -21,6 +21,7 @@ use iceberg::spec::{
     DataContentType, DataFile, Literal, PartitionSpec, PrimitiveLiteral, Struct, Transform,
 };
 use iceberg::table::Table;
+use iceberg::transaction::Transaction;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 use uuid::Uuid;
@@ -528,6 +529,87 @@ impl RewriteCommitRequest {
             ),
         ])
     }
+
+    /// Encodes this request as one replacement transaction against `table`.
+    ///
+    /// The encoding is pure: it names exactly the removals, additions, sequence
+    /// number, and lineage properties the request already validated, so the
+    /// only thing the caller adds is the decision to submit it. The delete
+    /// filter manager is disabled because the request already resolved delete
+    /// disposition itself and a second, independent resolution could silently
+    /// disagree with the retained set this rewrite committed to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Catalog`] when the transaction layer refuses to
+    /// encode the replacement. That refusal happens before any catalog call, so
+    /// the caller may treat it as definitely unsubmitted.
+    pub(super) fn encode(&self, table: &Table) -> Result<Transaction, ForgeError> {
+        let removed = self
+            .removed_data_files
+            .iter()
+            .cloned()
+            .chain(self.removed_delete_files.iter().cloned())
+            .collect::<Vec<_>>();
+        let transaction = Transaction::new(table);
+        let mut action = transaction
+            .rewrite_files()
+            .set_enable_delete_filter_manager(false)
+            .set_new_data_file_sequence_number(self.new_data_file_sequence_number)
+            .add_data_files(self.added_data_files.iter().cloned())
+            .delete_files(removed);
+        action.set_snapshot_properties(self.snapshot_properties().into_iter().collect());
+        iceberg::transaction::ApplyTransactionAction::apply(action, transaction)
+            .map_err(ForgeError::Catalog)
+    }
+
+    /// Confirms the committed snapshot carries exactly this request's lineage.
+    ///
+    /// The catalog is free to normalize a snapshot summary, and every later
+    /// recovery reads this rewrite's lineage back out of one. Proving the
+    /// properties still parse into the same values while the committing worker
+    /// is still here turns a silently unrecoverable snapshot into a loud
+    /// failure on the one attempt that can still explain it. The replacement is
+    /// already live at this point, so every mismatch is reported as
+    /// [`RewriteSubmission::AcceptanceUnknown`]: the operation stays open for
+    /// the evidence-based recovery that can still find the snapshot, never
+    /// Reset.
+    ///
+    /// # Errors
+    ///
+    /// Returns the validation error only when this request's own submitted
+    /// properties do not parse, which is an internal invariant rather than a
+    /// catalog outcome.
+    pub(super) fn confirm_committed_lineage(
+        &self,
+        committed: Table,
+    ) -> Result<RewriteSubmission, ForgeError> {
+        let Some(recorded) = committed.metadata().current_snapshot().map(|snapshot| {
+            snapshot
+                .summary()
+                .additional_properties
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<BTreeMap<_, _>>()
+        }) else {
+            return Ok(RewriteSubmission::AcceptanceUnknown(
+                ForgeError::Reconciliation {
+                    detail: "committed rewrite produced no current snapshot".to_owned(),
+                },
+            ));
+        };
+        let submitted = RewriteSnapshotProperties::validate(&self.snapshot_properties())?;
+        Ok(match RewriteSnapshotProperties::validate(&recorded) {
+            Ok(recorded) if recorded == submitted => {
+                RewriteSubmission::Committed(Box::new(committed))
+            }
+            Ok(_) => RewriteSubmission::AcceptanceUnknown(ForgeError::Reconciliation {
+                detail: "committed rewrite snapshot does not carry the submitted lineage"
+                    .to_owned(),
+            }),
+            Err(error) => RewriteSubmission::AcceptanceUnknown(error),
+        })
+    }
 }
 
 /// One validated rewrite snapshot property set.
@@ -852,6 +934,81 @@ impl RewriteAcceptance {
     }
 }
 
+/// The one absolute instant every catalog call of one publication shares.
+///
+/// A publication is allowed at most two catalog calls, and both of them are the
+/// same operation. Giving each call its own timeout would let a first call that
+/// burned the whole budget hand the retry a second full one, so the budget is
+/// captured once as an *instant* rather than a duration and every later call
+/// derives its wait from what is left of it. Nothing may renew it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RewritePublicationDeadline {
+    /// Absolute UTC instant no catalog call may start at or complete after.
+    at: chrono::DateTime<chrono::Utc>,
+}
+
+impl RewritePublicationDeadline {
+    /// Captures the one deadline as `now` plus the configured commit budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::InvalidConfig`] when the configured budget is not
+    /// representable as a `chrono` duration or the sum overflows the calendar.
+    pub(super) fn new(
+        now: chrono::DateTime<chrono::Utc>,
+        budget: std::time::Duration,
+    ) -> Result<Self, ForgeError> {
+        let budget = chrono::Duration::from_std(budget).map_err(|_| ForgeError::InvalidConfig {
+            detail: "Forge Iceberg retry timeout is not representable".to_owned(),
+        })?;
+        let at = now
+            .checked_add_signed(budget)
+            .ok_or_else(|| ForgeError::InvalidConfig {
+                detail: "Forge Iceberg retry timeout overflows the publication deadline".to_owned(),
+            })?;
+        Ok(Self { at })
+    }
+
+    /// Returns whether `now` has reached or passed the deadline.
+    pub(super) fn passed(self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        now >= self.at
+    }
+
+    /// Returns the strictly positive budget left at `now`.
+    ///
+    /// `None` means no catalog call may start: either the deadline has elapsed
+    /// or what remains cannot be represented as a wait, and both are refusals
+    /// rather than an unbounded call.
+    pub(super) fn remaining(
+        self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<std::time::Duration> {
+        self.at
+            .signed_duration_since(now)
+            .to_std()
+            .ok()
+            .filter(|remaining: &std::time::Duration| !remaining.is_zero())
+    }
+}
+
+/// What one publication's catalog submission boundary actually did.
+///
+/// The distinction the type exists to keep is `NotSubmitted` versus
+/// `AcceptanceUnknown`: the first is proof that no replacement can be live, the
+/// second is the absence of proof. Deriving that later from an error string is
+/// how a definitely-uncommitted operation gets stranded as Prepared, or worse,
+/// an ambiguous one gets Reset.
+pub(super) enum RewriteSubmission {
+    /// The catalog accepted the replacement and returned the committed table.
+    Committed(Box<Table>),
+    /// No `update_table` call was started, so nothing landed.
+    NotSubmitted(ForgeError),
+    /// The catalog answered with a definite, non-retryable refusal.
+    DefiniteConflict(ForgeError),
+    /// A call was submitted and its acceptance is unknown.
+    AcceptanceUnknown(ForgeError),
+}
+
 /// Derives the exact time partition one live file belongs to.
 ///
 /// The partition value is read off the file itself rather than out of
@@ -945,32 +1102,40 @@ pub(super) struct ForgeRewriteCommit<'commit> {
     pub(super) table: &'commit Table,
     /// Fully derived replacement this commit executes without further decisions.
     pub(super) request: &'commit RewriteCommitRequest,
+    /// The one absolute budget this call shares with the whole publication.
+    pub(super) deadline: RewritePublicationDeadline,
 }
 
 impl Forge {
-    /// Reads the immutable live file set of one snapshot into a rewrite base.
+    /// Reads the immutable live file set of one exact snapshot into a base.
     ///
-    /// This is the only IO the delete-disposition derivation depends on, and it
-    /// happens once: every later decision reads this value rather than the
-    /// catalog, so the disposition cannot silently change under a concurrent
-    /// writer between being derived and being committed. Alive manifest entries
-    /// carry the data sequence number that decides which deletes a replacement
-    /// can still be reached by, so it is captured here alongside the file.
+    /// The snapshot is addressed by identity rather than by "whatever is
+    /// current", which is what lets a publication re-read freshly loaded
+    /// metadata after its managed execution without silently re-planning
+    /// against a head a concurrent writer moved: the claimed base either is
+    /// still retained and reads back byte-identically, or it is gone and the
+    /// authority decision refuses. Alive manifest entries carry the data
+    /// sequence number that decides which deletes a replacement can still be
+    /// reached by, so it is captured here alongside the file.
     ///
     /// # Errors
     ///
-    /// Returns [`ForgeError::Invariant`] when the table has no current snapshot
-    /// or an alive entry carries no data sequence number, [`ForgeError::Catalog`]
-    /// when the manifest list or a manifest cannot be read, and the duplicate
-    /// and identity failures [`RewriteBase::try_new`] raises.
-    pub(super) async fn rewrite_base(&self, table: &Table) -> Result<RewriteBase, ForgeError> {
-        let snapshot =
-            table
-                .metadata()
-                .current_snapshot()
-                .ok_or_else(|| ForgeError::Invariant {
-                    detail: "rewrite base table has no current snapshot".to_owned(),
-                })?;
+    /// Returns [`ForgeError::Invariant`] when `snapshot_id` is not retained by
+    /// `table` or an alive entry carries no data sequence number,
+    /// [`ForgeError::Catalog`] when the manifest list or a manifest cannot be
+    /// read, and the duplicate and identity failures [`RewriteBase::try_new`]
+    /// raises.
+    pub(super) async fn rewrite_base_at(
+        &self,
+        table: &Table,
+        snapshot_id: i64,
+    ) -> Result<RewriteBase, ForgeError> {
+        let snapshot = table
+            .metadata()
+            .snapshot_by_id(snapshot_id)
+            .ok_or_else(|| ForgeError::Invariant {
+                detail: format!("rewrite base snapshot {snapshot_id} is no longer retained"),
+            })?;
         let manifests = table
             .manifest_list_reader(snapshot)
             .load()
@@ -1018,28 +1183,43 @@ impl Forge {
     ///
     /// Cancellation and timeout are raced against the in-flight commit and are
     /// never read as proof of rejection: both surface as
-    /// [`ForgeError::Reconciliation`] so the caller's Prepared operation stays
-    /// open for evidence-based recovery.
+    /// [`RewriteSubmission::AcceptanceUnknown`] so the caller's Prepared
+    /// operation stays open for evidence-based recovery.
+    ///
+    /// Every pre-submission refusal — a lost fence, a cancelled attempt, a
+    /// deadline that already elapsed, a replacement the transaction layer will
+    /// not even encode — is reported as [`RewriteSubmission::NotSubmitted`]
+    /// instead. That is knowledge, not an outcome: no catalog call started, so
+    /// the caller may close the operation as definitely uncommitted rather than
+    /// stranding it for a successor to reconcile a commit that never happened.
+    ///
+    /// The wait itself is derived from the publication's one absolute deadline
+    /// immediately before the call, so the initial commit and its single
+    /// permitted retry share one budget and neither can outlive it.
     ///
     /// # Errors
     ///
-    /// Returns [`ForgeError::FenceLost`] when the lease cannot cover the commit
-    /// window, [`ForgeError::Shutdown`] when cancellation arrives before
-    /// submission, [`ForgeError::Catalog`] when the catalog refuses the
-    /// replacement, and [`ForgeError::Reconciliation`] when acceptance becomes
-    /// unknown.
+    /// Returns [`ForgeError::Lease`] or [`ForgeError::Sql`] when the lease
+    /// cannot be renewed or fenced against the operator pool, and
+    /// [`ForgeError::InvalidConfig`] when the clock cannot report the current
+    /// instant. Every publication outcome is reported through the returned
+    /// [`RewriteSubmission`] rather than as an error.
     ///
     /// # Cancellation
     ///
-    /// Cancellation after submission leaves acceptance unknown and is reported
-    /// as a reconciliation error, never as a clean stop.
+    /// Cancellation observed before submission is `NotSubmitted`; cancellation
+    /// after submission leaves acceptance unknown and is never a clean stop.
     pub(super) async fn commit_rewrite(
         &self,
         lease: &mut ForgeLease,
         commit: ForgeRewriteCommit<'_>,
         stop: &CancellationToken,
-    ) -> Result<Table, ForgeError> {
-        let ForgeRewriteCommit { table, request } = commit;
+    ) -> Result<RewriteSubmission, ForgeError> {
+        let ForgeRewriteCommit {
+            table,
+            request,
+            deadline,
+        } = commit;
         let span = super::metrics::ForgeTelemetry::catalog_commit_span(
             super::metrics::ForgeCatalogCommitStrategy::IcebergRewrite,
             Some((request.identity.task_id, request.identity.attempt_id)),
@@ -1047,51 +1227,55 @@ impl Forge {
         if !lease.renew(&self.core.operator_pool).await?
             || !lease.commit_window_fits(self.core.config.commit_window())
         {
-            return Err(ForgeError::FenceLost {
+            return Ok(RewriteSubmission::NotSubmitted(ForgeError::FenceLost {
                 lease_key: lease.lease_key.clone(),
-            });
+            }));
         }
-        let removed = request
-            .removed_data_files
-            .iter()
-            .cloned()
-            .chain(request.removed_delete_files.iter().cloned())
-            .collect::<Vec<_>>();
-        let transaction = iceberg::transaction::Transaction::new(table);
-        let mut action = transaction
-            .rewrite_files()
-            .set_enable_delete_filter_manager(false)
-            .set_new_data_file_sequence_number(request.new_data_file_sequence_number)
-            .add_data_files(request.added_data_files.iter().cloned())
-            .delete_files(removed);
-        action.set_snapshot_properties(request.snapshot_properties().into_iter().collect());
-        let transaction = iceberg::transaction::ApplyTransactionAction::apply(action, transaction)
-            .map_err(ForgeError::Catalog)?;
+        let transaction = match request.encode(table) {
+            Ok(transaction) => transaction,
+            Err(error) => return Ok(RewriteSubmission::NotSubmitted(error)),
+        };
         lease.require_fence(&self.core.operator_pool).await?;
         if !lease.commit_window_fits(self.core.config.commit_window()) {
-            return Err(ForgeError::FenceLost {
+            return Ok(RewriteSubmission::NotSubmitted(ForgeError::FenceLost {
                 lease_key: lease.lease_key.clone(),
-            });
+            }));
         }
         if stop.is_cancelled() {
-            return Err(ForgeError::Shutdown);
+            return Ok(RewriteSubmission::NotSubmitted(ForgeError::Shutdown));
         }
-        let timeout = self.core.config.iceberg_total_retry_timeout;
+        // The wait is what is left of the publication's one deadline, taken
+        // from the same clock authority that created it and read here rather
+        // than at construction, so a slow first call shortens the retry instead
+        // of the configured budget silently restarting.
+        let Some(remaining) = deadline.remaining(self.core.clock.now()?) else {
+            return Ok(RewriteSubmission::NotSubmitted(ForgeError::Timeout {
+                operation: "rewrite publication",
+            }));
+        };
         let catalog = self.core.catalog.as_ref();
         let outcome = async move {
             let commit = transaction.commit(catalog);
             tokio::pin!(commit);
             tokio::select! {
-                response = tokio::time::timeout(timeout, &mut commit) => match response {
+                response = tokio::time::timeout(remaining, &mut commit) => match response {
                     Ok(Ok(committed)) => Ok(committed),
-                    Ok(Err(error)) => Err(ForgeError::Catalog(error)),
-                    Err(_) => Err(ForgeError::Reconciliation {
-                        detail: "Forge rewrite commit timed out with unknown acceptance".to_owned(),
-                    }),
+                    // A retryable catalog answer invites another call rather
+                    // than closing this one, so it is not proof of rejection:
+                    // it reconciles rather than resets.
+                    Ok(Err(error)) if error.retryable() => {
+                        Err(RewriteSubmission::AcceptanceUnknown(ForgeError::Catalog(error)))
+                    }
+                    Ok(Err(error)) => {
+                        Err(RewriteSubmission::DefiniteConflict(ForgeError::Catalog(error)))
+                    }
+                    Err(_) => Err(RewriteSubmission::AcceptanceUnknown(ForgeError::Reconciliation {
+                        detail: "Forge rewrite commit ran out of publication budget with unknown acceptance".to_owned(),
+                    })),
                 },
-                () = stop.cancelled() => Err(ForgeError::Reconciliation {
+                () = stop.cancelled() => Err(RewriteSubmission::AcceptanceUnknown(ForgeError::Reconciliation {
                     detail: "Forge rewrite commit was cancelled with unknown acceptance".to_owned(),
-                }),
+                })),
             }
         }
         .instrument(span.clone())
@@ -1104,34 +1288,10 @@ impl Forge {
                 "failed"
             },
         );
-        let committed = outcome?;
-        // The catalog is free to normalize a snapshot summary, and every later
-        // recovery reads this rewrite's lineage back out of one. Proving the
-        // properties still parse into the same values while the committing
-        // worker is still here turns a silently unrecoverable snapshot into a
-        // loud failure on the one attempt that can still explain it.
-        let recorded = committed
-            .metadata()
-            .current_snapshot()
-            .map(|snapshot| {
-                snapshot
-                    .summary()
-                    .additional_properties
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect::<BTreeMap<_, _>>()
-            })
-            .ok_or_else(|| ForgeError::Reconciliation {
-                detail: "committed rewrite produced no current snapshot".to_owned(),
-            })?;
-        let recorded = RewriteSnapshotProperties::validate(&recorded)?;
-        if recorded != RewriteSnapshotProperties::validate(&request.snapshot_properties())? {
-            return Err(ForgeError::Reconciliation {
-                detail: "committed rewrite snapshot does not carry the submitted lineage"
-                    .to_owned(),
-            });
+        match outcome {
+            Ok(committed) => request.confirm_committed_lineage(committed),
+            Err(submission) => Ok(submission),
         }
-        Ok(committed)
     }
 }
 
@@ -1749,10 +1909,37 @@ mod tests {
     /// One authority dimension broken, paired with the refusal it must produce.
     type RefusalCase = (fn(&mut RewriteCommitAuthority), RewriteRefusal);
 
-    /// Every knowable authority failure refuses before publication.
-    #[test]
-    fn rewrite_commit_decision_matrix_fails_closed() {
-        let authorized = RewriteCommitAuthority {
+    /// Sets one authority dimension of `authority` by its matrix position.
+    ///
+    /// The position order is the refusal order, which is what lets the
+    /// exhaustive sweep below predict the reported refusal from the lowest
+    /// broken bit rather than restating the decision it is checking.
+    fn set_authority_dimension(
+        authority: &mut RewriteCommitAuthority,
+        position: usize,
+        held: bool,
+    ) {
+        match position {
+            0 => authority.fence.lease_held = held,
+            1 => authority.fence.fence_held = held,
+            2 => authority.fence.commit_window_fits = held,
+            3 => authority.attempt.cancelled = !held,
+            4 => authority.attempt.deadline_passed = !held,
+            5 => authority.table.branch_head_is_base = held,
+            6 => authority.table.base_is_retained = held,
+            7 => authority.table.policy_unchanged = held,
+            8 => authority.files.inputs_all_live = held,
+            9 => authority.files.delete_scope_safe = held,
+            _ => unreachable!("the authority matrix has exactly ten dimensions"),
+        }
+    }
+
+    /// Builds one authority with every dimension held.
+    ///
+    /// Each matrix test starts from this complete authority and breaks only the
+    /// dimensions it is asserting about, so a refusal is always attributable.
+    fn authorized_rewrite_commit_authority() -> RewriteCommitAuthority {
+        RewriteCommitAuthority {
             fence: RewriteFenceAuthority {
                 lease_held: true,
                 fence_held: true,
@@ -1771,13 +1958,16 @@ mod tests {
                 inputs_all_live: true,
                 delete_scope_safe: true,
             },
-        };
-        assert_eq!(authorized.decide(), RewriteCommitDecision::Proceed);
+        }
+    }
 
-        // Each case breaks exactly one dimension of an otherwise complete
-        // authority, so the expected refusal is also a proof of the order: an
-        // earlier check would have reported a different one.
-        let refusals: [RefusalCase; 10] = [
+    /// The ten single-dimension breaks in exact refusal order.
+    ///
+    /// Each case breaks exactly one dimension of an otherwise complete
+    /// authority, so the expected refusal is also a proof of the order: an
+    /// earlier check would have reported a different one.
+    fn single_dimension_refusals() -> [RefusalCase; 10] {
+        [
             (
                 |authority| authority.fence.lease_held = false,
                 RewriteRefusal::LeaseLost,
@@ -1818,8 +2008,15 @@ mod tests {
                 |authority| authority.files.delete_scope_safe = false,
                 RewriteRefusal::DeleteScopeUnsafe,
             ),
-        ];
-        for (break_one, expected) in refusals {
+        ]
+    }
+
+    /// Every knowable authority failure refuses before publication.
+    #[test]
+    fn rewrite_commit_decision_matrix_fails_closed() {
+        let authorized = authorized_rewrite_commit_authority();
+        assert_eq!(authorized.decide(), RewriteCommitDecision::Proceed);
+        for (break_one, expected) in single_dimension_refusals() {
             let mut authority = authorized;
             break_one(&mut authority);
             assert_eq!(
@@ -1857,6 +2054,97 @@ mod tests {
             ),
             RewriteConflictAction::ResetDefinitelyUncommitted,
             "a changed assumption ends the attempt instead of buying a retry"
+        );
+    }
+
+    /// The closed matrix always reports its outermost broken dimension.
+    ///
+    /// The single-break cases prove the mapping; this proves the matrix is
+    /// closed. Every one of the 1024 combinations must proceed only when
+    /// nothing is broken, and must report the outermost broken dimension, so a
+    /// later reordering or an added early `Proceed` cannot hide a refusal
+    /// behind a dimension that happens to be checked first.
+    #[test]
+    fn rewrite_commit_decision_matrix_reports_the_outermost_refusal() {
+        let authorized = authorized_rewrite_commit_authority();
+        let ordered = single_dimension_refusals().map(|(_, refusal)| refusal);
+        for (position, refusal) in ordered.iter().enumerate() {
+            assert!(
+                !ordered[..position].contains(refusal),
+                "each refusal reason belongs to exactly one authority dimension"
+            );
+        }
+        for combination in 0_u16..1 << ordered.len() {
+            let mut authority = authorized;
+            for position in 0..ordered.len() {
+                set_authority_dimension(
+                    &mut authority,
+                    position,
+                    combination & (1 << position) == 0,
+                );
+            }
+            let expected = (0..ordered.len())
+                .find(|position| combination & (1 << position) != 0)
+                .map_or(RewriteCommitDecision::Proceed, |position| {
+                    RewriteCommitDecision::Refuse(ordered[position])
+                });
+            assert_eq!(
+                authority.decide(),
+                expected,
+                "authority combination {combination:#b} decided out of order"
+            );
+        }
+    }
+
+    /// One shared deadline never renews, and never permits a call past itself.
+    ///
+    /// The boundary is exclusive on both sides for a reason. A call that starts
+    /// exactly at the deadline has no budget to wait with, so it must not start
+    /// at all; and the remaining budget is always measured from the deadline
+    /// rather than from the configured timeout, so a first call that consumed
+    /// most of it leaves the retry only what is left.
+    #[test]
+    fn rewrite_publication_deadline_never_renews_its_budget() {
+        let start = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("a valid instant");
+        let budget = std::time::Duration::from_secs(30);
+        let deadline =
+            RewritePublicationDeadline::new(start, budget).expect("a representable deadline");
+
+        assert!(!deadline.passed(start), "a fresh deadline has not elapsed");
+        assert_eq!(deadline.remaining(start), Some(budget));
+
+        // A slow first call shortens the retry rather than restarting the clock.
+        let late = start + chrono::Duration::seconds(29);
+        assert!(!deadline.passed(late));
+        assert_eq!(
+            deadline.remaining(late),
+            Some(std::time::Duration::from_secs(1)),
+            "the retry inherits what the first call left, never a fresh budget"
+        );
+
+        // Exactly at the deadline there is nothing to wait with.
+        let at = start + chrono::Duration::seconds(30);
+        assert!(deadline.passed(at));
+        assert_eq!(
+            deadline.remaining(at),
+            None,
+            "a call may not start with zero remaining budget"
+        );
+
+        let after = start + chrono::Duration::seconds(31);
+        assert!(deadline.passed(after));
+        assert_eq!(deadline.remaining(after), None);
+
+        // The deadline is an instant, so re-deriving it from the same instant
+        // and budget is the only way to get the same value; nothing about the
+        // type can extend one that already exists.
+        assert_eq!(
+            deadline,
+            RewritePublicationDeadline::new(start, budget).expect("a representable deadline"),
+        );
+        assert!(
+            RewritePublicationDeadline::new(start, std::time::Duration::MAX).is_err(),
+            "an unrepresentable budget refuses instead of producing an unbounded call"
         );
     }
 }

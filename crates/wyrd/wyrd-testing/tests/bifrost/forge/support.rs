@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::TenantTableBinding;
 use vala_bifrost_redux::forge::{
-    Forge, ForgeError, ForgeSchedulerTrigger, ForgeWorker, ForgeWorkerCompletionObserver,
+    ForgeError, ForgeSchedulerTrigger, ForgeWorker, ForgeWorkerCompletionObserver,
     ForgeWorkerConfig,
 };
 use wyrd_server::BifrostTarget;
@@ -59,8 +59,6 @@ pub(crate) struct SupervisedForge {
     scheduler_task: JoinHandle<Result<(), ForgeError>>,
     /// Running production worker supervisor.
     worker_task: Option<JoinHandle<Result<(), ForgeError>>>,
-    /// Forge graph kept alive for the supervised lifetime.
-    forge: Arc<Forge>,
 }
 
 impl SupervisedForge {
@@ -131,35 +129,7 @@ impl SupervisedForge {
             worker_stop,
             scheduler_task,
             worker_task: Some(worker_task),
-            forge,
         }
-    }
-
-    /// Start a replacement worker over the same scheduler generation.
-    ///
-    /// Every `run_one_*` helper stops the worker so the caller's assertions
-    /// cannot race a retry. A journey that needs a further attempt therefore
-    /// restarts the worker rather than building a second supervisor, which
-    /// would stand by behind the first one's unexpired planning fence and plan
-    /// nothing.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a worker is already running or the graph is unusable.
-    pub(crate) fn restart_worker(&mut self) {
-        assert!(
-            self.worker_task.is_none(),
-            "a supervisor runs one worker at a time"
-        );
-        let worker = ForgeWorker::new(
-            Arc::clone(&self.forge),
-            ForgeWorkerConfig::default(),
-            uuid::Uuid::now_v7(),
-        )
-        .expect("validated journey worker");
-        self.worker_stop = CancellationToken::new();
-        let stop = self.worker_stop.clone();
-        self.worker_task = Some(tokio::spawn(async move { worker.run(stop).await }));
     }
 
     /// Request and await one pass from the running production scheduler.

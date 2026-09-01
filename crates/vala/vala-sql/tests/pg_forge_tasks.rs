@@ -2432,6 +2432,62 @@ mod pg_tests {
             .expect("drop failure function");
     }
 
+    /// One tenant's repeatedly re-demanded table cannot starve its siblings.
+    ///
+    /// Roster repair re-requests every table it knows about on each pass, in a
+    /// stable order, and each re-request resets `last_requested_at`. The table
+    /// refreshed first therefore stays its tenant's oldest demand forever, so a
+    /// page that carried only that one demand per tenant would never reach the
+    /// tables behind it. The page must reach them within one pass whenever the
+    /// bound has room.
+    ///
+    /// # Panics
+    /// Panics when a demanded table is absent from a page with room for it.
+    #[tokio::test]
+    async fn planning_demand_page_reaches_every_table_of_one_tenant() {
+        let (fixture, _admin) = setup().await;
+        let tasks = ForgeTasks::new(fixture.operator_pool().clone());
+        let tenant = fixture.data_tenant_id();
+        let starved = ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "starved")
+            .expect("starved identity");
+        let noisy = ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "noisy")
+            .expect("noisy identity");
+        tasks
+            .upsert_periodic(tenant, &starved)
+            .await
+            .expect("starved demand");
+        tasks
+            .upsert_periodic(tenant, &noisy)
+            .await
+            .expect("noisy demand");
+        let owner = Uuid::now_v7();
+        let fence = tasks
+            .acquire_scheduler(owner, 30)
+            .await
+            .expect("lease")
+            .expect("fence");
+        for _ in 0..3 {
+            tasks
+                .upsert_periodic(tenant, &noisy)
+                .await
+                .expect("noisy re-demand");
+            tasks
+                .upsert_periodic(tenant, &starved)
+                .await
+                .expect("starved re-demand");
+            let page = tasks
+                .planning_demands(owner, fence, 8)
+                .await
+                .expect("tenant page")
+                .0;
+            assert!(
+                page.iter()
+                    .any(|demand| demand.table_ref.table == starved.table),
+                "a re-demanded sibling must not hold the tenant's only planning slot"
+            );
+        }
+    }
+
     /// Proves strict-after tenant rotation, wraparound, takeover, RLS, and malformed-row refusal.
     ///
     /// # Panics

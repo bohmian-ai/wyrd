@@ -303,6 +303,21 @@ impl PromotionCatalogSeam {
         }
     }
 
+    /// Release the parked commit as a definite conflict and park the next one.
+    ///
+    /// Arming the follow-up park before the release is what makes the retry
+    /// observable: the conflicted call returns, production re-derives and
+    /// submits once more, and that second call stops here instead of racing the
+    /// test to the real catalog. The parked second call is never released, so
+    /// only the production budget can end it.
+    pub(crate) fn reject_parked_commit_and_park_next(&self) {
+        self.parked.store(false, Ordering::Release);
+        self.parked_dropped.store(false, Ordering::Release);
+        self.park_next.store(true, Ordering::Release);
+        self.reject_parked.store(true, Ordering::Release);
+        self.parked_release.notify_waiters();
+    }
+
     /// Release the parked commit as a definite conflict.
     pub(crate) fn reject_parked_commit(&self) {
         self.reject_parked.store(true, Ordering::Release);
@@ -813,6 +828,38 @@ impl PromotionIntegrationFixture {
         .expect("fixture claim aging");
     }
 
+    /// Expires the durable table lease this fixture's Forge owner holds.
+    ///
+    /// The lease row is the real fence owner, and every renewal is conditional
+    /// on it still being unexpired, so aging it here is exactly what a lost
+    /// fence looks like to production code: the next `renew` matches no row and
+    /// reports the lease as lost. Nothing about the claim, the attempt, or the
+    /// table is touched.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the update fails.
+    pub(crate) async fn expire_table_lease(&self) {
+        let lease_key = vala_bifrost_redux::forge::forge_lease_key(
+            self.tenant,
+            &self.binding.logical_namespace,
+            &self.binding.table_name,
+        );
+        let expired = sqlx::query(
+            "UPDATE vala.maintenance_leases \
+             SET expires_at = statement_timestamp() - interval '1 minute' WHERE lease_key = $1",
+        )
+        .bind(&lease_key)
+        .execute(self.operator_pool.pool())
+        .await
+        .expect("fixture lease aging");
+        assert_eq!(
+            expired.rows_affected(),
+            1,
+            "the publication under test holds exactly one table lease"
+        );
+    }
+
     /// Retires the retry backoff the production reclaim path just imposed.
     ///
     /// Reclaim deliberately holds a reclaimed task back for tens of seconds so
@@ -982,6 +1029,8 @@ pub(crate) struct SupervisedPromotion {
     scheduler_task: JoinHandle<Result<(), ForgeError>>,
     /// Running production worker supervisor.
     worker_task: Option<JoinHandle<Result<(), ForgeError>>>,
+    /// Whether a replacement worker is armed but not yet spawned.
+    worker_armed: bool,
     /// Forge graph kept alive for the supervised lifetime.
     ///
     /// Retaining it is what lets a scenario stop and restart the worker over
@@ -1036,6 +1085,7 @@ impl SupervisedPromotion {
             worker_stop,
             scheduler_task,
             worker_task: Some(worker_task),
+            worker_armed: false,
             forge,
         }
     }
@@ -1063,30 +1113,51 @@ impl SupervisedPromotion {
             .expect("fixture reclaim pass");
     }
 
-    /// Start a replacement worker over the same scheduler generation.
+    /// Arm a replacement worker over the same scheduler generation.
     ///
     /// Every `run_one_*` helper stops the worker so the caller's assertions
     /// cannot race a retry. A scenario that needs a second attempt therefore
     /// restarts the worker rather than building a second supervisor, which
     /// would stand by behind the first one's unexpired planning fence.
     ///
+    /// The replacement's cancellation token is installed here, so a caller may
+    /// capture it before the attempt starts. The worker itself is spawned by
+    /// the next `run_one_*` call,
+    /// after that call has armed its returned-attempt barrier. Spawning here
+    /// instead would let the worker claim an already-ready task and return an
+    /// unheld attempt before the barrier existed, which is exactly the retry
+    /// the helpers exist to exclude.
+    ///
     /// # Panics
     ///
-    /// Panics when a worker is already running or the graph is unusable.
+    /// Panics when a worker is already running or armed.
     pub(crate) fn restart_worker(&mut self) {
         assert!(
-            self.worker_task.is_none(),
+            self.worker_task.is_none() && !self.worker_armed,
             "a supervisor runs one worker at a time"
         );
+        self.worker_stop = CancellationToken::new();
+        self.worker_armed = true;
+    }
+
+    /// Spawn the armed replacement worker, if the caller armed one.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the validated worker graph cannot be constructed.
+    fn start_armed_worker(&mut self) {
+        if !self.worker_armed {
+            return;
+        }
         let worker = ForgeWorker::new(
             Arc::clone(&self.forge),
             ForgeWorkerConfig::default(),
             uuid::Uuid::now_v7(),
         )
         .expect("fixture Forge worker");
-        self.worker_stop = CancellationToken::new();
         let stop = self.worker_stop.clone();
         self.worker_task = Some(tokio::spawn(async move { worker.run(stop).await }));
+        self.worker_armed = false;
     }
 
     /// Request and await one production planning pass without running work.
@@ -1126,6 +1197,7 @@ impl SupervisedPromotion {
         let expected = self.worker_observer.completed().saturating_add(1);
         let expected_errors = self.worker_observer.returned_errors().len();
         self.worker_observer.hold_after_next_attempt_for_test();
+        self.start_armed_worker();
         self.schedule_once().await;
         tokio::time::timeout(
             FIXTURE_BOUND,
@@ -1164,6 +1236,7 @@ impl SupervisedPromotion {
             .len()
             .saturating_add(1);
         self.worker_observer.hold_after_next_attempt_for_test();
+        self.start_armed_worker();
         self.schedule_once().await;
         tokio::time::timeout(FIXTURE_BOUND, during)
             .await
@@ -1195,6 +1268,7 @@ impl SupervisedPromotion {
     pub(crate) async fn run_one_failure(&mut self) -> String {
         let before = self.worker_observer.returned_errors();
         self.worker_observer.hold_after_next_attempt_for_test();
+        self.start_armed_worker();
         self.schedule_once().await;
         tokio::time::timeout(
             FIXTURE_BOUND,
@@ -1208,6 +1282,62 @@ impl SupervisedPromotion {
             after.len(),
             before.len().saturating_add(1),
             "the attempt was expected to return exactly one error: {after:?}"
+        );
+        after
+            .last()
+            .expect("one error was just returned")
+            .to_owned()
+    }
+
+    /// Schedule one pass and hold the rewrite between its handoff and its
+    /// publication while `during` mutates real publication authority.
+    ///
+    /// The barrier is the only point at which a knowable authority change is
+    /// both possible and consequential: managed execution has produced its
+    /// handoff and outputs, and nothing has yet been derived, audited, or
+    /// submitted. `during` therefore mutates the same durable owner production
+    /// code will consult — the lease row, the cancellation token, the clock, or
+    /// the catalog — rather than any test-only verdict.
+    ///
+    /// Returns the one error the held attempt returned.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a deterministic bound is missed or the attempt did not
+    /// return exactly one error.
+    pub(crate) async fn run_one_failure_holding_handoff<F>(&mut self, during: F) -> String
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let before = self.worker_observer.returned_errors();
+        self.worker_observer
+            .hold_after_next_rewrite_handoff_for_test();
+        self.worker_observer.hold_after_next_attempt_for_test();
+        self.start_armed_worker();
+        self.schedule_once().await;
+        tokio::time::timeout(
+            FIXTURE_BOUND,
+            self.worker_observer
+                .wait_for_held_rewrite_handoff_for_test(),
+        )
+        .await
+        .expect("production Forge rewrite handoff bound");
+        tokio::time::timeout(FIXTURE_BOUND, during)
+            .await
+            .expect("held publication authority mutation bound");
+        self.worker_observer.release_held_rewrite_handoff_for_test();
+        tokio::time::timeout(
+            FIXTURE_BOUND,
+            self.worker_observer.wait_for_held_attempt_for_test(),
+        )
+        .await
+        .expect("production Forge worker attempt bound");
+        self.stop_worker().await;
+        let after = self.worker_observer.returned_errors();
+        assert_eq!(
+            after.len(),
+            before.len().saturating_add(1),
+            "the held attempt was expected to return exactly one error: {after:?}"
         );
         after
             .last()

@@ -172,16 +172,6 @@ pub enum ForgeError {
 }
 
 impl ForgeError {
-    /// Reports whether a catalog failure is worth retrying as-is.
-    ///
-    /// Only [`Self::Catalog`] can answer yes: every other variant either did
-    /// not reach the catalog or left acceptance unknown, and neither is a
-    /// retryable answer.
-    #[must_use]
-    pub(crate) fn is_retryable_catalog(&self) -> bool {
-        matches!(self, Self::Catalog(error) if error.retryable())
-    }
-
     /// Builds a grouping failure from a borrowed diagnostic.
     ///
     /// This exists so row-decoding helpers can be parameterized by the variant

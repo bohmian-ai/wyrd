@@ -475,6 +475,157 @@ async fn rewrite_publication_conflict_revalidates_once_or_resets() {
         4,
         "every rewrite commit attempt was reported by production telemetry: {commits:?}"
     );
+
+    // The retry the rule grants is bounded by the same absolute deadline the
+    // initial call started under, so the two phases below take that budget away
+    // in the only two ways it can end: entirely, and almost entirely.
+    assert_expired_deadline_makes_no_second_call().await;
+    assert_retry_inherits_only_the_remaining_budget().await;
+}
+
+/// One publication whose deadline elapses while its first call is in flight.
+///
+/// The retry a definite conflict buys is not unconditional: it is permitted
+/// only while the publication's one absolute deadline still has budget left.
+/// Advancing the manual clock past that deadline while the first call is parked
+/// makes this exact: the catalog then answers with a definite refusal — proof
+/// nothing landed — and the follow-up must still refuse to submit again,
+/// recording the operation as definitely uncommitted rather than spending a
+/// retry the deadline no longer covers.
+///
+/// # Panics
+///
+/// Panics when the fixture cannot start, a deterministic bound is missed, or a
+/// second catalog call was made.
+async fn assert_expired_deadline_makes_no_second_call() {
+    let promoted = PromotedRewriteFixture::start_unpromoted("rewrite_deadline_spent").await;
+    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let catalog = PromotionCatalogSeam::new(
+        promoted.fixture.catalog.iceberg_catalog(),
+        object_store.read_counter(),
+    );
+    let (clock, control) = manual_clock();
+    let mut supervisor = SupervisedPromotion::start(
+        &promoted.fixture,
+        Arc::clone(&catalog) as Arc<dyn Catalog>,
+        Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
+        clock,
+    );
+    supervisor.run_one_success().await;
+    let standing = live_data_paths(&promoted).await;
+
+    let attempts_before = catalog.attempts();
+    catalog.park_next_commit();
+    supervisor.restart_worker();
+    let supervisor = supervisor
+        .run_one_failure_while(async {
+            catalog.wait_for_parked_commit().await;
+            control
+                .set(expired_publication_deadline(&promoted, &control))
+                .expect("manual Forge clock advances");
+            catalog.reject_parked_commit();
+        })
+        .await;
+    supervisor.shutdown().await;
+
+    assert_eq!(
+        catalog.attempts() - attempts_before,
+        1,
+        "a conflict answered past the publication deadline buys no second call"
+    );
+    assert_eq!(
+        promoted.fixture.rewrite_phases().await,
+        vec!["reset".to_owned()],
+        "the refused publication is recorded as definitely uncommitted"
+    );
+    assert_eq!(
+        live_data_paths(&promoted).await,
+        standing,
+        "no replacement was published past the deadline"
+    );
+}
+
+/// The permitted retry inherits only what the first call left of the deadline.
+///
+/// A retry that restarted the configured budget would be a second publication
+/// wearing the first one's identity: it could still be in flight long after the
+/// window its Prepared record promised. So the clock is advanced to just short
+/// of the deadline while the first call is parked. The retry that follows then
+/// has about a second of budget, and the parked second call is never released —
+/// only the production deadline can end it. It does, leaving acceptance
+/// unknown, which is the honest answer for a call that was submitted: the
+/// operation stays Prepared for evidence-based recovery, and no third call is
+/// made.
+///
+/// # Panics
+///
+/// Panics when the fixture cannot start, a deterministic bound is missed — a
+/// renewed budget would miss it by minutes — or the publication claimed an
+/// outcome it could not know.
+async fn assert_retry_inherits_only_the_remaining_budget() {
+    let promoted = PromotedRewriteFixture::start_unpromoted("rewrite_deadline_remainder").await;
+    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let catalog = PromotionCatalogSeam::new(
+        promoted.fixture.catalog.iceberg_catalog(),
+        object_store.read_counter(),
+    );
+    let (clock, control) = manual_clock();
+    let mut supervisor = SupervisedPromotion::start(
+        &promoted.fixture,
+        Arc::clone(&catalog) as Arc<dyn Catalog>,
+        Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
+        clock,
+    );
+    supervisor.run_one_success().await;
+    let standing = live_data_paths(&promoted).await;
+
+    let attempts_before = catalog.attempts();
+    catalog.park_next_commit();
+    supervisor.restart_worker();
+    let supervisor = supervisor
+        .run_one_failure_while(async {
+            catalog.wait_for_parked_commit().await;
+            let nearly_spent =
+                expired_publication_deadline(&promoted, &control) - chrono::Duration::seconds(2);
+            control
+                .set(nearly_spent)
+                .expect("manual Forge clock advances");
+            catalog.reject_parked_commit_and_park_next();
+            catalog.wait_for_parked_commit().await;
+            catalog.wait_for_parked_commit_drop().await;
+        })
+        .await;
+    supervisor.shutdown().await;
+
+    assert_eq!(
+        catalog.attempts() - attempts_before,
+        2,
+        "the publication made its initial call and exactly one retry"
+    );
+    assert_eq!(
+        promoted.fixture.rewrite_phases().await,
+        vec!["prepared".to_owned()],
+        "a submitted call that ran out of budget claims no outcome"
+    );
+    assert_eq!(
+        live_data_paths(&promoted).await,
+        standing,
+        "the abandoned retry published nothing"
+    );
+}
+
+/// The first instant at which one publication's deadline has certainly passed.
+///
+/// Derived from the configured Iceberg budget rather than a literal, so the
+/// scenario stays correct if that budget is retuned.
+fn expired_publication_deadline(
+    promoted: &PromotedRewriteFixture,
+    control: &vala_bifrost_redux::forge::ForgeClockControl,
+) -> chrono::DateTime<chrono::Utc> {
+    control.now().expect("manual Forge clock")
+        + chrono::Duration::from_std(promoted.fixture.config.iceberg_total_retry_timeout)
+            .expect("the Iceberg retry budget is representable")
+        + chrono::Duration::seconds(1)
 }
 
 /// Asserts a cancelled in-flight commit left no claim on any outcome.
@@ -618,4 +769,173 @@ async fn rewrite_publication_ambiguity_restart_settles_once() {
     );
 
     telemetry.require_metrics(&["bifrost_forge_operations"]);
+}
+
+/// One real owner of publication authority, mutated while a rewrite is held.
+///
+/// Each variant names the durable thing production code consults, not the
+/// refusal it produces: the point of the scenario is that changing the real
+/// owner is enough, so no test-only verdict, branch, or injected decision is
+/// involved anywhere.
+#[derive(Debug, Clone, Copy)]
+enum HeldAuthorityMutation {
+    /// The durable lease row stops being renewable.
+    LeaseExpired,
+    /// The worker's own cancellation token is cancelled.
+    AttemptCancelled,
+    /// The manual Forge clock passes the publication's absolute deadline.
+    DeadlineElapsed,
+    /// Another writer commits, moving the branch off the planned base.
+    BranchMovedByAnotherWriter,
+}
+
+/// Every knowable authority change refuses before Prepared and before commit.
+///
+/// Managed execution runs while the table stays open to every other writer, so
+/// the metadata the attempt planned against is evidence, never authority. This
+/// holds one rewrite at the only point where that distinction is observable —
+/// its handoff and outputs exist, nothing has been derived, audited, or
+/// submitted — mutates the real owner of one authority dimension, and then
+/// requires the attempt to refuse with *no* effect at all: no catalog mutation,
+/// no Prepared operation row, no change to the published data cut. The
+/// authoritative reload is asserted directly through the catalog's load count,
+/// because a publication that reused its stale table would refuse none of this.
+///
+/// The refused attempt still carries the objects managed execution produced out
+/// with it, so nothing is left behind that no attempt can name.
+#[tokio::test]
+async fn rewrite_publication_refuses_authority_changes_before_any_effect() {
+    for mutation in [
+        HeldAuthorityMutation::LeaseExpired,
+        HeldAuthorityMutation::AttemptCancelled,
+        HeldAuthorityMutation::DeadlineElapsed,
+        HeldAuthorityMutation::BranchMovedByAnotherWriter,
+    ] {
+        assert_held_authority_change_refuses(mutation).await;
+    }
+}
+
+/// Drives one held-authority phase end to end over its own promoted table.
+///
+/// Each phase gets a fresh table because a refusal is durable: a moved branch
+/// or an expired lease stays refused, so phases sharing one table would prove
+/// only the first mutation. Returns nothing — every observation is asserted
+/// here, next to the mutation that has to explain it.
+///
+/// # Panics
+///
+/// Panics when the fixture cannot start, a deterministic bound is missed, or
+/// the held attempt produced any durable effect.
+async fn assert_held_authority_change_refuses(mutation: HeldAuthorityMutation) {
+    let table_name = match mutation {
+        HeldAuthorityMutation::LeaseExpired => "rewrite_hold_lease",
+        HeldAuthorityMutation::AttemptCancelled => "rewrite_hold_cancel",
+        HeldAuthorityMutation::DeadlineElapsed => "rewrite_hold_deadline",
+        HeldAuthorityMutation::BranchMovedByAnotherWriter => "rewrite_hold_branch",
+    };
+    let promoted = PromotedRewriteFixture::start_unpromoted(table_name).await;
+    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let catalog = PromotionCatalogSeam::new(
+        promoted.fixture.catalog.iceberg_catalog(),
+        object_store.read_counter(),
+    );
+    let (clock, control) = manual_clock();
+    let mut supervisor = SupervisedPromotion::start(
+        &promoted.fixture,
+        Arc::clone(&catalog) as Arc<dyn Catalog>,
+        Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
+        clock,
+    );
+    supervisor.run_one_success().await;
+    let planned = live_data_paths(&promoted).await;
+    assert!(
+        planned.len() >= 2,
+        "the held rewrite starts from a promoted live set: {planned:?}"
+    );
+
+    let mutations_before = catalog.attempts();
+    let loads_before = catalog.loads();
+    supervisor.restart_worker();
+    let worker_stop = supervisor.worker_stop();
+    let error = supervisor
+        .run_one_failure_holding_handoff(async {
+            match mutation {
+                HeldAuthorityMutation::LeaseExpired => {
+                    promoted.fixture.expire_table_lease().await;
+                }
+                HeldAuthorityMutation::AttemptCancelled => worker_stop.cancel(),
+                HeldAuthorityMutation::DeadlineElapsed => {
+                    let elapsed = control.now().expect("manual Forge clock")
+                        + chrono::Duration::from_std(
+                            promoted.fixture.config.iceberg_total_retry_timeout,
+                        )
+                        .expect("the Iceberg retry budget is representable")
+                        + chrono::Duration::seconds(1);
+                    control.set(elapsed).expect("manual Forge clock advances");
+                }
+                HeldAuthorityMutation::BranchMovedByAnotherWriter => {
+                    let target = planned.iter().next().expect("a delete target").clone();
+                    promoted.publish_deletes(&target, Some(0), None).await;
+                }
+            }
+        })
+        .await;
+    supervisor.shutdown().await;
+
+    assert!(
+        catalog.loads() > loads_before,
+        "publication reacquired authoritative metadata after the handoff ({mutation:?})"
+    );
+    assert_eq!(
+        catalog.attempts(),
+        mutations_before,
+        "a refused publication mutates no catalog state ({mutation:?}): {error}"
+    );
+    assert_eq!(
+        promoted.fixture.rewrite_phases().await,
+        Vec::<String>::new(),
+        "the refusal arrived before any Prepared operation row ({mutation:?})"
+    );
+    assert_eq!(
+        live_data_paths(&promoted).await,
+        planned,
+        "a refused publication leaves the published data cut exactly as it was ({mutation:?})"
+    );
+    assert!(
+        error.contains("possible rewrite output"),
+        "the refusal carries the objects managed execution produced ({mutation:?}): {error}"
+    );
+    let tasks = promoted
+        .fixture
+        .forge_tasks()
+        .await
+        .into_iter()
+        .filter(|task| task.strategy == "small_files")
+        .collect::<Vec<_>>();
+    assert_eq!(tasks.len(), 1, "one rewrite task was held: {tasks:?}");
+    assert_ne!(
+        tasks[0].state, "succeeded",
+        "a refused rewrite never records a committed outcome: {tasks:?}"
+    );
+    assert_eq!(
+        promoted.fixture.live_leases().await,
+        0,
+        "the refused attempt released its table lease ({mutation:?})"
+    );
+}
+
+/// Collects the live *data* object paths of the promoted table's current cut.
+///
+/// Delete attachments are excluded on purpose: a concurrent writer that adds
+/// one moves the branch without replacing any data, so comparing data paths is
+/// what makes "the refused publication changed nothing" a statement about the
+/// rows a reader would see.
+async fn live_data_paths(promoted: &PromotedRewriteFixture) -> BTreeSet<String> {
+    promoted
+        .live_data_files()
+        .await
+        .into_iter()
+        .filter(|file| file.content_type() == iceberg::spec::DataContentType::Data)
+        .map(|file| file.file_path().to_owned())
+        .collect()
 }

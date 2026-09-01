@@ -224,6 +224,14 @@ impl ForgeTasks {
 
     /// Lists a bounded tenant-ring page and returns each observed CAS generation.
     ///
+    /// The page is a round-robin interleave: demands are ranked per tenant by
+    /// how long they have waited, and the page takes every tenant's oldest
+    /// demand before any tenant's second, so one tenant with many tables still
+    /// cannot fill a bounded page ahead of its neighbours. Taking only rank one
+    /// would bound a tenant to one table per pass, and because every re-request
+    /// resets `last_requested_at`, a table that is re-demanded on each pass
+    /// would then hold rank one forever and starve its siblings indefinitely.
+    ///
     /// # Errors
     /// Returns conflict for a zero bound or stale exact scheduler fence and
     /// fails closed on malformed rows.
@@ -241,7 +249,7 @@ impl ForgeTasks {
                 detail: "planning demand cap must be positive".to_owned(),
             });
         }
-        let rows = sqlx::query_as::<_, ForgePlanningDemandSqlRow>("WITH scheduler AS MATERIALIZED (SELECT last_tenant_id FROM vala.forge_scheduler_state WHERE singleton AND owner=$1 AND fencing_token=$2 AND expires_at>statement_timestamp()), ranked AS MATERIALIZED (SELECT d.*,row_number() OVER (PARTITION BY d.data_tenant_id ORDER BY d.last_requested_at,d.catalog_name,d.namespace_name,d.table_name) AS tenant_rank FROM vala.forge_planning_demands d) SELECT d.data_tenant_id,d.catalog_name,d.namespace_name,d.table_name,d.first_requested_at,d.last_requested_at,d.last_source,d.generation,d.acknowledged_snapshot_id,d.acknowledged_commit_count FROM ranked d CROSS JOIN scheduler s WHERE d.tenant_rank=1 ORDER BY (s.last_tenant_id IS NULL OR d.data_tenant_id>s.last_tenant_id) DESC,d.data_tenant_id LIMIT $3")
+        let rows = sqlx::query_as::<_, ForgePlanningDemandSqlRow>("WITH scheduler AS MATERIALIZED (SELECT last_tenant_id FROM vala.forge_scheduler_state WHERE singleton AND owner=$1 AND fencing_token=$2 AND expires_at>statement_timestamp()), ranked AS MATERIALIZED (SELECT d.*,row_number() OVER (PARTITION BY d.data_tenant_id ORDER BY d.last_requested_at,d.catalog_name,d.namespace_name,d.table_name) AS tenant_rank FROM vala.forge_planning_demands d) SELECT d.data_tenant_id,d.catalog_name,d.namespace_name,d.table_name,d.first_requested_at,d.last_requested_at,d.last_source,d.generation,d.acknowledged_snapshot_id,d.acknowledged_commit_count FROM ranked d CROSS JOIN scheduler s ORDER BY d.tenant_rank,(s.last_tenant_id IS NULL OR d.data_tenant_id>s.last_tenant_id) DESC,d.data_tenant_id LIMIT $3")
             .bind(owner).bind(scheduler_fence).bind(i64::from(cap) + 1).fetch_all(self.operator_pool.pool()).await.map_err(SqlError::from)?;
         let live: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM vala.forge_scheduler_state WHERE singleton AND owner=$1 AND fencing_token=$2 AND expires_at>statement_timestamp())")
             .bind(owner).bind(scheduler_fence).fetch_one(self.operator_pool.pool()).await.map_err(SqlError::from)?;

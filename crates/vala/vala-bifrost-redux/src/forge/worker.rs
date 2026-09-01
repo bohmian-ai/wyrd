@@ -83,8 +83,8 @@ struct RewritePublication<'publication> {
     target_file_size_bytes: u64,
     /// Schema, spec, and sort identities the plan was authorized against.
     planned_policy: (i32, i32, i64),
-    /// One commit budget, captured before the first attempt.
-    deadline: chrono::DateTime<chrono::Utc>,
+    /// One commit budget, captured before the first attempt and never renewed.
+    deadline: super::publication::RewritePublicationDeadline,
 }
 
 impl RewritePublication<'_> {
@@ -392,6 +392,18 @@ pub struct ForgeWorkerCompletionObserver {
     /// Release for the one returned attempt held by the passive barrier.
     #[cfg(feature = "test-support")]
     attempt_pause_release: Arc<tokio::sync::Notify>,
+    /// One-shot passive barrier after the next managed rewrite handoff exists.
+    #[cfg(feature = "test-support")]
+    pause_after_next_handoff: Arc<AtomicBool>,
+    /// Whether a completed handoff is currently held at the passive barrier.
+    #[cfg(feature = "test-support")]
+    handoff_paused: Arc<AtomicBool>,
+    /// Wakeup for tests waiting until the completed handoff is held.
+    #[cfg(feature = "test-support")]
+    handoff_pause_ready: Arc<tokio::sync::Notify>,
+    /// Release for the one completed handoff held by the passive barrier.
+    #[cfg(feature = "test-support")]
+    handoff_pause_release: Arc<tokio::sync::Notify>,
 }
 
 /// Typed causal evidence from the production Forge scheduler and worker owners.
@@ -619,6 +631,39 @@ impl ForgeWorkerCompletionObserver {
         self.attempt_pause_release.notify_one();
     }
 
+    /// Hold the next managed rewrite once its handoff and outputs exist.
+    ///
+    /// The barrier is passive and sits after managed execution produced the
+    /// five-field handoff and before publication reacquires authoritative
+    /// metadata. It never manufactures a handoff, changes a verdict, skips IO,
+    /// publishes, or settles: a held rewrite resumes into exactly the same
+    /// production decisions it would have taken without the barrier. Tests use
+    /// it to mutate real publication authority through its own owner while the
+    /// rewrite is provably past execution and provably before validation.
+    #[cfg(feature = "test-support")]
+    pub fn hold_after_next_rewrite_handoff_for_test(&self) {
+        self.handoff_paused.store(false, Ordering::Release);
+        self.pause_after_next_handoff.store(true, Ordering::Release);
+    }
+
+    /// Wait until the armed post-handoff barrier is holding one rewrite.
+    #[cfg(feature = "test-support")]
+    pub async fn wait_for_held_rewrite_handoff_for_test(&self) {
+        loop {
+            let notified = self.handoff_pause_ready.notified();
+            if self.handoff_paused.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Release the one rewrite held after its managed handoff.
+    #[cfg(feature = "test-support")]
+    pub fn release_held_rewrite_handoff_for_test(&self) {
+        self.handoff_pause_release.notify_one();
+    }
+
     /// Wait until successful tasks have been completed by `expected` distinct workers.
     ///
     /// Callers own any timeout because the task count and role topology are
@@ -798,6 +843,18 @@ impl ForgeWorkerCompletionObserver {
         self.attempt_pause_ready.notify_waiters();
         self.attempt_pause_release.notified().await;
         self.attempt_paused.store(false, Ordering::Release);
+    }
+
+    /// Pause once after an armed managed rewrite handoff exists.
+    #[cfg(feature = "test-support")]
+    async fn pause_after_handoff_for_test(&self) {
+        if !self.pause_after_next_handoff.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        self.handoff_paused.store(true, Ordering::Release);
+        self.handoff_pause_ready.notify_waiters();
+        self.handoff_pause_release.notified().await;
+        self.handoff_paused.store(false, Ordering::Release);
     }
 
     /// Observe one persisted claim and pause execution until all configured roles participate.
@@ -1287,6 +1344,18 @@ impl ForgeWorker {
     async fn pause_after_attempt_for_test(&self) {
         if let Some(observer) = &self.completion_observer {
             observer.pause_after_attempt_for_test().await;
+        }
+    }
+
+    /// Apply the observer's one-shot passive post-handoff barrier.
+    ///
+    /// Called by publication after managed execution produced the handoff and
+    /// before authoritative metadata is reacquired. Without an armed observer
+    /// it is a no-op, so no production decision depends on it.
+    #[cfg(feature = "test-support")]
+    async fn pause_after_handoff_for_test(&self) {
+        if let Some(observer) = &self.completion_observer {
+            observer.pause_after_handoff_for_test().await;
         }
     }
 
@@ -2683,14 +2752,12 @@ impl ForgeWorker {
                 metadata.default_partition_spec_id(),
                 metadata.default_sort_order().order_id,
             ),
-            deadline: self.forge.core.clock.now()?
-                + chrono::Duration::from_std(self.forge.core.config.iceberg_total_retry_timeout)
-                    .map_err(|_| ForgeError::InvalidConfig {
-                        detail: "Forge Iceberg retry timeout is not representable".to_owned(),
-                    })?,
+            deadline: super::publication::RewritePublicationDeadline::new(
+                self.forge.core.clock.now()?,
+                self.forge.core.config.iceberg_total_retry_timeout,
+            )?,
         };
-        self.publish_rewrite(&context, &handoff, table, lease, stop)
-            .await
+        self.publish_rewrite(&context, &handoff, lease, stop).await
     }
 
     /// Settles every live replacement this table still owes, before any effect.
@@ -2807,94 +2874,212 @@ impl ForgeWorker {
 
     /// Derives, prepares, and commits one handoff, retrying at most once.
     ///
+    /// The first thing this does is load the table again. Managed
+    /// execution ran while the table stayed open to every other writer, so the
+    /// `Table` this attempt planned against is evidence of what was intended
+    /// and never authority to publish: a branch move, a policy change, a
+    /// replaced input, or a new delete that arrived during execution must be
+    /// observed *before* the Prepared audit and before any catalog mutation, or
+    /// a refusal would arrive after the effects it was supposed to prevent.
+    /// The claimed base is then resolved out of that fresh metadata by exact
+    /// snapshot identity, so a moved head cannot be silently reinterpreted as
+    /// the plan's base.
+    ///
     /// Each pass re-derives the replacement from the base it is about to commit
     /// against, because replaying a request derived against a stale base is
     /// what would delete files a concurrent writer has already replaced. The
-    /// Prepared audit is written exactly once, before the first catalog effect,
+    /// Prepared audit is written exactly once, only behind a complete
+    /// `Proceed`, naming the inputs and outputs a successor must reconcile.
+    ///
+    /// A refusal reached before any catalog call is definite non-acceptance: it
+    /// makes no `update_table` call, closes an already-Prepared operation once
+    /// as Reset rather than stranding it, and carries the objects the managed
+    /// core produced out with it as unsettled evidence so nothing is left that
+    /// no attempt can name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::RewriteUnsettled`] wrapping the refusal when
+    /// authority is refused or no call was submitted, [`ForgeError::Catalog`]
+    /// or [`ForgeError::Reconciliation`] when the catalog refused or its answer
+    /// was lost, and the reload, derivation, audit, fence, and clock failures
+    /// the boundary raises.
+    /// Reacquires authoritative metadata and refuses before any effect.
+    ///
+    /// Managed execution ran while the table stayed open to every other
+    /// writer, so the `Table` this attempt planned against is evidence of what
+    /// was intended and never authority to publish. A branch move, a policy
+    /// change, a replaced input, or a new delete that arrived during execution
+    /// must be observed here — before one manifest is read for the derivation,
+    /// before the Prepared audit, and before any catalog mutation — or a
+    /// refusal would arrive after the effects it was supposed to prevent.
+    ///
+    /// A refusal reached here is definite non-acceptance: no `update_table`
+    /// call was made, so the operation closes rather than stranding a successor
+    /// with a commit that never happened, and the objects the managed core
+    /// produced leave with it as unsettled evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Catalog`] when the reload fails, and
+    /// [`ForgeError::RewriteUnsettled`] wrapping the refusal when authority is
+    /// refused, alongside the audit, fence, and clock failures that boundary
+    /// raises.
+    async fn acquire_publication_authority(
+        &self,
+        context: &RewritePublication<'_>,
+        handoff: &super::managed::RewriteHandoff,
+        lease: &mut ForgeLease,
+        stop: &CancellationToken,
+    ) -> Result<Table, ForgeError> {
+        #[cfg(feature = "test-support")]
+        self.pause_after_handoff_for_test().await;
+        let current = self
+            .forge
+            .core
+            .catalog
+            .load_table(&context.binding.table_ident())
+            .await
+            .map_err(ForgeError::Catalog)?;
+        if let Some(refusal) = self
+            .rewrite_publication_refusal(context, &current, lease, stop)
+            .await?
+        {
+            return Err(self
+                .abandon_unsubmitted_rewrite(
+                    context,
+                    None,
+                    handoff,
+                    ForgeError::Reconciliation {
+                        detail: format!(
+                            "Forge rewrite publication refused before commit: {refusal:?}"
+                        ),
+                    },
+                    lease,
+                )
+                .await);
+        }
+        Ok(current)
+    }
+
+    /// Derives one pass's replacement and records the Prepared audit once.
+    ///
+    /// Each pass re-derives the replacement from the base it is about to commit
+    /// against, because replaying a request derived against a stale base is
+    /// what would delete files a concurrent writer has already replaced. The
+    /// claimed base is resolved out of `current` by exact snapshot identity, so
+    /// a moved head cannot be silently reinterpreted as the plan's base.
+    ///
+    /// The file-level authorities live in the derivation, so a derivation
+    /// refusal is a publication refusal and settles like one: no catalog call
+    /// was made, and the managed outputs leave as unsettled evidence. The
+    /// Prepared audit is written exactly once — when `prepared` is `None` —
     /// naming the inputs and outputs a successor must reconcile.
     ///
     /// # Errors
     ///
-    /// Returns [`ForgeError::Reconciliation`] when authority is refused before
-    /// the commit, when the catalog answer is unknown, or when a refusal
-    /// arrives after this task's own effect landed, and the derivation, audit,
-    /// fence, and catalog failures the boundary raises.
-    async fn publish_rewrite(
+    /// Returns [`ForgeError::RewriteUnsettled`] wrapping the derivation refusal
+    /// when the fresh base cannot produce this replacement, and the audit and
+    /// SQL failures the Prepared transition raises.
+    async fn prepare_rewrite_request(
         &self,
         context: &RewritePublication<'_>,
         handoff: &super::managed::RewriteHandoff,
-        table: &Table,
+        current: &Table,
+        prepared: Option<&super::publication::RewriteCommitRequest>,
         lease: &mut ForgeLease,
-        stop: &CancellationToken,
-    ) -> Result<ForgeDispatchResult, ForgeError> {
-        let mut reloaded: Option<Table> = None;
-        let mut prepared = false;
-        let mut retried = false;
-        loop {
-            let base_table = reloaded.as_ref().unwrap_or(table);
-            let base = self.forge.rewrite_base(base_table).await?;
-            let request = super::publication::RewriteCommitRequest::derive(
+    ) -> Result<super::publication::RewriteCommitRequest, ForgeError> {
+        let derived = async {
+            let base = self
+                .forge
+                .rewrite_base_at(current, context.claim.base_snapshot_id)
+                .await?;
+            super::publication::RewriteCommitRequest::derive(
                 super::publication::RewriteCommitInputs {
                     handoff,
                     base: &base,
                     selected_inputs: &context.claim.plan.inputs,
                     identity: &context.identity,
                 },
-            )?;
-            let authority = self
-                .rewrite_authority(
+            )
+        }
+        .await;
+        let request = match derived {
+            Ok(request) => request,
+            Err(error) => {
+                return Err(self
+                    .abandon_unsubmitted_rewrite(context, prepared, handoff, error, lease)
+                    .await);
+            }
+        };
+        if prepared.is_none() {
+            self.forge
+                .append_live_audit(
                     lease,
-                    base_table,
-                    &request,
-                    context.planned_policy,
-                    context.deadline,
-                    stop,
+                    &context.key,
+                    &rewrite_operation(ForgeIcebergRewritePhase::Prepared),
+                    context.audit(ForgeIcebergRewritePhase::Prepared, None, &request)?,
                 )
                 .await?;
-            if let super::publication::RewriteCommitDecision::Refuse(refusal) = authority.decide() {
-                return Err(ForgeError::Reconciliation {
-                    detail: format!("Forge rewrite publication refused before commit: {refusal:?}"),
-                });
-            }
-            if !prepared {
-                self.forge
-                    .append_live_audit(
-                        lease,
-                        &context.key,
-                        &rewrite_operation(ForgeIcebergRewritePhase::Prepared),
-                        context.audit(ForgeIcebergRewritePhase::Prepared, None, &request)?,
-                    )
-                    .await?;
-                prepared = true;
-            }
+        }
+        Ok(request)
+    }
+
+    async fn publish_rewrite(
+        &self,
+        context: &RewritePublication<'_>,
+        handoff: &super::managed::RewriteHandoff,
+        lease: &mut ForgeLease,
+        stop: &CancellationToken,
+    ) -> Result<ForgeDispatchResult, ForgeError> {
+        let mut current = self
+            .acquire_publication_authority(context, handoff, lease, stop)
+            .await?;
+        // Retains the request each pass derived, which is both the Prepared
+        // marker and the exact detail a terminal transition must describe.
+        let mut prepared: Option<super::publication::RewriteCommitRequest> = None;
+        let mut retried = false;
+        loop {
+            let request = self
+                .prepare_rewrite_request(context, handoff, &current, prepared.as_ref(), lease)
+                .await?;
+            let request: &super::publication::RewriteCommitRequest = prepared.insert(request);
             let (acceptance, conflict) = match self
                 .forge
                 .commit_rewrite(
                     lease,
                     super::publication::ForgeRewriteCommit {
-                        table: base_table,
-                        request: &request,
+                        table: &current,
+                        request,
+                        deadline: context.deadline,
                     },
                     stop,
                 )
-                .await
+                .await?
             {
-                Ok(committed) => {
+                super::publication::RewriteSubmission::Committed(committed) => {
                     return self
-                        .settle_committed_rewrite(context, &request, committed, lease)
+                        .settle_committed_rewrite(context, request, *committed, lease)
                         .await;
                 }
-                Err(error @ ForgeError::Catalog(_)) if !error.is_retryable_catalog() => (
+                super::publication::RewriteSubmission::NotSubmitted(error) => {
+                    // Knowledge, not an outcome: no call started, so the
+                    // operation closes here instead of waiting for a successor
+                    // to reconcile a commit that never happened.
+                    return Err(self
+                        .abandon_unsubmitted_rewrite(context, Some(request), handoff, error, lease)
+                        .await);
+                }
+                super::publication::RewriteSubmission::DefiniteConflict(error) => (
                     super::publication::RewriteAcceptance::DefiniteConflict,
                     error,
                 ),
-                Err(error @ ForgeError::Reconciliation { .. }) => {
+                super::publication::RewriteSubmission::AcceptanceUnknown(error) => {
                     (super::publication::RewriteAcceptance::Ambiguous, error)
                 }
-                Err(error) => return Err(error),
             };
             let (action, reloaded_after_conflict) = self
-                .rewrite_follow_up(context, acceptance, &request, retried, lease, stop)
+                .rewrite_follow_up(context, acceptance, request, retried, lease, stop)
                 .await?;
             match action {
                 super::publication::RewriteConflictAction::ReconcileWithoutRecommit => {
@@ -2905,15 +3090,15 @@ impl ForgeWorker {
                     // rather than left open for a successor to reconcile a
                     // commit that never happened. The outputs stay unreferenced
                     // and are reclaimed as orphans.
-                    self.forge
-                        .append_live_audit(
+                    return Err(self
+                        .abandon_unsubmitted_rewrite(
+                            context,
+                            Some(request),
+                            handoff,
+                            conflict,
                             lease,
-                            &context.key,
-                            &rewrite_operation(ForgeIcebergRewritePhase::Reset),
-                            context.audit(ForgeIcebergRewritePhase::Reset, None, &request)?,
                         )
-                        .await?;
-                    return Err(conflict);
+                        .await);
                 }
                 super::publication::RewriteConflictAction::RevalidateAndRecommit => {}
             }
@@ -2923,8 +3108,125 @@ impl ForgeWorker {
                 "re-deriving one Forge rewrite after a definite catalog conflict"
             );
             retried = true;
-            reloaded = reloaded_after_conflict;
+            current = reloaded_after_conflict.ok_or_else(|| ForgeError::Invariant {
+                detail: "a revalidated Forge rewrite retry has no reloaded table".to_owned(),
+            })?;
         }
+    }
+
+    /// Reports the one authority a fresh publication pass fails, if any.
+    ///
+    /// Split out so the refusal is decided against `current` — metadata loaded
+    /// after managed execution — with no derived request in hand yet: an
+    /// authority that has already lapsed must refuse before this attempt spends
+    /// manifest reads deriving a replacement it may not publish, and long
+    /// before the Prepared audit. The file-level dimensions stay with
+    /// [`super::publication::RewriteCommitRequest::derive`], which owns them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Lease`] or [`ForgeError::Sql`] when the lease
+    /// cannot be renewed, and the clock failures the deadline comparison
+    /// raises.
+    async fn rewrite_publication_refusal(
+        &self,
+        context: &RewritePublication<'_>,
+        current: &Table,
+        lease: &mut ForgeLease,
+        stop: &CancellationToken,
+    ) -> Result<Option<super::publication::RewriteRefusal>, ForgeError> {
+        let authority = self
+            .rewrite_authority(
+                lease,
+                current,
+                context.claim.base_snapshot_id,
+                context.planned_policy,
+                context.deadline,
+                stop,
+            )
+            .await?;
+        Ok(match authority.decide() {
+            super::publication::RewriteCommitDecision::Proceed => None,
+            super::publication::RewriteCommitDecision::Refuse(refusal) => Some(refusal),
+        })
+    }
+
+    /// Closes one publication that provably made no catalog call.
+    ///
+    /// Two things have to happen together and neither is optional. An operation
+    /// that reached Prepared is settled once as Reset, because leaving it open
+    /// would ask a successor to reconcile a commit that never started. And the
+    /// objects the managed core already wrote travel out on the returned error
+    /// as unsettled evidence, because this attempt is the last thing that can
+    /// name them; they stay unreferenced and are reclaimed as orphans.
+    ///
+    /// Cancellation is the one refusal that is returned bare. `run_slot`
+    /// matches [`ForgeError::Shutdown`] exactly to release a cleanly cancelled
+    /// claim, and a wrapper would silently turn that release into a retention.
+    ///
+    /// Returns the error to propagate, which is the audit failure instead when
+    /// the Reset transition could not be recorded.
+    async fn abandon_unsubmitted_rewrite(
+        &self,
+        context: &RewritePublication<'_>,
+        prepared: Option<&super::publication::RewriteCommitRequest>,
+        handoff: &super::managed::RewriteHandoff,
+        reason: ForgeError,
+        lease: &mut ForgeLease,
+    ) -> ForgeError {
+        if let Some(request) = prepared {
+            let reset = match context.audit(ForgeIcebergRewritePhase::Reset, None, request) {
+                Ok(detail) => detail,
+                Err(error) => return error,
+            };
+            if let Err(error) = self
+                .forge
+                .append_live_audit(
+                    lease,
+                    &context.key,
+                    &rewrite_operation(ForgeIcebergRewritePhase::Reset),
+                    reset,
+                )
+                .await
+            {
+                return error;
+            }
+        }
+        if matches!(
+            reason,
+            ForgeError::Shutdown
+                | ForgeError::ShutdownRetained
+                | ForgeError::RewriteUnsettled { .. }
+        ) {
+            return reason;
+        }
+        ForgeError::RewriteUnsettled {
+            source: Box::new(reason),
+            possible_outputs: Self::unsettled_rewrite_outputs(handoff),
+        }
+    }
+
+    /// Projects one handoff's outputs into the unsettled-object evidence shape.
+    ///
+    /// The core returned a handoff, so every object it names was written and
+    /// closed; `settled` is therefore true and the ordinal is the handoff's own
+    /// order, which is the only attempt-global ordering this owner can honestly
+    /// report.
+    fn unsettled_rewrite_outputs(
+        handoff: &super::managed::RewriteHandoff,
+    ) -> Vec<super::managed::ForgeUnsettledOutput> {
+        handoff
+            .output_data_files
+            .iter()
+            .zip(0_u64..)
+            .map(
+                |(file, logical_ordinal)| super::managed::ForgeUnsettledOutput {
+                    logical_ordinal,
+                    path: file.file_path().to_owned(),
+                    settled: true,
+                },
+            )
+            .collect()
     }
 
     /// Records the terminal audit for a rewrite the catalog accepted.
@@ -3023,7 +3325,7 @@ impl ForgeWorker {
                     .rewrite_authority(
                         lease,
                         &refreshed,
-                        request,
+                        request.base_snapshot_id,
                         context.planned_policy,
                         context.deadline,
                         stop,
@@ -3031,7 +3333,7 @@ impl ForgeWorker {
                     .await?;
                 let action = acceptance.next_action(
                     retried,
-                    self.forge.core.clock.now()? >= context.deadline,
+                    context.deadline.passed(self.forge.core.clock.now()?),
                     authority.decide(),
                 );
                 Ok((action, Some(refreshed)))
@@ -3050,8 +3352,13 @@ impl ForgeWorker {
     ///
     /// `inputs_all_live` and `delete_scope_safe` are recorded as held because
     /// [`super::publication::RewriteCommitRequest::derive`] is their owner and
-    /// already refused the request otherwise: the caller derives against this
-    /// exact base immediately before calling, so a live request is the proof.
+    /// refuses otherwise: the caller derives against this exact base right
+    /// after this call and settles that refusal the same way, so the two halves
+    /// of the decision cover every dimension between them.
+    ///
+    /// The base is named by the durable claim rather than read off a derived
+    /// request, so this can run against freshly loaded metadata before any
+    /// manifest is read.
     ///
     /// # Errors
     ///
@@ -3061,9 +3368,9 @@ impl ForgeWorker {
         &self,
         lease: &mut ForgeLease,
         table: &Table,
-        request: &super::publication::RewriteCommitRequest,
+        base_snapshot_id: i64,
         planned_policy: (i32, i32, i64),
-        deadline: chrono::DateTime<chrono::Utc>,
+        deadline: super::publication::RewritePublicationDeadline,
         stop: &CancellationToken,
     ) -> Result<super::publication::RewriteCommitAuthority, ForgeError> {
         let metadata = table.metadata();
@@ -3076,13 +3383,13 @@ impl ForgeWorker {
             },
             attempt: super::publication::RewriteAttemptAuthority {
                 cancelled: stop.is_cancelled(),
-                deadline_passed: self.forge.core.clock.now()? >= deadline,
+                deadline_passed: deadline.passed(self.forge.core.clock.now()?),
             },
             table: super::publication::RewriteTableAuthority {
                 branch_head_is_base: metadata
                     .snapshot_for_ref(super::scribe_promotion::PROMOTION_BRANCH)
-                    .is_some_and(|snapshot| snapshot.snapshot_id() == request.base_snapshot_id),
-                base_is_retained: metadata.snapshot_by_id(request.base_snapshot_id).is_some(),
+                    .is_some_and(|snapshot| snapshot.snapshot_id() == base_snapshot_id),
+                base_is_retained: metadata.snapshot_by_id(base_snapshot_id).is_some(),
                 policy_unchanged: planned_policy
                     == (
                         metadata.current_schema_id(),

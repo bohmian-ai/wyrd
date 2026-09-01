@@ -1553,6 +1553,42 @@ impl WyrdTestCluster {
         .await
     }
 
+    /// Start one embedded bound `all` pod with uncertainty and no ambient pass.
+    ///
+    /// The interval is explicit and long because a journey that drives the
+    /// server-owned scheduler itself cannot also be racing an ambient tick: a
+    /// pass it did not request could plan or claim the very task it is about to
+    /// observe. Everything else is the production composition — one bound pod
+    /// serving public HTTP and gRPC, with Scribe, Oracle, and the server-owned
+    /// Forge scheduler and worker roles.
+    ///
+    /// # Errors
+    /// Returns a topology, resource, or role-supervision error.
+    pub async fn start_embedded_forge_uncertainty_for_test(
+        interval: Duration,
+    ) -> Result<Self, ClusterError> {
+        Self::start_spec_with_all_options(
+            BifrostClusterSpec::one_mixed(),
+            Duration::ZERO,
+            None,
+            None,
+            false,
+            false,
+            (
+                ForgeHarnessOptions {
+                    completion_observer: Some(ForgeWorkerCompletionObserver::new()),
+                    config: None,
+                    inject_uncertainty: true,
+                    interval,
+                },
+                ClusterResourceSource::Owned {
+                    dedicated_root: None,
+                },
+            ),
+        )
+        .await
+    }
+
     async fn start_with_dedicated_forge_workers_with_options(
         forge_config: Option<ForgeConfig>,
         forge_interval: Option<Duration>,

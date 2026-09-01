@@ -177,8 +177,12 @@ pub struct WyrdTestServer {
     serve_handle: Option<JoinHandle<Result<BifrostShutdownReport, wyrd_server::BootExit>>>,
     /// Optional fixed HTTP/gRPC addresses reserved by a multi-node harness.
     requested_bind: Option<(std::net::SocketAddr, std::net::SocketAddr)>,
-    /// Optional TLS material applied when this in-process server binds.
-    requested_oracle_peer_tls: Option<TestBifrostPeerTls>,
+    /// Peer identity this server presents and verifies on the private plane.
+    peer_tls: Option<TestBifrostPeerTls>,
+    /// Retains generated peer PEM files for as long as this server exists.
+    _peer_tls_root: Option<Arc<tempfile::TempDir>>,
+    /// Exact private peer address this server binds and advertises.
+    peer_bind: Option<std::net::SocketAddr>,
     /// Test-only readiness failure requested by the builder.
     readiness_failure: bool,
     /// Optional test-only serve task that ignores cancellation until aborted.
@@ -499,7 +503,12 @@ pub struct WyrdTestServerBuilder {
     /// Optional cluster-scoped Oracle peer credential injected by the harness.
     oracle_peer_credentials: Option<Arc<dyn OraclePeerCredentials>>,
     /// Optional production-shaped Oracle server identity and peer trust paths.
-    oracle_peer_tls: Option<TestBifrostPeerTls>,
+    /// Peer identity for this server; provisioned by the builder when absent.
+    peer_tls: Option<TestBifrostPeerTls>,
+    /// Temporary root retaining generated peer PEM files for this server's life.
+    peer_tls_root: Option<Arc<tempfile::TempDir>>,
+    /// Exact private peer address this server binds and advertises.
+    peer_bind: Option<std::net::SocketAddr>,
     /// Production Forge process role used by bound test servers.
     forge_process_role: BifrostTarget,
     /// Optional observer of successful supervised worker completions.
@@ -580,7 +589,9 @@ impl Default for WyrdTestServerBuilder {
             telemetry: None,
             bind_addrs: None,
             oracle_peer_credentials: None,
-            oracle_peer_tls: None,
+            peer_tls: None,
+            peer_tls_root: None,
+            peer_bind: None,
             forge_process_role: BifrostTarget::All,
             forge_completion_observer: None,
             forge_catalog: None,
@@ -1665,17 +1676,32 @@ impl WyrdTestServer {
         }
     }
 
-    /// Return the gRPC endpoint URL when bound to a real socket.
+    /// Return the public gRPC endpoint URL when bound to a real socket.
+    ///
+    /// This is the client-facing listener only. Private peer services are not
+    /// mounted here; a peer RPC is reached through [`Self::peer_url`].
     #[must_use]
     pub fn grpc_url(&self) -> Option<String> {
         match &self.mode {
-            Mode::Bound { grpc_addr, .. } => Some(if self.requested_oracle_peer_tls.is_some() {
-                format!("https://localhost:{}", grpc_addr.port())
-            } else {
-                format!("http://{grpc_addr}")
-            }),
+            Mode::Bound { grpc_addr, .. } => Some(format!("http://{grpc_addr}")),
             Mode::InProcess => None,
         }
+    }
+
+    /// Return the private Bifrost peer endpoint URL this server advertises.
+    ///
+    /// The scheme is always `https` because the peer plane is mutually
+    /// authenticated; a caller still needs the peer client identity and a
+    /// purpose ticket to be admitted.
+    #[must_use]
+    pub fn peer_url(&self) -> Option<String> {
+        self.peer_bind.map(|bind| format!("https://{bind}"))
+    }
+
+    /// Return this server's peer certificate, key, and trust-root paths.
+    #[must_use]
+    pub fn peer_tls(&self) -> Option<&TestBifrostPeerTls> {
+        self.peer_tls.as_ref()
     }
 
     /// Return the placeholder API key (full bootstrap is complex).
@@ -2893,10 +2919,25 @@ impl WyrdTestServer {
         config.http.bind = http_bind;
         config.grpc.bind = grpc_bind;
         config.role = self.forge_process_role();
-        if let Some(tls) = &self.requested_oracle_peer_tls {
-            config.grpc.certificate_chain_path = Some(tls.certificate_path.clone());
-            config.grpc.private_key_path = Some(tls.private_key_path.clone());
-        }
+        let peer_tls = self
+            .peer_tls
+            .as_ref()
+            .expect("peer identity is provisioned during composition");
+        config.bifrost.peer.bind = self
+            .peer_bind
+            .expect("peer bind is reserved during composition");
+        config.bifrost.peer.ca_certificate_path = Some(peer_tls.ca_path.clone());
+        config.bifrost.peer.certificate_chain_path = Some(peer_tls.certificate_path.clone());
+        config.bifrost.peer.private_key_path = Some(peer_tls.private_key_path.clone());
+        config.bifrost.peer.server_name = Some(peer_tls.server_name.clone());
+        config.bifrost.peer.advertise_addr = Some(format!(
+            "https://{}",
+            self.peer_bind.expect("peer bind is reserved during composition")
+        ));
+        config.bifrost.peer.api_key = Some("harness-peer-api-key".to_owned());
+        config.bifrost.peer.ticket.active_key_id = Some("harness-peer-key".to_owned());
+        config.bifrost.peer.ticket.signing_key_path = Some(peer_tls.private_key_path.clone());
+        config.bifrost.peer.ticket.verifying_keyring_path = Some(peer_tls.ca_path.clone());
         config.metrics.enabled = false;
         config.serve.mode = ServeMode::Both;
         if let Some(drain) = self.shutdown_drain_for_test {
@@ -3390,10 +3431,25 @@ impl WyrdTestServerBuilder {
         self
     }
 
-    /// Enable TLS on the bound gRPC listener and Oracle peer transport.
+    /// Share one cluster-owned peer identity instead of provisioning a new one.
+    ///
+    /// Every replica in a topology must chain to the same peer CA, so a
+    /// multi-node harness mints the authority once and hands each server the
+    /// resulting material through this seat.
     #[must_use]
-    pub(crate) fn with_oracle_peer_tls(mut self, tls: TestBifrostPeerTls) -> Self {
-        self.oracle_peer_tls = Some(tls);
+    pub fn with_peer_tls(mut self, tls: TestBifrostPeerTls) -> Self {
+        self.peer_tls = Some(tls);
+        self
+    }
+
+    /// Pin the exact private peer address this server binds and advertises.
+    ///
+    /// A multi-process harness gives each simulated pod a distinct loopback
+    /// address on the canonical peer port so membership records one exact
+    /// pod-like endpoint rather than a load-balanced one.
+    #[must_use]
+    pub fn with_peer_bind(mut self, bind: std::net::SocketAddr) -> Self {
+        self.peer_bind = Some(bind);
         self
     }
 
@@ -3462,7 +3518,7 @@ impl WyrdTestServerBuilder {
     /// application router cannot be constructed. Cancellation may leave
     /// fixture-owned database setup committed, but no server task is retained.
     pub(crate) async fn start_with_resources(
-        self,
+        mut self,
         fixture: Arc<PgFixture>,
         storage: Arc<wyrd_storage::StorageHandle>,
         storage_root: Option<Arc<tempfile::TempDir>>,
@@ -3683,7 +3739,31 @@ impl WyrdTestServerBuilder {
             Some(credentials) => credentials,
             None => provision_oracle_peer_credentials(Arc::clone(&fixture)).await?,
         };
-        let peer_tls = match &self.oracle_peer_tls {
+        // Every Scribe- or Oracle-bearing target requires a complete peer
+        // identity, so the harness provisions one unconditionally rather than
+        // letting a test boot a server that production configuration would
+        // reject. A caller that already minted cluster-wide material keeps it.
+        if self.peer_tls.is_none() {
+            let root = Arc::new(
+                tempfile::tempdir().map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
+            );
+            let authority = crate::bifrost::peer_ca::BifrostPeerCa::generate("localhost")
+                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+            self.peer_tls = Some(
+                authority
+                    .materialize(root.path(), "node")
+                    .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
+            );
+            self.peer_tls_root = Some(root);
+        }
+        // Reserving the port here — before composition — is what lets the node
+        // advertise the exact address its listener will hold. Binding and
+        // dropping an ephemeral socket is the only way to learn a free port
+        // ahead of the production bind, which happens later in `start`.
+        if self.peer_bind.is_none() {
+            self.peer_bind = Some(reserve_loopback_addr()?);
+        }
+        let peer_tls = match &self.peer_tls {
             Some(tls) => {
                 let read = |path: &std::path::Path| {
                     std::fs::read(path)
@@ -3731,12 +3811,14 @@ impl WyrdTestServerBuilder {
             // Must agree with `WyrdTestServer::grpc_url`: the address published
             // into cluster membership is dialed by peer transports, and a TLS
             // transport refuses a peer advertising a plaintext scheme.
-            advertise_addr: match (self.bind_addrs, self.oracle_peer_tls.is_some()) {
-                (Some((_, grpc)), true) => format!("https://localhost:{}", grpc.port()),
-                (Some((_, grpc)), false) => format!("http://{grpc}"),
-                (None, true) => "https://localhost:0".to_owned(),
-                (None, false) => "http://127.0.0.1:0".to_owned(),
-            },
+            // Membership carries the private peer endpoint, never the public
+            // gRPC one: a selected node and fence must be dialed on the
+            // mutually authenticated plane. The port is reserved before this
+            // point so the advertised value is the address the listener holds.
+            advertise_addr: format!(
+                "https://{}",
+                self.peer_bind.expect("peer bind is reserved before composition")
+            ),
             wal_dir: wal_root.path().to_owned(),
             shutdown: shutdown.clone(),
             test_controls: Some(test_controls),
@@ -3808,7 +3890,9 @@ impl WyrdTestServerBuilder {
             shutdown_token: None,
             serve_handle: None,
             requested_bind: self.bind_addrs,
-            requested_oracle_peer_tls: self.oracle_peer_tls,
+            peer_tls: self.peer_tls,
+            _peer_tls_root: self.peer_tls_root,
+            peer_bind: self.peer_bind,
             readiness_failure: self.readiness_failure,
             stalled_drain_for_test: self.stalled_drain_for_test,
             shutdown_drain_for_test: self.shutdown_drain_for_test,

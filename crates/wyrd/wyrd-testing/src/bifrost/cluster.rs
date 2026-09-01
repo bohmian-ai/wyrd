@@ -1924,7 +1924,7 @@ impl WyrdTestCluster {
             builder = builder.with_scribe_persistence_faults_for_test(faults.clone());
         }
         if let Some((_, tls)) = &self.oracle_peer_tls {
-            builder = builder.with_oracle_peer_tls(tls.clone());
+            builder = builder.with_peer_tls(tls.clone());
         }
         Ok(builder
             .start_with_resources(Arc::clone(&self.fixture), Arc::clone(&self.storage), None)

@@ -956,7 +956,7 @@ mod tests {
     #[test]
     fn all_detail_variants_round_trip() {
         let origin = Origin {
-            repo: "github.com/wyrd-ai/wyrd".to_string(),
+            repo: "github.com/bohmian-ai/wyrd".to_string(),
             commit: CommitSha::new("0123456").expect("valid commit"),
             path: Some("cards/agent.yaml".to_string()),
             dirty: false,
@@ -1117,7 +1117,7 @@ mod tests {
                 }),
                 _ => serde_json::json!({
                     "kind": "ingest",
-                    "origin": {"repo": "github.com/wyrd-ai/wyrd", "commit": "0123456", "dirty": false},
+                    "origin": {"repo": "github.com/bohmian-ai/wyrd", "commit": "0123456", "dirty": false},
                     "batch_id": value,
                     "table": "vala.events",
                     "record_count": 1,
@@ -1159,8 +1159,8 @@ mod tests {
                 r#"{"backend":"s3","error_code":null,"kind":"storage","operation":"complete","status_code":200,"storage_path":"cards/a","upload_id":null}"#,
             ),
             (
-                r#"{"record_count":2,"table":"vala.events","decision":"allow","batch_id":"batch-1","origin":{"dirty":false,"path":"cards/agent.yaml","commit":"0123456","repo":"github.com/wyrd-ai/wyrd"},"kind":"ingest"}"#,
-                r#"{"batch_id":"batch-1","decision":"allow","kind":"ingest","origin":{"commit":"0123456","path":"cards/agent.yaml","repo":"github.com/wyrd-ai/wyrd"},"record_count":2,"table":"vala.events"}"#,
+                r#"{"record_count":2,"table":"vala.events","decision":"allow","batch_id":"batch-1","origin":{"dirty":false,"path":"cards/agent.yaml","commit":"0123456","repo":"github.com/bohmian-ai/wyrd"},"kind":"ingest"}"#,
+                r#"{"batch_id":"batch-1","decision":"allow","kind":"ingest","origin":{"commit":"0123456","path":"cards/agent.yaml","repo":"github.com/bohmian-ai/wyrd"},"record_count":2,"table":"vala.events"}"#,
             ),
         ];
 

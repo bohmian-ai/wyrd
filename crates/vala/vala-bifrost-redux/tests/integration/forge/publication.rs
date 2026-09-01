@@ -924,29 +924,17 @@ async fn assert_held_authority_change_refuses(
     let concurrent_cut = std::sync::Mutex::new(None::<LiveCut>);
     let error = supervisor
         .run_one_failure_holding_handoff(async {
-            match mutation {
-                HeldAuthorityMutation::LeaseExpired => {
-                    promoted.fixture.expire_table_lease().await;
-                }
-                HeldAuthorityMutation::AttemptCancelled => worker_stop.cancel(),
-                HeldAuthorityMutation::DeadlineElapsed => {
-                    let elapsed = control.now().expect("manual Forge clock")
-                        + chrono::Duration::from_std(
-                            promoted.fixture.config.iceberg_total_retry_timeout,
-                        )
-                        .expect("the Iceberg retry budget is representable")
-                        + chrono::Duration::seconds(1);
-                    control.set(elapsed).expect("manual Forge clock advances");
-                }
-                HeldAuthorityMutation::BranchMovedByAnotherWriter => {
-                    let target = planned.data.iter().next().expect("a delete target").clone();
-                    promoted.publish_deletes(&target, Some(0), None).await;
-                    *concurrent_cut
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        Some(live_cut(&promoted).await);
-                }
-            }
+            *concurrent_cut
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                apply_held_authority_mutation(
+                    mutation,
+                    &promoted,
+                    &control,
+                    &worker_stop,
+                    &planned,
+                )
+                .await;
         })
         .await;
     let possible_outputs = supervisor.last_possible_rewrite_outputs();
@@ -1001,6 +989,51 @@ async fn assert_held_authority_change_refuses(
         error: &error,
     })
     .await;
+}
+
+/// Applies one held-authority phase's mutation while publication is held.
+///
+/// Each arm changes the durable owner production code consults and nothing
+/// else; no verdict, branch, or decision is injected. Returns the live cut the
+/// concurrent writer left for
+/// [`HeldAuthorityMutation::BranchMovedByAnotherWriter`], captured after that
+/// writer's own commit and before publication is released, and `None` for
+/// every other phase, which expects the pre-mutation cut unchanged.
+///
+/// # Panics
+///
+/// Panics when the fixture cannot apply the mutation or the manual clock
+/// cannot represent the phase's deadline.
+async fn apply_held_authority_mutation(
+    mutation: HeldAuthorityMutation,
+    promoted: &PromotedRewriteFixture,
+    control: &vala_bifrost_redux::forge::ForgeClockControl,
+    worker_stop: &tokio_util::sync::CancellationToken,
+    planned: &LiveCut,
+) -> Option<LiveCut> {
+    match mutation {
+        HeldAuthorityMutation::LeaseExpired => {
+            promoted.fixture.expire_table_lease().await;
+            None
+        }
+        HeldAuthorityMutation::AttemptCancelled => {
+            worker_stop.cancel();
+            None
+        }
+        HeldAuthorityMutation::DeadlineElapsed => {
+            let elapsed = control.now().expect("manual Forge clock")
+                + chrono::Duration::from_std(promoted.fixture.config.iceberg_total_retry_timeout)
+                    .expect("the Iceberg retry budget is representable")
+                + chrono::Duration::seconds(1);
+            control.set(elapsed).expect("manual Forge clock advances");
+            None
+        }
+        HeldAuthorityMutation::BranchMovedByAnotherWriter => {
+            let target = planned.data.iter().next().expect("a delete target").clone();
+            promoted.publish_deletes(&target, Some(0), None).await;
+            Some(live_cut(promoted).await)
+        }
+    }
 }
 
 /// Everything one held-authority phase captured before it started asserting.

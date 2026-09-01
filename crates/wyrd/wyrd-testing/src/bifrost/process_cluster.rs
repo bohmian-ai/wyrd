@@ -191,6 +191,19 @@ pub enum ControlRequest {
     Shutdown,
 }
 
+/// Trust a probe establishes its connection under.
+///
+/// Named as a closed set because the private plane admits exactly one of them:
+/// a plaintext dial has no peer identity to present and must never reach a
+/// private adapter, whatever credential it carries above the transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PeerProbeTransport {
+    /// The child's own mutually authenticated Bifrost peer identity.
+    Mutual,
+    /// An unencrypted h2c connection carrying no certificate at all.
+    Plaintext,
+}
+
 /// One private-plane wire probe a child performs against another pod.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerProbePlan {
@@ -202,6 +215,8 @@ pub struct PeerProbePlan {
     pub credential: PeerProbeCredential,
     /// How the probe lays the first gRPC frame onto the wire.
     pub framing: PeerProbeFraming,
+    /// Trust the probe dials the destination under.
+    pub transport: PeerProbeTransport,
     /// Exact protobuf message bytes to send, when the probe carries a payload.
     ///
     /// A ticket binds the digest of the request it authorizes, so a journey
@@ -221,8 +236,16 @@ impl PeerProbePlan {
             service: PeerProbeService::OraclePeer,
             credential: PeerProbeCredential::Own,
             framing: PeerProbeFraming::Whole,
+            transport: PeerProbeTransport::Mutual,
             payload: None,
         }
+    }
+
+    /// Dials the destination in the clear instead of over the peer identity.
+    #[must_use]
+    pub fn over(mut self, transport: PeerProbeTransport) -> Self {
+        self.transport = transport;
+        self
     }
 
     /// Sends `payload` as the probe's one gRPC message.

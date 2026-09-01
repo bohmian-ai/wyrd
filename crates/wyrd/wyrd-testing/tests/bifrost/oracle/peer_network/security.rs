@@ -1,22 +1,22 @@
 //! Peer workload authentication, and the ordering it must hold against decode.
 
-use ed25519_dalek::{Signer as _, SigningKey};
+use ed25519_dalek::SigningKey;
 use secrecy::ExposeSecret as _;
 use vala_bifrost_redux::oracle::peer::{
-    ReservationBinding, ReservationOperationV1, ReservationTicketClaims, peer_signing_input,
-    reservation_body_digest,
+    ReservationBinding, ReservationOperationV1, reservation_body_digest,
 };
 use wyrd_spec::vala::api::NodeId;
-use wyrd_testing::bifrost::peer_keyring::TestPeerKeyring;
 use wyrd_testing::bifrost::process_cluster::{
-    BifrostProcessCluster, MembershipEntry, PeerProbeCredential, PeerProbeFraming, PeerProbePlan,
-    PeerProbeService, ProcessNodeTarget,
+    BifrostProcessCluster, PeerProbeCredential, PeerProbeFraming, PeerProbePlan, PeerProbeService,
+    ProcessNodeTarget,
 };
 use wyrd_testing::server::PeerPrincipalShape;
 use wyrd_tonic::prost::Message as _;
-use wyrd_tonic::wyrd::v1 as proto;
 
-use super::support::PeerJourneyError;
+use super::support::{
+    KeyringSigners, PeerJourneyError, ReservationPlane, polls_at, probe, reserve, sign_ticket,
+    stamped,
+};
 
 /// Path of the compiled child every simulated pod runs.
 const NODE_BINARY: &str = env!("CARGO_BIN_EXE_bifrost_peer_test_node");
@@ -146,19 +146,7 @@ const ADAPTERS: [PeerProbeService; 2] = [
 ///
 /// Returns the control-protocol failure unchanged.
 fn body_polls(cluster: &mut BifrostProcessCluster) -> Result<u64, PeerJourneyError> {
-    Ok(cluster.nodes_mut()[1].peer_body_polls()?)
-}
-
-/// Sends one probe from the first pod and reports the destination's outcome.
-///
-/// # Errors
-///
-/// Returns the control-protocol failure unchanged.
-fn probe(
-    cluster: &mut BifrostProcessCluster,
-    plan: &PeerProbePlan,
-) -> Result<String, PeerJourneyError> {
-    Ok(cluster.nodes_mut()[0].peer_probe(plan)?)
+    polls_at(cluster, 1)
 }
 
 /// No unauthorized identity causes the destination to poll a request body.
@@ -304,181 +292,6 @@ async fn prove_peer_tickets_are_independent_exact_and_replay_safe() -> Result<()
 
     cluster.shutdown();
     Ok(())
-}
-
-/// The two fenced Oracle incarnations one reservation travels between.
-///
-/// Read from live membership rather than assumed, because a reservation ticket
-/// binds both incarnations and a stale fence on either side is one of the
-/// refusals under test.
-struct ReservationPlane {
-    /// Address the follower advertises on the private plane.
-    destination: String,
-    /// Leader node identity minting the tickets.
-    leader_node_id: uuid::Uuid,
-    /// Leader Oracle fence at observation time.
-    leader_fence: u64,
-    /// Follower node identity the tickets are addressed to.
-    follower_node_id: uuid::Uuid,
-    /// Follower Oracle fence at observation time.
-    follower_fence: u64,
-}
-
-impl ReservationPlane {
-    /// Projects both Oracle incarnations out of a freshly taken membership cut.
-    ///
-    /// The cut is re-inspected rather than read from the ready report: the
-    /// leader answered readiness before the follower had registered, so its
-    /// startup report knows only itself. A reservation ticket binds both
-    /// fences, so the observation has to be as live as the tickets it feeds.
-    ///
-    /// # Errors
-    ///
-    /// Returns a message naming the role that is absent from membership.
-    fn observe(cluster: &mut BifrostProcessCluster) -> Result<Self, PeerJourneyError> {
-        let leader = cluster.nodes_mut()[0].inspect()?;
-        let follower_node_id = cluster.nodes()[1].ready_report().node_id;
-        let oracle = |node_id: uuid::Uuid| -> Result<&MembershipEntry, PeerJourneyError> {
-            leader
-                .membership
-                .iter()
-                .find(|entry| entry.node_id == node_id && entry.role == "oracle")
-                .ok_or_else(|| format!("no live Oracle lease for {node_id}").into())
-        };
-        let follower = oracle(follower_node_id)?;
-        Ok(Self {
-            destination: follower.address.clone(),
-            follower_fence: follower.fencing_token,
-            follower_node_id,
-            leader_fence: oracle(leader.node_id)?.fencing_token,
-            leader_node_id: leader.node_id,
-        })
-    }
-
-    /// Returns the binding a correct reserve ticket must carry.
-    fn reserve_binding(&self, query_id: uuid::Uuid) -> ReservationBinding {
-        ReservationBinding {
-            operation: ReservationOperationV1::ReserveSlots,
-            source_node_id: NodeId::new(self.leader_node_id),
-            source_fence: self.leader_fence,
-            destination_node_id: NodeId::new(self.follower_node_id),
-            destination_fence: self.follower_fence,
-            query_id,
-        }
-    }
-
-    /// Returns the ticket-free reserve request the leader would send.
-    fn reserve_request(&self, query_id: uuid::Uuid) -> proto::ReserveNodeSlotsRequest {
-        proto::ReserveNodeSlotsRequest {
-            query_id: query_id.as_bytes().to_vec(),
-            leader_node_id: self.leader_node_id.to_string(),
-            leader_fencing_token: self.leader_fence,
-            query_class: proto::QueryClass::Interactive as i32,
-            slot_units: 1,
-            expires_at_unix_ms: u64::try_from(
-                (chrono::Utc::now() + chrono::Duration::seconds(30)).timestamp_millis(),
-            )
-            .unwrap_or_default(),
-            ticket: None,
-        }
-    }
-}
-
-/// The signing keys one journey can present, by rotation state.
-///
-/// Held as raw signing keys rather than through the server authority because
-/// the point of the table is to present keys the server would never issue: a
-/// retired one, an expired one, one no manifest publishes, and the workload
-/// key that must never be interchangeable with any of them.
-struct KeyringSigners {
-    /// Currently issuing key; every correct ticket is signed with it.
-    active: (String, SigningKey),
-    /// Retired key still inside its published verification window.
-    retired_valid: (String, SigningKey),
-    /// Retired key whose verification window has closed.
-    retired_expired: (String, SigningKey),
-    /// Well-formed key that appears in no manifest.
-    unpublished: (String, SigningKey),
-}
-
-impl KeyringSigners {
-    /// Copies every rotation-state key out of the cluster's shared keyring.
-    fn from(keyring: &TestPeerKeyring) -> Self {
-        let pair = |key: &wyrd_testing::bifrost::peer_keyring::TestPeerTicketKey| {
-            (key.key_id().to_owned(), key.signing_key().clone())
-        };
-        Self {
-            active: pair(keyring.active()),
-            retired_valid: pair(keyring.retired_valid()),
-            retired_expired: pair(keyring.retired_expired()),
-            unpublished: pair(keyring.unpublished()),
-        }
-    }
-}
-
-/// Signs one reservation ticket with an arbitrary key.
-///
-/// Mirrors what the server authority does, but takes the key as an argument so
-/// a scenario can present a retired, expired, unpublished, or foreign key
-/// without the server ever agreeing to mint it.
-fn sign_ticket(
-    key: &(String, SigningKey),
-    binding: &ReservationBinding,
-    body_digest: String,
-) -> proto::SignedPeerTicket {
-    let claims = ReservationTicketClaims::for_binding(
-        binding,
-        body_digest,
-        uuid::Uuid::new_v4().as_bytes().to_vec(),
-        (chrono::Utc::now() + chrono::Duration::seconds(10)).timestamp_millis(),
-    );
-    let claims_bytes = claims.encode_to_vec();
-    let signature = key
-        .1
-        .sign(&peer_signing_input(
-            binding.operation.domain(),
-            &key.0,
-            &claims_bytes,
-        ))
-        .to_bytes()
-        .to_vec();
-    proto::SignedPeerTicket {
-        key_id: key.0.clone(),
-        claims_bytes,
-        signature,
-    }
-}
-
-/// Encodes one reserve request with `ticket` stamped onto it.
-///
-/// The digest is always taken over the ticket-free encoding, which is exactly
-/// what the follower recomputes.
-///
-/// # Errors
-///
-/// Returns the digest failure unchanged.
-fn stamped(
-    mut request: proto::ReserveNodeSlotsRequest,
-    ticket: impl FnOnce(String) -> proto::SignedPeerTicket,
-) -> Result<Vec<u8>, PeerJourneyError> {
-    request.ticket = None;
-    let digest = reservation_body_digest(&request.encode_to_vec())
-        .map_err(|error| format!("reserve body digest: {error}"))?;
-    request.ticket = Some(ticket(digest));
-    Ok(request.encode_to_vec())
-}
-
-/// Sends one reserve payload from the leader and returns the follower's verdict.
-///
-/// # Errors
-///
-/// Returns the control-protocol failure unchanged.
-fn reserve(
-    cluster: &mut BifrostProcessCluster,
-    destination: &str,
-    payload: Vec<u8>,
-) -> Result<String, PeerJourneyError> {
-    probe(cluster, &PeerProbePlan::own(destination).carrying(payload))
 }
 
 /// Only a published, unexpired key authorizes a reservation.

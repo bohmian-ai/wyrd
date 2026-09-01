@@ -63,8 +63,8 @@ use super::analytical_supervisor::{
     AnalyticalGraphGuard, AnalyticalSupervisorInspection, StageId, TaskId,
 };
 use super::analytical_transport::{
-    AnalyticalChannelResolver, AnalyticalCoordinatorIdentity, AnalyticalStageMinter,
-    StageWireIdentity, read_ticket,
+    AnalyticalChannelResolver, AnalyticalCoordinatorIdentity, AnalyticalParticipantCut,
+    AnalyticalStageSigning, StageWireIdentity, read_ticket,
 };
 use super::dispatcher::{BifrostPeerTls, OraclePeerCredentials};
 use super::participant_cut::OracleQueryAttemptCut;
@@ -563,7 +563,7 @@ impl WorkerSessionBuilder for AnalyticalSessionBuilder {
             ))
         })?;
         if let Some(resolver) = resolver {
-            let urls = self.egress.peer_urls().map_err(|error| {
+            let urls = self.egress.peer_urls(key).map_err(|error| {
                 DataFusionError::Execution(format!(
                     "Oracle analytical stage cannot address its peers: {error}"
                 ))
@@ -584,19 +584,14 @@ impl WorkerSessionBuilder for AnalyticalSessionBuilder {
 /// those as the client. A deeper graph does not: a middle stage runs on a
 /// follower and pulls from another follower, so that follower is itself a
 /// coordinator and must sign. Everything it signs with is already verified —
-/// the identity comes from the claims of the ticket that authorized its own
-/// stage, and the destination fence comes from this node's own membership view
-/// rather than from anything a caller supplied.
+/// both the identity and the addressable destinations come from the claims of
+/// the ticket that authorized its own stage. This owner never reads live
+/// membership: the participant cut was frozen by the leader at attempt start
+/// and travels signed with every operation, so churn cannot move a destination
+/// out from under an in-flight graph.
 pub struct AnalyticalStageEgress {
     /// Server-owned authority holding this node's signing key.
     authority: Arc<dyn OracleStageAuthority>,
-    /// Live peer directory: every addressable Oracle but this one, with the
-    /// fence each is currently serving under.
-    ///
-    /// A closure rather than the membership owner itself, because the fence a
-    /// ticket must carry is whatever the directory reports at send time, and
-    /// because the only thing this owner needs from membership is this map.
-    peers: AnalyticalPeerDirectory,
     /// This node's own identity, signed as the source of every outbound ticket.
     node_id: NodeId,
     /// This node's own current Oracle role fence.
@@ -611,16 +606,27 @@ pub struct AnalyticalStageEgress {
     identities: Mutex<HashMap<AnalyticalGraphKey, AnalyticalEgressIdentity>>,
 }
 
-/// Resolves this node's current Oracle peers to their fenced identities.
-type AnalyticalPeerDirectory =
-    Arc<dyn Fn() -> Result<HashMap<Url, (NodeId, u64)>, BifrostError> + Send + Sync>;
+/// One graph's recorded egress state, read out from under the identity lock.
+///
+/// A copy rather than a borrow because the lock must not be held across
+/// resolver construction, and both callers need the same three values.
+struct RecordedEgress {
+    /// Coordinator identity this node signs its own stage operations under.
+    identity: Arc<AnalyticalCoordinatorIdentity>,
+    /// Absolute graph deadline carried unchanged into every outbound ticket.
+    deadline_ms: i64,
+    /// Participant cut adopted from the ticket that authorized this graph.
+    cut: Arc<AnalyticalParticipantCut>,
+}
 
-/// One graph's verified outbound identity and deadline.
+/// One graph's verified outbound identity, deadline, and frozen destinations.
 struct AnalyticalEgressIdentity {
     /// Coordinator identity this node signs its own stage operations under.
     identity: Arc<AnalyticalCoordinatorIdentity>,
     /// Absolute graph deadline carried unchanged into every outbound ticket.
     deadline_ms: i64,
+    /// Participant cut adopted from the ticket that authorized this graph.
+    cut: Arc<AnalyticalParticipantCut>,
 }
 
 impl fmt::Debug for AnalyticalStageEgress {
@@ -635,11 +641,10 @@ impl fmt::Debug for AnalyticalStageEgress {
 }
 
 impl AnalyticalStageEgress {
-    /// Composes the egress owner over this node's authority and membership view.
+    /// Composes the egress owner over this node's authority and peer identity.
     #[must_use]
     pub fn new(
         authority: Arc<dyn OracleStageAuthority>,
-        peers: AnalyticalPeerDirectory,
         node_id: NodeId,
         oracle_fence: u64,
         ticket_ttl: chrono::Duration,
@@ -648,7 +653,6 @@ impl AnalyticalStageEgress {
     ) -> Self {
         Self {
             authority,
-            peers,
             node_id,
             oracle_fence,
             ticket_ttl,
@@ -668,7 +672,10 @@ impl AnalyticalStageEgress {
     ///
     /// # Errors
     ///
-    /// Returns [`BifrostError::Internal`] when the identity lock is poisoned.
+    /// Returns [`BifrostError::Internal`] when the identity lock is poisoned or
+    /// the ticket's participant cut is oversized, malformed, or plaintext, and
+    /// [`BifrostError::QueryPeerSecurity`] when the claims name an invalid
+    /// tenant.
     fn record(
         &self,
         graph: AnalyticalGraphKey,
@@ -692,6 +699,9 @@ impl AnalyticalStageEgress {
                 permission_digest: claims.permission_digest.clone(),
             }),
             deadline_ms: claims.absolute_deadline_ms,
+            // Adopted, never widened: this node can address exactly the
+            // destinations its own coordinator was authorized to address.
+            cut: Arc::new(AnalyticalParticipantCut::adopt(&claims.participants)?),
         };
         self.identities
             .lock()
@@ -722,48 +732,58 @@ impl AnalyticalStageEgress {
     ///
     /// # Errors
     ///
-    /// Returns [`BifrostError::Internal`] when the identity lock is poisoned or
-    /// a membership endpoint is not a valid URL.
+    /// Returns [`BifrostError::Internal`] when the identity lock is poisoned.
     fn resolver(
         &self,
         graph: AnalyticalGraphKey,
     ) -> Result<Option<AnalyticalChannelResolver>, BifrostError> {
-        let (identity, deadline_ms) = {
-            let identities = self.identities.lock().map_err(|_| poisoned_ingress())?;
-            match identities.get(&graph) {
-                Some(entry) => (Arc::clone(&entry.identity), entry.deadline_ms),
-                None => return Ok(None),
-            }
+        let Some(recorded) = self.recorded(graph)? else {
+            return Ok(None);
         };
-        let destinations = (self.peers)()?;
-        let authority = Arc::clone(&self.authority);
-        let ticket_ttl = self.ticket_ttl;
         Ok(Some(AnalyticalChannelResolver::new(
-            identity,
+            recorded.identity,
             self.peer_tls.clone(),
             Arc::clone(&self.peer_credentials),
-            Arc::new(move |url: &Url| {
-                destinations.get(url).map(|(node_id, fence)| {
-                    Arc::new(AnalyticalStageMinter::new(
-                        Arc::clone(&authority),
-                        *node_id,
-                        *fence,
-                        deadline_ms,
-                        ticket_ttl,
-                    ))
-                })
-            }),
+            recorded.cut,
+            AnalyticalStageSigning {
+                authority: Arc::clone(&self.authority),
+                absolute_deadline_ms: recorded.deadline_ms,
+                ticket_ttl: self.ticket_ttl,
+            },
         )))
     }
 
-    /// Returns every peer endpoint this node may address, for stage planning.
+    /// Returns the endpoints one authorized graph may address, for planning.
+    ///
+    /// These are the leader's frozen participants, not this node's membership
+    /// view, so a stage planned here spans exactly the attempt's own cut.
     ///
     /// # Errors
     ///
-    /// Returns [`BifrostError::Internal`] when a membership endpoint is not a
-    /// valid URL.
-    fn peer_urls(&self) -> Result<Vec<Url>, BifrostError> {
-        (self.peers)().map(|peers| peers.into_keys().collect())
+    /// Returns [`BifrostError::Internal`] when the identity lock is poisoned.
+    fn peer_urls(&self, graph: AnalyticalGraphKey) -> Result<Vec<Url>, BifrostError> {
+        Ok(self
+            .recorded(graph)?
+            .map(|recorded| recorded.cut.urls())
+            .unwrap_or_default())
+    }
+
+    /// Reads one graph's recorded identity, deadline, and frozen cut.
+    ///
+    /// Returns `None` when this node holds no recorded identity for `graph`.
+    /// Split out because both the resolver and stage planning need the same
+    /// entry and neither may hold the lock across the work that follows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when the identity lock is poisoned.
+    fn recorded(&self, graph: AnalyticalGraphKey) -> Result<Option<RecordedEgress>, BifrostError> {
+        let identities = self.identities.lock().map_err(|_| poisoned_ingress())?;
+        Ok(identities.get(&graph).map(|entry| RecordedEgress {
+            identity: Arc::clone(&entry.identity),
+            deadline_ms: entry.deadline_ms,
+            cut: Arc::clone(&entry.cut),
+        }))
     }
 }
 
@@ -1587,7 +1607,6 @@ mod tests {
     fn fixture_egress() -> Arc<AnalyticalStageEgress> {
         Arc::new(AnalyticalStageEgress::new(
             Arc::new(RefusingStageAuthority),
-            Arc::new(|| Ok(HashMap::new())),
             NodeId::new(Uuid::from_u128(0)),
             0,
             chrono::Duration::seconds(30),
@@ -2249,26 +2268,22 @@ impl AnalyticalExecutionHandle {
             reservation_id: reservation_id.to_owned(),
             permission_digest: permission_digest.to_owned(),
         });
-        let destinations = self.destinations(cut)?;
-        let urls = destinations.keys().cloned().collect::<Vec<_>>();
-        let authority = Arc::clone(&self.authority);
-        let deadline_ms = cut.deadline().timestamp_millis();
-        let ticket_ttl = self.config.ticket_ttl;
+        // Frozen here, once, for the whole attempt: everything downstream —
+        // this leader's own channels and every follower that becomes a
+        // coordinator beneath it — addresses this exact set, so no membership
+        // change can add, remove, or re-fence a destination mid-attempt.
+        let participants = Arc::new(AnalyticalParticipantCut::freeze(self.destinations(cut)?)?);
+        let urls = participants.urls();
         let resolver = AnalyticalChannelResolver::new(
             identity,
             self.config.peer_tls.clone(),
             Arc::clone(&self.config.peer_credentials),
-            Arc::new(move |url: &Url| {
-                destinations.get(url).map(|(node_id, fence)| {
-                    Arc::new(AnalyticalStageMinter::new(
-                        Arc::clone(&authority),
-                        *node_id,
-                        *fence,
-                        deadline_ms,
-                        ticket_ttl,
-                    ))
-                })
-            }),
+            Arc::clone(&participants),
+            AnalyticalStageSigning {
+                authority: Arc::clone(&self.authority),
+                absolute_deadline_ms: cut.deadline().timestamp_millis(),
+                ticket_ttl: self.config.ticket_ttl,
+            },
         );
         let shape = crate::resources::OracleSessionShape::for_grant(
             granted_memory_bytes,

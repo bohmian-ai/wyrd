@@ -1300,6 +1300,7 @@ mod tests {
             nonce.as_bytes().to_vec(),
             (now + chrono::Duration::seconds(20)).timestamp_millis(),
             (now + chrono::Duration::seconds(10)).timestamp_millis(),
+            Vec::new(),
         )
     }
 

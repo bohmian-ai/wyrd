@@ -26,7 +26,8 @@ use wyrd_server::config::BifrostTarget;
 
 use super::{
     ControlRequest, ControlResponse, MembershipEntry, NodeReport, PeerProbeCredential,
-    PeerProbeFraming, PeerProbePlan, ProcessClusterError, ProcessNodeTarget, env,
+    PeerProbeFraming, PeerProbePlan, PeerProbeTransport, ProcessClusterError, ProcessNodeTarget,
+    env,
 };
 use crate::bifrost::peer_keyring::TestPeerKeyringPaths;
 use crate::server::{TestBifrostPeerTls, WyrdTestServer};
@@ -426,14 +427,25 @@ impl ChildConfig {
         let read = |path: &std::path::Path| -> Result<Vec<u8>, ProcessClusterError> {
             std::fs::read(path).map_err(|error| ProcessClusterError::Resource(error.to_string()))
         };
-        let endpoint = wyrd_tonic::transport::mutually_authenticated_tls_endpoint(
-            plan.address.clone(),
-            &read(&self.peer_tls.ca_path)?,
-            self.peer_tls.server_name.clone(),
-            &read(&self.peer_tls.certificate_path)?,
-            &read(&self.peer_tls.private_key_path)?,
-        )
-        .map_err(|error| child(error.to_string()))?;
+        let endpoint = match plan.transport {
+            PeerProbeTransport::Mutual => {
+                wyrd_tonic::transport::mutually_authenticated_tls_endpoint(
+                    plan.address.clone(),
+                    &read(&self.peer_tls.ca_path)?,
+                    self.peer_tls.server_name.clone(),
+                    &read(&self.peer_tls.certificate_path)?,
+                    &read(&self.peer_tls.private_key_path)?,
+                )
+                .map_err(|error| child(error.to_string()))?
+            }
+            // Deliberately built from the raw address with no trust material
+            // at all: the destination must refuse the connection itself, so
+            // the probe never gets far enough to present a credential.
+            PeerProbeTransport::Plaintext => wyrd_tonic::tonic::transport::Endpoint::from_shared(
+                plan.address.replace("https://", "http://"),
+            )
+            .map_err(|error| child(error.to_string()))?,
+        };
         let mut channel = endpoint
             .connect()
             .await

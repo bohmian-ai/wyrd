@@ -335,7 +335,44 @@ pub struct StageTicketClaims {
     /// Short ticket acceptance expiry, distinct from the query deadline.
     #[prost(int64, tag = "20")]
     pub expires_at_ms: i64,
+    /// The attempt's frozen participant cut, signed as part of the ticket.
+    ///
+    /// The receiver cannot derive this the way it derives every other bound
+    /// field, so it is adopted rather than compared: a follower that is itself
+    /// a coordinator addresses exactly these destinations and no others. That
+    /// is what keeps membership churn from moving an in-flight participant —
+    /// the set was frozen by the leader and travels signed with every
+    /// operation, so no node re-reads live membership mid-attempt.
+    #[prost(message, repeated, tag = "21")]
+    pub participants: Vec<StageParticipantV1>,
 }
+
+/// One frozen destination a stage ticket authorizes its holder to address.
+///
+/// Carried inside the signed claims so a follower acting as a coordinator
+/// inherits the leader's cut verbatim. The fence is part of the identity: a
+/// destination that restarts under a new fence is a different incarnation and
+/// is not in this attempt's cut, which is what makes a frozen destination fail
+/// rather than silently redirect to its replacement.
+#[derive(Clone, PartialEq, Message)]
+pub struct StageParticipantV1 {
+    /// Participant node UUID bytes.
+    #[prost(bytes, tag = "1")]
+    pub node_id: Vec<u8>,
+    /// Role-incarnation fence this participant was frozen at.
+    #[prost(uint64, tag = "2")]
+    pub fence: u64,
+    /// Private peer endpoint the participant advertised at freeze time.
+    #[prost(string, tag = "3")]
+    pub address: String,
+}
+
+/// Hard cap on the participants one stage ticket may carry.
+///
+/// A cut larger than this is not a Bifrost topology, and the cap is checked
+/// before the list is adopted so a forged claim cannot grow a follower's
+/// destination table without bound.
+pub const MAX_STAGE_PARTICIPANTS: usize = 64;
 
 /// The receiver-derived expectation one stage operation must match exactly.
 ///
@@ -420,6 +457,7 @@ impl StageTicketClaims {
         nonce: Vec<u8>,
         absolute_deadline_ms: i64,
         expires_at_ms: i64,
+        participants: Vec<StageParticipantV1>,
     ) -> Self {
         Self {
             protocol_version: STAGE_PROTOCOL_VERSION,
@@ -442,6 +480,7 @@ impl StageTicketClaims {
             nonce,
             absolute_deadline_ms,
             expires_at_ms,
+            participants,
         }
     }
 
@@ -483,6 +522,12 @@ impl StageTicketClaims {
         }
         if self.body_digest != body_digest {
             return Err(PeerSecurityError::Body);
+        }
+        // The cut is adopted, not derived, so its only receiver-side check is
+        // that it is small enough to hold. Bounding it here keeps an oversized
+        // claim from ever reaching the egress owner that records it.
+        if self.participants.len() > MAX_STAGE_PARTICIPANTS {
+            return Err(PeerSecurityError::Claims);
         }
         let task_matches = match binding.task_id {
             Some(task_id) => self.has_task && self.task_id == task_id,
@@ -1240,8 +1285,14 @@ mod tests {
     fn oracle_stage_claims_reject_every_single_field_mutation() {
         let binding = stage_binding();
         let digest = stage_body_digest(b"body").expect("a bounded body digests");
-        let claims =
-            StageTicketClaims::for_binding(&binding, digest.clone(), vec![0; 16], 1_000, 2_000);
+        let claims = StageTicketClaims::for_binding(
+            &binding,
+            digest.clone(),
+            vec![0; 16],
+            1_000,
+            2_000,
+            Vec::new(),
+        );
         claims
             .verify_binding(&binding, &digest)
             .expect("an unmutated binding verifies");
@@ -1280,8 +1331,14 @@ mod tests {
         binding.operation = StageOperationV1::SetPlan;
         binding.task_id = None;
         let digest = stage_body_digest(b"plan").expect("a bounded body digests");
-        let claims =
-            StageTicketClaims::for_binding(&binding, digest.clone(), vec![0; 16], 1_000, 2_000);
+        let claims = StageTicketClaims::for_binding(
+            &binding,
+            digest.clone(),
+            vec![0; 16],
+            1_000,
+            2_000,
+            Vec::new(),
+        );
 
         let mut executing = binding.clone();
         executing.operation = StageOperationV1::ExecuteTask;

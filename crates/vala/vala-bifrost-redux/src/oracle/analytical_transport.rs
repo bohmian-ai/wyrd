@@ -68,6 +68,7 @@ use tower::Layer as _;
 use url::Url;
 use uuid::Uuid;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{NodeId, SignedPeerTicket};
 
 use super::analytical::{
@@ -76,8 +77,8 @@ use super::analytical::{
 };
 use super::dispatcher::{BifrostPeerTls, OraclePeerCredentials};
 use super::peer::{
-    MAX_STAGE_BODY_BYTES, OracleStageAuthority, PeerSecurityError, StageBinding, StageOperationV1,
-    StageTicketClaims, stage_body_digest,
+    MAX_STAGE_BODY_BYTES, MAX_STAGE_PARTICIPANTS, OracleStageAuthority, PeerSecurityError,
+    StageBinding, StageOperationV1, StageParticipantV1, StageTicketClaims, stage_body_digest,
 };
 use super::telemetry::record_exchange_transfer;
 
@@ -690,6 +691,145 @@ fn parse_u64(value: &str) -> Result<u64, PeerSecurityError> {
 /// One minter serves exactly one target follower, because the destination node
 /// identity and role fence it signs are that follower's. Reusing a minter across
 /// targets would mint tickets that the receiving follower correctly refuses.
+/// The frozen destination set one Analytical attempt is allowed to address.
+///
+/// Built once by the leader from its pinned attempt cut and thereafter carried
+/// inside every signed stage ticket, so a follower acting as a coordinator
+/// adopts the leader's cut verbatim instead of re-reading live membership. A
+/// destination is identified by endpoint *and* fence: a node that restarts
+/// under a new fence is a different incarnation and is simply absent from this
+/// cut, which fails the resolution locally rather than redirecting the request
+/// to the replacement.
+pub(crate) struct AnalyticalParticipantCut {
+    /// Signed wire form, stamped verbatim into every ticket minted from it.
+    wire: Vec<StageParticipantV1>,
+    /// Endpoint index every outbound channel resolves its audience through.
+    by_url: HashMap<Url, (NodeId, u64)>,
+}
+
+impl fmt::Debug for AnalyticalParticipantCut {
+    /// Reports the cut's size without rendering endpoints.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AnalyticalParticipantCut")
+            .field("participants", &self.wire.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl AnalyticalParticipantCut {
+    /// Freezes one leader-side attempt cut into its immutable destination set.
+    ///
+    /// Rejects a plaintext endpoint outright: every east-west channel is
+    /// mutually authenticated, so an endpoint that could only be dialed in the
+    /// clear is not a reachable destination and must never enter the cut a
+    /// ticket authorizes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when the cut exceeds
+    /// [`MAX_STAGE_PARTICIPANTS`] or names a non-TLS endpoint.
+    pub(crate) fn freeze(destinations: HashMap<Url, (NodeId, u64)>) -> Result<Self, BifrostError> {
+        let mut wire = destinations
+            .iter()
+            .map(|(url, (node_id, fence))| {
+                if url.scheme() != "https" {
+                    return Err(BifrostError::Internal {
+                        detail: "Oracle analytical participant endpoint is not mutually \
+                                 authenticated"
+                            .to_owned(),
+                    });
+                }
+                Ok(StageParticipantV1 {
+                    node_id: node_id.as_uuid().as_bytes().to_vec(),
+                    fence: *fence,
+                    address: url.to_string(),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if wire.len() > MAX_STAGE_PARTICIPANTS {
+            return Err(BifrostError::Internal {
+                detail: "Oracle analytical attempt cut exceeds the addressable participant bound"
+                    .to_owned(),
+            });
+        }
+        // Ordered so the encoded claims — and therefore the signature — depend
+        // only on the membership of the cut, never on iteration order.
+        wire.sort_by(|left, right| {
+            (&left.address, &left.node_id, left.fence).cmp(&(
+                &right.address,
+                &right.node_id,
+                right.fence,
+            ))
+        });
+        Ok(Self {
+            wire,
+            by_url: destinations,
+        })
+    }
+
+    /// Adopts the cut a verified stage ticket carried, without widening it.
+    ///
+    /// This is the follower's only source of destinations. Nothing here
+    /// consults membership, so a graph authorized on this node addresses
+    /// exactly the participants its coordinator froze.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when the carried cut exceeds
+    /// [`MAX_STAGE_PARTICIPANTS`], names a malformed or plaintext endpoint, or
+    /// carries a malformed node identity.
+    pub(crate) fn adopt(wire: &[StageParticipantV1]) -> Result<Self, BifrostError> {
+        if wire.len() > MAX_STAGE_PARTICIPANTS {
+            return Err(BifrostError::Internal {
+                detail: "Oracle analytical stage cut exceeds the addressable participant bound"
+                    .to_owned(),
+            });
+        }
+        let mut by_url = HashMap::with_capacity(wire.len());
+        for participant in wire {
+            let url = Url::parse(&participant.address).map_err(|error| BifrostError::Internal {
+                detail: format!("Oracle analytical stage cut endpoint is not a valid URL: {error}"),
+            })?;
+            if url.scheme() != "https" {
+                return Err(BifrostError::Internal {
+                    detail: "Oracle analytical stage cut endpoint is not mutually authenticated"
+                        .to_owned(),
+                });
+            }
+            let node_id = Uuid::from_slice(&participant.node_id)
+                .map(NodeId::new)
+                .map_err(|error| BifrostError::Internal {
+                    detail: format!("Oracle analytical stage cut names an invalid node: {error}"),
+                })?;
+            by_url.insert(url, (node_id, participant.fence));
+        }
+        Ok(Self {
+            wire: wire.to_vec(),
+            by_url,
+        })
+    }
+
+    /// Returns the fenced identity frozen for `url`, or `None` when it is
+    /// outside this attempt's cut.
+    #[must_use]
+    pub(crate) fn destination(&self, url: &Url) -> Option<(NodeId, u64)> {
+        self.by_url.get(url).copied()
+    }
+
+    /// Returns every endpoint this attempt may address.
+    #[must_use]
+    pub(crate) fn urls(&self) -> Vec<Url> {
+        self.by_url.keys().cloned().collect()
+    }
+
+    /// Returns the signed wire form stamped into every ticket.
+    #[must_use]
+    pub(crate) fn wire(&self) -> &[StageParticipantV1] {
+        &self.wire
+    }
+}
+
 pub(crate) struct AnalyticalStageMinter {
     /// Server-owned authority holding the signing key.
     authority: Arc<dyn OracleStageAuthority>,
@@ -701,6 +841,8 @@ pub(crate) struct AnalyticalStageMinter {
     absolute_deadline_ms: i64,
     /// Ticket lifetime, kept far shorter than the graph's own deadline.
     ticket_ttl: chrono::Duration,
+    /// Frozen cut stamped into every ticket so the receiver inherits it.
+    cut: Arc<AnalyticalParticipantCut>,
 }
 
 impl fmt::Debug for AnalyticalStageMinter {
@@ -723,6 +865,7 @@ impl AnalyticalStageMinter {
         destination_fence: u64,
         absolute_deadline_ms: i64,
         ticket_ttl: chrono::Duration,
+        cut: Arc<AnalyticalParticipantCut>,
     ) -> Self {
         Self {
             authority,
@@ -730,6 +873,7 @@ impl AnalyticalStageMinter {
             destination_fence,
             absolute_deadline_ms,
             ticket_ttl,
+            cut,
         }
     }
 
@@ -761,6 +905,7 @@ impl AnalyticalStageMinter {
             fresh_nonce(),
             self.absolute_deadline_ms,
             (now + self.ticket_ttl).timestamp_millis(),
+            self.cut.wire().to_vec(),
         );
         self.authority.mint_stage(operation, &claims)
     }
@@ -1239,13 +1384,20 @@ fn measured_exchange(
     }))
 }
 
-/// Resolves the follower-bound stage minter for one worker URL.
+/// The signing authority and lifetimes one coordinator mints every stage
+/// ticket under.
 ///
-/// Named because it appears both as a resolver field and as its constructor
-/// argument: a coordinator hands in the closure that knows which destination
-/// identities it was authorized for, and the resolver caches what it returns.
-pub(crate) type StageMinterFactory =
-    Arc<dyn Fn(&Url) -> Option<Arc<AnalyticalStageMinter>> + Send + Sync>;
+/// Grouped because the channel resolver only ever passes these three together
+/// into the per-destination minter it builds, and because the deadline and the
+/// ticket lifetime are attempt-invariant while the destination is not.
+pub(crate) struct AnalyticalStageSigning {
+    /// Server-owned authority holding this node's stage signing key.
+    pub(crate) authority: Arc<dyn OracleStageAuthority>,
+    /// Absolute wall-clock deadline of the graph, identical across attempts.
+    pub(crate) absolute_deadline_ms: i64,
+    /// Ticket lifetime, kept far shorter than the graph's own deadline.
+    pub(crate) ticket_ttl: chrono::Duration,
+}
 
 /// Tower layer that presents this node's peer workload credential outbound.
 ///
@@ -1424,8 +1576,10 @@ pub(crate) struct AnalyticalChannelResolver {
     identity: Arc<AnalyticalCoordinatorIdentity>,
     /// Per-follower minters, keyed by the follower each one is bound to.
     minters: Arc<std::sync::Mutex<HashMap<Url, Arc<AnalyticalStageMinter>>>>,
-    /// Builds the minter for a follower this resolver has not yet reached.
-    mint_for: StageMinterFactory,
+    /// Frozen destination set this resolver may address, and nothing beyond it.
+    cut: Arc<AnalyticalParticipantCut>,
+    /// Authority and lifetimes every minted ticket is signed under.
+    signing: AnalyticalStageSigning,
 }
 
 impl fmt::Debug for AnalyticalChannelResolver {
@@ -1439,24 +1593,26 @@ impl fmt::Debug for AnalyticalChannelResolver {
 }
 
 impl AnalyticalChannelResolver {
-    /// Builds the resolver for one query's coordinator identity.
+    /// Builds the resolver for one query's coordinator identity and frozen cut.
     ///
-    /// `mint_for` resolves the follower-bound minter for a worker URL. It
-    /// returns `None` for a URL this coordinator has no authorized destination
-    /// identity for, which fails the resolution closed rather than sending an
-    /// unsigned operation.
+    /// `cut` is the only source of destinations. A URL outside it resolves to
+    /// no minter, which fails the resolution closed — locally, before any
+    /// connection is attempted — rather than sending an unsigned operation or
+    /// dialing a node this attempt never froze.
     #[must_use]
     pub(crate) fn new(
         identity: Arc<AnalyticalCoordinatorIdentity>,
         tls: BifrostPeerTls,
         credentials: Arc<dyn OraclePeerCredentials>,
-        mint_for: StageMinterFactory,
+        cut: Arc<AnalyticalParticipantCut>,
+        signing: AnalyticalStageSigning,
     ) -> Self {
         Self {
             channels: AnalyticalPeerChannels::new(tls, credentials),
             identity,
             minters: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            mint_for,
+            cut,
+            signing,
         }
     }
 
@@ -1465,7 +1621,7 @@ impl AnalyticalChannelResolver {
     /// # Errors
     ///
     /// Returns [`DataFusionError::Execution`] when the cache lock is poisoned
-    /// or this coordinator has no authorized destination identity for `url`.
+    /// or `url` is not a destination this attempt's frozen cut contains.
     fn minter(&self, url: &Url) -> Result<Arc<AnalyticalStageMinter>, DataFusionError> {
         let mut minters = self.minters.lock().map_err(|_| {
             DataFusionError::Execution("Oracle analytical minter cache is poisoned".to_owned())
@@ -1473,11 +1629,19 @@ impl AnalyticalChannelResolver {
         if let Some(minter) = minters.get(url) {
             return Ok(Arc::clone(minter));
         }
-        let minter = (self.mint_for)(url).ok_or_else(|| {
+        let (node_id, fence) = self.cut.destination(url).ok_or_else(|| {
             DataFusionError::Execution(format!(
                 "Oracle analytical execution has no authorized destination identity for {url}"
             ))
         })?;
+        let minter = Arc::new(AnalyticalStageMinter::new(
+            Arc::clone(&self.signing.authority),
+            node_id,
+            fence,
+            self.signing.absolute_deadline_ms,
+            self.signing.ticket_ttl,
+            Arc::clone(&self.cut),
+        ));
         minters.insert(url.clone(), Arc::clone(&minter));
         Ok(minter)
     }
@@ -1522,6 +1686,114 @@ mod tests {
     use super::super::peer::AuthorizedStage;
     use super::super::spill::OracleSpillRuntime;
     use super::*;
+
+    /// Builds one https destination entry for a cut fixture.
+    fn destination(port: u16, node: u128, fence: u64) -> (Url, (NodeId, u64)) {
+        (
+            Url::parse(&format!("https://127.0.0.1:{port}/")).expect("fixture endpoint parses"),
+            (NodeId::new(Uuid::from_u128(node)), fence),
+        )
+    }
+
+    /// A frozen cut is the complete and only addressable destination set.
+    ///
+    /// Locks the three properties the immutability claim rests on: a cut round
+    /// trips through its signed wire form unchanged, an endpoint outside it
+    /// resolves to nothing at all rather than to a live lookup, and a plaintext
+    /// endpoint never enters a cut in either direction. The last is what keeps
+    /// a coordinator from being talked down to an unauthenticated channel by
+    /// the contents of a ticket it received.
+    #[test]
+    fn a_frozen_cut_is_the_only_addressable_destination_set() {
+        let (url, identity) = destination(50052, 1, 4);
+        let cut = AnalyticalParticipantCut::freeze(HashMap::from([(url.clone(), identity)]))
+            .expect("an https cut freezes");
+
+        assert_eq!(cut.destination(&url), Some(identity));
+        assert_eq!(cut.urls(), vec![url.clone()]);
+        let outside = Url::parse("https://127.0.0.1:50053/").expect("fixture endpoint parses");
+        assert!(
+            cut.destination(&outside).is_none(),
+            "an endpoint outside the cut must resolve to no destination"
+        );
+
+        let adopted = AnalyticalParticipantCut::adopt(cut.wire()).expect("a signed cut is adopted");
+        assert_eq!(adopted.destination(&url), Some(identity));
+        assert!(
+            adopted.destination(&outside).is_none(),
+            "adoption must not widen the cut it received"
+        );
+
+        let plaintext =
+            Url::parse("http://127.0.0.1:50052/").expect("fixture plaintext endpoint parses");
+        assert!(
+            AnalyticalParticipantCut::freeze(HashMap::from([(plaintext, identity)])).is_err(),
+            "a plaintext endpoint must never enter a frozen cut"
+        );
+        assert!(
+            AnalyticalParticipantCut::adopt(&[StageParticipantV1 {
+                node_id: Uuid::from_u128(1).as_bytes().to_vec(),
+                fence: 4,
+                address: "http://127.0.0.1:50052/".to_owned(),
+            }])
+            .is_err(),
+            "a plaintext endpoint must never be adopted from a ticket"
+        );
+    }
+
+    /// A cut's signed form depends on its membership, never on iteration order.
+    ///
+    /// The wire form is signed, so two coordinators that froze the same
+    /// participants must produce byte-identical claims; a `HashMap` iteration
+    /// order leaking into the signature would make an otherwise identical
+    /// ticket verify or not by chance.
+    #[test]
+    fn a_frozen_cut_encodes_independently_of_iteration_order() {
+        let entries = [
+            destination(50052, 1, 4),
+            destination(50053, 2, 5),
+            destination(50054, 3, 6),
+        ];
+        let forward =
+            AnalyticalParticipantCut::freeze(entries.iter().cloned().collect()).expect("freezes");
+        let reversed = AnalyticalParticipantCut::freeze(entries.iter().rev().cloned().collect())
+            .expect("freezes");
+        assert_eq!(forward.wire(), reversed.wire());
+    }
+
+    /// A cut larger than the addressable bound is refused in both directions.
+    ///
+    /// The bound exists so a forged claim cannot grow a receiver's destination
+    /// table without limit, which only holds if the freezing side is bounded
+    /// too — otherwise a coordinator could mint what no receiver may adopt.
+    #[test]
+    fn a_cut_beyond_the_participant_bound_is_refused() {
+        let oversized = (0..=MAX_STAGE_PARTICIPANTS)
+            .map(|index| {
+                destination(
+                    50052 + u16::try_from(index).expect("fixture index fits a port offset"),
+                    u128::try_from(index).expect("fixture index fits a node identity") + 1,
+                    4,
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        assert!(
+            AnalyticalParticipantCut::freeze(oversized.clone()).is_err(),
+            "an oversized cut must not freeze"
+        );
+        let wire = oversized
+            .into_iter()
+            .map(|(url, (node_id, fence))| StageParticipantV1 {
+                node_id: node_id.as_uuid().as_bytes().to_vec(),
+                fence,
+                address: url.to_string(),
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            AnalyticalParticipantCut::adopt(&wire).is_err(),
+            "an oversized cut must not be adopted"
+        );
+    }
 
     /// gRPC path of upstream's worker metadata call.
     ///
@@ -1832,7 +2104,6 @@ mod tests {
                     Arc::new(FixtureAuthority {
                         calls: Arc::new(AtomicUsize::new(0)),
                     }),
-                    Arc::new(|| Ok(std::collections::HashMap::new())),
                     node_id,
                     7,
                     chrono::Duration::seconds(30),
@@ -1893,6 +2164,7 @@ mod tests {
                 vec![1, 2, 3, 4],
                 0,
                 0,
+                Vec::new(),
             );
             let ticket = FixtureAuthority {
                 calls: Arc::new(AtomicUsize::new(0)),

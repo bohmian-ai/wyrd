@@ -2083,8 +2083,6 @@ struct AttemptPlanInputs<'a> {
 struct AnalyticalCompositionInputs {
     /// Signing and verifying authority for every stage ticket this node uses.
     authority: Arc<dyn peer::OracleStageAuthority>,
-    /// Live membership, read to resolve the authorized follower endpoints.
-    cluster: Arc<ClusterRegistry>,
     /// This node's Oracle identity.
     node_id: NodeId,
     /// This node's Oracle fencing token.
@@ -2119,7 +2117,6 @@ fn compose_analytical_handle(
 ) -> Arc<analytical::AnalyticalExecutionHandle> {
     let AnalyticalCompositionInputs {
         authority,
-        cluster,
         node_id,
         fence,
         catalog,
@@ -2139,24 +2136,6 @@ fn compose_analytical_handle(
     );
     let egress = Arc::new(analytical::AnalyticalStageEgress::new(
         Arc::clone(&authority),
-        Arc::new(move || {
-            cluster
-                .snapshot()
-                .live_oracles()
-                .iter()
-                .filter(|lease| lease.key.node_id != node_id)
-                .map(|lease| {
-                    let url = url::Url::parse(&lease.address).map_err(|error| {
-                        BifrostError::Internal {
-                            detail: format!(
-                                "Oracle analytical peer endpoint is not a valid URL: {error}"
-                            ),
-                        }
-                    })?;
-                    Ok((url, (lease.key.node_id, lease.fencing_token)))
-                })
-                .collect()
-        }),
         node_id,
         fence,
         ANALYTICAL_STAGE_TICKET_TTL,
@@ -2307,7 +2286,6 @@ impl Oracle {
                     authority,
                     peer_tls,
                     peer_credentials,
-                    cluster: Arc::clone(&cluster),
                     node_id: admission.local_role.key.node_id,
                     fence: admission.local_role.fencing_token,
                     catalog: Arc::clone(&config.catalog),

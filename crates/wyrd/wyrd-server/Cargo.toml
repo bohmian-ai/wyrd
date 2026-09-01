@@ -68,6 +68,7 @@ wyrd-sql = { path = "../wyrd-sql", version = "0.0.1", features = ["embedded-post
 tower = { workspace = true, features = ["util", "timeout", "limit", "load-shed"] }
 tower-http = { workspace = true, features = ["trace", "catch-panic"] }
 tower_governor = { workspace = true }
+http-body = { workspace = true }
 http-body-util = "0.1"
 wyrd-spec = { workspace = true, features = ["server"] }
 wyrd-semver = { workspace = true }

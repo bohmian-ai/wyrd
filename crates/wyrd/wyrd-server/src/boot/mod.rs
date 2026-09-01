@@ -1627,7 +1627,7 @@ impl<'a> OracleRoleBuilder<'a> {
             || !authenticated
                 .principal
                 .effective_permissions
-                .contains(&Permission::bifrost_oracle_peer_invoke())
+                .contains(&Permission::bifrost_peer_invoke())
         {
             return Err(ServerBootError::OraclePeer(
                 "Oracle peer credential lacks platform service authority".to_owned(),

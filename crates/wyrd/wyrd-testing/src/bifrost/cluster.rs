@@ -2909,10 +2909,10 @@ mod tests {
         .expect("Oracle peer role reads");
         drop(system_conn);
         assert_eq!(assigned.len(), 1);
-        assert_eq!(assigned[0].0, "bifrost_oracle_peer");
+        assert_eq!(assigned[0].0, "bifrost_peer");
         let stored_permissions: Vec<Permission> =
             serde_json::from_value(assigned[0].1.clone()).expect("permissions decode");
-        let expected = vec![Permission::bifrost_oracle_peer_invoke()];
+        let expected = vec![Permission::bifrost_peer_invoke()];
         assert_eq!(stored_permissions, expected);
         let bearer = cluster
             .oracle_peer_credentials

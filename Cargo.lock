@@ -11070,6 +11070,7 @@ dependencies = [
  "ed25519-dalek",
  "futures-util",
  "hex",
+ "http-body 1.1.0",
  "http-body-util",
  "iceberg",
  "insta",

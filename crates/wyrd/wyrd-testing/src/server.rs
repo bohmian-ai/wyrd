@@ -146,7 +146,7 @@ use wyrd_storage::{BackendConfig, StorageSettings};
 use crate::time::ClockHandle;
 
 /// Dedicated least-privilege role assigned to the test Oracle Service.
-const ORACLE_PEER_ROLE: &str = "bifrost_oracle_peer";
+const ORACLE_PEER_ROLE: &str = "bifrost_peer";
 
 /// Separates a serve-task join failure from the server's own terminal outcome.
 ///
@@ -4171,7 +4171,7 @@ pub(crate) async fn provision_oracle_peer_principal(
     seed_builtin_roles_for_tenant(&mut conn, tenant_id)
         .await
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-    let permissions = vec![Permission::bifrost_oracle_peer_invoke()];
+    let permissions = vec![Permission::bifrost_peer_invoke()];
     let permissions_json = serde_json::to_value(&permissions)
         .map_err(|error| WyrdTestServerError::Auth(error.to_string()))?;
     insert_role(

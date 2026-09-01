@@ -38,10 +38,104 @@ use crate::AppState;
 /// Encoded bytes occupied by the gRPC compression flag and big-endian length.
 const GRPC_FRAME_HEADER_BYTES: usize = 5;
 
-/// Reads the actual first gRPC envelope without decoding its protobuf payload.
-fn grpc_frame_message_bytes(data: &[u8]) -> Option<usize> {
-    let length = data.get(1..GRPC_FRAME_HEADER_BYTES)?.try_into().ok()?;
-    usize::try_from(u32::from_be_bytes(length)).ok()
+/// The head of a gRPC request body, read far enough to bound its first message.
+///
+/// A gRPC length-prefixed message is five header bytes followed by the declared
+/// payload, but HTTP/2 frames do not align to that boundary: a header can be
+/// split across two DATA frames, and several messages can be coalesced into
+/// one. This owner reads only as far as the first complete header, retains
+/// every byte it consumed, and replays all of them ahead of the untouched
+/// remainder — so the bound applies to the first message alone while later
+/// coalesced messages reach the codec intact.
+struct GrpcFirstFrame {
+    /// Frames already taken from the body, replayed to the inner service in order.
+    buffered: Vec<http_body::Frame<wyrd_tonic::tonic::codegen::Bytes>>,
+    /// Header bytes observed so far.
+    header: [u8; GRPC_FRAME_HEADER_BYTES],
+    /// How many of `header` are filled.
+    filled: usize,
+}
+
+/// Why a request body's first frame cannot be admitted.
+///
+/// Distinguished from a transport error because the body is well formed at the
+/// HTTP layer and malformed at the gRPC layer; the caller answers with a
+/// status rather than dropping the connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirstFrameError {
+    /// The compression flag is neither 0 nor 1.
+    MalformedFlag,
+}
+
+impl GrpcFirstFrame {
+    /// Creates an empty reader.
+    const fn new() -> Self {
+        Self {
+            buffered: Vec::new(),
+            header: [0; GRPC_FRAME_HEADER_BYTES],
+            filled: 0,
+        }
+    }
+
+    /// Reads `body` until the first message header is complete or it ends.
+    ///
+    /// Stops at the header, never at the payload: a large first message is
+    /// bounded by its declared length, not by buffering it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the body's own transport error unchanged. A malformed
+    /// compression flag is reported through [`Self::declared`] instead, so the
+    /// consumed bytes are still available to the caller for a clean refusal.
+    async fn read(body: &mut Body) -> Result<Self, Status> {
+        let mut reader = Self::new();
+        while reader.filled < GRPC_FRAME_HEADER_BYTES {
+            let Some(frame) = body.frame().await.transpose()? else {
+                break;
+            };
+            if let Some(data) = frame.data_ref() {
+                let wanted = GRPC_FRAME_HEADER_BYTES - reader.filled;
+                let taken = wanted.min(data.len());
+                reader.header[reader.filled..reader.filled + taken].copy_from_slice(&data[..taken]);
+                reader.filled += taken;
+            }
+            reader.buffered.push(frame);
+        }
+        Ok(reader)
+    }
+
+    /// Returns the first message's declared payload size, when it is knowable.
+    ///
+    /// `None` means the body ended before a complete header, which is a legal
+    /// empty body, or the message is compressed. A compressed frame declares
+    /// its *compressed* length, which would under-bound the decompressed body,
+    /// so it is treated as unknown rather than admitted against a lease that is
+    /// too small.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FirstFrameError::MalformedFlag`] when the compression flag is
+    /// neither 0 nor 1, which no conforming gRPC client emits.
+    fn declared(&self) -> Result<Option<usize>, FirstFrameError> {
+        if self.filled < GRPC_FRAME_HEADER_BYTES {
+            return Ok(None);
+        }
+        match self.header[0] {
+            0 => {}
+            1 => return Ok(None),
+            _ => return Err(FirstFrameError::MalformedFlag),
+        }
+        let length: [u8; 4] = self.header[1..GRPC_FRAME_HEADER_BYTES]
+            .try_into()
+            .unwrap_or([0; 4]);
+        Ok(usize::try_from(u32::from_be_bytes(length)).ok())
+    }
+
+    /// Rebuilds one body from the consumed frames followed by the remainder.
+    fn replay(self, rest: Body) -> Body {
+        let buffered = futures_util::stream::iter(self.buffered.into_iter().map(Ok));
+        Body::new(StreamBody::new(buffered.chain(BodyStream::new(rest))))
+    }
 }
 
 /// Service wrapper that acquires encoded gRPC body capacity before decoding.
@@ -91,14 +185,20 @@ where
         let mut inner = self.inner.clone();
         Box::pin(async move {
             let (parts, mut body) = request.into_parts();
-            let first = match body.frame().await.transpose() {
-                Ok(first) => first,
+            let head = match GrpcFirstFrame::read(&mut body).await {
+                Ok(head) => head,
                 Err(error) => return Ok(error.into_http()),
             };
-            let declared = first
-                .as_ref()
-                .and_then(|frame| frame.data_ref())
-                .and_then(|data| grpc_frame_message_bytes(data));
+            let declared = match head.declared() {
+                Ok(declared) => declared,
+                // Refused with the consumed bytes still in hand and never
+                // forwarded, so a malformed frame reaches no codec.
+                Err(FirstFrameError::MalformedFlag) => {
+                    return Ok(
+                        Status::invalid_argument("gRPC message framing is malformed").into_http(),
+                    );
+                }
+            };
             let lease = declared.map_or_else(
                 || admission.try_acquire_unknown(),
                 |bytes| admission.try_acquire(bytes),
@@ -112,9 +212,9 @@ where
                     .into_http());
                 }
             };
-            let first = futures_util::stream::iter(first.into_iter().map(Ok));
-            let body = Body::new(StreamBody::new(first.chain(BodyStream::new(body))));
-            inner.call(Request::from_parts(parts, body)).await
+            inner
+                .call(Request::from_parts(parts, head.replay(body)))
+                .await
         })
     }
 }
@@ -275,7 +375,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use http_body_util::Full;
+    use http_body_util::{BodyExt, Full, StreamBody};
     use tower::ServiceExt;
     use wyrd_tonic::tonic::codegen::Bytes;
 
@@ -328,6 +428,186 @@ mod tests {
         let mut header = vec![0_u8];
         header.extend_from_slice(&length.to_be_bytes());
         Body::new(Full::new(Bytes::from(header)))
+    }
+
+    /// Builds one body delivering `chunks` as separate DATA frames.
+    ///
+    /// HTTP/2 frame boundaries are the whole point of these cases: a gRPC
+    /// header can arrive split across two frames, and several messages can
+    /// arrive coalesced into one.
+    fn chunked_body(chunks: Vec<Vec<u8>>) -> Body {
+        let frames = futures_util::stream::iter(
+            chunks
+                .into_iter()
+                .map(|chunk| Ok::<_, Infallible>(http_body::Frame::data(Bytes::from(chunk)))),
+        );
+        Body::new(StreamBody::new(frames))
+    }
+
+    /// Builds the five header bytes declaring an uncompressed `payload` length.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a test requests a length outside the gRPC `u32` envelope.
+    fn header_for(payload: usize) -> Vec<u8> {
+        let length = u32::try_from(payload).expect("test frame length fits the gRPC u32 envelope");
+        let mut header = vec![0_u8];
+        header.extend_from_slice(&length.to_be_bytes());
+        header
+    }
+
+    /// Drains a body into the bytes an inner service would have received.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the body yields a transport error, which no test body does.
+    async fn drain(mut body: Body) -> Vec<u8> {
+        let mut collected = Vec::new();
+        while let Some(frame) = body.frame().await {
+            let frame = frame.expect("test body never errors");
+            if let Some(data) = frame.data_ref() {
+                collected.extend_from_slice(data);
+            }
+        }
+        collected
+    }
+
+    /// A header split across DATA frames is still read, and every byte replays.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the split header is not reassembled or a byte is lost.
+    #[tokio::test]
+    async fn a_split_first_header_is_reassembled_and_fully_replayed() {
+        let mut header = header_for(9);
+        let tail = header.split_off(2);
+        let mut body = chunked_body(vec![header.clone(), tail.clone(), vec![7_u8; 9]]);
+
+        let head = GrpcFirstFrame::read(&mut body)
+            .await
+            .expect("test body never errors");
+
+        assert_eq!(head.declared(), Ok(Some(9)));
+        let mut expected = header;
+        expected.extend_from_slice(&tail);
+        expected.extend_from_slice(&[7_u8; 9]);
+        assert_eq!(drain(head.replay(body)).await, expected);
+    }
+
+    /// A first payload split across frames is bounded once and replayed whole.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the declared bound or the replayed bytes differ.
+    #[tokio::test]
+    async fn a_split_first_payload_is_bounded_once_and_replayed_whole() {
+        let mut first = header_for(6);
+        first.extend_from_slice(&[1_u8, 2, 3]);
+        let mut body = chunked_body(vec![first.clone(), vec![4_u8, 5, 6]]);
+
+        let head = GrpcFirstFrame::read(&mut body)
+            .await
+            .expect("test body never errors");
+
+        assert_eq!(head.declared(), Ok(Some(6)));
+        let mut expected = first;
+        expected.extend_from_slice(&[4_u8, 5, 6]);
+        assert_eq!(drain(head.replay(body)).await, expected);
+    }
+
+    /// Messages coalesced behind the first one are bounded by the first alone.
+    ///
+    /// This is the defect the bound previously had: the following messages must
+    /// reach the codec untouched rather than being counted or dropped.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the bound counts a later message or a byte is lost.
+    #[tokio::test]
+    async fn coalesced_later_messages_are_neither_counted_nor_lost() {
+        let mut coalesced = header_for(4);
+        coalesced.extend_from_slice(&[1_u8, 2, 3, 4]);
+        coalesced.extend_from_slice(&header_for(3));
+        coalesced.extend_from_slice(&[5_u8, 6, 7]);
+        let mut body = chunked_body(vec![coalesced.clone()]);
+
+        let head = GrpcFirstFrame::read(&mut body)
+            .await
+            .expect("test body never errors");
+
+        assert_eq!(head.declared(), Ok(Some(4)));
+        assert_eq!(drain(head.replay(body)).await, coalesced);
+    }
+
+    /// A malformed compression flag is refused before any byte is forwarded.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the flag is accepted or the inner service is invoked.
+    #[tokio::test]
+    async fn a_malformed_compression_flag_never_reaches_the_codec() {
+        let admission = BifrostTransportAdmission::for_tests();
+        let invoked = Arc::new(AtomicBool::new(false));
+        let probe = AdmissionProbe {
+            invoked: Arc::clone(&invoked),
+            observed_bytes: Arc::new(AtomicUsize::new(0)),
+            admission: admission.clone(),
+        };
+        let mut malformed = vec![9_u8];
+        malformed.extend_from_slice(&4_u32.to_be_bytes());
+        let service = GrpcTransportAdmissionService::new(probe, admission.clone());
+
+        let response = service
+            .oneshot(Request::new(chunked_body(vec![malformed])))
+            .await
+            .expect("infallible refusal response");
+
+        assert_eq!(
+            response
+                .headers()
+                .get("grpc-status")
+                .and_then(|value| value.to_str().ok()),
+            Some("3")
+        );
+        assert!(!invoked.load(Ordering::Acquire));
+        assert_eq!(admission.used_bytes(), 0);
+    }
+
+    /// A compressed first frame declares a compressed length, so it is unknown.
+    ///
+    /// Admitting it against its declared length would lease less capacity than
+    /// the decompressed message occupies.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a compressed frame is bounded by its compressed length.
+    #[tokio::test]
+    async fn a_compressed_first_frame_is_bounded_as_unknown() {
+        let mut compressed = vec![1_u8];
+        compressed.extend_from_slice(&4_u32.to_be_bytes());
+        let mut body = chunked_body(vec![compressed]);
+
+        let head = GrpcFirstFrame::read(&mut body)
+            .await
+            .expect("test body never errors");
+
+        assert_eq!(head.declared(), Ok(None));
+    }
+
+    /// An empty body has no header to read and is admitted as unknown.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an empty body is treated as a declared length.
+    #[tokio::test]
+    async fn an_empty_body_declares_nothing() {
+        let mut body = Body::empty();
+
+        let head = GrpcFirstFrame::read(&mut body)
+            .await
+            .expect("test body never errors");
+
+        assert_eq!(head.declared(), Ok(None));
     }
 
     /// Actual gRPC frame length admits the exact cap and refuses one byte over.

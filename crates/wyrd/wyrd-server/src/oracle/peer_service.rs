@@ -291,7 +291,7 @@ fn peer_authority_violation(principal: &Principal) -> Option<BifrostSecurityViol
     }
     (!principal
         .effective_permissions
-        .contains(&Permission::bifrost_oracle_peer_invoke()))
+        .contains(&Permission::bifrost_peer_invoke()))
     .then_some(BifrostSecurityViolationKind::PeerAudience)
 }
 
@@ -563,7 +563,7 @@ mod tests {
             peer_authority_violation(&principal(
                 PrincipalKind::User,
                 wyrd_spec::DataTenantId::SYSTEM_OWNER,
-                PermissionSet::from_iter([Permission::bifrost_oracle_peer_invoke()]),
+                PermissionSet::from_iter([Permission::bifrost_peer_invoke()]),
             )),
             Some(BifrostSecurityViolationKind::PeerAudience)
         );
@@ -571,7 +571,7 @@ mod tests {
             peer_authority_violation(&principal(
                 service_kind.clone(),
                 wyrd_spec::DataTenantId::new_v7(),
-                PermissionSet::from_iter([Permission::bifrost_oracle_peer_invoke()]),
+                PermissionSet::from_iter([Permission::bifrost_peer_invoke()]),
             )),
             Some(BifrostSecurityViolationKind::PeerTenant)
         );
@@ -587,7 +587,7 @@ mod tests {
             peer_authority_violation(&principal(
                 service_kind,
                 wyrd_spec::DataTenantId::SYSTEM_OWNER,
-                PermissionSet::from_iter([Permission::bifrost_oracle_peer_invoke()]),
+                PermissionSet::from_iter([Permission::bifrost_peer_invoke()]),
             )),
             None
         );

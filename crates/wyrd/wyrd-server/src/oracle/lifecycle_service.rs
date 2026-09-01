@@ -84,7 +84,7 @@ impl OracleLifecycleGrpc {
             && matches!(authenticated.kind, PrincipalKind::Service { .. })
             && authenticated
                 .effective_permissions
-                .contains(&Permission::bifrost_oracle_peer_invoke());
+                .contains(&Permission::bifrost_peer_invoke());
         (tenant_self || platform_peer)
             .then_some(())
             .ok_or_else(|| Status::not_found("Oracle lifecycle is not owned locally"))
@@ -484,19 +484,19 @@ pub(crate) mod pg_tests {
         let allowed = principal(
             service_kind.clone(),
             DataTenantId::SYSTEM_OWNER,
-            PermissionSet::from_iter([Permission::bifrost_oracle_peer_invoke()]),
+            PermissionSet::from_iter([Permission::bifrost_peer_invoke()]),
         );
         assert!(OracleLifecycleGrpc::require_owner(&allowed, tenant).is_ok());
         for denied in [
             principal(
                 PrincipalKind::User,
                 DataTenantId::SYSTEM_OWNER,
-                PermissionSet::from_iter([Permission::bifrost_oracle_peer_invoke()]),
+                PermissionSet::from_iter([Permission::bifrost_peer_invoke()]),
             ),
             principal(
                 service_kind.clone(),
                 tenant,
-                PermissionSet::from_iter([Permission::bifrost_oracle_peer_invoke()]),
+                PermissionSet::from_iter([Permission::bifrost_peer_invoke()]),
             ),
             principal(
                 service_kind,

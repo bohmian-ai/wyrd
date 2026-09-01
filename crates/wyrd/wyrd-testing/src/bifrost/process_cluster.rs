@@ -188,6 +188,8 @@ pub enum ControlRequest {
     },
     /// Re-read the shared membership snapshot into this child's Oracle.
     RefreshSnapshot,
+    /// Report this child's graph-lease activations and the leases it still holds.
+    GraphLeases,
     /// Dial another pod's private peer socket and report the wire outcome.
     ///
     /// The child always presents its configured peer TLS material, so a
@@ -379,6 +381,13 @@ pub enum ControlResponse {
     Ingested,
     /// Answer to [`ControlRequest::RefreshSnapshot`].
     Refreshed,
+    /// Answer to [`ControlRequest::GraphLeases`].
+    GraphLeases {
+        /// Graph leases this child activated from a reservation, cumulatively.
+        activated: u64,
+        /// Graph leases this child still holds.
+        live: usize,
+    },
     /// Answer to [`ControlRequest::PeerProbe`].
     Probed {
         /// Non-secret gRPC status code name the destination returned.
@@ -908,6 +917,26 @@ impl ProcessNode {
             ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
             other => Err(ProcessClusterError::Protocol(format!(
                 "expected a refresh, received {other:?}"
+            ))),
+        }
+    }
+
+    /// Reports this child's cumulative graph-lease activations and live leases.
+    ///
+    /// The pair is the exactness evidence a graph lease claims: one activation
+    /// per distributed plan on this node regardless of how many stage messages
+    /// addressed it, and zero live leases once the plan has ended.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::request`], and
+    /// [`ProcessClusterError::Child`] when the child could not report.
+    pub fn graph_leases(&mut self) -> Result<(u64, usize), ProcessClusterError> {
+        match self.request(&ControlRequest::GraphLeases)? {
+            ControlResponse::GraphLeases { activated, live } => Ok((activated, live)),
+            ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
+            other => Err(ProcessClusterError::Protocol(format!(
+                "expected graph-lease counts, received {other:?}"
             ))),
         }
     }

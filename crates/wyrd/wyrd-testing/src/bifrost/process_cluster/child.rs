@@ -129,6 +129,10 @@ async fn serve() -> Result<(), ProcessClusterError> {
                     detail: error.to_string(),
                 })?,
             },
+            ControlRequest::GraphLeases => {
+                let (activated, live) = graph_lease_counts(&server);
+                emit(&ControlResponse::GraphLeases { activated, live })?;
+            }
             ControlRequest::PeerProbe(plan) => {
                 match config
                     .peer_probe(&plan, credentials.as_ref(), &fixture)
@@ -887,6 +891,18 @@ async fn refresh_snapshot(server: &WyrdTestServer) -> Result<(), ProcessClusterE
         .refresh_snapshot()
         .await
         .map_err(|error| ProcessClusterError::Child(error.to_string()))
+}
+
+/// Reports this pod's cumulative graph-lease activations and live leases.
+///
+/// A pod that composes no Oracle owns no reservation registry and therefore
+/// reports the baseline, which is the correct answer for a Scribe: it never
+/// leases a graph.
+fn graph_lease_counts(server: &WyrdTestServer) -> (u64, usize) {
+    server
+        .state()
+        .bifrost_query()
+        .map_or((0, 0), |oracle| oracle.engine().graph_lease_counts())
 }
 
 /// Encodes `rows` deterministic `(id, filter_key)` rows as one Arrow IPC stream.

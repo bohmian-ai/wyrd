@@ -1844,6 +1844,8 @@ pub struct Oracle {
     >,
     /// Immutable membership registry retained for planning and worker selection.
     cluster: Arc<ClusterRegistry>,
+    /// Reservation owner this node's fragment and graph paths both charge against.
+    reservations: Arc<dispatcher::ReservationRegistry>,
     /// One process-local lifecycle registry shared with private controls.
     running_queries: Arc<RunningQueryRegistry>,
     /// Tenant-qualified catalog and SQL owners retained for query execution.
@@ -2317,6 +2319,7 @@ impl Oracle {
             delegated_admission,
             delegated_loss: Mutex::new(Some(loss_rx)),
             cluster,
+            reservations: Arc::clone(&config.reservations),
             running_queries,
             catalog: config.catalog,
             vala: config.vala,
@@ -2555,6 +2558,21 @@ impl Oracle {
         handle
             .lease_session(attempt, &cut, &context, work_units)
             .await
+    }
+
+    /// Reports this node's graph-lease activations and the leases it still holds.
+    ///
+    /// Integration-only observable. A distributed plan must charge one envelope
+    /// per follower no matter how many stage messages address it, and must
+    /// return to zero live leases on every terminal path; neither is visible
+    /// from outside the process any other way.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn graph_lease_counts(&self) -> (u64, usize) {
+        (
+            self.reservations.graph_leases_activated_total(),
+            self.reservations.live_graph_leases(),
+        )
     }
 
     /// Prepares the immutable local-leader participant cut before an attempt begins.
@@ -3594,6 +3612,19 @@ impl Oracle {
     /// [`Self::begin_shutdown`] has already synchronously rejected new work.
     pub async fn shutdown(&self, deadline: Instant) -> admission::OracleShutdownReport {
         self.begin_shutdown();
+        // Before the capacity report, not after. A follower graph holds this
+        // node's peer running permit through its lease, and a coordinator that
+        // is itself shutting down will never send the message that would
+        // release it — so a node that skipped this reports peer capacity still
+        // charged for work that can no longer run.
+        if let Some(analytical) = self.analytical.as_ref()
+            && let Err(error) = analytical.worker().shutdown().await
+        {
+            tracing::warn!(
+                %error,
+                "Oracle analytical follower ownership did not release during shutdown"
+            );
+        }
         let report = self.admission.shutdown(deadline).await;
         if report.active_queries != 0
             || report.queued_queries != 0

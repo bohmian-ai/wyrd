@@ -1196,6 +1196,17 @@ impl AnalyticalStageIngress {
         }
         {
             let mut graphs = self.graphs.lock().map_err(|_| poisoned_ingress())?;
+            // Released, not merely forgotten. Dropping the supervisor guard
+            // returns the envelope, but the reservation's running permit is
+            // owned by the registry's lease, and a shutdown that clears the map
+            // without releasing it leaves this node's peer capacity charged for
+            // a graph that no longer exists.
+            for graph in graphs.keys() {
+                self.reservations.release_graph(AnalyticalGraphRef {
+                    public_query_id: graph.public_query_id.as_uuid(),
+                    datafusion_query_id: graph.datafusion_query_id.as_uuid(),
+                });
+            }
             graphs.clear();
         }
         self.supervisor.shutdown().await
@@ -1266,6 +1277,90 @@ impl AnalyticalStageIngress {
         )?;
         attempts.insert(key, guard);
         Ok(())
+    }
+}
+
+/// Leader-side ownership of every participant reservation one attempt took.
+///
+/// The leader reserves a whole query envelope on each participant before it
+/// freezes the cut, and a plan does not necessarily reach every participant it
+/// froze. Something must therefore return the reservations the plan never used,
+/// or a follower holds an envelope until the reservation's own expiry — long
+/// enough for the node to refuse real work and for a shutdown to report
+/// retained resource state.
+///
+/// Releasing is idempotent: a participant that already leased its reservation
+/// into graph ownership no longer holds the pending entry and answers
+/// successfully, so this returns exactly the unused reservations without
+/// needing to know which ones the plan reached.
+pub struct AnalyticalParticipantReservations {
+    /// Directory the reservations were taken through, cleared once released.
+    transports: Option<Arc<super::dispatcher::OraclePeerTransportDirectory>>,
+    /// Each reserved participant and the exact release its reservation needs.
+    releases: Vec<(
+        super::dispatcher::DispatchCandidate,
+        wyrd_spec::vala::api::ReleaseNodeSlotsRequest,
+    )>,
+}
+
+impl fmt::Debug for AnalyticalParticipantReservations {
+    /// Reports how many reservations are outstanding without rendering them.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AnalyticalParticipantReservations")
+            .field("outstanding", &self.releases.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl AnalyticalParticipantReservations {
+    /// Returns every reserved participant to its owner, exactly once.
+    ///
+    /// A per-participant failure is logged rather than propagated: the attempt
+    /// is already ending, the reservation expires on its own, and failing the
+    /// terminal because one peer was unreachable would turn a completed query
+    /// into an error.
+    async fn release(&mut self) {
+        let Some(transports) = self.transports.take() else {
+            return;
+        };
+        for (candidate, request) in self.releases.drain(..) {
+            if let Err(error) = transports
+                .release_graph_reservation(&candidate, request)
+                .await
+            {
+                tracing::warn!(
+                    error = ?error,
+                    node_id = %candidate.node_id.as_uuid(),
+                    "Oracle analytical leader could not release a participant reservation"
+                );
+            }
+        }
+    }
+}
+
+impl Drop for AnalyticalParticipantReservations {
+    /// Returns any reservation an unsettled attempt still holds.
+    ///
+    /// The settled path releases inline and leaves nothing to do here. This
+    /// covers the attempt that was dropped instead — a panic, an early return,
+    /// a caller that abandoned the session — where the alternative is holding a
+    /// follower's envelope until its reservation expires.
+    fn drop(&mut self) {
+        if self.transports.is_none() {
+            return;
+        }
+        let mut outstanding = Self {
+            transports: self.transports.take(),
+            releases: std::mem::take(&mut self.releases),
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(
+                "Oracle analytical leader dropped participant reservations outside a runtime"
+            );
+            return;
+        };
+        handle.spawn(async move { outstanding.release().await });
     }
 }
 
@@ -2250,7 +2345,7 @@ impl AnalyticalExecutionHandle {
         // Reserved before anything is admitted locally. A participant that
         // declines must fail the attempt while the leader still owns nothing,
         // not after it has charged its own envelope and registered a graph.
-        let destinations = self.reserve_destinations(cut, graph).await?;
+        let (destinations, participants) = self.reserve_destinations(cut, graph).await?;
         let resources = self
             .oracle_resources
             .try_acquire_query(OracleResourceRequest::for_class(
@@ -2299,6 +2394,7 @@ impl AnalyticalExecutionHandle {
             AnalyticalAttemptOwnership {
                 graph: graph_guard,
                 attempt: attempt_guard,
+                participants,
             },
         ))
     }
@@ -2422,14 +2518,26 @@ impl AnalyticalExecutionHandle {
         &self,
         cut: &OracleQueryAttemptCut,
         graph: AnalyticalGraphKey,
-    ) -> Result<HashMap<Url, AnalyticalDestination>, BifrostError> {
+    ) -> Result<
+        (
+            HashMap<Url, AnalyticalDestination>,
+            AnalyticalParticipantReservations,
+        ),
+        BifrostError,
+    > {
         let remote = cut
             .oracles()
             .iter()
             .filter(|participant| participant.node_id != self.config.node_id)
             .collect::<Vec<_>>();
         if remote.is_empty() {
-            return Ok(HashMap::new());
+            return Ok((
+                HashMap::new(),
+                AnalyticalParticipantReservations {
+                    transports: None,
+                    releases: Vec::new(),
+                },
+            ));
         }
         let Some(transports) = self.peer_transports.as_ref() else {
             return Err(BifrostError::Internal {
@@ -2450,6 +2558,13 @@ impl AnalyticalExecutionHandle {
             }),
         };
         let mut destinations = HashMap::with_capacity(remote.len());
+        // Held from the first successful reservation, so a later participant's
+        // refusal still returns everything already taken rather than stranding
+        // the peers that said yes.
+        let mut reserved = AnalyticalParticipantReservations {
+            transports: Some(Arc::clone(transports)),
+            releases: Vec::with_capacity(remote.len()),
+        };
         for participant in remote {
             let url =
                 Url::parse(&participant.endpoint).map_err(|error| BifrostError::Internal {
@@ -2467,6 +2582,15 @@ impl AnalyticalExecutionHandle {
                 .reserve_graph(&candidate, request.clone())
                 .await
                 .map_err(|_| BifrostError::QueryAdmissionRejected)?;
+            reserved.releases.push((
+                candidate,
+                wyrd_spec::vala::api::ReleaseNodeSlotsRequest {
+                    reservation_id: pending.reservation_id,
+                    query_id: request.query_id,
+                    leader_node_id: request.leader_node_id,
+                    leader_fencing_token: request.leader_fencing_token,
+                },
+            ));
             destinations.insert(
                 url,
                 AnalyticalDestination {
@@ -2476,7 +2600,7 @@ impl AnalyticalExecutionHandle {
                 },
             );
         }
-        Ok(destinations)
+        Ok((destinations, reserved))
     }
 }
 
@@ -2536,6 +2660,12 @@ pub struct AnalyticalAttemptOwnership {
     pub attempt: AnalyticalAttemptGuard,
     /// Graph ownership retained for as long as stages may be addressed.
     pub graph: AnalyticalGraphGuard,
+    /// Participant reservations this leader must return when the attempt ends.
+    ///
+    /// Declared last so it releases after the local guards: a participant is
+    /// told to drop the reservation only once this node has stopped addressing
+    /// it.
+    pub participants: AnalyticalParticipantReservations,
 }
 
 impl AnalyticalAttemptOwnership {
@@ -2598,7 +2728,14 @@ impl AnalyticalAttemptOwnership {
                     .to_owned(),
             });
         };
-        let Self { attempt, graph } = self;
+        // The retry reuses the graph and, with it, every participant
+        // reservation the first attempt took. Re-reserving would charge each
+        // follower a second envelope for a plan it is already holding one for.
+        let Self {
+            attempt,
+            graph,
+            participants,
+        } = self;
         let supervisor = attempt.supervisor();
         attempt.finish(AnalyticalAttemptOutcome::Retried).await?;
         let attempt = supervisor.spawn_attempt(
@@ -2611,7 +2748,11 @@ impl AnalyticalAttemptOwnership {
             ),
             grant,
         )?;
-        Ok(Self { attempt, graph })
+        Ok(Self {
+            attempt,
+            graph,
+            participants,
+        })
     }
 
     /// Settles the attempt and then releases its graph, in that order.
@@ -2632,9 +2773,14 @@ impl AnalyticalAttemptOwnership {
         self,
         outcome: AnalyticalAttemptOutcome,
     ) -> Result<AnalyticalAttemptRelease, BifrostError> {
-        let Self { attempt, graph } = self;
+        let Self {
+            attempt,
+            graph,
+            mut participants,
+        } = self;
         let release = attempt.finish(outcome).await?;
         graph.release()?;
+        participants.release().await;
         Ok(release)
     }
 }

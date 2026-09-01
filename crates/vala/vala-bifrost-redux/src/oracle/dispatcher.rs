@@ -2854,6 +2854,24 @@ impl OraclePeerTransportDirectory {
         }
     }
 
+    /// Releases one graph reservation this node took on a participant.
+    ///
+    /// Idempotent by construction: a participant that has already leased the
+    /// reservation into graph ownership no longer holds the pending entry and
+    /// answers successfully, which is what lets a leader release every
+    /// participant it reserved without knowing which ones the plan reached.
+    ///
+    /// # Errors
+    ///
+    /// Returns the selected adapter's retryable or terminal failure.
+    pub async fn release_graph_reservation(
+        &self,
+        candidate: &DispatchCandidate,
+        request: ReleaseNodeSlotsRequest,
+    ) -> Result<(), DispatchError> {
+        self.release(candidate, request).await
+    }
+
     /// Releases through the same identity-selected adapter used for reserve.
     ///
     /// # Errors

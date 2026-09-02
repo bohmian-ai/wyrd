@@ -161,3 +161,9 @@ pnpm check
 ```
 
 For visual work, inspect both light and dark behavior when theme support exists. Check that text fits, controls are reachable, and brutalist geometry is intact.
+
+## Handoff
+
+Report only the visible outcome, changed route or component, verification
+status, and any material limitation. Do not narrate implementation steps or
+repeat details visible in the diff.

@@ -184,7 +184,8 @@ consumer closure, and cross-scenario closure. Explicitly ask what decisions an
 implementer would still need to make; any plan-level answer requires further
 planning.
 
-Return `TASKS_PROPOSED`, `PLAN_BLOCKED`, or `SPEC_REVISION_REQUIRED`. Recommend
-`$wyrd-task-readiness` for an independent pre-implementation review. Planning
-does not implement, approve a task candidate, merge, revise the spec, or issue
-its own readiness verdict.
+Return `TASKS_PROPOSED`, `PLAN_BLOCKED`, or `SPEC_REVISION_REQUIRED`, followed
+only by task paths and any decision or blocker requiring attention. Do not
+repeat task contents in chat. Recommend `$wyrd-task-readiness` for an
+independent pre-implementation review. Planning does not implement, approve a
+task candidate, merge, revise the spec, or issue its own readiness verdict.

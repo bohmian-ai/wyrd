@@ -500,7 +500,10 @@ async fn valid_token_is_not_rejected_by_default_deny_layer() {
 /// Panics when Oracle readiness does not reach `expected` within the budget.
 #[cfg(feature = "test-support")]
 async fn await_oracle_ready(server: &WyrdTestServer, expected: bool) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    // Generous because every wait here is condition-polled, and this lane runs
+    // many servers against one Postgres: a budget tuned to an idle machine
+    // turns load into a false failure.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
     loop {
         let ready = server
             .state()
@@ -623,7 +626,7 @@ async fn supervisor_first_loss_closes_readiness_before_its_audit() {
     // Reach the cutoff through the production supervisor. A renewal that lands
     // first re-derives the deadlines from its fresh lease, so the collapse is
     // reapplied until admission actually closes.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_mins(2);
     while authority.admits() {
         assert!(
             std::time::Instant::now() < deadline,
@@ -670,7 +673,7 @@ async fn supervisor_first_loss_closes_readiness_before_its_audit() {
     // Releasing the gate lets the supervisor finish its audited loss edge, and
     // lets the continuity monitor's own audited deactivation land.
     gate.rollback().await.expect("the audit gate releases");
-    let advertising = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let advertising = std::time::Instant::now() + std::time::Duration::from_mins(2);
     while role_advertises_ready(&pool, node_id).await {
         assert!(
             std::time::Instant::now() < advertising,

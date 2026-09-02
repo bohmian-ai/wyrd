@@ -62,12 +62,10 @@ Remediation and task repair route to `$wyrd-plan`. Spec revisions route to
 ## Verdict and output
 
 Return `APPROVE`, `REMEDIATE`, `SPEC_REVISION_REQUIRED`, or `BLOCKED`. Lead with
-the verdict and findings. Then provide reviewed commit and authority identities,
-impact coverage, the complete requirement-to-evidence matrix, task-review
-closure, verification limits, merge readiness, and a completion payload with
-the durable intent, shipped behavior, lasting invariants and constraints,
-material decisions and rationale, revisions or deviations, evidence summary,
-delivery references, and current authority links.
+the verdict, then list only validated findings and verification limits. Build
+the complete requirement-to-evidence matrix and completion payload for the
+workflow, but do not dump them into the user-facing response or repeat the
+active packet. Pass them directly to `$wyrd-complete` on approval.
 
 `REMEDIATE` routes to `$wyrd-plan`; `SPEC_REVISION_REQUIRED` routes to
 `$wyrd-spec`; `BLOCKED` stops. `APPROVE` is not a stopping point: immediately

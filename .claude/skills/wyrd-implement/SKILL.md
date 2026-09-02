@@ -126,9 +126,10 @@ scenario's expected RED failure, GREEN result, any refactor, broader
 verification, command corrections, and material limitations.
 
 Return `COMPLETE`, `TASK_REVISION_REQUIRED`, `SPEC_REVISION_REQUIRED`, or
-`BLOCKED`, followed by the implemented outcome or exact blocker, changed
-owners, spec-obligation evidence trace, exact commands and results, bounded
-corrections, risks, and diff or commit reference.
+`BLOCKED`. Keep the user-facing handoff to the outcome or exact blocker, task
+path, verification status, material risk, and diff or commit reference. Do not
+repeat the spec trace, changed-owner inventory, or exact command log already
+recorded in the task evidence.
 
 Create a commit only when requested. Implementation completion does not approve
 the task, merge it, or authorize deployment; route the immutable cumulative

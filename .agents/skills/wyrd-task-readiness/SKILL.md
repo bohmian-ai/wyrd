@@ -112,11 +112,10 @@ simplest concrete task correction supported by that evidence. The correction
 must preserve the approved spec, follow the current architecture's ownership
 and dependency direction, and prefer the uniquely applicable existing
 repository shape. It must resolve the choice with an actual educated decision
-rather than delegate discovery to implementation.
+rather than delegate discovery to implementation. Follow KISS, YAGNI, and DRY principles.
 
 Return one verdict: `READY`, `REVISE_TASKS`, `SPEC_REVISION_REQUIRED`, or
-`BLOCKED`. Lead with the verdict, summarize the nine axes, and list only
-blocking findings. For `READY`, state `No blocking readiness findings` and
-confirm that the independently reconstructed decision ledger contains no open
-plan-level choice. This review does not edit the active packet, implement code,
+`BLOCKED`, then list only blocking findings. For `READY`, state
+`No blocking readiness findings`; do not summarize passing axes or repeat the
+task packet. This review does not edit the active packet, implement code,
 approve an implementation candidate, or authorize task branches.

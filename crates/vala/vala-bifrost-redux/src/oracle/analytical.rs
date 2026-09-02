@@ -1774,6 +1774,27 @@ impl AnalyticalStageIngress {
         }
     }
 
+    /// Returns the published lease for one graph, for identity assertions.
+    ///
+    /// Test-only. Exactly-once activation is only observable by comparing the
+    /// owner two callers received, and that owner is deliberately not part of
+    /// the production surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when the graph lock is poisoned.
+    #[cfg(test)]
+    fn published(&self, graph: AnalyticalGraphKey) -> Result<Arc<GraphLease>, BifrostError> {
+        let graphs = self.graphs.lock().map_err(|_| poisoned_ingress())?;
+        match graphs.get(&graph) {
+            Some(
+                AnalyticalGraphEntry::Active { lease, .. }
+                | AnalyticalGraphEntry::Draining { lease, .. },
+            ) => Ok(Arc::clone(lease)),
+            None => Err(BifrostError::QueryExecutionFailed),
+        }
+    }
+
     /// Reports what this follower still owns without releasing any of it.
     ///
     /// # Errors
@@ -2950,6 +2971,126 @@ mod tests {
                 .authorize_stage_message(message.operation, &headers, body, now)
                 .await
         }
+    }
+
+
+    /// A graph activates exactly once, whichever authorized message arrives first.
+    ///
+    /// Upstream sends its plan on a spawned coordinator-channel task, so
+    /// `SetPlan` and `ExecuteTask` legitimately arrive in either order, and two
+    /// equivalent messages can race. All three must converge on one activation:
+    /// one envelope charge, one supervisor registration, and the identical
+    /// owner handed to every caller. A message that names the same graph under a
+    /// different reservation is refused immediately rather than activating a
+    /// competing one.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a graph is activated more than once, when two callers receive
+    /// different owners, or when a mismatched reservation is admitted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graph_lease_activation_is_order_independent_and_shared() {
+        for (first, second) in [
+            (StageOperationV1::SetPlan, StageOperationV1::ExecuteTask),
+            (StageOperationV1::ExecuteTask, StageOperationV1::SetPlan),
+        ] {
+            let now = Utc::now();
+            let fixture = GraphFixture::new(now);
+            fixture
+                .send(&fixture.leader_message(first, 1), now)
+                .await
+                .expect("the first authorized message activates the graph");
+            let activated = fixture
+                .ingress
+                .published(fixture.graph)
+                .expect("activation published exactly one owner");
+            fixture
+                .send(&fixture.leader_message(second, 2), now)
+                .await
+                .expect("the second authorized message reuses the same graph");
+            assert!(
+                Arc::ptr_eq(
+                    &activated,
+                    &fixture
+                        .ingress
+                        .published(fixture.graph)
+                        .expect("the graph is still published")
+                ),
+                "both orderings share the identical graph owner"
+            );
+            assert_eq!(
+                fixture.reservations.graph_leases_activated_total(),
+                1,
+                "the follower charged the reserved envelope exactly once"
+            );
+            assert_eq!(
+                fixture
+                    .supervisor
+                    .live_graphs()
+                    .expect("graphs are readable"),
+                1,
+                "the graph registered with the node supervisor exactly once"
+            );
+        }
+
+        // Two equivalent messages released together from separate tasks. The
+        // barrier is the synchronization point, so the race is deterministic
+        // rather than timing-dependent.
+        let now = Utc::now();
+        let fixture = Arc::new(GraphFixture::new(now));
+        let gate = Arc::new(tokio::sync::Barrier::new(2));
+        let racers = (1u8..=2)
+            .map(|nonce| {
+                let fixture = Arc::clone(&fixture);
+                let gate = Arc::clone(&gate);
+                tokio::spawn(async move {
+                    let message = fixture.leader_message(StageOperationV1::SetPlan, nonce);
+                    gate.wait().await;
+                    fixture.send(&message, now).await.map(|_| ())
+                })
+            })
+            .collect::<Vec<_>>();
+        for racer in racers {
+            racer
+                .await
+                .expect("a racing sender must not panic")
+                .expect("a concurrent duplicate reuses the activated graph");
+        }
+        assert_eq!(
+            fixture.reservations.graph_leases_activated_total(),
+            1,
+            "a concurrent duplicate did not charge a second envelope"
+        );
+        assert_eq!(
+            fixture
+                .supervisor
+                .live_graphs()
+                .expect("graphs are readable"),
+            1,
+            "a concurrent duplicate did not register a second graph"
+        );
+
+        // A different reservation for the same graph is not a duplicate; it is a
+        // competing owner, and it is refused before anything is decoded.
+        let mut mismatched = fixture.leader_message(StageOperationV1::ExecuteTask, 3);
+        mismatched.reservation_id = Uuid::from_u128(77).to_string();
+        assert!(
+            matches!(
+                fixture.send(&mismatched, now).await,
+                Err(BifrostError::QueryPeerSecurity)
+            ),
+            "a message naming a different reservation for a live graph is refused"
+        );
+        assert_eq!(
+            fixture.reservations.graph_leases_activated_total(),
+            1,
+            "the refusal did not activate a competing graph"
+        );
+        assert_eq!(
+            fixture.resolutions.load(Ordering::SeqCst),
+            0,
+            "no refusal reached a provider"
+        );
     }
 
     /// A live graph lease retains its exact reservation and first-ticket authority.

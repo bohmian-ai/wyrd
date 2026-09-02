@@ -11323,7 +11323,6 @@ dependencies = [
  "wyrd-auth-issue",
  "wyrd-auth-oidc",
  "wyrd-auth-verify",
- "wyrd-bench",
  "wyrd-client",
  "wyrd-crypt",
  "wyrd-dev-fixtures",

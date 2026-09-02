@@ -18,9 +18,10 @@ frozen_candidate: f1ac4cb01fe9ddda0a133cb58c955bab1e1cf7df
 
 ## Outcome and value
 
-The inactive Analytical engine correctly executes the approved minimal
-cross-process baseline using the pinned DataFusion universe and produces real,
-bounded production evidence. A three-Oracle/one-Scribe journey proves remote
+The inactive Analytical engine correctly executes the minimal cross-process
+baseline admitted by Task 2's closed predicate using the pinned DataFusion
+universe and produces real, bounded production evidence. A
+three-Oracle/one-Scribe journey proves remote
 filtered/projected scans, multi-input equi-join, approved grouping, streamed
 exchange, one DataFusion spill, exact results, joined cleanup, and private peer
 topology. This task does not broaden compatibility or activate public routing.
@@ -29,19 +30,20 @@ Required execution skill: `$wyrd-implement`.
 
 ## Current-state amendment
 
-Retain the current codec, analytical scan, distributed executor, participant
-cut, mTLS transport, process-cluster harness, and existing partial physical
-journeys. Replace the follower join rejection and any synthetic/manual spill or
-test-only telemetry evidence. Remove the old one/two/three/six-replica matrix;
-use the smallest topology that produces two remote followers and a real network
-stage.
+Retain Task 2's closed supported-plan predicate and the current codec,
+analytical scan, distributed executor, participant cut, mTLS transport,
+process-cluster harness, and existing partial physical journeys. Replace the
+follower join rejection and any synthetic/manual spill or test-only telemetry
+evidence. Remove the old one/two/three/six-replica matrix; use the smallest
+topology that produces two remote followers and a real network stage.
 
 ## Owners, scope, consumers, and non-goals
 
-Owners are `oracle/splitter.rs`, `exec.rs`, `analytical_scan.rs`, `codec.rs`,
-the existing DataFusion distributed planner/worker adapter, `oracle/telemetry.rs`,
-`resources.rs`, `spill.rs`, and `wyrd-testing`'s Oracle process-cluster journey.
-Task 4 consumes only the qualified handle and closed supported-plan predicate.
+Owners are `exec.rs`, `analytical_scan.rs`, `codec.rs`, the existing DataFusion
+distributed planner/worker adapter, `oracle/telemetry.rs`, `resources.rs`,
+`spill.rs`, and `wyrd-testing`'s Oracle process-cluster journey. This task
+consumes Task 2's closed supported-plan predicate without modifying it. Task 4
+consumes the qualified handle and Task 2 predicate.
 
 Do not add windows, correlated subqueries, deduplicating sets, UDAFs, additional
 join families, a custom shuffle, a second optimizer, a dependency patch, or
@@ -49,45 +51,7 @@ production activation.
 
 ## Ordered implementation scenarios
 
-### Scenario 1 — Closed supported physical-plan predicate
-
-**Behavior.** Only filtered/projected scans, grouped
-`COUNT`/`SUM`/`MIN`/`MAX`, multi-input equi-join supported by the existing
-splitter, streamed network exchange, and the selected spill-capable operator
-qualify. Unsupported semantics fail the predicate without IO; dependency
-structural nodes required to carry those semantics remain accepted. Maps
-REQ-003, INV-007, INV-008, AC-002, AC-008.
-
-**RED.** Add
-`oracle::exec::tests::supported_analytical_plan_accepts_only_the_v1_baseline`.
-Construct positive and one-semantic-mutation negative physical trees, including
-missing exchange, non-equi join, unsupported aggregate function/mode/state, and
-an unknown semantic operator. Include the existing UTF-8 `filter_key` grouping
-journey as a positive case. Exact:
-
-```bash
-mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib --features test-support,bench-support -E 'test(=oracle::exec::tests::supported_analytical_plan_accepts_only_the_v1_baseline)'
-```
-
-**GREEN.** Tighten the existing synchronous
-`splitter::validate_supported` recursion around semantic capability instead of
-replacing it with a concrete-node whitelist. Validate scan/filter/projection,
-the splitter's supported equi-join forms, `COUNT`/`SUM`/`MIN`/`MAX` aggregate
-expressions and the partial/final modes actually emitted by the pinned planner,
-the real distributed exchange boundary, and `SortExec` for the qualified spill
-case. Recurse through the existing DataFusion/Wyrd structural wrappers used by
-those valid plans without treating their concrete names as new product
-operators. Reject non-equi joins, unsupported aggregate functions/modes/states,
-windows, unknown semantic leaves, and plans without a real network boundary
-before dispatch. Return a typed support result consumed later by Task 4 without
-duplicating logical optimization or estimating new routing facts.
-
-**REFACTOR.** Keep validation pure and closed over semantic capabilities while
-allowing pinned dependency structure to evolve within the already-qualified
-plan shapes. Operator execution remains owned by DataFusion and existing Wyrd
-adapters.
-
-### Scenario 2 — Correct remote join and grouped aggregation
+### Scenario 1 — Correct remote join and grouped aggregation
 
 **Behavior.** Distinct Oracle processes execute remote pushdown, equi-join, and
 partial/final fixed-width aggregation, producing the trusted local result.
@@ -112,7 +76,7 @@ or user result at the coordinator.
 **REFACTOR.** Shared physical decoding stays in the existing codec/executor
 owners; do not build a second follower SQL planner.
 
-### Scenario 3 — Real DataFusion spill and cleanup
+### Scenario 2 — Real DataFusion spill and cleanup
 
 **Behavior.** A real spill-capable DataFusion operator spills through the
 admitted query scratch allocation, produces the complete correct result from
@@ -140,7 +104,7 @@ Success waits for scratch cleanup verification; exhaustion is a failed terminal.
 **REFACTOR.** Test support may size inputs/capacity but cannot emit production
 spill events or touch spill files directly.
 
-### Scenario 4 — Physical telemetry and zero ownership
+### Scenario 3 — Physical telemetry and zero ownership
 
 **Behavior.** The physical journey observes bounded production metrics for
 actual fan-out, memory current/peak, exchange, and spill; all physical
@@ -166,7 +130,7 @@ trace fields, never labels. Remove retry series.
 **REFACTOR.** Do not add a telemetry registry, exporter, polling owner, or
 test-only production hook.
 
-### Scenario 5 — Private interchangeable process topology
+### Scenario 4 — Private interchangeable process topology
 
 **Behavior.** The same Oracle process shape coordinates and follows; worker and
 lifecycle services exist only on the private authenticated listener and join at
@@ -174,7 +138,7 @@ shutdown. Maps REQ-009, AC-005, AC-008.
 
 **RED.** Extend the physical journey to probe public/private listeners and swap
 the coordinating Oracle; assert both can coordinate/follow and public probes
-cannot reach peer services. The named tests in Scenarios 2–4 carry this proof.
+cannot reach peer services. The named tests in Scenarios 1–3 carry this proof.
 
 **GREEN.** Wire no new listener. Close only missing server target/readiness/
 shutdown composition through existing `BifrostTarget::serves_peer`,
@@ -204,7 +168,6 @@ git diff --check
 
 ## Completion evidence
 
-- Supported/unsupported physical-tree mutation ledger.
 - Child process/node/fence scan and exchange evidence plus exact result parity.
 - Positive DataFusion spill count/bytes/rows, complete result parity, and
   verified scratch cleanup.

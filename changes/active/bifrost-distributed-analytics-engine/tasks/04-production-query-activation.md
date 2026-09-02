@@ -92,10 +92,11 @@ or persisted query-path row.
 ### Scenario 2 — Conservative request-local selection
 
 **Behavior.** Interactive is default. Existing classification nominates an
-Analytical candidate; Task 3's supported physical plan plus real exchange and
-successful Analytical admission irreversibly select it. Unsupported shape,
-safe planning failure, or no exchange falls back before selection only. Maps
-REQ-002, REQ-003, INV-001, INV-008, AC-002, AC-003, AC-008.
+Analytical candidate; Task 2's supported physical-plan result plus a real
+exchange, Task 3's physical qualification, and successful Analytical admission
+irreversibly select it. Unsupported shape, safe planning failure, or no exchange
+falls back before selection only. Maps REQ-002, REQ-003, INV-001, INV-008,
+AC-002, AC-003, AC-008.
 
 **RED.** Add
 `oracle::tests::analytical_selection_requires_supported_physical_exchange`.
@@ -108,7 +109,7 @@ mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib --features t
 ```
 
 **GREEN.** Keep the request-local selected path initialized to `Interactive`.
-Use `PlannedSqlCut`'s existing classification inputs and Task 3's pure validator
+Use `PlannedSqlCut`'s existing classification inputs and Task 2's pure validator
 to prepare a candidate. Replace the selected value with `Analytical` exactly
 once, only after the physical plan is supported, contains a real exchange, and
 Analytical admission succeeds. Planning/support/no-exchange errors may continue

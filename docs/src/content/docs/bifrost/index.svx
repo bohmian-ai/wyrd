@@ -17,7 +17,7 @@ Bifrost is the Wyrd OLAP warehouse. It persists every Vala observation through a
 - **Understand Bifrost:** read the [architecture](./architecture) and the
   [Forge system overview](./forge).
 - **Maintain Bifrost:** use [data-plane internals](./data-plane-internals),
-  [schema](./schema), and [SLOs](./slos) as the operational reference.
+  and [schema](./schema) as the operational reference.
 
 ## What it is
 
@@ -124,5 +124,4 @@ The `POST /v1/observations/query` endpoint accepts raw SQL against the same tabl
 - [Schema](./schema): the pre-declared tables and their physical schemas
 - [Writing data](./writing-data): `vala-sdk` producer, batching, governance
 - [Reading data](./reading-data): typed methods, pagination, permissions, generic SQL
-- [SLOs](./slos): performance targets
 - [Data plane internals](./data-plane-internals): WAL and seal state machine, `vala.file_list`, Forge tick, audit data, database privilege model

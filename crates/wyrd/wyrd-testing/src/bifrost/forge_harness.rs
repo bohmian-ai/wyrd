@@ -105,9 +105,9 @@ pub struct ForgeFixture {
     pub tenant: DataTenantId,
     /// Real Scribe owner every durable fixture append and seal runs through.
     ///
-    /// `None` only for the benchmark-only synthetic fixture built by
+    /// `None` only for the synthetic owner-level fixture built by
     /// [`StandaloneForgeFixture`], which stands up no Scribe at all. Every
-    /// correctness fixture carries one, and [`ForgeFixture::scribe`] refuses
+    /// journey fixture carries one, and [`ForgeFixture::scribe`] refuses
     /// rather than silently falling back to a fabricated durable row.
     scribe: Option<Arc<ScribeImpl>>,
     /// Catalog owner retained so incremental appends can resolve the live
@@ -118,7 +118,7 @@ pub struct ForgeFixture {
 /// Real dependency graph shared by both Forge fixture seeders.
 ///
 /// Deliberately carries no Scribe handle: the Scribe-backed seeder takes one as
-/// an explicit argument so a correctness caller cannot reach the benchmark-only
+/// an explicit argument so a journey caller cannot reach the synthetic
 /// synthetic seeder by leaving an option unset.
 #[derive(Clone)]
 struct ForgeFixtureResources {
@@ -251,7 +251,7 @@ impl StandaloneForgeFixture {
         for index in 1..tenant_count {
             tenants.push(
                 database
-                    .seed_additional_tenant(&format!("forge-benchmark-{index}"))
+                    .seed_additional_tenant(&format!("forge-test-{index}"))
                     .await?,
             );
         }
@@ -259,7 +259,7 @@ impl StandaloneForgeFixture {
         let mut fixtures = Vec::with_capacity(tenants.len());
         for tenant in tenants {
             fixtures.push(
-                seed_synthetic_forge_group_for_bench(
+                seed_synthetic_forge_group_for_test(
                     resources.clone(),
                     tenant,
                     table_name,
@@ -1284,13 +1284,13 @@ impl ForgeFixture {
     ///
     /// # Panics
     ///
-    /// Panics for the benchmark-only synthetic fixture, which stands up no
+    /// Panics for the synthetic owner-level fixture, which stands up no
     /// Scribe. Refusing here is deliberate: a silent fallback to a fabricated
     /// durable row is exactly the failure mode the Scribe-backed seeder exists
     /// to remove.
     fn scribe(&self) -> &Arc<ScribeImpl> {
         self.scribe.as_ref().expect(
-            "this Forge fixture was built by seed_synthetic_forge_group_for_bench, which has no Scribe",
+            "this Forge fixture was built by seed_synthetic_forge_group_for_test, which has no Scribe",
         )
     }
 
@@ -1674,7 +1674,7 @@ impl ForgeFixture {
     /// # Panics
     ///
     /// Panics when `rows` is zero, when this fixture carries no Scribe owner
-    /// (the benchmark-only synthetic fixture), or when ingest or seal fails.
+    /// (the synthetic owner-level fixture), or when ingest or seal fails.
     async fn append_forge_file_for_day_with_rows(
         &self,
         sequence: i64,
@@ -2211,7 +2211,7 @@ async fn seed_forge_group_with_scribe(
     }
 }
 
-/// Seed a synthetic Forge group for the Forge benchmark harness only.
+/// Seed a synthetic Forge group for isolated owner-level tests.
 ///
 /// **Third documented raw-insert exemption.** [`StandaloneForgeFixture`] stands
 /// up Postgres, storage, a catalog, and Forge without an HTTP server,
@@ -2221,20 +2221,14 @@ async fn seed_forge_group_with_scribe(
 /// tenant setup — inside a fixture whose entire purpose is to exclude that
 /// stack.
 ///
-/// That is the right split rather than a concession. Its only consumer is
-/// `bench_forge`, which measures Forge compaction throughput; routing its setup
-/// through a real Scribe would make the benchmark measure Scribe ingest as well
-/// and couple a performance number to an unrelated subsystem. And the property
-/// the Scribe-backed seeder protects — a fixture cannot describe a file
-/// production would never produce — exists to stop a *correctness* test passing
-/// against impossible state. A benchmark asserts nothing, so a synthetic seed
-/// here cannot manufacture a false green.
+/// Its consumers exercise Forge owner lifecycle behavior without bringing up
+/// Scribe. User journeys use the Scribe-backed fixture instead.
 ///
 /// # Panics
 ///
 /// Panics when `partition_days` is empty or when table creation, object
 /// encoding, or the durable fixture insert fails.
-async fn seed_synthetic_forge_group_for_bench(
+async fn seed_synthetic_forge_group_for_test(
     resources: ForgeFixtureResources,
     tenant: DataTenantId,
     table_name: &str,

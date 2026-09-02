@@ -42,19 +42,6 @@ trap 'handle_signal INT' INT
 trap 'handle_signal TERM' TERM
 
 "${compose[@]}" up --detach --wait postgres
-if [[ ${WYRD_BIFROST_REFERENCE_PROFILE:-0} == 1 ]]; then
-  readonly postgres_container="$(${compose[@]} ps -q postgres)"
-  if [[ -z $postgres_container ]]; then
-    echo "reference Postgres container identity is unavailable" >&2
-    exit 1
-  fi
-  export WYRD_BENCH_CONTAINER_CPU_NANOS="$(docker inspect --format '{{.HostConfig.NanoCpus}}' "$postgres_container")"
-  export WYRD_BENCH_CONTAINER_MEMORY_BYTES="$(docker inspect --format '{{.HostConfig.Memory}}' "$postgres_container")"
-  if [[ $WYRD_BENCH_CONTAINER_CPU_NANOS == 0 || $WYRD_BENCH_CONTAINER_MEMORY_BYTES == 0 ]]; then
-    echo "reference Postgres container must have exact CPU and memory limits" >&2
-    exit 1
-  fi
-fi
 endpoint="$(${compose[@]} port --protocol tcp postgres 5432)"
 if [[ ! $endpoint =~ ^(127\.0\.0\.1|localhost|0\.0\.0\.0):([1-9][0-9]*)$ ]]; then
   echo "Docker returned an invalid loopback Postgres endpoint: '$endpoint'" >&2
@@ -75,7 +62,6 @@ export WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD="$platform_admin_password"
 export WYRD_DATABASE_CATALOG_APP_PASSWORD="$catalog_app_password"
 export WYRD_MIGRATOR_DSN="$DATABASE_URL"
 export BIFROST_TEST_DB_URL="$DATABASE_URL"
-export WYRD_BENCH_PG_URL="$DATABASE_URL"
 
 # Journey and e2e lanes boot one WyrdTestServer per test, each retaining an
 # app pool sized for a production server (PoolConfig::app_defaults, 32). A test

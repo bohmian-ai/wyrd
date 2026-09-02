@@ -1652,7 +1652,7 @@ impl WyrdTestServer {
         .map_err(sql)
     }
 
-    /// Trip the server-owned WAL breaker for a deterministic benchmark probe.
+    /// Trip the server-owned WAL breaker for a deterministic failure probe.
     pub fn trip_bifrost_wal_disk_full_for_test(&self) -> Result<(), WyrdTestServerError> {
         self.inner
             .state
@@ -1660,7 +1660,7 @@ impl WyrdTestServer {
             .map_err(WyrdTestServerError::Start)
     }
 
-    /// Return the server-owned Scribe snapshot used by benchmark inspection.
+    /// Return the server-owned Scribe snapshot used by journey inspection.
     pub fn scribe_inspection_snapshot(
         &self,
     ) -> Result<vala_bifrost_redux::scribe::telemetry::ScribeInspectionSnapshot, WyrdTestServerError>
@@ -3322,7 +3322,7 @@ impl WyrdTestServerBuilder {
         self
     }
 
-    /// Inject a deterministic WAL sync delay for benchmark and failure tests.
+    /// Inject a deterministic WAL sync delay for failure tests.
     /// Production server construction never uses this test-builder option.
     #[must_use]
     pub fn with_wal_sync_delay(mut self, delay: Duration) -> Self {
@@ -3662,7 +3662,7 @@ impl WyrdTestServerBuilder {
             TokenVerifier::new(decoding_keys, "wyrd", resolver, verify_settings)
                 // Match production's five-second epoch cache. Immediate
                 // revocation remains covered by the focused auth test seam;
-                // benchmark requests must not force a SQL lookup per request.
+                // repeated test requests must not force a SQL lookup per request.
                 .with_revocation(Arc::new(SqlRevocationCheck::new(Arc::new(
                     runtime_wyrd.app_pool().clone(),
                 ))))

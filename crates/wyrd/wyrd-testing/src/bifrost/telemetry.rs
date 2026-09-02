@@ -887,55 +887,6 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
     },
 ];
 
-/// Every destination required by a complete benchmark evidence window.
-#[cfg(feature = "bench")]
-const COMPLETE_BINDING_IDS: &[&str] = &[
-    "gate.requests.success",
-    "gate.requests.query_success",
-    "gate.requests.rejected",
-    "gate.requests.failed",
-    "gate.requests.cancelled",
-    "gate.requests.write_cancelled",
-    "gate.bytes",
-    "gate.rows",
-    "gate.active",
-    "cleanup.scribe_ingress",
-    "cleanup.scribe_lane_active",
-    "cleanup.scribe_lane_queued",
-    "cleanup.scribe_persistence_queue",
-    "cleanup.oracle_active",
-    "cleanup.storage_active",
-    "gate.query_streams",
-    "gate.query_streams.cancelled",
-    "gate.request_duration",
-    "gate.query_stream_duration",
-    "scribe.rows",
-    "forge.backlog_peak",
-    "oracle.admission",
-    "oracle.admission_queue",
-    "oracle.tenant_pressure_peak",
-    "scribe.wal_bytes",
-    "scribe.seal_rows",
-    "forge.publications",
-    "forge.rewrite_input_files",
-    "forge.rewrite_input_bytes",
-    "forge.rewrite_output_files",
-    "forge.rewrite_output_bytes",
-    "oracle.rows",
-    "oracle.stream_bytes",
-    "oracle.logical_bytes",
-    "oracle.physical_bytes",
-    "oracle.files",
-    "oracle.partitions",
-    "oracle.queued_peak",
-    "oracle.spill_bytes",
-    "postgres.acquire",
-    "postgres.transactions",
-    "storage.duration",
-    "storage.bytes",
-    "wal.fsync",
-];
-
 /// Closed dependency destinations carried by canonical evidence.
 const DEPENDENCY_BINDING_IDS: &[&str] = &[
     "postgres.acquire",
@@ -980,7 +931,7 @@ enum EvaluatedBindingValue {
     DurationP99Micros(u64),
 }
 
-/// Canonical crate-local phase evidence shared by benchmark and journey consumers.
+/// Canonical crate-local phase evidence shared by journey consumers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ClusterPhaseTelemetryEvidence {
     /// Gate rows accepted in the sampled phase.
@@ -1075,7 +1026,7 @@ pub(crate) struct ClusterPillarTelemetryEvidence {
     pub(crate) oracle_decoded_rows: u64,
 }
 
-/// Canonical dependency observations without a dependency on benchmark reports.
+/// Canonical dependency observations for journey reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ClusterDependencyTelemetryEvidence {
     /// PostgreSQL pool-acquire p99 in microseconds when observed.
@@ -1169,27 +1120,7 @@ pub(crate) struct ClusterCleanupTelemetryEvidence {
     pub(crate) storage_active: Option<u64>,
 }
 
-impl ClusterCleanupTelemetryEvidence {
-    /// Return whether every retained cleanup value is zero.
-    #[must_use]
-    #[cfg(feature = "bench")]
-    pub(crate) fn is_clean(&self) -> bool {
-        [
-            self.gate_active,
-            self.scribe_ingress,
-            self.scribe_lane_active,
-            self.scribe_lane_queued,
-            self.scribe_persistence_queue,
-            self.oracle_in_flight,
-            self.storage_active,
-        ]
-        .into_iter()
-        .flatten()
-        .all(|value| value == 0)
-    }
-}
-
-/// One complete canonical cluster projection shared by matrix and bench consumers.
+/// One complete canonical cluster projection shared by journey consumers.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ClusterTelemetryEvidence {
     /// Exact counters required by phase-level journey reconciliation.
@@ -1210,21 +1141,6 @@ pub(crate) struct ClusterTelemetryEvidence {
 
 /// Sole owner of canonical binding evaluation and complete evidence construction.
 pub(crate) struct ClusterTelemetryProjection;
-
-#[cfg(feature = "bench")]
-impl ClusterTelemetryExpectation {
-    /// Build the complete policy used by benchmark report assembly.
-    #[must_use]
-    pub(crate) const fn complete(topology: BifrostTopology) -> Self {
-        Self {
-            topology,
-            required_binding_ids: COMPLETE_BINDING_IDS,
-            required_dependency_ids: DEPENDENCY_BINDING_IDS,
-            required_trace_operations: COMPLETE_TRACE_OPERATIONS,
-            required_clean_binding_ids: CLEANUP_BINDING_IDS,
-        }
-    }
-}
 
 /// One parsed production Prometheus sample.
 #[derive(Debug, Clone, PartialEq)]
@@ -1686,7 +1602,7 @@ impl BifrostTelemetryCapture {
                 process: initial_process,
             };
             // Forge's production reservation can cover a sub-25ms rewrite. Sample at a
-            // millisecond cadence so the benchmark's peak remains an observed exporter
+            // millisecond cadence so the test's peak remains an observed exporter
             // value rather than a coincidental final zero.
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(1));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -5613,37 +5529,6 @@ mod tests {
         );
     }
 
-    /// Complete benchmark evidence cannot omit storage latency or synthesize a p99.
-    #[cfg(feature = "bench")]
-    #[test]
-    fn complete_projection_requires_storage_latency() {
-        let family = "wyrd_storage_operation_duration_seconds";
-        let mut absent = canonical_binding_delta();
-        absent.metrics.retain(|sample| sample.family != family);
-        assert!(matches!(
-            ClusterTelemetryProjection::from_delta(
-                &absent,
-                ClusterTelemetryExpectation::complete(BifrostTopology::OnePod),
-            ),
-            Err(BifrostTelemetryReportError::InvalidBinding { ref id, .. })
-                if id == "storage.duration"
-        ));
-
-        let mut idle = canonical_binding_delta();
-        idle.metrics
-            .iter_mut()
-            .filter(|sample| sample.family == family)
-            .for_each(|sample| sample.value = 0.0);
-        assert!(matches!(
-            ClusterTelemetryProjection::from_delta(
-                &idle,
-                ClusterTelemetryExpectation::complete(BifrostTopology::OnePod),
-            ),
-            Err(BifrostTelemetryReportError::InvalidBinding { ref id, .. })
-                if id == "storage.duration"
-        ));
-    }
-
     /// Proves the bounded sampler cancellation signal terminates and joins its owner task.
     #[tokio::test]
     async fn gauge_sampler_cancellation_cleans_up_owner_task() {
@@ -7071,21 +6956,6 @@ mod tests {
         let mut delta = complete_delta();
         delta.metrics[16].value = 5.0;
         assert_projection!(delta, role_topology);
-    }
-
-    /// Reject benchmark-local derivation paths outside the production capture mapper.
-    #[test]
-    fn forge_benchmark_has_no_parallel_metric_derivation() {
-        let source = include_str!("bench_forge.rs");
-        for prohibited in [
-            "Instant::elapsed",
-            "query_latency",
-            "schedule_once",
-            "execute_one_for_test",
-        ] {
-            assert!(!source.contains(prohibited));
-        }
-        assert!(source.contains("ForgeMaintenanceTelemetryReport::from_production_delta"));
     }
 
     /// Prove replacement starts remain distinct from maximum and final concurrency.

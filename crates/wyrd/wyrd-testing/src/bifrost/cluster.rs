@@ -59,10 +59,8 @@ pub enum BifrostTopology {
 impl BifrostTopology {
     /// Return the concrete node descriptor for this named topology.
     ///
-    /// Exposed at crate scope so the fixture-driven family runners can boot the
-    /// exact mixed-pod topology their distributed ladder selects
-    /// ([`super::bench_runner::topology_for_pods`]) without re-deriving the
-    /// spec, while the enum's construction stays owned here.
+    /// Keeps topology validation and cluster construction on one canonical
+    /// descriptor.
     pub(crate) fn spec(self) -> BifrostClusterSpec {
         match self {
             Self::OnePod => BifrostClusterSpec::one_mixed(),
@@ -583,7 +581,7 @@ impl OracleTelemetryCapture {
 
     /// Return the current production Prometheus series as absolute samples.
     ///
-    /// Benchmark polling uses this while a query owns its admission and memory
+    /// Test polling uses this while a query owns its admission and memory
     /// guards so peak gauges are observed before stream cleanup returns them to
     /// zero.
     ///
@@ -845,7 +843,7 @@ pub struct WyrdTestCluster {
 enum ClusterStorageRoot {
     /// Automatically removed test-only storage.
     Temporary(tempfile::TempDir),
-    /// Persistent benchmark storage rooted at the declared absolute path.
+    /// Persistent test storage rooted at the declared absolute path.
     Dedicated(std::path::PathBuf),
 }
 
@@ -857,26 +855,6 @@ impl ClusterStorageRoot {
             Self::Dedicated(root) => root,
         }
     }
-}
-
-/// Pre-provisioned dependencies a shared-resource cluster reuses in place of
-/// booting its own fixture, storage root, and peer credentials.
-///
-/// This is the `Some` arm of the shared-resource option threaded into
-/// [`WyrdTestCluster::start_spec_with_all_options`]. When present, the start
-/// path clones these instead of starting a fresh [`PgFixture`], allocating a
-/// tempdir, or provisioning peer credentials, so serially booted family
-/// clusters share one catalog namespace and one storage tree. It is a private
-/// value moved into the start path; [`SharedRunResources`] owns the durable
-/// originals across the whole run.
-#[cfg(any(test, feature = "bench"))]
-struct SharedClusterDeps {
-    /// Shared embedded Postgres fixture both catalogs are constructed from.
-    fixture: Arc<PgFixture>,
-    /// Shared local storage root the cluster's [`StorageHandle`] is built over.
-    storage_root: PathBuf,
-    /// Shared SYSTEM_OWNER peer credentials reused instead of re-provisioning.
-    oracle_peer_credentials: Arc<dyn OraclePeerCredentials>,
 }
 
 /// Where a starting cluster sources its fixture, storage root, and peer
@@ -896,106 +874,6 @@ enum ClusterResourceSource {
         /// temporary root owned by the cluster.
         dedicated_root: Option<PathBuf>,
     },
-    /// The cluster reuses run-owned shared resources ([`SharedRunResources`]):
-    /// it clones the shared fixture, roots its storage at the shared root, and
-    /// reuses the once-provisioned peer credentials. The cluster provisions and
-    /// tears down none of them; the run owns their lifetime.
-    #[cfg(any(test, feature = "bench"))]
-    Shared(SharedClusterDeps),
-}
-
-/// Run-owned durable resources shared by every family cluster in one
-/// qualification run.
-///
-/// A qualification run boots a sequence of differently-topologized family
-/// clusters that must all observe one once-materialized dataset. Because a
-/// [`WyrdTestCluster`] otherwise starts its own embedded Postgres and builds
-/// both catalogs from it, a fresh cluster cannot see tables another cluster
-/// materialized. This handle carries the single [`PgFixture`] and the single
-/// local storage root every family cluster is built over, plus the
-/// SYSTEM_OWNER oracle peer credentials provisioned exactly once on
-/// construction.
-///
-/// The credential provisioning path issues plain inserts that are not
-/// re-runnable against a reused fixture, so [`Self::deps`] hands back a clone
-/// of the stored handle rather than re-provisioning. The fixture and storage
-/// root outlive every cluster: cluster shutdown drops only the cluster's
-/// clones (the per-cluster storage root is a non-deleting
-/// [`ClusterStorageRoot::Dedicated`]), and the run owns teardown by dropping
-/// this handle, which removes the storage tree.
-///
-/// Family clusters are booted strictly serially; concurrent clusters over one
-/// set of shared resources are out of contract.
-#[cfg(any(test, feature = "bench"))]
-pub struct SharedRunResources {
-    /// Embedded Postgres fixture every family cluster's catalogs are built from.
-    fixture: Arc<PgFixture>,
-    /// Lifetime guard owning the shared local storage root directory tree.
-    storage_root: tempfile::TempDir,
-    /// SYSTEM_OWNER peer credentials provisioned once and reused by every cluster.
-    oracle_peer_credentials: Arc<dyn OraclePeerCredentials>,
-}
-
-#[cfg(any(test, feature = "bench"))]
-impl SharedRunResources {
-    /// Provision the shared fixture, storage root, and peer credentials once.
-    ///
-    /// Starts one embedded [`PgFixture`], creates the run's dedicated local
-    /// storage root, and provisions the SYSTEM_OWNER oracle peer credentials a
-    /// single time. Data-tenant built-in role seeding is left to each cluster's
-    /// start path, which performs it with an upsert-safe operation. The
-    /// returned handle is passed by shared reference into each family cluster
-    /// start ([`WyrdTestCluster::start_spec_with_shared_resources`]) and dropped
-    /// only at run teardown.
-    ///
-    /// # Errors
-    /// Returns [`ClusterError::Resource`] when the fixture cannot start, the
-    /// storage root cannot be created, or peer credential provisioning fails.
-    pub async fn provision() -> Result<Self, ClusterError> {
-        let fixture = Arc::new(
-            PgFixture::start()
-                .await
-                .map_err(|error| ClusterError::Resource(error.to_string()))?,
-        );
-        let storage_root =
-            tempfile::tempdir().map_err(|error| ClusterError::Resource(error.to_string()))?;
-        let oracle_peer_credentials =
-            provision_oracle_peer_credentials(Arc::clone(&fixture)).await?;
-        Ok(Self {
-            fixture,
-            storage_root,
-            oracle_peer_credentials,
-        })
-    }
-
-    /// Return the shared local storage root every family cluster is built over.
-    #[must_use]
-    pub fn storage_root(&self) -> &Path {
-        self.storage_root.path()
-    }
-
-    /// Return the shared embedded Postgres fixture.
-    ///
-    /// Exposed so a test can build a catalog view over the same fixture a
-    /// family cluster used, to assert cross-cluster table visibility directly.
-    #[must_use]
-    pub fn fixture(&self) -> &Arc<PgFixture> {
-        &self.fixture
-    }
-
-    /// Clone the shared dependencies for one family cluster start.
-    ///
-    /// Returns owned clones (`Arc` clones and a path copy) so the start path
-    /// consumes them without borrowing the run handle across the cluster's
-    /// lifetime. Cloning the peer credential handle is the deliberate reuse
-    /// path: the underlying rows are provisioned once by [`Self::provision`].
-    fn deps(&self) -> SharedClusterDeps {
-        SharedClusterDeps {
-            fixture: Arc::clone(&self.fixture),
-            storage_root: self.storage_root.path().to_path_buf(),
-            oracle_peer_credentials: Arc::clone(&self.oracle_peer_credentials),
-        }
-    }
 }
 
 /// Stable read-only view of all currently running server slots.
@@ -1425,42 +1303,6 @@ impl WyrdTestCluster {
         .await
     }
 
-    /// Start a family cluster over run-owned shared resources.
-    ///
-    /// Boots `spec` reusing the shared fixture, storage root, and once-provisioned
-    /// oracle peer credentials carried by `resources`, so a differently-topologized
-    /// cluster started later in the same run observes tables an earlier cluster
-    /// materialized. The cluster owns none of the shared resources: its shutdown
-    /// drops only its clones, and the run owns teardown by dropping the
-    /// [`SharedRunResources`] handle. A Forge completion observer is installed to
-    /// match the observed dedicated-root start path the family runners otherwise
-    /// use.
-    ///
-    /// # Errors
-    /// Returns the same topology, resource, and role-supervision errors as
-    /// [`Self::start_spec_with_forge_observer_and_storage_root`].
-    #[cfg(any(test, feature = "bench"))]
-    pub async fn start_spec_with_shared_resources(
-        spec: BifrostClusterSpec,
-        resources: &SharedRunResources,
-    ) -> Result<Self, ClusterError> {
-        Self::start_spec_with_all_options(
-            spec,
-            Duration::ZERO,
-            None,
-            None,
-            false,
-            (
-                ForgeHarnessOptions {
-                    completion_observer: Some(ForgeWorkerCompletionObserver::new()),
-                    ..ForgeHarnessOptions::default()
-                },
-                ClusterResourceSource::Shared(resources.deps()),
-            ),
-        )
-        .await
-    }
-
     /// Return the canonical local-filesystem root used by the live cluster.
     #[must_use]
     pub fn storage_root(&self) -> &std::path::Path {
@@ -1647,18 +1489,8 @@ impl WyrdTestCluster {
 
     /// Build a topology with production Forge role supervision controls.
     ///
-    /// The harness tuple's [`ClusterResourceSource`] selects where the cluster
-    /// sources its fixture, storage root, and peer credentials. For
-    /// [`ClusterResourceSource::Shared`], the cluster is booted over run-owned
-    /// shared resources ([`SharedRunResources`]): it reuses that fixture instead
-    /// of starting a fresh [`PgFixture`], roots its [`StorageHandle`] at the
-    /// shared storage root so tables another cluster materialized stay visible,
-    /// and reuses the once-provisioned oracle peer credentials rather than
-    /// re-running their non-idempotent provisioning. Built-in role seeding for
-    /// the data tenant is upsert-safe and runs unconditionally. For
-    /// [`ClusterResourceSource::Owned`] the start path is byte-identical to the
-    /// pre-shared behavior: a fresh fixture, a temporary (or caller-declared
-    /// dedicated) storage root, and freshly provisioned peer credentials.
+    /// The harness tuple selects a temporary or caller-declared storage root.
+    /// The cluster owns a fresh fixture and freshly provisioned peer credentials.
     ///
     /// # Errors
     /// Returns [`ClusterError::Topology`] when the descriptor fails validation,
@@ -1684,12 +1516,6 @@ impl WyrdTestCluster {
         // `explicit_root` is the storage root to reuse (a shared or a
         // caller-declared dedicated root); `None` selects a temporary root.
         let (fixture, shared_credentials, explicit_root) = match resource_source {
-            #[cfg(any(test, feature = "bench"))]
-            ClusterResourceSource::Shared(deps) => (
-                deps.fixture,
-                Some(deps.oracle_peer_credentials),
-                Some(deps.storage_root),
-            ),
             ClusterResourceSource::Owned { dedicated_root } => {
                 let fixture = Arc::new(
                     PgFixture::start()

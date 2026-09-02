@@ -137,21 +137,6 @@ Two things the lanes deliberately do **not** do:
   the end of the lane, so there is no post-mortem SQL. Anything you need after
   the fact has to be asserted or printed during the run.
 
-## Benchmarks
-
-Benchmarks are separate from tests and are never a correctness gate.
-
-```bash
-mise run bench:bifrost:preflight         # environment sanity before a real run
-mise run bench:bifrost:smoke             # short, run locally
-mise run bench:bifrost:qualification     # full; :ingest :oracle :distributed :mixed
-mise run test:bifrost:bench-cluster      # the bench harness's own correctness test
-```
-
-`test:bifrost:bench-cluster` is a *test* of the bench harness — it proves
-cross-cluster resource visibility — and belongs in the test lanes, not with the
-benchmarks it supports.
-
 ## Writing a test
 
 Follow `AGENTS.md` §16 for style, and these two rules specifically:

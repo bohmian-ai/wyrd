@@ -412,8 +412,7 @@ async fn scribe_promotion_catalog_sql_window_preserves_exact_visibility() {
         sealed: &BTreeSet<String>,
         label: &str,
     ) {
-        let permit =
-            vala_bifrost_redux::oracle::reader_pins::ReaderIoPermit::unfenced_for_test();
+        let permit = vala_bifrost_redux::oracle::reader_pins::ReaderIoPermit::unfenced_for_test();
         let prepared = catalog
             .prepare_reader_identity(table, tenant)
             .await

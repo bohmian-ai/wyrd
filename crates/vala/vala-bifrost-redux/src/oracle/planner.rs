@@ -123,15 +123,15 @@ impl OraclePlanner {
                 ClusterCapabilities::ScribeV1(_) => None,
             })
             .sum::<f64>();
-        self.pin_and_classify(
+        self.pin_and_classify(SqlPlanInputs {
             context,
-            &request.sql,
-            &tables,
+            sql: &request.sql,
+            tables: &tables,
             deadline,
             catalog,
             authority,
             live_oracle_cpu,
-        )
+        })
         .await
     }
 
@@ -357,14 +357,17 @@ impl OraclePlanner {
     /// Returns timeout, catalog, planning, or byte-accounting failures.
     pub(super) async fn pin_and_classify(
         &self,
-        context: &AuthorizedQueryContext,
-        sql: &str,
-        tables: &[TableRef],
-        deadline: Instant,
-        catalog: &BifrostCatalog,
-        authority: Option<&Arc<OracleReaderAuthority>>,
-        live_oracle_cpu: f64,
+        inputs: SqlPlanInputs<'_>,
     ) -> Result<PlannedSqlCut, BifrostError> {
+        let SqlPlanInputs {
+            context,
+            sql,
+            tables,
+            deadline,
+            catalog,
+            authority,
+            live_oracle_cpu,
+        } = inputs;
         let planning = self.try_planning()?;
         // DEBUG, not INFO: one event per catalog pin per query is per-request
         // decision detail, not a lifecycle transition. It is the only way to
@@ -494,6 +497,28 @@ impl OraclePlanner {
             .into_optimized_plan()
             .map_err(|error| map_datafusion_error(&error))
     }
+}
+
+/// Everything one SQL retry attempt needs to pin, protect, and classify.
+///
+/// Bundled rather than passed positionally because the same seven values are
+/// threaded through ingress classification and leader planning; a struct keeps
+/// the two call sites from drifting apart silently.
+pub(super) struct SqlPlanInputs<'a> {
+    /// Authenticated tenant and request context.
+    pub(super) context: &'a AuthorizedQueryContext,
+    /// Validated read-only SQL text.
+    pub(super) sql: &'a str,
+    /// Canonical table references parsed from that SQL.
+    pub(super) tables: &'a [TableRef],
+    /// Absolute deadline covering preparation and materialization.
+    pub(super) deadline: Instant,
+    /// Tenant-qualified catalog the cuts are resolved through.
+    pub(super) catalog: &'a BifrostCatalog,
+    /// This node's reader epoch, absent on a replica with no Oracle role.
+    pub(super) authority: Option<&'a Arc<OracleReaderAuthority>>,
+    /// Live Oracle CPU used by the classification formula.
+    pub(super) live_oracle_cpu: f64,
 }
 
 /// Dependencies required to build providers for one typed immutable cut.

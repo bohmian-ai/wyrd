@@ -1583,6 +1583,28 @@ struct CutAssignments {
     scribe_assignments: HashMap<NodeId, HashMap<String, FollowerScanAssignment>>,
 }
 
+/// One distributed scan being registered with [`CutAssignments`].
+///
+/// The fields travel together for a single source class of a single table, so
+/// they are bundled rather than threaded through a wide parameter list. Every
+/// borrow lives only for the duration of the `record_scan` call.
+struct RecordedScan<'a> {
+    /// Stable identifier the follower will echo back for this scan.
+    scan_id: &'a str,
+    /// Canonical table name this scan reads from.
+    table_name: &'a str,
+    /// Tenant/table binding the follower resolves the source against.
+    binding: &'a TenantTableBinding,
+    /// Fingerprint of the schema the leader planned against.
+    schema_fingerprint: &'a str,
+    /// Full physical schema, used to build the default unpruned closure.
+    physical_schema: &'a Schema,
+    /// Files assigned to this scan, empty for live Scribe tails.
+    files: Vec<PersistedFileDescriptor>,
+    /// Signed reader cut proving the follower may open this table's snapshot.
+    reader_cut: &'a wyrd_spec::vala::api::FollowerReaderCut,
+}
+
 impl CutAssignments {
     /// Records one Oracle-side scan id and the table it reads from.
     ///
@@ -1597,16 +1619,16 @@ impl CutAssignments {
     /// this scan id's `RemoteScanExec` once the physical plan exists; a scan id
     /// with no recovered closure (e.g. pruned out of the final plan) keeps this
     /// unpruned default rather than being narrowed to an empty projection.
-    fn record_scan(
-        &mut self,
-        scan_id: &str,
-        table_name: &str,
-        binding: &TenantTableBinding,
-        schema_fingerprint: &str,
-        physical_schema: &Schema,
-        files: Vec<PersistedFileDescriptor>,
-        reader_cut: &wyrd_spec::vala::api::FollowerReaderCut,
-    ) {
+    fn record_scan(&mut self, scan: RecordedScan<'_>) {
+        let RecordedScan {
+            scan_id,
+            table_name,
+            binding,
+            schema_fingerprint,
+            physical_schema,
+            files,
+            reader_cut,
+        } = scan;
         self.oracle_assignments.insert(
             scan_id.to_owned(),
             FollowerScanAssignment {
@@ -2021,6 +2043,37 @@ impl Oracle {
         self.tail_discovery.clone()
     }
 
+    /// Acquires this process's one reader epoch for the local Oracle role.
+    ///
+    /// Separated from construction because the epoch's queue bound is derived,
+    /// not configured: every plan reserves a release before admission, so the
+    /// bound must cover every plan that can exist at once rather than only the
+    /// admitted ones.
+    ///
+    /// # Errors
+    /// Returns the acquisition, fence, or audit failure from
+    /// [`reader_pins::OracleReaderAuthority::start`].
+    async fn start_reader_authority(
+        vala: &vala_sql::ValaPostgres,
+        operator_pool: &vala_sql::OperatorPool,
+        local_role: &RegisteredRole,
+        config: OracleConfig,
+        shutdown: &CancellationToken,
+    ) -> Result<Arc<reader_pins::OracleReaderAuthority>, BifrostError> {
+        let capacity =
+            (config.interactive_slots + config.analytical_slots + config.queue_capacity) as usize;
+        reader_pins::OracleReaderAuthority::start(reader_pins::OracleReaderAuthorityConfig {
+            vala: vala.clone(),
+            operator_pool: operator_pool.clone(),
+            node_id: local_role.key.node_id.as_uuid(),
+            fencing_token: local_role.fencing_token,
+            max_concurrent_queries: capacity.max(1),
+            terminator: Arc::new(reader_pins::AbortingEpochTerminator),
+            shutdown: shutdown.clone(),
+        })
+        .await
+    }
+
     /// Constructs a retained Oracle owner from explicit dependency handles.
     ///
     /// # Errors
@@ -2084,20 +2137,14 @@ impl Oracle {
         // Every plan takes a release reservation before admission, so the
         // bound is every plan that can exist at once: the running classes plus
         // the queue behind them, never just the admitted ones.
-        let reader_capacity = (config.config.interactive_slots
-            + config.config.analytical_slots
-            + config.config.queue_capacity) as usize;
-        let reader_authority =
-            reader_pins::OracleReaderAuthority::start(reader_pins::OracleReaderAuthorityConfig {
-                vala: config.vala.clone(),
-                operator_pool: operator_pool.clone(),
-                node_id: admission.local_role.key.node_id.as_uuid(),
-                fencing_token: admission.local_role.fencing_token,
-                max_concurrent_queries: reader_capacity.max(1),
-                terminator: Arc::new(reader_pins::AbortingEpochTerminator),
-                shutdown: shutdown.clone(),
-            })
-            .await?;
+        let reader_authority = Self::start_reader_authority(
+            &config.vala,
+            &operator_pool,
+            &admission.local_role,
+            config.config,
+            &shutdown,
+        )
+        .await?;
         let fragment_dispatcher = config.peer_transports.map(|transports| {
             Arc::new(dispatcher::FragmentDispatcher::new(
                 Arc::clone(&config.peer_ticket_minter),
@@ -2412,14 +2459,33 @@ impl Oracle {
         Err(BifrostError::QueryExecutionFailed)
     }
 
-    /// Starts one query telemetry owner once across a possible stale retry.
-    fn ensure_query_telemetry(
+    /// Accepts one planned attempt's class and enters it in the local ledger.
+    ///
+    /// The planned class must equal the class the ingress admission captured;
+    /// a peer that plans a different class than it was admitted for is treated
+    /// as a security failure rather than silently re-admitted. The telemetry
+    /// owner is started once across a possible stale retry.
+    ///
+    /// # Errors
+    /// Returns [`BifrostError::QueryPeerSecurity`] when the planned class does
+    /// not match the class captured at admission.
+    fn accept_planned_class(
         &self,
-        telemetry: &mut Option<QueryTelemetryGuard>,
+        planned: &PlannedSqlCut,
+        expected: QueryClass,
         visibility: VisibilityMode,
-        class: QueryClass,
-    ) {
-        telemetry.get_or_insert_with(|| self.telemetry.start_query(visibility, class));
+        telemetry: &mut Option<QueryTelemetryGuard>,
+    ) -> Result<(), BifrostError> {
+        if planned.query_class != expected {
+            return Err(BifrostError::QueryPeerSecurity);
+        }
+        // Every attempt enters the process-local ledger here, whichever path
+        // planned it. Background publication remains separate from query
+        // execution; closing the acquisition-ordering gap is remediation work
+        // and must not add a Postgres round trip to every read.
+        telemetry
+            .get_or_insert_with(|| self.telemetry.start_query(visibility, planned.query_class));
+        Ok(())
     }
 
     /// Execute one bounded plan/admit/audit/scan attempt for a SQL query.
@@ -2482,57 +2548,44 @@ impl Oracle {
 
     async fn run_sql_attempt(
         &self,
-        input: SqlAttemptInput<'_>,
+        mut input: SqlAttemptInput<'_>,
         query_telemetry: &mut Option<QueryTelemetryGuard>,
     ) -> Result<Option<OracleQueryStream>, BifrostError> {
-        let SqlAttemptInput {
-            context,
-            request,
-            tables,
-            deadline,
-            retry_ordinal,
-            gate_lifecycle,
-            participant_cut,
-            query_class: expected_query_class,
-            prepared,
-        } = input;
-        let stale_replacement = StaleReplacementGate::before_output(retry_ordinal);
+        // Only the two owned fields are taken; every borrowed field is read
+        // through `input` so this attempt keeps one obvious source of truth.
+        let prepared = input.prepared.take();
+        let gate_lifecycle = input.gate_lifecycle.take();
+        let request = input.request;
+        let deadline = input.deadline;
+        let stale_replacement = StaleReplacementGate::before_output(input.retry_ordinal);
         let planned = self
             .attempt_plan(
                 prepared,
-                context,
+                input.context,
                 request,
-                tables,
+                input.tables,
                 deadline,
-                participant_cut,
+                input.participant_cut,
             )
             .await?;
-        if planned.query_class != expected_query_class {
-            return Err(BifrostError::QueryPeerSecurity);
-        }
-        // Every attempt enters the process-local ledger here, whichever path
-        // planned it. Background publication remains separate from query
-        // execution; closing the acquisition-ordering gap is remediation work
-        // and must not add a Postgres round trip to every read.
-        self.ensure_query_telemetry(query_telemetry, request.visibility, planned.query_class);
+        self.accept_planned_class(
+            &planned,
+            input.query_class,
+            request.visibility,
+            query_telemetry,
+        )?;
         let mut phases = AttemptPhaseTimer::started();
         let reader_io_permit = planned.reader_io_permit.clone();
         let (session, mut admitted, running_query) = self
-            .admit_and_lease_attempt(context, &planned, participant_cut, deadline, &mut phases)
-            .await?;
-        let mut drained = match self
-            .audit_and_drain_cut(CutAuditInput {
-                context,
-                request,
-                cuts: &planned.cuts,
-                query_class: planned.query_class,
-                retry_ordinal,
+            .admit_and_lease_attempt(
+                input.context,
+                &planned,
+                input.participant_cut,
                 deadline,
-                admitted: &admitted,
-                participant_cut,
-            })
-            .await
-        {
+                &mut phases,
+            )
+            .await?;
+        let mut drained = match self.audit_attempt_cut(&input, &planned, &admitted).await {
             Ok(drained) => drained,
             Err(error) => return release_error(deadline, admitted, error, "audit rejection"),
         };
@@ -2545,7 +2598,7 @@ impl Oracle {
             ReaderProtectedQueryTerminalOwner::new(planned.reader_pin, reader_io_permit);
         let (schema, batches, scan_stats, degraded_sources) = match self
             .execute_sql_cut(SqlCutInput {
-                context,
+                context: input.context,
                 sql: &request.sql,
                 logical_bytes_selected: Self::logical_selected_bytes(&planned.cuts),
                 cuts: planned.cuts,
@@ -2556,7 +2609,7 @@ impl Oracle {
                 admitted: &admitted,
                 session,
                 deadline,
-                participant_cut,
+                participant_cut: input.participant_cut,
             })
             .await
         {
@@ -2571,17 +2624,17 @@ impl Oracle {
         record_degraded_live_tail(&degraded_sources, degraded_tails);
         settle_attempt_output(
             AttemptOutput {
-                reader_protection,
                 schema,
                 batches,
                 scan_stats,
                 degraded_sources,
                 admitted,
                 running_query,
+                reader_protection,
             },
             AttemptSettlement {
                 deadline,
-                retry_ordinal,
+                retry_ordinal: input.retry_ordinal,
                 stale_replacement,
                 visibility: request.visibility,
                 freshness: request.freshness,
@@ -2742,15 +2795,15 @@ impl Oracle {
     ) -> Result<PlannedSqlCut, BifrostError> {
         let planned = self
             .planner
-            .pin_and_classify(
+            .pin_and_classify(planner::SqlPlanInputs {
                 context,
                 sql,
                 tables,
                 deadline,
-                &self.catalog,
-                Some(&self.reader_authority),
+                catalog: &self.catalog,
+                authority: Some(&self.reader_authority),
                 live_oracle_cpu,
-            )
+            })
             .await?;
         Ok(planned)
     }
@@ -2767,6 +2820,34 @@ impl Oracle {
     ///
     /// Returns timeout, visibility, audit, or parent-memory failures after
     /// releasing every fence acquired before the failure.
+    /// Audits and drains one planned attempt's cut against its admission.
+    ///
+    /// Assembles the audit input from the attempt's own request state so the
+    /// audited cut can never disagree with the cut this attempt planned, then
+    /// delegates to [`Self::audit_and_drain_cut`].
+    ///
+    /// # Errors
+    /// Returns the stable audit, tenancy, or tail-drain error unchanged. The
+    /// caller still owns admission and must release it on failure.
+    async fn audit_attempt_cut(
+        &self,
+        input: &SqlAttemptInput<'_>,
+        planned: &PlannedSqlCut,
+        admitted: &AdmittedQueryGuard,
+    ) -> Result<DrainedTails, BifrostError> {
+        self.audit_and_drain_cut(CutAuditInput {
+            context: input.context,
+            request: input.request,
+            cuts: &planned.cuts,
+            query_class: planned.query_class,
+            retry_ordinal: input.retry_ordinal,
+            deadline: input.deadline,
+            admitted,
+            participant_cut: input.participant_cut,
+        })
+        .await
+    }
+
     async fn audit_and_drain_cut(
         &self,
         input: CutAuditInput<'_>,
@@ -3548,15 +3629,15 @@ impl Oracle {
                 .map(|file| iceberg_file_descriptor(file, cut.snapshot_id))
                 .collect::<Vec<_>>();
             files.sort_by(|left, right| left.path().cmp(right.path()));
-            assignments.record_scan(
-                &scan_id,
-                &table_name,
-                &binding,
-                &schema_fingerprint,
-                physical_schema.as_ref(),
+            assignments.record_scan(RecordedScan {
+                scan_id: &scan_id,
+                table_name: &table_name,
+                binding: &binding,
+                schema_fingerprint: &schema_fingerprint,
+                physical_schema: physical_schema.as_ref(),
                 files,
-                &reader_cut,
-            );
+                reader_cut: &reader_cut,
+            });
             common_scan_ids.push(scan_id.clone());
             remote_sources.iceberg_scan_id = Some(scan_id);
         }
@@ -3568,30 +3649,30 @@ impl Oracle {
                 .map(hot_file_descriptor)
                 .collect::<Result<Vec<_>, _>>()?;
             files.sort_by(|left, right| left.path().cmp(right.path()));
-            assignments.record_scan(
-                &scan_id,
-                &table_name,
-                &binding,
-                &schema_fingerprint,
-                physical_schema.as_ref(),
+            assignments.record_scan(RecordedScan {
+                scan_id: &scan_id,
+                table_name: &table_name,
+                binding: &binding,
+                schema_fingerprint: &schema_fingerprint,
+                physical_schema: physical_schema.as_ref(),
                 files,
-                &reader_cut,
-            );
+                reader_cut: &reader_cut,
+            });
             common_scan_ids.push(scan_id.clone());
             remote_sources.hot_scan_id = Some(scan_id);
         }
         let table_scribes = scribe_sources.remove(&table_name).unwrap_or_default();
         for template in &table_scribes {
             let live_scan_id = template.assignment.scan_id.clone();
-            assignments.record_scan(
-                &live_scan_id,
-                &table_name,
-                &binding,
-                &schema_fingerprint,
-                physical_schema.as_ref(),
-                Vec::new(),
-                &reader_cut,
-            );
+            assignments.record_scan(RecordedScan {
+                scan_id: &live_scan_id,
+                table_name: &table_name,
+                binding: &binding,
+                schema_fingerprint: &schema_fingerprint,
+                physical_schema: physical_schema.as_ref(),
+                files: Vec::new(),
+                reader_cut: &reader_cut,
+            });
             common_scan_ids.push(live_scan_id.clone());
             remote_sources.scribe_scan_ids.push(live_scan_id);
         }

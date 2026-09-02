@@ -57,6 +57,12 @@ pub(crate) const EPOCH_RENEWAL_INTERVAL: std::time::Duration = std::time::Durati
 /// the join budget plus the slack an ordinary cancellation needs, not a round
 /// number chosen for comfort.
 pub(crate) const EPOCH_SELF_FENCE_MARGIN: std::time::Duration = std::time::Duration::from_secs(10);
+/// Margin the readiness cutoff keeps ahead of the no-IO deadline.
+///
+/// Named as one constant because it is a difference of two durations that must
+/// never be computed at a call site where an accidental underflow would widen
+/// the authority window rather than narrow it.
+pub(crate) const EPOCH_READINESS_MARGIN: std::time::Duration = std::time::Duration::from_secs(8);
 /// Bounded time descendants have to finish after loss cancels the epoch root.
 pub(crate) const EPOCH_JOIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
 /// Unconditional subtraction covering SQL round trip and scheduling jitter.
@@ -105,6 +111,20 @@ pub struct LocalReaderCut {
 ///
 /// Returns [`BifrostError::Internal`] when a produced member fails the durable
 /// validation rules, which means the ancestry a cut supplied was malformed.
+/// One protection chain under construction inside frontier reduction.
+///
+/// A chain is a proven lineage: its `head` is the newest active cut whose own
+/// ancestry path witnesses every older cut folded into it, and the two
+/// `protected_*` fields record how far down that path the fold has reached.
+struct Chain<'cut> {
+    /// Newest active cut on the chain, whose path proves the chain.
+    head: &'cut LocalReaderCut,
+    /// Index in `head.ancestry_path` of the oldest active cut so far.
+    protected_index: usize,
+    /// Timestamp of the oldest active cut so far.
+    protected_timestamp_ms: i64,
+}
+
 pub fn frontier_from_active_cuts(
     identity: &TableAuthorityIdentity,
     cuts: &BTreeMap<u64, LocalReaderCut>,
@@ -116,16 +136,6 @@ pub fn frontier_from_active_cuts(
             .cmp(&left.timestamp_ms)
             .then_with(|| right.snapshot_id.cmp(&left.snapshot_id))
     });
-
-    /// One chain under construction: its head cut and how far down it reaches.
-    struct Chain<'cut> {
-        /// Newest active cut on the chain, whose path proves the chain.
-        head: &'cut LocalReaderCut,
-        /// Index in `head.ancestry_path` of the oldest active cut so far.
-        protected_index: usize,
-        /// Timestamp of the oldest active cut so far.
-        protected_timestamp_ms: i64,
-    }
 
     let mut chains: Vec<Chain<'_>> = Vec::new();
     for cut in ordered {
@@ -245,10 +255,9 @@ pub fn local_cut_from_follower(
             cut.snapshot_id
         )));
     }
-    let expected_version = u32::try_from(
-        vala_sql::row_types::oracle_reader_authority::ANCESTRY_DIGEST_VERSION,
-    )
-    .map_err(|_| internal("Oracle ancestry digest version does not fit its wire type"))?;
+    let expected_version =
+        u32::try_from(vala_sql::row_types::oracle_reader_authority::ANCESTRY_DIGEST_VERSION)
+            .map_err(|_| internal("Oracle ancestry digest version does not fit its wire type"))?;
     if cut.ancestry_digest_version != expected_version {
         return Err(internal(format!(
             "Oracle follower cut declares ancestry digest version {} but this node proves {}",
@@ -387,7 +396,7 @@ impl EpochDeadlines {
             .and_then(|instant| instant.checked_sub(EPOCH_DATABASE_TIME_ALLOWANCE))
             .ok_or_else(|| internal("Oracle epoch lease deadline is not representable"))?;
         let admission_cutoff = no_io
-            .checked_sub(EPOCH_SELF_FENCE_MARGIN - EPOCH_DATABASE_TIME_ALLOWANCE)
+            .checked_sub(EPOCH_READINESS_MARGIN)
             .ok_or_else(|| internal("Oracle epoch admission cutoff is not representable"))?;
         let join = admission_cutoff
             .checked_add(EPOCH_JOIN_BUDGET)
@@ -537,7 +546,7 @@ impl ReaderIoPermit {
         Self::new(
             CancellationToken::new(),
             CancellationToken::new(),
-            tokio::time::Instant::now() + std::time::Duration::from_secs(3_600),
+            tokio::time::Instant::now() + std::time::Duration::from_hours(1),
         )
     }
 
@@ -576,7 +585,9 @@ impl std::fmt::Debug for ReaderQueryGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReaderQueryGuard")
             .field("tables", &self.holdings.len())
-            .finish()
+            .field("released", &self.release.is_none())
+            .field("cancelled", &self.query_cancel.is_cancelled())
+            .finish_non_exhaustive()
     }
 }
 
@@ -697,9 +708,7 @@ impl OracleReaderAuthority {
     /// when the `cluster_nodes` fence has already been replaced, when an epoch
     /// row already exists at this exact new fence, or when the acquisition
     /// transaction or its audit fails.
-    pub async fn start(
-        config: OracleReaderAuthorityConfig,
-    ) -> Result<Arc<Self>, BifrostError> {
+    pub async fn start(config: OracleReaderAuthorityConfig) -> Result<Arc<Self>, BifrostError> {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| internal("Oracle reader authority requires an active Tokio runtime"))?;
         if config.max_concurrent_queries == 0 {
@@ -1154,7 +1163,10 @@ impl OracleReaderAuthority {
     /// [`OracleReaderAuthority::acquire_guard`] returns.
     pub async fn acquire_follower_guard(
         self: &Arc<Self>,
-        cuts: &[(TableAuthorityIdentity, wyrd_spec::vala::api::FollowerReaderCut)],
+        cuts: &[(
+            TableAuthorityIdentity,
+            wyrd_spec::vala::api::FollowerReaderCut,
+        )],
     ) -> Result<(ReaderQueryGuard, ReaderIoPermit), BifrostError> {
         let mut requested: BTreeMap<TableAuthorityIdentity, LocalReaderCut> = BTreeMap::new();
         for (identity, cut) in cuts {
@@ -1869,6 +1881,64 @@ impl OracleEpochRecovery {
     }
 }
 
+/// Builds the signed reader cut one follower must protect before it reads.
+///
+/// A follower protects exactly the snapshot it was assigned, so the cut's
+/// retained head and protected endpoint are the same snapshot and its ancestry
+/// path is that single entry. Signing the digest here binds the cut to the
+/// table's durable UID and tenant, so a peer cannot present the same snapshot
+/// identifier under a different table's identity.
+///
+/// Returns `None` when the pinned table has no Iceberg snapshot: there is
+/// nothing snapshot-dependent for the follower to protect.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::Internal`] when the pinned snapshot is absent from
+/// its own metadata, which would leave the cut undatable.
+pub fn follower_reader_cut(
+    pinned: &PinnedSealedTable,
+    planned_under_fence: u64,
+) -> Result<Option<wyrd_spec::vala::api::FollowerReaderCut>, BifrostError> {
+    let Some(snapshot_id) = pinned.snapshot_id else {
+        return Ok(None);
+    };
+    let metadata = pinned.iceberg_table.metadata();
+    let snapshot = metadata.snapshot_by_id(snapshot_id).ok_or_else(|| {
+        internal(format!(
+            "Oracle pinned snapshot {snapshot_id} is absent from its own table metadata"
+        ))
+    })?;
+    let identity = TableAuthorityIdentity {
+        tenant: pinned.binding.tenant,
+        table_uid: *pinned.table_uid.as_bytes(),
+        catalog_name: BIFROST_CATALOG_NAME.to_owned(),
+        namespace_name: pinned.binding.table_ref.namespace.as_str().to_owned(),
+        table_name: pinned.binding.table_ref.name.clone(),
+    };
+    let timestamp_ms = snapshot.timestamp_ms();
+    let member = ProtectionMember::new(&identity, vec![snapshot_id], timestamp_ms, timestamp_ms)
+        .map_err(|error| internal(error.to_string()))?;
+    let mut ancestry_digest_hex = String::with_capacity(64);
+    for byte in member.ancestry_digest {
+        use std::fmt::Write as _;
+        let _ = write!(ancestry_digest_hex, "{byte:02x}");
+    }
+    Ok(Some(wyrd_spec::vala::api::FollowerReaderCut {
+        table_uid: uuid::Uuid::from_bytes(*pinned.table_uid.as_bytes()),
+        snapshot_id,
+        snapshot_timestamp_ms: timestamp_ms,
+        retained_head_snapshot_id: snapshot_id,
+        ancestry_path: vec![snapshot_id],
+        ancestry_digest_version: u32::try_from(
+            vala_sql::row_types::oracle_reader_authority::ANCESTRY_DIGEST_VERSION,
+        )
+        .unwrap_or(1),
+        ancestry_digest_hex,
+        target_epoch_fence: planned_under_fence,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2036,62 +2106,4 @@ mod tests {
             .is_err()
         );
     }
-}
-
-/// Builds the signed reader cut one follower must protect before it reads.
-///
-/// A follower protects exactly the snapshot it was assigned, so the cut's
-/// retained head and protected endpoint are the same snapshot and its ancestry
-/// path is that single entry. Signing the digest here binds the cut to the
-/// table's durable UID and tenant, so a peer cannot present the same snapshot
-/// identifier under a different table's identity.
-///
-/// Returns `None` when the pinned table has no Iceberg snapshot: there is
-/// nothing snapshot-dependent for the follower to protect.
-///
-/// # Errors
-///
-/// Returns [`BifrostError::Internal`] when the pinned snapshot is absent from
-/// its own metadata, which would leave the cut undatable.
-pub fn follower_reader_cut(
-    pinned: &PinnedSealedTable,
-    planned_under_fence: u64,
-) -> Result<Option<wyrd_spec::vala::api::FollowerReaderCut>, BifrostError> {
-    let Some(snapshot_id) = pinned.snapshot_id else {
-        return Ok(None);
-    };
-    let metadata = pinned.iceberg_table.metadata();
-    let snapshot = metadata.snapshot_by_id(snapshot_id).ok_or_else(|| {
-        internal(format!(
-            "Oracle pinned snapshot {snapshot_id} is absent from its own table metadata"
-        ))
-    })?;
-    let identity = TableAuthorityIdentity {
-        tenant: pinned.binding.tenant,
-        table_uid: *pinned.table_uid.as_bytes(),
-        catalog_name: BIFROST_CATALOG_NAME.to_owned(),
-        namespace_name: pinned.binding.table_ref.namespace.as_str().to_owned(),
-        table_name: pinned.binding.table_ref.name.clone(),
-    };
-    let timestamp_ms = snapshot.timestamp_ms();
-    let member = ProtectionMember::new(&identity, vec![snapshot_id], timestamp_ms, timestamp_ms)
-        .map_err(|error| internal(error.to_string()))?;
-    let mut ancestry_digest_hex = String::with_capacity(64);
-    for byte in member.ancestry_digest {
-        use std::fmt::Write as _;
-        let _ = write!(ancestry_digest_hex, "{byte:02x}");
-    }
-    Ok(Some(wyrd_spec::vala::api::FollowerReaderCut {
-        table_uid: uuid::Uuid::from_bytes(*pinned.table_uid.as_bytes()),
-        snapshot_id,
-        snapshot_timestamp_ms: timestamp_ms,
-        retained_head_snapshot_id: snapshot_id,
-        ancestry_path: vec![snapshot_id],
-        ancestry_digest_version: u32::try_from(
-            vala_sql::row_types::oracle_reader_authority::ANCESTRY_DIGEST_VERSION,
-        )
-        .unwrap_or(1),
-        ancestry_digest_hex,
-        target_epoch_fence: planned_under_fence,
-    }))
 }

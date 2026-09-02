@@ -1123,6 +1123,7 @@ where
             .field("resolver", &self.resolver)
             .field("audit", &self.audit.is_some())
             .field("maximum_plan_bytes", &self.maximum_plan_bytes)
+            .field("reader_authority", &self.reader_authority.is_some())
             .field("effects", &self.effects)
             .finish()
     }
@@ -1215,8 +1216,8 @@ where
                     "assignment reader cut targets a different Oracle epoch fence".to_owned(),
                 ));
             }
-            let table =
-                assignment_table(&assignment.binding).map_err(PhysicalPlanFollowerError::Preflight)?;
+            let table = assignment_table(&assignment.binding)
+                .map_err(PhysicalPlanFollowerError::Preflight)?;
             cuts.push((
                 vala_sql::row_types::oracle_reader_authority::TableAuthorityIdentity {
                     tenant: assignment.binding.tenant_id,

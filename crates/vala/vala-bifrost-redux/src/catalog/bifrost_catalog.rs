@@ -407,7 +407,9 @@ impl BifrostCatalog {
             prepared.metadata_location.clone(),
             permit,
         )?;
-        let (iceberg_table, pinned, cut) = self.acquire_stable_cut_from(gated, &binding, tenant).await?;
+        let (iceberg_table, pinned, cut) = self
+            .acquire_stable_cut_from(gated, &binding, tenant)
+            .await?;
         if iceberg_table.metadata().current_snapshot_id() != prepared.metadata.current_snapshot_id()
         {
             return Err(BifrostCatalogError::MetadataMismatch(

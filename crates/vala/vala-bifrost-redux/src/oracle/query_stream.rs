@@ -422,35 +422,123 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
                 }
             }
         };
-        let failed_outcome = settle_failed_cancellation(
-            candidate.outcome,
-            &stream_telemetry_cancelled,
-            &request_cancellation,
-            &stream_cancellation,
-        );
-        drop(next);
-        drop(batches);
-        settle_distributed(&distributed_settlement, candidate.outcome, &stream_cancellation).await;
-        let candidate = close_ipc_stream(&mut ipc, candidate, visibility, row_count);
-        let terminal = release_and_finish_terminal(
-            &mut admitted,
-            &mut query_telemetry,
-            gate_lifecycle.as_ref(),
+        let terminal = settle_stream_terminal(TerminalSettleInput {
             candidate,
-            failed_outcome,
+            next,
+            batches,
+            distributed_settlement: &distributed_settlement,
+            stream_cancellation: &stream_cancellation,
+            request_cancellation: &request_cancellation,
+            stream_telemetry_cancelled: &stream_telemetry_cancelled,
+            ipc: &mut ipc,
+            admitted: &mut admitted,
+            query_telemetry: &mut query_telemetry,
+            gate_lifecycle: gate_lifecycle.as_ref(),
             visibility,
             row_count,
-        );
-        if let Some(owner) = &mut running_query {
-            owner.finish(terminal.outcome);
-        }
-        // Released only here. Every leader-local batch source was dropped above
-        // and the distributed settlement has joined, so no descendant of this
-        // query can read the protected snapshots again.
-        drop(reader_protection);
+            running_query: &mut running_query,
+            reader_protection,
+        })
+        .await;
         yield Ok(QueryStreamFrame::Terminal(terminal));
     };
     Box::pin(frames)
+}
+
+/// Everything one query stream must settle after its batch loop ends.
+///
+/// The fields are the stream's remaining owners and cancellation state; they
+/// are bundled because they are consumed together in one fixed order and would
+/// otherwise form an unreadable parameter list.
+struct TerminalSettleInput<'a> {
+    /// Terminal frame the batch loop chose before any settlement ran.
+    candidate: QueryTerminalFrame,
+    /// Unconsumed pre-read batch, dropped before distributed settlement.
+    next: Option<Result<RecordBatch, datafusion::error::DataFusionError>>,
+    /// Leader-local batch stream, dropped before distributed settlement.
+    batches: SendableRecordBatchStream,
+    /// Distributed participants this query must join before releasing owners.
+    distributed_settlement: &'a Arc<super::admission::DistributedQuerySettlement>,
+    /// Stream cancellation token, cancelled on a failed terminal.
+    stream_cancellation: &'a CancellationToken,
+    /// Request cancellation token, cancelled on a failed terminal.
+    request_cancellation: &'a CancellationToken,
+    /// Cancellation marker shared with telemetry.
+    stream_telemetry_cancelled: &'a Arc<AtomicBool>,
+    /// IPC encoder finished into the terminal frame.
+    ipc: &'a mut QueryIpcEncoder,
+    /// Admission guard released as part of terminal settlement.
+    admitted: &'a mut Option<AdmittedQueryGuard>,
+    /// Telemetry guard finished with the terminal outcome.
+    query_telemetry: &'a mut QueryTelemetryGuard,
+    /// Optional gate lifecycle guard released with admission.
+    gate_lifecycle: Option<&'a Arc<QueryStreamLifecycle>>,
+    /// Visibility contract for terminal mapping.
+    visibility: VisibilityMode,
+    /// Rows emitted before the terminal frame.
+    row_count: u64,
+    /// Exactly-once active-registry terminal owner.
+    running_query: &'a mut Option<RunningQueryTerminalOwner>,
+    /// Reader-epoch protection released only once nothing can read again.
+    reader_protection: Option<ReaderProtectedQueryTerminalOwner>,
+}
+
+/// Settles one query stream's owners and produces its terminal frame.
+///
+/// Ordering is the contract: leader-local sources are dropped and the
+/// distributed settlement is joined before any owner is released, so no
+/// descendant of this query can still be reading when the reader-epoch
+/// protection is finally dropped at the end.
+async fn settle_stream_terminal(input: TerminalSettleInput<'_>) -> QueryTerminalFrame {
+    let TerminalSettleInput {
+        candidate,
+        next,
+        batches,
+        distributed_settlement,
+        stream_cancellation,
+        request_cancellation,
+        stream_telemetry_cancelled,
+        ipc,
+        admitted,
+        query_telemetry,
+        gate_lifecycle,
+        visibility,
+        row_count,
+        running_query,
+        reader_protection,
+    } = input;
+    let failed_outcome = settle_failed_cancellation(
+        candidate.outcome,
+        stream_telemetry_cancelled,
+        request_cancellation,
+        stream_cancellation,
+    );
+    drop(next);
+    drop(batches);
+    settle_distributed(
+        distributed_settlement,
+        candidate.outcome,
+        stream_cancellation,
+    )
+    .await;
+    let candidate = close_ipc_stream(ipc, candidate, visibility, row_count);
+    let terminal = release_and_finish_terminal(
+        admitted,
+        query_telemetry,
+        gate_lifecycle,
+        candidate,
+        failed_outcome,
+        visibility,
+        row_count,
+    );
+    if let Some(owner) = running_query {
+        owner.finish(terminal.outcome);
+    }
+    // Released only here. Every leader-local batch source was dropped above
+    // and the distributed settlement has joined, so no descendant of this
+    // query can read the protected snapshots again.
+    drop(reader_protection);
+    terminal
 }
 
 /// Ordered degradation observed by one distributed query.

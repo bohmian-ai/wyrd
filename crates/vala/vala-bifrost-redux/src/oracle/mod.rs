@@ -3297,7 +3297,10 @@ impl Oracle {
     /// Awaits the exact startup result before role activation.
     ///
     /// # Errors
-    /// Returns the recovery failure, a duplicate-wait invariant, or task loss.
+    /// Returns the startup task's own failure, a duplicate-wait invariant, task
+    /// loss, an expired-epoch sweep that could not enumerate or reclaim, or an
+    /// activation that Postgres refused. Every one of those leaves this Oracle
+    /// unactivated and therefore unready.
     pub async fn await_startup(&self) -> Result<(), BifrostError> {
         let receiver = self
             .startup_result
@@ -3313,23 +3316,21 @@ impl Oracle {
             detail: "Oracle startup task ended without a result".to_owned(),
         })??;
         // Reclaiming crashed epochs precedes activation so this node does not
-        // start serving while dead peers still hold protection. A sweep failure
-        // is logged rather than fatal: excess retention is safe, and refusing to
-        // start would turn one dead peer into an unavailable cluster.
+        // start serving while dead peers still hold protection. Enumeration or
+        // a per-epoch reclaim that fails therefore fails startup: continuing
+        // would activate this epoch and publish readiness over retention that
+        // was never released, which is the exact condition this step exists to
+        // rule out.
         let recovery = reader_pins::OracleEpochRecovery::new(
             self.reader_authority.operator_pool().clone(),
             self.vala.clone(),
         );
-        match recovery.reclaim_expired(EXPIRED_EPOCH_SWEEP_LIMIT).await {
-            Ok(0) => {}
-            Ok(reclaimed) => tracing::info!(
+        let reclaimed = recovery.reclaim_expired(EXPIRED_EPOCH_SWEEP_LIMIT).await?;
+        if reclaimed > 0 {
+            tracing::info!(
                 reclaimed,
                 "Oracle reclaimed expired reader epochs before activation"
-            ),
-            Err(error) => tracing::warn!(
-                error = %error,
-                "Oracle could not sweep expired reader epochs before activation"
-            ),
+            );
         }
         // Activation is the last startup step, so readiness can never be
         // published under an epoch Postgres has not yet marked active.

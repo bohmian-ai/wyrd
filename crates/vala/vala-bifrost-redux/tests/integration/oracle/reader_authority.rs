@@ -14,8 +14,8 @@ use tokio_util::sync::CancellationToken;
 use crate::forge::support as forge_support;
 use uuid::Uuid;
 use vala_bifrost_redux::oracle::reader_pins::{
-    LocalReaderCut, OracleReaderAuthority, OracleReaderAuthorityConfig, ReaderQueryGuard,
-    RecordingEpochTerminator,
+    LocalReaderCut, OracleEpochRecovery, OracleReaderAuthority, OracleReaderAuthorityConfig,
+    ReaderQueryGuard, RecordingEpochTerminator,
 };
 use vala_sql::queries::cluster_nodes::ClusterNodes;
 use vala_sql::queries::olap_catalog::upsert_table;
@@ -1027,4 +1027,90 @@ async fn follower_protection_precedes_resolution(
 
     drop(retry);
     follower.retire().await.expect("the follower retires");
+}
+
+/// Proves an expired epoch this node cannot reclaim fails startup recovery
+/// rather than being logged past, so the local epoch never activates.
+///
+/// Recovery runs before activation precisely so this node does not begin
+/// serving while a dead peer still holds protection. Reporting success after a
+/// per-epoch reclaim failed defeats that ordering: startup would continue, the
+/// epoch would activate, and readiness would be published over retention that
+/// was never released. The failure must therefore reach the caller, and the
+/// epoch must remain exactly as acquired.
+///
+/// # Panics
+///
+/// Panics when recovery reports success, when the local epoch admits, or when
+/// its durable row moved past acquisition.
+#[tokio::test]
+async fn startup_recovery_failure_prevents_epoch_activation_and_readiness() {
+    let fixture = AuthorityFixture::start().await;
+    let terminator = Arc::new(RecordingEpochTerminator::default());
+    let authority = OracleReaderAuthority::start(OracleReaderAuthorityConfig {
+        vala: fixture.database.vala_postgres().clone(),
+        operator_pool: fixture.database.operator_pool().clone(),
+        node_id: fixture.node_id,
+        fencing_token: fixture.fence,
+        max_concurrent_queries: 1,
+        terminator: Arc::clone(&terminator) as Arc<_>,
+        shutdown: fixture.shutdown.clone(),
+    })
+    .await
+    .expect("epoch acquires");
+
+    // An expired epoch already past invalidation is enumerated by the sweep and
+    // then matches no reclaimable row, which is exactly the per-epoch recovery
+    // failure startup must not absorb.
+    let pool = fixture
+        .database
+        .superuser_pool()
+        .await
+        .expect("superuser pool");
+    let stale_fence = i64::try_from(fixture.fence).expect("fence fits") + 1_000;
+    sqlx::query(
+        "INSERT INTO vala.oracle_reader_epochs \
+           (epoch_owner_tenant_id, node_id, fencing_token, state, state_revision, \
+            acquired_at, renewed_at, lease_expires_at, invalidated_at) \
+         VALUES ($1, $2, $3, 'invalidated', 1, now() - interval '2 minutes', \
+                 now() - interval '2 minutes', now() - interval '1 minute', now())",
+    )
+    .bind(uuid::Uuid::from(DataTenantId::SYSTEM_OWNER))
+    .bind(fixture.node_id)
+    .bind(stale_fence)
+    .execute(&pool)
+    .await
+    .expect("the unreclaimable expired epoch seeds");
+
+    let recovery = OracleEpochRecovery::new(
+        fixture.database.operator_pool().clone(),
+        fixture.database.vala_postgres().clone(),
+    );
+    let error = recovery
+        .reclaim_expired(64)
+        .await
+        .expect_err("a per-epoch reclaim failure is a startup failure");
+    assert!(
+        error.to_string().contains("epoch"),
+        "the reported failure names the epoch recovery could not reclaim: {error}"
+    );
+
+    assert!(
+        !authority.admits(),
+        "an epoch whose startup recovery failed never opens admission"
+    );
+    assert_eq!(
+        fixture
+            .epoch_row()
+            .await
+            .expect("the local epoch row survives")
+            .state,
+        vala_sql::row_types::oracle_reader_authority::OracleEpochState::Acquired,
+        "startup stopped before activation"
+    );
+
+    authority
+        .retire()
+        .await
+        .expect("the acquired epoch retires");
 }

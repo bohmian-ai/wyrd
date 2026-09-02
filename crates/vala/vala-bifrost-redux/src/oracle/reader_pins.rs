@@ -1894,15 +1894,19 @@ impl OracleEpochRecovery {
         .map_err(|error| internal(error.to_string()))?;
         let mut reclaimed = 0;
         for epoch in expired {
-            match self.reclaim(epoch.node_id, epoch.fencing_token).await {
-                Ok(()) => reclaimed += 1,
-                Err(error) => tracing::warn!(
-                    error = %error,
-                    node_id = %epoch.node_id,
-                    fencing_token = epoch.fencing_token,
-                    "Oracle epoch recovery left an expired epoch for the next sweep"
-                ),
-            }
+            // An expired epoch this node cannot reclaim still holds protection,
+            // so the sweep reports the failure instead of counting past it. A
+            // caller that starts serving anyway would publish readiness over
+            // retention nothing released.
+            self.reclaim(epoch.node_id, epoch.fencing_token)
+                .await
+                .map_err(|error| {
+                    internal(format!(
+                        "Oracle epoch recovery could not reclaim expired epoch                          {}/{}: {error}",
+                        epoch.node_id, epoch.fencing_token
+                    ))
+                })?;
+            reclaimed += 1;
         }
         Ok(reclaimed)
     }

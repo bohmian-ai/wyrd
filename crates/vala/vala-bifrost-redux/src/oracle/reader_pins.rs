@@ -129,7 +129,23 @@ pub fn frontier_from_active_cuts(
     identity: &TableAuthorityIdentity,
     cuts: &BTreeMap<u64, LocalReaderCut>,
 ) -> Result<ProtectionFrontier, BifrostError> {
-    let mut ordered: Vec<&LocalReaderCut> = cuts.values().collect();
+    frontier_from_cuts(identity, cuts.values().collect())
+}
+
+/// Reduces an exact selection of active cuts into its smallest frontier.
+///
+/// Narrowing needs the frontier a table *would* have without one cut before it
+/// removes that cut locally, so the selection is passed in rather than derived
+/// from the coordinator's current map.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::Internal`] when a produced member fails the durable
+/// validation rules, which means the ancestry a cut supplied was malformed.
+fn frontier_from_cuts(
+    identity: &TableAuthorityIdentity,
+    mut ordered: Vec<&LocalReaderCut>,
+) -> Result<ProtectionFrontier, BifrostError> {
     ordered.sort_by(|left, right| {
         right
             .timestamp_ms
@@ -670,6 +686,9 @@ pub struct OracleReaderAuthority {
     /// Test-only latch making the confirmed lease stop extending.
     #[cfg(any(test, feature = "test-support"))]
     lease_collapsed: AtomicBool,
+    /// Test-only count of protection commits to refuse before the next one.
+    #[cfg(any(test, feature = "test-support"))]
+    protection_faults: std::sync::atomic::AtomicUsize,
 }
 
 impl std::fmt::Debug for OracleReaderAuthority {
@@ -776,6 +795,8 @@ impl OracleReaderAuthority {
             lease_worker: Mutex::new(None),
             #[cfg(any(test, feature = "test-support"))]
             lease_collapsed: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-support"))]
+            protection_faults: std::sync::atomic::AtomicUsize::new(0),
         });
         let narrowing = runtime.spawn(Arc::clone(&authority).run_narrowing(narrowing_rx));
         let lease = runtime.spawn(Arc::clone(&authority).supervise_lease(config.shutdown));
@@ -944,6 +965,26 @@ impl OracleReaderAuthority {
     #[cfg(any(test, feature = "test-support"))]
     pub fn collapse_lease_for_test(&self) {
         self.lease_collapsed.store(true, Ordering::SeqCst);
+    }
+
+    /// Makes the next `count` protection commits fail before touching Postgres.
+    ///
+    /// Test-only. A narrowing that must be retried needs a commit that fails
+    /// once and then succeeds, which no durable state can produce on its own:
+    /// every reachable Postgres failure either persists or resolves outside the
+    /// bounded retry it is supposed to exercise.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn inject_protection_faults_for_test(&self, count: usize) {
+        self.protection_faults
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Reports how many injected protection-commit faults remain unconsumed.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn pending_protection_faults_for_test(&self) -> usize {
+        self.protection_faults
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Closes admission exactly once and reports whether this call did it.
@@ -1404,6 +1445,18 @@ impl OracleReaderAuthority {
         required: &ProtectionFrontier,
         phase: OracleTableProtectionPhase,
     ) -> Result<Option<ProtectionRecord>, BifrostError> {
+        #[cfg(any(test, feature = "test-support"))]
+        if self
+            .protection_faults
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(internal("injected Oracle protection commit fault"));
+        }
         let mut expected = expected_revision;
         for attempt in 0..2 {
             let mut conn = self
@@ -1512,15 +1565,35 @@ impl OracleReaderAuthority {
         }
     }
 
-    /// Applies one query's exact pin removals across its tables.
+    /// Applies one query's exact pin removals across its tables, with one
+    /// bounded retry of whatever failed.
+    ///
+    /// A narrowing that fails leaves its cut pinned, so the same command is
+    /// still exactly applicable. It is retried once — and only while this epoch
+    /// still admits, because an epoch that has lost authority must not touch
+    /// protection it no longer owns. A second failure keeps the wider durable
+    /// set, which retirement or expiry recovery reclaims.
     async fn apply_narrowing(&self, command: NarrowingCommand) {
         let mut holdings = command.holdings;
         holdings.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut failed = Vec::new();
         for (identity, cut_id) in holdings {
             if let Err(error) = self.narrow_table(&identity, cut_id).await {
                 tracing::warn!(
                     error = %error,
                     "Oracle kept its previous reader protection after a failed narrowing"
+                );
+                failed.push((identity, cut_id));
+            }
+        }
+        if failed.is_empty() || !self.admits() {
+            return;
+        }
+        for (identity, cut_id) in failed {
+            if let Err(error) = self.narrow_table(&identity, cut_id).await {
+                tracing::warn!(
+                    error = %error,
+                    "Oracle kept its previous reader protection after a retried narrowing"
                 );
             }
         }
@@ -1540,14 +1613,30 @@ impl OracleReaderAuthority {
     ) -> Result<(), BifrostError> {
         let coordinator = self.coordinator(identity).await;
         let mut guard = coordinator.lock_owned().await;
-        if guard.active.remove(&cut_id).is_none() {
+        if !guard.active.contains_key(&cut_id) {
             return Ok(());
         }
-        let remaining = frontier_from_active_cuts(identity, &guard.active)?;
+        // Computed before any local mutation, so a failed commit leaves this
+        // cut exactly where it was: still pinned locally and still covered
+        // durably, which is the only state a retry can start from.
+        let remaining = frontier_from_cuts(
+            identity,
+            guard
+                .active
+                .iter()
+                .filter(|(id, _)| **id != cut_id)
+                .map(|(_, cut)| cut)
+                .collect(),
+        )?;
         let Some(confirmed) = guard.confirmed.as_ref() else {
+            guard.active.remove(&cut_id);
             return Ok(());
         };
+        // A cut whose removal changes nothing durable — a duplicate of what a
+        // concurrent query still pins — is removed locally and costs no
+        // statement, no compare-and-set, and no audit row.
         if !remaining.is_empty() && confirmed.frontier == remaining {
+            guard.active.remove(&cut_id);
             return Ok(());
         }
         let phase = if remaining.is_empty() {
@@ -1556,20 +1645,12 @@ impl OracleReaderAuthority {
             OracleTableProtectionPhase::Narrowed
         };
         let expected = confirmed.revision;
-        match self
+        let record = self
             .commit_frontier(identity, Some(expected), &remaining, phase)
-            .await
-        {
-            Ok(record) => {
-                guard.confirmed = record;
-                Ok(())
-            }
-            Err(error) => {
-                // The pin is gone locally but the durable set still covers it,
-                // which is the safe direction: retention, not absence.
-                Err(error)
-            }
-        }
+            .await?;
+        guard.active.remove(&cut_id);
+        guard.confirmed = record;
+        Ok(())
     }
 
     /// Closes admission, drains the narrowing queue, and releases every table.

@@ -1114,3 +1114,92 @@ async fn startup_recovery_failure_prevents_epoch_activation_and_readiness() {
         .await
         .expect("the acquired epoch retires");
 }
+
+/// Proves narrowing costs nothing when the released cut is still covered, and
+/// that a narrowing whose commit fails is retried exactly once.
+///
+/// Two guards on identical cuts leave one frontier. Releasing the first
+/// changes nothing durable, so it must remove its pin locally without a
+/// statement, a compare-and-set, or an audit row — the wrong shape here is a
+/// no-op revision bump on every concurrent query's release. Releasing the
+/// second does change the durable set, so a failed commit must leave the pin
+/// exactly where it was and the same command must be applied again, which is
+/// what makes the retry meaningful rather than a second no-op.
+///
+/// # Panics
+///
+/// Panics when the covered release spends SQL, when the retried release does
+/// not become durable, or when the injected fault is not consumed.
+#[tokio::test]
+async fn narrowing_retries_once_and_covered_duplicates_need_no_sql() {
+    let fixture = AuthorityFixture::start().await;
+    let (authority, _terminator) = fixture.authority(2).await;
+    let tenant = fixture.tenant().await;
+    let events = fixture.table(tenant, "events").await;
+
+    let first = authority
+        .acquire_guard_for_cuts(vec![(events.clone(), cut(30, 300, &[30, 20, 10]))])
+        .await
+        .expect("the first query protects");
+    let second = authority
+        .acquire_guard_for_cuts(vec![(events.clone(), cut(30, 300, &[30, 20, 10]))])
+        .await
+        .expect("the second query shares that protection");
+
+    let expanded = fixture
+        .header(&events)
+        .await
+        .expect("the shared protection is durable");
+    assert_eq!(
+        fixture.audit_operations(&events).await,
+        vec!["oracle.table_protection.expanded".to_owned()],
+        "an already covered second query commits nothing"
+    );
+
+    // Releasing a covered duplicate leaves the frontier identical, so it must
+    // not reach Postgres at all.
+    drop(first);
+    fixture
+        .settle(&events, "the shared protection is retained", |record| {
+            record.is_some_and(|record| record.frontier.covers(30))
+        })
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        fixture
+            .header(&events)
+            .await
+            .expect("the shared protection survives")
+            .revision,
+        expanded.revision,
+        "releasing a covered duplicate commits no revision"
+    );
+    assert_eq!(
+        fixture.audit_operations(&events).await,
+        vec!["oracle.table_protection.expanded".to_owned()],
+        "releasing a covered duplicate writes no audit row"
+    );
+
+    // The last release does change the durable set. Its first commit fails, so
+    // the pin must survive and the same command must be applied again.
+    authority.inject_protection_faults_for_test(1);
+    drop(second);
+    fixture
+        .settle(&events, "the retried release", |record| record.is_none())
+        .await;
+    assert_eq!(
+        authority.pending_protection_faults_for_test(),
+        0,
+        "the injected fault was consumed by the first attempt"
+    );
+    assert_eq!(
+        fixture.audit_operations(&events).await,
+        vec![
+            "oracle.table_protection.expanded".to_owned(),
+            "oracle.table_protection.released".to_owned(),
+        ],
+        "the retry commits exactly one release"
+    );
+
+    authority.retire().await.expect("the epoch retires");
+}

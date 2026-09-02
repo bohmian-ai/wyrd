@@ -2696,6 +2696,14 @@ struct AnalyticalGraphLifecycle {
 /// acknowledged well inside the window rather than only at its end.
 const RETAINED_RELEASE_RETRY: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Detail one graph records while a participant release stays unacknowledged.
+///
+/// Shared by the drain that first observes it and by the settlement that fails
+/// the query on it, so the residue a node reports and the failure its caller
+/// receives name the same condition.
+const RETAINED_RELEASE_UNACKNOWLEDGED: &str =
+    "Oracle analytical participant release was not acknowledged";
+
 impl AnalyticalGraphLifecycle {
     /// Starts one graph's lifecycle task and returns its attempt-side half.
     ///
@@ -2837,11 +2845,13 @@ impl AnalyticalGraphLifecycle {
             exchanges.close();
         }
         let retained = reservations.release(self.deadline).await;
-        let drained = self.drain(retained).await;
-        if failure.is_none()
-            && let Err(error) = drained
-        {
-            failure = Some(error.to_string());
+        // A cleanup failure that is not the reservation ambiguity retains this
+        // graph however the follower answers, so only an otherwise-clean
+        // settlement has anything to gain from following the records up.
+        let otherwise_clean = failure.is_none();
+        let unresolved = self.drain(retained).await;
+        if failure.is_none() && !unresolved.is_empty() {
+            failure = Some(RETAINED_RELEASE_UNACKNOWLEDGED.to_owned());
         }
         if failure.is_none()
             && let Err(error) = self.release_graph().await
@@ -2868,15 +2878,59 @@ impl AnalyticalGraphLifecycle {
                 let _ = self.result.send(AnalyticalGraphResult::SettledFailure);
             }
         }
+        if otherwise_clean && !unresolved.is_empty() {
+            self.expire(unresolved).await;
+        }
+    }
+
+    /// Holds a post-deadline reservation until it must have expired remotely.
+    ///
+    /// The deadline ends this node's right to *address* a participant, not its
+    /// ownership of what it took: until every record is authoritatively expired
+    /// this node cannot say whether a follower still holds an envelope on its
+    /// behalf, and the graph stays `Draining` for exactly that reason. So the
+    /// caller has already been failed and no further RPC is issued; only the
+    /// local two-clock predicate is re-evaluated, at the same retry cadence.
+    ///
+    /// Returns early once the supervisor stops accepting, because shutdown is
+    /// joining this task and a record that has not expired yet is residue it
+    /// must report rather than a wait it should serve. When every record does
+    /// expire, the graph, its envelope, and the admission permit it retained
+    /// are released together; a refusal there is recorded and leaves the entry
+    /// standing, exactly as the settlement sequence would.
+    async fn expire(&mut self, mut retained: Vec<AnalyticalRetainedRelease>) {
+        while !retained.is_empty() {
+            if !self.supervisor.is_healthy() {
+                return;
+            }
+            tokio::time::sleep(RETAINED_RELEASE_RETRY).await;
+            retained.retain(|record| !record.conservatively_expired());
+        }
+        // Removing the entry is what clears the retained cleanup: a released
+        // graph has no ambiguity left to record against it.
+        if let Err(error) = self.release_graph().await {
+            tracing::error!(
+                public_query_id = %self.graph.public_query_id,
+                error = %error,
+                "Oracle analytical graph could not be released after its reservations expired"
+            );
+            self.supervisor
+                .retain_graph_cleanup(self.graph, error.to_string());
+        }
     }
 
     /// Waits, bounded, for the envelope's children and then releases the graph.
     ///
+    /// Two bounds apply and the earlier one wins: the poll count, and the
+    /// graph's own absolute deadline. Only the deadline is a property the
+    /// caller was promised, so a child still live when it arrives ends this
+    /// wait immediately rather than let terminal publication run past it.
+    ///
     /// # Errors
     ///
     /// Returns [`BifrostError::Internal`] when a nested child of the query
-    /// envelope is still live after the bounded wait, and the supervisor's
-    /// refusal when the graph itself cannot be released.
+    /// envelope is still live at the earlier of those two bounds, and the
+    /// supervisor's refusal when the graph itself cannot be released.
     async fn release_graph(&mut self) -> Result<(), BifrostError> {
         for _ in 0..GRAPH_DRAIN_POLLS {
             if self.supervisor.graph_children_idle(self.graph)? {
@@ -2885,7 +2939,11 @@ impl AnalyticalGraphLifecycle {
                 // next query are returned last.
                 return self.supervisor.release_graph(self.graph);
             }
-            tokio::time::sleep(GRAPH_DRAIN_INTERVAL).await;
+            let now = tokio::time::Instant::now();
+            if now >= self.deadline {
+                break;
+            }
+            tokio::time::sleep_until(self.deadline.min(now + GRAPH_DRAIN_INTERVAL)).await;
         }
         let (scratch_bytes, memory_bytes) = self.supervisor.graph_children_debt(self.graph)?;
         tracing::warn!(
@@ -3017,27 +3075,23 @@ impl AnalyticalGraphLifecycle {
     /// this runs, because until every record resolves this node cannot say
     /// whether a follower is still holding an envelope on its behalf.
     ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostError::Internal`] when records are still unresolved at
-    /// the graph deadline. Retrying past it would be an unbounded wait on an
-    /// unreachable peer, so the residue is reported instead: the entry stays
-    /// `Draining`, shutdown reports it, and the follower's own pending TTL is
-    /// what finally frees the remote envelope.
+    /// Returns the records still unresolved at the graph deadline, empty when
+    /// every one of them resolved. Retrying past that deadline would be an
+    /// unbounded wait on an unreachable peer, so the remote calls stop there
+    /// and the entry stays `Draining`; the returned records are what the
+    /// lifecycle task then expires locally.
     async fn drain(
         &self,
         mut retained: Vec<AnalyticalRetainedRelease>,
-    ) -> Result<(), BifrostError> {
+    ) -> Vec<AnalyticalRetainedRelease> {
         if retained.is_empty() {
-            return Ok(());
+            return Vec::new();
         }
         let _ = self
             .supervisor
             .signal_terminal(self.graph, AnalyticalAttemptOutcome::Failed);
-        self.supervisor.retain_graph_cleanup(
-            self.graph,
-            "Oracle analytical participant release was not acknowledged".to_owned(),
-        );
+        self.supervisor
+            .retain_graph_cleanup(self.graph, RETAINED_RELEASE_UNACKNOWLEDGED.to_owned());
         while !retained.is_empty() {
             let now = tokio::time::Instant::now();
             if now >= self.deadline {
@@ -3046,9 +3100,7 @@ impl AnalyticalGraphLifecycle {
                     outstanding = retained.len(),
                     "Oracle analytical leader reached its deadline holding participant reservations"
                 );
-                return Err(BifrostError::Internal {
-                    detail: "Oracle analytical participant release was not acknowledged".to_owned(),
-                });
+                return retained;
             }
             tokio::time::sleep_until(self.deadline.min(now + RETAINED_RELEASE_RETRY)).await;
             let mut remaining = Vec::with_capacity(retained.len());
@@ -3064,7 +3116,7 @@ impl AnalyticalGraphLifecycle {
             retained = remaining;
         }
         self.supervisor.resolve_graph_cleanup(self.graph);
-        Ok(())
+        Vec::new()
     }
 }
 
@@ -4521,6 +4573,7 @@ mod tests {
         Box::pin(assert_first_terminal_alone_chooses_the_settlement()).await;
         Box::pin(assert_stream_drop_leaves_a_supervisor_owned_task()).await;
         Box::pin(assert_cleanup_failure_retains_draining_ownership()).await;
+        Box::pin(assert_release_stops_at_the_graph_deadline()).await;
     }
 
     /// Successful cleanup releases every owner once, then removes the graph.
@@ -4773,6 +4826,73 @@ mod tests {
             (0, 1),
             "shutdown reports the retained graph as residue instead of sweeping it"
         );
+        drop(admitted);
+    }
+
+    /// A live envelope child at the deadline fails settlement then, not later.
+    ///
+    /// The wait for a graph's nested children is bounded twice: by its own poll
+    /// count and by the envelope's absolute deadline. Only the second is a
+    /// property of the query, so a child still live when the deadline arrives
+    /// has to end the sequence immediately rather than let terminal publication
+    /// run on past the bound the caller was promised.
+    ///
+    /// # Panics
+    ///
+    /// Panics when settlement outlives the graph deadline, reports success, or
+    /// releases a graph whose envelope a child still holds.
+    async fn assert_release_stops_at_the_graph_deadline() {
+        let fixture = GraphFixture::new(Utc::now());
+        let oracle = fixture_oracle_role();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        let leased = lease_over_lossy_peers_until(&fixture, &oracle, 2, deadline);
+        let (admitted, ownership, _transport) = *leased;
+        ownership
+            .publish_participants()
+            .await
+            .expect("every addressed follower accepted its reservation");
+        let graph = ownership.key().graph();
+        // A nested child the settlement sequence cannot reach: the graph's own
+        // attempt is joined, but the envelope it charged is still owed scratch.
+        let stray = fixture
+            .supervisor
+            .spawn_attempt(
+                stray_attempt_key(graph),
+                AnalyticalAttemptGrant {
+                    scratch_bytes: 4_096,
+                },
+            )
+            .expect("an active graph admits one more stage");
+        let error = ownership
+            .settle(AnalyticalAttemptOutcome::Success)
+            .await
+            .expect_err("a live envelope child prevents a success terminal");
+        let overrun = tokio::time::Instant::now().saturating_duration_since(deadline);
+        assert!(
+            matches!(error, BifrostError::Internal { .. }),
+            "an undrained envelope is reported, not logged and ignored: {error:?}"
+        );
+        assert!(
+            overrun < Duration::from_secs(1),
+            "settlement ended at the graph deadline rather than at the drain poll count: {overrun:?}"
+        );
+        assert_eq!(
+            fixture
+                .supervisor
+                .live_graphs()
+                .expect("the supervisor reports live graphs"),
+            1,
+            "an undrained graph is retained rather than released"
+        );
+        assert_eq!(
+            fixture
+                .supervisor
+                .draining_graphs()
+                .expect("the supervisor reports retained cleanup"),
+            1,
+            "the retained graph is visible as draining"
+        );
+        drop(stray);
         drop(admitted);
     }
 
@@ -6027,6 +6147,7 @@ mod tests {
         Box::pin(assert_cancellation_interrupts_a_pending_reservation()).await;
         Box::pin(assert_the_deadline_interrupts_a_pending_reservation()).await;
         Box::pin(assert_release_is_bounded_and_residue_is_reported()).await;
+        Box::pin(assert_post_deadline_expiry_returns_the_graph()).await;
     }
 
     /// Graph cancellation ends a reservation no participant will ever answer.
@@ -6192,6 +6313,87 @@ mod tests {
                 .iter()
                 .all(|began| *began < deadline),
             "shutdown issues no peer call past the graph deadline either"
+        );
+    }
+
+    /// Authoritative expiry after the deadline still returns the retained graph.
+    ///
+    /// The deadline ends this node's right to address a peer, not its ownership
+    /// of what it took. A record whose conservative expiry falls after the
+    /// deadline is therefore still the lifecycle task's to resolve: the caller
+    /// is failed on time and every RPC stops, but the local expiry check keeps
+    /// running until the follower must have dropped the envelope, and only then
+    /// are the graph and its admission returned.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the caller is failed late, when a peer call is issued past
+    /// the deadline, or when authoritative expiry leaves the graph and its
+    /// admission charged forever.
+    async fn assert_post_deadline_expiry_returns_the_graph() {
+        // Already elapsed on the wall clock, so the local pending TTL measured
+        // from the reserve response is the bound that decides — and it falls
+        // after this graph's own deadline.
+        let expires_at = Utc::now() - chrono::Duration::seconds(1);
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        let fixture = ReservationFixture::start_bounded(2, expires_at, deadline);
+        fixture
+            .signals
+            .publish_participants()
+            .await
+            .expect("every addressed follower accepted its reservation");
+        fixture.transport.hang_releases();
+        fixture.signals.terminal(AnalyticalAttemptOutcome::Failed);
+        let error = fixture
+            .signals
+            .settled()
+            .await
+            .expect_err("unresolved reservations cannot settle as a success");
+        assert!(
+            matches!(error, BifrostError::Internal { .. }),
+            "the caller is failed at the deadline rather than held to expiry: {error:?}"
+        );
+        let ended = tokio::time::Instant::now();
+        assert!(
+            ended >= deadline && ended < deadline + RETAINED_RELEASE_RETRY,
+            "the caller's failure is published at the graph deadline"
+        );
+        assert_eq!(
+            fixture.draining(),
+            1,
+            "the unacknowledged release keeps the graph attributable as draining"
+        );
+        let attempted = fixture.transport.releases().len();
+        // Past both the deadline and the pending TTL the response was received
+        // under: the record is now authoritatively expired.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        settle_lifecycle().await;
+        assert_eq!(
+            fixture.transport.releases().len(),
+            attempted,
+            "no peer call is issued after the graph deadline"
+        );
+        assert!(
+            fixture
+                .transport
+                .call_instants()
+                .iter()
+                .all(|began| *began < deadline),
+            "conservative expiry is a local check, not another round of RPCs"
+        );
+        assert_eq!(
+            fixture.draining(),
+            0,
+            "authoritative expiry clears the reservation ambiguity"
+        );
+        assert_eq!(
+            fixture
+                .graph
+                .supervisor
+                .live_graphs()
+                .expect("the supervisor reports live graphs"),
+            0,
+            "the retained graph and its admission are returned once nothing remote owns them"
         );
     }
 

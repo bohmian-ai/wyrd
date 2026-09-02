@@ -876,3 +876,47 @@ a pruning journey with no Analytical lifecycle involvement; it passes standalone
 and in a clean full lane run);
 `mise run check:bifrost-resource-governance` passed;
 `mise run check:bifrost-oracle-deploy` → 2 passed; `git diff --check` clean.
+
+## Remediation round 4 — findings 4 and 5
+
+### FIND-BIFROST-R4-T02-QUERY-ENVELOPE-4 — graph release outran the deadline
+
+- RED: new paused-free branch `assert_release_stops_at_the_graph_deadline` in
+  `oracle::analytical::tests::leader_lifecycle_task_joins_every_owner_and_retains_failure`
+  leases a graph bounded 200 ms out, holds a nested scratch child through a
+  stray attempt, and settles. Failed with a 5.76 s overrun past the deadline:
+  `release_graph` polled `GRAPH_DRAIN_POLLS` × `GRAPH_DRAIN_INTERVAL`
+  unconditionally.
+- GREEN: `release_graph` now breaks at `self.deadline` and sleeps
+  `sleep_until(self.deadline.min(now + GRAPH_DRAIN_INTERVAL))`. No new helper,
+  timer, task, or configuration. Settlement now fails at the deadline with the
+  graph and its envelope retained as `Draining`.
+- Command: `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib --features test-support,bench-support -E 'test(=oracle::analytical::tests::leader_lifecycle_task_joins_every_owner_and_retains_failure)'` → 1 passed.
+
+### FIND-BIFROST-R4-T02-QUERY-ENVELOPE-5 — post-deadline conservative expiry
+
+- RED: new branch `assert_post_deadline_expiry_returns_the_graph` in
+  `oracle::analytical::tests::graph_peer_operations_are_bounded_by_the_graph_deadline`
+  uses an already-elapsed `expires_at` with a 500 ms graph deadline, so the
+  canonical two-second pending TTL is the deciding clock and falls after the
+  deadline. Failed: the graph stayed `Draining` forever (`draining() == 1`)
+  because `drain` returned at the deadline and the lifecycle task ended.
+- GREEN: `drain` now returns the unresolved records instead of an error;
+  `settle` derives the same cleanup failure from a non-empty result, publishes
+  the caller's failure at the deadline as before, and then — only when nothing
+  else failed — runs the new `AnalyticalGraphLifecycle::expire`. That loop
+  issues no RPC, re-evaluates only the existing two-clock
+  `conservatively_expired` predicate at the existing `RETAINED_RELEASE_RETRY`
+  cadence, returns immediately once the supervisor stops accepting so shutdown
+  still joins promptly and reports the residue, and releases the graph, its
+  envelope, and the retained admission once every record has expired. The
+  shared detail string is now the `RETAINED_RELEASE_UNACKNOWLEDGED` const. The
+  existing lifecycle task remains the sole owner: no scheduler, detached task,
+  registry, protocol, or dependency was added.
+- Command: `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib --features test-support,bench-support -E 'test(=oracle::analytical::tests::graph_peer_operations_are_bounded_by_the_graph_deadline)'` → 1 passed.
+
+Round 4 verification: `mise run fmt`; `mise run lints` clean;
+`mise run test:bifrost` → 972/972 passed;
+`mise run test:bifrost:journey:oracle` → 15/15 passed;
+`mise run check:bifrost-resource-governance` passed;
+`mise run check:bifrost-oracle-deploy` → 2 passed; `git diff --check` clean.

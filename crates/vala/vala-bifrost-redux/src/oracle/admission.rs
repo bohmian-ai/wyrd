@@ -1109,6 +1109,11 @@ impl Drop for AdmittedQueryGuard {
         self.cancellation.cancel();
         self.live_reservations.clear();
         self.physical_projections.clear();
+        // Before the permit: an Analytical graph owns this query's envelope, and
+        // the permit's release wakes queued waiters. Returning the envelope
+        // second would let the next query be admitted while this one's capacity
+        // is still charged to the governor.
+        self.analytical.take();
         if let Some(permit) = self.local_permit.take() {
             permit.release_inner();
         }
@@ -1130,6 +1135,41 @@ impl AdmittedQueryGuard {
         &mut self,
     ) -> Option<super::analytical::AnalyticalAttemptOwnership> {
         self.analytical.take()
+    }
+
+    /// Installs one already-admitted envelope for an ownership-transfer test.
+    #[cfg(test)]
+    pub(super) fn install_query_resources_for_test(
+        &mut self,
+        resources: crate::resources::OracleQueryResources,
+    ) {
+        let permit = self
+            .local_permit
+            .as_ref()
+            .expect("a test guard always holds its local permit");
+        *permit
+            .resources
+            .lock()
+            .expect("fixture permit resources lock is uncontended") = Some(resources);
+    }
+
+    /// Takes this query's admitted envelope so its Analytical graph can own it.
+    ///
+    /// An Analytical leader must not admit a second envelope for a query that
+    /// already holds one, so the graph is registered with *this* envelope rather
+    /// than a fresh acquisition. Taking rather than sharing keeps a single
+    /// owner: from here the graph releases it, and this guard's own drop only
+    /// returns the admission counters.
+    ///
+    /// Returns `None` when the query has no live local permit, which is the
+    /// refusal path — a query about to be rejected has no envelope to lend.
+    pub(super) fn take_query_resources(
+        &mut self,
+    ) -> Option<crate::resources::OracleQueryResources> {
+        self.local_permit
+            .as_ref()
+            .and_then(|permit| permit.resources.lock().ok())
+            .and_then(|mut resources| resources.take())
     }
 
     /// Records that result data left this query, fencing any later retry.
@@ -1290,6 +1330,10 @@ impl AdmittedQueryGuard {
     /// Cancels the query and releases all local resources synchronously.
     pub(super) fn release(mut self) {
         self.cancellation.cancel();
+        // Before the permit: the Analytical graph holds this query's envelope,
+        // and returning admission counters first would let a queued waiter be
+        // admitted while the envelope it needs is still charged.
+        self.analytical.take();
         self.live_reservations.clear();
         self.physical_projections.clear();
         if let Some(permit) = self.local_permit.take() {

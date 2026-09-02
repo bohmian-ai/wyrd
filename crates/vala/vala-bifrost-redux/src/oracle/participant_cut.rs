@@ -386,6 +386,45 @@ pub(super) mod tests {
         }
     }
 
+    /// Freezes one Analytical-capable three-Oracle cut led by `leader`.
+    ///
+    /// The Analytical leader path projects its remote participants straight out
+    /// of the frozen cut, so a leasing test needs a cut whose Oracle set is both
+    /// Analytical-capable and larger than the leader alone.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture snapshot does not freeze, which would make every
+    /// assertion built on the returned cut vacuous.
+    pub(crate) fn analytical_cut(
+        now: DateTime<Utc>,
+        leader: u128,
+        deadline: DateTime<Utc>,
+    ) -> OracleQueryAttemptCut {
+        let analytical = |node: u128, fence: u64| {
+            let mut role = lease(node, ClusterRole::Oracle, fence);
+            if let ClusterCapabilities::OracleV1(capabilities) = &mut role.capabilities {
+                capabilities.supported_classes = vec![QueryClass::Analytical];
+                capabilities.max_workers_per_query = 4;
+            }
+            role
+        };
+        let snapshot = ClusterSnapshot::observed(
+            vec![analytical(leader, 7), analytical(3, 8), analytical(4, 9)],
+            now,
+        );
+        OracleQueryAttemptCut::try_from_snapshot(
+            &snapshot,
+            QueryId::new(uuid::Uuid::now_v7()),
+            NodeId::new(uuid::Uuid::from_u128(leader)),
+            QueryClass::Analytical,
+            deadline,
+            now,
+            Duration::from_secs(15),
+        )
+        .expect("the fixture snapshot freezes one analytical cut")
+    }
+
     /// One snapshot becomes one deterministic Oracle and Scribe participant cut.
     ///
     /// # Panics

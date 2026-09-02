@@ -2652,7 +2652,6 @@ mod tests {
                 ),
                 reservations: Arc::clone(&reservations),
                 spill: Arc::clone(&spill),
-                exchange_buffer_bytes: 64 * 1024,
                 leaf: crate::oracle::codec::AnalyticalLeafBinding::new(
                     wyrd_spec::vala::api::ClusterRole::Oracle,
                     Arc::new(crate::oracle::follower::UnresolvableSource),

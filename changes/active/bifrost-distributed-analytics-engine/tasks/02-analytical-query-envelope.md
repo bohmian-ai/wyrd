@@ -556,3 +556,57 @@ contract.
   `AnalyticalGraphEntry::{Active, Draining}` map-value refactor; the `draining`
   registry added here provides the required supervisor-visible `Draining` state
   in the meantime.
+
+### Scenario 3 — One admitted guard, pool, runtime, and finite result transport
+
+- RED: `oracle::analytical::tests::analytical_graph_reuses_one_query_pool_per_process`
+  failed at `the registered graph installs the admitted envelope's own pool`
+  when `lease_session` built its runtime from a fresh `GreedyMemoryPool` instead
+  of the admitted envelope's pool (temporary one-line inversion, reverted).
+- GREEN:
+  - `AdmittedQueryGuard::take_query_resources` moves the leader envelope out of
+    the admission permit; `lease_session` takes `&mut AdmittedQueryGuard`,
+    builds the graph runtime from that envelope's pool and scratch grant, and
+    registers it. The handle no longer holds `OracleResources` and issues no
+    second `try_acquire_query`.
+  - Release order is now envelope-before-counters in both `Drop for
+    AdmittedQueryGuard` and `AdmittedQueryGuard::release`, so a queued waiter is
+    never admitted while the envelope it needs is still charged.
+  - Exchange child allocation is gone end to end: `EXCHANGE_CONSUMER`,
+    `AnalyticalAttemptGrant::exchange_buffer_bytes`,
+    `AnalyticalAttemptState::exchange_memory`,
+    `AnalyticalAttemptRelease::exchange_buffer_bytes`, the `try_split_memory`
+    call in `spawn_attempt`, `AnalyticalStageIngressConfig`/
+    `AnalyticalExecutionConfig::exchange_buffer_bytes`, and the
+    `analytical_exchange_buffer_bytes` server config are removed. The pinned
+    exchange consumer now allocates from the installed pool.
+  - `AnalyticalGraphRuntime` collapsed to its single `Arc<RuntimeEnv>`; its
+    `exchange_buffer_budget_bytes` prediction field had no consumers anywhere.
+- Command: `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib --features test-support,bench-support -E 'test(=oracle::analytical::tests::analytical_graph_reuses_one_query_pool_per_process)'` → 1 passed.
+- `oracle::analytical_supervisor::tests::analytical_attempt_installs_query_owned_runtime_and_releases_once`
+  was updated in place: it now asserts the attempt pre-charges nothing and that
+  a pinned exchange consumer charges the installed query pool.
+- Broader: `mise run fmt`; crate lib suite 962/966 passed with the same four
+  pre-existing failures, re-proven unrelated by re-running them on a stashed
+  tree; `cargo clippy -p vala-bifrost-redux --all-features --all-targets` clean;
+  `cargo check -p wyrd-testing --all-features --all-targets` clean;
+  `mise run check:bifrost-resource-governance` passed;
+  `mise run check:bifrost-oracle-deploy` 2 passed; `git diff --check` clean.
+- Bounded corrections recorded:
+  1. The task's literal "transfer the `AdmittedQueryGuard` into the graph" is
+     unrepresentable — the guard owns `analytical: Option<AnalyticalAttemptOwnership>`,
+     which owns the graph guard. The transferred value is therefore the guard's
+     `OracleQueryResources` envelope, which is what the rest of the scenario
+     ("build the graph runtime from that guard's pool and spill grant", "never
+     acquires another leader envelope") actually constrains.
+  2. `lease_inactive_analytical_attempt` (the `test-support` seam) previously
+     relied on the deleted `try_acquire_query` path. It now admits through the
+     production `admit_sql_query` and hands the resulting guard to
+     `AnalyticalAttemptOwnership::retain_admission`, so the seam holds admission
+     for exactly as long as the graph holds the envelope. The guard it retains
+     has `analytical: None`, so no ownership cycle exists.
+  3. The finite-result-channel fill and lifecycle-task join named in this
+     scenario's RED are deferred to Scenario 5, which owns the supervisor's
+     `JoinHandle` and the `AnalyticalGraphEntry::{Active, Draining}` refactor.
+     This scenario's terminal proof is that settlement returns the graph and the
+     envelope to the process root exactly once.

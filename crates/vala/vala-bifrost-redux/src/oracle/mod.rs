@@ -1566,8 +1566,6 @@ pub struct OracleConfig {
     pub queue_capacity: u32,
     /// Absolute queue wait cap.
     pub max_queue_wait: Duration,
-    /// Bytes one Analytical attempt may retain in live exchange buffers.
-    pub analytical_exchange_buffer_bytes: usize,
     /// Bytes one Analytical attempt may retain as spill scratch.
     pub analytical_scratch_bytes: u64,
 }
@@ -1590,7 +1588,6 @@ impl Default for OracleConfig {
             multi_tenant_ceiling: 4,
             queue_capacity: 64,
             max_queue_wait: Duration::from_millis(250),
-            analytical_exchange_buffer_bytes: 16 * 1024 * 1024,
             analytical_scratch_bytes: 64 * 1024 * 1024,
         }
     }
@@ -2103,12 +2100,8 @@ struct AnalyticalCompositionInputs {
     reservations: Arc<dispatcher::ReservationRegistry>,
     /// Directory this leader reserves each graph participant's envelope through.
     peer_transports: Option<Arc<dispatcher::OraclePeerTransportDirectory>>,
-    /// Process-level Oracle resource governor shared with admission.
-    resources: crate::resources::OracleResources,
     /// Process-owned spill runtime every query-owned runtime is built from.
     spill: Arc<OracleSpillRuntime>,
-    /// Per-attempt exchange buffer share.
-    exchange_buffer_bytes: usize,
     /// Per-attempt scratch share.
     scratch_bytes: u64,
     /// Immutable peer identity every east-west channel is dialed through.
@@ -2135,9 +2128,7 @@ fn compose_analytical_handle(
         audit,
         reservations,
         peer_transports,
-        resources,
         spill,
-        exchange_buffer_bytes,
         scratch_bytes,
         peer_tls,
         peer_credentials,
@@ -2164,7 +2155,6 @@ fn compose_analytical_handle(
             supervisor: Arc::clone(&supervisor),
             reservations,
             spill: Arc::clone(&spill),
-            exchange_buffer_bytes,
             leaf: leaf.clone(),
             egress,
         });
@@ -2174,14 +2164,12 @@ fn compose_analytical_handle(
             authority,
             supervisor,
             spill,
-            oracle_resources: resources,
             peer_transports,
         },
         analytical::AnalyticalExecutionConfig {
             node_id,
             oracle_fence: fence,
             ticket_ttl: ANALYTICAL_STAGE_TICKET_TTL,
-            exchange_buffer_bytes,
             scratch_bytes,
             peer_tls,
             peer_credentials,
@@ -2308,9 +2296,7 @@ impl Oracle {
                     audit: Arc::clone(&config.audit),
                     reservations: Arc::clone(&config.reservations),
                     peer_transports: config.peer_transports.as_ref().map(Arc::clone),
-                    resources: config.memory.resources.clone(),
                     spill: Arc::clone(&config.spill_runtime),
-                    exchange_buffer_bytes: config.config.analytical_exchange_buffer_bytes,
                     scratch_bytes: config.config.analytical_scratch_bytes,
                 })
             });
@@ -2556,7 +2542,27 @@ impl Oracle {
             .as_ref()
             .ok_or(BifrostError::OracleRoleUnavailable)?;
         let work_units = Self::scannable_work_units(&planned.cuts);
-        handle.lease_session(attempt, &cut, &context, work_units)
+        // Admitted exactly as production admits: the leader envelope this graph
+        // owns is the one this guard holds, and there is no second acquisition.
+        let deadline = Instant::now()
+            .checked_add(projected_request_deadline(
+                request.deadline_ms,
+                self.planner.config.default_deadline,
+            ))
+            .ok_or(BifrostError::QueryTimeout)?;
+        let mut admitted = self
+            .admit_sql_query(
+                &context,
+                planned.query_class,
+                planned.local_ratio,
+                deadline,
+                cut.attempt_id(),
+            )
+            .await?;
+        let (session, mut ownership) =
+            handle.lease_session(attempt, &cut, &context, &mut admitted, work_units)?;
+        ownership.retain_admission(admitted);
+        Ok((session, ownership))
     }
 
     /// Reports this node's graph-lease activations and the leases it still holds.
@@ -4309,9 +4315,9 @@ impl Oracle {
                 "analytical lease without a composed handle",
             );
         };
-        match handle.lease_session(attempt, participant_cut, context, work_units) {
+        let mut admitted = admitted;
+        match handle.lease_session(attempt, participant_cut, context, &mut admitted, work_units) {
             Ok((session, ownership)) => {
-                let mut admitted = admitted;
                 admitted.analytical = Some(ownership);
                 Ok((session, admitted))
             }

@@ -38,15 +38,7 @@ use super::analytical::{
     DataFusionQueryId, PublicQueryId,
 };
 use super::telemetry::{AnalyticalAttemptOutcome, AnalyticalAttemptTelemetry};
-use crate::resources::{
-    OracleQueryMemoryReservation, OracleQueryResources, OracleQueryScratchReservation,
-};
-
-/// Consumer name charged for an attempt's live exchange buffers.
-///
-/// The name is a compile-time constant so exchange memory is attributable in
-/// the query pool's consumer report without carrying an unbounded label.
-const EXCHANGE_CONSUMER: &str = "oracle-analytical-exchange";
+use crate::resources::{OracleQueryResources, OracleQueryScratchReservation};
 
 /// A graph-local stage ordinal.
 ///
@@ -179,15 +171,16 @@ struct AnalyticalAttemptSlot {
     task: Option<TaskId>,
 }
 
-/// The exact child grants one attempt splits from the admitted query envelope.
+/// The exact child grant one attempt splits from the admitted query envelope.
 ///
-/// Both values are children of capacity admission already charged for this
-/// query. Splitting them never admits new root capacity, so an attempt that
-/// cannot fit inside its own query's envelope is refused rather than growing it.
+/// Scratch is a child of capacity admission already charged for this query.
+/// Splitting it never admits new root capacity, so an attempt that cannot fit
+/// inside its own query's envelope is refused rather than growing it. Memory is
+/// deliberately absent: operators and exchanges allocate from the query's one
+/// installed pool, so a second per-attempt memory ceiling would only be able to
+/// refuse work the pool already governs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AnalyticalAttemptGrant {
-    /// Bytes the attempt's live exchange buffers may hold.
-    pub exchange_buffer_bytes: usize,
     /// Bytes of the query's admitted scratch share the attempt may spill into.
     pub scratch_bytes: u64,
 }
@@ -225,8 +218,6 @@ struct AnalyticalAttemptState {
     cancel: CancellationToken,
     /// Driver futures retained so settlement can join rather than orphan them.
     drivers: Vec<JoinHandle<()>>,
-    /// The attempt's exchange-buffer child of the query memory pool.
-    exchange_memory: OracleQueryMemoryReservation,
     /// The attempt's scratch child of the query scratch envelope.
     scratch: OracleQueryScratchReservation,
     /// In-flight gauge and duration accounting released on the terminal path.
@@ -254,8 +245,6 @@ pub struct AnalyticalAttemptRelease {
     pub outcome: AnalyticalAttemptOutcome,
     /// Driver futures joined before the attempt's resources were returned.
     pub drivers_joined: usize,
-    /// Exchange-buffer bytes returned to the query pool.
-    pub exchange_buffer_bytes: usize,
     /// Scratch bytes returned to the query envelope.
     pub scratch_bytes: u64,
     /// Whether result data left the node under this attempt.
@@ -664,10 +653,6 @@ impl AnalyticalSupervisor {
                     .to_owned(),
             });
         }
-        let exchange_memory = graph
-            .resources
-            .try_split_memory(EXCHANGE_CONSUMER, grant.exchange_buffer_bytes)
-            .map_err(|_| BifrostError::QueryExecutionFailed)?;
         let scratch = graph
             .resources
             .try_split_scratch(grant.scratch_bytes)
@@ -685,7 +670,6 @@ impl AnalyticalSupervisor {
             stage = %key.stage,
             task = key.task.map(TaskId::as_usize),
             attempt = key.attempt.as_u8(),
-            exchange_buffer_bytes = grant.exchange_buffer_bytes,
             scratch_bytes = grant.scratch_bytes,
             "Oracle analytical attempt admitted"
         );
@@ -694,7 +678,6 @@ impl AnalyticalSupervisor {
             AnalyticalAttemptState {
                 cancel: cancel.clone(),
                 drivers: Vec::new(),
-                exchange_memory,
                 scratch,
                 telemetry,
                 grant,
@@ -780,17 +763,11 @@ impl AnalyticalSupervisor {
             key,
             outcome,
             drivers_joined,
-            exchange_buffer_bytes: state.grant.exchange_buffer_bytes,
             scratch_bytes: state.grant.scratch_bytes,
             egressed: state.egressed.load(Ordering::Acquire),
         };
         state.telemetry.finish(outcome);
-        let AnalyticalAttemptState {
-            exchange_memory,
-            scratch,
-            ..
-        } = state;
-        drop(exchange_memory);
+        let AnalyticalAttemptState { scratch, .. } = state;
         drop(scratch);
         tracing::debug!(
             public_query_id = %key.public_query_id,
@@ -1136,7 +1113,7 @@ mod tests {
         let runtime = spill
             .build_query_runtime(resources.memory_pool(), resources.scratch_bytes)
             .expect("an admitted scratch share builds a bounded query runtime");
-        AnalyticalGraphRuntime::new(runtime, FIXTURE_EXCHANGE_BYTES)
+        AnalyticalGraphRuntime::new(runtime)
     }
 
     /// Names one stage-scoped attempt zero for `graph`.
@@ -1153,7 +1130,6 @@ mod tests {
     /// Builds the exact fixture grant both supervisor tests charge.
     const fn fixture_grant() -> AnalyticalAttemptGrant {
         AnalyticalAttemptGrant {
-            exchange_buffer_bytes: FIXTURE_EXCHANGE_BYTES,
             scratch_bytes: FIXTURE_SCRATCH_BYTES,
         }
     }
@@ -1293,6 +1269,36 @@ mod tests {
     /// # Panics
     ///
     /// Panics when admission, installation, or release diverges.
+    /// Proves an exchange meets the query's one ceiling and no second one.
+    ///
+    /// Spawning an attempt splits no exchange child off the envelope, so a
+    /// pinned exchange consumer registered on the installed runtime charges the
+    /// query pool directly and returns every byte when it is dropped.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the attempt pre-charged the pool, the allocation is refused,
+    /// or it is not charged to the installed pool.
+    fn assert_exchange_allocates_from_installed_pool(
+        runtime: &Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+        pool: &Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+    ) {
+        assert_eq!(
+            pool.reserved(),
+            0,
+            "spawning an attempt splits no exchange child off the query pool"
+        );
+        let exchange = datafusion::execution::memory_pool::MemoryConsumer::new("fixture-exchange");
+        let exchange = exchange.register(&runtime.memory_pool);
+        exchange
+            .try_grow(FIXTURE_EXCHANGE_BYTES)
+            .expect("the admitted grant covers one exchange allocation");
+        assert!(
+            pool.reserved() >= FIXTURE_EXCHANGE_BYTES,
+            "the pinned exchange consumer allocates from the installed query pool"
+        );
+    }
+
     #[tokio::test]
     async fn analytical_attempt_installs_query_owned_runtime_and_releases_once() {
         let recorder = wyrd_bench::BenchmarkRecorder::default();
@@ -1335,22 +1341,18 @@ mod tests {
             Arc::ptr_eq(&resolved.runtime().memory_pool, &pool),
             "the installed runtime carries this query's admitted memory pool"
         );
-        assert!(
-            pool.reserved() >= FIXTURE_EXCHANGE_BYTES,
-            "the exchange child is charged against the query pool, not new capacity"
-        );
+        assert_exchange_allocates_from_installed_pool(resolved.runtime(), &pool);
 
         let release = guard
             .finish(AnalyticalAttemptOutcome::Success)
             .await
             .expect("the attempt settles once");
-        assert_eq!(release.exchange_buffer_bytes, FIXTURE_EXCHANGE_BYTES);
         assert_eq!(release.scratch_bytes, FIXTURE_SCRATCH_BYTES);
         assert_eq!(release.drivers_joined, 0);
         assert_eq!(
             pool.reserved(),
             0,
-            "settlement returns the attempt's exchange child to the query pool"
+            "the exchange consumer returns every byte to the query pool"
         );
 
         assert!(

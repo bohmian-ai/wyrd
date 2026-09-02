@@ -321,3 +321,136 @@ weaker tenant/peer authority, a longer TTL, a second registry/supervisor, or
 best-effort cleanup. Return `PLAN_BLOCKED` if the pinned dependency prevents
 the existing stage ingress from awaiting an activation before decode without a
 fork; current adapters provide this interception point, so no block is known.
+
+## Execution evidence
+
+### Scenario 1 — retained binding, pre-IO refusal
+
+RED: `graph_lease_binding_mutation_is_refused_before_io` failed to compile —
+no `GraphLeaseBinding` owner existed on `AnalyticalStageIngress`.
+
+GREEN: added `GraphLeaseBinding` in `oracle/analytical.rs` holding the
+reservation half (`reservation_id`, `graph`, `query_id`,
+`reserving_leader_node_id`, `reserving_leader_fence`, `reservation_expires_at`)
+unioned with the first verified `StageTicketClaims` half (`tenant_id`,
+`public_query_id`, `datafusion_query_id`, `destination_node_id`,
+`destination_fence`, `participant_cut_fingerprint`, `participant_cut`,
+`snapshot_digest`, `permission_digest`, `absolute_deadline_ms`). Per-message
+source authority is `pair == original_reserving_leader_pair ||
+participant_cut.contains(pair)`, evaluated in `authorize` before any decode.
+`AnalyticalParticipantCut` gained `contains` and a `fingerprint` over
+`b"wyrd-oracle-analytical-participant-cut-v1"` plus canonically ordered
+participants.
+
+Command: `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib
+--features test-support,bench-support -E
+'test(=oracle::analytical::tests::graph_lease_binding_mutation_is_refused_before_io)'`
+— PASS.
+
+### Scenario 2 — exactly-once activation, order independent
+
+RED: `graph_lease_activation_is_order_independent_and_shared` failed — the old
+`lease_graph`/`release_graph` pair on `ReservationRegistry` admitted a second
+activation for the same graph.
+
+GREEN: replaced it with a two-phase activation transaction in
+`oracle/dispatcher.rs`: `begin_graph_activation` → `PendingGraphActivation`
+(`commit(register)` / `rollback(now)`) → `CommittedGraphActivation`, which owns
+the running permit and releases it on drop. `AnalyticalStageIngress::publish`
+installs exactly one `Arc<GraphLease>` per `AnalyticalGraphKey` under the
+existing graph mutex; the loser of a race reuses the published lease and its
+pending activation rolls back. No second registry or supervisor was added.
+
+Command: as above with
+`test(=oracle::analytical::tests::graph_lease_activation_is_order_independent_and_shared)`
+— PASS.
+
+### Scenario 3 — failed activation rolls back without publication
+
+RED: `graph_activation_failure_rolls_back_without_publication` failed — a
+supervisor registration failure left the reservation consumed.
+
+GREEN: `AnalyticalGraphSupervisor::register_graph` now returns
+`Result<AnalyticalGraphGuard, (Box<OracleQueryResources>, BifrostError)>` so the
+resources return to the caller, and `PendingGraphActivation::commit` restores
+the reservation entry on the register closure's failure. The helper
+`graph_rollback_restores_a_reservation_only_before_its_expiry` proves the
+restore is refused past the unchanged TTL rather than extending it.
+
+Command: as above with
+`test(=oracle::analytical::tests::graph_activation_failure_rolls_back_without_publication)`
+— PASS.
+
+### Scenario 4 — settlement driver and retained draining ownership
+
+RED: `follower_graph_release_waits_for_children_and_retains_cleanup_failure`
+failed — release force-dropped the supervisor entry beneath live nested
+children, so nothing was retained.
+
+GREEN: added `enum AnalyticalGraphEntry { Active { lease, open_connections },
+Draining { lease, settlement_failure } }` under the existing graph mutex, one
+ingress-owned bounded MPSC settlement driver sized to
+`ReservationRegistry::max_concurrent_graphs()`, and `drive_graph_settlements`
+holding only `Weak<AnalyticalStageIngress>`. `AnalyticalConnectionLease::drop`
+does only the synchronous decrement plus a non-blocking `try_send`.
+`AnalyticalGraphSupervisor::release_graph` now refuses to remove an entry whose
+nested children are not idle, and `graph_children_debt` (backed by
+`OracleQueryResources::nested_debt`) reports the exact retained scratch and
+memory bytes. `shutdown` closes admission, transitions `Active` → `Draining`,
+closes the sender, drains and joins the driver, and only then inspects retained
+`Draining` entries; `AnalyticalLiveOwnership` gained `cleanup_failures` so the
+retention is readiness-visible.
+
+Command: as above with
+`test(=oracle::analytical::tests::follower_graph_release_waits_for_children_and_retains_cleanup_failure)`
+— PASS.
+
+### Broader verification
+
+- `mise run fmt` — PASS.
+- `mise run lints` — PASS (required boxing four `result_large_err` payloads,
+  splitting two `too_many_lines` bodies, and introducing
+  `AnalyticalExecutionOwners` for a pre-existing `too_many_arguments`).
+- `mise run test:bifrost` — 961/961 PASS.
+- `mise run check:bifrost-resource-governance` — PASS.
+- `mise run check:proto-drift` — PASS.
+- `mise run codegen:check` — PASS (no private wire or generated contract
+  changed).
+- `git diff --check` — clean.
+- `mise run test:bifrost:journey:oracle` — 14/15 PASS. See the limitation
+  below.
+
+### Material limitation — blocks Scenario 4's required join
+
+`analytical_inactive::pg_inactive_analytical_raw_sql_executes_join_and_partial_final_aggregate_on_followers`
+fails at server shutdown with `Oracle shutdown retained admission, resource,
+peer, or audit state`, because the follower graph's envelope permanently
+retains nested memory after every attempt has settled:
+
+```
+WARN Oracle analytical graph did not drain before its follower release
+     scratch_bytes=0 memory_bytes=615
+WARN Oracle analytical follower could not settle a closed graph
+     error=... Oracle analytical graph cleanup did not complete
+WARN Oracle analytical follower shutdown retains unsettled graph ownership
+     graphs=1 attempts=0 cleanup_failures=1
+ERROR Bifrost resource accounting poisoned
+      detail="Oracle query owner outlived a nested resource child"
+```
+
+A `TrackConsumersPool` probe named the holders exactly — four
+`WorkerConnection#NNN` consumers at 205 B each. These are the pinned
+`datafusion-distributed` rev's `WorkerConnectionPool` reservations, registered
+against the graph's query memory pool at
+`src/protocol/grpc/worker_client.rs:102`, owned by
+`NetworkShuffleExec`/`NetworkCoalesceExec` plan nodes that the process-wide
+`Worker` retains inside `task_data_entries` — a `moka` cache with a 10-minute
+`time_to_idle`, `pub(crate)`, with no eviction API in the pinned rev. Raising
+the drain budget from 5 s to 40 s changed nothing (exactly 615 B throughout).
+
+Before this task, `drain_graph` warned and released anyway, masking the leak;
+the task's required join surfaces it as a shutdown failure. Settlement's
+required "joins ... cache entries ... verifies the pool idle" step therefore
+cannot complete against a process-wide `Worker`, and the gap is an ownership
+decision the task does not settle. See the returned
+`TASK_REVISION_REQUIRED` for the two reachable designs.

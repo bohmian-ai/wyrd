@@ -4180,6 +4180,26 @@ impl OracleQueryResources {
         Ok(*nested_scratch == 0 && self.memory_pool.reserved() == 0)
     }
 
+    /// Reports exactly what a non-idle query envelope still owes, in bytes.
+    ///
+    /// A drain that times out is only actionable if it names what stayed. This
+    /// returns the scratch and memory a child still holds, in that order, so the
+    /// refusal can say which one it was rather than only that one existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostResourceError::Poisoned`] when the scratch attribution
+    /// lock is poisoned.
+    pub fn nested_debt(&self) -> Result<(u64, usize), BifrostResourceError> {
+        let nested_scratch =
+            self.nested_scratch_used_bytes
+                .lock()
+                .map_err(|_| BifrostResourceError::Poisoned {
+                    detail: "Oracle query scratch attribution lock is poisoned".to_owned(),
+                })?;
+        Ok((*nested_scratch, self.memory_pool.reserved()))
+    }
+
     /// Splits one named memory child from the already admitted query pool.
     ///
     /// # Errors

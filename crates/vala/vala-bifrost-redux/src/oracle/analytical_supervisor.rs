@@ -421,6 +421,30 @@ impl AnalyticalSupervisor {
             .map_err(|_| poisoned_supervisor())
     }
 
+    /// Reports what one registered graph's envelope still owes its children.
+    ///
+    /// Returns the scratch and memory bytes a nested child still holds, in that
+    /// order. An unregistered graph owes nothing. This is what makes a drain
+    /// timeout name the resource that stayed rather than only its existence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when the graph or scratch attribution
+    /// lock is poisoned.
+    pub fn graph_children_debt(
+        &self,
+        graph: AnalyticalGraphKey,
+    ) -> Result<(u64, usize), BifrostError> {
+        let graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
+        let Some(state) = graphs.get(&graph) else {
+            return Ok((0, 0));
+        };
+        state
+            .resources
+            .nested_debt()
+            .map_err(|_| poisoned_supervisor())
+    }
+
     /// Returns the number of registered graphs, for terminal-cleanup evidence.
     ///
     /// # Errors

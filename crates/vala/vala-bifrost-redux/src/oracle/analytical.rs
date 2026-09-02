@@ -1136,9 +1136,12 @@ impl GraphLease {
             }
             tokio::time::sleep(GRAPH_DRAIN_INTERVAL).await;
         }
+        let (scratch_bytes, memory_bytes) = self.supervisor.graph_children_debt(self.graph)?;
         tracing::warn!(
             public_query_id = %self.graph.public_query_id,
             datafusion_query_id = %self.graph.datafusion_query_id,
+            scratch_bytes,
+            memory_bytes,
             "Oracle analytical graph did not drain before its follower release"
         );
         Err(BifrostError::Internal {

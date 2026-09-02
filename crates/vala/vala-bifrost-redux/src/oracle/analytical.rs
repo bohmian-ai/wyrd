@@ -1701,6 +1701,10 @@ impl AnalyticalStageIngress {
     /// # Errors
     ///
     /// Returns the untouched activation with the failure that stopped it.
+    // justification: the error half must carry the rollback-owning
+    // `PendingGraphActivation` back beside the failure that stopped it, so the
+    // caller can hand the reservation back under its own unchanged expiry. A
+    // one-use alias would only rename that pair, not simplify it.
     #[allow(clippy::type_complexity)]
     fn publish(
         &self,

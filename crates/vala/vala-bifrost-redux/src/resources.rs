@@ -4171,13 +4171,8 @@ impl OracleQueryResources {
     /// Returns [`BifrostResourceError::Poisoned`] when the scratch attribution
     /// lock is poisoned.
     pub fn nested_idle(&self) -> Result<bool, BifrostResourceError> {
-        let nested_scratch =
-            self.nested_scratch_used_bytes
-                .lock()
-                .map_err(|_| BifrostResourceError::Poisoned {
-                    detail: "Oracle query scratch attribution lock is poisoned".to_owned(),
-                })?;
-        Ok(*nested_scratch == 0 && self.memory_pool.reserved() == 0)
+        self.nested_debt()
+            .map(|(scratch_bytes, memory_bytes)| scratch_bytes == 0 && memory_bytes == 0)
     }
 
     /// Reports exactly what a non-idle query envelope still owes, in bytes.

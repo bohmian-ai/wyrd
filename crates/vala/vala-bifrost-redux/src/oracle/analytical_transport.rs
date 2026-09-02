@@ -1668,7 +1668,11 @@ fn measured_exchange(
 #[derive(Default)]
 pub struct AnalyticalGraphExchanges {
     /// The live partition streams, each retained until the graph closes it.
-    streams: Arc<std::sync::Mutex<Vec<ExchangeSlot>>>,
+    ///
+    /// Not itself shared: every long-lived consumer already holds the owning
+    /// [`AnalyticalGraphExchanges`] through an [`Arc`], and each retained slot
+    /// carries its own [`Arc`] for the graph and its consumer to share.
+    streams: std::sync::Mutex<Vec<ExchangeSlot>>,
 }
 
 impl fmt::Debug for AnalyticalGraphExchanges {

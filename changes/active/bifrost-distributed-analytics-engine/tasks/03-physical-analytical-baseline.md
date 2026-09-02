@@ -309,3 +309,79 @@ Return `PLAN_BLOCKED` if the pinned DataFusion metrics cannot expose positive
 spill count/bytes/rows for the same completed plan or Task 2's lifecycle cannot
 own the rewritten-plan metric future without changing a public contract; report
 the exact missing dependency capability rather than adding a parallel owner.
+
+## Execution evidence
+
+### Scenario 1 — `peer_network::analytical::inactive_baseline_executes_join_group_spill_and_interchangeable_topology`
+
+RED progressed through three genuine defects, each surfaced by the journey and
+each fixed at its owner:
+
+1. `query admission rejected` on the baseline statement. Child stderr (echoed
+   under `RUST_LOG`) showed `Resources exhausted: Additional allocation failed
+   for ExternalSorterMerge[N] ... fair(pool_size: 256.0 MB)`. Root cause:
+   `AnalyticalSessionBuilder::build_session_state` — the `WorkerSessionBuilder`
+   seam — applied only the Parquet options, so every distributed stage executed
+   the leader's plan under DataFusion defaults instead of the grant-derived
+   shape.
+2. `executed no uniquely identifiable output sort`, twice: the child read
+   `settled_physical_evidence()` before the graph lifecycle settled, and the
+   evidence walk double-counted nodes reachable through both a `Stage::Local`
+   boundary edge and the identical ordinary child.
+3. `coordinator 0 reported no spill: 0 spills, 0 bytes, 0 rows` while the
+   rewritten plan visibly carried `spill_count=32, spilled_bytes=296.5 MB,
+   spilled_rows=300.0 K`. Root cause: `datafusion-distributed`'s
+   `MetricsWrapperExec` implements `downcast_delegate`, so
+   `downcast_ref::<SortExec>()` succeeds on the wrapper but yields the inner
+   operator, which never executed here and carries an empty `MetricsSet`.
+
+GREEN: `1 test run: 1 passed` at 54.4s under the task's exact command.
+
+Fixes, at their owners:
+
+- `resources::OracleSessionShape` now owns `sort_spill_reservation_bytes` (half
+  a partition's share of the grant) and derives `batch_size` from
+  `partition_share - reservation` rather than the whole grant, because an
+  unspillable consumer pays a batch's memory cost once per partition.
+  `ORACLE_MAX_BATCH_SIZE` is now a ceiling, not the full-grant value. This is a
+  resource-governance contract change; its contract tests were updated to
+  compare shapes at a fixed partition count.
+- `AnalyticalGraphRuntime` carries the shape, set from the admission envelope on
+  a follower and from the local grant on the leader, and `apply` folds every
+  knob (partitions, batch size, join preference, reservation, Parquet) into the
+  stage session.
+- `AnalyticalGraphMetricFold::settle` yields the metric-carrying rewritten plan,
+  and the child polls `settled_physical_evidence()` to a bounded deadline.
+- `PhysicalEvidenceWalk` dedupes by node address and reads metrics from the
+  visited node instead of the downcast one.
+
+Harness: child stderr is echoed when `RUST_LOG` is set, and a `Failed` baseline
+response appends the stderr tail — without this every assertion failure was
+blind, which is what made the first defect expensive.
+
+```bash
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test oracle -P journey -E 'test(=peer_network::analytical::inactive_baseline_executes_join_group_spill_and_interchangeable_topology)' --run-ignored=all"
+```
+
+### Scenario 2 — `oracle::analytical_supervisor::tests::distributed_metrics_settle_within_the_graph_deadline`
+
+RED: the test hung on the result stream's unbounded await. GREEN removed that
+await and bound the metric fold to the graph deadline. Committed `c53ff5aff`.
+
+### Scenario 3 — `peer_network::listener::peer_listener_is_isolated_mtls_and_role_complete`
+
+Narrowed to one three-Oracle call. Committed `76b9453d2`.
+
+### Broader verification
+
+All commands in the section above ran clean: `lints` finished with no warnings,
+`test:bifrost` 973 passed, `test:bifrost:journey:oracle` 15 passed,
+`check:bifrost-oracle-deploy` 2 passed, `check:bifrost-resource-governance` and
+`check:object-store-pin` passed, `git diff --check` clean.
+
+### Material limitations
+
+DataFusion 55 offers no byte-based batch sizing and no merge fan-in cap, so the
+grant is held within the fair pool by row-count batch sizing derived from the
+per-partition share. The derived batch size was verified empirically across a
+pool/partition/reservation/batch sweep before being fixed as the contract.

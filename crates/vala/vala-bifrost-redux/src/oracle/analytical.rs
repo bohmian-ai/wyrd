@@ -2795,6 +2795,15 @@ impl AnalyticalGraphLifecycle {
                 Err(error) => failure = Some(error.to_string()),
             }
         }
+        // Cancellation alone cannot end an exchange whose consumer stopped
+        // polling it: upstream keeps a reader task, and the buffers it charges
+        // to this query's pool, alive until every partition stream it handed
+        // out is dropped. Closing the graph's own exchange registry is what
+        // drops them, and it has to happen before the envelope's children are
+        // waited on or the wait would be for bytes nothing will release.
+        if let Ok(Some(exchanges)) = self.supervisor.graph_exchanges(self.graph) {
+            exchanges.close();
+        }
         let retained = reservations.release().await;
         self.drain(retained).await;
         if failure.is_none()

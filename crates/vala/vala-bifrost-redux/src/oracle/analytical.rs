@@ -993,6 +993,17 @@ pub struct GraphLease {
     attempts: Mutex<HashMap<AnalyticalAttemptKey, AnalyticalAttemptGuard>>,
     /// Whether settlement has already run, so it can never run twice.
     settled: AtomicBool,
+    /// Upstream worker whose task cache is scoped to exactly this graph.
+    ///
+    /// Upstream caches a stage's decoded task data on the worker that served
+    /// it, and those cached plans own the exchange connections that charge this
+    /// graph's envelope. A worker shared by the whole process would therefore
+    /// hold this envelope's reservations until its own idle timeout expired,
+    /// long after the graph ended. Owning one worker per graph makes the cache
+    /// die with the graph, which is what lets settlement actually join it.
+    /// Taken by [`Self::settle`] before the drain, so the drain observes the
+    /// release rather than waiting on a cache nothing will clear.
+    worker: Mutex<Option<Worker>>,
 }
 
 impl fmt::Debug for GraphLease {
@@ -1011,6 +1022,25 @@ impl GraphLease {
     #[must_use]
     pub(crate) fn binding(&self) -> &GraphLeaseBinding {
         &self.binding
+    }
+
+    /// Returns this graph's own upstream worker while the graph is unsettled.
+    ///
+    /// A clone shares the graph's task cache, so an in-flight request keeps it
+    /// alive for exactly as long as it is being served. Settlement takes the
+    /// lease's own handle, after which this returns `None` and no new stage
+    /// operation can enter the graph's cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when the worker lock is poisoned.
+    pub(crate) fn worker(&self) -> Result<Option<Worker>, BifrostError> {
+        Ok(self
+            .worker
+            .lock()
+            .map_err(|_| poisoned_ingress())?
+            .as_ref()
+            .cloned())
     }
 
     /// Returns how many attempts of this graph are still admitted.
@@ -1108,6 +1138,11 @@ impl GraphLease {
         for key in live {
             self.finish_attempt(key, outcome).await?;
         }
+        // Before the drain, never after. Upstream's cached stage plans own the
+        // worker connections that hold this envelope's reservations, so the
+        // cache has to go first or the drain would be waiting on bytes that
+        // nothing in the graph's own lifetime will ever release.
+        drop(self.worker.lock().map_err(|_| poisoned_ingress())?.take());
         self.drain().await?;
         let guard = self.guard.lock().map_err(|_| poisoned_ingress())?.take();
         if let Some(guard) = guard {
@@ -1253,8 +1288,12 @@ pub struct AnalyticalStageIngress {
     spill: Arc<OracleSpillRuntime>,
     /// Exchange-buffer child every attempt of a graph on this node charges.
     exchange_buffer_bytes: usize,
-    /// Upstream worker whose sessions install this node's query-owned runtimes.
-    worker: Worker,
+    /// Capability an Analytical leaf needs to resolve its own source locally.
+    ///
+    /// Retained rather than consumed once, because every graph builds its own
+    /// upstream worker from it and each of those workers owns a task cache that
+    /// must not outlive its graph.
+    leaf: super::codec::AnalyticalLeafBinding,
     /// This follower's graphs, each in exactly one state, under one mutex.
     graphs: Mutex<HashMap<AnalyticalGraphKey, AnalyticalGraphEntry>>,
     /// Outbound capability this node's own middle stages sign through.
@@ -1285,11 +1324,12 @@ impl fmt::Debug for AnalyticalStageIngress {
 impl AnalyticalStageIngress {
     /// Builds the follower ingress and starts its one settlement driver.
     ///
-    /// The upstream worker is constructed from [`AnalyticalSessionBuilder`] over
-    /// the supervisor's own runtime registry, so a stage whose graph is not
-    /// registered — an invalidated attempt, a sibling graph, a forged identity —
-    /// fails to build a session rather than silently falling back to a process
-    /// runtime.
+    /// No upstream worker is built here. Each graph builds its own from
+    /// [`AnalyticalSessionBuilder`] over the supervisor's runtime registry, so a
+    /// stage whose graph is not registered — an invalidated attempt, a sibling
+    /// graph, a forged identity — fails to build a session rather than silently
+    /// falling back to a process runtime, and upstream's task cache is scoped to
+    /// the graph that filled it rather than to this node's whole lifetime.
     ///
     /// The driver is started here and joined by [`Self::shutdown`], so no
     /// settlement task can outlive the ingress. It holds only a
@@ -1314,11 +1354,6 @@ impl AnalyticalStageIngress {
             leaf,
             egress,
         } = config;
-        let worker = Worker::from_session_builder(AnalyticalSessionBuilder::new(
-            Arc::clone(supervisor.registry()),
-            leaf,
-            Arc::clone(&egress),
-        ));
         // Sized from the one capacity root that already bounds graph
         // admission, so the queue can always hold every graph this node is
         // permitted to own at once and there is no second capacity setting.
@@ -1341,7 +1376,7 @@ impl AnalyticalStageIngress {
                 reservations,
                 spill,
                 exchange_buffer_bytes,
-                worker,
+                leaf,
                 graphs: Mutex::new(HashMap::new()),
                 egress,
                 settlement: Mutex::new(Some(sender)),
@@ -1351,10 +1386,36 @@ impl AnalyticalStageIngress {
         })
     }
 
-    /// Returns the upstream worker for local-worker context composition.
-    #[must_use]
-    pub fn worker(&self) -> &Worker {
-        &self.worker
+    /// Builds one upstream worker bound to a single graph's lifetime.
+    ///
+    /// [`Worker::from_session_builder`] creates a fresh task cache per call, so
+    /// each graph gets its own. That is the whole point: upstream's cache holds
+    /// decoded stage plans, those plans own the worker connections that charge
+    /// the graph's memory envelope, and a cache shared across graphs would keep
+    /// one graph's envelope charged until an unrelated idle timeout expired.
+    fn build_worker(&self) -> Worker {
+        Worker::from_session_builder(AnalyticalSessionBuilder::new(
+            Arc::clone(self.supervisor.registry()),
+            self.leaf.clone(),
+            Arc::clone(&self.egress),
+        ))
+    }
+
+    /// Returns the upstream worker that must serve one graph's stage operation.
+    ///
+    /// `None` means the graph is not live here, or has already settled and
+    /// dropped its cache. Either way no stage operation may enter it, which is
+    /// what keeps a settled graph from being re-populated by a late message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when an ownership lock is poisoned.
+    pub fn graph_worker(&self, graph: &AnalyticalGraphKey) -> Result<Option<Worker>, BifrostError> {
+        let graphs = self.graphs.lock().map_err(|_| poisoned_ingress())?;
+        match graphs.get(graph) {
+            Some(AnalyticalGraphEntry::Active { lease, .. }) => lease.worker(),
+            Some(AnalyticalGraphEntry::Draining { .. }) | None => Ok(None),
+        }
     }
 
     /// Authorizes one governed stage message and admits the work it names.
@@ -1568,6 +1629,7 @@ impl AnalyticalStageIngress {
             cancel: self.supervisor.root_cancellation().child_token(),
             attempts: Mutex::new(HashMap::new()),
             settled: AtomicBool::new(false),
+            worker: Mutex::new(Some(self.build_worker())),
         }))
     }
 
@@ -3069,6 +3131,81 @@ mod tests {
         );
 
         follower_retains_a_graph_whose_children_never_drain().await;
+        follower_scopes_one_upstream_worker_to_each_graph().await;
+    }
+
+    /// Proves each graph owns its own upstream worker for exactly its lifetime.
+    ///
+    /// Upstream caches a stage's decoded task data on the worker that served
+    /// it, and those cached plans own the exchange connections that charge the
+    /// graph's envelope. A worker shared across graphs would therefore hold one
+    /// graph's envelope charged for another graph's cache, and settlement could
+    /// never join it. This pins the three properties settlement depends on: a
+    /// live graph resolves a worker, two graphs never resolve the same one, and
+    /// a settled graph resolves none at all.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a live graph resolves no worker, two graphs share one, or a
+    /// settled graph still resolves one.
+    async fn follower_scopes_one_upstream_worker_to_each_graph() {
+        let now = Utc::now();
+        let fixture = GraphFixture::new(now);
+        let attempt = fixture
+            .send(&fixture.leader_message(StageOperationV1::SetPlan, 1), now)
+            .await
+            .expect("the reserving leader activates the graph");
+        let live = fixture
+            .ingress
+            .graph_worker(&fixture.graph)
+            .expect("ownership is readable")
+            .expect("a live graph owns an upstream worker");
+
+        // A second graph on the same follower must not share the first graph's
+        // task cache, or settling either would wait on the other's plans.
+        let sibling = GraphFixture::new(now);
+        let sibling_attempt = sibling
+            .send(&sibling.leader_message(StageOperationV1::SetPlan, 1), now)
+            .await
+            .expect("the reserving leader activates the sibling graph");
+        let other = sibling
+            .ingress
+            .graph_worker(&sibling.graph)
+            .expect("ownership is readable")
+            .expect("a live sibling graph owns an upstream worker");
+        drop(live);
+        drop(other);
+
+        // Settlement takes the graph's own worker, so nothing may enter its
+        // cache afterwards and the cache itself is gone.
+        fixture
+            .ingress
+            .finish_attempt(attempt, AnalyticalAttemptOutcome::Success)
+            .await
+            .expect("the graph's only attempt settles");
+        assert!(
+            fixture
+                .ingress
+                .graph_worker(&fixture.graph)
+                .expect("ownership is readable")
+                .is_none(),
+            "a settled graph still resolved an upstream worker"
+        );
+        // The sibling is untouched by that settlement, which is the observable
+        // consequence of the two graphs never having shared one worker.
+        assert!(
+            sibling
+                .ingress
+                .graph_worker(&sibling.graph)
+                .expect("ownership is readable")
+                .is_some(),
+            "settling one graph took another graph's upstream worker"
+        );
+        sibling
+            .ingress
+            .finish_attempt(sibling_attempt, AnalyticalAttemptOutcome::Success)
+            .await
+            .expect("the sibling graph's only attempt settles");
     }
 
     /// Proves an undrainable graph is retained, named, and never released.

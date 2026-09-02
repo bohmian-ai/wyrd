@@ -60,7 +60,7 @@ use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion_distributed::grpc::{BoxCloneSyncChannel, create_worker_client};
 use datafusion_distributed::{
     ChannelResolver, CoordinatorToWorkerMsg, ExecuteTaskRequest, GetWorkerInfoRequest,
-    GetWorkerInfoResponse, SetPlanRequest, TaskKey, WorkerChannel, WorkerToCoordinatorMsg,
+    GetWorkerInfoResponse, SetPlanRequest, TaskKey, Worker, WorkerChannel, WorkerToCoordinatorMsg,
 };
 use futures_util::StreamExt as _;
 use futures_util::stream::BoxStream;
@@ -1130,6 +1130,160 @@ impl<B: Default> RefusalResponse for Response<B> {
     }
 }
 
+/// Upstream's own worker type, re-exported for the crate that mounts it.
+///
+/// The mounting server needs exactly one thing from upstream — the constructor
+/// that turns a worker into its generated gRPC service — and upstream does not
+/// export the generated service type by name. Re-exporting the worker lets the
+/// mount site name `Worker::into_worker_server` without taking a direct
+/// dependency on the distributed engine.
+pub use datafusion_distributed::Worker as UpstreamWorker;
+
+/// Resolves the upstream worker service that must serve one authorized graph.
+///
+/// Each graph owns its own upstream worker so that upstream's task cache — and
+/// the exchange connections its cached plans hold — dies with the graph instead
+/// of surviving on a process-wide worker. The auth layer therefore cannot hold
+/// one fixed upstream service: it resolves the service per authorized message,
+/// after the graph is known and before anything is forwarded.
+pub trait StageUpstream: Clone + Send + 'static {
+    /// Returns the service bound to `graph`, or `None` when it owns none.
+    ///
+    /// `None` is a refusal, not a fallback. A graph that is settling, settled,
+    /// or was never activated here has no cache a stage operation may enter.
+    fn for_graph(&self, graph: &AnalyticalGraphKey) -> Option<Self>
+    where
+        Self: Sized;
+}
+
+/// Production [`StageUpstream`] over this follower's per-graph workers.
+///
+/// The value mounted on the server carries no service at all; it exists only to
+/// resolve one. `resolved` is populated by [`StageUpstream::for_graph`] for the
+/// duration of a single request, which is exactly how long a clone of the
+/// graph's task cache is allowed to live outside the lease.
+///
+/// `S` is upstream's own generated worker service. It is a type parameter
+/// rather than a named type because upstream does not export the generated
+/// server; `build` is the constructor the mounting crate already had in hand.
+pub struct GraphWorkerServices<S> {
+    /// Follower ingress owning every live graph and its worker.
+    ingress: Arc<AnalyticalStageIngress>,
+    /// Upstream's own constructor from a worker to its generated service.
+    build: fn(Worker) -> S,
+    /// The graph-bound service, present only on a resolved value.
+    resolved: Option<S>,
+}
+
+impl<S> Clone for GraphWorkerServices<S>
+where
+    S: Clone,
+{
+    /// Clones the resolver, preserving whether it is bound to a graph.
+    fn clone(&self) -> Self {
+        Self {
+            ingress: Arc::clone(&self.ingress),
+            build: self.build,
+            resolved: self.resolved.clone(),
+        }
+    }
+}
+
+impl<S> fmt::Debug for GraphWorkerServices<S> {
+    /// Reports whether this value is resolved without rendering the service.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GraphWorkerServices")
+            .field("resolved", &self.resolved.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S> GraphWorkerServices<S> {
+    /// Builds the unresolved resolver the server mounts.
+    ///
+    /// `build` is upstream's own worker-to-service constructor, so this crate
+    /// never reimplements or renames the generated service.
+    #[must_use]
+    pub fn new(ingress: Arc<AnalyticalStageIngress>, build: fn(Worker) -> S) -> Self {
+        Self {
+            ingress,
+            build,
+            resolved: None,
+        }
+    }
+}
+
+impl<S> StageUpstream for GraphWorkerServices<S>
+where
+    S: Clone + Send + 'static,
+{
+    /// Resolves the live graph's own worker into a single-request service.
+    fn for_graph(&self, graph: &AnalyticalGraphKey) -> Option<Self> {
+        let worker = match self.ingress.graph_worker(graph) {
+            Ok(worker) => worker?,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "Oracle analytical stage ingress could not resolve a graph worker"
+                );
+                return None;
+            }
+        };
+        Some(Self {
+            ingress: Arc::clone(&self.ingress),
+            build: self.build,
+            resolved: Some((self.build)(worker)),
+        })
+    }
+}
+
+impl<S> wyrd_tonic::tonic::server::NamedService for GraphWorkerServices<S>
+where
+    S: wyrd_tonic::tonic::server::NamedService,
+{
+    /// Routing is upstream's: the resolver serves upstream's own service name.
+    const NAME: &'static str = S::NAME;
+}
+
+impl<S, B> tower::Service<Request<B>> for GraphWorkerServices<S>
+where
+    S: tower::Service<Request<B>> + Clone + Send + 'static,
+    S::Response: RefusalResponse,
+    S::Future: Send,
+    B: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    /// An unresolved resolver is ready; a resolved one defers to its service.
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        match self.resolved.as_mut() {
+            Some(service) => service.poll_ready(cx),
+            None => Poll::Ready(Ok(())),
+        }
+    }
+
+    /// Serves the request on the graph's own worker.
+    ///
+    /// An unresolved value is refused rather than served: the auth layer only
+    /// ever calls a value returned by [`StageUpstream::for_graph`], so reaching
+    /// this branch would mean the layer was bypassed.
+    fn call(&mut self, request: Request<B>) -> Self::Future {
+        let Some(service) = self.resolved.as_mut() else {
+            tracing::error!("Oracle analytical stage ingress called an unresolved graph worker");
+            return Box::pin(async { Ok(S::Response::refused()) });
+        };
+        // Same Tower readiness contract as the layers around it: the future
+        // owns the value that was polled ready, and an unreadied clone takes
+        // its place.
+        let unreadied = service.clone();
+        let mut service = std::mem::replace(service, unreadied);
+        Box::pin(async move { service.call(request).await })
+    }
+}
+
 /// Installs [`AnalyticalStageAuth`] over an upstream worker service.
 ///
 /// This is the follower half of the stage-operation authority. It is layered
@@ -1207,7 +1361,7 @@ where
 
 impl<S, B> tower::Service<Request<B>> for AnalyticalStageAuth<S>
 where
-    S: tower::Service<Request<ReplayBody<B>>> + Clone + Send + 'static,
+    S: tower::Service<Request<ReplayBody<B>>> + StageUpstream + Clone + Send + 'static,
     S::Future: Send,
     S::Response: RefusalResponse,
     B: Body<Data = Bytes> + Unpin + Send + 'static,
@@ -1227,7 +1381,7 @@ where
         // future must own the service value that was polled ready, so the
         // readied value is moved out and an unreadied clone takes its place.
         let unreadied = self.inner.clone();
-        let mut inner = std::mem::replace(&mut self.inner, unreadied);
+        let inner = std::mem::replace(&mut self.inner, unreadied);
         let ingress = Arc::clone(&self.ingress);
         Box::pin(async move {
             let path = request.uri().path().to_owned();
@@ -1281,6 +1435,13 @@ where
                     }
                 },
                 StageOperationV1::ExecuteTask => None,
+            };
+            // The graph's own worker, resolved only now: the message has been
+            // authorized, the graph is known, and a graph that is settling or
+            // gone owns no cache this may enter.
+            let Some(mut inner) = inner.for_graph(&key.graph()) else {
+                tracing::warn!(path = %path, reason = "graph_worker", "Oracle analytical stage ingress refused a request");
+                return Ok(S::Response::refused());
             };
             inner
                 .call(replay_request(
@@ -2075,6 +2236,17 @@ mod tests {
         probe: Arc<UpstreamProbe>,
         /// Bytes upstream reassembled from the forwarded body.
         seen: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl StageUpstream for RecordingUpstream {
+        /// The fixture upstream is graph-independent: it serves every graph.
+        ///
+        /// Per-graph resolution is proved by the production resolver's own
+        /// tests; this fixture exists to observe what upstream was handed, so
+        /// resolving it away would erase the observation.
+        fn for_graph(&self, _graph: &AnalyticalGraphKey) -> Option<Self> {
+            Some(self.clone())
+        }
     }
 
     impl<B> tower::Service<Request<B>> for RecordingUpstream

@@ -436,12 +436,20 @@ pub fn build_peer_grpc(
         .and_then(|query| query.engine().analytical_worker())
     {
         Some(ingress) => {
-            let worker = ingress.worker().clone().into_worker_server();
+            // Resolved per authorized message rather than mounted once: each
+            // graph owns its own upstream worker so that upstream's task cache,
+            // and the exchange connections its cached plans hold, die with the
+            // graph instead of outliving it on a process-wide worker.
+            let workers =
+                vala_bifrost_redux::oracle::analytical_transport::GraphWorkerServices::new(
+                    Arc::clone(&ingress),
+                    vala_bifrost_redux::oracle::analytical_transport::UpstreamWorker::into_worker_server,
+                );
             router.add_service(auth.wrap(GrpcTransportAdmissionService::new_peer(
                 vala_bifrost_redux::oracle::analytical_transport::AnalyticalStageAuthLayer::new(
                     ingress,
                 )
-                .layer_service(worker),
+                .layer_service(workers),
                 transport.clone(),
             )))
         }

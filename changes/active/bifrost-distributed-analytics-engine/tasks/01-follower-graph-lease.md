@@ -420,6 +420,38 @@ Command: as above with
 - `mise run test:bifrost:journey:oracle` — 14/15 PASS. See the limitation
   below.
 
+### Refactor — per-graph upstream worker ownership
+
+Scenario 4's settlement must join upstream's cache entries. It cannot while the
+node owns one process-wide `datafusion-distributed` `Worker`, because that
+worker's `moka` task cache retains decoded stage plans — and the exchange
+connections they own — for a 10-minute idle timeout with no eviction API on the
+pinned revision.
+
+`Worker::from_session_builder` creates a fresh cache per call, so ownership moved
+to the graph:
+
+- `GraphLease` owns `worker: Mutex<Option<Worker>>`, built in `publish` from the
+  ingress's retained `AnalyticalLeafBinding`. `settle` takes it before the drain,
+  so the drain observes the release rather than waiting on a cache nothing will
+  clear.
+- `AnalyticalStageIngress` no longer holds a shared `Worker`; `graph_worker`
+  resolves the live graph's own, and a settling or settled graph resolves none.
+- `analytical_transport` gained the `StageUpstream` trait and the generic
+  `GraphWorkerServices<S>` resolver. The auth layer already resolved the graph
+  before forwarding, so it now resolves the graph's worker there too; an
+  unresolvable graph is refused, not served on a fallback. `S` is a type
+  parameter because upstream does not export its generated server; `build` is
+  upstream's own `Worker::into_worker_server`, reached through the new
+  `UpstreamWorker` re-export so `wyrd-server` takes no direct dependency on the
+  distributed engine.
+- `wyrd-server/src/grpc/mod.rs` mounts the resolver instead of one worker
+  service built at startup.
+
+Covered by `follower_scopes_one_upstream_worker_to_each_graph`, run as part of
+Scenario 4's focused command: a live graph resolves a worker, settling one graph
+does not take another's, and a settled graph resolves none.
+
 ### Material limitation — blocks Scenario 4's required join
 
 `analytical_inactive::pg_inactive_analytical_raw_sql_executes_join_and_partial_final_aggregate_on_followers`
@@ -438,19 +470,46 @@ ERROR Bifrost resource accounting poisoned
       detail="Oracle query owner outlived a nested resource child"
 ```
 
-A `TrackConsumersPool` probe named the holders exactly — four
-`WorkerConnection#NNN` consumers at 205 B each. These are the pinned
-`datafusion-distributed` rev's `WorkerConnectionPool` reservations, registered
-against the graph's query memory pool at
-`src/protocol/grpc/worker_client.rs:102`, owned by
-`NetworkShuffleExec`/`NetworkCoalesceExec` plan nodes that the process-wide
-`Worker` retains inside `task_data_entries` — a `moka` cache with a 10-minute
-`time_to_idle`, `pub(crate)`, with no eviction API in the pinned rev. Raising
-the drain budget from 5 s to 40 s changed nothing (exactly 615 B throughout).
+A temporary per-consumer current-usage ledger on the test-support
+`PeakTrackingMemoryPool` named the holder exactly and unambiguously:
 
-Before this task, `drain_graph` warned and released anyway, masking the leak;
-the task's required join surfaces it as a shutdown failure. Settlement's
-required "joins ... cache entries ... verifies the pool idle" step therefore
-cannot complete against a process-wide `Worker`, and the gap is an ownership
-decision the task does not settle. See the returned
-`TASK_REVISION_REQUIRED` for the two reachable designs.
+```
+WARN DRAIN PROBE consumer=WorkerConnection bytes=615
+```
+
+`WorkerConnection` is the pinned `datafusion-distributed` revision's own
+client-side reservation, created in `execute_task` at
+`src/protocol/grpc/worker_client.rs:102` against the calling task context's
+memory pool — which is this graph's envelope — and captured by the detached
+demultiplexing task upstream spawns to fan one gRPC stream into per-partition
+queues. Wyrd does not own that task and cannot join it.
+
+Four independent interventions were tried and none moved the figure off exactly
+615 B:
+
+1. Per-graph `Worker` ownership, dropping the whole task cache before the drain
+   (the refactor above). Unchanged.
+2. Raising the drain budget from 5 s to 40 s. Unchanged.
+3. Cancelling the graph's cancellation token unconditionally before the drain,
+   not only on non-success. Unchanged, and reverted because the task specifies
+   cancellation on non-success.
+4. Running `admission.shutdown` before the follower settlement, in case a
+   co-located leader half held the reservation. Unchanged, and reverted.
+
+Before this task, `drain_graph` warned and released anyway, masking the leak and
+then poisoning the process governor at drop with `Oracle query owner outlived a
+nested resource child`. The task's required join surfaces it as a shutdown
+failure instead.
+
+The two designs that would close it are not reachable inside this task:
+
+1. **Join upstream's buffering task.** The pinned revision neither joins nor
+   exposes it. This needs an upstream capability, not a Wyrd change.
+2. **Charge worker-connection buffering to a node-level pool** instead of the
+   graph envelope. Reachable today only by matching upstream's literal
+   `"WorkerConnection"` consumer name, and it would remove per-query bounds from
+   network buffering — a fairness and tenant-isolation regression that the
+   spec's memory-envelope obligations do not permit.
+
+Both are ownership decisions above this task, which is why it returns
+`TASK_REVISION_REQUIRED` rather than picking one.

@@ -362,7 +362,10 @@ RED: the new test failed first on settlement-queue capacity (`left: 2`,
 final committed code: neutralising the `expire_due_graphs` push in
 `drive_graph_settlements` makes the test fail on its bounded wait,
 `.expect("the target graph settles at its signed deadline")`, and restoring the
-push makes it pass again.
+push makes it pass again. Disabling the `select!` timer arm instead — the only
+thing that wakes an otherwise idle driver at a deadline — fails the same
+assertion, so both halves of the deadline mechanism are proven by mutation
+rather than by argument.
 
 GREEN, in the existing owners only:
 

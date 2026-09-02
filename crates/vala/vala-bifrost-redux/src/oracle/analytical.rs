@@ -179,30 +179,15 @@ impl fmt::Display for DataFusionQueryId {
 
 /// The attempt ordinal within one distributed graph.
 ///
-/// Exactly two values are reachable: attempt zero, and the one permitted
-/// authenticated pre-egress retry. A third attempt is not representable through
-/// [`AnalyticalAttemptNumber::retry`], which is the only way to advance it.
+/// Exactly one value is reachable. A graph has one attempt: any failure after
+/// selection is terminal, so no successor ordinal is representable and the wire
+/// ordinal exists only because the distributed dependency encodes one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AnalyticalAttemptNumber(u8);
 
 impl AnalyticalAttemptNumber {
     /// The first attempt of a graph.
     pub const ZERO: Self = Self(0);
-
-    /// The one permitted retry of a graph.
-    pub const ONE: Self = Self(1);
-
-    /// Advances to the one permitted retry.
-    ///
-    /// Returns `None` for the retry itself, which is what makes "at most one
-    /// retry" a property of the type rather than of a caller's discipline.
-    #[must_use]
-    pub const fn retry(self) -> Option<Self> {
-        match self.0 {
-            0 => Some(Self::ONE),
-            _ => None,
-        }
-    }
 
     /// Returns the ordinal for wire encoding, claims binding, and evidence.
     #[must_use]
@@ -212,13 +197,12 @@ impl AnalyticalAttemptNumber {
 
     /// Adopts an attempt ordinal received on an authenticated stage operation.
     ///
-    /// Returns `None` for any ordinal above the one permitted retry, so a
-    /// forged third attempt is rejected at the parsing boundary.
+    /// Returns `None` for any ordinal other than zero, so a forged successor is
+    /// rejected at the parsing boundary rather than by a downstream policy.
     #[must_use]
     pub const fn from_u8(value: u8) -> Option<Self> {
         match value {
             0 => Some(Self::ZERO),
-            1 => Some(Self::ONE),
             _ => None,
         }
     }
@@ -3275,19 +3259,19 @@ mod tests {
         );
     }
 
-    /// At most one retry exists, and it is unreachable a second time.
+    /// A graph has exactly one attempt, and no successor is representable.
     ///
     /// # Panics
     ///
-    /// Panics when a third attempt becomes representable.
+    /// Panics when a successor attempt becomes representable.
     #[test]
-    fn analytical_attempt_number_permits_exactly_one_retry() {
+    fn analytical_attempt_number_permits_exactly_one_attempt() {
         assert_eq!(AnalyticalAttemptNumber::ZERO.as_u8(), 0);
         assert_eq!(
-            AnalyticalAttemptNumber::ZERO.retry(),
-            Some(AnalyticalAttemptNumber::ONE)
+            AnalyticalAttemptNumber::from_u8(0),
+            Some(AnalyticalAttemptNumber::ZERO)
         );
-        assert_eq!(AnalyticalAttemptNumber::ONE.retry(), None);
+        assert_eq!(AnalyticalAttemptNumber::from_u8(1), None);
         assert_eq!(AnalyticalAttemptNumber::from_u8(2), None);
     }
 
@@ -3695,13 +3679,28 @@ mod tests {
         ///
         /// Panics when the fixture's Oracle role cannot be composed.
         fn execution_handle(&self) -> AnalyticalExecutionHandle {
+            self.execution_handle_with(None)
+        }
+
+        /// Composes the same handle over an exact peer transport directory.
+        ///
+        /// A leader only reserves, releases, or loses a peer through this
+        /// directory, so a test that injects peer loss chooses it here.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the fixture's Oracle role cannot be composed.
+        fn execution_handle_with(
+            &self,
+            peer_transports: Option<Arc<super::super::dispatcher::OraclePeerTransportDirectory>>,
+        ) -> AnalyticalExecutionHandle {
             AnalyticalExecutionHandle::new(
                 AnalyticalExecutionOwners {
                     worker: Arc::clone(&self.ingress),
                     authority: Arc::new(VerifyingStageAuthority),
                     supervisor: Arc::clone(&self.supervisor),
                     spill: Arc::clone(&self.spill),
-                    peer_transports: None,
+                    peer_transports,
                 },
                 AnalyticalExecutionConfig {
                     node_id: self.node_id,
@@ -3790,7 +3789,7 @@ mod tests {
     }
 
     /// Builds one authenticated Analytical context for a leasing fixture.
-    fn leasing_context() -> AuthorizedQueryContext {
+    fn context_for_leasing() -> AuthorizedQueryContext {
         let tenant = DataTenantId::new_v7();
         AuthorizedQueryContext::try_new(
             wyrd_runtime::Principal {
@@ -3837,6 +3836,180 @@ mod tests {
         assert!(
             !Arc::ptr_eq(pool, &other.memory_pool()),
             "distinct queries never share one DataFusion pool"
+        );
+    }
+
+    /// Leases one leader attempt over a transport accepting `accepted` reserves.
+    ///
+    /// Returns the admitted guard, the attempt ownership, and the transport, so
+    /// a caller can inject peer loss and then observe exactly what was issued.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot admit or lease, which would make every
+    /// assertion built on the returned ownership vacuous.
+    fn lease_over_lossy_peers(
+        fixture: &GraphFixture,
+        oracle: &OracleResources,
+        accepted: usize,
+    ) -> Box<(
+        super::super::admission::AdmittedQueryGuard,
+        AnalyticalAttemptOwnership,
+        Arc<ReservingTransport>,
+    )> {
+        let now = Utc::now();
+        let deadline = now + chrono::Duration::seconds(60);
+        let transport = Arc::new(ReservingTransport::new(accepted, deadline));
+        let directory = Arc::new(
+            super::super::dispatcher::OraclePeerTransportDirectory::new_for_test(
+                fixture.node_id,
+                Arc::clone(&transport) as Arc<dyn super::super::dispatcher::OraclePeerTransport>,
+                Arc::clone(&transport) as Arc<dyn super::super::dispatcher::OraclePeerTransport>,
+            ),
+        );
+        let handle = fixture.execution_handle_with(Some(directory));
+        let resources = oracle
+            .try_acquire_query(OracleResourceRequest::for_class(
+                QueryClass::Analytical,
+                0.0,
+            ))
+            .expect("an idle Oracle admits one analytical query");
+        let (mut admitted, _shared, _cancel) = super::super::admission::admitted_guard_for_test();
+        admitted.install_query_resources_for_test(resources);
+        let attempt = AnalyticalAttemptContext {
+            public_query_id: PublicQueryId::from_uuid(Uuid::from_u128(201)),
+            datafusion_query_id: DataFusionQueryId::from_uuid(Uuid::from_u128(202)),
+            snapshot_digest: "fixture-snapshot".to_owned(),
+            permission_digest: "fixture-permissions".to_owned(),
+        };
+        let cut = super::super::participant_cut::tests::analytical_cut(
+            now,
+            fixture.node_id.as_uuid().as_u128(),
+            deadline,
+        );
+        let (session, ownership) = handle
+            .lease_session(&attempt, &cut, &context_for_leasing(), &mut admitted, 4)
+            .expect("the leader leases one session from its admitted envelope");
+        drop(session);
+        Box::new((admitted, ownership, transport))
+    }
+
+    /// Peer loss after selection is terminal, and no successor attempt exists.
+    ///
+    /// Two orders matter and are proven separately: peer loss before any result
+    /// frame has left, and peer loss after one has. Neither may produce a second
+    /// attempt, a second round of participant reservations, or a terminal that
+    /// leaves the query's ownership behind. The retry ordinal, the retry
+    /// entry point, and the `retried` telemetry outcome are all gone, so "one
+    /// attempt" is a property of the types rather than of a caller's restraint.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a successor is reachable or a terminal strands ownership.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn peer_loss_is_one_terminal_attempt() {
+        assert_eq!(
+            AnalyticalAttemptNumber::from_u8(1),
+            None,
+            "no successor attempt ordinal is representable"
+        );
+        assert!(
+            !AnalyticalAttemptOutcome::ALL
+                .iter()
+                .any(|outcome| outcome.as_str() == "retried"),
+            "no retry terminal outcome remains to be counted"
+        );
+
+        // Multi-threaded on purpose: the graph lifecycle task is polled off
+        // this test's own stack, and one boxed future slot is reused by both
+        // cases so two live fixtures never share one debug-build frame.
+        for accepted in [0_usize, 2] {
+            Box::pin(assert_peer_loss_is_terminal(accepted)).await;
+        }
+    }
+
+    /// Proves one peer-loss ordering ends in exactly one failed terminal.
+    ///
+    /// `accepted` chooses the ordering: zero refuses the first reservation, so
+    /// the loss lands before any result frame; two accepts the whole cut, so
+    /// the attempt is egressed before it is lost. Neither may produce a second
+    /// attempt or a second round of reservations.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the loss is not terminal, a successor round is issued, or
+    /// the terminal strands ownership.
+    async fn assert_peer_loss_is_terminal(accepted: usize) {
+        let fixture = GraphFixture::new(Utc::now());
+        let oracle = fixture_oracle_role();
+        let leased = lease_over_lossy_peers(&fixture, &oracle, accepted);
+        let (admitted, ownership, transport) = *leased;
+        let published = Box::pin(ownership.publish_participants()).await;
+        if accepted == 0 {
+            assert!(
+                matches!(published, Err(BifrostError::QueryAdmissionRejected)),
+                "peer loss before dispatch refuses the attempt outright"
+            );
+            assert!(
+                !ownership.egressed(),
+                "no result frame left before the peer was lost"
+            );
+        } else {
+            published.expect("every addressed follower accepted its reservation");
+            ownership.attempt.record_egress();
+            assert!(ownership.egressed(), "one result frame has left this query");
+        }
+        Box::pin(assert_terminal_returns_everything(
+            &fixture, &oracle, admitted, ownership,
+        ))
+        .await;
+        assert_eq!(
+            transport.reserves().len(),
+            if accepted == 0 { 1 } else { 2 },
+            "a lost peer starts no successor round of reservations"
+        );
+    }
+
+    /// Settles one failed attempt and proves nothing survives it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the terminal is refused, a successor becomes spawnable, or
+    /// the graph or query envelope is left charged.
+    async fn assert_terminal_returns_everything(
+        fixture: &GraphFixture,
+        oracle: &OracleResources,
+        admitted: super::super::admission::AdmittedQueryGuard,
+        ownership: AnalyticalAttemptOwnership,
+    ) {
+        let key = ownership.key();
+        ownership
+            .settle(AnalyticalAttemptOutcome::Failed)
+            .await
+            .expect("a lost peer settles this attempt exactly once");
+        drop(admitted);
+        assert!(
+            fixture
+                .supervisor
+                .spawn_attempt(key, AnalyticalAttemptGrant { scratch_bytes: 0 },)
+                .is_err(),
+            "the settled graph admits no further attempt"
+        );
+        assert_eq!(
+            fixture
+                .supervisor
+                .live_graphs()
+                .expect("the supervisor reports live graphs"),
+            0,
+            "one terminal releases the graph"
+        );
+        assert_eq!(
+            oracle
+                .snapshot()
+                .expect("the fixture root reports live ownership")
+                .oracle_analytical_queries,
+            0,
+            "one terminal returns the query envelope to the process root"
         );
     }
 
@@ -3890,7 +4063,7 @@ mod tests {
             fixture.node_id.as_uuid().as_u128(),
             deadline,
         );
-        let context = leasing_context();
+        let context = context_for_leasing();
         let (session, ownership) = handle
             .lease_session(&attempt, &cut, &context, &mut admitted, 4)
             .expect("the leader leases one session from its admitted envelope");
@@ -5964,77 +6137,6 @@ impl AnalyticalAttemptOwnership {
     /// lifecycle task is gone.
     pub async fn publish_participants(&self) -> Result<(), BifrostError> {
         self.signals.publish_participants().await
-    }
-
-    /// Admits the one permitted retry, draining this attempt first.
-    ///
-    /// Three refusals are structural rather than advisory, and each is checked
-    /// before anything is torn down so a refused retry leaves the caller's
-    /// attempt exactly as it was:
-    ///
-    /// * a retry after result data has already egressed is refused, because a
-    ///   successor would re-emit rows the client has seen;
-    /// * a second retry is refused by [`AnalyticalAttemptNumber::retry`],
-    ///   which has no successor for the retry itself;
-    /// * the successor is admitted only after this attempt settles, and the
-    ///   supervisor independently refuses a second live attempt in the same
-    ///   slot, so the drain-before-admit ordering cannot be skipped by a
-    ///   caller that settles out of order.
-    ///
-    /// The graph is carried through untouched: the retry reuses the same
-    /// query-owned runtime, admitted envelope, cut, and deadline, which is what
-    /// makes it a retry rather than a second query.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostError::Internal`] when result data already egressed,
-    /// when this attempt is already the one permitted retry, or when the
-    /// supervisor refuses the successor, and the error reported by
-    /// [`AnalyticalAttemptGuard::finish`] when this attempt cannot settle.
-    pub async fn retry_pre_egress(
-        self,
-        grant: AnalyticalAttemptGrant,
-    ) -> Result<Self, BifrostError> {
-        if self.egressed() {
-            return Err(BifrostError::Internal {
-                detail: "Oracle analytical attempt cannot retry after result-data egress"
-                    .to_owned(),
-            });
-        }
-        let key = self.key();
-        let Some(next) = key.attempt.retry() else {
-            return Err(BifrostError::Internal {
-                detail: "Oracle analytical graph has already consumed its one permitted retry"
-                    .to_owned(),
-            });
-        };
-        // The retry reuses the graph and, with it, every participant
-        // reservation the first attempt took. Re-reserving would charge each
-        // follower a second envelope for a plan it is already holding one for.
-        let Self {
-            attempt,
-            graph,
-            signals,
-            admission,
-        } = self;
-        let supervisor = attempt.supervisor();
-        attempt.finish(AnalyticalAttemptOutcome::Retried).await?;
-        let attempt = supervisor.spawn_attempt(
-            AnalyticalAttemptKey::new(
-                key.public_query_id,
-                key.datafusion_query_id,
-                key.stage,
-                key.task,
-                next,
-            ),
-            grant,
-        )?;
-        Ok(Self {
-            attempt,
-            graph,
-            signals,
-            admission,
-        })
     }
 
     /// Settles the attempt and then releases its graph, in that order.

@@ -413,8 +413,6 @@ impl AnalyticalStageAuthorityOutcome {
 pub enum AnalyticalAttemptOutcome {
     /// The attempt drained and produced its complete result.
     Success,
-    /// The attempt was superseded by the one permitted pre-egress retry.
-    Retried,
     /// The attempt was cancelled, by client drop, deadline, or shutdown.
     Cancelled,
     /// The attempt failed terminally.
@@ -423,14 +421,13 @@ pub enum AnalyticalAttemptOutcome {
 
 impl AnalyticalAttemptOutcome {
     /// Every attempt outcome, used to pre-register series at zero.
-    pub(crate) const ALL: [Self; 4] = [Self::Success, Self::Retried, Self::Cancelled, Self::Failed];
+    pub(crate) const ALL: [Self; 3] = [Self::Success, Self::Cancelled, Self::Failed];
 
     /// Returns the canonical low-cardinality metric label.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Success => "success",
-            Self::Retried => "retried",
             Self::Cancelled => "cancelled",
             Self::Failed => "failed",
         }

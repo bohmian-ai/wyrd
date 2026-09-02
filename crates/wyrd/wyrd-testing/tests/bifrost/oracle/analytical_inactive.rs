@@ -338,109 +338,6 @@ async fn await_clean_nodes(cluster: &WyrdTestCluster) -> Result<(), JourneyError
 /// Bound on how long terminal cleanup may take before it is called a leak.
 const CLEAN_NODE_POLLS: usize = 50;
 
-/// The one permitted retry is admitted only after its predecessor drains, is
-/// refused a second time, and is refused once result data has left the node.
-#[tokio::test]
-#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
-async fn pg_inactive_analytical_retry_drains_attempt_zero_before_attempt_one() {
-    prove_bounded_retry()
-        .await
-        .expect("inactive analytical retry journey");
-}
-
-/// Drives the retry ordering, single-retry, and egress-fence proofs.
-///
-/// # Errors
-///
-/// Returns a cluster, lease, or assertion error.
-async fn prove_bounded_retry() -> Result<(), JourneyError> {
-    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::six_capacity()).await?;
-    let tenant = cluster.data_tenant_id();
-    let table = seed_table(&cluster, "analytical_retry").await?;
-    let query_server = cluster.server(0).ok_or("missing query node")?;
-    let engine = Arc::clone(
-        query_server
-            .state()
-            .bifrost_query()
-            .ok_or("query node composed no Oracle")?
-            .engine(),
-    );
-    let handle = Arc::clone(
-        engine
-            .analytical_execution()
-            .ok_or("Oracle composed no Analytical handle")?,
-    );
-    let grant = handle.attempt_grant();
-    let sql = format!("SELECT id FROM vala.bifrost.{table} ORDER BY id");
-
-    let attempt = attempt_context();
-    let (_session, ownership) = engine
-        .lease_inactive_analytical_attempt(query_context(tenant)?, request(&sql), &attempt)
-        .await?;
-    let zero = ownership.key();
-
-    // Ordering, proved against the supervisor rather than against the retry
-    // helper: while attempt zero is live, its successor is refused outright.
-    // A retry that could be admitted beside its predecessor would double-charge
-    // the graph's envelope and leave two graphs able to emit for one query.
-    let premature = handle
-        .supervisor()
-        .spawn_attempt(successor_key(zero), grant);
-    if premature.is_ok() {
-        return Err("a retry was admitted while its predecessor was still live".into());
-    }
-
-    // Readiness now also consults the Analytical half. A live, healthy graph is
-    // ordinary service, so the production Oracle must still advertise itself.
-    if !engine.is_ready() {
-        return Err("a live analytical graph must not make its Oracle unready".into());
-    }
-
-    let retried = ownership.retry_pre_egress(grant).await?;
-    if retried.key().attempt.as_u8() != 1 {
-        return Err(format!(
-            "retry expected attempt ordinal 1, saw {}",
-            retried.key().attempt.as_u8()
-        )
-        .into());
-    }
-    if handle.supervisor().live_attempts()? != 1 {
-        return Err("the retry did not replace its predecessor one-for-one".into());
-    }
-    if retried.retry_pre_egress(grant).await.is_ok() {
-        return Err("a second retry was admitted".into());
-    }
-
-    // The egress fence, on a fresh graph so the refusal cannot be the
-    // single-retry rule firing instead.
-    let attempt = attempt_context();
-    let (_session, ownership) = engine
-        .lease_inactive_analytical_attempt(query_context(tenant)?, request(&sql), &attempt)
-        .await?;
-    ownership.record_egress();
-    if !ownership.egressed() {
-        return Err("recorded egress was not observable on the attempt".into());
-    }
-    if ownership.retry_pre_egress(grant).await.is_ok() {
-        return Err("a retry was admitted after result-data egress".into());
-    }
-
-    await_clean_nodes(&cluster).await?;
-    cluster.shutdown().await?;
-    Ok(())
-}
-
-/// Names the successor of one attempt, used to prove the ordering refusal.
-fn successor_key(key: AnalyticalAttemptKey) -> AnalyticalAttemptKey {
-    AnalyticalAttemptKey::new(
-        key.public_query_id,
-        key.datafusion_query_id,
-        key.stage,
-        key.task,
-        key.attempt.retry().expect("attempt zero has a successor"),
-    )
-}
-
 /// Builds one published-only strict request with the journey's deadline.
 fn request(sql: &str) -> BifrostQueryRequest {
     BifrostQueryRequest {
@@ -565,9 +462,16 @@ async fn prove_stale_and_sibling_fencing() -> Result<(), JourneyError> {
         .await?;
     let live = ownership.key();
 
-    // A stale attempt ordinal of this same graph: never admitted, so it can
-    // settle nothing and attach nothing.
-    let stale = successor_key(live);
+    // A stage of this same graph that was never admitted: it can settle
+    // nothing and attach nothing. A graph has one attempt, so an unadmitted
+    // sibling stage — not a successor ordinal — is what "stale" now means.
+    let stale = AnalyticalAttemptKey::new(
+        live.public_query_id,
+        live.datafusion_query_id,
+        vala_bifrost_redux::oracle::analytical_supervisor::StageId::new(7),
+        live.task,
+        live.attempt,
+    );
     if supervisor
         .finish_attempt(stale, AnalyticalAttemptOutcome::Cancelled)
         .await

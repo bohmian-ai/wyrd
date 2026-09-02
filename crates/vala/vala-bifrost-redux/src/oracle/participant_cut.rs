@@ -403,6 +403,9 @@ pub(super) mod tests {
     ) -> OracleQueryAttemptCut {
         let analytical = |node: u128, fence: u64| {
             let mut role = lease(node, ClusterRole::Oracle, fence);
+            // Mutually authenticated by construction: an Analytical participant
+            // cut refuses any endpoint that is not `https`.
+            role.address = format!("https://node-{node}.invalid/");
             if let ClusterCapabilities::OracleV1(capabilities) = &mut role.capabilities {
                 capabilities.supported_classes = vec![QueryClass::Analytical];
                 capabilities.max_workers_per_query = 4;

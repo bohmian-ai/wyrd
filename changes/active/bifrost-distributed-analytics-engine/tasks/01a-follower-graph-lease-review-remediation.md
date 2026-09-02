@@ -358,9 +358,11 @@ active graph making a real Oracle unready fails that journey.
 ### Scenario 2 — deadline settlement
 
 RED: the new test failed first on settlement-queue capacity (`left: 2`,
-`right: 4`), then — with the capacity fixed but the deadline sweep neutralised
-as a check — on the bounded wait for the target graph to settle, proving the
-deadline branch is load-bearing rather than incidentally satisfied.
+`right: 4`). The deadline half was then confirmed load-bearing against the
+final committed code: neutralising the `expire_due_graphs` push in
+`drive_graph_settlements` makes the test fail on its bounded wait,
+`.expect("the target graph settles at its signed deadline")`, and restoring the
+push makes it pass again.
 
 GREEN, in the existing owners only:
 

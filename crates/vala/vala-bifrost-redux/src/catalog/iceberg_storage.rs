@@ -441,9 +441,136 @@ impl StorageFactory for BifrostIcebergStorageFactory {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio_util::sync::CancellationToken;
 
     use super::*;
     use crate::storage::{BifrostStorageConfig, BifrostStoragePolicy};
+
+    /// Builds one list entry the gated wrapper is asked to expose.
+    fn entry(path: &str) -> ListEntry {
+        ListEntry {
+            path: path.to_owned(),
+            size: 1,
+            last_modified_ms: None,
+            is_dir: false,
+        }
+    }
+
+    /// Counts every poll a wrapped backend listing actually receives.
+    ///
+    /// The count is the whole point: a wrapper that collects eagerly, or that
+    /// keeps polling after a permit refusal, is indistinguishable from a
+    /// correct one by its yielded items alone.
+    fn counting_backend(
+        entries: Vec<ListEntry>,
+        polls: Arc<AtomicUsize>,
+    ) -> BoxStream<'static, IcebergResult<ListEntry>> {
+        let mut remaining = entries.into_iter();
+        stream::poll_fn(move |_| {
+            polls.fetch_add(1, Ordering::SeqCst);
+            std::task::Poll::Ready(remaining.next().map(Ok))
+        })
+        .boxed()
+    }
+
+    /// Proves a lazy listing gates every backend poll and every exposed item.
+    ///
+    /// Two fences are exercised because they refuse at different boundaries: a
+    /// fence taken before the first poll must stop the backend from being
+    /// polled at all, and a fence taken while an item is already in hand must
+    /// stop that item from reaching the caller. Both must terminate the
+    /// wrapper after exactly one error rather than resuming on the next poll.
+    #[tokio::test]
+    async fn gated_list_stops_polling_and_yielding_after_fence() {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+
+        // A live permit exposes every entry and polls the backend once per
+        // item plus the final exhaustion poll.
+        let polls = Arc::new(AtomicUsize::new(0));
+        let live = crate::oracle::reader_pins::ReaderIoPermit::new(
+            CancellationToken::new(),
+            CancellationToken::new(),
+            deadline,
+        );
+        let mut stream = gate_list_stream(
+            counting_backend(vec![entry("a"), entry("b")], Arc::clone(&polls)),
+            live,
+        );
+        let mut exposed = Vec::new();
+        while let Some(item) = stream.next().await {
+            exposed.push(item.expect("a live permit exposes every entry").path);
+        }
+        assert_eq!(exposed, vec!["a".to_owned(), "b".to_owned()]);
+        assert_eq!(polls.load(Ordering::SeqCst), 3);
+
+        // A fence taken after the stream exists but before it is polled must
+        // reach the backend zero times.
+        let polls = Arc::new(AtomicUsize::new(0));
+        let epoch = CancellationToken::new();
+        let mut stream = gate_list_stream(
+            counting_backend(vec![entry("a"), entry("b")], Arc::clone(&polls)),
+            crate::oracle::reader_pins::ReaderIoPermit::new(
+                epoch.clone(),
+                CancellationToken::new(),
+                deadline,
+            ),
+        );
+        epoch.cancel();
+        assert!(
+            stream
+                .next()
+                .await
+                .expect("one permit error is yielded")
+                .is_err(),
+            "a fenced epoch refuses the listing rather than returning entries"
+        );
+        assert!(
+            stream.next().await.is_none(),
+            "the wrapper terminates after its one permit error"
+        );
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            0,
+            "no backend poll happens after the fence"
+        );
+
+        // A fence that lands while a backend item is already in hand must stop
+        // that item from reaching the caller, and must not poll again after.
+        let polls = Arc::new(AtomicUsize::new(0));
+        let epoch = CancellationToken::new();
+        let fencing = epoch.clone();
+        let counted = Arc::clone(&polls);
+        let backend = stream::poll_fn(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            fencing.cancel();
+            std::task::Poll::Ready(Some(Ok(entry("a"))))
+        })
+        .boxed();
+        let mut stream = gate_list_stream(
+            backend,
+            crate::oracle::reader_pins::ReaderIoPermit::new(
+                epoch,
+                CancellationToken::new(),
+                deadline,
+            ),
+        );
+        assert!(
+            stream
+                .next()
+                .await
+                .expect("one permit error is yielded")
+                .is_err(),
+            "an entry read legally but fenced before exposure is refused, not returned"
+        );
+        assert!(stream.next().await.is_none());
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            1,
+            "the fenced wrapper never polls the backend again"
+        );
+    }
 
     /// Builds an adapter over a real local backend rooted at `root`.
     ///
@@ -599,6 +726,37 @@ fn permit_error(error: &wyrd_spec::vala::BifrostError) -> IcebergError {
     IcebergError::new(IcebergErrorKind::FeatureUnsupported, error.to_string())
 }
 
+/// Wraps one lazy listing so the permit gates every poll and every item.
+///
+/// A listing is the one storage operation whose work outlives the call that
+/// created it: the backend stream is returned unread and polled later, by
+/// whatever consumes it. Checking the permit only at construction would
+/// therefore leave the entire enumeration ungated, so the permit is checked
+/// immediately before each backend poll and again before each item — backend
+/// errors included — is handed on.
+///
+/// A refusal yields exactly one error and then terminates: the wrapper drops
+/// the backend stream with it, so nothing polls the backend afterwards. The
+/// wrapper adds no buffering and collects nothing, so laziness and the
+/// backend's own backpressure are unchanged.
+fn gate_list_stream(
+    entries: BoxStream<'static, IcebergResult<ListEntry>>,
+    permit: crate::oracle::reader_pins::ReaderIoPermit,
+) -> BoxStream<'static, IcebergResult<ListEntry>> {
+    stream::unfold(Some((entries, permit)), |state| async move {
+        let (mut entries, permit) = state?;
+        if let Err(error) = permit.begin_io() {
+            return Some((Err(permit_error(&error)), None));
+        }
+        let item = entries.next().await?;
+        if let Err(error) = permit.expose_result() {
+            return Some((Err(permit_error(&error)), None));
+        }
+        Some((item, Some((entries, permit))))
+    })
+    .boxed()
+}
+
 /// Read-only Iceberg storage that no operation escapes without a live permit.
 ///
 /// Every reachable read checks the permit immediately before the backend call
@@ -727,7 +885,7 @@ impl Storage for EpochGatedIcebergStorage {
         self.permit.begin_io().map_err(|e| permit_error(&e))?;
         let entries = self.inner.list(path, recursive).await?;
         self.permit.expose_result().map_err(|e| permit_error(&e))?;
-        Ok(entries)
+        Ok(gate_list_stream(entries, self.permit.clone()))
     }
 
     fn new_input(&self, path: &str) -> IcebergResult<InputFile> {

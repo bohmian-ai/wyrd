@@ -2556,9 +2556,7 @@ impl Oracle {
             .as_ref()
             .ok_or(BifrostError::OracleRoleUnavailable)?;
         let work_units = Self::scannable_work_units(&planned.cuts);
-        handle
-            .lease_session(attempt, &cut, &context, work_units)
-            .await
+        handle.lease_session(attempt, &cut, &context, work_units)
     }
 
     /// Reports this node's graph-lease activations and the leases it still holds.
@@ -2800,17 +2798,14 @@ impl Oracle {
         phases.admitted();
         let work_units = Self::scannable_work_units(&planned.cuts);
         let (session, mut admitted) = match analytical {
-            Some(attempt) => {
-                self.lease_analytical_session(
-                    deadline,
-                    admitted,
-                    attempt,
-                    participant_cut,
-                    context,
-                    work_units,
-                )
-                .await?
-            }
+            Some(attempt) => self.lease_analytical_session(
+                deadline,
+                admitted,
+                attempt,
+                participant_cut,
+                context,
+                work_units,
+            )?,
             None => self.lease_session(deadline, admitted, work_units, "lease rejection")?,
         };
         admitted.retain_physical_projections(&planned.cuts)?;
@@ -4029,6 +4024,17 @@ impl Oracle {
             .ok_or(BifrostError::QueryExecutionFailed)?;
         let (distributed_session, split) =
             plan_distributed_split(session, sql, source_groups, participant_cut).await?;
+        // Selection is irreversible here and nowhere earlier: the physical plan
+        // has been built and proven supported, and it carries a follower
+        // subtree, so this is both the first point a participant may be charged
+        // and the last point before anything is dispatched to one. A plan that
+        // failed to build, was refused as unsupported, or kept every operator on
+        // the leader never reaches this line and never issues a reserve.
+        if !split.followers.is_empty()
+            && let Some(ownership) = admitted.analytical.as_ref()
+        {
+            ownership.publish_participants().await?;
+        }
         // The optimized physical plan is the first point at which the real
         // predicate/projection closure for each distributed leaf is known
         // (`oracle_assignments` is built before SQL planning as a safe,
@@ -4286,7 +4292,7 @@ impl Oracle {
     ///
     /// Returns the stable admission, supervisor, or runtime error after
     /// synchronously releasing the supplied admission owner.
-    async fn lease_analytical_session(
+    fn lease_analytical_session(
         &self,
         deadline: Instant,
         admitted: AdmittedQueryGuard,
@@ -4303,10 +4309,7 @@ impl Oracle {
                 "analytical lease without a composed handle",
             );
         };
-        match handle
-            .lease_session(attempt, participant_cut, context, work_units)
-            .await
-        {
+        match handle.lease_session(attempt, participant_cut, context, work_units) {
             Ok((session, ownership)) => {
                 let mut admitted = admitted;
                 admitted.analytical = Some(ownership);

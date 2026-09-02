@@ -481,3 +481,78 @@ into the existing supervisor graph, or cannot install the bounded test-only
 process gate without changing a production contract. Report the exact missing
 capability; do not restore the deleted lazy-reservation design or invent a new
 contract.
+
+## Execution evidence
+
+### Scenario 1 — supported physical-plan predicate
+
+- RED: `oracle::exec::tests::supported_analytical_plan_accepts_only_the_v1_baseline`
+  failed because `splitter::validate_supported` matched operator *names* only and
+  accepted any aggregate, join, or union shape beneath them.
+- GREEN: closed the predicate in
+  `crates/vala/vala-bifrost-redux/src/oracle/splitter.rs` — downcast-checked
+  aggregate UDAF identity, argument/state/result typing, inner column
+  equi-joins, provider-local same-table unions beneath `TenantTripwireExec`, and
+  `SortExec` without `fetch`. Argument types are checked in `Partial` mode
+  against `AggregateExec::input_schema()` because `AggregateFunctionExpr::arg_fields`
+  is private; every distributed aggregate carries a `Partial` layer, so the
+  matrix stays closed for the whole plan.
+- Two pre-existing splitter tests were corrected, not weakened: `LIMIT`/
+  `GlobalLimitExec` is now outside the supported matrix, so
+  `distributed_split_retains_global_operators_on_leader` drops its `LIMIT 1` and
+  `distributed_split_wraps_final_plan_at_top` builds a real `SortExec`.
+- Command: `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib --features test-support,bench-support -E 'test(=oracle::exec::tests::supported_analytical_plan_accepts_only_the_v1_baseline) or test(/oracle::splitter/)'` → 4 passed.
+- Commit `26331b94c`.
+
+### Scenario 2 — reserve and publish the participant cut once before dispatch
+
+- RED: `oracle::analytical::tests::participant_cut_is_reserved_once_immediately_before_dispatch`
+  could not be satisfied by the prior design — `lease_session` reserved before
+  physical-plan support or exchange were known, `AnalyticalChannelResolver`
+  required a reservation-bearing cut at session construction, and
+  `reserve_destinations` discarded `PendingNodeReservation::expires_at`.
+- GREEN:
+  - `AnalyticalChannelResolver` now retains
+    `Arc<OnceLock<Arc<AnalyticalParticipantCut>>>` and `resolve` fails closed on
+    an unset cell before any channel work. The follower path wraps its adopted
+    cut in an already-published cell.
+  - `AnalyticalExecutionHandle::lease_session` no longer reserves. It projects
+    remote participants from `OracleQueryAttemptCut` via the IO-free
+    `remote_participants` (replacing `reserve_destinations`), so planning reads
+    only immutable node identities, endpoints, and fences.
+  - New `AnalyticalGraphLifecycle` task per graph, started at registration, with
+    a monotonic `tokio::sync::watch` control channel
+    (`Registered` → `ReserveRequested` → `Terminal`) and result channel
+    (`Pending` → `ReservationReady`/`ReservationFailed`). It owns the bulk
+    `reserve` loop, publishes the frozen cut into the cell exactly once after
+    the last acceptance, releases everything on partial failure, and retains
+    unacknowledged releases.
+  - `AnalyticalRetainedRelease` stores the follower-returned `expires_at` and a
+    local monotonic receipt `Instant`; `conservatively_expired` requires both
+    `Utc::now() >= expires_at` and a full `dispatcher::PENDING_TTL` (now
+    `pub(super)`, reused rather than copied) elapsed monotonically.
+  - `AnalyticalSupervisor` gained a `draining` registry
+    (`retain_graph_cleanup` / `resolve_graph_cleanup` / `draining_graphs`), and
+    `AnalyticalExecutionHandle::is_healthy` now refuses readiness while any
+    graph is draining.
+  - `AnalyticalAttemptOwnership.participants` became `signals`;
+    `publish_participants` is the attempt-side barrier and `settle`/`Drop`
+    signal the terminal after both local guards are gone.
+  - `Oracle::execute_distributed_session` calls `publish_participants` after
+    `plan_distributed_split` succeeds and only when the split produced a
+    follower subtree, so failed planning, an unsupported shape, and the
+    exchange-free fallback all issue zero reserve RPCs.
+- Command: `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib --features test-support,bench-support -E 'test(=oracle::analytical::tests::participant_cut_is_reserved_once_immediately_before_dispatch)'` → 1 passed.
+- Broader: `mise run fmt`; crate lib suite 961/965 passed with the same four
+  pre-existing failures (`catalog::bifrost_catalog::production_pin_tests::*` ×2,
+  `scribe::persistence::tests::*` ×2) proven unrelated earlier in this task;
+  `cargo clippy -p vala-bifrost-redux --all-features --all-targets` clean;
+  `git diff --check` clean.
+- Bounded corrections recorded: (1) the test uses `tokio` `test-util`
+  (`start_paused`) added as a dev-dependency feature, since the retention bound
+  is inherently time-based and the task forbids sleeps; (2) the lifecycle task
+  is spawned detached in this scenario — Scenario 5 moves its `JoinHandle` into
+  the supervisor entry and joins it, together with the
+  `AnalyticalGraphEntry::{Active, Draining}` map-value refactor; the `draining`
+  registry added here provides the required supervisor-visible `Draining` state
+  in the meantime.

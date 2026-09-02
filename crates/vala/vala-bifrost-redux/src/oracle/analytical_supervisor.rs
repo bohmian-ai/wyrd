@@ -290,6 +290,13 @@ pub struct AnalyticalSupervisor {
     graphs: Mutex<HashMap<AnalyticalGraphKey, AnalyticalGraphState>>,
     /// Live attempts keyed by complete two-identity attempt identity.
     attempts: Mutex<HashMap<AnalyticalAttemptKey, AnalyticalAttemptState>>,
+    /// Graphs whose participant reservations could not be confirmed released.
+    ///
+    /// Separate from `graphs` because a draining graph has already returned its
+    /// local envelope: what is retained is a remote follower's, which this node
+    /// can name but cannot free. Keeping it here is what makes the residue
+    /// attributable to this node instead of silently forgotten.
+    draining: Mutex<std::collections::HashSet<AnalyticalGraphKey>>,
     /// Node-scoped cancellation parent of every attempt's cancellation child.
     root_cancel: CancellationToken,
     /// Whether the supervisor still admits new attempts.
@@ -315,6 +322,7 @@ impl AnalyticalSupervisor {
             registry: Arc::new(AnalyticalRuntimeRegistry::new()),
             graphs: Mutex::new(HashMap::new()),
             attempts: Mutex::new(HashMap::new()),
+            draining: Mutex::new(std::collections::HashSet::new()),
             root_cancel: CancellationToken::new(),
             accepting: AtomicBool::new(true),
         }
@@ -507,6 +515,47 @@ impl AnalyticalSupervisor {
     /// Returns [`BifrostError::Internal`] when the graph lock is poisoned.
     pub fn live_graphs(&self) -> Result<usize, BifrostError> {
         Ok(self.graphs.lock().map_err(|_| poisoned_supervisor())?.len())
+    }
+
+    /// Counts graphs retained because a participant release was not acknowledged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when the draining lock is poisoned.
+    pub fn draining_graphs(&self) -> Result<usize, BifrostError> {
+        Ok(self
+            .draining
+            .lock()
+            .map_err(|_| poisoned_supervisor())?
+            .len())
+    }
+
+    /// Records that one graph is holding an unacknowledged participant release.
+    ///
+    /// A poisoned lock is logged rather than propagated: this is called from a
+    /// lifecycle task that has no caller to fail, and the alternative is losing
+    /// the record entirely.
+    pub fn retain_graph_cleanup(&self, graph: AnalyticalGraphKey) {
+        if let Ok(mut draining) = self.draining.lock() {
+            draining.insert(graph);
+        } else {
+            tracing::error!(
+                public_query_id = %graph.public_query_id,
+                "Oracle analytical draining registry is poisoned"
+            );
+        }
+    }
+
+    /// Clears one graph's retained cleanup once every release has resolved.
+    pub fn resolve_graph_cleanup(&self, graph: AnalyticalGraphKey) {
+        if let Ok(mut draining) = self.draining.lock() {
+            draining.remove(&graph);
+        } else {
+            tracing::error!(
+                public_query_id = %graph.public_query_id,
+                "Oracle analytical draining registry is poisoned"
+            );
+        }
     }
 
     /// Resolves the query-owned runtime one registered graph installs.

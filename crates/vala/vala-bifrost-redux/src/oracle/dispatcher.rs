@@ -63,7 +63,11 @@ use crate::cluster::{ClusterRegistry, ClusterSnapshot, ROLE_LIVENESS_CUTOFF};
 /// [`validated_claim_identifiers`] rather than accepted through a dual decoder.
 pub const PEER_PROTOCOL_VERSION: u32 = 3;
 /// Pending reservation time to live.
-const PENDING_TTL: ChronoDuration = ChronoDuration::seconds(2);
+///
+/// Shared with the Analytical leader's retained-release bound so a leader that
+/// cannot confirm a release waits out exactly the window the follower grants a
+/// pending reservation, rather than a second copy of the same duration.
+pub(super) const PENDING_TTL: ChronoDuration = ChronoDuration::seconds(2);
 /// Stable peer rejection hint.
 const RESERVATION_RETRY_MS: u32 = 1_000;
 

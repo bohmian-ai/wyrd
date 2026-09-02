@@ -1962,8 +1962,14 @@ pub(crate) struct AnalyticalChannelResolver {
     identity: Arc<AnalyticalCoordinatorIdentity>,
     /// Per-follower minter and identity, keyed by the follower each is bound to.
     minters: Arc<std::sync::Mutex<HashMap<Url, AnalyticalDestinationChannel>>>,
-    /// Frozen destination set this resolver may address, and nothing beyond it.
-    cut: Arc<AnalyticalParticipantCut>,
+    /// Graph-owned cell the frozen destination set is published into.
+    ///
+    /// Held rather than the cut itself because the cut does not exist yet when
+    /// the session is built: it is frozen only after every participant has
+    /// accepted its reservation, which happens after physical planning. An
+    /// unset cell is therefore the normal pre-reservation state, and resolving
+    /// through it fails closed instead of dialing an unauthorized destination.
+    cut: Arc<std::sync::OnceLock<Arc<AnalyticalParticipantCut>>>,
     /// The graph's own exchange registry, which owns every stream this opens.
     exchanges: Arc<AnalyticalGraphExchanges>,
     /// Authority and lifetimes every minted ticket is signed under.
@@ -1992,7 +1998,7 @@ impl AnalyticalChannelResolver {
         identity: Arc<AnalyticalCoordinatorIdentity>,
         tls: BifrostPeerTls,
         credentials: Arc<dyn OraclePeerCredentials>,
-        cut: Arc<AnalyticalParticipantCut>,
+        cut: Arc<std::sync::OnceLock<Arc<AnalyticalParticipantCut>>>,
         exchanges: Arc<AnalyticalGraphExchanges>,
         signing: AnalyticalStageSigning,
     ) -> Self {
@@ -2015,16 +2021,28 @@ impl AnalyticalChannelResolver {
     ///
     /// # Errors
     ///
-    /// Returns [`DataFusionError::Execution`] when the cache lock is poisoned
-    /// or `url` is not a destination this attempt's frozen cut contains.
-    fn resolve(&self, url: &Url) -> Result<AnalyticalDestinationChannel, DataFusionError> {
+    /// Returns [`DataFusionError::Execution`] when the cache lock is poisoned,
+    /// when the graph has not published its reserved participant cut yet, or
+    /// when `url` is not a destination that cut contains.
+    pub(super) fn resolve(
+        &self,
+        url: &Url,
+    ) -> Result<AnalyticalDestinationChannel, DataFusionError> {
         let mut minters = self.minters.lock().map_err(|_| {
             DataFusionError::Execution("Oracle analytical minter cache is poisoned".to_owned())
         })?;
         if let Some(resolved) = minters.get(url) {
             return Ok(resolved.clone());
         }
-        let destination = self.cut.destination(url).ok_or_else(|| {
+        // Read before any channel work: an unpublished cell means no
+        // participant has been reserved, so there is no destination this
+        // attempt is authorized to dial and nothing to open a connection for.
+        let cut = self.cut.get().ok_or_else(|| {
+            DataFusionError::Execution(
+                "Oracle analytical execution has no published participant cut".to_owned(),
+            )
+        })?;
+        let destination = cut.destination(url).ok_or_else(|| {
             DataFusionError::Execution(format!(
                 "Oracle analytical execution has no authorized destination identity for {url}"
             ))
@@ -2036,7 +2054,7 @@ impl AnalyticalChannelResolver {
                 destination.fence,
                 self.signing.absolute_deadline_ms,
                 self.signing.ticket_ttl,
-                Arc::clone(&self.cut),
+                Arc::clone(cut),
             )),
             identity: Arc::new(
                 self.identity

@@ -84,6 +84,7 @@ wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
 wyrd-bench = { workspace = true }
 iceberg-catalog-sql = { workspace = true }
 datafusion-distributed = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 url = { workspace = true }
 
 [lints]

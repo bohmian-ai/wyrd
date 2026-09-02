@@ -767,7 +767,9 @@ impl AnalyticalStageEgress {
             recorded.identity,
             self.peer_tls.clone(),
             Arc::clone(&self.peer_credentials),
-            recorded.cut,
+            // A follower adopts a cut that is already complete, so its cell is
+            // published at construction and never observed unset.
+            Arc::new(std::sync::OnceLock::from(recorded.cut)),
             recorded.exchanges,
             AnalyticalStageSigning {
                 authority: Arc::clone(&self.authority),
@@ -2267,11 +2269,42 @@ async fn settle_graph(
 pub struct AnalyticalParticipantReservations {
     /// Directory the reservations were taken through, cleared once released.
     transports: Option<Arc<super::dispatcher::OraclePeerTransportDirectory>>,
-    /// Each reserved participant and the exact release its reservation needs.
-    releases: Vec<(
-        super::dispatcher::DispatchCandidate,
-        wyrd_spec::vala::api::ReleaseNodeSlotsRequest,
-    )>,
+    /// Every accepted reservation and the exact release it needs.
+    releases: Vec<AnalyticalRetainedRelease>,
+}
+
+/// One accepted reservation the leader must return, and the bound it expires under.
+///
+/// The follower's own `expires_at` travels with the release because a release
+/// whose acknowledgement never arrived is not evidence the follower dropped the
+/// reservation. Only the follower's stated expiry proves that, and only once
+/// the leader has also watched a full pending TTL elapse on its own monotonic
+/// clock — a leader whose wall clock runs ahead of the follower's would
+/// otherwise declare the envelope free while the follower still holds it.
+struct AnalyticalRetainedRelease {
+    /// Participant the reservation was accepted by.
+    candidate: super::dispatcher::DispatchCandidate,
+    /// Exact idempotent release this reservation needs.
+    request: wyrd_spec::vala::api::ReleaseNodeSlotsRequest,
+    /// Wall-clock expiry the follower minted the pending reservation with.
+    expires_at: DateTime<Utc>,
+    /// Local monotonic instant the reserve response was received at.
+    received: tokio::time::Instant,
+}
+
+impl AnalyticalRetainedRelease {
+    /// Reports whether the follower must already have dropped this reservation.
+    ///
+    /// Both clocks must agree: the follower-stated wall-clock expiry has passed
+    /// *and* a full [`super::dispatcher::PENDING_TTL`] has elapsed locally since
+    /// the response was received. Requiring the later of the two is what keeps a
+    /// leader with a fast clock from forgetting an envelope a follower still owns.
+    fn conservatively_expired(&self) -> bool {
+        Utc::now() >= self.expires_at
+            && super::dispatcher::PENDING_TTL
+                .to_std()
+                .is_ok_and(|ttl| self.received.elapsed() >= ttl)
+    }
 }
 
 impl fmt::Debug for AnalyticalParticipantReservations {
@@ -2285,28 +2318,41 @@ impl fmt::Debug for AnalyticalParticipantReservations {
 }
 
 impl AnalyticalParticipantReservations {
+    /// Returns the owner an attempt that reserved nothing still holds.
+    const fn empty() -> Self {
+        Self {
+            transports: None,
+            releases: Vec::new(),
+        }
+    }
+
     /// Returns every reserved participant to its owner, exactly once.
     ///
-    /// A per-participant failure is logged rather than propagated: the attempt
-    /// is already ending, the reservation expires on its own, and failing the
-    /// terminal because one peer was unreachable would turn a completed query
-    /// into an error.
-    async fn release(&mut self) {
+    /// A per-participant failure is not propagated: the attempt is already
+    /// ending, and failing the terminal because one peer was unreachable would
+    /// turn a completed query into an error. It is not forgotten either — the
+    /// unacknowledged records are returned so the graph's lifecycle task can
+    /// retain them until they are acknowledged or conservatively expire.
+    async fn release(&mut self) -> Vec<AnalyticalRetainedRelease> {
         let Some(transports) = self.transports.take() else {
-            return;
+            return Vec::new();
         };
-        for (candidate, request) in self.releases.drain(..) {
+        let mut retained = Vec::new();
+        for record in self.releases.drain(..) {
             if let Err(error) = transports
-                .release_graph_reservation(&candidate, request)
+                .release_graph_reservation(&record.candidate, record.request.clone())
                 .await
             {
                 tracing::warn!(
                     error = ?error,
-                    node_id = %candidate.node_id.as_uuid(),
+                    node_id = %record.candidate.node_id.as_uuid(),
                     "Oracle analytical leader could not release a participant reservation"
                 );
+                retained.push(record);
             }
         }
+        self.transports = Some(transports);
+        retained
     }
 }
 
@@ -2321,6 +2367,9 @@ impl Drop for AnalyticalParticipantReservations {
         if self.transports.is_none() {
             return;
         }
+        if self.releases.is_empty() {
+            return;
+        }
         let mut outstanding = Self {
             transports: self.transports.take(),
             releases: std::mem::take(&mut self.releases),
@@ -2331,7 +2380,312 @@ impl Drop for AnalyticalParticipantReservations {
             );
             return;
         };
-        handle.spawn(async move { outstanding.release().await });
+        handle.spawn(async move {
+            outstanding.release().await;
+        });
+    }
+}
+
+/// What the attempt has asked its graph's lifecycle task to do next.
+///
+/// Monotonic: an attempt only ever moves forward through these, so the task can
+/// treat a repeated value as already handled rather than reserving twice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnalyticalGraphControl {
+    /// The graph is registered and nothing has been reserved.
+    Registered,
+    /// Selection is final; reserve the participant cut before dispatch.
+    ReserveRequested,
+    /// The attempt has reached its terminal; return everything reserved.
+    Terminal,
+}
+
+/// What the graph's lifecycle task has published back to its attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnalyticalGraphResult {
+    /// Nothing has been reserved yet, so nothing may be dispatched.
+    Pending,
+    /// Every participant accepted and the complete cut is published.
+    ReservationReady,
+    /// A participant declined; every accepted reservation was released.
+    ReservationFailed,
+}
+
+/// The attempt-side half of one graph's lifecycle task.
+///
+/// Declared as the last field of [`AnalyticalAttemptOwnership`] so dropping the
+/// ownership closes the control channel after the local guards are gone, which
+/// is what tells the task to return reservations only once this node has
+/// stopped addressing their owners.
+pub struct AnalyticalGraphSignals {
+    /// Control channel the attempt drives its lifecycle task through.
+    control: tokio::sync::watch::Sender<AnalyticalGraphControl>,
+    /// Result channel the lifecycle task publishes progress on.
+    result: tokio::sync::watch::Receiver<AnalyticalGraphResult>,
+    /// The graph-owned cell the reserved cut is published into.
+    participants: Arc<std::sync::OnceLock<Arc<AnalyticalParticipantCut>>>,
+}
+
+impl fmt::Debug for AnalyticalGraphSignals {
+    /// Reports whether the cut is published without rendering it.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AnalyticalGraphSignals")
+            .field("published", &self.participants.get().is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl AnalyticalGraphSignals {
+    /// Returns the cell every channel this attempt resolves reads its cut from.
+    #[must_use]
+    pub(super) fn participants(&self) -> Arc<std::sync::OnceLock<Arc<AnalyticalParticipantCut>>> {
+        Arc::clone(&self.participants)
+    }
+
+    /// Reserves the participant cut once and parks until it is published.
+    ///
+    /// Called exactly where selection becomes irreversible: after the physical
+    /// plan is known to be supported and to carry an exchange, and before the
+    /// first stage is dispatched. Repeat calls are idempotent — the task
+    /// reserves once and republishes the same result — so an orchestration that
+    /// re-enters this before dispatch cannot charge a follower twice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::QueryAdmissionRejected`] when a participant
+    /// declined its reservation, and [`BifrostError::QueryExecutionFailed`]
+    /// when the graph's lifecycle task is gone.
+    pub async fn publish_participants(&self) -> Result<(), BifrostError> {
+        if self
+            .control
+            .send(AnalyticalGraphControl::ReserveRequested)
+            .is_err()
+        {
+            return Err(BifrostError::QueryExecutionFailed);
+        }
+        let mut result = self.result.clone();
+        loop {
+            match *result.borrow_and_update() {
+                AnalyticalGraphResult::Pending => {}
+                AnalyticalGraphResult::ReservationReady => return Ok(()),
+                AnalyticalGraphResult::ReservationFailed => {
+                    return Err(BifrostError::QueryAdmissionRejected);
+                }
+            }
+            if result.changed().await.is_err() {
+                return Err(BifrostError::QueryExecutionFailed);
+            }
+        }
+    }
+
+    /// Tells the lifecycle task the attempt has reached its terminal.
+    fn terminal(&self) {
+        let _ = self.control.send(AnalyticalGraphControl::Terminal);
+    }
+}
+
+/// The task-side half of one graph's lifecycle, owning every reservation it takes.
+///
+/// Reservation is graph-wide and bulk, and it outlives the attempt that asked
+/// for it: a release whose acknowledgement never arrived has to be retried
+/// after the query has already failed. Keeping that follow-up on this one task
+/// is what avoids a detached timer, a second reservation registry, or a status
+/// RPC.
+struct AnalyticalGraphLifecycle {
+    /// The graph every reservation and retained release belongs to.
+    graph: AnalyticalGraphKey,
+    /// Supervisor the retained-cleanup state is made visible through.
+    supervisor: Arc<AnalyticalSupervisor>,
+    /// Directory every reserve and release is issued through.
+    transports: Option<Arc<super::dispatcher::OraclePeerTransportDirectory>>,
+    /// Frozen remote participants, already excluding this coordinator.
+    remote: Vec<(Url, super::dispatcher::DispatchCandidate)>,
+    /// The exact reserve request every participant receives.
+    request: ReserveNodeSlotsRequest,
+    /// The graph-owned cell the complete cut is published into.
+    participants: Arc<std::sync::OnceLock<Arc<AnalyticalParticipantCut>>>,
+    /// Control channel the attempt drives this task through.
+    control: tokio::sync::watch::Receiver<AnalyticalGraphControl>,
+    /// Result channel this task publishes its progress on.
+    result: tokio::sync::watch::Sender<AnalyticalGraphResult>,
+}
+
+/// How often a retained release is retried while it is neither acknowledged nor expired.
+///
+/// A quarter of the pending TTL, so a follower that becomes reachable again is
+/// acknowledged well inside the window rather than only at its end.
+const RETAINED_RELEASE_RETRY: std::time::Duration = std::time::Duration::from_millis(500);
+
+impl AnalyticalGraphLifecycle {
+    /// Starts one graph's lifecycle task and returns its attempt-side half.
+    ///
+    /// Nothing is reserved here. The task exists from registration so the
+    /// attempt has one owner to signal, and so the cell every channel resolves
+    /// through is the graph's own from the moment the session is built.
+    fn start(
+        graph: AnalyticalGraphKey,
+        supervisor: Arc<AnalyticalSupervisor>,
+        transports: Option<Arc<super::dispatcher::OraclePeerTransportDirectory>>,
+        remote: Vec<(Url, super::dispatcher::DispatchCandidate)>,
+        request: ReserveNodeSlotsRequest,
+    ) -> AnalyticalGraphSignals {
+        let participants = Arc::new(std::sync::OnceLock::new());
+        let (control, control_rx) = tokio::sync::watch::channel(AnalyticalGraphControl::Registered);
+        let (result, result_rx) = tokio::sync::watch::channel(AnalyticalGraphResult::Pending);
+        let lifecycle = Self {
+            graph,
+            supervisor,
+            transports,
+            remote,
+            request,
+            participants: Arc::clone(&participants),
+            control: control_rx,
+            result,
+        };
+        tokio::spawn(lifecycle.run());
+        AnalyticalGraphSignals {
+            control,
+            result: result_rx,
+            participants,
+        }
+    }
+
+    /// Runs the graph's whole reservation and cleanup lifecycle.
+    ///
+    /// Ends when the attempt signals its terminal or drops the control channel,
+    /// and then only after every accepted reservation has been returned or has
+    /// conservatively expired.
+    async fn run(mut self) {
+        let mut reservations = AnalyticalParticipantReservations::empty();
+        let mut requested = false;
+        while self.control.changed().await.is_ok() {
+            let control = *self.control.borrow_and_update();
+            match control {
+                AnalyticalGraphControl::Registered => {}
+                AnalyticalGraphControl::ReserveRequested => {
+                    if requested {
+                        continue;
+                    }
+                    requested = true;
+                    match self.reserve().await {
+                        Ok(taken) => {
+                            reservations = taken;
+                            let _ = self.result.send(AnalyticalGraphResult::ReservationReady);
+                        }
+                        Err(mut taken) => {
+                            let retained = taken.release().await;
+                            let _ = self.result.send(AnalyticalGraphResult::ReservationFailed);
+                            self.drain(retained).await;
+                            return;
+                        }
+                    }
+                }
+                AnalyticalGraphControl::Terminal => break,
+            }
+        }
+        let retained = reservations.release().await;
+        self.drain(retained).await;
+    }
+
+    /// Reserves every remote participant and publishes the complete cut once.
+    ///
+    /// The cell is set only after the last participant has accepted and the
+    /// destination map has been frozen with the follower-minted reservation
+    /// identities, so a partial cut is never observable and no dispatch can
+    /// address a participant that has not agreed to hold the envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns the accepted-reservation owner unchanged when a participant
+    /// declined or the cut could not be frozen, so the caller releases exactly
+    /// what was taken.
+    async fn reserve(
+        &self,
+    ) -> Result<AnalyticalParticipantReservations, AnalyticalParticipantReservations> {
+        if self.remote.is_empty() {
+            let _ = self.participants.set(Arc::new(
+                AnalyticalParticipantCut::freeze(HashMap::new())
+                    .unwrap_or_else(|_| unreachable!("an empty cut always freezes")),
+            ));
+            return Ok(AnalyticalParticipantReservations::empty());
+        }
+        let Some(transports) = self.transports.as_ref() else {
+            tracing::error!(
+                "Oracle analytical leader has no peer transport to reserve participants through"
+            );
+            return Err(AnalyticalParticipantReservations::empty());
+        };
+        let mut destinations = HashMap::with_capacity(self.remote.len());
+        // Held from the first acceptance, so a later participant's refusal
+        // still returns everything already taken rather than stranding the
+        // peers that said yes.
+        let mut reserved = AnalyticalParticipantReservations {
+            transports: Some(Arc::clone(transports)),
+            releases: Vec::with_capacity(self.remote.len()),
+        };
+        for (url, candidate) in &self.remote {
+            let Ok(pending) = transports
+                .reserve_graph(candidate, self.request.clone())
+                .await
+            else {
+                return Err(reserved);
+            };
+            reserved.releases.push(AnalyticalRetainedRelease {
+                candidate: candidate.clone(),
+                request: wyrd_spec::vala::api::ReleaseNodeSlotsRequest {
+                    reservation_id: pending.reservation_id,
+                    query_id: self.request.query_id,
+                    leader_node_id: self.request.leader_node_id,
+                    leader_fencing_token: self.request.leader_fencing_token,
+                },
+                expires_at: pending.expires_at,
+                received: tokio::time::Instant::now(),
+            });
+            destinations.insert(
+                url.clone(),
+                AnalyticalDestination {
+                    node_id: candidate.node_id,
+                    fence: candidate.worker_fence,
+                    reservation_id: pending.reservation_id.as_uuid().to_string(),
+                },
+            );
+        }
+        let Ok(cut) = AnalyticalParticipantCut::freeze(destinations) else {
+            return Err(reserved);
+        };
+        let _ = self.participants.set(Arc::new(cut));
+        Ok(reserved)
+    }
+
+    /// Retains every unacknowledged release until it resolves or expires.
+    ///
+    /// The graph stays supervisor-visible as draining for exactly as long as
+    /// this runs, because until every record resolves this node cannot say
+    /// whether a follower is still holding an envelope on its behalf.
+    async fn drain(&self, mut retained: Vec<AnalyticalRetainedRelease>) {
+        if retained.is_empty() {
+            return;
+        }
+        self.supervisor.retain_graph_cleanup(self.graph);
+        while !retained.is_empty() {
+            tokio::time::sleep(RETAINED_RELEASE_RETRY).await;
+            let mut remaining = Vec::with_capacity(retained.len());
+            for record in retained.drain(..) {
+                let acknowledged = match self.transports.as_ref() {
+                    Some(transports) => transports
+                        .release_graph_reservation(&record.candidate, record.request.clone())
+                        .await
+                        .is_ok(),
+                    None => true,
+                };
+                if !acknowledged && !record.conservatively_expired() {
+                    remaining.push(record);
+                }
+            }
+            retained = remaining;
+        }
+        self.supervisor.resolve_graph_cleanup(self.graph);
     }
 }
 
@@ -4268,6 +4622,464 @@ mod tests {
             "no refused message reached a provider, cache, or source"
         );
     }
+
+    /// Deterministic peer transport recording every reserve and release it sees.
+    ///
+    /// Both outcomes are chosen by the test rather than by timing, which is what
+    /// makes partial reservation failure and ambiguous release acknowledgement
+    /// observable without a sleep or a live peer.
+    struct ReservingTransport {
+        /// Participants a reserve was issued to, in issue order.
+        reserved: std::sync::Mutex<Vec<NodeId>>,
+        /// Participants a release was issued to, with the reservation named.
+        released: std::sync::Mutex<Vec<(NodeId, String)>>,
+        /// How many reserves are accepted before the rest are refused.
+        accepted: usize,
+        /// While set, every release answers with an unacknowledged failure.
+        release_fails: std::sync::atomic::AtomicBool,
+        /// Wall-clock expiry every accepted reservation is minted with.
+        expires_at: DateTime<Utc>,
+    }
+
+    impl ReservingTransport {
+        /// Builds a transport accepting exactly `accepted` reservations.
+        fn new(accepted: usize, expires_at: DateTime<Utc>) -> Self {
+            Self {
+                reserved: std::sync::Mutex::new(Vec::new()),
+                released: std::sync::Mutex::new(Vec::new()),
+                accepted,
+                release_fails: std::sync::atomic::AtomicBool::new(false),
+                expires_at,
+            }
+        }
+
+        /// Returns the participants a reserve was issued to.
+        fn reserves(&self) -> Vec<NodeId> {
+            self.reserved
+                .lock()
+                .expect("reserve log is readable")
+                .clone()
+        }
+
+        /// Returns the releases issued so far, participant and reservation.
+        fn releases(&self) -> Vec<(NodeId, String)> {
+            self.released
+                .lock()
+                .expect("release log is readable")
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl super::super::dispatcher::OraclePeerTransport for ReservingTransport {
+        /// Accepts the first `accepted` reservations and refuses the rest.
+        async fn reserve(
+            &self,
+            worker: NodeId,
+            _request: ReserveNodeSlotsRequest,
+        ) -> Result<
+            wyrd_spec::vala::api::ReserveNodeSlotsResponse,
+            super::super::dispatcher::DispatchError,
+        > {
+            let mut reserved = self.reserved.lock().expect("reserve log is writable");
+            let ordinal = reserved.len();
+            reserved.push(worker);
+            drop(reserved);
+            if ordinal >= self.accepted {
+                return Ok(wyrd_spec::vala::api::ReserveNodeSlotsResponse::Rejected(
+                    wyrd_spec::vala::api::ReservationRejected {
+                        retry_after_ms: 1_000,
+                    },
+                ));
+            }
+            Ok(wyrd_spec::vala::api::ReserveNodeSlotsResponse::Pending(
+                wyrd_spec::vala::api::PendingNodeReservation {
+                    reservation_id: wyrd_spec::vala::api::ReservationId::new(Uuid::from_u128(
+                        200 + ordinal as u128,
+                    )),
+                    expires_at: self.expires_at,
+                },
+            ))
+        }
+
+        /// Records the release and answers as the test currently dictates.
+        async fn release(
+            &self,
+            worker: NodeId,
+            request: wyrd_spec::vala::api::ReleaseNodeSlotsRequest,
+        ) -> Result<(), super::super::dispatcher::DispatchError> {
+            self.released
+                .lock()
+                .expect("release log is writable")
+                .push((worker, request.reservation_id.as_uuid().to_string()));
+            if self.release_fails.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(super::super::dispatcher::DispatchError::Terminal);
+            }
+            Ok(())
+        }
+
+        /// Never reached: this transport exists for reservation ownership only.
+        async fn execute(
+            &self,
+            _worker: NodeId,
+            _request: wyrd_spec::vala::api::ExecuteFragmentRequest,
+            _admitted_grant: Option<super::super::dispatcher::LeaderAdmittedGrant>,
+        ) -> Result<
+            super::super::dispatcher::WorkerAttemptStream,
+            super::super::dispatcher::DispatchError,
+        > {
+            unreachable!("the reservation owner never dispatches a fragment")
+        }
+    }
+
+    /// Everything one reservation-lifecycle assertion needs, composed once.
+    struct ReservationFixture {
+        /// The graph fixture supplying the supervisor and execution handle.
+        graph: GraphFixture,
+        /// The recording transport every reserve and release is issued through.
+        transport: Arc<ReservingTransport>,
+        /// The two remote participants this attempt may address.
+        remote: Vec<(Url, super::super::dispatcher::DispatchCandidate)>,
+        /// The attempt-side half of the started lifecycle task.
+        signals: AnalyticalGraphSignals,
+    }
+
+    impl ReservationFixture {
+        /// Starts one graph lifecycle over a transport with the given behavior.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the fixture endpoints are not valid URLs, which would
+        /// make every assertion below vacuous.
+        fn start(accepted: usize, expires_at: DateTime<Utc>) -> Self {
+            let graph = GraphFixture::new(Utc::now());
+            let transport = Arc::new(ReservingTransport::new(accepted, expires_at));
+            let directory = Arc::new(
+                super::super::dispatcher::OraclePeerTransportDirectory::new_for_test(
+                    graph.node_id,
+                    Arc::clone(&transport)
+                        as Arc<dyn super::super::dispatcher::OraclePeerTransport>,
+                    Arc::clone(&transport)
+                        as Arc<dyn super::super::dispatcher::OraclePeerTransport>,
+                ),
+            );
+            let remote = [
+                (31_u128, 5_u64, "https://follower-a.invalid/"),
+                (32, 6, "https://follower-b.invalid/"),
+            ]
+            .into_iter()
+            .map(|(node, fence, endpoint)| {
+                (
+                    Url::parse(endpoint).expect("a fixture endpoint is a valid URL"),
+                    super::super::dispatcher::DispatchCandidate {
+                        node_id: NodeId::new(Uuid::from_u128(node)),
+                        role: wyrd_spec::vala::api::ClusterRole::Oracle,
+                        worker_fence: fence,
+                        endpoint: Some(endpoint.to_owned()),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+            let signals = AnalyticalGraphLifecycle::start(
+                graph.graph,
+                Arc::clone(&graph.supervisor),
+                Some(directory),
+                remote.clone(),
+                ReserveNodeSlotsRequest {
+                    query_id: QueryId::new(graph.graph.public_query_id.as_uuid()),
+                    leader_node_id: graph.leader_node_id,
+                    leader_fencing_token: graph.leader_fence,
+                    query_class: QueryClass::Analytical,
+                    slot_units: ANALYTICAL_GRAPH_SLOT_UNITS,
+                    expires_at,
+                    graph: Some(AnalyticalGraphRef {
+                        public_query_id: graph.graph.public_query_id.as_uuid(),
+                        datafusion_query_id: graph.graph.datafusion_query_id.as_uuid(),
+                    }),
+                },
+            );
+            Self {
+                graph,
+                transport,
+                remote,
+                signals,
+            }
+        }
+
+        /// Counts the graphs this fixture's supervisor retains cleanup for.
+        fn draining(&self) -> usize {
+            self.graph
+                .supervisor
+                .draining_graphs()
+                .expect("the draining registry is readable")
+        }
+
+        /// Builds a resolver over this graph's own participant cell.
+        fn resolver(&self) -> AnalyticalChannelResolver {
+            AnalyticalChannelResolver::new(
+                Arc::new(AnalyticalCoordinatorIdentity {
+                    source_node_id: self.graph.node_id,
+                    source_fence: self.graph.fence,
+                    tenant_id: self.graph.tenant_id,
+                    graph: self.graph.graph,
+                    snapshot_digest: "fixture-snapshot".to_owned(),
+                    attempt: 0,
+                    reservation_id: String::new(),
+                    permission_digest: "fixture-permissions".to_owned(),
+                }),
+                BifrostPeerTls::unreachable_for_test(),
+                Arc::new(super::super::dispatcher::StaticOraclePeerCredentials::new(
+                    secrecy::SecretString::from("fixture-bearer"),
+                )),
+                self.signals.participants(),
+                Arc::default(),
+                AnalyticalStageSigning {
+                    authority: Arc::new(VerifyingStageAuthority),
+                    absolute_deadline_ms: self.graph.deadline_ms,
+                    ticket_ttl: chrono::Duration::seconds(30),
+                },
+            )
+        }
+    }
+
+    /// Yields until every already-runnable lifecycle step has run.
+    ///
+    /// The lifecycle task is a peer of the test task, so a plain assertion after
+    /// a signal would race it. This drains the ready queue instead of sleeping,
+    /// which keeps every assertion below deterministic.
+    async fn settle_lifecycle() {
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Nothing is reserved until selection becomes irreversible.
+    ///
+    /// Planning, an unsupported physical shape, and a no-exchange fallback all
+    /// leave the lifecycle unsignalled, so no follower is charged for a plan
+    /// that may never be selected — and the cell every channel resolves through
+    /// fails closed rather than dialing while it is unset.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a reserve is issued early or an unset cell resolves.
+    async fn assert_nothing_reserved_before_selection(fixture: &ReservationFixture) {
+        settle_lifecycle().await;
+        assert!(
+            fixture.transport.reserves().is_empty(),
+            "nothing is reserved before selection is final"
+        );
+        assert!(
+            fixture.signals.participants().get().is_none(),
+            "the graph's participant cell is unset while nothing is reserved"
+        );
+        let Err(unresolved) = fixture.resolver().resolve(&fixture.remote[0].0) else {
+            panic!("an unpublished cut resolves to no destination");
+        };
+        assert!(
+            unresolved
+                .to_string()
+                .contains("no published participant cut"),
+            "resolution fails closed on the unset cell rather than dialing: {unresolved}"
+        );
+    }
+
+    /// One reserve per participant, all acknowledged before the cut exists.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a participant is reserved more than once, when the published
+    /// cut does not carry the follower's own reservation identity, or when a
+    /// repeated publish charges a follower again.
+    async fn assert_reserved_once_and_published(fixture: &ReservationFixture) {
+        let url = fixture.remote[0].0.clone();
+        fixture
+            .signals
+            .publish_participants()
+            .await
+            .expect("every participant accepts its reservation");
+        assert_eq!(
+            fixture.transport.reserves(),
+            vec![fixture.remote[0].1.node_id, fixture.remote[1].1.node_id],
+            "each remote participant receives exactly one reserve"
+        );
+        let published = fixture
+            .signals
+            .participants()
+            .get()
+            .cloned()
+            .expect("the complete cut is published before any dispatch");
+        assert_eq!(
+            published
+                .destination(&url)
+                .expect("the reserved participant is in the published cut")
+                .reservation_id,
+            Uuid::from_u128(200).to_string(),
+            "the follower's own server-generated reservation is carried unchanged"
+        );
+        assert!(
+            fixture.resolver().resolve(&url).is_ok(),
+            "a published cut resolves the destination it authorizes"
+        );
+        fixture
+            .signals
+            .publish_participants()
+            .await
+            .expect("republishing the same cut is idempotent");
+        settle_lifecycle().await;
+        assert_eq!(
+            fixture.transport.reserves().len(),
+            2,
+            "a repeated publish charges no participant a second time"
+        );
+    }
+
+    /// A refusal after an acceptance returns exactly what was taken.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the attempt is not refused, when a release is inexact, when
+    /// a partial cut is published, or when acknowledged cleanup is retained.
+    async fn assert_partial_reservation_releases_exactly(expires_at: DateTime<Utc>) {
+        let refused = ReservationFixture::start(1, expires_at);
+        let error = refused
+            .signals
+            .publish_participants()
+            .await
+            .expect_err("a declined participant fails the attempt");
+        assert!(
+            matches!(error, BifrostError::QueryAdmissionRejected),
+            "a declined participant is an admission refusal: {error:?}"
+        );
+        assert_eq!(
+            refused.transport.releases(),
+            vec![(
+                refused.remote[0].1.node_id,
+                Uuid::from_u128(200).to_string()
+            )],
+            "exactly the one accepted reservation is returned"
+        );
+        assert!(
+            refused.signals.participants().get().is_none(),
+            "a partial reservation publishes no cut, so nothing may be dispatched"
+        );
+        settle_lifecycle().await;
+        assert!(
+            refused.graph.execution_handle().is_healthy(),
+            "an acknowledged release leaves no retained cleanup"
+        );
+    }
+
+    /// An unacknowledged release keeps the graph draining until it is answered.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an ambiguous release is forgotten, when the node advertises
+    /// readiness while retaining one, or when an acknowledgement does not clear it.
+    async fn assert_ambiguous_release_retains_until_acknowledged(expires_at: DateTime<Utc>) {
+        let ambiguous = ReservationFixture::start(1, expires_at);
+        ambiguous
+            .transport
+            .release_fails
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            ambiguous.signals.publish_participants().await.is_err(),
+            "the declined participant still fails the attempt"
+        );
+        settle_lifecycle().await;
+        assert_eq!(
+            ambiguous.draining(),
+            1,
+            "an unacknowledged release keeps the graph supervisor-visible"
+        );
+        assert!(
+            !ambiguous.graph.execution_handle().is_healthy(),
+            "a node retaining a follower's envelope does not advertise readiness"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        assert_eq!(
+            ambiguous.draining(),
+            1,
+            "the follower-stated expiry has not passed, so the record is retained"
+        );
+        ambiguous
+            .transport
+            .release_fails
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        settle_lifecycle().await;
+        assert_eq!(
+            ambiguous.draining(),
+            0,
+            "an acknowledgement clears the retained release immediately"
+        );
+    }
+
+    /// With no acknowledgement, only both bounds together free the envelope.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an elapsed wall clock alone frees the record, or when the
+    /// record survives both the stated expiry and a full local pending TTL.
+    async fn assert_expiry_needs_both_clocks() {
+        let expired = ReservationFixture::start(1, Utc::now() - chrono::Duration::seconds(1));
+        expired
+            .transport
+            .release_fails
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            expired.signals.publish_participants().await.is_err(),
+            "the declined participant still fails the attempt"
+        );
+        settle_lifecycle().await;
+        assert_eq!(
+            expired.draining(),
+            1,
+            "an already-elapsed wall clock alone does not free the envelope"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        settle_lifecycle().await;
+        assert_eq!(
+            expired.draining(),
+            0,
+            "both the stated expiry and a full local pending TTL free the envelope"
+        );
+    }
+
+    /// The participant cut is reserved exactly once, immediately before dispatch.
+    ///
+    /// Four orderings are load-bearing and none is observable from the
+    /// reservation count alone. Nothing is reserved until selection is final.
+    /// The graph-owned cut cell stays unset until *every* participant has
+    /// accepted, so no channel resolves against a partial cut and none is dialed
+    /// while it is unset. A refusal after earlier acceptances returns exactly
+    /// the reservations that were taken and publishes nothing. And a release
+    /// whose acknowledgement never arrived keeps the graph draining until either
+    /// the follower answers or both the follower-stated expiry and a full local
+    /// pending TTL have passed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a reservation is taken early, taken twice, published
+    /// partially, released inexactly, or forgotten before it can be proven gone.
+    #[tokio::test(start_paused = true)]
+    async fn participant_cut_is_reserved_once_immediately_before_dispatch() {
+        let expires_at = Utc::now() + chrono::Duration::seconds(60);
+        // The pending bound the leader retains is the dispatcher's own, not a
+        // second copy of the same duration.
+        assert_eq!(
+            super::super::dispatcher::PENDING_TTL,
+            chrono::Duration::seconds(2),
+            "the retained-release bound is the canonical two-second pending TTL"
+        );
+        let selected = ReservationFixture::start(2, expires_at);
+        assert_nothing_reserved_before_selection(&selected).await;
+        assert_reserved_once_and_published(&selected).await;
+        drop(selected);
+        assert_partial_reservation_releases_exactly(expires_at).await;
+        assert_ambiguous_release_retains_until_acknowledged(expires_at).await;
+        assert_expiry_needs_both_clocks().await;
+    }
 }
 
 /// The exact worker set one Analytical attempt may place tasks on.
@@ -4595,6 +5407,10 @@ impl AnalyticalExecutionHandle {
     pub fn is_healthy(&self) -> bool {
         self.supervisor.is_healthy()
             && self
+                .supervisor
+                .draining_graphs()
+                .is_ok_and(|draining| draining == 0)
+            && self
                 .worker
                 .live()
                 .is_ok_and(|follower| follower.cleanup_failures == 0)
@@ -4670,7 +5486,7 @@ impl AnalyticalExecutionHandle {
     /// participant endpoint is not a valid URL, and
     /// [`BifrostError::QueryExecutionFailed`] when `DataFusion` cannot build
     /// the bounded query runtime.
-    pub async fn lease_session(
+    pub fn lease_session(
         &self,
         attempt: &AnalyticalAttemptContext,
         cut: &OracleQueryAttemptCut,
@@ -4678,10 +5494,11 @@ impl AnalyticalExecutionHandle {
         work_units: usize,
     ) -> Result<(SessionContext, AnalyticalAttemptOwnership), BifrostError> {
         let graph = AnalyticalGraphKey::new(attempt.public_query_id, attempt.datafusion_query_id);
-        // Reserved before anything is admitted locally. A participant that
-        // declines must fail the attempt while the leader still owns nothing,
-        // not after it has charged its own envelope and registered a graph.
-        let (destinations, participants) = self.reserve_destinations(cut, graph).await?;
+        // Read from the immutable cut, not from a reservation: node identity,
+        // endpoint, and fence are all frozen before anything is reserved, so
+        // planning has everything it needs while the followers are still
+        // uncharged. Nothing here issues an RPC.
+        let remote = self.remote_participants(cut)?;
         let resources = self
             .oracle_resources
             .try_acquire_query(OracleResourceRequest::for_class(
@@ -4715,11 +5532,30 @@ impl AnalyticalExecutionHandle {
                 scratch_bytes: self.config.scratch_bytes,
             },
         )?;
+        let signals = AnalyticalGraphLifecycle::start(
+            graph,
+            Arc::clone(&self.supervisor),
+            self.peer_transports.clone(),
+            remote.clone(),
+            ReserveNodeSlotsRequest {
+                query_id: QueryId::new(graph.public_query_id.as_uuid()),
+                leader_node_id: self.config.node_id,
+                leader_fencing_token: self.config.oracle_fence,
+                query_class: QueryClass::Analytical,
+                slot_units: ANALYTICAL_GRAPH_SLOT_UNITS,
+                expires_at: cut.deadline(),
+                graph: Some(AnalyticalGraphRef {
+                    public_query_id: graph.public_query_id.as_uuid(),
+                    datafusion_query_id: graph.datafusion_query_id.as_uuid(),
+                }),
+            },
+        );
         let session = self.leader_session(
             AnalyticalSessionInputs {
                 context,
                 snapshot_digest: &attempt.snapshot_digest,
-                destinations,
+                urls: remote.into_iter().map(|(url, _)| url).collect(),
+                participants: signals.participants(),
                 permission_digest: &attempt.permission_digest,
                 granted_memory_bytes,
                 target_partitions,
@@ -4733,7 +5569,7 @@ impl AnalyticalExecutionHandle {
             AnalyticalAttemptOwnership {
                 graph: graph_guard,
                 attempt: attempt_guard,
-                participants,
+                signals,
             },
         ))
     }
@@ -4768,7 +5604,8 @@ impl AnalyticalExecutionHandle {
         let AnalyticalSessionInputs {
             context,
             snapshot_digest,
-            destinations,
+            urls,
+            participants,
             permission_digest,
             granted_memory_bytes,
             target_partitions,
@@ -4788,17 +5625,17 @@ impl AnalyticalExecutionHandle {
             reservation_id: String::new(),
             permission_digest: permission_digest.to_owned(),
         });
-        // Frozen here, once, for the whole attempt: everything downstream —
-        // this leader's own channels and every follower that becomes a
-        // coordinator beneath it — addresses this exact set, so no membership
-        // change can add, remove, or re-fence a destination mid-attempt.
-        let participants = Arc::new(AnalyticalParticipantCut::freeze(destinations)?);
-        let urls = participants.urls();
+        // The cell, not a cut: the frozen set is published into it once every
+        // participant has accepted its reservation, which is after this session
+        // is built. Everything downstream — this leader's own channels and every
+        // follower that becomes a coordinator beneath it — then addresses that
+        // exact set, so no membership change can add, remove, or re-fence a
+        // destination mid-attempt, and no channel resolves before it exists.
         let resolver = AnalyticalChannelResolver::new(
             identity,
             self.config.peer_tls.clone(),
             Arc::clone(&self.config.peer_credentials),
-            Arc::clone(&participants),
+            participants,
             self.supervisor.graph_exchanges(graph)?.unwrap_or_default(),
             AnalyticalStageSigning {
                 authority: Arc::clone(&self.authority),
@@ -4831,12 +5668,7 @@ impl AnalyticalExecutionHandle {
         Ok(SessionContext::new_with_state(state))
     }
 
-    /// Reserves every remote participant's graph envelope and freezes their identities.
-    ///
-    /// One reservation per participant, taken before the leader admits anything
-    /// of its own, and carried into the frozen cut so each follower is later
-    /// charged against the reservation it granted rather than one the
-    /// coordinator invented.
+    /// Projects the remote participants this attempt may address, without IO.
     ///
     /// The coordinator excludes itself. A leader is already an Oracle in its own
     /// pinned cut, so keeping it in the worker set would make this node dispatch
@@ -4847,100 +5679,39 @@ impl AnalyticalExecutionHandle {
     /// yields an empty worker set, and the attempt executes entirely on the
     /// leader, which is the correct shape for a single-node deployment.
     ///
+    /// Nothing is reserved here: identity, endpoint, and fence are already
+    /// immutable in the cut, which is what lets planning run to completion
+    /// before any follower is charged.
+    ///
     /// # Errors
     ///
     /// Returns [`BifrostError::Internal`] when a participant endpoint is not a
-    /// valid URL — which would otherwise leave a worker unreachable and
-    /// unsigned — or when this node composed no peer transport, and
-    /// [`BifrostError::QueryAdmissionRejected`] when a participant declined its
-    /// reservation.
-    async fn reserve_destinations(
+    /// valid URL, which would otherwise leave a worker unreachable and unsigned.
+    fn remote_participants(
         &self,
         cut: &OracleQueryAttemptCut,
-        graph: AnalyticalGraphKey,
-    ) -> Result<
-        (
-            HashMap<Url, AnalyticalDestination>,
-            AnalyticalParticipantReservations,
-        ),
-        BifrostError,
-    > {
-        let remote = cut
-            .oracles()
+    ) -> Result<Vec<(Url, super::dispatcher::DispatchCandidate)>, BifrostError> {
+        cut.oracles()
             .iter()
             .filter(|participant| participant.node_id != self.config.node_id)
-            .collect::<Vec<_>>();
-        if remote.is_empty() {
-            return Ok((
-                HashMap::new(),
-                AnalyticalParticipantReservations {
-                    transports: None,
-                    releases: Vec::new(),
-                },
-            ));
-        }
-        let Some(transports) = self.peer_transports.as_ref() else {
-            return Err(BifrostError::Internal {
-                detail: "Oracle analytical leader has no peer transport to reserve participants                          through"
-                    .to_owned(),
-            });
-        };
-        let request = ReserveNodeSlotsRequest {
-            query_id: QueryId::new(graph.public_query_id.as_uuid()),
-            leader_node_id: self.config.node_id,
-            leader_fencing_token: self.config.oracle_fence,
-            query_class: QueryClass::Analytical,
-            slot_units: ANALYTICAL_GRAPH_SLOT_UNITS,
-            expires_at: cut.deadline(),
-            graph: Some(AnalyticalGraphRef {
-                public_query_id: graph.public_query_id.as_uuid(),
-                datafusion_query_id: graph.datafusion_query_id.as_uuid(),
-            }),
-        };
-        let mut destinations = HashMap::with_capacity(remote.len());
-        // Held from the first successful reservation, so a later participant's
-        // refusal still returns everything already taken rather than stranding
-        // the peers that said yes.
-        let mut reserved = AnalyticalParticipantReservations {
-            transports: Some(Arc::clone(transports)),
-            releases: Vec::with_capacity(remote.len()),
-        };
-        for participant in remote {
-            let url =
-                Url::parse(&participant.endpoint).map_err(|error| BifrostError::Internal {
-                    detail: format!(
-                        "Oracle analytical participant endpoint is not a valid URL: {error}"
-                    ),
-                })?;
-            let candidate = super::dispatcher::DispatchCandidate {
-                node_id: participant.node_id,
-                role: wyrd_spec::vala::api::ClusterRole::Oracle,
-                worker_fence: participant.fencing_token,
-                endpoint: Some(participant.endpoint.clone()),
-            };
-            let pending = transports
-                .reserve_graph(&candidate, request.clone())
-                .await
-                .map_err(|_| BifrostError::QueryAdmissionRejected)?;
-            reserved.releases.push((
-                candidate,
-                wyrd_spec::vala::api::ReleaseNodeSlotsRequest {
-                    reservation_id: pending.reservation_id,
-                    query_id: request.query_id,
-                    leader_node_id: request.leader_node_id,
-                    leader_fencing_token: request.leader_fencing_token,
-                },
-            ));
-            destinations.insert(
-                url,
-                AnalyticalDestination {
-                    node_id: participant.node_id,
-                    fence: participant.fencing_token,
-                    reservation_id: pending.reservation_id.as_uuid().to_string(),
-                },
-            );
-        }
-        Ok((destinations, reserved))
+            .map(|participant| {
+                let url =
+                    Url::parse(&participant.endpoint).map_err(|error| BifrostError::Internal {
+                        detail: format!(
+                            "Oracle analytical participant endpoint is not a valid URL: {error}"
+                        ),
+                    })?;
+                Ok((
+                    url,
+                    super::dispatcher::DispatchCandidate {
+                        node_id: participant.node_id,
+                        role: wyrd_spec::vala::api::ClusterRole::Oracle,
+                        worker_fence: participant.fencing_token,
+                        endpoint: Some(participant.endpoint.clone()),
+                    },
+                ))
+            })
+            .collect()
     }
 }
 
@@ -4954,8 +5725,13 @@ struct AnalyticalSessionInputs<'a> {
     context: &'a AuthorizedQueryContext,
     /// Pinned snapshot digest of the attempt's cut.
     snapshot_digest: &'a str,
-    /// Reserved participants this attempt may address, and nothing beyond them.
-    destinations: HashMap<Url, AnalyticalDestination>,
+    /// Frozen participant endpoints this attempt plans across.
+    ///
+    /// Read from the immutable cut rather than from the reservation, because
+    /// planning happens before anything is reserved.
+    urls: Vec<Url>,
+    /// Graph-owned cell every channel this attempt opens resolves its cut from.
+    participants: Arc<std::sync::OnceLock<Arc<AnalyticalParticipantCut>>>,
     /// Digest of the leader-authorized permissions for this query.
     permission_digest: &'a str,
     /// Ceiling this query's pool may grow to.
@@ -5000,12 +5776,12 @@ pub struct AnalyticalAttemptOwnership {
     pub attempt: AnalyticalAttemptGuard,
     /// Graph ownership retained for as long as stages may be addressed.
     pub graph: AnalyticalGraphGuard,
-    /// Participant reservations this leader must return when the attempt ends.
+    /// The graph lifecycle task's attempt-side half.
     ///
-    /// Declared last so it releases after the local guards: a participant is
-    /// told to drop the reservation only once this node has stopped addressing
-    /// it.
-    pub participants: AnalyticalParticipantReservations,
+    /// Declared last so it closes after the local guards: the task is told to
+    /// return every participant reservation only once this node has stopped
+    /// addressing their owners.
+    pub signals: AnalyticalGraphSignals,
 }
 
 impl AnalyticalAttemptOwnership {
@@ -5024,6 +5800,17 @@ impl AnalyticalAttemptOwnership {
     #[must_use]
     pub fn egressed(&self) -> bool {
         self.attempt.egressed()
+    }
+
+    /// Reserves and publishes this graph's participant cut, once, before dispatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::QueryAdmissionRejected`] when a participant
+    /// declined, and [`BifrostError::QueryExecutionFailed`] when the graph's
+    /// lifecycle task is gone.
+    pub async fn publish_participants(&self) -> Result<(), BifrostError> {
+        self.signals.publish_participants().await
     }
 
     /// Admits the one permitted retry, draining this attempt first.
@@ -5074,7 +5861,7 @@ impl AnalyticalAttemptOwnership {
         let Self {
             attempt,
             graph,
-            participants,
+            signals,
         } = self;
         let supervisor = attempt.supervisor();
         attempt.finish(AnalyticalAttemptOutcome::Retried).await?;
@@ -5091,7 +5878,7 @@ impl AnalyticalAttemptOwnership {
         Ok(Self {
             attempt,
             graph,
-            participants,
+            signals,
         })
     }
 
@@ -5116,11 +5903,13 @@ impl AnalyticalAttemptOwnership {
         let Self {
             attempt,
             graph,
-            mut participants,
+            signals,
         } = self;
         let release = attempt.finish(outcome).await?;
         graph.release()?;
-        participants.release().await;
+        // Signalled only after both local guards are gone, so a participant is
+        // told to drop its reservation once this node can no longer address it.
+        signals.terminal();
         Ok(release)
     }
 }

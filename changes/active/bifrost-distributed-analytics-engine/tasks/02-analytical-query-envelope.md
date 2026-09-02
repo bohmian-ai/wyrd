@@ -920,3 +920,28 @@ Round 4 verification: `mise run fmt`; `mise run lints` clean;
 `mise run test:bifrost:journey:oracle` → 15/15 passed;
 `mise run check:bifrost-resource-governance` passed;
 `mise run check:bifrost-oracle-deploy` → 2 passed; `git diff --check` clean.
+
+## Remediation round 5 — finding 4 boundary-success path
+
+- RED: new branch `assert_an_idle_graph_past_the_deadline_is_not_released` in
+  `oracle::analytical::tests::leader_lifecycle_task_joins_every_owner_and_retains_failure`
+  leases a graph that reserves nothing, sleeps past its 50 ms deadline, then
+  settles. Failed by publishing `AnalyticalAttemptRelease { outcome: Success }`:
+  `release_graph` tested `graph_children_idle` before `self.deadline`, so an
+  already-idle graph reached after the bound was released and reported clean.
+- GREEN: the deadline check now precedes the idle check in the loop, so an
+  ordinary settlement can never publish success at or after the deadline. The
+  post-deadline expiry path calls `self.supervisor.release_graph(self.graph)`
+  directly instead of the deadline-bound wait — that wait exists to hold an
+  ordinary settlement inside the deadline, and expiry is past it by
+  construction; the supervisor's own refusal still covers a graph whose
+  envelope a child has not returned. The drain warning now names the deadline
+  rather than the poll count.
+- Commands: `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib --features test-support,bench-support -E 'test(=oracle::analytical::tests::leader_lifecycle_task_joins_every_owner_and_retains_failure)'` → 1 passed;
+  `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib --features test-support,bench-support -E 'test(=oracle::analytical::tests::graph_peer_operations_are_bounded_by_the_graph_deadline)'` → 1 passed.
+
+Round 5 verification: `mise run fmt`; `mise run lints` clean;
+`mise run test:bifrost` → 972/972 passed;
+`mise run test:bifrost:journey:oracle` → 15/15 passed;
+`mise run check:bifrost-resource-governance` passed;
+`mise run check:bifrost-oracle-deploy` → 2 passed; `git diff --check` clean.

@@ -2906,9 +2906,11 @@ impl AnalyticalGraphLifecycle {
             tokio::time::sleep(RETAINED_RELEASE_RETRY).await;
             retained.retain(|record| !record.conservatively_expired());
         }
-        // Removing the entry is what clears the retained cleanup: a released
-        // graph has no ambiguity left to record against it.
-        if let Err(error) = self.release_graph().await {
+        // Released directly rather than through the deadline-bound wait: that
+        // wait exists to hold an ordinary settlement inside the deadline, and
+        // this one is past it by construction. The supervisor's own refusal
+        // still covers a graph whose envelope a child has not returned.
+        if let Err(error) = self.supervisor.release_graph(self.graph) {
             tracing::error!(
                 public_query_id = %self.graph.public_query_id,
                 error = %error,
@@ -2922,26 +2924,30 @@ impl AnalyticalGraphLifecycle {
     /// Waits, bounded, for the envelope's children and then releases the graph.
     ///
     /// Two bounds apply and the earlier one wins: the poll count, and the
-    /// graph's own absolute deadline. Only the deadline is a property the
-    /// caller was promised, so a child still live when it arrives ends this
-    /// wait immediately rather than let terminal publication run past it.
+    /// graph's own absolute deadline. The deadline is checked *before* the
+    /// children are, because it is the bound the caller was promised and
+    /// idleness is not: a wait that ran past the deadline has already overrun
+    /// it, so finding the children idle at that point cannot turn the overrun
+    /// into a success. Only the post-deadline conservative-expiry path may
+    /// remove such a graph.
     ///
     /// # Errors
     ///
-    /// Returns [`BifrostError::Internal`] when a nested child of the query
-    /// envelope is still live at the earlier of those two bounds, and the
-    /// supervisor's refusal when the graph itself cannot be released.
+    /// Returns [`BifrostError::Internal`] when the graph deadline arrives first
+    /// or a nested child of the query envelope is still live after the poll
+    /// count, and the supervisor's refusal when the graph itself cannot be
+    /// released.
     async fn release_graph(&mut self) -> Result<(), BifrostError> {
         for _ in 0..GRAPH_DRAIN_POLLS {
+            let now = tokio::time::Instant::now();
+            if now >= self.deadline {
+                break;
+            }
             if self.supervisor.graph_children_idle(self.graph)? {
                 // Removing the entry drops the envelope and only then the
                 // admission permit it retained, so the counters that wake the
                 // next query are returned last.
                 return self.supervisor.release_graph(self.graph);
-            }
-            let now = tokio::time::Instant::now();
-            if now >= self.deadline {
-                break;
             }
             tokio::time::sleep_until(self.deadline.min(now + GRAPH_DRAIN_INTERVAL)).await;
         }
@@ -2951,7 +2957,7 @@ impl AnalyticalGraphLifecycle {
             datafusion_query_id = %self.graph.datafusion_query_id,
             scratch_bytes,
             memory_bytes,
-            "Oracle analytical leader graph did not drain before its release"
+            "Oracle analytical leader graph was not confirmed drained within its deadline"
         );
         Err(BifrostError::Internal {
             detail: "Oracle analytical graph cleanup did not complete".to_owned(),
@@ -4574,6 +4580,7 @@ mod tests {
         Box::pin(assert_stream_drop_leaves_a_supervisor_owned_task()).await;
         Box::pin(assert_cleanup_failure_retains_draining_ownership()).await;
         Box::pin(assert_release_stops_at_the_graph_deadline()).await;
+        Box::pin(assert_an_idle_graph_past_the_deadline_is_not_released()).await;
     }
 
     /// Successful cleanup releases every owner once, then removes the graph.
@@ -4893,6 +4900,59 @@ mod tests {
             "the retained graph is visible as draining"
         );
         drop(stray);
+        drop(admitted);
+    }
+
+    /// An idle graph reached only after the deadline is retained, not released.
+    ///
+    /// Idleness is not the bound. A cleanup that took until after the envelope's
+    /// absolute deadline has already overrun it, so finding the children idle at
+    /// that point cannot turn the overrun into a success: the graph is residue
+    /// the supervisor must keep observable, and only the post-deadline
+    /// conservative-expiry path may remove it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a settlement that began after the deadline publishes success
+    /// or releases the graph, its envelope, and its admission.
+    async fn assert_an_idle_graph_past_the_deadline_is_not_released() {
+        let fixture = GraphFixture::new(Utc::now());
+        let oracle = fixture_oracle_role();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+        // Nothing is ever reserved: the only owner this settlement has left to
+        // confirm is the envelope itself, and it is already idle.
+        let leased = lease_over_lossy_peers_until(&fixture, &oracle, 0, deadline);
+        let (admitted, ownership, transport) = *leased;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let error = ownership
+            .settle(AnalyticalAttemptOutcome::Success)
+            .await
+            .expect_err("cleanup that began after the deadline cannot settle as a success");
+        assert!(
+            matches!(error, BifrostError::Internal { .. }),
+            "an overrun cleanup is reported, not logged and ignored: {error:?}"
+        );
+        assert_eq!(
+            transport.releases().len(),
+            0,
+            "a graph that reserved nothing releases nothing"
+        );
+        assert_eq!(
+            fixture
+                .supervisor
+                .live_graphs()
+                .expect("the supervisor reports live graphs"),
+            1,
+            "an overrun cleanup retains the graph rather than releasing it"
+        );
+        assert_eq!(
+            fixture
+                .supervisor
+                .draining_graphs()
+                .expect("the supervisor reports retained cleanup"),
+            1,
+            "the retained graph stays observable as draining"
+        );
         drop(admitted);
     }
 

@@ -3,7 +3,7 @@ id: BIFROST-R4-T02A-RUNBOOK-AUTHORITY
 title: Remove the stale Oracle peer-retry runbook contract
 kind: remediation
 mode: REMEDIATE
-status: proposed
+status: implemented
 spec: SPEC-bifrost-distributed-analytics-engine
 spec_revision: 4
 depends_on: [BIFROST-R3-T00-AUTHORITY]
@@ -89,3 +89,18 @@ must belong to another named protocol.
 Return `SPEC_REVISION_REQUIRED` if reconciliation would permit an automatic
 successor attempt or weaken joined cleanup, peer trust, audit, or terminal
 semantics.
+
+## Execution evidence
+
+- `architecture/operations/runbooks.md` now makes every post-selection
+  Analytical failure terminal, forbids a successor attempt, and permits a
+  caller-initiated new logical query after the failure terminal.
+- The Oracle go/no-go text now requires cancellation/terminal stream evidence
+  and no longer requires retry evidence.
+- `rg -n "Retry once|cancellation/retry/terminal" architecture/operations/runbooks.md`
+  returned no matches.
+- `git diff --check` passed.
+- `mise run docs:check` reached generated-document drift unrelated to this
+  runbook-only change: the current OpenAPI source adds running-query routes and
+  schemas not yet reflected in `docs/src/content/docs/api/`. No generated file
+  was changed by this remediation.

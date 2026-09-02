@@ -6,7 +6,7 @@ mode: RECONCILE
 status: proposed
 spec: SPEC-bifrost-distributed-analytics-engine
 spec_revision: 4
-depends_on: [BIFROST-R4-T03-PHYSICAL-BASELINE]
+depends_on: [BIFROST-R4-T03A-CONTENTION-QUALIFICATION]
 requirements: [REQ-001, REQ-002, REQ-003, REQ-005, REQ-006, REQ-007, REQ-008, REQ-009, REQ-010, REQ-011]
 invariants: [INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007, INV-008]
 acceptance: [AC-002, AC-003, AC-004, AC-005, AC-006, AC-007, AC-008]
@@ -32,15 +32,18 @@ Required execution skill: `$wyrd-implement`.
 Retain `OraclePlanner`'s optimized-plan classification, immutable
 `PlannedSqlCut`, current authenticated query routes, audit-WAL acceptance,
 terminal-safe stream, lifecycle cancellation service, and internal
-`AppState::query_sql` seam. Do not create exact routing facts, public EXPLAIN,
-path hints, a query-job schema, or automatic retry. Replace the current
-Interactive-only dispatch after the qualified Analytical handle is integrated.
+`AppState::query_sql` seam. Consume Task 3A's qualified class/tenant admission,
+Interactive floor, and aggregate resource owner without modifying them. Do not
+create exact routing facts, public EXPLAIN, path hints, a query-job schema, or
+automatic retry. Replace the current Interactive-only dispatch after the
+qualified Analytical handle is integrated.
 
 ## Owners, scope, consumers, and non-goals
 
 - `vala-bifrost-redux::Oracle` owns prepare, candidate classification, physical
   planning/validation, path admission, selection, execution, and settlement.
-- `oracle/admission.rs` owns path counters/queues and the Interactive floor.
+- `oracle/admission.rs` owns the Task 3A-qualified path counters/queues and
+  Interactive floor; this task only consumes them during path selection.
 - `oracle/query_stream.rs` owns one terminal contract.
 - `wyrd-spec::vala::api` and proto source own the closed terminal execution path;
   `wyrd-tonic`, `wyrd-server`, and `vala-sdk` project it.
@@ -121,30 +124,7 @@ failures.
 assignment. Do not introduce a routing state-machine type; query class does not
 become the execution-path authority.
 
-### Scenario 3 — Path capacity and Interactive floor
-
-**Behavior.** Separate path accounting sits under one aggregate root;
-Analytical saturation never consumes the Interactive floor; refusal mutates no
-grant/counter. Maps REQ-005, REQ-006, INV-005, INV-006, AC-004.
-
-**RED.** Add
-`oracle::admission::tests::analytical_saturation_preserves_interactive_floor`.
-Fill all non-floor slots, race an Analytical refusal with an Interactive grant,
-and assert aggregate/path counts plus existing grants before/after. Exact:
-
-```bash
-mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib --features test-support,bench-support -E 'test(=oracle::admission::tests::analytical_saturation_preserves_interactive_floor)'
-```
-
-**GREEN.** Extend the existing atomic admission owner with closed path queues and
-counters; reserve `interactive_floor_slots` before any Analytical grant. Let
-Interactive use idle non-floor capacity. Both paths retain one query envelope
-and the same aggregate memory/scratch roots. Fail startup for invalid finite
-floor/total configuration using the existing config owner.
-
-**REFACTOR.** No per-path memory roots or duplicate admission service.
-
-### Scenario 4 — Shared Rust stream settlement
+### Scenario 3 — Shared Rust stream settlement
 
 **Behavior.** Normal terminal, explicit close, caller drop, bounded-collection
 overflow, decode/transport failure, and cancellation converge on one idempotent
@@ -181,7 +161,7 @@ discovered while implementing a projection must move into `vala-sdk` first and
 receive Rust coverage there; the projection then exposes it without
 duplication.
 
-### Scenario 5 — Public UI and distributed Rust journeys
+### Scenario 4 — Public UI and distributed Rust journeys
 
 **Behavior.** A real UI query selects Interactive while Analytical capacity is
 full; a real data-scientist query selects Analytical without a hint; exact
@@ -203,13 +183,14 @@ scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner &&
 ```
 
 **GREEN.** Wire the selected path into the existing public Oracle stream; reuse
-Task 2's admitted guard and Task 3's handle. Extend only existing production
-telemetry for candidate/selection/fallback/path terminal and ensure all active
-gauges settle through the joined owner.
+Task 2's admitted guard, Task 3's handle, and Task 3A's qualified contention
+owner. Extend only existing production telemetry for candidate/selection/
+fallback/path terminal and ensure all active gauges settle through the joined
+owner. Do not repeat Task 3A's admission or memory load matrix.
 
 **REFACTOR.** Do not copy the physical operator matrix; consume Task 3 evidence.
 
-### Scenario 6 — Pre-selection fallback versus post-selection failure
+### Scenario 5 — Pre-selection fallback versus post-selection failure
 
 **Behavior.** Unsupported/no-exchange candidates and a typed stale-Iceberg
 replan may run Interactive only before Analytical selection; injected peer/
@@ -241,7 +222,7 @@ dispatch and stable Wyrd error mapping at HTTP/gRPC/Rust boundaries.
 **REFACTOR.** One terminal constructor serves both paths; only the selected path
 and typed outcome vary.
 
-### Scenario 7 — Audit, internal scheduled caller, and lifecycle cancellation
+### Scenario 6 — Audit, internal scheduled caller, and lifecycle cancellation
 
 **Behavior.** One audit WAL acceptance fsyncs before rows; stages append none.
 The server-owned scheduled caller uses the same query operation, selects
@@ -289,6 +270,10 @@ check occurs on the built physical plan. Production telemetry labels use closed
 path/reason/outcome values only; IDs and SQL stay scrubbed traces. Rust is the
 client implementation authority: wire parsing, validation, errors, deadlines,
 cancellation, and settlement must not diverge by language.
+
+Task 3A owns admission fairness, Interactive protection, and lowest-rung
+contention qualification. This task may observe those behaviors through public
+routing but must not redesign or duplicate their owners or evidence matrix.
 
 Authority: `architecture/wyrd-design.md`, `architecture/bifrost-design.md`,
 `architecture/wyrd-security-posture.md`,

@@ -13,6 +13,8 @@ The repository OpenAPI document is `openapi.yaml`. Its current title is `wyrd-se
 ## Routes
 
 - `/v1/query`
+- `/v1/query/running`
+- `/v1/query/{request_id}`
 
 ## Refresh
 

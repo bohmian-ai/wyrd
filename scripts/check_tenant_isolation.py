@@ -78,6 +78,19 @@ VALA_TENANT_BOUND_CAPABILITY_ALLOWLIST = {
     "crates/vala/vala-sql/src/queries/audit_outbox.rs",
 }
 
+# Cohesive owners whose capability structs *hold* the caller's `TenantConn`
+# borrow for the lifetime of a multi-statement workflow, instead of taking one
+# per call. The isolation property is unchanged and in fact tighter: every
+# statement such a method issues runs on a tenant-scoped RLS connection the
+# struct cannot outlive, and the borrow keeps the whole workflow inside one
+# tenant transaction. Entries must satisfy the shape rule below: every public
+# async fn is either a method of a struct owning a `TenantConn` field, or a
+# free function taking `OperatorPool` for the bounded read-only cross-tenant
+# recovery enumeration. Every other tenant-query rule still runs unchanged.
+VALA_TENANT_CONN_OWNER_ALLOWLIST = {
+    "crates/vala/vala-sql/src/queries/oracle_reader_authority.rs",
+}
+
 # Vala tables that are intentionally cross-tenant control-plane surfaces with no
 # tenant column and NO RLS (accessed only via the OperatorPool). They are
 # exempt from the RLS-triple requirement because there is no `data_tenant_id`
@@ -163,9 +176,10 @@ def check_rls_triples(failures: list[str]) -> None:
                 if policy_block is None:
                     continue
 
+                column = re.escape(tenant_column(normalized_window))
                 policy_patterns = [
-                    r"using\s*\(\s*data_tenant_id\s*=\s*wyrd\.current_tenant\(\)\s*\)",
-                    r"with\s+check\s*\(\s*data_tenant_id\s*=\s*wyrd\.current_tenant\(\)\s*\)",
+                    rf"using\s*\(\s*{column}\s*=\s*wyrd\.current_tenant\(\)\s*\)",
+                    rf"with\s+check\s*\(\s*{column}\s*=\s*wyrd\.current_tenant\(\)\s*\)",
                 ]
                 for pattern in policy_patterns:
                     if not re.search(pattern, policy_block, re.IGNORECASE):
@@ -304,6 +318,32 @@ def check_vala_query_modules(failures: list[str]) -> None:
                     failures.append(
                         f"{relative}: mixed-executor public async fn {fn_name} must use an OperatorPool-owning self or take OperatorPool/TenantConn"
                     )
+            continue
+
+        if relative in VALA_TENANT_CONN_OWNER_ALLOWLIST:
+            owns_tenant_conn = re.search(
+                r"struct\s+\w+[^{]*\{[^}]*conn:\s*&'\w+\s+mut\s+TenantConn",
+                code,
+                re.DOTALL,
+            ) is not None
+            for fn_name, params in public_async_fns(code):
+                if (
+                    "TenantConn<'_" not in params
+                    and "TenantConn < '_" not in params
+                    and "OperatorPool" not in params
+                    and not (owns_tenant_conn and "self" in params)
+                ):
+                    failures.append(
+                        f"{relative}: public async fn {fn_name} must take &mut TenantConn<'_>, "
+                        "take an OperatorPool, or be a method of a struct owning a TenantConn"
+                    )
+            check_tenant_query_file(
+                relative,
+                body,
+                code,
+                failures,
+                exempt_tenant_conn_param=True,
+            )
             continue
 
         if relative in VALA_TENANT_BOUND_CAPABILITY_ALLOWLIST:
@@ -502,6 +542,30 @@ def tenant_table_windows(sql: str, schema: str) -> list[tuple[str, str]]:
         window_end = min(next_table_start, lookahead_end)
         windows.append((match.group(1), sql[match.start() : window_end]))
     return windows
+
+
+def tenant_column(normalized_window: str) -> str:
+    """Names the tenant column one table's RLS policy must be written against.
+
+    Nearly every tenant table calls the column `data_tenant_id`, and that name
+    wins whenever it is present. A table whose tenant is an ownership role
+    rather than the row's own data tenant names it accordingly — Oracle reader
+    epochs are owned by `epoch_owner_tenant_id` — and the policy has to match
+    the column that actually exists, so the single `*_tenant_id` column the
+    table declares is used instead. The rule itself is unchanged: both policy
+    directions must equal `wyrd.current_tenant()` on that column.
+    """
+    definition_end = normalized_window.find(");")
+    definition = (
+        normalized_window if definition_end == -1 else normalized_window[:definition_end]
+    )
+    declared = set(re.findall(r"\b([a-z_]*tenant_id)\s+uuid\b", definition))
+    if "data_tenant_id" in declared:
+        return "data_tenant_id"
+    candidates = declared
+    if len(candidates) == 1:
+        return candidates.pop()
+    return "data_tenant_id"
 
 
 def tenant_policy_block(normalized_window: str, qualified_table: str) -> str | None:

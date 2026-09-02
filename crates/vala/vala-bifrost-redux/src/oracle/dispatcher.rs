@@ -366,11 +366,12 @@ impl PendingGraphActivation {
     pub(crate) fn commit<T, F>(
         mut self,
         register: F,
-    ) -> Result<(CommittedGraphActivation, T), (Self, BifrostError)>
+    ) -> Result<(CommittedGraphActivation, T), (Box<Self>, BifrostError)>
     where
         F: FnOnce(
             crate::resources::OracleQueryResources,
-        ) -> Result<T, (crate::resources::OracleQueryResources, BifrostError)>,
+        )
+            -> Result<T, (Box<crate::resources::OracleQueryResources>, BifrostError)>,
     {
         let mut entry = self.entry.take().expect("a live activation owns its entry");
         let Some(ReservedCapacity::Graph(resources)) = entry.capacity.take() else {
@@ -396,9 +397,9 @@ impl PendingGraphActivation {
                 Ok((committed, owner))
             }
             Err((resources, error)) => {
-                entry.capacity = Some(ReservedCapacity::Graph(Box::new(resources)));
+                entry.capacity = Some(ReservedCapacity::Graph(resources));
                 self.entry = Some(entry);
-                Err((self, error))
+                Err((Box::new(self), error))
             }
         }
     }

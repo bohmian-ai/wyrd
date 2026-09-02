@@ -1321,18 +1321,14 @@ impl AnalyticalStageIngress {
         // permitted to own at once and there is no second capacity setting.
         let (sender, receiver) = mpsc::channel(reservations.max_concurrent_graphs());
         Arc::new_cyclic(|weak: &Weak<Self>| {
-            let driver = match tokio::runtime::Handle::try_current() {
-                Ok(handle) => {
-                    let ingress = Weak::clone(weak);
-                    Some(handle.spawn(drive_graph_settlements(receiver, ingress)))
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "Oracle analytical follower ingress was built outside a runtime; \
-                         caller-drop settlement is unavailable"
-                    );
-                    None
-                }
+            let driver = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                Some(handle.spawn(drive_graph_settlements(receiver, Weak::clone(weak))))
+            } else {
+                tracing::warn!(
+                    "Oracle analytical follower ingress was built outside a runtime; \
+                     caller-drop settlement is unavailable"
+                );
+                None
             };
             Self {
                 node_id,
@@ -1539,13 +1535,13 @@ impl AnalyticalStageIngress {
         activation: PendingGraphActivation,
         request: &GraphLeaseRequest,
         authorized: &AuthorizedStage,
-    ) -> Result<Arc<GraphLease>, (PendingGraphActivation, BifrostError)> {
+    ) -> Result<Arc<GraphLease>, (Box<PendingGraphActivation>, BifrostError)> {
         let binding = match GraphLeaseBinding::activate(&activation, request, authorized) {
             Ok(binding) => binding,
-            Err(error) => return Err((activation, error)),
+            Err(error) => return Err((Box::new(activation), error)),
         };
         if let Err(error) = binding.authorize(authorized) {
-            return Err((activation, error));
+            return Err((Box::new(activation), error));
         }
         let envelope = activation.envelope();
         let runtime = match self
@@ -1553,7 +1549,7 @@ impl AnalyticalStageIngress {
             .build_query_runtime(envelope.memory_pool(), envelope.scratch_bytes)
         {
             Ok(runtime) => AnalyticalGraphRuntime::new(runtime, self.exchange_buffer_bytes),
-            Err(error) => return Err((activation, error)),
+            Err(error) => return Err((Box::new(activation), error)),
         };
         let supervisor = Arc::clone(&self.supervisor);
         let registered = runtime.clone();
@@ -3069,6 +3065,18 @@ mod tests {
             "settlement returned the graph's reservation entry"
         );
 
+        follower_retains_a_graph_whose_children_never_drain().await;
+    }
+
+    /// Proves an undrainable graph is retained, named, and never released.
+    ///
+    /// Split from the release test only to keep each phase readable; it is the
+    /// second half of the same scenario.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a failed cleanup releases a graph or is reported as clean.
+    async fn follower_retains_a_graph_whose_children_never_drain() {
         // A graph whose envelope keeps a live nested child cannot drain. The
         // follower must report that as a failure and keep everything it owns.
         let now = Utc::now();
@@ -3081,7 +3089,7 @@ mod tests {
             .supervisor
             .graph_runtime(fixture.graph)
             .expect("the activated graph installed a query-owned runtime");
-        let mut stuck = datafusion::execution::memory_pool::MemoryConsumer::new("stuck-child")
+        let stuck = datafusion::execution::memory_pool::MemoryConsumer::new("stuck-child")
             .register(&runtime.runtime().memory_pool);
         stuck
             .try_grow(1024)
@@ -3195,6 +3203,19 @@ mod tests {
             "a second failure did not consume the restored reservation either"
         );
 
+        graph_rollback_restores_a_reservation_only_before_its_expiry().await;
+    }
+
+    /// Proves a refused registration restores an activatable reservation.
+    ///
+    /// Split from the rollback test only to keep each phase readable; it is the
+    /// second half of the same scenario.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a refused registration publishes a graph, when the restored
+    /// reservation cannot be activated, or when an expired one is resurrected.
+    async fn graph_rollback_restores_a_reservation_only_before_its_expiry() {
         // A supervisor registration that is refused because the graph is taken.
         let now = Utc::now();
         let fixture = GraphFixture::new(now);
@@ -3765,19 +3786,52 @@ impl fmt::Debug for AnalyticalExecutionHandle {
     }
 }
 
+/// The node-scoped owners one Analytical handle is composed from.
+///
+/// Named together because they are exactly the set a node already has when it
+/// composes its Analytical half, and naming them keeps two same-typed shared
+/// owners from being transposable at the call site.
+pub struct AnalyticalExecutionOwners {
+    /// This node's follower ingress, which also hosts the upstream worker.
+    pub worker: Arc<AnalyticalStageIngress>,
+    /// Server-owned authority every stage operation is signed and checked by.
+    pub authority: Arc<dyn OracleStageAuthority>,
+    /// Node-local supervisor owning graphs, attempts, and the runtime registry.
+    pub supervisor: Arc<AnalyticalSupervisor>,
+    /// Process spill owner that bounds each query runtime's disk manager.
+    pub spill: Arc<OracleSpillRuntime>,
+    /// This node's Oracle role owner, which admits each leader envelope.
+    pub oracle_resources: OracleResources,
+    /// Peer transports the leader reserves participant capacity through.
+    pub peer_transports: Option<Arc<super::dispatcher::OraclePeerTransportDirectory>>,
+}
+
+impl fmt::Debug for AnalyticalExecutionOwners {
+    /// Reports presence without rendering owned dependencies.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AnalyticalExecutionOwners")
+            .field("peer_transports", &self.peer_transports.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 impl AnalyticalExecutionHandle {
     /// Composes the handle over this node's existing Analytical owners.
     #[must_use]
     pub fn new(
-        worker: Arc<AnalyticalStageIngress>,
-        authority: Arc<dyn OracleStageAuthority>,
-        supervisor: Arc<AnalyticalSupervisor>,
-        spill: Arc<OracleSpillRuntime>,
-        oracle_resources: OracleResources,
-        peer_transports: Option<Arc<super::dispatcher::OraclePeerTransportDirectory>>,
+        owners: AnalyticalExecutionOwners,
         config: AnalyticalExecutionConfig,
         leaf: super::codec::AnalyticalLeafBinding,
     ) -> Self {
+        let AnalyticalExecutionOwners {
+            worker,
+            authority,
+            supervisor,
+            spill,
+            oracle_resources,
+            peer_transports,
+        } = owners;
         Self {
             worker,
             authority,

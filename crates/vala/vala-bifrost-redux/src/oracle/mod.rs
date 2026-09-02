@@ -2169,12 +2169,14 @@ fn compose_analytical_handle(
             egress,
         });
     Arc::new(analytical::AnalyticalExecutionHandle::new(
-        Arc::clone(&worker),
-        authority,
-        supervisor,
-        spill,
-        resources,
-        peer_transports,
+        analytical::AnalyticalExecutionOwners {
+            worker: Arc::clone(&worker),
+            authority,
+            supervisor,
+            spill,
+            oracle_resources: resources,
+            peer_transports,
+        },
         analytical::AnalyticalExecutionConfig {
             node_id,
             oracle_fence: fence,

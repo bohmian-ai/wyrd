@@ -363,29 +363,28 @@ impl AnalyticalSupervisor {
         graph: AnalyticalGraphKey,
         resources: OracleQueryResources,
         runtime: AnalyticalGraphRuntime,
-    ) -> Result<AnalyticalGraphGuard, (OracleQueryResources, BifrostError)> {
+    ) -> Result<AnalyticalGraphGuard, (Box<OracleQueryResources>, BifrostError)> {
         if !self.is_healthy() {
             return Err((
-                resources,
+                Box::new(resources),
                 BifrostError::Internal {
                     detail: "Oracle analytical supervisor is shutting down".to_owned(),
                 },
             ));
         }
-        let mut graphs = match self.graphs.lock() {
-            Ok(graphs) => graphs,
-            Err(_) => return Err((resources, poisoned_supervisor())),
+        let Ok(mut graphs) = self.graphs.lock() else {
+            return Err((Box::new(resources), poisoned_supervisor()));
         };
         if graphs.contains_key(&graph) {
             return Err((
-                resources,
+                Box::new(resources),
                 BifrostError::Internal {
                     detail: "Oracle analytical graph is already registered".to_owned(),
                 },
             ));
         }
         if let Err(error) = self.registry.register(graph, runtime.clone()) {
-            return Err((resources, error));
+            return Err((Box::new(resources), error));
         }
         graphs.insert(graph, AnalyticalGraphState { resources, runtime });
         drop(graphs);

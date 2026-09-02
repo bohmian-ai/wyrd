@@ -12,7 +12,8 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_bifrost_redux::oracle::reader_pins::{
-    LocalReaderCut, OracleReaderAuthority, OracleReaderAuthorityConfig, RecordingEpochTerminator,
+    LocalReaderCut, OracleReaderAuthority, OracleReaderAuthorityConfig, ReaderQueryGuard,
+    RecordingEpochTerminator,
 };
 use vala_sql::queries::cluster_nodes::ClusterNodes;
 use vala_sql::queries::olap_catalog::upsert_table;
@@ -289,41 +290,33 @@ fn cut(snapshot_id: i64, timestamp_ms: i64, ancestry: &[i64]) -> LocalReaderCut 
     }
 }
 
-/// Proves one authority aggregates every reader and narrows conservatively.
+/// Drives the aggregation phase: coverage, widening, forking, and narrowing.
 ///
-/// The durable frontier is the union of what every live query still needs, not
-/// a row per query: a covered admission writes nothing at all, a widening
-/// writes exactly one revision, and nothing narrows until the query that needed
-/// it is gone.
+/// Returns the two guards whose release the caller still needs, so the failure
+/// phase can prove a refused release retains exactly this state.
 ///
 /// # Panics
 ///
-/// Panics when any revision, member set, audit sequence, race outcome, or
-/// failed-release retention differs from the contract.
-#[tokio::test]
-async fn process_global_authority_aggregates_and_releases_conservatively() {
-    let fixture = AuthorityFixture::start().await;
-    let (authority, _terminator) = fixture.authority(8).await;
-    let tenant = fixture.tenant().await;
-    let other_tenant = fixture.tenant().await;
-    let events = fixture.table(tenant, "events").await;
-    let orders = fixture.table(tenant, "orders").await;
-    let foreign = fixture.table(other_tenant, "events").await;
-
+/// Panics when any revision, member set, audit sequence, or narrowing outcome
+/// differs from the contract.
+async fn aggregate_and_narrow(
+    fixture: &AuthorityFixture,
+    authority: &Arc<OracleReaderAuthority>,
+    events: &TableAuthorityIdentity,
+    orders: &TableAuthorityIdentity,
+    foreign: &TableAuthorityIdentity,
+) -> (ReaderQueryGuard, ReaderQueryGuard) {
     // A first admission is a first coverage: exactly one revision, one event.
     let (first, _first_permit) = authority
         .acquire_guard_for_cuts(vec![(events.clone(), cut(30, 300, &[30, 20, 10]))])
         .await
         .expect("first admission protects");
-    let opened = fixture
-        .header(&events)
-        .await
-        .expect("a first header exists");
+    let opened = fixture.header(events).await.expect("a first header exists");
     assert_eq!(opened.revision, 1);
     assert_eq!(opened.frontier.members.len(), 1);
     assert!(opened.frontier.covers(30));
     assert_eq!(
-        fixture.audit_operations(&events).await,
+        fixture.audit_operations(events).await,
         vec!["oracle.table_protection.expanded".to_owned()]
     );
 
@@ -333,16 +326,16 @@ async fn process_global_authority_aggregates_and_releases_conservatively() {
         .acquire_guard_for_cuts(vec![(events.clone(), cut(30, 300, &[30, 20, 10]))])
         .await
         .expect("covered admission protects");
-    let unchanged = fixture.header(&events).await.expect("the header survives");
+    let unchanged = fixture.header(events).await.expect("the header survives");
     assert_eq!(unchanged, opened, "a covered admission writes nothing");
-    assert_eq!(fixture.audit_operations(&events).await.len(), 1);
+    assert_eq!(fixture.audit_operations(events).await.len(), 1);
 
     // An older cut on the same chain widens the existing member downward.
     let (older, _older_permit) = authority
         .acquire_guard_for_cuts(vec![(events.clone(), cut(20, 200, &[20, 10]))])
         .await
         .expect("widening admission protects");
-    let widened = fixture.header(&events).await.expect("the header widened");
+    let widened = fixture.header(events).await.expect("the header widened");
     assert_eq!(widened.revision, 2);
     assert_eq!(widened.frontier.members.len(), 1);
     assert!(widened.frontier.covers(30) && widened.frontier.covers(20));
@@ -353,12 +346,12 @@ async fn process_global_authority_aggregates_and_releases_conservatively() {
         .acquire_guard_for_cuts(vec![(events.clone(), cut(25, 250, &[25, 15]))])
         .await
         .expect("forked admission protects");
-    let both = fixture.header(&events).await.expect("the header forked");
+    let both = fixture.header(events).await.expect("the header forked");
     assert_eq!(both.revision, 3);
     assert_eq!(both.frontier.members.len(), 2);
     assert!(both.frontier.covers(25) && both.frontier.covers(30));
     assert_eq!(
-        fixture.audit_operations(&events).await,
+        fixture.audit_operations(events).await,
         vec![
             "oracle.table_protection.expanded".to_owned(),
             "oracle.table_protection.expanded".to_owned(),
@@ -367,28 +360,28 @@ async fn process_global_authority_aggregates_and_releases_conservatively() {
     );
 
     // Protection is table-local and tenant-local throughout.
-    assert!(fixture.header(&orders).await.is_none());
-    assert!(fixture.header(&foreign).await.is_none());
+    assert!(fixture.header(orders).await.is_none());
+    assert!(fixture.header(foreign).await.is_none());
 
     // Nothing narrows while the query that needed it is still reachable.
     tokio::task::yield_now().await;
-    assert_eq!(fixture.header(&events).await.as_ref(), Some(&both));
+    assert_eq!(fixture.header(events).await.as_ref(), Some(&both));
 
     drop(forked);
     fixture
-        .settle(&events, "the forked member narrows away", |record| {
+        .settle(events, "the forked member narrows away", |record| {
             record.is_some_and(|record| record.frontier.members.len() == 1 && record.revision == 4)
         })
         .await;
     drop(older);
     fixture
-        .settle(&events, "the widened endpoint narrows back", |record| {
+        .settle(events, "the widened endpoint narrows back", |record| {
             record.is_some_and(|record| record.revision == 5 && !record.frontier.covers(20))
         })
         .await;
     assert!(
         fixture
-            .header(&events)
+            .header(events)
             .await
             .expect("still protected")
             .frontier
@@ -396,6 +389,22 @@ async fn process_global_authority_aggregates_and_releases_conservatively() {
         "narrowing must never drop a snapshot two readers still hold"
     );
 
+    (first, covered)
+}
+
+/// Drives the fail-closed phase: a release that cannot commit changes nothing.
+///
+/// # Panics
+///
+/// Panics when the refused release mutates the header, its members, or the
+/// audit log.
+async fn refuse_uncommittable_release(
+    fixture: &AuthorityFixture,
+    tenant: DataTenantId,
+    events: &TableAuthorityIdentity,
+    first: ReaderQueryGuard,
+    covered: ReaderQueryGuard,
+) {
     // A release that cannot commit retains the prior header. Corrupting the
     // stored digest is the same fail-closed path a poisoned row takes.
     let pool = fixture
@@ -403,7 +412,7 @@ async fn process_global_authority_aggregates_and_releases_conservatively() {
         .superuser_pool()
         .await
         .expect("superuser pool");
-    let intact = fixture.header(&events).await.expect("still protected");
+    let intact = fixture.header(events).await.expect("still protected");
     sqlx::query(
         "UPDATE vala.oracle_table_protections SET frontier_digest = $2 WHERE data_tenant_id = $1",
     )
@@ -414,7 +423,7 @@ async fn process_global_authority_aggregates_and_releases_conservatively() {
     .expect("digest corruption applies");
     drop(covered);
     drop(first);
-    let audits_before = fixture.audit_operations(&events).await.len();
+    let audits_before = fixture.audit_operations(events).await.len();
     tokio::time::sleep(Duration::from_millis(200)).await;
     let (revision, members): (i64, i64) = sqlx::query_as(
         "SELECT (SELECT revision FROM vala.oracle_table_protections WHERE data_tenant_id = $1), \
@@ -430,7 +439,7 @@ async fn process_global_authority_aggregates_and_releases_conservatively() {
         (intact.revision, 1),
         "a failed release keeps the prior protection exactly"
     );
-    assert_eq!(fixture.audit_operations(&events).await.len(), audits_before);
+    assert_eq!(fixture.audit_operations(events).await.len(), audits_before);
     sqlx::query(
         "UPDATE vala.oracle_table_protections SET frontier_digest = $2 WHERE data_tenant_id = $1",
     )
@@ -439,7 +448,19 @@ async fn process_global_authority_aggregates_and_releases_conservatively() {
     .execute(&pool)
     .await
     .expect("digest restore applies");
+}
 
+/// Drives the race phase: a queued narrowing against a fresh admission.
+///
+/// # Panics
+///
+/// Panics when either ordering leaves a frontier that fails to cover the
+/// admission that won.
+async fn race_narrowing_against_admission(
+    fixture: &AuthorityFixture,
+    authority: &Arc<OracleReaderAuthority>,
+    orders: &TableAuthorityIdentity,
+) {
     // A queued narrowing racing a new admission for the same table, in both
     // orders, must leave a frontier that covers the admission that won.
     let (held, _held_permit) = authority
@@ -452,7 +473,7 @@ async fn process_global_authority_aggregates_and_releases_conservatively() {
         .await
         .expect("admission after a queued narrowing protects");
     fixture
-        .settle(&orders, "the racing admission stays covered", |record| {
+        .settle(orders, "the racing admission stays covered", |record| {
             record.is_some_and(|record| record.frontier.covers(70))
         })
         .await;
@@ -463,16 +484,27 @@ async fn process_global_authority_aggregates_and_releases_conservatively() {
         .expect("second racing admission protects");
     drop(after_drop);
     fixture
-        .settle(&orders, "the reverse-order race stays covered", |record| {
+        .settle(orders, "the reverse-order race stays covered", |record| {
             record.is_some_and(|record| record.frontier.covers(60))
         })
         .await;
     drop(racing);
+}
 
+/// Drives the lock-order phase: opposite table orders must never deadlock.
+///
+/// # Panics
+///
+/// Panics when the two admissions do not both complete inside the budget.
+async fn admit_opposite_table_orders(
+    authority: &Arc<OracleReaderAuthority>,
+    events: &TableAuthorityIdentity,
+    orders: &TableAuthorityIdentity,
+) {
     // Two admissions naming the same tables in opposite orders serialize on the
     // canonical key order, so neither can wait on a lock the other holds.
-    let ascending = Arc::clone(&authority);
-    let descending = Arc::clone(&authority);
+    let ascending = Arc::clone(authority);
+    let descending = Arc::clone(authority);
     let (left, right) = (events.clone(), orders.clone());
     let forward = tokio::spawn(async move {
         ascending
@@ -502,6 +534,34 @@ async fn process_global_authority_aggregates_and_releases_conservatively() {
     .await
     .expect("opposite orders never deadlock");
     drop(both_orders);
+}
+
+/// Proves one authority aggregates every reader and narrows conservatively.
+///
+/// The durable frontier is the union of what every live query still needs, not
+/// a row per query: a covered admission writes nothing at all, a widening
+/// writes exactly one revision, and nothing narrows until the query that needed
+/// it is gone.
+///
+/// # Panics
+///
+/// Panics when any revision, member set, audit sequence, race outcome, or
+/// failed-release retention differs from the contract.
+#[tokio::test]
+async fn process_global_authority_aggregates_and_releases_conservatively() {
+    let fixture = AuthorityFixture::start().await;
+    let (authority, _terminator) = fixture.authority(8).await;
+    let tenant = fixture.tenant().await;
+    let other_tenant = fixture.tenant().await;
+    let events = fixture.table(tenant, "events").await;
+    let orders = fixture.table(tenant, "orders").await;
+    let foreign = fixture.table(other_tenant, "events").await;
+
+    let (first, covered) =
+        aggregate_and_narrow(&fixture, &authority, &events, &orders, &foreign).await;
+    refuse_uncommittable_release(&fixture, tenant, &events, first, covered).await;
+    race_narrowing_against_admission(&fixture, &authority, &orders).await;
+    admit_opposite_table_orders(&authority, &events, &orders).await;
 
     authority.retire().await.expect("epoch retires");
     assert!(fixture.header(&events).await.is_none());
@@ -516,23 +576,16 @@ async fn process_global_authority_aggregates_and_releases_conservatively() {
     );
 }
 
-/// Proves lease loss self-fences and retirement releases in the fixed order.
-///
-/// The ordering is the safety property: admission closes, the loss edge is
-/// audited, IO is cancelled, descendants are joined, and only then may any
-/// table be released or the epoch row deleted.
+/// Proves a live epoch's durable revisions, deadlines, and silent renewal.
 ///
 /// # Panics
 ///
-/// Panics when any revision, deadline relationship, permit refusal, terminator
-/// invocation, audit sequence, or release ordering differs from the contract.
-#[tokio::test]
-async fn epoch_lifecycle_self_fences_and_retires_in_order() {
-    let fixture = AuthorityFixture::start().await;
-    let (authority, terminator) = fixture.authority(2).await;
-    let tenant = fixture.tenant().await;
-    let events = fixture.table(tenant, "events").await;
-
+/// Panics when a revision, deadline relationship, or audit sequence differs
+/// from the contract.
+async fn assert_live_epoch_accounting(
+    fixture: &AuthorityFixture,
+    authority: &Arc<OracleReaderAuthority>,
+) {
     // Acquisition is revision 1 and activation is revision 2, both audited.
     let row = fixture.epoch_row().await.expect("the epoch row exists");
     assert_eq!(
@@ -575,6 +628,26 @@ async fn epoch_lifecycle_self_fences_and_retires_in_order() {
             "oracle.reader_epoch.activated".to_owned(),
         ]
     );
+}
+
+/// Proves lease loss self-fences and retirement releases in the fixed order.
+///
+/// The ordering is the safety property: admission closes, the loss edge is
+/// audited, IO is cancelled, descendants are joined, and only then may any
+/// table be released or the epoch row deleted.
+///
+/// # Panics
+///
+/// Panics when any revision, deadline relationship, permit refusal, terminator
+/// invocation, audit sequence, or release ordering differs from the contract.
+#[tokio::test]
+async fn epoch_lifecycle_self_fences_and_retires_in_order() {
+    let fixture = AuthorityFixture::start().await;
+    let (authority, terminator) = fixture.authority(2).await;
+    let tenant = fixture.tenant().await;
+    let events = fixture.table(tenant, "events").await;
+
+    assert_live_epoch_accounting(&fixture, &authority).await;
 
     // A held query may read; the same permit must refuse once the epoch is
     // fenced, including for a read that had already begun.

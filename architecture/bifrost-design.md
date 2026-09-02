@@ -269,18 +269,25 @@ Oracle has two execution paths:
 - **Interactive** is the default single-stage path for scans, filters, limits,
   global operations already supported locally, low-cardinality aggregation,
   and any query for which an analytical route cannot be established safely.
-- **Analytical** is the streamed distributed path for multi-input joins,
-  high-cardinality aggregation whose estimated hash state exceeds the
-  interactive grant, partitioned windows, and cross-source deduplicating set
-  operations.
+- **Analytical** is the streamed distributed path for the supported v1
+  baseline: filtered and projected scans, fixed-width grouped `COUNT`, `SUM`,
+  `MIN`, and `MAX` aggregation, multi-input equi-join, streamed network
+  exchange, and one real spilling DataFusion operator. Query shapes outside
+  that baseline remain Interactive when Interactive supports them and
+  otherwise return a stable structured failure. Bifrost promises no exhaustive
+  operator matrix for windows, correlated subqueries, deduplicating sets,
+  UDAFs, every join type, or every aggregation state.
 
-Routing uses the optimized plan and exact, snapshot-bound statistics from
-post-pruning Parquet files. Missing, inexact, incompatible, unsafe JSON,
-overflowed, or mutable estimates select Interactive. SQL text, row sampling,
-live execution statistics, client hints, and unpinned catalog state never
-select the path. An analytical candidate must contain a network exchange;
-otherwise Oracle executes the Interactive plan. Analytical planning failure
-also executes the Interactive plan and records a bounded fallback reason.
+Routing reuses Oracle's existing optimized-plan classification over the
+immutable pinned query facts to nominate an Analytical candidate; Bifrost adds
+no second optimizer and no separate routing-facts subsystem. Missing,
+incompatible, overflowed, or mutable estimates select Interactive. SQL text,
+row sampling, live execution statistics, client hints, and unpinned catalog
+state never select the path. A candidate becomes Analytical only when
+distributed physical planning succeeds, the plan stays inside the supported v1
+baseline, and the plan contains a real network exchange. Any of those checks
+failing before selection executes the Interactive plan and records a bounded
+fallback reason.
 
 ### Distributed analytical execution
 
@@ -303,30 +310,40 @@ share, cancellation token, and deadline. Query-owned leases remain alive until
 coordinator end-of-stream, cancellation, or cache invalidation and all
 structured tasks have joined.
 
-Exchange buffers are a checked child of the query's issued memory grant, never
-a second root reservation. The split accounts fan-out, connection buffer, and
-maximum message size and refuses before dispatch when the remaining grant
-cannot sustain the query's working partitions. Follower spill is charged to
-the same query-owned scratch allocation. Exhaustion is typed and releases all
-memory, scratch, slot, task, cache, and transport owners exactly once.
+Exchange buffers draw from the same finite query-owned memory pool as the
+operators; they are not precharged into a predicted child allocation. Before
+dispatch, Oracle enforces its configured selected-worker limit, admitted
+tasks/partitions, Wyrd-owned admission queue and slots, and scratch allocation
+with checked count/range arithmetic. Dependency-owned exchange queues retain
+their pinned byte backpressure without a Wyrd item-count guarantee. Oracle does
+not claim to predict every dependency allocation or transient encoded-message
+byte. Follower spill is charged to the same query-owned scratch allocation.
+Memory-pool, transport, or scratch exhaustion is typed and releases all memory,
+scratch, slot, task, cache, and transport owners exactly once after the graph
+drains. Cleanup timeout or failure is never reported as a successful release:
+the remaining graph stays observable to the owning supervisor, the node does
+not claim a clean terminal state, and readiness or shutdown evidence surfaces
+the failure.
 
-One immutable deadline and cancellation tree bound the complete stage graph.
-Head cancellation stops and joins every descendant. A retryable peer loss is
-an authenticated peer transport close, reset, or bounded availability timeout
-before the first result-data frame leaves Oracle. It excludes authentication,
-authorization, tenant, digest, protocol, resource, corruption, cancellation,
-and deadline failures. The first eligible loss discards the incomplete
-attempt, releases its owners, and rebuilds the stage dependency closure once
-against the identical pinned cut and deadline. A second loss, or any peer loss
-after a result-data frame has been emitted, fails the logical query terminally.
+One immutable cut, deadline, cancellation tree, and execution attempt bound
+the complete stage graph. Head cancellation stops and joins every descendant.
+Analytical selection binds the logical query to exactly one distributed
+attempt: after selection, peer transport close, reset, availability timeout,
+authentication, authorization, tenant, digest, protocol, resource, corruption,
+cancellation, deadline, and execution failures are all terminal. Oracle does
+not construct a successor attempt, does not rebuild the stage dependency
+closure, and does not fall back to Interactive. A caller that receives the
+failure terminal may submit a new logical query. Retry remains a property of
+unrelated Scribe, catalog, and Forge protocols, not of a selected Analytical
+query.
 
-Result frames carry query identity and attempt epoch and are followed by one
-explicit success or failure terminal. Bounded transport buffers provide
-backpressure but never spool the complete result. A caller may process frames
-incrementally, but the result is successful only after the success terminal;
-frames preceding a failure terminal are invalid as a complete query result.
-Stale-attempt frames are rejected before egress, so a successful stream cannot
-contain partial or duplicated rows.
+Result frames carry query and attempt identity and are followed by one explicit
+success or failure terminal. Bounded transport buffers provide backpressure but
+never spool the complete result. A caller may process frames incrementally, but
+the result is successful only after the success terminal; frames preceding a
+failure terminal are invalid as a complete query result. Frames that do not
+match the owning attempt identity are rejected before egress, so a successful
+stream cannot contain partial or duplicated rows.
 
 ### Admission and memory
 
@@ -362,15 +379,14 @@ the query lifetime and never recomputed under running operators. Each query's
 DataFusion pool enforces that ceiling while actual allocations draw from the
 shared root, whose hard limit remains authoritative.
 
-The exchange budget is an atomic child allocation inside the issued query
-ceiling: establishing it reduces the operator-working sublimit by the same
-amount, and refusal leaves both sublimits unchanged. The child is not a second
-root reservation. Admission refuses before dispatch unless the residual
-operator sublimit covers every required working partition. Root allocation
-refusal after admission is a typed query-resource failure and cancels the full
-query; it never borrows from another query's ceiling. The fixed grant sizes one
-`OracleSessionShape`: target partitions, batch size, and join preference.
-Scratch space is separately reserved because spill consumes real disk.
+Operators and exchange consumers share the issued query ceiling without
+separate sublimits. Admission refuses before dispatch when checked graph counts
+or scratch demand exceed their finite configured limits. Allocation or
+transport refusal after admission is a typed query-resource failure and
+cancels the full query; it never borrows from another query's ceiling. The
+fixed grant sizes one `OracleSessionShape`: target partitions, batch size, and
+join preference. Scratch space is separately reserved because spill consumes
+real disk.
 
 Tenant fairness is owned separately by per-tenant FIFO and weighted
 round-robin admission. Grants are tenant-blind. Memory governance protects
@@ -391,12 +407,11 @@ exchange exhaustion after framing is `QueryResourcesExhausted`. Cancellation,
 deadline, peer loss, and execution failure have typed terminal outcomes. A
 stream never represents partial rows as success.
 
-Oracle exposes typed EXPLAIN over the same authorized immutable planning path.
-EXPLAIN returns execution path, route and fallback reason, snapshot digest,
-bounded estimates, and a validated stage DAG. It acquires no query resources,
-reads no rows, and writes no successful read-audit record. Query and EXPLAIN
-share the public deadline range `1..=u32::MAX` milliseconds across Rust, HTTP,
-gRPC, Python, TypeScript, and MCP.
+A public distributed-plan or execution-path `EXPLAIN` surface is deferred and
+is not part of this delivery. Selected-path evidence reaches callers only
+through the success terminal of the one public query operation. The public
+query deadline range is `1..=u32::MAX` milliseconds across Rust, HTTP, gRPC,
+Python, TypeScript, and MCP.
 
 ## Maintenance: Forge
 
@@ -537,8 +552,11 @@ from age or path shape alone.
 
 ## Resource and failure invariants
 
-- Every queue, mailbox, stream, fanout, task set, buffer, memory pool, scratch
-  root, spill path, staged namespace, and object upload lane is bounded.
+- Every Wyrd-owned queue, mailbox, stream, fanout, task set, buffer, memory
+  pool, scratch root, spill path, staged namespace, and object upload lane is
+  bounded. A pinned dependency-internal queue may instead provide finite byte
+  backpressure when Wyrd cannot configure its item count; architecture must
+  name that exception rather than claim ownership it does not have.
 - Global resource owners account tenant and table attribution without creating
   an independent root pool per tenant.
 - Cancellation is structured: stop admission, cancel descendants, join work,
@@ -551,8 +569,8 @@ from age or path shape alone.
   transaction, except Oracle's WAL-before-read acceptance.
 - Operator-level Forge audit uses the tenant-bound fenced capability defined by
   repository SQL rules; it is not a generic cross-tenant executor.
-- No retry widens tenant, table, snapshot, participant, deadline, permission,
-  or resource authority.
+- No retry or successor attempt in any Bifrost protocol widens tenant, table,
+  snapshot, participant, deadline, permission, or resource authority.
 
 ## Telemetry
 
@@ -584,7 +602,6 @@ The surface includes:
   is the closed `AppendDurability::Acknowledged` value; the synchronous append
   response never reports staged, published, promoted, or rewritten state;
 - terminal-safe query streaming at `POST /v1/query`;
-- typed planning at `POST /v1/query/explain`;
 - typed Vala observation queries with mandatory bounded time windows and cursor
   pagination;
 - gRPC ingestion through `wyrd.v1.BifrostIngestService`;
@@ -615,8 +632,10 @@ Bifrost does not provide:
 - DML through Oracle, CTAS, distributed writes, or arbitrary code execution;
 - a materialized shuffle service, independent distributed scheduler, or
   detached stage runtime;
-- partial successful results, unpinned retry, or silent cross-engine fallback
-  after resource admission;
+- partial successful results, automatic retry of a selected analytical query,
+  or silent cross-engine fallback after analytical selection;
+- a public distributed-plan or execution-path `EXPLAIN` surface in this
+  delivery;
 - result caching as a correctness dependency;
 - cross-region query execution or autoscaling semantics;
 - cross-pod Scribe assembly or coordination of one append across ingest pods;

@@ -32,8 +32,8 @@ At minimum, deployments measure:
 - Scribe admission latency, queue age, fairness, WAL fsync latency, staged-run
   age, persistence lag, object publication, replay, and rejection;
 - Oracle interactive and analytical queue age, execution latency, result
-  outcome, cancellation, peer retry, memory, exchange, spill, audit-WAL lag,
-  and partial-result prevention;
+  outcome, cancellation, terminal peer failure, memory, exchange, spill,
+  audit-WAL lag, and partial-result prevention;
 - Forge demand age, claim age, lease expiry, attempt outcome, rewrite debt,
   commit conflict, uncertain publication, reconciliation, snapshot expiry,
   and orphan cleanup;
@@ -151,15 +151,23 @@ fabricate task completion to make health checks pass.
   query-owned cancellation tree. Cancellation joins every descendant and
   releases memory, exchange, spill, peer, and admission resources.
 - Every distributed stage is bound to tenant, snapshot digest, fragment digest,
-  retry epoch, deadline, destination, and fence before plan decode or IO.
-- One deterministic peer-loss retry may re-execute against the same pinned cut
-  within the original deadline. Any further peer loss fails the logical query.
+  attempt identity, deadline, destination, and fence before plan decode or IO.
+- Analytical selection binds one logical query to one execution attempt. Peer
+  or transport loss after selection fails the logical query terminally; the
+  server constructs no successor attempt and performs no interactive rerun. A
+  caller may submit a new logical query.
 - A failed stage, tenant tripwire, exhausted unspillable memory, spill
   exhaustion, protocol mismatch, deadline, or cancellation terminates the
   complete result. Terminal framing prevents a partial stream from being
   interpreted as success.
-- Multi-stage planning failure may select the authorized interactive path; it
-  cannot bypass admission, audit, tenant binding, deadline, or payload policy.
+- Multi-stage planning failure before analytical selection may select the
+  authorized interactive path; it cannot bypass admission, audit, tenant
+  binding, deadline, or payload policy. After selection there is no interactive
+  rerun.
+- Cleanup timeout or failure is never reported as a successful release. The
+  remaining graph stays observable to the owning supervisor, the node does not
+  claim a clean terminal state, and readiness or shutdown evidence surfaces the
+  failure.
 
 ## Forge failure boundaries
 
@@ -239,7 +247,8 @@ The production qualification suite exercises, with real dependencies:
 - Scribe crash at each durability boundary, replay, duplicate suppression,
   staged-run recovery, and uncertain publication;
 - Oracle leader and peer loss, cancellation, timeout, spill exhaustion,
-  retry-on-pinned-cut, and terminal-safe streaming;
+  terminal post-selection failure with joined cleanup, and terminal-safe
+  streaming;
 - Forge lease loss, stale completion, commit conflict, ambiguous publication,
   cleanup cursor takeover, and orphan protection;
 - credential/JWKS/peer-key rotation and emergency revocation;

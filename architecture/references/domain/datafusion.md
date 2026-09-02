@@ -7,8 +7,8 @@ distributed execution, managed compaction, memory, spill, or diagnostics.
 
 DataFusion receives an already authenticated, tenant-qualified, admitted
 operation. Wyrd owns authorization, query-class routing, resource grants,
-deadlines, retry, audit, and terminal semantics. A `SessionContext`, SQL parser,
-optimizer, or `TableProvider` is never an authorization boundary.
+deadlines, failure policy, audit, and terminal semantics. A `SessionContext`,
+SQL parser, optimizer, or `TableProvider` is never an authorization boundary.
 
 A provider owns schema, exact snapshot-bound file facts, statistics, scan
 construction, and truthful pushdown claims. Advertise `Exact` filtering only
@@ -21,10 +21,12 @@ map fields by name or stable field identity.
 
 The interactive engine is the default. Keep work interactive when it needs no
 network exchange or when cardinality/working-state estimates are missing or
-invalid. Use the streamed distributed path for exchange-requiring joins,
-high-cardinality aggregation, partitioned windows, subqueries, and
-deduplicating set operations. The analytical candidate must contain a real
-network exchange.
+invalid. Use the streamed distributed path for the supported baseline of
+filtered/projected scans, fixed-width grouped `COUNT`/`SUM`/`MIN`/`MAX`,
+multi-input equi-join, streamed exchange, and a spilling operator. The
+analytical candidate must contain a real network exchange, and its physical
+plan must validate inside that baseline before selection. Do not promise
+broader operator coverage than the delivery proves.
 
 Distributed stages use one partitioned streamed exchange and no materialized
 shuffle service. Bind tenant, pinned-snapshot digest, fragment digest, and fence
@@ -32,23 +34,23 @@ before decoding the physical plan or performing IO. Install the admitted
 query-owned `RuntimeEnv` and dynamic `MemoryPool` on leader and workers; never
 fall back to a worker's process-global runtime for Wyrd query work.
 
-Reserve exchange buffers as a child of the query grant:
-
-```text
-fan_out * (worker_connection_buffer_budget_bytes + max_message_bytes)
-```
-
-Refuse before dispatch if the checked reservation does not fit or leaves too
-little operator working state. Followers use the same query-owned scratch
+Operators and streamed exchanges use the same finite query-owned memory pool;
+do not create a predicted exchange child or separate operator/exchange
+sublimits. Before dispatch, enforce the configured selected-worker limit,
+admitted tasks/partitions, Wyrd-owned admission queue and slots, and scratch
+demand with checked count/range arithmetic. Dependency-owned exchange queues
+retain their pinned byte backpressure without a Wyrd item-count guarantee. Do
+not claim these controls predict every dependency allocation or transient
+encoded-message byte. Followers use the same query-owned scratch
 allocation for spill. One immutable deadline covers the entire stage tree;
-head cancellation cancels and joins every descendant. One authenticated
-availability loss may re-execute deterministically against the same pinned cut
-only before Oracle emits a result-data frame. Protocol, auth, tenant, resource,
-corruption, cancellation, deadline, and post-egress failures never retry.
+head cancellation cancels and joins every descendant. A selected analytical
+query owns exactly one execution attempt: peer, transport, protocol, auth,
+tenant, resource, corruption, cancellation, deadline, and execution failures
+after selection are terminal and are never retried or rerun interactively.
 DataFusion and the transport do not decide that policy.
 
 Disable or constrain execution features such as file-stream work stealing when
-they violate stage partition ownership or retry identity. Validate every
+they violate stage partition ownership or attempt identity. Validate every
 configuration key and default against Wyrd's pinned DataFusion version rather
 than copying examples from a newer upstream release.
 
@@ -80,18 +82,18 @@ uncertain-outcome reconciliation.
   buffers and memory even when each operator is individually bounded.
 - Stream `RecordBatch` output. A user-sized `collect()` is forbidden.
 
-Accurate statistics drive pruning, join choice, repartitioning, and routing.
-Use exact Parquet footer/provider statistics over the pinned post-pruning file
-set. File size and sort/time layout are not substitutes for row count,
-cardinality, null count, or value distribution.
+Accurate statistics drive pruning, join choice, and repartitioning. Prefer
+Parquet footer/provider statistics over the pinned post-pruning file set. File
+size and sort/time layout are not substitutes for row count, cardinality, null
+count, or value distribution.
 
 ## Metrics and dependency boundary
 
 Collect DataFusion plan and operator metrics for rows, batches, elapsed work,
 spills, and partition behavior. Wyrd separately owns admission waits, queue
-age, snapshot acquisition, exchange reservation, peer retry, WAL/catalog age,
-object-store errors, and successful-terminal accounting. Never infer resource
-or durability success from a metric descriptor alone.
+age, snapshot acquisition, exchange reservation, terminal peer failure,
+WAL/catalog age, object-store errors, and successful-terminal accounting. Never
+infer resource or durability success from a metric descriptor alone.
 
 `datafusion-distributed` is a pinned `datafusion-contrib` dependency, not part
 of Apache DataFusion core. Wyrd must qualify its planner/codec compatibility,

@@ -42,10 +42,12 @@ immutable members, closes residue claims, and drains admitted publication up
 to one absolute deadline; unsettled work retains exact replay evidence.
 
 Oracle admits interactive and analytical slots separately under one atomic
-total bound. Each query owns its runtime, memory pool, exchange child budget,
-spill allocation, cancellation tree, and deadline. A reservation refusal never
-mutates the root grant. Cancellation releases every descendant reservation and
-temporary file.
+total bound. Each query owns its runtime, one aggregate memory pool shared by
+operators and exchanges, spill allocation, bounded Wyrd-owned admission queues
+and graph controls, cancellation tree, and deadline. Dependency-owned exchange
+queues retain their pinned byte backpressure without a Wyrd item-count
+guarantee. Admission refusal never mutates the root grant. Cancellation releases
+every descendant reservation and temporary file.
 
 Forge leases resources per tenant/table/task/attempt. Physical writers may run
 concurrently within an attempt, but one fence owns final catalog publication.
@@ -99,7 +101,8 @@ Measure at minimum:
 - staged dwell, merge fan-in/passes, row groups, hot-object PUT amplification,
   `file_list` publication, reconciliation, and live-tail source counts;
 - Oracle route, slot wait, planning, pruning, exchange bytes, worker fan-out,
-  peer retry, cancellation, TTFF, terminal latency, and incomplete streams;
+  terminal peer failure, cancellation, TTFF, terminal latency, and incomplete
+  streams;
 - Forge promotion debt, rewrite debt, task/lease age, writer estimates and close
   reasons, commit conflicts, uncertain operations, no-progress refusals,
   snapshot age, cleanup cursor, and orphan backlog;

@@ -60,10 +60,11 @@ hot objects, and Scribe live-tail authority. It never opens another node's
 local staged files and does not query WAL in normal operation.
 
 The interactive path remains the default for low-latency scans and plans that
-do not require a network exchange. The analytical path executes joins,
-high-cardinality aggregation, partitioned windows, subqueries, and
-deduplicating set operations through streamed partitioned exchanges. It has no
-materialized shuffle service or independent scheduler.
+do not require a network exchange. The analytical path executes the supported
+baseline — filtered/projected scans, fixed-width grouped aggregation,
+multi-input equi-join, and a spilling operator — through streamed partitioned
+exchanges. It has no materialized shuffle service, independent scheduler, or
+public plan-explanation surface.
 
 Both paths:
 
@@ -77,12 +78,12 @@ Both paths:
 
 Distributed stages bind tenant, snapshot digest, fragment digest, and fence
 before plan decoding or IO. Every worker receives the admitted query-owned
-runtime, memory pool, exchange child budget, spill allocation, deadline, and
-cancellation tree. Head cancellation joins all descendants. One deterministic
-authenticated availability-loss retry may re-execute against the same pinned
-cut within the original deadline only before Oracle emits a result-data frame.
-Later loss fails the stream terminally; success can never contain partial or
-duplicate rows.
+runtime, memory pool, spill allocation, deadline, and cancellation tree, all
+drawn from one aggregate query memory pool shared by operators and exchanges.
+Head cancellation joins all descendants. A selected analytical query owns one
+execution attempt; peer or transport loss after selection fails the stream
+terminally with no successor attempt and no interactive rerun. Success can
+never contain partial or duplicate rows.
 
 Interactive and analytical work use separate queues and counters. Analytical
 work cannot borrow the protected interactive slot floor. Both remain beneath
@@ -90,11 +91,13 @@ one total Oracle capacity check and one shared elastic resource root.
 
 ## Admission and failure semantics
 
-Route from the optimized plan and exact statistics over post-pruning pinned
-files. Missing or invalid estimates select the conservative interactive path.
-An analytical candidate without an actual network exchange executes
-interactively. Planning fallback never bypasses authorization, admission,
-deadline, audit, or result budgets.
+Route from the existing optimized-plan classification over pinned query facts;
+add no separate routing-facts subsystem. Missing or invalid estimates select
+the conservative interactive path. A candidate whose distributed physical plan
+falls outside the supported baseline or contains no actual network exchange
+executes interactively. Planning fallback happens only before analytical
+selection and never bypasses authorization, admission, deadline, audit, or
+result budgets.
 
 Fail closed on tenant mismatch, schema fingerprint conflict, unknown columns,
 unregistered tables, replay identity conflict, unsupported expressions,

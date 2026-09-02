@@ -2790,8 +2790,8 @@ mod tests {
         participants: Vec<super::super::peer::StageParticipantV1>,
         /// Absolute deadline every fixture message carries.
         deadline_ms: i64,
-        /// Spill owner kept alive for the ingress's runtime construction.
-        _spill: Arc<OracleSpillRuntime>,
+        /// Process spill owner the ingress builds each graph runtime from.
+        spill: Arc<OracleSpillRuntime>,
         /// Scratch root kept alive for the spill owner.
         _root: tempfile::TempDir,
     }
@@ -2804,9 +2804,23 @@ mod tests {
         /// Panics when the Oracle role, spill owner, or reservation cannot be
         /// composed, which would make every assertion below vacuous.
         fn new(now: DateTime<Utc>) -> Self {
+            Self::with_pod_spill_limit(now, 2 * 1024 * 1024 * 1024)
+        }
+
+        /// Composes the same fixture over an exact process spill limit.
+        ///
+        /// A limit below the reserved envelope's scratch share is how a test
+        /// makes the graph runtime build — the first fallible activation step —
+        /// fail for a real reason rather than through an injected seam.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the Oracle role, spill owner, or reservation cannot be
+        /// composed, which would make every assertion below vacuous.
+        fn with_pod_spill_limit(now: DateTime<Utc>, pod_spill_limit_bytes: u64) -> Self {
             let root = tempfile::tempdir().expect("fixture scratch root must exist");
             let spill = Arc::new(
-                OracleSpillRuntime::new(root.path(), 2 * 1024 * 1024 * 1024)
+                OracleSpillRuntime::new(root.path(), pod_spill_limit_bytes)
                     .expect("bounded spill owner must be created"),
             );
             let resolutions = Arc::new(AtomicUsize::new(0));
@@ -2898,7 +2912,7 @@ mod tests {
                 reservation_id: reservation.reservation_id,
                 participants,
                 deadline_ms: deadline.timestamp_millis(),
-                _spill: spill,
+                spill,
                 _root: root,
             }
         }
@@ -2973,6 +2987,140 @@ mod tests {
         }
     }
 
+    /// A failed activation publishes nothing and hands the reservation back.
+    ///
+    /// Activation is a transaction across three fallible steps — the graph
+    /// runtime, the retained binding, and the supervisor registration — and a
+    /// failure in any of them must leave the follower exactly as it was: no
+    /// published graph, no charged envelope, and the pending reservation
+    /// restored under its own unchanged expiry so a serialized waiter can still
+    /// activate it. Past that expiry the reservation is not resurrected; its
+    /// permit and envelope are released instead.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a failed activation publishes a graph, consumes the
+    /// reservation before its expiry, or resurrects it after.
+    #[tokio::test]
+    async fn graph_activation_failure_rolls_back_without_publication() {
+        // A graph runtime that cannot be built inside the process spill limit.
+        let now = Utc::now();
+        let fixture = GraphFixture::with_pod_spill_limit(now, 1);
+        let message = fixture.leader_message(StageOperationV1::SetPlan, 1);
+        assert!(
+            fixture.send(&message, now).await.is_err(),
+            "a graph whose runtime cannot be built is not activated"
+        );
+        assert!(
+            fixture.ingress.published(fixture.graph).is_err(),
+            "a failed activation published no graph"
+        );
+        assert_eq!(
+            fixture.reservations.graph_leases_activated_total(),
+            0,
+            "a failed activation charged no envelope"
+        );
+        assert_eq!(
+            fixture.reservations.cleanup_expired(now),
+            1,
+            "the reservation was restored under its own unchanged expiry"
+        );
+        // The waiter observes no published completion; it simply looks the
+        // restored reservation up again and fails for the same real reason.
+        assert!(
+            fixture
+                .send(&fixture.leader_message(StageOperationV1::SetPlan, 2), now)
+                .await
+                .is_err(),
+            "the restored reservation is still the one a later message finds"
+        );
+        assert_eq!(
+            fixture.reservations.cleanup_expired(now),
+            1,
+            "a second failure did not consume the restored reservation either"
+        );
+
+        // A supervisor registration that is refused because the graph is taken.
+        let now = Utc::now();
+        let fixture = GraphFixture::new(now);
+        let occupied = fixture
+            .supervisor
+            .register_graph(
+                fixture.graph,
+                fixture_oracle_role()
+                    .try_acquire_query(OracleResourceRequest::for_class(
+                        QueryClass::Analytical,
+                        0.0,
+                    ))
+                    .expect("an idle Oracle admits one analytical query"),
+                AnalyticalGraphRuntime::new(
+                    fixture
+                        .spill
+                        .build_query_runtime(
+                            Arc::new(
+                                datafusion::execution::memory_pool::UnboundedMemoryPool::default(),
+                            ),
+                            0,
+                        )
+                        .expect("an unbounded fixture runtime builds"),
+                    64 * 1024,
+                ),
+            )
+            .expect("the fixture supervisor accepts one direct registration");
+        assert!(
+            fixture
+                .send(&fixture.leader_message(StageOperationV1::SetPlan, 1), now)
+                .await
+                .is_err(),
+            "a graph the supervisor refuses is not activated"
+        );
+        assert!(
+            fixture.ingress.published(fixture.graph).is_err(),
+            "a refused registration published no graph"
+        );
+        assert_eq!(
+            fixture.reservations.graph_leases_activated_total(),
+            0,
+            "a refused registration charged no envelope"
+        );
+        occupied
+            .release()
+            .expect("the direct registration releases cleanly");
+        fixture
+            .send(&fixture.leader_message(StageOperationV1::SetPlan, 2), now)
+            .await
+            .expect("a serialized waiter activates the restored reservation");
+        assert_eq!(
+            fixture.reservations.graph_leases_activated_total(),
+            1,
+            "the restored reservation became exactly one graph"
+        );
+
+        // Past its own expiry the reservation is released, not resurrected.
+        let now = Utc::now();
+        let fixture = GraphFixture::new(now);
+        let activation = fixture
+            .reservations
+            .begin_graph_activation(
+                &GraphLeaseRequest {
+                    reservation_id: fixture.reservation_id,
+                    graph: AnalyticalGraphRef {
+                        public_query_id: fixture.graph.public_query_id.as_uuid(),
+                        datafusion_query_id: fixture.graph.datafusion_query_id.as_uuid(),
+                    },
+                    query_id: QueryId::new(fixture.graph.public_query_id.as_uuid()),
+                },
+                now,
+            )
+            .expect("the reserved graph begins activation");
+        let expired = activation.expires_at() + chrono::Duration::seconds(1);
+        activation.rollback(expired);
+        assert_eq!(
+            fixture.reservations.cleanup_expired(now),
+            0,
+            "a reservation rolled back past its expiry is released, not restored"
+        );
+    }
 
     /// A graph activates exactly once, whichever authorized message arrives first.
     ///

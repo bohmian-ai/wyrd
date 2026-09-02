@@ -15,7 +15,7 @@ use vala_sql::queries::forge_tasks::ForgeTasks;
 use vala_sql::row_types::forge_operations::{
     ForgeClaimTable, ForgeExpirationAuthority, ForgeExpirationPreparation,
     ForgeExpirationResetRequest, ForgeExpirationSettlement, ForgeExpirationSettlementRequest,
-    ForgeOperationFamily,
+    ForgeOperationFamily, ForgeOperationStateRow,
 };
 use vala_sql::row_types::forge_tasks::{
     ForgeCleanupCandidate, ForgeCleanupCategory, ForgeCleanupPath, ForgeTaskEvidence,
@@ -84,11 +84,11 @@ pub(crate) struct ExpiryReconciliationOutcome {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ExpiryTaskAuthority {
     /// Stable task identity carrying this expiration.
-    pub(crate) task_id: Uuid,
+    pub(crate) task: Uuid,
     /// Attempt generation, preserved across reconciliation takeover.
-    pub(crate) attempt_id: Uuid,
+    pub(crate) attempt: Uuid,
     /// Worker acting on the task right now.
-    pub(crate) worker_id: Uuid,
+    pub(crate) worker: Uuid,
 }
 
 /// Selects only snapshots older than `cutoff_ms` that are not current, ref
@@ -206,9 +206,9 @@ impl Forge {
                 &key,
                 binding,
                 &ExpiryTaskAuthority {
-                    task_id,
-                    attempt_id,
-                    worker_id,
+                    task: task_id,
+                    attempt: attempt_id,
+                    worker: worker_id,
                 },
                 self.core.clock.now()?,
                 &CancellationToken::new(),
@@ -959,39 +959,30 @@ fn selected_ids_are_eligible(
 
 /// Recover this task's prepared expiry operation when its outcome is knowable.
 impl Forge {
-    /// Settles or retains the one operation this task's claims still name.
+    /// Resolves the single operation this task's surviving claims name.
     ///
-    /// The claim index is the lookup: an attempt that crashed after preparation
-    /// left exactly one operation's rows behind under its own `task_id`, so
-    /// reconciliation reads that operation by primary key instead of scanning
-    /// open operations and matching derived candidates. A selection already
-    /// absent from Iceberg is settled `Recovered`. A selection still present is
-    /// retried only after the uncertainty bound has elapsed.
+    /// Returns `None` when the task holds no claims, meaning nothing was
+    /// prepared and there is nothing to reconcile.
     ///
     /// # Errors
     ///
-    /// Returns SQL, lease, catalog, traversal, or settlement failures. Anything
-    /// that cannot prove acceptance leaves the operation, task, and claims
-    /// Prepared and blocks destructive maintenance for this pass.
-    async fn reconcile_expiry(
+    /// Returns [`ForgeError::Sql`] when the claim index, tenant connection, or
+    /// operation read fails, and [`ForgeError::Reconciliation`] when one task
+    /// owns claims for more than one operation or names an absent operation.
+    async fn claimed_expiry_operation(
         &self,
-        lease: &mut ForgeLease,
         key: &ForgeTableKey,
-        binding: &TenantTableBinding,
         authority: &ExpiryTaskAuthority,
-        now: DateTime<Utc>,
-        stop: &CancellationToken,
-    ) -> Result<ExpiryReconciliationOutcome, ForgeError> {
+    ) -> Result<Option<(ForgeClaimTable, ForgeOperationStateRow)>, ForgeError> {
         let resource = table_resource_for_key(key);
         let operations = ForgeOperations::new(&resource, ForgeOperationFamily::SnapshotExpire)
             .map_err(ForgeError::Sql)?;
         let claims = operations
-            .claims_for_task(&self.core.operator_pool, key.tenant, authority.task_id)
+            .claims_for_task(&self.core.operator_pool, key.tenant, authority.task)
             .await
             .map_err(ForgeError::Sql)?;
-        let mut outcome = ExpiryReconciliationOutcome::default();
         let Some(first) = claims.first() else {
-            return Ok(outcome);
+            return Ok(None);
         };
         if claims
             .iter()
@@ -1017,6 +1008,37 @@ impl Forge {
         let state = state.ok_or_else(|| ForgeError::Reconciliation {
             detail: format!("expiry claims reference missing operation {operation_id}"),
         })?;
+        Ok(Some((claim_table, state)))
+    }
+
+    /// Settles or retains the one operation this task's claims still name.
+    ///
+    /// The claim index is the lookup: an attempt that crashed after preparation
+    /// left exactly one operation's rows behind under its own `task_id`, so
+    /// reconciliation reads that operation by primary key instead of scanning
+    /// open operations and matching derived candidates. A selection already
+    /// absent from Iceberg is settled `Recovered`. A selection still present is
+    /// retried only after the uncertainty bound has elapsed.
+    ///
+    /// # Errors
+    ///
+    /// Returns SQL, lease, catalog, traversal, or settlement failures. Anything
+    /// that cannot prove acceptance leaves the operation, task, and claims
+    /// Prepared and blocks destructive maintenance for this pass.
+    async fn reconcile_expiry(
+        &self,
+        lease: &mut ForgeLease,
+        key: &ForgeTableKey,
+        binding: &TenantTableBinding,
+        authority: &ExpiryTaskAuthority,
+        now: DateTime<Utc>,
+        stop: &CancellationToken,
+    ) -> Result<ExpiryReconciliationOutcome, ForgeError> {
+        let mut outcome = ExpiryReconciliationOutcome::default();
+        let Some((claim_table, state)) = self.claimed_expiry_operation(key, authority).await?
+        else {
+            return Ok(outcome);
+        };
         let detail = state.prepared_detail;
         let AuditDetail::ForgeSnapshotExpire {
             selected_snapshot_ids,
@@ -1152,7 +1174,7 @@ impl Forge {
             AuditResult::Success,
         )?;
         let task_event = super::worker::task_event(
-            authority.task_id,
+            authority.task,
             ForgeTaskState::Prepared,
             "snapshot expiration claims prepared before the Iceberg gate",
         );
@@ -1196,7 +1218,7 @@ impl Forge {
         let operation_event =
             expiry_operation_event(detail, "forge.snapshot_expire.reset", AuditResult::Failure)?;
         let task_event = super::worker::task_event(
-            authority.task_id,
+            authority.task,
             ForgeTaskState::Cancelled,
             &format!("snapshot expiration released without an Iceberg mutation: {cause}"),
         );
@@ -1218,7 +1240,7 @@ impl Forge {
         .await
         .map_err(ForgeError::Sql)?;
         tracing::warn!(
-            task_id = %authority.task_id,
+            task_id = %authority.task,
             cause = %cause,
             "Forge released a prepared snapshot expiration without expiring anything"
         );
@@ -1277,7 +1299,7 @@ impl Forge {
             AuditResult::Success,
         )?;
         let task_event = super::worker::task_event(
-            authority.task_id,
+            authority.task,
             ForgeTaskState::Succeeded,
             "snapshot expiration settled with exact cleanup candidates",
         );
@@ -1310,9 +1332,9 @@ fn expiration_authority(
     lease: &ForgeLease,
 ) -> ForgeExpirationAuthority {
     ForgeExpirationAuthority {
-        task_id: authority.task_id,
-        attempt_id: authority.attempt_id,
-        worker_id: authority.worker_id,
+        task_id: authority.task,
+        attempt_id: authority.attempt,
+        worker_id: authority.worker,
         lease_key: lease.lease_key.clone(),
         lease_fencing_token: lease.fencing_token,
     }

@@ -887,23 +887,29 @@ mod pg_tests {
             grants(&pool, "oracle_reader_epochs", "wyrd_platform_admin").await,
             vec!["SELECT".to_owned()]
         );
-        assert!(
+        // Forge's expiration lifecycle runs on the operator pool and takes this
+        // row's `FOR UPDATE` lock as the table-local serialization boundary,
+        // which Postgres grants only alongside UPDATE.
+        assert_eq!(
             grants(
                 &pool,
                 "bifrost_table_maintenance_authority",
                 "wyrd_platform_admin"
             )
-            .await
-            .is_empty()
+            .await,
+            vec!["SELECT".to_owned(), "UPDATE".to_owned()]
         );
-        assert!(
+        // Expiration preparation proves on the operator transaction that no
+        // surviving frontier covers a selected snapshot, so the operator reads
+        // the members. It never writes one.
+        assert_eq!(
             grants(
                 &pool,
                 "oracle_table_protection_members",
                 "wyrd_platform_admin"
             )
-            .await
-            .is_empty()
+            .await,
+            vec!["SELECT".to_owned()]
         );
 
         // Retirement's cross-tenant proof is execute-only and read-only, and

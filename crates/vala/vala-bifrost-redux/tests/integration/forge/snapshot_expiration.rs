@@ -129,6 +129,139 @@ async fn seed_running_task(
     task_id
 }
 
+/// Proves a definite catalog rejection releases the whole preparation.
+///
+/// # Panics
+///
+/// Panics when the reset does not cancel the task, drop every claim, emit both
+/// audits, and leave the object store untouched.
+async fn reject_releases_every_claim(
+    fixture: &PromotionIntegrationFixture,
+    seam: &PromotionCatalogSeam,
+    store: &CountingObjectStore,
+    forge: &Arc<vala_bifrost_redux::forge::Forge>,
+    watermark: (i64, i64),
+) {
+    // --- a definite rejection releases the claims, expiring nothing ------
+    let rejected_attempt = Uuid::now_v7();
+    let rejected_worker = Uuid::now_v7();
+    let rejected_task = seed_running_task(
+        fixture,
+        fixture.tenant,
+        rejected_attempt,
+        rejected_worker,
+        watermark,
+        "00",
+    )
+    .await;
+    seam.reject_next_commits(64);
+    let outcome = forge
+        .run_snapshot_expiry_for_test(
+            &fixture.binding,
+            rejected_task,
+            rejected_attempt,
+            rejected_worker,
+        )
+        .await
+        .expect("a definite rejection is a released expiration, not a failed pass");
+    assert!(
+        outcome.is_none(),
+        "a rejected expiration settles nothing: {outcome:?}"
+    );
+    let released = expiry_state(fixture, rejected_task).await;
+    assert_eq!(released.task_state, "cancelled");
+    assert_eq!(released.claims, 0);
+    assert_eq!(released.operation_phase.as_deref(), Some("reset"));
+    assert!(
+        released
+            .audits
+            .contains(&"forge.snapshot_expire.prepared".to_owned())
+            && released
+                .audits
+                .contains(&"forge.snapshot_expire.reset".to_owned())
+            && released.audits.contains(&"forge.task.cancelled".to_owned()),
+        "reset emits the prepared, reset, and task-cancelled audits: {:?}",
+        released.audits
+    );
+    assert_eq!(store.deletes(), 0, "expiration never deletes an object");
+}
+
+/// Prepares one expiration and abandons the worker at the catalog gate.
+///
+/// Returns the task, its attempt, and the durable state a takeover must find
+/// unchanged.
+///
+/// # Panics
+///
+/// Panics when preparation is not fully durable before the catalog gate, or
+/// when the abandoned pass changed any durable expiration state.
+async fn prepare_and_abandon_at_the_catalog_gate(
+    fixture: &PromotionIntegrationFixture,
+    seam: &Arc<PromotionCatalogSeam>,
+    forge: &Arc<vala_bifrost_redux::forge::Forge>,
+    watermark: (i64, i64),
+) -> (Uuid, Uuid, ExpiryState) {
+    // --- an unproven outcome retains every claim -------------------------
+    seam.reject_next_commits(0);
+    let attempt = Uuid::now_v7();
+    let preparing_worker = Uuid::now_v7();
+    let task = seed_running_task(
+        fixture,
+        fixture.tenant,
+        attempt,
+        preparing_worker,
+        watermark,
+        "11",
+    )
+    .await;
+    seam.park_next_commit();
+    let parked = {
+        let forge = Arc::clone(forge);
+        let binding = fixture.binding.clone();
+        tokio::spawn(async move {
+            forge
+                .run_snapshot_expiry_for_test(&binding, task, attempt, preparing_worker)
+                .await
+        })
+    };
+    if tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        seam.wait_for_parked_commit(),
+    )
+    .await
+    .is_err()
+    {
+        let early = tokio::time::timeout(std::time::Duration::from_secs(5), parked).await;
+        panic!("the expiration never reached the catalog gate: {early:?}");
+    }
+    // Postgres closed before the catalog gate: the preparation is fully durable
+    // and holds no lock while the commit is parked.
+    let prepared = expiry_state(fixture, task).await;
+    assert_eq!(prepared.task_state, "prepared");
+    assert!(prepared.claims > 0, "preparation claims every selection");
+    assert_eq!(prepared.operation_phase.as_deref(), Some("prepared"));
+    let preparing_evidence: (Uuid, Uuid, Uuid) = sqlx::query_as(
+        "SELECT task_id, attempt_id, worker_id FROM vala.forge_snapshot_expiration_claims \
+         WHERE task_id = $1 LIMIT 1",
+    )
+    .bind(task)
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("immutable preparation evidence");
+    assert_eq!(preparing_evidence, (task, attempt, preparing_worker));
+
+    // The preparing worker dies at the catalog gate, so its outcome is
+    // genuinely unproven: nothing is released and every claim survives.
+    parked.abort();
+    seam.wait_for_parked_commit_drop().await;
+    let unproven = expiry_state(fixture, task).await;
+    assert_eq!(
+        unproven, prepared,
+        "an unproven pass changes no durable expiration state"
+    );
+    (task, attempt, unproven)
+}
+
 /// Proves the three Postgres boundaries bracket the one pinned Iceberg call.
 ///
 /// # Panics
@@ -173,110 +306,10 @@ async fn prepared_claim_releases_sql_before_iceberg_and_hands_exact_names_to_cle
         .expect("two promotions left a current snapshot");
     let watermark = head;
 
-    // --- a definite rejection releases the claims, expiring nothing ------
-    let rejected_attempt = Uuid::now_v7();
-    let rejected_worker = Uuid::now_v7();
-    let rejected_task = seed_running_task(
-        &fixture,
-        fixture.tenant,
-        rejected_attempt,
-        rejected_worker,
-        watermark,
-        "00",
-    )
-    .await;
-    seam.reject_next_commits(64);
-    let outcome = forge
-        .run_snapshot_expiry_for_test(
-            &fixture.binding,
-            rejected_task,
-            rejected_attempt,
-            rejected_worker,
-        )
-        .await
-        .expect("a definite rejection is a released expiration, not a failed pass");
-    assert!(
-        outcome.is_none(),
-        "a rejected expiration settles nothing: {outcome:?}"
-    );
-    let released = expiry_state(&fixture, rejected_task).await;
-    assert_eq!(released.task_state, "cancelled");
-    assert_eq!(released.claims, 0);
-    assert_eq!(released.operation_phase.as_deref(), Some("reset"));
-    assert!(
-        released
-            .audits
-            .contains(&"forge.snapshot_expire.prepared".to_owned())
-            && released
-                .audits
-                .contains(&"forge.snapshot_expire.reset".to_owned())
-            && released.audits.contains(&"forge.task.cancelled".to_owned()),
-        "reset emits the prepared, reset, and task-cancelled audits: {:?}",
-        released.audits
-    );
-    assert_eq!(store.deletes(), 0, "expiration never deletes an object");
+    reject_releases_every_claim(&fixture, &seam, &store, &forge, watermark).await;
 
-    // --- an unproven outcome retains every claim -------------------------
-    seam.reject_next_commits(0);
-    control
-        .advance(ChronoDuration::hours(1))
-        .expect("manual clock advance");
-    let attempt = Uuid::now_v7();
-    let preparing_worker = Uuid::now_v7();
-    let task = seed_running_task(
-        &fixture,
-        fixture.tenant,
-        attempt,
-        preparing_worker,
-        watermark,
-        "11",
-    )
-    .await;
-    seam.park_next_commit();
-    let parked = {
-        let forge = Arc::clone(&forge);
-        let binding = fixture.binding.clone();
-        tokio::spawn(async move {
-            forge
-                .run_snapshot_expiry_for_test(&binding, task, attempt, preparing_worker)
-                .await
-        })
-    };
-    if tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        seam.wait_for_parked_commit(),
-    )
-    .await
-    .is_err()
-    {
-        let early = tokio::time::timeout(std::time::Duration::from_secs(5), parked).await;
-        panic!("the expiration never reached the catalog gate: {early:?}");
-    }
-    // Postgres closed before the catalog gate: the preparation is fully durable
-    // and holds no lock while the commit is parked.
-    let prepared = expiry_state(&fixture, task).await;
-    assert_eq!(prepared.task_state, "prepared");
-    assert!(prepared.claims > 0, "preparation claims every selection");
-    assert_eq!(prepared.operation_phase.as_deref(), Some("prepared"));
-    let preparing_evidence: (Uuid, Uuid, Uuid) = sqlx::query_as(
-        "SELECT task_id, attempt_id, worker_id FROM vala.forge_snapshot_expiration_claims \
-         WHERE task_id = $1 LIMIT 1",
-    )
-    .bind(task)
-    .fetch_one(fixture.operator_pool.pool())
-    .await
-    .expect("immutable preparation evidence");
-    assert_eq!(preparing_evidence, (task, attempt, preparing_worker));
-
-    // The preparing worker dies at the catalog gate, so its outcome is
-    // genuinely unproven: nothing is released and every claim survives.
-    parked.abort();
-    seam.wait_for_parked_commit_drop().await;
-    let unproven = expiry_state(&fixture, task).await;
-    assert_eq!(
-        unproven, prepared,
-        "an unproven pass changes no durable expiration state"
-    );
+    let (task, attempt, prepared) =
+        prepare_and_abandon_at_the_catalog_gate(&fixture, &seam, &forge, watermark).await;
 
     // --- a takeover settles with exact candidates and zero deletes -------
     // The dead worker's lease ages out and the scheduler hands the same task
@@ -293,7 +326,7 @@ async fn prepared_claim_releases_sql_before_iceberg_and_hands_exact_names_to_cle
         .execute(fixture.operator_pool.pool())
         .await
         .expect("a new owner takes the prepared task over");
-    let before_demand = unproven.demand_generation;
+    let before_demand = prepared.demand_generation;
     let deletes_before = store.deletes();
     let evidence = forge
         .run_snapshot_expiry_for_test(&fixture.binding, settle_task, attempt, settling_worker)

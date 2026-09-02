@@ -62,6 +62,10 @@ VALA_OPERATOR_ALLOWLIST = {
 # use a dependency-owning handle; tenant workflows still take TenantConn.
 VALA_MIXED_EXECUTOR_ALLOWLIST = {
     "crates/vala/vala-sql/src/queries/forge_tasks.rs",
+    # Forge operation state: tenant-scoped state reads take a TenantConn, while
+    # the prepare/settle/reset lifecycle runs as one fenced operator
+    # transaction that must lock the table's maintenance-authority row.
+    "crates/vala/vala-sql/src/queries/forge_operations.rs",
 }
 
 # Cohesive owners that expose a narrow tenant-bound capability through a struct

@@ -1852,11 +1852,18 @@ impl ForgeWorker {
     /// Returns malformed identity/evidence, lease, catalog, object-read,
     /// heartbeat, digest mismatch, audit, or fencing failures. Any failure
     /// retains the Prepared row for another bounded takeover.
-    async fn reconcile_prepared(
+    /// Validates one Prepared claim's tenancy, attempt, and ownership, and
+    /// resolves the table binding reconciliation acts on.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Invariant`] when the claim's execution tenant
+    /// differs from the task's data tenant, the task carries no attempt
+    /// generation, or the task is no longer Prepared under this owner.
+    fn prepared_claim_context(
         &self,
-        claim: ForgePreparedTaskClaim,
-        shutdown: &CancellationToken,
-    ) -> Result<(), ForgeError> {
+        claim: &ForgePreparedTaskClaim,
+    ) -> Result<(Uuid, TenantTableBinding), ForgeError> {
         let task = &claim.task;
         if claim.execution_tenant_id != task.data_tenant_id {
             return Err(ForgeError::Invariant {
@@ -1876,6 +1883,16 @@ impl ForgeWorker {
             claim.execution_tenant_id,
             &task.table_ref,
         )?;
+        Ok((attempt, binding))
+    }
+
+    async fn reconcile_prepared(
+        &self,
+        claim: ForgePreparedTaskClaim,
+        shutdown: &CancellationToken,
+    ) -> Result<(), ForgeError> {
+        let (attempt, binding) = self.prepared_claim_context(&claim)?;
+        let task = &claim.task;
         let evidence = task
             .evidence
             .as_ref()
@@ -1998,9 +2015,9 @@ impl ForgeWorker {
                     &key,
                     binding,
                     &ExpiryTaskAuthority {
-                        task_id: task.task_id,
-                        attempt_id: attempt,
-                        worker_id: self.owner,
+                        task: task.task_id,
+                        attempt,
+                        worker: self.owner,
                     },
                     self.forge.core.clock.now()?,
                     stop,
@@ -2621,9 +2638,9 @@ impl ForgeWorker {
                     key: &key,
                     binding,
                     authority: &ExpiryTaskAuthority {
-                        task_id: claim.task_id,
-                        attempt_id: attempt,
-                        worker_id: self.owner,
+                        task: claim.task_id,
+                        attempt,
+                        worker: self.owner,
                     },
                     table,
                     manifest_paths: &claim.plan.inputs,

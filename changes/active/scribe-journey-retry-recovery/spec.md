@@ -1,7 +1,7 @@
 ---
 id: SPEC-scribe-journey-retry-recovery
 revision: 1
-status: draft
+status: approved
 ---
 
 # Scribe journey and staged-member retry recovery
@@ -305,7 +305,7 @@ durable contracts, or expand the change beyond one cohesive remediation task.
 
 ## Revision history
 
-- **Revision 1 — draft:** Defines the valid-HTTPS Scribe journey correction and
+- **Revision 1 — approved 2026-09-02:** Defines the valid-HTTPS Scribe journey correction and
   the existing-authority retry/restart contract for failures after durable local
   staging.
 
@@ -319,4 +319,3 @@ durable contracts, or expand the change beyond one cohesive remediation task.
 - `architecture/references/domain/analytical-operations-reliability.md`
 - `architecture/references/domain/olap-serving.md`
 - `architecture/references/languages/spec-driven-development.md`
-

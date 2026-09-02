@@ -125,9 +125,9 @@ non-tail WAL is a no-go and invokes full restore or incident escalation.
 
 1. Cancel and join the affected stage tree and release query-owned memory,
    exchange, scratch, peer, and slot resources.
-2. Retry once only for an authenticated availability loss before Oracle emitted
-   a result-data frame, using the same pinned cut, deadline, and permission
-   authority. Every other failure is terminal.
+2. Treat every failure after Analytical selection as terminal. Do not construct
+   a successor attempt; the caller may submit a new logical query after receiving
+   the terminal failure.
 3. Fence a peer that presents invalid tickets, tenant/digest mismatch, stale
    epoch, corrupt frames, or repeated availability loss. Preserve ticket and
    transport evidence without recording sensitive payloads.
@@ -136,7 +136,7 @@ non-tail WAL is a no-go and invokes full restore or incident escalation.
 
 Oracle is ready only when the acceptance WAL is writable and recoverable, relay
 lag is within its bound, canonical audit append is healthy, query resources
-release exactly once, peer trust is current, and cancellation/retry/terminal
+release exactly once, peer trust is current, and cancellation/terminal
 stream journeys pass. A skipped audit frame or stream interpreted as success
 after terminal failure is a no-go.
 

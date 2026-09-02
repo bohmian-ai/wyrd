@@ -6793,12 +6793,13 @@ mod tests {
         for mode in [
             AggregateMode::Partial,
             AggregateMode::PartialReduce,
+            AggregateMode::Final,
             AggregateMode::FinalPartitioned,
         ] {
             validate(&matrix_aggregate(mode, Arc::clone(&count_star), None))
                 .expect("accepted aggregate mode");
         }
-        for mode in [AggregateMode::Single, AggregateMode::Final] {
+        for mode in [AggregateMode::Single, AggregateMode::SinglePartitioned] {
             validate(&matrix_aggregate(mode, Arc::clone(&count_star), None))
                 .expect_err("unaccepted aggregate mode");
         }

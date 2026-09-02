@@ -678,12 +678,21 @@ fn validate_aggregate(plan: &dyn ExecutionPlan) -> Result<(), DataFusionError> {
     let aggregate = plan
         .downcast_ref::<AggregateExec>()
         .ok_or_else(|| unsupported("AggregateExec is not the pinned implementation"))?;
+    // `Final` is accepted alongside `FinalPartitioned`: both consume the
+    // accumulator state a `Partial` layer produced, and `Final` over a
+    // `CoalescePartitionsExec` is the shape `DataFusion` plans for every
+    // ungrouped aggregate. `Single` and `SinglePartitioned` are refused
+    // because they carry no partial layer at all, so their state never
+    // crosses a participant boundary and their arguments are never checked.
     if !matches!(
         aggregate.mode(),
-        AggregateMode::Partial | AggregateMode::PartialReduce | AggregateMode::FinalPartitioned
+        AggregateMode::Partial
+            | AggregateMode::PartialReduce
+            | AggregateMode::Final
+            | AggregateMode::FinalPartitioned
     ) {
         return Err(unsupported(
-            "aggregate mode outside Partial/PartialReduce/FinalPartitioned",
+            "aggregate mode outside Partial/PartialReduce/Final/FinalPartitioned",
         ));
     }
     if aggregate.filter_expr().iter().any(Option::is_some) {

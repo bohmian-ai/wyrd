@@ -417,8 +417,7 @@ Command: as above with
 - `mise run codegen:check` — PASS (no private wire or generated contract
   changed).
 - `git diff --check` — clean.
-- `mise run test:bifrost:journey:oracle` — 14/15 PASS. See the limitation
-  below.
+- `mise run test:bifrost:journey:oracle` — 15/15 PASS.
 
 ### Refactor — per-graph upstream worker ownership
 
@@ -452,64 +451,65 @@ Covered by `follower_scopes_one_upstream_worker_to_each_graph`, run as part of
 Scenario 4's focused command: a live graph resolves a worker, settling one graph
 does not take another's, and a settled graph resolves none.
 
-### Material limitation — blocks Scenario 4's required join
+### Refactor — graph-owned exchange streams
 
+With per-graph worker ownership in place, Scenario 4's settlement still could
+not join:
 `analytical_inactive::pg_inactive_analytical_raw_sql_executes_join_and_partial_final_aggregate_on_followers`
-fails at server shutdown with `Oracle shutdown retained admission, resource,
-peer, or audit state`, because the follower graph's envelope permanently
-retains nested memory after every attempt has settled:
+failed at shutdown with `Oracle shutdown retained admission, resource, peer, or
+audit state`, because the follower graph's envelope permanently retained exactly
+615 B after every attempt had settled:
 
 ```
 WARN Oracle analytical graph did not drain before its follower release
      scratch_bytes=0 memory_bytes=615
-WARN Oracle analytical follower could not settle a closed graph
-     error=... Oracle analytical graph cleanup did not complete
-WARN Oracle analytical follower shutdown retains unsettled graph ownership
-     graphs=1 attempts=0 cleanup_failures=1
 ERROR Bifrost resource accounting poisoned
       detail="Oracle query owner outlived a nested resource child"
 ```
 
-A temporary per-consumer current-usage ledger on the test-support
-`PeakTrackingMemoryPool` named the holder exactly and unambiguously:
+A temporary per-consumer usage ledger on the test-support
+`PeakTrackingMemoryPool` named the holder unambiguously —
+`DRAIN PROBE consumer=WorkerConnection bytes=615` — which is the pinned
+`datafusion-distributed` revision's own client-side reservation, created in
+`execute_task` (`src/protocol/grpc/worker_client.rs:102`) against the calling
+task context's memory pool, i.e. this graph's envelope.
 
-```
-WARN DRAIN PROBE consumer=WorkerConnection bytes=615
-```
+Four hypotheses were tested and each left the figure at exactly 615 B: the
+process-wide task cache (fixed by the per-graph worker above), an insufficient
+drain budget (5 s → 40 s), missing cancellation (unconditional `cancel.cancel()`
+before the drain), and shutdown ordering (leader `admission.shutdown` before
+follower settlement). The last three were reverted.
 
-`WorkerConnection` is the pinned `datafusion-distributed` revision's own
-client-side reservation, created in `execute_task` at
-`src/protocol/grpc/worker_client.rs:102` against the calling task context's
-memory pool — which is this graph's envelope — and captured by the detached
-demultiplexing task upstream spawns to fan one gRPC stream into per-partition
-queues. Wyrd does not own that task and cannot join it.
+Reading `worker_client.rs:130-320` gave the actual mechanism: `execute_task`
+spawns a demultiplexing task that holds `Arc<MemoryReservation>` and exits only
+when its own `cancel_token` fires, which `on_drop_stream` triggers only once
+`not_consumed_streams` reaches zero — that is, only when **every** returned
+partition stream has been dropped. A consumer that legitimately stops polling —
+a hash join whose build side has completed — holds one forever, and neither
+cancellation nor end-of-stream can reach it, because both only take effect on a
+poll that never comes.
 
-Four independent interventions were tried and none moved the figure off exactly
-615 B:
+So the graph owns the streams it opened. `AnalyticalGraphExchanges` retains each
+outbound partition stream in an `Arc<Mutex<Option<BoxStream>>>` and hands the
+consumer an `AnalyticalExchangeStream` that polls through that slot;
+`close()` drops every inner stream from the graph's side. `GraphLease::settle`
+calls it after joining every attempt and before taking the worker and draining,
+which fires upstream's `on_drop_stream`, cancels its reader task, and releases
+the reservation. `AnalyticalGraphSupervisor` owns the registry per graph so a
+co-located leader session composes its channel resolver over the same
+exchanges; the ingress egress path records against the graph's set.
 
-1. Per-graph `Worker` ownership, dropping the whole task cache before the drain
-   (the refactor above). Unchanged.
-2. Raising the drain budget from 5 s to 40 s. Unchanged.
-3. Cancelling the graph's cancellation token unconditionally before the drain,
-   not only on non-success. Unchanged, and reverted because the task specifies
-   cancellation on non-success.
-4. Running `admission.shutdown` before the follower settlement, in case a
-   co-located leader half held the reservation. Unchanged, and reverted.
+Covered by `a_graph_closes_an_exchange_its_consumer_stopped_polling`
+(`oracle::analytical_transport::tests`), which retains a never-ending stream,
+polls it once, stops polling, and proves the graph's `close` releases it and
+that a second `close` is a no-op.
 
-Before this task, `drain_graph` warned and released anyway, masking the leak and
-then poisoning the process governor at drop with `Oracle query owner outlived a
-nested resource child`. The task's required join surfaces it as a shutdown
-failure instead.
+Command: `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib
+--features test-support,bench-support -E
+'test(=oracle::analytical_transport::tests::a_graph_closes_an_exchange_its_consumer_stopped_polling)'`
+— PASS. `mise run test:bifrost:journey:oracle` — 15/15 PASS.
 
-The two designs that would close it are not reachable inside this task:
+### Bounded corrections
 
-1. **Join upstream's buffering task.** The pinned revision neither joins nor
-   exposes it. This needs an upstream capability, not a Wyrd change.
-2. **Charge worker-connection buffering to a node-level pool** instead of the
-   graph envelope. Reachable today only by matching upstream's literal
-   `"WorkerConnection"` consumer name, and it would remove per-query bounds from
-   network buffering — a fairness and tenant-isolation regression that the
-   spec's memory-envelope obligations do not permit.
-
-Both are ownership decisions above this task, which is why it returns
-`TASK_REVISION_REQUIRED` rather than picking one.
+- `mise run check:unwrap-audit` fails on this branch, verified pre-existing by
+  stashing every change in this task and re-running it to the identical failure.

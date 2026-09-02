@@ -1529,6 +1529,8 @@ impl AnalyticalCoordinatorIdentity {
 pub(crate) struct AnalyticalWorkerChannel {
     /// The stock upstream client for the target worker.
     inner: Box<dyn WorkerChannel>,
+    /// The graph's own exchange registry, which owns every stream this opens.
+    exchanges: Arc<AnalyticalGraphExchanges>,
     /// Query-invariant identity every call on this channel carries.
     identity: Arc<AnalyticalCoordinatorIdentity>,
 }
@@ -1538,9 +1540,14 @@ impl AnalyticalWorkerChannel {
     #[must_use]
     pub(crate) fn new(
         inner: Box<dyn WorkerChannel>,
+        exchanges: Arc<AnalyticalGraphExchanges>,
         identity: Arc<AnalyticalCoordinatorIdentity>,
     ) -> Self {
-        Self { inner, identity }
+        Self {
+            inner,
+            exchanges,
+            identity,
+        }
     }
 
     /// Writes this query's stage identity for `task_key` onto `headers`.
@@ -1594,7 +1601,10 @@ impl WorkerChannel for AnalyticalWorkerChannel {
             .inner
             .execute_task(headers, request, metrics, task_ctx)
             .await?;
-        Ok(partitions.into_iter().map(measured_exchange).collect())
+        Ok(partitions
+            .into_iter()
+            .map(|partition| measured_exchange(partition, &self.exchanges))
+            .collect())
     }
 
     /// Refuses worker version discovery, which Wyrd never performs.
@@ -1632,12 +1642,125 @@ impl WorkerChannel for AnalyticalWorkerChannel {
 /// the encoded wire size, which no owner here bounds.
 fn measured_exchange(
     partition: BoxStream<'static, Result<RecordBatch, DataFusionError>>,
+    exchanges: &AnalyticalGraphExchanges,
 ) -> BoxStream<'static, Result<RecordBatch, DataFusionError>> {
-    Box::pin(partition.inspect(|batch| {
+    let measured = partition.inspect(|batch| {
         if let Ok(batch) = batch {
             record_exchange_transfer(1, batch.get_array_memory_size() as u64);
         }
-    }))
+    });
+    Box::pin(exchanges.retain(Box::pin(measured)))
+}
+
+/// Every outbound partition stream one graph opened, owned by that graph.
+///
+/// Upstream keeps one reader task alive per `execute_task` call until every
+/// partition stream it returned has been dropped, and charges what that task
+/// buffers to this graph's own memory envelope. A consumer that stops polling
+/// a partition — a hash join whose build side completed, an aggregate that
+/// finished early — holds such a stream without ever polling it again, so
+/// neither cancellation nor end-of-stream can reach it: both only take effect
+/// on a poll that never comes.
+///
+/// Holding the stream here instead means the graph can drop it from its own
+/// side. That is what makes settlement's exchange join real rather than a wait
+/// on something no one will end.
+#[derive(Default)]
+pub struct AnalyticalGraphExchanges {
+    /// The live partition streams, each retained until the graph closes it.
+    streams: Arc<std::sync::Mutex<Vec<ExchangeSlot>>>,
+}
+
+impl fmt::Debug for AnalyticalGraphExchanges {
+    /// Reports how many exchanges are retained without rendering their data.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let retained = self.streams.lock().map(|streams| streams.len()).ok();
+        formatter
+            .debug_struct("AnalyticalGraphExchanges")
+            .field("retained", &retained)
+            .finish()
+    }
+}
+
+/// One retained partition stream, shared between the graph and its consumer.
+type ExchangeSlot =
+    Arc<std::sync::Mutex<Option<BoxStream<'static, Result<RecordBatch, DataFusionError>>>>>;
+
+impl AnalyticalGraphExchanges {
+    /// Retains `partition` and returns the stream the consumer polls instead.
+    ///
+    /// A poisoned registry yields an unretained stream rather than refusing the
+    /// exchange: losing the ability to close it early is strictly better than
+    /// failing a query that is otherwise running correctly, and the drain still
+    /// reports what stayed.
+    fn retain(
+        &self,
+        partition: BoxStream<'static, Result<RecordBatch, DataFusionError>>,
+    ) -> AnalyticalExchangeStream {
+        let slot: ExchangeSlot = Arc::new(std::sync::Mutex::new(Some(partition)));
+        if let Ok(mut streams) = self.streams.lock() {
+            streams.push(Arc::clone(&slot));
+        }
+        AnalyticalExchangeStream { slot }
+    }
+
+    /// Drops every retained partition stream, ending upstream's reader tasks.
+    ///
+    /// Idempotent: a stream already taken by its consumer's own drop leaves an
+    /// empty slot, and closing twice closes nothing the second time.
+    pub(crate) fn close(&self) {
+        let taken = match self.streams.lock() {
+            Ok(mut streams) => std::mem::take(&mut *streams),
+            Err(_) => return,
+        };
+        for slot in taken {
+            if let Ok(mut inner) = slot.lock() {
+                drop(inner.take());
+            }
+        }
+    }
+}
+
+/// The partition stream a consumer polls, whose data the graph still owns.
+///
+/// Yields end-of-stream once the graph has closed the exchange, which is what a
+/// consumer that is still polling observes when its graph settles.
+pub(crate) struct AnalyticalExchangeStream {
+    /// The retained inner stream, shared with the graph that may close it.
+    slot: ExchangeSlot,
+}
+
+impl fmt::Debug for AnalyticalExchangeStream {
+    /// Reports the stream without rendering the retained partition.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AnalyticalExchangeStream")
+            .finish_non_exhaustive()
+    }
+}
+
+impl futures_util::Stream for AnalyticalExchangeStream {
+    type Item = Result<RecordBatch, DataFusionError>;
+
+    /// Polls the retained partition, or ends once the graph closed it.
+    ///
+    /// The lock is held only for the duration of one inner poll and never
+    /// across an await, so a slow partition cannot block the graph's close.
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let Ok(mut inner) = self.slot.lock() else {
+            return Poll::Ready(None);
+        };
+        match inner.as_mut() {
+            Some(stream) => {
+                let polled = stream.as_mut().poll_next(cx);
+                if matches!(polled, Poll::Ready(None)) {
+                    drop(inner.take());
+                }
+                polled
+            }
+            None => Poll::Ready(None),
+        }
+    }
 }
 
 /// The signing authority and lifetimes one coordinator mints every stage
@@ -1837,6 +1960,8 @@ pub(crate) struct AnalyticalChannelResolver {
     minters: Arc<std::sync::Mutex<HashMap<Url, AnalyticalDestinationChannel>>>,
     /// Frozen destination set this resolver may address, and nothing beyond it.
     cut: Arc<AnalyticalParticipantCut>,
+    /// The graph's own exchange registry, which owns every stream this opens.
+    exchanges: Arc<AnalyticalGraphExchanges>,
     /// Authority and lifetimes every minted ticket is signed under.
     signing: AnalyticalStageSigning,
 }
@@ -1864,6 +1989,7 @@ impl AnalyticalChannelResolver {
         tls: BifrostPeerTls,
         credentials: Arc<dyn OraclePeerCredentials>,
         cut: Arc<AnalyticalParticipantCut>,
+        exchanges: Arc<AnalyticalGraphExchanges>,
         signing: AnalyticalStageSigning,
     ) -> Self {
         Self {
@@ -1871,6 +1997,7 @@ impl AnalyticalChannelResolver {
             identity,
             minters: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cut,
+            exchanges,
             signing,
         }
     }
@@ -1945,6 +2072,7 @@ impl ChannelResolver for AnalyticalChannelResolver {
             BoxCloneSyncChannel::new(AnalyticalStageMintLayer::new(resolved.minter).layer(channel));
         Ok(Box::new(AnalyticalWorkerChannel::new(
             create_worker_client(signed),
+            Arc::clone(&self.exchanges),
             resolved.identity,
         )))
     }
@@ -2283,6 +2411,57 @@ mod tests {
                 Ok(Response::new(()))
             })
         }
+    }
+
+    /// Proves a graph closes an exchange its consumer stopped polling.
+    ///
+    /// This is the exact shape that kept a settled graph's memory envelope
+    /// charged: upstream keeps one reader task alive per `execute_task` call
+    /// until every partition stream it returned is dropped, and a consumer that
+    /// stopped polling — a hash join whose build side completed — never drops
+    /// one. Neither cancellation nor end-of-stream reaches such a stream,
+    /// because both only take effect on a poll that never comes.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a retained exchange survives its graph's close, or when a
+    /// consumer still polling one does not observe end-of-stream.
+    #[tokio::test]
+    async fn a_graph_closes_an_exchange_its_consumer_stopped_polling() {
+        let exchanges = AnalyticalGraphExchanges::default();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let observer = Arc::clone(&dropped);
+        // A stream that never ends on its own and reports its own drop, which
+        // is the only observation that proves the graph released it.
+        let endless = futures_util::stream::pending::<Result<RecordBatch, DataFusionError>>();
+        let inner = Box::pin(futures_util::StreamExt::inspect(endless, move |_| {
+            let _ = &observer;
+        })) as BoxStream<'static, Result<RecordBatch, DataFusionError>>;
+        let mut held = exchanges.retain(inner);
+
+        // The consumer polls once, gets nothing, and then stops polling. From
+        // here nothing the stream itself could observe will ever run again.
+        assert!(
+            futures_util::poll!(futures_util::StreamExt::next(&mut held)).is_pending(),
+            "a pending exchange yielded before its data arrived"
+        );
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "an open exchange was released before its graph settled"
+        );
+
+        exchanges.close();
+        assert!(
+            matches!(
+                futures_util::poll!(futures_util::StreamExt::next(&mut held)),
+                Poll::Ready(None)
+            ),
+            "a consumer still holding a closed exchange did not observe its end"
+        );
+
+        // Closing twice closes nothing the second time, which is what makes a
+        // shutdown that races a caller-drop settlement safe.
+        exchanges.close();
     }
 
     /// Composes one injected, idle Oracle role for fixture graph reservations.

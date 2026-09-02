@@ -68,8 +68,8 @@ use super::analytical_supervisor::{
 };
 use super::analytical_transport::AnalyticalDestination;
 use super::analytical_transport::{
-    AnalyticalChannelResolver, AnalyticalCoordinatorIdentity, AnalyticalParticipantCut,
-    AnalyticalStageSigning, StageWireIdentity, read_ticket,
+    AnalyticalChannelResolver, AnalyticalCoordinatorIdentity, AnalyticalGraphExchanges,
+    AnalyticalParticipantCut, AnalyticalStageSigning, StageWireIdentity, read_ticket,
 };
 use super::dispatcher::{
     BifrostPeerTls, CommittedGraphActivation, GraphLeaseRequest, OraclePeerCredentials,
@@ -628,6 +628,14 @@ struct RecordedEgress {
     deadline_ms: i64,
     /// Participant cut adopted from the ticket that authorized this graph.
     cut: Arc<AnalyticalParticipantCut>,
+    /// The graph's own exchange registry, which owns every stream it opens.
+    ///
+    /// An outbound exchange stream is the only thing on this node that a
+    /// settling graph cannot reach by joining an attempt: upstream hands the
+    /// stream out and keeps its own reader task alive until every partition of
+    /// it has been dropped, and a consumer that stopped polling will never drop
+    /// it. Owning the stream is what lets the graph close it.
+    exchanges: Arc<AnalyticalGraphExchanges>,
 }
 
 /// One graph's verified outbound identity, deadline, and frozen destinations.
@@ -638,6 +646,8 @@ struct AnalyticalEgressIdentity {
     deadline_ms: i64,
     /// Participant cut adopted from the ticket that authorized this graph.
     cut: Arc<AnalyticalParticipantCut>,
+    /// The graph's own exchange registry, which owns every stream it opens.
+    exchanges: Arc<AnalyticalGraphExchanges>,
 }
 
 impl fmt::Debug for AnalyticalStageEgress {
@@ -691,6 +701,7 @@ impl AnalyticalStageEgress {
         &self,
         graph: AnalyticalGraphKey,
         authorized: &AuthorizedStage,
+        exchanges: Arc<AnalyticalGraphExchanges>,
     ) -> Result<(), BifrostError> {
         let claims = &authorized.claims;
         let tenant_id = Uuid::from_slice(&claims.tenant_id)
@@ -713,6 +724,7 @@ impl AnalyticalStageEgress {
             // Adopted, never widened: this node can address exactly the
             // destinations its own coordinator was authorized to address.
             cut: Arc::new(AnalyticalParticipantCut::adopt(&claims.participants)?),
+            exchanges,
         };
         self.identities
             .lock()
@@ -756,6 +768,7 @@ impl AnalyticalStageEgress {
             self.peer_tls.clone(),
             Arc::clone(&self.peer_credentials),
             recorded.cut,
+            recorded.exchanges,
             AnalyticalStageSigning {
                 authority: Arc::clone(&self.authority),
                 absolute_deadline_ms: recorded.deadline_ms,
@@ -794,6 +807,7 @@ impl AnalyticalStageEgress {
             identity: Arc::clone(&entry.identity),
             deadline_ms: entry.deadline_ms,
             cut: Arc::clone(&entry.cut),
+            exchanges: Arc::clone(&entry.exchanges),
         }))
     }
 }
@@ -993,6 +1007,8 @@ pub struct GraphLease {
     attempts: Mutex<HashMap<AnalyticalAttemptKey, AnalyticalAttemptGuard>>,
     /// Whether settlement has already run, so it can never run twice.
     settled: AtomicBool,
+    /// Every outbound exchange stream this graph opened, owned by the graph.
+    exchanges: Arc<AnalyticalGraphExchanges>,
     /// Upstream worker whose task cache is scoped to exactly this graph.
     ///
     /// Upstream caches a stage's decoded task data on the worker that served
@@ -1041,6 +1057,15 @@ impl GraphLease {
             .map_err(|_| poisoned_ingress())?
             .as_ref()
             .cloned())
+    }
+
+    /// Returns the registry owning every outbound exchange this graph opened.
+    ///
+    /// Settlement closes them, which is the only way this node can end an
+    /// upstream reader task it does not own.
+    #[must_use]
+    pub(crate) fn exchanges(&self) -> Arc<AnalyticalGraphExchanges> {
+        Arc::clone(&self.exchanges)
     }
 
     /// Returns how many attempts of this graph are still admitted.
@@ -1142,6 +1167,19 @@ impl GraphLease {
         // worker connections that hold this envelope's reservations, so the
         // cache has to go first or the drain would be waiting on bytes that
         // nothing in the graph's own lifetime will ever release.
+        // Unconditional, and only after every attempt has been joined. The
+        // graph is over on every terminal path, and its outbound exchanges are
+        // the one thing joining an attempt cannot reach: upstream keeps a
+        // reader task, and the buffers that task charges to this envelope,
+        // alive until every partition stream it handed out has been dropped.
+        // Cancelling here is what drops them. Cancelling any earlier would have
+        // turned a successful graph into a cancelled one.
+        self.cancel.cancel();
+        // Cancellation alone cannot end an exchange whose consumer stopped
+        // polling it, and upstream's reader task lives until every partition
+        // stream it handed out is dropped. The graph owns those streams, so it
+        // drops them here.
+        self.exchanges.close();
         drop(self.worker.lock().map_err(|_| poisoned_ingress())?.take());
         self.drain().await?;
         let guard = self.guard.lock().map_err(|_| poisoned_ingress())?.take();
@@ -1489,7 +1527,8 @@ impl AnalyticalStageIngress {
         // Recorded from the verified claims, after the graph accepted them, so a
         // stage that this node runs in the middle of a deeper graph can sign its
         // own outbound pulls with exactly the authority it was granted.
-        self.egress.record(key.graph(), &authorized)?;
+        self.egress
+            .record(key.graph(), &authorized, lease.exchanges())?;
         match operation {
             StageOperationV1::SetPlan => {
                 lease.admit_attempt(
@@ -1626,9 +1665,23 @@ impl AnalyticalStageIngress {
             supervisor: Arc::clone(&self.supervisor),
             egress: Arc::clone(&self.egress),
             guard: Mutex::new(Some(guard)),
-            cancel: self.supervisor.root_cancellation().child_token(),
+            // The graph's own token, not a fresh child: the leader session that
+            // opens this graph's outbound exchanges binds to the same one, so
+            // settling the graph ends them.
+            cancel: match self.supervisor.graph_cancellation(graph) {
+                Ok(Some(cancel)) => cancel,
+                Ok(None) | Err(_) => self.supervisor.root_cancellation().child_token(),
+            },
             attempts: Mutex::new(HashMap::new()),
             settled: AtomicBool::new(false),
+            // The supervisor's, not a fresh one: a leader session composed for
+            // this same graph opens its exchanges through the same registry.
+            exchanges: self
+                .supervisor
+                .graph_exchanges(graph)
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
             worker: Mutex::new(Some(self.build_worker())),
         }))
     }
@@ -4189,6 +4242,7 @@ impl AnalyticalExecutionHandle {
             self.config.peer_tls.clone(),
             Arc::clone(&self.config.peer_credentials),
             Arc::clone(&participants),
+            self.supervisor.graph_exchanges(graph)?.unwrap_or_default(),
             AnalyticalStageSigning {
                 authority: Arc::clone(&self.authority),
                 absolute_deadline_ms: deadline_ms,

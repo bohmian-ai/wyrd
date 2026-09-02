@@ -203,6 +203,20 @@ struct AnalyticalGraphState {
     resources: OracleQueryResources,
     /// The query-owned runtime every follower of this graph installs.
     runtime: AnalyticalGraphRuntime,
+    /// Every outbound exchange stream this graph opened, owned by the graph.
+    ///
+    /// Shared by the leader session that opens them and the lease that settles
+    /// the graph, so one graph has exactly one place its exchanges live.
+    exchanges: Arc<super::analytical_transport::AnalyticalGraphExchanges>,
+    /// Cancellation child covering every descendant of this graph.
+    ///
+    /// Owned by the graph rather than by each attempt because a graph's
+    /// outbound exchanges outlive the attempt that opened them: upstream keeps
+    /// its reader task, and the buffers it charges to this envelope, alive
+    /// until every partition stream it handed out is dropped. Both the leader
+    /// session that opens those exchanges and the lease that settles the graph
+    /// bind to this one token.
+    cancel: CancellationToken,
 }
 
 /// Everything one live attempt owns and must return exactly once.
@@ -386,7 +400,15 @@ impl AnalyticalSupervisor {
         if let Err(error) = self.registry.register(graph, runtime.clone()) {
             return Err((Box::new(resources), error));
         }
-        graphs.insert(graph, AnalyticalGraphState { resources, runtime });
+        graphs.insert(
+            graph,
+            AnalyticalGraphState {
+                resources,
+                runtime,
+                exchanges: Arc::default(),
+                cancel: self.root_cancel.child_token(),
+            },
+        );
         drop(graphs);
         tracing::debug!(
             public_query_id = %graph.public_query_id,
@@ -398,6 +420,39 @@ impl AnalyticalSupervisor {
             graph,
             released: false,
         })
+    }
+
+    /// Returns one registered graph's own exchange registry.
+    ///
+    /// `None` when the graph is not registered here, which is the correct
+    /// answer: an unregistered graph opens no exchange.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when the graph lock is poisoned.
+    pub fn graph_exchanges(
+        &self,
+        graph: AnalyticalGraphKey,
+    ) -> Result<Option<Arc<super::analytical_transport::AnalyticalGraphExchanges>>, BifrostError>
+    {
+        let graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
+        Ok(graphs.get(&graph).map(|state| Arc::clone(&state.exchanges)))
+    }
+
+    /// Returns one registered graph's own cancellation child.
+    ///
+    /// `None` when the graph is not registered here, which is the correct
+    /// answer: an unregistered graph owns no descendant to cancel.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when the graph lock is poisoned.
+    pub fn graph_cancellation(
+        &self,
+        graph: AnalyticalGraphKey,
+    ) -> Result<Option<CancellationToken>, BifrostError> {
+        let graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
+        Ok(graphs.get(&graph).map(|state| state.cancel.clone()))
     }
 
     /// Reports whether one registered graph's envelope has no nested child left.

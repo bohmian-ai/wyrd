@@ -1684,7 +1684,15 @@ impl OracleReaderAuthority {
         deadline: tokio::time::Instant,
     ) -> Result<(), BifrostError> {
         let bound = self.deadlines().await.join.min(deadline);
-        let settled = self.settle_lease_loss(bound).await;
+        // One timer over the whole settlement, not one per await: connection
+        // acquisition, the verification read, its commit, and the lifecycle
+        // lock are as capable of stalling as the loss edge is.
+        let settled = match tokio::time::timeout_at(bound, self.settle_lease_loss()).await {
+            Ok(result) => result,
+            Err(_) => Err(self.terminate_exhausted(
+                "Oracle reader epoch loss settlement outlived retirement's shutdown deadline",
+            )),
+        };
         // Cancelled whichever way settlement went: a process that could not
         // even record its loss must still stop reading under the lease it lost.
         self.epoch_cancel.cancel();
@@ -1806,21 +1814,6 @@ impl OracleReaderAuthority {
     ///
     /// Returns [`BifrostError::Internal`] when the supervisor is still running
     /// at `deadline`.
-    async fn join_lease_worker_by(
-        &self,
-        deadline: tokio::time::Instant,
-    ) -> Result<(), BifrostError> {
-        if tokio::time::timeout_at(deadline, self.join_lease_worker())
-            .await
-            .is_err()
-        {
-            return Err(self.terminate_exhausted(
-                "Oracle reader epoch lease supervisor outlived retirement's shutdown deadline",
-            ));
-        }
-        Ok(())
-    }
-
     /// Ends this process's source IO and reports the stage that exhausted.
     ///
     /// Retirement calls this at most once per attempt and always returns the
@@ -1849,27 +1842,24 @@ impl OracleReaderAuthority {
     /// releasing protection under an epoch that never recorded its loss would
     /// leave nothing to reclaim it.
     ///
-    /// Every awaited stage is bounded by `deadline`, the single absolute
-    /// instant retirement sampled, so a database that stalls the loss edge
-    /// cannot keep this epoch alive past the lease it last confirmed.
+    /// Nothing here bounds itself. Retirement runs this whole operation under
+    /// the single absolute instant it sampled, so a database that stalls any
+    /// stage — the supervisor join, the loss edge, a connection, the
+    /// verification read, its commit — cannot keep this epoch alive past the
+    /// lease it last confirmed.
     ///
     /// # Errors
     ///
-    /// Returns [`BifrostError::Internal`] when a stage exhausts `deadline`,
-    /// when the loss edge cannot be committed, when the epoch row cannot be
-    /// read, or when it is still in a state that has not lost authority.
-    async fn settle_lease_loss(&self, deadline: tokio::time::Instant) -> Result<(), BifrostError> {
+    /// Returns [`BifrostError::Internal`] when the loss edge cannot be
+    /// committed, when the epoch row cannot be read, or when it is still in a
+    /// state that has not lost authority.
+    async fn settle_lease_loss(&self) -> Result<(), BifrostError> {
         if self.select_loss().await {
             self.renewal_cancel.cancel();
-            self.join_lease_worker_by(deadline).await?;
-            return match tokio::time::timeout_at(deadline, self.commit_loss_edge()).await {
-                Ok(result) => result,
-                Err(_) => Err(self.terminate_exhausted(
-                    "Oracle reader epoch loss edge outlived retirement's shutdown deadline",
-                )),
-            };
+            self.join_lease_worker().await;
+            return self.commit_loss_edge().await;
         }
-        self.join_lease_worker_by(deadline).await?;
+        self.join_lease_worker().await;
         let mut conn = system_conn(&self.vala).await?;
         let row = OracleReaderEpochs::new(&mut conn)
             .map_err(|error| internal(error.to_string()))?

@@ -767,7 +767,126 @@ fn retirement_deadline() -> tokio::time::Instant {
 #[tokio::test]
 async fn epoch_deadline_exhaustion_terminates_and_retains_protection() {
     blocked_loss_settlement_terminates_at_the_caller_deadline().await;
+    stalled_loss_verification_terminates_at_the_caller_deadline().await;
     unjoined_descendants_terminate_at_the_caller_deadline().await;
+}
+
+/// Drives exhaustion in the branch the lease supervisor, not retirement, won.
+///
+/// When the supervisor already selected and recorded loss, retirement only
+/// verifies the durable epoch reached a loss state. That verification acquires
+/// a connection, reads, and commits, and every one of those can stall. It is
+/// bounded by the same single instant retirement sampled, so a stalled
+/// verification cannot carry retirement past its caller's deadline and into
+/// the release of protection the process can no longer prove it stopped
+/// reading under.
+///
+/// # Panics
+///
+/// Panics when verification outlives the caller deadline, when the terminator
+/// is not invoked exactly once, when retirement reports success, or when any
+/// durable protection, epoch state, or audit edge moves past the stalled read.
+async fn stalled_loss_verification_terminates_at_the_caller_deadline() {
+    let fixture = AuthorityFixture::start().await;
+    let (authority, terminator) = fixture.authority(2).await;
+    let tenant = fixture.tenant().await;
+    let events = fixture.table(tenant, "events").await;
+
+    // One real durable protection, published exactly the way a query does. No
+    // `begin_io`, so nothing is in flight and the fence joins immediately.
+    let (guard, _permit) = authority
+        .acquire_guard_for_cuts(vec![(events.clone(), cut(30, 300, &[30, 20, 10]))])
+        .await
+        .expect("admission protects");
+    fixture
+        .settle(&events, "the admitted cut is durably protected", |record| {
+            record.is_some_and(|record| record.frontier.covers(30))
+        })
+        .await;
+
+    // The supervisor, not retirement, selects this epoch's loss and owes its
+    // audited edge, leaving retirement with only the verification branch. The
+    // held guard is an unjoined descendant, so the fence terminates once on
+    // its own account; only the terminations retirement adds are under test.
+    authority.self_fence().await;
+    let fenced_terminations = terminator.invocations();
+    assert_eq!(
+        fenced_terminations, 1,
+        "the fence itself terminates exactly once, so the baseline is pinned"
+    );
+
+    // Hold the epoch table so retirement's verification read blocks. A row
+    // lock would not: the verification is a plain `SELECT`.
+    let pool = fixture
+        .database
+        .superuser_pool()
+        .await
+        .expect("superuser pool");
+    let mut gate = pool.begin().await.expect("epoch gate transaction begins");
+    sqlx::query("LOCK TABLE vala.oracle_reader_epochs IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *gate)
+        .await
+        .expect("the epoch table is held");
+    // Released well after the caller deadline, so an unbounded verification
+    // finishes late and successfully instead of hanging this lane forever.
+    let releaser = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        gate.rollback().await.expect("the epoch gate releases");
+    });
+
+    let caller_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let error = authority
+        .retire(caller_deadline)
+        .await
+        .expect_err("a stalled verification is not a successful retirement");
+    let finished = tokio::time::Instant::now();
+    assert!(
+        finished >= caller_deadline && finished < caller_deadline + Duration::from_secs(3),
+        "retirement completed at {finished:?}, not at its caller deadline {caller_deadline:?}"
+    );
+    assert!(matches!(
+        error,
+        wyrd_spec::vala::BifrostError::Internal { .. }
+    ));
+    assert_eq!(
+        terminator.invocations(),
+        fenced_terminations + 1,
+        "one exhausted retirement attempt terminates exactly once"
+    );
+    assert!(
+        authority.epoch_cancel().is_cancelled(),
+        "an epoch that could not verify its loss still stops reading"
+    );
+
+    releaser.await.expect("the epoch gate releases");
+
+    // Nothing past the exhausted verification happened.
+    assert!(
+        fixture
+            .header(&events)
+            .await
+            .is_some_and(|record| record.frontier.covers(30)),
+        "protection survives an exhausted verification"
+    );
+    assert_eq!(
+        fixture
+            .epoch_row()
+            .await
+            .expect("the epoch row survives")
+            .state,
+        vala_sql::row_types::oracle_reader_authority::OracleEpochState::Draining,
+        "the supervisor's loss edge stands and nothing follows it"
+    );
+    assert_eq!(
+        fixture.epoch_audit_operations().await,
+        vec![
+            "oracle.reader_epoch.acquired".to_owned(),
+            "oracle.reader_epoch.activated".to_owned(),
+            "oracle.reader_epoch.draining".to_owned(),
+        ],
+        "no invalidation or retirement edge follows an exhausted verification"
+    );
+    drop(guard);
 }
 
 /// Drives exhaustion in the audited loss edge, with the epoch row held.

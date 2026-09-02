@@ -989,5 +989,366 @@ mod pg_tests {
             assert_eq!(count_state(pool, tenant).await, 1);
             assert_eq!(count_audit(pool, tenant).await, 2);
         }
+
+        // -----------------------------------------------------------------------
+        // Self-contained operation state
+        // -----------------------------------------------------------------------
+
+        /// Seeds one `vala.forge_operation_state` row directly, with no
+        /// `vala.audit_outbox` row at either referenced sequence.
+        ///
+        /// Production always appends the audit event in the same transaction as
+        /// the transition, but audit delivery rows are subject to their own
+        /// retention lifecycle. This helper reproduces the state a Forge worker
+        /// legitimately restarts into once a delivered prepared audit row has
+        /// aged out of the outbox, which no public writer can otherwise create.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the tenant transaction, insert, or commit fails, or when
+        /// either detail cannot be serialized.
+        #[expect(
+            clippy::too_many_arguments,
+            reason = "one seeded projection row is exactly these columns"
+        )]
+        async fn seed_state_row(
+            pool: &PgPool,
+            tenant: DataTenantId,
+            family: ForgeOperationFamily,
+            operation_id: Uuid,
+            phase: &str,
+            prepared_detail: &AuditDetail,
+            current_detail: &AuditDetail,
+            prepared_audit_seq: i64,
+            terminal_audit_seq: Option<i64>,
+        ) {
+            let mut conn = TenantConn::acquire(pool, tenant)
+                .await
+                .expect("tenant connection for seeded projection row");
+            sqlx::query(
+                r#"
+                INSERT INTO vala.forge_operation_state
+                    (data_tenant_id, resource, family, operation_id, phase,
+                     prepared_detail, current_detail,
+                     prepared_audit_seq, terminal_audit_seq,
+                     prepared_at, updated_at)
+                VALUES (wyrd.current_tenant(), $1, $2, $3, $4,
+                        $5::jsonb, $6::jsonb, $7, $8, now(), now())
+                "#,
+            )
+            .bind(resource())
+            .bind(family.as_str())
+            .bind(operation_id)
+            .bind(phase)
+            .bind(serde_json::to_string(prepared_detail).expect("serialize seeded prepared detail"))
+            .bind(serde_json::to_string(current_detail).expect("serialize seeded current detail"))
+            .bind(prepared_audit_seq)
+            .bind(terminal_audit_seq)
+            .execute(&mut **conn.transaction())
+            .await
+            .expect("seeded projection insert");
+            conn.commit().await.expect("seeded projection commit");
+        }
+
+        /// Builds one snapshot-expiry detail for the fixed test resource.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the fixed metadata location is not a valid storage path.
+        fn expire_detail(
+            operation_id: Uuid,
+            phase: ForgeSnapshotExpirePhase,
+            group: &str,
+        ) -> AuditDetail {
+            AuditDetail::ForgeSnapshotExpire {
+                operation_id,
+                phase,
+                group: group.to_owned(),
+                base_metadata_location: StoragePath::new(
+                    "table/iceberg/metadata/00007-self-contained.json",
+                )
+                .expect("valid path"),
+                current_snapshot_id: Some(77),
+                retained_ref_heads: vec![77],
+                cutoff_ms: 1_700_000_000_000,
+                selected_snapshot_ids: vec![11, 12],
+            }
+        }
+
+        /// Lists open operations for one family through a tenant transaction.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the tenant transaction cannot be acquired or committed,
+        /// or when the fixed resource cannot construct the owner.
+        async fn list_open(
+            pool: &PgPool,
+            tenant: DataTenantId,
+            family: ForgeOperationFamily,
+        ) -> Result<vala_sql::row_types::forge_operations::OpenForgeOperationPage, SqlError>
+        {
+            let mut conn = TenantConn::acquire(pool, tenant)
+                .await
+                .expect("tenant connection for open listing");
+            let ops = ForgeOperations::new(resource(), family).expect("valid Forge resource");
+            let result = ops.list_open(&mut conn, 8).await;
+            conn.commit().await.expect("open listing commit");
+            result
+        }
+
+        /// Lists Reset operations for one family through a tenant transaction.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the tenant transaction cannot be acquired or committed,
+        /// or when the fixed resource cannot construct the owner.
+        async fn list_reset(
+            pool: &PgPool,
+            tenant: DataTenantId,
+            family: ForgeOperationFamily,
+        ) -> Result<vala_sql::row_types::forge_operations::OpenForgeOperationPage, SqlError>
+        {
+            let mut conn = TenantConn::acquire(pool, tenant)
+                .await
+                .expect("tenant connection for reset listing");
+            let ops = ForgeOperations::new(resource(), family).expect("valid Forge resource");
+            let result = ops.list_reset(&mut conn, 8).await;
+            conn.commit().await.expect("reset listing commit");
+            result
+        }
+
+        /// Proves Forge operation recovery reads only its own state projection.
+        ///
+        /// `vala.forge_operation_state` is the sole Forge recovery authority:
+        /// it stores the complete typed prepared and current details plus the
+        /// audit sequences those transitions produced. `vala.audit_outbox` is a
+        /// delivery table with its own retention, so requiring one of its rows
+        /// to still be present before a worker may read back its own prepared
+        /// operation would make recovery depend on audit delivery rather than
+        /// on Forge's own durable state.
+        ///
+        /// The seeded rows carry complete valid state and sequence references
+        /// with no outbox row at either sequence. Reads, Prepared replay, and
+        /// terminal settlement must all succeed on that state alone, terminal
+        /// settlement must still append exactly one audit event atomically, and
+        /// contradictory stored state must still fail closed.
+        ///
+        /// # Panics
+        ///
+        /// Panics when setup, seeding, reads, transitions, or exact phase,
+        /// sequence, cardinality, and refusal assertions fail.
+        #[tokio::test]
+        async fn self_contained_state_reads_and_replays_do_not_require_prepared_outbox_row() {
+            let TestFixtures { fixture, .. } = setup().await;
+            let pool = fixture.app_pool();
+            let tenant = fixture.data_tenant_id();
+
+            // A Prepared snapshot-expiry operation whose prepared audit row is
+            // no longer in the outbox.
+            let expire_id = Uuid::now_v7();
+            let prepared_seq = 4_242_i64;
+            let prepared_detail =
+                expire_detail(expire_id, ForgeSnapshotExpirePhase::Prepared, resource());
+            seed_state_row(
+                pool,
+                tenant,
+                ForgeOperationFamily::SnapshotExpire,
+                expire_id,
+                "prepared",
+                &prepared_detail,
+                &prepared_detail,
+                prepared_seq,
+                None,
+            )
+            .await;
+
+            // A terminal Reset rewrite operation whose audit rows are likewise
+            // absent.
+            let reset_id = Uuid::now_v7();
+            let reset_prepared_seq = 5_150_i64;
+            let reset_terminal_seq = 5_151_i64;
+            let reset_prepared_detail = rewrite_detail(
+                reset_id,
+                ForgeIcebergRewritePhase::Prepared,
+                None,
+                "table/rewrite-self-contained.parquet",
+            );
+            let reset_current_detail = rewrite_detail(
+                reset_id,
+                ForgeIcebergRewritePhase::Reset,
+                None,
+                "table/rewrite-self-contained.parquet",
+            );
+            seed_state_row(
+                pool,
+                tenant,
+                ForgeOperationFamily::IcebergRewrite,
+                reset_id,
+                "reset",
+                &reset_prepared_detail,
+                &reset_current_detail,
+                reset_prepared_seq,
+                Some(reset_terminal_seq),
+            )
+            .await;
+
+            assert_eq!(
+                count_audit(pool, tenant).await,
+                0,
+                "no audit delivery row backs either seeded operation"
+            );
+
+            let open = list_open(pool, tenant, ForgeOperationFamily::SnapshotExpire)
+                .await
+                .expect("open listing must not require an audit delivery row");
+            assert!(!open.overflowed, "single seeded open operation");
+            assert_eq!(open.operations.len(), 1, "exactly one open operation");
+            assert_eq!(open.operations[0].operation_id, expire_id);
+            assert_eq!(
+                open.operations[0].phase,
+                vala_sql::row_types::forge_operations::ForgeOperationPhase::Prepared
+            );
+            assert_eq!(open.operations[0].prepared_audit_seq, prepared_seq);
+            assert_eq!(open.operations[0].terminal_audit_seq, None);
+            assert_eq!(open.operations[0].prepared_detail, prepared_detail);
+
+            let reset = list_reset(pool, tenant, ForgeOperationFamily::IcebergRewrite)
+                .await
+                .expect("reset listing must not require an audit delivery row");
+            assert!(!reset.overflowed, "single seeded reset operation");
+            assert_eq!(reset.operations.len(), 1, "exactly one reset operation");
+            assert_eq!(reset.operations[0].operation_id, reset_id);
+            assert_eq!(
+                reset.operations[0].phase,
+                vala_sql::row_types::forge_operations::ForgeOperationPhase::Reset
+            );
+            assert_eq!(reset.operations[0].prepared_audit_seq, reset_prepared_seq);
+            assert_eq!(
+                reset.operations[0].terminal_audit_seq,
+                Some(reset_terminal_seq)
+            );
+
+            // Identical Prepared replay returns the stored sequence and writes
+            // nothing.
+            let replay = append_prepared(
+                pool,
+                tenant,
+                resource(),
+                ForgeOperationFamily::SnapshotExpire,
+                &event(
+                    "forge.snapshot_expire.prepared",
+                    resource(),
+                    Some(prepared_detail.clone()),
+                ),
+            )
+            .await
+            .expect("Prepared replay must not require an audit delivery row");
+            assert!(
+                matches!(
+                    replay,
+                    ForgeOperationTransition::AlreadyApplied { audit_seq } if audit_seq == prepared_seq
+                ),
+                "Prepared replay returns the stored prepared sequence, got {replay:?}"
+            );
+            assert_eq!(
+                count_audit(pool, tenant).await,
+                0,
+                "an idempotent Prepared replay appends no audit"
+            );
+
+            // Terminal settlement still appends exactly one audit event.
+            let committed_event = event(
+                "forge.snapshot_expire.committed",
+                resource(),
+                Some(expire_detail(
+                    expire_id,
+                    ForgeSnapshotExpirePhase::Committed,
+                    resource(),
+                )),
+            );
+            let terminal_seq = match append_terminal(
+                pool,
+                tenant,
+                resource(),
+                ForgeOperationFamily::SnapshotExpire,
+                &committed_event,
+            )
+            .await
+            .expect("terminal settlement must not require an audit delivery row")
+            {
+                ForgeOperationTransition::Applied { audit_seq } => audit_seq,
+                other => panic!("expected terminal application, got {other:?}"),
+            };
+            assert_eq!(
+                count_audit(pool, tenant).await,
+                1,
+                "terminal settlement appends exactly one audit event"
+            );
+            assert_eq!(
+                state_snapshot(
+                    pool,
+                    tenant,
+                    ForgeOperationFamily::SnapshotExpire,
+                    expire_id
+                )
+                .await,
+                StateSnapshot {
+                    phase: "committed".to_owned(),
+                    prepared_audit_seq: prepared_seq,
+                    terminal_audit_seq: Some(terminal_seq),
+                }
+            );
+
+            // Terminal replay is idempotent and appends nothing further.
+            let terminal_replay = append_terminal(
+                pool,
+                tenant,
+                resource(),
+                ForgeOperationFamily::SnapshotExpire,
+                &committed_event,
+            )
+            .await
+            .expect("idempotent terminal replay");
+            assert!(
+                matches!(
+                    terminal_replay,
+                    ForgeOperationTransition::AlreadyApplied { audit_seq } if audit_seq == terminal_seq
+                ),
+                "terminal replay returns the stored terminal sequence, got {terminal_replay:?}"
+            );
+            assert_eq!(
+                count_audit(pool, tenant).await,
+                1,
+                "an idempotent terminal replay appends no audit"
+            );
+
+            // Contradictory stored state still fails closed before any caller
+            // receives recovery authority.
+            let mismatched_id = Uuid::now_v7();
+            let mismatched_detail = expire_detail(
+                mismatched_id,
+                ForgeSnapshotExpirePhase::Prepared,
+                "tenant_a.ns.other",
+            );
+            seed_state_row(
+                pool,
+                tenant,
+                ForgeOperationFamily::SnapshotExpire,
+                mismatched_id,
+                "prepared",
+                &mismatched_detail,
+                &mismatched_detail,
+                9_001,
+                None,
+            )
+            .await;
+            assert!(
+                matches!(
+                    list_open(pool, tenant, ForgeOperationFamily::SnapshotExpire).await,
+                    Err(SqlError::InvariantViolation { .. })
+                ),
+                "state whose detail identity contradicts its row must fail closed"
+            );
+        }
     }
 }

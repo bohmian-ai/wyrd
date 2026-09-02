@@ -295,18 +295,18 @@ impl<'resource> ForgeOperations<'resource> {
     /// Returns at most `cap` fully validated open (Prepared) operations.
     ///
     /// The method selects `cap + 1` state rows from the partial
-    /// `forge_operation_state_open` index, point-joins each to its prepared
-    /// audit evidence, and validates every row (including the overflow
-    /// sentinel). An `overflowed = true` page means the caller should narrow
-    /// the resource/family scope or paginate.
+    /// `forge_operation_state_open` index and validates every row (including
+    /// the overflow sentinel). An `overflowed = true` page means the caller
+    /// should narrow the resource/family scope or paginate. The read touches
+    /// only the state projection: `vala.audit_outbox` is a delivery table with
+    /// its own retention, and Forge recovery must not depend on it.
     ///
     /// # Errors
     ///
     /// Returns [`SqlError::Conflict`] when `cap` is zero.
-    /// Returns [`SqlError::InvariantViolation`] when stored state or audit
-    /// evidence fails decoding/parity validation.
-    /// Returns [`SqlError::Query`] when the bounded state or point-evidence
-    /// query fails.
+    /// Returns [`SqlError::InvariantViolation`] when stored state fails
+    /// decoding or identity validation.
+    /// Returns [`SqlError::Query`] when the bounded state query fails.
     ///
     /// # Cancellation
     ///
@@ -333,25 +333,14 @@ impl<'resource> ForgeOperations<'resource> {
 
         let rows: Vec<ForgeOperationStateSqlRow> = sqlx::query_as(
             r#"
-            WITH selected AS MATERIALIZED (
-                SELECT *
-                  FROM vala.forge_operation_state
-                 WHERE data_tenant_id = wyrd.current_tenant()
-                   AND resource = $1
-                   AND family = $2
-                   AND phase = 'prepared'
-                 ORDER BY prepared_at, operation_id
-                 LIMIT $3
-            )
-            SELECT selected.*,
-                   audit.operation AS prepared_audit_operation,
-                   audit.resource AS prepared_audit_resource,
-                   audit.detail AS prepared_audit_detail
-              FROM selected
-              LEFT JOIN vala.audit_outbox AS audit
-                ON audit.data_tenant_id = wyrd.current_tenant()
-               AND audit.seq = selected.prepared_audit_seq
-             ORDER BY selected.prepared_at, selected.operation_id
+            SELECT *
+              FROM vala.forge_operation_state
+             WHERE data_tenant_id = wyrd.current_tenant()
+               AND resource = $1
+               AND family = $2
+               AND phase = 'prepared'
+             ORDER BY prepared_at, operation_id
+             LIMIT $3
             "#,
         )
         .bind(self.resource)
@@ -404,7 +393,7 @@ impl<'resource> ForgeOperations<'resource> {
                 detail: "cap overflow".to_owned(),
             })?;
         let rows: Vec<ForgeOperationStateSqlRow> = sqlx::query_as(
-            "WITH selected AS MATERIALIZED (SELECT * FROM vala.forge_operation_state WHERE data_tenant_id=wyrd.current_tenant() AND resource=$1 AND family=$2 AND phase='reset' ORDER BY updated_at,operation_id LIMIT $3) SELECT selected.*,audit.operation AS prepared_audit_operation,audit.resource AS prepared_audit_resource,audit.detail AS prepared_audit_detail FROM selected LEFT JOIN vala.audit_outbox audit ON audit.data_tenant_id=wyrd.current_tenant() AND audit.seq=selected.prepared_audit_seq ORDER BY selected.updated_at,selected.operation_id",
+            "SELECT * FROM vala.forge_operation_state WHERE data_tenant_id=wyrd.current_tenant() AND resource=$1 AND family=$2 AND phase='reset' ORDER BY updated_at,operation_id LIMIT $3",
         )
         .bind(self.resource)
         .bind(self.family.as_str())
@@ -496,14 +485,8 @@ impl<'resource> ForgeOperations<'resource> {
         // access, and FOR UPDATE provides an additional row-level safety layer.
         let row: Option<ForgeOperationStateSqlRow> = sqlx::query_as(
             r#"
-        SELECT state.*,
-               audit.operation AS prepared_audit_operation,
-               audit.resource AS prepared_audit_resource,
-               audit.detail AS prepared_audit_detail
+        SELECT state.*
           FROM vala.forge_operation_state AS state
-          LEFT JOIN vala.audit_outbox AS audit
-            ON audit.data_tenant_id = wyrd.current_tenant()
-           AND audit.seq = state.prepared_audit_seq
          WHERE state.data_tenant_id = wyrd.current_tenant()
            AND state.resource = $1
            AND state.family = $2

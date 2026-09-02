@@ -1,10 +1,11 @@
 //! SQL row mirrors and domain types for `vala.forge_operation_state`.
 //!
 //! The private [`ForgeOperationStateSqlRow`] mirrors the exact column layout of
-//! the bounded-read query that left-joins `vala.audit_outbox`. The public
-//! [`ForgeOperationStateRow`] is produced by explicit, fallible conversion that
-//! validates every stored value: closed enum strings, JSONB-to-detail decoding,
-//! prepared-audit parity, phase/nullability invariants, and tenant/resource/
+//! that table and nothing else — the projection is the sole Forge recovery
+//! authority, so no read joins the `vala.audit_outbox` delivery table. The
+//! public [`ForgeOperationStateRow`] is produced by explicit, fallible
+//! conversion that validates every stored value: closed enum strings,
+//! JSONB-to-detail decoding, phase/nullability invariants, and tenant/resource/
 //! detail identity.
 
 use chrono::{DateTime, Utc};
@@ -13,7 +14,7 @@ use std::str::FromStr;
 use sqlx::types::Uuid;
 use wyrd_spec::vala::api::{
     AuditDetail, ForgeIcebergRewritePhase, ForgeOrphanGcPhase, ForgeScribePromotionPhase,
-    ForgeSnapshotExpirePhase, audit_detail_canonical_json,
+    ForgeSnapshotExpirePhase,
 };
 
 use crate::SqlError;
@@ -168,7 +169,7 @@ pub struct ForgeOperationStateRow {
 /// A bounded page of open (Prepared) operations.
 #[derive(Debug, Clone)]
 pub struct OpenForgeOperationPage {
-    /// At most `cap` validated, parity-proven Prepared operations.
+    /// At most `cap` validated Prepared operations.
     pub operations: Vec<ForgeOperationStateRow>,
     /// `true` when `cap + 1` state rows existed, meaning the caller should
     /// paginate or widen the resource/family scope.
@@ -194,11 +195,17 @@ pub enum ForgeOperationTransition {
 }
 
 // ---------------------------------------------------------------------------
-// Private SQL row mirror — maps the exact bounded-read query projection.
+// Private SQL row mirror — maps the exact `forge_operation_state` columns.
 // ---------------------------------------------------------------------------
 
-/// Raw SQL row mirror for the bounded `forge_operation_state` read query that
-/// left-joins `vala.audit_outbox` for the prepared audit evidence.
+/// Raw SQL row mirror for the `forge_operation_state` projection.
+///
+/// The projection is the sole Forge operation and recovery authority: it stores
+/// the complete typed prepared and current details alongside the audit
+/// sequences the transitions that wrote them produced. `vala.audit_outbox` is a
+/// delivery table with its own retention lifecycle, so no read here joins it —
+/// a delivered audit row that later ages out must not remove a worker's ability
+/// to recover its own prepared operation.
 ///
 /// This is the sole `sqlx::FromRow` decoder. Every decoded row goes through
 /// an explicit [`TryInto<ForgeOperationStateRow>`] that validates stored
@@ -227,16 +234,10 @@ pub(crate) struct ForgeOperationStateSqlRow {
     pub(crate) prepared_at: DateTime<Utc>,
     /// Wall-clock time of the most recent update.
     pub(crate) updated_at: DateTime<Utc>,
-    /// Operation column from the optional joined prepared audit row.
-    pub(crate) prepared_audit_operation: Option<String>,
-    /// Resource column from the optional joined prepared audit row.
-    pub(crate) prepared_audit_resource: Option<String>,
-    /// Detail text from the optional joined prepared audit row.
-    pub(crate) prepared_audit_detail: Option<String>,
 }
 
 impl TryFrom<ForgeOperationStateSqlRow> for ForgeOperationStateRow {
-    /// Error returned when persisted state or its prepared evidence violates an invariant.
+    /// Error returned when persisted state violates an invariant.
     type Error = SqlError;
 
     /// Converts a raw SQL row into a validated public domain row.
@@ -244,14 +245,9 @@ impl TryFrom<ForgeOperationStateSqlRow> for ForgeOperationStateRow {
     /// Validation steps in order:
     /// 1. Parse closed `family` and `phase` strings.
     /// 2. Decode both JSONB columns to typed `AuditDetail`.
-    /// 3. Decode the prepared audit detail (text -> JSON -> `AuditDetail`).
-    /// 4. Validate the joined audit operation is the exact Prepared operation
-    ///    for the family and its resource equals `row.resource`.
-    /// 5. Validate tenant/resource/family/operation/phase identity in both
+    /// 3. Validate tenant/resource/family/operation/phase identity in both
     ///    state details.
-    /// 6. Require prepared state detail and joined prepared audit detail to
-    ///    have identical `audit_detail_canonical_json`.
-    /// 7. Enforce the terminal-sequence nullability check.
+    /// 4. Enforce the terminal-sequence nullability check.
     ///
     /// # Errors
     /// Returns [`SqlError::InvariantViolation`] when any stored value fails
@@ -267,42 +263,6 @@ impl TryFrom<ForgeOperationStateSqlRow> for ForgeOperationStateRow {
 
         let prepared_detail = decode_detail_value(row.prepared_detail, "prepared_detail")?;
         let current_detail = decode_detail_value(row.current_detail, "current_detail")?;
-        let prepared_audit_operation = require_prepared_audit_field(
-            row.prepared_audit_operation,
-            "operation",
-            row.prepared_audit_seq,
-        )?;
-        let prepared_audit_resource = require_prepared_audit_field(
-            row.prepared_audit_resource,
-            "resource",
-            row.prepared_audit_seq,
-        )?;
-        let prepared_audit_detail = require_prepared_audit_field(
-            row.prepared_audit_detail,
-            "detail",
-            row.prepared_audit_seq,
-        )?;
-        let audit_detail =
-            decode_audit_detail_text(&prepared_audit_detail, row.prepared_audit_seq)?;
-
-        // Validate the joined audit operation is the exact Prepared operation for this family.
-        let expected_prepared_operation = format!("{}.prepared", family.operation_prefix());
-        if prepared_audit_operation != expected_prepared_operation {
-            return Err(SqlError::InvariantViolation {
-                detail: format!(
-                    "prepared audit operation mismatch: expected {expected_prepared_operation}, got {}",
-                    prepared_audit_operation
-                ),
-            });
-        }
-        if prepared_audit_resource != row.resource {
-            return Err(SqlError::InvariantViolation {
-                detail: format!(
-                    "prepared audit resource mismatch: expected {}, got {}",
-                    row.resource, prepared_audit_resource
-                ),
-            });
-        }
 
         // Validate identity in both state details.
         validate_detail_identity(
@@ -319,15 +279,6 @@ impl TryFrom<ForgeOperationStateSqlRow> for ForgeOperationStateRow {
             row.operation_id,
             phase,
         )?;
-
-        // Prepared state detail must match the joined audit detail.
-        let state_canonical = audit_detail_canonical_json(&prepared_detail);
-        let audit_canonical = audit_detail_canonical_json(&audit_detail);
-        if state_canonical != audit_canonical {
-            return Err(SqlError::InvariantViolation {
-                detail: "prepared state detail and joined audit detail do not match".to_owned(),
-            });
-        }
 
         // Enforce nullability invariant.
         match phase {
@@ -366,26 +317,6 @@ impl TryFrom<ForgeOperationStateSqlRow> for ForgeOperationStateRow {
 // Private decoding helpers
 // ---------------------------------------------------------------------------
 
-/// Requires one column from the optional prepared-audit join.
-///
-/// The state queries deliberately use a `LEFT JOIN` so missing immutable
-/// evidence reaches this conversion boundary instead of becoming a SQLx
-/// null-decoding failure.
-///
-/// # Errors
-///
-/// Returns [`SqlError::InvariantViolation`] naming `field` and `audit_seq`
-/// when the joined value is absent.
-fn require_prepared_audit_field<T>(
-    value: Option<T>,
-    field: &'static str,
-    audit_seq: i64,
-) -> Result<T, SqlError> {
-    value.ok_or_else(|| SqlError::InvariantViolation {
-        detail: format!("missing prepared audit {field} at seq {audit_seq}"),
-    })
-}
-
 /// Decodes a `serde_json::Value` stored in a JSONB column into a typed
 /// [`AuditDetail`].
 ///
@@ -398,19 +329,6 @@ fn decode_detail_value(
 ) -> Result<AuditDetail, SqlError> {
     serde_json::from_value(value).map_err(|e| SqlError::InvariantViolation {
         detail: format!("failed to decode {stored_field} audit detail: {e}"),
-    })
-}
-
-/// Decodes prepared audit text into a typed [`AuditDetail`].
-///
-/// The caller first establishes that the optional join produced a value. This
-/// helper owns only JSON decoding of `vala.audit_outbox.detail`.
-///
-/// # Errors
-/// Returns [`SqlError::InvariantViolation`] when `value` cannot be parsed.
-fn decode_audit_detail_text(value: &str, audit_seq: i64) -> Result<AuditDetail, SqlError> {
-    serde_json::from_str(value).map_err(|e| SqlError::InvariantViolation {
-        detail: format!("failed to decode prepared audit detail at seq {audit_seq}: {e}"),
     })
 }
 

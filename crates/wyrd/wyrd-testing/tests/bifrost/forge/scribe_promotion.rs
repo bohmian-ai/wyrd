@@ -412,8 +412,14 @@ async fn scribe_promotion_catalog_sql_window_preserves_exact_visibility() {
         sealed: &BTreeSet<String>,
         label: &str,
     ) {
+        let permit =
+            vala_bifrost_redux::oracle::reader_pins::ReaderIoPermit::unfenced_for_test();
+        let prepared = catalog
+            .prepare_reader_identity(table, tenant)
+            .await
+            .expect("the registered table prepares its reader identity");
         let pinned = catalog
-            .pin_sealed_table(table, tenant)
+            .materialize_reader_cut(prepared, &permit)
             .await
             .unwrap_or_else(|error| panic!("{label} cut: {error}"));
         let hot = pinned

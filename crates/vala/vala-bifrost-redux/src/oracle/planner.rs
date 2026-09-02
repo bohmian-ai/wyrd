@@ -110,7 +110,7 @@ impl OraclePlanner {
         request: &BifrostQueryRequest,
         deadline: Instant,
         catalog: &BifrostCatalog,
-        authority: &Arc<OracleReaderAuthority>,
+        authority: Option<&Arc<OracleReaderAuthority>>,
         snapshot: &crate::cluster::ClusterSnapshot,
     ) -> Result<PlannedSqlCut, BifrostError> {
         self.validate_query(request)?;
@@ -188,7 +188,7 @@ impl OraclePlanner {
         authority: &Arc<OracleReaderAuthority>,
     ) -> Result<ProtectedPlannedSqlCut, BifrostError> {
         let tables = collect_plan_table_refs(plan)?;
-        Self::protect_and_materialize(&tables, tenant, deadline, catalog, authority).await
+        Self::protect_and_materialize(&tables, tenant, deadline, catalog, Some(authority)).await
     }
 
     /// Prepares identities, takes one complete reader guard, then materializes.
@@ -207,8 +207,13 @@ impl OraclePlanner {
         tenant: wyrd_spec::DataTenantId,
         deadline: Instant,
         catalog: &BifrostCatalog,
-        authority: &Arc<OracleReaderAuthority>,
+        authority: Option<&Arc<OracleReaderAuthority>>,
     ) -> Result<ProtectedPlannedSqlCut, BifrostError> {
+        let Some(authority) = authority else {
+            // A replica with no local Oracle role holds no reader epoch, so it
+            // has nothing that could protect a snapshot it is about to read.
+            return Err(BifrostError::OracleRoleUnavailable);
+        };
         let mut prepared = Vec::with_capacity(tables.len());
         for table in tables {
             let remaining = deadline
@@ -357,7 +362,7 @@ impl OraclePlanner {
         tables: &[TableRef],
         deadline: Instant,
         catalog: &BifrostCatalog,
-        authority: &Arc<OracleReaderAuthority>,
+        authority: Option<&Arc<OracleReaderAuthority>>,
         live_oracle_cpu: f64,
     ) -> Result<PlannedSqlCut, BifrostError> {
         let planning = self.try_planning()?;

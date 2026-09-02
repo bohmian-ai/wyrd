@@ -220,6 +220,65 @@ pub fn local_cut_from_prepared(
     )))
 }
 
+/// Derives one follower's per-table cut from the leader's signed evidence.
+///
+/// Returns `None` for a cut that names no snapshot, which is how the leader
+/// describes a scan that reads only a live writer tail.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::Internal`] when the signed ancestry does not begin
+/// at the signed snapshot, when its declared digest version is not the one this
+/// build proves, or when recomputing the member digest does not reproduce the
+/// signed value. All three mean the follower cannot prove the lineage it is
+/// about to claim protection over.
+pub fn local_cut_from_follower(
+    identity: &TableAuthorityIdentity,
+    cut: &wyrd_spec::vala::api::FollowerReaderCut,
+) -> Result<Option<LocalReaderCut>, BifrostError> {
+    if !cut.protects_a_snapshot() {
+        return Ok(None);
+    }
+    if cut.ancestry_path.first() != Some(&cut.snapshot_id) {
+        return Err(internal(format!(
+            "Oracle follower cut {} has an ancestry that does not begin at it",
+            cut.snapshot_id
+        )));
+    }
+    let expected_version = u32::try_from(
+        vala_sql::row_types::oracle_reader_authority::ANCESTRY_DIGEST_VERSION,
+    )
+    .map_err(|_| internal("Oracle ancestry digest version does not fit its wire type"))?;
+    if cut.ancestry_digest_version != expected_version {
+        return Err(internal(format!(
+            "Oracle follower cut declares ancestry digest version {} but this node proves {}",
+            cut.ancestry_digest_version, expected_version
+        )));
+    }
+    let member = ProtectionMember::new(
+        identity,
+        cut.ancestry_path.clone(),
+        cut.snapshot_timestamp_ms,
+        cut.snapshot_timestamp_ms,
+    )
+    .map_err(|error| internal(error.to_string()))?;
+    let mut recomputed = String::with_capacity(64);
+    for byte in member.ancestry_digest {
+        use std::fmt::Write as _;
+        let _ = write!(recomputed, "{byte:02x}");
+    }
+    if recomputed != cut.ancestry_digest_hex {
+        return Err(internal(
+            "Oracle follower cut ancestry does not reproduce its own signed digest",
+        ));
+    }
+    Ok(Some(LocalReaderCut {
+        snapshot_id: cut.snapshot_id,
+        timestamp_ms: cut.snapshot_timestamp_ms,
+        ancestry_path: cut.ancestry_path.clone(),
+    }))
+}
+
 /// What one process does when its epoch cannot join descendants in time.
 ///
 /// Production aborts: a process that still has an unjoined task holding an open
@@ -466,6 +525,22 @@ impl ReaderIoPermit {
         Ok(())
     }
 
+    /// Builds a permit that authorizes IO for the life of one focused test.
+    ///
+    /// Test-only: no epoch, no query, and a deadline far past any test's
+    /// runtime. It exists so catalog-level tests can exercise materialization
+    /// without standing up a durable reader epoch, and it is never reachable
+    /// from a production build.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn unfenced_for_test() -> Self {
+        Self::new(
+            CancellationToken::new(),
+            CancellationToken::new(),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(3_600),
+        )
+    }
+
     /// Reports the conservative instant this permit stops authorizing IO.
     #[must_use]
     pub fn no_io_deadline(&self) -> tokio::time::Instant {
@@ -555,10 +630,27 @@ pub struct OracleReaderAuthority {
     release_capacity: usize,
     /// Bounded queue the narrowing worker drains.
     narrowing_tx: mpsc::Sender<NarrowingCommand>,
+    /// Signal telling the narrowing worker to drain what remains and stop.
+    narrowing_drain: CancellationToken,
     /// Whether new admission is still open.
     admission_open: AtomicBool,
     /// What this process does when it cannot join descendants in time.
     terminator: Arc<dyn OracleEpochTerminator>,
+    /// The epoch's own background tasks, joined during retirement.
+    ///
+    /// Owned here rather than by the engine because retirement's ordering is
+    /// this type's invariant: the narrowing worker must be drained and joined
+    /// after descendants are joined and before any table is released, and no
+    /// caller can be relied on to sequence that from outside.
+    workers: Mutex<Option<EpochWorkers>>,
+}
+
+/// The two background tasks one reader epoch owns for its whole life.
+struct EpochWorkers {
+    /// Bounded worker draining reserved narrowing commands.
+    narrowing: tokio::task::JoinHandle<()>,
+    /// Renewal and self-fence supervisor for this epoch's lease.
+    lease: tokio::task::JoinHandle<()>,
 }
 
 impl std::fmt::Debug for OracleReaderAuthority {
@@ -585,6 +677,8 @@ pub struct OracleReaderAuthorityConfig {
     pub max_concurrent_queries: usize,
     /// What this process does when it cannot join descendants in time.
     pub terminator: Arc<dyn OracleEpochTerminator>,
+    /// Process shutdown token that stops this epoch's lease supervisor.
+    pub shutdown: CancellationToken,
 }
 
 impl OracleReaderAuthority {
@@ -605,7 +699,7 @@ impl OracleReaderAuthority {
     /// transaction or its audit fails.
     pub async fn start(
         config: OracleReaderAuthorityConfig,
-    ) -> Result<(Arc<Self>, tokio::task::JoinHandle<()>), BifrostError> {
+    ) -> Result<Arc<Self>, BifrostError> {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| internal("Oracle reader authority requires an active Tokio runtime"))?;
         if config.max_concurrent_queries == 0 {
@@ -656,11 +750,15 @@ impl OracleReaderAuthority {
             release_permits: Arc::new(Semaphore::new(config.max_concurrent_queries)),
             release_capacity: config.max_concurrent_queries,
             narrowing_tx,
+            narrowing_drain: CancellationToken::new(),
             admission_open: AtomicBool::new(false),
             terminator: config.terminator,
+            workers: Mutex::new(None),
         });
-        let worker = runtime.spawn(Arc::clone(&authority).run_narrowing(narrowing_rx));
-        Ok((authority, worker))
+        let narrowing = runtime.spawn(Arc::clone(&authority).run_narrowing(narrowing_rx));
+        let lease = runtime.spawn(Arc::clone(&authority).supervise_lease(config.shutdown));
+        *authority.workers.lock().await = Some(EpochWorkers { narrowing, lease });
+        Ok(authority)
     }
 
     /// Borrows the cancellation root every descendant of this epoch observes.
@@ -1028,6 +1126,58 @@ impl OracleReaderAuthority {
         self: &Arc<Self>,
         prepared: &[crate::catalog::PreparedReaderIdentity],
     ) -> Result<(ReaderQueryGuard, ReaderIoPermit), BifrostError> {
+        let mut requested: BTreeMap<TableAuthorityIdentity, LocalReaderCut> = BTreeMap::new();
+        for cut in prepared {
+            let Some((identity, local)) = local_cut_from_prepared(cut)? else {
+                continue;
+            };
+            // One query cannot hold two different cuts of one table: the cut is
+            // immutable and per-table, so a repeat is the same snapshot.
+            requested.entry(identity).or_insert(local);
+        }
+        self.protect(requested).await
+    }
+
+    /// Protects one follower fragment's assigned cuts under this node's epoch.
+    ///
+    /// A follower never resolves its own snapshot: the leader signed exactly
+    /// which snapshot each scan reads, so the follower re-derives the same
+    /// local cut from that signed evidence and protects it under its own epoch
+    /// before it opens anything. The digest is recomputed here rather than
+    /// trusted, so a tampered ancestry cannot widen what this node claims to
+    /// have proven.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when a signed cut's ancestry does not
+    /// reproduce its own digest, and every failure
+    /// [`OracleReaderAuthority::acquire_guard`] returns.
+    pub async fn acquire_follower_guard(
+        self: &Arc<Self>,
+        cuts: &[(TableAuthorityIdentity, wyrd_spec::vala::api::FollowerReaderCut)],
+    ) -> Result<(ReaderQueryGuard, ReaderIoPermit), BifrostError> {
+        let mut requested: BTreeMap<TableAuthorityIdentity, LocalReaderCut> = BTreeMap::new();
+        for (identity, cut) in cuts {
+            let Some(local) = local_cut_from_follower(identity, cut)? else {
+                continue;
+            };
+            requested.entry(identity.clone()).or_insert(local);
+        }
+        self.protect(requested).await
+    }
+
+    /// Commits the durable protection one already-derived cut set requires.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when admission is closed, when the
+    /// epoch is past its admission cutoff, when a table has no maintenance
+    /// authority row, or when a required durable widening could not commit.
+    /// Every failure leaves prior conservative protection in place.
+    async fn protect(
+        self: &Arc<Self>,
+        requested: BTreeMap<TableAuthorityIdentity, LocalReaderCut>,
+    ) -> Result<(ReaderQueryGuard, ReaderIoPermit), BifrostError> {
         let (no_io_deadline, admission_cutoff) = {
             let lifecycle = self.lifecycle.lock().await;
             (
@@ -1051,16 +1201,6 @@ impl OracleReaderAuthority {
             .acquire_owned()
             .await
             .map_err(|_| internal("Oracle reader authority release queue is closed"))?;
-
-        let mut requested: BTreeMap<TableAuthorityIdentity, LocalReaderCut> = BTreeMap::new();
-        for cut in prepared {
-            let Some((identity, local)) = local_cut_from_prepared(cut)? else {
-                continue;
-            };
-            // One query cannot hold two different cuts of one table: the cut is
-            // immutable and per-table, so a repeat is the same snapshot.
-            requested.entry(identity).or_insert(local);
-        }
 
         let mut coordinators = Vec::with_capacity(requested.len());
         for identity in requested.keys() {
@@ -1267,7 +1407,19 @@ impl OracleReaderAuthority {
     /// commits the remaining frontier. A failed mutation keeps the prior
     /// confirmed frontier rather than advertising an unconfirmed narrowing.
     async fn run_narrowing(self: Arc<Self>, mut commands: mpsc::Receiver<NarrowingCommand>) {
-        while let Some(command) = commands.recv().await {
+        loop {
+            tokio::select! {
+                biased;
+                command = commands.recv() => {
+                    let Some(command) = command else { return };
+                    self.apply_narrowing(command).await;
+                }
+                () = self.narrowing_drain.cancelled() => break,
+            }
+        }
+        // Reached only after descendants are joined, so no sender can add
+        // another command and what is queued here is the complete remainder.
+        while let Ok(command) = commands.try_recv() {
             self.apply_narrowing(command).await;
         }
     }
@@ -1349,6 +1501,20 @@ impl OracleReaderAuthority {
         self.select_loss().await;
         self.commit_loss_edge().await?;
         self.epoch_cancel.cancel();
+        // Ordered, not incidental: descendants are joined before the narrowing
+        // worker is stopped, and both happen before the first table release, so
+        // no table is released while a reader of it can still be running and no
+        // reserved narrowing is abandoned unapplied.
+        if !self.join_descendants().await {
+            tracing::error!(
+                node_id = %self.node_id,
+                fencing_token = self.fencing_token,
+                "Oracle retired its reader epoch without joining every descendant"
+            );
+            self.terminator
+                .terminate("Oracle reader epoch descendants outlived retirement's join budget");
+        }
+        self.stop_workers().await;
 
         let identities: Vec<TableAuthorityIdentity> =
             self.coordinators.lock().await.keys().cloned().collect();
@@ -1403,6 +1569,29 @@ impl OracleReaderAuthority {
         Ok(())
     }
 
+    /// Closes the narrowing queue, then joins both of this epoch's workers.
+    ///
+    /// The lease supervisor is aborted rather than awaited: it is a renewal
+    /// loop with no unflushed state, and the epoch has already committed its
+    /// loss edge, so another renewal would be wrong rather than merely late.
+    /// The narrowing worker is drained instead, because its queue may still
+    /// hold reserved releases that must reach Postgres.
+    async fn stop_workers(&self) {
+        let Some(workers) = self.workers.lock().await.take() else {
+            return;
+        };
+        workers.lease.abort();
+        self.narrowing_drain.cancel();
+        if let Err(error) = workers.narrowing.await
+            && !error.is_cancelled()
+        {
+            tracing::error!(
+                node_id = %self.node_id,
+                "Oracle reader epoch narrowing worker did not terminate cleanly"
+            );
+        }
+    }
+
     /// Borrows the read-only pool reader recovery enumerates through.
     #[must_use]
     pub fn operator_pool(&self) -> &vala_sql::OperatorPool {
@@ -1416,7 +1605,7 @@ impl OracleReaderAuthority {
     /// Postgres refused, and a local monotonic clock that has reached the
     /// no-IO deadline derived from the last confirmed lease. The second matters
     /// because a supervisor that is merely starved never learns the first.
-    pub async fn supervise_lease(self: Arc<Self>, shutdown: CancellationToken) {
+    async fn supervise_lease(self: Arc<Self>, shutdown: CancellationToken) {
         loop {
             let no_io = self.deadlines().await.no_io;
             tokio::select! {

@@ -78,7 +78,7 @@ pub mod peer;
 mod planner;
 pub(crate) mod pruning;
 mod query_stream;
-pub(crate) mod reader_pins;
+pub mod reader_pins;
 mod running;
 mod spill;
 mod splitter;
@@ -1870,10 +1870,6 @@ pub struct Oracle {
     maintenance: Mutex<Option<JoinHandle<()>>>,
     /// Background-only `PostgreSQL` allocator and renewal task.
     delegated_maintenance: Mutex<Option<JoinHandle<()>>>,
-    /// Bounded worker draining this epoch's batched protection narrowing.
-    reader_narrowing: Mutex<Option<JoinHandle<()>>>,
-    /// Cancellation-bound task renewing this epoch's lease or self-fencing.
-    reader_lease_supervisor: Mutex<Option<JoinHandle<()>>>,
     /// Test-tier one-shot pause after immutable worker selection.
     #[cfg(feature = "test-support")]
     topology_probe: Mutex<Option<Arc<OracleTopologyProbe>>>,
@@ -2091,7 +2087,7 @@ impl Oracle {
         let reader_capacity = (config.config.interactive_slots
             + config.config.analytical_slots
             + config.config.queue_capacity) as usize;
-        let (reader_authority, reader_narrowing) =
+        let reader_authority =
             reader_pins::OracleReaderAuthority::start(reader_pins::OracleReaderAuthorityConfig {
                 vala: config.vala.clone(),
                 operator_pool: operator_pool.clone(),
@@ -2099,10 +2095,9 @@ impl Oracle {
                 fencing_token: admission.local_role.fencing_token,
                 max_concurrent_queries: reader_capacity.max(1),
                 terminator: Arc::new(reader_pins::AbortingEpochTerminator),
+                shutdown: shutdown.clone(),
             })
             .await?;
-        let reader_lease_supervisor = tokio::runtime::Handle::current()
-            .spawn(Arc::clone(&reader_authority).supervise_lease(shutdown.clone()));
         let fragment_dispatcher = config.peer_transports.map(|transports| {
             Arc::new(dispatcher::FragmentDispatcher::new(
                 Arc::clone(&config.peer_ticket_minter),
@@ -2134,8 +2129,6 @@ impl Oracle {
             startup_result: Mutex::new(Some(startup_result)),
             maintenance: Mutex::new(Some(maintenance)),
             delegated_maintenance: Mutex::new(Some(delegated_maintenance)),
-            reader_narrowing: Mutex::new(Some(reader_narrowing)),
-            reader_lease_supervisor: Mutex::new(Some(reader_lease_supervisor)),
             #[cfg(feature = "test-support")]
             topology_probe: Mutex::new(None),
         })
@@ -2278,7 +2271,7 @@ impl Oracle {
                 request,
                 deadline,
                 &self.catalog,
-                &self.reader_authority,
+                Some(&self.reader_authority),
                 &snapshot,
             )
             .await?;
@@ -2755,7 +2748,7 @@ impl Oracle {
                 tables,
                 deadline,
                 &self.catalog,
-                &self.reader_authority,
+                Some(&self.reader_authority),
                 live_oracle_cpu,
             )
             .await?;
@@ -3347,35 +3340,11 @@ impl Oracle {
                 delegated.abort();
             }
         }
-        // Retirement closes admission, releases every table, and deletes the
-        // epoch row. Only then are its workers joined: a worker cancelled first
-        // could leave a reserved release undelivered.
+        // Retirement owns its own ordering end to end: it closes admission,
+        // joins descendants, drains and joins its workers, releases every
+        // table, and only then deletes the epoch row.
         if let Err(error) = self.reader_authority.retire().await {
             tracing::error!(error = %error, "Oracle retained reader protection after retirement failed");
-        }
-        let supervisor = self
-            .reader_lease_supervisor
-            .lock()
-            .ok()
-            .and_then(|mut handle| handle.take());
-        if let Some(supervisor) = supervisor {
-            supervisor.abort();
-        }
-        let watermarks = self
-            .reader_narrowing
-            .lock()
-            .ok()
-            .and_then(|mut handle| handle.take());
-        if let Some(mut watermarks) = watermarks {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .unwrap_or(Duration::ZERO);
-            if tokio::time::timeout(remaining, &mut watermarks)
-                .await
-                .is_err()
-            {
-                watermarks.abort();
-            }
         }
         let _ = deadline;
         report

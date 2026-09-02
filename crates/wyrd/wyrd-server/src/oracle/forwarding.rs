@@ -163,6 +163,9 @@ impl ReadyOracleForwarder {
                 &request,
                 monotonic_deadline,
                 &self.catalog,
+                self.local_oracle
+                    .as_ref()
+                    .map(|oracle| oracle.reader_authority()),
                 &snapshot,
             )
             .await?;

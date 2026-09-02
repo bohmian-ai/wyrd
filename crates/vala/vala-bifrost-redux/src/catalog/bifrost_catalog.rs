@@ -487,6 +487,29 @@ impl BifrostCatalog {
         })
     }
 
+    /// Builds a `FileIO` whose every read is gated by one reader permit.
+    ///
+    /// This is the only place Oracle constructs read storage for a protected
+    /// cut. Writes and deletes are refused by the storage itself rather than by
+    /// convention, so a query path cannot mutate warehouse objects even if it
+    /// reaches an Iceberg API that would.
+    #[must_use]
+    pub fn gated_file_io(
+        &self,
+        permit: &crate::oracle::reader_pins::ReaderIoPermit,
+    ) -> iceberg::io::FileIO {
+        let factory = Arc::new(
+            crate::catalog::iceberg_storage::EpochGatedIcebergStorageFactory::new(
+                Arc::clone(&self.storage),
+                &self.warehouse,
+                permit.clone(),
+            ),
+        ) as Arc<dyn StorageFactory>;
+        FileIOBuilder::new(factory)
+            .with_props(self.storage_properties.clone())
+            .build()
+    }
+
     /// Rebuilds one immutable table over storage gated by a reader permit.
     ///
     /// Uses the prepared metadata document rather than reloading it, so this
@@ -504,16 +527,7 @@ impl BifrostCatalog {
         metadata_location: Option<String>,
         permit: &crate::oracle::reader_pins::ReaderIoPermit,
     ) -> Result<iceberg::table::Table, BifrostCatalogError> {
-        let factory = Arc::new(
-            crate::catalog::iceberg_storage::EpochGatedIcebergStorageFactory::new(
-                Arc::clone(&self.storage),
-                &self.warehouse,
-                permit.clone(),
-            ),
-        ) as Arc<dyn StorageFactory>;
-        let file_io = FileIOBuilder::new(factory)
-            .with_props(self.storage_properties.clone())
-            .build();
+        let file_io = self.gated_file_io(permit);
         let mut builder = iceberg::table::Table::builder()
             .file_io(file_io)
             .metadata(metadata)
@@ -1150,7 +1164,19 @@ impl BifrostCatalog {
         table: &TableRef,
         tenant: DataTenantId,
     ) -> Result<arrow::datatypes::SchemaRef, BifrostCatalogError> {
-        let provider = self.provider(table, tenant).await?;
+        // Schema only: the provider is built from the loaded metadata document
+        // and dropped here, so this path opens no snapshot object and needs no
+        // reader permit to gate one.
+        let fqn = table.fqn();
+        let Some(_row) = self.lookup_table_row(&fqn, tenant).await? else {
+            return Err(BifrostCatalogError::TableNotFound(fqn));
+        };
+        let binding = TenantTableBinding::resolve((tenant, table.clone()))
+            .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
+        let iceberg_table = self.catalog.load_table(&binding.table_ident()).await?;
+        let provider = ReduxTableProvider::try_new(iceberg_table, tenant)
+            .await
+            .map_err(BifrostCatalogError::DataFusion)?;
         Ok(datafusion::datasource::TableProvider::schema(&provider))
     }
 
@@ -1211,6 +1237,7 @@ impl BifrostCatalog {
         &self,
         table: &TableRef,
         tenant: DataTenantId,
+        permit: &crate::oracle::reader_pins::ReaderIoPermit,
     ) -> Result<ReduxTableProvider, BifrostCatalogError> {
         let fqn = table.fqn();
         let Some(_row) = self.lookup_table_row(&fqn, tenant).await? else {
@@ -1218,7 +1245,14 @@ impl BifrostCatalog {
         };
         let binding = TenantTableBinding::resolve((tenant, table.clone()))
             .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
-        let iceberg_table = self.catalog.load_table(&binding.table_ident()).await?;
+        let identifier = binding.table_ident();
+        let loaded = self.catalog.load_table(&identifier).await?;
+        let iceberg_table = self.permit_scoped_table(
+            &identifier,
+            loaded.metadata_ref(),
+            loaded.metadata_location().map(ToOwned::to_owned),
+            permit,
+        )?;
         ReduxTableProvider::try_new(iceberg_table, tenant)
             .await
             .map_err(BifrostCatalogError::DataFusion)
@@ -1243,6 +1277,7 @@ impl BifrostCatalog {
         table: &TableRef,
         tenant: DataTenantId,
         snapshot_id: i64,
+        permit: &crate::oracle::reader_pins::ReaderIoPermit,
     ) -> Result<ReduxTableProvider, BifrostCatalogError> {
         let fqn = table.fqn();
         let Some(_row) = self.lookup_table_row(&fqn, tenant).await? else {
@@ -1250,7 +1285,14 @@ impl BifrostCatalog {
         };
         let binding = TenantTableBinding::resolve((tenant, table.clone()))
             .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
-        let iceberg_table = self.catalog.load_table(&binding.table_ident()).await?;
+        let identifier = binding.table_ident();
+        let loaded = self.catalog.load_table(&identifier).await?;
+        let iceberg_table = self.permit_scoped_table(
+            &identifier,
+            loaded.metadata_ref(),
+            loaded.metadata_location().map(ToOwned::to_owned),
+            permit,
+        )?;
         ReduxTableProvider::try_new_pinned(iceberg_table, tenant, snapshot_id)
             .await
             .map_err(BifrostCatalogError::DataFusion)
@@ -1427,7 +1469,12 @@ mod schema_shape_tests {
         /// Accepts only a catalog lookup taking exactly a table reference and tenant.
         fn accepts_direct_catalog_provider<T, F>(_provider: F)
         where
-            F: Fn(&'static BifrostCatalog, &'static TableRef, DataTenantId) -> T,
+            F: Fn(
+                &'static BifrostCatalog,
+                &'static TableRef,
+                DataTenantId,
+                &'static crate::oracle::reader_pins::ReaderIoPermit,
+            ) -> T,
         {
         }
 
@@ -1805,20 +1852,25 @@ mod production_pin_tests {
                 .await
                 .expect("fast append commits");
 
+            let permit = crate::oracle::reader_pins::ReaderIoPermit::unfenced_for_test();
+            let prepared = catalog
+                .prepare_reader_identity(&table, tenant)
+                .await
+                .expect("the registered table prepares");
             let pinned = catalog
-                .pin_sealed_table(&table, tenant)
+                .materialize_reader_cut(prepared, &permit)
                 .await
                 .expect("the committed snapshot pins");
             let snapshot_id = pinned
                 .snapshot_id
                 .expect("a committed table has a snapshot");
             catalog
-                .pinned_provider(&table, tenant, snapshot_id)
+                .pinned_provider(&table, tenant, snapshot_id, &permit)
                 .await
                 .expect("the published snapshot resolves");
             assert!(
                 catalog
-                    .pinned_provider(&table, tenant, snapshot_id.wrapping_add(1))
+                    .pinned_provider(&table, tenant, snapshot_id.wrapping_add(1), &permit)
                     .await
                     .is_err(),
                 "an unpublished snapshot must fail to resolve rather than serve the current one"
@@ -1905,8 +1957,13 @@ mod production_pin_tests {
                 .await
                 .expect("fast append commits");
 
+            let permit = crate::oracle::reader_pins::ReaderIoPermit::unfenced_for_test();
+            let prepared = catalog
+                .prepare_reader_identity(&table, tenant)
+                .await
+                .expect("the registered table prepares");
             let pinned = catalog
-                .pin_sealed_table(&table, tenant)
+                .materialize_reader_cut(prepared, &permit)
                 .await
                 .expect("the committed snapshot pins");
             assert_eq!(

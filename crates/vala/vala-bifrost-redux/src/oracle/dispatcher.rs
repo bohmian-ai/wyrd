@@ -997,10 +997,11 @@ impl OraclePeerWorker {
         self.physical_observer
             .oracle_executions
             .fetch_add(1, Ordering::AcqRel);
-        let (stream, scan_evidence) = stream.split();
+        let (stream, scan_evidence, reader_protection) = stream.split();
         let output = encode_attempt_frames(
             stream,
             scan_evidence,
+            reader_protection,
             running,
             follower_deadline,
             request.plan_fingerprint.clone(),
@@ -1398,6 +1399,7 @@ impl AttemptEncoder {
 fn encode_attempt_frames(
     stream: datafusion::execution::SendableRecordBatchStream,
     scan_evidence: super::follower::FollowerScanEvidence,
+    reader_protection: Option<super::follower::FollowerReaderProtection>,
     running: RunningReservation,
     follower_deadline: tokio::time::Instant,
     plan_fingerprint: String,
@@ -1405,6 +1407,10 @@ fn encode_attempt_frames(
 ) -> WorkerAttemptStream {
     Box::pin(async_stream::stream! {
         let _running = running;
+        // Retained for the whole attempt, footer and error paths included: the
+        // fragment's snapshots stay protected until this stream is finished or
+        // dropped, never merely until its plan was built.
+        let _reader_protection = reader_protection;
         let mut stream = stream;
         let mut encoder = AttemptEncoder::default();
         match encoder.start(stream.schema()) {
@@ -3085,6 +3091,7 @@ mod tests {
             _target_role: ClusterRole,
             assignment: &FollowerScanAssignment,
             _session: &datafusion::execution::session_state::SessionState,
+            _reader_io_permit: Option<&crate::oracle::reader_pins::ReaderIoPermit>,
         ) -> Result<super::super::follower::ResolvedFollowerSource, String> {
             let schema = Arc::new(Schema::new(vec![
                 Field::new("value", DataType::Int64, false),
@@ -4169,10 +4176,11 @@ mod tests {
             target_role: ClusterRole,
             assignment: &FollowerScanAssignment,
             session: &datafusion::execution::session_state::SessionState,
+            reader_io_permit: Option<&crate::oracle::reader_pins::ReaderIoPermit>,
         ) -> Result<super::super::follower::ResolvedFollowerSource, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             TestFollowerResolver
-                .resolve(target_role, assignment, session)
+                .resolve(target_role, assignment, session, reader_io_permit)
                 .await
         }
     }

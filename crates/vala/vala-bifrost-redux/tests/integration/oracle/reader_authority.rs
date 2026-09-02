@@ -10,6 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
+
+use crate::forge::support as forge_support;
 use uuid::Uuid;
 use vala_bifrost_redux::oracle::reader_pins::{
     LocalReaderCut, OracleReaderAuthority, OracleReaderAuthorityConfig, ReaderQueryGuard,
@@ -730,4 +732,299 @@ async fn epoch_lifecycle_self_fences_and_retires_in_order() {
             "oracle.reader_epoch.retired".to_owned(),
         ]
     );
+}
+
+/// Registers one more Oracle node and starts its activated epoch.
+///
+/// Each node in this journey needs its own fenced role row, because protection
+/// is keyed by node and fence: a follower must be able to protect the same
+/// table the leader protects, under its own epoch, without touching the
+/// leader's row.
+///
+/// # Panics
+///
+/// Panics when registration, acquisition, or activation fails.
+async fn oracle_epoch(
+    fixture: &forge_support::PromotionIntegrationFixture,
+    address: &str,
+) -> (Arc<OracleReaderAuthority>, Uuid, u64) {
+    let node_id = Uuid::now_v7();
+    let mut conn = fixture
+        .vala
+        .tenant_conn(DataTenantId::SYSTEM_OWNER)
+        .await
+        .expect("system connection");
+    let row = ClusterNodes::new(fixture.vala.clone())
+        .register(
+            &mut conn,
+            &RoleRegistration {
+                key: ClusterNodeKey {
+                    node_id: NodeId::new(node_id),
+                    role: ClusterRole::Oracle,
+                },
+                address: address.into(),
+                capabilities: ClusterCapabilities::OracleV1(OracleCapabilitiesV1 {
+                    storage_protocol_version: 1,
+                    cpu_cores: 4.0,
+                    memory_budget_bytes: 4096,
+                    cpu_cores_per_slot: 1.0,
+                    memory_bytes_per_slot: 1024,
+                    raw_slots: 4,
+                    usable_slots: 3,
+                    supported_classes: vec![QueryClass::Interactive],
+                    max_workers_per_query: 3,
+                }),
+                started_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .expect("oracle role registers");
+    conn.commit().await.expect("registration commits");
+    let fence = row.lease.fencing_token;
+    let authority = OracleReaderAuthority::start(OracleReaderAuthorityConfig {
+        vala: fixture.vala.clone(),
+        operator_pool: fixture.operator_pool.clone(),
+        node_id,
+        fencing_token: fence,
+        max_concurrent_queries: 4,
+        terminator: Arc::new(RecordingEpochTerminator::default()) as Arc<_>,
+        shutdown: CancellationToken::new(),
+    })
+    .await
+    .expect("epoch acquires");
+    authority.activate().await.expect("epoch activates");
+    (authority, node_id, fence)
+}
+
+/// Reads one node's durable protection header for one table.
+///
+/// # Panics
+///
+/// Panics when the read fails, which means the stored evidence is corrupt.
+async fn node_protection(
+    fixture: &forge_support::PromotionIntegrationFixture,
+    identity: &TableAuthorityIdentity,
+    node_id: Uuid,
+    fence: u64,
+) -> Option<ProtectionRecord> {
+    let mut conn = fixture
+        .vala
+        .tenant_conn(identity.tenant)
+        .await
+        .expect("tenant connection");
+    let record = OracleTableProtections::new(&mut conn)
+        .read(identity, node_id, i64::try_from(fence).expect("fence fits"))
+        .await
+        .expect("protection read");
+    conn.commit().await.expect("protection read commits");
+    record
+}
+
+/// Commits one real Iceberg snapshot over the fixture's sealed hot objects.
+///
+/// The journey needs a snapshot that exists, is dated, and has an ancestry the
+/// authority can walk, so it is produced by the production promotion route
+/// rather than written by hand.
+///
+/// # Panics
+///
+/// Panics when the supervised promotion does not commit.
+async fn commit_one_snapshot(fixture: &forge_support::PromotionIntegrationFixture) {
+    let object_store = forge_support::CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let mut forge = forge_support::SupervisedPromotion::start(
+        fixture,
+        fixture.catalog.iceberg_catalog(),
+        object_store as Arc<dyn vala_bifrost_redux::forge::ForgeObjectStore>,
+        vala_bifrost_redux::forge::ForgeClock::system(),
+    );
+    forge.run_one_success().await;
+    forge.shutdown().await;
+}
+
+/// Proves a leader and its followers protect before IO and release after join.
+///
+/// The ordering under test spans two epochs over one table: identity
+/// resolution takes no protection, the leader's protection is durable before
+/// any manifest or data object opens, each follower protects the signed cut
+/// under its *own* epoch before it resolves a source, a fenced permit refuses
+/// every later open, and neither epoch's release touches the other's row.
+///
+/// # Panics
+///
+/// Panics when protection is absent before an open, when a fenced permit still
+/// reads, or when a release happens in the wrong order.
+#[tokio::test]
+async fn leader_and_followers_protect_before_io_and_join_before_release() {
+    let fixture = forge_support::PromotionIntegrationFixture::start("reader_journey").await;
+    commit_one_snapshot(&fixture).await;
+    let (leader, leader_node, leader_fence) =
+        oracle_epoch(&fixture, "http://oracle-leader:5002").await;
+    let (follower, follower_node, follower_fence) =
+        oracle_epoch(&fixture, "http://oracle-follower:5002").await;
+
+    // Identity resolution is metadata-only: it names the cut and protects nothing.
+    let prepared = fixture
+        .catalog
+        .prepare_reader_identity(&fixture.binding.table_ref, fixture.tenant)
+        .await
+        .expect("the registered table resolves");
+    let (identity, local) =
+        vala_bifrost_redux::oracle::reader_pins::local_cut_from_prepared(&prepared)
+            .expect("the prepared identity is protectable")
+            .expect("promotion committed a snapshot to protect");
+    assert!(
+        node_protection(&fixture, &identity, leader_node, leader_fence)
+            .await
+            .is_none(),
+        "resolving an identity must not claim protection"
+    );
+
+    // Protection is durable before the cut opens a manifest or a data object.
+    let (leader_guard, leader_permit) = leader
+        .acquire_guard(std::slice::from_ref(&prepared))
+        .await
+        .expect("the leader protects its cut");
+    let opened = node_protection(&fixture, &identity, leader_node, leader_fence)
+        .await
+        .expect("leader protection is durable before any source open");
+    assert!(opened.frontier.covers(local.snapshot_id));
+    let pinned = fixture
+        .catalog
+        .materialize_reader_cut(prepared, &leader_permit)
+        .await
+        .expect("the protected cut materializes");
+    assert!(
+        !pinned.iceberg_file_paths.is_empty(),
+        "the materialized cut opened the committed manifest under its permit"
+    );
+
+    let signed =
+        vala_bifrost_redux::oracle::reader_pins::follower_reader_cut(&pinned, leader_fence)
+            .expect("the pinned cut signs")
+            .expect("a committed snapshot signs a follower cut");
+    follower_protection_precedes_resolution(
+        &fixture,
+        &follower,
+        &identity,
+        &signed,
+        (follower_node, follower_fence),
+        &opened,
+        (leader_node, leader_fence),
+    )
+    .await;
+
+    // Neither epoch's release touches the other's row.
+    assert!(
+        node_protection(&fixture, &identity, follower_node, follower_fence)
+            .await
+            .is_none(),
+        "the follower released its own protection"
+    );
+    let held = node_protection(&fixture, &identity, leader_node, leader_fence)
+        .await
+        .expect("one epoch's retirement never releases another's protection");
+    assert_eq!(held, opened);
+    drop(leader_guard);
+    drop(leader_permit);
+    leader.retire().await.expect("the leader retires");
+    assert!(
+        node_protection(&fixture, &identity, leader_node, leader_fence)
+            .await
+            .is_none(),
+        "the leader releases only after its own query is gone"
+    );
+}
+
+/// Drives the follower phase: protect, retry, fence, and release.
+///
+/// # Panics
+///
+/// Panics when the follower resolves before protecting, when a fenced permit
+/// still reads or exposes, when loss removes protection, or when the follower's
+/// lifecycle disturbs the leader's header.
+async fn follower_protection_precedes_resolution(
+    fixture: &forge_support::PromotionIntegrationFixture,
+    follower: &Arc<OracleReaderAuthority>,
+    identity: &TableAuthorityIdentity,
+    signed: &wyrd_spec::vala::api::FollowerReaderCut,
+    follower_epoch: (Uuid, u64),
+    leader_header: &ProtectionRecord,
+    leader_epoch: (Uuid, u64),
+) {
+    let (follower_node, follower_fence) = follower_epoch;
+    let (leader_node, leader_fence) = leader_epoch;
+    assert!(
+        node_protection(fixture, identity, follower_node, follower_fence)
+            .await
+            .is_none(),
+        "a follower starts with no protection of its own"
+    );
+    let cuts = vec![(identity.clone(), signed.clone())];
+    let (attempt, attempt_permit) = follower
+        .acquire_follower_guard(&cuts)
+        .await
+        .expect("the follower protects the signed cut");
+    let header = node_protection(fixture, identity, follower_node, follower_fence)
+        .await
+        .expect("each follower's own epoch protects before it resolves");
+    assert!(header.frontier.covers(signed.snapshot_id));
+    attempt_permit
+        .begin_io()
+        .expect("a protected follower may open its assigned source");
+
+    // A retry takes its own guard while the reachable attempt still holds one,
+    // and releasing the old attempt cannot narrow what the retry still needs.
+    let (retry, retry_permit) = follower
+        .acquire_follower_guard(&cuts)
+        .await
+        .expect("a retry acquires its own guard");
+    drop(attempt);
+    assert!(
+        node_protection(fixture, identity, follower_node, follower_fence)
+            .await
+            .expect("the retry still needs the snapshot")
+            .frontier
+            .covers(signed.snapshot_id)
+    );
+
+    // Loss stops every read the fragment could still start or expose, and
+    // removes nothing: the follower cannot prove its descendants stopped.
+    follower.self_fence().await;
+    assert!(
+        attempt_permit.begin_io().is_err(),
+        "a fenced epoch starts no new source IO"
+    );
+    assert!(
+        retry_permit.expose_result().is_err(),
+        "a read begun before loss cannot expose bytes afterward"
+    );
+    assert!(
+        node_protection(fixture, identity, follower_node, follower_fence)
+            .await
+            .is_some(),
+        "no protection is removed after loss"
+    );
+    let reprepared = fixture
+        .catalog
+        .prepare_reader_identity(&fixture.binding.table_ref, fixture.tenant)
+        .await
+        .expect("the registered table still resolves");
+    assert!(
+        fixture
+            .catalog
+            .materialize_reader_cut(reprepared, &retry_permit)
+            .await
+            .is_err(),
+        "every source open a cut needs goes through its permit"
+    );
+    assert_eq!(
+        node_protection(fixture, identity, leader_node, leader_fence)
+            .await
+            .as_ref(),
+        Some(leader_header),
+        "a follower's whole lifecycle never touches the leader's header"
+    );
+
+    drop(retry);
+    follower.retire().await.expect("the follower retires");
 }
